@@ -357,6 +357,11 @@ impl ExternalFlow {
         // Keyed just before the turn's anchor so the reply's parts — whose
         // server times are at or after it — always insert BELOW the preview.
         let anchor_text = (!preview.is_empty()).then(|| format!("👤 {}", preview));
+        // This render starts a NEW external run: a `/stop` from before it is
+        // not this run's ending — the same rule a fresh Turn applies to the
+        // sticky marker (ADR-0043). A stop landing after this point ends the
+        // render promptly as ⏹ 已停止 (the loop's own check).
+        handles.waits.stopped_sessions.lock().await.remove(session_id);
         Turn::arm_external_render(
             &handles.cards,
             session_id,
@@ -490,6 +495,11 @@ impl ExternalFlow {
                 static_text.push_str(&format!("\n{role} {text}"));
             }
         }
+        // A NEW external run (the adoption follows it): a `/stop` from before
+        // it is not this run's ending, same as the reply renderer's arm. A
+        // stop landing after this point ends the follow promptly as
+        // ⏹ 已停止 (the loop's own check).
+        handles.waits.stopped_sessions.lock().await.remove(session_id);
         Turn::arm_external_render(
             &handles.cards,
             session_id,
@@ -800,7 +810,8 @@ pub(crate) async fn settle_snapshot_after_send(
 
 /// Incremental renderer for an external message's reply: poll the session,
 /// stream reasoning/tool/text into the notification card, then finalize it as
-/// Done when the model finishes. Exits when the turn completes, the accumulator
+/// Done when the model finishes — or ⏹ 已停止 when a deliberate `/stop` lands
+/// on the run it renders (#394). Exits when the turn completes, the accumulator
 /// was replaced (cola's own prompt or a newer external message), a newer user
 /// message starts a new turn, or the hard timeout elapses.
 async fn external_render_loop(
@@ -834,6 +845,12 @@ async fn external_render_loop(
         if replaced {
             break;
         }
+        // A deliberate `/stop` on this run owns the ending (#394): the render
+        // below first reconciles the abort's settled tool states, then the
+        // card stamps ⏹ 已停止 — never the ✅ at the bottom of the tick. The
+        // arm cleared any earlier marker, so only a stop landing on THIS run
+        // lands here.
+        let stopped = handles.waits.is_stopped(&session_id).await;
         // Stream the reply's reasoning/tools/text into the notification card.
         let Some((new_parts, _, _)) = Turn::render_and_flush(
             &handles.cards,
@@ -849,6 +866,11 @@ async fn external_render_loop(
         };
         if new_parts > 0 {
             tracing::info!("external render: session {} gained parts", session_id);
+        }
+        if stopped {
+            Turn::finalize_stopped(&handles.cards, &session_id).await;
+            tracing::info!("external reply render stopped: session {}", session_id);
+            break;
         }
         // The model finished answering this turn: the transcript's turn
         // projection says so — finalize the card, then stop.
