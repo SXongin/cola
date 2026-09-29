@@ -136,10 +136,6 @@ fn long_resumed_work(created: i64) -> TranscriptMessage {
     )
 }
 
-/// The 承接 receipt line a Wake continuation opens with — the one user-facing
-/// marker that tells a continuation card apart from a fresh turn's card.
-const LEAD: &str = "已恢复执行";
-
 /// The card a platform call carried, whatever kind of call it was (a sent,
 /// replied or updated card) — the one match the helpers below share.
 fn call_card(call: &PlatformCall) -> Option<&serde_json::Value> {
@@ -153,20 +149,7 @@ fn call_card(call: &PlatformCall) -> Option<&serde_json::Value> {
 
 /// Whether `card` is a Wake continuation card (it carries the 承接 line).
 fn is_continuation(card: &serde_json::Value) -> bool {
-    card_text(card).contains(LEAD)
-}
-
-/// Every card the platform saw carrying the continuation's 承接 line.
-async fn continuation_cards(platform: &RecordingPlatform) -> Vec<serde_json::Value> {
-    platform
-        .calls
-        .lock()
-        .await
-        .iter()
-        .filter_map(call_card)
-        .filter(|card| is_continuation(card))
-        .cloned()
-        .collect()
+    card_text(card).contains(WAKE_LEAD)
 }
 
 /// Await any card — sent, replied or updated — carrying `needle`, or panic
@@ -265,7 +248,7 @@ async fn a_wake_after_a_waiting_yield_continues_on_a_new_card() {
     // every part of the resumed run: the work carries server times from the
     // wake (already in the past at poll time), so a receipt keyed at cola's
     // "now" would sort after it — the live order bug.
-    let receipt = body_index(&last, LEAD).expect("the 承接 line rides the continuation");
+    let receipt = body_index(&last, WAKE_LEAD).expect("the 承接 line rides the continuation");
     assert_eq!(
         receipt, 0,
         "the 承接 line must open the continuation card: {last}"
@@ -406,7 +389,7 @@ async fn a_wake_after_a_restart_posts_a_continuation_card() {
     // The fresh arm keys the 承接 line before the Wake's own work, so it opens
     // the card here too — not only in the split path.
     assert_eq!(
-        body_index(&last, LEAD),
+        body_index(&last, WAKE_LEAD),
         Some(0),
         "the 承接 line opens the restart continuation: {last}"
     );
@@ -573,7 +556,7 @@ async fn content_a_finalized_card_missed_still_continues() {
         "only the missed content renders: {last}"
     );
     assert_eq!(
-        body_index(&last, LEAD),
+        body_index(&last, WAKE_LEAD),
         Some(0),
         "the 承接 line opens the content-diff continuation too: {last}"
     );
@@ -606,7 +589,7 @@ async fn a_wake_when_the_newest_user_message_is_external_stays_unrendered() {
         .insert("ses_test".into(), 1_000);
 
     spawn_sync(&app);
-    wait_for_any_card(&platform, LEAD).await;
+    wait_for_any_card(&platform, WAKE_LEAD).await;
     // The Wake never moved the Sync Watermark: it still accounts user messages
     // only (the cola-authored message's own time).
     assert_eq!(
@@ -639,14 +622,15 @@ async fn a_wake_when_the_newest_user_message_is_external_stays_unrendered() {
     .await;
     wait_for_any_card(&platform, "OpenChamber 的消息").await;
 
-    let continuations = continuation_cards(&platform).await;
-    let before = continuations.len();
-    assert!(before >= 1, "the wake-only pass rendered its continuation");
-    // Many more passes with the external message newest: no Wake rendering.
+    let posted = continuation_sends(&platform).await.len();
+    assert!(posted >= 1, "the wake-only pass rendered its continuation");
+    // Many more passes with the external message newest: no NEW continuation
+    // is posted (the render may PATCH the one card in place as often as it
+    // likes — a send is what a re-post would add).
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert_eq!(
-        continuation_cards(&platform).await.len(),
-        before,
+        continuation_sends(&platform).await.len(),
+        posted,
         "a Wake must not render when the newest user message is external: {:?}",
         platform.calls.lock().await
     );
@@ -714,7 +698,7 @@ async fn a_wake_on_a_non_active_session_is_not_rendered() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     assert!(
-        continuation_cards(&platform).await.is_empty(),
+        continuation_sends(&platform).await.is_empty(),
         "a Wake on a non-active session must stay unrendered: {:?}",
         platform.calls.lock().await
     );
@@ -747,7 +731,7 @@ async fn a_live_card_is_never_split_by_a_wake() {
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     assert!(
-        continuation_cards(&platform).await.is_empty(),
+        continuation_sends(&platform).await.is_empty(),
         "a live card must not be split by a Wake: {:?}",
         platform.calls.lock().await
     );
@@ -781,14 +765,15 @@ async fn a_rendered_wake_is_never_re_posted() {
         |card| card_header(card).contains("✅"),
     )
     .await;
-    let posted = continuation_cards(&platform).await.len();
+    let posted = continuation_sends(&platform).await.len();
     assert!(posted >= 1, "the Wake must post its continuation first");
 
     // Many more sync passes over the same read: the card chain already holds
-    // the Wake's work, so nothing new is owed.
+    // the Wake's work, so nothing new is owed. Only SENDS count: the render
+    // PATCHes the one card as it streams.
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(
-        continuation_cards(&platform).await.len(),
+        continuation_sends(&platform).await.len(),
         posted,
         "a rendered Wake must not be re-posted on every poll: {:?}",
         platform.calls.lock().await
@@ -862,14 +847,12 @@ async fn a_second_wake_continues_the_chain_again() {
         !card_text(&last).contains("CI 通过了。"),
         "the second continuation renders only its own run: {last}"
     );
-    let continuations = continuation_cards(&platform).await;
+    // Two SENDS: each Wake posts its own continuation card (the ✅ arrives by
+    // an in-place update of that card, never as another send).
     assert!(
-        continuations
-            .iter()
-            .filter(|card| card_header(card).contains("✅"))
-            .count()
-            >= 2,
-        "both Wakes end on their own continuation card: {continuations:?}"
+        continuation_sends(&platform).await.len() >= 2,
+        "both Wakes end on their own continuation card: {:?}",
+        platform.calls.lock().await
     );
     assert!(
         platform
@@ -1213,7 +1196,7 @@ async fn a_stale_wake_is_not_reposted_after_a_restart() {
     // Several sync passes over the stale read: no Fresh card may be posted.
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert!(
-        continuation_cards(&platform).await.is_empty(),
+        continuation_sends(&platform).await.is_empty(),
         "a Wake the conversation moved past must not be re-posted: {:?}",
         platform.calls.lock().await
     );
@@ -1234,7 +1217,7 @@ async fn a_stale_wake_is_not_reposted_after_a_restart() {
         ],
     )
     .await;
-    wait_for_any_card(&platform, LEAD).await;
+    wait_for_any_card(&platform, WAKE_LEAD).await;
     assert!(
         platform.sent_cards().await.iter().any(is_continuation),
         "the genuine restart Wake still posts: {:?}",
@@ -1491,7 +1474,7 @@ async fn a_chained_wake_marks_the_live_continuation_card_once() {
 
     let opened = platform.updated_cards().await.last().cloned().unwrap();
     assert!(
-        card_text(&opened).contains(LEAD),
+        card_text(&opened).contains(WAKE_LEAD),
         "the continuation opens with the 承接 line: {opened}"
     );
     assert!(

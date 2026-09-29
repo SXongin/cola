@@ -28,9 +28,6 @@ use crate::opencode::types::SessionStatus;
 const SUPERSEDED: &str = "已由新消息接管";
 const SWITCHED: &str = "已切换会话 · 后台任务仍在运行";
 
-/// The one user-facing marker a Wake continuation opens with.
-const WAKE_LEAD: &str = "已恢复执行";
-
 /// A Turn whose Execution idled with a live Background Task: the waiting
 /// yield's fixture (spec #405 ticket 2).
 fn waiting_transcript() -> SessionTranscript {
@@ -89,26 +86,6 @@ async fn patches_to(platform: &RecordingPlatform, message_id: &str) -> Vec<serde
                 message_id: mid,
                 card,
             } if mid == message_id => Some(card.clone()),
-            _ => None,
-        })
-        .collect()
-}
-
-/// Every card SEND (reply or top-level) carrying the Wake continuation's 承接
-/// line, in call order. A re-post would be another send, while the render
-/// updates the one continuation card in place many times.
-async fn continuation_sends(platform: &RecordingPlatform) -> Vec<serde_json::Value> {
-    platform
-        .calls
-        .lock()
-        .await
-        .iter()
-        .filter_map(|call| match call {
-            PlatformCall::ReplyCard { card, .. } | PlatformCall::SendCard { card, .. }
-                if card_text(card).contains(WAKE_LEAD) =>
-            {
-                Some(card.clone())
-            }
             _ => None,
         })
         .collect()
