@@ -243,26 +243,33 @@ async fn a_new_turn_collects_the_waiting_card() {
     // never touched again.
     script_transcript(&backend, vec![resumed_transcript()]).await;
     spawn_sync(&app);
+    // Wait for the CONTINUATION's own ending: the distinctive resumed text and
+    // the Wake lead tie the wait to that card, so no other update (and no
+    // initial reply payload) can satisfy it.
     wait_for_card_update(&platform, "the Wake's done card", CardUpdates::Latest, |card| {
         card_header(card).contains("✅")
+            && card_text(card).contains(WAKE_LEAD)
+            && card_text(card).contains("CI 通过了。")
     })
     .await;
 
     // The continuation is replied to the second message (the wait panics if it
     // never is); the settle loop renders the resumed work INTO that same card
-    // and ends it ✅, while the collected card's content never replays.
+    // and ends it ✅, while the collected card's content never replays. The
+    // call ORDER between that reply and the final update is not asserted — the
+    // matched update is read back below, not "the latest call".
     wait_for_replied_card(&platform, "msg_next", "the Wake continuation", |card| {
         card_text(card).contains(WAKE_LEAD)
     })
     .await;
-    let rendered = latest_card(&platform).await;
+    let rendered = platform.updated_cards().await.last().cloned().unwrap();
     assert!(
         card_header(&rendered).contains("✅"),
         "the Wake ends ✅: {rendered}"
     );
     assert!(
-        card_text(&rendered).contains("CI 通过了。"),
-        "the continuation renders the resumed work: {rendered}"
+        card_text(&rendered).contains(WAKE_LEAD) && card_text(&rendered).contains("CI 通过了。"),
+        "the done card is the Wake's own continuation: {rendered}"
     );
     assert!(
         !card_text(&rendered).contains("已经交给后台了。"),
@@ -476,10 +483,15 @@ async fn a_collected_chain_still_takes_a_wake_after_switching_back() {
     );
 
     // The Wake resumes the Session: its continuation is a new card below the
-    // collected chain, and the collected card keeps its ending untouched.
+    // collected chain, and the collected card keeps its ending untouched. The
+    // wait is tied to the continuation's own ending (lead + resumed text), and
+    // the assertion reads that same matched update — never "the latest call",
+    // which could be the reply's initial payload.
     script_transcript(&backend, vec![resumed_transcript()]).await;
     wait_for_card_update(&platform, "the Wake's done card", CardUpdates::Latest, |card| {
         card_header(card).contains("✅")
+            && card_text(card).contains(WAKE_LEAD)
+            && card_text(card).contains("CI 通过了。")
     })
     .await;
 
@@ -487,9 +499,9 @@ async fn a_collected_chain_still_takes_a_wake_after_switching_back() {
         card_text(card).contains(WAKE_LEAD)
     })
     .await;
-    let rendered = latest_card(&platform).await;
+    let rendered = platform.updated_cards().await.last().cloned().unwrap();
     assert!(
-        card_text(&rendered).contains("CI 通过了。"),
+        card_text(&rendered).contains("CI 通过了。") && card_text(&rendered).contains(WAKE_LEAD),
         "the continuation renders the resumed work: {rendered}"
     );
 
