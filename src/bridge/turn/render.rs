@@ -16,7 +16,7 @@ use crate::bridge::handles::{CardsHandle, RequestsHandle, SessionsHandle, TurnHa
 use crate::bridge::span;
 use crate::bridge::turn::state::{RenderedPart, StreamAccumulator};
 use crate::config::ThreadKey;
-use crate::feishu::card::ledger::{TASK_LABEL_CHARS, TaskKind, TaskLedgerRow};
+use crate::feishu::card::ledger::{TaskCompletionEntry, TaskKind, TaskLedgerRow};
 use crate::feishu::card::tool_render::{ChildActivity, TaskLiveness};
 
 use super::Turn;
@@ -271,32 +271,56 @@ pub(super) fn capture_footer_model(acc: &mut StreamAccumulator, message: &crate:
     }
 }
 
-/// How much of a Wake's label the merged-path receipt shows: one short line.
-/// The Background Task Ledger's rows clip their labels at the same length
-/// (ADR-0060), so one label has one visible length wherever it renders.
-const RECEIPT_LABEL_CHARS: usize = TASK_LABEL_CHARS;
-
-/// The merged-path completion receipt for a Wake whose work resumes a card
-/// that is already live (ADR-0059): one short, mechanical line, because the
-/// completion must not depend on the model narrating it. Only the Background
-/// Task sources get one — a restart notice or an interruption continuation
-/// keeps today's behavior — and the label is the Wake's own tag attribute
-/// ([`Wake::label`]); a Wake that named none says only what finished, never
-/// inventing detail.
-fn wake_receipt(wake: &Wake) -> Option<String> {
-    let noun = match wake.source {
-        WakeSource::Shell => "后台任务完成",
-        WakeSource::Subagent => "子代理完成",
+/// The completion entry a shell/subagent Wake leaves on the card that hosted
+/// its task (ADR-0060): the retired task's kind and label (the Wake's own tag
+/// attribute), its identity, and the run's own server-time span. `None` for a
+/// Wake that is not a shell/subagent completion — a restart notice or an
+/// interruption continuation keeps today's behavior — and the label is never
+/// invented: a Wake that named none renders the bare completion line.
+///
+/// The retired task is joined back from the read through the backend's own
+/// correlation ([`Wake::retires`] over each part's derived task), so the entry
+/// can only name a run the Wake actually completed; the launch's start time
+/// gives the fold's duration. A read that no longer carries the launch renders
+/// the entry without a duration rather than inventing one.
+fn wake_completion_entry(wake: &Wake, transcript: &SessionTranscript) -> Option<TaskCompletionEntry> {
+    let kind = match wake.source {
+        WakeSource::Shell => TaskKind::Shell,
+        WakeSource::Subagent => TaskKind::Subagent,
         WakeSource::Restart | WakeSource::Interrupt | WakeSource::Other(_) | WakeSource::Unknown => {
             return None;
         }
     };
-    Some(match wake.label.as_deref().filter(|label| !label.is_empty()) {
-        Some(label) => format!(
-            "🔔 {noun}：{}",
-            crate::feishu::card::truncate_md(label, RECEIPT_LABEL_CHARS)
-        ),
-        None => format!("🔔 {noun}"),
+    let retired = transcript
+        .messages
+        .iter()
+        .flat_map(|message| &message.parts)
+        .filter_map(|part| match part {
+            Part::Tool(call) => call.background_task(),
+            _ => None,
+        })
+        .find(|task| wake.retires(task));
+    // The retired task's own identity is the read's fact; the Wake's named keys
+    // are the fallback when the launch is no longer in the read. The launch
+    // call's own id covers a task that recorded no shell/child id. Never a
+    // made-up one — and never a Wake key that names a different run when the
+    // read's task is right there.
+    let id = match &retired {
+        Some(task) => match kind {
+            TaskKind::Shell => task.shell_id.clone().or_else(|| Some(task.tool.call_id.clone())),
+            TaskKind::Subagent => task.child_id.clone().or_else(|| Some(task.tool.call_id.clone())),
+        },
+        None => match kind {
+            TaskKind::Shell => wake.shell_id.clone().or_else(|| wake.job_id.clone()),
+            TaskKind::Subagent => wake.child_id.clone(),
+        },
+    };
+    Some(TaskCompletionEntry {
+        kind,
+        label: wake.label.clone(),
+        id,
+        started_at: retired.as_ref().and_then(|task| task.started_at),
+        finished_at: wake.created_ms?,
     })
 }
 
@@ -354,7 +378,7 @@ fn task_kind(tool: &str) -> TaskKind {
 /// the shell's `command` (or its `description` when the payload carries no
 /// command), the subagent's `description` — the `subagent` arm nothing else
 /// needed. `None` when the input names no label, so the row renders bare
-/// rather than inventing one (the receipt's own rule).
+/// rather than inventing one (the completion entry's own rule).
 fn task_label(kind: TaskKind, input: Option<&serde_json::Value>) -> Option<String> {
     let label = match kind {
         TaskKind::Shell => input
@@ -373,15 +397,15 @@ fn task_label(kind: TaskKind, input: Option<&serde_json::Value>) -> Option<Strin
     (!label.is_empty()).then(|| label.to_string())
 }
 
-/// Insert a merged-path receipt for every Wake whose resumed work this render
-/// is about to show, and report whether any was inserted (so a receipt reaches
-/// the card even when no part changed). A Wake that opened the card itself was
+/// Insert the completion entry for every Wake whose resumed work this render is
+/// about to show, and report whether any was inserted (so an entry reaches the
+/// card even when no part changed). A Wake that opened the card itself was
 /// already announced by its 承接 line, a Wake with no server time cannot be
 /// ordered, and a Wake outside this card's Turn is not this render's content —
 /// all are skipped. Each Wake marks at most once per chain
-/// ([`StreamAccumulator::announce_wake`]), so a repeated poll never doubles a
-/// receipt.
-fn render_wake_receipts(
+/// ([`StreamAccumulator::announce_wake`]), so a repeated poll never doubles an
+/// entry.
+fn render_wake_entries(
     acc: &mut StreamAccumulator,
     transcript: &SessionTranscript,
     anchor: &TurnAnchor,
@@ -394,16 +418,16 @@ fn render_wake_receipts(
         if created_ms < anchor.created_ms {
             continue;
         }
-        let Some(receipt) = wake_receipt(wake) else {
+        let Some(entry) = wake_completion_entry(wake, transcript) else {
             continue;
         };
         if !acc.announce_wake(wake.id.as_str()) {
             continue;
         }
-        // Keyed at the Wake's moment, so the receipt sorts before the work it
+        // Keyed at the Wake's moment, so the entry sorts before the work it
         // announces, whose server times are at/after it (the 承接 line's own
         // lesson).
-        acc.push_receipt_at(Some(created_ms.saturating_sub(1)), &receipt);
+        acc.push_ledger_entry_at(Some(created_ms.saturating_sub(1)), entry);
         inserted = true;
     }
     inserted
@@ -436,9 +460,9 @@ pub(super) fn render_new_turn_parts(acc: &mut StreamAccumulator, transcript: &Se
     let Some(anchor) = acc.turn_anchor.clone() else {
         return false;
     };
-    // A merged Wake's completion is marked before its work renders, so the
-    // receipt sorts above the parts it announces.
-    let mut rendered_any = render_wake_receipts(acc, transcript, &anchor);
+    // A merged Wake's completion entry is written before its work renders, so
+    // the entry sorts above the parts it announces.
+    let mut rendered_any = render_wake_entries(acc, transcript, &anchor);
     for message in transcript.turn_for_user(&anchor).messages {
         // An error-card retry carries the failed attempt's baseline (#387):
         // its messages stay suppressed, so the rebuilt card streams only the

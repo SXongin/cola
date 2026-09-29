@@ -355,7 +355,7 @@ async fn several_tasks_list_in_transcript_order_beside_the_other_tail_sections()
 /// stands in for a missing `command`, a subagent reads its `description`, a
 /// task whose input names no label renders bare, and a long label clips.
 #[tokio::test]
-async fn labels_join_by_call_id_and_clip_like_the_receipt() {
+async fn labels_join_by_call_id_and_clip_like_the_entry_title() {
     let _wd = test_work_dir();
     let long = "very long command ".repeat(8);
     let transcript = SessionTranscript::new(vec![
@@ -410,7 +410,7 @@ async fn labels_join_by_call_id_and_clip_like_the_receipt() {
     );
     assert!(
         !text.contains("· shell：very long command very long command very long command very long command"),
-        "a long label must clip like the completion receipt in the ROW: {text}"
+        "a long label must clip like the completion entry's title in the ROW: {text}"
     );
     let clipped = text
         .lines()

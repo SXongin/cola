@@ -6,6 +6,11 @@
 //! the true end, ❌ without Retry for a settled failure, ⏹ 已停止 for `/stop`,
 //! or the waiting yield when the Wake backgrounded work of its own.
 //!
+//! A shell/subagent completion that lands in an already-live card leaves the
+//! Background Task Ledger's fixed completion entry there instead of a receipt
+//! line (ADR-0060, ticket #417); each Wake marks exactly once and a
+//! restart/interrupt Wake leaves no entry at all.
+//!
 //! Every test scripts the Backend's reads and injects tiny poll cadences, so no
 //! test waits on a production interval.
 
@@ -62,6 +67,64 @@ fn another_background_shell(started_at: i64) -> BackgroundTask {
         child_id: None,
         started_at: Some(started_at),
     }
+}
+
+/// The settled `shell` call that moved a run to the background: the panel the
+/// hosting card shows, and the launch a completion entry joins its identity
+/// and duration from (by the task's own shell id).
+fn background_shell_launch(created: i64, call_id: &str, shell_id: &str, command: &str) -> TranscriptMessage {
+    typed_message(
+        &format!("msg_launch_{call_id}"),
+        MessageRole::Assistant,
+        Some(created),
+        vec![Part::Tool(ToolCall {
+            identity: ToolIdentity {
+                name: "shell".into(),
+                call_id: call_id.into(),
+            },
+            status: ToolStatus::Completed,
+            started_at: Some(created),
+            input: Some(serde_json::json!({ "command": command })),
+            // The background marker the run's own plugin writes: settled call,
+            // run still going — what the read derives a Background Task from.
+            metadata: Some(serde_json::json!({ "status": "running", "shellID": shell_id })),
+            output: ToolOutput {
+                raw: None,
+                blocks: vec![ContentBlock::Text("moved to background".into())],
+                error: None,
+            },
+        })],
+    )
+}
+
+/// [`background_shell_launch`] for a backgrounded subagent, identified by its
+/// child session.
+fn background_subagent_launch(
+    created: i64,
+    call_id: &str,
+    child_id: &str,
+    description: &str,
+) -> TranscriptMessage {
+    typed_message(
+        &format!("msg_launch_{call_id}"),
+        MessageRole::Assistant,
+        Some(created),
+        vec![Part::Tool(ToolCall {
+            identity: ToolIdentity {
+                name: "subagent".into(),
+                call_id: call_id.into(),
+            },
+            status: ToolStatus::Completed,
+            started_at: Some(created),
+            input: Some(serde_json::json!({ "description": description })),
+            metadata: Some(serde_json::json!({ "status": "running", "sessionID": child_id })),
+            output: ToolOutput {
+                raw: None,
+                blocks: vec![ContentBlock::Text("moved to background".into())],
+                error: None,
+            },
+        })],
+    )
 }
 
 /// The resumed run's own work: reasoning, a settled tool and the closing text,
@@ -1285,65 +1348,102 @@ async fn a_top_level_continuation_keeps_its_chain() {
     );
 }
 
-/// The merged-path receipt (approved extension, ADR-0059): a shell Wake whose
-/// work resumes a CARD THAT IS ALREADY LIVE gets one mechanical completion
-/// line at the Wake's moment, before the resumed work — so "never silently
-/// dropped" does not depend on the model narrating it. A repeated poll must
-/// not duplicate it.
+/// The pinned entry body's two server times: a launch at 13:50 and its Wake at
+/// 14:02 — 12 minutes later — so the copy pins as
+/// `shell sh_bg · 14:02 · 12m` in any machine timezone.
+fn entry_span() -> (i64, i64) {
+    let finished = crate::feishu::card::test_local_ms(2026, 9, 29, 14, 2);
+    (finished - 12 * 60_000, finished)
+}
+
+/// The merged-path entry (ADR-0060, ticket #417): a shell Wake whose work
+/// resumes a CARD THAT IS ALREADY LIVE leaves one folded ledger entry at the
+/// Wake's moment, before the resumed work — the live row leaves the list and
+/// the mechanical completion line becomes the entry's collapsed title, its
+/// identity and timing the fold body — so "never silently dropped" does not
+/// depend on the model narrating it. A repeated poll must not duplicate it.
 #[tokio::test]
-async fn a_merged_shell_wake_marks_the_live_turn_card_once() {
+async fn a_merged_shell_wake_leaves_one_entry_on_the_live_turn_card() {
     let _wd = test_work_dir();
-    let live = SessionTranscript::new(vec![
-        user("msg_cola_anchor", 1_000, "跑一下 CI"),
-        assistant(2_000, "已经交给后台了。"),
-    ])
-    .with_executions(vec![execution(2_500)])
-    .with_background_tasks(vec![background_shell(2_100)]);
+    let (started, finished) = entry_span();
+    let timeline = |resumed: Option<TranscriptMessage>| {
+        let mut messages = vec![
+            user("msg_cola_anchor", started - 60_000, "跑一下 CI"),
+            assistant(started - 30_000, "已经交给后台了。"),
+            background_shell_launch(started, "call_bg", "sh_bg", "gh run watch"),
+        ];
+        messages.extend(resumed);
+        messages
+    };
+    let live = SessionTranscript::new(timeline(None))
+        .with_executions(vec![execution(started + 30_000)])
+        .with_background_tasks(vec![background_shell(started)]);
     let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Busy)).await;
 
-    // The Turn is live: its drain keeps rendering onto the same card.
+    // The Turn is live: its drain keeps rendering onto the same card, whose
+    // ledger lists the run.
     let turn = spawn_turn(&app, ctx("ses_test", "跑一下 CI"));
-    wait_for_card_text(&platform, "已经交给后台了。").await;
+    wait_for_card_update(&platform, "the live ledger row", CardUpdates::Any, |card| {
+        let text = card_text(card);
+        text.contains("⏳ 后台任务（1）") && text.contains("· shell：gh run watch")
+    })
+    .await;
 
     // The shell Wake retires the task and its run resumes on the SAME card
     // (its Execution has not reached a boundary yet).
     script_transcript(
         &backend,
         vec![
-            SessionTranscript::new(vec![
-                user("msg_cola_anchor", 1_000, "跑一下 CI"),
-                assistant(2_000, "已经交给后台了。"),
-                assistant(3_100, "CI 通过了。"),
-            ])
-            .with_executions(vec![execution(2_500)])
-            .with_wakes(vec![shell_wake(2_900)]),
+            SessionTranscript::new(timeline(Some(assistant(finished + 30_000, "CI 通过了。"))))
+                .with_executions(vec![execution(started + 30_000)])
+                .with_wakes(vec![shell_wake(finished)]),
         ],
     )
     .await;
     wait_for_card_text(&platform, "CI 通过了。").await;
     wait_for_card_update(
         &platform,
-        "the merged completion receipt",
+        "the merged completion entry",
         CardUpdates::Any,
         |card| card_text(card).contains("后台任务完成"),
     )
     .await;
 
     let last = platform.updated_cards().await.last().cloned().unwrap();
+    let text = card_text(&last);
     assert!(
-        card_text(&last).contains("🔔 后台任务完成：gh run watch"),
-        "the Wake's own command labels the receipt: {last}"
+        text.contains("🔔 后台任务完成：gh run watch"),
+        "the Wake's own command is the entry's collapsed title: {last}"
+    );
+    assert!(
+        text.contains("shell sh_bg · 14:02 · 12m"),
+        "the fold body carries identity and timing (ADR-0060): {last}"
     );
     assert_eq!(
-        card_text(&last).matches("后台任务完成").count(),
+        text.matches("后台任务完成").count(),
         1,
-        "exactly one receipt: {last}"
+        "exactly one entry: {last}"
     );
-    let receipt = body_index(&last, "后台任务完成").expect("the receipt renders");
+    // The entry is one folded collapsible panel, and the live row it retired
+    // is gone: one mechanism, not two renderings.
+    let entry = body_index(&last, "后台任务完成").expect("the entry renders");
+    let element = &last["body"]["elements"][entry];
+    assert_eq!(
+        element["tag"], "collapsible_panel",
+        "the entry is folded: {element}"
+    );
+    assert_eq!(
+        element["expanded"], false,
+        "the entry starts collapsed: {element}"
+    );
+    assert!(
+        !text.contains("⏳ 后台任务（"),
+        "the retired run leaves the live list: {last}"
+    );
     let work = body_index(&last, "CI 通过了。").expect("the resumed work renders");
     assert!(
-        receipt < work,
-        "the receipt precedes the work it announces (receipt@{receipt}, work@{work}): {last}"
+        entry < work,
+        "the entry precedes the work it announces (entry@{entry}, work@{work}): {last}"
     );
 
     // Later polls over the same read must not duplicate it.
@@ -1352,20 +1452,16 @@ async fn a_merged_shell_wake_marks_the_live_turn_card_once() {
     assert_eq!(
         card_text(&later).matches("后台任务完成").count(),
         1,
-        "a repeated poll must not duplicate the receipt: {later}"
+        "a repeated poll must not duplicate the entry: {later}"
     );
 
     // Let the run end so the Turn finishes cleanly.
     script_transcript(
         &backend,
         vec![
-            SessionTranscript::new(vec![
-                user("msg_cola_anchor", 1_000, "跑一下 CI"),
-                assistant(2_000, "已经交给后台了。"),
-                assistant(3_100, "CI 通过了。"),
-            ])
-            .with_executions(vec![execution(2_500), execution(4_000)])
-            .with_wakes(vec![shell_wake(2_900)]),
+            SessionTranscript::new(timeline(Some(assistant(finished + 30_000, "CI 通过了。"))))
+                .with_executions(vec![execution(started + 30_000), execution(finished + 60_000)])
+                .with_wakes(vec![shell_wake(finished)]),
         ],
     )
     .await;
@@ -1379,18 +1475,133 @@ async fn a_merged_shell_wake_marks_the_live_turn_card_once() {
     result.unwrap();
 }
 
-/// A subagent Wake merging into a live card marks itself with its own task
-/// description, truncated to one short line.
+/// Several completions in one read: each Wake leaves its own entry, in the
+/// read's own (transcript) order, even when the task that started first
+/// finishes last — and each entry joins its OWN task's identity and span.
 #[tokio::test]
-async fn a_merged_subagent_wake_marks_the_live_card_with_its_description() {
+async fn several_completions_leave_one_entry_each_in_wake_order() {
     let _wd = test_work_dir();
-    let long = "很长的子代理任务描述".repeat(10); // 100 chars: the receipt clips at 60
-    let live = SessionTranscript::new(vec![
-        user("msg_cola_anchor", 1_000, "跑一下 CI"),
-        assistant(2_000, "已经交给后台了。"),
-    ])
-    .with_executions(vec![execution(2_500)])
-    .with_background_tasks(vec![background_shell(2_100)]);
+    let base = crate::feishu::card::test_local_ms(2026, 9, 29, 13, 50);
+    let shell_wake_at = base + 12 * 60_000; // 14:02, 12m after its launch
+    let subagent_wake_at = base + 10 * 60_000; // 14:00, 5m after its launch
+    let timeline = |resumed: Option<TranscriptMessage>| {
+        let mut messages = vec![
+            user("msg_cola_anchor", base - 120_000, "跑一下 CI"),
+            assistant(base - 60_000, "已经交给后台了。"),
+            background_shell_launch(base, "call_bg", "sh_bg", "gh run watch"),
+            // The subagent started later but finishes first.
+            background_subagent_launch(base + 5 * 60_000, "call_sub", "ses_child", "review the diff"),
+        ];
+        messages.extend(resumed);
+        messages
+    };
+    let shell_task = background_shell(base);
+    let subagent_task = BackgroundTask {
+        tool: ToolIdentity {
+            name: "subagent".into(),
+            call_id: "call_sub".into(),
+        },
+        shell_id: None,
+        child_id: Some("ses_child".into()),
+        started_at: Some(base + 5 * 60_000),
+    };
+    let live = SessionTranscript::new(timeline(None))
+        .with_executions(vec![execution(base + 30_000)])
+        .with_background_tasks(vec![shell_task.clone(), subagent_task.clone()]);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Busy)).await;
+    let turn = spawn_turn(&app, ctx("ses_test", "跑一下 CI"));
+    wait_for_card_update(&platform, "both live rows", CardUpdates::Any, |card| {
+        card_text(card).contains("⏳ 后台任务（2）")
+    })
+    .await;
+
+    // The read carries the later-starting subagent's Wake FIRST (it finished
+    // first), then the shell's.
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(timeline(Some(assistant(shell_wake_at + 30_000, "都跑完了。"))))
+                .with_executions(vec![execution(base + 30_000)])
+                .with_wakes(vec![
+                    subagent_wake(subagent_wake_at, "review the diff"),
+                    shell_wake(shell_wake_at),
+                ]),
+        ],
+    )
+    .await;
+    wait_for_card_text(&platform, "都跑完了。").await;
+
+    let last = platform.updated_cards().await.last().cloned().unwrap();
+    let text = card_text(&last);
+    assert_eq!(
+        text.matches("后台任务完成").count(),
+        1,
+        "the shell Wake leaves exactly one shell entry: {last}"
+    );
+    assert_eq!(
+        text.matches("子代理完成").count(),
+        1,
+        "the subagent Wake leaves exactly one subagent entry: {last}"
+    );
+    assert!(
+        text.contains("shell sh_bg · 14:02 · 12m") && text.contains("子代理 ses_child · 14:00 · 5m"),
+        "each entry carries its own identity and span: {last}"
+    );
+    let subagent = body_index(&last, "子代理完成").expect("the subagent entry renders");
+    let shell = body_index(&last, "后台任务完成").expect("the shell entry renders");
+    assert!(
+        subagent < shell,
+        "entries keep the read's order (subagent finished first) (subagent@{subagent}, shell@{shell}): {last}"
+    );
+    assert!(
+        !text.contains("⏳ 后台任务（"),
+        "both retired runs leave the live list: {last}"
+    );
+
+    // End the turn.
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(timeline(Some(assistant(shell_wake_at + 30_000, "都跑完了。"))))
+                .with_executions(vec![execution(base + 30_000), execution(shell_wake_at + 60_000)])
+                .with_wakes(vec![
+                    subagent_wake(subagent_wake_at, "review the diff"),
+                    shell_wake(shell_wake_at),
+                ])
+                .with_background_tasks(vec![shell_task, subagent_task]),
+        ],
+    )
+    .await;
+    backend
+        .set_session_status("ses_test", Some(SessionStatus::Idle))
+        .await;
+    let result = tokio::time::timeout(Duration::from_secs(5), turn)
+        .await
+        .expect("the boundary ends the turn")
+        .unwrap();
+    result.unwrap();
+}
+
+/// A subagent Wake merging into a live card leaves an entry whose collapsed
+/// title is its own task description, clipped to one short line, and whose fold
+/// names the child session.
+#[tokio::test]
+async fn a_merged_subagent_wake_labels_the_entry_with_its_description() {
+    let _wd = test_work_dir();
+    let long = "很长的子代理任务描述".repeat(10); // 100 chars: the title clips at 60
+    let (started, finished) = entry_span();
+    let timeline = |resumed: Option<TranscriptMessage>| {
+        let mut messages = vec![
+            user("msg_cola_anchor", started - 60_000, "跑一下 CI"),
+            assistant(started - 30_000, "已经交给后台了。"),
+            background_subagent_launch(started, "call_sub", "ses_child", &long),
+        ];
+        messages.extend(resumed);
+        messages
+    };
+    let live = SessionTranscript::new(timeline(None))
+        .with_executions(vec![execution(started + 30_000)])
+        .with_background_tasks(vec![background_shell(started)]);
     let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Busy)).await;
     let turn = spawn_turn(&app, ctx("ses_test", "跑一下 CI"));
     wait_for_card_text(&platform, "已经交给后台了。").await;
@@ -1398,13 +1609,9 @@ async fn a_merged_subagent_wake_marks_the_live_card_with_its_description() {
     script_transcript(
         &backend,
         vec![
-            SessionTranscript::new(vec![
-                user("msg_cola_anchor", 1_000, "跑一下 CI"),
-                assistant(2_000, "已经交给后台了。"),
-                assistant(3_100, "子代理跑完了。"),
-            ])
-            .with_executions(vec![execution(2_500)])
-            .with_wakes(vec![subagent_wake(2_900, &long)]),
+            SessionTranscript::new(timeline(Some(assistant(finished + 30_000, "子代理跑完了。"))))
+                .with_executions(vec![execution(started + 30_000)])
+                .with_wakes(vec![subagent_wake(finished, &long)]),
         ],
     )
     .await;
@@ -1414,16 +1621,28 @@ async fn a_merged_subagent_wake_marks_the_live_card_with_its_description() {
     let clipped = format!("🔔 子代理完成：{}…", long.chars().take(60).collect::<String>());
     assert!(
         card_text(&last).contains(&clipped),
-        "the subagent's description labels the receipt, clipped to 60 chars: {last}"
-    );
-    assert!(
-        !card_text(&last).contains(&long),
-        "the full label must not leak past the clip: {last}"
+        "the subagent's description is the collapsed title, clipped to 60 chars: {last}"
     );
     assert_eq!(
         card_text(&last).matches("子代理完成").count(),
         1,
-        "exactly one receipt: {last}"
+        "exactly one entry: {last}"
+    );
+    // The clip holds for the entry itself: the launch panel below may still
+    // carry the full description as its input, the title must not.
+    let entry = body_index(&last, "子代理完成").expect("the entry renders");
+    let element = &last["body"]["elements"][entry];
+    assert_eq!(
+        element["tag"], "collapsible_panel",
+        "the entry is folded: {element}"
+    );
+    assert!(
+        !element.to_string().contains(&long),
+        "the full label must not leak past the clip: {element}"
+    );
+    assert!(
+        card_text(&last).contains("子代理 ses_child · 14:02 · 12m"),
+        "the fold names the child session and times: {last}"
     );
 
     // End the turn: the wake's retirement also releases the background task.
@@ -1433,14 +1652,10 @@ async fn a_merged_subagent_wake_marks_the_live_card_with_its_description() {
     script_transcript(
         &backend,
         vec![
-            SessionTranscript::new(vec![
-                user("msg_cola_anchor", 1_000, "跑一下 CI"),
-                assistant(2_000, "已经交给后台了。"),
-                assistant(3_100, "子代理跑完了。"),
-            ])
-            .with_executions(vec![execution(2_500), execution(4_000)])
-            .with_wakes(vec![subagent_wake(2_900, &long)])
-            .with_background_tasks(vec![background_shell(2_100)]),
+            SessionTranscript::new(timeline(Some(assistant(finished + 30_000, "子代理跑完了。"))))
+                .with_executions(vec![execution(started + 30_000), execution(finished + 60_000)])
+                .with_wakes(vec![subagent_wake(finished, &long)])
+                .with_background_tasks(vec![background_shell(started)]),
         ],
     )
     .await;
@@ -1451,18 +1666,31 @@ async fn a_merged_subagent_wake_marks_the_live_card_with_its_description() {
     result.unwrap();
 }
 
-/// The wake-continuation path (ADR-0059): the card a Wake opens carries the
-/// 承接 line and NOT the merged receipt for its own Wake; a later Wake that
-/// resumes that live continuation card does get its receipt — exactly once.
+/// The wake-continuation path (ADR-0059/0060): the card a Wake opens carries
+/// the 承接 line and NOT an entry for its own Wake; a later Wake that resumes
+/// that live continuation card does leave its entry — exactly once, on the
+/// continuation, while the entry from the old card never migrates.
 #[tokio::test]
-async fn a_chained_wake_marks_the_live_continuation_card_once() {
+async fn a_chained_wake_leaves_its_entry_on_the_live_continuation_card_once() {
     let _wd = test_work_dir();
-    let waiting = SessionTranscript::new(vec![
-        user("msg_cola_anchor", 1_000, "跑一下 CI"),
-        assistant(2_000, "已经交给后台了。"),
-    ])
-    .with_executions(vec![execution(2_500)])
-    .with_background_tasks(vec![background_shell(2_100)]);
+    let (started, finished) = entry_span();
+    let timeline = |first: bool, second: bool| {
+        let mut messages = vec![
+            user("msg_cola_anchor", started - 120_000, "跑一下 CI"),
+            assistant(started - 60_000, "已经交给后台了。"),
+            background_shell_launch(started, "call_bg", "sh_bg", "gh run watch"),
+        ];
+        if first {
+            messages.push(assistant(started + 120_000, "第一段进展。"));
+        }
+        if second {
+            messages.push(assistant(finished + 30_000, "第二段进展。"));
+        }
+        messages
+    };
+    let waiting = SessionTranscript::new(timeline(false, false))
+        .with_executions(vec![execution(started + 30_000)])
+        .with_background_tasks(vec![background_shell(started)]);
     let (_dir, app, backend, platform) = scripted_app(vec![waiting], Some(SessionStatus::Idle)).await;
     Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下 CI"))
         .await
@@ -1473,13 +1701,9 @@ async fn a_chained_wake_marks_the_live_continuation_card_once() {
     script_transcript(
         &backend,
         vec![
-            SessionTranscript::new(vec![
-                user("msg_cola_anchor", 1_000, "跑一下 CI"),
-                assistant(2_000, "已经交给后台了。"),
-                assistant(3_100, "第一段进展。"),
-            ])
-            .with_executions(vec![execution(2_500)])
-            .with_wakes(vec![shell_wake(2_900)]),
+            SessionTranscript::new(timeline(true, false))
+                .with_executions(vec![execution(started + 30_000)])
+                .with_wakes(vec![shell_wake(started + 90_000)]),
         ],
     )
     .await;
@@ -1496,19 +1720,14 @@ async fn a_chained_wake_marks_the_live_continuation_card_once() {
         "the Wake that opened the card is announced by the line alone: {opened}"
     );
 
-    // A SECOND Wake resumes the same live continuation card: its completion is
-    // marked mechanically, before its work.
+    // A SECOND Wake resumes the same live continuation card: its completion
+    // leaves one entry there, before its work.
     script_transcript(
         &backend,
         vec![
-            SessionTranscript::new(vec![
-                user("msg_cola_anchor", 1_000, "跑一下 CI"),
-                assistant(2_000, "已经交给后台了。"),
-                assistant(3_100, "第一段进展。"),
-                assistant(4_100, "第二段进展。"),
-            ])
-            .with_executions(vec![execution(2_500)])
-            .with_wakes(vec![shell_wake(2_900), shell_wake(3_900)]),
+            SessionTranscript::new(timeline(true, true))
+                .with_executions(vec![execution(started + 30_000)])
+                .with_wakes(vec![shell_wake(started + 90_000), shell_wake(finished)]),
         ],
     )
     .await;
@@ -1518,54 +1737,69 @@ async fn a_chained_wake_marks_the_live_continuation_card_once() {
     assert_eq!(
         card_text(&last).matches("后台任务完成").count(),
         1,
-        "the chained Wake marks exactly once: {last}"
+        "the chained Wake leaves exactly one entry: {last}"
     );
-    let receipt = body_index(&last, "后台任务完成").expect("the chained receipt renders");
+    assert!(
+        card_text(&last).contains("shell sh_bg · 14:02 · 12m"),
+        "the chained entry carries identity and timing: {last}"
+    );
+    let entry = body_index(&last, "后台任务完成").expect("the chained entry renders");
     let work = body_index(&last, "第二段进展。").expect("the chained work renders");
     assert!(
-        receipt < work,
-        "the chained receipt precedes its work (receipt@{receipt}, work@{work}): {last}"
+        entry < work,
+        "the chained entry precedes its work (entry@{entry}, work@{work}): {last}"
     );
 
-    // Later polls must not duplicate the chained receipt.
+    // Later polls must not duplicate the chained entry.
     tokio::time::sleep(Duration::from_millis(80)).await;
     let later = platform.updated_cards().await.last().cloned().unwrap();
     assert_eq!(
         card_text(&later).matches("后台任务完成").count(),
         1,
-        "a repeated poll must not duplicate the chained receipt: {later}"
+        "a repeated poll must not duplicate the chained entry: {later}"
     );
 }
 
 /// A Wake that is neither a shell nor a subagent completion (a restart notice,
-/// an interruption continuation) keeps today's behavior: no merged receipt.
+/// an interruption continuation) keeps today's behavior: no entry.
 #[tokio::test]
-async fn a_restart_wake_gets_no_merged_receipt() {
+async fn a_restart_or_interrupt_wake_gets_no_entry() {
     let _wd = test_work_dir();
+    let (started, finished) = entry_span();
     let live = SessionTranscript::new(vec![
-        user("msg_cola_anchor", 1_000, "跑一下 CI"),
-        assistant(2_000, "已经交给后台了。"),
+        user("msg_cola_anchor", started - 60_000, "跑一下 CI"),
+        assistant(started - 30_000, "已经交给后台了。"),
+        background_shell_launch(started, "call_bg", "sh_bg", "gh run watch"),
     ])
-    .with_executions(vec![execution(2_500)])
-    .with_background_tasks(vec![background_shell(2_100)]);
+    .with_executions(vec![execution(started + 30_000)])
+    .with_background_tasks(vec![background_shell(started)]);
     let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Busy)).await;
     let turn = spawn_turn(&app, ctx("ses_test", "跑一下 CI"));
     wait_for_card_text(&platform, "已经交给后台了。").await;
 
-    // A restart notice (the fixture keeps its shell keys, the source is what
-    // the rule reads).
-    let mut restart = shell_wake(2_900);
-    restart.source = WakeSource::Restart;
+    // A restart notice and an interruption continuation (the fixtures keep
+    // their shell keys, the source is what the rule reads).
+    let variants = || {
+        let mut restart = shell_wake(finished);
+        restart.source = WakeSource::Restart;
+        let mut interrupt = shell_wake(finished + 1_000);
+        interrupt.source = WakeSource::Interrupt;
+        vec![restart, interrupt]
+    };
+    let resumed = |text: &str| {
+        vec![
+            user("msg_cola_anchor", started - 60_000, "跑一下 CI"),
+            assistant(started - 30_000, "已经交给后台了。"),
+            background_shell_launch(started, "call_bg", "sh_bg", "gh run watch"),
+            assistant(finished + 30_000, text),
+        ]
+    };
     script_transcript(
         &backend,
         vec![
-            SessionTranscript::new(vec![
-                user("msg_cola_anchor", 1_000, "跑一下 CI"),
-                assistant(2_000, "已经交给后台了。"),
-                assistant(3_100, "重启后继续。"),
-            ])
-            .with_executions(vec![execution(2_500)])
-            .with_wakes(vec![restart.clone()]),
+            SessionTranscript::new(resumed("重启后继续。"))
+                .with_executions(vec![execution(started + 30_000)])
+                .with_wakes(variants()),
         ],
     )
     .await;
@@ -1574,20 +1808,91 @@ async fn a_restart_wake_gets_no_merged_receipt() {
     let last = platform.updated_cards().await.last().cloned().unwrap();
     assert!(
         !card_text(&last).contains("后台任务完成") && !card_text(&last).contains("子代理完成"),
-        "a restart notice gets no merged receipt: {last}"
+        "a restart/interrupt notice gets no entry: {last}"
     );
 
-    // End the turn: its Execution idles after the restart wake.
+    // End the turn: its Execution idles after the non-completion Wakes.
     script_transcript(
         &backend,
         vec![
-            SessionTranscript::new(vec![
-                user("msg_cola_anchor", 1_000, "跑一下 CI"),
-                assistant(2_000, "已经交给后台了。"),
-                assistant(3_100, "重启后继续。"),
-            ])
-            .with_executions(vec![execution(2_500), execution(4_000)])
-            .with_wakes(vec![restart]),
+            SessionTranscript::new(resumed("重启后继续。"))
+                .with_executions(vec![execution(started + 30_000), execution(finished + 60_000)])
+                .with_wakes(variants()),
+        ],
+    )
+    .await;
+    backend
+        .set_session_status("ses_test", Some(SessionStatus::Idle))
+        .await;
+    let result = tokio::time::timeout(Duration::from_secs(5), turn)
+        .await
+        .expect("the boundary ends the turn")
+        .unwrap();
+    result.unwrap();
+}
+
+/// An unnamed Wake (no label in its text) still leaves the entry: the bare
+/// completion line as its title, identity and timing in the fold.
+#[tokio::test]
+async fn an_unnamed_merged_wake_renders_the_bare_title() {
+    let _wd = test_work_dir();
+    let (started, finished) = entry_span();
+    let timeline = |resumed: Option<TranscriptMessage>| {
+        let mut messages = vec![
+            user("msg_cola_anchor", started - 60_000, "跑一下 CI"),
+            assistant(started - 30_000, "已经交给后台了。"),
+            background_shell_launch(started, "call_bg", "sh_bg", "gh run watch"),
+        ];
+        messages.extend(resumed);
+        messages
+    };
+    let live = SessionTranscript::new(timeline(None))
+        .with_executions(vec![execution(started + 30_000)])
+        .with_background_tasks(vec![background_shell(started)]);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Busy)).await;
+    let turn = spawn_turn(&app, ctx("ses_test", "跑一下 CI"));
+    wait_for_card_text(&platform, "已经交给后台了。").await;
+
+    let mut wake = shell_wake(finished);
+    wake.label = None;
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(timeline(Some(assistant(finished + 30_000, "跑完了。"))))
+                .with_executions(vec![execution(started + 30_000)])
+                .with_wakes(vec![wake.clone()]),
+        ],
+    )
+    .await;
+    wait_for_card_text(&platform, "跑完了。").await;
+
+    let last = platform.updated_cards().await.last().cloned().unwrap();
+    let text = card_text(&last);
+    assert!(
+        text.contains("🔔 后台任务完成"),
+        "the unnamed Wake renders the bare completion line: {last}"
+    );
+    assert!(
+        !text.contains("🔔 后台任务完成："),
+        "a bare title carries no dangling label separator: {last}"
+    );
+    assert!(
+        text.contains("shell sh_bg · 14:02 · 12m"),
+        "identity and timing survive an unnamed completion: {last}"
+    );
+    assert_eq!(
+        text.matches("后台任务完成").count(),
+        1,
+        "exactly one entry: {last}"
+    );
+
+    // End the turn.
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(timeline(Some(assistant(finished + 30_000, "跑完了。"))))
+                .with_executions(vec![execution(started + 30_000), execution(finished + 60_000)])
+                .with_wakes(vec![wake]),
         ],
     )
     .await;
