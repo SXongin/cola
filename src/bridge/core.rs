@@ -214,6 +214,12 @@ impl SharedCore {
                 .session_file
                 .with_file_name("interactive_surfaces.json"),
         ));
+        // The long-task notice threshold, created once: the Turn config and
+        // Session Sync's quiet true-end settle (ADR-0060) must read the SAME
+        // atomic, so a test's tiny injection moves both.
+        let long_task_notice_ms = Arc::new(std::sync::atomic::AtomicU64::new(
+            crate::bridge::turn::LONG_TASK_NOTICE_MS,
+        ));
         Ok(Self {
             sessions: Arc::new(Mutex::new(session_store)),
             cards: Arc::new(Mutex::new(HashMap::new())),
@@ -228,7 +234,13 @@ impl SharedCore {
                 Box::new(crate::bridge::request::kind::QuestionKind),
                 Arc::clone(&surfaces),
             )),
-            external: Arc::new(crate::bridge::external::ExternalFlow::new()),
+            external: Arc::new(crate::bridge::external::ExternalFlow::new(
+                crate::bridge::handles::NoticeRules::new(
+                    cfg.bridge.group_completion_notice,
+                    cfg.bridge.long_task_notice,
+                    Arc::clone(&long_task_notice_ms),
+                ),
+            )),
             snapshot_claims: Arc::new(Mutex::new(
                 crate::bridge::snapshot_claims::SnapshotClaims::default(),
             )),
@@ -248,9 +260,7 @@ impl SharedCore {
                 .map(|p| p.to_string_lossy().to_string()),
             group_completion_notice: cfg.bridge.group_completion_notice,
             long_task_notice: cfg.bridge.long_task_notice,
-            long_task_notice_ms: Arc::new(std::sync::atomic::AtomicU64::new(
-                crate::bridge::turn::LONG_TASK_NOTICE_MS,
-            )),
+            long_task_notice_ms,
             reminder: Arc::new(crate::bridge::reminder::ReminderState::new(
                 cfg.bridge.instant_reminder,
                 // The persisted pin set lives beside the session mapping

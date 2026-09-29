@@ -122,5 +122,12 @@ async fn run(handles: TurnHandles, facts: FollowFacts, timing: SettleTiming) {
         return;
     }
     settle::stamp(&flow.cards, &session_id, &ending).await;
-    super::send_completion_notice(&handles, &session_id, started_at).await;
+    super::send_completion_notice(
+        &handles.cards,
+        &handles.platform,
+        &handles.config.notice_rules(),
+        &session_id,
+        started_at,
+    )
+    .await;
 }
