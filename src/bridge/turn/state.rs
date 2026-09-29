@@ -280,6 +280,13 @@ pub struct CardSession {
     /// when the two share a Turn anchor — a Wake continuation continues the
     /// SAME Turn, so the anchor alone cannot tell them apart (ADR-0059).
     chain_id: u64,
+    /// The Chat a continuation card goes to at the TOP LEVEL when the chain
+    /// has no reply target: a Wake continuation armed after a restart sends
+    /// its first card top-level (there is no user message to reply to), so a
+    /// later size split must follow it there instead of stopping the chain
+    /// mid-way. `None` — every reply-anchored chain — keeps the continuation
+    /// reply-only, exactly as before.
+    pub(super) fallback_chat: Option<String>,
 }
 
 /// Hands out a fresh [`CardSession::chain_id`] per created session.
@@ -302,6 +309,7 @@ impl CardSession {
             pending_split: Vec::new(),
             card_is_live: true,
             chain_id: next_chain_id(),
+            fallback_chat: None,
         }
     }
 

@@ -116,6 +116,26 @@ fn body_index(card: &serde_json::Value, needle: &str) -> Option<usize> {
         .position(|element| element.to_string().contains(needle))
 }
 
+/// A resumed run long enough to overflow ONE card (7200 chars > the 6000-char
+/// card text budget), so its chain must split and hand over — the Fresh
+/// path's top-level continuation fixture.
+fn long_resumed_work(created: i64) -> TranscriptMessage {
+    typed_message(
+        &format!("msg_a_{created}"),
+        MessageRole::Assistant,
+        Some(created),
+        vec![
+            Part::Text(TextPart {
+                text: "很长的回答。".repeat(1_200),
+                started_at: Some(created),
+            }),
+            Part::StepFinish(StepFinish {
+                reason: FinishReason::Stop,
+            }),
+        ],
+    )
+}
+
 /// The 承接 receipt line a Wake continuation opens with — the one user-facing
 /// marker that tells a continuation card apart from a fresh turn's card.
 const LEAD: &str = "已恢复执行";
@@ -1165,4 +1185,104 @@ async fn a_message_in_the_waiting_window_starts_a_new_turn() {
         .expect("the new Turn must finish")
         .unwrap();
     assert!(!app.inflight.lock().await.contains("ses_test"));
+}
+
+/// Fix 1 (live defect): the Fresh path must not resurrect a Wake the
+/// conversation has moved past. A user message NEWER than the newest Wake
+/// proves a later cola life already saw or superseded it, and re-posting would
+/// replay every turn after the Wake; with no newer user message the genuine
+/// restart case still posts.
+#[tokio::test]
+async fn a_stale_wake_is_not_reposted_after_a_restart() {
+    let _wd = test_work_dir();
+    // The Wake resumed a run, and a LATER cola turn followed it: the
+    // conversation has moved past the Wake.
+    let stale = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+        assistant(3_100, "CI 通过了。"),
+        user("msg_cola_later", 5_000, "后来我又说了一句"),
+        assistant(5_100, "好的。"),
+    ])
+    .with_executions(vec![execution(2_500), execution(4_000), execution(6_000)])
+    .with_wakes(vec![shell_wake(2_900)]);
+    let (_dir, app, backend, platform) = scripted_app(vec![stale], Some(SessionStatus::Idle)).await;
+
+    spawn_sync(&app);
+    // Several sync passes over the stale read: no Fresh card may be posted.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        continuation_cards(&platform).await.is_empty(),
+        "a Wake the conversation moved past must not be re-posted: {:?}",
+        platform.calls.lock().await
+    );
+
+    // The same restart read WITHOUT the later user message is the genuine
+    // case: the Wake's run is still pending (or it finished while cola was
+    // down), so the continuation must post.
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(vec![
+                user("msg_cola_anchor", 1_000, "跑一下 CI"),
+                assistant(2_000, "已经交给后台了。"),
+                assistant(3_100, "CI 通过了。"),
+            ])
+            .with_executions(vec![execution(2_500), execution(4_000)])
+            .with_wakes(vec![shell_wake(2_900)]),
+        ],
+    )
+    .await;
+    wait_for_any_card(&platform, LEAD).await;
+    assert!(
+        platform.sent_cards().await.iter().any(is_continuation),
+        "the genuine restart Wake still posts: {:?}",
+        platform.calls.lock().await
+    );
+}
+
+/// Fix 2 (live defect): a Fresh card is sent top-level (a restart leaves no
+/// reply target), so when its run overflows one card the flush must continue
+/// top-level too. Before the fix the continuation was never sent and the card
+/// stayed at 「部分完成，继续中」 with the ending unstamped.
+#[tokio::test]
+async fn a_top_level_continuation_keeps_its_chain() {
+    let _wd = test_work_dir();
+    let resumed = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        long_resumed_work(3_100),
+    ])
+    .with_executions(vec![execution(2_500), execution(4_000)])
+    .with_wakes(vec![shell_wake(2_900)]);
+    let (_dir, app, _backend, platform) = scripted_app(vec![resumed], Some(SessionStatus::Idle)).await;
+
+    spawn_sync(&app);
+    wait_for_card_update(
+        &platform,
+        "the continuation's done card",
+        CardUpdates::Latest,
+        |card| card_header(card).contains("✅"),
+    )
+    .await;
+
+    // The first card hands over with the standard split header ...
+    assert!(
+        platform
+            .updated_cards()
+            .await
+            .iter()
+            .any(|card| card_header(card).contains("继续中")),
+        "the overflowing card hands over: {:?}",
+        platform.updated_cards().await
+    );
+    // ... and the remainder continues in a NEW top-level message that takes
+    // the ending — nothing is left at 继续中.
+    let sent = platform.sent_cards().await;
+    assert!(sent.len() >= 2, "the overflow must continue top-level: {sent:?}");
+    let last = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(card_header(&last).contains("✅"), "{last}");
+    assert!(
+        card_text(&last).contains("很长的回答。"),
+        "the remainder lands on the continuation: {last}"
+    );
 }

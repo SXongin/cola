@@ -613,6 +613,7 @@ impl ExternalFlow {
                     &anchor,
                     ContinuationFacts {
                         reply_to: reply_target.as_deref(),
+                        chat_id: &thread_key.chat_id,
                         subtitle: &subtitle,
                         directory,
                         variant,
