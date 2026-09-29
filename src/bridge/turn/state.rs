@@ -245,6 +245,12 @@ pub(super) struct PendingSplit {
     /// resolution-moment key, unchanged. The line also names the Wake it
     /// covers, marked so the merged-path entry cannot double it.
     pub(super) line: Option<super::ContinuationLine>,
+    /// Whether the outgoing card already received this split's ledger handover
+    /// (ADR-0060): the read's remaining list left it and/or a retiring Wake's
+    /// completion entry arrived. A terminal card that received one still owes
+    /// the handover PATCH — its ending kept intact — while an untouched
+    /// terminal card is left alone.
+    pub(super) handover: bool,
 }
 
 /// One live card per session: the streaming accumulator plus the card identity
@@ -763,13 +769,17 @@ impl StreamAccumulator {
     /// thread superseded it, or the Session stopped being the thread's Active
     /// Session. Only a card still in `Waiting` is collected: a live card is
     /// somebody else's to finish and an ended card keeps the ending it
-    /// recorded. Returns whether this call collected the card, so the caller
-    /// flushes only a real transition.
+    /// recorded. The live list leaves with the collect (ADR-0060): the card
+    /// stops updating, so it cannot keep a list that claims to be live — a
+    /// superseding Turn's own card carries the remaining tasks, a switched-away
+    /// chain's next Wake handover owns the section. Returns whether this call
+    /// collected the card, so the caller flushes only a real transition.
     pub(super) fn collect_waiting(&mut self, collected: CardState) -> bool {
         if self.card_state != CardState::Waiting {
             return false;
         }
         self.card_state = collected;
+        self.ledger.clear();
         true
     }
 
@@ -1391,16 +1401,24 @@ impl StreamAccumulator {
     }
 
     /// Build the card's LIVE slice (`render_from` to the end) as a finalized
-    /// card — the split header, no tail — and ADVANCE `render_from` past it.
-    /// A Supplement forces this split even though the slice fits (ADR-0043):
-    /// the finalized card keeps everything before the split, and the
-    /// continuation renders only the delta appended afterwards — the same
-    /// handoff a size split performs. Receipts queued after this build land
-    /// past the new boundary, so they ride the continuation.
-    pub(super) fn build_finalized_handoff(&mut self) -> serde_json::Value {
+    /// card — no tail — and ADVANCE `render_from` past it. A Supplement forces
+    /// this split even though the slice fits (ADR-0043): the finalized card
+    /// keeps everything before the split, and the continuation renders only
+    /// the delta appended afterwards — the same handoff a size split performs.
+    /// Receipts queued after this build land past the new boundary, so they
+    /// ride the continuation. `state` overrides the header for the finalized
+    /// card (`None` takes the standard 「部分完成，继续中…」); a terminal card
+    /// keeps its own recorded ending when the ledger handover still owes it a
+    /// PATCH (ADR-0060).
+    pub(super) fn build_finalized_handoff(&mut self, state: Option<CardState>) -> serde_json::Value {
         let end = self.timeline.len();
         let card = self
-            .build_card_inner(self.render_from, end, false, Some(CardState::Continued))
+            .build_card_inner(
+                self.render_from,
+                end,
+                false,
+                Some(state.unwrap_or(CardState::Continued)),
+            )
             .0;
         self.render_from = end;
         card

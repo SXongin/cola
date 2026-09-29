@@ -1333,9 +1333,36 @@ impl Turn {
                 // A Supplement's or a pull's content always arrives after the
                 // split: the receipt keeps cola's "now" key.
                 line: None,
+                // Only a Wake continuation's handover writes the ledger's
+                // outgoing facts (ADR-0060).
+                handover: false,
             });
         }
         flush::flush_card_locked(cards, session_id).await;
+    }
+
+    /// Write the handover facts a Wake continuation owes the chain it is
+    /// leaving (ADR-0060): the read's remaining live list and the retiring
+    /// Wakes' fixed completion entries go onto the outgoing accumulator BEFORE
+    /// the split, so the old card's handover PATCH carries both and the
+    /// continuation — whose slice starts after them — renders only its 承接
+    /// line and the remaining list. Returns whether the outgoing card changed:
+    /// a terminal card that did still owes the handover PATCH, one the read did
+    /// not touch keeps the ending it shows. `false` also when the session has
+    /// no card, or none with a Turn anchor to scope the entries with.
+    pub(crate) async fn record_wake_handover(
+        cards: &CardsHandle,
+        session_id: &str,
+        transcript: &SessionTranscript,
+    ) -> bool {
+        let mut live = cards.cards.lock().await;
+        let Some(card) = live.get_mut(session_id) else {
+            return false;
+        };
+        let Some(anchor) = card.acc.turn_anchor.clone() else {
+            return false;
+        };
+        render::write_wake_handover(&mut card.acc, transcript, &anchor)
     }
 
     /// Hand an ENDED card chain over to a Wake continuation (ADR-0059): queue
@@ -1343,7 +1370,9 @@ impl Turn {
     /// finalized and a NEW continuation card — replied to `reply_to`, opening
     /// with the 承接 receipt — becomes the chain's newest card. A Waiting card
     /// is stamped 「部分完成，继续中…」 (its wait is over, the chain moves on);
-    /// a terminal card keeps the ending it recorded. Unlike
+    /// a terminal card keeps the ending it recorded — unless `handover` says
+    /// the ledger handover just wrote it (ADR-0060), in which case even a
+    /// terminal card is PATCHed, with its ending intact. Unlike
     /// [`Self::split_card_chain`], the chain must NOT be owned by a live
     /// Turn/renderer: the Wake decision reads a snapshot, and a Wake
     /// continuation must never split a card somebody else is still streaming
@@ -1356,6 +1385,7 @@ impl Turn {
         session_id: &str,
         reply_to: &str,
         line: ContinuationLine,
+        handover: bool,
     ) -> bool {
         let write_lock = cards.write_lock(session_id).await;
         let _guard = write_lock.lock().await;
@@ -1372,6 +1402,7 @@ impl Turn {
                 kind: SplitKind::Wake,
                 receipt_pushed: false,
                 line: Some(line),
+                handover,
             });
         }
         flush::flush_card_locked(cards, session_id).await;
@@ -1707,7 +1738,9 @@ impl Turn {
     /// with the reason's collected header — 「⏳ 部分完成 · 已由新消息接管」 for a
     /// supersede, 「⏳ 已切换会话 · 后台任务仍在运行」 for a Session that stopped
     /// being the thread's Active Session — refresh the work context and flush
-    /// once. No-op — nothing flushed — when the session has no card or the card
+    /// once. The collect also drops the card's live ledger section (ADR-0060):
+    /// a card that stops updating cannot carry a list that claims to be live.
+    /// No-op — nothing flushed — when the session has no card or the card
     /// is not waiting. Neither collect sends a Completion Notice (the notice
     /// belongs to a true end), and the background work behind the wait is
     /// unaffected: a later Wake still continues the chain on a new card.

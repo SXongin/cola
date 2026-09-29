@@ -25,7 +25,10 @@ pub(crate) fn user(id: &str, created: i64, text: &str) -> TranscriptMessage {
     typed_message(id, MessageRole::User, Some(created), vec![text_part(text)])
 }
 
-/// A finished assistant turn whose only visible content is `text`.
+/// A finished assistant turn whose only visible content is `text`. The text
+/// carries the message's own server time, like a real part: the timeline keys
+/// off it, so a fixture cannot make a later server-keyed part sort behind a
+/// "now"-keyed one.
 pub(crate) fn assistant(created: i64, text: &str) -> TranscriptMessage {
     typed_message(
         &format!("msg_a_{created}"),
@@ -34,7 +37,7 @@ pub(crate) fn assistant(created: i64, text: &str) -> TranscriptMessage {
         vec![
             Part::Text(TextPart {
                 text: text.to_string(),
-                started_at: None,
+                started_at: Some(created),
             }),
             Part::StepFinish(StepFinish {
                 reason: FinishReason::Stop,

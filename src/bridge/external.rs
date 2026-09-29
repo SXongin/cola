@@ -584,7 +584,13 @@ impl ExternalFlow {
                     );
                     return;
                 };
-                if !Turn::split_chain_for_wake(&handles.cards, sid, &reply_to, line).await {
+                // The ledger handover rides the split (ADR-0060): the read's
+                // remaining list and the retiring Wakes' entries go onto the
+                // outgoing card NOW, so its finalize PATCH carries them and
+                // the continuation — whose slice starts after both — opens
+                // with only its 承接 line and the remaining list.
+                let handover = Turn::record_wake_handover(&handles.cards, sid, transcript).await;
+                if !Turn::split_chain_for_wake(&handles.cards, sid, &reply_to, line, handover).await {
                     return;
                 }
                 let (Some(anchor), Some(chain)) = (

@@ -365,6 +365,13 @@ async fn switching_away_collects_a_card_that_really_yielded() {
         "the collect keeps the turn's content: {}",
         patches[0]
     );
+    // The live list cannot stay on a card that stops updating (ADR-0060): it
+    // leaves with the collect, and the chain's next Wake handover owns it.
+    assert!(
+        !card_text(&patches[0]).contains("后台任务（"),
+        "the switch-away collect drops the live list: {}",
+        patches[0]
+    );
     assert!(
         !noticed(&platform).await,
         "the collect sends no Completion Notice: {:?}",
@@ -438,7 +445,10 @@ async fn forgetting_a_session_collects_its_waiting_card() {
 /// during the absence; after switching back the Session Snapshot reports the
 /// Session's current state, and Session Sync's Wake pass continues the
 /// collected chain on a new card — exactly one continuation, never re-posted
-/// by a later pass, the collected card itself never updating again.
+/// by a later pass. The collected card takes ONE more PATCH, the ledger
+/// handover (ADR-0060): the retired task's completion entry lands there, and
+/// nothing else follows — its collect state stays, and no live list is ever
+/// re-shown.
 #[tokio::test]
 async fn a_collected_chain_still_takes_a_wake_after_switching_back() {
     let _wd = test_work_dir();
@@ -483,10 +493,11 @@ async fn a_collected_chain_still_takes_a_wake_after_switching_back() {
     );
 
     // The Wake resumes the Session: its continuation is a new card below the
-    // collected chain, and the collected card keeps its ending untouched. The
-    // wait is tied to the continuation's own ending (lead + resumed text), and
-    // the assertion reads that same matched update — never "the latest call",
-    // which could be the reply's initial payload.
+    // collected chain, and the collected card only receives the ledger
+    // handover (ADR-0060) — the retired task's entry, its collected ending
+    // untouched. The wait is tied to the continuation's own ending (lead +
+    // resumed text), and the assertion reads that same matched update — never
+    // "the latest call", which could be the reply's initial payload.
     script_transcript(&backend, vec![resumed_transcript()]).await;
     wait_for_card_update(&platform, "the Wake's done card", CardUpdates::Latest, |card| {
         card_header(card).contains("✅")
@@ -520,9 +531,26 @@ async fn a_collected_chain_still_takes_a_wake_after_switching_back() {
         "later Session Sync passes must not re-post the rendered Wake: {:?}",
         platform.calls.lock().await
     );
+    // The collected card's ledger handover: one PATCH carrying the retired
+    // task's completion entry, with the collect's own facts intact — its
+    // header, and no live list left (or re-shown) anywhere.
+    let patches = patches_to(&platform, "om_waiting").await;
     assert_eq!(
-        patches_to(&platform, "om_waiting").await.len(),
-        1,
-        "the collected card never updates again"
+        patches.len(),
+        2,
+        "the collect and the ledger handover are the collected card's only PATCHes: {patches:?}"
+    );
+    let handover = &patches[1];
+    assert!(
+        card_header(handover).contains("已切换会话"),
+        "the handover leaves the collect state intact: {handover}"
+    );
+    assert!(
+        card_text(handover).contains("后台任务完成"),
+        "the retired task's entry lands on the card that hosted it: {handover}"
+    );
+    assert!(
+        !card_text(handover).contains("后台任务（"),
+        "the handover never re-shows a live list: {handover}"
     );
 }

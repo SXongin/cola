@@ -183,7 +183,12 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str) {
             let continues_an_ended_card = pending_split
                 .iter()
                 .any(|split| split.kind.continues_an_ended_card());
-            let (finalized, restamp) = if supplement_split_requested && !built.full {
+            // Whether the outgoing card received a ledger handover (ADR-0060)
+            // before this split: its remaining list left, a retiring Wake's
+            // completion entry arrived. A terminal card that received one
+            // still owes the handover PATCH.
+            let handover = pending_split.iter().any(|split| split.handover);
+            let (finalized, patch) = if supplement_split_requested && !built.full {
                 // The live slice still fits, but a supplement forces the split
                 // anyway: finalize the slice here and HAND IT OFF — the
                 // continuation carries only the receipts queued below and the
@@ -193,14 +198,17 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str) {
                     return;
                 };
                 // A cause that continues an ENDED card (a Wake) advances the
-                // render boundary either way, but only a waiting card takes
-                // the standard 「部分完成，继续中…」 header — a terminal card
-                // keeps the ending it recorded. Every other cause splits a
-                // live card and re-stamps unconditionally: its slice may not
-                // have reached Feishu yet (the loading-card window's deferred
-                // split).
-                let restamp = !continues_an_ended_card || !card.acc.card_state.is_terminal();
-                (card.acc.build_finalized_handoff(), restamp)
+                // render boundary either way, but only a waiting or live card
+                // takes the standard 「部分完成，继续中…」 header — a terminal
+                // card keeps the ending it recorded. It is still PATCHed when
+                // the ledger handover wrote its last facts; without one it
+                // keeps the ending it already shows and is not touched. Every
+                // other cause splits a live card and re-stamps
+                // unconditionally: its slice may not have reached Feishu yet
+                // (the loading-card window's deferred split).
+                let terminal = continues_an_ended_card && card.acc.card_state.is_terminal();
+                let state = terminal.then(|| card.acc.card_state.clone());
+                (card.acc.build_finalized_handoff(state), !terminal || handover)
             } else {
                 (built.card, true)
             };
@@ -228,7 +236,7 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str) {
                 // them.
                 push_queued_receipts(cards, session_id).await;
             }
-            if restamp && let Err(e) = cards.feishu.update_message(&card_id, &finalized).await {
+            if patch && let Err(e) = cards.feishu.update_message(&card_id, &finalized).await {
                 tracing::warn!("Card update failed: {}", e);
                 if is_card_content_rejected(&e) {
                     if matches!(

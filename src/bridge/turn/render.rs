@@ -440,6 +440,27 @@ fn render_wake_entries(
     inserted
 }
 
+/// The facts a Wake handover must write onto the OUTGOING card before its
+/// chain splits (ADR-0060): the read's remaining live list — so the
+/// continuation's very first payload already carries the remaining tasks,
+/// never the one that just retired — and each retiring shell/subagent Wake's
+/// completion entry, keyed where the completion happened, so the entry stays
+/// on the card that hosted the task and the continuation, whose slice starts
+/// after it, can never render it. Both come from the same derivations the live
+/// render uses ([`ledger_rows`], [`render_wake_entries`]), so the handover
+/// cannot drift from it. Returns whether the outgoing card changed at all: a
+/// terminal card that did still owes its handover PATCH, while one the read
+/// did not touch keeps the ending it shows.
+pub(super) fn write_wake_handover(
+    acc: &mut StreamAccumulator,
+    transcript: &SessionTranscript,
+    anchor: &TurnAnchor,
+) -> bool {
+    let mut changed = acc.set_ledger(ledger_rows(transcript));
+    changed |= render_wake_entries(acc, transcript, anchor);
+    changed
+}
+
 /// Render the parts of this turn's assistant messages that haven't been
 /// rendered yet, and refresh the live Background Task ledger from the read.
 /// Returns true if anything new was rendered.
