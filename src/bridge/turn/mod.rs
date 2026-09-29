@@ -1364,7 +1364,9 @@ impl Turn {
     /// both and the continuation, whose slice starts after them, renders only
     /// its 承接 line and the remaining list. A refused split writes nothing,
     /// and a card with no Turn anchor to scope the entries with owes no
-    /// handover (`handover = false`) while the split still proceeds.
+    /// handover (`handover = false`) while the split still proceeds. `now_ms`
+    /// is the read's clock — the Session Sync pass's own, shared with the
+    /// yielded refresh of the same read.
     ///
     /// Returns false — nothing queued — when the session has no card or a live
     /// renderer owns it.
@@ -1374,6 +1376,7 @@ impl Turn {
         reply_to: &str,
         line: ContinuationLine,
         transcript: &SessionTranscript,
+        now_ms: i64,
     ) -> bool {
         let write_lock = cards.write_lock(session_id).await;
         let _guard = write_lock.lock().await;
@@ -1386,8 +1389,9 @@ impl Turn {
                 return false;
             }
             let anchor = card.acc.turn_anchor.clone();
-            let handover =
-                anchor.is_some_and(|anchor| render::write_wake_handover(&mut card.acc, transcript, &anchor));
+            let handover = anchor.as_ref().is_some_and(|anchor| {
+                render::apply_ledger_read(&mut card.acc, transcript, Some(anchor), now_ms)
+            });
             card.pending_split.push(state::PendingSplit {
                 reply_to: reply_to.to_string(),
                 kind: SplitKind::Wake,
@@ -1395,6 +1399,51 @@ impl Turn {
                 line: Some(line),
                 handover,
             });
+        }
+        flush::flush_card_locked(cards, session_id).await;
+        true
+    }
+
+    /// Refresh a yielded card's ledger from a Session Sync read, in place
+    /// (ADR-0060): the freeze's carve-out, beside the Wake handover. A Waiting
+    /// card has no render loop — its Turn yielded to its live Background Tasks
+    /// — so the existing reads are what keep its section true: a task that
+    /// retired quietly (its Wake's resumed run renders nothing, so no
+    /// continuation is owed) leaves the live list while its fixed completion
+    /// entry arrives on the host card, an elapsed row moves when a whole
+    /// minute turns, and an unchanged read leaves the card completely alone —
+    /// no PATCH at all, so its header, timeline and footer stay frozen.
+    ///
+    /// Only the yielded `Waiting` card is refreshed: a live card is
+    /// render-owned (its own loop streams into it, and Session Sync's Wake step
+    /// above refused to touch it), and a terminal card keeps the ending it
+    /// recorded. Runs under the session's card-write lock
+    /// ([`CardsHandle::write_lock`]), like every other card write, so the facts
+    /// and the PATCH they owe cannot interleave with a split, a collect or
+    /// another flush. `now_ms` is the read's clock, shared with the same pass's
+    /// Wake decision. Returns whether this read moved the ledger — the card is
+    /// PATCHed when it did.
+    pub(crate) async fn refresh_yielded_ledger(
+        cards: &CardsHandle,
+        session_id: &str,
+        transcript: &SessionTranscript,
+        now_ms: i64,
+    ) -> bool {
+        let write_lock = cards.write_lock(session_id).await;
+        let _guard = write_lock.lock().await;
+        let changed = {
+            let mut live = cards.cards.lock().await;
+            let Some(card) = live.get_mut(session_id) else {
+                return false;
+            };
+            if card.acc.card_state != crate::feishu::card::CardState::Waiting {
+                return false;
+            }
+            let anchor = card.acc.turn_anchor.clone();
+            render::apply_ledger_read(&mut card.acc, transcript, anchor.as_ref(), now_ms)
+        };
+        if !changed {
+            return false;
         }
         flush::flush_card_locked(cards, session_id).await;
         true

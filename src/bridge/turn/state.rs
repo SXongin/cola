@@ -479,6 +479,12 @@ pub(super) struct StreamAccumulator {
     /// card. Empty renders nothing — V1 has no Background Task facts, so its
     /// ledger is always empty.
     pub(super) ledger: Vec<TaskLedgerRow>,
+    /// The ledger's refresh clock ([`Self::set_ledger`]): each row's elapsed in
+    /// whole minutes as of the read that last moved the section (ADR-0060).
+    /// The rows alone cannot tell that a yielded card's elapsed went stale, and
+    /// the rendered seconds move on every read — this coarser key owes a flush
+    /// exactly when a minute turns, so an unchanged read PATCHes nothing.
+    ledger_clock: Vec<Option<u64>>,
     /// Text, reasoning, tool and receipt entries ordered by their key (the
     /// server-side part start time) — the card is built from this, so message ↔
     /// tool interleaving is preserved even when a part renders late.
@@ -780,6 +786,9 @@ impl StreamAccumulator {
         }
         self.card_state = collected;
         self.ledger.clear();
+        // The refresh clock goes with the list: a card that no longer shows a
+        // section must not owe a flush for having one.
+        self.ledger_clock.clear();
         true
     }
 
@@ -1335,15 +1344,20 @@ impl StreamAccumulator {
     }
 
     /// Replace the live Background Task ledger from a transcript read
-    /// (ADR-0060). The read is the authority: a task it no longer lists has
-    /// retired and leaves the section, a new one joins in transcript order.
-    /// Returns whether the rendered section changed, so a membership change
-    /// flushes even when no part did.
-    pub(super) fn set_ledger(&mut self, rows: Vec<TaskLedgerRow>) -> bool {
-        if self.ledger == rows {
+    /// (ADR-0060), stamped with the read's clock. The read is the authority: a
+    /// task it no longer lists has retired and leaves the section, a new one
+    /// joins in transcript order. Returns whether the card owes a flush: a
+    /// membership change, or a row's elapsed crossing a whole minute since the
+    /// section last rendered. The clock is minute-granular on purpose — the
+    /// seconds inside a minute never owe one, so a yielded card is not PATCHed
+    /// on every read, while the read that crosses a minute is.
+    pub(super) fn set_ledger(&mut self, rows: Vec<TaskLedgerRow>, now_ms: i64) -> bool {
+        let clock = crate::feishu::card::ledger::task_ledger_clock(&rows, now_ms);
+        if self.ledger == rows && self.ledger_clock == clock {
             return false;
         }
         self.ledger = rows;
+        self.ledger_clock = clock;
         true
     }
 

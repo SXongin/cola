@@ -158,6 +158,19 @@ pub(crate) fn task_ledger_text(rows: &[TaskLedgerRow], now_ms: i64) -> Option<St
     Some(text)
 }
 
+/// The ledger's refresh clock (ADR-0060): each row's elapsed in whole minutes
+/// against `now_ms`, in row order. [`task_ledger_text`] renders the elapsed in
+/// seconds; this coarser key is what the Bridge compares across reads, so a
+/// card with no render loop — a yielded one — owes a PATCH exactly when a
+/// whole minute turns and none for the seconds inside it. A row with no start
+/// time never ticks (`None`), and a start skewed into the future clamps like
+/// the render it keys.
+pub(crate) fn task_ledger_clock(rows: &[TaskLedgerRow], now_ms: i64) -> Vec<Option<u64>> {
+    rows.iter()
+        .map(|row| row.started_at.map(|at| secs_since(at, now_ms) / 60))
+        .collect()
+}
+
 /// The one shape a task label takes inside the ledger: newlines fold to spaces
 /// (a multi-line command cannot break a row or a panel header) and the text
 /// clips like a short line. Shared by the live row and the completion entry's
@@ -331,6 +344,46 @@ mod tests {
             task_ledger_text(&rows, 1_000).unwrap().ends_with(" · 0m00s"),
             "a skewed clock must not render a negative age"
         );
+    }
+
+    /// The refresh clock is the elapsed in whole minutes (ADR-0060): the
+    /// seconds inside a minute never move it, crossing one does, a row with no
+    /// start time has no clock at all, and a future start clamps like the
+    /// render it keys.
+    #[test]
+    fn the_refresh_clock_moves_once_a_minute() {
+        let start = 1_800_000_000_000;
+        let rows = vec![
+            TaskLedgerRow {
+                kind: TaskKind::Shell,
+                label: None,
+                started_at: Some(start),
+            },
+            TaskLedgerRow {
+                kind: TaskKind::Subagent,
+                label: None,
+                started_at: None,
+            },
+        ];
+
+        let clock = task_ledger_clock(&rows, start + 59_000);
+        assert_eq!(clock, vec![Some(0), None], "the whole minutes, in row order");
+        assert_eq!(
+            task_ledger_clock(&rows, start + 59_999),
+            clock,
+            "the seconds inside the minute do not move the clock"
+        );
+        assert_eq!(
+            task_ledger_clock(&rows, start + 60_000),
+            vec![Some(1), None],
+            "crossing the minute moves it"
+        );
+        assert_eq!(
+            task_ledger_clock(&rows, start - 5_000),
+            vec![Some(0), None],
+            "a future start clamps like the render"
+        );
+        assert_eq!(task_ledger_clock(&[], start), Vec::<Option<u64>>::new());
     }
 
     /// The estimate is clipped like the render it estimates: a label longer

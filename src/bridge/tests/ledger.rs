@@ -857,6 +857,325 @@ async fn a_new_turn_takes_the_live_list_over_from_the_waiting_card() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// The yielded card's ledger stays fresh (ADR-0060, ticket #419): a Waiting
+// card has no render loop of its own, so the existing Session Sync reads drive
+// its ledger in place — a quiet retirement's row leaves and its entry arrives,
+// elapsed moves when a whole minute turns, and an unchanged read PATCHes
+// nothing. The carve-out is the ledger alone: the rest of the yielded card
+// stays frozen.
+// ---------------------------------------------------------------------------
+
+/// The one-task waiting read the in-place tests yield from: the timeline's
+/// shell launched at `started_at`. A start near the test's own clock keeps the
+/// row's elapsed minute far from turning, so a short test window cannot cross
+/// it by accident.
+fn waiting_shell(started_at: i64) -> SessionTranscript {
+    SessionTranscript::new(two_task_timeline(vec![]))
+        .with_executions(vec![execution(2_500)])
+        .with_background_tasks(vec![live_shell(started_at, "call_bg")])
+}
+
+/// The same read with the subagent still live beside the shell: the quiet
+/// retirement retires the shell only, so the card stays Waiting (the LAST
+/// retirement's settle belongs to a different ticket).
+fn waiting_shell_and_subagent(shell_started_at: i64, subagent_started_at: i64) -> SessionTranscript {
+    SessionTranscript::new(two_task_timeline(vec![]))
+        .with_executions(vec![execution(2_500)])
+        .with_background_tasks(vec![
+            live_shell(shell_started_at, "call_bg"),
+            live_subagent(subagent_started_at, "call_sub"),
+        ])
+}
+
+/// Run the turn on `read` to its waiting yield and name the yielded card
+/// `om_waiting` (the harness replies every card with one id), so the ledger
+/// PATCHes the in-place pass adds can be told apart from every other card's.
+async fn yield_waiting_card(app: &Arc<App>, platform: &RecordingPlatform, live_tasks: usize) {
+    Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下构建并审阅"))
+        .await
+        .unwrap();
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Waiting),
+        "idle with live tasks yields waiting"
+    );
+    let yielded = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_text(&yielded).contains(&format!("⏳ 后台任务（{live_tasks}）")),
+        "the waiting card carries its live tasks: {yielded}"
+    );
+    Turn::set_card_message_id(&app.cards_handle(), "ses_test", "om_waiting").await;
+}
+
+/// Every card CREATED (a reply or a top-level send), in call order — the
+/// counter for "was a new card posted?" (an in-place PATCH updates one).
+async fn created_cards(platform: &RecordingPlatform) -> Vec<serde_json::Value> {
+    platform
+        .calls
+        .lock()
+        .await
+        .iter()
+        .filter_map(|call| match call {
+            PlatformCall::ReplyCard { card, .. } | PlatformCall::SendCard { card, .. } => Some(card.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Acceptance 1 (#419): a quiet retirement — the shell's Wake with no resumed
+/// work, so no continuation is owed — updates the WAITING card in place: the
+/// retired row leaves, its fixed completion entry arrives on the same card,
+/// and nothing is posted. The card's non-ledger content (waiting header,
+/// timeline, footer) is untouched.
+#[tokio::test]
+async fn a_quiet_retirement_updates_the_waiting_card_in_place() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let sub_started = now - 4_000;
+    let live = waiting_shell_and_subagent(now - 5_000, sub_started);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    yield_waiting_card(&app, &platform, 2).await;
+    let cards_before = created_cards(&platform).await.len();
+
+    // The shell retires and its run resumes nothing; the subagent stays live,
+    // so the card keeps a ledger but owes no continuation.
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(two_task_timeline(vec![]))
+                .with_executions(vec![execution(2_500)])
+                .with_wakes(vec![shell_wake(2_900)])
+                .with_background_tasks(vec![live_subagent(sub_started, "call_sub")]),
+        ],
+    )
+    .await;
+    spawn_sync(&app);
+    wait_for_card_update(&platform, "the quiet retirement", CardUpdates::Latest, |card| {
+        card_text(card).contains("🔔 后台任务完成：gh run watch")
+            && !card_text(card).contains("· shell：gh run watch")
+    })
+    .await;
+
+    // Exactly ONE in-place PATCH carries both facts: the row left and the
+    // entry arrived, with the remaining list riding along.
+    let patches = patches_to(&platform, "om_waiting").await;
+    assert_eq!(
+        patches.len(),
+        1,
+        "the retirement is one in-place PATCH: {patches:?}"
+    );
+    let updated = &patches[0];
+    let text = card_text(updated);
+    assert!(
+        !text.contains("· shell：gh run watch"),
+        "the retired task's row leaves: {updated}"
+    );
+    assert!(
+        text.contains("⏳ 后台任务（1）") && text.contains("· 子代理：review the diff"),
+        "the remaining list rides the same card: {updated}"
+    );
+    assert!(
+        text.contains("🔔 后台任务完成：gh run watch") && text.contains("shell sh_bg · "),
+        "the fixed entry lands on the card the task lived on: {updated}"
+    );
+    assert!(
+        card_header(updated).contains("等待后台任务"),
+        "the waiting header is untouched: {updated}"
+    );
+    assert!(
+        text.contains("已经交给后台了。"),
+        "the card's timeline is untouched: {updated}"
+    );
+    assert!(text.contains("📁"), "the Turn Footer is untouched: {updated}");
+
+    // Nothing was posted: no continuation, no new card at all.
+    assert!(
+        continuation_sends(&platform).await.is_empty(),
+        "a quiet retirement owes no continuation: {:?}",
+        platform.calls.lock().await
+    );
+    assert_eq!(
+        created_cards(&platform).await.len(),
+        cards_before,
+        "no new card is posted for a ledger update"
+    );
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Waiting),
+        "the card is still waiting"
+    );
+}
+
+/// Acceptance 2 (#419): an unchanged read PATCHes nothing — the Session Sync
+/// passes run on the injected cadence, but the ledger did not move, so the
+/// yielded card keeps the exact bytes the yield left. The control at the end
+/// proves the loop was alive for the whole unchanged window: a read that does
+/// move the ledger PATCHes immediately after it.
+#[tokio::test]
+async fn an_unchanged_read_leaves_the_waiting_card_unpatched() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let sub_started = now - 4_000;
+    let live = waiting_shell_and_subagent(now - 5_000, sub_started);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    yield_waiting_card(&app, &platform, 2).await;
+    let yielded = platform.updated_cards().await.last().cloned().unwrap();
+    let elapsed = ledger_elapsed(&yielded, "· shell：gh run watch · ");
+    let cards_before = created_cards(&platform).await.len();
+
+    // Many passes at the injected cadence (20 ms each): the ledger is
+    // unchanged, so no PATCH and no card.
+    spawn_sync(&app);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        patches_to(&platform, "om_waiting").await.is_empty(),
+        "an unchanged read must not PATCH the yielded card: {:?}",
+        platform.updated_cards().await
+    );
+    assert_eq!(
+        created_cards(&platform).await.len(),
+        cards_before,
+        "an unchanged read posts nothing"
+    );
+    let last = platform.updated_cards().await.last().cloned().unwrap();
+    assert_eq!(
+        ledger_elapsed(&last, "· shell：gh run watch · "),
+        elapsed,
+        "the frozen card still reads the yield's elapsed: {elapsed:?}"
+    );
+
+    // Control: the same loop is listening — a read that changes the ledger
+    // PATCHes right away.
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(two_task_timeline(vec![]))
+                .with_executions(vec![execution(2_500)])
+                .with_wakes(vec![shell_wake(2_900)])
+                .with_background_tasks(vec![live_subagent(sub_started, "call_sub")]),
+        ],
+    )
+    .await;
+    wait_for_card_update(&platform, "the read that moved", CardUpdates::Latest, |card| {
+        !card_text(card).contains("· shell：gh run watch")
+    })
+    .await;
+}
+
+/// Acceptance 2 (#419): elapsed refresh is minute-granular and driven by the
+/// reads. The seconds inside a minute never owe a PATCH (however many reads
+/// land), the read that crosses a whole minute PATCHes exactly once with the
+/// new minute — and nothing more follows inside that minute.
+#[tokio::test]
+async fn a_waiting_cards_elapsed_refreshes_on_the_minute() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = waiting_shell(now - 5_000);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    yield_waiting_card(&app, &platform, 1).await;
+
+    // A read whose row's elapsed is seconds short of the whole minute: the
+    // start moved, so this membership change PATCHes once, deterministically
+    // before the boundary.
+    let started = chrono::Utc::now().timestamp_millis() - 58_000;
+    let near_boundary = waiting_shell(started);
+    script_transcript(&backend, vec![near_boundary]).await;
+    spawn_sync(&app);
+    wait_for_card_update(&platform, "the moved start", CardUpdates::Latest, |card| {
+        ledger_elapsed(card, "· shell：gh run watch · ").starts_with("0m5")
+    })
+    .await;
+
+    // The minute turns over: one more PATCH with the new elapsed, and that is
+    // all — if the refresh were second-granular, every read in between would
+    // have PATCHed too.
+    wait_for_card_update(&platform, "the elapsed minute", CardUpdates::Latest, |card| {
+        ledger_elapsed(card, "· shell：gh run watch · ").starts_with("1m")
+    })
+    .await;
+    assert_eq!(
+        patches_to(&platform, "om_waiting").await.len(),
+        2,
+        "one PATCH for the start move and one for the minute turn: {:?}",
+        platform.updated_cards().await
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        patches_to(&platform, "om_waiting").await.len(),
+        2,
+        "the seconds inside the new minute do not PATCH: {:?}",
+        platform.updated_cards().await
+    );
+}
+
+/// The retire-then-takeover race (#418 review): a completion that retires
+/// between reads is owned by the in-place pass, and the later new-Turn collect
+/// — which drops the live list — leaves the entry on the card it happened on.
+#[tokio::test]
+async fn a_quiet_retirement_survives_a_later_takeover() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let sub_started = now - 4_000;
+    let live = waiting_shell_and_subagent(now - 5_000, sub_started);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    yield_waiting_card(&app, &platform, 2).await;
+
+    // The shell retires quietly: the waiting card updates in place, its entry
+    // landing where the task lived.
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(two_task_timeline(vec![]))
+                .with_executions(vec![execution(2_500)])
+                .with_wakes(vec![shell_wake(2_900)])
+                .with_background_tasks(vec![live_subagent(sub_started, "call_sub")]),
+        ],
+    )
+    .await;
+    spawn_sync(&app);
+    wait_for_card_update(&platform, "the quiet retirement", CardUpdates::Latest, |card| {
+        card_text(card).contains("🔔 后台任务完成：gh run watch")
+    })
+    .await;
+
+    // The user posts again: the new Turn collects the waiting card, dropping
+    // its live list — the entry stays.
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(two_task_timeline(vec![user("msg_cola_next", 3_000, "新问题")]))
+                .with_executions(vec![execution(2_500)])
+                .with_background_tasks(vec![live_subagent(sub_started, "call_sub")]),
+        ],
+    )
+    .await;
+    let mut second = ctx("ses_test", "新问题");
+    second.message_id = "msg_next".into();
+    second.cola_message_id = Some("msg_cola_next".into());
+    Turn::run(&app.turn_handles(), second).await.unwrap();
+
+    let patches = patches_to(&platform, "om_waiting").await;
+    assert_eq!(
+        patches.len(),
+        2,
+        "the retirement and the collect are the waiting card's PATCHes: {patches:?}"
+    );
+    let collected = &patches[1];
+    assert!(
+        !card_text(collected).contains("后台任务（"),
+        "the collect drops the live list: {collected}"
+    );
+    assert!(
+        card_text(collected).contains("🔔 后台任务完成：gh run watch"),
+        "the entry stays on the card it happened on: {collected}"
+    );
+    assert!(
+        card_header(collected).contains("已由新消息接管"),
+        "the collect keeps its own header: {collected}"
+    );
+}
+
 /// The ledger's elapsed is rendered at card build time: a task whose start
 /// clock is ahead (server skew) clamps to `0m00s`, so a row never renders a
 /// negative age.

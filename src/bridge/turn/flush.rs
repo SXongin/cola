@@ -72,8 +72,10 @@ async fn advance_card_fallback(cards: &CardsHandle, session_id: &str) -> Fallbac
 }
 
 /// The flush machine proper, entered with the session's card-write lock
-/// already held by [`Turn::flush_card`](super::Turn::flush_card) or
-/// [`Turn::split_card_chain`](super::Turn::split_card_chain).
+/// already held by [`Turn::flush_card`](super::Turn::flush_card),
+/// [`Turn::split_card_chain`](super::Turn::split_card_chain),
+/// [`Turn::split_chain_for_wake`](super::Turn::split_chain_for_wake) or
+/// [`Turn::refresh_yielded_ledger`](super::Turn::refresh_yielded_ledger).
 pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str) {
     // The card-chain state a flush resumes from: a pending Supplement split
     // (ADR-0043) and whether the tracked card is still the live (growing) one.

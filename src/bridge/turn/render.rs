@@ -440,24 +440,33 @@ fn render_wake_entries(
     inserted
 }
 
-/// The facts a Wake handover must write onto the OUTGOING card before its
-/// chain splits (ADR-0060): the read's remaining live list — so the
-/// continuation's very first payload already carries the remaining tasks,
-/// never the one that just retired — and each retiring shell/subagent Wake's
-/// completion entry, keyed where the completion happened, so the entry stays
-/// on the card that hosted the task and the continuation, whose slice starts
-/// after it, can never render it. Both come from the same derivations the live
-/// render uses ([`ledger_rows`], [`render_wake_entries`]), so the handover
-/// cannot drift from it. Returns whether the outgoing card changed at all: a
-/// terminal card that did still owes its handover PATCH, while one the read
-/// did not touch keeps the ending it shows.
-pub(super) fn write_wake_handover(
+/// The ledger facts a transcript read owes a card (ADR-0060): the read's
+/// remaining live list — so a retired task's row leaves and the still-running
+/// ones stay, on a continuation's very first payload or on a yielded card's
+/// in-place refresh — and each retiring shell/subagent Wake's completion entry,
+/// keyed where the completion happened, so the entry stays on the card that
+/// hosted the task. Both come from the same derivations the live render uses
+/// ([`ledger_rows`], [`render_wake_entries`]), so no path can drift from it.
+/// `now_ms` is the read's clock, at the minute granularity
+/// [`set_ledger`](StreamAccumulator::set_ledger) compares.
+///
+/// A Wake handover calls this on the OUTGOING card before its chain splits;
+/// Session Sync's in-place pass calls it on a yielded card. Returns whether the
+/// card changed at all: a terminal card that did still owes its handover PATCH,
+/// while one the read did not touch keeps the ending it shows, and a yielded
+/// card is only PATCHed for a real change. `anchor` scopes the completion
+/// entries; without one the live list still moves, but a Wake's entry cannot
+/// be placed.
+pub(super) fn apply_ledger_read(
     acc: &mut StreamAccumulator,
     transcript: &SessionTranscript,
-    anchor: &TurnAnchor,
+    anchor: Option<&TurnAnchor>,
+    now_ms: i64,
 ) -> bool {
-    let mut changed = acc.set_ledger(ledger_rows(transcript));
-    changed |= render_wake_entries(acc, transcript, anchor);
+    let mut changed = acc.set_ledger(ledger_rows(transcript), now_ms);
+    if let Some(anchor) = anchor {
+        changed |= render_wake_entries(acc, transcript, anchor);
+    }
     changed
 }
 
@@ -518,10 +527,12 @@ pub(super) fn render_new_turn_parts(acc: &mut StreamAccumulator, transcript: &Se
         }
     }
     // The live Background Task Ledger (ADR-0060) rides the card tail this
-    // render feeds. The transcript read is its authority, and a membership
-    // change must flush even when no part moved, so it counts as rendered
-    // content.
-    rendered_any |= acc.set_ledger(ledger_rows(transcript));
+    // render feeds. The transcript read is its authority: a membership change
+    // — or a row's elapsed crossing a whole minute — must flush even when no
+    // part moved, so it counts as rendered content. The decision's clock is
+    // this read's own; the card renders the rows from its build clock, the
+    // same minute.
+    rendered_any |= acc.set_ledger(ledger_rows(transcript), chrono::Utc::now().timestamp_millis());
     rendered_any
 }
 
