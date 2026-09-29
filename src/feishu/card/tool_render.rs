@@ -28,6 +28,12 @@ pub struct ToolPanel {
     liveness: Option<TaskLiveness>,
 }
 
+/// The status marker a backgrounded call's panel shows instead of ✅
+/// (ADR-0060, the pinned copy): the call settled by returning the background
+/// handle, so the panel never claims the run completed — the Background Task
+/// Ledger owns the run's liveness, before and after retirement.
+pub const BACKGROUNDED_STATUS: &str = "已转后台";
+
 impl ToolPanel {
     pub fn new(call: ToolCall) -> Self {
         Self { call, liveness: None }
@@ -53,6 +59,13 @@ impl ToolPanel {
     }
 
     pub fn status_icon(&self) -> &'static str {
+        // A backgrounded call never claims completion (ADR-0060): it settled
+        // at launch while its run continues, so the panel reads 已转后台 —
+        // durably, before and after the task retires. The ledger owns the
+        // run's liveness.
+        if self.backgrounded() {
+            return BACKGROUNDED_STATUS;
+        }
         match self.status() {
             ToolStatus::Running | ToolStatus::Pending => "⏳",
             ToolStatus::Completed => "✅",
@@ -80,6 +93,16 @@ impl ToolPanel {
     /// "⏳ tool" hint names the Turn's running call (ADR-0014).
     pub fn is_running(&self) -> bool {
         matches!(self.status(), ToolStatus::Running)
+    }
+
+    /// Whether this call moved its run to the background (ADR-0060): the
+    /// backend's own durable marker on the call — the settled `shell`/
+    /// `subagent` launch whose metadata still says the run is going
+    /// ([`ToolCall::background_launch`]). Such a panel keeps its timeline place
+    /// as the record of the request and reads [`BACKGROUNDED_STATUS`] instead
+    /// of ✅ — never claiming completion, whatever the ledger currently lists.
+    pub(crate) fn backgrounded(&self) -> bool {
+        self.call.background_launch().is_some()
     }
 
     /// The raw structured tool input (what OpenCode recorded for the call), kept
@@ -1152,6 +1175,90 @@ mod tests {
         let running = |status| ToolPanel::for_test("bash", status, None, None).is_running();
         assert!(running(ToolStatus::Running));
         assert!(!running(ToolStatus::Pending));
+    }
+
+    /// ADR-0060 (#416): a settled `shell`/`subagent` call whose metadata says
+    /// its run is still going reads 「已转后台」 instead of ✅ — it keeps its
+    /// timeline place as the record of the request and never claims completion,
+    /// before AND after the run retires (the marker is durable). A foreground
+    /// call, a V1 `task` and a launch that has not returned its handle yet
+    /// render exactly as today.
+    #[test]
+    fn a_backgrounded_call_renders_moved_to_the_background() {
+        let at = crate::feishu::card::test_local_ms(2026, 9, 16, 14, 5);
+        let panel = |name: &str, status: ToolStatus, metadata: Option<serde_json::Value>| {
+            CardBuilder::new()
+                .with_state(CardState::Done)
+                .with_tool_at(
+                    ToolPanel::new(ToolCall {
+                        identity: ToolIdentity {
+                            name: name.into(),
+                            call_id: format!("call_{name}"),
+                        },
+                        status,
+                        started_at: None,
+                        input: None,
+                        metadata,
+                        output: ToolOutput::default(),
+                    }),
+                    Some(at),
+                    None,
+                )
+                .build()
+        };
+        let title = |card: &serde_json::Value| {
+            card["body"]["elements"][0]["header"]["title"]["content"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+
+        // The pinned copy. The metadata keeps saying `running` after a run
+        // retires, so the panel's marker is the same before and after.
+        let running = Some(json!({"status": "running", "shellID": "sh_1"}));
+        assert_eq!(
+            title(&panel("shell", ToolStatus::Completed, running.clone())),
+            format!("{BACKGROUNDED_STATUS} shell · 14:05")
+        );
+        assert_eq!(
+            title(&panel(
+                "subagent",
+                ToolStatus::Completed,
+                Some(json!({"status": "running", "sessionID": "ses_1"}))
+            )),
+            format!("{BACKGROUNDED_STATUS} subagent · 14:05")
+        );
+        assert_eq!(BACKGROUNDED_STATUS, "已转后台", "the pinned copy");
+
+        // Foreground control: the run finished inside the call — its metadata
+        // says `completed`, or names no run status at all.
+        assert_eq!(
+            title(&panel(
+                "shell",
+                ToolStatus::Completed,
+                Some(json!({"status": "completed"}))
+            )),
+            "✅ shell · 14:05"
+        );
+        assert_eq!(
+            title(&panel("shell", ToolStatus::Completed, None)),
+            "✅ shell · 14:05"
+        );
+        // A V1 `task` call records no run status: unchanged.
+        assert_eq!(
+            title(&panel(
+                "task",
+                ToolStatus::Completed,
+                Some(json!({"sessionId": "ses_child"}))
+            )),
+            "✅ task · 14:05"
+        );
+        // A launch that has not returned its handle yet is still live: ⏳, not
+        // 已转后台 (the marker only holds once the call settled).
+        assert_eq!(
+            title(&panel("shell", ToolStatus::Running, running)),
+            "⏳ shell · 14:05"
+        );
     }
 
     /// #183: the tool panel's header shows the call's start time (`HH:MM`,

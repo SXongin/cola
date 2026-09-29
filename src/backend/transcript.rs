@@ -695,6 +695,56 @@ pub struct ToolCall {
     pub output: ToolOutput,
 }
 
+/// A run a settled tool call moved to the background: which tool launched it
+/// and the identity that tool's metadata carries for it. The call's own
+/// durable record — the Background Task's live membership is separate
+/// ([`BackgroundTask`], which a retiring Wake drops).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackgroundLaunch {
+    /// A backgrounded shell command: the shell it runs in, when the metadata
+    /// named one.
+    Shell { shell_id: Option<String> },
+    /// A backgrounded subagent: the child session it runs in, when the
+    /// metadata named one.
+    Subagent { child_id: Option<String> },
+}
+
+impl ToolCall {
+    /// The background run this call left behind, if it moved its run to the
+    /// background (ADR-0059/0060): a `shell`/`subagent` call that SETTLED —
+    /// it returned the background handle, so its status is
+    /// [`ToolStatus::Completed`] — while its recorded metadata still says the
+    /// run is `running`. Those three facts are the backend's own predicate
+    /// (the official 2.0.x app derives its live background tasks from exactly
+    /// them), and they are durable: the metadata never flips when the run
+    /// retires, so this stays true for the call's whole life. `None` for every
+    /// foreground call and every generation that records no such marker (V1).
+    pub fn background_launch(&self) -> Option<BackgroundLaunch> {
+        if self.status != ToolStatus::Completed {
+            return None;
+        }
+        let metadata = self.metadata.as_ref()?;
+        if metadata.get("status").and_then(Value::as_str) != Some("running") {
+            return None;
+        }
+        match self.identity.name.as_str() {
+            "shell" => Some(BackgroundLaunch::Shell {
+                shell_id: metadata
+                    .get("shellID")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            }),
+            "subagent" => Some(BackgroundLaunch::Subagent {
+                child_id: metadata
+                    .get("sessionID")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            }),
+            _ => None,
+        }
+    }
+}
+
 /// A tool call's identity: the tool's name plus the call's opaque correlation
 /// id.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -797,6 +847,112 @@ mod tests {
             metadata: None,
             output: ToolOutput::default(),
         })
+    }
+
+    /// The call-level background marker (ADR-0059/0060) is exactly the
+    /// backend's own predicate: settled (`completed`), a `shell`/`subagent`,
+    /// and metadata still saying the run is `running`. Every other fact —
+    /// a live call, a finished run, another tool, a V1 `task`, no metadata —
+    /// is not a launch.
+    #[test]
+    fn background_launch_reads_the_settled_calls_running_marker() {
+        let call = |name: &str, status: ToolStatus, metadata: Option<Value>| ToolCall {
+            identity: ToolIdentity {
+                name: name.into(),
+                call_id: format!("call_{name}"),
+            },
+            status,
+            started_at: Some(1_000),
+            input: None,
+            metadata,
+            output: ToolOutput::default(),
+        };
+
+        assert_eq!(
+            call(
+                "shell",
+                ToolStatus::Completed,
+                Some(serde_json::json!({"status": "running", "shellID": "sh_1"}))
+            )
+            .background_launch(),
+            Some(BackgroundLaunch::Shell {
+                shell_id: Some("sh_1".into())
+            })
+        );
+        assert_eq!(
+            call(
+                "subagent",
+                ToolStatus::Completed,
+                Some(serde_json::json!({"status": "running", "sessionID": "ses_1"}))
+            )
+            .background_launch(),
+            Some(BackgroundLaunch::Subagent {
+                child_id: Some("ses_1".into())
+            })
+        );
+        // The identity is optional: a marker without its id is still a launch.
+        assert_eq!(
+            call(
+                "shell",
+                ToolStatus::Completed,
+                Some(serde_json::json!({"status": "running"}))
+            )
+            .background_launch(),
+            Some(BackgroundLaunch::Shell { shell_id: None })
+        );
+
+        let not_launches = [
+            // A live call has not returned its handle yet.
+            (
+                "a running call",
+                call(
+                    "shell",
+                    ToolStatus::Running,
+                    Some(serde_json::json!({"status": "running", "shellID": "sh_1"})),
+                ),
+            ),
+            // A settled run's metadata says `completed`.
+            (
+                "a finished run",
+                call(
+                    "shell",
+                    ToolStatus::Completed,
+                    Some(serde_json::json!({"status": "completed"})),
+                ),
+            ),
+            // A failure is not a background launch.
+            (
+                "a failed call",
+                call(
+                    "shell",
+                    ToolStatus::Error,
+                    Some(serde_json::json!({"status": "running", "shellID": "sh_1"})),
+                ),
+            ),
+            // Only the two tools that background through this shape.
+            (
+                "another tool",
+                call(
+                    "read",
+                    ToolStatus::Completed,
+                    Some(serde_json::json!({"status": "running"})),
+                ),
+            ),
+            // V1's `task` carries no run status.
+            (
+                "a V1 task",
+                call(
+                    "task",
+                    ToolStatus::Completed,
+                    Some(serde_json::json!({"sessionId": "ses_child"})),
+                ),
+            ),
+            // No metadata at all.
+            ("no metadata", call("shell", ToolStatus::Completed, None)),
+        ];
+        for (label, not_launch) in not_launches {
+            assert_eq!(not_launch.background_launch(), None, "{label} is not a launch");
+        }
     }
 
     fn anchored(id: &str, created_ms: i64) -> (TranscriptMessage, TurnAnchor) {

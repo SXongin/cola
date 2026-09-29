@@ -2,7 +2,9 @@
 //! #415): a Session's live Background Tasks ride the newest (live) card's tail
 //! like the Todo Panel and the live Tool Panels — one row per task, labelled
 //! from the originating tool part's input by `call_id`, elapsed bare — and a
-//! retirement leaves the section on the card's existing render cadence.
+//! retirement leaves the section on the card's existing render cadence. The
+//! launch panel itself (ticket #416) keeps its timeline place and reads
+//! 「已转后台」 instead of ✅, before and after the retirement.
 //!
 //! V1 carries no Background Task facts, so its section never renders; the
 //! tests here script the typed transcript reads (the read model already owns
@@ -69,6 +71,36 @@ fn background_launch(created: i64, name: &str, call_id: &str, input: serde_json:
                 output: ToolOutput {
                     raw: None,
                     blocks: vec![ContentBlock::Text("moved to background".into())],
+                    error: None,
+                },
+            }),
+            Part::StepFinish(StepFinish {
+                reason: FinishReason::ToolCalls,
+            }),
+        ],
+    )
+}
+
+/// A settled FOREGROUND `shell` call — the control: its run finished inside
+/// the call (metadata says `completed`), so its panel reads ✅ as today.
+fn foreground_shell(created: i64, call_id: &str) -> TranscriptMessage {
+    typed_message(
+        &format!("msg_fg_{call_id}"),
+        MessageRole::Assistant,
+        Some(created),
+        vec![
+            Part::Tool(ToolCall {
+                identity: ToolIdentity {
+                    name: "shell".into(),
+                    call_id: call_id.into(),
+                },
+                status: ToolStatus::Completed,
+                started_at: Some(created),
+                input: Some(serde_json::json!({ "command": "cargo test" })),
+                metadata: Some(serde_json::json!({ "status": "completed" })),
+                output: ToolOutput {
+                    raw: None,
+                    blocks: vec![ContentBlock::Text("test result: ok".into())],
                     error: None,
                 },
             }),
@@ -170,6 +202,78 @@ async fn one_live_task_rides_the_live_cards_tail() {
     assert!(
         card_text(&card).contains("moved to background"),
         "the launching call's panel stays on the card: {card}"
+    );
+}
+
+/// Acceptance (#416): a backgrounded launch's panel reads 「已转后台」 instead
+/// of ✅ — before AND after its run retires (the panel never claims completion;
+/// the ledger's entry is the completion record) — while a foreground `shell`
+/// call renders ✅ exactly as today.
+#[tokio::test]
+async fn a_backgrounded_launchs_panel_never_claims_completion() {
+    let _wd = test_work_dir();
+    let timeline = || {
+        vec![
+            user("msg_cola_anchor", 1_000, "跑一下构建并测试"),
+            background_launch(
+                2_000,
+                "shell",
+                "call_bg",
+                serde_json::json!({ "command": "npm run build" }),
+            ),
+            foreground_shell(2_100, "call_fg"),
+        ]
+    };
+    let with_task =
+        SessionTranscript::new(timeline()).with_background_tasks(vec![live_shell(2_000, "call_bg")]);
+    let retired = SessionTranscript::new(timeline());
+    let (_dir, app, backend, platform) = scripted_app(vec![with_task], Some(SessionStatus::Busy)).await;
+
+    let _turn = spawn_turn(&app, ctx("ses_test", "跑一下构建并测试"));
+    // Before retirement: 「已转后台」 in the status slot while the run's row
+    // rides the ledger.
+    wait_for_card_update(&platform, "the backgrounded panel", CardUpdates::Any, |card| {
+        let text = card_text(card);
+        text.contains("已转后台 shell") && text.contains("⏳ 后台任务（1）")
+    })
+    .await;
+    let card = platform.updated_cards().await.last().cloned().unwrap();
+    let text = card_text(&card);
+    assert_eq!(
+        text.matches("已转后台 shell · ").count(),
+        1,
+        "the launch's panel carries the pinned copy exactly once: {text}"
+    );
+    assert_eq!(
+        text.matches("✅ shell · ").count(),
+        1,
+        "only the foreground control claims completion: {text}"
+    );
+
+    // The run retires: the ledger's row leaves, the launch's panel keeps its
+    // place and STILL reads 已转后台 — it never flips to ✅.
+    script_transcript(&backend, vec![retired]).await;
+    wait_for_card_update(
+        &platform,
+        "the retired launch's panel",
+        CardUpdates::Latest,
+        |card| {
+            let text = card_text(card);
+            !text.contains("后台任务") && text.contains("已转后台 shell")
+        },
+    )
+    .await;
+    let card = platform.updated_cards().await.last().cloned().unwrap();
+    let text = card_text(&card);
+    assert_eq!(
+        text.matches("已转后台 shell · ").count(),
+        1,
+        "the retired launch keeps the marker: {text}"
+    );
+    assert_eq!(
+        text.matches("✅ shell · ").count(),
+        1,
+        "the foreground control still claims completion: {text}"
     );
 }
 
