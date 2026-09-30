@@ -172,6 +172,10 @@ impl Backend for OpenCodeBackend {
         OpenCodeBackend::task_runtime(self, session_id, directory, shells, children).await
     }
 
+    fn retire_background_tasks(&self, session_id: &str, call_ids: &[String]) {
+        OpenCodeBackend::retire_background_tasks(self, session_id, call_ids);
+    }
+
     async fn model_context_window(&self, provider: &str, model: &str) -> Result<Option<i64>> {
         OpenCodeBackend::model_context_window(self, provider, model).await
     }

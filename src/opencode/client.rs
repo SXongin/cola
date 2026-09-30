@@ -10,7 +10,7 @@
 
 use std::sync::{Arc, RwLock};
 
-use crate::backend::{SessionTranscript, TaskRuntime};
+use crate::backend::{SessionTranscript, TaskRetirements, TaskRuntime};
 
 use super::parsing::parse_model;
 use super::strategy::{Generation, GenerationStrategy};
@@ -49,6 +49,10 @@ pub struct OpenCodeBackend {
     /// replacement on the same port (a new generation or password). Shared
     /// across clones like the strategy.
     attached_pid: Arc<RwLock<Option<i32>>>,
+    /// The Background Tasks a runtime reconciliation retired this cola life
+    /// (issue #454), applied to every transcript read so the durable launch
+    /// record cannot resurrect them. Shared across clones like the strategy.
+    retirements: Arc<TaskRetirements>,
 }
 
 impl Clone for OpenCodeBackend {
@@ -59,6 +63,7 @@ impl Clone for OpenCodeBackend {
             model: self.model.clone(),
             strategy: Arc::clone(&self.strategy),
             attached_pid: Arc::clone(&self.attached_pid),
+            retirements: Arc::clone(&self.retirements),
         }
     }
 }
@@ -126,6 +131,7 @@ impl OpenCodeBackend {
             model: model.and_then(parse_model),
             strategy: Arc::new(RwLock::new(generation.strategy())),
             attached_pid: Arc::new(RwLock::new(attached_pid)),
+            retirements: Arc::new(TaskRetirements::default()),
         }
     }
 
@@ -322,8 +328,19 @@ impl OpenCodeBackend {
             .await
     }
 
+    /// The session transcript, with this cola life's runtime retirements
+    /// applied ([`TaskRetirements`], issue #454): a Background Task the runtime
+    /// confirmed ended leaves the live list here, so no read path resurrects it.
     pub async fn transcript(&self, session_id: &str) -> crate::error::Result<SessionTranscript> {
-        self.strategy().transcript(&self.transport, session_id).await
+        let mut transcript = self.strategy().transcript(&self.transport, session_id).await?;
+        self.retirements.apply(session_id, &mut transcript);
+        Ok(transcript)
+    }
+
+    /// Record the Background Tasks a runtime reconciliation retired (issue
+    /// #454). See [`crate::backend::Backend::retire_background_tasks`].
+    pub fn retire_background_tasks(&self, session_id: &str, call_ids: &[String]) {
+        self.retirements.record(session_id, call_ids);
     }
 
     /// The session's durable model/agent selection where the generation keeps

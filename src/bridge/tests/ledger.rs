@@ -1255,6 +1255,44 @@ async fn a_runtime_confirmed_end_settles_the_waiting_card() {
             .any(|(sid, shells, _)| sid == "ses_test" && shells == &vec!["sh_call_bg".to_string()]),
         "the reconcile read named the live shell: {calls:?}"
     );
+    // The retirement is overlay-recorded: a later read of the same scripted
+    // transcript no longer lists the task (issue #454 review — without this the
+    // next live card would resurrect it).
+    let later = crate::backend::Backend::transcript(backend.as_ref(), "ses_test")
+        .await
+        .unwrap();
+    assert!(
+        later.background_tasks.is_empty(),
+        "the retirement overlay filters every later read"
+    );
+}
+
+/// Issue #454 review: a retirement observed by a chain whose anchor postdates
+/// the task's launch still renders its entry — after a restart the launching
+/// card is gone, and scoping the entry to the observing chain's anchor would
+/// silently swallow it (the real reboot settled ✅ with no entry).
+#[tokio::test]
+async fn a_runtime_retirement_renders_on_a_later_chain() {
+    let _wd = test_work_dir();
+    // The task launched BEFORE this card's Turn anchor (the fixture timeline's
+    // user message is at 1_000): this chain observes the end, the launching
+    // chain is not the card being refreshed.
+    let live = waiting_shell(500);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    yield_one_task_card(&app, &platform, ctx("ses_test", "跑一下构建并审阅")).await;
+
+    backend.task_runtime.lock().unwrap().shells = vec![("sh_call_bg".into(), ShellRuntime::Missing)];
+    spawn_sync(&app);
+    wait_for_card_update(&platform, "the later-chain entry", CardUpdates::Latest, |card| {
+        card_header(card).contains("✅") && card_text(card).contains("🔔 后台任务已失联：gh run watch")
+    })
+    .await;
+
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Done),
+        "the later-chain retirement still settles the wait"
+    );
 }
 
 /// Issue #454: a shell the runtime no longer knows (its completion record was

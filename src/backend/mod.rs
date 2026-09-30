@@ -314,6 +314,16 @@ pub trait Backend: Send + Sync {
         children: &[String],
     ) -> Result<TaskRuntime>;
 
+    /// Record the Background Tasks a runtime reconciliation retired for one
+    /// session (issue #454), so every later [`Self::transcript`] read drops
+    /// them from its live list. The launch record in the transcript never
+    /// flips, so without this overlay the next read would resurrect the task
+    /// on a live card and the next Turn would yield waiting on it again.
+    ///
+    /// In-memory on purpose: it is a cola-life overlay, not durable state. A
+    /// restart loses it and the next read re-derives the same retirement.
+    fn retire_background_tasks(&self, session_id: &str, call_ids: &[String]);
+
     /// The model's context-window size (tokens), from `GET /provider`. Used to
     /// compute the context-usage ratio for the card footer. Best-effort: None
     /// when the provider/model can't be resolved.

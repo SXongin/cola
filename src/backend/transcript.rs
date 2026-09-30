@@ -771,6 +771,54 @@ pub enum TaskRetirementEnding {
     Lost,
 }
 
+/// The process-local overlay of Background Tasks the runtime confirmed ended
+/// (issue #454): the transcript's launch record never flips, so without this
+/// every re-read of the transcript would resurrect a task the runtime already
+/// retired — a live turn's ledger would show it again, and the next Turn would
+/// yield waiting on it, forever.
+///
+/// The Bridge records each retirement here right after a reconciliation read
+/// ([`SessionTranscript::apply_task_runtime`]); the adapter applies the overlay
+/// to every transcript it returns ([`SessionTranscript`]'s
+/// `background_tasks` minus the recorded call ids), so no read path can
+/// disagree. It is deliberately in-memory: a cola restart loses it, the next
+/// read re-derives the same retirement and re-renders one entry on the newest
+/// chain, and the runtime explains the task again.
+#[derive(Default)]
+pub struct TaskRetirements {
+    retired: std::sync::Mutex<std::collections::HashMap<String, std::collections::HashSet<String>>>,
+}
+
+impl TaskRetirements {
+    /// Record the call ids the runtime retired for one session. Idempotent.
+    pub fn record(&self, session_id: &str, call_ids: &[String]) {
+        let mut retired = self
+            .retired
+            .lock()
+            .expect("the task-retirement lock is never poisoned");
+        let session = retired.entry(session_id.to_string()).or_default();
+        for call_id in call_ids {
+            session.insert(call_id.clone());
+        }
+    }
+
+    /// Remove every Background Task the runtime already retired for
+    /// `session_id` from `transcript`'s live list. A session with no recorded
+    /// retirement is untouched (the common case does no set lookup per task).
+    pub fn apply(&self, session_id: &str, transcript: &mut SessionTranscript) {
+        let retired = self
+            .retired
+            .lock()
+            .expect("the task-retirement lock is never poisoned");
+        let Some(ids) = retired.get(session_id) else {
+            return;
+        };
+        transcript
+            .background_tasks
+            .retain(|task| !ids.contains(task.tool.call_id.as_str()));
+    }
+}
+
 /// One recent-conversation tail entry: a text-bearing user/assistant message's
 /// role, created time and verbatim text.
 #[derive(Debug, Clone, PartialEq)]
@@ -1530,6 +1578,51 @@ mod tests {
         assert_eq!(untouched.background_tasks.len(), 1);
         assert!(untouched.runtime_retired.is_empty());
         assert_eq!(untouched.settle(Some(&anchor)), TurnSettle::Waiting);
+    }
+
+    /// The process-local retirement overlay (issue #454 review): a recorded
+    /// call id leaves every later read of that session's live list, other
+    /// sessions and other call ids stay untouched, and the live list's own
+    /// facts (the retirement entries) are not what it filters.
+    #[test]
+    fn recorded_retirements_leave_later_reads_of_the_live_list() {
+        let retirements = TaskRetirements::default();
+        let live = || SessionTranscript::new(vec![]).with_background_tasks(vec![background_shell(1_100)]);
+        let mut transcript = live();
+        retirements.apply("ses_a", &mut transcript);
+        assert_eq!(
+            transcript.background_tasks.len(),
+            1,
+            "nothing recorded yet leaves the read as decoded"
+        );
+
+        retirements.record("ses_a", &["call_bg".to_string()]);
+        let mut filtered = live();
+        retirements.apply("ses_a", &mut filtered);
+        assert!(
+            filtered.background_tasks.is_empty(),
+            "the recorded task leaves the live list"
+        );
+
+        let mut other_session = live();
+        retirements.apply("ses_b", &mut other_session);
+        assert_eq!(
+            other_session.background_tasks.len(),
+            1,
+            "another session is untouched"
+        );
+
+        let mut other_id = SessionTranscript::new(vec![]).with_background_tasks(vec![BackgroundTask {
+            tool: ToolIdentity {
+                name: "shell".into(),
+                call_id: "call_other".into(),
+            },
+            shell_id: Some("sh_other".into()),
+            child_id: None,
+            started_at: Some(1_100),
+        }]);
+        retirements.apply("ses_a", &mut other_id);
+        assert_eq!(other_id.background_tasks.len(), 1, "another call id is untouched");
     }
 
     /// A Wake opens an Execution, so its content landing before that
