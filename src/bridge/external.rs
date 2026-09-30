@@ -608,10 +608,10 @@ impl ExternalFlow {
     ) {
         // A live Turn/follow/renderer owns the session: it renders (or will
         // render) whatever arrives — never double-render into a second card.
-        if handles.waits.inflight.lock().await.contains(sid) {
-            return;
-        }
-        if Turn::card_is_owned(&handles.cards, sid).await {
+        if Turn::chain_ownership(&handles.cards, &handles.waits, sid)
+            .await
+            .is_some()
+        {
             return;
         }
         let Some(continuation) = Turn::wake_continuation(&handles.cards, sid, transcript, turn_anchor).await

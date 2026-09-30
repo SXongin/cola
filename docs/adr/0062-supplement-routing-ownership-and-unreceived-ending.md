@@ -35,7 +35,10 @@ confirmation window as Done, stamping ✅ over a message nobody executed.
 
 **Ownership is the routing key.** A message is a Supplement only when cola
 itself owns the Session's live Execution: the in-flight guard its Turn holds,
-or the follow that inherited it for its whole window. The Backend's status read
+or the follow that inherited it for its whole window — or a card chain a live
+renderer owns (the busy-adopt snapshot follow's external render, a Wake
+continuation), which owns its card without holding the guard: the same
+`inflight || card_is_owned` pair the Wake step reads. The Backend's status read
 stays — as an advisory fact for the card's opening line and the waiting hint —
 but it never routes. With no owned card chain, a message starts a new Turn,
 whose V2 prompt still carries `delivery:"steer"`: a genuinely live run merges
@@ -82,7 +85,9 @@ read said live, and an ordinary loading card otherwise.
   load-bearing fact rather than a footnote.
 - CONTEXT.md's **Supplement** is redefined on ownership, and gains
   **Unreceived Message**.
-- The advisory read cannot regress #409: every #409 case holds the guard.
+- The advisory read cannot regress #409: every #409 case holds the guard. The
+  external snapshot follow (ADR-0028) holds no guard, so it is covered as a
+  render-owned chain instead — a message during it still splits that chain.
 - Tests pin: a stale live read with no owned chain starts a Turn, not a
   Supplement; a never-promoted submit at idle ends Unreceived, never Done; the
   waiting hint appears only after the grace; 重新发起 resumes.

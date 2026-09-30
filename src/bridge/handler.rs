@@ -530,11 +530,14 @@ impl App {
     /// ownership verdict and, when read, the advisory status — never chat
     /// content.
     async fn route_prompt(&self, session_id: &str) -> PromptRoute {
-        let guarded = self.inflight.lock().await.contains(session_id);
-        let render_owned = crate::bridge::turn::Turn::card_is_owned(&self.cards_handle(), session_id).await;
-        if guarded || render_owned {
-            let ownership = if guarded { "guard" } else { "card-chain" };
-            tracing::info!("prompt routing: session={session_id} ownership={ownership} route=supplement");
+        if let Some(ownership) =
+            crate::bridge::turn::Turn::chain_ownership(&self.cards_handle(), &self.waits_handle(), session_id)
+                .await
+        {
+            tracing::info!(
+                "prompt routing: session={session_id} ownership={} route=supplement",
+                ownership.label()
+            );
             return PromptRoute::Supplement;
         }
         let directory = self.sessions.lock().await.directory_for_session(session_id);
@@ -546,11 +549,13 @@ impl App {
             directory.as_deref(),
         )
         .await;
-        let advisory_live = status.is_some_and(SessionStatus::is_live);
-        let advisory = match status {
-            Some(status) if status.is_live() => "live",
-            Some(_) => "idle",
-            None => "unreadable",
+        // One match yields both the verdict's name and the boolean the card's
+        // opening line reads: the same `is_live` predicate cannot be computed
+        // twice.
+        let (advisory_live, advisory) = match status {
+            Some(status) if status.is_live() => (true, "live"),
+            Some(_) => (false, "idle"),
+            None => (false, "unreadable"),
         };
         tracing::info!("prompt routing: session={session_id} ownership=none advisory={advisory} route=turn");
         PromptRoute::NewTurn { advisory_live }
