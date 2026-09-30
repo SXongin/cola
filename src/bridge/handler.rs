@@ -151,6 +151,17 @@ pub struct CardActionResult {
     pub toast: Option<String>,
 }
 
+/// Everything a terminal card's recovery click needs once its claim is held:
+/// the claimed fixture, the Chat/Topic it belongs to, the directory its reads
+/// route under, and the narrow handle bundle the spawned pipeline runs with.
+/// Built by [`App::claim_recovery_click`].
+struct RecoveryClick {
+    recovery: crate::bridge::turn::TurnRecovery,
+    thread_key: ThreadKey,
+    directory: Option<String>,
+    handles: crate::bridge::handles::TurnHandles,
+}
+
 /// The thread a card callback routes to. Every cola card button carries its
 /// `chat_id` + `thread_id` in the value payload so the ack can route the choice
 /// back to the right conversation.
@@ -1968,6 +1979,61 @@ impl App {
         })
     }
 
+    /// The claim-and-dispatch preamble the Error card's retry (spec #391) and
+    /// the Unreceived card's 重新发起 (#437) share: claim `from`'s recovery
+    /// action (the atomic double-click gate), resolve the thread and directory
+    /// the spawned pipeline needs, and refuse a Session that already has a
+    /// prompt in flight. Every refusal releases the claim, so a later click can
+    /// try again. `label` names the action in the warn lines ("retry" /
+    /// "resume"); the callers spawn their own pipelines and ack with their own
+    /// toasts.
+    async fn claim_recovery_click(
+        self: &Arc<Self>,
+        value: &serde_json::Value,
+        from: crate::feishu::card::CardState,
+        label: &str,
+    ) -> Option<RecoveryClick> {
+        let sid = value
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        if sid.is_empty() {
+            return None;
+        }
+        let handles = self.turn_handles();
+        let Some(recovery) =
+            crate::bridge::turn::Turn::claim_recovery(&handles.cards, &sid, from.clone()).await
+        else {
+            tracing::warn!("{label}: no {from:?} card for session {sid}");
+            return None;
+        };
+        let inflight = { self.inflight.lock().await.contains(&sid) };
+        let (thread_key, directory) = {
+            let sessions = self.sessions.lock().await;
+            (
+                sessions.thread_for_session(&sid),
+                sessions.directory_for_session(&sid),
+            )
+        };
+        let Some(thread_key) = thread_key else {
+            crate::bridge::turn::Turn::release_recovery_claim(&handles.cards, &sid).await;
+            tracing::warn!("{label}: no thread mapped for session {sid}");
+            return None;
+        };
+        if inflight {
+            crate::bridge::turn::Turn::release_recovery_claim(&handles.cards, &sid).await;
+            tracing::warn!("{label}: session {sid} already has a prompt in flight");
+            return None;
+        }
+        Some(RecoveryClick {
+            recovery,
+            thread_key,
+            directory,
+            handles,
+        })
+    }
+
     /// Re-submit a failed prompt from the error-card "retry" button (spec
     /// #391). The card callback must ack within 3s, so the click claims the
     /// retry (the atomic double-click guard behind the Turn interface), spawns
@@ -1981,50 +2047,19 @@ impl App {
     /// re-attached (a session/thread that vanished, or a busy run with no
     /// anchor to follow), so a later click can try again.
     async fn handle_retry_action(self: &Arc<Self>, value: &serde_json::Value) -> Option<CardActionResult> {
-        let sid = value
-            .get("session_id")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .unwrap_or_default();
-        if sid.is_empty() {
-            return None;
-        }
-        let handles = self.turn_handles();
-        // The atomic gate: only one click can hold a claim, and only while the
-        // card is still in the Error state (a marked or live card is not).
-        let Some(retry) = crate::bridge::turn::Turn::claim_recovery(
-            &handles.cards,
-            &sid,
-            crate::feishu::card::CardState::Error,
-        )
-        .await
-        else {
-            tracing::warn!("retry: no retryable error card for session {}", sid);
-            return None;
-        };
-        let inflight = { self.inflight.lock().await.contains(&sid) };
-        let (thread_key, directory) = {
-            let sessions = self.sessions.lock().await;
-            (
-                sessions.thread_for_session(&sid),
-                sessions.directory_for_session(&sid),
-            )
-        };
-        let Some(thread_key) = thread_key else {
-            crate::bridge::turn::Turn::release_recovery_claim(&handles.cards, &sid).await;
-            tracing::warn!("retry: no thread mapped for session {}", sid);
-            return None;
-        };
-        if inflight {
-            crate::bridge::turn::Turn::release_recovery_claim(&handles.cards, &sid).await;
-            tracing::warn!("retry: session {} already has a prompt in flight", sid);
-            return None;
-        }
+        let RecoveryClick {
+            recovery,
+            thread_key,
+            directory,
+            handles,
+        } = self
+            .claim_recovery_click(value, crate::feishu::card::CardState::Error, "retry")
+            .await?;
         let app = Arc::clone(self);
-        let span = span::turn(&sid, &thread_key, None);
+        let span = span::turn(&recovery.session_id, &thread_key, None);
         tokio::spawn(
             async move {
-                app.run_retry(handles, retry, thread_key, directory).await;
+                app.run_retry(handles, recovery, thread_key, directory).await;
             }
             .instrument(span),
         );
@@ -2139,48 +2174,16 @@ impl App {
     /// proceed (no thread mapping, or a prompt already in flight) is released,
     /// so a later press can try again.
     async fn handle_resume_action(self: &Arc<Self>, value: &serde_json::Value) -> Option<CardActionResult> {
-        let sid = value
-            .get("session_id")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .unwrap_or_default();
-        if sid.is_empty() {
-            return None;
-        }
-        let handles = self.turn_handles();
-        // The atomic gate: only one click can hold a claim, and only while the
-        // card is still in the Unreceived state (a live or re-armed card is
-        // not).
-        let Some(recovery) = crate::bridge::turn::Turn::claim_recovery(
-            &handles.cards,
-            &sid,
-            crate::feishu::card::CardState::Unreceived,
-        )
-        .await
-        else {
-            tracing::warn!("resume: no unreceived card for session {}", sid);
-            return None;
-        };
-        let inflight = { self.inflight.lock().await.contains(&sid) };
-        let (thread_key, directory) = {
-            let sessions = self.sessions.lock().await;
-            (
-                sessions.thread_for_session(&sid),
-                sessions.directory_for_session(&sid),
-            )
-        };
-        let Some(thread_key) = thread_key else {
-            crate::bridge::turn::Turn::release_recovery_claim(&handles.cards, &sid).await;
-            tracing::warn!("resume: no thread mapped for session {}", sid);
-            return None;
-        };
-        if inflight {
-            crate::bridge::turn::Turn::release_recovery_claim(&handles.cards, &sid).await;
-            tracing::warn!("resume: session {} already has a prompt in flight", sid);
-            return None;
-        }
+        let RecoveryClick {
+            recovery,
+            thread_key,
+            directory,
+            handles,
+        } = self
+            .claim_recovery_click(value, crate::feishu::card::CardState::Unreceived, "resume")
+            .await?;
         let app = Arc::clone(self);
-        let span = span::turn(&sid, &thread_key, None);
+        let span = span::turn(&recovery.session_id, &thread_key, None);
         tokio::spawn(
             async move {
                 app.run_resume(handles, recovery, thread_key, directory).await;
@@ -2222,8 +2225,17 @@ impl App {
         let session_id = recovery.session_id.clone();
         if !handles.backend.resume_supported() {
             // V1 degradation (#437, ADR-0062): no resume endpoint, so
-            // resubmit the already-admitted message as a new Turn, reusing
-            // its id so a landing in between upserts instead of duplicating.
+            // resubmit the already-admitted message as a new Turn. The id is
+            // reused unconditionally — deliberately NOT `retry_decision`'s
+            // matrix. The Unreceived ending means the message never landed (an
+            // unadmitted id, the reuse cell on either generation); reusing it
+            // also keeps the action idempotent if the message DID land between
+            // the ending and the click, since V1's prompt upserts by id
+            // (`Backend::reuse_continues_an_admitted_turn`). In every shape the
+            // user's message is answered and never duplicated: unlanded → the
+            // upsert creates and runs it; landed-unsettled → the upsert
+            // continues the turn; landed-and-settled → it was already answered
+            // (the stale card simply never showed it).
             tracing::info!("resume: session {session_id} has no resume endpoint; resubmitting as a new Turn");
             let cola_message_id = recovery.cola_message_id.clone();
             if let Err(e) = self

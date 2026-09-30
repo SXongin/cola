@@ -1882,6 +1882,13 @@ pub(crate) enum InlineResidue<'a> {
     Single(&'a str),
 }
 
+/// A card's re-arm transition: moves a card out of one ending (Error or
+/// Unreceived) and yields the follow fixture's facts — the anchor it watches
+/// and the directory its status reads route under — or `None` when the card is
+/// no longer in that ending. Passed to [`Turn::rearm_and_follow`] as the one
+/// fact distinguishing a retry re-attach from a resumed re-arm.
+type CardRearm = fn(&mut state::CardSession, Option<String>) -> Option<(Option<TurnAnchor>, String)>;
+
 /// The Turn's card-state interface (spec #298, A3): the operations sibling
 /// flows invoke against a session's streaming card — identity, lifecycle,
 /// interaction blocks and the external renderer's arming. The accumulator and
@@ -2160,19 +2167,23 @@ impl Turn {
 
     /// Claim a terminal card's recovery action exactly once: spec #391's Error
     /// retry (`from = CardState::Error`) or #437's Unreceived 重新发起
-    /// (`from = CardState::Unreceived`). Returns the turn's recovery fixture
-    /// while the card is still in `from` and no earlier click holds the claim;
-    /// `None` when the card is in another state (already marked, live, or
-    /// replaced), a claim is already taken, no card exists, or no prompt was
-    /// stored to re-run (an externally-rendered card). This atomic claim is
-    /// what makes the callback safe to double-click: the click is acked
-    /// immediately, so a second click can arrive before the action's own
-    /// marking lands.
+    /// (`from = CardState::Unreceived`) — [`CardState::offers_recovery`] is the
+    /// one predicate naming the states a caller may pass. Returns the turn's
+    /// recovery fixture while the card is still in `from` and no earlier click
+    /// holds the claim; `None` when `from` names no action, the card is in
+    /// another state (already marked, live, or replaced), a claim is already
+    /// taken, no card exists, or no prompt was stored to re-run (an
+    /// externally-rendered card). This atomic claim is what makes the callback
+    /// safe to double-click: the click is acked immediately, so a second click
+    /// can arrive before the action's own marking lands.
     pub(crate) async fn claim_recovery(
         cards: &CardsHandle,
         session_id: &str,
         from: crate::feishu::card::CardState,
     ) -> Option<TurnRecovery> {
+        if !from.offers_recovery() {
+            return None;
+        }
         let mut live = cards.cards.lock().await;
         let card = live.get_mut(session_id)?;
         if card.acc.card_state != from
@@ -2213,82 +2224,35 @@ impl Turn {
         }
     }
 
-    /// Re-attach a still-running run to its live card (spec #391, ticket #393):
-    /// the retry click's decision read found the run alive, so nothing is
-    /// submitted. The card's Error is cleared — its content is untouched — a
-    /// live header state is restored, the unused retry claim goes back (the
-    /// follow may fail the card again, and that retry must be claimable), and
-    /// the out-of-turn [`follow`] is spawned on the accumulator's own anchor to
-    /// keep rendering until the run truly ends — holding the Session's guard
-    /// for its window, exactly like the drain hand-off (ADR-0059). Re-attach
-    /// adds no loop: the follow already owns Busy→non-busy finalization,
-    /// `/stop`, the graces and the silent exit when a new Turn replaces the
-    /// accumulator.
+    /// The shared body of a recovery re-arm (spec #391's retry re-attach, #437's
+    /// resumed re-arm): `rearm` moves the card out of its ending and returns
+    /// the follow fixture — the anchor it watches (`None` for the Unreceived
+    /// watch: the message never landed) and the directory its status reads
+    /// route under — or `None` when the card is no longer in that ending (a new
+    /// Turn may have replaced it since the claim). The new live state is
+    /// flushed now, so the operator's click is visible before the follow's
+    /// first sleep, then the out-of-turn [`follow`] is spawned: it inherits the
+    /// Session's guard — this path held none — exactly like the drain hand-off
+    /// (ADR-0059), and its window owns Busy→non-busy finalization, `/stop`, the
+    /// graces and the silent exit when a new Turn replaces the accumulator.
     ///
-    /// `directory` routes the follow's status reads (the handler's session
-    /// mapping first, the accumulator's work context as the fallback). The
-    /// follow's start time is "now": the original turn's start is no longer
-    /// known here, so the long-task notice measures the re-attached stretch.
+    /// `directory` routes the follow's status reads (the caller's
+    /// session-mapped one first, the accumulator's work context as the
+    /// fallback). The follow's start time is "now": the original turn's start is
+    /// no longer known here, so the long-task notice measures the re-attached
+    /// stretch.
     ///
-    /// Returns false when there is no card, the card is not in `Error` (a new
-    /// Turn may have replaced the accumulator since the claim), or the
-    /// accumulator carries no anchor to follow (nothing the failed submission
-    /// stored can be ordered against a run) — the caller then releases the
-    /// claim and the Error card keeps a working retry.
-    pub(crate) async fn reattach_run(
+    /// Returns false when `rearm` declined — the caller then releases the claim.
+    async fn rearm_and_follow(
         handles: &TurnHandles,
         session_id: &str,
         thread_key: &ThreadKey,
         directory: Option<String>,
+        rearm: CardRearm,
     ) -> bool {
         let Some((anchor, directory)) = ({
             let mut live = handles.cards.cards.lock().await;
-            live.get_mut(session_id).and_then(|card| card.reattach(directory))
-        }) else {
-            return false;
-        };
-        // The operator just clicked: the card must leave Error now, not after
-        // the follow's first sleep.
-        Self::flush_card(&handles.cards, session_id).await;
-        // The re-attached follow inherits the guard here (this path had none);
-        // `spawn` guarantees it before the task starts (ADR-0059).
-        follow::spawn(
-            handles,
-            follow::FollowFacts {
-                session_id: session_id.to_string(),
-                thread_key: thread_key.clone(),
-                directory,
-                started_at: std::time::Instant::now(),
-                anchor: Some(anchor),
-            },
-        )
-        .await;
-        true
-    }
-
-    /// Re-arm an Unreceived card after a successful V2 resume (#437): the
-    /// resumed run renders on the SAME card, through the unreceived watch —
-    /// the out-of-turn [`follow`] under the card's chain identity (its
-    /// accumulator anchor is `None`: the submitted message never landed),
-    /// which captures the Turn anchor the moment the promoted message appears
-    /// and then settles the card through the single decision. The card leaves
-    /// `Unreceived` and is flushed now, so the click's effect is visible
-    /// before the watch's first tick; the watch inherits the Session's guard,
-    /// exactly like the retry re-attach (ADR-0059).
-    ///
-    /// Returns false when there is no card, or the card is no longer
-    /// `Unreceived` (a new Turn may have replaced it since the claim) — the
-    /// caller then releases the claim, and a later press can retry.
-    pub(crate) async fn reattach_resumed(
-        handles: &TurnHandles,
-        session_id: &str,
-        thread_key: &ThreadKey,
-        directory: Option<String>,
-    ) -> bool {
-        let Some((anchor, directory)) = ({
-            let mut live = handles.cards.cards.lock().await;
-            live.get_mut(session_id)
-                .and_then(|card| card.rearm_unreceived(directory))
+            live.get_mut(session_id).and_then(|card| rearm(card, directory))
         }) else {
             return false;
         };
@@ -2305,6 +2269,55 @@ impl Turn {
         )
         .await;
         true
+    }
+
+    /// Re-attach a still-running run to its live card (spec #391, ticket #393):
+    /// the retry click's decision read found the run alive, so nothing is
+    /// submitted. The card's Error is cleared — its content is untouched — the
+    /// unused retry claim goes back (the follow may fail the card again, and
+    /// that retry must be claimable), and the out-of-turn [`follow`] is spawned
+    /// on the accumulator's own anchor: both the flush and the guard hand-off
+    /// live in [`Self::rearm_and_follow`].
+    ///
+    /// Returns false when there is no card, the card is not in `Error` (a new
+    /// Turn may have replaced the accumulator since the claim), or the
+    /// accumulator carries no anchor to follow (nothing the failed submission
+    /// stored can be ordered against a run) — the caller then releases the
+    /// claim and the Error card keeps a working retry.
+    pub(crate) async fn reattach_run(
+        handles: &TurnHandles,
+        session_id: &str,
+        thread_key: &ThreadKey,
+        directory: Option<String>,
+    ) -> bool {
+        Self::rearm_and_follow(handles, session_id, thread_key, directory, CardSession::reattach).await
+    }
+
+    /// Re-arm an Unreceived card after a successful V2 resume (#437): the
+    /// resumed run renders on the SAME card, through the unreceived watch —
+    /// the out-of-turn [`follow`] under the card's chain identity (its
+    /// accumulator anchor is `None`: the submitted message never landed),
+    /// which captures the Turn anchor the moment the promoted message appears
+    /// and then settles the card through the single decision. The flush and
+    /// the guard hand-off live in [`Self::rearm_and_follow`].
+    ///
+    /// Returns false when there is no card, or the card is no longer
+    /// `Unreceived` (a new Turn may have replaced it since the claim) — the
+    /// caller then releases the claim, and a later press can retry.
+    pub(crate) async fn reattach_resumed(
+        handles: &TurnHandles,
+        session_id: &str,
+        thread_key: &ThreadKey,
+        directory: Option<String>,
+    ) -> bool {
+        Self::rearm_and_follow(
+            handles,
+            session_id,
+            thread_key,
+            directory,
+            CardSession::rearm_unreceived,
+        )
+        .await
     }
 
     /// Mark the session's failed card `Retried` and flush it (spec #391):

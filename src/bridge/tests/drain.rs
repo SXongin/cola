@@ -1897,13 +1897,97 @@ async fn pressing_resume_interrupts_then_resumes_and_renders_the_promoted_messag
     assert_no_further_rendering(&backend, &platform).await;
 }
 
-/// Ticket #437 (ADR-0062): V1 has no resume endpoint, so 重新发起 degrades to
-/// resubmitting the message as a new Turn — under its own `msg_cola_` id, so a
-/// message that landed in the meantime upserts rather than duplicating — with
-/// no interrupt and no resume on the wire, and the old card collected as
-/// 「↩️ 已重试」 without keeping the button.
+/// Ticket #437 (ADR-0062): the genuine Unreceived shape — the message never
+/// landed and V1 has no resume endpoint, so 重新发起 resubmits it as a new
+/// Turn whose own prompt is what creates the message; the new Turn's drain
+/// then reads it back and runs the attempt to its true end. No interrupt, no
+/// resume, no second id.
 #[tokio::test]
-async fn resume_on_v1_resubmits_the_message_as_a_new_turn() {
+async fn resume_on_v1_resubmits_a_never_landed_message_into_a_new_turn() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    // V1: no resume endpoint (the mock's default, stated explicitly).
+    backend.with_resume_supported(false);
+    // The message never lands: the scripted transcript stays empty, so the
+    // first Turn ends Unreceived.
+    backend.given_transcript("ses_test", vec![SessionTranscript::new(Vec::new())]);
+    // The resubmit is what creates the message: on the SECOND submit (the
+    // click's), the transcript starts carrying the user message and its answer
+    // — what a V1 `prompt_async` upsert leaves behind.
+    let scripts = backend.transcript_scripts.clone();
+    let submits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let landed = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "第一条消息"),
+        assistant(2_000, "第一轮回答。"),
+    ]);
+    backend.on_prompt(move || {
+        if submits.fetch_add(1, Ordering::SeqCst) == 1 {
+            scripts
+                .try_lock()
+                .expect("the test never holds the transcript script while a prompt runs")
+                .insert("ses_test".into(), vec![landed.clone()]);
+        }
+    });
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    seed_session(&app, "ses_test", "/work").await;
+    app.turn_render_poll_ms.store(5, Ordering::Relaxed);
+    app.turn_drain_timeout_ms.store(60_000, Ordering::Relaxed);
+
+    Turn::run(&app.turn_handles(), ctx("ses_test", "第一条消息"))
+        .await
+        .unwrap();
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Unreceived)
+    );
+
+    let result = app
+        .host_action(serde_json::json!({ "action": "resume", "session_id": "ses_test" }))
+        .await
+        .expect("the V1 degradation must still be claimable");
+    assert_eq!(result.toast.as_deref(), Some("正在重新发起..."));
+
+    // The resubmitted Turn runs to its true end and renders the answer its own
+    // prompt created.
+    wait_for_card_update(&platform, "the resubmitted Done card", CardUpdates::Any, |card| {
+        card_header(card).contains("完成") && card_text(card).contains("第一轮回答。")
+    })
+    .await;
+
+    // No resume write on this generation; the message was created by a new
+    // Turn under its own id.
+    assert!(
+        backend.recovery_ops.lock().await.is_empty(),
+        "V1 has no resume endpoint: no interrupt, no resume may reach the wire"
+    );
+    assert_eq!(
+        backend.prompt_calls.lock().await.clone(),
+        vec!["第一条消息".to_string(), "第一条消息".to_string()],
+        "the degradation submits exactly one new prompt"
+    );
+    assert_eq!(
+        backend.prompt_message_ids.lock().await.clone(),
+        vec![
+            Some("msg_cola_anchor".to_string()),
+            Some("msg_cola_anchor".to_string())
+        ],
+        "the resubmit reuses the message's own id"
+    );
+    assert!(!app.inflight.lock().await.contains("ses_test"));
+}
+
+/// Ticket #437 (ADR-0062): the other V1 shape — the message landed between
+/// the Unreceived ending and the click (a delayed promotion). The degradation
+/// still resubmits it as a new Turn under its own `msg_cola_` id; V1's prompt
+/// upserts by id, so the re-post neither duplicates the transcript message nor
+/// mints a second identity. The old card is collected as 「↩️ 已重试」 without
+/// keeping the button.
+#[tokio::test]
+async fn resume_on_v1_reuses_the_message_id_when_it_landed_in_between() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));

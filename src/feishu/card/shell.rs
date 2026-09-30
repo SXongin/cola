@@ -57,7 +57,7 @@ pub struct CardBuilder {
     date: Option<String>,
     /// JSON 2.0 recovery buttons (the Error card's retry, the Unreceived
     /// card's 重新发起): rendered only in those states.
-    error_buttons: Vec<CardActionButton>,
+    recovery_buttons: Vec<CardActionButton>,
     /// Progress/liveness inputs for the header (ADR-0014): the waiting flag,
     /// the phase timer, and the reasoning length. When absent (all defaults)
     /// the header renders the plain phase label — non-streaming builders
@@ -104,7 +104,7 @@ impl CardBuilder {
             footer: None,
             subtitle: None,
             date: None,
-            error_buttons: Vec::new(),
+            recovery_buttons: Vec::new(),
             progress: HeaderProgress::default(),
             markdown: CardMarkdown::new(),
         }
@@ -148,8 +148,8 @@ impl CardBuilder {
     /// retry (spec #391) or the Unreceived card's 重新发起 (#437). Rendered
     /// only in those states (see [`CardBuilder::build`]), so a live or
     /// collected card can never offer one.
-    pub fn with_error_buttons(mut self, buttons: Vec<CardActionButton>) -> Self {
-        self.error_buttons = buttons;
+    pub fn with_recovery_buttons(mut self, buttons: Vec<CardActionButton>) -> Self {
+        self.recovery_buttons = buttons;
         self
     }
 
@@ -315,10 +315,10 @@ impl CardBuilder {
 
         // Terminal-card recovery actions: the Error card's retry (spec #391)
         // and the Unreceived card's 重新发起 (#437), so the user can recover
-        // without retyping. Only those states render them — a live, Done or
-        // collected card must not.
-        if matches!(self.state, CardState::Error | CardState::Unreceived) {
-            for btn in &self.error_buttons {
+        // without retyping. `offers_recovery` is the one predicate naming the
+        // states that own one — a live, Done or collected card renders none.
+        if self.state.offers_recovery() {
+            for btn in &self.recovery_buttons {
                 elements.push(json!({
                     "tag": "button",
                     "text": { "tag": "plain_text", "content": btn.text },
@@ -959,7 +959,7 @@ mod tests {
         let card = CardBuilder::new()
             .with_state(CardState::Retried)
             .with_text("**错误**: 503 request queue full")
-            .with_error_buttons(vec![CardActionButton {
+            .with_recovery_buttons(vec![CardActionButton {
                 text: "🔄 重试".to_string(),
                 kind: "primary",
                 value: serde_json::json!({ "action": "retry" }),
@@ -1003,7 +1003,7 @@ mod tests {
         let card = CardBuilder::new()
             .with_state(CardState::Stopped)
             .with_text("正在分析…")
-            .with_error_buttons(vec![CardActionButton {
+            .with_recovery_buttons(vec![CardActionButton {
                 text: "🔄 重试".to_string(),
                 kind: "primary",
                 value: serde_json::json!({ "action": "retry" }),
@@ -1049,7 +1049,7 @@ mod tests {
         let card = CardBuilder::new()
             .with_state(CardState::Unreceived)
             .with_text("📨 已收到，将并入当前运行")
-            .with_error_buttons(vec![CardActionButton {
+            .with_recovery_buttons(vec![CardActionButton {
                 text: "重新发起".to_string(),
                 kind: "primary",
                 value: serde_json::json!({ "action": "resume", "session_id": "ses_1" }),
@@ -1091,7 +1091,7 @@ mod tests {
         ] {
             let card = CardBuilder::new()
                 .with_state(state.clone())
-                .with_error_buttons(vec![CardActionButton {
+                .with_recovery_buttons(vec![CardActionButton {
                     text: "重新发起".to_string(),
                     kind: "primary",
                     value: serde_json::json!({ "action": "resume", "session_id": "ses_1" }),
@@ -1109,7 +1109,7 @@ mod tests {
         for state in [CardState::Error, CardState::Unreceived] {
             let card = CardBuilder::new()
                 .with_state(state.clone())
-                .with_error_buttons(vec![CardActionButton {
+                .with_recovery_buttons(vec![CardActionButton {
                     text: "重新发起".to_string(),
                     kind: "primary",
                     value: serde_json::json!({ "action": "resume", "session_id": "ses_1" }),
