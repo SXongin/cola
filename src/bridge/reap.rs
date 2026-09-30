@@ -87,6 +87,18 @@ pub(crate) async fn reconcile(
     {
         return;
     }
+    // Why not [`Turn::chain_ownership`]? Routing and the Wake step need only
+    // "owned or not"; a reconcile needs the record's card id and the lifecycle
+    // distinctions below — keep a live or yielded record, drop a spent one,
+    // collect a lagged one and re-point. The two agree where it matters: the
+    // orphan branch below runs only when this process holds no card identity
+    // for the session (and the record can never name a card this process is
+    // mid-admitting: `take_over_card` attaches the id before tracking), while
+    // a card this process still holds is never PATCHed by the ladder — a
+    // Waiting card included, which routing reads as unowned but whose true end
+    // this process's ledger watch still owes. A future ownership rule must be
+    // mirrored here, or the reap restructured to consume the verdict, rather
+    // than assumed to reach it.
     // What does THIS process know about the session's card?
     let current_id = Turn::card_message_id(&handles.cards, session_id).await;
     // A live or yielded card is still running; a terminal one (and a missing
