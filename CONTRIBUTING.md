@@ -161,10 +161,7 @@ newly published RUSTSEC advisories surface even when nothing is pushed.
 The `main: CI` ruleset requires eight checks: `Format`, `Check`,
 `Test (macos-latest)`, `Test (windows-latest)`, `Live V1`, `Live V2`,
 `Dependency audit` and `Docs drift` — judge merge-readiness with `gh pr checks
-<branch> --required`, not by eyeballing every check. CodeQL also runs on PRs, but it is
-advisory: it is not a required check, so a slow or red CodeQL result never
-blocks a normal merge. The release cut is the one flow that makes it required
-(its watch covers every check).
+<branch> --required`, not by eyeballing every check.
 
 Release PRs (`release/*`) and docs-only PRs skip the code-dependent work
 (Format, Check, Coverage, the live suites, and the Test steps): a skipped job
@@ -175,35 +172,17 @@ seconds) — a job-level skip leaves the matrix unexpanded or the required
 `Live V1`/`Live V2` checks unreported, so only their steps are gated.
 `Dependency audit` and `Docs drift` always run: the drift guard is not gated by
 `classify` precisely because a docs-only PR, which skips every code gate, is
-where the guide pair can drift. The release cut keeps its CodeQL gate.
+where the guide pair can drift.
 
-### Security scanning alerts
+### Security scanning
 
-CodeQL runs on `main` pushes, PRs and a weekly schedule, but on normal PRs it is
-advisory (above). Rust extraction analyzes `#[cfg(test)]` code by default
-(github/codeql#18347; the upstream opt-out `cargo_cfg_overrides=-test` is a CLI
-extractor option a code scanning workflow cannot set), so test-only findings are
-handled by shape:
-
-- **Test-only files and trees** are excluded from the CodeQL database by
-  `.github/codeql/codeql-config.yml` (`paths-ignore`) — the bridge test suite
-  and its harness (`src/bridge/tests/**`, `src/bridge/test_support.rs`), the
-  test servers (`src/test_*.rs`), the OpenCode adapter's dedicated test modules
-  (`src/opencode/tests.rs`, `src/opencode/conformance.rs` and their `v1`/`v2`
-  equivalents), the fixture corpus (`src/opencode/wire/**`) and the ignored
-  live harness (`src/opencode/live/**`). A new test-only file or tree belongs on
-  that list, where it produces no alerts at all rather than another dismissal.
-- **In-file `#[cfg(test)] mod tests`** cannot be path-filtered — the file also
-  ships production code — so findings there are dismissed: *used in tests*.
-- **cola's own server bootstrap** — the fixed password passed to the
-  self-spawned `opencode serve --hostname 127.0.0.1` (ADR-0013), which must stay
-  stable across restarts: *won't fix*.
-
-A genuine scanner mis-read (e.g. an empty string flowing into a password
-parameter) is *false positive*. Never obfuscate a literal (`concat!`, runtime
-assembly) to silence the scanner: that trades a visible, triaged alert for a
-hidden one. OpenSSF Scorecard findings follow ADR-0034 — several are deliberate
-no-s; do not "fix" them without revisiting that ADR.
+CodeQL was retired on 2026-09-30 (ADR-0064): ~640 runs reported 52 alerts and
+no true positive, and the credential class it kept flagging is covered by
+secret scanning with push protection (enabled on this repository). Dependencies
+are guarded by `cargo-deny` (`Dependency audit`), the hand-written WS parser by
+the weekly fuzz job, and everything else by review. Do not re-add a scanner for
+Scorecard's `SAST` check alone — ADR-0034 records that check as a deliberate
+no.
 
 Description template:
 
@@ -258,9 +237,9 @@ The command is the whole process — do not hand-edit the version or tag by hand
 2. Bumps `Cargo.toml`/`Cargo.lock`, commits `chore(release): bump version to
    1.2.3` on a `release/1.2.3` branch and pushes it.
 3. Opens the PR and watches every check — the release cut is the one flow where
-   advisory CodeQL gates too. The PR skips the code-dependent jobs and the
+   the advisory checks gate too. The PR skips the code-dependent jobs and the
    automated review (the cut merges with the admin bypass), so what it waits on
-   is Dependency audit and CodeQL.
+   is `Dependency audit` and `Docs drift`.
 4. Rebase-merges with the admin bypass once every check is green (the
    `main: review` ruleset requires a PR and one approval — the admin role
    bypasses both; the `main: CI` ruleset has no bypass, so the checks are
