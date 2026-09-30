@@ -1350,3 +1350,89 @@ async fn new_pending_stops_syncing_and_switch_back_resyncs_silently() {
         "the reactivated session re-records its watermark"
     );
 }
+
+/// A Session can move itself to another directory mid-life (#433): the sync
+/// pass follows the server-reported location, so the directory-routed sweeps
+/// (and the next turn's work context) target the new directory. The mapping's
+/// other fields — the per-session override here — stay untouched.
+#[tokio::test]
+async fn session_sync_follows_a_moved_session_to_its_new_directory() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut mock = MockBackend::new(realistic_parts());
+    // The shared store reports the session at its new location: an agent
+    // created a git worktree and moved the session into it.
+    mock.given_sessions(vec![list_session(
+        "ses_moved",
+        "移动到 worktree",
+        "/work/.worktrees/zh-user-guide",
+        100,
+    )]);
+    let (app, _platform) = build_app(cfg, mock).await;
+
+    let key = crate::config::ThreadKey::new("oc_moved".into(), "oc_moved".into());
+    let mut entry = crate::config::SessionEntry::new(key.clone(), "ses_moved", "/work/old");
+    entry.model = Some("provider/model-a".into());
+    seed_entry(&app, entry).await;
+    // Baseline the watermark so the pass stays off the notify path.
+    app.external
+        .last_user_msg_epoch
+        .lock()
+        .await
+        .insert("ses_moved".into(), now_ms());
+
+    app.external
+        .poll_interval_ms
+        .store(20, std::sync::atomic::Ordering::Relaxed);
+    tokio::spawn({
+        let app = app.clone();
+        async move {
+            let _ = app.external.poll_loop(&app.flow_handles()).await;
+        }
+    });
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let moved = app
+            .sessions
+            .lock()
+            .await
+            .directory_for_session("ses_moved")
+            .as_deref()
+            == Some("/work/.worktrees/zh-user-guide");
+        if moved {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the sync pass must follow the server-reported location"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    let entry = app
+        .sessions
+        .lock()
+        .await
+        .entry_for_session("ses_moved")
+        .cloned()
+        .expect("still mapped");
+    assert_eq!(
+        entry.model.as_deref(),
+        Some("provider/model-a"),
+        "the move must not reset the per-session override"
+    );
+    assert_eq!(entry.thread_key, key);
+    // The sweep's directory set follows: the old location is gone and the new
+    // one is listed, so requests raised there are found.
+    let dirs = app.sessions.lock().await.directories();
+    assert!(
+        dirs.contains(&"/work/.worktrees/zh-user-guide".to_string()),
+        "the new directory must be swept: {dirs:?}"
+    );
+    assert!(
+        !dirs.contains(&"/work/old".to_string()),
+        "the old directory must be dropped: {dirs:?}"
+    );
+}

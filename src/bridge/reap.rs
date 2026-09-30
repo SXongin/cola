@@ -72,8 +72,11 @@ pub(crate) async fn collect_orphan(cards: &CardsHandle, session_id: &str, card_m
 
 /// Reconcile one record against the Session's own reads (ADR-0063). `directory`
 /// is the Session's mapped directory, when it still has one — the fallback
-/// route when the record itself carries none; the effective routing directory
-/// is also the move verdict's baseline (#439) — and `record` is the snapshot
+/// route when the record itself carries none. `baseline_directory` is the
+/// directory the card was tracked under, for the move verdict (#439): the
+/// caller passes the pre-follow mapping when this pass followed a move (#433),
+/// so a record with no directory of its own still names the move even though
+/// `directory` already points at the new location. `record` is the snapshot
 /// the caller took from the sidecar. `read_timeout_ms` bounds each of the
 /// reads, the Session Sync pass's own request bound (injectable in tests), so
 /// a hung server degrades to "nothing claimed" instead of freezing the tick.
@@ -81,6 +84,7 @@ pub(crate) async fn reconcile(
     handles: &FlowHandles,
     session_id: &str,
     directory: Option<&str>,
+    baseline_directory: Option<&str>,
     record: &LiveCard,
     read_timeout_ms: u64,
 ) {
@@ -166,6 +170,16 @@ pub(crate) async fn reconcile(
         );
         return;
     };
+    // The move verdict's baseline: the record's own directory when it has one,
+    // else the pre-follow directory the caller captured (#433) — the mapping's
+    // current directory would already name the new location and could never
+    // prove a move.
+    let baseline_directory = record
+        .directory
+        .as_deref()
+        .filter(|directory| !directory.is_empty())
+        .or(baseline_directory)
+        .unwrap_or(directory);
     let status = match crate::bridge::bounded_call(
         "live-card reap status",
         read_timeout_ms,
@@ -217,7 +231,7 @@ pub(crate) async fn reconcile(
         handles,
         session_id,
         record,
-        baseline_directory: directory,
+        baseline_directory,
         read_timeout_ms,
     };
     match transcript.settle(scope.as_ref()) {
@@ -322,10 +336,8 @@ impl ReapPass<'_> {
     /// `read_timeout_ms`. That price buys a cosmetic line and is bounded; the
     /// ending itself is never withheld for it. A read that fails, a Session the
     /// list does not carry, an empty directory, or the baseline itself all
-    /// claim nothing — no line, exactly the pre-#439 card. On a V1 server
-    /// without the experimental list route the read answers the project-scoped
-    /// list, so a moved Session may not appear in it and the line simply does
-    /// not render: V1 move awareness is #433's, out of this module's scope.
+    /// claim nothing — no line, exactly the pre-#439 card. V1 Sessions cannot
+    /// move, so the line only ever renders on V2 (#433).
     async fn move_note(&self) -> Option<String> {
         let sessions = match crate::bridge::bounded_call(
             "live-card reap session list",

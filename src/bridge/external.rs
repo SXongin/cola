@@ -98,6 +98,13 @@ impl ExternalFlow {
     /// One sync pass: snapshot the sessions from ONE store view, then run each
     /// active one through [`Self::poll_session`].
     async fn sync_sessions(&self, handles: &FlowHandles) {
+        // Follow any Session that moved itself (into a git worktree, #433)
+        // BEFORE the snapshot below, so this pass's reads and the sweeps'
+        // directory set already use the new location. The returned map is the
+        // PRE-follow directory of every session this pass moved — the move
+        // verdict's baseline for a record that carries no directory of its own
+        // (#439).
+        let moved_from = self.follow_locations(handles).await;
         // Only each thread's ACTIVE session is synced (ADR-0017): a lobby
         // (p2p/group) can stack several sessions via /new and /switch, and
         // notifying for a historical one would interleave its cards with the
@@ -153,16 +160,73 @@ impl ExternalFlow {
         for (sid, record) in handles.cards.live_cards.entries() {
             let mapping = mapped.get(&sid);
             let span = crate::bridge::span::external(&sid, mapping.map(|(thread_key, _)| thread_key));
+            // The route is the followed directory; the move verdict's baseline
+            // is where the card was tracked (the pre-follow directory when this
+            // pass followed the session, #433).
+            let baseline = moved_from
+                .get(&sid)
+                .map(String::as_str)
+                .or(mapping.map(|(_, directory)| directory.as_str()));
             crate::bridge::reap::reconcile(
                 handles,
                 &sid,
                 mapping.map(|(_, directory)| directory.as_str()),
+                baseline,
                 &record,
                 read_timeout_ms,
             )
             .instrument(span)
             .await;
         }
+    }
+
+    /// Follow every mapped Session's server-reported location (#433): a
+    /// Session can move itself into another directory mid-life (an agent
+    /// creating and entering a git worktree), and the directory-routed reads
+    /// — the permission/form sweeps, the next turn's work context, the reap's
+    /// status read — must target the new directory. One list read per pass,
+    /// through the shared session-list cache (at most one fetch per cache TTL
+    /// touches the wire); a session absent from the list, an empty directory
+    /// or an unchanged one all claim nothing. A V1 server has no move, so the
+    /// same read simply never observes a change there.
+    ///
+    /// Returns the PRE-follow directory of every session this pass moved
+    /// (session id → directory) — the reap's move-verdict baseline for a
+    /// record that carries no directory of its own (#439).
+    async fn follow_locations(&self, handles: &FlowHandles) -> HashMap<String, String> {
+        let mut moved_from = HashMap::new();
+        let read_timeout_ms = self.request_timeout_ms.load(std::sync::atomic::Ordering::Relaxed);
+        let Some(Ok(sessions)) = crate::bridge::bounded_call(
+            "session sync location read",
+            read_timeout_ms,
+            handles.sessions.cached_session_list(&handles.backend),
+        )
+        .await
+        else {
+            return moved_from;
+        };
+        for listed in sessions {
+            if listed.directory.is_empty() {
+                continue;
+            }
+            match handles
+                .sessions
+                .follow_directory(&listed.id, &listed.directory)
+                .await
+            {
+                Ok(Some(previous)) => {
+                    tracing::info!("session {} followed its move to {}", listed.id, listed.directory);
+                    moved_from.insert(listed.id, previous);
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!(
+                    "session {} could not follow its move to {}: {e}",
+                    listed.id,
+                    listed.directory
+                ),
+            }
+        }
+        moved_from
     }
 
     /// One Session's pass through the poll loop, run inside that Session's

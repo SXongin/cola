@@ -210,6 +210,19 @@ impl SessionsHandle {
         self.store.lock().await.update(session_id, f)
     }
 
+    /// Follow a Session's server-reported location (#433): update the mapped
+    /// directory in place and persist it. Returns the previous directory when
+    /// the mapping moved, `None` when nothing changed. Every other mapping
+    /// field stays untouched. The session-list cache is untouched too: the
+    /// list the read came from already carries the new directory.
+    pub(crate) async fn follow_directory(
+        &self,
+        session_id: &str,
+        directory: &str,
+    ) -> crate::error::Result<Option<String>> {
+        self.store.lock().await.update_directory(session_id, directory)
+    }
+
     /// Mutate the conversation's Pending Session and persist (ADR-0041).
     /// `false` when the thread has none.
     pub(crate) async fn update_pending<F>(&self, thread_key: &ThreadKey, f: F) -> crate::error::Result<bool>
