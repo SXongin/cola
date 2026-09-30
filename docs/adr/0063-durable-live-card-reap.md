@@ -71,6 +71,10 @@ re-render the Fresh path deliberately avoids.
 - A restart no longer leaves a frozen card: every non-terminal card either gets
   its true ending or is collected, and a still-live Session's card is settled
   by the same reconcile later.
+- Every reap PATCH keeps the card's already-rendered body best-effort (#434
+  acceptance feedback): the card's own view is read and the ending restamped
+  over it with its controls stripped, while a failed read still settles the
+  bare ending and content the card never showed is still never rebuilt.
 - `live_cards.json` holds at most one record per Session and shrinks at every
   terminal or collection; no separate pruning pass is needed.
 - Tests pin: a persisted live card over a restart settles in place by the

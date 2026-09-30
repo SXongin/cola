@@ -278,6 +278,11 @@ pub struct RecordingPlatform {
     /// the default text parent). Lets tests script quote-injection cases.
     pub quoted_messages:
         std::sync::Mutex<std::collections::HashMap<String, crate::feishu::client::FeishuMessage>>,
+    /// message_id → the card view served by `get_card_view`: the schema-2.0
+    /// JSON a real whole-card read returns. Absent = the read fails (like a
+    /// missing permission), which is what every reap test that expects the
+    /// bare ending relies on.
+    pub card_views: std::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>,
     /// One-shot mid-send pause installed by a concurrency test (absent in
     /// every other test). Taken by the first matching call.
     pub pause_call: std::sync::Mutex<Option<CallGate>>,
@@ -299,6 +304,7 @@ impl RecordingPlatform {
             fail_pin: std::sync::atomic::AtomicBool::new(false),
             reply_in_thread_thread_id: Some("omt_created_topic".into()),
             quoted_messages: std::sync::Mutex::new(std::collections::HashMap::new()),
+            card_views: std::sync::Mutex::new(std::collections::HashMap::new()),
             pause_call: std::sync::Mutex::new(None),
         }
     }
@@ -320,6 +326,16 @@ impl RecordingPlatform {
             release: release.clone(),
         });
         (entered, release)
+    }
+
+    /// Script the card view `get_card_view` serves for `message_id`: the
+    /// schema-2.0 JSON a real whole-card read returns. An unscripted message
+    /// fails the read, exactly like a missing `im:message` grant.
+    pub fn given_card_view(&self, message_id: &str, view: serde_json::Value) {
+        self.card_views
+            .lock()
+            .unwrap()
+            .insert(message_id.to_string(), view);
     }
 
     /// Take the installed gate when this call matches it.
@@ -735,6 +751,18 @@ impl feishu::Platform for RecordingPlatform {
             .get(message_id)
             .cloned()
             .ok_or_else(|| crate::error::BridgeError::Feishu(format!("mock: no quoted message {message_id}")))
+    }
+
+    async fn get_card_view(&self, message_id: &str) -> crate::error::Result<serde_json::Value> {
+        // Scripted via `given_card_view`; a missing entry is a hard failure
+        // (like a real read of a deleted or non-card message), so the reap's
+        // bare-ending fallback is what every unscripted test exercises.
+        self.card_views
+            .lock()
+            .unwrap()
+            .get(message_id)
+            .cloned()
+            .ok_or_else(|| crate::error::BridgeError::Feishu(format!("mock: no card view {message_id}")))
     }
 
     async fn download_image(
@@ -2600,6 +2628,21 @@ pub(crate) fn card_buttons(card: &serde_json::Value) -> Vec<&serde_json::Value> 
 /// A card's header title, for Done/Streaming/topic assertions.
 pub(crate) fn card_header(card: &serde_json::Value) -> &str {
     card["header"]["title"]["content"].as_str().unwrap_or("")
+}
+
+/// Whether any element anywhere on the card carries `tag` — elements nest in
+/// panels, column sets and action blocks, so a top-level scan is not enough.
+pub(crate) fn card_has_tag(card: &serde_json::Value, tag: &str) -> bool {
+    fn walk(value: &serde_json::Value, tag: &str) -> bool {
+        match value {
+            serde_json::Value::Object(map) => {
+                map.get("tag").and_then(|t| t.as_str()) == Some(tag) || map.values().any(|v| walk(v, tag))
+            }
+            serde_json::Value::Array(items) => items.iter().any(|v| walk(v, tag)),
+            _ => false,
+        }
+    }
+    walk(card, tag)
 }
 
 /// The last card the app flushed in place — the finalized card.

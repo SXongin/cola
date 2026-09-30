@@ -730,6 +730,48 @@ impl Client {
         })
     }
 
+    /// Fetch a card message's currently rendered view
+    /// (`GET /im/v1/messages/{id}?card_msg_content_type=user_card_content`):
+    /// the schema-2.0 card JSON the PATCH API accepts back verbatim. Not
+    /// `raw_card_content` — that form is CardKit-internal and a PATCH of it is
+    /// rejected (`unknown property: id`).
+    ///
+    /// The durable reap (ADR-0063, #434 acceptance feedback) reads a card this
+    /// way to keep the card's existing body while it restamps the header.
+    /// Requires the `im:message` permission. Any failure (missing permission,
+    /// deleted message, a non-card message, unparseable content) surfaces as an
+    /// error; the reap degrades to its bare ending, never to a guess.
+    pub async fn get_card_view(&self, message_id: &str) -> crate::error::Result<serde_json::Value> {
+        let token = self.get_access_token().await?;
+        let resp = self
+            .http
+            .get(self.endpoint(&format!(
+                "/open-apis/im/v1/messages/{message_id}?card_msg_content_type=user_card_content"
+            )))
+            .bearer_auth(&token)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await?;
+        let text = read_body_with_diag(resp, "get card view").await?;
+        let v: serde_json::Value = parse_json(&text, "get_card_view")?;
+        let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+        if code != 0 {
+            return Err(crate::error::BridgeError::Feishu(format!(
+                "get card view error {code}: {}",
+                body_snippet(&text, 300)
+            )));
+        }
+        let Some(item) = v["data"]["items"].get(0) else {
+            return Err(crate::error::BridgeError::Feishu(format!(
+                "get card view error: no data for {message_id} — body: {}",
+                body_snippet(&text, 300)
+            )));
+        };
+        let content = item["body"]["content"].as_str().unwrap_or_default();
+        let view: serde_json::Value = parse_json(content, "get_card_view content")?;
+        Ok(view)
+    }
+
     /// Download an image embedded in a message (`GET /im/v1/messages/{id}/resources/{key}?type=image`),
     /// returning its bytes and the server-declared content type. Requires the
     /// `im:message` permission (already held); callers degrade to a `[图片]`
@@ -1563,6 +1605,88 @@ mod tests {
         assert_eq!(
             request.query_param("card_msg_content_type").as_deref(),
             Some("raw_card_content")
+        );
+    }
+
+    /// The reap's whole-card read (#434 acceptance feedback): `user_card_content`
+    /// returns the schema-2.0 card JSON — not `raw_card_content`, whose CardKit
+    /// form the PATCH API rejects — and the client hands that view back parsed.
+    #[tokio::test]
+    async fn get_card_view_requests_user_card_content_and_parses_the_2_0_view() {
+        let (server, client) = wire_client().await;
+        let view = serde_json::json!({
+            "schema": "2.0",
+            "config": { "wide_screen_mode": true, "streaming_mode": true },
+            "header": {
+                "template": "blue",
+                "title": { "tag": "plain_text", "content": "✍️ 回复中" }
+            },
+            "body": { "elements": [
+                { "tag": "markdown", "content": "**正文** 第一段" },
+                { "tag": "button", "text": { "tag": "plain_text", "content": "重新发起" } }
+            ] }
+        });
+        server.route(
+            "GET",
+            "/open-apis/im/v1/messages/om_7",
+            200,
+            serde_json::json!({
+                "code": 0,
+                "msg": "ok",
+                "data": {
+                    "items": [{
+                        "msg_type": "interactive",
+                        "body": { "content": view.to_string() },
+                    }],
+                },
+            })
+            .to_string(),
+        );
+
+        let got = client.get_card_view("om_7").await.unwrap();
+        assert_eq!(got["schema"], "2.0");
+        assert_eq!(got["header"]["title"]["content"], "✍️ 回复中");
+        assert_eq!(got["body"]["elements"][0]["content"], "**正文** 第一段");
+        assert_eq!(got["config"]["streaming_mode"], true);
+
+        let request = last_request(&server);
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.path, "/open-apis/im/v1/messages/om_7");
+        assert_eq!(request.header("authorization"), Some("Bearer t-abc"));
+        assert_eq!(
+            request.query_param("card_msg_content_type").as_deref(),
+            Some("user_card_content")
+        );
+    }
+
+    /// A non-zero business code and a body whose `content` is not card JSON
+    /// both fail the read: the reap must degrade to its bare ending, never
+    /// patch an empty guess.
+    #[tokio::test]
+    async fn get_card_view_maps_business_errors_and_unparseable_content() {
+        let (server, client) = wire_client().await;
+        server.route(
+            "GET",
+            "/open-apis/im/v1/messages/om_gone",
+            200,
+            r#"{"code":230002,"msg":"message not found"}"#,
+        );
+        let message = feishu_error(client.get_card_view("om_gone").await.unwrap_err());
+        assert!(
+            message.contains("get card view error 230002") && message.contains("message not found"),
+            "unexpected error: {message}"
+        );
+
+        server.route(
+            "GET",
+            "/open-apis/im/v1/messages/om_text",
+            200,
+            r#"{"code":0,"msg":"ok","data":{"items":[{"msg_type":"text","body":{"content":"hello"}}]}}"#,
+        );
+        let message = feishu_error(client.get_card_view("om_text").await.unwrap_err());
+        assert!(
+            message.contains("parse get_card_view content"),
+            "unexpected error: {message}"
         );
     }
 

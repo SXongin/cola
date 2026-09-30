@@ -74,6 +74,14 @@ pub trait Platform: Send + Sync {
     /// to text-only on any error (e.g. the `im:message` permission missing).
     async fn get_message(&self, message_id: &str) -> Result<client::FeishuMessage>;
 
+    /// Fetch a card message's currently rendered view
+    /// (`GET /im/v1/messages/{id}?card_msg_content_type=user_card_content`):
+    /// the schema-2.0 JSON a PATCH of the same message accepts back. The
+    /// durable reap reads it to keep an orphaned card's existing body while it
+    /// restamps the header (ADR-0063, #434 acceptance feedback). Best-effort:
+    /// callers degrade to the bare ending on any error.
+    async fn get_card_view(&self, message_id: &str) -> Result<Value>;
+
     /// Download an image embedded in a message (`GET /im/v1/messages/{id}/resources/{key}?type=image`),
     /// used to attach Image Attachments to a prompt. Requires the `im:message`
     /// permission (already held); callers degrade to a `[图片]` placeholder on
@@ -169,6 +177,10 @@ impl Platform for Client {
 
     async fn get_message(&self, message_id: &str) -> Result<client::FeishuMessage> {
         Client::get_message(self, message_id).await
+    }
+
+    async fn get_card_view(&self, message_id: &str) -> Result<Value> {
+        Client::get_card_view(self, message_id).await
     }
 
     async fn download_image(&self, message_id: &str, image_key: &str) -> Result<client::ImageAttachment> {
