@@ -260,6 +260,30 @@ impl SessionStore {
         Ok(Some(updated))
     }
 
+    /// Follow a Session's server-reported location (#433): set the mapped
+    /// directory in place and persist, leaving every other field — the thread
+    /// key, the topic anchors, the per-session overrides — untouched. A
+    /// Session can move itself into another directory mid-life (the git
+    /// worktree flow); the directory-routed reads must follow. Returns the
+    /// previous directory when the mapping moved, `None` when the session is
+    /// not mapped or already points at `directory` — so a steady-state sync
+    /// pass neither rewrites the store nor claims a move.
+    pub fn update_directory(
+        &mut self,
+        session_id: &str,
+        directory: &str,
+    ) -> crate::error::Result<Option<String>> {
+        let Some(entry) = self.entries.iter_mut().find(|e| e.session_id == session_id) else {
+            return Ok(None);
+        };
+        if entry.directory == directory {
+            return Ok(None);
+        }
+        let previous = std::mem::replace(&mut entry.directory, directory.to_string());
+        self.write_to_disk()?;
+        Ok(Some(previous))
+    }
+
     /// Mutate the conversation's Pending Session in place and persist,
     /// returning `false` when the thread has no pending (ADR-0041: `/name`
     /// and the per-session settings commands configure a pending). Mirrors
