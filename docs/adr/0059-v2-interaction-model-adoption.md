@@ -4,6 +4,12 @@
 > **Background Task Ledger** updates it in place, and a last task retiring with
 > nothing to render settles it ✅ there (the "the card stops updating" half of
 > this ADR is narrowed; everything else stands).
+>
+> **Amended by ADR-0061**: "card state stays in memory" is narrowed for the
+> restart path (#424): the newest Wake a card has already announced persists as
+> a per-session **Wake Watermark**, and the no-chain Fresh continuation posts
+> only for a Wake strictly newer than it. Live cards still die with the
+> process, and the continuation still scopes itself at the Wake.
 
 ## Context
 
