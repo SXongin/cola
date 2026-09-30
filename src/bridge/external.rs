@@ -759,14 +759,12 @@ impl ExternalFlow {
                 };
                 match sent {
                     Ok(card_id) => {
-                        // The continuation takes the chain over: whatever card
-                        // a previous life left recorded is collected as taken
-                        // over and the durable record re-points at the
-                        // continuation (ADR-0063) — a chain handover never
-                        // leaves the old card looking live. This runs BEFORE
-                        // the id attach, whose own re-point collects nothing.
-                        Turn::track_live_card(&handles.cards, sid, &card_id, true, Some(directory)).await;
-                        Turn::set_card_message_id(&handles.cards, sid, &card_id).await;
+                        // The continuation takes the chain over: attach its
+                        // identity first, then collect whatever card a previous
+                        // life left recorded and re-point the durable record at
+                        // the continuation (ADR-0063) — a chain handover never
+                        // leaves the old card looking live.
+                        Turn::take_over_card(&handles.cards, sid, &card_id, Some(directory)).await;
                         // The card carried the 承接 line: the Wake is now
                         // user-visible, so the durable Wake Watermark advances
                         // (ADR-0061).
