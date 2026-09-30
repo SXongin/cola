@@ -157,6 +157,17 @@ _Avoid_: Foreign message, out-of-band message
 Session Sync's per-session record of the newest user message it has already accounted for: anything newer that is not a Cola-Authored Message is an External Message and triggers a notification. Advances past both cola-authored and external messages; cleared when a session stops being the Active Session so a later `/switch` back re-baselines silently. Owned by Session Sync alone — the prompt path no longer records it (formerly called the "baseline"). A **Wake** never moves it: it accounts user messages only.
 _Avoid_: Baseline (the old name; it implied the prompt path owned it)
 
+**Wake Watermark**:
+The durable per-session record of the newest **Wake** whose completion a card
+has already announced — its identity and server time — advanced only after the
+card write that carried the announcement succeeds. **Session Sync**'s
+post-restart continuation reads it: a Wake at or below the watermark is never
+re-announced, only a strictly newer one continues (with the content probe still
+required). Distinct from the **Sync Watermark**, which accounts user messages,
+lives in memory, and is never moved by a Wake (ADR-0061).
+_Avoid_: Sync Watermark (the user-message-scoped one), announced set (the
+in-memory per-chain predecessor)
+
 **Session Sync** (会话同步):
 The Bridge flow that keeps a thread's **Active Session**'s card chain current without a user message: it notifies **External Messages**, renders **Wakes** as continuation cards, and catches content its card missed (ADR-0059). The successor of the external-message sync; still scoped to the thread's active Session (ADR-0017).
 _Avoid_: External poller (the old name), background watcher
@@ -325,6 +336,7 @@ _Avoid_: Notification, message, signal
 - A **Topic** is created around its **Topic Root** and, when cola opens it, is anchored on its **Topic Anchor**; a cola-created **Topic Root** is a **Topic Cover Card**
 - A **Session** contains many **Turns** and has one **Project** and one optional **Agent**; a **Turn** spans one or more **Executions**, and an **Execution** ends at the Backend's idle boundary, which a **Wake** may follow with another Execution (ADR-0059)
 - A **Session** is read through one **Session Transcript**, whose projections serve rendering, **Session Sync** and the **Session Snapshot**
+- A **Wake Watermark** persists which **Wake**s a card chain has already announced, so a cola restart never re-posts one; the **Sync Watermark** stays user-message-scoped (ADR-0061)
 - A **Turn** renders into a **Card Chain**; a pending **Permission**/**Question** rides its newest card as an **Interaction Block**, and resolving one leaves an **Interaction Receipt**
 - A **Supplement** splits its **Turn**'s **Card Chain** so the continuation card is the newest message; the render loop stays alive across a Supplement that starts a new **Turn**; a **Command** reply does not split the chain by itself — `/card` pulls the live card down on explicit request
 - A **Turn** with live **Background Tasks** yields its card as 等待后台任务; the next **Wake** continues the chain on a new card, and a **Turn** superseded while waiting collects as 已由新消息接管 (ADR-0059); the Session's live tasks ride the newest card as one **Background Task Ledger**, a completed task leaves a fixed entry on the card it lived on, and a last task retiring with nothing to render settles the waiting card as ✅ (ADR-0060)
