@@ -775,6 +775,11 @@ pub(crate) struct CardsHandle {
     /// bot cover card as their root (ADR-0023).
     pub(crate) cover_titles: Arc<Mutex<HashMap<String, CoverTitle>>>,
     pub(crate) feishu: Arc<dyn feishu::Platform>,
+    /// The durable per-session Wake Watermark (ADR-0061). Reachable from every
+    /// path that announces a Wake: the flush advances it after a delivering
+    /// card write, the Fresh decision reads it, and the Fresh arm advances it
+    /// after its card's own send lands.
+    pub(crate) wake_watermarks: Arc<crate::bridge::wake_watermark::WakeWatermarks>,
     /// session_id → the lock serializing that session's card writes. Private:
     /// [`CardsHandle::write_lock`] is the accessor.
     write_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
@@ -786,6 +791,7 @@ impl CardsHandle {
         card_handles: Arc<Mutex<CardHandles>>,
         cover_titles: Arc<Mutex<HashMap<String, CoverTitle>>>,
         feishu: Arc<dyn feishu::Platform>,
+        wake_watermarks: Arc<crate::bridge::wake_watermark::WakeWatermarks>,
         write_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     ) -> Self {
         Self {
@@ -793,6 +799,7 @@ impl CardsHandle {
             card_handles,
             cover_titles,
             feishu,
+            wake_watermarks,
             write_locks,
         }
     }
@@ -906,6 +913,15 @@ pub(crate) struct WaitsHandle {
     /// Session ids with a prompt currently in flight (serializes prompts per
     /// session so concurrent messages don't clobber each other's cards).
     pub(crate) inflight: Arc<Mutex<HashSet<String>>>,
+    /// Session ids with an inbound user message being routed to them (#424):
+    /// set at message admission — earlier than `inflight`, because the message
+    /// is invisible to the Session Transcript until its Turn writes it — and
+    /// cleared by the Turn that takes it, or by the handler when it merges as
+    /// a Supplement. A Session Sync Fresh continuation checks it before
+    /// posting, so a message arriving inside the Sync read's window cannot be
+    /// raced. An entry older than [`INBOUND_CLAIM_TTL`] reads as absent: a
+    /// lost clear degrades to "no claim", never to a blocked continuation.
+    pub(crate) inbound: Arc<Mutex<HashMap<String, std::time::Instant>>>,
     /// Session ids whose run was interrupted by `/stop`; the post-prompt drain
     /// (ADR-0043) reads it so a stopped session finalizes promptly.
     pub(crate) stopped_sessions: Arc<Mutex<HashSet<String>>>,
@@ -918,6 +934,12 @@ pub(crate) struct WaitsHandle {
     pub(crate) message_pins: Arc<MessagePins>,
 }
 
+/// How long an un-cleared inbound claim suppresses a Fresh continuation
+/// (#424). Far longer than any real admission (a Turn claims the session in
+/// milliseconds), short enough that a missed clear cannot wedge a session's
+/// continuations for the process lifetime.
+const INBOUND_CLAIM_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+
 impl WaitsHandle {
     /// Whether this session's run was stopped with `/stop` — the sticky marker
     /// the drain rule (ADR-0043) and the stop terminal (#394) read. One
@@ -925,6 +947,36 @@ impl WaitsHandle {
     /// sees the same fact.
     pub(crate) async fn is_stopped(&self, session_id: &str) -> bool {
         self.stopped_sessions.lock().await.contains(session_id)
+    }
+
+    /// Mark that a user message is being routed to `session_id` (#424). The
+    /// Fresh continuation checks this before posting because the message
+    /// cannot yet be seen in the transcript.
+    pub(crate) async fn note_inbound(&self, session_id: &str) {
+        self.inbound
+            .lock()
+            .await
+            .insert(session_id.to_string(), std::time::Instant::now());
+    }
+
+    /// Drop `session_id`'s inbound claim: the message was admitted by a Turn
+    /// or merged as a Supplement.
+    pub(crate) async fn clear_inbound(&self, session_id: &str) {
+        self.inbound.lock().await.remove(session_id);
+    }
+
+    /// Whether a message is (still) being routed to `session_id`. A claim past
+    /// the TTL is dropped here, so a missed clear reads as no claim.
+    pub(crate) async fn inbound_pending(&self, session_id: &str) -> bool {
+        let mut inbound = self.inbound.lock().await;
+        match inbound.get(session_id) {
+            Some(at) if at.elapsed() < INBOUND_CLAIM_TTL => true,
+            Some(_) => {
+                inbound.remove(session_id);
+                false
+            }
+            None => false,
+        }
     }
 }
 

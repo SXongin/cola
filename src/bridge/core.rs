@@ -71,6 +71,10 @@ pub struct SharedCore {
     /// remote resolution, a sweep strip — whether or not it is still the
     /// accumulator's current card.
     pub card_handles: Arc<Mutex<crate::bridge::card_handles::CardHandles>>,
+    /// The durable per-session Wake Watermark (ADR-0061), beside the session
+    /// mapping: what a card has already announced survives a restart, so the
+    /// no-chain Fresh continuation never re-posts it (#424).
+    pub wake_watermarks: Arc<crate::bridge::wake_watermark::WakeWatermarks>,
     /// Permission flow: owns `sent_cards`, polls pending requests, auto-accepts
     /// for `/autoaccept` sessions, and handles the "perm" card action.
     pub permission: Arc<crate::bridge::request::flow::RequestFlow>,
@@ -112,6 +116,10 @@ pub struct SharedCore {
     /// Session ids with a prompt currently in flight (serializes prompts per
     /// session so concurrent messages don't clobber each other's cards).
     pub inflight: Arc<Mutex<HashSet<String>>>,
+    /// Session ids with an inbound user message being routed to them (#424):
+    /// set at admission, cleared when the message is taken or merged. See
+    /// [`crate::bridge::handles::WaitsHandle`].
+    pub inbound: Arc<Mutex<HashMap<String, std::time::Instant>>>,
     /// Session ids whose run was interrupted by `/stop`. The post-prompt drain
     /// (ADR-0043) reads it so a stopped session finalizes promptly instead of
     /// waiting out its bound on a Supplement the abort left unanswered; a new
@@ -226,6 +234,9 @@ impl SharedCore {
             card_handles: Arc::new(Mutex::new(
                 crate::bridge::card_handles::CardHandles::with_surfaces(Arc::clone(&surfaces)),
             )),
+            wake_watermarks: Arc::new(crate::bridge::wake_watermark::WakeWatermarks::load(
+                cfg.bridge.session_file.with_file_name("wake_watermarks.json"),
+            )),
             permission: Arc::new(crate::bridge::request::flow::RequestFlow::new(
                 Box::new(crate::bridge::request::kind::PermissionKind),
                 Arc::clone(&surfaces),
@@ -247,6 +258,7 @@ impl SharedCore {
             answered_requests: Arc::new(Mutex::new(HashSet::new())),
             settling_requests: Arc::new(Mutex::new(HashMap::new())),
             inflight: Arc::new(Mutex::new(HashSet::new())),
+            inbound: Arc::new(Mutex::new(HashMap::new())),
             stopped_sessions: Arc::new(Mutex::new(HashSet::new())),
             turn_render_poll_ms: Arc::new(std::sync::atomic::AtomicU64::new(1_500)),
             turn_drain_timeout_ms: Arc::new(std::sync::atomic::AtomicU64::new(600_000)),
@@ -362,6 +374,7 @@ impl SharedCore {
             Arc::clone(&self.card_handles),
             Arc::clone(&self.cover_titles),
             Arc::clone(&self.feishu),
+            Arc::clone(&self.wake_watermarks),
             Arc::clone(&self.card_write_locks),
         )
     }
@@ -381,6 +394,7 @@ impl SharedCore {
     pub(crate) fn waits_handle(&self) -> crate::bridge::handles::WaitsHandle {
         crate::bridge::handles::WaitsHandle {
             inflight: Arc::clone(&self.inflight),
+            inbound: Arc::clone(&self.inbound),
             stopped_sessions: Arc::clone(&self.stopped_sessions),
             reminder: Arc::clone(&self.reminder),
             message_pins: Arc::clone(&self.message_pins),

@@ -671,6 +671,32 @@ impl ExternalFlow {
             WakeContinuation::Fresh { anchor } => {
                 // No chain (a cola restart): arm a fresh card scoped at the
                 // newest Wake, so the lost card's content is never replayed.
+                //
+                // #424: the read that decided this predates any message that
+                // arrived since, and a received message is invisible to the
+                // transcript until its Turn admits it — so the in-process
+                // claim is the check that closes the observed race, and the
+                // re-read only corroborates it for messages another
+                // shared-store client wrote.
+                if handles.waits.inbound_pending(sid).await
+                    || handles.waits.inflight.lock().await.contains(sid)
+                {
+                    return;
+                }
+                let Some(Ok(fresh)) = crate::bridge::bounded_call(
+                    "wake continuation recheck",
+                    self.request_timeout_ms.load(std::sync::atomic::Ordering::Relaxed),
+                    handles.backend.transcript(sid),
+                )
+                .await
+                else {
+                    return;
+                };
+                if fresh.newest_user().map(|message| message.id.as_str())
+                    != Some(turn_anchor.message_id.as_str())
+                {
+                    return;
+                }
                 let subtitle = self.session_subtitle(handles, sid, directory).await;
                 let variant = handles
                     .sessions
@@ -707,6 +733,26 @@ impl ExternalFlow {
                 match sent {
                     Ok(card_id) => {
                         Turn::set_card_message_id(&handles.cards, sid, &card_id).await;
+                        // The card carried the 承接 line: the Wake is now
+                        // user-visible, so the durable Wake Watermark advances
+                        // (ADR-0061).
+                        handles.cards.wake_watermarks.advance(
+                            sid,
+                            anchor.message_id.as_str(),
+                            anchor.created_ms,
+                        );
+                        if handles.waits.inbound_pending(sid).await
+                            || handles.waits.inflight.lock().await.contains(sid)
+                        {
+                            // The accepted residual window: the claim landed
+                            // between the pre-send check and the send. Logged,
+                            // never recalled — a destructive API for a
+                            // sub-second window is worse than the rare stray
+                            // card.
+                            tracing::warn!(
+                                "wake continuation: session {sid} posted while an inbound message was being admitted"
+                            );
+                        }
                         let Some(chain) = Turn::chain_id(&handles.cards, sid).await else {
                             return;
                         };

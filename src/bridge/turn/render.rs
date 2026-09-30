@@ -355,7 +355,7 @@ fn render_wake_entries(
         let Some(entry) = wake_completion_entry(wake, transcript, created_ms) else {
             continue;
         };
-        if !acc.announce_wake(wake.id.as_str()) {
+        if !acc.announce_wake(wake.id.as_str(), created_ms) {
             continue;
         }
         // Keyed at the Wake's moment, so the entry sorts before the work it

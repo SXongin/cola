@@ -392,6 +392,16 @@ async fn a_wake_after_a_waiting_yield_continues_on_a_new_card() {
         "the waiting card takes the handoff header: {:?}",
         platform.updated_cards().await
     );
+    // The split's continuation send delivered the 承接 line, so the durable
+    // Wake Watermark advanced (ADR-0061): a restart cannot re-post this Wake.
+    assert_eq!(
+        app.cards_handle()
+            .wake_watermarks
+            .announced("ses_test")
+            .map(|mark| mark.created_ms),
+        Some(2_900),
+        "a delivered 承接 line advances the durable Wake Watermark"
+    );
 }
 
 /// Acceptance 3, first half: a Wake arriving after the Turn's card already
@@ -509,6 +519,16 @@ async fn a_wake_after_a_restart_posts_a_continuation_card() {
         platform.sent_cards().await.iter().any(is_continuation),
         "the restart continuation reaches the chat: {:?}",
         platform.calls.lock().await
+    );
+    // The Fresh card carried the 承接 line: the durable Wake Watermark
+    // advanced (ADR-0061), so a later restart cannot re-post this Wake.
+    assert_eq!(
+        app.cards_handle()
+            .wake_watermarks
+            .announced("ses_test")
+            .map(|mark| mark.created_ms),
+        Some(2_900),
+        "the Fresh send advances the durable Wake Watermark"
     );
 }
 
@@ -1334,6 +1354,131 @@ async fn a_stale_wake_is_not_reposted_after_a_restart() {
     );
 }
 
+/// Acceptance 1 (ADR-0061): a Wake a previous cola life already announced is
+/// never re-posted after a restart — the durable Wake Watermark is the fact
+/// the lost card left behind, and without it the Fresh path re-announces
+/// (#424).
+#[tokio::test]
+async fn an_announced_wake_is_not_reposted_after_a_restart() {
+    let _wd = test_work_dir();
+    let resumed = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+        assistant(3_100, "CI 通过了。"),
+    ])
+    .with_executions(vec![execution(2_500), execution(4_000)])
+    .with_wakes(vec![shell_wake(2_900)]);
+    let (_dir, app, _backend, platform) = scripted_app(vec![resumed], Some(SessionStatus::Idle)).await;
+    // The previous life's card announced this Wake before the restart.
+    app.cards_handle()
+        .wake_watermarks
+        .advance("ses_test", "msg_wake_2900", 2_900);
+
+    spawn_sync(&app);
+    // Several sync passes over the read: no Fresh card may be posted.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        continuation_sends(&platform).await.is_empty(),
+        "an announced Wake must not be re-posted after a restart: {:?}",
+        platform.calls.lock().await
+    );
+}
+
+/// Acceptance 2 (ADR-0061): a Wake NEWER than the watermark still continues —
+/// the mark covers only what a previous life has shown, so work that finished
+/// while cola was down is never lost.
+#[tokio::test]
+async fn a_wake_newer_than_the_watermark_still_continues() {
+    let _wd = test_work_dir();
+    let resumed = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+        assistant(3_100, "CI 通过了。"),
+    ])
+    .with_executions(vec![execution(2_500), execution(4_000)])
+    .with_wakes(vec![shell_wake(2_900)]);
+    let (_dir, app, _backend, platform) = scripted_app(vec![resumed], Some(SessionStatus::Idle)).await;
+    // An older Wake was announced before the restart; this one was not.
+    app.cards_handle()
+        .wake_watermarks
+        .advance("ses_test", "msg_wake_1900", 1_900);
+
+    spawn_sync(&app);
+    wait_for_any_card(&platform, WAKE_LEAD).await;
+    assert!(
+        platform.sent_cards().await.iter().any(is_continuation),
+        "a Wake newer than the watermark must still continue: {:?}",
+        platform.calls.lock().await
+    );
+}
+
+/// Acceptance 3 (ADR-0061): a message being admitted blocks the Fresh post —
+/// the claim is set before the Turn writes the prompt, so the Sync's stale
+/// read cannot race it — and releasing the claim lets the continuation post.
+#[tokio::test]
+async fn an_inbound_claim_blocks_then_releases_the_fresh_post() {
+    let _wd = test_work_dir();
+    let resumed = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+        assistant(3_100, "CI 通过了。"),
+    ])
+    .with_executions(vec![execution(2_500), execution(4_000)])
+    .with_wakes(vec![shell_wake(2_900)]);
+    let (_dir, app, _backend, platform) = scripted_app(vec![resumed], Some(SessionStatus::Idle)).await;
+    app.waits_handle().note_inbound("ses_test").await;
+
+    spawn_sync(&app);
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    assert!(
+        continuation_sends(&platform).await.is_empty(),
+        "an inbound claim must block the Fresh post: {:?}",
+        platform.calls.lock().await
+    );
+
+    app.waits_handle().clear_inbound("ses_test").await;
+    wait_for_any_card(&platform, WAKE_LEAD).await;
+    assert!(
+        platform.sent_cards().await.iter().any(is_continuation),
+        "the claim's release lets the continuation post: {:?}",
+        platform.calls.lock().await
+    );
+}
+
+/// Acceptance 3 (ADR-0061), the corroborating read: a message that IS in the
+/// store — another shared-store client's — is invisible to the Sync's stale
+/// read; the pre-send re-read sees the newest user anchor moved and bails.
+#[tokio::test]
+async fn a_changed_anchor_in_the_recheck_blocks_the_fresh_post() {
+    let _wd = test_work_dir();
+    let wake_read = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+        assistant(3_100, "CI 通过了。"),
+    ])
+    .with_executions(vec![execution(2_500), execution(4_000)])
+    .with_wakes(vec![shell_wake(2_900)]);
+    let moved_on = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+        assistant(3_100, "CI 通过了。"),
+        user("msg_ext", 5_000, "等一下，先别继续"),
+        assistant(5_100, "好。"),
+    ])
+    .with_executions(vec![execution(2_500), execution(4_000), execution(6_000)])
+    .with_wakes(vec![shell_wake(2_900)]);
+    let (_dir, app, _backend, platform) =
+        scripted_app(vec![wake_read, moved_on], Some(SessionStatus::Idle)).await;
+
+    spawn_sync(&app);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        continuation_sends(&platform).await.is_empty(),
+        "a moved-on conversation must not get a Fresh continuation: {:?}",
+        platform.calls.lock().await
+    );
+}
+
 /// Fix 2 (live defect): a Fresh card is sent top-level (a restart leaves no
 /// reply target), so when its run overflows one card the flush must continue
 /// top-level too. Before the fix the continuation was never sent and the card
@@ -1481,6 +1626,17 @@ async fn a_merged_shell_wake_leaves_one_entry_on_the_live_turn_card() {
         card_text(&later).matches("后台任务完成").count(),
         1,
         "a repeated poll must not duplicate the entry: {later}"
+    );
+
+    // The PATCH that carried the entry advanced the durable Wake Watermark
+    // (ADR-0061): a restart must not re-announce this Wake.
+    assert_eq!(
+        app.cards_handle()
+            .wake_watermarks
+            .announced("ses_test")
+            .map(|mark| mark.created_ms),
+        Some(finished),
+        "a delivered merged entry advances the durable Wake Watermark"
     );
 
     // Let the run end so the Turn finishes cleanly.
