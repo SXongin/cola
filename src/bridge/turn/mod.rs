@@ -482,24 +482,11 @@ impl Turn {
             .await
             .map(|e| e.directory.clone())
             .unwrap_or_default();
-        {
-            let mut cards = handles.cards.cards.lock().await;
-            if let Some(card) = cards.get_mut(&session_id) {
-                card.card_message_id = Some(new_card_id.clone());
-            }
-        }
-        // The loading card is the session's live card now: persist the durable
-        // record (ADR-0063) — the anchor follows on the first read that carries
-        // the submitted message. A previously recorded orphan this Turn's card
-        // replaces is collected as taken over.
-        Self::track_live_card(
-            &handles.cards,
-            &session_id,
-            &new_card_id,
-            true,
-            Some(&session_dir),
-        )
-        .await;
+        // The loading card is the session's live card now: attach its identity
+        // and persist the durable record (ADR-0063) — the anchor follows on the
+        // first read that carries the submitted message. A previously recorded
+        // orphan this Turn's card replaces is collected as taken over.
+        Self::take_over_card(&handles.cards, &session_id, &new_card_id, Some(&session_dir)).await;
 
         // The work context (ADR-0019) is captured before the prompt runs but
         // AFTER the card is live and its id known: the git read neither delays
@@ -1468,7 +1455,8 @@ impl Turn {
     /// fresh Turn, a Wake continuation armed after a restart, an external arm),
     /// false where it continues the same chain (a split's continuation, a
     /// re-adopt), whose predecessor the split — or the static snapshot it
-    /// replaces — already ended.
+    /// replaces — already ended. The three takeover sends go through
+    /// [`Self::take_over_card`], which owns the attach-then-collect order.
     ///
     /// `directory` is the Session's directory when the caller knows it (a
     /// Turn's mapping, an external arm); `None` falls back to the card's own
@@ -1516,6 +1504,36 @@ impl Turn {
             && previous.card_message_id != card_message_id
         {
             crate::bridge::reap::collect_orphan(cards, session_id, &previous.card_message_id).await;
+        }
+    }
+
+    /// Make `card_message_id` the session's live card, taking the chain over
+    /// from whatever card the durable record still names (ADR-0063): attach the
+    /// id to the in-memory card FIRST — so a reap tick racing the send never
+    /// reads the record naming a card the in-memory chain has not admitted yet
+    /// — then track it with a DIFFERENT recorded predecessor collected as taken
+    /// over. A send that opens a new chain over an orphan (a fresh Turn's
+    /// loading card, an external arm, a Wake continuation after a restart) takes
+    /// over; a send that continues the same chain (a split's continuation, a
+    /// re-adopt) tracks with `collect_predecessor = false` instead.
+    ///
+    /// `directory` is the Session's directory when the caller knows it; `None`
+    /// falls back to the card's own work context (see [`Self::track_live_card`]).
+    pub(crate) async fn take_over_card(
+        cards: &CardsHandle,
+        session_id: &str,
+        card_message_id: &str,
+        directory: Option<&str>,
+    ) {
+        Self::attach_card_message_id(cards, session_id, card_message_id).await;
+        Self::track_live_card(cards, session_id, card_message_id, true, directory).await;
+    }
+
+    /// Attach `card_message_id` to the session's in-memory card, when it still
+    /// has one (a card replaced in the released moment is never touched).
+    async fn attach_card_message_id(cards: &CardsHandle, session_id: &str, card_message_id: &str) {
+        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
+            card.card_message_id = Some(card_message_id.to_string());
         }
     }
 
@@ -2642,12 +2660,12 @@ impl Turn {
             session_id.to_string(),
             state::CardSession::new(acc, Some(card_id.to_string())),
         );
-        // An adopted run's card is the session's live card: track it (the
-        // anchor is known here, so the record needs no transcript probe, and
-        // the arm carries the directory its reads route under). A different
+        // An adopted run's card is the session's live card: take the chain over
+        // (the anchor is known here, so the record needs no transcript probe,
+        // and the arm carries the directory its reads route under). A different
         // previously recorded card was orphaned by this arm and is collected
         // as taken over.
-        Self::track_live_card(cards, session_id, card_id, true, Some(session_dir)).await;
+        Self::take_over_card(cards, session_id, card_id, Some(session_dir)).await;
     }
 }
 
@@ -2912,7 +2930,7 @@ impl Turn {
     /// `anchor` — opens with the 承接 line, carries the session's work context,
     /// answers to `facts.reply_to` and is marked a continuation (it offers no
     /// Retry). Returns the card to send; the caller attaches its id with
-    /// [`Self::set_card_message_id`]. `None` when the session has a card after
+    /// [`Self::take_over_card`]. `None` when the session has a card after
     /// all — the decision saw none, so a chain appeared meanwhile and owns the
     /// session now; the caller must send nothing and the next poll re-decides.
     pub(crate) async fn arm_wake_continuation(
@@ -2977,15 +2995,15 @@ impl Turn {
         settle::stamp(&flow.cards, session_id, &ending).await;
     }
 
-    /// Attach the sent card's identity to an armed-but-idless continuation
-    /// (the Wake continuation's arm-then-send ordering, ADR-0059). The durable
-    /// record follows the card (ADR-0063): a takeover path that replaces an
-    /// orphan calls [`Self::track_live_card`] with the collect flag BEFORE
-    /// this, and this call's own re-point collects nothing.
+    /// Attach a sent card's identity to an armed-but-idless continuation and
+    /// re-point its durable record without collecting a predecessor — the card
+    /// continues the chain it already owns (ADR-0059, ADR-0063). The test seam
+    /// for tests that name a seeded card; production takeover paths use
+    /// [`Self::take_over_card`], which attaches and collects in one ordered
+    /// step.
+    #[cfg(test)]
     pub(crate) async fn set_card_message_id(cards: &CardsHandle, session_id: &str, message_id: &str) {
-        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
-            card.card_message_id = Some(message_id.to_string());
-        }
+        Self::attach_card_message_id(cards, session_id, message_id).await;
         Self::track_live_card(cards, session_id, message_id, false, None).await;
     }
 
