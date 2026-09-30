@@ -38,6 +38,20 @@ pub struct SessionTranscript {
     /// assistant tool parts that started them, with every matching Wake
     /// applied. Empty on a generation without them (V1).
     pub background_tasks: Vec<BackgroundTask>,
+    /// The Background Tasks a **runtime reconciliation** read retired while no
+    /// Wake retired them ([`SessionTranscript::apply_task_runtime`]): the
+    /// completion record was lost, and the runtime either reported a terminal
+    /// end or no longer knows the task. They have already left
+    /// [`Self::background_tasks`], so the settle decision treats them as
+    /// ended; the ledger renders each as a completion entry. Empty unless a
+    /// reconciliation read ran.
+    pub runtime_retired: Vec<TaskRetirement>,
+    /// The call ids of live Background Tasks a reconciliation read could not
+    /// confirm as running (a subagent child the runtime reports inactive) while
+    /// no Wake retired them. The ledger renders those rows as 状态待确认; the
+    /// settle rule is deliberately unchanged (only a Wake or a positive
+    /// terminal verdict retires a task).
+    pub unconfirmed_tasks: std::collections::HashSet<String>,
 }
 
 impl SessionTranscript {
@@ -47,6 +61,8 @@ impl SessionTranscript {
             executions: Vec::new(),
             wakes: Vec::new(),
             background_tasks: Vec::new(),
+            runtime_retired: Vec::new(),
+            unconfirmed_tasks: std::collections::HashSet::new(),
         }
     }
 
@@ -68,6 +84,56 @@ impl SessionTranscript {
     pub fn with_background_tasks(mut self, background_tasks: Vec<BackgroundTask>) -> Self {
         self.background_tasks = background_tasks;
         self
+    }
+
+    /// Apply one runtime reconciliation read (`TaskRuntime`, issue #454): a
+    /// shell the runtime reports ended — or no longer knows at all — leaves the
+    /// live list as a [`TaskRetirement`]; a subagent child the runtime reports
+    /// inactive stays live but is marked unconfirmed; a task with no verdict is
+    /// untouched. An empty read changes nothing, so V1 and a server that could
+    /// not answer reconcile to the transcript exactly as read.
+    ///
+    /// The retirement is deliberately limited to positive evidence: an id the
+    /// runtime did not mention (a failed per-shell read, an unrecognised active
+    /// entry) never retires a task, and a subagent only ever gains the
+    /// unconfirmed marker. A Wake-retired task is already absent here.
+    pub fn apply_task_runtime(&mut self, runtime: &TaskRuntime) {
+        if runtime.shells.is_empty() && runtime.children.is_empty() {
+            return;
+        }
+        let mut kept = Vec::with_capacity(self.background_tasks.len());
+        let mut retired = Vec::new();
+        for task in std::mem::take(&mut self.background_tasks) {
+            if let Some(shell_id) = task.shell_id.clone() {
+                match runtime.shell(&shell_id) {
+                    // No verdict: the read could not place this shell — leave
+                    // the task exactly as the transcript read it.
+                    None | Some(ShellRuntime::Running) => kept.push(task),
+                    Some(ShellRuntime::Ended { end, completed_at }) => retired.push(TaskRetirement {
+                        task,
+                        ending: TaskRetirementEnding::Ended(end.clone()),
+                        finished_at: *completed_at,
+                    }),
+                    Some(ShellRuntime::Missing) => retired.push(TaskRetirement {
+                        task,
+                        ending: TaskRetirementEnding::Lost,
+                        finished_at: None,
+                    }),
+                }
+                continue;
+            }
+            let Some(child_id) = task.child_id.clone() else {
+                // A task with neither identity cannot be reconciled.
+                kept.push(task);
+                continue;
+            };
+            if runtime.child(&child_id) == Some(ChildRuntime::Inactive) {
+                self.unconfirmed_tasks.insert(task.tool.call_id.clone());
+            }
+            kept.push(task);
+        }
+        self.background_tasks = kept;
+        self.runtime_retired.extend(retired);
     }
 
     /// The newest user message by server time, if any — the message a Turn's
@@ -601,6 +667,93 @@ pub struct BackgroundTask {
     pub child_id: Option<String>,
     /// When the tool call started the task, when the payload reported a time.
     pub started_at: Option<i64>,
+}
+
+/// How a shell Background Task ended, as the runtime reports it (V2's
+/// `/api/shell/{id}` terminal statuses). A status this build does not know
+/// stays verbatim, like every other tolerant arm of the read model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShellEnd {
+    Exited,
+    Timeout,
+    Killed,
+    /// A status this build does not know, kept verbatim.
+    Other(String),
+}
+
+/// One shell's runtime verdict from a reconciliation read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShellRuntime {
+    /// The runtime reports the shell running.
+    Running,
+    /// The runtime knows the shell and reports a terminal end.
+    Ended {
+        end: ShellEnd,
+        completed_at: Option<i64>,
+    },
+    /// The runtime has no record of the shell: the record was removed, or the
+    /// process that hosted it is gone. The task is not running under the
+    /// attached server.
+    Missing,
+}
+
+/// One subagent child session's runtime verdict: whether the server owns a live
+/// drain for it. Only the live/inactive bit is read — the child's own transcript
+/// is a separate, heavier read no reconciliation path needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildRuntime {
+    /// The runtime reports the child session's drain active.
+    Running,
+    /// The runtime does not report the child active.
+    Inactive,
+}
+
+/// The runtime evidence one reconciliation read carries, in the order asked.
+/// An id with no verdict is no evidence at all — the caller must leave its task
+/// exactly as the transcript read it, never guess.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TaskRuntime {
+    pub shells: Vec<(String, ShellRuntime)>,
+    pub children: Vec<(String, ChildRuntime)>,
+}
+
+impl TaskRuntime {
+    /// The verdict for one shell id, when the read produced one.
+    pub fn shell(&self, shell_id: &str) -> Option<&ShellRuntime> {
+        self.shells
+            .iter()
+            .find(|(id, _)| id == shell_id)
+            .map(|(_, verdict)| verdict)
+    }
+
+    /// The verdict for one child session id, when the read produced one.
+    pub fn child(&self, child_id: &str) -> Option<ChildRuntime> {
+        self.children
+            .iter()
+            .find(|(id, _)| id == child_id)
+            .map(|(_, verdict)| *verdict)
+    }
+}
+
+/// A Background Task a runtime reconciliation retired while no Wake retired it
+/// (issue #454): the completion record was lost, and the runtime either
+/// reported a terminal end or no longer knows the task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskRetirement {
+    pub task: BackgroundTask,
+    pub ending: TaskRetirementEnding,
+    /// When the run ended, when the runtime reported a completion time; the
+    /// `Lost` ending carries none (the runtime had nothing to report).
+    pub finished_at: Option<i64>,
+}
+
+/// What the runtime said about a retired task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskRetirementEnding {
+    /// The runtime reported a terminal end for the shell.
+    Ended(ShellEnd),
+    /// The runtime has no record of the task.
+    Lost,
 }
 
 /// One recent-conversation tail entry: a text-bearing user/assistant message's
@@ -1251,6 +1404,117 @@ mod tests {
             failed.settle(Some(&anchor)),
             TurnSettle::Failed("provider 503".into())
         );
+    }
+
+    /// The runtime reconciliation (issue #454): a shell the runtime reports
+    /// ended — or no longer knows — leaves the live list as a retirement (with
+    /// the runtime's completion time when it has one), so an idle read whose
+    /// last task is gone settles complete; a running shell and a child the
+    /// runtime reports inactive stay live (the child marked unconfirmed); a
+    /// task with no verdict and an empty read are untouched.
+    #[test]
+    fn a_runtime_read_retires_ended_shells_and_marks_inactive_children() {
+        let (_, anchor) = anchored("msg_u1", 1_000);
+        let shell_task = |call_id: &str, shell_id: &str| BackgroundTask {
+            tool: ToolIdentity {
+                name: "shell".into(),
+                call_id: call_id.into(),
+            },
+            shell_id: Some(shell_id.into()),
+            child_id: None,
+            started_at: Some(1_100),
+        };
+        let child_task = BackgroundTask {
+            tool: ToolIdentity {
+                name: "subagent".into(),
+                call_id: "call_sub".into(),
+            },
+            shell_id: None,
+            child_id: Some("ses_child".into()),
+            started_at: Some(1_100),
+        };
+
+        // An ended shell retires with the runtime's own completion time; a
+        // running shell and an inactive child stay live (the child marked).
+        let mut transcript = SessionTranscript::new(vec![assistant_step("msg_a1", 1_100, None)])
+            .with_executions(vec![boundary(1_200)])
+            .with_background_tasks(vec![
+                shell_task("call_done", "sh_done"),
+                shell_task("call_run", "sh_run"),
+                child_task.clone(),
+            ]);
+        transcript.apply_task_runtime(&TaskRuntime {
+            shells: vec![
+                (
+                    "sh_done".into(),
+                    ShellRuntime::Ended {
+                        end: ShellEnd::Exited,
+                        completed_at: Some(2_000),
+                    },
+                ),
+                ("sh_run".into(), ShellRuntime::Running),
+            ],
+            children: vec![("ses_child".into(), ChildRuntime::Inactive)],
+        });
+        assert_eq!(
+            transcript
+                .background_tasks
+                .iter()
+                .map(|task| task.tool.call_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["call_run", "call_sub"],
+            "only the ended shell left the live list"
+        );
+        assert!(transcript.unconfirmed_tasks.contains("call_sub"));
+        assert_eq!(
+            transcript.runtime_retired,
+            vec![TaskRetirement {
+                task: shell_task("call_done", "sh_done"),
+                ending: TaskRetirementEnding::Ended(ShellEnd::Exited),
+                finished_at: Some(2_000),
+            }]
+        );
+        assert_eq!(
+            transcript.settle(Some(&anchor)),
+            TurnSettle::Waiting,
+            "an unconfirmed child still holds the wait"
+        );
+
+        // A missing record retires as Lost with no completion time, so the
+        // last task's retirement is the true end.
+        let mut lost = SessionTranscript::new(vec![assistant_step("msg_a1", 1_100, None)])
+            .with_executions(vec![boundary(1_200)])
+            .with_background_tasks(vec![shell_task("call_lost", "sh_lost")]);
+        lost.apply_task_runtime(&TaskRuntime {
+            shells: vec![("sh_lost".into(), ShellRuntime::Missing)],
+            children: vec![],
+        });
+        assert_eq!(
+            lost.runtime_retired[0].ending,
+            TaskRetirementEnding::Lost,
+            "a runtime without the record is the Lost ending"
+        );
+        assert_eq!(lost.runtime_retired[0].finished_at, None);
+        assert!(lost.background_tasks.is_empty());
+        assert_eq!(
+            lost.settle(Some(&anchor)),
+            TurnSettle::Complete,
+            "a lost completion record no longer holds the wait"
+        );
+
+        // No verdict for an id (a failed per-shell read) and an empty read
+        // leave the transcript exactly as read.
+        let mut untouched = SessionTranscript::new(vec![assistant_step("msg_a1", 1_100, None)])
+            .with_executions(vec![boundary(1_200)])
+            .with_background_tasks(vec![shell_task("call_bg", "sh_bg")]);
+        untouched.apply_task_runtime(&TaskRuntime {
+            shells: vec![("sh_other".into(), ShellRuntime::Missing)],
+            children: vec![],
+        });
+        untouched.apply_task_runtime(&TaskRuntime::default());
+        assert_eq!(untouched.background_tasks.len(), 1);
+        assert!(untouched.runtime_retired.is_empty());
+        assert_eq!(untouched.settle(Some(&anchor)), TurnSettle::Waiting);
     }
 
     /// A Wake opens an Execution, so its content landing before that

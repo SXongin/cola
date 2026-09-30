@@ -21,7 +21,7 @@ mod tests;
 
 use async_trait::async_trait;
 
-use crate::backend::SessionTranscript;
+use crate::backend::{SessionTranscript, TaskRuntime};
 use crate::error::Result;
 
 use super::strategy::GenerationStrategy;
@@ -412,6 +412,22 @@ impl GenerationStrategy for V1Strategy {
             None => Some(SessionStatus::Idle),
             Some(entry) => parse_session_status_entry(entry),
         })
+    }
+
+    /// V1 carries no Background Tasks (the `task` tool's calls are foreground
+    /// and its completions never produce a Wake), so the reconciliation read
+    /// answers an empty verdict without a request. The caller's task lists are
+    /// empty there anyway; this arm exists so the trait has no unimplemented
+    /// generation.
+    async fn task_runtime(
+        &self,
+        _http: &Transport,
+        _session_id: &str,
+        _directory: Option<&str>,
+        _shells: &[String],
+        _children: &[String],
+    ) -> Result<TaskRuntime> {
+        Ok(TaskRuntime::default())
     }
 
     /// List pending question requests for an instance (canonical:

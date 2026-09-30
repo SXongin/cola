@@ -6,6 +6,7 @@
 //! 204 mutations, the run-state derivation, the admit-then-return prompt, the
 //! session-scoped switches, and the permission/form surface.
 
+use crate::backend::{ChildRuntime, ShellEnd, ShellRuntime};
 use crate::bridge::test_support::{assert_line_level, capture_logs, level_count};
 use crate::error::BridgeError;
 use crate::opencode::client::OpenCodeBackend;
@@ -541,6 +542,185 @@ async fn session_status_surfaces_failures() {
     assert!(
         warning.contains("nope"),
         "the warning carries the body: {warning}"
+    );
+}
+
+/// The Background Task runtime reconciliation (issue #454): one location-scoped
+/// shell list, a per-shell read for every shell it does not list (a terminal
+/// record becomes its `Ended` verdict, a 404 the runtime's own `Missing`), and
+/// the global active map for the children (absent → `Inactive`, an
+/// unrecognised type → no verdict, never guessed).
+#[tokio::test]
+async fn task_runtime_reads_the_shell_registry_and_the_active_map() {
+    let server = TestHttpServer::start().await;
+    server.route(
+        "GET",
+        "/api/shell",
+        200,
+        serde_json::json!({
+            "location": {"directory": "/work/cola"},
+            "data": [
+                {"id": "sh_run", "status": "running", "time": {"started": 100}},
+                {"id": "sh_race", "status": "exited", "time": {"started": 100, "completed": 250}},
+            ],
+        })
+        .to_string(),
+    );
+    server.route(
+        "GET",
+        "/api/shell/sh_race",
+        200,
+        serde_json::json!({
+            "location": {"directory": "/work/cola"},
+            "data": {"id": "sh_race", "status": "exited", "time": {"started": 100, "completed": 250}},
+        })
+        .to_string(),
+    );
+    server.route(
+        "GET",
+        "/api/shell/sh_done",
+        200,
+        serde_json::json!({
+            "location": {"directory": "/work/cola"},
+            "data": {"id": "sh_done", "status": "killed", "time": {"started": 100, "completed": 300}},
+        })
+        .to_string(),
+    );
+    server.route(
+        "GET",
+        "/api/shell/sh_gone",
+        404,
+        r#"{"_tag":"ShellNotFoundError","message":"Shell command not found: sh_gone"}"#,
+    );
+    server.route(
+        "GET",
+        "/api/session/active",
+        200,
+        serde_json::json!({
+            "data": {"ses_child_run": {"type": "running"}, "ses_child_weird": {"type": "zombie"}},
+        })
+        .to_string(),
+    );
+    let client = v2_wire_client(&server);
+
+    let runtime = client
+        .task_runtime(
+            "ses_1",
+            Some("/work/cola"),
+            &[
+                "sh_run".into(),
+                "sh_race".into(),
+                "sh_done".into(),
+                "sh_gone".into(),
+            ],
+            &[
+                "ses_child_run".into(),
+                "ses_child_idle".into(),
+                "ses_child_weird".into(),
+            ],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(runtime.shell("sh_run"), Some(&ShellRuntime::Running));
+    assert_eq!(
+        runtime.shell("sh_race"),
+        Some(&ShellRuntime::Ended {
+            end: ShellEnd::Exited,
+            completed_at: Some(250),
+        }),
+        "a listed non-running entry falls through to the per-shell read"
+    );
+    assert_eq!(
+        runtime.shell("sh_done"),
+        Some(&ShellRuntime::Ended {
+            end: ShellEnd::Killed,
+            completed_at: Some(300),
+        })
+    );
+    assert_eq!(runtime.shell("sh_gone"), Some(&ShellRuntime::Missing));
+    assert_eq!(runtime.child("ses_child_run"), Some(ChildRuntime::Running));
+    assert_eq!(runtime.child("ses_child_idle"), Some(ChildRuntime::Inactive));
+    assert_eq!(
+        runtime.child("ses_child_weird"),
+        None,
+        "an unrecognised active type is never guessed"
+    );
+
+    // The reads: one location-scoped list, one per-shell read for the shells
+    // it did not list (in ask order; the 404 shell still pays its read), then
+    // the global active map.
+    let list = request_at(&server, 0);
+    assert_eq!(list.path, "/api/shell");
+    assert_eq!(
+        list.query_param("location[directory]").as_deref(),
+        Some("/work/cola")
+    );
+    assert_eq!(request_at(&server, 1).path, "/api/shell/sh_race");
+    assert_eq!(request_at(&server, 2).path, "/api/shell/sh_done");
+    assert_eq!(request_at(&server, 3).path, "/api/shell/sh_gone");
+    assert_eq!(request_at(&server, 4).path, "/api/session/active");
+    assert_eq!(server.request_count(), 5);
+}
+
+/// A failed shell list fails the whole read (the caller keeps the transcript
+/// as read); a failed per-shell read only drops that shell's verdict, never
+/// the other verdicts and never a guess.
+#[tokio::test]
+async fn task_runtime_degrades_one_bad_shell_read() {
+    let failed = TestHttpServer::start().await;
+    failed.route("GET", "/api/shell", 500, r#"{"message":"boom"}"#);
+    let client = v2_wire_client(&failed);
+    let message = opencode_error(
+        client
+            .task_runtime("ses_1", None, &["sh_1".into()], &[])
+            .await
+            .unwrap_err(),
+    );
+    assert!(message.contains("shell list failed"), "unexpected: {message}");
+    assert!(message.contains("500"), "unexpected: {message}");
+
+    let one_bad = TestHttpServer::start().await;
+    one_bad.route(
+        "GET",
+        "/api/shell",
+        200,
+        serde_json::json!({"data": [{"id": "sh_run", "status": "running", "time": {}}]}).to_string(),
+    );
+    one_bad.route("GET", "/api/shell/sh_bad", 500, r#"{"message":"boom"}"#);
+    one_bad.route(
+        "GET",
+        "/api/shell/sh_done",
+        200,
+        serde_json::json!({"data": {"id": "sh_done", "status": "exited", "time": {"completed": 400}}})
+            .to_string(),
+    );
+    let client = v2_wire_client(&one_bad);
+    let (runtime, logs) = capture_logs(async {
+        client
+            .task_runtime(
+                "ses_1",
+                None,
+                &["sh_run".into(), "sh_bad".into(), "sh_done".into()],
+                &[],
+            )
+            .await
+    })
+    .await;
+    let runtime = runtime.unwrap();
+    assert_eq!(runtime.shell("sh_run"), Some(&ShellRuntime::Running));
+    assert_eq!(runtime.shell("sh_bad"), None, "a failed read leaves no verdict");
+    assert_eq!(
+        runtime.shell("sh_done"),
+        Some(&ShellRuntime::Ended {
+            end: ShellEnd::Exited,
+            completed_at: Some(400),
+        })
+    );
+    let debug = assert_line_level(&logs, "shell sh_bad", "DEBUG");
+    assert!(
+        debug.contains("500"),
+        "the debug line carries the status: {debug}"
     );
 }
 

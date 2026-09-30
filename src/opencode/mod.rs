@@ -33,7 +33,7 @@ mod wire;
 
 use std::sync::Arc;
 
-use crate::backend::{Backend, BackendDirectory, DirectoryBackend, SessionTranscript};
+use crate::backend::{Backend, BackendDirectory, DirectoryBackend, SessionTranscript, TaskRuntime};
 use crate::error::Result;
 use async_trait::async_trait;
 use client::OpenCodeBackend;
@@ -160,6 +160,16 @@ impl Backend for OpenCodeBackend {
         directory: Option<&str>,
     ) -> Result<Option<SessionStatus>> {
         OpenCodeBackend::session_status(self, session_id, directory).await
+    }
+
+    async fn task_runtime(
+        &self,
+        session_id: &str,
+        directory: Option<&str>,
+        shells: &[String],
+        children: &[String],
+    ) -> Result<TaskRuntime> {
+        OpenCodeBackend::task_runtime(self, session_id, directory, shells, children).await
     }
 
     async fn model_context_window(&self, provider: &str, model: &str) -> Result<Option<i64>> {

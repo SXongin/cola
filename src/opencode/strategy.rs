@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::backend::SessionTranscript;
+use crate::backend::{SessionTranscript, TaskRuntime};
 use crate::error::Result;
 
 use super::transport::Transport;
@@ -173,6 +173,20 @@ pub(crate) trait GenerationStrategy: Send + Sync {
         session_id: &str,
         directory: Option<&str>,
     ) -> Result<Option<SessionStatus>>;
+
+    /// The runtime verdict for the named Background Tasks of one session (V2:
+    /// `GET /api/shell` for the location's running shells, `GET
+    /// /api/shell/{id}` for the ones it no longer lists, and `GET
+    /// /api/session/active` for subagent child sessions). V1 carries no
+    /// Background Tasks and answers an empty read without a request.
+    async fn task_runtime(
+        &self,
+        http: &Transport,
+        session_id: &str,
+        directory: Option<&str>,
+        shells: &[String],
+        children: &[String],
+    ) -> Result<TaskRuntime>;
 
     async fn model_context_window(
         &self,

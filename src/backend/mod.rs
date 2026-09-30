@@ -296,6 +296,24 @@ pub trait Backend: Send + Sync {
         directory: Option<&str>,
     ) -> Result<Option<SessionStatus>>;
 
+    /// The runtime verdict for the named Background Tasks of one session
+    /// (issue #454; V2 reads `GET /api/shell` + `GET /api/shell/{id}` + `GET
+    /// /api/session/active`). `shells` and `children` are the task identities
+    /// the caller cares about; every id the read can place gets a verdict, and
+    /// an id left out is no evidence — the caller must not guess from absence.
+    ///
+    /// The reads are process-local to the attached server: a restarted server
+    /// answers `Missing` for shells it never hosted. V1 carries no Background
+    /// Tasks, so its callers never ask (it still answers an empty read without
+    /// a request).
+    async fn task_runtime(
+        &self,
+        session_id: &str,
+        directory: Option<&str>,
+        shells: &[String],
+        children: &[String],
+    ) -> Result<TaskRuntime>;
+
     /// The model's context-window size (tokens), from `GET /provider`. Used to
     /// compute the context-usage ratio for the card footer. Best-effort: None
     /// when the provider/model can't be resolved.

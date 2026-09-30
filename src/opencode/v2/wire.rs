@@ -30,9 +30,9 @@ use serde_json::Value;
 
 use crate::backend::{
     BackgroundLaunch, BackgroundTask, ContentBlock, Execution, ExecutionOutcome, FinishReason, MessageId,
-    MessageRole, MessageTime, ModelIdentity, OtherPart, Part, ReasoningPart, SessionTranscript, StepFinish,
-    TextPart, TokenUsage, ToolCall, ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage, Wake,
-    WakeSource,
+    MessageRole, MessageTime, ModelIdentity, OtherPart, Part, ReasoningPart, SessionTranscript, ShellEnd,
+    ShellRuntime, StepFinish, TextPart, TokenUsage, ToolCall, ToolIdentity, ToolOutput, ToolStatus,
+    TranscriptMessage, Wake, WakeSource,
 };
 use crate::opencode::types::{
     AgentInfo, FormFieldKind, ModelInfo, ModelOption, PermissionRequest, QuestionInfo, QuestionOption,
@@ -259,6 +259,61 @@ impl ActiveSessions {
         self.data
             .get(session_id)
             .map(|entry| entry.get("type").and_then(Value::as_str) == Some("running"))
+    }
+}
+
+/// `GET /api/shell` — `{location, data: Shell.Info[]}`. The list carries only
+/// currently running shells; exited ones are retained for `get`/`output` only,
+/// so a shell absent from the list is asked about individually.
+#[derive(Debug, Deserialize)]
+pub(super) struct ShellList {
+    #[serde(default)]
+    pub(super) data: Vec<RawShell>,
+}
+
+/// One `Shell.Info` as the runtime read uses it: identity, status and
+/// completion time. `metadata`/`command`/`cwd`/`exit` are deliberately not
+/// decoded — the transcript already owns the task's label and times, and the
+/// neutral verdict carries the terminal status the copy reads.
+#[derive(Debug, Deserialize)]
+pub(super) struct RawShell {
+    pub(super) id: String,
+    pub(super) status: String,
+    #[serde(default)]
+    pub(super) time: Option<RawShellTime>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct RawShellTime {
+    #[serde(default)]
+    pub(super) completed: Option<i64>,
+}
+
+impl RawShell {
+    /// This shell's neutral runtime verdict: `running` stays live, the three
+    /// documented terminal statuses map to their [`ShellEnd`] arm, and a status
+    /// this build does not know stays verbatim (never misread as success).
+    pub(super) fn into_runtime(self) -> ShellRuntime {
+        let completed_at = self.time.and_then(|time| time.completed);
+        match self.status.as_str() {
+            "running" => ShellRuntime::Running,
+            "exited" => ShellRuntime::Ended {
+                end: ShellEnd::Exited,
+                completed_at,
+            },
+            "timeout" => ShellRuntime::Ended {
+                end: ShellEnd::Timeout,
+                completed_at,
+            },
+            "killed" => ShellRuntime::Ended {
+                end: ShellEnd::Killed,
+                completed_at,
+            },
+            other => ShellRuntime::Ended {
+                end: ShellEnd::Other(other.to_string()),
+                completed_at,
+            },
+        }
     }
 }
 
