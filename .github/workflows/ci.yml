@@ -226,6 +226,24 @@ jobs:
           !startsWith(github.head_ref || '', 'release/')
         run: cargo test --workspace --locked
 
+  docs-drift:
+    # The zh-CN user guide must stay structurally in step with its English
+    # source (docs/user-guide.md). Deliberately NOT gated by `classify`: a
+    # docs-only PR is classified `heavy=false` and skips every code job — and
+    # is exactly the PR that edits the guide pair, so this guard must still
+    # run there. Required by the `main: CI` ruleset; it needs only a checkout
+    # and the toolchain.
+    name: Docs drift
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Docs drift (zh-CN vs English)
+        run: cargo xtask check-doc-drift
+
   audit:
     name: Dependency audit
     runs-on: ubuntu-latest

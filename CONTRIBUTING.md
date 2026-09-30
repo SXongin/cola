@@ -116,6 +116,7 @@ Commits, `pre-push` runs the dependency audit. The full loop CI runs:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo xtask check-generation
+cargo xtask check-doc-drift
 cargo test --workspace --locked
 cargo build --release --locked
 ```
@@ -124,6 +125,13 @@ cargo build --release --locked
 literals and wire field names may live only in the V1 generation strategy
 (`src/opencode/v1/`) or the explicitly allow-listed tool-render surface, so V1
 retirement stays a deletion rather than a scavenger hunt.
+
+`cargo xtask check-doc-drift` is the translation drift guard: it compares the
+Simplified Chinese user guide (`docs/user-guide.zh-CN.md`) with its English
+source (`docs/user-guide.md`) structurally — heading levels, fenced code
+blocks, table shapes, indented code blocks, links and in-page anchors. Prose is
+translated and never compared; a source edit that adds or removes structure
+fails CI until the translation follows.
 
 Note: CI's Format job is `cargo fmt --all -- --check` — clippy and rustc do
 **not** check formatting, so a clean clippy does not mean a clean fmt.
@@ -150,10 +158,10 @@ newly published RUSTSEC advisories surface even when nothing is pushed.
    and explicit go-ahead before merging (see *Branch workflow*; the release cut
    is the ADR-0033 exception).
 
-The `main: CI` ruleset requires seven checks: `Format`, `Check`,
-`Test (macos-latest)`, `Test (windows-latest)`, `Live V1`, `Live V2` and
-`Dependency audit` — judge merge-readiness with `gh pr checks <branch>
---required`, not by eyeballing every check. CodeQL also runs on PRs, but it is
+The `main: CI` ruleset requires eight checks: `Format`, `Check`,
+`Test (macos-latest)`, `Test (windows-latest)`, `Live V1`, `Live V2`,
+`Dependency audit` and `Docs drift` — judge merge-readiness with `gh pr checks
+<branch> --required`, not by eyeballing every check. CodeQL also runs on PRs, but it is
 advisory: it is not a required check, so a slow or red CodeQL result never
 blocks a normal merge. The release cut is the one flow that makes it required
 (its watch covers every check).
@@ -165,7 +173,9 @@ ruleset and the PR stays mergeable without running the code-dependent gates.
 The Test matrix and the two live jobs still dispatch (idling for a few
 seconds) — a job-level skip leaves the matrix unexpanded or the required
 `Live V1`/`Live V2` checks unreported, so only their steps are gated.
-`Dependency audit` always runs, and the release cut keeps its CodeQL gate.
+`Dependency audit` and `Docs drift` always run: the drift guard is not gated by
+`classify` precisely because a docs-only PR, which skips every code gate, is
+where the guide pair can drift. The release cut keeps its CodeQL gate.
 
 ### Security scanning alerts
 

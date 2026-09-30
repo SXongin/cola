@@ -17,6 +17,7 @@ These are the CI gates and the pre-PR bar:
 | Format | `cargo fmt --all -- --check` | CI's Format job; clippy and rustc do **not** check formatting |
 | Lints | `cargo clippy --workspace --all-targets -- -D warnings` | zero warnings, `-D warnings` |
 | Generation guard | `cargo xtask check-generation` | V1 route literals and wire field names stay inside `src/opencode/v1/` (plus the tool-render allow-list); CI's Check job |
+| Docs drift | `cargo xtask check-doc-drift` | `docs/user-guide.zh-CN.md` stays structurally in sync with its English source (headings, code blocks, table shapes, links); CI's Docs drift job, which also runs on docs-only PRs |
 | Tests | `cargo test --workspace --locked` | unit + integration (`src/bridge/test_support.rs`) |
 | Build | `cargo build --release --locked` | `--locked` keeps the lockfile authoritative |
 | Dep audit | `cargo xtask audit` | cargo-deny over `deny.toml`; also runs in CI |

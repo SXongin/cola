@@ -1,12 +1,17 @@
+use std::path::{Path, PathBuf};
 use std::process::{Command, exit};
 
+mod doc_drift;
 mod generation_guard;
 mod release;
 
 fn main() {
     let task = std::env::args().nth(1).unwrap_or_else(|| {
         eprintln!("Usage: cargo xtask <task>");
-        eprintln!("Tasks: check, test, clippy, fmt, audit, check-commit-msg, check-generation, release");
+        eprintln!(
+            "Tasks: check, test, clippy, fmt, audit, check-commit-msg, check-generation, \
+             check-doc-drift, release"
+        );
         exit(1);
     });
 
@@ -18,15 +23,24 @@ fn main() {
         "audit" => run_audit(),
         "check-commit-msg" => run_check_commit_msg(),
         "check-generation" => generation_guard::run(),
+        "check-doc-drift" => doc_drift::run(),
         "release" => release::cli(),
         other => {
             eprintln!(
                 "Unknown task: {other}. Available: check, test, clippy, fmt, audit, check-commit-msg, \
-                 check-generation, release"
+                 check-generation, check-doc-drift, release"
             );
             exit(1);
         }
     }
+}
+
+/// The repository root: xtask lives directly under it.
+pub(crate) fn repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("xtask lives under the repository root")
+        .to_path_buf()
 }
 
 fn run_check_commit_msg() {
