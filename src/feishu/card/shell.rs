@@ -640,6 +640,7 @@ mod tests {
             kind: TaskKind::Shell,
             label: Some("a <number_tag> | b".into()),
             started_at: Some(start),
+            unconfirmed: false,
         }];
         let card = CardBuilder::new()
             .with_state(CardState::Streaming)
@@ -710,7 +711,7 @@ mod tests {
     /// stable element id for the reader's fold state.
     #[test]
     fn task_entry_renders_a_folded_panel_where_it_is_called() {
-        use crate::feishu::card::ledger::{TaskCompletionEntry, TaskKind};
+        use crate::feishu::card::ledger::{TaskCompletionEntry, TaskEnding, TaskKind};
 
         let finished = crate::feishu::card::test_local_ms(2026, 9, 29, 14, 2);
         let entry = TaskCompletionEntry {
@@ -718,7 +719,8 @@ mod tests {
             label: Some("gh run watch".into()),
             id: Some("sh_abc".into()),
             started_at: Some(finished - 12 * 60_000),
-            finished_at: finished,
+            finished_at: Some(finished),
+            ending: TaskEnding::Wake { state: None },
         };
         let card = CardBuilder::new()
             .with_state(CardState::Streaming)

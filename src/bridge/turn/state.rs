@@ -2069,6 +2069,10 @@ fn ledger_rows(transcript: &SessionTranscript) -> Vec<TaskLedgerRow> {
                 kind,
                 label: task_label(kind, inputs.get(task.tool.call_id.as_str()).copied()),
                 started_at: task.started_at,
+                // A task the runtime could not confirm (issue #454): the row
+                // renders its own facts plus the unconfirmed marker, and stays
+                // live until its Wake or a positive terminal verdict retires it.
+                unconfirmed: transcript.unconfirmed_tasks.contains(task.tool.call_id.as_str()),
             }
         })
         .collect()
@@ -2077,7 +2081,7 @@ fn ledger_rows(transcript: &SessionTranscript) -> Vec<TaskLedgerRow> {
 /// The ledger kind of a Background Task's tool. Only `shell` and `subagent`
 /// ever background through the V2 tool shape (`decode_background_task` returns
 /// `None` for every other name), so the pair is matched once, here.
-fn task_kind(tool: &str) -> TaskKind {
+pub(super) fn task_kind(tool: &str) -> TaskKind {
     match tool {
         "subagent" => TaskKind::Subagent,
         _ => TaskKind::Shell,
@@ -2089,7 +2093,7 @@ fn task_kind(tool: &str) -> TaskKind {
 /// command), the subagent's `description` — the `subagent` arm nothing else
 /// needed. `None` when the input names no label, so the row renders bare
 /// rather than inventing one (the completion entry's own rule).
-fn task_label(kind: TaskKind, input: Option<&serde_json::Value>) -> Option<String> {
+pub(super) fn task_label(kind: TaskKind, input: Option<&serde_json::Value>) -> Option<String> {
     let label = match kind {
         TaskKind::Shell => input
             .and_then(|input| input.get("command"))
@@ -2607,6 +2611,7 @@ mod tests {
                 kind: TaskKind::Shell,
                 label: Some("npm run build".into()),
                 started_at: None,
+                unconfirmed: false,
             }],
             0,
             LedgerCadence::Minute,
@@ -2655,6 +2660,7 @@ mod tests {
                 kind: TaskKind::Shell,
                 label: Some("npm run build".into()),
                 started_at: Some(start),
+                unconfirmed: false,
             }]
         };
         let cadence = |acc: &mut StreamAccumulator, at: i64, cadence| acc.set_ledger(rows(), at, cadence);
@@ -2694,6 +2700,7 @@ mod tests {
                 kind: TaskKind::Subagent,
                 label: Some("review the diff".into()),
                 started_at: None,
+                unconfirmed: false,
             }]
         };
         let mut acc = StreamAccumulator::new("test");
