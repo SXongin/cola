@@ -1036,6 +1036,177 @@ async fn external_reply_render_times_out_and_finalizes_partial_content() {
     );
 }
 
+/// #451: a Feishu Supplement landing during an external follow is a
+/// cola-authored message merged into the SAME run — only a newer EXTERNAL
+/// message is a turn boundary (ADR-0028). Before the fix the follow's renderer
+/// exited silently on the newest-user check; the Wake step then declined (the
+/// chain was still owned) and the reap deferred (the card was still held), so
+/// the card stranded while the run kept working. The follow must keep
+/// streaming the continuation into the same card until the true end.
+#[tokio::test]
+async fn external_render_follows_a_supplement_into_the_continuation() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut mock = MockBackend::new(realistic_parts());
+    // A fixed server time so the supplement is unambiguously newer than the
+    // external turn's anchor.
+    mock.external_message("OpenChamber 里发的消息");
+    mock.external_message_created_at(2_000_000);
+    mock.external_reply(vec![text_part("前半回答。")])
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    // Keep the concrete backend: the test swaps its scripted transcript
+    // mid-life to land the supplement and the continuation.
+    let backend = Arc::new(mock);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
+            session_id: "ses_ext".into(),
+            directory: "/tmp/ext".into(),
+            agent: None,
+            model: None,
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        },
+    )
+    .await;
+    app.external
+        .render_poll_ms
+        .store(5, std::sync::atomic::Ordering::Relaxed);
+    // The production 10-minute cap stays out of the way: the terminal
+    // step-finish is the true end this test drives.
+    app.external
+        .render_timeout_ms
+        .store(3_600_000, std::sync::atomic::Ordering::Relaxed);
+
+    let anchor = TurnAnchor {
+        message_id: MessageId::new("msg_ext_user"),
+        created_ms: 2_000_000,
+    };
+    app.external
+        .start_reply_render(
+            &app.flow_handles(),
+            "ses_ext",
+            &anchor,
+            "msg_sent",
+            "OpenChamber 里发的消息",
+        )
+        .await;
+    wait_for_card_update(
+        &platform,
+        "the pre-supplement reply",
+        CardUpdates::Latest,
+        |card| card_text(card).contains("前半回答"),
+    )
+    .await;
+
+    // The Supplement lands (a cola-authored user message merged into THIS
+    // run) and the run keeps working: more output, no terminal finish yet.
+    // Consuming THIS read is the render the old boundary check killed.
+    let external = || {
+        typed_message(
+            "msg_ext_user",
+            MessageRole::User,
+            Some(2_000_000),
+            vec![text_part("OpenChamber 里发的消息")],
+        )
+    };
+    let first_reply = || {
+        typed_message(
+            "msg_ext_assist",
+            MessageRole::Assistant,
+            Some(2_001_000),
+            vec![text_part("前半回答。")],
+        )
+    };
+    let supplement = || {
+        typed_message(
+            "msg_cola_supplement",
+            MessageRole::User,
+            Some(2_002_000),
+            vec![text_part("补充")],
+        )
+    };
+    let mid = || {
+        typed_message(
+            "msg_ext_assist_2",
+            MessageRole::Assistant,
+            Some(2_003_000),
+            vec![text_part("补充后的中间内容。")],
+        )
+    };
+    backend
+        .given_transcript_after_build(
+            "ses_ext",
+            vec![SessionTranscript::new(vec![
+                external(),
+                first_reply(),
+                supplement(),
+                mid(),
+            ])],
+        )
+        .await;
+    wait_for_card_update(
+        &platform,
+        "the merged continuation",
+        CardUpdates::Latest,
+        |card| card_text(card).contains("补充后的中间内容"),
+    )
+    .await;
+
+    // The merged run finishes: the follow must still be attached, render the
+    // rest and end the card Done.
+    let tail = || {
+        typed_message(
+            "msg_ext_assist_3",
+            MessageRole::Assistant,
+            Some(2_004_000),
+            vec![
+                text_part("补充之后的回答。"),
+                Part::StepFinish(StepFinish {
+                    reason: FinishReason::Stop,
+                }),
+            ],
+        )
+    };
+    backend
+        .given_transcript_after_build(
+            "ses_ext",
+            vec![SessionTranscript::new(vec![
+                external(),
+                first_reply(),
+                supplement(),
+                mid(),
+                tail(),
+            ])],
+        )
+        .await;
+    wait_for_card_update(
+        &platform,
+        "the continuation's true end",
+        CardUpdates::Latest,
+        |card| card_text(card).contains("补充之后的回答"),
+    )
+    .await;
+    wait_for_card_update(
+        &platform,
+        "the finalized continuation",
+        CardUpdates::Latest,
+        |card| card_header(card).contains("完成") || card_header(card).contains("✓"),
+    )
+    .await;
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_ext").await,
+        Some(crate::feishu::card::CardState::Done),
+        "the follow rendered the merged run to its true end"
+    );
+}
+
 /// A deliberate `/stop` on a live EXTERNAL run finalizes the notification card
 /// ⏹ 已停止, never ✅ (#394) — the external renderer owns that card, so it must
 /// hold up the "a render-owned card stamps the stop" invariant the command

@@ -404,8 +404,9 @@ impl ExternalFlow {
     /// Arm an incremental renderer that streams the model's reply to the
     /// external message INTO the notification card (update in place — no
     /// second card). The loop exits when the turn finishes, cola's own prompt
-    /// (or a newer external message) replaces the accumulator, a newer user
-    /// message starts a new turn, or a hard timeout elapses.
+    /// (or a newer external message) replaces the accumulator, a newer EXTERNAL
+    /// message starts a new turn, or a hard timeout elapses — a cola-authored
+    /// Supplement merges into the run it is already streaming (#451).
     pub(crate) async fn start_reply_render(
         &self,
         handles: &FlowHandles,
@@ -954,8 +955,10 @@ pub(crate) async fn settle_snapshot_after_send(
 /// stream reasoning/tool/text into the notification card, then finalize it as
 /// Done when the model finishes — or ⏹ 已停止 when a deliberate `/stop` lands
 /// on the run it renders (#394). Exits when the turn completes, the accumulator
-/// was replaced (cola's own prompt or a newer external message), a newer user
-/// message starts a new turn, or the hard timeout elapses.
+/// was replaced (cola's own prompt or a newer external message), a newer
+/// EXTERNAL user message starts a new turn, or the hard timeout elapses — a
+/// cola-authored Supplement merges into the run this loop is already streaming
+/// (#451).
 async fn external_render_loop(
     handles: &FlowHandles,
     session_id: String,
@@ -1021,13 +1024,20 @@ async fn external_render_loop(
             tracing::info!("external reply rendered: session {} done", session_id);
             break;
         }
-        // A NEWER user message is a turn boundary — the poller notifies and
-        // arms a fresh renderer for it. The boundary stays time-based (the
-        // pre-migration rule: strictly greater server time wins) because a
-        // same-millisecond message cannot be ordered by server time; the
-        // armed-renderer guards above use full-anchor identity instead.
+        // A NEWER EXTERNAL user message is a turn boundary — the poller
+        // notifies and arms a fresh renderer for it (ADR-0028). A message cola
+        // authored itself is NOT: a Supplement merges into THIS run and keeps
+        // streaming into this card (#451), while a genuine new Turn replaces
+        // the accumulator and is already caught by the `replaced` guard above.
+        // Both this boundary and the poller key on the session's newest user
+        // message, so the two agree on which message is the boundary. The
+        // boundary stays time-based (the pre-migration rule: strictly greater
+        // server time wins) because a same-millisecond message cannot be
+        // ordered by server time; the armed-renderer guards above use
+        // full-anchor identity instead.
         let newer_turn = transcript
             .newest_user()
+            .filter(|message| !crate::opencode::parsing::is_cola_message_id(message.id.as_str()))
             .and_then(|message| message.anchor())
             .is_some_and(|newest| newest.created_ms > anchor.created_ms);
         if newer_turn {
