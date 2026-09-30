@@ -39,3 +39,14 @@ continuation chain — must still say which model is answering; previously it
 dropped the line, which read as data loss. The 📊 context-window ratio stays
 final-card-only, because it is genuinely computed only at turn end. Source:
 reported split-card footer missing the model.
+
+## Amendment (2026-09-30): a worktree Session is marked
+
+A Session can move itself into a linked git worktree (#433). The 📁 segment now
+marks such a session with 🌲 between the project basename and the branch —
+`📁 zh-user-guide 🌲 · docs/zh-user-guide` — so a worktree's directory name
+reads as a worktree context rather than a bare branch. Detection is one extra
+`git rev-parse --git-dir --git-common-dir` per work-context read (start and
+end): a turn's git subprocess count goes from four to six. A main checkout and
+a submodule resolve the two paths to one directory and are not marked. Source:
+#433.
