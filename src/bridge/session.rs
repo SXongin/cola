@@ -260,28 +260,40 @@ impl SessionStore {
         Ok(Some(updated))
     }
 
-    /// Follow a Session's server-reported location (#433): set the mapped
-    /// directory in place and persist, leaving every other field — the thread
-    /// key, the topic anchors, the per-session overrides — untouched. A
+    /// Follow the mapped Sessions' server-reported locations (#433): a
     /// Session can move itself into another directory mid-life (the git
-    /// worktree flow); the directory-routed reads must follow. Returns the
-    /// previous directory when the mapping moved, `None` when the session is
-    /// not mapped or already points at `directory` — so a steady-state sync
-    /// pass neither rewrites the store nor claims a move.
-    pub fn update_directory(
+    /// worktree flow), and the directory-routed reads must follow.
+    /// `locations` is the server's session list as `(session id, directory)`
+    /// pairs; a mapped session whose directory differs follows it in place —
+    /// every other field (the thread key, the topic anchors, the per-session
+    /// overrides) stays untouched — and the store is persisted once, only
+    /// when at least one mapping moved. Returns the pre-follow directory of
+    /// every moved session, so the live-card reap keeps the directory the
+    /// card was tracked under as its move baseline (#439). Two spellings of
+    /// one directory (a trailing slash, repeated separators) are not a move.
+    pub fn follow_locations(
         &mut self,
-        session_id: &str,
-        directory: &str,
-    ) -> crate::error::Result<Option<String>> {
-        let Some(entry) = self.entries.iter_mut().find(|e| e.session_id == session_id) else {
-            return Ok(None);
-        };
-        if entry.directory == directory {
-            return Ok(None);
+        locations: &[(String, String)],
+    ) -> crate::error::Result<Vec<(String, String)>> {
+        let listed: std::collections::HashMap<&str, &str> = locations
+            .iter()
+            .map(|(session_id, directory)| (session_id.as_str(), directory.as_str()))
+            .collect();
+        let mut moved = Vec::new();
+        for entry in &mut self.entries {
+            let Some(directory) = listed.get(entry.session_id.as_str()) else {
+                continue;
+            };
+            if same_directory(&entry.directory, directory) {
+                continue;
+            }
+            let previous = std::mem::replace(&mut entry.directory, (*directory).to_string());
+            moved.push((entry.session_id.clone(), previous));
         }
-        let previous = std::mem::replace(&mut entry.directory, directory.to_string());
-        self.write_to_disk()?;
-        Ok(Some(previous))
+        if !moved.is_empty() {
+            self.write_to_disk()?;
+        }
+        Ok(moved)
     }
 
     /// Mutate the conversation's Pending Session in place and persist,
@@ -466,6 +478,15 @@ impl SessionStore {
     }
 }
 
+/// Whether two directory spellings name the same path, without touching the
+/// filesystem: an exact match, or the same path components (a trailing slash,
+/// doubled separators). A spelling-only difference must not report a move —
+/// that would rewrite the store, log a move and stamp 「会话已迁移」 on the
+/// card every pass for a Session that never moved (#433).
+fn same_directory(a: &str, b: &str) -> bool {
+    a == b || std::path::Path::new(a) == std::path::Path::new(b)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -540,6 +561,53 @@ mod tests {
         let found = store2.get_active(&ThreadKey::new("chat1".into(), "root1".into()));
         assert!(found.is_some());
         assert_eq!(found.unwrap().directory, "/tmp/x");
+    }
+
+    /// Following the server's locations updates only the moved sessions and
+    /// reports their pre-follow directory; a spelling-only difference and an
+    /// unmapped session change nothing (#433).
+    #[test]
+    fn follow_locations_moves_only_real_changes() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let mut store = SessionStore::new(path).unwrap();
+        store.set_active(make_entry("chat1", "root1", "ses_a", "/work/proj"));
+        store.set_active(make_entry("chat2", "root2", "ses_b", "/work/other"));
+
+        let locations = |a: &str, b: &str| {
+            vec![
+                ("ses_a".to_string(), a.to_string()),
+                ("ses_b".to_string(), b.to_string()),
+                ("ses_unmapped".to_string(), "/work/new".to_string()),
+            ]
+        };
+
+        // The trailing slash is the same directory: no move, no write.
+        let moved = store
+            .follow_locations(&locations("/work/proj/", "/work/other"))
+            .unwrap();
+        assert!(moved.is_empty(), "a spelling difference is not a move: {moved:?}");
+
+        // A different directory is: the previous one is reported and the
+        // mapping follows.
+        let moved = store
+            .follow_locations(&locations("/work/other", "/work/.worktrees/x"))
+            .unwrap();
+        assert_eq!(moved.len(), 2, "both real moves reported: {moved:?}");
+        assert_eq!(
+            store.directory_for_session("ses_a").as_deref(),
+            Some("/work/other")
+        );
+        assert_eq!(
+            store.directory_for_session("ses_b").as_deref(),
+            Some("/work/.worktrees/x")
+        );
+        let reloaded = SessionStore::new(dir.path().join("sessions.json")).unwrap();
+        assert_eq!(
+            reloaded.directory_for_session("ses_b").as_deref(),
+            Some("/work/.worktrees/x"),
+            "the move is persisted"
+        );
     }
 
     #[test]

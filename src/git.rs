@@ -62,7 +62,9 @@ async fn linked_worktree(dir: &str) -> bool {
     };
     let mut lines = paths.lines();
     match (lines.next(), lines.next()) {
-        (Some(git_dir), Some(common_dir)) => resolve(dir, git_dir) != resolve(dir, common_dir),
+        (Some(git_dir), Some(common_dir)) => {
+            resolve_git_path(dir, git_dir) != resolve_git_path(dir, common_dir)
+        }
         _ => false,
     }
 }
@@ -71,7 +73,7 @@ async fn linked_worktree(dir: &str) -> bool {
 /// one, canonicalized so `.`/`..` spellings and symlinks compare equal. The
 /// path exists whenever git printed it; when canonicalization fails anyway,
 /// the joined path still normalizes the common cases.
-fn resolve(dir: &str, path: &str) -> std::path::PathBuf {
+fn resolve_git_path(dir: &str, path: &str) -> std::path::PathBuf {
     let joined = if std::path::Path::new(path).is_absolute() {
         std::path::PathBuf::from(path)
     } else {
