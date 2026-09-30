@@ -38,6 +38,13 @@ pub enum CardState {
     /// chain on a new continuation card; a later Turn supersedes this one or a
     /// switch-away collects it (spec #405).
     Waiting,
+    /// A card whose Turn's submitted message never reached the session
+    /// transcript and whose Session is not live (ADR-0062): a steered admit
+    /// no runner promoted, so nobody will answer it. Header
+    /// 「⚠️ 这条消息未被接收」, terminal and never ✅ — the card offers the
+    /// 重新发起 action (#437). Distinct from `Error`: nothing failed, the
+    /// message was simply never received.
+    Unreceived,
     /// A waiting card collected because a new Turn in the thread superseded it
     /// (ADR-0059, spec #405): header 「⏳ 部分完成 · 已由新消息接管」. Terminal —
     /// the card stops updating — and no Completion Notice follows (the notice
@@ -54,19 +61,26 @@ pub enum CardState {
 
 impl CardState {
     /// Whether this state ends the card's lifecycle: no more content arrives,
-    /// the header timer stops, and the only action left is the Error card's
-    /// retry. `Continued` is NOT terminal — the chain continues on a new card —
-    /// and neither is `Waiting`: the Turn's Background Tasks are still live and
-    /// a Wake will continue its chain on a new card (ADR-0059). The collected
-    /// waiting states (`Superseded`, `SwitchedAway`) ARE terminal: the wait is
-    /// over even though its background work is not, so the card stops updating
-    /// (ADR-0059).
+    /// the header timer stops, and the only actions left are the ending's own
+    /// recovery ones (the Error card's retry; the Unreceived card's 重新发起,
+    /// spec #434). `Continued` is NOT terminal — the chain continues on a new
+    /// card — and neither is `Waiting`: the Turn's Background Tasks are still
+    /// live and a Wake will continue its chain on a new card (ADR-0059). The
+    /// collected waiting states (`Superseded`, `SwitchedAway`) ARE terminal:
+    /// the wait is over even though its background work is not, so the card
+    /// stops updating (ADR-0059).
     /// One definition, so a new terminal state (#394's `Stopped`) cannot leave
     /// a probe reading the set differently.
     pub(crate) fn is_terminal(&self) -> bool {
         matches!(
             self,
-            Self::Done | Self::Error | Self::Retried | Self::Stopped | Self::Superseded | Self::SwitchedAway
+            Self::Done
+                | Self::Error
+                | Self::Retried
+                | Self::Stopped
+                | Self::Unreceived
+                | Self::Superseded
+                | Self::SwitchedAway
         )
     }
 
@@ -341,11 +355,23 @@ mod tests {
             CardState::Retried,
             CardState::Stopped,
             CardState::Waiting,
+            CardState::Unreceived,
             CardState::Superseded,
             CardState::SwitchedAway,
         ] {
             assert!(state.overrides_awaiting(), "{state:?} has its own ending to show");
         }
+    }
+
+    /// The Unreceived ending (ADR-0062) is terminal — the card stops updating
+    /// and its 重新发起 action is the only way forward (#437) — and never
+    /// render-owned, so the prompt router and the Wake step see no live chain
+    /// over a message nobody will answer.
+    #[test]
+    fn the_unreceived_ending_is_terminal_and_not_render_owned() {
+        assert!(CardState::Unreceived.is_terminal());
+        assert!(!CardState::Unreceived.is_render_owned());
+        assert!(CardState::Unreceived.overrides_awaiting());
     }
 
     /// The collected waiting states (ADR-0059) are terminal — the card stops

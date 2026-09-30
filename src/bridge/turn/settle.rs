@@ -1,7 +1,7 @@
-//! The out-of-turn settle loop the follow and the Wake continuation share
-//! (ADR-0059).
+//! The out-of-turn settle loop the follow, the unreceived watch and the Wake
+//! continuation share (ADR-0059, ADR-0062).
 //!
-//! Both loops watch a card no live Turn owns: they poll the Session's
+//! Each loop watches a card no live Turn owns: they poll the Session's
 //! transcript and status on an injected cadence, stream into the card, and end
 //! through the single settle decision — never from a terminal step — with no
 //! total budget. The only ceilings are the two graces for states nobody can
@@ -10,20 +10,23 @@
 //! readable, settled card still carries a `⏳` panel). A `/stop` ends either
 //! loop promptly in the stop terminal (#394), after one last reconcile render.
 //!
-//! The two loops differ in exactly two facts, both parameters here:
+//! The loops differ in exactly two facts, both parameters here:
 //!
 //! - **what owns the card** ([`Ownership`]): the follow watches the
-//!   accumulator's Turn anchor, while a Wake continuation watches the chain
-//!   identity — a Wake continues the SAME Turn, so the anchor cannot tell its
-//!   loop apart from a new Turn's;
+//!   accumulator's Turn anchor — or, before the submitted message has landed,
+//!   the card's chain identity (the unreceived watch: it captures the anchor
+//!   the moment the message appears, and ends the card Unreceived when the
+//!   session idles first); a Wake continuation watches the chain identity — a
+//!   Wake continues the SAME Turn, so the anchor cannot tell its loop apart
+//!   from a new Turn's;
 //! - **what an ending means**: the follow announces the Turn's true end with a
 //!   Completion Notice, while a Wake continuation is itself the notification.
 //!   The loop therefore only decides ([`Ending`]) and stamps
 //!   ([`stamp`]) — its callers add their own announcement.
 //!
-//! Everything else — the reads, the contact bookkeeping, the panel grace and
-//! the settle dispatch — lives here once, so a fix to one loop cannot leave
-//! the other diverged.
+//! Everything else — the reads, the contact bookkeeping, the panel grace, the
+//! unreceived watch's waiting hint and the settle dispatch — lives here once,
+//! so a fix to one loop cannot leave the other diverged.
 
 use crate::backend::{TurnAnchor, TurnSettle};
 use crate::bridge::handles::{CardsHandle, FlowHandles};
@@ -42,6 +45,19 @@ pub(super) enum Ownership {
     /// settle decision's scope: the Turn's own anchor for a chain
     /// continuation, the newest Wake's for a fresh (restart) card.
     Chain { chain: u64, anchor: TurnAnchor },
+    /// The unreceived watch (ADR-0062): a follow whose Turn's submitted
+    /// message has not landed yet. No Turn anchor exists, so the card's chain
+    /// identity is the ownership — it survives a Supplement split and dies
+    /// with a new Turn — and the settle decision's anchor is captured from
+    /// the transcript the moment `submitted` appears. `hint_at` is when the
+    /// neutral waiting line is due: the Turn's start plus the follow grace,
+    /// so cola does not nag while a genuine long tool call could still merge
+    /// the message.
+    Unlanded {
+        chain: u64,
+        submitted: String,
+        hint_at: std::time::Instant,
+    },
 }
 
 impl Ownership {
@@ -55,14 +71,36 @@ impl Ownership {
             Self::TurnAnchor(anchor) => {
                 Turn::armed_turn_anchor(cards, session_id).await.as_ref() == Some(anchor)
             }
-            Self::Chain { chain, .. } => Turn::chain_id(cards, session_id).await == Some(*chain),
+            Self::Chain { chain, .. } | Self::Unlanded { chain, .. } => {
+                Turn::chain_id(cards, session_id).await == Some(*chain)
+            }
         }
     }
 
-    /// The Turn anchor the settle decision reads.
-    fn anchor(&self) -> &TurnAnchor {
+    /// The Turn anchor the settle decision reads; `None` for the unreceived
+    /// watch until the loop captures the landed message's anchor.
+    fn anchor(&self) -> Option<&TurnAnchor> {
         match self {
-            Self::TurnAnchor(anchor) | Self::Chain { anchor, .. } => anchor,
+            Self::TurnAnchor(anchor) | Self::Chain { anchor, .. } => Some(anchor),
+            Self::Unlanded { .. } => None,
+        }
+    }
+
+    /// The submitted message id the unreceived watch captures its anchor
+    /// from; `None` for a loop that already has one.
+    fn submitted(&self) -> Option<&str> {
+        match self {
+            Self::Unlanded { submitted, .. } => Some(submitted),
+            _ => None,
+        }
+    }
+
+    /// When the neutral waiting line is due; `None` for a loop whose message
+    /// already landed (it never shows the line).
+    fn hint_at(&self) -> Option<std::time::Instant> {
+        match self {
+            Self::Unlanded { hint_at, .. } => Some(*hint_at),
+            _ => None,
         }
     }
 
@@ -70,7 +108,7 @@ impl Ownership {
     /// variant, so the guard and the name always travel together.
     fn label(&self) -> &'static str {
         match self {
-            Self::TurnAnchor(_) => "drain follow",
+            Self::TurnAnchor(_) | Self::Unlanded { .. } => "drain follow",
             Self::Chain { .. } => "wake continuation",
         }
     }
@@ -87,6 +125,9 @@ pub(super) enum Ending {
     Failed(String),
     /// The true end: idle with no live Background Task.
     Done,
+    /// The submitted message never reached the transcript and the Session is
+    /// not live (ADR-0062): the card ends 「⚠️ 这条消息未被接收」 — never ✅.
+    Unreceived,
     /// No full read pair answered for the grace: a wedged Backend.
     LostContact,
     /// A readable, settled card still carried a `⏳` panel past the grace.
@@ -102,6 +143,7 @@ impl Ending {
             Self::Waiting => "idle with live background tasks; yielded waiting",
             Self::Failed(_) => "failed; finalized Error",
             Self::Done => "idle; finalized",
+            Self::Unreceived => "message never landed at idle; finalized Unreceived",
             Self::LostContact => "lost contact; finalized Error",
             Self::StuckPanel => "ended with an unreconcilable panel; finalized Error",
         }
@@ -127,6 +169,7 @@ pub(super) async fn stamp(cards: &CardsHandle, session_id: &str, ending: &Ending
         Ending::Waiting => Turn::finalize_waiting(cards, session_id).await,
         Ending::Failed(error) => Turn::finalize_error(cards, session_id, error).await,
         Ending::Done => Turn::finalize_done(cards, session_id).await,
+        Ending::Unreceived => Turn::finalize_unreceived(cards, session_id).await,
         Ending::LostContact => Turn::finalize_error(cards, session_id, LOST_CONTACT_ERROR).await,
         Ending::StuckPanel => Turn::finalize_error(cards, session_id, STUCK_PANEL_ERROR).await,
     }
@@ -175,6 +218,11 @@ pub(super) async fn run(
     let grace = tokio::time::Duration::from_millis(timing.grace_ms);
     let mut last_contact = tokio::time::Instant::now();
     let mut stuck_since: Option<tokio::time::Instant> = None;
+    // The settle decision's scope: the loop's own anchor, or — for the
+    // unreceived watch — the anchor captured from the transcript the moment
+    // the submitted message lands (ADR-0062). `None` means "never landed", the
+    // Unreceived ending.
+    let mut anchor: Option<TurnAnchor> = owns.anchor().cloned();
     loop {
         tokio::time::sleep(tokio::time::Duration::from_millis(timing.poll_ms)).await;
         // The card was replaced (a new Turn, an external arming, another Wake
@@ -225,6 +273,17 @@ pub(super) async fn run(
                 None
             }
         };
+        // The unreceived watch's anchor capture (ADR-0062): the submitted
+        // message may have landed since the last tick — the render above
+        // already captured it onto the card, and from here the normal settle
+        // decision judges the Turn. Nothing to do for a loop that already has
+        // its anchor, or an anchored read that did not carry the message
+        // (compaction cannot un-land it: the local anchor stays Some).
+        if anchor.is_none()
+            && let (Some(submitted), Some(transcript)) = (owns.submitted(), &transcript)
+        {
+            anchor = transcript.anchor_of_user(submitted);
+        }
         let status = match crate::bridge::bounded_call(
             &format!("{label} session status"),
             timing.read_timeout_ms,
@@ -252,6 +311,17 @@ pub(super) async fn run(
         // above and below only watch the states nobody can act on.
         if status.is_some_and(|status| status.is_some_and(SessionStatus::is_live)) {
             stuck_since = None;
+            // The waiting hint (ADR-0062): while the session reads live but
+            // the submitted message has not landed, the card gains the neutral
+            // line once the follow grace has passed — a genuine long tool call
+            // and a dead run look identical from outside, so cola does not nag
+            // early. Pushed once, then flushed.
+            if anchor.is_none()
+                && owns.hint_at().is_some_and(|at| std::time::Instant::now() >= at)
+                && Turn::show_receive_hint(&flow.cards, session_id).await
+            {
+                Turn::flush_card(&flow.cards, session_id).await;
+            }
             continue;
         }
         // The status read itself failed or timed out: observation is broken
@@ -289,9 +359,10 @@ pub(super) async fn run(
         if flow.waits.is_stopped(session_id).await {
             return finish(Ending::Stopped, session_id, label);
         }
-        // The single settle decision (ADR-0059): this match is exhaustive on
-        // purpose, so every decision variant is answered here explicitly.
-        match transcript.settle(owns.anchor()) {
+        // The single settle decision (ADR-0059, ADR-0062): this match is
+        // exhaustive on purpose, so every decision variant is answered here
+        // explicitly.
+        match transcript.settle(anchor.as_ref()) {
             // A Wake's Execution has not reached its boundary yet: the ending
             // is not decided, and the Wake's content must not declare it.
             TurnSettle::Running => stuck_since = None,
@@ -300,6 +371,9 @@ pub(super) async fn run(
             // Notice — the next Wake continues the chain on a new card).
             TurnSettle::Waiting => return finish(Ending::Waiting, session_id, label),
             TurnSettle::Failed(error) => return finish(Ending::Failed(error), session_id, label),
+            // The submitted message never landed and the session is idle: the
+            // card ends Unreceived — never ✅ (ADR-0062).
+            TurnSettle::Unreceived => return finish(Ending::Unreceived, session_id, label),
             TurnSettle::Complete => return finish(Ending::Done, session_id, label),
         }
     }

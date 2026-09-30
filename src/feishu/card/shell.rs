@@ -396,6 +396,11 @@ pub(crate) fn header_title_and_template(
         // (ADR-0059): the card yields, grey like the other non-working ends —
         // it is not ✅ and not a terminal. The next Wake continues the chain.
         CardState::Waiting => ("⏳ 等待后台任务".to_string(), "grey"),
+        // The Turn's submitted message never reached the transcript and the
+        // Session is not live (ADR-0062): nobody will answer it. Orange, like
+        // the other attention-needing non-failure ends — it is never ✅, and
+        // the card action offers to resubmit (#437).
+        CardState::Unreceived => ("⚠️ 这条消息未被接收".to_string(), "orange"),
         // A waiting card collected by a new Turn in its thread (ADR-0059): the
         // wait is over — the new message took over — while the background work
         // runs on. 部分完成 echoes the split header, pointing at the takeover.
@@ -1126,6 +1131,7 @@ mod tests {
             (CardState::Done, "✅ 完成"),
             (CardState::Stopped, "⏹ 已停止"),
             (CardState::Waiting, "⏳ 等待后台任务"),
+            (CardState::Unreceived, "⚠️ 这条消息未被接收"),
             (CardState::Superseded, "⏳ 部分完成 · 已由新消息接管"),
             (CardState::SwitchedAway, "⏳ 已切换会话 · 后台任务仍在运行"),
         ] {
