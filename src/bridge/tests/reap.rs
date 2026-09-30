@@ -20,7 +20,7 @@ use crate::bridge::test_support::*;
 use crate::bridge::turn::Turn;
 use crate::config::{SessionEntry, ThreadKey};
 use crate::feishu::card::CardState;
-use crate::opencode::types::SessionStatus;
+use crate::opencode::types::{SessionListInfo, SessionStatus};
 
 /// The sidecar path the app's own rule derives from the session file.
 fn sidecar(session_file: &Path) -> PathBuf {
@@ -86,8 +86,19 @@ async fn build_restarted(
     session_file: &Path,
     transcript: SessionTranscript,
 ) -> (Arc<App>, Arc<RecordingPlatform>, Arc<MockBackend>) {
+    build_restarted_with_sessions(session_file, transcript, Vec::new()).await
+}
+
+/// [`build_restarted`] with the store's own session list scripted too — the
+/// read the move verdict compares against the record's directory (#439).
+async fn build_restarted_with_sessions(
+    session_file: &Path,
+    transcript: SessionTranscript,
+    sessions: Vec<SessionListInfo>,
+) -> (Arc<App>, Arc<RecordingPlatform>, Arc<MockBackend>) {
     let mut backend = MockBackend::new(realistic_parts());
     backend.given_transcript("ses_test", vec![transcript]);
+    backend.given_sessions(sessions);
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(
@@ -261,6 +272,200 @@ async fn a_restart_reaps_a_persisted_card_to_error() {
         "the failure's own message rides the card: {card}"
     );
     assert!(app.cards_handle().live_cards.get("ses_test").is_none());
+}
+
+/// The #428/#439 shape: the Session moved itself (into a git worktree) while
+/// the run was in flight, so the step was interrupted — and the card a restart
+/// reaps carries the move line naming the new directory, explaining the
+/// interruption instead of leaving it mysterious. The line carries no chat
+/// content.
+#[tokio::test]
+async fn a_reap_of_a_moved_session_names_the_move() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_live_card(
+        &session_file,
+        LiveCard::new("om_frozen", MessageId::new("msg_cola_anchor"), Some(1_000))
+            .with_directory(Some("/work".into())),
+    );
+
+    let mut interrupted = assistant(2_000, "被打断了。");
+    interrupted.error = Some("Step interrupted".into());
+    let transcript = SessionTranscript::new(vec![user("msg_cola_anchor", 1_000, "问题"), interrupted])
+        .with_executions(vec![execution(2_500)]);
+    // The store now reports the Session under its new directory, while the
+    // record still names the old one.
+    let (app, platform, _backend) = build_restarted_with_sessions(
+        &session_file,
+        transcript,
+        vec![list_session(
+            "ses_test",
+            "题目",
+            "/work/.worktrees/zh-user-guide",
+            1_000,
+        )],
+    )
+    .await;
+
+    spawn_sync(&app);
+    wait_for_card_update(
+        &platform,
+        "the reaped card's ❌ ending",
+        CardUpdates::Any,
+        |card| card_header(card).contains("出错"),
+    )
+    .await;
+
+    let card = last_update_of(&platform, "om_frozen")
+        .await
+        .expect("the persisted card is settled in place");
+    let text = card_text(&card);
+    assert!(
+        text.contains("Step interrupted"),
+        "the failure's own message rides the card: {card}"
+    );
+    assert!(
+        text.contains("会话已迁移") && text.contains("/work/.worktrees/zh-user-guide"),
+        "the move line names the new directory: {card}"
+    );
+    assert!(
+        !text.contains("问题") && !text.contains("被打断了。"),
+        "the move line rebuilds no chat content: {card}"
+    );
+    assert!(
+        app.cards_handle().live_cards.get("ses_test").is_none(),
+        "the terminal drops the record"
+    );
+}
+
+/// The never-promoted variant of a moved Session (the #428 follow-up message):
+/// the reaped card ends Unreceived — never ✅ — and still names the move.
+#[tokio::test]
+async fn a_moved_never_promoted_card_names_the_move_too() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_live_card(
+        &session_file,
+        LiveCard::new("om_frozen", MessageId::new("msg_cola_anchor"), None)
+            .with_directory(Some("/work".into())),
+    );
+
+    // The submitted message never landed; the store reports the new directory.
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_prev", 500, "上一条"),
+        assistant(600, "好的。"),
+    ])
+    .with_executions(vec![execution(700)]);
+    let (app, platform, _backend) = build_restarted_with_sessions(
+        &session_file,
+        transcript,
+        vec![list_session(
+            "ses_test",
+            "题目",
+            "/work/.worktrees/zh-user-guide",
+            500,
+        )],
+    )
+    .await;
+
+    spawn_sync(&app);
+    wait_for_card_update(
+        &platform,
+        "the reaped card's Unreceived ending",
+        CardUpdates::Any,
+        |card| card_header(card).contains("未被接收"),
+    )
+    .await;
+
+    let card = last_update_of(&platform, "om_frozen")
+        .await
+        .expect("the persisted card is settled in place");
+    assert_eq!(card_header(&card), "⚠️ 这条消息未被接收");
+    let text = card_text(&card);
+    assert!(
+        text.contains("会话已迁移") && text.contains("/work/.worktrees/zh-user-guide"),
+        "the Unreceived card still names the move: {card}"
+    );
+    assert!(
+        app.cards_handle().live_cards.get("ses_test").is_none(),
+        "the terminal drops the record"
+    );
+}
+
+/// A run whose Session never moved reaps exactly as before: the settling card
+/// carries no move line (#439 leaves the no-move cards unchanged).
+#[tokio::test]
+async fn a_reap_of_an_unmoved_session_carries_no_move_line() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_live_card(
+        &session_file,
+        LiveCard::new("om_frozen", MessageId::new("msg_cola_anchor"), Some(1_000))
+            .with_directory(Some("/work".into())),
+    );
+
+    // The store reports the same directory the record was tracked under.
+    let (app, platform, _backend) = build_restarted_with_sessions(
+        &session_file,
+        completed(1_000),
+        vec![list_session("ses_test", "题目", "/work", 1_000)],
+    )
+    .await;
+
+    spawn_sync(&app);
+    wait_for_card_update(
+        &platform,
+        "the reaped card's ✅ ending",
+        CardUpdates::Any,
+        |card| card_header(card).contains("✅"),
+    )
+    .await;
+
+    let card = last_update_of(&platform, "om_frozen")
+        .await
+        .expect("the persisted card is settled in place");
+    assert_eq!(card_header(&card), "✅ 完成");
+    assert!(
+        !card_text(&card).contains("会话已迁移"),
+        "a same-directory reap carries no move line: {card}"
+    );
+}
+
+/// A Session the store's session list does not carry cannot have its move
+/// claimed: the card settles exactly as before.
+#[tokio::test]
+async fn an_unknown_current_directory_claims_no_move() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_live_card(
+        &session_file,
+        LiveCard::new("om_frozen", MessageId::new("msg_cola_anchor"), Some(1_000))
+            .with_directory(Some("/work".into())),
+    );
+
+    let (app, platform, _backend) =
+        build_restarted_with_sessions(&session_file, completed(1_000), Vec::new()).await;
+
+    spawn_sync(&app);
+    wait_for_card_update(
+        &platform,
+        "the reaped card's ✅ ending",
+        CardUpdates::Any,
+        |card| card_header(card).contains("✅"),
+    )
+    .await;
+
+    let card = last_update_of(&platform, "om_frozen")
+        .await
+        .expect("the persisted card is settled in place");
+    assert!(
+        !card_text(&card).contains("会话已迁移"),
+        "no listed directory claims nothing: {card}"
+    );
 }
 
 /// A run that idled with live Background Tasks while cola was down gets the
