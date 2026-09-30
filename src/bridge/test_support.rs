@@ -258,6 +258,11 @@ pub struct RecordingPlatform {
     /// caller must only warn (the retry's `Retried` marker PATCH must never
     /// block the retry itself, spec #391).
     pub fail_update_count: std::sync::atomic::AtomicUsize,
+    /// The next N `update_message` calls fail with a transport-class error
+    /// (`BridgeError::Io`, the shape a timeout or dropped connection surfaces
+    /// as) instead of an API response. An ambiguous failure: the PATCH may
+    /// have landed, so callers must not treat it as a definite card rejection.
+    pub fail_update_transport_count: std::sync::atomic::AtomicUsize,
     /// The next N `reply_card` calls fail with the same typed rejection, for
     /// the continuation-send recovery path.
     pub fail_reply_card_content_count: std::sync::atomic::AtomicUsize,
@@ -299,6 +304,7 @@ impl RecordingPlatform {
             fail_reply_card_count: std::sync::atomic::AtomicUsize::new(0),
             fail_update_card_content_count: std::sync::atomic::AtomicUsize::new(0),
             fail_update_count: std::sync::atomic::AtomicUsize::new(0),
+            fail_update_transport_count: std::sync::atomic::AtomicUsize::new(0),
             fail_reply_card_content_count: std::sync::atomic::AtomicUsize::new(0),
             fail_instant_reminder: std::sync::atomic::AtomicBool::new(false),
             fail_pin: std::sync::atomic::AtomicBool::new(false),
@@ -579,6 +585,14 @@ impl feishu::Platform for RecordingPlatform {
             self.fail_update_count
                 .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         }
+        let transport_failed = self
+            .fail_update_transport_count
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0;
+        if transport_failed {
+            self.fail_update_transport_count
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
         if let Some(gate) = self.take_gate("update", message_id) {
             wait_gate(gate).await;
         }
@@ -596,6 +610,12 @@ impl feishu::Platform for RecordingPlatform {
             return Err(crate::error::BridgeError::Feishu(
                 "simulated card update failure".into(),
             ));
+        }
+        if transport_failed {
+            return Err(crate::error::BridgeError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "simulated update transport failure",
+            )));
         }
         Ok(())
     }

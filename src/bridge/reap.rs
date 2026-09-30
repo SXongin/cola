@@ -49,10 +49,9 @@ use crate::feishu::card::{CardState, error_line, move_line, shell::CardBuilder};
 
 /// Collect the orphaned card `card_message_id` because a new card took the
 /// chain over (ADR-0063): one PATCH naming the successor, terminal and grey,
-/// keeping whatever the card already showed (best-effort, #434 acceptance
-/// feedback). Best-effort — a failed PATCH only warns; the record follows the
-/// successor either way, so the freeze it leaves behind is the pre-#438
-/// behavior, never a crash.
+/// keeping whatever the card already showed (#434 acceptance feedback). A
+/// failed PATCH only warns; the record follows the successor either way, so the
+/// freeze it leaves behind is the pre-#438 behavior, never a crash.
 pub(crate) async fn collect_orphan(cards: &CardsHandle, session_id: &str, card_message_id: &str) {
     if card_message_id.is_empty() {
         return;
@@ -268,16 +267,15 @@ struct ReapPass<'a> {
 
 impl ReapPass<'_> {
     /// PATCH the record's card into `state` — keeping the card's existing body
-    /// best-effort (#434 acceptance feedback) — and, when the state is
-    /// terminal, drop the record: nothing is owed a reap any more. A terminal
-    /// ending
-    /// whose Session's current directory differs from the pass's baseline
-    /// directory gains one extra line naming the move (#439), on top of
-    /// `detail` (the failure's message when there is one); a Waiting yield is
-    /// not a settle and carries none. Returns whether the PATCH landed (a
-    /// failed one keeps the record for the next tick). One INFO line per
-    /// action, naming the session and the decision — never chat content; a
-    /// settle that named a move says so.
+    /// best-effort (#434 acceptance feedback) — and, when the state is terminal,
+    /// drop the record: nothing is owed a reap any more. A terminal ending whose
+    /// Session's current directory differs from the pass's baseline directory
+    /// gains one extra line naming the move (#439), on top of `detail` (the
+    /// failure's message when there is one); a Waiting yield is not a settle and
+    /// carries none. Returns whether the PATCH landed (a failed one keeps the
+    /// record for the next tick). One INFO line per action, naming the session
+    /// and the decision — never chat content; a settle that named a move says
+    /// so.
     async fn settle(&self, state: CardState, detail: Option<&str>) -> bool {
         let terminal = state.is_terminal();
         let move_note = if terminal { self.move_note().await } else { None };
@@ -384,10 +382,14 @@ fn ending_card(state: CardState, detail: Option<&str>, move_note: Option<&str>) 
 /// PATCH `bare` onto `card_message_id`, keeping the card's existing body
 /// best-effort (#434 acceptance feedback): read the card's own view, merge the
 /// ending over it, PATCH the merge. A failed read PATCHes `bare` directly —
-/// today's behavior — because the ending must never depend on the read. And
-/// when the platform refuses the preserved shape the bare ending cannot hit
-/// (e.g. `230099`), retry once with `bare`: the card's owner died, so it must
-/// never stay looking live.
+/// today's behavior — because the ending must never depend on the read.
+///
+/// A PATCH the platform *definitely* refuses as card content (the typed
+/// `CardContentRejected`, e.g. `230099`) is retried once bare: the refusal is
+/// deterministic, so the bare ending lands and the card never stays looking
+/// live. Any other failure — transport, timeout, auth, server — is returned
+/// as-is: the preserved PATCH may already have landed, and retrying bare would
+/// then wipe the very body this path exists to keep.
 async fn patch_ending_keeping_body(
     platform: &dyn crate::feishu::Platform,
     card_message_id: &str,
@@ -398,12 +400,13 @@ async fn patch_ending_keeping_body(
             let card = ending_card_keeping_body(bare, &view);
             match platform.update_message(card_message_id, &card).await {
                 Ok(()) => Ok(()),
-                Err(e) => {
+                Err(e @ crate::error::BridgeError::CardContentRejected { .. }) => {
                     tracing::warn!(
                         "live-card reap: card {card_message_id} refused the preserved ending ({e}); retrying bare"
                     );
                     platform.update_message(card_message_id, bare).await
                 }
+                Err(e) => Err(e),
             }
         }
         Err(e) => {
@@ -443,30 +446,40 @@ fn ending_card_keeping_body(bare: &serde_json::Value, view: &serde_json::Value) 
     })
 }
 
-/// The element tags that are interactive — buttons and form controls. A
-/// preserved card must never show a control whose action can no longer run
-/// (its `value` did not survive the whole-card read), so these are stripped
-/// wherever they nest: panels, column sets and forms included.
+/// The card components that are interactive, or exist only to group controls.
+/// A preserved card must never show a control whose action can no longer run
+/// (its callback `value` did not survive the whole-card read), so these are
+/// stripped wherever they nest: panels, column sets and forms included. The
+/// list is Feishu's interactive card-JSON-2.0 components (`checker` is the
+/// documented 勾选器) plus the `form` container — `form` goes whole because an
+/// emptied form is invalid and every child it can hold is stripped anyway.
+const INTERACTIVE_TAGS: &[&str] = &[
+    "button",
+    "action",
+    "input",
+    "select_static",
+    "multi_select_static",
+    "select_person",
+    "multi_select_person",
+    "overflow",
+    "date_picker",
+    "picker_time",
+    "picker_datetime",
+    "select_img",
+    "checker",
+    "form",
+];
+
+/// Whether `tag` names an [`INTERACTIVE_TAGS`] component.
 fn is_interactive_element(tag: &str) -> bool {
-    matches!(
-        tag,
-        "button"
-            | "action"
-            | "input"
-            | "select_static"
-            | "multi_select_static"
-            | "select_person"
-            | "multi_select_person"
-            | "overflow"
-            | "date_picker"
-            | "picker_time"
-            | "picker_datetime"
-            | "checker"
-    )
+    INTERACTIVE_TAGS.contains(&tag)
 }
 
 /// [`is_interactive_element`]'s recursive application: `None` for a stripped
-/// element, the element — its nested arrays and objects filtered — otherwise.
+/// element, the element — its nested arrays and object fields filtered —
+/// otherwise. An interactive child is dropped **whole**: leaving a `null`
+/// placeholder would itself be invalid card JSON and get the preserved PATCH
+/// rejected.
 fn stripped_of_controls(element: &serde_json::Value) -> Option<serde_json::Value> {
     if element
         .get("tag")
@@ -479,23 +492,15 @@ fn stripped_of_controls(element: &serde_json::Value) -> Option<serde_json::Value
         serde_json::Value::Object(map) => {
             let mut cleaned = serde_json::Map::with_capacity(map.len());
             for (key, value) in map {
-                match value {
-                    serde_json::Value::Array(items) => {
-                        cleaned.insert(
-                            key.clone(),
-                            serde_json::Value::Array(items.iter().filter_map(stripped_of_controls).collect()),
-                        );
-                    }
-                    other => {
-                        cleaned.insert(
-                            key.clone(),
-                            stripped_of_controls(other).unwrap_or(serde_json::Value::Null),
-                        );
-                    }
+                if let Some(cleaned_value) = stripped_of_controls(value) {
+                    cleaned.insert(key.clone(), cleaned_value);
                 }
             }
             Some(serde_json::Value::Object(cleaned))
         }
+        serde_json::Value::Array(items) => Some(serde_json::Value::Array(
+            items.iter().filter_map(stripped_of_controls).collect(),
+        )),
         other => Some(other.clone()),
     }
 }
@@ -662,6 +667,69 @@ mod tests {
         assert_eq!(card["config"]["wide_screen_mode"], true);
         assert_eq!(card["config"]["streaming_mode"], false);
         assert_eq!(card["body"]["elements"][1]["content"], "旧的正文");
+    }
+
+    /// Nested and container controls: an interactive object at a non-array key
+    /// is dropped **whole** (a `null` placeholder would itself be invalid card
+    /// JSON), a whole `form` goes (an emptied form is invalid and every child
+    /// it can hold is stripped anyway), and a `checker`/`select_img` nested in
+    /// a column go too — while the display content around them survives.
+    #[test]
+    fn ending_card_keeping_body_drops_containers_without_nulls() {
+        use crate::bridge::test_support::{card_has_tag, card_text};
+
+        fn contains_null(value: &serde_json::Value) -> bool {
+            match value {
+                serde_json::Value::Null => true,
+                serde_json::Value::Object(map) => map.values().any(contains_null),
+                serde_json::Value::Array(items) => items.iter().any(contains_null),
+                _ => false,
+            }
+        }
+
+        let bare = ending_card(CardState::Done, None, None);
+        let view = serde_json::json!({
+            "config": { "wide_screen_mode": true },
+            "body": { "elements": [
+                { "tag": "form", "name": "switch_search", "elements": [
+                    { "tag": "input", "name": "search" },
+                    { "tag": "button", "text": { "tag": "plain_text", "content": "搜索" },
+                      "value": { "action": "submit" } }
+                ] },
+                { "tag": "collapsible_panel", "elements": [
+                    { "tag": "markdown", "content": "面板里的输出" }
+                ],
+                  // An object-valued key holding a control: the key must go
+                  // whole, not become `"button_area": null`.
+                  "button_area": { "tag": "button", "value": { "action": "retry" } } },
+                { "tag": "column_set", "columns": [
+                    { "tag": "column", "elements": [
+                        { "tag": "checker", "name": "check_1" },
+                        { "tag": "select_img", "name": "pick_1" },
+                        { "tag": "markdown", "content": "保留的正文" }
+                    ] }
+                ] }
+            ] }
+        });
+
+        let card = ending_card_keeping_body(&bare, &view);
+        for tag in ["form", "input", "button", "checker", "select_img"] {
+            assert!(!card_has_tag(&card, tag), "{tag} must be stripped whole: {card}");
+        }
+        assert!(
+            !contains_null(&card),
+            "no null placeholder may survive a stripped child: {card}"
+        );
+        assert!(
+            card_text(&card).contains("面板里的输出") && card_text(&card).contains("保留的正文"),
+            "the display content around the controls survives: {card}"
+        );
+        let panel = &card["body"]["elements"][0];
+        assert_eq!(panel["tag"], "collapsible_panel", "{card}");
+        assert!(
+            panel.get("button_area").is_none(),
+            "the object-valued control's key is dropped, never nulled: {card}"
+        );
     }
 
     /// A bare ending with no line of its own prepends nothing: the preserved
