@@ -106,6 +106,15 @@ impl CardState {
     pub(crate) fn overrides_awaiting(&self) -> bool {
         self.is_terminal() || matches!(self, Self::Waiting)
     }
+
+    /// Whether this state owns a recovery action: `Error` (the retry that
+    /// re-submits the failed prompt, spec #391) and `Unreceived` (重新发起,
+    /// #437). The card render, the accumulator's button builder and
+    /// [`crate::bridge::turn::Turn::claim_recovery`]'s contract all read this
+    /// one predicate, so the set of action-owning states cannot drift.
+    pub(crate) fn offers_recovery(&self) -> bool {
+        matches!(self, Self::Error | Self::Unreceived)
+    }
 }
 
 /// How much text ONE card carries before it is finalized and the rest continues
