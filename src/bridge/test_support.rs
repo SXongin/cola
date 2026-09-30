@@ -1072,6 +1072,10 @@ pub struct MockBackend {
     pub task_runtime: Arc<std::sync::Mutex<crate::backend::TaskRuntime>>,
     /// Records every `task_runtime` call: `(session_id, shells, children)`.
     pub task_runtime_calls: Arc<tokio::sync::Mutex<Vec<TaskRuntimeCall>>>,
+    /// The Background Task retirement overlay (issue #454): recorded through
+    /// `retire_background_tasks` and applied inside `transcript`, exactly like
+    /// the real adapter's.
+    pub retirements: crate::backend::TaskRetirements,
     /// When set, `session_status` fails with this message (simulates a read
     /// failure — the caller must not guess a status).
     pub session_status_error: Option<String>,
@@ -1183,6 +1187,7 @@ impl MockBackend {
             session_status_reads: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             task_runtime: Arc::new(std::sync::Mutex::new(crate::backend::TaskRuntime::default())),
             task_runtime_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            retirements: crate::backend::TaskRetirements::default(),
             session_status_error: None,
             session_status_fails: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             status_busy_once: std::sync::atomic::AtomicBool::new(false),
@@ -1953,10 +1958,13 @@ impl crate::backend::Backend for MockBackend {
                 _ => None,
             }
         };
-        let transcript = match scripted {
+        let mut transcript = match scripted {
             Some(transcript) => transcript,
             None => self.default_transcript(session_id),
         };
+        // The runtime retirement overlay, applied exactly like the real
+        // adapter's (issue #454).
+        self.retirements.apply(session_id, &mut transcript);
         self.transcript_calls.lock().await.push(session_id.to_string());
         Ok(transcript)
     }
@@ -2233,6 +2241,10 @@ impl crate::backend::Backend for MockBackend {
             .lock()
             .expect("the task-runtime lock is never poisoned")
             .clone())
+    }
+
+    fn retire_background_tasks(&self, session_id: &str, call_ids: &[String]) {
+        self.retirements.record(session_id, call_ids);
     }
 
     async fn interrupt(&self, session_id: &str) -> crate::error::Result<()> {

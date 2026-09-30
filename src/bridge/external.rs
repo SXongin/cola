@@ -218,7 +218,25 @@ impl ExternalFlow {
         )
         .await
         {
-            Some(Ok(runtime)) => transcript.apply_task_runtime(&runtime),
+            Some(Ok(runtime)) => {
+                transcript.apply_task_runtime(&runtime);
+                // Record the retirements so every later transcript read — the
+                // live render, the drain's settle, the reap — sees them gone:
+                // the launch record never flips (issue #454), so without the
+                // overlay the next read would resurrect the task.
+                if !transcript.runtime_retired.is_empty() {
+                    let call_ids: Vec<String> = transcript
+                        .runtime_retired
+                        .iter()
+                        .map(|retirement| retirement.task.tool.call_id.clone())
+                        .collect();
+                    tracing::info!(
+                        "session {sid}: runtime reconciliation retired {} background task(s)",
+                        call_ids.len()
+                    );
+                    handles.backend.retire_background_tasks(sid, &call_ids);
+                }
+            }
             Some(Err(error)) => {
                 tracing::debug!("session {sid} task runtime read failed: {error}; waiting for the next read");
             }

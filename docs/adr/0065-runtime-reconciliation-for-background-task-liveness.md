@@ -56,6 +56,19 @@ with positive evidence only.**
   the gone record — with the runtime's own completion time when it has one,
   never an invented clock. The last retirement ends the wait per ADR-0060's
   quiet true end (✅ in place, no new card).
+- **A retirement is remembered for cola's life.** The read that observes one
+  records its call ids in a process-local overlay the adapter applies to every
+  transcript read, so the never-flipping launch record cannot resurrect the
+  task on the next live card or the next Turn's waiting yield (found live after
+  the real reboot: with the retirement only in the reconciling read, the next
+  Turn's card showed the tasks again). The overlay is deliberately in-memory —
+  a restart re-derives the retirement.
+- **The entry renders on the chain that OBSERVED the retirement**, whatever
+  anchor that chain has. After a restart the launching chain is gone, so
+  scoping the entry to the observing chain's anchor swallowed it (the same
+  reboot settled ✅ with no entry). Exactly-once comes from the overlay plus
+  the chain's own announcement set; a cola restart may re-show one entry on the
+  newest chain, which is honest — that card is where the user is looking.
 - **A 404 is an ending, not a maybe** (the one deliberate departure from the
   design comment on #454, which first proposed 待确认): the runtime that hosts
   the task says it has no such shell, and a shell cannot be running under a

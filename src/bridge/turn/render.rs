@@ -378,11 +378,18 @@ fn render_wake_entries(
 /// is its one record when no Wake will ever arrive: the runtime's own
 /// completion time when it reported one (the `Lost` ending reports none), the
 /// task's launch and identity from the read, and the label joined from the
-/// originating tool part's input by `call_id` (the live row's own join). The
-/// exactly-once gate is the Wake announcement set, keyed by a synthetic
-/// `runtime:<call_id>` id and stamped at a stable time (the completion, else
-/// the launch), so a retirement is announced at most once per chain — a card
-/// that already showed it never doubles it.
+/// originating tool part's input by `call_id` (the live row's own join).
+///
+/// The entry renders on the chain that OBSERVED the retirement, whatever
+/// anchor that chain has: the launch record never flips, so the observing chain
+/// can be a later Turn — or, after a restart, the first chain on a store whose
+/// launch card was already collected — and scoping the entry to the launching
+/// Turn would silently swallow it (found in review on a real reboot,
+/// 2026-10-01: the card settled ✅ with no entry). Exactly-once does not come
+/// from the anchor: the read that carries a retirement records it in the
+/// backend's process-local overlay, so no later read derives it again, and the
+/// Wake announcement set (keyed by a synthetic `runtime:<call_id>` id) covers
+/// the reads within the observing chain.
 fn render_runtime_entries(
     acc: &mut StreamAccumulator,
     transcript: &SessionTranscript,
@@ -391,10 +398,6 @@ fn render_runtime_entries(
     let mut inserted = false;
     for retirement in &transcript.runtime_retired {
         let task = &retirement.task;
-        // Scope: a task launched before this card's Turn is not its content.
-        if task.started_at.is_some_and(|started| started < anchor.created_ms) {
-            continue;
-        }
         let key = format!("runtime:{}", task.tool.call_id);
         let at = retirement
             .finished_at
