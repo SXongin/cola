@@ -588,6 +588,9 @@ pub(super) struct StreamAccumulator {
     /// turn start, refreshed at turn end. Only set alongside `branch`
     /// (ADR-0019: the halves are omitted together).
     pub(super) dirty: bool,
+    /// The session's directory is a linked git worktree (#433): the 📁
+    /// segment marks it with 🌲. Moves with the branch/dirty halves.
+    pub(super) worktree: bool,
     /// The session/thread name; shown as the card subtitle so the header can
     /// stay focused on state (the question is already in the reply context).
     pub(super) title: String,
@@ -763,6 +766,7 @@ impl StreamAccumulator {
         if let Some(branch) = state.branch {
             self.branch = Some(branch);
             self.dirty = state.dirty;
+            self.worktree = state.worktree;
         }
     }
 
@@ -1896,6 +1900,9 @@ impl StreamAccumulator {
         if let Some(dir) = &self.directory {
             let name = self.project_name.as_deref().unwrap_or(dir);
             let mut segment = format!("📁 {}", crate::feishu::message::strip_mention_tokens(name));
+            if self.worktree {
+                segment.push_str(" 🌲");
+            }
             match (&self.branch, self.dirty) {
                 (Some(branch), true) => segment.push_str(&format!(" · {} ⚠", branch)),
                 (Some(branch), false) => segment.push_str(&format!(" · {}", branch)),
@@ -2257,6 +2264,26 @@ mod tests {
         assert!(!text.contains("⚠"), "clean tree must not show ⚠: {}", text);
     }
 
+    /// #433: a session running in a linked worktree shows 🌲 between the
+    /// project name and the branch — the project name is the worktree
+    /// directory's basename, the branch is what it checks out.
+    #[test]
+    fn card_footer_marks_a_worktree() {
+        let mut acc = StreamAccumulator::new("test");
+        acc.card_state = CardState::Done;
+        acc.directory = Some("/root/workspace/dev/cola/.worktrees/zh-user-guide".into());
+        acc.project_name = Some("zh-user-guide".into());
+        acc.branch = Some("docs/zh-user-guide".into());
+        acc.worktree = true;
+        acc.push_text("结果");
+
+        let text = acc.build_card().to_string();
+        assert!(
+            text.contains("📁 zh-user-guide 🌲 · docs/zh-user-guide"),
+            "missing: {text}"
+        );
+    }
+
     /// Non-git directory: only the project name, no branch/dirty halves.
     #[test]
     fn card_footer_non_git_shows_project_only() {
@@ -2282,22 +2309,27 @@ mod tests {
         acc.apply_git_state(GitState {
             branch: Some("main".into()),
             dirty: true,
+            worktree: false,
         });
         assert_eq!(acc.branch.as_deref(), Some("main"));
         assert!(acc.dirty);
+        assert!(!acc.worktree);
 
         // Failed/empty end read: the start capture stays.
         acc.apply_git_state(GitState::default());
         assert_eq!(acc.branch.as_deref(), Some("main"));
         assert!(acc.dirty);
+        assert!(!acc.worktree);
 
         // Successful end read: the AI switched branch and committed.
         acc.apply_git_state(GitState {
             branch: Some("feat/ai-work".into()),
             dirty: false,
+            worktree: true,
         });
         assert_eq!(acc.branch.as_deref(), Some("feat/ai-work"));
         assert!(!acc.dirty);
+        assert!(acc.worktree, "the worktree marker rides the refreshed halves");
     }
 
     /// ADR-0019/ADR-0044: the 📁 segment, the 🤖 model line and the 📊 context
