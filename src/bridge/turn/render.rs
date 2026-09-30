@@ -2280,6 +2280,22 @@ Index: /x/src/main.rs
         })
     }
 
+    /// A typed V2 `subagent` call: running, with the child session id in its
+    /// metadata as the current generation records it (`state.metadata.sessionID`).
+    fn subagent_part(call_id: &str, started_at: i64, child: &str) -> Part {
+        Part::Tool(ToolCall {
+            identity: ToolIdentity {
+                name: "subagent".into(),
+                call_id: call_id.into(),
+            },
+            status: ToolStatus::Running,
+            started_at: Some(started_at),
+            input: Some(serde_json::json!({"agent": "general", "description": "review"})),
+            metadata: Some(serde_json::json!({"sessionID": child, "status": "running"})),
+            output: ToolOutput::default(),
+        })
+    }
+
     /// ADR-0054: a live task panel's title carries the child's liveness, and a
     /// later poll refreshes it from the child's new state.
     #[tokio::test]
@@ -2348,6 +2364,63 @@ Index: /x/src/main.rs
         assert!(
             second.contains("read 1s") || second.contains("read 2s"),
             "the next poll refreshes the child's liveness: {second}"
+        );
+    }
+
+    /// ADR-0054 on OpenCode 2: a live `subagent` panel carries its child
+    /// session's liveness exactly as V1's `task` does, even though both the
+    /// tool id (`subagent`) and the metadata's child key (`sessionID`) differ.
+    #[tokio::test]
+    async fn live_subagent_panel_shows_the_childs_liveness() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.given_transcript(
+            "ses_v2_child",
+            vec![SessionTranscript::new(vec![message(
+                "a_child",
+                now - 3_000,
+                vec![tool(
+                    "shell",
+                    "call_child",
+                    ToolStatus::Running,
+                    Some(now - 3_000),
+                    Some(serde_json::json!({"command": "cargo test"})),
+                    None,
+                )],
+            )])],
+        );
+        let parent = SessionTranscript::new(vec![message(
+            "a1",
+            now - 9_000,
+            vec![subagent_part("call_subagent", now - 9_000, "ses_v2_child")],
+        )]);
+        let (app, platform) = build_app(cfg, backend).await;
+        let cards = app.cards_handle();
+        let sid = "ses_parent";
+        Turn::seed_card(&cards, sid, Some("om_parent")).await;
+        Turn::set_turn_anchor(&cards, sid, &turn_anchor(now - 10_000)).await;
+
+        let _ = render_and_flush(
+            &cards,
+            &app.sessions_handle(),
+            &app.opencode,
+            &app.requests_handle(),
+            sid,
+            &parent,
+        )
+        .await;
+        let updates = platform.updated_cards().await;
+        let card = updates.last().expect("a live flush").to_string();
+        assert!(
+            card.contains("shell 3s") || card.contains("shell 4s"),
+            "the subagent panel carries its child's running tool: {card}"
+        );
+        assert!(
+            card.contains("review"),
+            "the subagent panel keeps its own input line: {card}"
         );
     }
 

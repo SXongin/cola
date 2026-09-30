@@ -67,6 +67,9 @@ impl ToolPanel {
         if self.backgrounded() {
             return BACKGROUNDED_MARKER;
         }
+        if self.metadata_failure() {
+            return "❌";
+        }
         match self.status() {
             ToolStatus::Running | ToolStatus::Pending => "⏳",
             ToolStatus::Completed => "✅",
@@ -114,6 +117,63 @@ impl ToolPanel {
         self.call.input.as_ref()
     }
 
+    /// The call's raw metadata (what OpenCode recorded beside the input): V2
+    /// keeps a shell's exit code, a search's result count and a Code Mode
+    /// program's nested call list here, so the panel reads run facts the text
+    /// output does not carry.
+    fn metadata(&self) -> Option<&serde_json::Value> {
+        self.call.metadata.as_ref()
+    }
+
+    /// Whether the call is V2's Code Mode entry by shape: the id `execute`
+    /// carrying its `{code}` input. ADR-0042's gate — a same-named foreign tool
+    /// with a different input shape stays on the opaque path.
+    fn is_code_mode(&self) -> bool {
+        self.name() == "execute"
+            && self
+                .call
+                .input
+                .as_ref()
+                .and_then(|input| input.get("code"))
+                .is_some_and(serde_json::Value::is_string)
+    }
+
+    /// Whether the call's own recorded metadata reports a failed run even
+    /// though the protocol's status settled `completed`: V2 records a shell's
+    /// non-zero exit / timeout there, and Code Mode reports its program errors
+    /// (its own or a nested call's) in `toolCalls`. The official 2.0.x client
+    /// derives its error rendering from exactly these fields; the typed
+    /// [`ToolStatus`] stays the protocol's own and is never rewritten.
+    fn metadata_failure(&self) -> bool {
+        if self.status() != &ToolStatus::Completed {
+            return false;
+        }
+        let Some(metadata) = self.metadata() else {
+            return false;
+        };
+        match self.name() {
+            "shell" => {
+                metadata.get("timeout").and_then(serde_json::Value::as_bool) == Some(true)
+                    || metadata
+                        .get("exit")
+                        .and_then(serde_json::Value::as_f64)
+                        .is_some_and(|exit| exit != 0.0)
+            }
+            "execute" if self.is_code_mode() => {
+                metadata.get("error").and_then(serde_json::Value::as_bool) == Some(true)
+                    || metadata
+                        .get("toolCalls")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|calls| {
+                            calls.iter().any(|call| {
+                                call.get("status").and_then(serde_json::Value::as_str) == Some("error")
+                            })
+                        })
+            }
+            _ => false,
+        }
+    }
+
     /// The output text the panel renders: the decoder's text blocks joined (in
     /// decoder order) with a failure's message appended on its own line, or —
     /// for a file-editing tool — the real diff recorded in the call's raw
@@ -123,7 +183,10 @@ impl ToolPanel {
     /// already applied the sources' precedence into the typed output's blocks,
     /// so a payload carrying more than one text source can never render twice.
     pub fn output(&self) -> Option<String> {
-        if self.call.identity.name == "edit" || self.call.identity.name == "apply_patch" {
+        if self.call.identity.name == "edit"
+            || self.call.identity.name == "apply_patch"
+            || self.call.identity.name == "patch"
+        {
             edit_tool_output(&self.call)
         } else {
             tool_output(&self.call)
@@ -142,24 +205,30 @@ impl ToolPanel {
         self.liveness = liveness;
     }
 
-    /// The child Session a `task` call runs — `state.metadata.sessionId`, the
-    /// camelCase field the event contract carries (AGENTS.md #2). `None` for
-    /// any other tool, or when the payload recorded no session id.
+    /// The child Session a `task`/`subagent` call runs — V1 records
+    /// `state.metadata.sessionId`, V2 `state.metadata.sessionID` (the camelCase
+    /// field each generation's contract carries; AGENTS.md #2). `None` for any
+    /// other tool, or when the payload recorded no session id.
     pub(crate) fn child_session_id(&self) -> Option<&str> {
-        if self.call.identity.name != TASK_TOOL {
+        if !is_task_tool(&self.call.identity.name) {
             return None;
         }
-        self.call
-            .metadata
-            .as_ref()?
-            .get("sessionId")
-            .and_then(|value| value.as_str())
+        let metadata = self.call.metadata.as_ref()?;
+        ["sessionId", "sessionID"]
+            .iter()
+            .find_map(|key| metadata.get(*key).and_then(serde_json::Value::as_str))
     }
 }
 
-/// The built-in tool a child session hangs off (`task`): the one call kind
-/// whose panel carries liveness, checked by name in the card and the Bridge.
-pub(crate) const TASK_TOOL: &str = "task";
+/// The built-in tools whose calls spawn a child session — V1's `task` and V2's
+/// `subagent`: the one call kind whose panel carries liveness, checked by name
+/// in the card and the Bridge.
+pub(crate) const TASK_TOOLS: [&str; 2] = ["task", "subagent"];
+
+/// Whether `name` is a child-session-spawning built-in ([`TASK_TOOLS`]).
+pub(crate) fn is_task_tool(name: &str) -> bool {
+    TASK_TOOLS.contains(&name)
+}
 
 /// A live `task` call's child-session liveness (ADR-0054): what the child is
 /// doing right now, as the panel title shows it. Display-only data — the Bridge
@@ -370,7 +439,17 @@ pub(super) fn tool_panel_element(
     // formatter's dispatch, the todo section's detection, and the input
     // formatter's dispatch.
     let name = tool.name();
-    let output = tool.output().map(|raw| format_tool_output(name, &raw));
+    // `execute` assembles its body from the call's nested-call metadata as well
+    // as its text output, so it has its own output builder; every other tool's
+    // body is its output text through the per-tool formatter. The result-count
+    // header (glob/grep) is metadata-side, so it is applied over either path.
+    let output = if tool.is_code_mode() {
+        execute_output(tool)
+    } else {
+        tool.output().map(|raw| format_tool_output(name, &raw))
+    };
+    let output = output
+        .map(|(header, style, body)| (search_count_header(name, tool.metadata()).or(header), style, body));
     // The todo panel is a status section, not a transcript: a parsed list is
     // the panel, so the generic Input line and Output marker would only frame
     // the checklist (a still-running call has no parsed output yet — the Input
@@ -386,11 +465,18 @@ pub(super) fn tool_panel_element(
     if !todowrite_list && let Some(i) = tool.input() {
         let formatted = format_tool_input(name, i);
         if !formatted.is_empty() {
+            // A program is the exception to the 400-char input budget: its
+            // code is the panel, so it gets the output budget.
+            let budget = if tool.is_code_mode() {
+                TOOL_OUTPUT_MAX_CHARS
+            } else {
+                400
+            };
             // Trailing blank line so a multi-line input (edit diff, skill
             // metadata list) can't swallow the Output section as a markdown
             // lazy continuation of its last list line — Feishu would render
             // `**Output**` glued to the last input line.
-            content.push_str(&format!("**Input**\n{}\n\n", truncate_md(&formatted, 400)));
+            content.push_str(&format!("**Input**\n{}\n\n", truncate_md(&formatted, budget)));
         }
     }
     let mut title_details: Option<String> = None;
@@ -410,7 +496,11 @@ pub(super) fn tool_panel_element(
             // the whole run above it, marker included, into one heading
             // (`## Output99- …`), glued together.
             content.push_str("**Output**\n\n");
-            if let Some(h) = &header {
+            if tool.is_code_mode() {
+                // The call count is the folded panel's progress line; the body
+                // leads with the nested call rows themselves.
+                title_details = header;
+            } else if let Some(h) = &header {
                 content.push_str(&format!("{}\n\n", h));
             }
             let body = truncate_md(&body, TOOL_OUTPUT_MAX_CHARS);
@@ -673,24 +763,30 @@ fn format_todo_list(todos: &[TodoItem]) -> String {
 /// Render a tool's raw output string human-friendly. OpenCode's `read` tool
 /// wraps its output in XML tags (`<path>…</path>`, `<type>…</type>`,
 /// `<content>…</content>`) — strip them so the card shows just the file path
-/// and the numbered lines; a `task`/`skill` output is an XML envelope around
-/// the content the reader wants. An `edit` or `apply_patch` output is
-/// substituted by its unified diff (`apply_patch` keeps each file's `Index:`
-/// line) — keep only the hunks and report the change count. A `todowrite`
-/// output is its todo list JSON-encoded — render it as a status checklist; a
-/// `websearch` output is its JSON result envelope — render it as a title+url
-/// list. Other tools pass through unchanged.
+/// and the numbered lines; a `task`/`subagent` output is an XML envelope around
+/// the content the reader wants. An `edit`, `apply_patch` or `patch` output is
+/// substituted by its unified diff (`apply_patch`/`patch` keep each file's
+/// `Index:` line) — keep only the hunks and report the change count. A
+/// `todowrite` output is its todo list JSON-encoded — render it as a status
+/// checklist; a `websearch` output is a result envelope — render it as a
+/// title+url list. Other tools pass through unchanged.
+///
+/// **OpenCode 2 shapes.** The same arms also recognize the current
+/// generation's shapes: `subagent`'s `<subagent sessionID state>` envelope,
+/// `read`'s `Read file <path>, lines N-M` header line (no XML wrapper), and
+/// `websearch`'s markdown result blocks (`## [title](url)` + `Published:`).
+/// `patch` is V2's `apply_patch`.
 ///
 /// Returns `(header, body style, body)`: the header is the short markdown line
 /// above the body (file path, change count, result count); the style decides
 /// how the body blocks (see [`BodyStyle`]). A `todowrite` header is the list's
 /// size and per-status counts — the folded panel's progress line.
 fn format_tool_output(name: &str, output: &str) -> (Option<String>, BodyStyle, String) {
-    if name == "edit" || name == "apply_patch" {
-        let parsed = if name == "apply_patch" {
-            parse_multi_file_diff(output)
-        } else {
+    if name == "edit" || name == "apply_patch" || name == "patch" {
+        let parsed = if name == "edit" {
             parse_edit_diff(output)
+        } else {
+            parse_multi_file_diff(output)
         };
         return match parsed {
             Some(d) => {
@@ -718,6 +814,12 @@ fn format_tool_output(name: &str, output: &str) -> (Option<String>, BodyStyle, S
     {
         return (header, BodyStyle::Auto, body);
     }
+    if name == "subagent"
+        && output.starts_with("<subagent ")
+        && let Some(body) = parse_subagent_envelope(output)
+    {
+        return (None, BodyStyle::Auto, body);
+    }
     if name == "skill"
         && output.starts_with("<skill_content ")
         && let Some(body) = parse_skill_envelope(output)
@@ -738,10 +840,20 @@ fn format_tool_output(name: &str, output: &str) -> (Option<String>, BodyStyle, S
             );
         }
     }
-    if name == "websearch"
-        && let Some((count, body)) = parse_websearch_results(output)
-    {
-        return (Some(format!("🔎 {} 条结果", count)), BodyStyle::Markdown, body);
+    if name == "websearch" {
+        // V1 emits a JSON envelope (`parallel`) or plain-text blocks (`exa`);
+        // V2 emits markdown result blocks. Each parser shape-gates itself, so
+        // an unrecognized provider output still passes through unchanged.
+        if let Some((count, body)) = parse_websearch_results(output) {
+            return (Some(format!("🔎 {} 条结果", count)), BodyStyle::Markdown, body);
+        }
+    }
+    if name == "read" && !output.contains("<path>") {
+        // V2's read output carries no XML wrapper: a header line over numbered
+        // lines or a directory listing. Anything else falls through to raw.
+        if let Some(parsed) = parse_v2_read_output(output) {
+            return parsed;
+        }
     }
     if name != "read" || !output.contains("<path>") {
         return (None, BodyStyle::Auto, output.to_string());
@@ -777,6 +889,92 @@ fn format_tool_output(name: &str, output: &str) -> (Option<String>, BodyStyle, S
         BodyStyle::Code(code_lang_for_path(&path)),
         body,
     )
+}
+
+/// The result-count header V2 records in a search call's metadata (`count` for
+/// `glob`, `matches` for `grep`, plus its `truncated` flag). `None` when the
+/// call carries neither — a generation that doesn't record it, or a third-party
+/// tool that merely claims the id — so the panel keeps its raw shape.
+fn search_count_header(name: &str, metadata: Option<&serde_json::Value>) -> Option<String> {
+    let metadata = metadata?;
+    let (count, unit) = match name {
+        "glob" => (metadata.get("count")?.as_u64()?, "个文件"),
+        "grep" => (metadata.get("matches")?.as_u64()?, "处匹配"),
+        _ => return None,
+    };
+    let truncated = metadata.get("truncated").and_then(serde_json::Value::as_bool) == Some(true);
+    Some(if truncated {
+        format!("{count} {unit} · 已截断")
+    } else {
+        format!("{count} {unit}")
+    })
+}
+
+/// The `execute` panel's output (V2's Code Mode entry): one status row per
+/// nested tool call the program made — the call's metadata records them live,
+/// in start order, while the program runs — followed by the formatted result.
+/// The header is the call count (plus failures), which the panel promotes to
+/// its folded title (`title_details`). `None` when there is neither a nested
+/// call nor a result, so the panel falls back to its input alone.
+fn execute_output(tool: &ToolPanel) -> Option<(Option<String>, BodyStyle, String)> {
+    let calls = tool
+        .metadata()
+        .and_then(|metadata| metadata.get("toolCalls"))
+        .and_then(serde_json::Value::as_array);
+    let result = tool.output();
+    if calls.is_none() && result.is_none() {
+        return None;
+    }
+    let calls = calls.map(Vec::as_slice).unwrap_or_default();
+    let failures = calls
+        .iter()
+        .filter(|call| call.get("status").and_then(serde_json::Value::as_str) == Some("error"))
+        .count();
+    let header = (!calls.is_empty()).then(|| match failures {
+        0 => format!("{} 个工具调用", calls.len()),
+        n => format!("{} 个工具调用 · {} 失败", calls.len(), n),
+    });
+    let mut body = calls
+        .iter()
+        .map(|call| {
+            let name = call
+                .get("tool")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("tool");
+            let status = call
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            format!("- {} `{}`", nested_status_icon(status), name)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if let Some(result) = result.filter(|result| !result.is_empty()) {
+        if !body.is_empty() {
+            body.push_str("\n\n");
+        }
+        // The result is often JSON; fence it when the generic long-line rules
+        // would wrap or fold it. Truncation happens before fencing so the
+        // panel's own budget clamp cannot leave an unclosed fence.
+        let result = truncate_md(&result, TOOL_OUTPUT_MAX_CHARS - 256);
+        if needs_code_block(&result) {
+            body.push_str(&fenced_code(&result, None));
+        } else {
+            body.push_str(&result);
+        }
+    }
+    Some((header, BodyStyle::Markdown, body))
+}
+
+/// The icon for one nested Code Mode call's recorded status — the same
+/// vocabulary the nested tool's own panel would show.
+fn nested_status_icon(status: &str) -> &'static str {
+    match status {
+        "completed" => "✅",
+        "error" => "❌",
+        "running" | "pending" => "⏳",
+        _ => "🔧",
+    }
 }
 
 /// The raw lines inside an XML-envelope output — the shape `task` and `skill`
@@ -830,6 +1028,18 @@ fn parse_task_envelope(output: &str) -> Option<(Option<String>, String)> {
     Some((summary, body.trim_end().to_string()))
 }
 
+/// Strip V2's `subagent` envelope: `<subagent sessionID state>` around the
+/// child's final report. Unlike V1's `<task>`, the body is the whole envelope
+/// (no `<summary>`/`<task_result>` inner tags). `None` when the shape doesn't
+/// match (a failure text, the background handle's plain sentence), so the
+/// caller shows the output unchanged.
+fn parse_subagent_envelope(output: &str) -> Option<String> {
+    let body = envelope_lines(output, "<subagent ", "</subagent>")?
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(body.trim().to_string())
+}
+
 /// Strip a `skill` tool's XML envelope: `<skill_content name=…>` around the
 /// skill's own markdown, dropping the sampled `<skill_files>` inventory (a
 /// file list the reader can't use). `None` when the wrapper isn't there, so the
@@ -851,6 +1061,42 @@ fn parse_skill_envelope(output: &str) -> Option<String> {
     Some(body.trim_end().to_string())
 }
 
+/// Parse V2's `read` output — no XML wrapper, just a header line over the
+/// content (`Read file <path>, lines N-M` / `Read directory <path>, entries
+/// N-M`, or the `0 lines` / `0 entries` empty forms). The header line is
+/// promoted to the panel header (`📄` for a file, `📁` for a directory) and the
+/// rest renders as a code block (the directory listing without a language).
+/// `None` when the first line isn't that shape, so the caller shows the output
+/// unchanged.
+fn parse_v2_read_output(output: &str) -> Option<(Option<String>, BodyStyle, String)> {
+    let (first, body) = match output.split_once('\n') {
+        Some((first, body)) => (first, body),
+        None => (output, ""),
+    };
+    // The path may itself contain ", ", so the counted tail decides where it
+    // ends (`lines 1-2` / `0 lines` / `entries 3-4` / `0 entries`).
+    let (head, tail) = first.rsplit_once(", ")?;
+    if !(tail.starts_with("lines ")
+        || tail == "0 lines"
+        || tail.starts_with("entries ")
+        || tail == "0 entries")
+    {
+        return None;
+    }
+    let (icon, path) = if let Some(path) = head.strip_prefix("Read file ") {
+        ("📄", path)
+    } else {
+        let path = head.strip_prefix("Read directory ")?;
+        ("📁", path)
+    };
+    let style = if icon == "📄" {
+        BodyStyle::Code(code_lang_for_path(path))
+    } else {
+        BodyStyle::Code(None)
+    };
+    Some((Some(format!("{icon} `{path}`")), style, body.to_string()))
+}
+
 /// Parse a `websearch` tool's JSON result envelope into an un-fenced markdown
 /// list: one `[title](url)` per result, with its publish date when present.
 /// Excerpts are deliberately dropped — they are the model's reading material,
@@ -858,7 +1104,9 @@ fn parse_skill_envelope(output: &str) -> Option<String> {
 /// provider's no-results text, a different provider's shape), so the caller
 /// shows it unchanged.
 fn parse_websearch_results(output: &str) -> Option<(usize, String)> {
-    let results = parse_parallel_results(output).or_else(|| parse_exa_results(output))?;
+    let results = parse_parallel_results(output)
+        .or_else(|| parse_exa_results(output))
+        .or_else(|| parse_websearch_markdown(output))?;
     let lines = results
         .iter()
         .enumerate()
@@ -933,6 +1181,39 @@ fn parse_exa_results(output: &str) -> Option<Vec<SearchEntry>> {
         let title = if title == "N/A" { String::new() } else { title };
         let date = date.filter(|d| !d.is_empty() && d != "N/A");
         results.push((title, url, date));
+    }
+    (!results.is_empty()).then_some(results)
+}
+
+/// V2's `websearch` output is markdown: each result is a `## [title](url)`
+/// heading, an optional `Published:` line, then the excerpt. Parse the headings
+/// into the same `(title, url, date)` entries and drop the excerpts (the
+/// model's reading material, as with the V1 envelopes). A heading only counts
+/// at a block start (the first line or after a blank line), so an excerpt that
+/// itself quotes a `## …` line is not read as another result; `None` when the
+/// shape doesn't match (the provider's no-results text), so the caller shows
+/// the output unchanged.
+fn parse_websearch_markdown(output: &str) -> Option<Vec<SearchEntry>> {
+    let mut results: Vec<SearchEntry> = Vec::new();
+    let mut previous_blank = true;
+    for line in output.lines() {
+        if previous_blank
+            && let Some(rest) = line.strip_prefix("## [")
+            && let Some((title, rest)) = rest.split_once("](")
+            && let Some(url) = rest.strip_suffix(')')
+            && !url.is_empty()
+        {
+            results.push((title.to_string(), url.to_string(), None));
+            previous_blank = false;
+            continue;
+        }
+        if let Some(date) = line.trim().strip_prefix("Published: ")
+            && let Some(entry) = results.last_mut()
+            && entry.2.is_none()
+        {
+            entry.2 = Some(date.trim().to_string());
+        }
+        previous_blank = line.trim().is_empty();
     }
     (!results.is_empty()).then_some(results)
 }
@@ -1062,9 +1343,23 @@ fn format_tool_input(name: &str, input: &serde_json::Value) -> String {
                 s.push_str(&format!("\n从第 {} 行起", offset));
             }
             if let Some(limit) = obj.get("limit").and_then(|v| v.as_i64()) {
-                s.push_str(&format!("\n最多 {} 行", limit));
+                // `limit` counts the tool's own unit: read pages lines, glob
+                // counts files (grep's limit counts matching lines).
+                let unit = if name == "glob" { "个文件" } else { "行" };
+                s.push_str(&format!("\n最多 {} {}", limit, unit));
             }
             if s.len() <= 1 { input.to_string() } else { s }
+        }
+        "apply_patch" | "patch" => {
+            // The patch text is the tool's whole request; the card only needs
+            // what it touched. V1's `apply_patch` and V2's `patch` share the
+            // `patchText` field and the `*** Update File:` framing.
+            let files = patch_files(get("patchText").unwrap_or(""));
+            match files.as_slice() {
+                [] => generic_tool_input(obj),
+                [only] => format!("📄 `{only}`"),
+                [first, ..] => format!("📄 `{first}` 等 {} 个文件", files.len()),
+            }
         }
         "webfetch" => {
             if let Some(url) = get("url") {
@@ -1073,14 +1368,28 @@ fn format_tool_input(name: &str, input: &serde_json::Value) -> String {
                 input.to_string()
             }
         }
-        "task" => {
+        "websearch" => match get("query") {
+            Some(query) => format!("🔎 `{}`", query),
+            None => generic_tool_input(obj),
+        },
+        "execute" => match get("code") {
+            // V2's Code Mode entry: the program is the panel's input, fenced
+            // with the output budget (`tool_panel_element` widens the input
+            // clamp for this tool); the pre-clamp keeps the closing fence
+            // inside the panel's budget.
+            Some(code) => fenced_code(&truncate_md(code, TOOL_OUTPUT_MAX_CHARS - 64), Some("javascript")),
+            None => generic_tool_input(obj),
+        },
+        "task" | "subagent" => {
             let desc = get("description").unwrap_or("子任务");
-            let sub = get("subagent_type")
+            // V1 names the subagent type `subagent_type`, V2 `agent`.
+            let sub = get("agent")
+                .or_else(|| get("subagent_type"))
                 .map(|s| format!("\n🤖 `{}`", s))
                 .unwrap_or_default();
             format!("🔀 {}{}", desc, sub)
         }
-        "skill" => match get("name") {
+        "skill" => match get("name").or_else(|| get("id")) {
             Some(name) => format!("🧩 {}", name),
             None => input.to_string(),
         },
@@ -1101,25 +1410,42 @@ fn format_tool_input(name: &str, input: &serde_json::Value) -> String {
             Some(todos) => format!("📋 共 {} 项任务", todos.len()),
             None => input.to_string(),
         },
-        _ => {
-            // Generic: one `- key: value` line per scalar field.
-            let mut lines = Vec::new();
-            for (k, v) in obj {
-                let val = match v {
-                    serde_json::Value::String(s) => s.to_string(),
-                    serde_json::Value::Number(n) => n.to_string(),
-                    serde_json::Value::Bool(b) => b.to_string(),
-                    other => other.to_string(),
-                };
-                lines.push(format!("- {}: {}", k, first_chunk(&val, 160)));
-            }
-            if lines.is_empty() {
-                input.to_string()
-            } else {
-                lines.join("\n")
-            }
-        }
+        _ => generic_tool_input(obj),
     }
+}
+
+/// The generic fallback for a tool without a tailored input arm: one
+/// `- key: value` line per scalar field, nested values compacted and clipped.
+fn generic_tool_input(obj: &serde_json::Map<String, serde_json::Value>) -> String {
+    let mut lines = Vec::new();
+    for (k, v) in obj {
+        let val = match v {
+            serde_json::Value::String(s) => s.to_string(),
+            serde_json::Value::Number(n) => n.to_string(),
+            serde_json::Value::Bool(b) => b.to_string(),
+            other => other.to_string(),
+        };
+        lines.push(format!("- {}: {}", k, first_chunk(&val, 160)));
+    }
+    if lines.is_empty() {
+        serde_json::Value::Object(obj.clone()).to_string()
+    } else {
+        lines.join("\n")
+    }
+}
+
+/// The files a patch text touches, in the order it names them: the
+/// `*** Update File: <path>` / `*** Add File:` / `*** Delete File:` headers of
+/// OpenCode's patch format (V1 `apply_patch` and V2 `patch`).
+fn patch_files(patch_text: &str) -> Vec<&str> {
+    patch_text
+        .lines()
+        .filter_map(|line| {
+            ["*** Update File: ", "*** Add File: ", "*** Delete File: "]
+                .iter()
+                .find_map(|prefix| line.strip_prefix(prefix))
+        })
+        .collect()
 }
 
 /// The first line of `s`, clipped to `max_chars` (with a "…" marker). Used to
@@ -1398,11 +1724,11 @@ mod tests {
         assert_eq!(untimed.title_fragment(now), "bash");
     }
 
-    /// The child session id is read from a task call's metadata only
-    /// (`state.metadata.sessionId`); every other tool and a metadata-less task
-    /// call yield nothing.
+    /// The child session id is read from a child-spawning call's metadata only:
+    /// V1's `task` records it as `sessionId`, V2's `subagent` as `sessionID`.
+    /// Every other tool and a metadata-less call yield nothing.
     #[test]
-    fn task_child_session_id_reads_metadata_session_id() {
+    fn task_child_session_id_reads_both_generations_metadata() {
         let plain = ToolPanel::for_test("task", ToolStatus::Running, None, None);
         assert_eq!(plain.child_session_id(), None);
 
@@ -1418,6 +1744,23 @@ mod tests {
             output: ToolOutput::default(),
         });
         assert_eq!(with_metadata.child_session_id(), Some("ses_child"));
+
+        let subagent = ToolPanel::new(ToolCall {
+            identity: ToolIdentity {
+                name: "subagent".into(),
+                call_id: "call_2".into(),
+            },
+            status: ToolStatus::Running,
+            started_at: None,
+            input: None,
+            metadata: Some(json!({"sessionID": "ses_v2_child", "status": "running"})),
+            output: ToolOutput::default(),
+        });
+        assert_eq!(subagent.child_session_id(), Some("ses_v2_child"));
+
+        // A `subagent` part without a recorded child id yields nothing.
+        let bare = ToolPanel::for_test("subagent", ToolStatus::Running, None, None);
+        assert_eq!(bare.child_session_id(), None);
 
         let mut bash = ToolPanel::for_test("bash", ToolStatus::Running, None, None);
         bash.call = ToolCall {
@@ -2649,5 +2992,399 @@ LSP errors detected in a.rs, please fix:
         assert_eq!(first_chunk(&long, 10), format!("{}…", "a".repeat(10)));
         // Only the first line of multi-line input is shown.
         assert_eq!(first_chunk("first line\nsecond line", 100), "first line");
+    }
+
+    // --- OpenCode 2 built-in tools (spec #467) ------------------------------
+    //
+    // V2 renamed three built-ins (`bash`→`shell`, `task`→`subagent`,
+    // `apply_patch`→`patch`), reshaped `read`/`websearch` output, and added the
+    // Code Mode `execute` tool. These tests pin the arms that keep the same
+    // information on the card for each.
+
+    /// A ToolPanel over a call with recorded metadata (V2 records run state,
+    /// diffs and nested calls there) and one text output block.
+    fn panel_with(
+        name: &str,
+        status: ToolStatus,
+        input: serde_json::Value,
+        metadata: serde_json::Value,
+        output: Option<&str>,
+    ) -> ToolPanel {
+        ToolPanel::new(ToolCall {
+            identity: ToolIdentity {
+                name: name.into(),
+                call_id: format!("call_{name}"),
+            },
+            status,
+            started_at: None,
+            input: Some(input),
+            metadata: Some(metadata),
+            output: ToolOutput {
+                raw: output.map(|text| serde_json::Value::String(text.to_string())),
+                blocks: output
+                    .map(|text| vec![ContentBlock::Text(text.to_string())])
+                    .unwrap_or_default(),
+                error: None,
+            },
+        })
+    }
+
+    fn panel_md(tool: ToolPanel) -> String {
+        let card = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_tool(tool)
+            .build();
+        card["body"]["elements"][0]["elements"][0]["content"]
+            .as_str()
+            .expect("panel markdown content")
+            .to_string()
+    }
+
+    fn panel_title(tool: ToolPanel) -> String {
+        let card = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_tool(tool)
+            .build();
+        card["body"]["elements"][0]["header"]["title"]["content"]
+            .as_str()
+            .expect("panel title")
+            .to_string()
+    }
+
+    /// V2 spells the file-editing patch tool `patch` (V1: `apply_patch`) and
+    /// records the same `metadata.files[]` diffs `edit` does. The panel must
+    /// render the hunks, name the touched files in the input, and drop the
+    /// generated success summary.
+    #[test]
+    fn patch_v2_renders_hunks_and_names_the_files() {
+        let patch = "\
+Index: /a/one.rs
+===================================================================
+--- /a/one.rs
++++ /a/one.rs
+@@ -1,3 +1,3 @@
+ let a = 1;
+-let b = 2;
++let b = 3;
+ let c = 4;";
+        let tool = panel_with(
+            "patch",
+            ToolStatus::Completed,
+            json!({"patchText": "*** Begin Patch\n*** Update File: /a/one.rs\n@@\n-let b = 2;\n+let b = 3;\n*** End Patch"}),
+            json!({"files": [{"file": "/a/one.rs", "patch": patch, "status": "modified",
+                              "additions": 1, "deletions": 1}]}),
+            Some("Success. Updated the following files:\nM /a/one.rs"),
+        );
+        let md = panel_md(tool);
+        assert!(md.contains("**Input**\n📄 `/a/one.rs`"), "file in input: {md}");
+        assert!(md.contains("**Output**\n\n+1 −1"), "count header: {md}");
+        assert!(md.contains("```\nIndex: /a/one.rs"), "fenced hunks: {md}");
+        assert!(
+            md.contains("-let b = 2;") && md.contains("+let b = 3;"),
+            "hunks: {md}"
+        );
+        assert!(!md.contains("let a = 1;"), "context dropped: {md}");
+        assert!(!md.contains("Success. Updated"), "summary dropped: {md}");
+
+        // Several files: the input names the first and counts the rest.
+        assert_eq!(
+            format_tool_input(
+                "patch",
+                &json!({"patchText": "*** Begin Patch\n*** Add File: a.rs\n*** Delete File: b.rs\n*** End Patch"})
+            ),
+            "📄 `a.rs` 等 2 个文件"
+        );
+        // An unparseable patchText falls back to the generic key-value list,
+        // never a raw JSON dump.
+        assert_eq!(
+            format_tool_input("patch", &json!({"patchText": "not a patch"})),
+            "- patchText: not a patch"
+        );
+    }
+
+    /// V2 spells the subagent tool `subagent` (V1: `task`) and names the agent
+    /// type `agent` (V1: `subagent_type`); the panel renders the same one-line
+    /// summary for both.
+    #[test]
+    fn subagent_input_shows_the_agent_and_description() {
+        assert_eq!(
+            format_tool_input(
+                "subagent",
+                &json!({"agent": "general", "description": "review the diff", "prompt": "…", "background": true})
+            ),
+            "🔀 review the diff\n🤖 `general`"
+        );
+        assert_eq!(
+            format_tool_input("task", &json!({"description": "x", "subagent_type": "build"})),
+            "🔀 x\n🤖 `build`"
+        );
+        assert_eq!(
+            format_tool_input("subagent", &json!({"agent": "explore"})),
+            "🔀 子任务\n🤖 `explore`"
+        );
+    }
+
+    /// V2's subagent output is a `<subagent sessionID state>` envelope with the
+    /// report as its whole body (no `<summary>`/`<task_result>` inner tags like
+    /// V1's `<task>`). The wrapper must never reach the card; a background
+    /// handle is plain text and stays unchanged.
+    #[test]
+    fn subagent_v2_output_strips_the_envelope() {
+        let raw = "<subagent sessionID=\"ses_child\" state=\"completed\">\n\
+                   Report line 1\n\nReport line 2\n</subagent>";
+        let (header, style, body) = format_tool_output("subagent", raw);
+        assert_eq!(header, None);
+        assert_eq!(style, BodyStyle::Auto);
+        assert!(body.starts_with("Report line 1"), "report kept: {body:?}");
+        assert!(body.contains("Report line 2"), "report kept: {body:?}");
+        assert!(!body.contains("<subagent"), "wrapper stripped: {body:?}");
+        assert!(!body.contains("</subagent>"), "wrapper stripped: {body:?}");
+
+        let handle = "The subagent is working in the background (sessionID: ses_x).";
+        assert_eq!(format_tool_output("subagent", handle).2, handle);
+    }
+
+    /// V2's `skill` input is `{id}` where V1's was `{name}`; both render the
+    /// skill's name, and V2's output envelope (`<skill_content>`) is unchanged
+    /// and already handled.
+    #[test]
+    fn skill_input_reads_v2_id_and_v1_name() {
+        assert_eq!(
+            format_tool_input("skill", &json!({"id": "implement"})),
+            "🧩 implement"
+        );
+        assert_eq!(
+            format_tool_input("skill", &json!({"name": "caveman"})),
+            "🧩 caveman"
+        );
+    }
+
+    /// A `websearch` input had no V1 arm either: the query leads the panel.
+    #[test]
+    fn websearch_input_shows_the_query() {
+        assert_eq!(
+            format_tool_input("websearch", &json!({"query": "rust lifetimes"})),
+            "🔎 `rust lifetimes`"
+        );
+    }
+
+    /// V2's `read` output has no XML wrapper: a header line (`Read file
+    /// <path>, lines N-M` / `Read directory <path>, entries N-M`) over numbered
+    /// lines or a listing. The header line is promoted to the panel header and
+    /// the body fences with the path's language (a directory listing without
+    /// one).
+    #[test]
+    fn v2_read_output_promotes_the_header_line() {
+        let file = "Read file /x/y.rs, lines 1-2\n1: use std::fs;\n2: fn main() {}";
+        let (header, style, body) = format_tool_output("read", file);
+        assert_eq!(style, BodyStyle::Code(Some("rust")), "language from .rs");
+        let header = header.unwrap_or_default();
+        assert!(header.contains("/x/y.rs"), "path in header: {header}");
+        assert!(!body.contains("Read file"), "header line promoted: {body}");
+        assert!(body.contains("1: use std::fs;"), "code kept: {body}");
+
+        let dir = "Read directory /x/src, entries 1-2\n/x/src/a.rs\n/x/src/b.rs";
+        let (header, style, body) = format_tool_output("read", dir);
+        let header = header.unwrap_or_default();
+        assert!(header.contains("/x/src"), "dir path: {header}");
+        assert_eq!(style, BodyStyle::Code(None));
+        assert!(body.contains("/x/src/a.rs"), "listing kept: {body}");
+
+        let empty = "Read file /x/empty.txt, 0 lines";
+        let (header, _, body) = format_tool_output("read", empty);
+        assert!(header.unwrap_or_default().contains("/x/empty.txt"));
+        assert!(body.is_empty(), "empty file has no body: {body:?}");
+
+        // A card-level check: the read header and fence reach the panel.
+        let tool = ToolPanel::for_test(
+            "read",
+            ToolStatus::Completed,
+            Some(json!({"path": "/x/y.rs"})),
+            Some(file),
+        );
+        let md = panel_md(tool);
+        assert!(md.contains("**Output**\n\n📄 `/x/y.rs`"), "read header: {md}");
+        assert!(md.contains("```rust\n1: use std::fs;"), "fenced body: {md}");
+    }
+
+    /// V2's `websearch` output is markdown (`## [title](url)` + an optional
+    /// `Published:` line + the excerpt), not V1's JSON/Exa envelopes. The panel
+    /// renders the same title+url list and drops the excerpts.
+    #[test]
+    fn websearch_v2_markdown_renders_as_a_result_list() {
+        let raw = "\
+## [First result](https://a.example/one)
+Published: 2026-01-02T00:00:00.000Z
+
+excerpt one that must not appear
+
+## [Second result](https://b.example/two)
+
+excerpt two";
+        let (header, style, body) = format_tool_output("websearch", raw);
+        assert_eq!(header.as_deref(), Some("🔎 2 条结果"));
+        assert_eq!(style, BodyStyle::Markdown);
+        assert!(
+            body.contains("1. [First result](https://a.example/one) · 2026-01-02T00:00:00.000Z"),
+            "dated first result: {body}"
+        );
+        assert!(
+            body.contains("2. [Second result](https://b.example/two)"),
+            "second: {body}"
+        );
+        assert!(!body.contains("excerpt"), "excerpts dropped: {body}");
+        assert_eq!(
+            format_tool_output("websearch", "No search results found.").0,
+            None
+        );
+    }
+
+    /// V2 records a shell command's outcome in the call's metadata; a settled
+    /// call that exited non-zero or timed out renders the failure icon even
+    /// though the protocol's status is `completed` (the same derivation the
+    /// official 2.0.x client uses). The typed liveness stays status-based.
+    #[test]
+    fn a_settled_shell_reports_metadata_failures() {
+        let with = |metadata: serde_json::Value| {
+            panel_with(
+                "shell",
+                ToolStatus::Completed,
+                json!({"command": "false"}),
+                metadata,
+                Some(""),
+            )
+        };
+        assert_eq!(
+            panel_title(with(json!({"status": "completed", "exit": 1}))),
+            "❌ shell"
+        );
+        assert_eq!(
+            panel_title(with(json!({"status": "completed", "exit": 0}))),
+            "✅ shell"
+        );
+        assert_eq!(
+            panel_title(with(json!({"status": "completed", "timeout": true}))),
+            "❌ shell"
+        );
+        // A backgrounded launch keeps its 🌙 marker: the run is the ledger's.
+        assert_eq!(
+            panel_title(with(json!({"status": "running", "shellID": "sh_1"}))),
+            "🌙 shell"
+        );
+        // The icon is presentation only: the call is settled either way.
+        assert!(!with(json!({"status": "completed", "exit": 1})).is_live());
+    }
+
+    /// V2 records the result count and truncation in the call's metadata; the
+    /// panel's output header carries them. A call without the metadata (a
+    /// third-party tool claiming the id) keeps the raw shape.
+    #[test]
+    fn glob_and_grep_headers_carry_the_result_counts() {
+        let glob = panel_with(
+            "glob",
+            ToolStatus::Completed,
+            json!({"pattern": "**/*.rs"}),
+            json!({"count": 3, "truncated": false}),
+            Some("a.rs\nb.rs\nc.rs"),
+        );
+        let md = panel_md(glob);
+        assert!(md.contains("**Output**\n\n3 个文件"), "glob count: {md}");
+
+        let truncated = panel_with(
+            "glob",
+            ToolStatus::Completed,
+            json!({"pattern": "**/*.rs"}),
+            json!({"count": 100, "truncated": true}),
+            Some("a.rs"),
+        );
+        let md = panel_md(truncated);
+        assert!(md.contains("100 个文件 · 已截断"), "truncation noted: {md}");
+
+        let grep = panel_with(
+            "grep",
+            ToolStatus::Completed,
+            json!({"pattern": "fn main"}),
+            json!({"matches": 2, "truncated": false}),
+            Some("Found 2 matches\nsrc/a.rs:\n  Line 1: fn main() {}"),
+        );
+        let md = panel_md(grep);
+        assert!(md.contains("**Output**\n\n2 处匹配"), "grep count: {md}");
+
+        assert_eq!(format_tool_output("glob", "a.rs\nb.rs").0, None);
+    }
+
+    /// V2's Code Mode entry (`execute`): the script renders as a fenced
+    /// JavaScript block and the nested calls the program made render as one
+    /// status row each from the call's metadata (present while it runs). A
+    /// completed program whose metadata reports an error — its own or a nested
+    /// call's — shows the failure icon, and the folded title carries the call
+    /// count.
+    #[test]
+    fn execute_panel_renders_the_script_and_its_nested_calls() {
+        let tool = panel_with(
+            "execute",
+            ToolStatus::Completed,
+            json!({"code": "const r = await tools.webfetch({ url: \"https://a.example\" });\nreturn r.output;"}),
+            json!({"toolCalls": [
+                {"tool": "webfetch", "status": "completed", "input": {"url": "https://a.example"}},
+                {"tool": "opencode_models", "status": "error"}
+            ]}),
+            Some("boom"),
+        );
+        assert_eq!(panel_title(tool.clone()), "❌ execute · 2 个工具调用 · 1 失败");
+        let md = panel_md(tool);
+        assert!(md.contains("**Input**\n```javascript"), "script fenced: {md}");
+        assert!(md.contains("tools.webfetch"), "script kept: {md}");
+        assert!(md.contains("- ✅ `webfetch`"), "nested row: {md}");
+        assert!(md.contains("- ❌ `opencode_models`"), "failed nested row: {md}");
+        assert!(md.contains("boom"), "result kept: {md}");
+
+        // A successful program: ✅ and no failure count.
+        let ok = panel_with(
+            "execute",
+            ToolStatus::Completed,
+            json!({"code": "return 1"}),
+            json!({"toolCalls": [{"tool": "fetch", "status": "completed"}]}),
+            Some("1"),
+        );
+        assert_eq!(panel_title(ok), "✅ execute · 1 个工具调用");
+
+        // A live program with no output yet still lists its calls.
+        let live = panel_with(
+            "execute",
+            ToolStatus::Running,
+            json!({"code": "await tools.webfetch({ url: \"https://a.example\" })"}),
+            json!({"toolCalls": [{"tool": "fetch", "status": "running", "input": {"url": "https://a.example"}}]}),
+            None,
+        );
+        assert!(panel_title(live.clone()).starts_with("⏳ execute · 1 个工具调用"));
+        let md = panel_md(live);
+        assert!(md.contains("- ⏳ `fetch`"), "live nested row: {md}");
+
+        // A same-named foreign tool without the Code Mode input shape stays on
+        // the opaque path: no fenced JavaScript, no call-count title.
+        let foreign = panel_with(
+            "execute",
+            ToolStatus::Completed,
+            json!({"script": "console.log(1)"}),
+            json!({}),
+            Some("done"),
+        );
+        assert!(
+            !panel_md(foreign.clone()).contains("```javascript"),
+            "no Code Mode input rendering for a foreign shape"
+        );
+        assert!(!panel_title(foreign).contains("工具调用"));
+    }
+
+    /// The input limit hint carries the tool's own unit: `read` pages lines,
+    /// `glob` counts files.
+    #[test]
+    fn input_limit_hints_match_the_tool() {
+        assert!(
+            format_tool_input("glob", &json!({"pattern": "**/*.rs", "limit": 5})).contains("最多 5 个文件")
+        );
+        assert!(format_tool_input("read", &json!({"path": "a.rs", "limit": 5})).contains("最多 5 行"));
+        assert!(format_tool_input("grep", &json!({"pattern": "x", "limit": 5})).contains("最多 5 行"));
     }
 }

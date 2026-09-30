@@ -99,3 +99,33 @@ This ADR is about *how* a Tool Panel renders (tailored vs. opaque) and assumed
 it is a timeline row. ADR-0045 moves a panel whose tool is still running out of
 the timeline and into the card tail, so a Card Chain split can never strand it;
 the rendering boundary here is unchanged.
+
+## Amendment (2026-10-01): the OpenCode 2 built-in set
+
+The observed built-in set recorded above is V1's. The current generation
+(OpenCode 2.0.x, the `/api` surface) ships a different set, and the Tool Panel
+arms now match it by the same rule — exact built-in id, shape-gated:
+
+- `shell` replaces V1's `bash`. The id arm is unchanged; V2 additionally
+  records the run's outcome in `metadata.exit`/`metadata.timeout`, which the
+  panel reads for its failure icon (a settled call can report a failure while
+  its protocol status reads `completed`).
+- `subagent` replaces V1's `task`, and records the child session as
+  `metadata.sessionID` (V1: `sessionId`). Both ids keep ADR-0054's child
+  liveness; the output envelope is `<subagent sessionID state>` rather than
+  `<task …>` with `<summary>`/`<task_result>` inner tags.
+- `patch` replaces V1's `apply_patch`; its diff is the same
+  `metadata.files[].patch` shape `edit` records, and its input is the same
+  `patchText` framing.
+- `todowrite` does not exist in OpenCode 2 (the V1→V2 migration removes it);
+  the Todo Panel is a V1-only surface until V1 retirement.
+- `execute` is new: the Code Mode entry. Its `metadata.toolCalls` records the
+  nested calls the program made (name, status, input) and updates while it
+  runs; the panel renders them as display-only status rows. cola never treats
+  another tool's payload as a protocol trigger.
+- Namespaced tools (MCP servers, the `opencode_*` session/model tools) are
+  flattened to `<namespace>_<tool>` ids and stay opaque, per this ADR's
+  third-party rule.
+
+Nothing above changes the boundary: only ids OpenCode ships get arms, each arm
+stays shape-gated, and every other payload stays raw.
