@@ -332,6 +332,21 @@ impl CardSession {
         self.chain_id
     }
 
+    /// Whether this card can still receive the Background Task Ledger
+    /// (ADR-0060): a yielded Waiting card, live, with no handoff owed — exactly
+    /// the admission [`super::Turn::refresh_yielded_ledger`] grants. The
+    /// runtime reconciliation only observes a retirement while this holds,
+    /// because the entry renders on the chain that observes it: observing with
+    /// no such card (a settled chain, or no card at all) would record the task
+    /// and swallow its entry forever (found on a real restart, 2026-10-01 —
+    /// the reconcile ran against a session whose card had just settled, and
+    /// the 已失联 entries never appeared).
+    pub(crate) fn accepts_ledger_refresh(&self) -> bool {
+        self.acc.card_state == crate::feishu::card::CardState::Waiting
+            && self.card_is_live
+            && self.pending_split.is_empty()
+    }
+
     /// True while this card belongs to a Turn that has not finished: the pull
     /// condition for `/card` (ADR-0043, 2026-09-22 amendment). A terminal card
     /// (Done/Error/Retried/Stopped and the collected waiting states

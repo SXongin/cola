@@ -56,6 +56,15 @@ with positive evidence only.**
   the gone record — with the runtime's own completion time when it has one,
   never an invented clock. The last retirement ends the wait per ADR-0060's
   quiet true end (✅ in place, no new card).
+- **A retirement is observed only while a waiting card can receive it.** The
+  reconcile runs only when the tracked card is a yielded, live Waiting card —
+  the very admission the ledger refresh grants (`CardSession::accepts_ledger_refresh`).
+  The entry renders on the observing chain, so observing with a settled chain
+  or no chain at all would record the task and swallow its entry (found on the
+  same real restart: the reconcile retired two tasks at 02:25:13 while the card
+  had settled a minute earlier, and nothing rendered). With no such card the
+  transcript is left as read; the next Waiting card reconciles and shows the
+  ending.
 - **A retirement is remembered for cola's life.** The read that observes one
   records its call ids in a process-local overlay the adapter applies to every
   transcript read, so the never-flipping launch record cannot resurrect the

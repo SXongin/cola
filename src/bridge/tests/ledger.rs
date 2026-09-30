@@ -1267,6 +1267,46 @@ async fn a_runtime_confirmed_end_settles_the_waiting_card() {
     );
 }
 
+/// Issue #454 review: the reconcile observes a retirement only while a card can
+/// still receive the ledger. With no card — a settled chain, or right after a
+/// restart — observing would record the task and swallow its entry (the real
+/// restart retired at 02:25:13 with no card and showed nothing); the next
+/// Waiting card reconciles instead, and the task is still there to be seen.
+#[tokio::test]
+async fn a_runtime_retirement_waits_for_a_waiting_card() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = waiting_shell(now - 5_000);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    backend.task_runtime.lock().unwrap().shells = vec![("sh_call_bg".into(), ShellRuntime::Missing)];
+
+    // No card yet: Session Sync runs, but must not observe (or record) the
+    // retirement.
+    spawn_sync(&app);
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    assert!(
+        backend.task_runtime_calls.lock().await.is_empty(),
+        "no waiting card means no runtime observation"
+    );
+
+    // A card exists and yields waiting: the same read now observes, renders the
+    // entry, and settles.
+    yield_one_task_card(&app, &platform, ctx("ses_test", "跑一下构建并审阅")).await;
+    wait_for_card_update(
+        &platform,
+        "the entry after the card exists",
+        CardUpdates::Latest,
+        |card| {
+            card_header(card).contains("✅") && card_text(card).contains("🔔 后台任务已失联：gh run watch")
+        },
+    )
+    .await;
+    assert!(
+        !backend.task_runtime_calls.lock().await.is_empty(),
+        "the waiting card's pass observed the retirement"
+    );
+}
+
 /// Issue #454 review: a retirement observed by a chain whose anchor postdates
 /// the task's launch still renders its entry — after a restart the launching
 /// card is gone, and scoping the entry to the observing chain's anchor would

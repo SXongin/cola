@@ -1742,10 +1742,7 @@ impl Turn {
             let Some(card) = live.get_mut(session_id) else {
                 return YieldedUpdate::Unchanged;
             };
-            if card.acc.card_state != crate::feishu::card::CardState::Waiting {
-                return YieldedUpdate::Unchanged;
-            }
-            if !card.card_is_live || !card.pending_split.is_empty() {
+            if !card.accepts_ledger_refresh() {
                 return YieldedUpdate::Unchanged;
             }
             let anchor = card.acc.turn_anchor.clone();
