@@ -146,6 +146,13 @@ pub(crate) struct PromptContext {
     pub(crate) cola_message_id: Option<String>,
     /// Downloaded images attached to this turn (Image Attachments).
     pub(crate) images: Vec<ImageAttachment>,
+    /// The Backend's ADVISORY status read reported a live Execution while cola
+    /// owned no live card chain (ADR-0062): the new Turn's card opens with
+    /// [`MERGE_OPENING`], and its prompt still carries the merge delivery (the
+    /// V2 steer), so a genuinely live run merges the message exactly as a
+    /// Supplement would. False when the advisory read was idle or unreadable,
+    /// and for a retry (never routed by this reading).
+    pub(crate) advisory_live: bool,
 }
 
 /// One user→assistant exchange (CONTEXT.md: Turn). Owns the per-turn state and
@@ -285,6 +292,7 @@ impl Turn {
             is_group,
             cola_message_id,
             images,
+            advisory_live,
         } = ctx;
         // This logical user message keeps ONE id across every attempt of this
         // turn (ADR-0026): a retry carries the previous attempt's id so the
@@ -359,6 +367,14 @@ impl Turn {
         // on a missing id, and the first flush after the id lands serves it.
         let started_at = std::time::Instant::now();
         let mut acc = StreamAccumulator::new(&subtitle);
+        // The advisory-live opening line (ADR-0062): pushed BEFORE any part can
+        // render, so it heads the card's timeline and every later flush keeps
+        // it — the card that owns this message says the message merged into a
+        // live run, whether the read was stale (this Turn runs it) or true
+        // (the run merges it through the steer delivery).
+        if advisory_live {
+            acc.push_receipt(MERGE_OPENING);
+        }
         acc.reply_to_message_id = Some(message_id.clone());
         acc.session_id = Some(session_id.clone());
         // The notice's clock travels on the card (ADR-0060): a quiet true end
@@ -408,10 +424,16 @@ impl Turn {
             );
         }
 
-        let loading = crate::feishu::card::shell::CardBuilder::new()
+        let mut loading = crate::feishu::card::shell::CardBuilder::new()
             .with_state(crate::feishu::card::CardState::Loading)
-            .with_subtitle(&subtitle)
-            .build();
+            .with_subtitle(&subtitle);
+        if advisory_live {
+            // The first visible card carries the same opening line the first
+            // flush will re-render from the accumulator: the reply window can
+            // outlast the render poll, and the card must not open silent.
+            loading = loading.with_text(MERGE_OPENING);
+        }
+        let loading = loading.build();
         // Every attempt gets its own card, a retry included: the failed card
         // stays below the new one, marked `Retried` by the retry handler before
         // this submit (spec #391). The reply target is the failed turn's own
@@ -1258,6 +1280,14 @@ const PULL_RECEIPT: &str = "⏬ 实时卡片已移到底部";
 /// restart, and cola never claims more than "the work resumed".
 const WAKE_RECEIPT: &str = "🔔 已恢复执行，继续处理…";
 
+/// The opening line a new Turn's card carries when cola owned no live chain
+/// but the Backend's ADVISORY status read reported the Session live
+/// (ADR-0062): the message rides the merge delivery (the V2 steer), so a
+/// genuinely live run merges it exactly as a Supplement would — and the card
+/// says so instead of promising a fresh run. Never a routing key itself: a
+/// stale read only changes this line, never the route.
+const MERGE_OPENING: &str = "📨 已收到，将并入当前运行";
+
 impl SplitKind {
     /// The one receipt line this cause's continuation carries: every queued
     /// split gets exactly one, in arrival order.
@@ -1668,6 +1698,9 @@ impl TurnRetry {
             is_group: self.is_group,
             cola_message_id,
             images: Vec::new(),
+            // A retry never routes through the advisory read (its own decision
+            // matrix already judged the run): an ordinary card.
+            advisory_live: false,
         }
     }
 }
@@ -3001,6 +3034,7 @@ mod tests {
             is_group: false,
             cola_message_id: None,
             images: Vec::new(),
+            advisory_live: false,
         }
     }
 

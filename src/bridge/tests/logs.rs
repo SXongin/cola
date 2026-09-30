@@ -55,6 +55,7 @@ fn prompt_context(thread_key: ThreadKey, text: &str) -> PromptContext {
         is_group: false,
         cola_message_id: Some("msg_cola_anchor".into()),
         images: Vec::new(),
+        advisory_live: false,
     }
 }
 
@@ -712,5 +713,90 @@ async fn a_re_switch_snapshot_gather_carries_the_session() {
     assert!(
         failed.contains("chat=chat_1"),
         "the gather warning carries the chat: {failed}"
+    );
+}
+
+/// ADR-0062's routing log: exactly one INFO line per routing decision, naming
+/// the session and the ownership verdict (with the advisory status when there
+/// is no owned chain) — and never the message body. Ownership alone decides
+/// the route; a message with no owned chain logs the advisory read it made,
+/// an owned one does not need a read at all.
+#[tokio::test]
+async fn prompt_routing_logs_the_ownership_verdict_without_the_message() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = MockBackend::new(realistic_parts());
+    // The first (advisory) read says Busy; every read after it serves the map
+    // (idle), so the new Turn settles instead of observing a live run forever.
+    backend.busy_then_idle_once();
+    let (app, _platform) = build_app(cfg, backend).await;
+    seed_session(&app, "ses_test", "/work").await;
+
+    // No owned chain: the advisory read is recorded, and it routed nothing —
+    // the message starts a Turn.
+    let text = "内部的秘密问题";
+    let ((), logs) = capture_logs(async {
+        app.handle_message(incoming(
+            "msg_1".into(),
+            "chat_1".into(),
+            "p2p".into(),
+            None,
+            text.into(),
+            None,
+        ))
+        .await;
+    })
+    .await;
+    let lines: Vec<&str> = logs
+        .lines()
+        .filter(|line| line.contains("prompt routing:"))
+        .collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "exactly one routing line per decision: {lines:?}\n{logs}"
+    );
+    let line = lines[0];
+    assert_eq!(line_level(line), "INFO", "the routing line stays INFO: {line}");
+    assert!(
+        line.contains("session=ses_test"),
+        "the verdict names the session: {line}"
+    );
+    assert!(line.contains("ownership=none"), "the ownership verdict: {line}");
+    assert!(line.contains("advisory=live"), "the advisory read: {line}");
+    assert!(line.contains("route=turn"), "the route: {line}");
+    assert!(
+        !logs.contains(text),
+        "the message body must never be logged:\n{logs}"
+    );
+
+    // An owned chain: ownership decides with no advisory read at all.
+    app.inflight.lock().await.insert("ses_test".into());
+    let text = "补充追问";
+    let ((), logs) = capture_logs(async {
+        app.handle_message(incoming(
+            "msg_2".into(),
+            "chat_1".into(),
+            "p2p".into(),
+            None,
+            text.into(),
+            None,
+        ))
+        .await;
+    })
+    .await;
+    let line = line_with(&logs, "prompt routing:");
+    assert!(
+        line.contains("ownership=guard") && line.contains("route=supplement"),
+        "an owned chain routes the Supplement by ownership alone: {line}"
+    );
+    assert!(
+        !line.contains("advisory="),
+        "an owned chain needs no advisory read: {line}"
+    );
+    assert!(
+        !logs.contains(text),
+        "the message body must never be logged:\n{logs}"
     );
 }

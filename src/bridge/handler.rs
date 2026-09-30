@@ -45,18 +45,19 @@ pub(crate) fn image_inputs(
         .collect()
 }
 
-/// One bounded `session_status` read for the prompt path — the admission
-/// liveness check (ADR-0059's routing key) and the retry matrix read through
-/// it, so the two can never drift in bound or failure policy. `what` labels
-/// the read in the bounded-call timeout log; both callers pass the same
-/// injected per-read bound (`TurnConfig::follow_read_timeout_ms`).
+/// One bounded `session_status` read for the prompt path — the ADVISORY read
+/// that picks a new Turn's opening line (ADR-0062; it no longer routes) — and
+/// the retry matrix read through it, so the two can never drift in bound or
+/// failure policy. `what` labels the read in the bounded-call timeout log;
+/// both callers pass the same injected per-read bound
+/// (`TurnConfig::follow_read_timeout_ms`).
 ///
 /// `None` is UNKNOWN: a failed call, a timed-out call, or an unrecognised
 /// status kind (each warned once here). A successful read always yields a
 /// status — absence from the server's map means idle. The callers own the
-/// direction: admission reads unknown as NOT live (a new Turn is the safe
-/// shape; the read may never invent a live Execution), while the retry matrix
-/// submits a fresh id (the click must always have an effect).
+/// direction: the advisory read treats unknown as NOT live (the ordinary
+/// loading card; a read may never invent a live Execution), while the retry
+/// matrix submits a fresh id (the click must always have an effect).
 async fn read_session_status(
     what: &str,
     timeout_ms: u64,
@@ -77,6 +78,25 @@ async fn read_session_status(
         // `bounded_call` already logged the timeout.
         None => None,
     }
+}
+
+/// The prompt routing verdict (ADR-0062). cola's own live ownership is the
+/// routing key; the Backend's status read is advisory data that only picks the
+/// new card's opening line.
+enum PromptRoute {
+    /// cola owns the Session's live card chain — a Turn's inflight guard (or
+    /// the out-of-turn follow that inherited it), or a chain a live renderer
+    /// owns: the message merges into it as a Supplement, and the chain splits.
+    Supplement,
+    /// cola owns no live chain: the message starts a new Turn, whose card owns
+    /// and settles it. A genuinely live run still merges it through the
+    /// prompt's merge delivery.
+    NewTurn {
+        /// Whether the Backend's advisory read reported a live Execution.
+        /// `false` when it read idle, unreadable (failed / timed out /
+        /// unrecognised) — never a route, only the opening line.
+        advisory_live: bool,
+    },
 }
 
 /// The bridge coordinator. Owns the state shared by every flow ([`SharedCore`])
@@ -489,32 +509,51 @@ impl App {
         })
     }
 
-    /// ADR-0059's routing key: whether the Session has a live Execution at
-    /// admission — the fact that decides Supplement vs new Turn.
+    /// Route a prompt by cola's OWN live ownership (ADR-0062): the inflight
+    /// guard a Turn holds — inherited by its out-of-turn follow for its whole
+    /// window — or a card chain a live renderer owns (the busy-adopt snapshot
+    /// follow's external render, a Wake continuation): the same pair the Wake
+    /// step treats as "a live Turn/follow/renderer owns the session". Only an
+    /// owned chain takes the Supplement path — the split needs a live card,
+    /// and with no owned chain it would find nothing to continue (the #428
+    /// strand, where the read said live and the message was silently
+    /// absorbed).
     ///
-    /// cola's inflight guard answers first: a running Turn holds it, and the
-    /// out-of-turn follow inherits it for its whole window, so a followed
-    /// Session is live without touching the wire. A free guard falls back to
-    /// the Backend's own status read through [`read_session_status`] — a live
-    /// status is a running Execution, and an unknown read (failed, timed out,
-    /// unrecognised) reads as NOT live: it may never invent a run (the message
-    /// would be swallowed into a Supplement with no card to continue), while
-    /// the new Turn it starts instead is safe either way — a V2 prompt carries
-    /// the merge delivery, and a V1 runner absorbs a mid-run message.
-    async fn session_has_live_execution(&self, session_id: &str) -> bool {
-        if self.inflight.lock().await.contains(session_id) {
-            return true;
+    /// With no owned chain, the Backend's status read is ADVISORY: it no
+    /// longer routes, it only tells the new Turn whether to open with the
+    /// merge line ([`crate::bridge::turn`]'s `MERGE_OPENING`). The new Turn is
+    /// safe either way — its V2 prompt carries the merge delivery, so a
+    /// genuinely live run merges the message exactly as a Supplement would,
+    /// while a stale read gets a card that owns and settles the message.
+    ///
+    /// One INFO line records every decision (ADR-0048): the session, the
+    /// ownership verdict and, when read, the advisory status — never chat
+    /// content.
+    async fn route_prompt(&self, session_id: &str) -> PromptRoute {
+        let guarded = self.inflight.lock().await.contains(session_id);
+        let render_owned = crate::bridge::turn::Turn::card_is_owned(&self.cards_handle(), session_id).await;
+        if guarded || render_owned {
+            let ownership = if guarded { "guard" } else { "card-chain" };
+            tracing::info!("prompt routing: session={session_id} ownership={ownership} route=supplement");
+            return PromptRoute::Supplement;
         }
         let directory = self.sessions.lock().await.directory_for_session(session_id);
-        read_session_status(
-            "prompt live execution status",
+        let status = read_session_status(
+            "prompt advisory status",
             self.turn_config().follow_read_timeout_ms(),
             &self.opencode,
             session_id,
             directory.as_deref(),
         )
-        .await
-        .is_some_and(SessionStatus::is_live)
+        .await;
+        let advisory_live = status.is_some_and(SessionStatus::is_live);
+        let advisory = match status {
+            Some(status) if status.is_live() => "live",
+            Some(_) => "idle",
+            None => "unreadable",
+        };
+        tracing::info!("prompt routing: session={session_id} ownership=none advisory={advisory} route=turn");
+        PromptRoute::NewTurn { advisory_live }
     }
 
     pub(crate) async fn handle_prompt(
@@ -630,92 +669,100 @@ impl App {
         )
         .await;
 
-        // Supplement path (ADR-0043 + ADR-0059's routing key): a message
-        // arriving while the Session has a live Execution does not start a
-        // competing run_prompt (it would overwrite the running turn's
-        // accumulator and race on the same card). Instead submit the message to
-        // the backend without starting a Turn — OpenCode persists it and the
-        // running loop picks it up at the next tool boundary, merging it into
-        // the current turn (original message preserved; model sees full
-        // history). This is what lets the user append context mid-turn without
-        // /stop and without interrupting a tool call. The message landed below
-        // the live card, so the Card Chain splits at it (ADR-0043) — the split
-        // is requested even when the send failed, never for commands (they are
-        // dispatched above this path). The out-of-turn follow inherits the
-        // inflight guard for its whole window (ADR-0059), so a message during a
-        // run that outlived the drain bound keeps merging into the still-live
-        // chain instead of freezing its card; and a Session that is idle —
-        // including the waiting window — has no live Execution and falls
-        // through to a normal new Turn on a new card.
-        if self.session_has_live_execution(&session_id).await {
-            let image_inputs = image_inputs(&images);
-            // Each supplement is its own logical user message: fresh
-            // cola-authored id (ADR-0026), never reused.
-            let cola_msg_id = crate::opencode::parsing::cola_message_id();
-            match self
-                .opencode
-                .prompt(
-                    &session_id,
-                    &text,
-                    &image_inputs,
-                    self.session_model_override(&session_id).await.as_ref(),
-                    self.session_variant_override(&session_id).await.as_deref(),
-                    self.session_agent_override(&session_id).await.as_deref(),
-                    Some(&cola_msg_id),
-                )
+        // Prompt routing (ADR-0062): cola's own live ownership decides a
+        // Supplement, never the Backend's read. With no owned chain the message
+        // starts a new Turn — whose card owns and settles it — opening with the
+        // merge line only when the advisory read said live; a genuinely live
+        // run still merges it through the prompt's merge delivery (V2's steer).
+        match self.route_prompt(&session_id).await {
+            PromptRoute::NewTurn { advisory_live } => {
+                self.run_prompt(PromptContext {
+                    session_id,
+                    thread_key,
+                    text,
+                    message_id,
+                    subtitle,
+                    is_retry: false,
+                    requester_open_id,
+                    is_group,
+                    cola_message_id: None,
+                    images,
+                    advisory_live,
+                })
                 .await
-            {
-                Ok(()) => {
-                    tracing::info!(
-                        "supplement: session {} in-flight, message queued to merge into current turn",
-                        session_id
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!("supplement: prompt failed: {}", e);
-                    // The failure notice is sent first, then the split
-                    // still happens below — the live card must remain the
-                    // newest message, not the notice.
-                    let _ = self
-                        .feishu
-                        .reply_text(&message_id, "⚠️ 补充消息发送失败，请稍后重试。")
-                        .await;
-                }
             }
-            // The supplement landed below the live card: split the Card
-            // Chain at this message (ADR-0043). The previous card is
-            // finalized with the standard split header and keeps everything
-            // before the split; the continuation — a reply to the
-            // supplement — carries the receipt (and only the content that
-            // arrives after it) and becomes the tracked live card. There is
-            // NO separate acknowledgement message.
-            crate::bridge::turn::Turn::split_card_chain(
-                &self.cards_handle(),
-                &session_id,
-                &message_id,
-                crate::bridge::turn::SplitKind::Supplement,
-            )
-            .await;
-            // The message merged into the live Execution: the claim's job is
-            // done — once the prompt is visible in the transcript, the Sync's
-            // own staleness rule takes over (#424).
-            self.waits_handle().clear_inbound(&session_id).await;
-            return Ok(());
+            // Supplement path (ADR-0043, owned routing per ADR-0062): cola
+            // holds the Session's live Execution, so the message does not start
+            // a competing run_prompt (it would overwrite the running turn's
+            // accumulator and race on the same card). Instead submit the
+            // message to the backend without starting a Turn — OpenCode
+            // persists it and the running loop picks it up at the next tool
+            // boundary, merging it into the current turn (original message
+            // preserved; model sees full history). This is what lets the user
+            // append context mid-turn without /stop and without interrupting a
+            // tool call. The message landed below the live card, so the Card
+            // Chain splits at it (ADR-0043) — the split is requested even when
+            // the send failed, never for commands (they are dispatched above
+            // this path). The out-of-turn follow inherits the inflight guard
+            // for its whole window (ADR-0059), so a message during a run that
+            // outlived the drain bound keeps merging into the still-live chain
+            // instead of freezing its card.
+            PromptRoute::Supplement => {
+                let image_inputs = image_inputs(&images);
+                // Each supplement is its own logical user message: fresh
+                // cola-authored id (ADR-0026), never reused.
+                let cola_msg_id = crate::opencode::parsing::cola_message_id();
+                match self
+                    .opencode
+                    .prompt(
+                        &session_id,
+                        &text,
+                        &image_inputs,
+                        self.session_model_override(&session_id).await.as_ref(),
+                        self.session_variant_override(&session_id).await.as_deref(),
+                        self.session_agent_override(&session_id).await.as_deref(),
+                        Some(&cola_msg_id),
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        tracing::info!(
+                            "supplement: session {} in-flight, message queued to merge into current turn",
+                            session_id
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("supplement: prompt failed: {}", e);
+                        // The failure notice is sent first, then the split
+                        // still happens below — the live card must remain the
+                        // newest message, not the notice.
+                        let _ = self
+                            .feishu
+                            .reply_text(&message_id, "⚠️ 补充消息发送失败，请稍后重试。")
+                            .await;
+                    }
+                }
+                // The supplement landed below the live card: split the Card
+                // Chain at this message (ADR-0043). The previous card is
+                // finalized with the standard split header and keeps everything
+                // before the split; the continuation — a reply to the
+                // supplement — carries the receipt (and only the content that
+                // arrives after it) and becomes the tracked live card. There is
+                // NO separate acknowledgement message.
+                crate::bridge::turn::Turn::split_card_chain(
+                    &self.cards_handle(),
+                    &session_id,
+                    &message_id,
+                    crate::bridge::turn::SplitKind::Supplement,
+                )
+                .await;
+                // The message merged into the live Execution: the claim's job
+                // is done — once the prompt is visible in the transcript, the
+                // Sync's own staleness rule takes over (#424).
+                self.waits_handle().clear_inbound(&session_id).await;
+                Ok(())
+            }
         }
-
-        self.run_prompt(PromptContext {
-            session_id,
-            thread_key,
-            text,
-            message_id,
-            subtitle,
-            is_retry: false,
-            requester_open_id,
-            is_group,
-            cola_message_id: None,
-            images,
-        })
-        .await
     }
 
     /// Run one prompt end-to-end: show a Loading card (either a fresh reply or a

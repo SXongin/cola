@@ -20,6 +20,7 @@ fn retry_ctx(session_id: &str, text: &str, cola_message_id: &str) -> crate::brid
         is_group: false,
         cola_message_id: (!cola_message_id.is_empty()).then(|| cola_message_id.to_string()),
         images: Vec::new(),
+        advisory_live: false,
     }
 }
 
@@ -355,6 +356,7 @@ async fn transcript_recorded_failure_renders_error_card() {
         is_group: false,
         cola_message_id: Some("msg_cola_failed".into()),
         images: Vec::new(),
+        advisory_live: false,
     };
     crate::bridge::turn::Turn::run(&app.turn_handles(), context)
         .await
@@ -429,6 +431,7 @@ async fn transcript_recovered_step_finishes_done() {
         is_group: false,
         cola_message_id: Some("msg_cola_recovered".into()),
         images: Vec::new(),
+        advisory_live: false,
     };
     crate::bridge::turn::Turn::run(&app.turn_handles(), context)
         .await
@@ -1649,6 +1652,7 @@ async fn error_card_retry_does_not_replay_the_failed_attempt() {
             is_group: false,
             cola_message_id: Some(ANCHOR.into()),
             images: Vec::new(),
+            advisory_live: false,
         },
     )
     .await
@@ -1757,6 +1761,7 @@ async fn retrying_again_suppresses_every_earlier_attempt() {
             is_group: false,
             cola_message_id: Some(ANCHOR.into()),
             images: Vec::new(),
+            advisory_live: false,
         },
     )
     .await

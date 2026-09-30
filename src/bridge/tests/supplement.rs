@@ -1,10 +1,14 @@
-//! Supplement-triggered Card Chain splits (ADR-0043): a user message that
-//! lands below a session's live card while its Turn is in flight splits the
-//! chain at that message — the previous card keeps everything before the
-//! split, and the continuation card is the supplement's reply, carrying the
-//! receipt line plus only the content that arrives after it (a delta handoff,
-//! like a size split). The old text acknowledgement is gone; commands never
-//! split the chain.
+//! The Supplement routing decision (ADR-0062) and the Card Chain splits it
+//! selects (ADR-0043): a message that lands below a session's live card while
+//! cola OWNS the live chain (the in-flight guard a Turn holds or its follow
+//! inherits, or a chain a live renderer owns) splits the chain at that message
+//! — the previous card keeps everything before the split, and the continuation
+//! card is the supplement's reply, carrying the receipt line plus only the
+//! content that arrives after it (a delta handoff, like a size split). The old
+//! text acknowledgement is gone; commands never split the chain. With no owned
+//! chain the message starts a new Turn instead, and the Backend's advisory
+//! status read only picks that card's opening line — a stale "live" can never
+//! strand the message in a split that has no owned card to continue.
 
 use std::sync::Arc;
 
@@ -221,31 +225,37 @@ async fn supplement_splits_the_chain_and_the_continuation_takes_over() {
     assert!(has(&last_update.1, "后续进度。"));
 }
 
-/// ADR-0059's routing key: the Backend's own liveness decides, not cola's
-/// bookkeeping. With NO inflight guard at all (a restart lost it, or another
-/// client is running the Session), a `Busy` Session still routes the message
-/// as a Supplement — the status read says the Execution is live, so the
-/// message merges into it and the chain splits, never a competing Turn. A
-/// V2 prompt carries the merge delivery, so the Backend's behavior is
-/// identical either way.
+/// ADR-0062 (spec #434, ticket #435): the Backend's status read is ADVISORY,
+/// never the routing key. A stale `Busy` while cola owns no live chain — here
+/// a terminal card from a finished turn with no inflight guard; in the #428
+/// incident the card had died with the restart, and either way cola owns
+/// nothing to split — must NOT route the message as a Supplement:
+/// `split_card_chain` would find no owned card to continue and the message
+/// would be silently absorbed. The message starts a new Turn instead, whose
+/// card replies to it and opens with the merge line; the V2 prompt still
+/// carries the steer delivery, so a genuinely live run merges it exactly as a
+/// Supplement would.
 #[tokio::test]
-async fn a_message_while_the_backend_reports_a_live_run_splits_the_chain() {
+async fn a_stale_live_read_with_no_owned_chain_starts_a_turn_with_the_merge_line() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
-    let mut backend = MockBackend::new(realistic_parts());
-    backend.with_session_status("ses_test", Some(crate::opencode::types::SessionStatus::Busy));
+    let backend = MockBackend::new(realistic_parts());
+    // The stale read: the advisory read (the first one) says Busy, while every
+    // read after it serves the map — idle. The scenario is a stale status, not
+    // a live run cola must observe.
+    backend.busy_then_idle_once();
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
     seed_session(&app, "ses_test", "/work").await;
 
-    // A live card, but deliberately NO guard: only the Backend knows the run
-    // is alive.
+    // An old, settled card: a chain no renderer owns (the incident's card was
+    // gone entirely — the same ownership verdict).
     let cards = app.cards_handle();
     Turn::seed_card(&cards, "ses_test", Some("om_live")).await;
-    Turn::set_card_state(&cards, "ses_test", CardState::Streaming).await;
-    Turn::push_text(&cards, "ses_test", "第一段进度。").await;
+    Turn::set_card_state(&cards, "ses_test", CardState::Done).await;
+    Turn::push_text(&cards, "ses_test", "上一轮回答。").await;
     Turn::set_reply_target(&cards, "ses_test", "msg_1").await;
     assert!(!app.inflight.lock().await.contains("ses_test"));
 
@@ -259,7 +269,7 @@ async fn a_message_while_the_backend_reports_a_live_run_splits_the_chain() {
     ))
     .await;
 
-    // The admission read the Backend's own status...
+    // The advisory status was read...
     assert!(
         backend
             .session_status_reads
@@ -267,11 +277,11 @@ async fn a_message_while_the_backend_reports_a_live_run_splits_the_chain() {
             .await
             .iter()
             .any(|sid| sid == "ses_test"),
-        "the routing key must be a status read: {:?}",
+        "the advisory status must be read: {:?}",
         backend.session_status_reads.lock().await
     );
-    // ... and the message merged: submitted, no busy notice, no competing
-    // Turn's card.
+    // ...and did NOT route: the message was submitted as a new Turn, never
+    // answered busy (the routing decision is cola's, not the guard's).
     assert!(
         backend
             .prompt_calls
@@ -279,7 +289,7 @@ async fn a_message_while_the_backend_reports_a_live_run_splits_the_chain() {
             .await
             .iter()
             .any(|text| text == "补充一下，改用方案 B"),
-        "the Supplement must be submitted: {:?}",
+        "the message must ride a new Turn's prompt: {:?}",
         backend.prompt_calls.lock().await
     );
     assert!(
@@ -288,22 +298,98 @@ async fn a_message_while_the_backend_reports_a_live_run_splits_the_chain() {
             .await
             .iter()
             .any(|text| text.contains("还在处理中")),
-        "a live-Execution message is never answered busy: {:?}",
+        "the new Turn must not be refused busy: {:?}",
         platform.calls.lock().await
+    );
+    // The new card replies to the message and opens with the merge line.
+    let (reply_to, card) = continuation(&platform).await;
+    assert_eq!(reply_to, "msg_sup", "the new Turn's card replies to the message");
+    assert!(
+        has(&card, "📨 已收到，将并入当前运行"),
+        "the advisory-live card opens with the merge line: {card}"
+    );
+    // The line persists across the Turn's own flushes: the card owns the
+    // message from its first send to its settle.
+    let settled = last_update_of(&platform, "msg_reply").await;
+    assert!(
+        settled.contains("📨 已收到，将并入当前运行"),
+        "the merge line stays on the Turn's card: {settled}"
+    );
+    // The unowned card was never split, and no supplement continuation was
+    // sent: nothing owned the chain the split would have continued.
+    let calls = platform.calls.lock().await.clone();
+    assert!(
+        !calls.iter().any(|c| matches!(
+            c,
+            PlatformCall::UpdateMessage { message_id, card }
+                if message_id == "om_live" && card_text(card).contains("部分完成，继续中")
+        )),
+        "the unowned card must not be finalized by a supplement split: {calls:?}"
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|c| matches!(c, PlatformCall::ReplyCard { card, .. } if has(card, "📨 已收到补充"))),
+        "no supplement continuation may be sent: {calls:?}"
+    );
+    // The new Turn took the session's card chain over; its guard was released
+    // when it settled.
+    assert_eq!(
+        Turn::card_message_id(&cards, "ses_test").await.as_deref(),
+        Some("msg_reply"),
+        "the new Turn's card is the tracked live card"
     );
     assert!(
         !app.inflight.lock().await.contains("ses_test"),
-        "a Supplement never takes the guard"
+        "the guard is released when the Turn settles"
     );
-    assert_eq!(
-        Turn::reply_target(&cards, "ses_test").await.as_deref(),
-        Some("msg_sup"),
-        "the chain re-anchored on the supplement"
-    );
+}
 
-    // The chain split at the message: exactly one card replies to it, the
-    // continuation, carrying the receipt.
-    supplement_continuation(&platform, "msg_sup").await;
+/// ADR-0062: with no owned chain and an advisory read that is NOT live — idle,
+/// or unreadable (a failed read) — the new Turn's card is an ordinary loading
+/// card. The merge line would promise a merge that is not happening.
+#[tokio::test]
+async fn a_non_live_advisory_read_starts_a_turn_with_an_ordinary_card() {
+    for unreadable in [false, true] {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        if unreadable {
+            backend.status_read_fails("session status read down");
+        }
+        let backend = Arc::new(backend);
+        let platform = Arc::new(RecordingPlatform::new());
+        let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+        seed_session(&app, "ses_test", "/work").await;
+
+        app.handle_message(incoming(
+            "msg_1".into(),
+            "chat_1".into(),
+            "p2p".into(),
+            None,
+            "普通提问".into(),
+            None,
+        ))
+        .await;
+
+        assert!(
+            backend
+                .prompt_calls
+                .lock()
+                .await
+                .iter()
+                .any(|text| text == "普通提问"),
+            "unreadable={unreadable}: the message must still run: {:?}",
+            backend.prompt_calls.lock().await
+        );
+        let (reply_to, card) = continuation(&platform).await;
+        assert_eq!(reply_to, "msg_1");
+        assert!(
+            !has(&card, "📨 已收到，将并入当前运行"),
+            "unreadable={unreadable}: an ordinary card must not carry the merge line: {card}"
+        );
+    }
 }
 
 /// A split while a tool is running: the panel is live tail content (ADR-0045),
