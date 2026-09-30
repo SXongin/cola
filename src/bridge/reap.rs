@@ -14,6 +14,14 @@
 //! card) or simply left in the transcript: the reap never replays a turn onto
 //! a stale card.
 //!
+//! A Session that relocated while the run was in flight (#428: `session_move`
+//! into a git worktree) gains one line naming the move before its card
+//! settles (#439): the record's stored directory is the baseline, the store's
+//! own session list is the current fact, and a difference between them is the
+//! move. That explains the interruption the ending alone would leave
+//! mysterious, and it carries no chat content — only the new directory, a
+//! server fact.
+//!
 //! Every action leaves one INFO line carrying the session and the decision —
 //! never chat content. A read the reap could not make, or could not interpret,
 //! claims nothing: the record stays for the next tick. That covers an
@@ -39,7 +47,7 @@ pub(crate) async fn collect_orphan(cards: &CardsHandle, session_id: &str, card_m
     if card_message_id.is_empty() {
         return;
     }
-    let card = ending_card(CardState::TakenOver, None);
+    let card = ending_card(CardState::TakenOver, None, None);
     match cards.feishu.update_message(card_message_id, &card).await {
         Ok(()) => tracing::info!("live-card reap: session {session_id} collected the orphaned card"),
         Err(e) => tracing::warn!(
@@ -50,8 +58,9 @@ pub(crate) async fn collect_orphan(cards: &CardsHandle, session_id: &str, card_m
 
 /// Reconcile one record against the Session's own reads (ADR-0063). `directory`
 /// is the Session's mapped directory, when it still has one — the fallback
-/// route when the record itself carries none — and `record` is the snapshot
-/// the caller took from the sidecar. `read_timeout_ms` bounds each of the two
+/// route when the record itself carries none; the effective routing directory
+/// is also the move verdict's baseline (#439) — and `record` is the snapshot
+/// the caller took from the sidecar. `read_timeout_ms` bounds each of the
 /// reads, the Session Sync pass's own request bound (injectable in tests), so
 /// a hung server degrades to "nothing claimed" instead of freezing the tick.
 pub(crate) async fn reconcile(
@@ -181,15 +190,26 @@ pub(crate) async fn reconcile(
         // closed): the ending is not decided — keep observing.
         TurnSettle::Running => {}
         TurnSettle::Complete => {
-            settle(handles, session_id, record, CardState::Done, None).await;
+            settle(
+                handles,
+                session_id,
+                record,
+                directory,
+                CardState::Done,
+                None,
+                read_timeout_ms,
+            )
+            .await;
         }
         TurnSettle::Failed(error) => {
             settle(
                 handles,
                 session_id,
                 record,
+                directory,
                 CardState::Error,
                 Some(&error_line(&error)),
+                read_timeout_ms,
             )
             .await;
         }
@@ -200,7 +220,17 @@ pub(crate) async fn reconcile(
             if record.waiting_reaped {
                 return;
             }
-            if settle(handles, session_id, record, CardState::Waiting, None).await {
+            if settle(
+                handles,
+                session_id,
+                record,
+                directory,
+                CardState::Waiting,
+                None,
+                read_timeout_ms,
+            )
+            .await
+            {
                 handles
                     .cards
                     .live_cards
@@ -210,23 +240,38 @@ pub(crate) async fn reconcile(
         // The submitted message never reached the transcript and the Session
         // is idle: nobody will answer it — never ✅ (ADR-0062).
         TurnSettle::Unreceived => {
-            settle(handles, session_id, record, CardState::Unreceived, None).await;
+            settle(
+                handles,
+                session_id,
+                record,
+                directory,
+                CardState::Unreceived,
+                None,
+                read_timeout_ms,
+            )
+            .await;
         }
     }
 }
 
 /// PATCH `record`'s card into `state` and, when the state is terminal, drop the
-/// record: nothing is owed a reap any more. Returns whether the PATCH landed
-/// (a failed one keeps the record for the next tick). One INFO line per
-/// action, naming the session and the decision — never chat content.
+/// record: nothing is owed a reap any more. A Session whose current directory
+/// differs from `baseline_directory` — the routing directory the card was
+/// tracked under — gains one extra line naming the move (#439), on top of
+/// `detail` (the failure's message when there is one). Returns whether the
+/// PATCH landed (a failed one keeps the record for the next tick). One INFO
+/// line per action, naming the session and the decision — never chat content.
 async fn settle(
     handles: &FlowHandles,
     session_id: &str,
     record: &LiveCard,
+    baseline_directory: &str,
     state: CardState,
     detail: Option<&str>,
+    read_timeout_ms: u64,
 ) -> bool {
-    let card = ending_card(state.clone(), detail);
+    let move_line = session_move_line(handles, session_id, baseline_directory, read_timeout_ms).await;
+    let card = ending_card(state.clone(), detail, move_line.as_deref());
     if let Err(e) = handles
         .cards
         .feishu
@@ -239,26 +284,84 @@ async fn settle(
         );
         return false;
     }
-    tracing::info!("live-card reap: session {session_id} {}", state.reap_word());
+    let moved = if move_line.is_some() {
+        " on a session that moved"
+    } else {
+        ""
+    };
+    tracing::info!(
+        "live-card reap: session {session_id} {}{moved}",
+        state.reap_word()
+    );
     if state.is_terminal() {
         handles.cards.live_cards.remove(session_id);
     }
     true
 }
 
+/// The one line a settling card carries when the Session's location changed
+/// since the card was tracked (#428, #439): the move named, so an interruption
+/// the ending alone would leave mysterious is explained. The current directory
+/// comes from the store's own session list, never from chat: the moved Session
+/// now lives under its new directory, so the directory-routed reads that got
+/// the reap here may not know it. A read that fails, a Session the list does
+/// not carry, an empty directory, or the baseline itself all claim nothing —
+/// no line, exactly the pre-#439 card.
+async fn session_move_line(
+    handles: &FlowHandles,
+    session_id: &str,
+    baseline_directory: &str,
+    read_timeout_ms: u64,
+) -> Option<String> {
+    let sessions = match crate::bridge::bounded_call(
+        "live-card reap session list",
+        read_timeout_ms,
+        handles.backend.list_sessions(),
+    )
+    .await
+    {
+        Some(Ok(sessions)) => sessions,
+        Some(Err(e)) => {
+            tracing::warn!("live-card reap: session {session_id} session list read failed: {e}");
+            return None;
+        }
+        None => return None,
+    };
+    let current = sessions
+        .iter()
+        .find(|session| session.id == session_id)?
+        .directory
+        .as_str();
+    if current.is_empty() || current == baseline_directory {
+        return None;
+    }
+    Some(move_line(current))
+}
+
+/// The move line's copy (#439): one markdown line in the same
+/// `**label**: text` voice as [`error_line`], the new directory in backticks.
+/// It carries no chat content.
+fn move_line(directory: &str) -> String {
+    format!("\n**会话已迁移**: 已迁移到 `{directory}`")
+}
+
 /// A bare card carrying one ending — the reap's whole card vocabulary. The
 /// lost turn's content is deliberately NOT rebuilt (ADR-0063): the ending's
-/// header, the failure's own message when there is one, and no action. The
-/// whole card is replaced, so whatever the orphan last showed — a half-drawn
-/// turn, a stale spinner, a live tool panel — goes with it: the reap writes
-/// state, never content. The Unreceived ending is therefore actionless here —
-/// the restart took the accumulator its 重新发起 click would claim (the
-/// original prompt and the card session), so the button could only be dead;
-/// the user re-sends instead (ADR-0062's amendment).
-fn ending_card(state: CardState, detail: Option<&str>) -> serde_json::Value {
+/// header, the failure's own message when there is one, the move line when the
+/// Session relocated (#439), and no action. The whole card is replaced, so
+/// whatever the orphan last showed — a half-drawn turn, a stale spinner, a
+/// live tool panel — goes with it: the reap writes state, never content. The
+/// Unreceived ending is therefore actionless here — the restart took the
+/// accumulator its 重新发起 click would claim (the original prompt and the card
+/// session), so the button could only be dead; the user re-sends instead
+/// (ADR-0062's amendment).
+fn ending_card(state: CardState, detail: Option<&str>, move_line: Option<&str>) -> serde_json::Value {
     let mut builder = CardBuilder::new().with_state(state);
     if let Some(detail) = detail.filter(|detail| !detail.is_empty()) {
         builder = builder.with_text(detail);
+    }
+    if let Some(line) = move_line.filter(|line| !line.is_empty()) {
+        builder = builder.with_text(line);
     }
     builder.build()
 }
@@ -267,23 +370,24 @@ fn ending_card(state: CardState, detail: Option<&str>) -> serde_json::Value {
 mod tests {
     use super::*;
 
-    /// The reap's card vocabulary is one state + one optional line: the
-    /// ending's header, the failure message when given, and no recovery
-    /// button (the restart took the accumulator that could claim one).
+    /// The reap's card vocabulary is one state + one optional line (plus the
+    /// move line when the Session relocated): the ending's header, the failure
+    /// message when given, and no recovery button (the restart took the
+    /// accumulator that could claim one).
     #[test]
     fn ending_cards_carry_the_state_and_no_action() {
-        let done = ending_card(CardState::Done, None);
+        let done = ending_card(CardState::Done, None, None);
         assert_eq!(done["header"]["title"]["content"], "✅ 完成");
         assert!(done["body"]["elements"].as_array().unwrap().is_empty());
 
-        let failed = ending_card(CardState::Error, Some("**错误**: 503"));
+        let failed = ending_card(CardState::Error, Some("**错误**: 503"), None);
         assert_eq!(failed["header"]["title"]["content"], "❌ 出错");
         assert!(
             failed.to_string().contains("503"),
             "the failure's own message rides the card: {failed}"
         );
 
-        let unreceived = ending_card(CardState::Unreceived, None);
+        let unreceived = ending_card(CardState::Unreceived, None, None);
         assert_eq!(unreceived["header"]["title"]["content"], "⚠️ 这条消息未被接收");
         assert!(
             unreceived["body"]["elements"]
@@ -294,7 +398,41 @@ mod tests {
             "the reap offers no recovery action: {unreceived}"
         );
 
-        let waiting = ending_card(CardState::Waiting, None);
+        let waiting = ending_card(CardState::Waiting, None, None);
         assert_eq!(waiting["header"]["title"]["content"], "⏳ 等待后台任务");
+    }
+
+    /// The move line (#439) rides the ending next to its other line: the header
+    /// keeps the state, the failure's message and the new directory both
+    /// render, and the line is built from the directory alone — no chat
+    /// content.
+    #[test]
+    fn ending_cards_carry_the_move_line_next_to_the_detail() {
+        let failed_and_moved = ending_card(
+            CardState::Error,
+            Some("**错误**: Step interrupted"),
+            Some(&move_line("/work/.worktrees/zh-user-guide")),
+        );
+        assert_eq!(failed_and_moved["header"]["title"]["content"], "❌ 出错");
+        let rendered = failed_and_moved.to_string();
+        assert!(
+            rendered.contains("Step interrupted"),
+            "the failure's own message stays: {failed_and_moved}"
+        );
+        assert!(
+            rendered.contains("**会话已迁移**: 已迁移到 `/work/.worktrees/zh-user-guide`"),
+            "the move line names the new directory: {failed_and_moved}"
+        );
+        assert_eq!(
+            failed_and_moved["body"]["elements"].as_array().unwrap().len(),
+            2,
+            "the card carries the detail and the move line and nothing else: {failed_and_moved}"
+        );
+
+        let unreceived_moved = ending_card(CardState::Unreceived, None, Some(&move_line("/w2")));
+        assert_eq!(
+            unreceived_moved["body"]["elements"][0]["content"],
+            "\n**会话已迁移**: 已迁移到 `/w2`"
+        );
     }
 }
