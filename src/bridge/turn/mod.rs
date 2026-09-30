@@ -84,10 +84,13 @@ enum IdleRead {
     Unreadable,
 }
 
-/// The disposition one [`TurnSettle`] decision gives a Turn ending. The read
-/// model decides once; this is the ONE place the Turn maps that decision, so
-/// the drain (`settle_or_yield`) and finalization (`finish`) cannot read it
-/// differently and a new decision variant needs one mapping edit here.
+/// The disposition one [`TurnSettle`] decision gives a Turn ending, as the
+/// drain and finalization read it — distinct from the settle loop's own
+/// [`settle::Ending`], which names the eight ways the out-of-turn loop can
+/// stop. The read model decides once; this is the ONE place the Turn maps that
+/// decision, so the drain (`settle_or_yield`) and finalization (`finish`)
+/// cannot read it differently and a new decision variant needs one mapping edit
+/// here.
 ///
 /// [`TurnSettle::Failed`] folds into [`Self::Settle`] deliberately: both
 /// callers only need "the ending is decided" — the failure's message is read
@@ -96,7 +99,7 @@ enum IdleRead {
 /// the full decision instead: it needs the message to write the card and acts
 /// per disposition (❌ / ✅ / yield / observe).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Ending {
+enum DrainEnding {
     /// The ending is not decided (a Wake's Execution has not reached its
     /// boundary yet): keep observing.
     Observe,
@@ -109,7 +112,7 @@ enum Ending {
     Settle,
 }
 
-impl From<TurnSettle> for Ending {
+impl From<TurnSettle> for DrainEnding {
     fn from(settle: TurnSettle) -> Self {
         match settle {
             TurnSettle::Running => Self::Observe,
@@ -734,14 +737,14 @@ impl Turn {
             // An undecided read makes no ending decision: the drain's own last
             // word stands (a failed read is equally undecided).
             Some(TurnSettle::Running) | None => match drain_outcome {
-                Some(DrainState::Waiting) => Ending::Waiting,
-                Some(DrainState::Unreceived) => Ending::Unreceived,
-                _ => Ending::Observe,
+                Some(DrainState::Waiting) => DrainEnding::Waiting,
+                Some(DrainState::Unreceived) => DrainEnding::Unreceived,
+                _ => DrainEnding::Observe,
             },
-            Some(settle) => Ending::from(settle),
+            Some(settle) => DrainEnding::from(settle),
         };
-        let waiting = ending == Ending::Waiting && !stopped && prompt_err.is_none();
-        let unreceived = ending == Ending::Unreceived && !stopped && prompt_err.is_none();
+        let waiting = ending == DrainEnding::Waiting && !stopped && prompt_err.is_none();
+        let unreceived = ending == DrainEnding::Unreceived && !stopped && prompt_err.is_none();
 
         // The card is followed instead of finalized when the drain bound was
         // reached with the session still running (#284) or the final read
@@ -1257,11 +1260,11 @@ impl Turn {
     /// mapping, so the drain and finalization cannot read a decision
     /// differently.
     fn drain_ending(settle: TurnSettle) -> DrainState {
-        match Ending::from(settle) {
-            Ending::Observe => DrainState::Running,
-            Ending::Waiting => DrainState::Waiting,
-            Ending::Unreceived => DrainState::Unreceived,
-            Ending::Settle => DrainState::Settled,
+        match DrainEnding::from(settle) {
+            DrainEnding::Observe => DrainState::Running,
+            DrainEnding::Waiting => DrainState::Waiting,
+            DrainEnding::Unreceived => DrainState::Unreceived,
+            DrainEnding::Settle => DrainState::Settled,
         }
     }
 
@@ -1420,7 +1423,7 @@ pub(crate) enum YieldedUpdate {
 }
 
 /// The ending a quiet true-end read stamps in place — the same choices
-/// [`settle::stamp`] maps its [`Ending`]s to, with the failure's message kept
+/// [`settle::stamp`] maps its [`settle::Ending`]s to, with the failure's message kept
 /// (the out-of-turn loops re-read it from the transcript; this path has it in
 /// hand).
 enum QuietEnding {
