@@ -1,0 +1,31 @@
+# CodeQL configuration for the advanced setup in .github/workflows/codeql.yml.
+#
+# Rust extraction analyzes `#[cfg(test)]` code by default (github/codeql#18347;
+# the upstream opt-out `cargo_cfg_overrides=-test` is a CLI extractor option and
+# is not settable from a code scanning workflow). Whole files and trees that
+# exist only under `#[cfg(test)]` are therefore excluded from the database
+# here: they can never produce an alert, and nothing needs dismissing. In-file
+# `#[cfg(test)] mod tests` cannot be path-filtered — those findings are
+# dismissed per CONTRIBUTING.md ("Security scanning alerts").
+
+paths-ignore:
+  # The bridge integration-test suite and its harness (`#[cfg(test)]` in
+  # src/bridge/mod.rs).
+  - 'src/bridge/tests/**'
+  - 'src/bridge/test_support.rs'
+
+  # The OpenCode adapter's test modules, live contract harness and recorded
+  # fixture corpus (`#[cfg(test)]` modules in src/opencode/mod.rs and the
+  # v1/v2 strategies' mod.rs).
+  - 'src/opencode/tests.rs'
+  - 'src/opencode/conformance.rs'
+  - 'src/opencode/live/**'
+  - 'src/opencode/wire/**'
+  - 'src/opencode/v1/tests.rs'
+  - 'src/opencode/v1/conformance.rs'
+  - 'src/opencode/v2/tests.rs'
+  - 'src/opencode/v2/conformance.rs'
+
+  # The HTTP and WebSocket test servers (`#[cfg(test)]` in src/main.rs).
+  - 'src/test_http.rs'
+  - 'src/test_ws.rs'
