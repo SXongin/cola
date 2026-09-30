@@ -9,10 +9,14 @@
 //! still-live Session keeps the record. A card a successor took over is
 //! collected as 「⏳ 已由新卡片接管 · 已停止更新」 at the takeover itself
 //! ([`collect_orphan`], called by the card paths that arm over an orphan), so
-//! two cards never both look live. Work that landed while cola was down is
-//! published by the existing continuation machinery (a Wake's continuation
-//! card) or simply left in the transcript: the reap never replays a turn onto
-//! a stale card.
+//! two cards never both look live. Every ending PATCH keeps the card's
+//! already-rendered body best-effort (#434 acceptance feedback): the reap reads
+//! the card's own view, strips the controls a whole-card read cannot preserve
+//! and restamps the header over the kept elements; a failed read degrades to
+//! the bare ending. Work that landed while cola was down is published by the
+//! existing continuation machinery (a Wake's continuation card) or simply left
+//! in the transcript: content the card never showed is never rebuilt, and the
+//! reap never replays a turn onto a stale card.
 //!
 //! A Session that relocated while the run was in flight (#428: `session_move`
 //! into a git worktree) gains one line naming the move when its card reaches a
@@ -44,16 +48,17 @@ use crate::bridge::turn::Turn;
 use crate::feishu::card::{CardState, error_line, move_line, shell::CardBuilder};
 
 /// Collect the orphaned card `card_message_id` because a new card took the
-/// chain over (ADR-0063): one PATCH naming the successor, terminal and grey.
-/// Best-effort — a failed PATCH only warns; the record follows the successor
-/// either way, so the freeze it leaves behind is the pre-#438 behavior, never
-/// a crash.
+/// chain over (ADR-0063): one PATCH naming the successor, terminal and grey,
+/// keeping whatever the card already showed (best-effort, #434 acceptance
+/// feedback). Best-effort — a failed PATCH only warns; the record follows the
+/// successor either way, so the freeze it leaves behind is the pre-#438
+/// behavior, never a crash.
 pub(crate) async fn collect_orphan(cards: &CardsHandle, session_id: &str, card_message_id: &str) {
     if card_message_id.is_empty() {
         return;
     }
     let card = ending_card(CardState::TakenOver, None, None);
-    match cards.feishu.update_message(card_message_id, &card).await {
+    match patch_ending_keeping_body(cards.feishu.as_ref(), card_message_id, &card).await {
         // The one reap vocabulary: the INFO line's ending word comes from the
         // state itself, exactly like every `ReapPass::settle` line.
         Ok(()) => tracing::info!(
@@ -262,8 +267,10 @@ struct ReapPass<'a> {
 }
 
 impl ReapPass<'_> {
-    /// PATCH the record's card into `state` and, when the state is terminal,
-    /// drop the record: nothing is owed a reap any more. A terminal ending
+    /// PATCH the record's card into `state` — keeping the card's existing body
+    /// best-effort (#434 acceptance feedback) — and, when the state is
+    /// terminal, drop the record: nothing is owed a reap any more. A terminal
+    /// ending
     /// whose Session's current directory differs from the pass's baseline
     /// directory gains one extra line naming the move (#439), on top of
     /// `detail` (the failure's message when there is one); a Waiting yield is
@@ -275,12 +282,12 @@ impl ReapPass<'_> {
         let terminal = state.is_terminal();
         let move_note = if terminal { self.move_note().await } else { None };
         let card = ending_card(state.clone(), detail, move_note.as_deref());
-        if let Err(e) = self
-            .handles
-            .cards
-            .feishu
-            .update_message(&self.record.card_message_id, &card)
-            .await
+        if let Err(e) = patch_ending_keeping_body(
+            self.handles.cards.feishu.as_ref(),
+            &self.record.card_message_id,
+            &card,
+        )
+        .await
         {
             tracing::warn!(
                 "live-card reap: session {} could not settle card {}: {e}",
@@ -351,16 +358,18 @@ impl ReapPass<'_> {
     }
 }
 
-/// A bare card carrying one ending — the reap's whole card vocabulary. The
-/// lost turn's content is deliberately NOT rebuilt (ADR-0063): the ending's
-/// header, the failure's own message when there is one, the move line when the
-/// Session relocated (#439), and no action. The whole card is replaced, so
-/// whatever the orphan last showed — a half-drawn turn, a stale spinner, a
-/// live tool panel — goes with it: the reap writes state, never content. The
-/// Unreceived ending is therefore actionless here — the restart took the
-/// accumulator its 重新发起 click would claim (the original prompt and the card
-/// session), so the button could only be dead; the user re-sends instead
-/// (ADR-0062's amendment).
+/// A bare card carrying one ending — the reap's whole card vocabulary when the
+/// card's own view cannot be read. The lost turn's content is deliberately NOT
+/// rebuilt (ADR-0063): the ending's header, the failure's own message when
+/// there is one, the move line when the Session relocated (#439), and no
+/// action. On the PATCH path this bare ending is merged with the card's
+/// currently rendered view best-effort ([`ending_card_keeping_body`], #434
+/// acceptance feedback): the card keeps whatever it already showed, while
+/// content it never showed — the lost turn's missing work — is still never
+/// rebuilt. The Unreceived ending is therefore actionless here — the restart
+/// took the accumulator its 重新发起 click would claim (the original prompt and
+/// the card session), so the button could only be dead; the user re-sends
+/// instead (ADR-0062's amendment).
 fn ending_card(state: CardState, detail: Option<&str>, move_note: Option<&str>) -> serde_json::Value {
     let mut builder = CardBuilder::new().with_state(state);
     if let Some(detail) = detail.filter(|detail| !detail.is_empty()) {
@@ -370,6 +379,125 @@ fn ending_card(state: CardState, detail: Option<&str>, move_note: Option<&str>) 
         builder = builder.with_text(note);
     }
     builder.build()
+}
+
+/// PATCH `bare` onto `card_message_id`, keeping the card's existing body
+/// best-effort (#434 acceptance feedback): read the card's own view, merge the
+/// ending over it, PATCH the merge. A failed read PATCHes `bare` directly —
+/// today's behavior — because the ending must never depend on the read. And
+/// when the platform refuses the preserved shape the bare ending cannot hit
+/// (e.g. `230099`), retry once with `bare`: the card's owner died, so it must
+/// never stay looking live.
+async fn patch_ending_keeping_body(
+    platform: &dyn crate::feishu::Platform,
+    card_message_id: &str,
+    bare: &serde_json::Value,
+) -> crate::error::Result<()> {
+    match platform.get_card_view(card_message_id).await {
+        Ok(view) => {
+            let card = ending_card_keeping_body(bare, &view);
+            match platform.update_message(card_message_id, &card).await {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    tracing::warn!(
+                        "live-card reap: card {card_message_id} refused the preserved ending ({e}); retrying bare"
+                    );
+                    platform.update_message(card_message_id, bare).await
+                }
+            }
+        }
+        Err(e) => {
+            tracing::debug!("live-card reap: card {card_message_id} view unreadable ({e}); settling bare");
+            platform.update_message(card_message_id, bare).await
+        }
+    }
+}
+
+/// The bare ending restamped over the card's existing view (#434 acceptance
+/// feedback): the ending's header leads, its own elements (the failure's
+/// message and/or the move line) come before the view's body, and every
+/// interactive element is stripped from the view's elements — a whole-card read
+/// does not return a control's `value`, so a preserved control could only
+/// render dead. The view's `config` rules the restamped card (`streaming_mode`
+/// forced off so a preserved card never keeps a live-streaming presentation);
+/// a view without one keeps the ending's. Schema 2.0, the one the PATCH API
+/// accepts back.
+fn ending_card_keeping_body(bare: &serde_json::Value, view: &serde_json::Value) -> serde_json::Value {
+    let mut elements: Vec<serde_json::Value> =
+        bare["body"]["elements"].as_array().cloned().unwrap_or_default();
+    if let Some(view_elements) = view["body"]["elements"].as_array() {
+        elements.extend(view_elements.iter().filter_map(stripped_of_controls));
+    }
+    let mut config = view
+        .get("config")
+        .filter(|config| config.is_object())
+        .cloned()
+        .or_else(|| bare.get("config").filter(|config| config.is_object()).cloned())
+        .unwrap_or_else(|| serde_json::json!({ "wide_screen_mode": true }));
+    config["streaming_mode"] = serde_json::json!(false);
+    serde_json::json!({
+        "schema": "2.0",
+        "config": config,
+        "header": bare["header"].clone(),
+        "body": { "elements": elements },
+    })
+}
+
+/// The element tags that are interactive — buttons and form controls. A
+/// preserved card must never show a control whose action can no longer run
+/// (its `value` did not survive the whole-card read), so these are stripped
+/// wherever they nest: panels, column sets and forms included.
+fn is_interactive_element(tag: &str) -> bool {
+    matches!(
+        tag,
+        "button"
+            | "action"
+            | "input"
+            | "select_static"
+            | "multi_select_static"
+            | "select_person"
+            | "multi_select_person"
+            | "overflow"
+            | "date_picker"
+            | "picker_time"
+            | "picker_datetime"
+            | "checker"
+    )
+}
+
+/// [`is_interactive_element`]'s recursive application: `None` for a stripped
+/// element, the element — its nested arrays and objects filtered — otherwise.
+fn stripped_of_controls(element: &serde_json::Value) -> Option<serde_json::Value> {
+    if element
+        .get("tag")
+        .and_then(|tag| tag.as_str())
+        .is_some_and(is_interactive_element)
+    {
+        return None;
+    }
+    match element {
+        serde_json::Value::Object(map) => {
+            let mut cleaned = serde_json::Map::with_capacity(map.len());
+            for (key, value) in map {
+                match value {
+                    serde_json::Value::Array(items) => {
+                        cleaned.insert(
+                            key.clone(),
+                            serde_json::Value::Array(items.iter().filter_map(stripped_of_controls).collect()),
+                        );
+                    }
+                    other => {
+                        cleaned.insert(
+                            key.clone(),
+                            stripped_of_controls(other).unwrap_or(serde_json::Value::Null),
+                        );
+                    }
+                }
+            }
+            Some(serde_json::Value::Object(cleaned))
+        }
+        other => Some(other.clone()),
+    }
 }
 
 #[cfg(test)]
@@ -440,5 +568,115 @@ mod tests {
             unreceived_moved["body"]["elements"][0]["content"],
             "**会话已迁移**: `/w2`"
         );
+    }
+
+    /// The preserved ending (#434 acceptance feedback): the ending's header
+    /// replaces the old one, the ending's own line is prepended to the fetched
+    /// body, every interactive element is stripped recursively (a nested
+    /// button and a whole action block included), and `streaming_mode` is
+    /// forced off while the view's other config survives. A view without a
+    /// config keeps the ending's.
+    #[test]
+    fn ending_card_keeping_body_prepends_the_line_and_strips_controls() {
+        use crate::bridge::test_support::{card_buttons, card_has_tag, card_text};
+
+        let bare = ending_card(CardState::Error, Some("**错误**: 503"), None);
+        let view = serde_json::json!({
+            "schema": "2.0",
+            "config": {
+                "wide_screen_mode": true,
+                "streaming_mode": true,
+                "enable_forward_interaction": false
+            },
+            "header": {
+                "template": "blue",
+                "title": { "tag": "plain_text", "content": "✍️ 回复中" }
+            },
+            "body": { "elements": [
+                { "tag": "markdown", "content": "**正文** 第一段" },
+                { "tag": "collapsible_panel", "expanded": false, "elements": [
+                    { "tag": "markdown", "content": "面板里的输出" },
+                    { "tag": "button", "text": { "tag": "plain_text", "content": "重试" },
+                      "value": { "action": "retry" } }
+                ] },
+                { "tag": "action", "actions": [
+                    { "tag": "button", "text": { "tag": "plain_text", "content": "重新发起" },
+                      "value": { "action": "resume" } }
+                ] },
+                { "tag": "hr" }
+            ] }
+        });
+
+        let card = ending_card_keeping_body(&bare, &view);
+        assert_eq!(card["schema"], "2.0");
+        assert_eq!(
+            card["header"]["title"]["content"], "❌ 出错",
+            "the ending's header replaces the card's old one: {card}"
+        );
+        assert_eq!(
+            card["config"]["streaming_mode"], false,
+            "streaming is forced off: {card}"
+        );
+        assert_eq!(
+            card["config"]["wide_screen_mode"], true,
+            "other config fields survive: {card}"
+        );
+        assert_eq!(card["config"]["enable_forward_interaction"], false);
+        let elements = card["body"]["elements"].as_array().unwrap();
+        assert_eq!(
+            elements[0]["content"], "**错误**: 503",
+            "the ending's own line is prepended: {card}"
+        );
+        assert_eq!(
+            elements[1]["content"], "**正文** 第一段",
+            "the preserved body follows the line: {card}"
+        );
+        assert!(
+            card_text(&card).contains("面板里的输出"),
+            "nested panel content survives: {card}"
+        );
+        assert!(
+            card_buttons(&card).is_empty(),
+            "no preserved button survives, nested or not: {card}"
+        );
+        assert!(!card_has_tag(&card, "action"), "no action block survives: {card}");
+        assert_eq!(
+            elements[2]["tag"], "collapsible_panel",
+            "the panel itself survives: {card}"
+        );
+        assert_eq!(
+            elements[2]["elements"].as_array().unwrap().len(),
+            1,
+            "the panel's nested control is stripped: {card}"
+        );
+        assert_eq!(
+            elements[3]["tag"], "hr",
+            "non-interactive elements keep their order: {card}"
+        );
+
+        // A view without a config keeps the ending's own (streaming still off).
+        let no_config = serde_json::json!({
+            "body": { "elements": [{ "tag": "markdown", "content": "旧的正文" }] }
+        });
+        let card = ending_card_keeping_body(&bare, &no_config);
+        assert_eq!(card["config"]["wide_screen_mode"], true);
+        assert_eq!(card["config"]["streaming_mode"], false);
+        assert_eq!(card["body"]["elements"][1]["content"], "旧的正文");
+    }
+
+    /// A bare ending with no line of its own prepends nothing: the preserved
+    /// body leads the card.
+    #[test]
+    fn ending_card_keeping_body_without_a_line_leads_with_the_view() {
+        let bare = ending_card(CardState::Done, None, None);
+        let view = serde_json::json!({
+            "config": { "wide_screen_mode": true },
+            "body": { "elements": [{ "tag": "markdown", "content": "保留的正文" }] }
+        });
+        let card = ending_card_keeping_body(&bare, &view);
+        let elements = card["body"]["elements"].as_array().unwrap();
+        assert_eq!(elements.len(), 1);
+        assert_eq!(elements[0]["content"], "保留的正文");
+        assert_eq!(card["header"]["title"]["content"], "✅ 完成");
     }
 }

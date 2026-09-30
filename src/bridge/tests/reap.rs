@@ -205,6 +205,56 @@ fn completed(created_ms: i64) -> SessionTranscript {
     .with_executions(vec![execution(created_ms + 1_500)])
 }
 
+/// The card view a whole-card read answers for a live turn's card: markdown,
+/// a collapsible panel with nested markdown, controls (a nested button and an
+/// action block) and an hr — the shape a reap must keep without its controls
+/// (#434 acceptance feedback).
+fn realistic_card_view() -> serde_json::Value {
+    serde_json::json!({
+        "schema": "2.0",
+        "config": { "wide_screen_mode": true, "streaming_mode": true },
+        "header": {
+            "template": "blue",
+            "title": { "tag": "plain_text", "content": "✍️ 回复中" }
+        },
+        "body": { "elements": [
+            { "tag": "markdown", "content": "**正文** 第一段" },
+            { "tag": "collapsible_panel", "expanded": false,
+              "header": { "title": { "tag": "plain_text", "content": "🧰 bash" } },
+              "elements": [
+                  { "tag": "markdown", "content": "面板里的输出" },
+                  { "tag": "button", "text": { "tag": "plain_text", "content": "重试" },
+                    "value": { "action": "retry" } }
+              ] },
+            { "tag": "action", "actions": [
+                { "tag": "button", "text": { "tag": "plain_text", "content": "重新发起" },
+                  "value": { "action": "resume" } }
+            ] },
+            { "tag": "hr" }
+        ] }
+    })
+}
+
+/// The preservation contract the kept-body tests share: the old body's text
+/// survived, no interactive element did (the whole-card read loses a control's
+/// `value`, so a kept control could only be dead), and streaming is off.
+fn assert_preserved_body(card: &serde_json::Value) {
+    assert!(
+        card_text(card).contains("**正文** 第一段") && card_text(card).contains("面板里的输出"),
+        "the card keeps what it already showed: {card}"
+    );
+    assert!(
+        card_buttons(card).is_empty(),
+        "no preserved button survives: {card}"
+    );
+    assert!(!card_has_tag(card, "action"), "no action block survives: {card}");
+    assert_eq!(
+        card["config"]["streaming_mode"], false,
+        "a preserved card never keeps a live-streaming presentation: {card}"
+    );
+    assert_eq!(card["schema"], "2.0", "the PATCH stays schema 2.0: {card}");
+}
+
 /// A restart reaps a persisted card by the transcript's real ending: the run
 /// finished while cola was down, so the card takes ✅ — never an invented
 /// interruption — and the record is spent.
@@ -1005,6 +1055,291 @@ async fn a_record_that_lagged_a_handover_collects_the_orphan_and_repoints() {
         record.directory.as_deref(),
         Some("/work"),
         "the re-point keeps the session's route"
+    );
+}
+
+/// The acceptance feedback fix (#434): a collected orphan keeps what it already
+/// showed — the takeover restamps the header over the fetched body, with the
+/// old card's controls stripped (a whole-card read returns no button `value`,
+/// so a kept control could only be dead).
+#[tokio::test]
+async fn a_collected_orphan_keeps_its_body_without_the_controls() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_live_card(
+        &session_file,
+        LiveCard::new("om_old", MessageId::new("msg_cola_anchor"), Some(1_000))
+            .with_directory(Some("/work".into())),
+    );
+
+    let (app, platform) = restarted_app(&session_file, completed(1_000), None).await;
+    platform.given_card_view("om_old", realistic_card_view());
+    // The process's live card: a handover the record missed.
+    Turn::seed_card(&app.cards_handle(), "ses_test", Some("om_live")).await;
+
+    spawn_sync(&app);
+    wait_for_card_update(
+        &platform,
+        "the orphan's taken-over note",
+        CardUpdates::Any,
+        |card| card_header(card).contains("已由新卡片接管"),
+    )
+    .await;
+
+    let collected = last_update_of(&platform, "om_old")
+        .await
+        .expect("the recorded card is collected in place");
+    assert_eq!(card_header(&collected), "⏳ 已由新卡片接管 · 已停止更新");
+    assert_preserved_body(&collected);
+    assert_eq!(
+        collected["body"]["elements"][0]["content"], "**正文** 第一段",
+        "the collected ending carries no line of its own, so the kept body leads: {collected}"
+    );
+}
+
+/// A reaped (restart) card settled ✅ keeps its body under the new header
+/// (#434 acceptance feedback) — the user sees the card they had, ended,
+/// instead of a blank one.
+#[tokio::test]
+async fn a_reaped_done_card_keeps_its_body() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
+
+    let (app, platform) = restarted_app(&session_file, completed(1_000), None).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+
+    spawn_sync(&app);
+    wait_for_card_update(
+        &platform,
+        "the reaped card's ✅ ending",
+        CardUpdates::Any,
+        |card| card_header(card).contains("✅"),
+    )
+    .await;
+
+    let card = last_update_of(&platform, "om_frozen")
+        .await
+        .expect("the persisted card is settled in place");
+    assert_eq!(card_header(&card), "✅ 完成");
+    assert_preserved_body(&card);
+    assert!(
+        app.cards_handle().live_cards.get("ses_test").is_none(),
+        "a terminal removes the record"
+    );
+}
+
+/// A reaped Error card keeps its body too, with the ending's own lines — the
+/// failure's message and the move line (#439) — prepended before it, in order
+/// (#434 acceptance feedback).
+#[tokio::test]
+async fn a_reaped_error_card_keeps_its_body_after_the_detail_and_move_line() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_live_card(
+        &session_file,
+        LiveCard::new("om_frozen", MessageId::new("msg_cola_anchor"), Some(1_000))
+            .with_directory(Some("/work".into())),
+    );
+
+    let mut failed = assistant(2_000, "没成功。");
+    failed.error = Some("503 request queue full".into());
+    let transcript = SessionTranscript::new(vec![user("msg_cola_anchor", 1_000, "问题"), failed])
+        .with_executions(vec![execution(2_500)]);
+    let (app, platform, _backend) = build_restarted_with_sessions(
+        &session_file,
+        transcript,
+        vec![list_session(
+            "ses_test",
+            "题目",
+            "/work/.worktrees/zh-user-guide",
+            1_000,
+        )],
+    )
+    .await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+
+    spawn_sync(&app);
+    wait_for_card_update(
+        &platform,
+        "the reaped card's ❌ ending",
+        CardUpdates::Any,
+        |card| card_header(card).contains("出错"),
+    )
+    .await;
+
+    let card = last_update_of(&platform, "om_frozen")
+        .await
+        .expect("the persisted card is settled in place");
+    assert_eq!(card_header(&card), "❌ 出错");
+    let elements = card["body"]["elements"].as_array().unwrap();
+    assert!(
+        elements[0]["content"]
+            .as_str()
+            .is_some_and(|line| line.contains("503 request queue full")),
+        "the failure's own message leads: {card}"
+    );
+    assert!(
+        elements[1]["content"].as_str().is_some_and(
+            |line| line.contains("会话已迁移") && line.contains("/work/.worktrees/zh-user-guide")
+        ),
+        "the move line follows the detail: {card}"
+    );
+    assert_eq!(
+        elements[2]["content"], "**正文** 第一段",
+        "the kept body follows both lines: {card}"
+    );
+    assert_preserved_body(&card);
+}
+
+/// The Unreceived ending keeps the card's body as well — the copy (and the
+/// absence of the 重新发起 action) is the ending's, the content is the user's
+/// (#434 acceptance feedback, ADR-0062's reaped-card rule).
+#[tokio::test]
+async fn a_reaped_unreceived_card_keeps_its_body() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", None);
+
+    // The session has earlier traffic, but the submitted message never landed.
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_prev", 500, "上一条"),
+        assistant(600, "好的。"),
+    ])
+    .with_executions(vec![execution(700)]);
+    let (app, platform) = restarted_app(&session_file, transcript, None).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+
+    spawn_sync(&app);
+    wait_for_card_update(
+        &platform,
+        "the reaped card's Unreceived ending",
+        CardUpdates::Any,
+        |card| card_header(card).contains("未被接收"),
+    )
+    .await;
+
+    let card = last_update_of(&platform, "om_frozen")
+        .await
+        .expect("the persisted card is settled in place");
+    assert_eq!(card_header(&card), "⚠️ 这条消息未被接收");
+    assert_preserved_body(&card);
+    assert!(app.cards_handle().live_cards.get("ses_test").is_none());
+}
+
+/// A Waiting yield keeps the body too, and the record stays for the later true
+/// end (#434 acceptance feedback).
+#[tokio::test]
+async fn a_reaped_waiting_card_keeps_its_body() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
+
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_background_tasks(vec![background_shell(2_100)]);
+    let (app, platform) = restarted_app(&session_file, transcript, None).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+
+    spawn_sync(&app);
+    wait_for_card_update(
+        &platform,
+        "the reaped card's waiting ending",
+        CardUpdates::Any,
+        |card| card_header(card).contains("等待后台任务"),
+    )
+    .await;
+
+    let card = last_update_of(&platform, "om_frozen")
+        .await
+        .expect("the persisted card is yielded in place");
+    assert_eq!(card_header(&card), "⏳ 等待后台任务");
+    assert_preserved_body(&card);
+    assert!(
+        app.cards_handle().live_cards.get("ses_test").is_some(),
+        "a waiting yield keeps its record"
+    );
+}
+
+/// An unreadable card view settles the bare ending exactly as before the fix:
+/// the reap must never depend on the read (#434 acceptance feedback).
+#[tokio::test]
+async fn a_reap_without_a_readable_card_view_falls_back_to_the_bare_ending() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
+
+    // No `given_card_view`: the read fails, like a missing permission.
+    let (app, platform) = restarted_app(&session_file, completed(1_000), None).await;
+
+    spawn_sync(&app);
+    wait_for_card_update(
+        &platform,
+        "the reaped card's ✅ ending",
+        CardUpdates::Any,
+        |card| card_header(card).contains("✅"),
+    )
+    .await;
+
+    let card = last_update_of(&platform, "om_frozen")
+        .await
+        .expect("the persisted card is settled in place");
+    assert_eq!(card_header(&card), "✅ 完成");
+    assert!(
+        card["body"]["elements"].as_array().unwrap().is_empty(),
+        "an unreadable view settles the bare ending: {card}"
+    );
+}
+
+/// When the platform refuses the preserved shape (e.g. `230099`), the ending
+/// still lands: the PATCH retries once with the bare ending, so the card never
+/// stays looking live behind a rejected nicety (#434 acceptance feedback).
+#[tokio::test]
+async fn a_rejected_preserved_ending_retries_the_bare_one() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
+
+    let (app, platform) = restarted_app(&session_file, completed(1_000), None).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+    platform
+        .fail_update_card_content_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+
+    spawn_sync(&app);
+    wait_for_card_update(&platform, "the bare retry", CardUpdates::Latest, |card| {
+        card_header(card).contains("✅")
+            && card["body"]["elements"]
+                .as_array()
+                .is_some_and(|elements| elements.is_empty())
+    })
+    .await;
+
+    let patches = patches_to(&platform, "om_frozen").await;
+    assert_eq!(
+        patches.len(),
+        2,
+        "the preserved attempt and its bare retry: {patches:?}"
+    );
+    assert!(
+        card_text(&patches[0]).contains("**正文** 第一段"),
+        "the first attempt kept the body: {}",
+        patches[0]
+    );
+    assert!(
+        patches[1]["body"]["elements"].as_array().unwrap().is_empty(),
+        "the retry is the bare ending: {}",
+        patches[1]
     );
 }
 
