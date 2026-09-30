@@ -147,6 +147,21 @@ impl SessionTranscript {
             .max_by_key(|message| message.time.map(|time| time.created))
     }
 
+    /// The input of the tool call `call_id`, joined over the WHOLE read: a
+    /// Background Task can outlive the Turn that started it, so its part may
+    /// sit anywhere in the transcript (ADR-0060's label join). `None` when no
+    /// part carries that call's input. The one join the live ledger rows and a
+    /// reconciliation retirement entry both read, so they cannot drift.
+    pub fn tool_input(&self, call_id: &str) -> Option<&serde_json::Value> {
+        self.messages
+            .iter()
+            .flat_map(|message| &message.parts)
+            .find_map(|part| match part {
+                Part::Tool(call) if call.identity.call_id == call_id => call.input.as_ref(),
+                _ => None,
+            })
+    }
+
     /// The Turn anchor the user message `message_id` carries: the message's
     /// identity together with its server time, one fact (ADR-0026's
     /// `msg_cola_` id is how the Turn knows which message is its own). `None`

@@ -455,17 +455,7 @@ impl GenerationStrategy for V2Strategy {
         session_id: &str,
         _directory: Option<&str>,
     ) -> Result<Option<SessionStatus>> {
-        let resp = http.client().get(http.url(SESSION_ACTIVE)).send().await?;
-        if !resp.status().is_success() {
-            return Err(read_failure(resp, "session status").await);
-        }
-        let text = resp.text().await?;
-        let active: wire::ActiveSessions = serde_json::from_str(&text).map_err(|e| {
-            crate::error::BridgeError::OpenCode(format!(
-                "session status parse: {e} — body: {}",
-                body_preview(&text)
-            ))
-        })?;
+        let active = self.active_sessions(http, "session status").await?;
         Ok(match active.state(session_id) {
             // Running: the retry field can only be set while the drain owns the
             // session, so this is where the second read is worth paying.
@@ -549,17 +539,7 @@ impl GenerationStrategy for V2Strategy {
             }
         }
         if !children.is_empty() {
-            let resp = http.client().get(http.url(SESSION_ACTIVE)).send().await?;
-            if !resp.status().is_success() {
-                return Err(read_failure(resp, "task runtime active map").await);
-            }
-            let text = resp.text().await?;
-            let active: wire::ActiveSessions = serde_json::from_str(&text).map_err(|e| {
-                crate::error::BridgeError::OpenCode(format!(
-                    "task runtime active map parse: {e} — body: {}",
-                    body_preview(&text)
-                ))
-            })?;
+            let active = self.active_sessions(http, "task runtime active map").await?;
             for child_id in children {
                 match active.state(child_id) {
                     Some(true) => runtime.children.push((child_id.clone(), ChildRuntime::Running)),
@@ -881,6 +861,20 @@ impl V2Strategy {
         }
         let body: wire::DataEnvelope<wire::RawSessionInfo> = resp.json().await?;
         Ok(body.data)
+    }
+
+    /// The active-session run-state map (`GET /api/session/active`), shared by
+    /// the run-state read and the Background Task reconciliation. `what` names
+    /// the caller in the failure text — each read's diagnostics stay its own.
+    async fn active_sessions(&self, http: &Transport, what: &str) -> Result<wire::ActiveSessions> {
+        let resp = http.client().get(http.url(SESSION_ACTIVE)).send().await?;
+        if !resp.status().is_success() {
+            return Err(read_failure(resp, what).await);
+        }
+        let text = resp.text().await?;
+        serde_json::from_str(&text).map_err(|e| {
+            crate::error::BridgeError::OpenCode(format!("{what} parse: {e} — body: {}", body_preview(&text)))
+        })
     }
 
     /// One shell's runtime verdict (`GET /api/shell/{id}`, issue #454). 404 is
