@@ -10,6 +10,17 @@
 > a per-session **Wake Watermark**, and the no-chain Fresh continuation posts
 > only for a Wake strictly newer than it. Live cards still die with the
 > process, and the continuation still scopes itself at the Wake.
+>
+> **Amended by ADR-0062**: the routing key is cola's own live ownership, not
+> the Backend's status read — `/api/session/active` can report live with no
+> runner left to promote the message (#428). A message whose Session only
+> *reads* live while cola owns no card chain starts a new Turn, and a submit
+> the Session never promoted ends 「未被接收」, never ✅. The Follow's guard
+> and every #409 case stand.
+>
+> **Amended by ADR-0063**: the live card's identity and anchor are durable; a
+> restart reaps the card it orphaned instead of leaving it frozen. "Card state
+> stays in memory" is narrowed accordingly, as with ADR-0061.
 
 ## Context
 
