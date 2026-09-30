@@ -72,6 +72,18 @@ enum DrainState {
     Unreceived,
 }
 
+/// What a non-busy status read said, as [`Turn::settle_or_yield`] reads it
+/// (ADR-0062): the Session is not live, or the read could not say. A named
+/// fact, so the Unreceived decision cannot confuse "idle" with "unreadable" —
+/// an unreadable read is no evidence either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdleRead {
+    /// A readable, non-busy status: the Session is not live.
+    Idle,
+    /// The status call failed or timed out: nothing may be decided from it.
+    Unreadable,
+}
+
 /// The disposition one [`TurnSettle`] decision gives a Turn ending. The read
 /// model decides once; this is the ONE place the Turn maps that decision, so
 /// the drain (`settle_or_yield`) and finalization (`finish`) cannot read it
@@ -686,9 +698,18 @@ impl Turn {
         // undecided read (a Wake whose Execution has not reached its boundary)
         // keeps the drain's own disposition, and a stop or a failure dominates
         // below.
-        let final_settle = final_transcript
-            .as_ref()
-            .map(|transcript| transcript.settle(transcript.anchor_of_user(&self.cola_message_id).as_ref()));
+        // The settle scope: the final read's own anchor when it still carries
+        // the submitted message, else the card's captured anchor — the anchor
+        // is sticky (a compaction or a partial read cannot un-land a message
+        // the Turn already anchored), so Unreceived is decided only when
+        // neither knows the message.
+        let captured_anchor = Turn::armed_turn_anchor(&handles.cards, &self.session_id).await;
+        let final_settle = final_transcript.as_ref().map(|transcript| {
+            let anchor = transcript
+                .anchor_of_user(&self.cola_message_id)
+                .or_else(|| captured_anchor.clone());
+            transcript.settle(anchor.as_ref())
+        });
         // Read before the match consumes the decision (a `Failed` carries its
         // message): an undecided read keeps the follow observing.
         let final_running = final_settle == Some(TurnSettle::Running);
@@ -1165,16 +1186,16 @@ impl Turn {
             // A non-busy status: the settle decision owns the ending (ADR-0059,
             // ADR-0062) once the run was observed; before that the
             // confirmation window still bounds an unregistered submit. The
-            // failed and timed-out paths pass `false`: an unreadable status is
-            // no evidence the session is not live, so it can never decide the
+            // failed and timed-out paths pass [`IdleRead::Unreadable`]: no
+            // evidence the session is not live, so it can never decide the
             // Unreceived ending — see `settle_or_yield`.
-            Some(Ok(_)) => self.settle_or_yield(transcript, anchor.as_ref(), observed, true),
+            Some(Ok(_)) => self.settle_or_yield(transcript, anchor.as_ref(), observed, IdleRead::Idle),
             Some(Err(e)) => {
                 tracing::warn!("turn drain session status: {}", e);
-                self.settle_or_yield(transcript, anchor.as_ref(), observed, false)
+                self.settle_or_yield(transcript, anchor.as_ref(), observed, IdleRead::Unreadable)
             }
             // The bounded status call timed out: same rule as a failed read.
-            None => self.settle_or_yield(transcript, anchor.as_ref(), observed, false),
+            None => self.settle_or_yield(transcript, anchor.as_ref(), observed, IdleRead::Unreadable),
         }
     }
 
@@ -1189,8 +1210,8 @@ impl Turn {
     /// submit only schedules execution (ADR-0056), so the decision may not
     /// judge the Turn on an early idle read.
     ///
-    /// `status_known` distinguishes a readable non-busy status from a failed
-    /// or timed-out read. An unreadable status counts as idle for a run whose
+    /// `read` distinguishes a readable non-busy status from a failed or
+    /// timed-out one. An unreadable status counts as idle for a run whose
     /// message landed — the pre-settle rule's own treatment — but it is no
     /// evidence the Session is not live, so it can never decide the Unreceived
     /// ending: an anchorless submit keeps observing instead (the drain bound's
@@ -1201,9 +1222,9 @@ impl Turn {
         transcript: &SessionTranscript,
         anchor: Option<&TurnAnchor>,
         observed: bool,
-        status_known: bool,
+        read: IdleRead,
     ) -> DrainState {
-        if anchor.is_none() && !status_known {
+        if anchor.is_none() && read == IdleRead::Unreadable {
             return DrainState::Running;
         }
         if !observed {
@@ -2010,8 +2031,8 @@ impl Turn {
     /// refreshed, flushed once, never ✅ — and stops updating; the 重新发起
     /// action (#437) is its recovery. No Completion Notice is sent (the card
     /// is no 完成/出错/已停止 ending). Used by the out-of-turn follow's
-    /// unreceived watch and the drain's own finalization; the reaper
-    /// (ADR-0063) settles by the same rule.
+    /// unreceived watch and the drain's own finalization; the durable
+    /// live-card reap (#438, ADR-0063) settles by the same rule.
     pub(crate) async fn finalize_unreceived(cards: &CardsHandle, session_id: &str) {
         if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
             card.acc.set_unreceived();
@@ -2690,6 +2711,20 @@ impl Turn {
             .await
             .get(session_id)
             .map(|card| card.chain_id())
+    }
+
+    /// The submitted user message's cola id on `session_id`'s card (ADR-0026),
+    /// when the card carries one — the id the unreceived watch's anchor
+    /// capture matches on (`capture_turn_anchor`). `None` when the session has
+    /// no card, or the card never carried a submitted message (an external
+    /// render's, a Wake continuation's): the watch has nothing to look for.
+    pub(crate) async fn submitted_message_id(cards: &CardsHandle, session_id: &str) -> Option<String> {
+        cards
+            .cards
+            .lock()
+            .await
+            .get(session_id)
+            .and_then(|card| card.acc.cola_message_id.clone())
     }
 
     /// Arm a FRESH Wake continuation card: the no-chain path (a cola restart

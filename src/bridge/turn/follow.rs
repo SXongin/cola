@@ -102,27 +102,27 @@ pub(super) async fn spawn(handles: &TurnHandles, facts: FollowFacts) {
 /// Supplement split and dies with a new Turn. The watch carries the submitted
 /// id the anchor capture looks for and the hint's deadline (the turn's start
 /// plus the follow grace); the loop reads all three through the variant.
-async fn ownership(handles: &TurnHandles, facts: &FollowFacts, timing: SettleTiming) -> settle::Ownership {
-    match &facts.anchor {
-        Some(anchor) => settle::Ownership::TurnAnchor(anchor.clone()),
-        None => settle::Ownership::Unlanded {
-            chain: super::Turn::chain_id(&handles.cards, &facts.session_id)
-                .await
-                .unwrap_or(0),
-            // The accumulator carries the id the anchor capture matches on
-            // (`capture_turn_anchor`), read from the same place so the two
-            // cannot drift.
-            submitted: handles
-                .cards
-                .cards
-                .lock()
-                .await
-                .get(&facts.session_id)
-                .and_then(|card| card.acc.cola_message_id.clone())
-                .unwrap_or_default(),
-            hint_at: facts.started_at + std::time::Duration::from_millis(timing.grace_ms),
-        },
+/// `None` — the card is gone, or carries no submitted message — means there is
+/// nothing to watch; [`run`] then hands the guard back and stops.
+async fn ownership(
+    handles: &TurnHandles,
+    facts: &FollowFacts,
+    timing: SettleTiming,
+) -> Option<settle::Ownership> {
+    if let Some(anchor) = &facts.anchor {
+        return Some(settle::Ownership::TurnAnchor(anchor.clone()));
     }
+    // The unreceived watch: the card's chain identity and the accumulator's
+    // submitted id, both read through the Turn accessors so the watch and
+    // `capture_turn_anchor` look at the same facts. Absence is explicit — a
+    // sentinel chain or an empty id could never match what the loop watches.
+    let chain = super::Turn::chain_id(&handles.cards, &facts.session_id).await?;
+    let submitted = super::Turn::submitted_message_id(&handles.cards, &facts.session_id).await?;
+    Some(settle::Ownership::Unlanded {
+        chain,
+        submitted,
+        hint_at: facts.started_at + std::time::Duration::from_millis(timing.grace_ms),
+    })
 }
 
 /// The follow's loop: the shared settle loop under the accumulator's anchor
@@ -142,7 +142,14 @@ async fn ownership(handles: &TurnHandles, facts: &FollowFacts, timing: SettleTim
 /// moment replaced the accumulator, and stamping its live card with the old
 /// ending would be a lie.
 async fn run(handles: TurnHandles, facts: FollowFacts, timing: SettleTiming) {
-    let owns = ownership(&handles, &facts, timing).await;
+    let Some(owns) = ownership(&handles, &facts, timing).await else {
+        // The card vanished between the hand-off and this loop (or never
+        // carried a submitted message): there is nothing to watch. The spawn
+        // inherited the guard, so hand it back — a stale hold would leave the
+        // session busy forever.
+        super::release_inflight(&handles, &facts.session_id).await;
+        return;
+    };
     let FollowFacts {
         session_id,
         thread_key: _,

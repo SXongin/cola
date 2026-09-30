@@ -27,9 +27,10 @@ incident is ADR-0063's.
 The stale read is not a freak accident: the active map is process-local and
 lossy (ADR-0059's own considered options said so), and a run can outlive its
 runner through an interrupt, a move, or a location eviction. Second, even a
-correct Turn cannot end honestly in that state: a Turn whose submitted message
-never reaches the transcript settles through `settle_or_confirm`'s idle
-confirmation window as Done, stamping ✅ over a message nobody executed.
+correct Turn could not end honestly in that state: a Turn whose submitted
+message never reached the transcript settled through `settle_or_confirm`'s idle
+confirmation window — the pre-#436 rule, since retired — as Done, stamping ✅
+over a message nobody executed.
 
 ## Decision
 
