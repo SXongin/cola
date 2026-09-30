@@ -42,18 +42,31 @@ async fn restarted_app(
     transcript: SessionTranscript,
     status: Option<SessionStatus>,
 ) -> (Arc<App>, Arc<RecordingPlatform>) {
+    let (app, platform, _backend) = restarted_app_with_backend(session_file, transcript, status).await;
+    (app, platform)
+}
+
+/// [`restarted_app`] with the scripted Backend handed back — for a test that
+/// re-scripts the session's read mid-life (the tasks retiring while cola
+/// watches).
+async fn restarted_app_with_backend(
+    session_file: &Path,
+    transcript: SessionTranscript,
+    status: Option<SessionStatus>,
+) -> (Arc<App>, Arc<RecordingPlatform>, Arc<MockBackend>) {
     let mut backend = MockBackend::new(realistic_parts());
     backend.given_transcript("ses_test", vec![transcript]);
     if let Some(status) = status {
         backend.with_session_status("ses_test", Some(status));
     }
+    let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(
-        App::new(test_config(session_file), Arc::new(backend), platform.clone())
+        App::new(test_config(session_file), backend.clone(), platform.clone())
             .expect("the restarted app builds"),
     );
     seed_session(&app, "ses_test", "/work").await;
-    (app, platform)
+    (app, platform, backend)
 }
 
 /// The card the platform PATCHed onto `message_id` last, if any.
@@ -208,6 +221,60 @@ async fn a_restart_reaps_a_persisted_card_to_waiting_and_keeps_its_record() {
         stamped,
         "the waiting ending is stamped once per life: {:?}",
         platform.calls.lock().await
+    );
+}
+
+/// A Waiting card orphaned by a restart is not left frozen: when the Session's
+/// true end arrives (the last Background Task retires while cola watches), the
+/// same truth rule settles it ✅ and spends the record — the waiting stamp
+/// never becomes the card's permanent state.
+#[tokio::test]
+async fn a_waiting_orphan_settles_at_its_true_end() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
+
+    let waiting = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_background_tasks(vec![background_shell(2_100)]);
+    let (app, platform, backend) = restarted_app_with_backend(&session_file, waiting, None).await;
+
+    spawn_sync(&app);
+    wait_for_card_update(
+        &platform,
+        "the reaped card's waiting ending",
+        CardUpdates::Latest,
+        |card| card_header(card).contains("等待后台任务"),
+    )
+    .await;
+
+    // The background work retires: the same settle rule now reads the true end.
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(vec![
+                user("msg_cola_anchor", 1_000, "跑一下 CI"),
+                assistant(2_000, "已经交给后台了。"),
+                assistant(3_100, "CI 通过了。"),
+            ])
+            .with_executions(vec![execution(2_500), execution(4_000)]),
+        ],
+    )
+    .await;
+    wait_for_card_update(
+        &platform,
+        "the waiting orphan's true end",
+        CardUpdates::Latest,
+        |card| card_header(card).contains("✅"),
+    )
+    .await;
+    assert!(
+        app.cards_handle().live_cards.get("ses_test").is_none(),
+        "the true end spends the record"
     );
 }
 
