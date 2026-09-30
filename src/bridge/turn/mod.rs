@@ -2437,7 +2437,16 @@ impl Turn {
         {
             let live = cards.cards.lock().await;
             if let Some(card) = live.get(session_id) {
-                if !render::renders_new_content(&card.acc, transcript, turn_anchor) {
+                // The probe judges the chain's OWN rendered scope, not the
+                // newest user message's: a restart continuation is anchored at
+                // the Wake (`arm_wake_continuation`), and the pre-Wake content
+                // the lost card showed is outside that scope. Judging it by the
+                // user anchor read that content as unrendered on every pass and
+                // looped a fresh 承接 card each Sync tick (live 2026-09-30). A
+                // same-life card's anchor is the user message's, so the common
+                // path is unchanged.
+                let anchor = card.acc.turn_anchor.as_ref().unwrap_or(turn_anchor);
+                if !render::renders_new_content(&card.acc, transcript, anchor) {
                     return None;
                 }
                 // Key the 承接 receipt just before the work the continuation
