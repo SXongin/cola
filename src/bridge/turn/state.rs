@@ -12,7 +12,7 @@ use crate::bridge::handles::CardsHandle;
 use crate::feishu::card::first_n_chars_bytes;
 use crate::feishu::card::ledger::{TaskCompletionEntry, TaskKind, TaskLedgerRow};
 use crate::feishu::card::shell::CardBuilder;
-use crate::feishu::card::tool_render::{TASK_TOOL, TaskLiveness, ToolPanel};
+use crate::feishu::card::tool_render::{TaskLiveness, ToolPanel, is_task_tool};
 use crate::feishu::card::{AwaitingAction, CardState};
 use indexmap::IndexMap;
 use std::sync::Arc;
@@ -1431,13 +1431,13 @@ impl StreamAccumulator {
         self.refresh_phase();
     }
 
-    /// The live `task` panels' (call id, child Session id) pairs (ADR-0054):
-    /// the render path reads each child's liveness for them. A task call with
-    /// no recorded child id contributes nothing.
+    /// The live `task`/`subagent` panels' (call id, child Session id) pairs
+    /// (ADR-0054): the render path reads each child's liveness for them. A
+    /// child-spawning call with no recorded child id contributes nothing.
     pub(super) fn live_task_children(&self) -> Vec<(String, String)> {
         self.tools
             .iter()
-            .filter(|(_, panel)| panel.is_live() && panel.name() == TASK_TOOL)
+            .filter(|(_, panel)| panel.is_live() && is_task_tool(panel.name()))
             .filter_map(|(call_id, panel)| {
                 panel
                     .child_session_id()
