@@ -26,8 +26,8 @@ use super::drain::{
     assistant, ctx, noticed, script_transcript, scripted_app, scripted_app_with, spawn_sync, spawn_turn, user,
 };
 use crate::backend::{
-    BackgroundTask, ContentBlock, FinishReason, MessageRole, Part, SessionTranscript, StepFinish, ToolCall,
-    ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage,
+    BackgroundTask, ChildRuntime, ContentBlock, FinishReason, MessageRole, Part, SessionTranscript, ShellEnd,
+    ShellRuntime, StepFinish, ToolCall, ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage,
 };
 use crate::bridge::test_support::*;
 use crate::bridge::turn::{PromptContext, Turn};
@@ -1188,6 +1188,151 @@ async fn a_quiet_true_end_settles_the_host_card_in_place() {
         notices[0].3.contains("已完成"),
         "unexpected notice text: {}",
         notices[0].3
+    );
+}
+
+/// Issue #454: a shell the runtime reports ENDED — while its completion Wake
+/// never arrives — retires on the same Session Sync read that refreshes the
+/// yielded ledger, and the last retirement settles the waiting card in place
+/// with the runtime's own ending (「🔔 后台任务结束」), never a Wake entry. The
+/// transcript still listed the task and keeps listing it; the runtime read is
+/// what ends the wait.
+#[tokio::test]
+async fn a_runtime_confirmed_end_settles_the_waiting_card() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = waiting_shell(now - 5_000);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    yield_one_task_card(&app, &platform, ctx("ses_test", "跑一下构建并审阅")).await;
+    let cards_before = created_cards(&platform).await.len();
+
+    // The runtime confirms the shell ended (killed) at its own completion
+    // time; no Wake will ever retire it. The transcript stays as scripted and
+    // keeps listing the task, so only the runtime read can end the wait.
+    let finished = now - 1_000;
+    backend.task_runtime.lock().unwrap().shells = vec![(
+        "sh_call_bg".into(),
+        ShellRuntime::Ended {
+            end: ShellEnd::Killed,
+            completed_at: Some(finished),
+        },
+    )];
+    spawn_sync(&app);
+    wait_for_card_update(&platform, "the settled card", CardUpdates::Latest, |card| {
+        card_header(card).contains("✅") && card_text(card).contains("🔔 后台任务结束：gh run watch")
+    })
+    .await;
+
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Done),
+        "the runtime end is the card's terminal"
+    );
+    let patches = patches_to(&platform, "om_waiting").await;
+    assert_eq!(patches.len(), 1, "the settle is one in-place PATCH: {patches:?}");
+    let settled = &patches[0];
+    let text = card_text(settled);
+    assert!(
+        !text.contains("后台任务（"),
+        "the runtime-retired task's live list is gone: {settled}"
+    );
+    assert!(
+        text.contains("shell sh_call_bg · ") && !text.contains("后台任务已失联"),
+        "the runtime entry carries the task's identity and its own ending: {settled}"
+    );
+    assert!(
+        continuation_sends(&platform).await.is_empty()
+            && created_cards(&platform).await.len() == cards_before,
+        "a runtime settle posts nothing: {:?}",
+        platform.calls.lock().await
+    );
+    // The reconcile asked for exactly this session's task: the runtime read,
+    // not a rewritten transcript, is what retired it (#454).
+    let calls = backend.task_runtime_calls.lock().await.clone();
+    assert!(
+        calls
+            .iter()
+            .any(|(sid, shells, _)| sid == "ses_test" && shells == &vec!["sh_call_bg".to_string()]),
+        "the reconcile read named the live shell: {calls:?}"
+    );
+}
+
+/// Issue #454: a shell the runtime no longer knows (its completion record was
+/// lost with the process that hosted it) retires as 已失联 — the card settles
+/// and the entry says what is known, with no invented completion time.
+#[tokio::test]
+async fn a_runtime_lost_shell_settles_as_lost() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = waiting_shell(now - 5_000);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    yield_one_task_card(&app, &platform, ctx("ses_test", "跑一下构建并审阅")).await;
+
+    backend.task_runtime.lock().unwrap().shells = vec![("sh_call_bg".into(), ShellRuntime::Missing)];
+    spawn_sync(&app);
+    wait_for_card_update(&platform, "the lost settle", CardUpdates::Latest, |card| {
+        card_header(card).contains("✅") && card_text(card).contains("🔔 后台任务已失联：gh run watch")
+    })
+    .await;
+
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Done)
+    );
+    let patches = patches_to(&platform, "om_waiting").await;
+    assert_eq!(patches.len(), 1, "one in-place PATCH: {patches:?}");
+    let text = card_text(&patches[0]);
+    assert!(
+        text.contains("shell sh_call_bg") && !text.contains("shell sh_call_bg · "),
+        "a lost entry carries identity but no invented clock: {patches:?}"
+    );
+}
+
+/// Issue #454: a subagent the runtime reports INACTIVE is evidence, not an
+/// ending — the row gains the 待确认 marker, the card stays waiting, and its
+/// Wake (or the user's own decision) remains the only retirement.
+#[tokio::test]
+async fn an_inactive_child_marks_its_row_unconfirmed_without_settling() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = waiting_shell_and_subagent(now - 5_000, now - 3_000);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    yield_waiting_card(&app, &platform, 2).await;
+
+    {
+        let mut runtime = backend.task_runtime.lock().unwrap();
+        runtime.shells = vec![("sh_call_bg".into(), ShellRuntime::Running)];
+        runtime.children = vec![("ses_call_sub".into(), ChildRuntime::Inactive)];
+    }
+    spawn_sync(&app);
+    wait_for_card_update(&platform, "the unconfirmed marker", CardUpdates::Latest, |card| {
+        card_text(card).contains("⚠️ 状态待确认")
+    })
+    .await;
+
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Waiting),
+        "an unconfirmed row never settles the card"
+    );
+    let latest = platform.updated_cards().await.last().cloned().unwrap();
+    let text = card_text(&latest);
+    assert!(
+        text.contains("⏳ 后台任务（2 · 1 待确认）"),
+        "the title counts the unconfirmed row without unfolding: {latest}"
+    );
+    assert!(
+        text.lines()
+            .any(|line| line.contains("子代理：**review the diff**") && line.ends_with("⚠️ 状态待确认")),
+        "the marker trails the child's own facts: {latest}"
+    );
+    // The runtime read asked for exactly this session's tasks.
+    let calls = backend.task_runtime_calls.lock().await.clone();
+    assert!(
+        calls.iter().any(|(sid, shells, children)| sid == "ses_test"
+            && shells == &vec!["sh_call_bg".to_string()]
+            && children == &vec!["ses_call_sub".to_string()]),
+        "the reconcile read named the live tasks: {calls:?}"
     );
 }
 

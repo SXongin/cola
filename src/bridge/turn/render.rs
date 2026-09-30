@@ -10,13 +10,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing::Instrument;
 
-use crate::backend::{Part, SessionTranscript, ToolStatus, TurnAnchor, Wake, WakeSource};
+use crate::backend::{
+    Part, SessionTranscript, TaskRetirementEnding, ToolStatus, TurnAnchor, Wake, WakeSource,
+};
 use crate::bridge::core::SESSION_INFO_TIMEOUT;
 use crate::bridge::handles::{CardsHandle, RequestsHandle, SessionsHandle, TurnHandles};
 use crate::bridge::span;
 use crate::bridge::turn::state::{LedgerCadence, RenderedPart, StreamAccumulator};
 use crate::config::ThreadKey;
-use crate::feishu::card::ledger::{TaskCompletionEntry, TaskKind};
+use crate::feishu::card::ledger::{TaskCompletionEntry, TaskEnding, TaskKind};
 use crate::feishu::card::tool_render::{ChildActivity, TaskLiveness};
 
 use super::Turn;
@@ -326,7 +328,10 @@ fn wake_completion_entry(
         label: wake.label.clone(),
         id,
         started_at: retired.as_ref().and_then(|task| task.started_at),
-        finished_at,
+        finished_at: Some(finished_at),
+        ending: TaskEnding::Wake {
+            state: wake.state.clone(),
+        },
     })
 }
 
@@ -367,18 +372,81 @@ fn render_wake_entries(
     inserted
 }
 
+/// Insert the completion entry for every Background Task a runtime
+/// reconciliation retired without a Wake (issue #454) and report whether any
+/// was inserted. The retired task has already left the live list, so this entry
+/// is its one record when no Wake will ever arrive: the runtime's own
+/// completion time when it reported one (the `Lost` ending reports none), the
+/// task's launch and identity from the read, and the label joined from the
+/// originating tool part's input by `call_id` (the live row's own join). The
+/// exactly-once gate is the Wake announcement set, keyed by a synthetic
+/// `runtime:<call_id>` id and stamped at a stable time (the completion, else
+/// the launch), so a retirement is announced at most once per chain — a card
+/// that already showed it never doubles it.
+fn render_runtime_entries(
+    acc: &mut StreamAccumulator,
+    transcript: &SessionTranscript,
+    anchor: &TurnAnchor,
+) -> bool {
+    let mut inserted = false;
+    for retirement in &transcript.runtime_retired {
+        let task = &retirement.task;
+        // Scope: a task launched before this card's Turn is not its content.
+        if task.started_at.is_some_and(|started| started < anchor.created_ms) {
+            continue;
+        }
+        let key = format!("runtime:{}", task.tool.call_id);
+        let at = retirement
+            .finished_at
+            .or(task.started_at)
+            .unwrap_or(anchor.created_ms);
+        if !acc.announce_wake(&key, at) {
+            continue;
+        }
+        let kind = super::state::task_kind(&task.tool.name);
+        let ending = match &retirement.ending {
+            TaskRetirementEnding::Ended(_) => TaskEnding::RuntimeEnded,
+            TaskRetirementEnding::Lost => TaskEnding::Lost,
+        };
+        let input = transcript
+            .messages
+            .iter()
+            .flat_map(|message| &message.parts)
+            .find_map(|part| match part {
+                Part::Tool(call) if call.identity.call_id == task.tool.call_id => call.input.as_ref(),
+                _ => None,
+            });
+        let id = match kind {
+            TaskKind::Shell => task.shell_id.clone().or_else(|| Some(task.tool.call_id.clone())),
+            TaskKind::Subagent => task.child_id.clone().or_else(|| Some(task.tool.call_id.clone())),
+        };
+        let entry = TaskCompletionEntry {
+            kind,
+            label: super::state::task_label(kind, input),
+            id,
+            started_at: task.started_at,
+            finished_at: retirement.finished_at,
+            ending,
+        };
+        acc.push_ledger_entry_at(retirement.finished_at, entry);
+        inserted = true;
+    }
+    inserted
+}
+
 /// The ledger facts a transcript read owes a card (ADR-0060): the read's
 /// remaining live list — so a retired task's row leaves and the still-running
 /// ones stay, on a continuation's very first payload or on a yielded card's
 /// in-place refresh — and each retiring shell/subagent Wake's completion entry,
 /// keyed where the completion happened, so the entry stays on the card that
-/// hosted the task. Both enter the accumulator through the same one-site
-/// primitives the live render uses
+/// hosted the task. A runtime reconciliation's retirements (issue #454) render
+/// their entries through the same site. Both enter the accumulator through the
+/// same one-site primitives the live render uses
 /// ([`set_ledger_from_read`](StreamAccumulator::set_ledger_from_read),
-/// [`render_wake_entries`]), so no path can drift from it. `now_ms` is the
-/// read's clock; `cadence` is the granularity its ledger clock is compared at
-/// (the live render and its Wake handover at whole minutes, the yielded
-/// refresh at whole seconds — [`LedgerCadence`]).
+/// [`render_wake_entries`], [`render_runtime_entries`]), so no path can drift
+/// from it. `now_ms` is the read's clock; `cadence` is the granularity its
+/// ledger clock is compared at (the live render and its Wake handover at whole
+/// minutes, the yielded refresh at whole seconds — [`LedgerCadence`]).
 ///
 /// A Wake handover calls this on the OUTGOING card before its chain splits;
 /// Session Sync's in-place pass calls it on a yielded card. Returns whether the
@@ -397,6 +465,7 @@ pub(super) fn apply_ledger_read(
     let mut changed = acc.set_ledger_from_read(transcript, now_ms, cadence);
     if let Some(anchor) = anchor {
         changed |= render_wake_entries(acc, transcript, anchor);
+        changed |= render_runtime_entries(acc, transcript, anchor);
     }
     changed
 }
