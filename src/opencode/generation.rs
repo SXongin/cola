@@ -196,12 +196,50 @@ mod tests {
     use crate::bridge::test_support::{assert_line_level, capture_logs, level_count};
     use crate::test_http::TestHttpServer;
 
-    /// A transport pointed at the fake server, with the env proxy disabled so
-    /// a developer shell's `http_proxy` cannot intercept the loopback probe.
-    async fn probe_server(server: &TestHttpServer, username: &str, password: &str) -> ProbeOutcome {
-        let transport = Transport::new(Some(username), Some(password), server.base_url());
+    /// A transport pointed at `url`, with the env proxy disabled so a
+    /// developer shell's `http_proxy` cannot intercept the loopback probe.
+    async fn probe_url(username: &str, password: &str, url: impl Into<String>) -> ProbeOutcome {
+        let transport = Transport::new(Some(username), Some(password), url);
         transport.disable_env_proxy(Some(username), Some(password));
         probe_transport(&transport).await
+    }
+
+    /// A transport pointed at the fake server.
+    async fn probe_server(server: &TestHttpServer, username: &str, password: &str) -> ProbeOutcome {
+        probe_url(username, password, server.base_url()).await
+    }
+
+    /// How many fresh ports [`probe_refused_port`] tries before giving up.
+    ///
+    /// A dropped ephemeral listener does not reserve its port, so a parallel
+    /// test's `TestHttpServer` can claim the fresh one before the probe
+    /// arrives (issue #382). Each retry needs a fresh port, not a fresh wait:
+    /// whatever claimed the old one is still there.
+    const REFUSED_PROBE_ATTEMPTS: usize = 32;
+
+    /// Probe a loopback port that has no listener and return the refusal.
+    ///
+    /// The port is not held open while probing: it is bound, its number read,
+    /// and the listener dropped, so the OS may reuse it at any moment — in
+    /// this binary, for the next `TestHttpServer` another test starts (issue
+    /// #382). An answer therefore means the port was claimed, not that the
+    /// classifier failed, and a fresh port is tried; a claimed port always
+    /// answers immediately, so a stolen port retries at once. The retries are
+    /// bounded so a machine where every port answers still fails loudly, and
+    /// the message names both possibilities.
+    async fn probe_refused_port(username: &str, password: &str) -> ProbeOutcome {
+        for _ in 0..REFUSED_PROBE_ATTEMPTS {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+            let outcome = probe_url(username, password, format!("http://127.0.0.1:{port}")).await;
+            if !outcome.reachable {
+                return outcome;
+            }
+        }
+        panic!(
+            "no refused port in {REFUSED_PROBE_ATTEMPTS} attempts: every dropped ephemeral port was answered (issue #382), or the probe misclassifies refused connections"
+        );
     }
 
     #[tokio::test]
@@ -354,17 +392,9 @@ mod tests {
         }
 
         // The unreachable path builds its evidence from the transport error,
-        // which can echo the URL but never the credentials.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        let transport = Transport::new(
-            Some("opencode"),
-            Some(PASSWORD),
-            format!("http://127.0.0.1:{port}"),
-        );
-        transport.disable_env_proxy(Some("opencode"), Some(PASSWORD));
-        let outcome = probe_transport(&transport).await;
+        // which can echo the URL but never the credentials. The refused port
+        // is retried because a parallel test can claim the dropped one (#382).
+        let outcome = probe_refused_port("opencode", PASSWORD).await;
         assert!(
             !outcome.evidence.is_empty(),
             "the unreachable path produced no evidence to inspect"
@@ -380,14 +410,10 @@ mod tests {
     async fn an_unreachable_server_is_inconclusive() {
         // A port with no listener: connection refused, fast. No-proxy so a
         // developer shell's `http_proxy` cannot answer in the dead port's
-        // place (the proxy would make the server look reachable).
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        let transport = Transport::new(Some("opencode"), Some("pw"), format!("http://127.0.0.1:{port}"));
-        transport.disable_env_proxy(Some("opencode"), Some("pw"));
-
-        let outcome = probe_transport(&transport).await;
+        // place (the proxy would make the server look reachable). The helper
+        // retries with a fresh port when a parallel test claims the dropped
+        // one before the probe arrives (issue #382).
+        let outcome = probe_refused_port("opencode", "pw").await;
 
         assert_eq!(outcome.generation, None);
         assert!(!outcome.reachable, "a refused connection is not reachable");
