@@ -83,14 +83,6 @@ impl std::fmt::Display for Finding {
     }
 }
 
-/// The repository root: xtask lives directly under it.
-fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("xtask lives under the repository root")
-        .to_path_buf()
-}
-
 /// Scan `root`'s Rust sources recursively.
 ///
 /// IO failures are errors, never skipped files: a missing or unreadable `src/`
@@ -170,7 +162,7 @@ fn collect_rust_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), String
 /// `cargo xtask check-generation`: fail when a V1 wire literal escaped the V1
 /// strategy, or when the sources cannot be scanned at all.
 pub(crate) fn run() {
-    let findings = match scan_tree(&repo_root().join("src")) {
+    let findings = match scan_tree(&crate::repo_root().join("src")) {
         Ok(findings) => findings,
         Err(error) => {
             eprintln!("{error}");
@@ -303,7 +295,8 @@ let help = \"/agent build\";\n";
     /// sources are clean, so any future escape fails this test and CI.
     #[test]
     fn the_repository_tree_is_clean() {
-        let findings = scan_tree(&repo_root().join("src")).expect("the repository tree must be readable");
+        let findings =
+            scan_tree(&crate::repo_root().join("src")).expect("the repository tree must be readable");
         assert!(
             findings.is_empty(),
             "V1 wire coupling outside the V1 strategy:\n{}",
