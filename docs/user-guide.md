@@ -1,5 +1,9 @@
 # cola User Guide
 
+A **Chinese translation** lives at [user-guide.zh-CN.md](user-guide.zh-CN.md) —
+English is the source of truth, and `cargo xtask check-doc-drift` keeps the
+translation's structure in sync with this file.
+
 The full operation manual for running cola day to day. For installation and the
 first chat, see the [README](../README.md).
 
@@ -342,7 +346,7 @@ lock lives at `~/.cola/cola.lock`.
   prints a clear message. Take over with `cola --replace`, or from Feishu send
   the old instance `/restart`.
 - Starting interactively (a terminal): cola asks
-  `旧实例 PID x 在运行，是否替换它并接管？[y/N]`.
+  `⚠️ 另一个 cola 实例（PID x）正在运行。是否替换它并接管？[y/N]`.
 - `/restart` re-execs cola itself with `--replace` (keeping its startup args and
   log redirect), so the new process always takes over the lock. The takeover is
   robust to the old instance mid-`exit()`: an owner that is no longer

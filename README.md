@@ -17,6 +17,8 @@ Feishu threads to OpenCode sessions, streams the AI's reasoning/tools/answers
 onto interactive cards, and surfaces permission and question requests as
 tap-to-answer cards.
 
+**中文文档**: [用户使用手册（简体中文）](docs/user-guide.zh-CN.md)。
+
 <!-- TODO(screenshots): add Feishu screenshots here when ready. Suggested
      set — a turn card mid-stream, a permission card, a question card, the
      todo panel. Save them under docs/images/ and reference by relative path. -->
@@ -182,6 +184,9 @@ to get started after claiming.
 - **User guide** — [docs/user-guide.md](docs/user-guide.md): where things live,
   full configuration reference, autostart, logs, self-update, singleton &
   restart, every Feishu command, troubleshooting.
+- **用户使用手册（简体中文）** — [docs/user-guide.zh-CN.md](docs/user-guide.zh-CN.md):
+  用户手册的简体中文译本（英文版为事实来源；结构漂移由
+  `cargo xtask check-doc-drift` 守护）。
 - **Contributing** — [CONTRIBUTING.md](CONTRIBUTING.md): commit conventions,
   the verification loop, PR rules.
 - **Architecture** — [docs/adr/](docs/adr/), [CONTEXT.md](CONTEXT.md),
