@@ -633,6 +633,12 @@ pub(super) struct StreamAccumulator {
     /// replacement guard all read it, so cola's own clock is never compared
     /// against the server's (#183, #190).
     pub(super) turn_anchor: Option<TurnAnchor>,
+    /// Whether this card has already shown the neutral waiting line
+    /// 「⏳ 等待当前运行接收…」 (ADR-0062): the unreceived watch pushes it
+    /// exactly once while the Session reads live but the submitted message
+    /// has not landed — a genuine long tool call and a dead run look
+    /// identical, so the line waits out the follow grace and never doubles.
+    pub(super) receive_hint_shown: bool,
     /// ADR-0014: progress/liveness signals for the header.
     /// The active header phase; None when the turn is not actively working
     /// (Done/Error/Continued show no timer).
@@ -801,6 +807,16 @@ impl StreamAccumulator {
     /// yields waiting over one).
     pub(super) fn set_waiting(&mut self) {
         self.card_state = CardState::Waiting;
+        self.refresh_phase();
+    }
+
+    /// The Unreceived ending (ADR-0062): the Turn's submitted message never
+    /// reached the transcript and the Session is not live, so nobody will
+    /// answer it. Terminal, never ✅, not a failure — the card says the
+    /// message was not received and offers the 重新发起 action (#437).
+    pub(super) fn set_unreceived(&mut self) {
+        self.error = None;
+        self.card_state = CardState::Unreceived;
         self.refresh_phase();
     }
 

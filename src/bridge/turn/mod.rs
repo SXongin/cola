@@ -66,6 +66,10 @@ enum DrainState {
     /// Turn yields 「⏳ 等待后台任务」 — not Done, no Completion Notice — and
     /// the next Wake continues the chain on a new card.
     Waiting,
+    /// The submitted message never reached the transcript and the Session is
+    /// idle (ADR-0062): nobody will answer it, so the card ends Unreceived —
+    /// 「⚠️ 这条消息未被接收」, never ✅.
+    Unreceived,
 }
 
 /// The disposition one [`TurnSettle`] decision gives a Turn ending. The read
@@ -86,6 +90,9 @@ enum Ending {
     Observe,
     /// The card yields waiting.
     Waiting,
+    /// The submitted message never landed at an idle session: the card ends
+    /// Unreceived (ADR-0062).
+    Unreceived,
     /// The ending is decided and the turn settles.
     Settle,
 }
@@ -95,6 +102,7 @@ impl From<TurnSettle> for Ending {
         match settle {
             TurnSettle::Running => Self::Observe,
             TurnSettle::Waiting => Self::Waiting,
+            TurnSettle::Unreceived => Self::Unreceived,
             TurnSettle::Complete | TurnSettle::Failed(_) => Self::Settle,
         }
     }
@@ -196,9 +204,10 @@ pub(crate) struct Turn {
     drain_started: bool,
     /// How many consecutive reads have seen no run yet. The admit only
     /// *schedules* execution, and the old confirmed-absence window is kept:
-    /// after [`IDLE_CONFIRMATIONS`] unstarted reads the submit is treated as
-    /// never having registered (the pre-S8 behavior) instead of observing to
-    /// the drain bound. Only consulted while `drain_started` is false.
+    /// after [`IDLE_CONFIRMATIONS`] unstarted reads the settle decision judges
+    /// the submit — Complete when its message landed, Unreceived when it never
+    /// did (ADR-0062) — instead of observing to the drain bound. Only
+    /// consulted while `drain_started` is false.
     unstarted_reads: usize,
     /// Whether this turn's submit was REJECTED (the prompt call returned Err).
     /// A rejected submit may never have scheduled a run at all, so the drain
@@ -667,46 +676,52 @@ impl Turn {
             }
         };
 
-        // The single settle decision (ADR-0059): a Turn that idles with live
-        // Background Tasks yields waiting — never ✅, never a terminal, no
-        // Completion Notice. The drain's own ending decides; the final
-        // reconcile read re-decides it so a task that appeared, or the
-        // retirement that arrived, inside this finalization window is honored:
-        // an undecided read (a Wake whose Execution has not reached its
-        // boundary, or no anchor to judge) keeps the drain's own disposition,
-        // and a stop or a failure dominates below.
-        let waiting = {
-            let ending = final_transcript.as_ref().and_then(|transcript| {
-                transcript
-                    .anchor_of_user(&self.cola_message_id)
-                    .map(|anchor| Ending::from(transcript.settle(&anchor)))
-            });
-            let waiting = match ending {
-                Some(Ending::Waiting) => true,
-                Some(Ending::Settle) => false,
-                Some(Ending::Observe) | None => drain_outcome == Some(DrainState::Waiting),
-            };
-            waiting && !stopped && prompt_err.is_none()
+        // The single settle decision (ADR-0059, ADR-0062): a Turn that idles
+        // with live Background Tasks yields waiting — never ✅, never a
+        // terminal, no Completion Notice — and one whose submitted message
+        // never landed at an idle session ends Unreceived, also never ✅. The
+        // drain's own ending decides; the final reconcile read re-decides it
+        // so a task that appeared, the retirement that arrived, or the message
+        // that finally landed inside this finalization window is honored: an
+        // undecided read (a Wake whose Execution has not reached its boundary)
+        // keeps the drain's own disposition, and a stop or a failure dominates
+        // below.
+        let final_settle = final_transcript
+            .as_ref()
+            .map(|transcript| transcript.settle(transcript.anchor_of_user(&self.cola_message_id).as_ref()));
+        // Read before the match consumes the decision (a `Failed` carries its
+        // message): an undecided read keeps the follow observing.
+        let final_running = final_settle == Some(TurnSettle::Running);
+        let ending = match final_settle {
+            // An undecided read makes no ending decision: the drain's own last
+            // word stands (a failed read is equally undecided).
+            Some(TurnSettle::Running) | None => match drain_outcome {
+                Some(DrainState::Waiting) => Ending::Waiting,
+                Some(DrainState::Unreceived) => Ending::Unreceived,
+                _ => Ending::Observe,
+            },
+            Some(settle) => Ending::from(settle),
         };
+        let waiting = ending == Ending::Waiting && !stopped && prompt_err.is_none();
+        let unreceived = ending == Ending::Unreceived && !stopped && prompt_err.is_none();
 
-        // #284: a drain bound reached while the session is still running is NOT
-        // completion. The turn ends as usual (the guard is released below, so
-        // the next message is a normal new Turn), but its card must not be
-        // marked Done from a snapshot that still shows running tools: it is
-        // handed to the out-of-turn follow, which keeps rendering the SAME
-        // accumulator and card chain until the session reports non-busy (or the
-        // follow's own fallback (lost contact / an unreconcilable panel) ends
-        // it in Error). The anchor is the follow's
-        // identity: without one there is no card content to follow, so the
-        // turn ends the normal way. A stopped turn never hands off: the stop
-        // is its ending, so it finalizes right here (#394).
-        let follow_anchor = if !stopped && prompt_err.is_none() && drain_outcome == Some(DrainState::Running)
-        {
+        // The card is followed instead of finalized when the drain bound was
+        // reached with the session still running (#284) or the final read
+        // itself is undecided (a Wake's Execution has not reached its
+        // boundary): the follow keeps the SAME accumulator and card chain and
+        // settles it when the session reports non-busy. The armed anchor is
+        // the follow's identity; with none — the submitted message never
+        // landed (ADR-0062) — the card goes to the unreceived watch instead,
+        // which owns it by chain identity and captures the anchor the moment
+        // the message appears. A stopped turn never hands off: the stop is its
+        // ending, so it finalizes right here (#394).
+        let follow =
+            !stopped && prompt_err.is_none() && (drain_outcome == Some(DrainState::Running) || final_running);
+        let follow_anchor = if follow {
             Turn::armed_turn_anchor(&handles.cards, &self.session_id).await
         } else {
             None
         };
-        let follow = follow_anchor.is_some();
 
         // #187: a turn that ended without completing (abort, interrupt, prompt
         // error) leaves every still-pending Permission/Question behind with a
@@ -743,8 +758,8 @@ impl Turn {
         // below the guard is the normal end of a turn.
         if !follow {
             // Reconcile: render any parts the incremental poll missed from the
-            // settled transcript read above, then mark the card Stopped, Done
-            // or Error.
+            // settled transcript read above, then mark the card Stopped, Done,
+            // Error, Waiting or Unreceived.
             //
             // A stop landing after the read above (during the leftover
             // rejection, or any scheduler hop since) must still win: re-read
@@ -794,6 +809,12 @@ impl Turn {
                         // live (ADR-0059): the card yields 「⏳ 等待后台任务」
                         // and stops updating — not Done, and no notice below.
                         acc.set_waiting();
+                    } else if unreceived {
+                        // The submitted message never reached the transcript
+                        // and the session is idle (ADR-0062): the card says so
+                        // and stops updating — never ✅, no notice below (the
+                        // 重新发起 action arrives with #437).
+                        acc.set_unreceived();
                     } else {
                         acc.card_state = crate::feishu::card::CardState::Done;
                     }
@@ -879,20 +900,23 @@ impl Turn {
         }
 
         // The guard is released here for every end except a follow hand-off:
-        // the follow inherits it (ADR-0059) and hands it back when its own loop
-        // ends, so the follow window has no guard-free gap and `busy()` (the
-        // server-yield read) never sees a followed Session as idle.
-        if follow_anchor.is_none() {
+        // the follow (the unreceived watch included) inherits it (ADR-0059,
+        // ADR-0062) and hands it back when its own loop ends, so the follow
+        // window has no guard-free gap and `busy()` (the server-yield read)
+        // never sees a followed Session as idle.
+        if !follow {
             self.release(handles).await;
         }
-        if let Some(anchor) = follow_anchor {
+        if follow {
             tracing::info!(
-                "turn drain: bound with session {} running; handing off to the follow",
+                "turn drain: session {} not finalized; handing off to the follow",
                 self.session_id
             );
             // No release happened above: the follow inherits the guard this
             // Turn is still holding (ADR-0059) and hands it back when its loop
-            // ends.
+            // ends. `anchor` is None when the submitted message never landed:
+            // the follow then watches the card chain until it does — or ends
+            // it Unreceived (ADR-0062).
             follow::spawn(
                 handles,
                 follow::FollowFacts {
@@ -900,7 +924,7 @@ impl Turn {
                     thread_key: self.thread_key.clone(),
                     directory: self.directory.clone(),
                     started_at: self.started_at,
-                    anchor,
+                    anchor: follow_anchor,
                 },
             )
             .await;
@@ -932,17 +956,20 @@ impl Turn {
     ///
     /// Returns the state the last drain observed at its bound when that was
     /// still pending (`Some(Running)` / `Some(Supplement)`), `Some(Waiting)`
-    /// when the settle decision ended it with live Background Tasks, `None`
-    /// when the drain settled or never saw anything pending. `finish` turns
-    /// bound-with-`Running` into the out-of-turn follow (#284) instead of
-    /// finalizing a card under a live session, and `Some(Waiting)` into the
-    /// card's waiting yield (ADR-0059).
+    /// when the settle decision ended it with live Background Tasks,
+    /// `Some(Unreceived)` when the decision found the submitted message never
+    /// landed at an idle session, `None` when the drain settled or never saw
+    /// anything pending. `finish` turns bound-with-`Running` into the
+    /// out-of-turn follow (#284) instead of finalizing a card under a live
+    /// session, and `Some(Waiting)` / `Some(Unreceived)` into the card's own
+    /// ending (ADR-0059, ADR-0062).
     async fn drain_after_prompt(&mut self, handles: &TurnHandles) -> Option<DrainState> {
         let last = self.drain(handles).await;
-        // A waiting yield is the ending: no racing-Supplement re-check may
-        // reopen the drain (its render would add content to a card that is
-        // about to stop updating, and the yield was already decided).
-        if last == Some(DrainState::Waiting) {
+        // A waiting yield or an Unreceived ending is the decision: no
+        // racing-Supplement re-check may reopen the drain (its render would add
+        // content to a card that is about to stop updating, and the ending was
+        // already decided).
+        if matches!(last, Some(DrainState::Waiting | DrainState::Unreceived)) {
             return last;
         }
         if self
@@ -968,9 +995,9 @@ impl Turn {
     ///
     /// `Some(state)` means the bound was reached with `state` the last thing
     /// observed — the caller must not read it as completion (#284) — except
-    /// for [`DrainState::Waiting`], the settle decision's yield, which ends
-    /// the drain immediately; `None` means the drain settled, stopped, or
-    /// never observed anything pending.
+    /// for [`DrainState::Waiting`] and [`DrainState::Unreceived`], the settle
+    /// decision's endings, which end the drain immediately; `None` means the
+    /// drain settled, stopped, or never observed anything pending.
     async fn drain(&mut self, handles: &TurnHandles) -> Option<DrainState> {
         let poll_ms = handles.config.render_poll_ms();
         let deadline = drain_deadline(handles);
@@ -980,10 +1007,11 @@ impl Turn {
             // the run is already on the Backend when the submit returns.
             match self.drain_tick(handles, drain_request_timeout(deadline)).await {
                 Some(DrainState::Settled) => return None,
-                // The Turn yields waiting (ADR-0059): the ending is decided, so
-                // there is nothing left to observe — the card stops updating
-                // and the next Wake continues the chain on a new card.
-                Some(state @ DrainState::Waiting) => return Some(state),
+                // The Turn yields waiting (ADR-0059) or ends Unreceived
+                // (ADR-0062): the ending is decided, so there is nothing left
+                // to observe — the card stops updating (the next Wake
+                // continues a waiting chain on a new card).
+                Some(state @ (DrainState::Waiting | DrainState::Unreceived)) => return Some(state),
                 Some(state) => last = Some(state),
                 None if last.is_none() => return None,
                 None => {}
@@ -1134,73 +1162,68 @@ impl Turn {
                 self.drain_started = true;
                 DrainState::Running
             }
-            // A non-busy status: the settle decision owns the ending (ADR-0059)
-            // once the run was observed; before that the confirmation window
-            // still bounds an unregistered submit. The failed and timed-out
-            // paths take the same rule, counting an unreadable status as idle
-            // (the pre-settle rule's own treatment, and conservative: only the
-            // transcript's durable facts then decide) — see `settle_or_yield`.
-            Some(Ok(_)) => self.settle_or_yield(transcript, anchor.as_ref(), observed),
+            // A non-busy status: the settle decision owns the ending (ADR-0059,
+            // ADR-0062) once the run was observed; before that the
+            // confirmation window still bounds an unregistered submit. The
+            // failed and timed-out paths pass `false`: an unreadable status is
+            // no evidence the session is not live, so it can never decide the
+            // Unreceived ending — see `settle_or_yield`.
+            Some(Ok(_)) => self.settle_or_yield(transcript, anchor.as_ref(), observed, true),
             Some(Err(e)) => {
                 tracing::warn!("turn drain session status: {}", e);
-                self.settle_or_yield(transcript, anchor.as_ref(), observed)
+                self.settle_or_yield(transcript, anchor.as_ref(), observed, false)
             }
             // The bounded status call timed out: same rule as a failed read.
-            None => self.settle_or_yield(transcript, anchor.as_ref(), observed),
+            None => self.settle_or_yield(transcript, anchor.as_ref(), observed, false),
         }
     }
 
     /// The ending a non-busy (or unreadable) status read gives the Turn
-    /// (ADR-0059): the single settle decision decides it once the run was
-    /// observed — `Waiting` yields the card, `Running` keeps observing (the
+    /// (ADR-0059, ADR-0062): the single settle decision decides it —
+    /// `Waiting` yields the card, `Unreceived` ends it when the submitted
+    /// message never landed at an idle session, `Running` keeps observing (the
     /// read carries a Wake whose Execution has not reached its boundary yet:
     /// the Wake's content must never declare the Turn complete),
-    /// `Complete`/`Failed` settle it. Before the run was observed, or with no
-    /// anchor to judge against, [`Self::settle_or_confirm`]'s confirmation
-    /// window still bounds an unregistered submit.
+    /// `Complete`/`Failed` settle it. Before the run was observed the
+    /// [`IDLE_CONFIRMATIONS`] window still bounds an unregistered submit: the
+    /// submit only schedules execution (ADR-0056), so the decision may not
+    /// judge the Turn on an early idle read.
     ///
-    /// An unreadable status (a failed or timed-out call) counts as idle here,
-    /// the pre-settle rule's own treatment — the conservative choice: the
-    /// Turn can never end MORE than it used to (the old rule settled on the
-    /// same read), and a read with a live Background Task or an unanswered
-    /// Wake now yields waiting / keeps observing instead of stamping Done on
-    /// a session cola cannot see. Only a bounded, task-free read settles.
+    /// `status_known` distinguishes a readable non-busy status from a failed
+    /// or timed-out read. An unreadable status counts as idle for a run whose
+    /// message landed — the pre-settle rule's own treatment — but it is no
+    /// evidence the Session is not live, so it can never decide the Unreceived
+    /// ending: an anchorless submit keeps observing instead (the drain bound's
+    /// hand-off and the follow's lost-contact grace own a Backend cola cannot
+    /// see).
     fn settle_or_yield(
         &mut self,
         transcript: &SessionTranscript,
         anchor: Option<&TurnAnchor>,
         observed: bool,
+        status_known: bool,
     ) -> DrainState {
-        let Some(anchor) = anchor.filter(|_| observed) else {
-            return self.settle_or_confirm(observed);
-        };
-        match Ending::from(transcript.settle(anchor)) {
-            Ending::Observe => DrainState::Running,
-            Ending::Waiting => DrainState::Waiting,
-            Ending::Settle => DrainState::Settled,
+        if anchor.is_none() && !status_known {
+            return DrainState::Running;
         }
+        if !observed {
+            self.unstarted_reads += 1;
+            if self.unstarted_reads < IDLE_CONFIRMATIONS {
+                return DrainState::Running;
+            }
+        }
+        Self::drain_ending(transcript.settle(anchor))
     }
 
-    /// The non-busy (or unreadable) status rule with no anchor to apply the
-    /// settle decision to: once the run was observed the turn settles; before
-    /// that, [`IDLE_CONFIRMATIONS`] consecutive reads are required before the
-    /// submit is treated as never registered. Shared by the idle, failed and
-    /// timed-out status paths so they cannot drift.
-    ///
-    /// It cannot drift from [`Self::settle_or_yield`]: the two are mutually
-    /// exclusive — this is reached only when there is no anchor for a settle
-    /// decision to judge — and it deliberately makes no ending decision the
-    /// settle decision could contradict. It only bounds an unregistered
-    /// submit; every anchored read takes the settle path.
-    fn settle_or_confirm(&mut self, observed: bool) -> DrainState {
-        if observed {
-            return DrainState::Settled;
-        }
-        self.unstarted_reads += 1;
-        if self.unstarted_reads >= IDLE_CONFIRMATIONS {
-            DrainState::Settled
-        } else {
-            DrainState::Running
+    /// The [`DrainState`] one settle decision gives the drain — the ONE
+    /// mapping, so the drain and finalization cannot read a decision
+    /// differently.
+    fn drain_ending(settle: TurnSettle) -> DrainState {
+        match Ending::from(settle) {
+            Ending::Observe => DrainState::Running,
+            Ending::Waiting => DrainState::Waiting,
+            Ending::Unreceived => DrainState::Unreceived,
+            Ending::Settle => DrainState::Settled,
         }
     }
 
@@ -1242,9 +1265,10 @@ pub(crate) const MAX_CARD_CHAIN: usize = 8;
 
 /// The injectable timings of the out-of-turn settle loop the follow and the
 /// Wake continuation share ([`settle`]): the render poll cadence, the
-/// per-read bound, and the lost-contact / stuck-panel grace. Built by each
-/// caller from its own injected atomics (the follow's `TurnConfig`, the
-/// external flow's cadences), so the loop never reads a global.
+/// per-read bound, and the lost-contact / stuck-panel grace (also the
+/// unreceived watch's waiting-hint delay, ADR-0062). Built by each caller
+/// from its own injected atomics (the follow's `TurnConfig`, the external
+/// flow's cadences), so the loop never reads a global.
 #[derive(Clone, Copy)]
 pub(crate) struct SettleTiming {
     pub(crate) poll_ms: u64,
@@ -1287,6 +1311,13 @@ const WAKE_RECEIPT: &str = "🔔 已恢复执行，继续处理…";
 /// says so instead of promising a fresh run. Never a routing key itself: a
 /// stale read only changes this line, never the route.
 const MERGE_OPENING: &str = "📨 已收到，将并入当前运行";
+
+/// The neutral line a card gains while the Session reads live but the Turn's
+/// submitted message has not landed (ADR-0062), after the follow grace — a
+/// genuine long tool call and a dead run look identical from outside, so cola
+/// does not nag early. Not a claim, not an error: the wait may still end in
+/// the run merging the message, or in the Unreceived ending.
+const RECEIVE_HINT: &str = "⏳ 等待当前运行接收…";
 
 impl SplitKind {
     /// The one receipt line this cause's continuation carries: every queued
@@ -1423,6 +1454,26 @@ impl Turn {
             });
         }
         flush::flush_card_locked(cards, session_id, flush::SplitPolicy::Allow).await;
+    }
+
+    /// Push the neutral waiting line ([`RECEIVE_HINT`]) onto `session_id`'s
+    /// card, exactly once (ADR-0062): while the Session reads live but the
+    /// Turn's submitted message has not landed, the card gains the line once
+    /// the follow grace passes — a genuine long tool call and a dead run look
+    /// identical from outside, so cola does not nag early. Returns whether the
+    /// line was pushed now (the caller flushes it); false when the line is
+    /// already shown or the card is gone.
+    pub(crate) async fn show_receive_hint(cards: &CardsHandle, session_id: &str) -> bool {
+        let mut live = cards.cards.lock().await;
+        let Some(card) = live.get_mut(session_id) else {
+            return false;
+        };
+        if card.acc.receive_hint_shown {
+            return false;
+        }
+        card.acc.receive_hint_shown = true;
+        card.acc.push_receipt(RECEIVE_HINT);
+        true
     }
 
     /// Hand an ENDED card chain over to a Wake continuation (ADR-0059): write
@@ -1570,12 +1621,14 @@ impl Turn {
             // Background Task settles, and the ending stamped is the one the
             // out-of-turn loops would stamp ([`QuietEnding`] mirrors
             // `settle::stamp`'s mapping) — a settled failure or a deliberate
-            // stop dominates ✅.
-            let ending = match anchor.as_ref().map(|anchor| transcript.settle(anchor)) {
-                Some(TurnSettle::Complete | TurnSettle::Failed(_)) if stopped => Some(QuietEnding::Stopped),
-                Some(TurnSettle::Complete) => Some(QuietEnding::Done),
-                Some(TurnSettle::Failed(error)) => Some(QuietEnding::Failed(error)),
-                Some(TurnSettle::Waiting | TurnSettle::Running) | None => None,
+            // stop dominates ✅. A Waiting card always carries an anchor (the
+            // yield is only decided from one), so the anchorless Unreceived
+            // decision cannot arise here; a Running read keeps observing.
+            let ending = match transcript.settle(anchor.as_ref()) {
+                TurnSettle::Complete | TurnSettle::Failed(_) if stopped => Some(QuietEnding::Stopped),
+                TurnSettle::Complete => Some(QuietEnding::Done),
+                TurnSettle::Failed(error) => Some(QuietEnding::Failed(error)),
+                TurnSettle::Waiting | TurnSettle::Running | TurnSettle::Unreceived => None,
             };
             if let Some(ending) = &ending {
                 match ending {
@@ -1950,6 +2003,23 @@ impl Turn {
         Self::flush_card(cards, session_id).await;
     }
 
+    /// End a card as Unreceived (ADR-0062): the settle decision found the
+    /// Turn's submitted message never reached the transcript and the Session
+    /// idle, so nobody will answer it. The card takes its own terminal —
+    /// header 「⚠️ 这条消息未被接收」, phase timer cleared, work context
+    /// refreshed, flushed once, never ✅ — and stops updating; the 重新发起
+    /// action (#437) is its recovery. No Completion Notice is sent (the card
+    /// is no 完成/出错/已停止 ending). Used by the out-of-turn follow's
+    /// unreceived watch and the drain's own finalization; the reaper
+    /// (ADR-0063) settles by the same rule.
+    pub(crate) async fn finalize_unreceived(cards: &CardsHandle, session_id: &str) {
+        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
+            card.acc.set_unreceived();
+        }
+        Self::refresh_work_context(cards, session_id).await;
+        Self::flush_card(cards, session_id).await;
+    }
+
     /// Collect `session_id`'s Waiting card (ADR-0059, spec #405): restamp it
     /// with the reason's collected header — 「⏳ 部分完成 · 已由新消息接管」 for a
     /// supersede, 「⏳ 已切换会话 · 后台任务仍在运行」 for a Session that stopped
@@ -2161,7 +2231,7 @@ impl Turn {
                 thread_key: thread_key.clone(),
                 directory,
                 started_at: std::time::Instant::now(),
-                anchor,
+                anchor: Some(anchor),
             },
         )
         .await;

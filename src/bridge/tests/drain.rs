@@ -1714,6 +1714,9 @@ async fn an_unregistered_run_is_not_settled_by_the_first_idle_read() {
 /// A run that never registers (the transcript never carries a step and the
 /// status stays idle) is bounded by the confirmation window, not the whole
 /// drain budget: the turn finalizes promptly instead of observing for minutes.
+/// The submitted message IS in the transcript — it was received, just never
+/// answered — so this is not the Unreceived case (ADR-0062): an idle read with
+/// the message present settles Complete.
 #[tokio::test]
 async fn a_never_registering_run_settles_after_the_confirmation_window() {
     let _wd = test_work_dir();
@@ -1738,6 +1741,211 @@ async fn a_never_registering_run_settles_after_the_confirmation_window() {
     let final_card = platform.updated_cards().await.last().cloned().unwrap();
     assert!(card_header(&final_card).contains("完成"), "final card Done");
     assert!(!app.inflight.lock().await.contains("ses_test"));
+}
+
+/// ADR-0062 (spec #434, ticket #436): a submit whose message never reaches
+/// the transcript and whose session is idle ends Unreceived — the card says
+/// 「⚠️ 这条消息未被接收」 and never ✅ — bounded by the same confirmation
+/// window an unregistered run gets, not the whole drain budget. The sibling
+/// test above carries the message in its transcript: that one was received
+/// and is simply unanswered, so it keeps today's Done.
+#[tokio::test]
+async fn a_never_promoted_submit_at_idle_ends_unreceived() {
+    let _wd = test_work_dir();
+    // The transcript never carries the submitted message: the steer sat in
+    // the session inbox and no runner promoted it.
+    let (_dir, app, backend, platform) = scripted_app(
+        vec![SessionTranscript::new(Vec::new())],
+        Some(SessionStatus::Idle),
+    )
+    .await;
+    app.turn_render_poll_ms.store(5, Ordering::Relaxed);
+    // A bound the test would never wait out: only the window can end the drain.
+    app.turn_drain_timeout_ms.store(60_000, Ordering::Relaxed);
+
+    let started = std::time::Instant::now();
+    Turn::run(&app.turn_handles(), ctx("ses_test", "第一条消息"))
+        .await
+        .unwrap();
+
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the confirmation window must bound a never-landed submit: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Unreceived),
+        "a never-landed submit at idle ends Unreceived"
+    );
+    let final_card = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_header(&final_card).contains("⚠️ 这条消息未被接收"),
+        "the card names the unreceived message: {final_card}"
+    );
+    assert!(
+        !card_header(&final_card).contains("完成"),
+        "an Unreceived card is never ✅: {final_card}"
+    );
+    assert!(
+        !card_text(&final_card).contains("等待当前运行接收"),
+        "an idle session never shows the waiting hint: {final_card}"
+    );
+    assert!(
+        !app.inflight.lock().await.contains("ses_test"),
+        "the guard is released at the Unreceived ending"
+    );
+    assert_no_further_rendering(&backend, &platform).await;
+}
+
+/// ADR-0062 (spec #434, ticket #436): the whole #428 shape through the real
+/// message path — the advisory status read says live (a stale active entry),
+/// so the new Turn's card opens with the merge line, but no runner ever
+/// promotes the steered message and the session idles. The card that owns the
+/// message ends Unreceived, never ✅.
+#[tokio::test]
+async fn a_stale_live_submit_that_never_lands_ends_unreceived() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    // The advisory read (the routing decision's) says live; every read after
+    // it serves the map — idle. The scenario is a stale status, not a run.
+    backend.busy_then_idle_once();
+    // The message never lands: no read carries cola's prompt (the inbox steer
+    // no runner promoted).
+    backend.given_transcript("ses_test", vec![SessionTranscript::new(Vec::new())]);
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    seed_session(&app, "ses_test", "/work").await;
+    app.turn_render_poll_ms.store(5, Ordering::Relaxed);
+    app.turn_drain_timeout_ms.store(60_000, Ordering::Relaxed);
+
+    app.handle_message(incoming(
+        "msg_1".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "补充一下，改用方案 B".into(),
+        None,
+    ))
+    .await;
+
+    // The routing read live and still started a Turn (ADR-0062's advisory
+    // rule): the message rode its own prompt.
+    assert!(
+        backend
+            .prompt_calls
+            .lock()
+            .await
+            .iter()
+            .any(|text| text == "补充一下，改用方案 B"),
+        "the message must ride its own Turn's prompt: {:?}",
+        backend.prompt_calls.lock().await
+    );
+    // The card opened with the merge line and, the message never landing,
+    // ended Unreceived — never ✅.
+    let final_card = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_header(&final_card).contains("⚠️ 这条消息未被接收"),
+        "a never-landed stale-live submit ends Unreceived: {final_card}"
+    );
+    assert!(
+        card_text(&final_card).contains("📨 已收到，将并入当前运行"),
+        "the advisory opening line stays on the card: {final_card}"
+    );
+    assert!(
+        !card_header(&final_card).contains("完成"),
+        "an Unreceived card is never ✅: {final_card}"
+    );
+    assert!(
+        !app.inflight.lock().await.contains("ses_test"),
+        "the guard is released at the Unreceived ending"
+    );
+}
+
+/// ADR-0062 (spec #434, ticket #436): while the session reads live but the
+/// submitted message has not landed, the drained Turn hands the card to the
+/// unreceived watch; the card gains the neutral 「⏳ 等待当前运行接收…」 line
+/// only once the follow grace has passed since the turn's start — a genuine
+/// long tool call and a dead run look identical from outside, so cola does not
+/// nag early. When the session then idles with the message still absent, the
+/// watch ends it Unreceived, never ✅, and the hint stays on the settled card.
+#[tokio::test]
+async fn a_never_promoted_submit_on_a_live_run_waits_out_the_grace_then_ends_unreceived() {
+    let _wd = test_work_dir();
+    // The stale-live read of #428: the session reports Busy while the message
+    // never lands in the transcript.
+    let (_dir, app, backend, platform) = scripted_app(
+        vec![SessionTranscript::new(Vec::new())],
+        Some(SessionStatus::Busy),
+    )
+    .await;
+    app.turn_render_poll_ms.store(5, Ordering::Relaxed);
+    // The drain bound hands the card off while the session still reads live;
+    // the grace (the hint's delay) is measured from the turn's own start, so
+    // it has not passed when the watch takes over.
+    app.turn_drain_timeout_ms.store(30, Ordering::Relaxed);
+    app.turn_follow_grace_ms.store(800, Ordering::Relaxed);
+    app.turn_follow_read_timeout_ms.store(20, Ordering::Relaxed);
+
+    let turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
+    let result = tokio::time::timeout(Duration::from_secs(5), turn)
+        .await
+        .expect("the turn must hand off at the drain bound")
+        .unwrap();
+    result.unwrap();
+    assert!(
+        app.inflight.lock().await.contains("ses_test"),
+        "the unreceived watch must inherit the guard at the bound"
+    );
+
+    // Before the grace passes the card must not nag: the live session may
+    // still be a genuine long tool call that merges the message.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let early = platform.updated_cards().await;
+    assert!(
+        early
+            .iter()
+            .all(|card| !card_text(card).contains("等待当前运行接收")),
+        "the waiting hint must not appear before the grace: {:?}",
+        early.last()
+    );
+
+    // After the grace the neutral line arrives, exactly once, on a card that
+    // is still not ✅.
+    wait_for_card_text(&platform, "⏳ 等待当前运行接收…").await;
+    let hinted = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        !card_header(&hinted).contains("完成"),
+        "the waiting card is never ✅: {hinted}"
+    );
+    assert!(
+        app.inflight.lock().await.contains("ses_test"),
+        "the watch keeps the card while the session reads live"
+    );
+
+    // The session idles with the message still absent: Unreceived, never ✅.
+    backend
+        .set_session_status("ses_test", Some(SessionStatus::Idle))
+        .await;
+    wait_for_card_header(&platform, "未被接收").await;
+    let final_card = platform.updated_cards().await.last().cloned().unwrap();
+    assert_eq!(
+        card_text(&final_card).matches("等待当前运行接收").count(),
+        1,
+        "the hint is pushed exactly once: {final_card}"
+    );
+    assert!(
+        !card_header(&final_card).contains("完成"),
+        "an Unreceived card is never ✅: {final_card}"
+    );
+    assert!(
+        !app.inflight.lock().await.contains("ses_test"),
+        "the watch releases the guard when it ends"
+    );
+    assert_no_further_rendering(&backend, &platform).await;
 }
 
 /// A final reconcile whose transcript read no longer carries the turn (a

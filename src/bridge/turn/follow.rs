@@ -42,12 +42,18 @@ pub(super) struct FollowFacts {
     pub(super) directory: String,
     /// The original Turn's start; the retry re-attach passes "now" (the
     /// original start is no longer known there), so the long-task notice
-    /// measures the stretch the follow actually covers.
+    /// measures the stretch the follow actually covers. Also the unreceived
+    /// watch's hint clock: the neutral waiting line (ADR-0062) appears once
+    /// the follow grace has passed since the turn was submitted.
     pub(super) started_at: std::time::Instant,
     /// The accumulator's identity — the message id together with its server
     /// time, one fact: the loop's ownership guard and the settle decision's
-    /// scope.
-    pub(super) anchor: TurnAnchor,
+    /// scope. `None` when the submitted message has not landed yet (the
+    /// unreceived watch, ADR-0062): the loop then owns the card by chain
+    /// identity and captures the anchor from the transcript the moment the
+    /// message appears — or ends the card Unreceived when the session idles
+    /// first.
+    pub(super) anchor: Option<TurnAnchor>,
 }
 
 /// Take the Session's inflight guard for a follow window (ADR-0059).
@@ -89,11 +95,43 @@ pub(super) async fn spawn(handles: &TurnHandles, facts: FollowFacts) {
     );
 }
 
-/// The follow's loop: the shared settle loop under the accumulator's anchor,
-/// then the ending stamped on the card and the Turn announced. The notice is
-/// sent for every ending (the helper itself declines a card that is not at an
-/// ending, so a waiting yield stays silent) and reads the card's real terminal
-/// for its copy (#394).
+/// What the follow's loop owns (ADR-0059, ADR-0062): the accumulator's Turn
+/// anchor when the submitted message has landed — the renderer identity a new
+/// Turn or an external arming replaces — or, when the message has not landed
+/// yet (the unreceived watch), the card's chain identity, which survives a
+/// Supplement split and dies with a new Turn. The watch carries the submitted
+/// id the anchor capture looks for and the hint's deadline (the turn's start
+/// plus the follow grace); the loop reads all three through the variant.
+async fn ownership(handles: &TurnHandles, facts: &FollowFacts, timing: SettleTiming) -> settle::Ownership {
+    match &facts.anchor {
+        Some(anchor) => settle::Ownership::TurnAnchor(anchor.clone()),
+        None => settle::Ownership::Unlanded {
+            chain: super::Turn::chain_id(&handles.cards, &facts.session_id)
+                .await
+                .unwrap_or(0),
+            // The accumulator carries the id the anchor capture matches on
+            // (`capture_turn_anchor`), read from the same place so the two
+            // cannot drift.
+            submitted: handles
+                .cards
+                .cards
+                .lock()
+                .await
+                .get(&facts.session_id)
+                .and_then(|card| card.acc.cola_message_id.clone())
+                .unwrap_or_default(),
+            hint_at: facts.started_at + std::time::Duration::from_millis(timing.grace_ms),
+        },
+    }
+}
+
+/// The follow's loop: the shared settle loop under the accumulator's anchor
+/// (or, before the submitted message lands, under the unreceived watch's
+/// chain identity — ADR-0062), then the ending stamped on the card and the
+/// Turn announced. The notice is sent for every ending (the helper itself
+/// declines a card that is not at an ending, so a waiting yield and an
+/// Unreceived card stay silent) and reads the card's real terminal for its
+/// copy (#394).
 ///
 /// The loop owns the Session's guard for the whole run and hands it back as
 /// soon as the loop ends — BEFORE the ending is stamped. A message arriving at
@@ -104,15 +142,15 @@ pub(super) async fn spawn(handles: &TurnHandles, facts: FollowFacts) {
 /// moment replaced the accumulator, and stamping its live card with the old
 /// ending would be a lie.
 async fn run(handles: TurnHandles, facts: FollowFacts, timing: SettleTiming) {
+    let owns = ownership(&handles, &facts, timing).await;
     let FollowFacts {
         session_id,
         thread_key: _,
         directory,
         started_at,
-        anchor,
+        anchor: _,
     } = facts;
     let flow = handles.flow();
-    let owns = settle::Ownership::TurnAnchor(anchor);
     let ending = settle::run(&flow, &session_id, &directory, timing, &owns).await;
     super::release_inflight(&handles, &session_id).await;
     let Some(ending) = ending else {

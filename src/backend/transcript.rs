@@ -139,9 +139,19 @@ impl SessionTranscript {
         }
     }
 
-    /// The single settle decision every Turn ending uses (ADR-0059): the
-    /// drain, the out-of-turn follow, and the Wake continuation all read a
-    /// Turn's ending from here.
+    /// The single settle decision every Turn ending uses (ADR-0059, ADR-0062):
+    /// the drain, the out-of-turn follow, the unreceived watch and the Wake
+    /// continuation all read a Turn's ending from here.
+    ///
+    /// `anchor` is the Turn's scope: the submitted user message's identity
+    /// together with its server time, once a read has carried the message.
+    /// `None` means the submitted message never reached the transcript — a
+    /// steered admit no runner promoted. The caller owns the liveness read: it
+    /// asks for a decision only once the Session reads non-busy, so an
+    /// anchorless ask is the Unreceived ending ([`TurnSettle::Unreceived`]):
+    /// nobody will ever answer the message. A read whose Wakes are not yet
+    /// answered still holds every decision back (including Unreceived): a
+    /// Wake's resumed run is exactly what can promote the queued message.
     ///
     /// The decision never reads a terminal step. A Turn spans every Execution
     /// its chain opened — including ones a Wake opened after the Backend went
@@ -149,14 +159,14 @@ impl SessionTranscript {
     /// Execution boundary answers every [placeable](Wake::created_ms) Wake:
     /// the Wake's own content (an assistant step with a terminal finish)
     /// landing inside a finalization window can no longer declare the Turn
-    /// complete. The caller owns the liveness read: it asks for a decision
-    /// only once the Session reads non-busy (an unreadable status counts as
-    /// idle, the callers' pre-existing treatment), so [`TurnSettle::Running`]
-    /// here means the read's own boundary rule is unsatisfied — never "the
-    /// session is busy".
+    /// complete. [`TurnSettle::Running`] therefore means the read's own
+    /// boundary rule is unsatisfied — never "the session is busy".
     ///
     /// At an answered read the ending is, in decision order:
     ///
+    /// - no anchor — [`TurnSettle::Unreceived`]: the submitted message is not
+    ///   in the transcript and the Session is idle, so the card ends
+    ///   「⚠️ 这条消息未被接收」 — never ✅;
     /// - [`TurnSettle::Failed`] — the Turn's settled failure (its newest
     ///   assistant message's error). A failure dominates: a failed Turn never
     ///   yields waiting, even with live Background Tasks;
@@ -168,10 +178,17 @@ impl SessionTranscript {
     ///
     /// A read with no Executions, Wakes or Background Tasks (V1) decides
     /// exactly as before: idle with no live Background Task is complete.
-    pub fn settle(&self, anchor: &TurnAnchor) -> TurnSettle {
+    pub fn settle(&self, anchor: Option<&TurnAnchor>) -> TurnSettle {
         if !self.wakes_answered() {
             return TurnSettle::Running;
         }
+        let Some(anchor) = anchor else {
+            // No anchor: `anchor_of_user` never found the submitted message.
+            // Background Tasks read here belong to an earlier Turn — a Turn
+            // whose run started has an anchor — so they cannot make this one
+            // wait.
+            return TurnSettle::Unreceived;
+        };
         if let Some(error) = self.turn_for_user(anchor).error {
             return TurnSettle::Failed(error);
         }
@@ -430,10 +447,10 @@ pub struct TurnView<'a> {
     pub error: Option<String>,
 }
 
-/// How a Turn ends, as [`SessionTranscript::settle`] decides it (ADR-0059).
-/// The one ending decision the drain, the out-of-turn follow and the Wake
-/// continuation share; the sticky `/stop` marker dominates it in the callers
-/// that know about it.
+/// How a Turn ends, as [`SessionTranscript::settle`] decides it (ADR-0059,
+/// ADR-0062). The one ending decision the drain, the out-of-turn follow, the
+/// unreceived watch and the Wake continuation share; the sticky `/stop`
+/// marker dominates it in the callers that know about it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TurnSettle {
     /// The ending is not decided: a Wake's Execution has not reached its
@@ -447,6 +464,13 @@ pub enum TurnSettle {
     /// yields 「⏳ 等待后台任务」 — not ✅, not a terminal, no Completion
     /// Notice — and the next Wake continues the chain on a new card.
     Waiting,
+    /// The Turn's submitted message never reached the transcript and the
+    /// Session is not live (ADR-0062): a steered admit no runner promoted, so
+    /// nobody will answer it. The card ends 「⚠️ 这条消息未被接收」 — never ✅ —
+    /// with the 重新发起 action. The caller reaches this only from an
+    /// idle-bounded read with no anchor: the message's own user message was
+    /// never found (`anchor_of_user` absent).
+    Unreceived,
     /// The true end: idle with no live Background Task.
     Complete,
 }
@@ -1202,10 +1226,10 @@ mod tests {
         let v2 = SessionTranscript::new(vec![assistant_step("msg_a1", 1_100, None)])
             .with_executions(vec![boundary(1_200)])
             .with_wakes(vec![shell_wake(1_050)]);
-        assert_eq!(v2.settle(&anchor), TurnSettle::Complete);
+        assert_eq!(v2.settle(Some(&anchor)), TurnSettle::Complete);
 
         let v1 = SessionTranscript::new(vec![assistant_step("msg_a1", 1_100, None)]);
-        assert_eq!(v1.settle(&anchor), TurnSettle::Complete);
+        assert_eq!(v1.settle(Some(&anchor)), TurnSettle::Complete);
     }
 
     /// A live Background Task turns the idle ending into Waiting; a settled
@@ -1216,12 +1240,15 @@ mod tests {
         let waiting = SessionTranscript::new(vec![assistant_step("msg_a1", 1_100, None)])
             .with_executions(vec![boundary(1_200)])
             .with_background_tasks(vec![background_shell(1_100)]);
-        assert_eq!(waiting.settle(&anchor), TurnSettle::Waiting);
+        assert_eq!(waiting.settle(Some(&anchor)), TurnSettle::Waiting);
 
         let failed = SessionTranscript::new(vec![assistant_step("msg_a1", 1_100, Some("provider 503"))])
             .with_executions(vec![boundary(1_200)])
             .with_background_tasks(vec![background_shell(1_100)]);
-        assert_eq!(failed.settle(&anchor), TurnSettle::Failed("provider 503".into()));
+        assert_eq!(
+            failed.settle(Some(&anchor)),
+            TurnSettle::Failed("provider 503".into())
+        );
     }
 
     /// A Wake opens an Execution, so its content landing before that
@@ -1234,7 +1261,7 @@ mod tests {
         let (_, anchor) = anchored("msg_u1", 1_000);
         let no_boundary = SessionTranscript::new(vec![assistant_step("msg_a1", 1_100, None)])
             .with_wakes(vec![shell_wake(1_300)]);
-        assert_eq!(no_boundary.settle(&anchor), TurnSettle::Running);
+        assert_eq!(no_boundary.settle(Some(&anchor)), TurnSettle::Running);
 
         let woke = SessionTranscript::new(vec![
             assistant_step("msg_a1", 1_100, None),
@@ -1242,7 +1269,7 @@ mod tests {
         ])
         .with_executions(vec![boundary(1_200)])
         .with_wakes(vec![shell_wake(1_300)]);
-        assert_eq!(woke.settle(&anchor), TurnSettle::Running);
+        assert_eq!(woke.settle(Some(&anchor)), TurnSettle::Running);
 
         // The Wake's Execution ends: the boundary after the Wake answers it.
         let answered = SessionTranscript::new(vec![
@@ -1251,7 +1278,7 @@ mod tests {
         ])
         .with_executions(vec![boundary(1_200), boundary(1_500)])
         .with_wakes(vec![shell_wake(1_300)]);
-        assert_eq!(answered.settle(&anchor), TurnSettle::Complete);
+        assert_eq!(answered.settle(Some(&anchor)), TurnSettle::Complete);
     }
 
     /// A Wake without a server time cannot be ordered against a boundary, so
@@ -1265,7 +1292,26 @@ mod tests {
             .with_executions(vec![boundary(1_200)])
             .with_wakes(vec![untimed]);
 
-        assert_eq!(transcript.settle(&anchor), TurnSettle::Complete);
+        assert_eq!(transcript.settle(Some(&anchor)), TurnSettle::Complete);
+    }
+
+    /// No anchor: the submitted message never reached the transcript. At an
+    /// idle read (the caller owns the liveness read) nobody will answer it —
+    /// the Unreceived ending (ADR-0062), even when the read carries other
+    /// content and live Background Tasks (which belong to an earlier Turn: a
+    /// Turn whose run started has an anchor). An unanswered Wake still holds
+    /// the decision back — its resumed run is exactly what can promote the
+    /// queued message.
+    #[test]
+    fn settle_ends_unreceived_when_the_submitted_message_never_landed() {
+        let never_landed = SessionTranscript::new(vec![assistant_step("msg_a1", 1_100, None)])
+            .with_executions(vec![boundary(1_200)])
+            .with_background_tasks(vec![background_shell(1_100)]);
+        assert_eq!(never_landed.settle(None), TurnSettle::Unreceived);
+
+        let unanswered_wake = SessionTranscript::new(vec![assistant_step("msg_a1", 1_100, None)])
+            .with_wakes(vec![shell_wake(1_300)]);
+        assert_eq!(unanswered_wake.settle(None), TurnSettle::Running);
     }
 
     #[test]
