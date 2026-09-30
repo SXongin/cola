@@ -15,28 +15,33 @@
 //! a stale card.
 //!
 //! A Session that relocated while the run was in flight (#428: `session_move`
-//! into a git worktree) gains one line naming the move before its card
-//! settles (#439): the record's stored directory is the baseline, the store's
-//! own session list is the current fact, and a difference between them is the
-//! move. That explains the interruption the ending alone would leave
-//! mysterious, and it carries no chat content — only the new directory, a
-//! server fact.
+//! into a git worktree) gains one line naming the move when its card reaches a
+//! terminal ending (#439): the record's directory — the mapping's when the
+//! record carries none — is the baseline, the store's session list is the
+//! current fact where the generation exposes the canonical one, and a
+//! difference between them is the move. That explains the interruption the
+//! ending alone would leave mysterious, and it carries no chat content — only
+//! the new directory, a server fact. A Waiting yield is not a settle and gets
+//! no line; V1 move awareness is #433's, so on a V1 server without the
+//! experimental list route the line may simply not render.
 //!
 //! Every action leaves one INFO line carrying the session and the decision —
-//! never chat content. A read the reap could not make, or could not interpret,
-//! claims nothing: the record stays for the next tick. That covers an
-//! unrecognised status kind (unknown is not idle) and a record with no
-//! directory to route the reads by (a cwd-routed read could be another
-//! instance's run on V1). Neither PATCH takes a session's card-write lock: no
-//! in-memory accumulator owns the card it targets (that is the reap's
-//! precondition) and the ending it writes is a constant, so there is no
-//! read-send-record sequence to serialize.
+//! never chat content; a settle that named a move says so too. A deciding read
+//! the reap could not make, or could not interpret, claims nothing: the record
+//! stays for the next tick. That covers an unrecognised status kind (unknown
+//! is not idle) and a record with no directory to route the reads by (a
+//! cwd-routed read could be another instance's run on V1). The move line's own
+//! read is cosmetic: a failed or missed one only means the ending carries no
+//! line, never that the ending is withheld. Neither PATCH takes a session's
+//! card-write lock: no in-memory accumulator owns the card it targets (that is
+//! the reap's precondition) and the ending is computed whole, then PATCHed
+//! once, so there is no read-send-record sequence to serialize.
 
 use crate::backend::TurnSettle;
 use crate::bridge::handles::{CardsHandle, FlowHandles};
 use crate::bridge::live_cards::LiveCard;
 use crate::bridge::turn::Turn;
-use crate::feishu::card::{CardState, error_line, shell::CardBuilder};
+use crate::feishu::card::{CardState, error_line, move_line, shell::CardBuilder};
 
 /// Collect the orphaned card `card_message_id` because a new card took the
 /// chain over (ADR-0063): one PATCH naming the successor, terminal and grey.
@@ -185,52 +190,34 @@ pub(crate) async fn reconcile(
     let scope = record
         .anchor()
         .or_else(|| transcript.anchor_of_user(record.message_id.as_str()));
+    // One record's reconcile: the facts every ending shares, so the settle
+    // calls below carry only what differs (the ending and its detail).
+    let pass = ReapPass {
+        handles,
+        session_id,
+        record,
+        baseline_directory: directory,
+        read_timeout_ms,
+    };
     match transcript.settle(scope.as_ref()) {
         // The read's boundary rule is unsatisfied (a Wake's Execution has not
         // closed): the ending is not decided — keep observing.
         TurnSettle::Running => {}
         TurnSettle::Complete => {
-            settle(
-                handles,
-                session_id,
-                record,
-                directory,
-                CardState::Done,
-                None,
-                read_timeout_ms,
-            )
-            .await;
+            pass.settle(CardState::Done, None).await;
         }
         TurnSettle::Failed(error) => {
-            settle(
-                handles,
-                session_id,
-                record,
-                directory,
-                CardState::Error,
-                Some(&error_line(&error)),
-                read_timeout_ms,
-            )
-            .await;
+            pass.settle(CardState::Error, Some(&error_line(&error))).await;
         }
         // The wait is still on: the card yields 「⏳ 等待后台任务」 and keeps its
         // record, so a later read (this pass, every tick) settles the true end.
-        // The ending is PATCHed once per life; a restart re-stamps it once.
+        // The ending is PATCHed once per life; a restart re-stamps it once. A
+        // yield is not a settle: it carries no move line.
         TurnSettle::Waiting => {
             if record.waiting_reaped {
                 return;
             }
-            if settle(
-                handles,
-                session_id,
-                record,
-                directory,
-                CardState::Waiting,
-                None,
-                read_timeout_ms,
-            )
-            .await
-            {
+            if pass.settle(CardState::Waiting, None).await {
                 handles
                     .cards
                     .live_cards
@@ -240,109 +227,111 @@ pub(crate) async fn reconcile(
         // The submitted message never reached the transcript and the Session
         // is idle: nobody will answer it — never ✅ (ADR-0062).
         TurnSettle::Unreceived => {
-            settle(
-                handles,
-                session_id,
-                record,
-                directory,
-                CardState::Unreceived,
-                None,
-                read_timeout_ms,
-            )
-            .await;
+            pass.settle(CardState::Unreceived, None).await;
         }
     }
 }
 
-/// PATCH `record`'s card into `state` and, when the state is terminal, drop the
-/// record: nothing is owed a reap any more. A Session whose current directory
-/// differs from `baseline_directory` — the routing directory the card was
-/// tracked under — gains one extra line naming the move (#439), on top of
-/// `detail` (the failure's message when there is one). Returns whether the
-/// PATCH landed (a failed one keeps the record for the next tick). One INFO
-/// line per action, naming the session and the decision — never chat content.
-async fn settle(
-    handles: &FlowHandles,
-    session_id: &str,
-    record: &LiveCard,
-    baseline_directory: &str,
-    state: CardState,
-    detail: Option<&str>,
+/// One record's reconcile, as the facts every settle reads: the handles, the
+/// Session id, the record, the baseline directory the move verdict compares
+/// against, and the pass's read bound. Grouped so the four endings' settle
+/// calls carry only what differs between them.
+struct ReapPass<'a> {
+    handles: &'a FlowHandles,
+    session_id: &'a str,
+    record: &'a LiveCard,
+    baseline_directory: &'a str,
     read_timeout_ms: u64,
-) -> bool {
-    let move_line = session_move_line(handles, session_id, baseline_directory, read_timeout_ms).await;
-    let card = ending_card(state.clone(), detail, move_line.as_deref());
-    if let Err(e) = handles
-        .cards
-        .feishu
-        .update_message(&record.card_message_id, &card)
-        .await
-    {
-        tracing::warn!(
-            "live-card reap: session {session_id} could not settle card {}: {e}",
-            record.card_message_id
-        );
-        return false;
-    }
-    let moved = if move_line.is_some() {
-        " on a session that moved"
-    } else {
-        ""
-    };
-    tracing::info!(
-        "live-card reap: session {session_id} {}{moved}",
-        state.reap_word()
-    );
-    if state.is_terminal() {
-        handles.cards.live_cards.remove(session_id);
-    }
-    true
 }
 
-/// The one line a settling card carries when the Session's location changed
-/// since the card was tracked (#428, #439): the move named, so an interruption
-/// the ending alone would leave mysterious is explained. The current directory
-/// comes from the store's own session list, never from chat: the moved Session
-/// now lives under its new directory, so the directory-routed reads that got
-/// the reap here may not know it. A read that fails, a Session the list does
-/// not carry, an empty directory, or the baseline itself all claim nothing —
-/// no line, exactly the pre-#439 card.
-async fn session_move_line(
-    handles: &FlowHandles,
-    session_id: &str,
-    baseline_directory: &str,
-    read_timeout_ms: u64,
-) -> Option<String> {
-    let sessions = match crate::bridge::bounded_call(
-        "live-card reap session list",
-        read_timeout_ms,
-        handles.backend.list_sessions(),
-    )
-    .await
-    {
-        Some(Ok(sessions)) => sessions,
-        Some(Err(e)) => {
-            tracing::warn!("live-card reap: session {session_id} session list read failed: {e}");
+impl ReapPass<'_> {
+    /// PATCH the record's card into `state` and, when the state is terminal,
+    /// drop the record: nothing is owed a reap any more. A terminal ending
+    /// whose Session's current directory differs from the pass's baseline
+    /// directory gains one extra line naming the move (#439), on top of
+    /// `detail` (the failure's message when there is one); a Waiting yield is
+    /// not a settle and carries none. Returns whether the PATCH landed (a
+    /// failed one keeps the record for the next tick). One INFO line per
+    /// action, naming the session and the decision — never chat content; a
+    /// settle that named a move says so.
+    async fn settle(&self, state: CardState, detail: Option<&str>) -> bool {
+        let terminal = state.is_terminal();
+        let move_note = if terminal { self.move_note().await } else { None };
+        let card = ending_card(state.clone(), detail, move_note.as_deref());
+        if let Err(e) = self
+            .handles
+            .cards
+            .feishu
+            .update_message(&self.record.card_message_id, &card)
+            .await
+        {
+            tracing::warn!(
+                "live-card reap: session {} could not settle card {}: {e}",
+                self.session_id,
+                self.record.card_message_id
+            );
+            return false;
+        }
+        let moved = if move_note.is_some() {
+            " on a session that moved"
+        } else {
+            ""
+        };
+        tracing::info!(
+            "live-card reap: session {} {}{moved}",
+            self.session_id,
+            state.reap_word()
+        );
+        if terminal {
+            self.handles.cards.live_cards.remove(self.session_id);
+        }
+        true
+    }
+
+    /// The one line a settling card carries when the Session's location changed
+    /// since the card was tracked (#428, #439): the move named, so an
+    /// interruption the ending alone would leave mysterious is explained. The
+    /// current directory comes from the Session reads, never from chat: the
+    /// moved Session now lives under its new directory, so the directory-routed
+    /// reads that got the reap here may not know it. The list read goes through
+    /// the shared session-list cache (`SessionsHandle::cached_session_list`), so
+    /// at most one settle per cache TTL touches the wire — but that miss is
+    /// awaited before the PATCH, so on a hung server the ending can wait up to
+    /// `read_timeout_ms`. That price buys a cosmetic line and is bounded; the
+    /// ending itself is never withheld for it. A read that fails, a Session the
+    /// list does not carry, an empty directory, or the baseline itself all
+    /// claim nothing — no line, exactly the pre-#439 card. On a V1 server
+    /// without the experimental list route the read answers the project-scoped
+    /// list, so a moved Session may not appear in it and the line simply does
+    /// not render: V1 move awareness is #433's, out of this module's scope.
+    async fn move_note(&self) -> Option<String> {
+        let sessions = match crate::bridge::bounded_call(
+            "live-card reap session list",
+            self.read_timeout_ms,
+            self.handles.sessions.cached_session_list(&self.handles.backend),
+        )
+        .await
+        {
+            Some(Ok(sessions)) => sessions,
+            Some(Err(e)) => {
+                tracing::warn!(
+                    "live-card reap: session {} session list read failed: {e}",
+                    self.session_id
+                );
+                return None;
+            }
+            None => return None,
+        };
+        let current = sessions
+            .iter()
+            .find(|session| session.id == self.session_id)?
+            .directory
+            .as_str();
+        if current.is_empty() || current == self.baseline_directory {
             return None;
         }
-        None => return None,
-    };
-    let current = sessions
-        .iter()
-        .find(|session| session.id == session_id)?
-        .directory
-        .as_str();
-    if current.is_empty() || current == baseline_directory {
-        return None;
+        Some(move_line(current))
     }
-    Some(move_line(current))
-}
-
-/// The move line's copy (#439): one markdown line in the same
-/// `**label**: text` voice as [`error_line`], the new directory in backticks.
-/// It carries no chat content.
-fn move_line(directory: &str) -> String {
-    format!("\n**会话已迁移**: 已迁移到 `{directory}`")
 }
 
 /// A bare card carrying one ending — the reap's whole card vocabulary. The
@@ -355,13 +344,13 @@ fn move_line(directory: &str) -> String {
 /// accumulator its 重新发起 click would claim (the original prompt and the card
 /// session), so the button could only be dead; the user re-sends instead
 /// (ADR-0062's amendment).
-fn ending_card(state: CardState, detail: Option<&str>, move_line: Option<&str>) -> serde_json::Value {
+fn ending_card(state: CardState, detail: Option<&str>, move_note: Option<&str>) -> serde_json::Value {
     let mut builder = CardBuilder::new().with_state(state);
     if let Some(detail) = detail.filter(|detail| !detail.is_empty()) {
         builder = builder.with_text(detail);
     }
-    if let Some(line) = move_line.filter(|line| !line.is_empty()) {
-        builder = builder.with_text(line);
+    if let Some(note) = move_note {
+        builder = builder.with_text(note);
     }
     builder.build()
 }
@@ -420,7 +409,7 @@ mod tests {
             "the failure's own message stays: {failed_and_moved}"
         );
         assert!(
-            rendered.contains("**会话已迁移**: 已迁移到 `/work/.worktrees/zh-user-guide`"),
+            rendered.contains("**会话已迁移**: `/work/.worktrees/zh-user-guide`"),
             "the move line names the new directory: {failed_and_moved}"
         );
         assert_eq!(
@@ -432,7 +421,7 @@ mod tests {
         let unreceived_moved = ending_card(CardState::Unreceived, None, Some(&move_line("/w2")));
         assert_eq!(
             unreceived_moved["body"]["elements"][0]["content"],
-            "\n**会话已迁移**: 已迁移到 `/w2`"
+            "**会话已迁移**: `/w2`"
         );
     }
 }

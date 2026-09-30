@@ -468,6 +468,96 @@ async fn an_unknown_current_directory_claims_no_move() {
     );
 }
 
+/// The move baseline is the routing directory: a record with no directory of
+/// its own falls back to the mapping's, so a mapping that still names the
+/// pre-move directory still produces the line (#439).
+#[tokio::test]
+async fn a_mapping_directory_serves_as_the_move_baseline() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    // The record carries no directory; the mapping (seeded below) is the only
+    // baseline the reap has.
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
+
+    let (app, platform, _backend) = build_restarted_with_sessions(
+        &session_file,
+        completed(1_000),
+        vec![list_session("ses_test", "题目", "/work/moved", 1_000)],
+    )
+    .await;
+    seed_session(&app, "ses_test", "/work").await;
+
+    spawn_sync(&app);
+    wait_for_card_update(
+        &platform,
+        "the reaped card's ✅ ending",
+        CardUpdates::Any,
+        |card| card_header(card).contains("✅"),
+    )
+    .await;
+
+    let card = last_update_of(&platform, "om_frozen")
+        .await
+        .expect("the persisted card is settled in place");
+    let text = card_text(&card);
+    assert!(
+        text.contains("会话已迁移") && text.contains("/work/moved"),
+        "the mapping's directory is the baseline: {card}"
+    );
+}
+
+/// A Waiting yield is not a settle: a moved Session's yielded card keeps
+/// 「⏳ 等待后台任务」 without the move line — the line belongs to the true end
+/// (#439).
+#[tokio::test]
+async fn a_waiting_yield_carries_no_move_line() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_live_card(
+        &session_file,
+        LiveCard::new("om_frozen", MessageId::new("msg_cola_anchor"), Some(1_000))
+            .with_directory(Some("/work".into())),
+    );
+
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_background_tasks(vec![background_shell(2_100)]);
+    let (app, platform, _backend) = build_restarted_with_sessions(
+        &session_file,
+        transcript,
+        vec![list_session(
+            "ses_test",
+            "题目",
+            "/work/.worktrees/zh-user-guide",
+            1_000,
+        )],
+    )
+    .await;
+
+    spawn_sync(&app);
+    wait_for_card_update(
+        &platform,
+        "the reaped card's waiting ending",
+        CardUpdates::Any,
+        |card| card_header(card).contains("等待后台任务"),
+    )
+    .await;
+
+    let card = last_update_of(&platform, "om_frozen")
+        .await
+        .expect("the persisted card is yielded in place");
+    assert_eq!(card_header(&card), "⏳ 等待后台任务");
+    assert!(
+        !card_text(&card).contains("会话已迁移"),
+        "a yield is not a settle and carries no move line: {card}"
+    );
+}
+
 /// A run that idled with live Background Tasks while cola was down gets the
 /// waiting ending — not ✅ — and KEEPS its record, so the later true end is
 /// still reaped. The ending is PATCHed once per life, not every tick.
