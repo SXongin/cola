@@ -16,6 +16,7 @@ use crate::backend::{
 use crate::bridge::test_support::*;
 use crate::bridge::turn::{PromptContext, Turn};
 use crate::config::{SessionEntry, ThreadKey};
+use crate::feishu::card::CardState;
 
 /// The timeline both render-log tests serve: cola's anchor user message and
 /// the assistant turn that answers it.
@@ -794,6 +795,38 @@ async fn prompt_routing_logs_the_ownership_verdict_without_the_message() {
     assert!(
         !line.contains("advisory="),
         "an owned chain needs no advisory read: {line}"
+    );
+    assert!(
+        !logs.contains(text),
+        "the message body must never be logged:\n{logs}"
+    );
+
+    // The other owned verdict: a render-owned card chain with a free guard
+    // (the snapshot-follow shape) is ownership too, and its name is its own.
+    app.inflight.lock().await.remove("ses_test");
+    Turn::seed_card(&app.cards_handle(), "ses_test", Some("om_live")).await;
+    Turn::set_card_state(&app.cards_handle(), "ses_test", CardState::Streaming).await;
+    let text = "卡片链上的追问";
+    let ((), logs) = capture_logs(async {
+        app.handle_message(incoming(
+            "msg_3".into(),
+            "chat_1".into(),
+            "p2p".into(),
+            None,
+            text.into(),
+            None,
+        ))
+        .await;
+    })
+    .await;
+    let line = line_with(&logs, "prompt routing:");
+    assert!(
+        line.contains("ownership=card-chain") && line.contains("route=supplement"),
+        "a render-owned chain routes the Supplement without a guard: {line}"
+    );
+    assert!(
+        !line.contains("advisory="),
+        "a card-chain ownership needs no advisory read: {line}"
     );
     assert!(
         !logs.contains(text),
