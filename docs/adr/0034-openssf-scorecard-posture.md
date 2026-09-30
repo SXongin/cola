@@ -173,3 +173,12 @@ or not anything ever runs it (the published 2026-09-22 result at `c83eedf`
 shows `Fuzzing` 10). Wiring the weekly job therefore changes no score; it
 exists for the bug-finding value only. Do not adopt ClusterFuzzLite to "fix" a
 check that the fuzz target already satisfies.
+
+## Amendment (2026-09-30): the `SAST` check is a deliberate no
+
+CodeQL was retired (ADR-0064), so the `SAST` check — expected above to "heal on
+its own" once CodeQL's runs covered the sampled commits — returns to 0 (no SAST
+tool detected). That is now deliberate: the tool produced no true positive in
+~640 runs, and the credential class it kept flagging is covered by secret
+scanning with push protection. Add `SAST` to the "Explicit no-s" list; do not
+re-add a scanner for this check alone.

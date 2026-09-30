@@ -135,3 +135,11 @@ job now always dispatches and its **steps** carry the release/docs-only gate
 (the pattern the docs-only path already used), so both required checks report
 success with no test work. `Format`, `Check` and `Coverage` still skip at job
 level, and `Dependency audit` and CodeQL still gate the cut.
+
+## Amendment (2026-09-30): CodeQL is retired
+
+CodeQL was retired (ADR-0064); the 2026-09-20 amendment's "advisory CodeQL
+included" no longer applies. `watch_checks` is unchanged — it still waits on
+every check reported for the release PR — but the set it watches no longer
+contains a code-scanning one: `Dependency audit` and `Docs drift` are the
+always-run checks, and the dispatched-but-gated CI checks report success.
