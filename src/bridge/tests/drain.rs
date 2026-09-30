@@ -1948,6 +1948,234 @@ async fn a_never_promoted_submit_on_a_live_run_waits_out_the_grace_then_ends_unr
     assert_no_further_rendering(&backend, &platform).await;
 }
 
+/// ADR-0062 (spec #434, ticket #436): the unreceived watch is a wait, not a
+/// verdict — the submitted message may still land. A genuinely live run that
+/// merges the steer after the hand-off must be captured by the watch, its
+/// reply rendered, and the card settled normally (Done), never Unreceived.
+#[tokio::test]
+async fn the_unreceived_watch_captures_a_message_that_lands_after_the_handoff() {
+    let _wd = test_work_dir();
+    // The stale-looking start: Busy, with no transcript carrying the message.
+    let (_dir, app, backend, platform) = scripted_app(
+        vec![SessionTranscript::new(Vec::new())],
+        Some(SessionStatus::Busy),
+    )
+    .await;
+    app.turn_render_poll_ms.store(5, Ordering::Relaxed);
+    app.turn_drain_timeout_ms.store(30, Ordering::Relaxed);
+    // No hint in this test: the message lands well inside the grace.
+    app.turn_follow_grace_ms.store(60_000, Ordering::Relaxed);
+    app.turn_follow_read_timeout_ms.store(20, Ordering::Relaxed);
+
+    let turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
+    let result = tokio::time::timeout(Duration::from_secs(5), turn)
+        .await
+        .expect("the turn must hand off at the drain bound")
+        .unwrap();
+    result.unwrap();
+    assert!(
+        app.inflight.lock().await.contains("ses_test"),
+        "the watch inherits the guard at the bound"
+    );
+
+    // The run merges the steered message: it lands, with its answer.
+    script_transcript(
+        &backend,
+        vec![SessionTranscript::new(vec![
+            user("msg_cola_anchor", 1_000, "第一条消息"),
+            assistant(2_000, "第一轮回答。"),
+        ])],
+    )
+    .await;
+    // The watch captures the anchor and renders the answer while the session
+    // still reads live.
+    wait_for_card_text(&platform, "第一轮回答。").await;
+    assert!(
+        app.inflight.lock().await.contains("ses_test"),
+        "the watch keeps observing while the session reads live"
+    );
+
+    // The run ends: the settle decision judges the captured Turn and Done.
+    backend
+        .set_session_status("ses_test", Some(SessionStatus::Idle))
+        .await;
+    wait_for_card_header(&platform, "完成").await;
+    let final_card = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        !card_header(&final_card).contains("未被接收"),
+        "a message that landed is never Unreceived: {final_card}"
+    );
+    assert!(
+        !app.inflight.lock().await.contains("ses_test"),
+        "the watch releases the guard at the true end"
+    );
+    assert_no_further_rendering(&backend, &platform).await;
+}
+
+/// The finalization boundary honors an undecided final read (ADR-0062's "no
+/// divergent ending path"): the drain settles, but the read taken at
+/// finalization carries an unanswered Wake — no ending may be claimed from
+/// it, so the card is handed to the follow, never finalized from the drain's
+/// last disposition (the pre-#436 path stamped Done here). The follow then
+/// settles it once the Wake's Execution boundary arrives.
+#[tokio::test]
+async fn an_undecided_final_read_hands_the_card_to_the_follow_not_done() {
+    let _wd = test_work_dir();
+    let settled = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+    ]);
+    // The finalization read: a Wake resumed the run and its Execution has not
+    // reached a boundary yet — the read cannot judge the Turn.
+    let waked = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+    ])
+    .with_wakes(vec![shell_wake(2_900)]);
+    let answered = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+        assistant(3_100, "CI 通过了。"),
+    ])
+    .with_executions(vec![execution(3_500)])
+    .with_wakes(vec![shell_wake(2_900)]);
+    let (_dir, app, backend, platform) = scripted_app(vec![settled, waked], Some(SessionStatus::Idle)).await;
+    app.turn_render_poll_ms.store(5, Ordering::Relaxed);
+
+    Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下 CI"))
+        .await
+        .unwrap();
+
+    let state = Turn::card_state(&app.cards_handle(), "ses_test").await;
+    assert!(
+        !matches!(state, Some(CardState::Done | CardState::Unreceived)),
+        "an undecided final read must not finalize the card: {state:?}"
+    );
+    assert!(
+        app.inflight.lock().await.contains("ses_test"),
+        "the card is handed to the follow instead"
+    );
+
+    // The Wake's Execution boundary arrives: the follow settles the true end.
+    script_transcript(&backend, vec![answered]).await;
+    wait_for_card_header(&platform, "完成").await;
+    let final_card = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_text(&final_card).contains("CI 通过了。"),
+        "the Wake's resumed work lands at the true end: {final_card}"
+    );
+    assert!(!app.inflight.lock().await.contains("ses_test"));
+    assert_no_further_rendering(&backend, &platform).await;
+}
+
+/// The settle mapping is singular (AC4): the confirmation window still bounds
+/// an anchored read whose run was never observed, but the drain's own ending
+/// for it now comes from the settle decision, not the retired window-only
+/// rule — a read carrying live Background Tasks yields 「⏳ 等待后台任务」
+/// rather than reporting the turn settled. Finalization reaches the same
+/// yield, so the card can never show two readings of one decision.
+#[tokio::test]
+async fn an_unobserved_run_with_live_background_tasks_yields_waiting() {
+    let _wd = test_work_dir();
+    let transcript = SessionTranscript::new(vec![user("msg_cola_anchor", 1_000, "跑一下 CI")])
+        .with_executions(vec![execution(1_500)])
+        .with_background_tasks(vec![background_shell(1_100)]);
+    let (_dir, app, _backend, platform) = scripted_app(vec![transcript], Some(SessionStatus::Idle)).await;
+    app.turn_render_poll_ms.store(5, Ordering::Relaxed);
+    // A bound the test would never wait out: only the window can end the drain.
+    app.turn_drain_timeout_ms.store(60_000, Ordering::Relaxed);
+
+    let started = std::time::Instant::now();
+    Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下 CI"))
+        .await
+        .unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the confirmation window must bound the wait: {:?}",
+        started.elapsed()
+    );
+
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Waiting),
+        "the settle decision owns the unobserved ending too"
+    );
+    let card = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_header(&card).contains("等待后台任务"),
+        "the card yields for the live task: {card}"
+    );
+    assert!(
+        !card_header(&card).contains("完成"),
+        "a waiting card is never ✅: {card}"
+    );
+    assert!(!noticed(&platform).await, "no notice before the true end");
+    assert!(
+        !app.inflight.lock().await.contains("ses_test"),
+        "the yield releases the guard"
+    );
+}
+
+/// ADR-0062 (ticket #436, review fix): the Turn's anchor is sticky. A final
+/// read that no longer carries the submitted message (a compaction, a partial
+/// read) must not flip a completed card to Unreceived: the captured anchor
+/// already proved the message landed, so the read's own missing anchor is not
+/// "never landed".
+#[tokio::test]
+async fn a_final_read_dropping_the_message_does_not_become_unreceived() {
+    let _wd = test_work_dir();
+    let timeline = vec![
+        user("msg_cola_anchor", 1_000, "第一条消息"),
+        assistant(2_000, "第一轮回答。"),
+    ];
+    // Snapshot 1 is the settled turn the drain anchors and renders under the
+    // busy read; every read after it is anchorless — the compaction /
+    // partial-read hiccup.
+    let (_dir, app, backend, platform) = scripted_app(
+        vec![
+            SessionTranscript::new(timeline),
+            SessionTranscript::new(Vec::new()),
+        ],
+        Some(SessionStatus::Busy),
+    )
+    .await;
+    app.turn_render_poll_ms.store(5, Ordering::Relaxed);
+    app.turn_drain_timeout_ms.store(60_000, Ordering::Relaxed);
+
+    let turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
+    // The busy drain renders and anchors the turn...
+    wait_for_card_text(&platform, "第一轮回答。").await;
+    // ...then the session idles and every later read is anchorless.
+    backend
+        .set_session_status("ses_test", Some(SessionStatus::Idle))
+        .await;
+    let result = tokio::time::timeout(Duration::from_secs(5), turn)
+        .await
+        .expect("the turn must finalize once the session idles")
+        .unwrap();
+    result.unwrap();
+
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Done),
+        "a landed message stays Done after an anchorless final read"
+    );
+    let final_card = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_header(&final_card).contains("完成"),
+        "a landed message stays Done after an anchorless final read: {final_card}"
+    );
+    assert!(
+        !card_header(&final_card).contains("未被接收"),
+        "the sticky anchor must not be read as never-landed: {final_card}"
+    );
+    assert!(
+        card_text(&final_card).contains("第一轮回答。"),
+        "the drained content stays: {final_card}"
+    );
+    assert!(!app.inflight.lock().await.contains("ses_test"));
+}
+
 /// A final reconcile whose transcript read no longer carries the turn (a
 /// failed/empty read) must not stamp Done over a failure the drain observed:
 /// the last observed failure is the fallback, so a read hiccup cannot erase

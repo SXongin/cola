@@ -995,9 +995,10 @@ pub(crate) struct TurnConfig {
     pub(crate) turn_render_poll_ms: Arc<AtomicU64>,
     /// Bound on a Turn's post-prompt drain (ms); injectable for tests.
     pub(crate) turn_drain_timeout_ms: Arc<AtomicU64>,
-    /// The lost-contact / stuck-panel grace on the out-of-turn drain follow
-    /// (ms, #284/#386), and the delay before the unreceived watch shows its
-    /// neutral waiting line (ADR-0062); injectable for tests.
+    /// The long follow grace (ms): the out-of-turn drain follow's lost-contact
+    /// / stuck-panel bound (#284/#386) and the unreceived watch's waiting-hint
+    /// delay (ADR-0062) — deliberately one knob, the follow grace the spec
+    /// names; injectable for tests.
     pub(crate) turn_follow_grace_ms: Arc<AtomicU64>,
     /// Per-read bound on the out-of-turn drain follow (ms, #386); injectable
     /// for tests.
@@ -1055,8 +1056,9 @@ impl TurnConfig {
         self.turn_drain_timeout_ms.load(Ordering::Relaxed)
     }
 
-    /// The out-of-turn drain follow's lost-contact / stuck-panel grace, and
-    /// the unreceived watch's waiting-hint delay (ms, #284/#386, ADR-0062).
+    /// The long follow grace (ms): the out-of-turn follow's lost-contact /
+    /// stuck-panel bound and the unreceived watch's waiting-hint delay — one
+    /// knob by design (#284/#386, ADR-0062). See the field's own docs.
     pub(crate) fn follow_grace_ms(&self) -> u64 {
         self.turn_follow_grace_ms.load(Ordering::Relaxed)
     }
