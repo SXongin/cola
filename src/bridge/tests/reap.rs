@@ -206,9 +206,9 @@ fn completed(created_ms: i64) -> SessionTranscript {
 }
 
 /// The card view a whole-card read answers for a live turn's card: markdown,
-/// a collapsible panel with nested markdown, controls (a nested button and an
-/// action block) and an hr — the shape a reap must keep without its controls
-/// (#434 acceptance feedback).
+/// a collapsible panel with nested markdown, a `form` of controls, an action
+/// block and an hr — the shape a reap must keep without its controls (#434
+/// acceptance feedback).
 fn realistic_card_view() -> serde_json::Value {
     serde_json::json!({
         "schema": "2.0",
@@ -226,6 +226,11 @@ fn realistic_card_view() -> serde_json::Value {
                   { "tag": "button", "text": { "tag": "plain_text", "content": "重试" },
                     "value": { "action": "retry" } }
               ] },
+            { "tag": "form", "name": "switch_search", "elements": [
+                { "tag": "input", "name": "search" },
+                { "tag": "button", "text": { "tag": "plain_text", "content": "搜索" },
+                  "value": { "action": "submit" } }
+            ] },
             { "tag": "action", "actions": [
                 { "tag": "button", "text": { "tag": "plain_text", "content": "重新发起" },
                   "value": { "action": "resume" } }
@@ -236,8 +241,9 @@ fn realistic_card_view() -> serde_json::Value {
 }
 
 /// The preservation contract the kept-body tests share: the old body's text
-/// survived, no interactive element did (the whole-card read loses a control's
-/// `value`, so a kept control could only be dead), and streaming is off.
+/// survived, no interactive element or control container did (the whole-card
+/// read loses a control's `value`, so a kept control could only be dead), and
+/// streaming is off.
 fn assert_preserved_body(card: &serde_json::Value) {
     assert!(
         card_text(card).contains("**正文** 第一段") && card_text(card).contains("面板里的输出"),
@@ -247,7 +253,10 @@ fn assert_preserved_body(card: &serde_json::Value) {
         card_buttons(card).is_empty(),
         "no preserved button survives: {card}"
     );
-    assert!(!card_has_tag(card, "action"), "no action block survives: {card}");
+    assert!(
+        !card_has_tag(card, "action") && !card_has_tag(card, "form") && !card_has_tag(card, "input"),
+        "no preserved control or control container survives: {card}"
+    );
     assert_eq!(
         card["config"]["streaming_mode"], false,
         "a preserved card never keeps a live-streaming presentation: {card}"
@@ -1340,6 +1349,48 @@ async fn a_rejected_preserved_ending_retries_the_bare_one() {
         patches[1]["body"]["elements"].as_array().unwrap().is_empty(),
         "the retry is the bare ending: {}",
         patches[1]
+    );
+}
+
+/// A PATCH failure that is NOT a definite card-content rejection — here a
+/// transport-class failure, the shape a timeout or dropped connection surfaces
+/// as — is never retried bare: the preserved attempt may already have landed,
+/// and the bare ending would then wipe the body this path exists to keep. The
+/// record stays, so the next tick tries the settle again (#434 acceptance
+/// feedback).
+#[tokio::test]
+async fn a_transport_failed_preserved_ending_does_not_retry_bare() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
+
+    let (app, platform, backend) = restarted_app_with_backend(&session_file, completed(1_000), None).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+    // A transport failure on every attempt, so each observed tick records
+    // what it sent before failing.
+    platform
+        .fail_update_transport_count
+        .store(10, std::sync::atomic::Ordering::SeqCst);
+
+    spawn_sync(&app);
+    // Three observed status reads: at least two passes reached their PATCH.
+    wait_for_status_reads(&backend, "ses_test", 3).await;
+
+    let patches = patches_to(&platform, "om_frozen").await;
+    assert!(
+        patches.len() >= 2,
+        "the observed ticks retried the settle: {patches:?}"
+    );
+    assert!(
+        patches
+            .iter()
+            .all(|card| card_text(card).contains("**正文** 第一段")),
+        "no transport failure falls back to the bare ending: {patches:?}"
+    );
+    assert!(
+        app.cards_handle().live_cards.get("ses_test").is_some(),
+        "a failed settle keeps the record for the next tick"
     );
 }
 

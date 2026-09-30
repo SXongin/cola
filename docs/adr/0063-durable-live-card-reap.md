@@ -39,7 +39,11 @@ pass reconciles the card against the Session's own reads:
   amendment in ADR-0062);
 - a live Session keeps the card: the run may still be answering it;
 - a continuation that took the chain over collects the old card in place, so no
-  card is left looking live.
+  card is left looking live;
+- every ending is stamped over the card's own view, read best-effort: the body
+  the card already rendered stays (interactive elements stripped, since a
+  whole-card read does not return their callback values), and a failed read
+  still settles the bare ending.
 
 The same pass covers a Waiting card orphaned by a restart: its Session's true
 end settles it (ADR-0060's quiet true end), instead of leaving it frozen.
