@@ -36,7 +36,7 @@ mod tests;
 
 use async_trait::async_trait;
 
-use crate::backend::SessionTranscript;
+use crate::backend::{ChildRuntime, SessionTranscript, ShellRuntime, TaskRuntime};
 use crate::error::Result;
 
 use super::strategy::GenerationStrategy;
@@ -70,6 +70,10 @@ const SESSION_MODEL_SUFFIX: &str = "/model";
 const SESSION_AGENT_SUFFIX: &str = "/agent";
 /// The active-session run-state map (`{data: Record<SessionID, {type:"running"}>}`).
 const SESSION_ACTIVE: &str = "/api/session/active";
+/// The location-scoped shell registry: `GET` lists the running shells, and
+/// `GET /api/shell/{id}` reads one retained shell (running or terminated).
+/// The Background Task runtime reconciliation (issue #454) is its one caller.
+const SHELL: &str = "/api/shell";
 /// The per-session projected-message read: the S4b transcript decode and, for
 /// active sessions, the run state's retry derivation.
 const SESSION_MESSAGES_SUFFIX: &str = "/message";
@@ -482,6 +486,93 @@ impl GenerationStrategy for V2Strategy {
         })
     }
 
+    /// The runtime verdict for the named Background Tasks (issue #454).
+    ///
+    /// One location-scoped `GET /api/shell` carries every currently running
+    /// shell of the session's directory; each shell it does not list is asked
+    /// for individually — a retained terminal record becomes its `Ended`
+    /// verdict, a 404 the runtime's own `Missing` (the record is gone: the
+    /// serving process restarted, or it was removed), and any other failure
+    /// leaves that shell without a verdict, never guessed. The active map
+    /// (`GET /api/session/active`) answers the subagent children: a child
+    /// absent from it is `Inactive`, a child present with an unrecognised type
+    /// gets no verdict. Both maps are process-local to the attached server —
+    /// absence can mean "a different process hosted it", which is exactly why
+    /// only a positive verdict ever retires a task.
+    async fn task_runtime(
+        &self,
+        http: &Transport,
+        session_id: &str,
+        directory: Option<&str>,
+        shells: &[String],
+        children: &[String],
+    ) -> Result<TaskRuntime> {
+        let mut runtime = TaskRuntime::default();
+        if !shells.is_empty() {
+            let resp = http
+                .client()
+                .get(location_url(&http.url(SHELL), directory)?)
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                return Err(read_failure(resp, "shell list").await);
+            }
+            let text = resp.text().await?;
+            let list: wire::ShellList = serde_json::from_str(&text).map_err(|e| {
+                crate::error::BridgeError::OpenCode(format!(
+                    "shell list parse: {e} — body: {}",
+                    body_preview(&text)
+                ))
+            })?;
+            // The list is running-only, so membership is the live verdict; a
+            // non-running entry (a race, or a future server that lists more)
+            // falls through to the per-shell read below.
+            let running: std::collections::HashSet<&str> = list
+                .data
+                .iter()
+                .filter(|shell| shell.status == "running")
+                .map(|shell| shell.id.as_str())
+                .collect();
+            for shell_id in shells {
+                if running.contains(shell_id.as_str()) {
+                    runtime.shells.push((shell_id.clone(), ShellRuntime::Running));
+                    continue;
+                }
+                match self.shell_runtime(http, directory, shell_id).await {
+                    Ok(verdict) => runtime.shells.push((shell_id.clone(), verdict)),
+                    // No verdict: the read failed — the task stays as the
+                    // transcript read it, and the next pass retries.
+                    Err(error) => {
+                        tracing::debug!("session {session_id} task runtime: shell {shell_id}: {error}");
+                    }
+                }
+            }
+        }
+        if !children.is_empty() {
+            let resp = http.client().get(http.url(SESSION_ACTIVE)).send().await?;
+            if !resp.status().is_success() {
+                return Err(read_failure(resp, "task runtime active map").await);
+            }
+            let text = resp.text().await?;
+            let active: wire::ActiveSessions = serde_json::from_str(&text).map_err(|e| {
+                crate::error::BridgeError::OpenCode(format!(
+                    "task runtime active map parse: {e} — body: {}",
+                    body_preview(&text)
+                ))
+            })?;
+            for child_id in children {
+                match active.state(child_id) {
+                    Some(true) => runtime.children.push((child_id.clone(), ChildRuntime::Running)),
+                    // Present with an unrecognised type: no verdict, never a
+                    // guessed `Inactive`.
+                    Some(false) => {}
+                    None => runtime.children.push((child_id.clone(), ChildRuntime::Inactive)),
+                }
+            }
+        }
+        Ok(runtime)
+    }
+
     /// The session's durable selection (`GET /api/session/{id}`): the model
     /// ref (variant inside it) and agent the server will use for the next
     /// turn, visible to every client sharing the store. This is the read the
@@ -790,6 +881,29 @@ impl V2Strategy {
         }
         let body: wire::DataEnvelope<wire::RawSessionInfo> = resp.json().await?;
         Ok(body.data)
+    }
+
+    /// One shell's runtime verdict (`GET /api/shell/{id}`, issue #454). 404 is
+    /// the runtime's positive "no record" ([`ShellRuntime::Missing`]); a 200
+    /// decodes the retained shell, which may still race back to `running`; any
+    /// other failure is an `Err` the caller degrades to "no verdict" after a
+    /// debug log, so one bad shell read cannot fail the whole reconciliation.
+    async fn shell_runtime(
+        &self,
+        http: &Transport,
+        directory: Option<&str>,
+        shell_id: &str,
+    ) -> Result<ShellRuntime> {
+        let url = location_url(&http.url(&format!("{SHELL}/{shell_id}")), directory)?;
+        let resp = http.client().get(url).send().await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(ShellRuntime::Missing);
+        }
+        if !resp.status().is_success() {
+            return Err(read_failure(resp, "shell read").await);
+        }
+        let body: wire::DataEnvelope<wire::RawShell> = resp.json().await?;
+        Ok(body.data.into_runtime())
     }
 
     /// Read the session's projected messages, decoded-ready: the raw `data`

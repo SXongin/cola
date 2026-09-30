@@ -797,6 +797,10 @@ impl feishu::Platform for RecordingPlatform {
     }
 }
 
+/// One `task_runtime` call as the mock records it: the session id and the
+/// shell / child ids the reconcile asked about, in order (issue #454).
+pub(crate) type TaskRuntimeCall = (String, Vec<String>, Vec<String>);
+
 /// Serves scripted parts/permissions instead of a live OpenCode server.
 pub struct MockBackend {
     /// The parts the default assistant turn carries: reasoning → tool → text.
@@ -1062,6 +1066,12 @@ pub struct MockBackend {
     /// Records the session ids each `session_status` read targeted — the `/sub`
     /// card asserts one read per rendered row (spec #344).
     pub session_status_reads: Arc<tokio::sync::Mutex<Vec<String>>>,
+    /// The runtime verdict `task_runtime` serves (issue #454): set per test to
+    /// script a shell the runtime reports ended/missing, or a child session it
+    /// reports inactive. Empty by default — no evidence, exactly like V1.
+    pub task_runtime: Arc<std::sync::Mutex<crate::backend::TaskRuntime>>,
+    /// Records every `task_runtime` call: `(session_id, shells, children)`.
+    pub task_runtime_calls: Arc<tokio::sync::Mutex<Vec<TaskRuntimeCall>>>,
     /// When set, `session_status` fails with this message (simulates a read
     /// failure — the caller must not guess a status).
     pub session_status_error: Option<String>,
@@ -1171,6 +1181,8 @@ impl MockBackend {
             switch_error: None,
             session_statuses: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             session_status_reads: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            task_runtime: Arc::new(std::sync::Mutex::new(crate::backend::TaskRuntime::default())),
+            task_runtime_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             session_status_error: None,
             session_status_fails: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             status_busy_once: std::sync::atomic::AtomicBool::new(false),
@@ -2199,6 +2211,28 @@ impl crate::backend::Backend for MockBackend {
             Some(status) => *status,
             None => Some(opencode::types::SessionStatus::Idle),
         })
+    }
+
+    /// The scripted runtime verdict (issue #454). Empty by default, so a test
+    /// that does not care gets the same no-op reconciliation V1 would produce;
+    /// a test scripts verdicts through [`Self::task_runtime`]'s `Arc`.
+    async fn task_runtime(
+        &self,
+        session_id: &str,
+        _directory: Option<&str>,
+        shells: &[String],
+        children: &[String],
+    ) -> crate::error::Result<crate::backend::TaskRuntime> {
+        self.task_runtime_calls.lock().await.push((
+            session_id.to_string(),
+            shells.to_vec(),
+            children.to_vec(),
+        ));
+        Ok(self
+            .task_runtime
+            .lock()
+            .expect("the task-runtime lock is never poisoned")
+            .clone())
     }
 
     async fn interrupt(&self, session_id: &str) -> crate::error::Result<()> {

@@ -10,7 +10,7 @@
 
 use std::sync::{Arc, RwLock};
 
-use crate::backend::SessionTranscript;
+use crate::backend::{SessionTranscript, TaskRuntime};
 
 use super::parsing::parse_model;
 use super::strategy::{Generation, GenerationStrategy};
@@ -397,6 +397,21 @@ impl OpenCodeBackend {
     ) -> crate::error::Result<Option<SessionStatus>> {
         self.strategy()
             .session_status(&self.transport, session_id, directory)
+            .await
+    }
+
+    /// The runtime verdict for the named Background Tasks of one session (V2's
+    /// live shell/session registries; issue #454). See
+    /// [`crate::backend::Backend::task_runtime`].
+    pub async fn task_runtime(
+        &self,
+        session_id: &str,
+        directory: Option<&str>,
+        shells: &[String],
+        children: &[String],
+    ) -> crate::error::Result<TaskRuntime> {
+        self.strategy()
+            .task_runtime(&self.transport, session_id, directory, shells, children)
             .await
     }
 
