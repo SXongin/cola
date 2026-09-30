@@ -83,6 +83,7 @@ pub(crate) fn ctx(session_id: &str, text: &str) -> PromptContext {
         is_group: false,
         cola_message_id: Some("msg_cola_anchor".into()),
         images: Vec::new(),
+        advisory_live: false,
     }
 }
 
