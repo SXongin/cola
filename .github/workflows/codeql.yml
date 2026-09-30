@@ -53,4 +53,7 @@ jobs:
         with:
           languages: ${{ matrix.language }}
           build-mode: none
+          # Excludes the `#[cfg(test)]`-only files and trees from the database;
+          # see the config file's header and CONTRIBUTING.md.
+          config-file: ./.github/codeql/codeql-config.yml
       - uses: github/codeql-action/analyze@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1
