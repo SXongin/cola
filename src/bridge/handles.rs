@@ -780,6 +780,11 @@ pub(crate) struct CardsHandle {
     /// card write, the Fresh decision reads it, and the Fresh arm advances it
     /// after its card's own send lands.
     pub(crate) wake_watermarks: Arc<crate::bridge::wake_watermark::WakeWatermarks>,
+    /// The durable per-session Live Card record (ADR-0063). Written whenever a
+    /// card becomes the session's live card, re-pointed when the chain
+    /// continues on a successor, and dropped at every terminal or collection;
+    /// Session Sync's reap reads it to settle the card a restart orphaned.
+    pub(crate) live_cards: Arc<crate::bridge::live_cards::LiveCards>,
     /// session_id → the lock serializing that session's card writes. Private:
     /// [`CardsHandle::write_lock`] is the accessor.
     write_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
@@ -792,6 +797,7 @@ impl CardsHandle {
         cover_titles: Arc<Mutex<HashMap<String, CoverTitle>>>,
         feishu: Arc<dyn feishu::Platform>,
         wake_watermarks: Arc<crate::bridge::wake_watermark::WakeWatermarks>,
+        live_cards: Arc<crate::bridge::live_cards::LiveCards>,
         write_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     ) -> Self {
         Self {
@@ -800,6 +806,7 @@ impl CardsHandle {
             cover_titles,
             feishu,
             wake_watermarks,
+            live_cards,
             write_locks,
         }
     }

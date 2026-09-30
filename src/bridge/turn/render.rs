@@ -515,11 +515,15 @@ pub(super) async fn render_and_flush(
     // OpenCode auto-renames sessions after a turn; follow the server's live
     // title so the card subtitle doesn't stay on the "new session" default.
     refresh_session_title(cards, sessions, backend, session_id).await;
-    let (changed, header_changed, new_parts, text_len, reasoning_len) = {
+    let (changed, header_changed, new_parts, text_len, reasoning_len, anchor) = {
         let mut live = cards.cards.lock().await;
         let card = live.get_mut(session_id)?;
         let before = card.acc.rendered_parts.len();
         let changed = render_new_turn_parts(&mut card.acc, transcript);
+        // The Turn anchor this render captured (or already carried) plus the
+        // card it belongs to: the durable live-card record's anchor is written
+        // below, outside the lock (ADR-0063).
+        let anchor = card.card_message_id.clone().zip(card.acc.turn_anchor.clone());
         // Re-flush when the header changed even without new content: the
         // progress timer keeps ticking, so an idle turn still proves it is
         // alive (ADR-0014). Whole-second timestamps bound this to at most one
@@ -535,8 +539,15 @@ pub(super) async fn render_and_flush(
             card.acc.rendered_parts.len() - before,
             card.acc.text.len(),
             card.acc.reasoning.len(),
+            anchor,
         )
     };
+    // Persist the captured anchor on the durable record (ADR-0063), so a
+    // restart's reap can ask the transcript what became of this Turn's message
+    // instead of probing for it. A no-op while the record names another card.
+    if let Some((card_message_id, anchor)) = &anchor {
+        cards.live_cards.set_anchor(session_id, card_message_id, anchor);
+    }
     // Keep the footer's context segment current (ADR-0044): the token usage
     // landed in the render above, and the window lookup is memoized per
     // (provider, model) for the turn, so later polls are a field swap. Runs

@@ -21,6 +21,7 @@ pub(crate) mod pending;
 pub(crate) mod permission;
 pub(crate) mod prompt_render;
 pub(crate) mod question;
+pub(crate) mod reap;
 pub(crate) mod reminder;
 pub(crate) mod session_routing;
 pub(crate) mod snapshot_follow;

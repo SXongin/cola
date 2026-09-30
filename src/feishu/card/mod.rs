@@ -57,6 +57,13 @@ pub enum CardState {
     /// Completion Notice; switching back reports the Session through the
     /// ADR-0028 snapshot, and the background work runs on.
     SwitchedAway,
+    /// A persisted live card collected because a new card took the chain over
+    /// after a cola restart (ADR-0063): the Wake continuation the restart's
+    /// Session Sync posted, or a fresh Turn's card. The orphaned card stops
+    /// looking live — header 「⏳ 已由新卡片接管 · 已停止更新」 — so two cards
+    /// never both claim the session. Terminal, grey, no Completion Notice and
+    /// no recovery action: the successor owns the chain.
+    TakenOver,
 }
 
 impl CardState {
@@ -81,6 +88,7 @@ impl CardState {
                 | Self::Unreceived
                 | Self::Superseded
                 | Self::SwitchedAway
+                | Self::TakenOver
         )
     }
 
@@ -367,9 +375,20 @@ mod tests {
             CardState::Unreceived,
             CardState::Superseded,
             CardState::SwitchedAway,
+            CardState::TakenOver,
         ] {
             assert!(state.overrides_awaiting(), "{state:?} has its own ending to show");
         }
+    }
+
+    /// The TakenOver collect (ADR-0063) is terminal — the successor owns the
+    /// chain, so the orphan stops updating — and never render-owned: Session
+    /// Sync must not treat it as a live renderer's card.
+    #[test]
+    fn the_taken_over_collect_is_terminal_and_not_render_owned() {
+        assert!(CardState::TakenOver.is_terminal());
+        assert!(!CardState::TakenOver.is_render_owned());
+        assert!(!CardState::TakenOver.offers_recovery());
     }
 
     /// The Unreceived ending (ADR-0062) is terminal — the card stops updating

@@ -415,6 +415,10 @@ pub(crate) fn header_title_and_template(
         // no longer the thread's Active Session, so this chain can no longer be
         // continued by a message here; the background work runs on.
         CardState::SwitchedAway => ("⏳ 已切换会话 · 后台任务仍在运行".to_string(), "grey"),
+        // A persisted live card collected because a new card took the chain
+        // over after a restart (ADR-0063): the orphan stops looking live —
+        // the successor card below is the session's one live card now.
+        CardState::TakenOver => ("⏳ 已由新卡片接管 · 已停止更新".to_string(), "grey"),
     };
     let mut title = label;
     match state {
@@ -1088,6 +1092,7 @@ mod tests {
             CardState::Waiting,
             CardState::Superseded,
             CardState::SwitchedAway,
+            CardState::TakenOver,
         ] {
             let card = CardBuilder::new()
                 .with_state(state.clone())
