@@ -22,6 +22,7 @@ pub mod span;
 pub mod surfaces;
 pub mod topic;
 pub mod turn;
+pub(crate) mod wake_watermark;
 
 #[cfg(test)]
 pub(crate) mod test_support;

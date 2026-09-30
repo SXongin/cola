@@ -181,27 +181,36 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, spl
             let supplement_split_requested = !pending_split.is_empty();
             if !supplement_split_requested && !built.full {
                 // The live card still fits: a plain update.
-                if let Err(e) = cards.feishu.update_message(&card_id, &built.card).await {
-                    tracing::warn!("Card update failed: {}", e);
-                    if is_card_content_rejected(&e) {
-                        match advance_card_fallback(cards, session_id).await {
-                            // Feishu refused the content: rebuild the SAME
-                            // slice with every markdown element fenced and
-                            // PATCH again. `render_from` did not advance, so
-                            // the retry renders exactly this content.
-                            FallbackAdvance::RetryFenced => continue,
-                            // The fenced retry was rejected too — the card is
-                            // suspended; stop instead of PATCHing forever.
-                            FallbackAdvance::Stop => return,
+                let delivered = match cards.feishu.update_message(&card_id, &built.card).await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        tracing::warn!("Card update failed: {}", e);
+                        if is_card_content_rejected(&e) {
+                            match advance_card_fallback(cards, session_id).await {
+                                // Feishu refused the content: rebuild the SAME
+                                // slice with every markdown element fenced and
+                                // PATCH again. `render_from` did not advance, so
+                                // the retry renders exactly this content.
+                                FallbackAdvance::RetryFenced => continue,
+                                // The fenced retry was rejected too — the card is
+                                // suspended; stop instead of PATCHing forever.
+                                FallbackAdvance::Stop => return,
+                            }
                         }
+                        false
                     }
-                }
+                };
                 // Record what this card now renders: the live blocks.
                 cards
                     .card_handles
                     .lock()
                     .await
                     .record(&card_id, &built.card, rendered);
+                if delivered {
+                    // The PATCH carried this slice's completion entries: the
+                    // staged Wake Watermark is now user-visible (ADR-0061).
+                    drain_wake_watermark(cards, session_id).await;
+                }
                 return;
             }
             // The tracked card is finalized: it overflowed (size split) or a
@@ -265,42 +274,57 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, spl
                 // them.
                 push_queued_receipts(cards, session_id).await;
             }
-            if should_patch && let Err(e) = cards.feishu.update_message(&card_id, &finalized).await {
-                tracing::warn!("Card update failed: {}", e);
-                if is_card_content_rejected(&e) {
-                    if matches!(
-                        advance_card_fallback(cards, session_id).await,
-                        FallbackAdvance::RetryFenced
-                    ) {
-                        // The finalized slice never reached Feishu: restore it
-                        // and re-send it fenced on the same card, instead of
-                        // losing it to a rejection that would repeat verbatim.
-                        let mut cards = cards.cards.lock().await;
-                        if let Some(card) = cards.get_mut(session_id)
-                            && card.acc.render_from == slice_to
-                        {
-                            card.acc.render_from = slice_from;
-                            card.card_is_live = true;
-                            card_is_live = true;
+            let delivered = if should_patch {
+                match cards.feishu.update_message(&card_id, &finalized).await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        tracing::warn!("Card update failed: {}", e);
+                        if is_card_content_rejected(&e) {
+                            if matches!(
+                                advance_card_fallback(cards, session_id).await,
+                                FallbackAdvance::RetryFenced
+                            ) {
+                                // The finalized slice never reached Feishu: restore it
+                                // and re-send it fenced on the same card, instead of
+                                // losing it to a rejection that would repeat verbatim.
+                                let mut cards = cards.cards.lock().await;
+                                if let Some(card) = cards.get_mut(session_id)
+                                    && card.acc.render_from == slice_to
+                                {
+                                    card.acc.render_from = slice_from;
+                                    card.card_is_live = true;
+                                    card_is_live = true;
+                                }
+                                continue;
+                            }
+                            // The fenced retry was rejected too: the card is
+                            // suspended, so stop the chain instead of building the
+                            // next card out of content the platform may refuse too.
+                            cards
+                                .card_handles
+                                .lock()
+                                .await
+                                .record(&card_id, &finalized, Vec::new());
+                            return;
                         }
-                        continue;
+                        false
                     }
-                    // The fenced retry was rejected too: the card is
-                    // suspended, so stop the chain instead of building the
-                    // next card out of content the platform may refuse too.
-                    cards
-                        .card_handles
-                        .lock()
-                        .await
-                        .record(&card_id, &finalized, Vec::new());
-                    return;
                 }
-            }
+            } else {
+                false
+            };
             cards
                 .card_handles
                 .lock()
                 .await
                 .record(&card_id, &finalized, Vec::new());
+            if delivered {
+                // The finalized PATCH delivered this slice's entries; with no
+                // split queued the mark is fully user-visible, so it may drain
+                // (a queued split's 承接 line still owes the continuation send
+                // — the drain helper holds it back).
+                drain_wake_watermark(cards, session_id).await;
+            }
             continue;
         }
 
@@ -365,6 +389,9 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, spl
                     .lock()
                     .await
                     .record(&new_id, &built.card, rendered);
+                // The send delivered the 承接 line (or the size-split slice):
+                // the staged Wake Watermark is user-visible now (ADR-0061).
+                drain_wake_watermark(cards, session_id).await;
                 if !built.full {
                     return;
                 }
@@ -419,13 +446,35 @@ async fn push_queued_receipts(cards: &CardsHandle, session_id: &str) {
         let line = card.pending_split[i].line.clone();
         card.acc
             .push_receipt_at(line.as_ref().map(|line| line.at), kind.receipt());
-        if let Some(wake) = line.as_ref().and_then(|line| line.wake.as_deref()) {
+        if let Some((wake, created_ms)) = line.as_ref().and_then(|line| line.wake.as_ref()) {
             // The 承接 line announces this Wake's completion: mark it, so the
             // merged-path entry (a Wake that resumes an already-live card)
-            // cannot double it.
-            card.acc.announce_wake(wake);
+            // cannot double it — and stage the durable Wake Watermark, which
+            // advances only when this line's card actually sends (ADR-0061).
+            card.acc.announce_wake(wake, *created_ms);
         }
         card.pending_split[i].receipt_pushed = true;
+    }
+}
+
+/// Persist the chain's staged Wake Watermark (ADR-0061) after a card write
+/// delivered it. A queued split keeps the mark staged: its 承接 line still
+/// owes its own send, and until that lands the covered Wake is not
+/// user-visible, so a crash here must leave it unannounced for the next
+/// restart. The staged value is cleared only on a successful drain.
+pub(super) async fn drain_wake_watermark(cards: &CardsHandle, session_id: &str) {
+    let staged = {
+        let mut live = cards.cards.lock().await;
+        let Some(card) = live.get_mut(session_id) else {
+            return;
+        };
+        if !card.pending_split.is_empty() {
+            return;
+        }
+        card.acc.pending_watermark.take()
+    };
+    if let Some((wake_id, created_ms)) = staged {
+        cards.wake_watermarks.advance(session_id, &wake_id, created_ms);
     }
 }
 

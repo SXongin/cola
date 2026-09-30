@@ -610,6 +610,11 @@ impl App {
         let (session_id, created) = self
             .get_or_create_session(&thread_key, &text, &message_id)
             .await?;
+        // #424: from here until this message is admitted (`Turn::start`) or
+        // merged (the Supplement path below), a Session Sync Fresh
+        // continuation must not post: the message is not in the transcript
+        // yet, so no read can see it.
+        self.waits_handle().note_inbound(&session_id).await;
 
         // First message on a group's top level created a lobby session: reply
         // once with guidance so the user knows each topic isolates a session.
@@ -691,6 +696,10 @@ impl App {
                 crate::bridge::turn::SplitKind::Supplement,
             )
             .await;
+            // The message merged into the live Execution: the claim's job is
+            // done — once the prompt is visible in the transcript, the Sync's
+            // own staleness rule takes over (#424).
+            self.waits_handle().clear_inbound(&session_id).await;
             return Ok(());
         }
 

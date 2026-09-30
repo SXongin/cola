@@ -297,6 +297,11 @@ impl Turn {
             let mut inflight = handles.waits.inflight.lock().await;
             if inflight.contains(&session_id) {
                 drop(inflight);
+                // The message was refused, not admitted: drop the inbound
+                // claim with it (#424) — the inflight guard blocks the Fresh
+                // path anyway, and a lingering claim would only outlive its
+                // message.
+                handles.waits.clear_inbound(&session_id).await;
                 if is_retry {
                     // The retry lost the guard: nothing was submitted, so
                     // nothing may be marked. Its user message is the failed
@@ -314,6 +319,9 @@ impl Turn {
             }
             inflight.insert(session_id.clone());
         }
+        // This Turn is the inbound message's admission: the pre-guard claim
+        // (#424) is superseded by the inflight guard it just became.
+        handles.waits.clear_inbound(&session_id).await;
         // A fresh Turn supersedes any `/stop` from an earlier one: the drain
         // marker (ADR-0043) is per-session and sticky until the next turn, so
         // clearing it here keeps a past stop from silencing this turn's drain.
@@ -2359,13 +2367,14 @@ pub(crate) enum WakeContinuation {
 
 /// The opening 承接 line of a Wake continuation card (ADR-0059): the timeline
 /// key the line takes — just before the work the continuation renders — and
-/// the Wake whose completion the line already announces, so the merged-path
-/// receipt (the render pass's) cannot double it. `wake` is `None` for the
-/// content-diff fallback, which answers no Wake.
+/// the Wake whose completion the line already announces, with its own server
+/// time (the durable Wake Watermark's value once the line's card sends,
+/// ADR-0061), so the merged-path receipt (the render pass's) cannot double it.
+/// `wake` is `None` for the content-diff fallback, which answers no Wake.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ContinuationLine {
     pub(crate) at: i64,
-    pub(crate) wake: Option<String>,
+    pub(crate) wake: Option<(String, i64)>,
 }
 
 /// The destination and identity a Wake continuation card is armed with:
@@ -2446,12 +2455,23 @@ impl Turn {
                 return Some(WakeContinuation::ContinueChain {
                     line: ContinuationLine {
                         at,
-                        wake: wake.map(|wake| wake.message_id.to_string()),
+                        wake: wake.map(|wake| (wake.message_id.to_string(), wake.created_ms)),
                     },
                 });
             }
         }
         let anchor = newest_wake?.anchor()?;
+        // A restart must not re-announce a Wake a previous cola life already
+        // showed (#424): the watermark is the durable half of this chain's own
+        // `announced_wakes`, so only a strictly newer Wake is owed. Equal
+        // server times read as announced — the conservative side.
+        if cards
+            .wake_watermarks
+            .announced(session_id)
+            .is_some_and(|mark| anchor.created_ms <= mark.created_ms)
+        {
+            return None;
+        }
         // A Wake older than the newest user message is STALE: the conversation
         // has moved past it — a later cola life already saw or superseded it —
         // and re-posting it after a restart would replay every turn that
@@ -2541,7 +2561,7 @@ impl Turn {
         acc.wake_continuation = true;
         // The 承接 line announces this Wake's completion: mark it, so the
         // merged-path entry never doubles the line when the work renders.
-        acc.announce_wake(anchor.message_id.as_str());
+        acc.announce_wake(anchor.message_id.as_str(), anchor.created_ms);
         acc.apply_work_context(work_context);
         // The 承接 line is keyed just before the Wake's own work so the
         // resumed parts — whose server times are at or after the anchor —

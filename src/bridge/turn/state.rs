@@ -617,6 +617,13 @@ pub(super) struct StreamAccumulator {
     /// [`Self::continue_on_new_card`], so a Wake that resumes a
     /// wake-continuation card still marks exactly once (ADR-0059).
     pub(super) announced_wakes: std::collections::HashSet<String>,
+    /// The newest announcement this chain has staged but not yet delivered:
+    /// `(wake id, created_ms)`, advanced by [`Self::announce_wake`] and drained
+    /// into the durable Wake Watermark once a card write actually carries it
+    /// (ADR-0061). In-memory `announced_wakes` is the exactly-once gate; this
+    /// is the restart-surviving high-water mark, so it must never advance
+    /// before the write that makes the announcement user-visible.
+    pub(super) pending_watermark: Option<(String, i64)>,
     /// The Turn's anchor, captured as one fact: the identity of the user
     /// message this turn answers together with that message's server time. An
     /// external render arms with the external message's anchor directly; a
@@ -930,9 +937,21 @@ impl StreamAccumulator {
 
     /// Mark `wake_id`'s completion as announced on this chain — by the opening
     /// 承接 line or by the merged-path completion entry. Returns false when it
-    /// already was: the exactly-once gate both paths honour (ADR-0059).
-    pub(super) fn announce_wake(&mut self, wake_id: &str) -> bool {
-        self.announced_wakes.insert(wake_id.to_string())
+    /// already was: the exactly-once gate both paths honour (ADR-0059). A new
+    /// mark also stages the durable Wake Watermark (ADR-0061), which only a
+    /// delivering card write drains.
+    pub(super) fn announce_wake(&mut self, wake_id: &str, created_ms: i64) -> bool {
+        if !self.announced_wakes.insert(wake_id.to_string()) {
+            return false;
+        }
+        if self
+            .pending_watermark
+            .as_ref()
+            .is_none_or(|(_, staged_ms)| created_ms > *staged_ms)
+        {
+            self.pending_watermark = Some((wake_id.to_string(), created_ms));
+        }
+        true
     }
 
     /// The completed Background Task ledger entry a shell/subagent Wake leaves
