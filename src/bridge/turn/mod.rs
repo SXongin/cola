@@ -2402,7 +2402,7 @@ pub(crate) enum WakeContinuation {
 /// decides Supplement vs new Turn, and the Wake step's double-render guard.
 /// The variant is also the verdict's name in the routing log, so the label
 /// cannot drift from the predicate that produced it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 pub(crate) enum ChainOwnership {
     /// The inflight guard a Turn holds, or its out-of-turn follow inherited
     /// for its whole window.

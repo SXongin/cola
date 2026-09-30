@@ -348,7 +348,7 @@ async fn a_stale_live_read_with_no_owned_chain_starts_a_turn_with_the_merge_line
         );
         assert!(
             !app.inflight.lock().await.contains("ses_test"),
-            "the guard is released when the Turn settles"
+            "seed_terminal_card={seed_terminal_card}: the guard is released when the Turn settles"
         );
     }
 }
