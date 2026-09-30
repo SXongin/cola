@@ -1412,6 +1412,63 @@ async fn a_wake_newer_than_the_watermark_still_continues() {
     );
 }
 
+/// #424 follow-up (live 2026-09-30): once the restart continuation has
+/// rendered the Wake's work and finalized, later Sync passes must post
+/// nothing. The chain probe judged the whole newest-user Turn against the
+/// Fresh card's state — whose scope starts at the Wake — so the pre-Wake
+/// content the lost card had shown read as unrendered on every pass and a
+/// fresh 承接 card looped out each Sync tick.
+#[tokio::test]
+async fn a_settled_restart_continuation_is_not_re_split() {
+    let _wd = test_work_dir();
+    let resumed = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+        assistant(3_100, "CI 通过了。"),
+    ])
+    .with_executions(vec![execution(2_500), execution(4_000)])
+    .with_wakes(vec![shell_wake(2_900)]);
+    let (_dir, app, _backend, platform) = scripted_app(vec![resumed], Some(SessionStatus::Idle)).await;
+    // A topic session whose anchor a continuation can reply to: a lobby has
+    // no reply target, so the loop's re-split aborts with a warning instead
+    // of posting the cards the live defect showed.
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            thread_key: crate::config::ThreadKey::new("chat_1".into(), "om_wake_topic".into()),
+            session_id: "ses_test".into(),
+            directory: "/work".into(),
+            agent: None,
+            model: None,
+            variant: None,
+            auto_accept: false,
+            topic_anchor: Some("om_anchor".into()),
+            topic_root: None,
+        },
+    )
+    .await;
+
+    spawn_sync(&app);
+    // The restart continuation posts once and settles ✅.
+    wait_for_card_update(
+        &platform,
+        "the restart continuation's done card",
+        CardUpdates::Latest,
+        |card| card_header(card).contains("✅") && card_text(card).contains("CI 通过了。"),
+    )
+    .await;
+    let posted = continuation_sends(&platform).await.len();
+
+    // Several more sync passes over the same read: no further card may post.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        continuation_sends(&platform).await.len(),
+        posted,
+        "a settled restart continuation must not be re-split: {:?}",
+        platform.calls.lock().await
+    );
+}
+
 /// Acceptance 3 (ADR-0061): a message being admitted blocks the Fresh post —
 /// the claim is set before the Turn writes the prompt, so the Sync's stale
 /// read cannot race it — and releasing the claim lets the continuation post.
