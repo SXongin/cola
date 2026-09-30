@@ -5,9 +5,16 @@
 ADR-0059/0060 derive a **Background Task**'s liveness from durable transcript
 facts: the completed `shell`/`subagent` tool part whose metadata still says the
 run is `running`, minus every Wake that retired it. The completion record is
-the Wake — OpenCode 2.0.x writes one whenever a background job settles, and its
-restart sweep writes one for every persisted background job — so the happy path
-is exact, and no poll of the runtime is needed while the queue is healthy.
+the Wake — OpenCode 2.0.x writes one whenever a background job settles, and a
+managed-lifecycle server's restart sweep writes one for every persisted
+background job — so the happy path is exact, and no poll of the runtime is
+needed while the queue is healthy. The sweep is lifecycle-gated, though
+(`packages/server/src/process.ts`: `installRestartContinuity` runs only
+`if (lifecycle)`), and cola's Owned Server is a plain `opencode serve`: a host
+reboot that kills the server mid-task leaves the `job.background/*` markers
+unconsumed and no Wake anywhere (measured 2026-10-01 on 2.0.18 — a real reboot
+mid-run left two background shells' markers in the store and zero Wakes in the
+transcript).
 
 The derivation has a failure mode (issue #454, reproduced 2026-09-30 on 2.0.18):
 the process that hosted a background shell — or the layer that reported its
@@ -107,9 +114,12 @@ with positive evidence only.**
   launching a shell asks the new location and may see `Missing` for a live
   task. The move flow (#433) is rare mid-task and the loss is a false 失联, not
   a silently stuck card; a future cut can carry the launch directory.
-- The upstream fix remains desirable: a runtime that reconciles its own
-  transcript markers (or a job list endpoint) would make this a fallback
-  rather than the cure. #454 keeps that half open.
+- The upstream fix remains desirable: run the restart sweep for a plain
+  `opencode serve` too (or reconcile stale `job.background/*` markers at boot),
+  and/or expose a job list endpoint — this would make the client reconcile a
+  second line rather than the cure. The stale markers are a leak of their own:
+  a later managed-lifecycle boot on the same store would replay a cancellation
+  Wake for a task this client already retired. #454 keeps that half open.
 - Tests pin: the verdict decode (running list, per-shell terminal/404, active
   map, unknown statuses), the neutral reconciliation (ended/missing/running/
   inactive/no-verdict/empty), the marker and ending copy, and the yielded
