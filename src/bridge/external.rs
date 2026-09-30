@@ -127,6 +127,12 @@ impl ExternalFlow {
             }
             (active, sessions)
         };
+        // The same snapshot as a per-session lookup: the reap's records are
+        // keyed by session id, not by the thread loop.
+        let mapped: HashMap<String, (crate::config::ThreadKey, String)> = sessions
+            .iter()
+            .map(|(sid, thread_key, directory)| (sid.clone(), (thread_key.clone(), directory.clone())))
+            .collect();
         for (sid, thread_key, directory) in sessions {
             // One `external` span per Session (ADR-0048): the observation,
             // the notification and the renderer it arms are all retrievable
@@ -135,6 +141,27 @@ impl ExternalFlow {
             self.poll_session(handles, &active, &sid, &thread_key, &directory)
                 .instrument(span)
                 .await;
+        }
+        // The durable Live Card reap (ADR-0063): every record is reconciled
+        // against its Session's own reads on EVERY pass, after the sessions'
+        // own steps — so a Wake continuation this pass posted is already
+        // visible and the card it took the chain from is collected, never left
+        // looking live. A record whose session is no longer mapped is still
+        // reconciled (no directory to route its status read), so the sidecar
+        // cannot keep a record nothing will ever settle.
+        let read_timeout_ms = self.request_timeout_ms.load(std::sync::atomic::Ordering::Relaxed);
+        for (sid, record) in handles.cards.live_cards.entries() {
+            let mapped = mapped.get(&sid);
+            let span = crate::bridge::span::external(&sid, mapped.map(|(thread_key, _)| thread_key));
+            crate::bridge::reap::reconcile(
+                handles,
+                &sid,
+                mapped.map(|(_, directory)| directory.as_str()),
+                &record,
+                read_timeout_ms,
+            )
+            .instrument(span)
+            .await;
         }
     }
 
@@ -732,6 +759,13 @@ impl ExternalFlow {
                 };
                 match sent {
                     Ok(card_id) => {
+                        // The continuation takes the chain over: whatever card
+                        // a previous life left recorded is collected as taken
+                        // over and the durable record re-points at the
+                        // continuation (ADR-0063) — a chain handover never
+                        // leaves the old card looking live. This runs BEFORE
+                        // the id attach, whose own re-point collects nothing.
+                        Turn::track_live_card(&handles.cards, sid, &card_id, true).await;
                         Turn::set_card_message_id(&handles.cards, sid, &card_id).await;
                         // The card carried the 承接 line: the Wake is now
                         // user-visible, so the durable Wake Watermark advances

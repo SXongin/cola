@@ -474,9 +474,14 @@ impl Turn {
         {
             let mut cards = handles.cards.cards.lock().await;
             if let Some(card) = cards.get_mut(&session_id) {
-                card.card_message_id = Some(new_card_id);
+                card.card_message_id = Some(new_card_id.clone());
             }
         }
+        // The loading card is the session's live card now: persist the durable
+        // record (ADR-0063) — the anchor follows on the first read that carries
+        // the submitted message. A previously recorded orphan this Turn's card
+        // replaces is collected as taken over.
+        Self::track_live_card(&handles.cards, &session_id, &new_card_id, true).await;
 
         // The work context (ADR-0019) is captured before the prompt runs but
         // AFTER the card is live and its id known: the git read neither delays
@@ -608,6 +613,9 @@ impl Turn {
                 cards.insert(fresh_id.clone(), card);
             }
         }
+        // The live-card record is a fact about the card, not the session id it
+        // was filed under: re-key it so the fresh session's card is reap-able.
+        handles.cards.live_cards.rename(&self.session_id, &fresh_id);
         {
             let mut inflight = handles.waits.inflight.lock().await;
             inflight.remove(&self.session_id);
@@ -1435,6 +1443,76 @@ impl Turn {
         let write_lock = cards.write_lock(session_id).await;
         let _guard = write_lock.lock().await;
         flush::flush_card_locked(cards, session_id, flush::SplitPolicy::Allow).await;
+        Self::discard_spent_record(cards, session_id).await;
+    }
+
+    /// Record that `card_message_id` is now `session_id`'s live card
+    /// (ADR-0063): the durable fact Session Sync's reap needs after a restart.
+    /// Every path that sends a card INTO the Session tracks it — a Turn's
+    /// loading card, an external renderer's arm, a chain's continuation send —
+    /// so the record always names the one card a restart should reap.
+    ///
+    /// `collect_predecessor` collects a DIFFERENT previously recorded card as
+    /// taken over: true where this send opens a new chain over an orphan (a
+    /// fresh Turn, a Wake continuation armed after a restart, an external arm),
+    /// false where it continues the same chain (a split's continuation, a
+    /// re-adopt), whose predecessor the split — or the static snapshot it
+    /// replaces — already ended.
+    pub(crate) async fn track_live_card(
+        cards: &CardsHandle,
+        session_id: &str,
+        card_message_id: &str,
+        collect_predecessor: bool,
+    ) {
+        let (message_id, created_ms) = {
+            let live = cards.cards.lock().await;
+            match live.get(session_id) {
+                Some(card) => (
+                    card.acc.cola_message_id.clone().or_else(|| {
+                        card.acc
+                            .turn_anchor
+                            .as_ref()
+                            .map(|anchor| anchor.message_id.to_string())
+                    }),
+                    card.acc.turn_anchor.as_ref().map(|anchor| anchor.created_ms),
+                ),
+                None => (None, None),
+            }
+        };
+        // A card with no Turn message to scope a settle decision with cannot be
+        // reaped: no record, no reap attempt after a restart.
+        let Some(message_id) = message_id else {
+            return;
+        };
+        let previous = cards.live_cards.replace(
+            session_id,
+            crate::bridge::live_cards::LiveCard::new(card_message_id, message_id, created_ms),
+        );
+        if collect_predecessor
+            && let Some(previous) = previous
+            && previous.card_message_id != card_message_id
+        {
+            crate::bridge::reap::collect_orphan(cards, session_id, &previous.card_message_id).await;
+        }
+    }
+
+    /// Drop `session_id`'s durable record once its card reached a terminal
+    /// (ADR-0063): the record is spent, and keeping it would make the reap
+    /// PATCH a card nothing will ever update again. Called from every card
+    /// flush — the one write path every ending goes through, so a new terminal
+    /// state cannot leave the record behind. A yielded `Waiting` card keeps it
+    /// (the reap settles its true end later) and a live card keeps it (still
+    /// owed).
+    pub(crate) async fn discard_spent_record(cards: &CardsHandle, session_id: &str) {
+        let terminal = cards
+            .cards
+            .lock()
+            .await
+            .get(session_id)
+            .is_some_and(|card| card.acc.card_state.is_terminal());
+        if terminal {
+            cards.live_cards.remove(session_id);
+        }
     }
 
     /// Split `session_id`'s Card Chain at a user message (ADR-0043): append the
@@ -1684,6 +1762,9 @@ impl Turn {
             // Best effort, like every other finalize.
             state::refresh_work_context(cards, session_id).await;
             flush::flush_card_locked(cards, session_id, flush::SplitPolicy::Forbid).await;
+            // The quiet true end is a terminal: its durable record is spent
+            // (ADR-0063).
+            Self::discard_spent_record(cards, session_id).await;
             tracing::info!("yielded card settled in place: session {session_id} ({what})");
             return YieldedUpdate::Settled { notice_at };
         }
@@ -1983,11 +2064,14 @@ impl Turn {
 
     /// Re-point the live card identity at a new message (ADR-0028: a re-adopt
     /// mid-turn sends a fresh snapshot; the follow renderer keeps updating the
-    /// new card instead of the old one). The content is untouched.
+    /// new card instead of the old one). The content is untouched. The durable
+    /// record follows the re-point: the new card is the session's live card now
+    /// (the old snapshot was already static, so nothing is collected).
     pub(crate) async fn repoint_card(cards: &CardsHandle, session_id: &str, message_id: &str) {
         if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
             card.repoint(message_id);
         }
+        Self::track_live_card(cards, session_id, message_id, false).await;
     }
 
     /// Refresh the live card's work context at turn end (ADR-0019): re-read the
@@ -2256,6 +2340,13 @@ impl Turn {
         }) else {
             return false;
         };
+        // The card is live again: its durable record comes back with it (the
+        // terminal that owned the ending dropped it), so a crash during the
+        // re-armed run still reaps.
+        let card_message_id = Self::card_message_id(&handles.cards, session_id).await;
+        if let Some(card_message_id) = card_message_id {
+            Self::track_live_card(&handles.cards, session_id, &card_message_id, false).await;
+        }
         Self::flush_card(&handles.cards, session_id).await;
         follow::spawn(
             handles,
@@ -2530,6 +2621,11 @@ impl Turn {
             session_id.to_string(),
             state::CardSession::new(acc, Some(card_id.to_string())),
         );
+        // An adopted run's card is the session's live card: track it (the
+        // anchor is known here, so the record needs no transcript probe). A
+        // different previously recorded card was orphaned by this arm and is
+        // collected as taken over.
+        Self::track_live_card(cards, session_id, card_id, true).await;
     }
 }
 
@@ -2860,11 +2956,15 @@ impl Turn {
     }
 
     /// Attach the sent card's identity to an armed-but-idless continuation
-    /// (the Wake continuation's arm-then-send ordering, ADR-0059).
+    /// (the Wake continuation's arm-then-send ordering, ADR-0059). The durable
+    /// record follows the card (ADR-0063): a takeover path that replaces an
+    /// orphan calls [`Self::track_live_card`] with the collect flag BEFORE
+    /// this, and this call's own re-point collects nothing.
     pub(crate) async fn set_card_message_id(cards: &CardsHandle, session_id: &str, message_id: &str) {
         if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
             card.card_message_id = Some(message_id.to_string());
         }
+        Self::track_live_card(cards, session_id, message_id, false).await;
     }
 
     /// Drop an armed continuation whose card never sent: the session must not

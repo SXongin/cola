@@ -75,6 +75,11 @@ pub struct SharedCore {
     /// mapping: what a card has already announced survives a restart, so the
     /// no-chain Fresh continuation never re-posts it (#424).
     pub wake_watermarks: Arc<crate::bridge::wake_watermark::WakeWatermarks>,
+    /// The durable per-session Live Card record (ADR-0063), beside the session
+    /// mapping and the Wake Watermark: which card each Session is streaming
+    /// into, so Session Sync can reap the card a restart orphaned instead of
+    /// leaving it frozen (#438).
+    pub live_cards: Arc<crate::bridge::live_cards::LiveCards>,
     /// Permission flow: owns `sent_cards`, polls pending requests, auto-accepts
     /// for `/autoaccept` sessions, and handles the "perm" card action.
     pub permission: Arc<crate::bridge::request::flow::RequestFlow>,
@@ -237,6 +242,9 @@ impl SharedCore {
             wake_watermarks: Arc::new(crate::bridge::wake_watermark::WakeWatermarks::load(
                 cfg.bridge.session_file.with_file_name("wake_watermarks.json"),
             )),
+            live_cards: Arc::new(crate::bridge::live_cards::LiveCards::load(
+                cfg.bridge.session_file.with_file_name("live_cards.json"),
+            )),
             permission: Arc::new(crate::bridge::request::flow::RequestFlow::new(
                 Box::new(crate::bridge::request::kind::PermissionKind),
                 Arc::clone(&surfaces),
@@ -375,6 +383,7 @@ impl SharedCore {
             Arc::clone(&self.cover_titles),
             Arc::clone(&self.feishu),
             Arc::clone(&self.wake_watermarks),
+            Arc::clone(&self.live_cards),
             Arc::clone(&self.card_write_locks),
         )
     }
