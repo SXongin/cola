@@ -125,15 +125,17 @@ impl CardState {
     }
 
     /// The ending's word in Session Sync's reap INFO line (ADR-0063): one
-    /// match here, so the reap cannot restate the state vocabulary. The four
-    /// states the reap stamps have their own words; a state it never stamps
-    /// falls back to the bare word rather than inventing a meaning.
+    /// match here, so the reap cannot restate the state vocabulary. The five
+    /// states the reap stamps — the settle endings and the takeover collect —
+    /// have their own words; a state it never stamps falls back to the bare
+    /// word rather than inventing a meaning.
     pub(crate) fn reap_word(&self) -> &'static str {
         match self {
             Self::Done => "settled done",
             Self::Error => "settled error",
             Self::Waiting => "settled waiting",
             Self::Unreceived => "ended unreceived",
+            Self::TakenOver => "collected the orphaned card",
             _ => "settled",
         }
     }
@@ -421,6 +423,11 @@ mod tests {
         assert_eq!(CardState::Error.reap_word(), "settled error");
         assert_eq!(CardState::Waiting.reap_word(), "settled waiting");
         assert_eq!(CardState::Unreceived.reap_word(), "ended unreceived");
+        assert_eq!(
+            CardState::TakenOver.reap_word(),
+            "collected the orphaned card",
+            "the takeover collect has its own word too"
+        );
         assert_eq!(
             CardState::Streaming.reap_word(),
             "settled",

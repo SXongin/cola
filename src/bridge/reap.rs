@@ -54,7 +54,12 @@ pub(crate) async fn collect_orphan(cards: &CardsHandle, session_id: &str, card_m
     }
     let card = ending_card(CardState::TakenOver, None, None);
     match cards.feishu.update_message(card_message_id, &card).await {
-        Ok(()) => tracing::info!("live-card reap: session {session_id} collected the orphaned card"),
+        // The one reap vocabulary: the INFO line's ending word comes from the
+        // state itself, exactly like every `ReapPass::settle` line.
+        Ok(()) => tracing::info!(
+            "live-card reap: session {session_id} {}",
+            CardState::TakenOver.reap_word()
+        ),
         Err(e) => tracing::warn!(
             "live-card reap: session {session_id} could not collect card {card_message_id}: {e}"
         ),
