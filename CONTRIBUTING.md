@@ -180,15 +180,24 @@ where the guide pair can drift. The release cut keeps its CodeQL gate.
 ### Security scanning alerts
 
 CodeQL runs on `main` pushes, PRs and a weekly schedule, but on normal PRs it is
-advisory (above). Its credential and cleartext findings on this repo fall into
-two known, deliberate categories — dismiss them with the matching reason instead
-of "fixing" the code:
+advisory (above). Rust extraction analyzes `#[cfg(test)]` code by default
+(github/codeql#18347; the upstream opt-out `cargo_cfg_overrides=-test` is a CLI
+extractor option a code scanning workflow cannot set), so test-only findings are
+handled by shape:
 
-- **Test-only values** — fixture passwords in `#[cfg(test)]` code and the
-  ignored live harness (`src/opencode/live/`). Reason: *used in tests*.
+- **Test-only files and trees** are excluded from the CodeQL database by
+  `.github/codeql/codeql-config.yml` (`paths-ignore`) — the bridge test suite
+  and its harness (`src/bridge/tests/**`, `src/bridge/test_support.rs`), the
+  test servers (`src/test_*.rs`), the OpenCode adapter's dedicated test modules
+  (`src/opencode/tests.rs`, `src/opencode/conformance.rs` and their `v1`/`v2`
+  equivalents), the fixture corpus (`src/opencode/wire/**`) and the ignored
+  live harness (`src/opencode/live/**`). A new test-only file or tree belongs on
+  that list, where it produces no alerts at all rather than another dismissal.
+- **In-file `#[cfg(test)] mod tests`** cannot be path-filtered — the file also
+  ships production code — so findings there are dismissed: *used in tests*.
 - **cola's own server bootstrap** — the fixed password passed to the
   self-spawned `opencode serve --hostname 127.0.0.1` (ADR-0013), which must stay
-  stable across restarts. Reason: *won't fix*.
+  stable across restarts: *won't fix*.
 
 A genuine scanner mis-read (e.g. an empty string flowing into a password
 parameter) is *false positive*. Never obfuscate a literal (`concat!`, runtime
