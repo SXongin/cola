@@ -147,6 +147,15 @@ pub(crate) fn error_line(error: &str) -> String {
     format!("\n**错误**: {error}")
 }
 
+/// The one line a settling card records a Session's location move on (#428,
+/// #439), [`error_line`]'s sibling: the move named, the new directory in
+/// backticks. Built from the session's own directory alone — no chat content.
+/// The reap renders it as its own markdown element, so it carries no leading
+/// blank line.
+pub(crate) fn move_line(directory: &str) -> String {
+    format!("**会话已迁移**: `{directory}`")
+}
+
 /// How much text ONE card carries before it is finalized and the rest continues
 /// on the next card. Kept below Feishu's card limits so a card full of text
 /// never overflows; long answers flow across continuation cards instead of a
@@ -416,6 +425,16 @@ mod tests {
             CardState::Streaming.reap_word(),
             "settled",
             "a state the reap never stamps keeps the bare word"
+        );
+    }
+
+    /// The settle card's move line (#439) names the new directory alone — no
+    /// chat content can ride a directory formatter.
+    #[test]
+    fn the_move_line_names_the_directory_alone() {
+        assert_eq!(
+            move_line("/work/.worktrees/zh-user-guide"),
+            "**会话已迁移**: `/work/.worktrees/zh-user-guide`"
         );
     }
 
