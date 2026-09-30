@@ -123,6 +123,28 @@ impl CardState {
     pub(crate) fn offers_recovery(&self) -> bool {
         matches!(self, Self::Error | Self::Unreceived)
     }
+
+    /// The ending's word in Session Sync's reap INFO line (ADR-0063): one
+    /// match here, so the reap cannot restate the state vocabulary. The four
+    /// states the reap stamps have their own words; a state it never stamps
+    /// falls back to the bare word rather than inventing a meaning.
+    pub(crate) fn reap_word(&self) -> &'static str {
+        match self {
+            Self::Done => "settled done",
+            Self::Error => "settled error",
+            Self::Waiting => "settled waiting",
+            Self::Unreceived => "ended unreceived",
+            _ => "settled",
+        }
+    }
+}
+
+/// The one line a card records a settled failure on (the accumulator's Error
+/// card, the reap's reaped ending): the failure's own text, written verbatim
+/// after `**错误**: ` and preceded by a blank line, so it reads as its own
+/// paragraph under whatever content the card carries.
+pub(crate) fn error_line(error: &str) -> String {
+    format!("\n**错误**: {error}")
 }
 
 /// How much text ONE card carries before it is finalized and the rest continues
@@ -379,6 +401,22 @@ mod tests {
         ] {
             assert!(state.overrides_awaiting(), "{state:?} has its own ending to show");
         }
+    }
+
+    /// The reap's INFO line reads its ending word from the state itself
+    /// (ADR-0063): each ending the reap stamps has its own word, so the log
+    /// vocabulary cannot drift from the card vocabulary.
+    #[test]
+    fn reap_words_name_each_ending_the_reap_stamps() {
+        assert_eq!(CardState::Done.reap_word(), "settled done");
+        assert_eq!(CardState::Error.reap_word(), "settled error");
+        assert_eq!(CardState::Waiting.reap_word(), "settled waiting");
+        assert_eq!(CardState::Unreceived.reap_word(), "ended unreceived");
+        assert_eq!(
+            CardState::Streaming.reap_word(),
+            "settled",
+            "a state the reap never stamps keeps the bare word"
+        );
     }
 
     /// The TakenOver collect (ADR-0063) is terminal — the successor owns the

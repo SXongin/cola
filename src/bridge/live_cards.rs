@@ -2,27 +2,28 @@
 //! streaming into, and the Turn it answers, so a restart can reap the card it
 //! orphaned instead of leaving it frozen forever.
 //!
-//! Persisted beside the session mapping (`live_cards.json`) — the
-//! wake_watermarks and `interactive_surfaces.json` pattern: a missing or
+//! Persisted beside the session mapping (`live_cards.json`) through the
+//! shared best-effort sidecar I/O ([`crate::bridge::sidecar`]): a missing or
 //! corrupt file is an empty record (fail open — the pre-#438 behavior freezes
-//! at most the card the crash orphaned, then self-heals), writes are
-//! best-effort temp-file + rename, and an empty record removes the file.
+//! at most the card the crash orphaned, then self-heals), writes are atomic
+//! temp-file + rename, and an empty record removes the file.
 //!
 //! At most one record per Session: it is written when a card becomes the
 //! Session's live card, re-pointed when the same chain continues on a new card
 //! or a successor takes over, and removed when the card reaches a terminal or
-//! is collected (ADR-0063). The record holds no chat content — only the two
-//! message identities and the anchor's server time — so an orphan can be
-//! settled from the transcript without storing anything the transcript does
-//! not already have.
+//! is collected (ADR-0063). The record holds no chat content — the card's
+//! message id, the Turn's own message id and anchor, and the directory its
+//! reads route under — so an orphan can be settled from the transcript without
+//! storing anything the transcript does not already have.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
 use crate::backend::{MessageId, TurnAnchor};
+use crate::bridge::sidecar;
 
 /// One Session's durable live-card facts. `card_message_id` is the Feishu
 /// message the reap PATCHes; `message_id` is the Turn's own message (the
@@ -33,12 +34,19 @@ use crate::backend::{MessageId, TurnAnchor};
 /// never been observed: the reap then probes the transcript with `message_id`,
 /// and a read that still carries no such user message ends the card Unreceived
 /// (ADR-0062), never ✅.
+///
+/// `directory` is the Session's working directory at track time: on a
+/// generation whose reads route per directory (V1), the reap must ask the
+/// instance the card belongs to, never the process's cwd — and an unmapped
+/// Session has no mapping to fall back to (finding #438).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct LiveCard {
     pub(crate) card_message_id: String,
-    pub(crate) message_id: String,
+    pub(crate) message_id: MessageId,
     #[serde(default)]
     pub(crate) created_ms: Option<i64>,
+    #[serde(default)]
+    pub(crate) directory: Option<String>,
     /// In-memory only: the reap already PATCHed this card into its waiting
     /// ending. A record that is rewritten (a new card becomes live) starts
     /// unmarked; the flag only suppresses PATCHing the same waiting card on
@@ -50,15 +58,23 @@ pub(crate) struct LiveCard {
 impl LiveCard {
     pub(crate) fn new(
         card_message_id: impl Into<String>,
-        message_id: impl Into<String>,
+        message_id: MessageId,
         created_ms: Option<i64>,
     ) -> Self {
         Self {
             card_message_id: card_message_id.into(),
-            message_id: message_id.into(),
+            message_id,
             created_ms,
+            directory: None,
             waiting_reaped: false,
         }
+    }
+
+    /// Carry the Session's directory so the reap's reads route to the right
+    /// instance. An empty directory is unknown, exactly like `None`.
+    pub(crate) fn with_directory(mut self, directory: Option<String>) -> Self {
+        self.directory = directory.filter(|directory| !directory.is_empty());
+        self
     }
 
     /// The Turn anchor this record scopes a settle decision with, when the
@@ -67,7 +83,7 @@ impl LiveCard {
     /// The message id travels with its time as one fact, like every anchor.
     pub(crate) fn anchor(&self) -> Option<TurnAnchor> {
         Some(TurnAnchor {
-            message_id: MessageId::new(&self.message_id),
+            message_id: self.message_id.clone(),
             created_ms: self.created_ms?,
         })
     }
@@ -95,26 +111,7 @@ impl LiveCards {
     /// unreadable. A corrupt file is logged and replaced on the next write —
     /// never an error: a lost record only means a restart reaps nothing.
     pub(crate) fn load(path: PathBuf) -> Self {
-        let sessions = match std::fs::read_to_string(&path) {
-            Ok(raw) => match serde_json::from_str::<LiveCardFile>(&raw) {
-                Ok(file) => file.sessions,
-                Err(e) => {
-                    tracing::warn!(
-                        "could not parse {} ({e}); starting with an empty live-card record",
-                        path.display()
-                    );
-                    HashMap::new()
-                }
-            },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
-            Err(e) => {
-                tracing::warn!(
-                    "could not read {} ({e}); starting with an empty live-card record",
-                    path.display()
-                );
-                HashMap::new()
-            }
-        };
+        let sessions = sidecar::load::<LiveCardFile>(&path, "live-card record").sessions;
         Self {
             path,
             sessions: Mutex::new(sessions),
@@ -146,7 +143,7 @@ impl LiveCards {
     pub(crate) fn replace(&self, session_id: &str, card: LiveCard) -> Option<LiveCard> {
         let mut sessions = self.lock();
         let previous = sessions.insert(session_id.to_string(), card);
-        write_file(&self.path, &sessions);
+        write(&self.path, &sessions);
         previous
     }
 
@@ -155,7 +152,7 @@ impl LiveCards {
     pub(crate) fn remove(&self, session_id: &str) {
         let mut sessions = self.lock();
         if sessions.remove(session_id).is_some() {
-            write_file(&self.path, &sessions);
+            write(&self.path, &sessions);
         }
     }
 
@@ -167,7 +164,7 @@ impl LiveCards {
             return;
         };
         sessions.insert(to.to_string(), card);
-        write_file(&self.path, &sessions);
+        write(&self.path, &sessions);
     }
 
     /// Refresh the anchor of the record naming `card_message_id` — the render
@@ -181,13 +178,13 @@ impl LiveCards {
             return;
         };
         if card.card_message_id != card_message_id
-            || (card.message_id == anchor.message_id.as_str() && card.created_ms == Some(anchor.created_ms))
+            || (card.message_id == anchor.message_id && card.created_ms == Some(anchor.created_ms))
         {
             return;
         }
-        card.message_id = anchor.message_id.to_string();
+        card.message_id = anchor.message_id.clone();
         card.created_ms = Some(anchor.created_ms);
-        write_file(&self.path, &sessions);
+        write(&self.path, &sessions);
     }
 
     /// Mark that `card_message_id`'s waiting ending was already PATCHed, so
@@ -210,38 +207,17 @@ impl LiveCards {
     }
 }
 
-/// Write the record atomically (temp file + rename), best-effort: the record
-/// only feeds the next restart's reap, so a failure logs and changes nothing
-/// else. An empty record removes the file.
-fn write_file(path: &Path, sessions: &HashMap<String, LiveCard>) {
-    if sessions.is_empty() {
-        if let Err(e) = std::fs::remove_file(path)
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::warn!("live cards: could not remove {}: {}", path.display(), e);
-        }
-        return;
-    }
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let data = match serde_json::to_string(&LiveCardFile {
-        sessions: sessions.clone(),
-    }) {
-        Ok(data) => data,
-        Err(e) => {
-            tracing::warn!("live cards: could not serialize the record: {e}");
-            return;
-        }
-    };
-    let tmp = path.with_extension("tmp");
-    if let Err(e) = std::fs::write(&tmp, data) {
-        tracing::warn!("live cards: could not write {}: {}", tmp.display(), e);
-        return;
-    }
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        tracing::warn!("live cards: could not replace {}: {}", path.display(), e);
-    }
+/// Persist the record through the shared sidecar writer; an empty record
+/// removes the file.
+fn write(path: &std::path::Path, sessions: &HashMap<String, LiveCard>) {
+    sidecar::store(
+        path,
+        "live-card record",
+        &LiveCardFile {
+            sessions: sessions.clone(),
+        },
+        sessions.is_empty(),
+    );
 }
 
 #[cfg(test)]
@@ -255,31 +231,52 @@ mod tests {
         let cards = LiveCards::load(path.clone());
 
         assert_eq!(
-            cards.replace("ses_a", LiveCard::new("om_card_1", "msg_cola_1", Some(1_000))),
+            cards.replace(
+                "ses_a",
+                LiveCard::new("om_card_1", MessageId::new("msg_cola_1"), Some(1_000))
+            ),
             None
         );
-        cards.replace("ses_b", LiveCard::new("om_card_2", "msg_cola_2", None));
+        cards.replace(
+            "ses_b",
+            LiveCard::new("om_card_2", MessageId::new("msg_cola_2"), None),
+        );
 
         let reloaded = LiveCards::load(path.clone());
         assert_eq!(
             reloaded.get("ses_a"),
-            Some(LiveCard::new("om_card_1", "msg_cola_1", Some(1_000)))
+            Some(LiveCard::new(
+                "om_card_1",
+                MessageId::new("msg_cola_1"),
+                Some(1_000)
+            ))
         );
         assert_eq!(
             reloaded.get("ses_b"),
-            Some(LiveCard::new("om_card_2", "msg_cola_2", None))
+            Some(LiveCard::new("om_card_2", MessageId::new("msg_cola_2"), None))
         );
         assert_eq!(reloaded.get("ses_c"), None);
 
         // Replacing returns the previous record and keeps one per session.
-        let previous = cards.replace("ses_a", LiveCard::new("om_card_3", "msg_cola_1", Some(1_000)));
+        let previous = cards.replace(
+            "ses_a",
+            LiveCard::new("om_card_3", MessageId::new("msg_cola_1"), Some(1_000)),
+        );
         assert_eq!(
             previous,
-            Some(LiveCard::new("om_card_1", "msg_cola_1", Some(1_000)))
+            Some(LiveCard::new(
+                "om_card_1",
+                MessageId::new("msg_cola_1"),
+                Some(1_000)
+            ))
         );
         assert_eq!(
             LiveCards::load(path.clone()).get("ses_a"),
-            Some(LiveCard::new("om_card_3", "msg_cola_1", Some(1_000)))
+            Some(LiveCard::new(
+                "om_card_3",
+                MessageId::new("msg_cola_1"),
+                Some(1_000)
+            ))
         );
 
         // Removing the last record removes the file entirely.
@@ -294,13 +291,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("live_cards.json");
         let cards = LiveCards::load(path.clone());
-        cards.replace("ses_old", LiveCard::new("om_card_1", "msg_cola_1", Some(1_000)));
+        cards.replace(
+            "ses_old",
+            LiveCard::new("om_card_1", MessageId::new("msg_cola_1"), Some(1_000)),
+        );
 
         cards.rename("ses_old", "ses_fresh");
         assert_eq!(cards.get("ses_old"), None);
         assert_eq!(
             LiveCards::load(path).get("ses_fresh"),
-            Some(LiveCard::new("om_card_1", "msg_cola_1", Some(1_000)))
+            Some(LiveCard::new(
+                "om_card_1",
+                MessageId::new("msg_cola_1"),
+                Some(1_000)
+            ))
         );
     }
 
@@ -314,10 +318,17 @@ mod tests {
         let cards = LiveCards::load(path.clone());
         assert_eq!(cards.get("ses_a"), None, "a corrupt file reads as empty");
         // The next write replaces the corrupt file with a valid one.
-        cards.replace("ses_a", LiveCard::new("om_card_1", "msg_cola_1", Some(1_000)));
+        cards.replace(
+            "ses_a",
+            LiveCard::new("om_card_1", MessageId::new("msg_cola_1"), Some(1_000)),
+        );
         assert_eq!(
             LiveCards::load(path).get("ses_a"),
-            Some(LiveCard::new("om_card_1", "msg_cola_1", Some(1_000)))
+            Some(LiveCard::new(
+                "om_card_1",
+                MessageId::new("msg_cola_1"),
+                Some(1_000)
+            ))
         );
     }
 
@@ -328,7 +339,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("live_cards.json");
         let cards = LiveCards::load(path.clone());
-        cards.replace("ses_a", LiveCard::new("om_card_1", "msg_cola_1", Some(1_000)));
+        cards.replace(
+            "ses_a",
+            LiveCard::new("om_card_1", MessageId::new("msg_cola_1"), Some(1_000)),
+        );
 
         assert!(!cards.mark_waiting_reaped("ses_a", "om_other"));
         assert!(!cards.get("ses_a").unwrap().waiting_reaped);
@@ -337,15 +351,41 @@ mod tests {
 
         // A reload (a restart) forgets it; a rewrite (a new live card) resets it.
         assert!(!LiveCards::load(path.clone()).get("ses_a").unwrap().waiting_reaped);
-        cards.replace("ses_a", LiveCard::new("om_card_2", "msg_cola_1", Some(1_000)));
+        cards.replace(
+            "ses_a",
+            LiveCard::new("om_card_2", MessageId::new("msg_cola_1"), Some(1_000)),
+        );
         assert!(!cards.get("ses_a").unwrap().waiting_reaped);
+    }
+
+    /// The stored directory round-trips (the reap's V1 route); an empty string
+    /// is unknown, exactly like `None`.
+    #[test]
+    fn the_directory_round_trips_and_an_empty_one_reads_as_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live_cards.json");
+        let cards = LiveCards::load(path.clone());
+        cards.replace(
+            "ses_a",
+            LiveCard::new("om_card_1", MessageId::new("msg_cola_1"), Some(1_000))
+                .with_directory(Some("/work".into())),
+        );
+        cards.replace(
+            "ses_b",
+            LiveCard::new("om_card_2", MessageId::new("msg_cola_2"), None)
+                .with_directory(Some(String::new())),
+        );
+
+        let reloaded = LiveCards::load(path);
+        assert_eq!(reloaded.get("ses_a").unwrap().directory.as_deref(), Some("/work"));
+        assert_eq!(reloaded.get("ses_b").unwrap().directory, None);
     }
 
     #[test]
     fn the_anchor_travels_only_once_its_server_time_is_known() {
-        let anchorless = LiveCard::new("om_card_1", "msg_cola_1", None);
+        let anchorless = LiveCard::new("om_card_1", MessageId::new("msg_cola_1"), None);
         assert_eq!(anchorless.anchor(), None);
-        let anchored = LiveCard::new("om_card_1", "msg_cola_1", Some(1_000));
+        let anchored = LiveCard::new("om_card_1", MessageId::new("msg_cola_1"), Some(1_000));
         assert_eq!(
             anchored.anchor(),
             Some(TurnAnchor {

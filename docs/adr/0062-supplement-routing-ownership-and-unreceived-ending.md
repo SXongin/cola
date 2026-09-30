@@ -62,6 +62,11 @@ run's start; V2 gains the `POST /api/session/{id}/resume` write. The button is
 the user's consent — cola never interrupts a run on its own, because a long
 tool call and a dead run look identical from outside.
 
+The same ending reaped onto a card a restart orphaned shows the copy without
+the action (ADR-0063): the click's fixture — the original prompt and the card
+session it would claim — died with the process, so a button there could only
+be dead. The user re-sends instead.
+
 The new-Turn card opens with 「📨 已收到，将并入当前运行」 when the advisory
 read said live, and an ordinary loading card otherwise.
 

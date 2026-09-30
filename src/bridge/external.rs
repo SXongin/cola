@@ -151,12 +151,12 @@ impl ExternalFlow {
         // cannot keep a record nothing will ever settle.
         let read_timeout_ms = self.request_timeout_ms.load(std::sync::atomic::Ordering::Relaxed);
         for (sid, record) in handles.cards.live_cards.entries() {
-            let mapped = mapped.get(&sid);
-            let span = crate::bridge::span::external(&sid, mapped.map(|(thread_key, _)| thread_key));
+            let mapping = mapped.get(&sid);
+            let span = crate::bridge::span::external(&sid, mapping.map(|(thread_key, _)| thread_key));
             crate::bridge::reap::reconcile(
                 handles,
                 &sid,
-                mapped.map(|(_, directory)| directory.as_str()),
+                mapping.map(|(_, directory)| directory.as_str()),
                 &record,
                 read_timeout_ms,
             )
@@ -765,7 +765,7 @@ impl ExternalFlow {
                         // continuation (ADR-0063) — a chain handover never
                         // leaves the old card looking live. This runs BEFORE
                         // the id attach, whose own re-point collects nothing.
-                        Turn::track_live_card(&handles.cards, sid, &card_id, true).await;
+                        Turn::track_live_card(&handles.cards, sid, &card_id, true, Some(directory)).await;
                         Turn::set_card_message_id(&handles.cards, sid, &card_id).await;
                         // The card carried the 承接 line: the Wake is now
                         // user-visible, so the durable Wake Watermark advances

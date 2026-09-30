@@ -58,36 +58,17 @@ fn target_order(a: &ReminderTarget, b: &ReminderTarget) -> std::cmp::Ordering {
         .then_with(|| b.user_ids.cmp(&a.user_ids))
 }
 
-/// Write the persisted pin set atomically (temp file + rename), best-effort:
-/// it only feeds the next startup's orphan sweep, so a failure logs and
-/// changes nothing else. An empty set removes the file.
+/// Write the persisted pin set through the shared sidecar I/O: atomic
+/// (temp file + rename), best-effort, and an empty set removes the file. The
+/// set only feeds the next startup's orphan sweep, so a failure logs and
+/// changes nothing else.
 fn write_pins_file(path: &Path, pins: &[PinnedChat]) {
-    if pins.is_empty() {
-        if let Err(e) = std::fs::remove_file(path)
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::warn!("instant reminder: could not remove {}: {}", path.display(), e);
-        }
-        return;
-    }
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let data = match serde_json::to_string(&PinnedChatsFile { pins: pins.to_vec() }) {
-        Ok(data) => data,
-        Err(e) => {
-            tracing::warn!("instant reminder: could not serialize the pin file: {e}");
-            return;
-        }
-    };
-    let tmp = path.with_extension("tmp");
-    if let Err(e) = std::fs::write(&tmp, data) {
-        tracing::warn!("instant reminder: could not write {}: {}", tmp.display(), e);
-        return;
-    }
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        tracing::warn!("instant reminder: could not replace {}: {}", path.display(), e);
-    }
+    crate::bridge::sidecar::store(
+        path,
+        "instant reminder",
+        &PinnedChatsFile { pins: pins.to_vec() },
+        pins.is_empty(),
+    );
 }
 
 /// The reminder cola believes is currently ON at Feishu, the generation that
@@ -469,6 +450,11 @@ impl ReminderState {
         let Some(path) = &self.pins_file else {
             return;
         };
+        // Deliberately NOT the shared `sidecar::load`: a corrupt pin file is
+        // left UNTOUCHED (logged and skipped) — its entries are clears owed to
+        // Feishu, so reading it as empty would silently orphan the pins the
+        // fail-open recovery records the shared loader serves. The shared
+        // writer above is used because the write semantics are identical.
         let Ok(raw) = std::fs::read_to_string(path) else {
             return; // Missing (or unreadable) means nothing recorded.
         };

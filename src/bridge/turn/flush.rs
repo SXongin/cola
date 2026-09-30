@@ -99,6 +99,12 @@ async fn advance_card_fallback(cards: &CardsHandle, session_id: &str) -> Fallbac
 /// `split_policy` decides whether an over-budget slice may finalize the card
 /// and continue on a new one ([`SplitPolicy`]).
 pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, split_policy: SplitPolicy) {
+    // A terminal card's durable record is spent (ADR-0063): drop it here, at
+    // the ONE entry every card write goes through, so an ending stamped
+    // through this flush can never leave the record behind — whatever caller
+    // queued the write. A live or yielded card keeps its record, and a card
+    // that continues the chain below re-tracks the new one.
+    Turn::discard_spent_record(cards, session_id).await;
     // The card-chain state a flush resumes from: a pending Supplement split
     // (ADR-0043) and whether the tracked card is still the live (growing) one.
     // Both survive the flush — a chain that exhausted the size bound, or died
@@ -385,7 +391,7 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, spl
                 // The chain continues on a new card: the durable record
                 // follows it (ADR-0063). No predecessor is collected — the
                 // split above finalized the outgoing card itself.
-                Turn::track_live_card(cards, session_id, &new_id, false).await;
+                Turn::track_live_card(cards, session_id, &new_id, false, None).await;
                 // The continuation takes the blocks over from the finalized
                 // slice it follows (its spans are the tail this card renders).
                 cards

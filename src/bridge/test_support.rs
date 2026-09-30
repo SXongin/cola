@@ -1326,6 +1326,21 @@ impl MockBackend {
         self
     }
 
+    /// [`given_transcript`] after the app is built (through the `Arc` the app
+    /// holds): script a session the pass must be able to read — a second
+    /// mapped session whose reads are a test's proof-of-pass, or a session
+    /// whose read changes mid-life.
+    pub(crate) async fn given_transcript_after_build(
+        &self,
+        session_id: &str,
+        snapshots: Vec<SessionTranscript>,
+    ) {
+        self.transcript_scripts
+            .lock()
+            .await
+            .insert(session_id.to_string(), snapshots);
+    }
+
     /// Scenario: hold every `prompt` until the returned semaphore is released
     /// — the test can keep a turn in flight and interleave state through the
     /// normal seams.
