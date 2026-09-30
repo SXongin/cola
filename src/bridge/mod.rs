@@ -18,6 +18,7 @@ pub(crate) mod reap;
 pub mod reminder;
 pub mod request;
 pub mod session;
+pub(crate) mod sidecar;
 pub mod snapshot;
 pub mod snapshot_claims;
 pub mod span;

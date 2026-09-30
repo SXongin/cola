@@ -15,6 +15,7 @@
 //! They are typed here and empty on a generation that records none (V1), so no
 //! flow re-derives them from message kinds or timestamps.
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// One Session's normalized read: every message the backend reports, decoded
@@ -344,8 +345,9 @@ impl TranscriptMessage {
     }
 }
 
-/// A message's opaque server identity.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+/// A message's opaque server identity. Serializes as the bare id string (a
+/// newtype), so a durable record that names a message stays readable.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct MessageId(String);
 
 impl MessageId {

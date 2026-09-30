@@ -119,7 +119,7 @@ A user message sent while cola itself owns its **Session**'s live **Execution** 
 _Avoid_: Follow-up, addition, queued message
 
 **Unreceived Message** (未被接收的消息):
-A user message a **Turn** submitted but the Session never promoted into the Session Transcript — the Backend accepted it durably, yet no runner merged it, so nobody will answer it. The Turn's card ends 「⚠️ 这条消息未被接收」 and offers 「重新发起」 (interrupt, then resume, so the queued message is promoted when the new run starts); it never settles ✅ (ADR-0062).
+A user message a **Turn** submitted but the Session never promoted into the Session Transcript — the Backend accepted it durably, yet no runner merged it, so nobody will answer it. The Turn's card ends 「⚠️ 这条消息未被接收」 and offers 「重新发起」 (interrupt, then resume, so the queued message is promoted when the new run starts); it never settles ✅ (ADR-0062). A card a cola restart reaped into this ending (ADR-0063) shows the same copy without the action — the click's fixture died with the process — so the user re-sends instead.
 _Avoid_: Failed message, lost message (the submit succeeded — no run ever received it)
 
 **Background Task** (后台任务):

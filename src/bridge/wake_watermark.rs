@@ -17,10 +17,12 @@
 //! temp-file + rename, and an empty record removes the file.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
+
+use crate::bridge::sidecar;
 
 /// One session's newest announced Wake: its identity and server time travel
 /// together, the same one-fact anchor rule as [`TurnAnchor`].
@@ -53,26 +55,7 @@ impl WakeWatermarks {
     /// unreadable. A corrupt file is logged and replaced on the next write —
     /// never an error: the record only gates the next restart's continuation.
     pub(crate) fn load(path: PathBuf) -> Self {
-        let sessions = match std::fs::read_to_string(&path) {
-            Ok(raw) => match serde_json::from_str::<WakeMarkFile>(&raw) {
-                Ok(file) => file.sessions,
-                Err(e) => {
-                    tracing::warn!(
-                        "could not parse {} ({e}); starting with an empty Wake watermark",
-                        path.display()
-                    );
-                    HashMap::new()
-                }
-            },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
-            Err(e) => {
-                tracing::warn!(
-                    "could not read {} ({e}); starting with an empty Wake watermark",
-                    path.display()
-                );
-                HashMap::new()
-            }
-        };
+        let sessions = sidecar::load::<WakeMarkFile>(&path, "Wake watermark").sessions;
         Self {
             path,
             sessions: Mutex::new(sessions),
@@ -105,45 +88,18 @@ impl WakeWatermarks {
                 created_ms,
             },
         );
-        write_file(&self.path, &sessions);
+        sidecar::store(
+            &self.path,
+            "Wake watermark",
+            &WakeMarkFile {
+                sessions: sessions.clone(),
+            },
+            sessions.is_empty(),
+        );
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, WakeMark>> {
         self.sessions.lock().unwrap_or_else(|e| e.into_inner())
-    }
-}
-
-/// Write the record atomically (temp file + rename), best-effort: the record
-/// only feeds the next restart's continuation, so a failure logs and changes
-/// nothing else. An empty record removes the file.
-fn write_file(path: &Path, sessions: &HashMap<String, WakeMark>) {
-    if sessions.is_empty() {
-        if let Err(e) = std::fs::remove_file(path)
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::warn!("wake watermark: could not remove {}: {}", path.display(), e);
-        }
-        return;
-    }
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let data = match serde_json::to_string(&WakeMarkFile {
-        sessions: sessions.clone(),
-    }) {
-        Ok(data) => data,
-        Err(e) => {
-            tracing::warn!("wake watermark: could not serialize the record: {e}");
-            return;
-        }
-    };
-    let tmp = path.with_extension("tmp");
-    if let Err(e) = std::fs::write(&tmp, data) {
-        tracing::warn!("wake watermark: could not write {}: {}", tmp.display(), e);
-        return;
-    }
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        tracing::warn!("wake watermark: could not replace {}: {}", path.display(), e);
     }
 }
 

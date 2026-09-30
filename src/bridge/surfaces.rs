@@ -20,12 +20,13 @@
 //! and must not rewrite the file every second.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
 use crate::bridge::card_handles::BlockSpan;
+use crate::bridge::sidecar;
 use crate::bridge::snapshot_claims::ClaimKind;
 
 /// One live interaction block and the card that renders it — the persisted
@@ -92,26 +93,7 @@ impl Surfaces {
     /// unreadable. A corrupt file is logged and replaced on the next write —
     /// never an error: the mirror only feeds the next restart's re-adoption.
     pub fn load(path: PathBuf) -> Self {
-        let state = match std::fs::read_to_string(&path) {
-            Ok(raw) => match serde_json::from_str::<SurfaceState>(&raw) {
-                Ok(state) => state,
-                Err(e) => {
-                    tracing::warn!(
-                        "could not parse {} ({e}); starting with an empty surface record",
-                        path.display()
-                    );
-                    SurfaceState::default()
-                }
-            },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => SurfaceState::default(),
-            Err(e) => {
-                tracing::warn!(
-                    "could not read {} ({e}); starting with an empty surface record",
-                    path.display()
-                );
-                SurfaceState::default()
-            }
-        };
+        let state: SurfaceState = sidecar::load(&path, "surface record");
         Self {
             path,
             state: Mutex::new(state),
@@ -194,39 +176,7 @@ impl Surfaces {
         if !f(&mut state) {
             return;
         }
-        write_file(&self.path, &state);
-    }
-}
-
-/// Write the record atomically (temp file + rename), best-effort: the mirror
-/// only feeds the next startup's re-adoption, so a failure logs and changes
-/// nothing else. An empty record removes the file.
-fn write_file(path: &Path, state: &SurfaceState) {
-    if state.is_empty() {
-        if let Err(e) = std::fs::remove_file(path)
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::warn!("surfaces: could not remove {}: {}", path.display(), e);
-        }
-        return;
-    }
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let data = match serde_json::to_string(state) {
-        Ok(data) => data,
-        Err(e) => {
-            tracing::warn!("surfaces: could not serialize the record: {e}");
-            return;
-        }
-    };
-    let tmp = path.with_extension("tmp");
-    if let Err(e) = std::fs::write(&tmp, data) {
-        tracing::warn!("surfaces: could not write {}: {}", tmp.display(), e);
-        return;
-    }
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        tracing::warn!("surfaces: could not replace {}: {}", path.display(), e);
+        sidecar::store(&self.path, "surface record", &*state, state.is_empty());
     }
 }
 

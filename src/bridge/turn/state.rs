@@ -1838,7 +1838,7 @@ impl StreamAccumulator {
             }
 
             if let Some(ref err) = self.error {
-                builder = builder.with_text(&format!("\n**错误**: {}", err));
+                builder = builder.with_text(&crate::feishu::card::error_line(err));
             }
 
             // The retry marker (spec #391): this failed attempt was retried on

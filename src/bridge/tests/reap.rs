@@ -14,10 +14,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::drain::{assistant, ctx, script_transcript, scripted_app, spawn_sync, user};
-use crate::backend::SessionTranscript;
+use crate::backend::{MessageId, SessionTranscript};
 use crate::bridge::live_cards::{LiveCard, LiveCards};
 use crate::bridge::test_support::*;
 use crate::bridge::turn::Turn;
+use crate::config::{SessionEntry, ThreadKey};
 use crate::feishu::card::CardState;
 use crate::opencode::types::SessionStatus;
 
@@ -30,8 +31,15 @@ fn sidecar(session_file: &Path) -> PathBuf {
 /// when the process died — directly into the sidecar, so the next app loads it
 /// at construction exactly like a real restart.
 fn seed_record(session_file: &Path, card_message_id: &str, message_id: &str, created_ms: Option<i64>) {
-    LiveCards::load(sidecar(session_file))
-        .replace("ses_test", LiveCard::new(card_message_id, message_id, created_ms));
+    seed_live_card(
+        session_file,
+        LiveCard::new(card_message_id, MessageId::new(message_id), created_ms),
+    );
+}
+
+/// [`seed_record`] with the record built by the caller (a stored directory).
+fn seed_live_card(session_file: &Path, card: LiveCard) {
+    LiveCards::load(sidecar(session_file)).replace("ses_test", card);
 }
 
 /// The restarted process: a fresh app over `session_file`, with the transcript
@@ -48,24 +56,44 @@ async fn restarted_app(
 
 /// [`restarted_app`] with the scripted Backend handed back — for a test that
 /// re-scripts the session's read mid-life (the tasks retiring while cola
-/// watches).
+/// watches) or waits on the reap's own reads.
 async fn restarted_app_with_backend(
     session_file: &Path,
     transcript: SessionTranscript,
     status: Option<SessionStatus>,
 ) -> (Arc<App>, Arc<RecordingPlatform>, Arc<MockBackend>) {
+    let (app, platform, backend) = build_restarted(session_file, transcript).await;
+    if let Some(status) = status {
+        backend.set_session_status("ses_test", Some(status)).await;
+    }
+    seed_session(&app, "ses_test", "/work").await;
+    (app, platform, backend)
+}
+
+/// The restarted process with NO session mapping at all: only the sidecar (and
+/// the backend's own reads) says anything about the session — an orphan whose
+/// mapping was forgotten while cola was down.
+async fn restarted_app_unmapped(
+    session_file: &Path,
+    transcript: SessionTranscript,
+) -> (Arc<App>, Arc<RecordingPlatform>, Arc<MockBackend>) {
+    build_restarted(session_file, transcript).await
+}
+
+/// Build the app over `session_file` with `ses_test`'s transcript scripted and
+/// nothing else wired — the common half of the two restart helpers above.
+async fn build_restarted(
+    session_file: &Path,
+    transcript: SessionTranscript,
+) -> (Arc<App>, Arc<RecordingPlatform>, Arc<MockBackend>) {
     let mut backend = MockBackend::new(realistic_parts());
     backend.given_transcript("ses_test", vec![transcript]);
-    if let Some(status) = status {
-        backend.with_session_status("ses_test", Some(status));
-    }
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(
         App::new(test_config(session_file), backend.clone(), platform.clone())
             .expect("the restarted app builds"),
     );
-    seed_session(&app, "ses_test", "/work").await;
     (app, platform, backend)
 }
 
@@ -86,6 +114,86 @@ async fn last_update_of(platform: &RecordingPlatform, message_id: &str) -> Optio
         })
 }
 
+/// Wait until the reap read `session_id`'s status at least `n` times — proof
+/// its passes ran and did not stop at a guard — or panic after 5 s. Lets a
+/// negative assertion ("no card was touched") follow observed work instead of
+/// racing a bare sleep.
+async fn wait_for_status_reads(backend: &Arc<MockBackend>, session_id: &str, n: usize) {
+    let probe = async {
+        loop {
+            let reads = backend
+                .session_status_reads
+                .lock()
+                .await
+                .iter()
+                .filter(|sid| sid.as_str() == session_id)
+                .count();
+            if reads >= n {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), probe)
+        .await
+        .unwrap_or_else(|_| panic!("the reap never read {session_id}'s status {n} times"));
+}
+
+/// Wait until the Session Sync pass has read `session_id`'s transcript at
+/// least `n` times — the proof-of-pass for a test whose reap is for a session
+/// it never reads.
+async fn wait_for_transcript_reads(backend: &Arc<MockBackend>, session_id: &str, n: usize) {
+    let probe = async {
+        loop {
+            let reads = backend
+                .transcript_calls
+                .lock()
+                .await
+                .iter()
+                .filter(|sid| sid.as_str() == session_id)
+                .count();
+            if reads >= n {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), probe)
+        .await
+        .unwrap_or_else(|_| panic!("Session Sync never read {session_id}'s transcript {n} times"));
+}
+
+/// Wait until the session's record names `card_message_id`, or panic after
+/// 5 s.
+async fn wait_for_record_card(app: &Arc<App>, session_id: &str, card_message_id: &str) {
+    let probe = async {
+        loop {
+            if app
+                .cards_handle()
+                .live_cards
+                .get(session_id)
+                .is_some_and(|record| record.card_message_id == card_message_id)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), probe)
+        .await
+        .unwrap_or_else(|_| panic!("the record never named {card_message_id}"));
+}
+
+/// The transcript that has finished while cola was down: the submitted
+/// message and a clean assistant answer.
+fn completed(created_ms: i64) -> SessionTranscript {
+    SessionTranscript::new(vec![
+        user("msg_cola_anchor", created_ms, "问题"),
+        assistant(created_ms + 1_000, "回答"),
+    ])
+    .with_executions(vec![execution(created_ms + 1_500)])
+}
+
 /// A restart reaps a persisted card by the transcript's real ending: the run
 /// finished while cola was down, so the card takes ✅ — never an invented
 /// interruption — and the record is spent.
@@ -96,12 +204,7 @@ async fn a_restart_reaps_a_persisted_card_to_done() {
     let session_file = dir.path().join("sessions.json");
     seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
 
-    let transcript = SessionTranscript::new(vec![
-        user("msg_cola_anchor", 1_000, "问题"),
-        assistant(2_000, "回答"),
-    ])
-    .with_executions(vec![execution(2_500)]);
-    let (app, platform) = restarted_app(&session_file, transcript, None).await;
+    let (app, platform) = restarted_app(&session_file, completed(1_000), None).await;
 
     spawn_sync(&app);
     wait_for_card_update(
@@ -176,7 +279,7 @@ async fn a_restart_reaps_a_persisted_card_to_waiting_and_keeps_its_record() {
     ])
     .with_executions(vec![execution(2_500)])
     .with_background_tasks(vec![background_shell(2_100)]);
-    let (app, platform) = restarted_app(&session_file, transcript, None).await;
+    let (app, platform, backend) = restarted_app_with_backend(&session_file, transcript, None).await;
 
     spawn_sync(&app);
     wait_for_card_update(
@@ -202,15 +305,16 @@ async fn a_restart_reaps_a_persisted_card_to_waiting_and_keeps_its_record() {
         "a waiting turn must never read ✅"
     );
 
-    // Later passes leave the stamped card alone: one waiting PATCH, not one
-    // per Session Sync tick.
+    // Observed later passes leave the stamped card alone: one waiting PATCH,
+    // not one per Session Sync tick.
     let stamped = platform
         .updated_cards()
         .await
         .iter()
         .filter(|card| card_header(card).contains("等待后台任务"))
         .count();
-    tokio::time::sleep(Duration::from_millis(120)).await;
+    let reads = backend.session_status_reads.lock().await.len();
+    wait_for_status_reads(&backend, "ses_test", reads + 3).await;
     assert_eq!(
         platform
             .updated_cards()
@@ -332,12 +436,7 @@ async fn a_landed_message_settles_done_even_when_the_anchor_never_persisted() {
     let session_file = dir.path().join("sessions.json");
     seed_record(&session_file, "om_frozen", "msg_cola_anchor", None);
 
-    let transcript = SessionTranscript::new(vec![
-        user("msg_cola_anchor", 1_000, "问题"),
-        assistant(2_000, "回答"),
-    ])
-    .with_executions(vec![execution(2_500)]);
-    let (app, platform) = restarted_app(&session_file, transcript, None).await;
+    let (app, platform) = restarted_app(&session_file, completed(1_000), None).await;
 
     spawn_sync(&app);
     wait_for_card_update(
@@ -368,10 +467,13 @@ async fn a_still_live_session_keeps_its_persisted_card() {
     seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
 
     let transcript = SessionTranscript::new(vec![user("msg_cola_anchor", 1_000, "问题")]);
-    let (app, platform) = restarted_app(&session_file, transcript, Some(SessionStatus::Busy)).await;
+    let (app, platform, backend) =
+        restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Busy)).await;
 
     spawn_sync(&app);
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // Several observed passes, each reading the live status: none may touch
+    // the card.
+    wait_for_status_reads(&backend, "ses_test", 3).await;
     assert!(
         last_update_of(&platform, "om_frozen").await.is_none(),
         "a live Session's card is never touched: {:?}",
@@ -380,6 +482,33 @@ async fn a_still_live_session_keeps_its_persisted_card() {
     assert!(
         app.cards_handle().live_cards.get("ses_test").is_some(),
         "a still-live Session keeps its record"
+    );
+}
+
+/// An unrecognised status kind is unknown, never idle: the reap decides
+/// nothing from it — not even with a transcript that reads complete.
+#[tokio::test]
+async fn an_unrecognised_status_never_decides_an_ending() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
+
+    // `None` in the script is the backend's `Ok(None)`: a status kind this
+    // build does not recognise.
+    let (app, platform, backend) = restarted_app_with_backend(&session_file, completed(1_000), None).await;
+    backend.set_session_status("ses_test", None).await;
+
+    spawn_sync(&app);
+    wait_for_status_reads(&backend, "ses_test", 3).await;
+    assert!(
+        last_update_of(&platform, "om_frozen").await.is_none(),
+        "an unrecognised status claims nothing: {:?}",
+        platform.calls.lock().await
+    );
+    assert!(
+        app.cards_handle().live_cards.get("ses_test").is_some(),
+        "the record stays for the next tick"
     );
 }
 
@@ -392,25 +521,14 @@ async fn an_unreadable_transcript_keeps_the_record() {
     let session_file = dir.path().join("sessions.json");
     seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
 
-    let mut backend = MockBackend::new(realistic_parts());
-    backend.given_transcript(
-        "ses_test",
-        vec![SessionTranscript::new(vec![user(
-            "msg_cola_anchor",
-            1_000,
-            "问题",
-        )])],
-    );
+    let (app, platform, backend) = restarted_app_with_backend(&session_file, completed(1_000), None).await;
     backend.hang_transcript_reads(1_000);
-    let platform = Arc::new(RecordingPlatform::new());
-    let app = Arc::new(App::new(test_config(&session_file), Arc::new(backend), platform.clone()).unwrap());
-    seed_session(&app, "ses_test", "/work").await;
     app.external
         .request_timeout_ms
         .store(20, std::sync::atomic::Ordering::Relaxed);
 
     spawn_sync(&app);
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    wait_for_status_reads(&backend, "ses_test", 3).await;
     assert!(
         last_update_of(&platform, "om_frozen").await.is_none(),
         "an unreadable transcript claims nothing: {:?}",
@@ -419,6 +537,86 @@ async fn an_unreadable_transcript_keeps_the_record() {
     assert!(
         app.cards_handle().live_cards.get("ses_test").is_some(),
         "the record stays for the next tick"
+    );
+}
+
+/// A record whose session lost its mapping is still reaped when the record
+/// carries the directory its reads route under — no cwd-instance guess.
+#[tokio::test]
+async fn a_stored_directory_routes_the_reap_without_the_mapping() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_live_card(
+        &session_file,
+        LiveCard::new("om_frozen", MessageId::new("msg_cola_anchor"), Some(1_000))
+            .with_directory(Some("/gone".into())),
+    );
+
+    // No mapping at all: only the record says where the session lives.
+    let (app, platform, _backend) = restarted_app_unmapped(&session_file, completed(1_000)).await;
+
+    spawn_sync(&app);
+    wait_for_card_update(
+        &platform,
+        "the routed card's ✅ ending",
+        CardUpdates::Any,
+        |card| card_header(card).contains("✅"),
+    )
+    .await;
+    assert!(app.cards_handle().live_cards.get("ses_test").is_none());
+}
+
+/// A record with neither a stored directory nor a mapping decides nothing: on
+/// a generation whose reads are per-directory (V1), a cwd-routed status could
+/// belong to another instance's run, and stamping over a live run is worse
+/// than keeping the record (growth is bounded by the live-card sessions).
+#[tokio::test]
+async fn a_record_without_a_directory_is_never_decided() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_record(&session_file, "om_orphan", "msg_cola_anchor", Some(1_000));
+
+    // The pass needs work it CAN interpret: another mapped session, whose
+    // transcript reads are the proof the reap had passes to run.
+    let (app, platform, backend) = restarted_app_unmapped(&session_file, completed(1_000)).await;
+    backend
+        .given_transcript_after_build(
+            "ses_other",
+            vec![SessionTranscript::new(vec![user(
+                "msg_cola_other",
+                1_000,
+                "别的会话",
+            )])],
+        )
+        .await;
+    seed_entry(
+        &app,
+        SessionEntry {
+            thread_key: ThreadKey::new("chat_1".into(), "chat_1".into()),
+            session_id: "ses_other".into(),
+            directory: "/work".into(),
+            agent: None,
+            model: None,
+            variant: None,
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+        },
+    )
+    .await;
+
+    spawn_sync(&app);
+    wait_for_transcript_reads(&backend, "ses_other", 3).await;
+    assert!(
+        last_update_of(&platform, "om_orphan").await.is_none(),
+        "a directory-less record is never decided: {:?}",
+        platform.calls.lock().await
+    );
+    assert!(
+        app.cards_handle().live_cards.get("ses_test").is_some(),
+        "the record stays for a later life"
     );
 }
 
@@ -477,47 +675,47 @@ async fn a_restart_continuation_collects_the_old_card() {
 }
 
 /// A record left naming an older card while a live in-memory card owns the
-/// session (the record write raced the handover) is re-pointed at the owner:
-/// the sidecar never keeps naming a card nothing will reap — and nothing is
-/// collected, because a real handover collects at its own takeover.
+/// session (the record write raced the handover) collects the orphan in place
+/// and re-points the record at the owner: no card is left looking live, and
+/// the sidecar never keeps naming a card nothing will reap.
 #[tokio::test]
-async fn a_record_that_lagged_a_handover_is_repointed_at_the_live_card() {
+async fn a_record_that_lagged_a_handover_collects_the_orphan_and_repoints() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("sessions.json");
-    seed_record(&session_file, "om_old", "msg_cola_anchor", Some(1_000));
+    seed_live_card(
+        &session_file,
+        LiveCard::new("om_old", MessageId::new("msg_cola_anchor"), Some(1_000))
+            .with_directory(Some("/work".into())),
+    );
 
-    let transcript = SessionTranscript::new(vec![
-        user("msg_cola_anchor", 1_000, "问题"),
-        assistant(2_000, "回答"),
-    ])
-    .with_executions(vec![execution(2_500)]);
-    let (app, platform) = restarted_app(&session_file, transcript, None).await;
+    let (app, platform) = restarted_app(&session_file, completed(1_000), None).await;
     // The process's live card: a handover the record missed.
     Turn::seed_card(&app.cards_handle(), "ses_test", Some("om_live")).await;
     Turn::set_turn_anchor(&app.cards_handle(), "ses_test", &turn_anchor(1_000)).await;
 
     spawn_sync(&app);
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    let record = app
-        .cards_handle()
-        .live_cards
-        .get("ses_test")
-        .expect("the live card keeps a record");
-    assert_eq!(
-        record.card_message_id, "om_live",
-        "the record follows the live card"
-    );
+    wait_for_record_card(&app, "ses_test", "om_live").await;
+    let collected = last_update_of(&platform, "om_old")
+        .await
+        .expect("the recorded card is collected in place");
+    assert_eq!(card_header(&collected), "⏳ 已由新卡片接管 · 已停止更新");
     assert!(
-        platform.updated_cards().await.is_empty(),
-        "a re-point collects nothing: {:?}",
+        last_update_of(&platform, "om_live").await.is_none(),
+        "the live card is never touched: {:?}",
         platform.calls.lock().await
+    );
+    let record = app.cards_handle().live_cards.get("ses_test").unwrap();
+    assert_eq!(
+        record.directory.as_deref(),
+        Some("/work"),
+        "the re-point keeps the session's route"
     );
 }
 
-/// A Turn tracks its card the moment it becomes live — card id, message id and
-/// the captured anchor — and a terminal drops the record; a Waiting yield
-/// keeps it for the later true end.
+/// A Turn tracks its card the moment it becomes live — card id, message id,
+/// the captured anchor and the session's directory — and a terminal drops the
+/// record; a Waiting yield keeps it for the later true end.
 #[tokio::test]
 async fn a_live_turn_tracks_its_card_and_every_terminal_drops_the_record() {
     let _wd = test_work_dir();
@@ -546,11 +744,16 @@ async fn a_live_turn_tracks_its_card_and_every_terminal_drops_the_record() {
         .get("ses_test")
         .expect("a live Turn tracks its card");
     assert_eq!(record.card_message_id, "msg_reply", "the sent card is tracked");
-    assert_eq!(record.message_id, "msg_cola_anchor");
+    assert_eq!(record.message_id, MessageId::new("msg_cola_anchor"));
     assert_eq!(
         record.created_ms,
         Some(1_000),
         "the record carries the captured anchor's server time"
+    );
+    assert_eq!(
+        record.directory.as_deref(),
+        Some("/work"),
+        "the record carries the session's route"
     );
 
     // The background work ends while cola is up: the yielded card's quiet true

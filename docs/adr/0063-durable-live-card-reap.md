@@ -22,7 +22,10 @@ atomic tmp+rename, best-effort, absent or corrupt reads as empty). It is
 written when a card becomes a Session's live card, and removed when that card
 reaches a terminal (Done / Error / Stopped) or is collected by a successor. The
 anchor is the settle decision's scope — without it the transcript cannot be
-asked what happened to the run.
+asked what happened to the run. The record also carries the Session's directory
+at track time: the reap's reads route by it, so an orphan whose mapping is gone
+still asks the instance the card belongs to — never the process's cwd, which on
+a generation with per-directory reads (V1) could be another instance's run.
 
 **Reap in Session Sync, every pass, not just at startup.** For each record the
 pass reconciles the card against the Session's own reads:
@@ -31,7 +34,9 @@ pass reconciles the card against the Session's own reads:
   Background Tasks — so a run that finished while cola was down gets its true
   ending, never an invented interruption;
 - an idle Session whose Turn message never landed ends Unreceived (ADR-0062),
-  never ✅;
+  never ✅ — the same ending, without the 重新发起 action: the click's fixture
+  died with the process, so the reaped card tells the user to re-send (the
+  amendment in ADR-0062);
 - a live Session keeps the card: the run may still be answering it;
 - a continuation that took the chain over collects the old card in place, so no
   card is left looking live.
