@@ -161,12 +161,10 @@ impl ExternalFlow {
             let mapping = mapped.get(&sid);
             let span = crate::bridge::span::external(&sid, mapping.map(|(thread_key, _)| thread_key));
             // The route is the followed directory; the move verdict's baseline
-            // is where the card was tracked (the pre-follow directory when this
-            // pass followed the session, #433).
-            let baseline = moved_from
-                .get(&sid)
-                .map(String::as_str)
-                .or(mapping.map(|(_, directory)| directory.as_str()));
+            // is where the card was tracked — the pre-follow directory when
+            // this pass followed the session (#433), else the reap falls back
+            // to the route itself.
+            let baseline = moved_from.get(&sid).map(String::as_str);
             crate::bridge::reap::reconcile(
                 handles,
                 &sid,
@@ -194,7 +192,6 @@ impl ExternalFlow {
     /// (session id → directory) — the reap's move-verdict baseline for a
     /// record that carries no directory of its own (#439).
     async fn follow_locations(&self, handles: &FlowHandles) -> HashMap<String, String> {
-        let mut moved_from = HashMap::new();
         let read_timeout_ms = self.request_timeout_ms.load(std::sync::atomic::Ordering::Relaxed);
         let Some(Ok(sessions)) = crate::bridge::bounded_call(
             "session sync location read",
@@ -203,30 +200,33 @@ impl ExternalFlow {
         )
         .await
         else {
-            return moved_from;
+            return HashMap::new();
         };
-        for listed in sessions {
-            if listed.directory.is_empty() {
-                continue;
-            }
-            match handles
-                .sessions
-                .follow_directory(&listed.id, &listed.directory)
-                .await
-            {
-                Ok(Some(previous)) => {
-                    tracing::info!("session {} followed its move to {}", listed.id, listed.directory);
-                    moved_from.insert(listed.id, previous);
+        let locations: Vec<(String, String)> = sessions
+            .into_iter()
+            .filter(|listed| !listed.directory.is_empty())
+            .map(|listed| (listed.id, listed.directory))
+            .collect();
+        match handles.sessions.follow_locations(&locations).await {
+            Ok(moved) => {
+                let listed: HashMap<&str, &str> = locations
+                    .iter()
+                    .map(|(session_id, directory)| (session_id.as_str(), directory.as_str()))
+                    .collect();
+                for (session_id, previous) in &moved {
+                    if let Some(directory) = listed.get(session_id.as_str()) {
+                        tracing::info!(
+                            "session {session_id} followed its move from {previous} to {directory}"
+                        );
+                    }
                 }
-                Ok(None) => {}
-                Err(e) => tracing::warn!(
-                    "session {} could not follow its move to {}: {e}",
-                    listed.id,
-                    listed.directory
-                ),
+                moved.into_iter().collect()
+            }
+            Err(e) => {
+                tracing::warn!("session sync: could not follow the session locations: {e}");
+                HashMap::new()
             }
         }
-        moved_from
     }
 
     /// One Session's pass through the poll loop, run inside that Session's

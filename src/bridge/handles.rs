@@ -210,17 +210,16 @@ impl SessionsHandle {
         self.store.lock().await.update(session_id, f)
     }
 
-    /// Follow a Session's server-reported location (#433): update the mapped
-    /// directory in place and persist it. Returns the previous directory when
-    /// the mapping moved, `None` when nothing changed. Every other mapping
-    /// field stays untouched. The session-list cache is untouched too: the
-    /// list the read came from already carries the new directory.
-    pub(crate) async fn follow_directory(
+    /// Follow the mapped Sessions' server-reported locations in ONE store
+    /// view (#433): see [`SessionStore::follow_locations`]. Returns the
+    /// pre-follow directory of every moved session. The session-list cache is
+    /// untouched: the list the read came from already carries the new
+    /// directories.
+    pub(crate) async fn follow_locations(
         &self,
-        session_id: &str,
-        directory: &str,
-    ) -> crate::error::Result<Option<String>> {
-        self.store.lock().await.update_directory(session_id, directory)
+        locations: &[(String, String)],
+    ) -> crate::error::Result<Vec<(String, String)>> {
+        self.store.lock().await.follow_locations(locations)
     }
 
     /// Mutate the conversation's Pending Session and persist (ADR-0041).

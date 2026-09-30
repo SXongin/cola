@@ -72,19 +72,19 @@ pub(crate) async fn collect_orphan(cards: &CardsHandle, session_id: &str, card_m
 
 /// Reconcile one record against the Session's own reads (ADR-0063). `directory`
 /// is the Session's mapped directory, when it still has one — the fallback
-/// route when the record itself carries none. `baseline_directory` is the
-/// directory the card was tracked under, for the move verdict (#439): the
-/// caller passes the pre-follow mapping when this pass followed a move (#433),
-/// so a record with no directory of its own still names the move even though
-/// `directory` already points at the new location. `record` is the snapshot
-/// the caller took from the sidecar. `read_timeout_ms` bounds each of the
-/// reads, the Session Sync pass's own request bound (injectable in tests), so
-/// a hung server degrades to "nothing claimed" instead of freezing the tick.
+/// route when the record itself carries none. `tracked_directory` is the
+/// directory the card was tracked under when the caller knows it independently
+/// of the current mapping (the pre-follow directory, #433), used for the move
+/// verdict (#439) when the record carries no directory of its own. `record` is
+/// the snapshot the caller took from the sidecar. `read_timeout_ms` bounds each
+/// of the reads, the Session Sync pass's own request bound (injectable in
+/// tests), so a hung server degrades to "nothing claimed" instead of freezing
+/// the tick.
 pub(crate) async fn reconcile(
     handles: &FlowHandles,
     session_id: &str,
     directory: Option<&str>,
-    baseline_directory: Option<&str>,
+    tracked_directory: Option<&str>,
     record: &LiveCard,
     read_timeout_ms: u64,
 ) {
@@ -159,27 +159,21 @@ pub(crate) async fn reconcile(
     // status could belong to a different instance's run, and stamping over a
     // live run is worse than leaving a record for a later life (growth is
     // bounded by the live-card sessions).
-    let directory = record
+    // The directory the card was TRACKED under: the record's own when it has
+    // one, else the caller's pre-follow value. The followed route can never
+    // prove a move — it already names the new location (#433).
+    let tracked = record
         .directory
         .as_deref()
-        .filter(|directory| !directory.is_empty())
-        .or(directory);
+        .filter(|directory| !directory.is_empty());
+    let directory = tracked.or(directory);
     let Some(directory) = directory else {
         tracing::debug!(
             "live-card reap: session {session_id} has no directory to route its reads; keeping the record"
         );
         return;
     };
-    // The move verdict's baseline: the record's own directory when it has one,
-    // else the pre-follow directory the caller captured (#433) — the mapping's
-    // current directory would already name the new location and could never
-    // prove a move.
-    let baseline_directory = record
-        .directory
-        .as_deref()
-        .filter(|directory| !directory.is_empty())
-        .or(baseline_directory)
-        .unwrap_or(directory);
+    let baseline_directory = tracked.or(tracked_directory).unwrap_or(directory);
     let status = match crate::bridge::bounded_call(
         "live-card reap status",
         read_timeout_ms,
@@ -336,8 +330,9 @@ impl ReapPass<'_> {
     /// `read_timeout_ms`. That price buys a cosmetic line and is bounded; the
     /// ending itself is never withheld for it. A read that fails, a Session the
     /// list does not carry, an empty directory, or the baseline itself all
-    /// claim nothing — no line, exactly the pre-#439 card. V1 Sessions cannot
-    /// move, so the line only ever renders on V2 (#433).
+    /// claim nothing — no line, exactly the pre-#439 card. A project-scoped
+    /// session list may omit the moved Session, and then no line renders
+    /// either.
     async fn move_note(&self) -> Option<String> {
         let sessions = match crate::bridge::bounded_call(
             "live-card reap session list",
