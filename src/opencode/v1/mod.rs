@@ -358,6 +358,22 @@ impl GenerationStrategy for V1Strategy {
         true
     }
 
+    /// V1 has no resume endpoint (the 1.18.x surface predates the inbox
+    /// semantics): the bridge's 重新发起 action degrades to resubmitting the
+    /// message as a new Turn on this generation.
+    fn resume_supported(&self) -> bool {
+        false
+    }
+
+    /// Unreachable by contract: [`Self::resume_supported`] is false on V1, so
+    /// no caller may reach this. An Err (never a silent success) keeps a
+    /// bypass from looking like the write landed.
+    async fn resume(&self, _http: &Transport, session_id: &str) -> Result<()> {
+        Err(crate::error::BridgeError::OpenCode(format!(
+            "resume {session_id}: V1 has no resume endpoint"
+        )))
+    }
+
     /// The server's per-session run state for ONE session (canonical:
     /// `GET /session/status`, which returns `Record<sessionID, SessionStatus>`).
     ///

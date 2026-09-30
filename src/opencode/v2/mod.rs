@@ -61,6 +61,9 @@ const SESSION_PROMPT_SUFFIX: &str = "/prompt";
 pub(crate) const PROMPT_DELIVERY: &str = "steer";
 /// The interrupt endpoint (`POST /api/session/{id}/interrupt`).
 const SESSION_INTERRUPT_SUFFIX: &str = "/interrupt";
+/// The resume endpoint (`POST /api/session/{id}/resume`, 204): promotes a
+/// message queued in the session inbox at a new run's start.
+const SESSION_RESUME_SUFFIX: &str = "/resume";
 /// The durable model switch (`POST /api/session/{id}/model`, 204).
 const SESSION_MODEL_SUFFIX: &str = "/model";
 /// The durable agent switch (`POST /api/session/{id}/agent`, 204).
@@ -564,6 +567,11 @@ impl GenerationStrategy for V2Strategy {
         false
     }
 
+    /// V2 serves the durable resume write.
+    fn resume_supported(&self) -> bool {
+        true
+    }
+
     /// The model's context-window size (tokens), from `GET /api/model`. Best
     /// effort like V1's provider read: any failure returns Ok(None) so the
     /// footer just omits the ratio.
@@ -662,6 +670,25 @@ impl GenerationStrategy for V2Strategy {
             .await?;
         if !response.status().is_success() {
             return Err(write_failure(response, session_id, "interrupt").await);
+        }
+        Ok(())
+    }
+
+    /// Resume the session (`POST /api/session/{id}/resume`): a message queued
+    /// in the session inbox (cola's steered submit, `delivery:"steer"`) is
+    /// promoted at the new run's start. Answers 204 — the body is ignored like
+    /// the other status-only writes. Failures go through the same mapping as
+    /// the interrupt route's: the tagged `SessionNotFoundError` 404 becomes the
+    /// bridge's SessionNotFound, anything else an OpenCode error naming the
+    /// operation.
+    async fn resume(&self, http: &Transport, session_id: &str) -> Result<()> {
+        let response = http
+            .client()
+            .post(http.url(&format!("{SESSION}/{session_id}{SESSION_RESUME_SUFFIX}")))
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(write_failure(response, session_id, "resume").await);
         }
         Ok(())
     }

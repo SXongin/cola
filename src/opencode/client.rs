@@ -383,6 +383,13 @@ impl OpenCodeBackend {
         self.strategy().reuse_continues_an_admitted_turn()
     }
 
+    /// Whether the attached generation serves the durable resume write
+    /// (`POST /api/session/{id}/resume`, V2). See
+    /// [`crate::backend::Backend::resume_supported`].
+    pub fn resume_supported(&self) -> bool {
+        self.strategy().resume_supported()
+    }
+
     pub async fn session_status(
         &self,
         session_id: &str,
@@ -423,6 +430,13 @@ impl OpenCodeBackend {
 
     pub async fn interrupt(&self, session_id: &str) -> crate::error::Result<()> {
         self.strategy().interrupt(&self.transport, session_id).await
+    }
+
+    /// Resume a session (`POST /api/session/{id}/resume`, V2): promote a queued
+    /// steer at a new run's start. Only called where
+    /// [`Self::resume_supported`] is true.
+    pub async fn resume(&self, session_id: &str) -> crate::error::Result<()> {
+        self.strategy().resume(&self.transport, session_id).await
     }
 
     /// Compact a session's context. The `/api/session/{id}/compact` path is

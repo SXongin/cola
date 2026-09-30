@@ -224,6 +224,23 @@ pub trait Backend: Send + Sync {
     /// policy.
     fn reuse_continues_an_admitted_turn(&self) -> bool;
 
+    /// Whether this generation can resume a Session through [`Self::resume`]
+    /// (`POST /api/session/{id}/resume`, V2): a message queued in the session
+    /// inbox (cola's steered submit) is promoted at the new run's start. V1 has
+    /// no resume endpoint, so the Unreceived card's 重新发起 action degrades to
+    /// resubmitting the message as a new Turn there (#437). States the server
+    /// contract, never a policy.
+    fn resume_supported(&self) -> bool;
+
+    /// Resume a Session: promote the queued steer at a new run's start
+    /// (`POST /api/session/{id}/resume`, 204). The 重新发起 action pairs it
+    /// with an [`Self::interrupt`] (a no-op when the Session is idle): the
+    /// interrupt stops whatever stale run still holds the Session, and the
+    /// resume promotes cola's already-admitted message into a fresh run —
+    /// pressing the button never duplicates the transcript message. Only
+    /// called where [`Self::resume_supported`] is true.
+    async fn resume(&self, session_id: &str) -> Result<()>;
+
     /// Reply to a pending permission with a decision (`once` / `always` /
     /// `reject`). `session_id` is the requesting session (the child session for
     /// a sub-task ask): V2's reply is session-scoped and needs it; V1 routes by

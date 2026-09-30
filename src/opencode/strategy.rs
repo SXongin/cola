@@ -153,6 +153,20 @@ pub(crate) trait GenerationStrategy: Send + Sync {
     /// [`crate::backend::Backend::reuse_continues_an_admitted_turn`].
     fn reuse_continues_an_admitted_turn(&self) -> bool;
 
+    /// Whether this generation can resume a session through [`Self::resume`]
+    /// (V2's `POST /api/session/{id}/resume`): a queued steer message is
+    /// promoted at the new run's start. V1 has no resume endpoint. Unlike a
+    /// failed write, this answers without a wire read, so the bridge can pick
+    /// its degradation (V1 resubmits the message as a new Turn) before
+    /// touching the network.
+    fn resume_supported(&self) -> bool;
+
+    /// Resume the session (`POST /api/session/{id}/resume`, 204): promote the
+    /// queued steer at a new run's start. Only called where
+    /// [`Self::resume_supported`] is true; a generation without the endpoint
+    /// errors rather than silently doing nothing.
+    async fn resume(&self, http: &Transport, session_id: &str) -> Result<()>;
+
     async fn session_status(
         &self,
         http: &Transport,

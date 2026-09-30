@@ -337,7 +337,7 @@ impl Turn {
                     // turn's and the running prompt already answered it; give
                     // the claim back so the still-Error card keeps a working
                     // retry button (spec #391).
-                    Self::release_retry_claim(&handles.cards, &session_id).await;
+                    Self::release_recovery_claim(&handles.cards, &session_id).await;
                 } else {
                     let _ = handles
                         .platform
@@ -1738,10 +1738,12 @@ pub(crate) struct TurnPinSource {
     pub(crate) is_group: bool,
 }
 
-/// The error-card retry fixture a failed turn's card carries: the original
-/// prompt, its reply target, and the identity/thread facts a retry reuses.
-pub(crate) struct TurnRetry {
-    /// The failed turn's session.
+/// The recovery fixture a terminal card carries for its one recovery action:
+/// the Error card's retry (spec #391) or the Unreceived card's 重新发起
+/// (#437). The original prompt, its reply target, and the identity/thread
+/// facts a re-run reuses.
+pub(crate) struct TurnRecovery {
+    /// The failed/unreceived turn's session.
     pub(crate) session_id: String,
     pub(crate) prompt: String,
     pub(crate) reply_to: String,
@@ -1751,11 +1753,11 @@ pub(crate) struct TurnRetry {
     pub(crate) cola_message_id: Option<String>,
 }
 
-impl TurnRetry {
-    /// This retry as the new attempt's [`PromptContext`]: the same facts under
-    /// the context's names, with the id policy the decision chose (`None` = a
-    /// fresh `msg_cola_` id, `Some` = the failed attempt's). Images are not
-    /// re-sent on a retry (#391, out of scope).
+impl TurnRecovery {
+    /// This recovery as the new attempt's [`PromptContext`]: the same facts
+    /// under the context's names, with the id policy the caller chose (`None`
+    /// = a fresh `msg_cola_` id, `Some` = the previous attempt's). Images are
+    /// not re-sent on a recovery (#391, out of scope).
     pub(crate) fn into_context(
         self,
         thread_key: ThreadKey,
@@ -1772,8 +1774,8 @@ impl TurnRetry {
             is_group: self.is_group,
             cola_message_id,
             images: Vec::new(),
-            // A retry never routes through the advisory read (its own decision
-            // matrix already judged the run): an ordinary card.
+            // A recovery never routes through the advisory read (its own
+            // decision already judged the run): an ordinary card.
             advisory_live: false,
         }
     }
@@ -2156,20 +2158,25 @@ impl Turn {
         })
     }
 
-    /// Claim the session's error-card retry (spec #391): returns the failed
-    /// turn's retry fixture exactly once while the card is still in the `Error`
-    /// state and no earlier click holds the claim. `None` when the card is not
-    /// failed (already marked `Retried` or live), a retry is already claimed,
-    /// no card exists, or no prompt was stored to re-submit (an
-    /// externally-rendered error card). This atomic claim is what makes the
-    /// callback safe to double-click: the click is acked immediately, so a
-    /// second click can arrive before the retry's own Error→`Retried` marking
-    /// lands.
-    pub(crate) async fn claim_retry(cards: &CardsHandle, session_id: &str) -> Option<TurnRetry> {
+    /// Claim a terminal card's recovery action exactly once: spec #391's Error
+    /// retry (`from = CardState::Error`) or #437's Unreceived 重新发起
+    /// (`from = CardState::Unreceived`). Returns the turn's recovery fixture
+    /// while the card is still in `from` and no earlier click holds the claim;
+    /// `None` when the card is in another state (already marked, live, or
+    /// replaced), a claim is already taken, no card exists, or no prompt was
+    /// stored to re-run (an externally-rendered card). This atomic claim is
+    /// what makes the callback safe to double-click: the click is acked
+    /// immediately, so a second click can arrive before the action's own
+    /// marking lands.
+    pub(crate) async fn claim_recovery(
+        cards: &CardsHandle,
+        session_id: &str,
+        from: crate::feishu::card::CardState,
+    ) -> Option<TurnRecovery> {
         let mut live = cards.cards.lock().await;
         let card = live.get_mut(session_id)?;
-        if card.acc.card_state != crate::feishu::card::CardState::Error
-            || card.acc.retry_claimed
+        if card.acc.card_state != from
+            || card.acc.recovery_claimed
             // A Wake continuation carries no question to re-ask (ADR-0059):
             // its card never offers Retry, so no click may claim one either.
             || card.acc.wake_continuation
@@ -2180,11 +2187,11 @@ impl Turn {
         // has one (`Turn::start` drops the session when the Loading reply
         // fails).
         card.card_message_id.as_ref()?;
-        // An external turn's failure has no prompt to re-submit; the button
-        // must not claim (there is nothing to retry).
+        // An external turn's ending has no prompt to re-submit; the button
+        // must not claim (there is nothing to recover).
         let prompt = card.acc.prompt.clone().filter(|prompt| !prompt.is_empty())?;
-        card.acc.retry_claimed = true;
-        Some(TurnRetry {
+        card.acc.recovery_claimed = true;
+        Some(TurnRecovery {
             session_id: session_id.to_string(),
             prompt,
             reply_to: card.acc.reply_to_message_id.clone().unwrap_or_default(),
@@ -2195,14 +2202,14 @@ impl Turn {
         })
     }
 
-    /// Release an unused retry claim. A click that neither submits nor
+    /// Release an unused recovery claim. A click that neither submits nor
     /// re-attaches (the `Busy` decision with no anchor to follow, a retry that
-    /// lost the inflight guard, or a vanished session/thread) gives the claim
-    /// back, so a later click can retry once the run has ended instead of
-    /// finding a dead button.
-    pub(crate) async fn release_retry_claim(cards: &CardsHandle, session_id: &str) {
+    /// lost the inflight guard, a resume whose write failed, or a vanished
+    /// session/thread) gives the claim back, so a later click can try again
+    /// instead of finding a dead button.
+    pub(crate) async fn release_recovery_claim(cards: &CardsHandle, session_id: &str) {
         if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
-            card.release_retry_claim();
+            card.release_recovery_claim();
         }
     }
 
@@ -2253,6 +2260,47 @@ impl Turn {
                 directory,
                 started_at: std::time::Instant::now(),
                 anchor: Some(anchor),
+            },
+        )
+        .await;
+        true
+    }
+
+    /// Re-arm an Unreceived card after a successful V2 resume (#437): the
+    /// resumed run renders on the SAME card, through the unreceived watch —
+    /// the out-of-turn [`follow`] under the card's chain identity (its
+    /// accumulator anchor is `None`: the submitted message never landed),
+    /// which captures the Turn anchor the moment the promoted message appears
+    /// and then settles the card through the single decision. The card leaves
+    /// `Unreceived` and is flushed now, so the click's effect is visible
+    /// before the watch's first tick; the watch inherits the Session's guard,
+    /// exactly like the retry re-attach (ADR-0059).
+    ///
+    /// Returns false when there is no card, or the card is no longer
+    /// `Unreceived` (a new Turn may have replaced it since the claim) — the
+    /// caller then releases the claim, and a later press can retry.
+    pub(crate) async fn reattach_resumed(
+        handles: &TurnHandles,
+        session_id: &str,
+        thread_key: &ThreadKey,
+        directory: Option<String>,
+    ) -> bool {
+        let Some((anchor, directory)) = ({
+            let mut live = handles.cards.cards.lock().await;
+            live.get_mut(session_id)
+                .and_then(|card| card.rearm_unreceived(directory))
+        }) else {
+            return false;
+        };
+        Self::flush_card(&handles.cards, session_id).await;
+        follow::spawn(
+            handles,
+            follow::FollowFacts {
+                session_id: session_id.to_string(),
+                thread_key: thread_key.clone(),
+                directory,
+                started_at: std::time::Instant::now(),
+                anchor,
             },
         )
         .await;

@@ -980,6 +980,23 @@ pub struct MockBackend {
     /// answers. Default true (V1); a V2 scenario sets it false, where admission
     /// makes the re-post a no-op.
     pub reuse_continues_an_admitted_turn: bool,
+    /// Whether the mock speaks a generation with the resume endpoint (V2) —
+    /// what [`crate::backend::Backend::resume_supported`] answers. Default
+    /// false (V1: no resume endpoint, so the 重新发起 action degrades to a new
+    /// Turn); a V2 scenario sets it true.
+    pub resume_supported: bool,
+    /// Records every `resume` call's session id (the 重新发起 action, #437).
+    pub resume_calls: Arc<tokio::sync::Mutex<Vec<String>>>,
+    /// The ordered recovery-write sequence the 重新发起 action issues
+    /// (`"interrupt:<sid>"` / `"resume:<sid>"`), so a test pins the order:
+    /// interrupt must precede resume (#437). `/stop`'s interrupt writes the
+    /// same entry; a recovery scenario issues nothing else.
+    pub recovery_ops: Arc<tokio::sync::Mutex<Vec<String>>>,
+    /// Number of initial `resume` calls to fail with a genuine error (the
+    /// action's failure path); consumed one per call.
+    pub fail_resume_count: Arc<std::sync::atomic::AtomicUsize>,
+    /// The message counted `resume` failures report; `None` keeps the generic.
+    pub fail_resume_message: Option<String>,
     /// Records `switch_session_model` calls: `(session_id, model)`.
     pub switch_model_calls: Arc<tokio::sync::Mutex<Vec<(String, opencode::types::ModelInfo)>>>,
     /// Records `switch_session_agent` calls: `(session_id, agent)`.
@@ -1096,6 +1113,11 @@ impl MockBackend {
             durable_selection: false,
             session_selection_error: None,
             reuse_continues_an_admitted_turn: true,
+            resume_supported: false,
+            resume_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            recovery_ops: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            fail_resume_count: std::sync::atomic::AtomicUsize::new(0).into(),
+            fail_resume_message: None,
             switch_model_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             switch_agent_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             switch_error: None,
@@ -1173,6 +1195,23 @@ impl MockBackend {
         self.fail_interrupt_count
             .store(count, std::sync::atomic::Ordering::SeqCst);
         self.fail_interrupt_message = Some(message.to_string());
+        self
+    }
+
+    /// Scenario: the mock speaks a generation with the resume endpoint (V2) —
+    /// the 重新发起 action then interrupts and resumes instead of degrading to
+    /// a new Turn.
+    pub(crate) fn with_resume_supported(&mut self, supported: bool) -> &mut Self {
+        self.resume_supported = supported;
+        self
+    }
+
+    /// Scenario: the next `count` `resume` calls fail with `message`; the
+    /// scripted failure is consumed, so a later press succeeds.
+    pub(crate) fn fail_resumes(&mut self, count: usize, message: &str) -> &mut Self {
+        self.fail_resume_count
+            .store(count, std::sync::atomic::Ordering::SeqCst);
+        self.fail_resume_message = Some(message.to_string());
         self
     }
 
@@ -2020,6 +2059,10 @@ impl crate::backend::Backend for MockBackend {
         self.reuse_continues_an_admitted_turn
     }
 
+    fn resume_supported(&self) -> bool {
+        self.resume_supported
+    }
+
     async fn switch_session_model(
         &self,
         session_id: &str,
@@ -2097,6 +2140,10 @@ impl crate::backend::Backend for MockBackend {
 
     async fn interrupt(&self, session_id: &str) -> crate::error::Result<()> {
         self.interrupt_calls.lock().await.push(session_id.to_string());
+        self.recovery_ops
+            .lock()
+            .await
+            .push(format!("interrupt:{session_id}"));
         if self
             .fail_interrupt_count
             .load(std::sync::atomic::Ordering::SeqCst)
@@ -2108,6 +2155,24 @@ impl crate::backend::Backend for MockBackend {
                 self.fail_interrupt_message
                     .clone()
                     .unwrap_or_else(|| "Simulated interrupt failure".into()),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn resume(&self, session_id: &str) -> crate::error::Result<()> {
+        self.resume_calls.lock().await.push(session_id.to_string());
+        self.recovery_ops
+            .lock()
+            .await
+            .push(format!("resume:{session_id}"));
+        if self.fail_resume_count.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+            self.fail_resume_count
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            return Err(crate::error::BridgeError::OpenCode(
+                self.fail_resume_message
+                    .clone()
+                    .unwrap_or_else(|| "Simulated resume failure".into()),
             ));
         }
         Ok(())

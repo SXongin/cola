@@ -1798,6 +1798,258 @@ async fn a_never_promoted_submit_at_idle_ends_unreceived() {
     assert_no_further_rendering(&backend, &platform).await;
 }
 
+/// ADR-0062 (spec #434, ticket #437): the Unreceived card offers 「重新发起」.
+/// Pressing it records interrupt then resume; the queued steer is promoted at
+/// the new run's start and renders on the SAME card, which settles through the
+/// normal decision — and no second prompt is ever submitted, so the transcript
+/// message is never duplicated. A second click while the first is in flight
+/// claims nothing.
+#[tokio::test]
+async fn pressing_resume_interrupts_then_resumes_and_renders_the_promoted_message() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    // V2: the generation serves the durable resume write.
+    backend.with_resume_supported(true);
+    // The message never lands: no read carries cola's prompt (the inbox steer
+    // no runner promoted).
+    backend.given_transcript("ses_test", vec![SessionTranscript::new(Vec::new())]);
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    seed_session(&app, "ses_test", "/work").await;
+    app.turn_render_poll_ms.store(5, Ordering::Relaxed);
+    app.turn_drain_timeout_ms.store(60_000, Ordering::Relaxed);
+
+    Turn::run(&app.turn_handles(), ctx("ses_test", "第一条消息"))
+        .await
+        .unwrap();
+    let unreceived = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_header(&unreceived).contains("未被接收"),
+        "the stalled submit must end Unreceived first: {unreceived}"
+    );
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Unreceived)
+    );
+    let button = card_buttons(&unreceived)
+        .into_iter()
+        .find(|button| button["value"]["action"] == "resume")
+        .expect("the Unreceived card must offer 重新发起");
+    assert_eq!(button["text"]["content"].as_str().unwrap(), "重新发起");
+    assert_eq!(button["value"]["session_id"].as_str().unwrap(), "ses_test");
+    assert!(!app.inflight.lock().await.contains("ses_test"));
+
+    // The resumed run promotes the queued message: the transcript now carries
+    // it, with its answer.
+    script_transcript(
+        &backend,
+        vec![SessionTranscript::new(vec![
+            user("msg_cola_anchor", 1_000, "第一条消息"),
+            assistant(2_000, "第一轮回答。"),
+        ])],
+    )
+    .await;
+
+    let first = app
+        .host_action(serde_json::json!({ "action": "resume", "session_id": "ses_test" }))
+        .await
+        .expect("the first click must claim the resume");
+    assert_eq!(first.toast.as_deref(), Some("正在重新发起..."));
+    let second = app
+        .host_action(serde_json::json!({ "action": "resume", "session_id": "ses_test" }))
+        .await;
+    assert!(second.is_none(), "a second click must claim nothing");
+
+    // The click interrupted then resumed, the message rendered on the SAME
+    // card, and the settle decision finished it (the session reads idle, the
+    // turn's reply is complete).
+    wait_for_card_header(&platform, "完成").await;
+    assert_eq!(
+        backend.recovery_ops.lock().await.clone(),
+        vec!["interrupt:ses_test".to_string(), "resume:ses_test".to_string()],
+        "the click must interrupt first, then resume — exactly once each"
+    );
+    let final_card = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_text(&final_card).contains("第一轮回答。"),
+        "the promoted message's answer renders on the card: {final_card}"
+    );
+    assert!(
+        !card_header(&final_card).contains("未被接收"),
+        "the resumed card is no longer Unreceived: {final_card}"
+    );
+    assert_eq!(
+        backend
+            .prompt_calls
+            .lock()
+            .await
+            .iter()
+            .filter(|text| text.as_str() == "第一条消息")
+            .count(),
+        1,
+        "resume must not submit a second prompt: {:?}",
+        backend.prompt_calls.lock().await
+    );
+    assert!(!app.inflight.lock().await.contains("ses_test"));
+    assert_no_further_rendering(&backend, &platform).await;
+}
+
+/// Ticket #437 (ADR-0062): V1 has no resume endpoint, so 重新发起 degrades to
+/// resubmitting the message as a new Turn — under its own `msg_cola_` id, so a
+/// message that landed in the meantime upserts rather than duplicating — with
+/// no interrupt and no resume on the wire, and the old card collected as
+/// 「↩️ 已重试」 without keeping the button.
+#[tokio::test]
+async fn resume_on_v1_resubmits_the_message_as_a_new_turn() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    // V1: no resume endpoint (the mock's default, stated explicitly).
+    backend.with_resume_supported(false);
+    backend.given_transcript("ses_test", vec![SessionTranscript::new(Vec::new())]);
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    seed_session(&app, "ses_test", "/work").await;
+    app.turn_render_poll_ms.store(5, Ordering::Relaxed);
+    app.turn_drain_timeout_ms.store(60_000, Ordering::Relaxed);
+
+    Turn::run(&app.turn_handles(), ctx("ses_test", "第一条消息"))
+        .await
+        .unwrap();
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Unreceived)
+    );
+
+    script_transcript(
+        &backend,
+        vec![SessionTranscript::new(vec![
+            user("msg_cola_anchor", 1_000, "第一条消息"),
+            assistant(2_000, "第一轮回答。"),
+        ])],
+    )
+    .await;
+
+    let result = app
+        .host_action(serde_json::json!({ "action": "resume", "session_id": "ses_test" }))
+        .await
+        .expect("the V1 degradation must still be claimable");
+    assert_eq!(result.toast.as_deref(), Some("正在重新发起..."));
+
+    // The resubmitted Turn runs to its true end...
+    wait_for_card_header(&platform, "完成").await;
+    let wait_finished = async {
+        while app.inflight.lock().await.contains("ses_test") {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), wait_finished)
+        .await
+        .expect("the resubmitted turn must finish");
+
+    // ...while the old Unreceived card is collected as retried: a new attempt
+    // exists below, and the collected card keeps no 重新发起 button.
+    wait_for_card_header(&platform, "已重试").await;
+    let retried = platform
+        .updated_cards()
+        .await
+        .into_iter()
+        .find(|card| card_header(card).contains("已重试"))
+        .expect("the Unreceived card must be marked retried");
+    assert!(
+        card_buttons(&retried)
+            .iter()
+            .all(|button| button["value"]["action"] != "resume"),
+        "a collected card must not keep 重新发起: {retried}"
+    );
+
+    // No resume write on this generation; the message was resubmitted as a new
+    // Turn under its own id (V1 upserts by id, so nothing is duplicated).
+    assert!(
+        backend.recovery_ops.lock().await.is_empty(),
+        "V1 has no resume endpoint: no interrupt, no resume may reach the wire"
+    );
+    assert!(backend.interrupt_calls.lock().await.is_empty());
+    assert!(backend.resume_calls.lock().await.is_empty());
+    assert_eq!(
+        backend.prompt_calls.lock().await.clone(),
+        vec!["第一条消息".to_string(), "第一条消息".to_string()],
+        "the degradation submits exactly one new prompt"
+    );
+    assert_eq!(
+        backend.prompt_message_ids.lock().await.clone(),
+        vec![
+            Some("msg_cola_anchor".to_string()),
+            Some("msg_cola_anchor".to_string())
+        ],
+        "the resubmit must reuse the message's own id"
+    );
+}
+
+/// Ticket #437: a failed resume write releases the claim and leaves the card
+/// Unreceived — the button keeps working for a later press instead of turning
+/// into a dead end.
+#[tokio::test]
+async fn a_failed_resume_leaves_the_unreceived_card_actionable() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_resume_supported(true);
+    backend.fail_resumes(1, "Simulated resume failure");
+    backend.given_transcript("ses_test", vec![SessionTranscript::new(Vec::new())]);
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    seed_session(&app, "ses_test", "/work").await;
+    app.turn_render_poll_ms.store(5, Ordering::Relaxed);
+    app.turn_drain_timeout_ms.store(60_000, Ordering::Relaxed);
+
+    Turn::run(&app.turn_handles(), ctx("ses_test", "第一条消息"))
+        .await
+        .unwrap();
+
+    let first = app
+        .host_action(serde_json::json!({ "action": "resume", "session_id": "ses_test" }))
+        .await;
+    assert!(first.is_some(), "the first click claims the resume");
+
+    // The failed write must give the claim back, so a later press can try
+    // again; the scripted failure is consumed, so the retry succeeds.
+    let second = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(result) = app
+                .host_action(serde_json::json!({ "action": "resume", "session_id": "ses_test" }))
+                .await
+            {
+                return result;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("a failed resume must leave the button actionable");
+    assert_eq!(second.toast.as_deref(), Some("正在重新发起..."));
+    let wait_recorded = async {
+        while backend.resume_calls.lock().await.len() < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), wait_recorded)
+        .await
+        .expect("the retry's resume write must reach the backend");
+    assert_eq!(
+        backend.resume_calls.lock().await.clone(),
+        vec!["ses_test".to_string(), "ses_test".to_string()],
+        "the first press failed once; the second press tried again"
+    );
+}
+
 /// ADR-0062 (spec #434, ticket #436): the whole #428 shape through the real
 /// message path — the advisory status read says live (a stale active entry),
 /// so the new Turn's card opens with the merge line, but no runner ever
