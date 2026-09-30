@@ -988,6 +988,7 @@ impl App {
                         .await
                 }
                 "retry" => self.handle_retry_action(&value).await,
+                "resume" => self.handle_resume_action(&value).await,
                 "switch" => self.handle_switch_card_action(&self.core, &value).await,
                 "sub" => self.handle_sub_card_action(&self.core, &value).await,
                 "dir" => self.handle_dir_card_action(&self.core, &value).await,
@@ -1991,7 +1992,13 @@ impl App {
         let handles = self.turn_handles();
         // The atomic gate: only one click can hold a claim, and only while the
         // card is still in the Error state (a marked or live card is not).
-        let Some(retry) = crate::bridge::turn::Turn::claim_retry(&handles.cards, &sid).await else {
+        let Some(retry) = crate::bridge::turn::Turn::claim_recovery(
+            &handles.cards,
+            &sid,
+            crate::feishu::card::CardState::Error,
+        )
+        .await
+        else {
             tracing::warn!("retry: no retryable error card for session {}", sid);
             return None;
         };
@@ -2004,12 +2011,12 @@ impl App {
             )
         };
         let Some(thread_key) = thread_key else {
-            crate::bridge::turn::Turn::release_retry_claim(&handles.cards, &sid).await;
+            crate::bridge::turn::Turn::release_recovery_claim(&handles.cards, &sid).await;
             tracing::warn!("retry: no thread mapped for session {}", sid);
             return None;
         };
         if inflight {
-            crate::bridge::turn::Turn::release_retry_claim(&handles.cards, &sid).await;
+            crate::bridge::turn::Turn::release_recovery_claim(&handles.cards, &sid).await;
             tracing::warn!("retry: session {} already has a prompt in flight", sid);
             return None;
         }
@@ -2043,7 +2050,7 @@ impl App {
     async fn run_retry(
         self: Arc<Self>,
         handles: crate::bridge::handles::TurnHandles,
-        retry: crate::bridge::turn::TurnRetry,
+        retry: crate::bridge::turn::TurnRecovery,
         thread_key: ThreadKey,
         directory: Option<String>,
     ) {
@@ -2095,7 +2102,8 @@ impl App {
                 if !attached {
                     // No live card, or no anchor to follow: give the claim
                     // back so the Error card's retry still works.
-                    crate::bridge::turn::Turn::release_retry_claim(&handles.cards, &retry.session_id).await;
+                    crate::bridge::turn::Turn::release_recovery_claim(&handles.cards, &retry.session_id)
+                        .await;
                 }
                 tracing::info!(
                     "retry: session {} still busy; re-attached={}",
@@ -2115,6 +2123,136 @@ impl App {
             .await
         {
             tracing::error!("retry prompt: {}", e);
+        }
+    }
+
+    /// Handle the Unreceived card's 重新发起 action (ADR-0062, #437): on V2 the
+    /// click interrupts (a no-op when the Session is already idle) and resumes,
+    /// promoting the queued steer at the new run's start; on V1, which has no
+    /// resume endpoint, the action degrades to resubmitting the message as a
+    /// new Turn. Either way the already-admitted message is reused, never
+    /// retyped, and the transcript message is never duplicated.
+    ///
+    /// The card callback must ack within 3s, so the click claims the action
+    /// (the same atomic double-click guard the Error card's retry uses), spawns
+    /// the pipeline and returns a toast immediately. A claim that cannot
+    /// proceed (no thread mapping, or a prompt already in flight) is released,
+    /// so a later press can try again.
+    async fn handle_resume_action(self: &Arc<Self>, value: &serde_json::Value) -> Option<CardActionResult> {
+        let sid = value
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        if sid.is_empty() {
+            return None;
+        }
+        let handles = self.turn_handles();
+        // The atomic gate: only one click can hold a claim, and only while the
+        // card is still in the Unreceived state (a live or re-armed card is
+        // not).
+        let Some(recovery) = crate::bridge::turn::Turn::claim_recovery(
+            &handles.cards,
+            &sid,
+            crate::feishu::card::CardState::Unreceived,
+        )
+        .await
+        else {
+            tracing::warn!("resume: no unreceived card for session {}", sid);
+            return None;
+        };
+        let inflight = { self.inflight.lock().await.contains(&sid) };
+        let (thread_key, directory) = {
+            let sessions = self.sessions.lock().await;
+            (
+                sessions.thread_for_session(&sid),
+                sessions.directory_for_session(&sid),
+            )
+        };
+        let Some(thread_key) = thread_key else {
+            crate::bridge::turn::Turn::release_recovery_claim(&handles.cards, &sid).await;
+            tracing::warn!("resume: no thread mapped for session {}", sid);
+            return None;
+        };
+        if inflight {
+            crate::bridge::turn::Turn::release_recovery_claim(&handles.cards, &sid).await;
+            tracing::warn!("resume: session {} already has a prompt in flight", sid);
+            return None;
+        }
+        let app = Arc::clone(self);
+        let span = span::turn(&sid, &thread_key, None);
+        tokio::spawn(
+            async move {
+                app.run_resume(handles, recovery, thread_key, directory).await;
+            }
+            .instrument(span),
+        );
+        Some(CardActionResult {
+            card: None,
+            toast: Some("正在重新发起...".to_string()),
+        })
+    }
+
+    /// The resume pipeline, off the ack path.
+    ///
+    /// V2 (the generation has the resume write): interrupt first — a no-op
+    /// when the Session is already idle, but exactly what frees a stale run
+    /// still holding it — then resume, which promotes the message already
+    /// queued in the session inbox at the new run's start. On success the SAME
+    /// card is re-armed live and the unreceived watch renders the resumed run,
+    /// capturing the Turn anchor the moment the promoted message lands
+    /// (ADR-0062). The click never re-submits the message: the queued steer is
+    /// already durable, so nothing is duplicated.
+    ///
+    /// V1 (no resume endpoint): the message is resubmitted as a new Turn under
+    /// its own `msg_cola_` id. V1's prompt upserts by id
+    /// (`Backend::reuse_continues_an_admitted_turn`), so the re-post stays
+    /// idempotent even if the message landed between the Unreceived ending and
+    /// the click — the action cannot duplicate a transcript message either way.
+    ///
+    /// A failed write releases the claim and leaves the card Unreceived: the
+    /// button keeps working for a later press, never a dead end.
+    async fn run_resume(
+        self: Arc<Self>,
+        handles: crate::bridge::handles::TurnHandles,
+        recovery: crate::bridge::turn::TurnRecovery,
+        thread_key: ThreadKey,
+        directory: Option<String>,
+    ) {
+        let session_id = recovery.session_id.clone();
+        if !handles.backend.resume_supported() {
+            // V1 degradation (#437, ADR-0062): no resume endpoint, so
+            // resubmit the already-admitted message as a new Turn, reusing
+            // its id so a landing in between upserts instead of duplicating.
+            tracing::info!("resume: session {session_id} has no resume endpoint; resubmitting as a new Turn");
+            let cola_message_id = recovery.cola_message_id.clone();
+            if let Err(e) = self
+                .run_prompt(recovery.into_context(thread_key, cola_message_id))
+                .await
+            {
+                tracing::error!("resume resubmit: {}", e);
+            }
+            return;
+        }
+        // The click IS the user's consent: interrupt the stale run (idle is a
+        // success no-op), then resume so the queued message is promoted at the
+        // new run's start.
+        if let Err(e) = handles.backend.interrupt(&session_id).await {
+            tracing::warn!("resume: interrupt failed for session {session_id}: {e}");
+            crate::bridge::turn::Turn::release_recovery_claim(&handles.cards, &session_id).await;
+            return;
+        }
+        if let Err(e) = handles.backend.resume(&session_id).await {
+            tracing::warn!("resume: resume failed for session {session_id}: {e}");
+            crate::bridge::turn::Turn::release_recovery_claim(&handles.cards, &session_id).await;
+            return;
+        }
+        tracing::info!("resume: session {session_id} interrupted then resumed; watching the queued message");
+        if !crate::bridge::turn::Turn::reattach_resumed(&handles, &session_id, &thread_key, directory).await {
+            // The card was replaced between the claim and the writes (a new
+            // Turn owns the session now): nothing to re-arm. The resumed
+            // message still runs; whoever owns the card renders it.
+            crate::bridge::turn::Turn::release_recovery_claim(&handles.cards, &session_id).await;
         }
     }
 }

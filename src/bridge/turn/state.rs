@@ -355,10 +355,11 @@ impl CardSession {
         self.card_is_live = true;
     }
 
-    /// Give an unused retry claim back (spec #391): a click that neither
-    /// submitted nor re-attached leaves the Error card retryable.
-    pub(super) fn release_retry_claim(&mut self) {
-        self.acc.retry_claimed = false;
+    /// Give an unused recovery claim back (spec #391, #437): a click that
+    /// neither submitted nor re-attached leaves the terminal card's action
+    /// working for a later click.
+    pub(super) fn release_recovery_claim(&mut self) {
+        self.acc.recovery_claimed = false;
     }
 
     /// Re-attach this card to a run that is still alive (spec #391, ticket
@@ -376,13 +377,40 @@ impl CardSession {
         }
         let anchor = self.acc.turn_anchor.clone()?;
         self.acc.error = None;
-        self.release_retry_claim();
+        self.release_recovery_claim();
         self.acc.restore_live_state();
         let directory = directory
             .filter(|directory| !directory.is_empty())
             .or_else(|| self.acc.directory.clone())
             .unwrap_or_default();
         Some((anchor, directory))
+    }
+
+    /// Re-arm an Unreceived card for the resumed run (#437): the 重新发起
+    /// click interrupted and resumed the Session, so the queued message is
+    /// promoted at the new run's start and this SAME card renders it — through
+    /// the unreceived watch, respawned under the card's identity, which
+    /// captures the Turn anchor the moment the message lands (ADR-0062).
+    /// `None` — nothing changed — when the card is no longer `Unreceived` (a
+    /// new Turn may have replaced it since the claim). On success the ending
+    /// is cleared, a live header state is restored, the claim goes back, and
+    /// the follow fixture's facts are returned: the accumulator's anchor
+    /// (`None` for a never-landed message — the watch's own scope) and the
+    /// directory its status reads route under.
+    pub(super) fn rearm_unreceived(
+        &mut self,
+        directory: Option<String>,
+    ) -> Option<(Option<TurnAnchor>, String)> {
+        if self.acc.card_state != CardState::Unreceived {
+            return None;
+        }
+        self.release_recovery_claim();
+        self.acc.restore_live_state();
+        let directory = directory
+            .filter(|directory| !directory.is_empty())
+            .or_else(|| self.acc.directory.clone())
+            .unwrap_or_default();
+        Some((self.acc.turn_anchor.clone(), directory))
     }
 }
 
@@ -565,11 +593,12 @@ pub(super) struct StreamAccumulator {
     /// The full original prompt text of this turn, kept so the error-card
     /// "retry" button can re-submit it without the user retyping.
     pub(super) prompt: Option<String>,
-    /// Whether this card's error-card retry has been claimed (spec #391). The
-    /// click is acked immediately, so a second click can arrive before the
-    /// retry's own Error→Retried marking lands; the claim is checked and set
-    /// under the cards lock, so exactly one click submits.
-    pub(super) retry_claimed: bool,
+    /// Whether this card's terminal recovery action has been claimed (spec
+    /// #391's Error retry, #437's Unreceived 重新发起). The click is acked
+    /// immediately, so a second click can arrive before the retry's own
+    /// Error→Retried marking lands; the claim is checked and set under the
+    /// cards lock, so exactly one click submits.
+    pub(super) recovery_claimed: bool,
     /// The id this turn's user message carries (`msg_cola_…`, ADR-0026), so a
     /// later error-card retry reuses it and the server deduplicates by id.
     pub(super) cola_message_id: Option<String>,
@@ -853,7 +882,7 @@ impl StreamAccumulator {
     pub(super) fn continue_on_new_card(&mut self) {
         self.error = None;
         self.prompt = None;
-        self.retry_claimed = false;
+        self.recovery_claimed = false;
         self.wake_continuation = true;
         self.card_fallback = CardFallback::None;
         self.card_state = CardState::Loading;
@@ -1827,6 +1856,23 @@ impl StreamAccumulator {
                     text: "🔄 重试".to_string(),
                     kind: "primary",
                     value: serde_json::json!({ "action": "retry", "session_id": sid }),
+                }]);
+            }
+
+            // Unreceived card: offer 重新发起 (ADR-0062, #437) — interrupt (a
+            // no-op when idle) then resume, promoting the queued message at the
+            // new run's start; on V1, which has no resume endpoint, the handler
+            // degrades to resubmitting the message as a new Turn. Only
+            // `Unreceived` offers it, and it carries only the session id: the
+            // handler recovers the message from this card's own accumulator —
+            // the same fixture the Error retry claims.
+            if self.card_state == CardState::Unreceived
+                && let Some(sid) = &self.session_id
+            {
+                builder = builder.with_error_buttons(vec![crate::feishu::card::CardActionButton {
+                    text: "重新发起".to_string(),
+                    kind: "primary",
+                    value: serde_json::json!({ "action": "resume", "session_id": sid }),
                 }]);
             }
         }

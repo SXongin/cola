@@ -911,7 +911,12 @@ async fn retry_losing_the_inflight_guard_marks_nothing_and_releases_the_claim() 
     .await;
 
     // The click claims the retry (the handler's gate)...
-    let retry = crate::bridge::turn::Turn::claim_retry(&app.cards_handle(), "ses_test").await;
+    let retry = crate::bridge::turn::Turn::claim_recovery(
+        &app.cards_handle(),
+        "ses_test",
+        crate::feishu::card::CardState::Error,
+    )
+    .await;
     assert!(retry.is_some(), "the Error card must be retryable");
     // ...then another prompt takes the session's guard before this retry's
     // `Turn::start` runs.
@@ -942,9 +947,13 @@ async fn retry_losing_the_inflight_guard_marks_nothing_and_releases_the_claim() 
         "no retry prompt may be submitted"
     );
     assert!(
-        crate::bridge::turn::Turn::claim_retry(&app.cards_handle(), "ses_test")
-            .await
-            .is_some(),
+        crate::bridge::turn::Turn::claim_recovery(
+            &app.cards_handle(),
+            "ses_test",
+            crate::feishu::card::CardState::Error
+        )
+        .await
+        .is_some(),
         "the lost guard must release the claim for a later click"
     );
 }
@@ -1066,9 +1075,13 @@ async fn busy_retry_without_an_anchor_leaves_the_card_retryable() {
     // claim back (the no-anchor fallback leaves the button usable).
     let retryable = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            if crate::bridge::turn::Turn::claim_retry(&app.cards_handle(), "ses_test")
-                .await
-                .is_some()
+            if crate::bridge::turn::Turn::claim_recovery(
+                &app.cards_handle(),
+                "ses_test",
+                crate::feishu::card::CardState::Error,
+            )
+            .await
+            .is_some()
             {
                 return;
             }
@@ -1208,9 +1221,13 @@ async fn busy_retry_reattach_finalizes_error_with_a_working_retry() {
         "the re-attached failure must offer a retry: {final_card}"
     );
     assert!(
-        crate::bridge::turn::Turn::claim_retry(&app.cards_handle(), "ses_test")
-            .await
-            .is_some(),
+        crate::bridge::turn::Turn::claim_recovery(
+            &app.cards_handle(),
+            "ses_test",
+            crate::feishu::card::CardState::Error
+        )
+        .await
+        .is_some(),
         "the re-attach must release the claim so the new Error is retryable"
     );
     assert_eq!(

@@ -33,6 +33,10 @@ pub(crate) struct SessionCase {
     /// V2, whose admission makes the re-post a no-op). Drives the retry-id
     /// conformance scenario.
     pub(crate) reuse_continues_an_admitted_turn: bool,
+    /// Whether this generation serves the resume write (`true` on V2's
+    /// `POST /api/session/{id}/resume`, `false` on V1, which has no resume
+    /// endpoint). Drives the resume-capability conformance scenario.
+    pub(crate) resume_supported: bool,
     /// Mount the generation's fake session-read routes (a two-page list, one
     /// session get, the run-state reads), publishing the shared
     /// [`SessionReadFixture`] values in that generation's envelope shapes.
@@ -883,6 +887,30 @@ async fn retry_reuse_continuation_matches_the_generation() {
             backend.reuse_continues_an_admitted_turn(),
             case.reuse_continues_an_admitted_turn,
             "{generation}: the retry-reuse contract must match the generation"
+        );
+        assert!(
+            server.requests().is_empty(),
+            "{generation}: the capability must answer without a wire read: {:?}",
+            server.requests()
+        );
+    }
+}
+
+/// The resume contract is generation-dependent too (#437): V2 serves the
+/// durable resume write, while V1 has no resume endpoint — the Unreceived
+/// card's 重新发起 action degrades to a new Turn there. The capability must
+/// answer without a wire read, so the bridge picks the degradation before
+/// touching the network.
+#[tokio::test]
+async fn resume_support_matches_the_generation() {
+    for case in cases() {
+        let generation = case.generation.as_str();
+        let server = TestHttpServer::start().await;
+        let backend = case.backend(&server);
+        assert_eq!(
+            backend.resume_supported(),
+            case.resume_supported,
+            "{generation}: the resume contract must match the generation"
         );
         assert!(
             server.requests().is_empty(),

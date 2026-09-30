@@ -150,6 +150,10 @@ impl Backend for OpenCodeBackend {
         OpenCodeBackend::reuse_continues_an_admitted_turn(self)
     }
 
+    fn resume_supported(&self) -> bool {
+        OpenCodeBackend::resume_supported(self)
+    }
+
     async fn session_status(
         &self,
         session_id: &str,
@@ -180,6 +184,10 @@ impl Backend for OpenCodeBackend {
 
     async fn interrupt(&self, session_id: &str) -> Result<()> {
         OpenCodeBackend::interrupt(self, session_id).await
+    }
+
+    async fn resume(&self, session_id: &str) -> Result<()> {
+        OpenCodeBackend::resume(self, session_id).await
     }
 
     async fn compact(&self, session_id: &str) -> Result<()> {

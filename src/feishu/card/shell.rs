@@ -55,7 +55,8 @@ pub struct CardBuilder {
     /// The card's date anchor (`MM-DD`, from the turn's server time), joined
     /// to the subtitle so a card spanning midnight stays readable (#183).
     date: Option<String>,
-    /// JSON 2.0 buttons shown only on the Error card (e.g. a retry action).
+    /// JSON 2.0 recovery buttons (the Error card's retry, the Unreceived
+    /// card's 重新发起): rendered only in those states.
     error_buttons: Vec<CardActionButton>,
     /// Progress/liveness inputs for the header (ADR-0014): the waiting flag,
     /// the phase timer, and the reasoning length. When absent (all defaults)
@@ -143,7 +144,10 @@ impl CardBuilder {
         self
     }
 
-    /// Buttons shown on the Error card (rendered only in that state).
+    /// Recovery buttons for a terminal card's own action: the Error card's
+    /// retry (spec #391) or the Unreceived card's 重新发起 (#437). Rendered
+    /// only in those states (see [`CardBuilder::build`]), so a live or
+    /// collected card can never offer one.
     pub fn with_error_buttons(mut self, buttons: Vec<CardActionButton>) -> Self {
         self.error_buttons = buttons;
         self
@@ -309,9 +313,11 @@ impl CardBuilder {
             elements.push(json!({ "tag": "markdown", "content": footer }));
         }
 
-        // Error card actions: a retry button so the user can re-submit without
-        // retyping. Only rendered in the Error state.
-        if self.state == CardState::Error {
+        // Terminal-card recovery actions: the Error card's retry (spec #391)
+        // and the Unreceived card's 重新发起 (#437), so the user can recover
+        // without retyping. Only those states render them — a live, Done or
+        // collected card must not.
+        if matches!(self.state, CardState::Error | CardState::Unreceived) {
             for btn in &self.error_buttons {
                 elements.push(json!({
                     "tag": "button",
@@ -1032,6 +1038,92 @@ mod tests {
         let (title, template) = header_title_and_template(&CardState::Stopped, None, &progress);
         assert_eq!(title, "⏹ 已停止");
         assert_eq!(template, "grey");
+    }
+
+    /// The Unreceived ending's recovery (ADR-0062, #437): the card offers
+    /// 「重新发起」 — `action: "resume"` carrying the session — while keeping
+    /// whatever content the turn rendered. The button's own name and action are
+    /// the card's contract; the accumulator is what decides when to supply it.
+    #[test]
+    fn unreceived_card_offers_the_resume_button() {
+        let card = CardBuilder::new()
+            .with_state(CardState::Unreceived)
+            .with_text("📨 已收到，将并入当前运行")
+            .with_error_buttons(vec![CardActionButton {
+                text: "重新发起".to_string(),
+                kind: "primary",
+                value: serde_json::json!({ "action": "resume", "session_id": "ses_1" }),
+            }])
+            .build();
+        assert_eq!(card["header"]["template"].as_str().unwrap(), "orange");
+        assert_eq!(
+            card["header"]["title"]["content"].as_str().unwrap(),
+            "⚠️ 这条消息未被接收"
+        );
+        let button = card["body"]["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|element| element["tag"] == "button")
+            .expect("the Unreceived card must offer the resume button");
+        assert_eq!(button["text"]["content"].as_str().unwrap(), "重新发起");
+        assert_eq!(button["value"]["action"].as_str().unwrap(), "resume");
+        assert_eq!(button["value"]["session_id"].as_str().unwrap(), "ses_1");
+    }
+
+    /// The recovery buttons render on exactly the two terminal cards that own
+    /// an action (spec #391's Error retry, #437's Unreceived 重新发起) and on
+    /// no other state: a live, Done or collected card must never offer a
+    /// re-run, even when a builder is handed buttons by mistake.
+    #[test]
+    fn recovery_buttons_render_only_on_the_error_and_unreceived_cards() {
+        for state in [
+            CardState::Loading,
+            CardState::Reasoning,
+            CardState::Streaming,
+            CardState::Continued,
+            CardState::Done,
+            CardState::Retried,
+            CardState::Stopped,
+            CardState::Waiting,
+            CardState::Superseded,
+            CardState::SwitchedAway,
+        ] {
+            let card = CardBuilder::new()
+                .with_state(state.clone())
+                .with_error_buttons(vec![CardActionButton {
+                    text: "重新发起".to_string(),
+                    kind: "primary",
+                    value: serde_json::json!({ "action": "resume", "session_id": "ses_1" }),
+                }])
+                .build();
+            assert!(
+                card["body"]["elements"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|element| element["tag"] != "button"),
+                "{state:?} must not render a recovery button: {card}"
+            );
+        }
+        for state in [CardState::Error, CardState::Unreceived] {
+            let card = CardBuilder::new()
+                .with_state(state.clone())
+                .with_error_buttons(vec![CardActionButton {
+                    text: "重新发起".to_string(),
+                    kind: "primary",
+                    value: serde_json::json!({ "action": "resume", "session_id": "ses_1" }),
+                }])
+                .build();
+            assert!(
+                card["body"]["elements"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|element| element["tag"] == "button"),
+                "{state:?} must render its recovery button: {card}"
+            );
+        }
     }
 
     #[test]

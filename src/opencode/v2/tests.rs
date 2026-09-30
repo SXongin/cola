@@ -742,6 +742,47 @@ async fn interrupt_accepts_the_idle_no_op_and_compact_sends_an_empty_payload() {
     );
 }
 
+/// Resume (`POST /api/session/{id}/resume`, 204): the durable write that
+/// promotes a queued steer at a new run's start — the second half of the
+/// Unreceived card's 重新发起 action (#437). It carries no body, and its
+/// failure mapping is the interrupt route's: a tagged 404 is the missing
+/// session (the recreate heal), an untagged proxy 404 is a plain error.
+#[tokio::test]
+async fn resume_posts_the_durable_route_and_maps_failures_like_interrupt() {
+    let server = TestHttpServer::start().await;
+    server.route("POST", "/api/session/ses_1/resume", 204, "");
+    server.route(
+        "POST",
+        "/api/session/ses_gone/resume",
+        404,
+        r#"{"_tag":"SessionNotFoundError","message":"gone"}"#,
+    );
+    server.route(
+        "POST",
+        "/api/session/ses_proxy/resume",
+        404,
+        r#"{"message":"proxy has no such route"}"#,
+    );
+    let client = v2_wire_client(&server);
+
+    client.resume("ses_1").await.unwrap();
+    let resume = request_at(&server, 0);
+    assert_eq!(resume.method, "POST");
+    assert_eq!(resume.path, "/api/session/ses_1/resume");
+    assert_eq!(resume.body, "", "resume carries no body");
+
+    let error = client.resume("ses_gone").await.unwrap_err();
+    assert!(
+        matches!(error, BridgeError::SessionNotFound(_)),
+        "a tagged resume 404 is SessionNotFound: {error:?}"
+    );
+    let error = client.resume("ses_proxy").await.unwrap_err();
+    assert!(
+        matches!(error, BridgeError::OpenCode(_)),
+        "an untagged resume 404 must not trigger the recreate heal: {error:?}"
+    );
+}
+
 /// The durable-selection read: `GET /api/session/{id}`'s `{data}` envelope
 /// carries the model ref (variant inside it) and the selected agent — the
 /// state the effective-model ladder and the footer read.
