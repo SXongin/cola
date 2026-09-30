@@ -408,14 +408,7 @@ fn render_runtime_entries(
             TaskRetirementEnding::Ended(_) => TaskEnding::RuntimeEnded,
             TaskRetirementEnding::Lost => TaskEnding::Lost,
         };
-        let input = transcript
-            .messages
-            .iter()
-            .flat_map(|message| &message.parts)
-            .find_map(|part| match part {
-                Part::Tool(call) if call.identity.call_id == task.tool.call_id => call.input.as_ref(),
-                _ => None,
-            });
+        let input = transcript.tool_input(task.tool.call_id.as_str());
         let id = match kind {
             TaskKind::Shell => task.shell_id.clone().or_else(|| Some(task.tool.call_id.clone())),
             TaskKind::Subagent => task.child_id.clone().or_else(|| Some(task.tool.call_id.clone())),

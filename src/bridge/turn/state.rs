@@ -7,7 +7,7 @@
 //! Turn module, and every read or write goes through a `Turn::` method. The
 //! accumulator's own tests are the module's internal seam.
 
-use crate::backend::{Part, SessionTranscript, TurnAnchor};
+use crate::backend::{SessionTranscript, TurnAnchor};
 use crate::bridge::handles::CardsHandle;
 use crate::feishu::card::first_n_chars_bytes;
 use crate::feishu::card::ledger::{TaskCompletionEntry, TaskKind, TaskLedgerRow};
@@ -2046,18 +2046,6 @@ fn ledger_rows(transcript: &SessionTranscript) -> Vec<TaskLedgerRow> {
     if transcript.background_tasks.is_empty() {
         return Vec::new();
     }
-    let inputs: std::collections::HashMap<&str, &serde_json::Value> = transcript
-        .messages
-        .iter()
-        .flat_map(|message| &message.parts)
-        .filter_map(|part| match part {
-            Part::Tool(call) => call
-                .input
-                .as_ref()
-                .map(|input| (call.identity.call_id.as_str(), input)),
-            _ => None,
-        })
-        .collect();
     transcript
         .background_tasks
         .iter()
@@ -2067,7 +2055,7 @@ fn ledger_rows(transcript: &SessionTranscript) -> Vec<TaskLedgerRow> {
             let kind = task_kind(&task.tool.name);
             TaskLedgerRow {
                 kind,
-                label: task_label(kind, inputs.get(task.tool.call_id.as_str()).copied()),
+                label: task_label(kind, transcript.tool_input(task.tool.call_id.as_str())),
                 started_at: task.started_at,
                 // A task the runtime could not confirm (issue #454): the row
                 // renders its own facts plus the unconfirmed marker, and stays
