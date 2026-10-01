@@ -1,10 +1,16 @@
-//! The Wake continuation (ADR-0059, spec #405 ticket 3): Session Sync renders
-//! work the Backend resumed with no user message — a finished Background Task,
-//! a restart, an interruption — as a Card Chain continuation. The new card is
-//! replied to the user's message, carries the 承接 line and only the work the
-//! chain had not rendered, and ends through the single settle decision: ✅ at
-//! the true end, ❌ without Retry for a settled failure, ⏹ 已停止 for `/stop`,
-//! or the waiting yield when the Wake backgrounded work of its own.
+//! The Wake continuation (ADR-0059, ADR-0066): Session Sync renders work the
+//! Backend resumed with no user message — a finished Background Task, a
+//! restart, an interruption. A shell/subagent completion that lands on a
+//! yielded (⏳) card resumes THAT card in place: one card per request, so the
+//! retiring task's fixed entry, the resumed work and the eventual ending all
+//! stay on the card the user's message opened, and no 承接 line is written.
+//! Every other continuation keeps the ADR-0059 split — the card is finalized
+//! and a NEW continuation card, replied to the user's message (or sent
+//! top-level after a restart) and opening with the 承接 line, carries only the
+//! work the chain had not rendered. Either path ends through the single settle
+//! decision: ✅ at the true end, ❌ for a settled failure (the request's own
+//! in-place card keeps its ordinary Retry, ADR-0066), ⏹ 已停止 for `/stop`, or
+//! the waiting yield when the Wake backgrounded work of its own.
 //!
 //! A shell/subagent completion that lands in an already-live card leaves the
 //! Background Task Ledger's fixed completion entry there instead of a receipt
@@ -721,6 +727,9 @@ async fn a_message_during_a_resumed_run_supplements_it() {
     Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下 CI"))
         .await
         .unwrap();
+    // Name the request's card so the split's finalization of it can be read
+    // apart from the continuation's own updates.
+    Turn::set_card_message_id(&app.cards_handle(), "ses_test", "om_waiting").await;
 
     // The resume: the Wake's own work, its Execution not yet bounded, so the
     // resumed run stays live.
@@ -766,6 +775,39 @@ async fn a_message_during_a_resumed_run_supplements_it() {
     assert!(
         card_text(&resumed).contains("📨 已收到补充"),
         "the continuation carries the supplement receipt: {resumed}"
+    );
+    // The message was SUBMITTED into the running Session (the Supplement
+    // steer), not silently absorbed: the backend received it as a prompt.
+    assert!(
+        backend
+            .prompt_calls
+            .lock()
+            .await
+            .iter()
+            .any(|text| text == "补充一下，改用方案 B"),
+        "the mid-resume message reaches the run: {:?}",
+        backend.prompt_calls.lock().await
+    );
+    // The chain really SPLITS at the message (ADR-0043): the resumed card is
+    // finalized with the standard handoff, keeping the work it already showed,
+    // and the receipt rides the continuation only. The message merges into the
+    // RUN — never onto the card's timeline (ADR-0066 supersedes #426's "same
+    // card" shorthand: the same Turn continues, not the same Feishu message).
+    let finalized = patches_to(&platform, "om_waiting")
+        .await
+        .pop()
+        .expect("the resumed card is finalized at the split");
+    assert!(
+        card_header(&finalized).contains("继续中"),
+        "the split finalizes the resumed card with the standard handoff: {finalized}"
+    );
+    assert!(
+        card_text(&finalized).contains("正在合并。"),
+        "the finalized card keeps the work it already showed: {finalized}"
+    );
+    assert!(
+        !card_text(&finalized).contains("📨 已收到补充"),
+        "the receipt rides the continuation only: {finalized}"
     );
     assert_eq!(
         Turn::card_state(&app.cards_handle(), "ses_test").await,
@@ -1205,6 +1247,9 @@ async fn a_stop_during_a_resumed_run_finalizes_stopped() {
     context.is_group = true;
     context.requester_open_id = Some(TEST_HOST.to_string());
     Turn::run(&app.turn_handles(), context).await.unwrap();
+    // Name the request's card so its own PATCHes can be told apart from any
+    // other card's (the harness replies every card with one id).
+    Turn::set_card_message_id(&app.cards_handle(), "ses_test", "om_waiting").await;
 
     // The Wake's Execution has no boundary yet: the resumed run is still going,
     // so the continuation keeps observing.
@@ -1221,16 +1266,32 @@ async fn a_stop_during_a_resumed_run_finalizes_stopped() {
     assert_eq!(
         Turn::card_state(&app.cards_handle(), "ses_test").await,
         Some(CardState::Streaming),
-        "the resumed run is live on the continuation"
+        "the resumed run is live on the request's card"
     );
+    let posts_before = posted_cards(&platform).await;
 
     send_command(&app, "/stop", "msg_stop").await;
     wait_for_card_header(&platform, "已停止").await;
 
-    let last = platform.updated_cards().await.last().cloned().unwrap();
+    // The stop ends the RESUMED card in place: nothing is posted, and the
+    // request's own card carries the terminal.
+    assert_eq!(
+        posted_cards(&platform).await,
+        posts_before,
+        "the stop posts no card: {:?}",
+        platform.calls.lock().await
+    );
+    let stopped = patches_to(&platform, "om_waiting")
+        .await
+        .pop()
+        .expect("the resumed card is PATCHed");
     assert!(
-        !card_header(&last).contains("✅") && !card_header(&last).contains("出错"),
-        "a deliberate stop is its own terminal: {last}"
+        card_header(&stopped).contains("已停止"),
+        "the resumed card takes the stop's terminal: {stopped}"
+    );
+    assert!(
+        !card_header(&stopped).contains("✅") && !card_header(&stopped).contains("出错"),
+        "a deliberate stop is its own terminal: {stopped}"
     );
     // The notice trails the stop's PATCH in the same pass: give it the moment.
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1257,6 +1318,9 @@ async fn a_failed_in_place_resume_keeps_retry() {
     context.is_group = true;
     context.requester_open_id = Some(TEST_HOST.to_string());
     Turn::run(&app.turn_handles(), context).await.unwrap();
+    // Name the request's card so its own PATCHes can be told apart from any
+    // other card's (the harness replies every card with one id).
+    Turn::set_card_message_id(&app.cards_handle(), "ses_test", "om_waiting").await;
     let posts_before = posted_cards(&platform).await;
 
     // The resumed run fails.
@@ -1278,16 +1342,25 @@ async fn a_failed_in_place_resume_keeps_retry() {
     )
     .await;
 
-    let last = platform.updated_cards().await.last().cloned().unwrap();
+    // The ❌ lands on the RESUMED card — the request's own — which still
+    // carries its prompt, so its ordinary Retry stays actionable.
+    let errored = patches_to(&platform, "om_waiting")
+        .await
+        .pop()
+        .expect("the resumed card is PATCHed");
     assert!(
-        card_text(&last).contains("provider 503"),
-        "the settled failure reaches the resumed card: {last}"
+        card_header(&errored).contains("出错"),
+        "the resumed card takes the failure's terminal: {errored}"
     );
     assert!(
-        card_buttons(&last)
+        card_text(&errored).contains("provider 503"),
+        "the settled failure reaches the resumed card: {errored}"
+    );
+    assert!(
+        card_buttons(&errored)
             .iter()
             .any(|button| button["value"]["action"] == "retry"),
-        "the request's own card keeps its Retry: {last}"
+        "the request's own card keeps its Retry: {errored}"
     );
     assert_eq!(
         posted_cards(&platform).await,
@@ -2700,6 +2773,11 @@ async fn a_restart_cards_later_completion_resumes_it_in_place() {
     assert!(
         !Turn::card_is_owned(&app.cards_handle(), "ses_test").await,
         "the yielded card is nobody's to render until the next Wake"
+    );
+    assert_eq!(
+        Turn::reply_target(&app.cards_handle(), "ses_test").await,
+        None,
+        "the top-level restart card has no reply target — the lobby case (#426)"
     );
     let cards_posted = posted_cards(&platform).await;
 

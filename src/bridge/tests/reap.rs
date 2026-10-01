@@ -712,6 +712,65 @@ async fn a_waiting_orphan_settles_at_its_true_end() {
     );
 }
 
+/// A card persisted MID-RESUME (#426/#487): cola died while the resumed run
+/// was in flight, so the sidecar still names the request's card and the
+/// durable Wake Watermark holds the completion the previous life's in-place
+/// PATCH already announced (ADR-0061, ADR-0066). The restart has nothing to
+/// post for that Wake, and the reap reads the transcript's true ending — the
+/// resumed run finished while cola was down — settling THAT card in place:
+/// never frozen at the resuming header its last life showed.
+#[tokio::test]
+async fn a_card_persisted_mid_resume_is_reaped_to_its_true_end() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_record(&session_file, "om_resumed", "msg_cola_anchor", Some(1_000));
+
+    // The read the restart wakes to: the completion Wake (2_900) resumed the
+    // run, and the resumed run's own Execution boundary (4_000) arrived while
+    // cola was down — the true end, with every Wake answered.
+    let resumed = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+        assistant(3_100, "CI 通过了。"),
+    ])
+    .with_executions(vec![execution(2_500), execution(4_000)])
+    .with_wakes(vec![shell_wake(2_900)]);
+    let (app, platform) = restarted_app(&session_file, resumed, None).await;
+    // The previous life's in-place PATCH announced this Wake: the mark is the
+    // durable fact the restart loads, so the Fresh path must not re-post it.
+    app.cards_handle()
+        .wake_watermarks
+        .advance("ses_test", "msg_wake_2900", 2_900);
+
+    spawn_sync(&app);
+    wait_for_card_update(
+        &platform,
+        "the mid-resume card's true ending",
+        CardUpdates::Any,
+        |card| card_header(card).contains("✅"),
+    )
+    .await;
+
+    let card = last_update_of(&platform, "om_resumed")
+        .await
+        .expect("the mid-resume card is settled in place");
+    assert_eq!(
+        card_header(&card),
+        "✅ 完成",
+        "the reap stamps the transcript's true end, not the resuming header"
+    );
+    assert!(
+        app.cards_handle().live_cards.get("ses_test").is_none(),
+        "the true end spends the record"
+    );
+    assert!(
+        continuation_sends(&platform).await.is_empty(),
+        "a Wake the previous life announced is never re-posted: {:?}",
+        platform.calls.lock().await
+    );
+}
+
 /// The #428 variant: a submit whose message never reached the transcript ends
 /// 「⚠️ 这条消息未被接收」 — never ✅ — and drops its record.
 #[tokio::test]
