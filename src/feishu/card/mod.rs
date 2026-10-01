@@ -34,9 +34,13 @@ pub enum CardState {
     Stopped,
     /// A card whose Execution ended but whose Turn still has live Background
     /// Tasks (ADR-0059): it yields with 「⏳ 等待后台任务」 — NOT a terminal and
-    /// never ✅ — and stops receiving updates. The next Wake continues the
-    /// chain on a new continuation card; a later Turn supersedes this one or a
-    /// switch-away collects it (spec #405).
+    /// never ✅ — and stops receiving updates. A shell/subagent completion Wake
+    /// resumes it IN PLACE as `Resuming` (ADR-0066); every other continuation
+    /// keeps the ADR-0059 split onto a new card — restart/interrupt Wakes, the
+    /// Wake-less content-diff fallback, a Wake arriving after an ending (a
+    /// terminal card), the size and supplement splits, and the post-restart
+    /// Fresh card. A later Turn supersedes this one or a switch-away collects
+    /// it (spec #405).
     Waiting,
     /// A card whose Wait a shell/subagent completion Wake resumed IN PLACE
     /// (ADR-0066): no new card is sent — the retiring task's completion entry
@@ -82,10 +86,12 @@ impl CardState {
     /// recovery ones (the Error card's retry; the Unreceived card's 重新发起,
     /// spec #434). `Continued` is NOT terminal — the chain continues on a new
     /// card — and neither is `Waiting`: the Turn's Background Tasks are still
-    /// live and a Wake will continue its chain on a new card (ADR-0059). The
-    /// collected waiting states (`Superseded`, `SwitchedAway`) ARE terminal:
-    /// the wait is over even though its background work is not, so the card
-    /// stops updating (ADR-0059). `Resuming` is NOT terminal either (ADR-0066):
+    /// live and a shell/subagent completion Wake resumes its card in place
+    /// (ADR-0066), while the remaining continuations keep the ADR-0059 split
+    /// onto a new card. The collected waiting states (`Superseded`,
+    /// `SwitchedAway`) ARE terminal: the wait is over even though its
+    /// background work is not, so the card stops updating (ADR-0059).
+    /// `Resuming` is NOT terminal either (ADR-0066):
     /// the Wake resumed the run on this card, so it is live again and must be
     /// able to end ✅/❌/⏹ or yield back to `Waiting`.
     /// One definition, so a new terminal state (#394's `Stopped`) cannot leave
@@ -106,9 +112,10 @@ impl CardState {
 
     /// Whether a live renderer still owns the card's chain: the card is
     /// neither ended nor yielded to its Background Tasks. `Waiting` is NOT
-    /// owned in this sense — the Turn that owned it yielded and the next Wake
-    /// continues the chain on a new card (ADR-0059) — and neither is a
-    /// terminal card. `Resuming` IS owned: an in-place Wake handed the chain
+    /// owned in this sense — the Turn that owned it yielded; a shell/subagent
+    /// completion Wake re-owns it as `Resuming` (ADR-0066) and the remaining
+    /// continuations keep the ADR-0059 split onto a new card — and neither is
+    /// a terminal card. `Resuming` IS owned: an in-place Wake handed the chain
     /// to the resumed run's renderer (ADR-0066). Session Sync's Wake step reads
     /// this to decide whether the chain can be handed over without
     /// double-rendering. Distinct from `CardSession::card_is_live` (the last

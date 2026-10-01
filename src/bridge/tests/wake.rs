@@ -389,23 +389,6 @@ async fn wait_for_any_card(platform: &RecordingPlatform, needle: &str) {
         .unwrap_or_else(|_| panic!("no card ever carried {needle:?}"));
 }
 
-/// Every card POST (a reply or a top-level send) the platform recorded — the
-/// counter for "was a new card posted?" (an in-place PATCH updates one).
-async fn posted_cards(platform: &RecordingPlatform) -> usize {
-    platform
-        .calls
-        .lock()
-        .await
-        .iter()
-        .filter(|call| {
-            matches!(
-                call,
-                PlatformCall::ReplyCard { .. } | PlatformCall::SendCard { .. }
-            )
-        })
-        .count()
-}
-
 /// Give `ses_test`'s tracked card the explicit id `om_waiting`: the harness
 /// replies every card with one id, so a test that must count PATCHes per chain
 /// has to name the request's own card itself.
@@ -446,7 +429,7 @@ async fn a_completion_wake_resumes_the_yielded_card_in_place() {
         Turn::card_state(&app.cards_handle(), "ses_test").await,
         Some(CardState::Waiting)
     );
-    let posts_before = posted_cards(&platform).await;
+    let posts_before = card_posts(&platform).await;
     let replies_before = platform.replied_cards().await.len();
 
     // The Wake resumes the Turn with real work: reasoning, a settled tool and
@@ -466,7 +449,7 @@ async fn a_completion_wake_resumes_the_yielded_card_in_place() {
     // No card was posted and nothing was replied to: the SAME card carried the
     // completion entry, the resumed work and the ending.
     assert_eq!(
-        posted_cards(&platform).await,
+        card_posts(&platform).await,
         posts_before,
         "an in-place resume posts no card: {:?}",
         platform.calls.lock().await
@@ -590,14 +573,14 @@ async fn a_completion_wake_resumes_the_yielded_card_in_place() {
         Some(2_900),
         "the restarted process loads the resumed Wake's mark from disk"
     );
-    let posts = posted_cards(&platform).await;
+    let posts = card_posts(&platform).await;
     spawn_sync(&restarted);
     // The restarted process really ran its Session Sync pass over the read …
     wait_for_transcript_reads(&restarted_backend, "ses_test", 2).await;
     tokio::time::sleep(Duration::from_millis(150)).await;
     // … and posted nothing: the resumed Wake is covered by the durable mark.
     assert_eq!(
-        posted_cards(&platform).await,
+        card_posts(&platform).await,
         posts,
         "a restarted cola must not re-post the resumed Wake: {:?}",
         platform.calls.lock().await
@@ -754,7 +737,7 @@ async fn an_in_place_resume_that_overflows_still_splits() {
         .await
         .unwrap();
     name_request_card(&app).await;
-    let posts_before = posted_cards(&platform).await;
+    let posts_before = card_posts(&platform).await;
 
     // The resumed run's answer fills a card on its own; the subagent stays
     // live, so the continuation still has a ledger to carry.
@@ -782,7 +765,7 @@ async fn an_in_place_resume_that_overflows_still_splits() {
     )
     .await;
     assert_eq!(
-        posted_cards(&platform).await,
+        card_posts(&platform).await,
         posts_before + 1,
         "an overflowing resume continues on exactly one new card: {:?}",
         platform.calls.lock().await
@@ -1258,7 +1241,7 @@ async fn restart_like_wake_on_a_waiting_card_still_splits(source: WakeSource) {
         Some(CardState::Waiting)
     );
     name_request_card(&app).await;
-    let posts_before = posted_cards(&platform).await;
+    let posts_before = card_posts(&platform).await;
 
     // The server restarted (or the run was interrupted): the Wake records
     // that, and the run resumed with real work while the subagent stays live.
@@ -1294,7 +1277,7 @@ async fn restart_like_wake_on_a_waiting_card_still_splits(source: WakeSource) {
     // A NEW card carried the 承接 line and the resumed work: the yielded card
     // was not resumed in place, and exactly one continuation was posted.
     assert_eq!(
-        posted_cards(&platform).await,
+        card_posts(&platform).await,
         posts_before + 1,
         "a restart/interrupt Wake still continues on exactly one new card: {:?}",
         platform.calls.lock().await
@@ -1359,7 +1342,7 @@ async fn a_wake_less_tail_on_a_waiting_card_still_splits() {
     Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下 CI"))
         .await
         .unwrap();
-    let posts_before = posted_cards(&platform).await;
+    let posts_before = card_posts(&platform).await;
 
     // Content landed with no Wake recorded at all: the tail the finalized
     // read missed.
@@ -1387,7 +1370,7 @@ async fn a_wake_less_tail_on_a_waiting_card_still_splits() {
     .await;
 
     assert!(
-        posted_cards(&platform).await > posts_before,
+        card_posts(&platform).await > posts_before,
         "the Wake-less fallback still continues on a new card: {:?}",
         platform.calls.lock().await
     );
@@ -1408,8 +1391,8 @@ async fn a_stop_during_a_resumed_run_finalizes_stopped() {
     Turn::run(&app.turn_handles(), context).await.unwrap();
     name_request_card(&app).await;
 
-    // The Wake's Execution has no boundary yet: the resumed run is still going,
-    // so the continuation keeps observing.
+    // The Wake's Execution has no boundary yet: the resumed run is still going
+    // on the request's own card, which stays live.
     script_transcript(
         &backend,
         vec![woken_shell_transcript(
@@ -1425,7 +1408,7 @@ async fn a_stop_during_a_resumed_run_finalizes_stopped() {
         Some(CardState::Streaming),
         "the resumed run is live on the request's card"
     );
-    let posts_before = posted_cards(&platform).await;
+    let posts_before = card_posts(&platform).await;
 
     send_command(&app, "/stop", "msg_stop").await;
     wait_for_card_header(&platform, "已停止").await;
@@ -1433,7 +1416,7 @@ async fn a_stop_during_a_resumed_run_finalizes_stopped() {
     // The stop ends the RESUMED card in place: nothing is posted, and the
     // request's own card carries the terminal.
     assert_eq!(
-        posted_cards(&platform).await,
+        card_posts(&platform).await,
         posts_before,
         "the stop posts no card: {:?}",
         platform.calls.lock().await
@@ -1476,7 +1459,7 @@ async fn a_failed_in_place_resume_keeps_retry() {
     context.requester_open_id = Some(TEST_HOST.to_string());
     Turn::run(&app.turn_handles(), context).await.unwrap();
     name_request_card(&app).await;
-    let posts_before = posted_cards(&platform).await;
+    let posts_before = card_posts(&platform).await;
 
     // The resumed run fails.
     script_transcript(
@@ -1518,7 +1501,7 @@ async fn a_failed_in_place_resume_keeps_retry() {
         "the request's own card keeps its Retry: {errored}"
     );
     assert_eq!(
-        posted_cards(&platform).await,
+        card_posts(&platform).await,
         posts_before,
         "the failed resume posted no card: {:?}",
         platform.calls.lock().await
@@ -1876,7 +1859,7 @@ async fn a_second_wake_resumes_the_same_card_again() {
         .await
         .unwrap();
     name_request_card(&app).await;
-    let posts_before = posted_cards(&platform).await;
+    let posts_before = card_posts(&platform).await;
 
     // The first completion resumes the card, and its run backgrounds a SECOND
     // task: the card yields back to 「⏳ 等待后台任务」 with the remaining list.
@@ -1952,7 +1935,7 @@ async fn a_second_wake_resumes_the_same_card_again() {
         "no continuation was ever posted for either Wake: {last}"
     );
     assert_eq!(
-        posted_cards(&platform).await,
+        card_posts(&platform).await,
         posts_before,
         "two completions, still one card: {:?}",
         platform.calls.lock().await
@@ -2932,7 +2915,7 @@ async fn a_restart_cards_later_completion_resumes_it_in_place() {
         None,
         "the top-level restart card has no reply target — the lobby case (#426)"
     );
-    let cards_posted = posted_cards(&platform).await;
+    let cards_posted = card_posts(&platform).await;
 
     // The second completion resumes THAT card in place — no reply target
     // exists, and none is needed: the entry and the work land on the card the
@@ -2955,7 +2938,7 @@ async fn a_restart_cards_later_completion_resumes_it_in_place() {
     .await;
 
     assert_eq!(
-        posted_cards(&platform).await,
+        card_posts(&platform).await,
         cards_posted,
         "the later completion posts nothing: the chain resumes its own card: {:?}",
         platform.calls.lock().await
