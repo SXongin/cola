@@ -28,6 +28,9 @@ pub mod turn;
 pub(crate) mod wake_watermark;
 
 #[cfg(test)]
+mod attach_live;
+
+#[cfg(test)]
 pub(crate) mod test_support;
 
 #[cfg(test)]
