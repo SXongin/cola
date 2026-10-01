@@ -4,7 +4,7 @@ How the engineering skills should consume this repo's domain documentation when 
 
 ## Before exploring, read these
 
-- **`CONTEXT.md`** at the repo root — the project's domain glossary
+- **`GLOSSARY.md`** at the repo root — the project's domain glossary (formerly `CONTEXT.md`: upstream renamed the convention in 2026-08; older ADRs still use the old name)
 - **`docs/adr/`** — read ADRs that touch the area you're about to work in
 - **`AGENTS.md`** — agent skill configuration (this file is a sibling, not part of the domain docs)
 
@@ -17,7 +17,7 @@ Single-context repo:
 ```
 /
 ├── AGENTS.md
-├── CONTEXT.md
+├── GLOSSARY.md
 ├── docs/
 │   ├── adr/
 │   │   ├── 0001-rust-bridge-architecture.md
@@ -28,7 +28,7 @@ Single-context repo:
 
 ## Use the glossary's vocabulary
 
-When your output names a domain concept, use the term as defined in `CONTEXT.md`. Don't drift to synonyms the glossary explicitly avoids (e.g. don't say "workspace" when the glossary says "project").
+When your output names a domain concept, use the term as defined in `GLOSSARY.md`. Don't drift to synonyms the glossary explicitly avoids (e.g. don't say "workspace" when the glossary says "project").
 
 If the concept you need isn't in the glossary yet, that's a signal — either you're inventing language the project doesn't use (reconsider) or there's a real gap (note it for `/domain-modeling`).
 
