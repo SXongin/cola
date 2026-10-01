@@ -807,13 +807,13 @@ impl ExternalFlow {
         handles.waits.stopped_sessions.lock().await.remove(sid);
 
         match continuation {
-            WakeContinuation::ResumeInPlace => {
+            WakeContinuation::ResumeInPlace { wake_id } => {
                 // ADR-0066, the one-card-per-request handoff: the yielded card
                 // resumes in place. Nothing is sent and nothing is replied to,
                 // so this path needs no Feishu reply target — which is exactly
                 // what closes the lobby/restart gap where a split had nowhere
                 // to go and the work never rendered.
-                if !Turn::resume_yielded_card(&handles.cards, sid, transcript, now_ms).await {
+                if !Turn::resume_yielded_card(&handles.cards, sid, &wake_id, transcript, now_ms).await {
                     return;
                 }
                 let (Some(anchor), Some(chain)) = (

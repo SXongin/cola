@@ -667,12 +667,27 @@ pub(super) struct StreamAccumulator {
     /// [`Self::continue_on_new_card`] and by a fresh (restart) arm.
     pub(super) wake_continuation: bool,
     /// The Wakes whose completion this chain has already announced: marked by
-    /// its own opening 承接 line (a Wake that opened a card) or by the
-    /// merged-path completion entry (a shell/subagent Wake that resumed an
-    /// already-live card). One mark per Wake id; the set is kept across
+    /// its own opening 承接 line (a Wake that opened a card) or by a
+    /// completion entry — the merged-path render of a live card, or a yielded
+    /// card's ledger refresh. One mark per Wake id; the set is kept across
     /// [`Self::continue_on_new_card`], so a Wake that resumes a
-    /// wake-continuation card still marks exactly once (ADR-0059).
+    /// wake-continuation card still marks exactly once (ADR-0059). This is the
+    /// ANNOUNCEMENT gate (it keeps an entry single); the Wake step's in-place
+    /// decision reads [`Self::handed_over_wakes`], because an entry a ledger
+    /// refresh placed is not a handoff.
     pub(super) announced_wakes: std::collections::HashSet<String>,
+    /// The Wakes whose resumed work this chain has HANDED OVER to a card
+    /// (ADR-0066): a 承接 line's split (a continuation card takes it) or the
+    /// in-place resume (the same card takes it). The Wake step's in-place gate
+    /// keys on THIS, never on `announced_wakes`: a yielded card's ledger
+    /// refresh places a completion entry while the Wake's work is still
+    /// unrendered (live 2026-10-01 — the resumed message's text part was empty
+    /// at the read that placed it), and that entry must not read as a handoff,
+    /// or the work would split into a 承接 card when it arrives. Once a Wake IS
+    /// handed over, a later tail past it is the content-diff fallback and
+    /// splits. Like the announcement set, one mark per Wake id, kept across
+    /// [`Self::continue_on_new_card`].
+    pub(super) handed_over_wakes: std::collections::HashSet<String>,
     /// The newest announcement this chain has staged but not yet delivered:
     /// `(wake id, created_ms)`, advanced by [`Self::announce_wake`] and drained
     /// into the durable Wake Watermark once a card write actually carries it
@@ -1023,6 +1038,16 @@ impl StreamAccumulator {
     pub(super) fn push_receipt_at(&mut self, at_ms: Option<i64>, text: &str) {
         let key = at_ms.unwrap_or_else(|| self.next_order());
         self.insert_kind(key, None, TimelineKind::Receipt(text.to_string()));
+    }
+
+    /// Mark `wake_id`'s resumed work as handed to a card: the handoff a 承接
+    /// line's split or the in-place resume performs (ADR-0059, ADR-0066).
+    /// Idempotent, and independent of [`Self::announce_wake`] — the in-place
+    /// resume marks a Wake whose entry a yielded ledger refresh may already
+    /// have placed, so the mark must not disturb the announcement set (the
+    /// entry stays single).
+    pub(super) fn hand_over_wake(&mut self, wake_id: &str) {
+        self.handed_over_wakes.insert(wake_id.to_string());
     }
 
     /// Mark `wake_id`'s completion as announced on this chain — by the opening
