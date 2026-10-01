@@ -308,20 +308,62 @@ pub(crate) fn fenced_code(text: &str, lang: Option<&str>) -> String {
     format!("{head}\n{text}\n{fence}")
 }
 
+/// The content cap for a session title, in characters. The server's `title`
+/// agent caps its own output at 100 characters; matching that keeps every
+/// legal title verbatim while still guarding the card against a title that
+/// did not pass through that cap. `truncate_md` adds its `…` marker on top,
+/// so the rendered label is at most one character longer than this budget.
+const TITLE_MAX_CHARS: usize = 100;
+
+/// The markers of the tool-call markup a hallucinating `title` model can emit
+/// in place of a title (real example:
+/// `<tool_call><function=bash><parameter=command>ls -la …`). Matched
+/// ASCII-case-insensitively.
+const TOOL_CALL_MARKERS: &[&str] = &[
+    "<tool_call",
+    "<tool_calls",
+    "</tool_call",
+    "</tool_calls",
+    "<function",
+    "</function",
+    "<parameter",
+    "</parameter",
+];
+
+/// The part of `title` before any tool-call markup. A title that is nothing
+/// but markup becomes empty — the caller then shows the session ID, exactly
+/// like the other meaningless defaults. ASCII-only case folding keeps the
+/// marker offsets valid for slicing `title`.
+fn cut_tool_call_markup(title: &str) -> &str {
+    let folded = title.to_ascii_lowercase();
+    TOOL_CALL_MARKERS
+        .iter()
+        .filter_map(|marker| folded.find(marker))
+        .min()
+        .map_or(title, |at| title[..at].trim_end())
+}
+
 /// A display label for a session title: strips raw Feishu mention tokens
 /// (`@_user_N`) and drops meaningless default titles — the `/new`-generated
 /// `sess-<uuid>` and the server's `New session - <iso>` / `Child session - <iso>`
 /// placeholders (the caller then shows the session ID instead). Used for card
 /// subtitles and notification cards.
+///
+/// A server title is untrusted display text: the title model can emit
+/// tool-call markup instead of a title (see `cut_tool_call_markup`) and only
+/// the server's own path applies a cap, so the label is cut at that markup and
+/// its content capped at `TITLE_MAX_CHARS` characters (the truncation marker
+/// rides on top) — a card subtitle stays a subtitle.
 pub fn clean_session_label(name: &str) -> String {
     let cleaned = crate::feishu::message::strip_mention_tokens(name);
+    let cleaned = cut_tool_call_markup(&cleaned);
     if (cleaned.starts_with("sess-") && cleaned.len() == 41)
         || cleaned.starts_with("New session - ")
         || cleaned.starts_with("Child session - ")
     {
         String::new()
     } else {
-        cleaned
+        truncate_md(cleaned, TITLE_MAX_CHARS)
     }
 }
 
@@ -527,5 +569,42 @@ mod tests {
         let card = notify::build_external_message_card("sess-7a025fa5-74a1-44e0-b5c5-80b9a21f71bc", "hi");
         let text = card.to_string();
         assert!(!text.contains("sess-"), "raw sess-uuid must not leak: {}", text);
+    }
+
+    /// The server's `title` model can emit a tool call instead of a title; the
+    /// card must show the human prefix, never the markup. A title that is
+    /// nothing but markup degrades to the empty label (the caller falls back
+    /// to the session ID).
+    #[test]
+    fn clean_session_label_strips_hallucinated_tool_call_markup() {
+        assert_eq!(
+            clean_session_label("我来测试 patch 效果。<tool_call><function=bash><parameter=command>ls -la"),
+            "我来测试 patch 效果。"
+        );
+        assert_eq!(clean_session_label("<tool_call><function=bash>ls"), "");
+        assert_eq!(
+            clean_session_label("Tail </TOOL_CALL> markup"),
+            "Tail",
+            "marker matching is case-insensitive"
+        );
+        // A legit title carrying angle brackets is not markup and stays intact.
+        assert_eq!(
+            clean_session_label("Fix <Component> props"),
+            "Fix <Component> props"
+        );
+    }
+
+    /// A server title's content is capped at the same character budget the
+    /// server's own title agent uses (the `…` marker rides on top), so an
+    /// over-long title — or one from a server that does not cap — cannot become
+    /// a card-length paragraph; CJK is cut by character, not by byte.
+    #[test]
+    fn clean_session_label_caps_the_display_length() {
+        let long = "修".repeat(TITLE_MAX_CHARS + 40);
+        let label = clean_session_label(&long);
+        assert_eq!(label.chars().count(), TITLE_MAX_CHARS + 1);
+        assert!(label.ends_with('…'), "clipped label is marked: {label}");
+        let at_cap = "短".repeat(TITLE_MAX_CHARS);
+        assert_eq!(clean_session_label(&at_cap), at_cap, "at the cap stays verbatim");
     }
 }
