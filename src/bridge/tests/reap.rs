@@ -150,30 +150,6 @@ async fn wait_for_status_reads(backend: &Arc<MockBackend>, session_id: &str, n: 
         .unwrap_or_else(|_| panic!("the reap never read {session_id}'s status {n} times"));
 }
 
-/// Wait until the Session Sync pass has read `session_id`'s transcript at
-/// least `n` times — the proof-of-pass for a test whose reap is for a session
-/// it never reads.
-async fn wait_for_transcript_reads(backend: &Arc<MockBackend>, session_id: &str, n: usize) {
-    let probe = async {
-        loop {
-            let reads = backend
-                .transcript_calls
-                .lock()
-                .await
-                .iter()
-                .filter(|sid| sid.as_str() == session_id)
-                .count();
-            if reads >= n {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    };
-    tokio::time::timeout(Duration::from_secs(5), probe)
-        .await
-        .unwrap_or_else(|_| panic!("Session Sync never read {session_id}'s transcript {n} times"));
-}
-
 /// Wait until the session's record names `card_message_id`, or panic after
 /// 5 s.
 async fn wait_for_record_card(app: &Arc<App>, session_id: &str, card_message_id: &str) {

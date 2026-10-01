@@ -161,6 +161,34 @@ fn merged_shell_timeline(started: i64, resumed: Vec<TranscriptMessage>) -> Vec<T
     )
 }
 
+/// The wait most Wake tests start from: the shared `shell`/`sh_bg`/
+/// `gh run watch` Background Task live at 2_100, whose Execution idled at
+/// 2_500 — a cola Turn that yields 「⏳ 等待后台任务」 on it.
+fn yielding_shell_transcript() -> SessionTranscript {
+    SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_background_tasks(vec![background_shell(2_100)])
+}
+
+/// [`yielding_shell_transcript`]'s read after the shell's completion Wake
+/// (2_900) resumed it: the same timeline plus the resumed run's own messages
+/// and the Execution boundaries that run has reached — the arrived pair is
+/// what makes the read decree the run's ending, one boundary only leaves it
+/// running.
+fn woken_shell_transcript(resumed: Vec<TranscriptMessage>, boundaries: &[i64]) -> SessionTranscript {
+    let mut messages = vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+    ];
+    messages.extend(resumed);
+    SessionTranscript::new(messages)
+        .with_executions(boundaries.iter().copied().map(execution).collect())
+        .with_wakes(vec![shell_wake(2_900)])
+}
+
 /// The resumed run's own work: reasoning, a settled tool and the closing text,
 /// each carrying the SERVER start time it really has. This is what a Wake
 /// continuation renders after the 承接 receipt — and the element kinds the
@@ -301,13 +329,8 @@ async fn posted_cards(platform: &RecordingPlatform) -> usize {
 #[tokio::test]
 async fn a_completion_wake_resumes_the_yielded_card_in_place() {
     let _wd = test_work_dir();
-    let waiting = SessionTranscript::new(vec![
-        user("msg_cola_anchor", 1_000, "跑一下 CI"),
-        assistant(2_000, "已经交给后台了。"),
-    ])
-    .with_executions(vec![execution(2_500)])
-    .with_background_tasks(vec![background_shell(2_100)]);
-    let (_dir, app, backend, platform) = scripted_app(vec![waiting], Some(SessionStatus::Idle)).await;
+    let waiting = yielding_shell_transcript();
+    let (dir, app, backend, platform) = scripted_app(vec![waiting], Some(SessionStatus::Idle)).await;
 
     Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下 CI"))
         .await
@@ -321,19 +344,8 @@ async fn a_completion_wake_resumes_the_yielded_card_in_place() {
 
     // The Wake resumes the Turn with real work: reasoning, a settled tool and
     // the answer, all carrying server times from the wake moment.
-    script_transcript(
-        &backend,
-        vec![
-            SessionTranscript::new(vec![
-                user("msg_cola_anchor", 1_000, "跑一下 CI"),
-                assistant(2_000, "已经交给后台了。"),
-                resumed_work(3_100),
-            ])
-            .with_executions(vec![execution(2_500), execution(4_000)])
-            .with_wakes(vec![shell_wake(2_900)]),
-        ],
-    )
-    .await;
+    let resumed_read = woken_shell_transcript(vec![resumed_work(3_100)], &[2_500, 4_000]);
+    script_transcript(&backend, vec![resumed_read.clone()]).await;
 
     spawn_sync(&app);
     wait_for_card_update(
@@ -436,15 +448,56 @@ async fn a_completion_wake_resumes_the_yielded_card_in_place() {
         "a delivered in-place entry advances the durable Wake Watermark"
     );
 
-    // A restart after the resume (the in-memory chain is gone) finds the Wake
-    // covered by the durable mark: no fresh continuation re-posts it.
-    Turn::drop_card(&app.cards_handle(), "ses_test").await;
+    // Now RESTART: a fresh process over the same session file — so it loads the
+    // durable Wake Watermark from disk — with its own Backend and no card chain
+    // of its own. Its Session Sync pass decides the no-chain path, the one that
+    // re-announces a Wake the in-memory record can no longer cover; the mark
+    // the delivering PATCH wrote must suppress it. (Its reads are counted on
+    // its OWN Backend, so "the pass ran" and "no card was posted" are separate
+    // facts: a pass that decided nothing could not have posted anyway.)
+    let restarted_backend = Arc::new({
+        let mut mock = MockBackend::new(realistic_parts());
+        mock.given_transcript("ses_test", vec![resumed_read.clone()]);
+        mock.with_session_status("ses_test", Some(SessionStatus::Idle));
+        mock
+    });
+    let restarted = Arc::new(
+        App::new(
+            test_config(&dir.path().join("sessions.json")),
+            restarted_backend.clone(),
+            platform.clone(),
+        )
+        .expect("the restarted app builds"),
+    );
+    seed_session(&restarted, "ses_test", "/work").await;
+    assert!(
+        !Turn::has_card(&restarted.cards_handle(), "ses_test").await,
+        "a restart starts with no card chain"
+    );
+    assert_eq!(
+        restarted
+            .cards_handle()
+            .wake_watermarks
+            .announced("ses_test")
+            .map(|mark| mark.created_ms),
+        Some(2_900),
+        "the restarted process loads the resumed Wake's mark from disk"
+    );
     let posts = posted_cards(&platform).await;
+    spawn_sync(&restarted);
+    // The restarted process really ran its Session Sync pass over the read …
+    wait_for_transcript_reads(&restarted_backend, "ses_test", 2).await;
     tokio::time::sleep(Duration::from_millis(150)).await;
+    // … and posted nothing: the resumed Wake is covered by the durable mark.
     assert_eq!(
         posted_cards(&platform).await,
         posts,
-        "an in-place resume's Wake must not be re-posted after a restart: {:?}",
+        "a restarted cola must not re-post the resumed Wake: {:?}",
+        platform.calls.lock().await
+    );
+    assert!(
+        continuation_sends(&platform).await.is_empty(),
+        "no 承接 card is posted for a Wake the durable mark covers: {:?}",
         platform.calls.lock().await
     );
 }
@@ -585,12 +638,7 @@ async fn a_wake_after_a_restart_posts_a_continuation_card() {
 #[tokio::test]
 async fn an_in_place_resume_that_overflows_still_splits() {
     let _wd = test_work_dir();
-    let waiting = SessionTranscript::new(vec![
-        user("msg_cola_anchor", 1_000, "跑一下 CI"),
-        assistant(2_000, "已经交给后台了。"),
-    ])
-    .with_executions(vec![execution(2_500)])
-    .with_background_tasks(vec![background_shell(2_100)]);
+    let waiting = yielding_shell_transcript();
     let (_dir, app, backend, platform) = scripted_app(vec![waiting], Some(SessionStatus::Idle)).await;
     Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下 CI"))
         .await
@@ -601,31 +649,14 @@ async fn an_in_place_resume_that_overflows_still_splits() {
     // The resumed run's answer is longer than one card.
     script_transcript(
         &backend,
-        vec![
-            SessionTranscript::new(vec![
-                user("msg_cola_anchor", 1_000, "跑一下 CI"),
-                assistant(2_000, "已经交给后台了。"),
-                long_resumed_work(3_100),
-            ])
-            .with_executions(vec![execution(2_500), execution(4_000)])
-            .with_wakes(vec![shell_wake(2_900)]),
-        ],
+        vec![woken_shell_transcript(
+            vec![long_resumed_work(3_100)],
+            &[2_500, 4_000],
+        )],
     )
     .await;
     spawn_sync(&app);
-    // The overflowing card hands over with the standard split header, carrying
-    // the retirement's entry ...
-    wait_for_card_update(
-        &platform,
-        "the overflowing resume's handoff",
-        CardUpdates::Latest,
-        |card| {
-            card_header(card).contains("继续中") && card_text(card).contains("🔔 后台任务完成：gh run watch")
-        },
-    )
-    .await;
-
-    // ... and the remainder continues on a new card, which takes the ending.
+    // The remainder continues on a new card, which takes the ending.
     wait_for_card_update(
         &platform,
         "the continuation's done state",
@@ -638,16 +669,22 @@ async fn an_in_place_resume_that_overflows_still_splits() {
         "an overflowing resume continues on a new card: {:?}",
         platform.calls.lock().await
     );
-    // The entry stayed on the card the task lived on: no continuation carries
-    // it, and the request's card is the one that was finalized.
+    // The overflow's handoff is the request card's LAST PATCH — every later
+    // update belongs to its successor — and it carries both the standard split
+    // header and the retirement's entry: the entry stays on the card that
+    // hosted the task, and no continuation renders it.
     let handover = patches_to(&platform, "om_waiting")
         .await
         .pop()
         .expect("the request's card was PATCHed");
     assert!(
+        card_header(&handover).contains("继续中"),
+        "the overflowing card hands over with the standard split header: {handover}"
+    );
+    assert!(
         card_text(&handover).contains("🔔 后台任务完成：gh run watch")
-            && card_header(&handover).contains("继续中"),
-        "the entry rides the finalized card: {handover}"
+            && card_text(&handover).contains("已经交给后台了。"),
+        "the entry and the request's timeline ride the finalized card: {handover}"
     );
 }
 
@@ -660,12 +697,7 @@ async fn an_in_place_resume_that_overflows_still_splits() {
 #[tokio::test]
 async fn a_message_during_a_resumed_run_supplements_it() {
     let _wd = test_work_dir();
-    let waiting = SessionTranscript::new(vec![
-        user("msg_cola_anchor", 1_000, "跑一下 CI"),
-        assistant(2_000, "已经交给后台了。"),
-    ])
-    .with_executions(vec![execution(2_500)])
-    .with_background_tasks(vec![background_shell(2_100)]);
+    let waiting = yielding_shell_transcript();
     let (_dir, app, backend, platform) = scripted_app(vec![waiting], Some(SessionStatus::Idle)).await;
     Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下 CI"))
         .await
@@ -675,15 +707,10 @@ async fn a_message_during_a_resumed_run_supplements_it() {
     // resumed run stays live.
     script_transcript(
         &backend,
-        vec![
-            SessionTranscript::new(vec![
-                user("msg_cola_anchor", 1_000, "跑一下 CI"),
-                assistant(2_000, "已经交给后台了。"),
-                assistant(3_100, "正在合并。"),
-            ])
-            .with_executions(vec![execution(2_500)])
-            .with_wakes(vec![shell_wake(2_900)]),
-        ],
+        vec![woken_shell_transcript(
+            vec![assistant(3_100, "正在合并。")],
+            &[2_500],
+        )],
     )
     .await;
     spawn_sync(&app);
@@ -736,16 +763,13 @@ async fn a_message_during_a_resumed_run_supplements_it() {
     // new content riding ONE payload is what names it).
     script_transcript(
         &backend,
-        vec![
-            SessionTranscript::new(vec![
-                user("msg_cola_anchor", 1_000, "跑一下 CI"),
-                assistant(2_000, "已经交给后台了。"),
+        vec![woken_shell_transcript(
+            vec![
                 assistant(3_100, "正在合并。"),
                 assistant(3_400, "合并完成，改用方案 B 后重跑。"),
-            ])
-            .with_executions(vec![execution(2_500)])
-            .with_wakes(vec![shell_wake(2_900)]),
-        ],
+            ],
+            &[2_500],
+        )],
     )
     .await;
     wait_for_card_update(
@@ -768,12 +792,7 @@ async fn a_message_during_a_resumed_run_supplements_it() {
 #[tokio::test]
 async fn an_in_place_resumes_true_end_notifies_once() {
     let _wd = test_work_dir();
-    let waiting = SessionTranscript::new(vec![
-        user("msg_cola_anchor", 1_000, "跑一下 CI"),
-        assistant(2_000, "已经交给后台了。"),
-    ])
-    .with_executions(vec![execution(2_500)])
-    .with_background_tasks(vec![background_shell(2_100)]);
+    let waiting = yielding_shell_transcript();
     let (_dir, app, backend, platform) = scripted_app_with(vec![waiting], Some(SessionStatus::Idle), |cfg| {
         cfg.bridge.long_task_notice = true;
     })
@@ -789,15 +808,10 @@ async fn an_in_place_resumes_true_end_notifies_once() {
 
     script_transcript(
         &backend,
-        vec![
-            SessionTranscript::new(vec![
-                user("msg_cola_anchor", 1_000, "跑一下 CI"),
-                assistant(2_000, "已经交给后台了。"),
-                assistant(3_100, "CI 通过了。"),
-            ])
-            .with_executions(vec![execution(2_500), execution(4_000)])
-            .with_wakes(vec![shell_wake(2_900)]),
-        ],
+        vec![woken_shell_transcript(
+            vec![assistant(3_100, "CI 通过了。")],
+            &[2_500, 4_000],
+        )],
     )
     .await;
     spawn_sync(&app);
@@ -828,12 +842,7 @@ async fn an_in_place_resumes_true_end_notifies_once() {
 #[tokio::test]
 async fn a_restart_wake_on_a_waiting_card_still_splits() {
     let _wd = test_work_dir();
-    let waiting = SessionTranscript::new(vec![
-        user("msg_cola_anchor", 1_000, "跑一下 CI"),
-        assistant(2_000, "已经交给后台了。"),
-    ])
-    .with_executions(vec![execution(2_500)])
-    .with_background_tasks(vec![background_shell(2_100)]);
+    let waiting = yielding_shell_transcript();
     let (_dir, app, backend, platform) = scripted_app(vec![waiting], Some(SessionStatus::Idle)).await;
     Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下 CI"))
         .await
@@ -900,12 +909,7 @@ async fn a_restart_wake_on_a_waiting_card_still_splits() {
 #[tokio::test]
 async fn a_wake_less_tail_on_a_waiting_card_still_splits() {
     let _wd = test_work_dir();
-    let waiting = SessionTranscript::new(vec![
-        user("msg_cola_anchor", 1_000, "跑一下 CI"),
-        assistant(2_000, "已经交给后台了。"),
-    ])
-    .with_executions(vec![execution(2_500)])
-    .with_background_tasks(vec![background_shell(2_100)]);
+    let waiting = yielding_shell_transcript();
     let (_dir, app, backend, platform) = scripted_app(vec![waiting], Some(SessionStatus::Idle)).await;
     Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下 CI"))
         .await
@@ -949,12 +953,7 @@ async fn a_wake_less_tail_on_a_waiting_card_still_splits() {
 #[tokio::test]
 async fn a_stop_during_a_resumed_run_finalizes_stopped() {
     let _wd = test_work_dir();
-    let waiting = SessionTranscript::new(vec![
-        user("msg_cola_anchor", 1_000, "跑一下 CI"),
-        assistant(2_000, "已经交给后台了。"),
-    ])
-    .with_executions(vec![execution(2_500)])
-    .with_background_tasks(vec![background_shell(2_100)]);
+    let waiting = yielding_shell_transcript();
     let (_dir, app, backend, platform) = scripted_app(vec![waiting], Some(SessionStatus::Idle)).await;
     Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下 CI"))
         .await
@@ -964,15 +963,10 @@ async fn a_stop_during_a_resumed_run_finalizes_stopped() {
     // so the continuation keeps observing.
     script_transcript(
         &backend,
-        vec![
-            SessionTranscript::new(vec![
-                user("msg_cola_anchor", 1_000, "跑一下 CI"),
-                assistant(2_000, "已经交给后台了。"),
-                assistant(3_100, "正在合并。"),
-            ])
-            .with_executions(vec![execution(2_500)])
-            .with_wakes(vec![shell_wake(2_900)]),
-        ],
+        vec![woken_shell_transcript(
+            vec![assistant(3_100, "正在合并。")],
+            &[2_500],
+        )],
     )
     .await;
     spawn_sync(&app);
@@ -1005,12 +999,7 @@ async fn a_stop_during_a_resumed_run_finalizes_stopped() {
 #[tokio::test]
 async fn a_failed_in_place_resume_keeps_retry() {
     let _wd = test_work_dir();
-    let waiting = SessionTranscript::new(vec![
-        user("msg_cola_anchor", 1_000, "跑一下 CI"),
-        assistant(2_000, "已经交给后台了。"),
-    ])
-    .with_executions(vec![execution(2_500)])
-    .with_background_tasks(vec![background_shell(2_100)]);
+    let waiting = yielding_shell_transcript();
     let (_dir, app, backend, platform) = scripted_app(vec![waiting], Some(SessionStatus::Idle)).await;
     // A group turn with a requester: a settle notifies, so the notice's copy
     // can be read back with the card's own terminal.
@@ -1023,15 +1012,10 @@ async fn a_failed_in_place_resume_keeps_retry() {
     // The resumed run fails.
     script_transcript(
         &backend,
-        vec![
-            SessionTranscript::new(vec![
-                user("msg_cola_anchor", 1_000, "跑一下 CI"),
-                assistant(2_000, "已经交给后台了。"),
-                failed_assistant(3_100, "失败的一步", "provider 503"),
-            ])
-            .with_executions(vec![execution(2_500), execution(4_000)])
-            .with_wakes(vec![shell_wake(2_900)]),
-        ],
+        vec![woken_shell_transcript(
+            vec![failed_assistant(3_100, "失败的一步", "provider 503")],
+            &[2_500, 4_000],
+        )],
     )
     .await;
 
@@ -1411,12 +1395,7 @@ async fn a_rendered_wake_is_never_re_posted() {
 #[tokio::test]
 async fn a_second_wake_resumes_the_same_card_again() {
     let _wd = test_work_dir();
-    let waiting = SessionTranscript::new(vec![
-        user("msg_cola_anchor", 1_000, "跑一下 CI"),
-        assistant(2_000, "已经交给后台了。"),
-    ])
-    .with_executions(vec![execution(2_500)])
-    .with_background_tasks(vec![background_shell(2_100)]);
+    let waiting = yielding_shell_transcript();
     let (_dir, app, backend, platform) = scripted_app(vec![waiting], Some(SessionStatus::Idle)).await;
     Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下 CI"))
         .await
@@ -1428,21 +1407,15 @@ async fn a_second_wake_resumes_the_same_card_again() {
 
     // The first completion resumes the card, and its run backgrounds a SECOND
     // task: the card yields back to 「⏳ 等待后台任务」 with the remaining list.
-    script_transcript(
-        &backend,
+    let first_resumed = woken_shell_transcript(
         vec![
-            SessionTranscript::new(vec![
-                user("msg_cola_anchor", 1_000, "跑一下 CI"),
-                assistant(2_000, "已经交给后台了。"),
-                assistant(3_100, "CI 通过了。"),
-                background_shell_launch(3_200, "call_bg2", "sh_bg2", "再次运行"),
-            ])
-            .with_executions(vec![execution(2_500), execution(4_000)])
-            .with_wakes(vec![shell_wake(2_900)])
-            .with_background_tasks(vec![another_background_shell(3_200)]),
+            assistant(3_100, "CI 通过了。"),
+            background_shell_launch(3_200, "call_bg2", "sh_bg2", "再次运行"),
         ],
+        &[2_500, 4_000],
     )
-    .await;
+    .with_background_tasks(vec![another_background_shell(3_200)]);
+    script_transcript(&backend, vec![first_resumed]).await;
     spawn_sync(&app);
     wait_for_card_update(
         &platform,
@@ -1526,12 +1499,7 @@ async fn a_second_wake_resumes_the_same_card_again() {
 #[tokio::test]
 async fn a_wake_clears_a_stale_stop_marker() {
     let _wd = test_work_dir();
-    let waiting = SessionTranscript::new(vec![
-        user("msg_cola_anchor", 1_000, "跑一下 CI"),
-        assistant(2_000, "已经交给后台了。"),
-    ])
-    .with_executions(vec![execution(2_500)])
-    .with_background_tasks(vec![background_shell(2_100)]);
+    let waiting = yielding_shell_transcript();
     let (_dir, app, backend, platform) = scripted_app(vec![waiting], Some(SessionStatus::Idle)).await;
     Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下 CI"))
         .await
@@ -1542,15 +1510,10 @@ async fn a_wake_clears_a_stale_stop_marker() {
 
     script_transcript(
         &backend,
-        vec![
-            SessionTranscript::new(vec![
-                user("msg_cola_anchor", 1_000, "跑一下 CI"),
-                assistant(2_000, "已经交给后台了。"),
-                assistant(3_100, "CI 通过了。"),
-            ])
-            .with_executions(vec![execution(2_500), execution(4_000)])
-            .with_wakes(vec![shell_wake(2_900)]),
-        ],
+        vec![woken_shell_transcript(
+            vec![assistant(3_100, "CI 通过了。")],
+            &[2_500, 4_000],
+        )],
     )
     .await;
 
@@ -1581,12 +1544,7 @@ async fn a_wake_clears_a_stale_stop_marker() {
 #[tokio::test]
 async fn a_live_panel_outranks_the_wake_settle() {
     let _wd = test_work_dir();
-    let waiting = SessionTranscript::new(vec![
-        user("msg_cola_anchor", 1_000, "跑一下 CI"),
-        assistant(2_000, "已经交给后台了。"),
-    ])
-    .with_executions(vec![execution(2_500)])
-    .with_background_tasks(vec![background_shell(2_100)]);
+    let waiting = yielding_shell_transcript();
     let (_dir, app, backend, platform) = scripted_app(vec![waiting], Some(SessionStatus::Idle)).await;
     Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下 CI"))
         .await
@@ -1598,14 +1556,8 @@ async fn a_live_panel_outranks_the_wake_settle() {
     script_transcript(
         &backend,
         vec![
-            SessionTranscript::new(vec![
-                user("msg_cola_anchor", 1_000, "跑一下 CI"),
-                assistant(2_000, "已经交给后台了。"),
-                assistant_with_live_tool(3_100),
-            ])
-            .with_executions(vec![execution(2_500), execution(4_000)])
-            .with_wakes(vec![shell_wake(2_900)])
-            .with_background_tasks(vec![another_background_shell(3_200)]),
+            woken_shell_transcript(vec![assistant_with_live_tool(3_100)], &[2_500, 4_000])
+                .with_background_tasks(vec![another_background_shell(3_200)]),
         ],
     )
     .await;
@@ -1637,12 +1589,7 @@ async fn a_live_panel_outranks_the_wake_settle() {
 #[tokio::test]
 async fn an_unreadable_status_never_settles_a_wake_before_the_grace() {
     let _wd = test_work_dir();
-    let waiting = SessionTranscript::new(vec![
-        user("msg_cola_anchor", 1_000, "跑一下 CI"),
-        assistant(2_000, "已经交给后台了。"),
-    ])
-    .with_executions(vec![execution(2_500)])
-    .with_background_tasks(vec![background_shell(2_100)]);
+    let waiting = yielding_shell_transcript();
     let (_dir, app, backend, platform) = scripted_app(vec![waiting], Some(SessionStatus::Idle)).await;
     Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下 CI"))
         .await
@@ -1651,15 +1598,10 @@ async fn an_unreadable_status_never_settles_a_wake_before_the_grace() {
     // The resumed run reads settleable (its boundary landed, nothing live) ...
     script_transcript(
         &backend,
-        vec![
-            SessionTranscript::new(vec![
-                user("msg_cola_anchor", 1_000, "跑一下 CI"),
-                assistant(2_000, "已经交给后台了。"),
-                assistant(3_100, "CI 通过了。"),
-            ])
-            .with_executions(vec![execution(2_500), execution(4_000)])
-            .with_wakes(vec![shell_wake(2_900)]),
-        ],
+        vec![woken_shell_transcript(
+            vec![assistant(3_100, "CI 通过了。")],
+            &[2_500, 4_000],
+        )],
     )
     .await;
     // ... but the status read never answers, so no ending may be claimed.
@@ -1697,12 +1639,7 @@ async fn a_message_in_the_waiting_window_starts_a_new_turn() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
-    let waiting = SessionTranscript::new(vec![
-        user("msg_cola_anchor", 1_000, "跑一下 CI"),
-        assistant(2_000, "已经交给后台了。"),
-    ])
-    .with_executions(vec![execution(2_500)])
-    .with_background_tasks(vec![background_shell(2_100)]);
+    let waiting = yielding_shell_transcript();
     let mut backend = MockBackend::new(realistic_parts());
     backend.given_transcript("ses_test", vec![waiting]);
     backend.with_session_status("ses_test", Some(SessionStatus::Idle));
@@ -1860,15 +1797,10 @@ async fn a_stale_wake_is_not_reposted_after_a_restart() {
     // down), so the continuation must post.
     script_transcript(
         &backend,
-        vec![
-            SessionTranscript::new(vec![
-                user("msg_cola_anchor", 1_000, "跑一下 CI"),
-                assistant(2_000, "已经交给后台了。"),
-                assistant(3_100, "CI 通过了。"),
-            ])
-            .with_executions(vec![execution(2_500), execution(4_000)])
-            .with_wakes(vec![shell_wake(2_900)]),
-        ],
+        vec![woken_shell_transcript(
+            vec![assistant(3_100, "CI 通过了。")],
+            &[2_500, 4_000],
+        )],
     )
     .await;
     wait_for_any_card(&platform, WAKE_LEAD).await;
