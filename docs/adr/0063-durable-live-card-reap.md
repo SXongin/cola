@@ -86,3 +86,33 @@ re-render the Fresh path deliberately avoids.
   collects the old card; a still-live Session leaves the record in place.
 
 Related: #428, #424, ADR-0059, ADR-0060, ADR-0061, ADR-0062.
+
+## Amendment (2026-10-02): a still-live restart orphan is stamped once (#443)
+
+Between a cola restart and the run's true end — or a successor's takeover —
+nothing updated the orphaned card: the reap keeps its record while the
+Session reads live, and no in-process accumulator owns the card, so it sat
+frozen at its pre-restart state (observed during #434's acceptance round; the
+batch promised "not frozen forever", not "keeps ticking"). The reap now
+stamps such a card **once per process life** with the header
+「⏳ 已重启，等待运行结束」: the card's own view is read back and only the
+header changes — body kept, controls stripped, like every ending, except
+that a failed view read leaves the card untouched rather than settling bare,
+because the stamp's whole value is the body it preserves. The in-memory mark
+is set only when the PATCH lands, so a failed attempt retries on the next
+pass; the transcript-truth settle (or a successor's collect) supersedes the
+stamp as today. No timer refresh, no recurring PATCHes, no adoption:
+re-following the run is deferred until a faithful no-duplicate/no-omission
+restore exists (#505).
+
+## Amendment (2026-10-02): the record is removed after delivery, not before (ADR-0067)
+
+The removal rule above ("removed when that card reaches a terminal") is
+narrowed: a terminal card's record is dropped only once its ending write is
+**confirmed** — delivered, or permanently refused; a final PATCH that fails
+(or is still pending in ADR-0067's Pending Card Update outbox) leaves the
+record in place, so Session Sync's reap still finds the card and re-settles
+it from transcript truth, and the reap doubles as the record's cleaner once
+the write is confirmed. Without this, a failed final PATCH plus a cola
+restart froze the card forever: the record was already gone and nothing knew
+the card existed.
