@@ -1,5 +1,15 @@
 # cola renders by polling only; the SSE event surface is dead code
 
+> **Amended 2026-10-01 (#470)**: cola now consumes V2's `GET /api/event`
+> stream — for one purpose only: overlaying ephemeral `session.tool.progress`
+> metadata onto RUNNING tool parts at transcript decode, so a live `subagent`
+> carries its child session id (ADR-0054) and Code Mode's nested rows update
+> while they run. This follows the rule below rather than contradicting it:
+> the overlay starts from the polled-parts representation, the polled message
+> remains the source of truth (a lost stream degrades to no live line, never a
+> wrong one), and V1 stays polling-only. The dead V1 SSE fold stays deleted.
+> See ADR-0059's "Amended 2026-10-01 (#470)" banner for the decision.
+
 ADR-0001 already decided the global SSE is heartbeat-only (the server ends it
 every few seconds on the shared store) and that cola renders by polling
 `GET /session/{id}/message`. This ADR records the consequence: the
