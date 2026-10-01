@@ -507,6 +507,10 @@ async fn a_collected_chain_still_takes_a_wake_after_switching_back() {
         card_text(&rendered).contains("CI 通过了。") && card_text(&rendered).contains(WAKE_LEAD),
         "the continuation renders the resumed work: {rendered}"
     );
+    assert!(
+        !card_text(&rendered).contains("后台任务完成"),
+        "the entry stays on the card that hosted the task, never the continuation: {rendered}"
+    );
 
     // Exactly one continuation for the missed work; a later Session Sync pass
     // over the same read must not re-post it.

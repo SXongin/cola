@@ -9,10 +9,14 @@
 //! renders 🌙 in its status slot instead of ✅, before and after the
 //! retirement.
 //!
-//! The section follows the chain's newest card (ticket #418): when a Wake
-//! opens a continuation card or a new Turn takes over a waiting card, the
-//! handover PATCH leaves the section on the new card and removes it from the
-//! old one — whose own completion entries stay behind, never migrating.
+//! The section stays on the card the tasks lived on (ADR-0066, ticket #488):
+//! a shell/subagent completion Wake resumes its yielded card in place, so the
+//! live list and the fixed completion entries never leave it. The handover
+//! PATCH runs only when the chain genuinely moves — a new Turn takes over a
+//! waiting card, or a size overflow, a Supplement split or a restart/interrupt
+//! Wake continues the chain — and then the section follows the newest card
+//! while the outgoing card keeps the entries of the tasks that lived there; an
+//! entry never migrates to a continuation.
 //!
 //! V1 carries no Background Task facts, so its section never renders; the
 //! tests here script the typed transcript reads (the read model already owns
@@ -23,7 +27,8 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use super::drain::{
-    assistant, ctx, noticed, script_transcript, scripted_app, scripted_app_with, spawn_sync, spawn_turn, user,
+    assistant, ctx, noticed, script_transcript, scripted_app, scripted_app_with, spawn_sync, spawn_turn,
+    user, wait_for_card_text,
 };
 use crate::backend::{
     BackgroundTask, ChildRuntime, ContentBlock, FinishReason, MessageRole, Part, SessionTranscript, ShellEnd,
@@ -745,6 +750,15 @@ async fn a_completion_wake_keeps_the_live_list_on_the_resumed_card() {
         resume_text.contains("⏳ 后台任务（1）") && !resume_text.contains("后台任务（2）"),
         "the entry lands with the remaining list, never the retired row: {resume}"
     );
+    // No handover PATCH exists: the request's card never finalizes with the
+    // split header — its only transitions are updates — and no continuation
+    // card was posted below it (`created_cards` above).
+    assert!(
+        patches
+            .iter()
+            .all(|patch| !card_header(patch).contains("部分完成")),
+        "an in-place resume hands nothing over: {patches:?}"
+    );
 }
 
 /// Acceptance 3 (#418), the several-completions case under ADR-0066: both
@@ -881,6 +895,118 @@ async fn a_new_turn_takes_the_live_list_over_from_the_waiting_card() {
     assert!(
         !card_text(&live).contains("· shell：**gh run watch**"),
         "the retired task's row does not migrate onto the new Turn's card: {live}"
+    );
+}
+
+/// The third handover cause (ADR-0066, ticket #488): a Supplement split still
+/// moves the chain. The shell's completion resumed the card in place with the
+/// subagent still live, so a user message landing below the live resumed card
+/// routes as a Supplement (ADR-0043): the request's card finalizes with the
+/// standard handoff — keeping the retiring task's entry — and the continuation
+/// carries the REMAINING live list. The entry never migrates, and no ledger row
+/// is lost or duplicated across the two cards.
+#[tokio::test]
+async fn a_supplement_split_hands_the_remaining_list_to_the_continuation() {
+    let _wd = test_work_dir();
+    let (_dir, app, backend, platform) =
+        scripted_app(vec![two_task_waiting()], Some(SessionStatus::Idle)).await;
+    yield_the_two_task_card(&app, &platform).await;
+
+    // The shell's completion resumes the card in place; the subagent stays
+    // live and the resumed run is still going (one boundary only).
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(two_task_timeline(vec![assistant(3_100, "正在合并。")]))
+                .with_executions(vec![execution(2_500)])
+                .with_wakes(vec![shell_wake(2_900)])
+                .with_background_tasks(vec![live_subagent(2_100, "call_sub")]),
+        ],
+    )
+    .await;
+    spawn_sync(&app);
+    wait_for_card_text(&platform, "正在合并。").await;
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Streaming),
+        "the resumed run is live on the request's card"
+    );
+
+    // A message lands below it: the owned chain routes it as a Supplement and
+    // splits the chain at the message.
+    app.handle_message(incoming(
+        "msg_sup".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "补充一下，改用方案 B".into(),
+        None,
+    ))
+    .await;
+
+    // The continuation carries the supplement receipt and the REMAINING live
+    // list — never the retired row, never the entry (which stays where the
+    // task lived).
+    let continuation = {
+        let calls = platform.calls.lock().await;
+        calls
+            .iter()
+            .find_map(|call| match call {
+                PlatformCall::ReplyCard { reply_to, card } if reply_to == "msg_sup" => Some(card.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("the supplement must split the chain at the message: {calls:?}"))
+    };
+    let continuation_text = card_text(&continuation);
+    assert!(
+        continuation_text.contains("📨 已收到补充"),
+        "the continuation carries the supplement receipt: {continuation}"
+    );
+    assert!(
+        continuation_text.contains("⏳ 后台任务（1）")
+            && continuation_text.contains("· 子代理：**review the diff**"),
+        "the continuation carries the remaining live list: {continuation}"
+    );
+    assert!(
+        !continuation_text.contains("· shell：**gh run watch**"),
+        "the retired task's row does not migrate onto the continuation: {continuation}"
+    );
+    assert!(
+        !continuation_text.contains("后台任务完成"),
+        "the entry never migrates onto the continuation: {continuation}"
+    );
+
+    // The request's card finalizes with the standard handoff, keeping its own
+    // timeline and the entry — and hands the live list over.
+    let finalized = patches_to(&platform, "om_waiting")
+        .await
+        .pop()
+        .expect("the resumed card is finalized at the split");
+    let finalized_text = card_text(&finalized);
+    assert!(
+        card_header(&finalized).contains("部分完成，继续中"),
+        "the split finalizes the resumed card with the standard handoff: {finalized}"
+    );
+    assert!(
+        finalized_text.contains("🔔 后台任务完成：gh run watch") && finalized_text.contains("正在合并。"),
+        "the entry and the work stay on the card that hosted the task: {finalized}"
+    );
+    assert!(
+        !finalized_text.contains("后台任务（"),
+        "the finalized card hands the live list over: {finalized}"
+    );
+
+    // Every ledger fact renders exactly once across the two cards.
+    assert_eq!(
+        finalized_text.matches("后台任务完成").count() + continuation_text.matches("后台任务完成").count(),
+        1,
+        "one completion entry across the split: {finalized} / {continuation}"
+    );
+    assert_eq!(
+        finalized_text.matches("· 子代理：**review the diff**").count()
+            + continuation_text.matches("· 子代理：**review the diff**").count(),
+        1,
+        "one remaining live row across the split: {finalized} / {continuation}"
     );
 }
 
