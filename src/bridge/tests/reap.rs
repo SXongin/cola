@@ -18,6 +18,7 @@ use crate::backend::{MessageId, SessionTranscript};
 use crate::bridge::live_cards::{LiveCard, LiveCards};
 use crate::bridge::test_support::*;
 use crate::bridge::turn::Turn;
+use crate::bridge::wake_watermark::WakeWatermarks;
 use crate::config::{SessionEntry, ThreadKey};
 use crate::feishu::card::CardState;
 use crate::opencode::types::{SessionListInfo, SessionStatus};
@@ -40,6 +41,15 @@ fn seed_record(session_file: &Path, card_message_id: &str, message_id: &str, cre
 /// [`seed_record`] with the record built by the caller (a stored directory).
 fn seed_live_card(session_file: &Path, card: LiveCard) {
     LiveCards::load(sidecar(session_file)).replace("ses_test", card);
+}
+
+/// Seed the durable Wake Watermark a previous cola life left behind — the
+/// completion whose in-place PATCH announced it (ADR-0061) — directly into the
+/// sidecar file, so the next app loads it at construction exactly like a real
+/// restart.
+fn seed_wake_mark(session_file: &Path, wake_id: &str, created_ms: i64) {
+    WakeWatermarks::load(session_file.with_file_name("wake_watermarks.json"))
+        .advance("ses_test", wake_id, created_ms);
 }
 
 /// The restarted process: a fresh app over `session_file`, with the transcript
@@ -725,6 +735,9 @@ async fn a_card_persisted_mid_resume_is_reaped_to_its_true_end() {
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("sessions.json");
     seed_record(&session_file, "om_resumed", "msg_cola_anchor", Some(1_000));
+    // The previous life's in-place PATCH announced this Wake; the mark is on
+    // disk BEFORE the restart builds, exactly as the killed process left it.
+    seed_wake_mark(&session_file, "msg_wake_2900", 2_900);
 
     // The read the restart wakes to: the completion Wake (2_900) resumed the
     // run, and the resumed run's own Execution boundary (4_000) arrived while
@@ -737,11 +750,16 @@ async fn a_card_persisted_mid_resume_is_reaped_to_its_true_end() {
     .with_executions(vec![execution(2_500), execution(4_000)])
     .with_wakes(vec![shell_wake(2_900)]);
     let (app, platform) = restarted_app(&session_file, resumed, None).await;
-    // The previous life's in-place PATCH announced this Wake: the mark is the
-    // durable fact the restart loads, so the Fresh path must not re-post it.
-    app.cards_handle()
-        .wake_watermarks
-        .advance("ses_test", "msg_wake_2900", 2_900);
+    // The restarted process really loaded the previous life's mark from disk:
+    // the no-repost assertion below is the durable path's, not a pre-set field.
+    assert_eq!(
+        app.cards_handle()
+            .wake_watermarks
+            .announced("ses_test")
+            .map(|mark| mark.created_ms),
+        Some(2_900),
+        "the restart loads the previous life's Wake Watermark"
+    );
 
     spawn_sync(&app);
     wait_for_card_update(
@@ -764,6 +782,9 @@ async fn a_card_persisted_mid_resume_is_reaped_to_its_true_end() {
         app.cards_handle().live_cards.get("ses_test").is_none(),
         "the true end spends the record"
     );
+    // No 承接 card: the mark LOADED from disk is what suppresses the Fresh
+    // path — the absent-mark counterfactual (a continuation posted, the old
+    // card collected as taken over) is `a_restart_continuation_collects_the_old_card`.
     assert!(
         continuation_sends(&platform).await.is_empty(),
         "a Wake the previous life announced is never re-posted: {:?}",
