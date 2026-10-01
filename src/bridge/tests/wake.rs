@@ -331,6 +331,13 @@ async fn posted_cards(platform: &RecordingPlatform) -> usize {
         .count()
 }
 
+/// Give `ses_test`'s tracked card the explicit id `om_waiting`: the harness
+/// replies every card with one id, so a test that must count PATCHes per chain
+/// has to name the request's own card itself.
+async fn name_request_card(app: &Arc<App>) {
+    Turn::set_card_message_id(&app.cards_handle(), "ses_test", "om_waiting").await;
+}
+
 /// The one Completion Notice a scenario sent: exactly one, replying to the
 /// request's message (`msg_1`) — the shape every notice assertion shares. The
 /// COPY stays with the scenario (已完成, 已停止, the ❌ retry line), so the
@@ -668,7 +675,7 @@ async fn an_in_place_resume_that_overflows_still_splits() {
     Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下 CI"))
         .await
         .unwrap();
-    Turn::set_card_message_id(&app.cards_handle(), "ses_test", "om_waiting").await;
+    name_request_card(&app).await;
     let posts_before = posted_cards(&platform).await;
 
     // The resumed run's answer is longer than one card.
@@ -727,9 +734,7 @@ async fn a_message_during_a_resumed_run_supplements_it() {
     Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下 CI"))
         .await
         .unwrap();
-    // Name the request's card so the split's finalization of it can be read
-    // apart from the continuation's own updates.
-    Turn::set_card_message_id(&app.cards_handle(), "ses_test", "om_waiting").await;
+    name_request_card(&app).await;
 
     // The resume: the Wake's own work, its Execution not yet bounded, so the
     // resumed run stays live.
@@ -1247,9 +1252,7 @@ async fn a_stop_during_a_resumed_run_finalizes_stopped() {
     context.is_group = true;
     context.requester_open_id = Some(TEST_HOST.to_string());
     Turn::run(&app.turn_handles(), context).await.unwrap();
-    // Name the request's card so its own PATCHes can be told apart from any
-    // other card's (the harness replies every card with one id).
-    Turn::set_card_message_id(&app.cards_handle(), "ses_test", "om_waiting").await;
+    name_request_card(&app).await;
 
     // The Wake's Execution has no boundary yet: the resumed run is still going,
     // so the continuation keeps observing.
@@ -1318,9 +1321,7 @@ async fn a_failed_in_place_resume_keeps_retry() {
     context.is_group = true;
     context.requester_open_id = Some(TEST_HOST.to_string());
     Turn::run(&app.turn_handles(), context).await.unwrap();
-    // Name the request's card so its own PATCHes can be told apart from any
-    // other card's (the harness replies every card with one id).
-    Turn::set_card_message_id(&app.cards_handle(), "ses_test", "om_waiting").await;
+    name_request_card(&app).await;
     let posts_before = posted_cards(&platform).await;
 
     // The resumed run fails.
@@ -1720,9 +1721,7 @@ async fn a_second_wake_resumes_the_same_card_again() {
     Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下 CI"))
         .await
         .unwrap();
-    // The harness replies every card with one id; name the request's card so
-    // every PATCH below can be told apart from any other card's.
-    Turn::set_card_message_id(&app.cards_handle(), "ses_test", "om_waiting").await;
+    name_request_card(&app).await;
     let posts_before = posted_cards(&platform).await;
 
     // The first completion resumes the card, and its run backgrounds a SECOND
