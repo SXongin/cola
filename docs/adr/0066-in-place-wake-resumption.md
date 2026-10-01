@@ -30,12 +30,17 @@ Precisely:
 - **Trigger.** The Wake step (`Turn::wake_continuation`) picks the in-place
   handoff iff the chain's card is `Waiting` and the newest placeable Wake —
   the completion whose work the continuation would render — is a shell or
-  subagent Wake the card has not yet announced. Restart and interrupt Wakes,
-  the Wake-less content-diff fallback, and a card already at a terminal
-  (✅/❌/⏹) keep the ADR-0059 split. Terminal cards are the third new-card
-  exception the design round's shorthand left implicit: a Wake arriving after
-  an ending is a race or a late tail, and re-opening a ✅ card would misread
-  the ending it recorded.
+  subagent Wake the card has not yet taken over. "Taken over" is the HANDOFF,
+  never the announcement (2026-10-01, live): a yielded card's ledger refresh
+  may already have placed the Wake's completion entry while its work was still
+  unrendered — the resumed message's text part was empty at that read — and
+  that entry must not read as a handoff, or the work splits into a 承接 card
+  when it arrives. Only a 承接 line's split or an earlier in-place resume
+  takes a Wake over. Restart and interrupt Wakes, the Wake-less content-diff
+  fallback, and a card already at a terminal (✅/❌/⏹) keep the ADR-0059
+  split. Terminal cards are the third new-card exception the design round's
+  shorthand left implicit: a Wake arriving after an ending is a race or a late
+  tail, and re-opening a ✅ card would misread the ending it recorded.
 - **Resumption.** Under the session's card-write lock the same accumulator
   takes one ledger read — the retiring Wake's fixed completion entry lands at
   its own moment and the remaining live list stays — then the card takes

@@ -592,6 +592,188 @@ async fn a_completion_wake_resumes_the_yielded_card_in_place() {
     );
 }
 
+/// The live race (2026-10-01, `ses_f0917a54…`): the shell completed while the
+/// resumed assistant message's text part was still EMPTY, so that pass rendered
+/// nothing and only its yielded ledger refresh placed the completion entry —
+/// the quiet-wake path — which announces the Wake. When the text fills, the
+/// Wake's WORK is still unrendered, so the card must resume IN PLACE: the gate
+/// reads the HANDOFF, not the announcement, and an entry a ledger refresh
+/// placed is not a handoff. Nothing is posted, no 承接 line is written, the
+/// resumed work lands on the request's own card, and the entry stays single.
+#[tokio::test]
+async fn a_completion_wake_resumes_in_place_after_its_entry_was_placed() {
+    let _wd = test_work_dir();
+    let waiting = yielding_shell_transcript();
+    let (_dir, app, backend, platform) = scripted_app(vec![waiting], Some(SessionStatus::Idle)).await;
+    Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下 CI"))
+        .await
+        .unwrap();
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Waiting)
+    );
+    name_request_card(&app).await;
+    let posts_before = card_posts(&platform).await;
+
+    // Read #1 — the live read: the Wake is there, the resumed run's message
+    // carries an empty text part, and its Execution has no boundary yet.
+    script_transcript(
+        &backend,
+        vec![woken_shell_transcript(vec![assistant(3_100, "")], &[2_500])],
+    )
+    .await;
+    spawn_sync(&app);
+    // The quiet path places the entry on the waiting card — nothing renders and
+    // nothing is posted — and the delivering PATCH advances the durable mark.
+    wait_for_card_update(
+        &platform,
+        "the entry on the waiting card",
+        CardUpdates::Latest,
+        |card| {
+            card_header(card).contains("等待后台任务")
+                && card_text(card).contains("🔔 后台任务完成：gh run watch")
+        },
+    )
+    .await;
+    assert_eq!(
+        card_posts(&platform).await,
+        posts_before,
+        "the quiet-wake pass posts nothing: {:?}",
+        platform.calls.lock().await
+    );
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Waiting),
+        "no content renders, so the card keeps waiting"
+    );
+    assert_eq!(
+        app.cards_handle()
+            .wake_watermarks
+            .announced("ses_test")
+            .map(|mark| mark.created_ms),
+        Some(2_900),
+        "the entry's PATCH advanced the durable Wake Watermark"
+    );
+
+    // Read #2: the text fills and the run's Execution boundary arrives.
+    script_transcript(
+        &backend,
+        vec![woken_shell_transcript(
+            vec![assistant(3_100, "CI 通过了。")],
+            &[2_500, 4_000],
+        )],
+    )
+    .await;
+    wait_for_card_update(
+        &platform,
+        "the resumed card's ending",
+        CardUpdates::Latest,
+        |card| card_header(card).contains("✅") && card_text(card).contains("CI 通过了。"),
+    )
+    .await;
+
+    // The resumed work landed on the SAME card: no card was posted, no 承接
+    // line was written, and the entry the quiet pass placed stays single.
+    assert_eq!(
+        card_posts(&platform).await,
+        posts_before,
+        "the resume posts no card: {:?}",
+        platform.calls.lock().await
+    );
+    let last = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        !card_text(&last).contains(WAKE_LEAD),
+        "an in-place resume writes no 承接 line: {last}"
+    );
+    assert_eq!(
+        card_text(&last).matches("后台任务完成").count(),
+        1,
+        "the already-placed entry is not doubled: {last}"
+    );
+    assert!(
+        card_text(&last).contains("已经交给后台了。"),
+        "the resumed work joins the request's own timeline: {last}"
+    );
+    assert!(
+        !card_text(&last).contains("⏳ 后台任务（"),
+        "the retired task's live row is gone: {last}"
+    );
+}
+
+/// The boundary the handoff mark protects (ADR-0059, ADR-0066): once a Wake's
+/// work has been TAKEN OVER — here by an in-place resume — content that no new
+/// completion announced is the Wake-less content-diff fallback, so it continues
+/// the chain on a new 承接 card instead of re-opening the resumed one. The
+/// announcement mark alone cannot tell the two apart (both Wakes are announced
+/// by their entries); the handoff can.
+#[tokio::test]
+async fn a_tail_after_a_taken_over_wake_still_splits() {
+    let _wd = test_work_dir();
+    let waiting = yielding_shell_and_subagent_transcript();
+    let (_dir, app, backend, platform) = scripted_app(vec![waiting], Some(SessionStatus::Idle)).await;
+    Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下 CI 并审阅"))
+        .await
+        .unwrap();
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Waiting)
+    );
+    name_request_card(&app).await;
+
+    // The shell's completion resumes the card in place; the subagent stays
+    // live, so the resumed run yields the card back to ⏳.
+    script_transcript(
+        &backend,
+        vec![woken_shell_and_subagent_transcript(
+            shell_wake(2_900),
+            vec![assistant(3_100, "CI 通过了。")],
+            &[2_500, 4_000],
+        )],
+    )
+    .await;
+    spawn_sync(&app);
+    wait_for_card_update(
+        &platform,
+        "the resumed card's wait",
+        CardUpdates::Latest,
+        |card| card_header(card).contains("等待后台任务") && card_text(card).contains("CI 通过了。"),
+    )
+    .await;
+    let resumed = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        !card_text(&resumed).contains(WAKE_LEAD),
+        "the completion resumes in place — the premise of the tail's split: {resumed}"
+    );
+    let posts = card_posts(&platform).await;
+
+    // A later tail, with the SAME Wake as the newest one and no new completion:
+    // the Wake is this chain's already, so this is the content-diff fallback.
+    script_transcript(
+        &backend,
+        vec![woken_shell_and_subagent_transcript(
+            shell_wake(2_900),
+            vec![
+                assistant(3_100, "CI 通过了。"),
+                assistant(5_000, "收尾时补上的一段。"),
+            ],
+            &[2_500, 4_000],
+        )],
+    )
+    .await;
+    wait_for_card_update(
+        &platform,
+        "the tail's continuation",
+        CardUpdates::Latest,
+        |card| card_text(card).contains(WAKE_LEAD) && card_text(card).contains("收尾时补上的一段。"),
+    )
+    .await;
+    assert!(
+        card_posts(&platform).await > posts,
+        "a tail past a taken-over Wake still continues on a new card: {:?}",
+        platform.calls.lock().await
+    );
+}
+
 /// Acceptance 3, first half: a Wake arriving after the Turn's card already
 /// ended ✅ still posts a continuation card — the ✅ card keeps its ending.
 #[tokio::test]

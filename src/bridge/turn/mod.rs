@@ -1708,12 +1708,15 @@ impl Turn {
     /// yielded one this handoff admits
     /// ([`state::CardSession::accepts_ledger_refresh`]: still `Waiting`, live,
     /// no split owed), so a race with a collect, a new Turn or a handoff can
-    /// never resume a card somebody else took over. `now_ms` is the read's
-    /// clock — the Session Sync pass's own, shared with the split handover of
-    /// the same read.
+    /// never resume a card somebody else took over. `wake_id` is the completion
+    /// this resume takes over, marked as such in the same locked write, so a
+    /// later tail past it splits (ADR-0059) and the resume is never re-decided.
+    /// `now_ms` is the read's clock — the Session Sync pass's own, shared with
+    /// the split handover of the same read.
     pub(crate) async fn resume_yielded_card(
         cards: &CardsHandle,
         session_id: &str,
+        wake_id: &str,
         transcript: &SessionTranscript,
         now_ms: i64,
     ) -> bool {
@@ -1735,6 +1738,11 @@ impl Turn {
                 now_ms,
                 state::LedgerCadence::Second,
             );
+            // The chain has taken this completion's work over. Its entry may
+            // already be on the card (a yielded ledger refresh placed it while
+            // the work was unrendered): the announcement set stays untouched,
+            // so the entry is never doubled — only the handoff is recorded.
+            card.acc.hand_over_wake(wake_id);
             card.acc.set_resuming();
         }
         flush::flush_card_locked(cards, session_id, flush::SplitPolicy::Allow).await;
@@ -2728,15 +2736,18 @@ impl Turn {
 /// re-derived under a second look.
 pub(crate) enum WakeContinuation {
     /// A card chain exists whose newest placeable Wake is a shell/subagent
-    /// completion the card has NOT announced, and whose card is still yielded
-    /// 「⏳ 等待后台任务」: resume that card IN PLACE (ADR-0066) — no new card,
-    /// no 承接 line. The retiring task's completion entry and the remaining
-    /// live list land on the card the task lived on, the card takes the
-    /// resuming state, and the shared out-of-turn settle loop streams the
-    /// resumed work into it. Decided only for the state this delivery admits
-    /// ([`state::CardSession::accepts_ledger_refresh`]), so a decision and its
-    /// write can never disagree about which card resumes.
-    ResumeInPlace,
+    /// completion this chain has not yet TAKEN OVER, and whose card is still
+    /// yielded 「⏳ 等待后台任务」: resume that card IN PLACE (ADR-0066) — no new
+    /// card, no 承接 line. The retiring task's completion entry and the
+    /// remaining live list land on the card the task lived on, the card takes
+    /// the resuming state, and the shared out-of-turn settle loop streams the
+    /// resumed work into it. `wake_id` is the completion this resume takes
+    /// over, marked as such under the delivery's own write lock — so a later
+    /// tail past it splits (ADR-0059), while the entry a yielded ledger refresh
+    /// already placed stays single. Decided only for the state this delivery
+    /// admits ([`state::CardSession::accepts_ledger_refresh`]), so a decision
+    /// and its write can never disagree about which card resumes.
+    ResumeInPlace { wake_id: String },
     /// A card chain exists: continue it by split. Only the content the chain
     /// has not rendered lands on the continuation, and the accumulator's own
     /// anchor scopes the settle decision. `line` is the new card's opening
@@ -2824,8 +2835,8 @@ impl Turn {
     ///   landed after the card was finalized. Nothing new renders -> nothing
     ///   is owed, which is also what keeps a rendered Wake from being
     ///   re-posted on every poll. What it owes is then one of two handoffs: a
-    ///   yielded card whose newest placeable Wake is an unannounced
-    ///   shell/subagent completion resumes in place
+    ///   yielded card whose newest placeable Wake is a shell/subagent
+    ///   completion the chain has not taken over yet resumes in place
     ///   ([`WakeContinuation::ResumeInPlace`], ADR-0066), and every other
     ///   continuation continues the chain by split.
     /// - **No chain (a cola restart).** Nothing durable says what the lost
@@ -2863,22 +2874,31 @@ impl Turn {
                 }
                 // A yielded card resumes IN PLACE (ADR-0066) iff the newest
                 // placeable Wake — the completion whose work this continuation
-                // would render — is a shell/subagent completion the card has
-                // not announced yet. One card per request: the entry, the
+                // would render — is a shell/subagent completion this chain has
+                // not TAKEN OVER yet. One card per request: the entry, the
                 // resumed work and the ending all stay on the card the user's
-                // message opened. Every other continuation keeps the ADR-0059
-                // split: a restart/interrupt Wake is not a task completion (no
-                // entry to place), an already-announced Wake is the Wake-less
-                // content-diff fallback (its entry is on the card; there is
-                // nothing to name), and a card past its wait (terminal, or a
-                // handoff already owed) must not be re-opened — a ✅ flipping
-                // back to 🔄 would misread the ending it recorded.
+                // message opened. The gate reads the HANDOFF, not the
+                // announcement: a yielded card's ledger refresh places the
+                // completion entry while the Wake's work is still unrendered
+                // (live 2026-10-01 — the resumed message's text part was empty
+                // at that read), and that entry must not masquerade as a
+                // handoff, or the work would split into a 承接 card when it
+                // arrives. Every other continuation keeps the ADR-0059 split: a
+                // restart/interrupt Wake is not a task completion (no entry to
+                // place), a Wake this chain already handed over (a 承接 line or
+                // an earlier resume) is the Wake-less content-diff fallback — a
+                // later tail past it must not re-open the card — and a card past
+                // its wait (terminal, or a handoff already owed) must not be
+                // re-opened either: a ✅ flipping back to 🔄 would misread the
+                // ending it recorded.
                 if card.accepts_ledger_refresh()
                     && let Some(wake) = newest_wake
                     && matches!(wake.source, WakeSource::Shell | WakeSource::Subagent)
-                    && !card.acc.announced_wakes.contains(wake.id.as_str())
+                    && !card.acc.handed_over_wakes.contains(wake.id.as_str())
                 {
-                    return Some(WakeContinuation::ResumeInPlace);
+                    return Some(WakeContinuation::ResumeInPlace {
+                        wake_id: wake.id.to_string(),
+                    });
                 }
                 // Key the 承接 receipt just before the work the continuation
                 // will render: the newest Wake's own server time when there is
@@ -3036,9 +3056,12 @@ impl Turn {
         acc.reply_to_message_id = facts.reply_to.map(str::to_string);
         acc.variant = facts.variant;
         acc.wake_continuation = true;
-        // The 承接 line announces this Wake's completion: mark it, so the
-        // merged-path entry never doubles the line when the work renders.
+        // The 承接 line announces this Wake's completion and hands its work to
+        // this fresh card: mark both, so the merged-path entry never doubles
+        // the line when the work renders, and a later tail past the Wake still
+        // splits (ADR-0059) instead of resuming this card in place.
         acc.announce_wake(anchor.message_id.as_str(), anchor.created_ms);
+        acc.hand_over_wake(anchor.message_id.as_str());
         acc.apply_work_context(work_context);
         // The 承接 line is keyed just before the Wake's own work so the
         // resumed parts — whose server times are at or after the anchor —

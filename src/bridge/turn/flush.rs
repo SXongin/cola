@@ -457,11 +457,15 @@ async fn push_queued_receipts(cards: &CardsHandle, session_id: &str) {
         card.acc
             .push_receipt_at(line.as_ref().map(|line| line.at), kind.receipt());
         if let Some((wake, created_ms)) = line.as_ref().and_then(|line| line.wake.as_ref()) {
-            // The 承接 line announces this Wake's completion: mark it, so the
-            // merged-path entry (a Wake that resumes an already-live card)
-            // cannot double it — and stage the durable Wake Watermark, which
-            // advances only when this line's card actually sends (ADR-0061).
+            // The 承接 line announces this Wake's completion and hands its work
+            // to the continuation card: mark both, so the merged-path entry (a
+            // Wake that resumes an already-live card) cannot double it, and a
+            // later tail past the Wake still splits (ADR-0059) instead of
+            // resuming the continuation in place. The announcement also stages
+            // the durable Wake Watermark, which advances only when this line's
+            // card actually sends (ADR-0061).
             card.acc.announce_wake(wake, *created_ms);
+            card.acc.hand_over_wake(wake);
         }
         card.pending_split[i].receipt_pushed = true;
     }
