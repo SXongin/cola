@@ -199,3 +199,41 @@ spec #501): the ledger and the Tool Panel call one task the same thing.
 - Unchanged: the live list's title `⏳ 后台任务（N）`, the unconfirmed marker
   `⚠️ 状态待确认`, the resumption header `🔄 后台任务完成，继续处理中…`, and the
   permission card's 「调用子代理」.
+
+## Amendment (2026-10-02, the yielded row's child activity): live subagent liveness on the ledger row
+
+A background `subagent`'s live row carries the same child-session liveness the
+live task panel shows (spec #501, ticket #503): appended after the row's
+elapsed — `· subagent：**review the diff** · 14:04 · 1m05s · bash 5s`, or
+`· 思考中 30s · 等待你的授权` for a phase and its wait — through the front's own
+fragment vocabulary, so one child state reads the same wherever cola renders
+it. The fragment sits after the elapsed and before `· ⚠️ 状态待确认`; a row the
+runtime reconciliation could not confirm renders no activity, and a `shell`
+row is unchanged (no fragment).
+
+- **One shared gather.** The front task panel's per-child read loop becomes a
+  batch — a set of `(call_id, child)` pairs, one transcript light read per
+  distinct child plus its one pending-wait query, keyed back by call id — and
+  the yielded ledger refresh reuses it. A pass reads each distinct child at
+  most once; a session with no live background subagent (shell-only, V1) names
+  no child and spends no new request, and a pass whose card cannot receive the
+  refresh gathers nothing.
+- **This cut wires Session Sync.** The live render path gathers no liveness for
+  the ledger: the fragment first appears on the yielding card's ~8 s Session
+  Sync reads (a waiting card's only clock). A path that does not gather keeps
+  whatever fragment is already stored — its age keeps counting — so the
+  handover, the in-place resume and a live re-render never drop it.
+- **Failure keeps the last successful fragment.** The gather carries only
+  successes; a call whose child read fails (or whose transcript carries no
+  timestamp) keeps the fragment of the last read that succeeded, whose stored
+  times are never refreshed, so the rendered age keeps growing truthfully and a
+  failed read never ends the wait (ADR-0054's rule).
+- **The ledger clock covers the fragment's age.** A row's clock now holds its
+  elapsed and its activity age; the live path still compares whole minutes and
+  the yielded refresh whole seconds, so a yielded card PATCHes when its visible
+  second turns and never once per read, while the live card gains no
+  per-second churn. An unconfirmed row's stored age never ticks (it renders
+  none), and an untimed tool has no age to tick.
+
+GLOSSARY's **Background Task Ledger** entry follows. The child retirement read
+of #464 will reuse the same gather.

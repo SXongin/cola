@@ -440,9 +440,12 @@ fn render_runtime_entries(
 /// same one-site primitives the live render uses
 /// ([`set_ledger_from_read`](StreamAccumulator::set_ledger_from_read),
 /// [`render_wake_entries`], [`render_runtime_entries`]), so no path can drift
-/// from it. `now_ms` is the read's clock; `cadence` is the granularity its
-/// ledger clock is compared at (the live render and its Wake handover at whole
-/// minutes, the yielded refresh at whole seconds — [`LedgerCadence`]).
+/// from it. `activities` is the child liveness this read gathered for the
+/// ledger's live subagents, keyed by call id (spec #501) — empty on the paths
+/// that gather nothing, where a stored fragment is kept rather than dropped.
+/// `now_ms` is the read's clock; `cadence` is the granularity its ledger clock
+/// is compared at (the live render and its Wake handover at whole minutes, the
+/// yielded refresh at whole seconds — [`LedgerCadence`]).
 ///
 /// A Wake handover calls this on the OUTGOING card before its chain splits;
 /// Session Sync's in-place pass calls it on a yielded card. Returns whether the
@@ -454,11 +457,12 @@ fn render_runtime_entries(
 pub(super) fn apply_ledger_read(
     acc: &mut StreamAccumulator,
     transcript: &SessionTranscript,
+    activities: &std::collections::HashMap<String, TaskLiveness>,
     anchor: Option<&TurnAnchor>,
     now_ms: i64,
     cadence: LedgerCadence,
 ) -> bool {
-    let mut changed = acc.set_ledger_from_read(transcript, now_ms, cadence);
+    let mut changed = acc.set_ledger_from_read(transcript, activities, now_ms, cadence);
     if let Some(anchor) = anchor {
         changed |= render_wake_entries(acc, transcript, anchor);
         changed |= render_runtime_entries(acc, transcript, anchor);
@@ -529,9 +533,12 @@ pub(super) fn render_new_turn_parts(acc: &mut StreamAccumulator, transcript: &Se
     // compared at the live path's whole-minute cadence on purpose: this loop
     // flushes on content, and a per-render second clock would be churn. The
     // decision's clock is this read's own; the card renders the rows from its
-    // build clock, the same second.
+    // build clock, the same second. This path gathers no child liveness (the
+    // yielded refresh does, spec #501): a fragment already established is kept
+    // and its age keeps growing, and no read is spent on a live card's ledger.
     rendered_any |= acc.set_ledger_from_read(
         transcript,
+        &std::collections::HashMap::new(),
         chrono::Utc::now().timestamp_millis(),
         LedgerCadence::Minute,
     );
@@ -695,12 +702,72 @@ fn child_liveness(transcript: &SessionTranscript) -> Option<TaskLiveness> {
     })
 }
 
+/// One batched gather of child-session liveness (ADR-0054, spec #501): every
+/// distinct child in `children` costs exactly ONE transcript light read and,
+/// on a successful read, one pending-wait query; every `(call_id, child)` pair
+/// names its child's liveness in the returned map under its own call id (one
+/// child can be driven by several calls, and each renders the same state). A
+/// child whose read fails — or whose transcript carries no timestamp — is
+/// absent from the map, so its caller keeps whatever fragment it last rendered
+/// instead of inventing one; a child named by several pairs is still read once.
+pub(super) async fn gather_child_liveness(
+    backend: &Arc<dyn crate::backend::Backend>,
+    requests: &RequestsHandle,
+    children: &[(String, String)],
+) -> std::collections::HashMap<String, TaskLiveness> {
+    let mut by_child: std::collections::HashMap<&str, Option<TaskLiveness>> =
+        std::collections::HashMap::new();
+    let mut gathered = std::collections::HashMap::new();
+    for (call_id, child) in children {
+        // The distinct-child cache holds failures too (`None`), so a child
+        // whose read already failed is not read again for another call.
+        if !by_child.contains_key(child.as_str()) {
+            let liveness = match backend.transcript(child).await {
+                Ok(transcript) => match child_liveness(&transcript) {
+                    Some(mut liveness) => {
+                        liveness.wait = requests.wait_for(child).await;
+                        Some(liveness)
+                    }
+                    None => None,
+                },
+                Err(_) => None,
+            };
+            by_child.insert(child.as_str(), liveness);
+        }
+        if let Some(liveness) = by_child.get(child.as_str()).and_then(Option::as_ref) {
+            gathered.insert(call_id.clone(), liveness.clone());
+        }
+    }
+    gathered
+}
+
+/// The live background subagents a transcript read names, as the
+/// `(call_id, child_session_id)` pairs the shared liveness gather consumes
+/// (spec #501): a `subagent` Background Task that recorded a child, minus the
+/// rows a runtime reconciliation marked unconfirmed — an unconfirmed row
+/// renders no activity, so its child is never read. A shell task has no child.
+pub(super) fn background_subagent_children(transcript: &SessionTranscript) -> Vec<(String, String)> {
+    transcript
+        .background_tasks
+        .iter()
+        .filter(|task| {
+            super::state::task_kind(&task.tool.name) == TaskKind::Subagent
+                && !transcript.unconfirmed_tasks.contains(task.tool.call_id.as_str())
+        })
+        .filter_map(|task| {
+            task.child_id
+                .as_deref()
+                .map(|child| (task.tool.call_id.clone(), child.to_string()))
+        })
+        .collect()
+}
+
 /// Read and attach the child-session liveness of every live `task` panel on
-/// `session_id`'s card (ADR-0054): one transcript read per distinct child, the
-/// wait from the request flows' pending record. Returns true when a panel
-/// changed. Every read is best-effort: a failure keeps the previous line (its
-/// stored activity time keeps the age growing truthfully) instead of clearing
-/// it or inventing one.
+/// `session_id`'s card (ADR-0054): the shared batched gather does one
+/// transcript read per distinct child and the wait from the request flows'
+/// pending record. Returns true when a panel changed. Every read is
+/// best-effort: a failure keeps the previous line (its stored activity time
+/// keeps the age growing truthfully) instead of clearing it or inventing one.
 async fn refresh_task_liveness(
     cards: &CardsHandle,
     requests: &RequestsHandle,
@@ -717,30 +784,14 @@ async fn refresh_task_liveness(
     if tasks.is_empty() {
         return false;
     }
-    let mut gathered: std::collections::HashMap<String, TaskLiveness> = std::collections::HashMap::new();
-    let mut failed: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for (_, child) in &tasks {
-        if gathered.contains_key(child) || failed.contains(child) {
-            continue;
-        }
-        let Ok(transcript) = backend.transcript(child).await else {
-            failed.insert(child.clone());
-            continue;
-        };
-        let Some(mut liveness) = child_liveness(&transcript) else {
-            failed.insert(child.clone());
-            continue;
-        };
-        liveness.wait = requests.wait_for(child).await;
-        gathered.insert(child.clone(), liveness);
-    }
+    let gathered = gather_child_liveness(backend, requests, &tasks).await;
     let mut live = cards.cards.lock().await;
     let Some(card) = live.get_mut(session_id) else {
         return false;
     };
     let mut changed = false;
-    for (call_id, child) in tasks {
-        if let Some(liveness) = gathered.get(&child).cloned() {
+    for (call_id, _) in tasks {
+        if let Some(liveness) = gathered.get(&call_id).cloned() {
             changed |= card.acc.set_tool_liveness(&call_id, Some(liveness));
         }
     }

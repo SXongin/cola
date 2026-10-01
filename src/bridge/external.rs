@@ -396,7 +396,18 @@ impl ExternalFlow {
             // quiet retirement (no continuation to render) lands here, and a
             // read that changed nothing PATCHes nothing.
             let stopped = handles.waits.is_stopped(sid).await;
-            match Turn::refresh_yielded_ledger(&handles.cards, sid, &transcript, now_ms, stopped).await {
+            match Turn::refresh_yielded_ledger(
+                &handles.cards,
+                &handles.backend,
+                &handles.requests,
+                sid,
+                &transcript,
+                now_ms,
+                stopped,
+                self.request_timeout_ms.load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .await
+            {
                 YieldedUpdate::Unchanged => {}
                 YieldedUpdate::Refreshed => {
                     tracing::info!("yielded ledger refreshed: session {sid}");

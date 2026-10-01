@@ -1668,6 +1668,7 @@ impl Turn {
                 render::apply_ledger_read(
                     &mut card.acc,
                     transcript,
+                    &HashMap::new(),
                     Some(anchor),
                     now_ms,
                     state::LedgerCadence::Minute,
@@ -1734,6 +1735,7 @@ impl Turn {
             render::apply_ledger_read(
                 &mut card.acc,
                 transcript,
+                &HashMap::new(),
                 anchor.as_ref(),
                 now_ms,
                 state::LedgerCadence::Second,
@@ -1792,13 +1794,50 @@ impl Turn {
     /// another flush. `now_ms` is the read's clock, shared with the same pass's
     /// Wake decision. Returns what this read did — the card is PATCHed exactly
     /// when it moved.
+    ///
+    /// The live subagents' child liveness (spec #501) is gathered on the same
+    /// pass — one transcript light read per distinct child plus its pending-wait
+    /// query, through the shared batch the live task panel uses — BEFORE the
+    /// write lock (the reads are network calls) and only while a card that
+    /// admits the refresh exists: a session with no such card, no live
+    /// subagent, or none at all (V1) gathers nothing and spends no request.
+    /// The batch shares the pass's read bound (`read_timeout_ms`) like the
+    /// parent transcript read: one child on a half-open connection must not
+    /// freeze Session Sync for every session, and a timed-out batch leaves each
+    /// row exactly as it was (its stored fragment, ADR-0054).
+    #[allow(clippy::too_many_arguments)] // the read's facts + the pass's read bound
     pub(crate) async fn refresh_yielded_ledger(
         cards: &CardsHandle,
+        backend: &Arc<dyn crate::backend::Backend>,
+        requests: &RequestsHandle,
         session_id: &str,
         transcript: &SessionTranscript,
         now_ms: i64,
         stopped: bool,
+        read_timeout_ms: u64,
     ) -> YieldedUpdate {
+        let admitted = {
+            let live = cards.cards.lock().await;
+            live.get(session_id)
+                .is_some_and(|card| card.accepts_ledger_refresh())
+        };
+        let activities = if admitted {
+            let children = render::background_subagent_children(transcript);
+            if children.is_empty() {
+                HashMap::new()
+            } else {
+                crate::bridge::bounded_call("yielded ledger child liveness", read_timeout_ms, async {
+                    Ok::<_, crate::error::BridgeError>(
+                        render::gather_child_liveness(backend, requests, &children).await,
+                    )
+                })
+                .await
+                .and_then(Result::ok)
+                .unwrap_or_default()
+            }
+        } else {
+            HashMap::new()
+        };
         let write_lock = cards.write_lock(session_id).await;
         let _guard = write_lock.lock().await;
         let (changed, settled, notice_at) = {
@@ -1813,6 +1852,7 @@ impl Turn {
             let changed = render::apply_ledger_read(
                 &mut card.acc,
                 transcript,
+                &activities,
                 anchor.as_ref(),
                 now_ms,
                 state::LedgerCadence::Second,

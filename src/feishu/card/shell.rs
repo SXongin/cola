@@ -646,6 +646,7 @@ mod tests {
             label: Some("a <number_tag> | b".into()),
             started_at: Some(start),
             unconfirmed: false,
+            activity: None,
         }];
         let card = CardBuilder::new()
             .with_state(CardState::Streaming)
