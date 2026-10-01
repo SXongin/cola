@@ -1350,10 +1350,10 @@ fn format_tool_input(name: &str, input: &serde_json::Value) -> String {
             }
             if s.len() <= 1 { input.to_string() } else { s }
         }
-        "apply_patch" | "patch" => {
-            // The patch text is the tool's whole request; the card only needs
-            // what it touched. V1's `apply_patch` and V2's `patch` share the
-            // `patchText` field and the `*** Update File:` framing.
+        // V2's `patch` gets the touched-file summary. V1's `apply_patch` keeps
+        // its pre-V2 generic fallback: spec #467 US18 puts every V1 rendering
+        // change out of scope, so only the V2 id takes this arm.
+        "patch" => {
             let files = patch_files(get("patchText").unwrap_or(""));
             match files.as_slice() {
                 [] => generic_tool_input(obj),
@@ -3099,6 +3099,17 @@ Index: /a/one.rs
         assert_eq!(
             format_tool_input("patch", &json!({"patchText": "not a patch"})),
             "- patchText: not a patch"
+        );
+        // V1's `apply_patch` keeps its historical generic rendering even when
+        // its patchText carries the same `*** … File:` headers (#467 US18:
+        // every V1 rendering change is out of scope). Only the V2 id takes the
+        // file-summary arm.
+        assert_eq!(
+            format_tool_input(
+                "apply_patch",
+                &json!({"patchText": "*** Begin Patch\n*** Update File: a.rs\n*** End Patch"})
+            ),
+            "- patchText: *** Begin Patch"
         );
     }
 
