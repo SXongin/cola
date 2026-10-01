@@ -21,6 +21,16 @@
 > **Amended by ADR-0063**: the live card's identity and anchor are durable; a
 > restart reaps the card it orphaned instead of leaving it frozen. "Card state
 > stays in memory" is narrowed accordingly, as with ADR-0061.
+>
+> **Amended 2026-10-01 (#470)**: V2 persists a running tool call with empty
+> metadata and publishes `context.progress` on the event bus only — the message
+> projection folds in terminal events alone — so the polled message read cannot
+> carry a live `subagent`'s child session id. cola now consumes `GET /api/event`
+> for one purpose: overlaying that ephemeral progress onto RUNNING tool parts,
+> restoring ADR-0054's liveness and Code Mode's live rows. The stream is
+> volatile by contract and the overlay is additive; the polled message stays
+> the source of truth, so a lost stream degrades to no live line, never to a
+> wrong one.
 
 ## Context
 

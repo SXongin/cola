@@ -32,17 +32,29 @@ fn v2_wire_client(server: &TestHttpServer) -> OpenCodeBackend {
     client
 }
 
-/// The request at `index` in arrival order.
-fn request_at(server: &TestHttpServer, index: usize) -> RecordedRequest {
+/// The fake server's requests minus the live-progress event stream: the V2
+/// strategy's reader task runs concurrently with every test call (issue #470),
+/// so request-order and count assertions scope to the wire exchange under test.
+fn wired_requests(server: &TestHttpServer) -> Vec<RecordedRequest> {
     server
         .requests()
+        .into_iter()
+        .filter(|request| request.path != "/api/event")
+        .collect()
+}
+
+/// The request at `index` in arrival order.
+fn request_at(server: &TestHttpServer, index: usize) -> RecordedRequest {
+    wired_requests(server)
         .get(index)
         .cloned()
         .unwrap_or_else(|| panic!("request {index} should have been sent"))
 }
 
 fn last_request(server: &TestHttpServer) -> RecordedRequest {
-    server.requests().pop().expect("a request should have been sent")
+    wired_requests(server)
+        .pop()
+        .expect("a request should have been sent")
 }
 
 fn body_json(request: &RecordedRequest) -> serde_json::Value {
@@ -130,7 +142,7 @@ async fn list_sessions_unwraps_the_data_envelope_and_follows_the_body_cursor() {
         "V2's epoch-millis time decodes into the neutral row"
     );
     assert_eq!(
-        server.request_count(),
+        wired_requests(&server).len(),
         3,
         "two pages plus the terminating empty page"
     );
@@ -167,7 +179,7 @@ async fn list_sessions_does_not_fall_back_on_404_or_accept_a_bare_array() {
 
     assert!(client.list_sessions().await.is_err());
     assert_eq!(
-        server.request_count(),
+        wired_requests(&server).len(),
         1,
         "a 404 must not fall back to another route"
     );
@@ -315,7 +327,7 @@ async fn transcript_follows_the_body_cursor_in_ascending_order() {
     );
 
     assert_eq!(
-        server.request_count(),
+        wired_requests(&server).len(),
         3,
         "two pages plus the terminating empty page"
     );
@@ -467,7 +479,7 @@ async fn session_status_derives_retry_from_the_newest_assistant_message() {
     assert_eq!(request_at(&server, 4).path, "/api/session/active");
     assert_eq!(request_at(&server, 5).path, "/api/session/active");
     assert_eq!(
-        server.request_count(),
+        wired_requests(&server).len(),
         6,
         "retry=2, busy=2, idle=1 (no retry read), weird=1 (no retry read)"
     );
@@ -660,7 +672,7 @@ async fn task_runtime_reads_the_shell_registry_and_the_active_map() {
     assert_eq!(request_at(&server, 2).path, "/api/shell/sh_done");
     assert_eq!(request_at(&server, 3).path, "/api/shell/sh_gone");
     assert_eq!(request_at(&server, 4).path, "/api/session/active");
-    assert_eq!(server.request_count(), 5);
+    assert_eq!(wired_requests(&server).len(), 5);
 }
 
 /// A failed shell list fails the whole read (the caller keeps the transcript
@@ -773,7 +785,7 @@ async fn prompt_admits_the_text_files_and_id_then_returns_without_waiting() {
         .unwrap();
 
     assert_eq!(
-        server.request_count(),
+        wired_requests(&server).len(),
         1,
         "admit only: the submit must not wait or read the transcript"
     );
