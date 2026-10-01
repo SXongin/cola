@@ -37,7 +37,8 @@ use super::drain::{
 };
 use crate::backend::{
     BackgroundTask, ContentBlock, FinishReason, MessageRole, Part, ReasoningPart, SessionTranscript,
-    StepFinish, TextPart, ToolCall, ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage, WakeSource,
+    StepFinish, TextPart, ToolCall, ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage, Wake,
+    WakeSource,
 };
 use crate::bridge::test_support::*;
 use crate::bridge::turn::Turn;
@@ -231,10 +232,13 @@ fn yielding_shell_and_subagent_transcript() -> SessionTranscript {
     .with_background_tasks(vec![background_shell(2_100), live_subagent(2_100)])
 }
 
-/// [`yielding_shell_and_subagent_transcript`]'s read after the shell's
-/// completion Wake (2_900) resumed it: the resumed run's own messages, the
-/// Execution boundaries it has reached, and the subagent still live.
+/// [`yielding_shell_and_subagent_transcript`]'s read after `wake` resumed it:
+/// the resumed run's own messages, the Execution boundaries it has reached, and
+/// the subagent still live. The Wake's source selects the path — a shell/
+/// subagent completion resumes in place, a restart/interrupt continuation
+/// splits — so one fixture serves both.
 fn woken_shell_and_subagent_transcript(
+    wake: Wake,
     resumed: Vec<TranscriptMessage>,
     boundaries: &[i64],
 ) -> SessionTranscript {
@@ -247,7 +251,7 @@ fn woken_shell_and_subagent_transcript(
     messages.extend(resumed);
     SessionTranscript::new(messages)
         .with_executions(boundaries.iter().copied().map(execution).collect())
-        .with_wakes(vec![shell_wake(2_900)])
+        .with_wakes(vec![wake])
         .with_background_tasks(vec![live_subagent(2_100)])
 }
 
@@ -757,6 +761,7 @@ async fn an_in_place_resume_that_overflows_still_splits() {
     script_transcript(
         &backend,
         vec![woken_shell_and_subagent_transcript(
+            shell_wake(2_900),
             vec![card_filling_resumed_work(3_100)],
             &[2_500, 4_000],
         )],
@@ -822,23 +827,9 @@ async fn an_in_place_resume_that_overflows_still_splits() {
         "the entry never migrates onto the continuation: {continuation}"
     );
     // Every ledger fact renders exactly once across the two cards.
-    assert_eq!(
-        handover_text.matches("后台任务完成").count() + continuation_text.matches("后台任务完成").count(),
-        1,
-        "one completion entry across the split: {handover} / {continuation}"
-    );
-    assert_eq!(
-        handover_text.matches("· 子代理：**review the diff**").count()
-            + continuation_text.matches("· 子代理：**review the diff**").count(),
-        1,
-        "one remaining live row across the split: {handover} / {continuation}"
-    );
-    assert_eq!(
-        handover_text.matches("· shell：**gh run watch**").count()
-            + continuation_text.matches("· shell：**gh run watch**").count(),
-        0,
-        "the retired row is gone from both cards: {handover} / {continuation}"
-    );
+    assert_across_cards([&handover, &continuation], "后台任务完成", 1);
+    assert_across_cards([&handover, &continuation], "· 子代理：**review the diff**", 1);
+    assert_across_cards([&handover, &continuation], "· shell：**gh run watch**", 0);
 }
 
 /// The mid-resume user message (ADR-0066, ADR-0043): a resumed card is LIVE
@@ -1250,69 +1241,111 @@ async fn a_restart_fresh_cards_ending_sends_no_notice() {
 /// The ADR-0059 boundary ADR-0066 deliberately keeps: a Wake that is NOT a
 /// shell/subagent completion — a server restart, an interruption continuation —
 /// does not resume a yielded card in place. The chain continues on a 承接 card
-/// below the user's message, exactly as before.
-#[tokio::test]
-async fn a_restart_wake_on_a_waiting_card_still_splits() {
+/// below the user's message, exactly as before — and the ledger handover still
+/// runs (ADR-0060): the remaining live list moves to the continuation while the
+/// outgoing card keeps its own timeline, and no completion entry is placed
+/// (these Wakes name no task completion). `source` selects the variant; both
+/// take the same decision branch.
+async fn restart_like_wake_on_a_waiting_card_still_splits(source: WakeSource) {
     let _wd = test_work_dir();
-    let waiting = yielding_shell_transcript();
+    let waiting = yielding_shell_and_subagent_transcript();
     let (_dir, app, backend, platform) = scripted_app(vec![waiting], Some(SessionStatus::Idle)).await;
-    Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下 CI"))
+    Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下 CI 并审阅"))
         .await
         .unwrap();
     assert_eq!(
         Turn::card_state(&app.cards_handle(), "ses_test").await,
         Some(CardState::Waiting)
     );
+    name_request_card(&app).await;
     let posts_before = posted_cards(&platform).await;
 
-    // The server restarted: the Wake records that, and the run resumed with
-    // real work.
-    let mut restart = shell_wake(2_900);
-    restart.source = WakeSource::Restart;
-    restart.label = None;
+    // The server restarted (or the run was interrupted): the Wake records
+    // that, and the run resumed with real work while the subagent stays live.
+    let mut wake = shell_wake(2_900);
+    wake.source = source;
+    wake.label = None;
     script_transcript(
         &backend,
-        vec![
-            SessionTranscript::new(vec![
-                user("msg_cola_anchor", 1_000, "跑一下 CI"),
-                assistant(2_000, "已经交给后台了。"),
-                assistant(3_100, "重启后继续。"),
-            ])
-            .with_executions(vec![execution(2_500), execution(4_000)])
-            .with_wakes(vec![restart]),
-        ],
+        vec![woken_shell_and_subagent_transcript(
+            wake,
+            vec![assistant(3_100, "重启后继续。")],
+            &[2_500, 4_000],
+        )],
     )
     .await;
 
     spawn_sync(&app);
+    // The continuation replies with the 承接 line and yields back to ⏳ with
+    // the remaining live list.
     wait_for_card_update(
         &platform,
-        "the restart continuation's done card",
+        "the restart continuation's remaining list",
         CardUpdates::Latest,
         |card| {
-            card_header(card).contains("✅")
+            card_header(card).contains("等待后台任务")
                 && card_text(card).contains(WAKE_LEAD)
                 && card_text(card).contains("重启后继续。")
+                && card_text(card).contains("· 子代理：**review the diff**")
         },
     )
     .await;
 
     // A NEW card carried the 承接 line and the resumed work: the yielded card
-    // was not resumed in place.
-    assert!(
-        posted_cards(&platform).await > posts_before,
-        "a restart Wake still continues on a new card: {:?}",
+    // was not resumed in place, and exactly one continuation was posted.
+    assert_eq!(
+        posted_cards(&platform).await,
+        posts_before + 1,
+        "a restart/interrupt Wake still continues on exactly one new card: {:?}",
         platform.calls.lock().await
     );
+    // The yielded card's handover PATCH: the standard split header and its own
+    // timeline — the live list leaves, and no entry is written.
+    let handover = patches_to(&platform, "om_waiting")
+        .await
+        .pop()
+        .expect("the yielded card is finalized at the split");
     assert!(
-        platform
-            .updated_cards()
-            .await
-            .iter()
-            .any(|card| card_header(card).contains("继续中")),
-        "the yielded card hands over with the standard split header: {:?}",
-        platform.updated_cards().await
+        card_header(&handover).contains("部分完成，继续中"),
+        "the yielded card hands over with the standard split header: {handover}"
     );
+    assert!(
+        !card_text(&handover).contains("后台任务（")
+            && !card_text(&handover).contains("· 子代理：**review the diff**"),
+        "the finalized card hands its live list over: {handover}"
+    );
+
+    // The continuation carries the REMAINING row and no entry: the live list
+    // moved to the new card, and the entry rule stays on the card that hosted
+    // the task.
+    let continuation = platform.updated_cards().await.last().cloned().unwrap();
+    let continuation_text = card_text(&continuation);
+    assert!(
+        continuation_text.contains("⏳ 后台任务（1）")
+            && continuation_text.contains("· 子代理：**review the diff**"),
+        "the continuation carries the remaining live list: {continuation}"
+    );
+    assert!(
+        !continuation_text.contains("· shell：**gh run watch**"),
+        "the retired task's row does not migrate onto the continuation: {continuation}"
+    );
+    assert_across_cards([&handover, &continuation], "· 子代理：**review the diff**", 1);
+    assert_across_cards([&handover, &continuation], "· shell：**gh run watch**", 0);
+    assert_across_cards([&handover, &continuation], "后台任务完成", 0);
+    assert_across_cards([&handover, &continuation], "子代理完成", 0);
+}
+
+/// The restart source of [`restart_like_wake_on_a_waiting_card_still_splits`].
+#[tokio::test]
+async fn a_restart_wake_on_a_waiting_card_still_splits() {
+    restart_like_wake_on_a_waiting_card_still_splits(WakeSource::Restart).await;
+}
+
+/// The interrupt source, the same branch: an interruption continuation on a
+/// yielded card also splits and hands the remaining live list over.
+#[tokio::test]
+async fn an_interrupt_wake_on_a_waiting_card_still_splits() {
+    restart_like_wake_on_a_waiting_card_still_splits(WakeSource::Interrupt).await;
 }
 
 /// The other kept boundary: the Wake-less content-diff fallback. New content

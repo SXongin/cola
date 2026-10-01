@@ -2595,6 +2595,22 @@ pub(crate) fn card_text(card: &serde_json::Value) -> String {
     card_texts(card).join("\n")
 }
 
+/// Assert `needle` renders exactly `count` times across a split's two cards —
+/// the outgoing card and its continuation — so a ledger fact (a completion
+/// entry, a live row) can never be lost or duplicated across a handover
+/// (ADR-0060, ticket #488). `count` is 0 for a fact that must not migrate.
+pub(crate) fn assert_across_cards(cards: [&serde_json::Value; 2], needle: &str, count: usize) {
+    let counts: Vec<usize> = cards
+        .iter()
+        .map(|card| card_text(card).matches(needle).count())
+        .collect();
+    assert_eq!(
+        counts.iter().sum::<usize>(),
+        count,
+        "expected {needle:?} ×{count} across the outgoing/continuation cards, got {counts:?}"
+    );
+}
+
 /// Every in-place PATCH the platform recorded for `message_id`, in call order —
 /// so one card's own updates can be told apart from every other card's (the
 /// harness serves one message id per send, so a scenario that must count
