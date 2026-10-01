@@ -2759,7 +2759,7 @@ async fn a_quiet_retirement_after_the_yield_settles_the_waiting_card() {
     .await;
     spawn_sync(&app);
     wait_for_card_update(&platform, "the settled card", CardUpdates::Latest, |card| {
-        card_header(card).contains("✅") && card_text(card).contains("🔔 后台任务完成：gh run watch")
+        card_header(card).contains("✅") && card_text(card).contains("🔔 shell 完成：gh run watch")
     })
     .await;
 
@@ -2775,7 +2775,7 @@ async fn a_quiet_retirement_after_the_yield_settles_the_waiting_card() {
         "the retired task's live list is gone: {settled}"
     );
     assert!(
-        text.contains("🔔 后台任务完成：gh run watch") && text.contains("shell sh_bg · "),
+        text.contains("🔔 shell 完成：gh run watch") && text.contains("shell sh_bg · "),
         "the fixed entry stays on the card that hosted the task: {settled}"
     );
     assert!(

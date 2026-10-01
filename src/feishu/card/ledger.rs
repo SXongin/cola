@@ -23,7 +23,7 @@ use super::sanitize::{AMPERSAND_ESCAPE, ASTERISK_ESCAPE, UNDERSCORE_ESCAPE};
 use super::{first_n_chars_bytes, fmt_local_time, truncate_md};
 
 /// Characters of a task label the ledger row shows before clipping — shared
-/// with the completion entry's collapsed title (`🔔 后台任务完成：<label>`), so
+/// with the completion entry's collapsed title (`🔔 shell 完成：<label>`), so
 /// one label clips identically wherever the ledger renders it (ADR-0060).
 pub(crate) const TASK_LABEL_CHARS: usize = 60;
 
@@ -46,40 +46,32 @@ pub enum TaskKind {
 }
 
 impl TaskKind {
-    /// The row's type noun: `shell` stays the tool's own name (the pinned
-    /// copy), the subagent reads in Chinese like the completion entry's
-    /// `子代理完成`.
+    /// The row's type noun: the tool's own name, `shell` / `subagent` (#502).
+    /// Shared by the live row and the completion entry's fold body, so one
+    /// task type reads the same wherever the ledger renders it.
     fn noun(self) -> &'static str {
         match self {
             Self::Shell => "shell",
-            Self::Subagent => "子代理",
+            Self::Subagent => "subagent",
         }
     }
 
-    /// The completion entry's collapsed-title noun: what happened to the task,
-    /// in the one noun the merged-path receipt always used (`🔔 后台任务完成` /
-    /// `🔔 子代理完成`). A Wake that reported a cancelled/error state, a
-    /// runtime-confirmed end without a Wake, and a lost completion record each
-    /// get their own noun — the entry never claims 完成 for work that was
-    /// stopped or lost (issue #454). Distinct from [`Self::noun`], which names
-    /// the task type on the live row.
-    fn completion_noun(self, ending: &TaskEnding) -> &'static str {
-        match self {
-            Self::Shell => match ending {
-                TaskEnding::Wake { state } if state.as_deref() == Some("cancelled") => "后台任务已取消",
-                TaskEnding::Wake { state } if state.as_deref() == Some("error") => "后台任务失败",
-                TaskEnding::Wake { .. } => "后台任务完成",
-                TaskEnding::RuntimeEnded => "后台任务结束",
-                TaskEnding::Lost => "后台任务已失联",
-            },
-            Self::Subagent => match ending {
-                TaskEnding::Wake { state } if state.as_deref() == Some("cancelled") => "子代理已取消",
-                TaskEnding::Wake { state } if state.as_deref() == Some("error") => "子代理失败",
-                TaskEnding::Wake { .. } => "子代理完成",
-                TaskEnding::RuntimeEnded => "子代理结束",
-                TaskEnding::Lost => "子代理已失联",
-            },
-        }
+    /// The completion entry's collapsed-title phrase: the tool's own name plus
+    /// what happened to the task — `🔔 shell 完成` / `🔔 subagent 已取消`. A
+    /// Wake that reported a cancelled/error state, a runtime-confirmed end
+    /// without a Wake, and a lost completion record each get their own ending —
+    /// the entry never claims 完成 for work that was stopped or lost (issue
+    /// #454). Built on [`Self::noun`], so the completion entry and the live row
+    /// name the task type with one word.
+    fn completion_noun(self, ending: &TaskEnding) -> String {
+        let ending = match ending {
+            TaskEnding::Wake { state } if state.as_deref() == Some("cancelled") => "已取消",
+            TaskEnding::Wake { state } if state.as_deref() == Some("error") => "失败",
+            TaskEnding::Wake { .. } => "完成",
+            TaskEnding::RuntimeEnded => "结束",
+            TaskEnding::Lost => "已失联",
+        };
+        format!("{} {ending}", self.noun())
     }
 }
 
@@ -145,7 +137,7 @@ pub struct TaskCompletionEntry {
 
 /// The completion entry's collapsed title (ADR-0060) — the mechanical
 /// completion line the merged-path receipt always carried,
-/// `🔔 后台任务完成：<label>` / `🔔 子代理完成：<label>`, bare when the Wake
+/// `🔔 shell 完成：<label>` / `🔔 subagent 完成：<label>`, bare when the Wake
 /// named no label. The label goes through the shared [`folded_label`], so one
 /// label has one visible shape wherever the ledger renders it.
 pub(crate) fn task_entry_title(entry: &TaskCompletionEntry) -> String {
@@ -157,7 +149,7 @@ pub(crate) fn task_entry_title(entry: &TaskCompletionEntry) -> String {
 }
 
 /// The completion entry's fold body: the task's identity and the run's timing —
-/// `shell sh_abc · 14:02 · 12m`, and `子代理 ses_child · 14:02 · 1m` for the
+/// `shell sh_abc · 14:02 · 12m`, and `subagent ses_child · 14:02 · 1m` for the
 /// subagent kind, whose noun is the ledger's own ([`TaskKind::noun`]). The
 /// timing parts carry no Chinese labels (ADR-0060). Each part is omitted when
 /// the read named none (an id-less or start-less entry stays honest rather than
@@ -208,7 +200,7 @@ pub(crate) fn task_ledger_title(rows: &[TaskLedgerRow]) -> Option<String> {
 ///
 /// ```text
 /// · shell：**npm run build** · 14:02 · 3m12s
-/// · 子代理：**review the diff** · 14:04 · 1m05s
+/// · subagent：**review the diff** · 14:04 · 1m05s
 /// ```
 ///
 /// `None` when no task is live (the title's own emptiness rule, kept here so
@@ -384,7 +376,7 @@ mod tests {
         assert_eq!(task_ledger_title(&rows).unwrap(), "⏳ 后台任务（2）");
         assert_eq!(
             task_ledger_text(&rows, now).unwrap(),
-            "· shell：**gh run watch** · 14:02 · 3m12s\n· 子代理：**review the diff** · 14:04 · 1m05s"
+            "· shell：**gh run watch** · 14:02 · 3m12s\n· subagent：**review the diff** · 14:04 · 1m05s"
         );
     }
 
@@ -427,7 +419,7 @@ mod tests {
                 now,
             )
             .unwrap(),
-            "· 子代理：**review the diff** · 14:02 · 3m12s"
+            "· subagent：**review the diff** · 14:02 · 3m12s"
         );
     }
 
@@ -455,7 +447,7 @@ mod tests {
         assert_eq!(task_ledger_title(&rows).unwrap(), "⏳ 后台任务（2 · 1 待确认）");
         assert_eq!(
             task_ledger_text(&rows, now).unwrap(),
-            "· shell：**npm run build** · 14:02 · 3m12s · ⚠️ 状态待确认\n· 子代理"
+            "· shell：**npm run build** · 14:02 · 3m12s · ⚠️ 状态待确认\n· subagent"
         );
         // A fully unconfirmed section keeps the same shape; the marker only
         // appends, it never replaces a row's own facts.
@@ -496,23 +488,23 @@ mod tests {
 
         assert_eq!(
             task_entry_title(&shell_entry(wake(None), Some(finished))),
-            "🔔 后台任务完成：gh run watch"
+            "🔔 shell 完成：gh run watch"
         );
         assert_eq!(
             task_entry_title(&shell_entry(wake(Some("cancelled")), Some(finished))),
-            "🔔 后台任务已取消：gh run watch"
+            "🔔 shell 已取消：gh run watch"
         );
         assert_eq!(
             task_entry_title(&shell_entry(wake(Some("error")), Some(finished))),
-            "🔔 后台任务失败：gh run watch"
+            "🔔 shell 失败：gh run watch"
         );
         assert_eq!(
             task_entry_title(&shell_entry(TaskEnding::RuntimeEnded, Some(finished))),
-            "🔔 后台任务结束：gh run watch"
+            "🔔 shell 结束：gh run watch"
         );
         assert_eq!(
             task_entry_title(&shell_entry(TaskEnding::Lost, None)),
-            "🔔 后台任务已失联：gh run watch"
+            "🔔 shell 已失联：gh run watch"
         );
         assert_eq!(
             task_entry_body(&shell_entry(TaskEnding::RuntimeEnded, Some(finished))),
@@ -533,10 +525,13 @@ mod tests {
             finished_at: None,
             ending,
         };
-        assert_eq!(task_entry_title(&subagent(TaskEnding::Lost)), "🔔 子代理已失联");
+        assert_eq!(
+            task_entry_title(&subagent(TaskEnding::Lost)),
+            "🔔 subagent 已失联"
+        );
         assert_eq!(
             task_entry_title(&subagent(wake(Some("cancelled")))),
-            "🔔 子代理已取消"
+            "🔔 subagent 已取消"
         );
     }
 
@@ -635,7 +630,7 @@ mod tests {
         ];
         assert_eq!(
             task_ledger_text(&rows, now).unwrap(),
-            "· shell · 14:01 · 0m05s\n· 子代理"
+            "· shell · 14:01 · 0m05s\n· subagent"
         );
     }
 
@@ -771,7 +766,7 @@ mod tests {
             finished_at: Some(finished),
             ending: TaskEnding::Wake { state: None },
         };
-        assert_eq!(task_entry_title(&entry), "🔔 后台任务完成：gh run watch");
+        assert_eq!(task_entry_title(&entry), "🔔 shell 完成：gh run watch");
         assert_eq!(task_entry_body(&entry), "shell sh_abc · 14:02 · 12m");
 
         let subagent = TaskCompletionEntry {
@@ -782,8 +777,8 @@ mod tests {
             finished_at: Some(finished),
             ending: TaskEnding::Wake { state: None },
         };
-        assert_eq!(task_entry_title(&subagent), "🔔 子代理完成：review the diff");
-        assert_eq!(task_entry_body(&subagent), "子代理 ses_child · 14:02 · 1m");
+        assert_eq!(task_entry_title(&subagent), "🔔 subagent 完成：review the diff");
+        assert_eq!(task_entry_body(&subagent), "subagent ses_child · 14:02 · 1m");
     }
 
     /// A Wake that named no label renders the bare completion line — it says
@@ -792,8 +787,8 @@ mod tests {
     fn an_unnamed_completion_renders_the_bare_title() {
         let finished = crate::feishu::card::test_local_ms(2026, 9, 29, 14, 2);
         for (kind, title) in [
-            (TaskKind::Shell, "🔔 后台任务完成"),
-            (TaskKind::Subagent, "🔔 子代理完成"),
+            (TaskKind::Shell, "🔔 shell 完成"),
+            (TaskKind::Subagent, "🔔 subagent 完成"),
         ] {
             let entry = TaskCompletionEntry {
                 kind,
@@ -815,7 +810,7 @@ mod tests {
             finished_at: Some(finished),
             ending: TaskEnding::Wake { state: None },
         };
-        assert_eq!(task_entry_title(&empty), "🔔 后台任务完成");
+        assert_eq!(task_entry_title(&empty), "🔔 shell 完成");
     }
 
     /// Each body part is omitted when the read named none: no identity, no
@@ -861,7 +856,7 @@ mod tests {
         };
         assert_eq!(
             task_entry_title(&entry),
-            format!("🔔 后台任务完成：{}…", "x".repeat(TASK_LABEL_CHARS))
+            format!("🔔 shell 完成：{}…", "x".repeat(TASK_LABEL_CHARS))
         );
     }
 

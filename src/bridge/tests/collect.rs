@@ -491,7 +491,7 @@ async fn a_collected_chain_still_takes_a_wake_after_switching_back() {
         "the continuation renders the resumed work: {rendered}"
     );
     assert!(
-        !card_text(&rendered).contains("后台任务完成"),
+        !card_text(&rendered).contains("shell 完成"),
         "the entry stays on the card that hosted the task, never the continuation: {rendered}"
     );
 
@@ -525,7 +525,7 @@ async fn a_collected_chain_still_takes_a_wake_after_switching_back() {
         "the handover leaves the collect state intact: {handover}"
     );
     assert!(
-        card_text(handover).contains("后台任务完成"),
+        card_text(handover).contains("shell 完成"),
         "the retired task's entry lands on the card that hosted it: {handover}"
     );
     assert!(
