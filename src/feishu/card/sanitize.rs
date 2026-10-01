@@ -58,6 +58,18 @@ pub(crate) const UNDERSCORE_ESCAPE: &str = "&#95;";
 /// literally instead of being decoded into a construct.
 pub(crate) const AMPERSAND_ESCAPE: &str = "&amp;";
 
+/// A transcript-authored string's own `&` / `*` / `_` swapped for their
+/// numeric entities, `&` first (see [`AMPERSAND_ESCAPE`]): the text renders
+/// unchanged while it cannot seed a construct, close a `**…**` span or bleed
+/// formatting into a neighbouring element. Shared by the ledger's bold label
+/// and its activity fragment's tool name, and by the size reserve that must
+/// cover both — so the escaping's cost has one owner.
+pub(crate) fn escaped_entities(text: &str) -> String {
+    text.replace('&', AMPERSAND_ESCAPE)
+        .replace('*', ASTERISK_ESCAPE)
+        .replace('_', UNDERSCORE_ESCAPE)
+}
+
 /// Sanitize a single markdown element for its own card — for one-shot cards
 /// whose text never shares a table budget with other elements (notifications,
 /// ack cards). A card that builds several model texts should thread one

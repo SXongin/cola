@@ -1538,31 +1538,40 @@ impl StreamAccumulator {
     /// Replace the live Background Task ledger from an already-derived read
     /// (ADR-0060), stamped with the read's clock. The read is the authority: a
     /// task it no longer lists has retired and leaves the section, a new one
-    /// joins in transcript order. Returns whether the card owes a flush:
-    /// membership, or a rendered number — the elapsed, or the activity age
-    /// (spec #501) — moving at `cadence` since the section last rendered. The
-    /// clock stores the rendered seconds — what the card last rendered — so the
-    /// live path compares whole minutes of it (the seconds inside a rendered
-    /// minute never owe one and the card gains no per-render clock churn) while
-    /// the yielded path compares whole seconds (its 8 s reads keep the visible
-    /// elapsed and activity age true).
+    /// joins in transcript order. Returns whether the card owes a flush: a
+    /// RENDERED change — membership, a row's visible facts, or a rendered
+    /// number (the elapsed, or the activity age, spec #501) moving at
+    /// `cadence`. The comparison reads what the row renders, never the
+    /// gathered liveness's hidden timestamps: a child part landing inside the
+    /// second the card already shows owes nothing. The clock stores the
+    /// rendered seconds — what the card last rendered at the path's cadence —
+    /// so the live path compares whole minutes of it (the seconds inside a
+    /// rendered minute never owe one and the card gains no per-render clock
+    /// churn) while the yielded path compares whole seconds (its 8 s reads keep
+    /// the visible elapsed and activity age true). The read's rows and clock
+    /// are stored whatever the decision, so the next age is measured from the
+    /// freshest gathered timestamps rather than from a stale accepted read.
     fn set_ledger(&mut self, rows: Vec<TaskLedgerRow>, now_ms: i64, cadence: LedgerCadence) -> bool {
         let clock = crate::feishu::card::ledger::task_ledger_clock(&rows, now_ms);
         let moved = |rendered: Option<u64>, new: Option<u64>| match cadence {
             LedgerCadence::Minute => rendered.map(|secs| secs / 60) != new.map(|secs| secs / 60),
             LedgerCadence::Second => rendered != new,
         };
-        // `rows` equality implies equal lengths, so the zip covers every row.
-        let unchanged = self.ledger == rows
-            && self.ledger_clock.iter().zip(&clock).all(|(rendered, new)| {
-                !moved(rendered.elapsed, new.elapsed) && !moved(rendered.activity, new.activity)
-            });
-        if unchanged {
-            return false;
-        }
+        // A length mismatch is already a membership change (`rows_alike`
+        // false); when the lengths match, the zips cover every row.
+        let rows_alike = self.ledger.len() == rows.len()
+            && self
+                .ledger
+                .iter()
+                .zip(&rows)
+                .all(|(rendered, new)| rendered.renders_like(new));
+        let clock_alike = self.ledger_clock.iter().zip(&clock).all(|(rendered, new)| {
+            !moved(rendered.elapsed, new.elapsed) && !moved(rendered.activity, new.activity)
+        });
+        let owes = !rows_alike || !clock_alike;
         self.ledger = rows;
         self.ledger_clock = clock;
-        true
+        owes
     }
 
     /// The live Background Task ledger a transcript read owes the card
@@ -2842,6 +2851,58 @@ mod tests {
         // The same read repeated never owes one, on either cadence.
         assert!(!cadence(&mut acc, start + 61_500, LedgerCadence::Minute));
         assert!(!cadence(&mut acc, start + 61_500, LedgerCadence::Second));
+    }
+
+    /// The flush decision reads the RENDERED row, not the gathered liveness's
+    /// hidden timestamps (spec #501): a child's newest-part time moving inside
+    /// the rendered second the card already shows owes nothing, while a
+    /// rendered second turning — or the fragment's words changing — owes the
+    /// PATCH. The freshest timestamps are stored either way, so the next age
+    /// counts from the latest read, never from a stale accepted one.
+    #[test]
+    fn a_hidden_activity_timestamp_inside_the_rendered_second_owes_nothing() {
+        let start = 1_800_000_000_000;
+        let row = |activity: TaskLiveness| {
+            vec![TaskLedgerRow {
+                kind: TaskKind::Subagent,
+                label: Some("review the diff".into()),
+                // No elapsed: the activity age is the card's only rendered
+                // number, so each assertion isolates it.
+                started_at: None,
+                unconfirmed: false,
+                activity: Some(activity),
+            }]
+        };
+        let thinking = |last_activity_ms: i64| TaskLiveness {
+            activity: crate::feishu::card::tool_render::ChildActivity::Thinking,
+            last_activity_ms,
+            wait: None,
+        };
+        let mut acc = StreamAccumulator::new("test");
+
+        // The first read is a membership change (empty -> one row).
+        assert!(acc.set_ledger(row(thinking(start)), start, LedgerCadence::Second));
+        // A new child part 400 ms later: the fragment still renders `思考中 0s`,
+        // so no PATCH — and the fresh timestamp IS stored.
+        assert!(!acc.set_ledger(row(thinking(start + 400)), start + 400, LedgerCadence::Second));
+        assert_eq!(
+            acc.ledger[0].activity.as_ref().unwrap().last_activity_ms,
+            start + 400,
+            "the fresh timestamp is stored without a PATCH"
+        );
+        // The rendered second turns: 0s -> 1s, which owes.
+        assert!(acc.set_ledger(row(thinking(start + 400)), start + 1_400, LedgerCadence::Second));
+        // A shape change at the same instant owes too: the phase word...
+        let replying = |at: i64| TaskLiveness {
+            activity: crate::feishu::card::tool_render::ChildActivity::Replying,
+            last_activity_ms: at,
+            wait: None,
+        };
+        assert!(acc.set_ledger(row(replying(start + 1_400)), start + 1_400, LedgerCadence::Second));
+        // ...and a wait joining an otherwise identical fragment.
+        let mut waiting = row(replying(start + 1_400));
+        waiting[0].activity.as_mut().unwrap().wait = Some(crate::feishu::card::AwaitingAction::Permission);
+        assert!(acc.set_ledger(waiting, start + 1_400, LedgerCadence::Second));
     }
 
     /// A row with no start time has no clock: a read that only re-reports it
