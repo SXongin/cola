@@ -4,6 +4,12 @@ Welcome! This file is the contract for how changes land in this repo. Agents and
 humans alike are expected to follow it — the git hooks, CI, and code review all
 assume it.
 
+## Code of conduct
+
+Participation in this project — issues, pull requests, discussions — is covered
+by the [Contributor Covenant](CODE_OF_CONDUCT.md). Report unacceptable behavior
+to the address in that file.
+
 ## Before you start
 
 - Read `AGENTS.md` — especially **Known pitfalls** — before touching the

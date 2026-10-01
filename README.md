@@ -188,6 +188,8 @@ to get started after claiming.
   `cargo xtask check-doc-drift` 守护）。
 - **Contributing** — [CONTRIBUTING.md](CONTRIBUTING.md): commit conventions,
   the verification loop, PR rules.
+- **Code of conduct** — [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md): the
+  Contributor Covenant 2.1, including where to report unacceptable behavior.
 - **Architecture** — [docs/adr/](docs/adr/), [CONTEXT.md](CONTEXT.md),
   [AGENTS.md](AGENTS.md) (includes the hard-won known pitfalls for the OpenCode
   server API and Feishu integration — read before contributing).
