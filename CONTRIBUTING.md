@@ -15,7 +15,7 @@ to the address in that file.
 - Read `AGENTS.md` — especially **Known pitfalls** — before touching the
   OpenCode server API, Feishu card/WS integration, or the bridge protocol. Those
   pitfalls are hard-won and cheap to re-introduce.
-- Read `CONTEXT.md` and `docs/adr/` before designing anything: use the glossary's
+- Read `GLOSSARY.md` and `docs/adr/` before designing anything: use the glossary's
   vocabulary and don't silently contradict an existing ADR (surface it instead).
 - Keep PRs small and focused on one thing. A reviewable diff is more valuable
   than a big one.

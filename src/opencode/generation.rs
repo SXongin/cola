@@ -18,7 +18,7 @@
 //!   reconnect scan retries (spec #364 §2).
 //!
 //! The `[opencode] generation` override exists for proxies and unusual builds
-//! where the probe cannot be trusted (CONTEXT.md "Generation Override").
+//! where the probe cannot be trusted (GLOSSARY.md "Generation Override").
 
 use std::time::Duration;
 

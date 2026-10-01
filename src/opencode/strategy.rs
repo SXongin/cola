@@ -216,7 +216,7 @@ pub(crate) trait GenerationStrategy: Send + Sync {
     async fn compact(&self, http: &Transport, session_id: &str) -> Result<()>;
 }
 
-/// An OpenCode protocol generation cola can speak (CONTEXT.md "Generation").
+/// An OpenCode protocol generation cola can speak (GLOSSARY.md "Generation").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Generation {
     /// The 1.18.x unprefixed compatibility surface.

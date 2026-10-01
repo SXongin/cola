@@ -208,7 +208,7 @@ fn denial_text(reason: &DenyReason) -> &'static str {
 
 /// A display label for the Chat/Topic that owns a session, for the force-confirm
 /// card: the chat's display name (falling back to its id), with `（话题）` when
-/// the owner is a Topic rather than the Chat lobby. Vocabulary per CONTEXT.md —
+/// the owner is a Topic rather than the Chat lobby. Vocabulary per GLOSSARY.md —
 /// the Feishu side is a Chat/Topic, never a "conversation".
 async fn owner_label(core: &Arc<SharedCore>, owner_key: &ThreadKey) -> String {
     let chat_name = core

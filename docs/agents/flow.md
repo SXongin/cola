@@ -6,7 +6,7 @@ The route work travels through the skills in this repo. `/ask-matt` is the full 
 
 Keep steps 1–3 in one unbroken context window, so the grilling, spec, and tickets build on the same thinking. A multi-session build then runs under `/foreman`: implementation stays out of the orchestrating window (one implementer sub-agent per ticket), while the per-ticket review reports and fix rounds do accumulate there — so each ticket's progress comment is a sanctioned `/compact` boundary, and `/clear` between tickets is needed only when implementing them by hand. If the window approaches the smart zone before tickets exist, `/compact` at the nearest phase boundary rather than pushing on.
 
-1. **`/grill-with-docs`** sharpens the idea by interview and writes what it learns into `CONTEXT.md` and `docs/adr/` as it goes (`domain.md`). Done when every question is settled, or routed to step 2.
+1. **`/grill-with-docs`** sharpens the idea by interview and writes what it learns into `GLOSSARY.md` and `docs/adr/` as it goes (`domain.md`). Done when every question is settled, or routed to step 2.
 2. **Does a question need a runnable answer?** — a state model, business logic, a UI you have to see. Take the prototype detour:
    - `/handoff` out, open a fresh session on the file,
    - `/prototype` answers the question in throwaway code,
@@ -27,7 +27,6 @@ All of it runs under the `CONTRIBUTING.md` branch loop: start on `main`, branch,
 - `## What` opens with the smallest visual — a diff sketch, tree, sequence diagram, or pseudocode — then the paragraph.
 - `## How tested` reads as **Before:** → **After:** — failing → passing test, old log → new log, card screenshots for visual changes — ahead of the verification-loop commands.
 - Add `## Merge Danger` only when the change is non-trivial: **Door** (two-way, or one-way naming what reversal would cost) and **Blast Radius**. A one-way door is where an ADR is due.
-- The skill's `GLOSSARY.md` maps to this repo's `CONTEXT.md`.
 
 ## On-ramps
 

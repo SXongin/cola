@@ -39,7 +39,7 @@ Follow Conventional Commits — see `CONTRIBUTING.md`. The format is enforced by
 - **Part payloads have no `id`**: a part's `id` is a database column not
   serialised into the part JSON. Dedupe text/reasoning on **content**, never on
   a part `id`.
-- **Use the glossary's vocabulary** (`CONTEXT.md`): say *Bridge*, *Platform*,
+- **Use the glossary's vocabulary** (`GLOSSARY.md`): say *Bridge*, *Platform*,
   *Backend*, *Shared Store*, *Owned Server*, *Coexistent Server*, *Session*,
   *Card* — not synonyms the glossary explicitly avoids.
 - **Surface ADR conflicts** rather than silently overriding them; record
@@ -49,5 +49,5 @@ Follow Conventional Commits — see `CONTRIBUTING.md`. The format is enforced by
 
 ## Domain docs
 
-Single-context: one `CONTEXT.md` at the repo root, ADRs in `docs/adr/`,
+Single-context: one `GLOSSARY.md` at the repo root, ADRs in `docs/adr/`,
 engineering-skill configuration in `docs/agents/`. See `docs/agents/domain.md`.

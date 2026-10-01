@@ -178,7 +178,7 @@ pub(crate) struct PromptContext {
     pub(crate) advisory_live: bool,
 }
 
-/// One user→assistant exchange (CONTEXT.md: Turn). Owns the per-turn state and
+/// One user→assistant exchange (GLOSSARY.md: Turn). Owns the per-turn state and
 /// carries it through the phases in [`Turn::run`]:
 ///
 /// - `start` — the busy guard, the Loading card, the fresh accumulator;
