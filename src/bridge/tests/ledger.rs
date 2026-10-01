@@ -647,20 +647,22 @@ async fn yield_the_two_task_card(app: &Arc<App>, platform: &RecordingPlatform) {
     Turn::set_card_message_id(&app.cards_handle(), "ses_test", "om_waiting").await;
 }
 
-/// Handover cause 1 (#418): a Wake continuation takes the live list to the new
-/// card. The waiting card's handover PATCH loses the section and gains the
-/// retired task's fixed completion entry — the entry stays on the card that
-/// hosted the task — while the continuation opens with its 承接 line and lists
-/// only the REMAINING task. The entry never migrates onto the continuation.
+/// The one-card-per-request contract where a live list is involved (#418,
+/// rewritten for ADR-0066): the shell retires with resumed work while the
+/// subagent stays live, so the completion Wake resumes the yielded card IN
+/// PLACE — the retired shell's row goes, its fixed entry arrives beside the
+/// REMAINING subagent's row, the resumed work renders on the same card, and
+/// the card yields back to 「⏳ 等待后台任务」. The live list never leaves the
+/// card, so no handover and no new card exist at all.
 #[tokio::test]
-async fn a_wake_continuation_hands_the_live_list_to_the_new_card() {
+async fn a_completion_wake_keeps_the_live_list_on_the_resumed_card() {
     let _wd = test_work_dir();
     let (_dir, app, backend, platform) =
         scripted_app(vec![two_task_waiting()], Some(SessionStatus::Idle)).await;
     yield_the_two_task_card(&app, &platform).await;
+    let cards_before = created_cards(&platform).await.len();
 
-    // The shell retires (its Wake at 2_900) while the subagent stays live: the
-    // chain continues on a new card below the user's message.
+    // The shell retires (its Wake at 2_900) while the subagent stays live.
     script_transcript(
         &backend,
         vec![
@@ -674,94 +676,90 @@ async fn a_wake_continuation_hands_the_live_list_to_the_new_card() {
     spawn_sync(&app);
     wait_for_card_update(
         &platform,
-        "the continuation's remaining list",
+        "the resumed card's remaining list",
         CardUpdates::Latest,
         |card| {
             let text = card_text(card);
-            text.contains(WAKE_LEAD)
-                && text.contains("⏳ 后台任务（1）")
-                && text.contains("· 子代理：**review the diff**")
+            card_header(card).contains("等待后台任务")
+                && text.contains("🔔 后台任务完成：gh run watch")
+                && text.contains("CI 通过了。")
+                && !text.contains("· shell：**gh run watch**")
         },
     )
     .await;
 
-    // The continuation's very FIRST payload already carries the remaining
-    // list: the handover wrote the read's live set before the split, so the
-    // retired shell's row never appears there, not even briefly.
-    let first = platform
-        .replied_cards()
-        .await
-        .into_iter()
-        .find(|card| card_text(card).contains(WAKE_LEAD))
-        .expect("the continuation card is replied to the user's message");
-    let first_text = card_text(&first);
-    assert!(
-        first_text.contains("⏳ 后台任务（1）") && !first_text.contains("后台任务（2）"),
-        "the continuation opens with the remaining list, never the retired row: {first}"
+    // The card is waiting again — the resumed run left the subagent live — and
+    // the entry, the work and the remaining list all ride it.
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Waiting),
+        "the resumed run yields back to ⏳ while a task stays live"
     );
-
-    // The newest card carries the remaining task only: the retired shell's row
-    // is gone and its completion entry did not migrate onto the continuation.
-    let continuation = platform.updated_cards().await.last().cloned().unwrap();
-    let text = card_text(&continuation);
+    assert_eq!(
+        created_cards(&platform).await.len(),
+        cards_before,
+        "an in-place resume posts no card: {:?}",
+        platform.calls.lock().await
+    );
+    let resumed = platform.updated_cards().await.last().cloned().unwrap();
+    let text = card_text(&resumed);
+    assert!(
+        card_header(&resumed).contains("等待后台任务"),
+        "the card is back to its wait header: {resumed}"
+    );
+    assert!(
+        text.contains("🔔 后台任务完成：gh run watch") && text.contains("shell sh_bg · "),
+        "the retired task's entry lands on the card that hosted it: {resumed}"
+    );
     assert!(
         !text.contains("· shell：**gh run watch**"),
-        "the retired task's live row leaves the continuation: {continuation}"
+        "the retired task's live row is gone: {resumed}"
     );
     assert!(
-        !text.contains("后台任务完成"),
-        "the completion entry stays on the card the task lived on: {continuation}"
+        text.contains("⏳ 后台任务（1）") && text.contains("· 子代理：**review the diff**"),
+        "the remaining live list stays on the same card: {resumed}"
+    );
+    assert!(
+        text.contains("CI 通过了。") && text.contains("已经交给后台了。"),
+        "the resumed work joins the request's own timeline: {resumed}"
+    );
+    assert!(
+        !text.contains(WAKE_LEAD),
+        "an in-place resume writes no 承接 line: {resumed}"
+    );
+    assert_eq!(
+        text.matches("后台任务完成").count(),
+        1,
+        "exactly one entry: {resumed}"
     );
 
-    // The outgoing card's handover PATCH: the live list is gone, the entry and
-    // the card's own facts (timeline, footer, handoff header) stay.
+    // The resume PATCH itself already carried the remaining list: the retired
+    // shell's row never appears beside the entry, not even briefly.
     let patches = patches_to(&platform, "om_waiting").await;
-    assert_eq!(
-        patches.len(),
-        1,
-        "the handover is the old card's last PATCH: {patches:?}"
-    );
-    let handover = &patches[0];
+    let resume = patches
+        .iter()
+        .find(|patch| card_text(patch).contains("🔔 后台任务完成：gh run watch"))
+        .unwrap_or_else(|| panic!("the entry landed on the request's card: {patches:?}"));
+    let resume_text = card_text(resume);
     assert!(
-        !card_text(handover).contains("后台任务（"),
-        "the old card shows no live list after the handover: {handover}"
-    );
-    assert!(
-        card_text(handover).contains("🔔 后台任务完成：gh run watch"),
-        "the retired task's entry lands on the card that hosted it: {handover}"
-    );
-    assert!(
-        card_text(handover).contains("shell sh_bg · "),
-        "the entry's fold body carries the task's identity: {handover}"
-    );
-    assert!(
-        card_text(handover).contains("已经交给后台了。"),
-        "the handover PATCH keeps the old card's timeline: {handover}"
-    );
-    assert!(
-        card_text(handover).contains("📁"),
-        "the handover PATCH keeps the Turn Footer: {handover}"
-    );
-    assert!(
-        card_header(handover).contains("继续中"),
-        "the waiting yield hands over with the standard header: {handover}"
+        resume_text.contains("⏳ 后台任务（1）") && !resume_text.contains("后台任务（2）"),
+        "the entry lands with the remaining list, never the retired row: {resume}"
     );
 }
 
-/// Acceptance 3 (#418), the several-completions case: both tasks retire in one
-/// read — the shell's Wake at 2_900, the subagent's at 3_500 — so each Wake
-/// leaves its own fixed entry on the card that hosted it, in Wake order, and
-/// the continuation, opening with the newest Wake's 承接 line, renders neither.
+/// Acceptance 3 (#418), the several-completions case under ADR-0066: both
+/// tasks retire in one read — the shell's Wake at 2_900, the subagent's at
+/// 3_500 — with the resumed work landing after both, so the SAME resumed card
+/// carries both fixed entries in Wake order, the work, and the ✅ ending. No
+/// continuation exists to migrate an entry onto: one card per request.
 #[tokio::test]
-async fn a_continuation_never_renders_an_entry_from_an_earlier_card() {
+async fn a_resumed_card_carries_every_completion_of_the_read() {
     let _wd = test_work_dir();
     let (_dir, app, backend, platform) =
         scripted_app(vec![two_task_waiting()], Some(SessionStatus::Idle)).await;
     yield_the_two_task_card(&app, &platform).await;
+    let cards_before = created_cards(&platform).await.len();
 
-    // Both tasks complete while the card waits, with the resumed work landing
-    // after both: the handover owes the old card BOTH entries and the
-    // continuation only its 承接 line.
     script_transcript(
         &backend,
         vec![
@@ -774,51 +772,44 @@ async fn a_continuation_never_renders_an_entry_from_an_earlier_card() {
     spawn_sync(&app);
     wait_for_card_update(
         &platform,
-        "the continuation's done card",
+        "the resumed card's done state",
         CardUpdates::Latest,
-        |card| {
-            card_header(card).contains("✅")
-                && card_text(card).contains(WAKE_LEAD)
-                && card_text(card).contains("都完成了。")
-        },
+        |card| card_header(card).contains("✅") && card_text(card).contains("都完成了。"),
     )
     .await;
 
-    // The newest card renders no entry of its own and no live list: the
-    // completions belong to the card they happened on.
-    let continuation = platform.updated_cards().await.last().cloned().unwrap();
-    let text = card_text(&continuation);
-    assert!(
-        !text.contains("后台任务完成") && !text.contains("子代理完成"),
-        "no entry migrates onto the continuation: {continuation}"
-    );
-    assert!(
-        !text.contains("后台任务（"),
-        "no live list rides a session with nothing live: {continuation}"
-    );
-
-    // The old card's one handover PATCH carries both entries in Wake order.
-    let patches = patches_to(&platform, "om_waiting").await;
     assert_eq!(
-        patches.len(),
-        1,
-        "the handover is the old card's last PATCH: {patches:?}"
+        created_cards(&platform).await.len(),
+        cards_before,
+        "both completions still post no card: {:?}",
+        platform.calls.lock().await
     );
-    let handover = &patches[0];
-    let text = card_text(handover);
+    let resumed = platform.updated_cards().await.last().cloned().unwrap();
+    let text = card_text(&resumed);
     assert!(
         !text.contains("后台任务（"),
-        "the old card shows no live list after the handover: {handover}"
+        "no live list rides a session with nothing live: {resumed}"
     );
     let shell = text
         .find("🔔 后台任务完成：gh run watch")
-        .unwrap_or_else(|| panic!("the shell's entry lands where the task lived: {handover}"));
+        .unwrap_or_else(|| panic!("the shell's entry lands where the task lived: {resumed}"));
     let subagent = text
         .find("🔔 子代理完成：review the diff")
-        .unwrap_or_else(|| panic!("the subagent's entry lands where the task lived: {handover}"));
+        .unwrap_or_else(|| panic!("the subagent's entry lands where the task lived: {resumed}"));
+    let work = text
+        .find("都完成了。")
+        .unwrap_or_else(|| panic!("the resumed work renders: {resumed}"));
     assert!(
         shell < subagent,
-        "the entries keep Wake order (shell before subagent): {handover}"
+        "the entries keep Wake order (shell before subagent): {resumed}"
+    );
+    assert!(
+        subagent < work,
+        "both entries precede the work they announce: {resumed}"
+    );
+    assert!(
+        !text.contains(WAKE_LEAD),
+        "an in-place resume writes no 承接 line: {resumed}"
     );
 }
 
@@ -1761,19 +1752,20 @@ async fn a_retirement_before_the_wakes_boundary_does_not_settle() {
     );
 }
 
-/// A Wake continuation's own quiet true end (#420): the continuation yields
-/// Waiting on the task its resumed run left live, and THAT card's last
-/// retirement settles it in place — ✅ — without a second notice: the
-/// continuation's own card send was the notification (ADR-0059).
+/// The in-place resume's quiet true end (#420, ADR-0066): the resumed card
+/// yields 「⏳」 on the task its run left live — an in-place update, so the
+/// resume itself never notifies — and THAT card's last retirement settles it
+/// ✅ in place and sends the request's ONE notice (a group turn's opt-in, whose
+/// clock the card's own Turn start is). No card is posted at either step.
 #[tokio::test]
-async fn a_continuations_quiet_true_end_settles_without_a_second_notice() {
+async fn an_in_place_resumes_quiet_true_end_notifies_once() {
     let _wd = test_work_dir();
     let now = chrono::Utc::now().timestamp_millis();
     let sub_started = now - 4_000;
     let (_dir, app, backend, platform) =
         scripted_app(vec![two_task_waiting()], Some(SessionStatus::Idle)).await;
-    // A group turn with a requester: the continuation inherits both, so its
-    // settle WOULD notify if the guard did not stay silent.
+    // A group turn with a requester: a true end notifies, so the notice below
+    // is evidence, not a missing opt-in.
     let mut context = ctx("ses_test", "跑一下构建并审阅");
     context.is_group = true;
     context.requester_open_id = Some(TEST_HOST.to_string());
@@ -1783,9 +1775,15 @@ async fn a_continuations_quiet_true_end_settles_without_a_second_notice() {
         Some(CardState::Waiting)
     );
     Turn::set_card_message_id(&app.cards_handle(), "ses_test", "om_waiting").await;
+    let cards_before = created_cards(&platform).await.len();
+    assert!(
+        !noticed(&platform).await,
+        "the waiting yield never notifies: {:?}",
+        platform.calls.lock().await
+    );
 
-    // The shell retires with resumed work: the chain continues on a new card,
-    // which yields Waiting on the remaining subagent.
+    // The shell retires with resumed work: the SAME card resumes in place and
+    // yields Waiting again on the remaining subagent — still no notice.
     script_transcript(
         &backend,
         vec![
@@ -1799,13 +1797,23 @@ async fn a_continuations_quiet_true_end_settles_without_a_second_notice() {
     spawn_sync(&app);
     wait_for_card_update(
         &platform,
-        "the continuation waiting on the subagent",
+        "the resumed card waiting on the subagent",
         CardUpdates::Latest,
-        |card| card_header(card).contains("等待后台任务") && card_text(card).contains(WAKE_LEAD),
+        |card| {
+            card_header(card).contains("等待后台任务")
+                && card_text(card).contains("CI 通过了。")
+                && !card_text(card).contains("后台任务（2）")
+        },
     )
     .await;
+    assert!(
+        !noticed(&platform).await,
+        "an in-place update never notifies: {:?}",
+        platform.calls.lock().await
+    );
 
-    // The subagent retires quietly: the continuation card reaches its true end.
+    // The subagent retires quietly: the card reaches its true end in place,
+    // and the request's ONE notice follows it.
     script_transcript(
         &backend,
         vec![
@@ -1817,15 +1825,24 @@ async fn a_continuations_quiet_true_end_settles_without_a_second_notice() {
     .await;
     wait_for_card_update(
         &platform,
-        "the continuation's true end",
+        "the resumed card's true end",
         CardUpdates::Latest,
         |card| card_header(card).contains("✅") && !card_text(card).contains("后台任务（"),
     )
     .await;
 
+    let notices = wait_for_notice(&platform).await;
+    assert_eq!(notices.len(), 1, "exactly one notice: {notices:?}");
+    assert_eq!(notices[0].0, "msg_1", "it replies to the request's message");
     assert!(
-        !noticed(&platform).await,
-        "a Wake continuation's own send was the notification: {:?}",
+        notices[0].3.contains("已完成"),
+        "the true end is what it announces: {:?}",
+        notices[0].3
+    );
+    assert_eq!(
+        created_cards(&platform).await.len(),
+        cards_before,
+        "the whole resume ran in place: {:?}",
         platform.calls.lock().await
     );
 }

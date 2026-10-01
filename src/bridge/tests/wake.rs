@@ -19,8 +19,8 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use super::drain::{
-    assistant, ctx, script_transcript, scripted_app, spawn_sync, spawn_turn, user, wait_for_card_header,
-    wait_for_card_text,
+    assistant, ctx, noticed, script_transcript, scripted_app, scripted_app_with, spawn_sync, spawn_turn,
+    user, wait_for_card_header, wait_for_card_text,
 };
 use crate::backend::{
     BackgroundTask, ContentBlock, FinishReason, MessageRole, Part, ReasoningPart, SessionTranscript,
@@ -273,13 +273,33 @@ async fn wait_for_any_card(platform: &RecordingPlatform, needle: &str) {
         .unwrap_or_else(|_| panic!("no card ever carried {needle:?}"));
 }
 
-/// The #403 shape (acceptance 1): a Turn idles with a live Background Task and
-/// yields 「⏳ 等待后台任务」; the Wake's later content becomes a continuation
-/// card replying to the user's message, streams the new work and ends ✅ under
-/// the settle rule — never replaying the previous card's content (acceptance
-/// 2), with the Turn Footer current.
+/// Every card POST (a reply or a top-level send) the platform recorded — the
+/// counter for "was a new card posted?" (an in-place PATCH updates one).
+async fn posted_cards(platform: &RecordingPlatform) -> usize {
+    platform
+        .calls
+        .lock()
+        .await
+        .iter()
+        .filter(|call| {
+            matches!(
+                call,
+                PlatformCall::ReplyCard { .. } | PlatformCall::SendCard { .. }
+            )
+        })
+        .count()
+}
+
+/// The one-card-per-request contract (ADR-0066, #485): a Turn idles with a
+/// live Background Task and yields 「⏳ 等待后台任务」; the task's completing
+/// shell Wake resumes THAT card in place — **no card is posted and nothing is
+/// replied to**. The retiring task's fixed entry lands on the card that hosted
+/// it, the resumed work streams into the same card, and it ends ✅ there: the
+/// header cycles 等待后台任务 → 🔄 继续中 → ✅, and the delivering PATCH
+/// advances the durable Wake Watermark (ADR-0061) so a restart cannot re-post
+/// the Wake.
 #[tokio::test]
-async fn a_wake_after_a_waiting_yield_continues_on_a_new_card() {
+async fn a_completion_wake_resumes_the_yielded_card_in_place() {
     let _wd = test_work_dir();
     let waiting = SessionTranscript::new(vec![
         user("msg_cola_anchor", 1_000, "跑一下 CI"),
@@ -296,6 +316,8 @@ async fn a_wake_after_a_waiting_yield_continues_on_a_new_card() {
         Turn::card_state(&app.cards_handle(), "ses_test").await,
         Some(CardState::Waiting)
     );
+    let posts_before = posted_cards(&platform).await;
+    let replies_before = platform.replied_cards().await.len();
 
     // The Wake resumes the Turn with real work: reasoning, a settled tool and
     // the answer, all carrying server times from the wake moment.
@@ -314,93 +336,116 @@ async fn a_wake_after_a_waiting_yield_continues_on_a_new_card() {
     .await;
 
     spawn_sync(&app);
-    wait_for_card_text(&platform, "CI 通过了。").await;
-    // The wait is tied to the CONTINUATION's own ending (lead + this test's
-    // resumed text): the earlier waiting card is not ✅ and cannot satisfy it.
     wait_for_card_update(
         &platform,
-        "the continuation's done card",
+        "the resumed card's done state",
         CardUpdates::Latest,
-        |card| {
-            card_header(card).contains("✅")
-                && card_text(card).contains(WAKE_LEAD)
-                && card_text(card).contains("CI 通过了。")
-        },
+        |card| card_header(card).contains("✅") && card_text(card).contains("CI 通过了。"),
     )
     .await;
+
+    // No card was posted and nothing was replied to: the SAME card carried the
+    // completion entry, the resumed work and the ending.
+    assert_eq!(
+        posted_cards(&platform).await,
+        posts_before,
+        "an in-place resume posts no card: {:?}",
+        platform.calls.lock().await
+    );
+    assert_eq!(
+        platform.replied_cards().await.len(),
+        replies_before,
+        "an in-place resume replies to nothing: {:?}",
+        platform.calls.lock().await
+    );
 
     let last = platform.updated_cards().await.last().cloned().unwrap();
     assert!(
         card_text(&last).contains("CI 通过了。"),
-        "the resumed work lands on the continuation: {last}"
+        "the resumed work lands on the card the request opened: {last}"
     );
     assert!(
-        !card_text(&last).contains("已经交给后台了。"),
-        "the continuation must not replay the previous card's content: {last}"
+        card_text(&last).contains("已经交给后台了。"),
+        "the resumed card keeps the request's own timeline: {last}"
     );
+    // No 承接 line: the card has its context — one card per request.
+    assert!(
+        !card_text(&last).contains(WAKE_LEAD),
+        "an in-place resume writes no 承接 line: {last}"
+    );
+    // The retiring task's own entry, exactly once, ahead of the work it
+    // announces, and its live row gone.
+    assert_eq!(
+        card_text(&last).matches("后台任务完成").count(),
+        1,
+        "exactly one completion entry: {last}"
+    );
+    let entry = body_index(&last, "后台任务完成").expect("the retired task's entry renders");
+    let work = body_index(&last, "CI 通过了。").expect("the resumed work renders");
+    assert!(
+        entry < work,
+        "the entry precedes the work it announces (entry@{entry}, work@{work}): {last}"
+    );
+    assert!(
+        !card_text(&last).contains("⏳ 后台任务（"),
+        "the retired task's live row is gone: {last}"
+    );
+    assert!(
+        card_text(&last).contains("📁"),
+        "the resumed card keeps the Turn Footer: {last}"
+    );
+
+    // The header cycled waiting → 🔄 resuming → ✅ on that one card: the
+    // resume PATCH says the task is done and the run works on.
+    assert!(
+        platform
+            .updated_cards()
+            .await
+            .iter()
+            .any(|card| card_header(card).contains("后台任务完成，继续处理中")),
+        "the card takes the resuming header before the work streams: {:?}",
+        platform.updated_cards().await
+    );
+    // The resumed work streamed before the ending (the ✅ was not the first
+    // thing the card showed).
     assert!(
         platform
             .updated_cards()
             .await
             .iter()
             .any(|card| card_text(card).contains("CI 通过了。") && !card_header(card).contains("✅")),
-        "the continuation streams the resumed work before it ends: {:?}",
+        "the resumed work streams into the card before it ends: {:?}",
         platform.updated_cards().await
     );
-    // The 承接 receipt is the continuation's FIRST visible block, ahead of
-    // every part of the resumed run: the work carries server times from the
-    // wake (already in the past at poll time), so a receipt keyed at cola's
-    // "now" would sort after it — the live order bug.
-    let receipt = body_index(&last, WAKE_LEAD).expect("the 承接 line rides the continuation");
-    assert_eq!(
-        receipt, 0,
-        "the 承接 line must open the continuation card: {last}"
-    );
-    for work in ["正在验证 CI 结果。", "workflow run 123 成功", "CI 通过了。"] {
-        let at = body_index(&last, work)
-            .unwrap_or_else(|| panic!("the resumed work must render ({work}): {last}"));
-        assert!(
-            receipt < at,
-            "the 承接 receipt must precede the resumed work {work:?} (receipt@{receipt}, work@{at}): {last}"
-        );
-    }
-    assert!(
-        card_text(&last).contains("📁"),
-        "the continuation keeps the Turn Footer: {last}"
-    );
-
-    // The continuation is a reply to the user's message (the Turn's own reply
-    // target) and is itself the notification.
-    let replied = platform.replied_cards().await;
-    assert!(
-        replied.iter().any(is_continuation),
-        "the continuation card must be replied to the user's message: {replied:?}"
-    );
+    // A p2p turn under the long-task threshold (the default rules): the
+    // in-place resume's ending is not announced — it is the same card, and the
+    // card's own updates are what the operator watches.
     assert!(
         platform.completion_notices().await.is_empty(),
-        "the continuation card is the notification; no notice is sent: {:?}",
+        "a short p2p resume sends no notice: {:?}",
         platform.calls.lock().await
     );
-    // The waiting card hands over with the standard split header — its wait is
-    // over and the chain moved on.
-    assert!(
-        platform
-            .updated_cards()
-            .await
-            .iter()
-            .any(|card| card_header(card).contains("继续中")),
-        "the waiting card takes the handoff header: {:?}",
-        platform.updated_cards().await
-    );
-    // The split's continuation send delivered the 承接 line, so the durable
-    // Wake Watermark advanced (ADR-0061): a restart cannot re-post this Wake.
+    // The delivering PATCH carried the entry, so the durable Wake Watermark
+    // advanced (ADR-0061): a restart cannot re-post this Wake.
     assert_eq!(
         app.cards_handle()
             .wake_watermarks
             .announced("ses_test")
             .map(|mark| mark.created_ms),
         Some(2_900),
-        "a delivered 承接 line advances the durable Wake Watermark"
+        "a delivered in-place entry advances the durable Wake Watermark"
+    );
+
+    // A restart after the resume (the in-memory chain is gone) finds the Wake
+    // covered by the durable mark: no fresh continuation re-posts it.
+    Turn::drop_card(&app.cards_handle(), "ses_test").await;
+    let posts = posted_cards(&platform).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        posted_cards(&platform).await,
+        posts,
+        "an in-place resume's Wake must not be re-posted after a restart: {:?}",
+        platform.calls.lock().await
     );
 }
 
@@ -532,6 +577,373 @@ async fn a_wake_after_a_restart_posts_a_continuation_card() {
     );
 }
 
+/// A resumed run that outgrows one card still splits (ADR-0066 keeps the size
+/// split): the in-place resume renders the whole live slice on the request's
+/// card, so an overflow finalizes it with the standard 「部分完成，继续中…」
+/// handoff — the retiring task's entry stays on the card that hosted it — and
+/// the remainder continues on a new card, which takes the ending.
+#[tokio::test]
+async fn an_in_place_resume_that_overflows_still_splits() {
+    let _wd = test_work_dir();
+    let waiting = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_background_tasks(vec![background_shell(2_100)]);
+    let (_dir, app, backend, platform) = scripted_app(vec![waiting], Some(SessionStatus::Idle)).await;
+    Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下 CI"))
+        .await
+        .unwrap();
+    Turn::set_card_message_id(&app.cards_handle(), "ses_test", "om_waiting").await;
+    let posts_before = posted_cards(&platform).await;
+
+    // The resumed run's answer is longer than one card.
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(vec![
+                user("msg_cola_anchor", 1_000, "跑一下 CI"),
+                assistant(2_000, "已经交给后台了。"),
+                long_resumed_work(3_100),
+            ])
+            .with_executions(vec![execution(2_500), execution(4_000)])
+            .with_wakes(vec![shell_wake(2_900)]),
+        ],
+    )
+    .await;
+    spawn_sync(&app);
+    // The overflowing card hands over with the standard split header, carrying
+    // the retirement's entry ...
+    wait_for_card_update(
+        &platform,
+        "the overflowing resume's handoff",
+        CardUpdates::Latest,
+        |card| {
+            card_header(card).contains("继续中") && card_text(card).contains("🔔 后台任务完成：gh run watch")
+        },
+    )
+    .await;
+
+    // ... and the remainder continues on a new card, which takes the ending.
+    wait_for_card_update(
+        &platform,
+        "the continuation's done state",
+        CardUpdates::Latest,
+        |card| card_header(card).contains("✅") && card_text(card).contains("很长的回答。"),
+    )
+    .await;
+    assert!(
+        posted_cards(&platform).await > posts_before,
+        "an overflowing resume continues on a new card: {:?}",
+        platform.calls.lock().await
+    );
+    // The entry stayed on the card the task lived on: no continuation carries
+    // it, and the request's card is the one that was finalized.
+    let handover = patches_to(&platform, "om_waiting")
+        .await
+        .pop()
+        .expect("the request's card was PATCHed");
+    assert!(
+        card_text(&handover).contains("🔔 后台任务完成：gh run watch")
+            && card_header(&handover).contains("继续中"),
+        "the entry rides the finalized card: {handover}"
+    );
+}
+
+/// The mid-resume user message (ADR-0066, ADR-0043): a resumed card is LIVE
+/// again — render-owned — so a message landing below it is a Supplement. The
+/// chain splits at the message, the continuation replies to it with the
+/// receipt, and the resumed run keeps streaming into that continuation (the
+/// same chain, so the same settle loop) — never a new Turn that would strand
+/// the resumed work.
+#[tokio::test]
+async fn a_message_during_a_resumed_run_supplements_it() {
+    let _wd = test_work_dir();
+    let waiting = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_background_tasks(vec![background_shell(2_100)]);
+    let (_dir, app, backend, platform) = scripted_app(vec![waiting], Some(SessionStatus::Idle)).await;
+    Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下 CI"))
+        .await
+        .unwrap();
+
+    // The resume: the Wake's own work, its Execution not yet bounded, so the
+    // resumed run stays live.
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(vec![
+                user("msg_cola_anchor", 1_000, "跑一下 CI"),
+                assistant(2_000, "已经交给后台了。"),
+                assistant(3_100, "正在合并。"),
+            ])
+            .with_executions(vec![execution(2_500)])
+            .with_wakes(vec![shell_wake(2_900)]),
+        ],
+    )
+    .await;
+    spawn_sync(&app);
+    wait_for_card_text(&platform, "正在合并。").await;
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Streaming),
+        "the resumed run is live on the request's card"
+    );
+
+    // A message lands below it: the owned chain routes it as a Supplement.
+    app.handle_message(incoming(
+        "msg_sup".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "补充一下，改用方案 B".into(),
+        None,
+    ))
+    .await;
+
+    // The continuation replies to the message, carries the receipt, and the
+    // resumed run keeps rendering into it — the same chain, no new Turn.
+    let resumed = {
+        let calls = platform.calls.lock().await;
+        calls
+            .iter()
+            .find_map(|call| match call {
+                PlatformCall::ReplyCard { reply_to, card } if reply_to == "msg_sup" => Some(card.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("the supplement must split the chain at the message: {calls:?}"))
+    };
+    assert!(
+        card_text(&resumed).contains("📨 已收到补充"),
+        "the continuation carries the supplement receipt: {resumed}"
+    );
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Streaming),
+        "the split leaves the run live on the continuation"
+    );
+    assert!(
+        !Turn::has_pending_split(&app.cards_handle(), "ses_test").await,
+        "the split is consumed"
+    );
+
+    // The run keeps streaming into the continuation: a later read's part lands
+    // on it (the harness serves one id for every card, so the receipts and the
+    // new content riding ONE payload is what names it).
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(vec![
+                user("msg_cola_anchor", 1_000, "跑一下 CI"),
+                assistant(2_000, "已经交给后台了。"),
+                assistant(3_100, "正在合并。"),
+                assistant(3_400, "合并完成，改用方案 B 后重跑。"),
+            ])
+            .with_executions(vec![execution(2_500)])
+            .with_wakes(vec![shell_wake(2_900)]),
+        ],
+    )
+    .await;
+    wait_for_card_update(
+        &platform,
+        "the continuation's later content",
+        CardUpdates::Latest,
+        |card| {
+            card_text(card).contains("📨 已收到补充")
+                && card_text(card).contains("合并完成，改用方案 B 后重跑。")
+        },
+    )
+    .await;
+}
+
+/// One notice (ADR-0066): the in-place resume itself never notifies — a PATCH
+/// pushes nothing — and its TRUE END notifies once under the ordinary rules,
+/// with the clock the request's ORIGINAL Turn start reads: here a p2p run past
+/// the long-task threshold fires exactly one notice, and a resume clock
+/// ("now") could not have passed it.
+#[tokio::test]
+async fn an_in_place_resumes_true_end_notifies_once() {
+    let _wd = test_work_dir();
+    let waiting = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_background_tasks(vec![background_shell(2_100)]);
+    let (_dir, app, backend, platform) = scripted_app_with(vec![waiting], Some(SessionStatus::Idle), |cfg| {
+        cfg.bridge.long_task_notice = true;
+    })
+    .await;
+    app.long_task_notice_ms.store(50, Ordering::Relaxed);
+    let mut context = ctx("ses_test", "跑一下 CI");
+    context.requester_open_id = Some(TEST_HOST.to_string());
+    Turn::run(&app.turn_handles(), context).await.unwrap();
+    assert!(!noticed(&platform).await, "the waiting yield never notifies");
+    // The wait outlives the threshold: the notice's clock has to be the
+    // request's original Turn start (a resume-time clock would measure ~0).
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(vec![
+                user("msg_cola_anchor", 1_000, "跑一下 CI"),
+                assistant(2_000, "已经交给后台了。"),
+                assistant(3_100, "CI 通过了。"),
+            ])
+            .with_executions(vec![execution(2_500), execution(4_000)])
+            .with_wakes(vec![shell_wake(2_900)]),
+        ],
+    )
+    .await;
+    spawn_sync(&app);
+    wait_for_card_update(
+        &platform,
+        "the resumed card's done state",
+        CardUpdates::Latest,
+        |card| card_header(card).contains("✅") && card_text(card).contains("CI 通过了。"),
+    )
+    .await;
+
+    // The notice trails the settle PATCH in the same pass: give it the moment.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let notices = platform.completion_notices().await;
+    assert_eq!(notices.len(), 1, "exactly one notice: {notices:?}");
+    assert_eq!(notices[0].0, "msg_1", "it replies to the request's message");
+    assert!(
+        notices[0].3.contains("已完成"),
+        "the card's ✅ is what it announces: {:?}",
+        notices[0].3
+    );
+}
+
+/// The ADR-0059 boundary ADR-0066 deliberately keeps: a Wake that is NOT a
+/// shell/subagent completion — a server restart, an interruption continuation —
+/// does not resume a yielded card in place. The chain continues on a 承接 card
+/// below the user's message, exactly as before.
+#[tokio::test]
+async fn a_restart_wake_on_a_waiting_card_still_splits() {
+    let _wd = test_work_dir();
+    let waiting = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_background_tasks(vec![background_shell(2_100)]);
+    let (_dir, app, backend, platform) = scripted_app(vec![waiting], Some(SessionStatus::Idle)).await;
+    Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下 CI"))
+        .await
+        .unwrap();
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Waiting)
+    );
+    let posts_before = posted_cards(&platform).await;
+
+    // The server restarted: the Wake records that, and the run resumed with
+    // real work.
+    let mut restart = shell_wake(2_900);
+    restart.source = WakeSource::Restart;
+    restart.label = None;
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(vec![
+                user("msg_cola_anchor", 1_000, "跑一下 CI"),
+                assistant(2_000, "已经交给后台了。"),
+                assistant(3_100, "重启后继续。"),
+            ])
+            .with_executions(vec![execution(2_500), execution(4_000)])
+            .with_wakes(vec![restart]),
+        ],
+    )
+    .await;
+
+    spawn_sync(&app);
+    wait_for_card_update(
+        &platform,
+        "the restart continuation's done card",
+        CardUpdates::Latest,
+        |card| {
+            card_header(card).contains("✅")
+                && card_text(card).contains(WAKE_LEAD)
+                && card_text(card).contains("重启后继续。")
+        },
+    )
+    .await;
+
+    // A NEW card carried the 承接 line and the resumed work: the yielded card
+    // was not resumed in place.
+    assert!(
+        posted_cards(&platform).await > posts_before,
+        "a restart Wake still continues on a new card: {:?}",
+        platform.calls.lock().await
+    );
+    assert!(
+        platform
+            .updated_cards()
+            .await
+            .iter()
+            .any(|card| card_header(card).contains("继续中")),
+        "the yielded card hands over with the standard split header: {:?}",
+        platform.updated_cards().await
+    );
+}
+
+/// The other kept boundary: the Wake-less content-diff fallback. New content
+/// with no placeable Wake has no completion to name, so 「后台任务完成」 would
+/// lie — the yielded card keeps the ADR-0059 split.
+#[tokio::test]
+async fn a_wake_less_tail_on_a_waiting_card_still_splits() {
+    let _wd = test_work_dir();
+    let waiting = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_background_tasks(vec![background_shell(2_100)]);
+    let (_dir, app, backend, platform) = scripted_app(vec![waiting], Some(SessionStatus::Idle)).await;
+    Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下 CI"))
+        .await
+        .unwrap();
+    let posts_before = posted_cards(&platform).await;
+
+    // Content landed with no Wake recorded at all: the tail the finalized
+    // read missed.
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(vec![
+                user("msg_cola_anchor", 1_000, "跑一下 CI"),
+                assistant(2_000, "已经交给后台了。"),
+                assistant(3_100, "收尾时补上的一段。"),
+            ])
+            .with_executions(vec![execution(2_500), execution(4_000)])
+            .with_background_tasks(vec![background_shell(2_100)]),
+        ],
+    )
+    .await;
+
+    spawn_sync(&app);
+    wait_for_card_update(
+        &platform,
+        "the content-diff continuation",
+        CardUpdates::Latest,
+        |card| card_text(card).contains(WAKE_LEAD) && card_text(card).contains("收尾时补上的一段。"),
+    )
+    .await;
+
+    assert!(
+        posted_cards(&platform).await > posts_before,
+        "the Wake-less fallback still continues on a new card: {:?}",
+        platform.calls.lock().await
+    );
+}
+
 /// Acceptance 4a: `/stop` during a resumed run finalizes ⏹ 已停止 — never ✅ or
 /// ❌ — and sends no Completion Notice.
 #[tokio::test]
@@ -585,10 +997,13 @@ async fn a_stop_during_a_resumed_run_finalizes_stopped() {
     );
 }
 
-/// Acceptance 4b: a resumed run that fails finalizes ❌ with the failure and
-/// NO Retry button — the continuation carries no question to re-ask.
+/// Failure keeps Retry on an in-place resume (ADR-0066): the resumed card is
+/// the REQUEST's own — it still carries its prompt and its reply target — so a
+/// failed resumed run ends ❌ on it with the ordinary #391 重试, which is
+/// exactly what the ❌ notice's 「可点击卡片上的「重试」」 copy promises. The ❌
+/// notice fires once, on the request's own card, per the ordinary rules.
 #[tokio::test]
-async fn a_failed_resumed_run_finalizes_error_without_retry() {
+async fn a_failed_in_place_resume_keeps_retry() {
     let _wd = test_work_dir();
     let waiting = SessionTranscript::new(vec![
         user("msg_cola_anchor", 1_000, "跑一下 CI"),
@@ -597,10 +1012,15 @@ async fn a_failed_resumed_run_finalizes_error_without_retry() {
     .with_executions(vec![execution(2_500)])
     .with_background_tasks(vec![background_shell(2_100)]);
     let (_dir, app, backend, platform) = scripted_app(vec![waiting], Some(SessionStatus::Idle)).await;
-    Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下 CI"))
-        .await
-        .unwrap();
+    // A group turn with a requester: a settle notifies, so the notice's copy
+    // can be read back with the card's own terminal.
+    let mut context = ctx("ses_test", "跑一下 CI");
+    context.is_group = true;
+    context.requester_open_id = Some(TEST_HOST.to_string());
+    Turn::run(&app.turn_handles(), context).await.unwrap();
+    let posts_before = posted_cards(&platform).await;
 
+    // The resumed run fails.
     script_transcript(
         &backend,
         vec![
@@ -618,9 +1038,80 @@ async fn a_failed_resumed_run_finalizes_error_without_retry() {
     spawn_sync(&app);
     wait_for_card_update(
         &platform,
-        "the continuation's error card",
+        "the resumed card's error",
         CardUpdates::Latest,
         |card| card_header(card).contains("出错"),
+    )
+    .await;
+
+    let last = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_text(&last).contains("provider 503"),
+        "the settled failure reaches the resumed card: {last}"
+    );
+    assert!(
+        card_buttons(&last)
+            .iter()
+            .any(|button| button["value"]["action"] == "retry"),
+        "the request's own card keeps its Retry: {last}"
+    );
+    assert_eq!(
+        posted_cards(&platform).await,
+        posts_before,
+        "the failed resume posted no card: {:?}",
+        platform.calls.lock().await
+    );
+    let notices = platform.completion_notices().await;
+    assert_eq!(notices.len(), 1, "exactly one notice: {notices:?}");
+    assert_eq!(notices[0].0, "msg_1", "it replies to the request's message");
+    assert!(
+        notices[0].3.contains("出错") && notices[0].3.contains("重试"),
+        "the notice follows the card's terminal and names its Retry: {:?}",
+        notices[0].3
+    );
+}
+
+/// The other half of the Retry rule (ADR-0059, narrowed by ADR-0066): a SPLIT
+/// continuation is armed without a user prompt, so a failed resumed run on one
+/// ends ❌ with NO Retry — there is no question to re-ask. A late Wake after
+/// the card already ended ✅ is exactly the case that still splits.
+#[tokio::test]
+async fn a_failed_split_continuation_offers_no_retry() {
+    let _wd = test_work_dir();
+    let done = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "第一轮回答。"),
+    ])
+    .with_executions(vec![execution(2_500)]);
+    let (_dir, app, backend, platform) = scripted_app(vec![done], Some(SessionStatus::Idle)).await;
+    Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下 CI"))
+        .await
+        .unwrap();
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Done)
+    );
+
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(vec![
+                user("msg_cola_anchor", 1_000, "跑一下 CI"),
+                assistant(2_000, "第一轮回答。"),
+                failed_assistant(3_100, "失败的一步", "provider 503"),
+            ])
+            .with_executions(vec![execution(2_500), execution(4_000)])
+            .with_wakes(vec![shell_wake(2_900)]),
+        ],
+    )
+    .await;
+
+    spawn_sync(&app);
+    wait_for_card_update(
+        &platform,
+        "the continuation's error card",
+        CardUpdates::Latest,
+        |card| card_header(card).contains("出错") && card_text(card).contains(WAKE_LEAD),
     )
     .await;
 
@@ -634,6 +1125,11 @@ async fn a_failed_resumed_run_finalizes_error_without_retry() {
             .iter()
             .any(|button| button["value"]["action"] == "retry"),
         "a Wake continuation offers no Retry: {last}"
+    );
+    assert!(
+        platform.completion_notices().await.is_empty(),
+        "the split continuation's own send was the notification: {:?}",
+        platform.calls.lock().await
     );
 }
 
@@ -907,11 +1403,13 @@ async fn a_rendered_wake_is_never_re_posted() {
     );
 }
 
-/// A chained Wake: after the first continuation ended ✅, a second Wake
-/// resumes the Turn again — a new continuation card below, again replying to
-/// the user's message and carrying only the second run's work.
+/// A second completion resumes the SAME card again — no chain of continuation
+/// cards (ADR-0066 acceptance 3). The resumed run leaves a new Background Task
+/// live, so the card yields back to 「⏳ 等待后台任务」 with its remaining list;
+/// the second task's Wake then resumes that same card in place: its own entry,
+/// its own work, and the final ✅ all land there. Nothing is ever posted.
 #[tokio::test]
-async fn a_second_wake_continues_the_chain_again() {
+async fn a_second_wake_resumes_the_same_card_again() {
     let _wd = test_work_dir();
     let waiting = SessionTranscript::new(vec![
         user("msg_cola_anchor", 1_000, "跑一下 CI"),
@@ -923,7 +1421,13 @@ async fn a_second_wake_continues_the_chain_again() {
     Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下 CI"))
         .await
         .unwrap();
+    // The harness replies every card with one id; name the request's card so
+    // every PATCH below can be told apart from any other card's.
+    Turn::set_card_message_id(&app.cards_handle(), "ses_test", "om_waiting").await;
+    let posts_before = posted_cards(&platform).await;
 
+    // The first completion resumes the card, and its run backgrounds a SECOND
+    // task: the card yields back to 「⏳ 等待后台任务」 with the remaining list.
     script_transcript(
         &backend,
         vec![
@@ -931,22 +1435,33 @@ async fn a_second_wake_continues_the_chain_again() {
                 user("msg_cola_anchor", 1_000, "跑一下 CI"),
                 assistant(2_000, "已经交给后台了。"),
                 assistant(3_100, "CI 通过了。"),
+                background_shell_launch(3_200, "call_bg2", "sh_bg2", "再次运行"),
             ])
             .with_executions(vec![execution(2_500), execution(4_000)])
-            .with_wakes(vec![shell_wake(2_900)]),
+            .with_wakes(vec![shell_wake(2_900)])
+            .with_background_tasks(vec![another_background_shell(3_200)]),
         ],
     )
     .await;
     spawn_sync(&app);
     wait_for_card_update(
         &platform,
-        "the first continuation's done card",
+        "the card waiting on the second task",
         CardUpdates::Latest,
-        |card| card_header(card).contains("✅") && card_text(card).contains("CI 通过了。"),
+        |card| card_text(card).contains("CI 通过了。") && card_text(card).contains("· shell：**再次运行**"),
     )
     .await;
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Waiting),
+        "a live task yields the resumed card back to ⏳"
+    );
 
-    // A second Background Task's Wake: new work, a new Execution boundary.
+    // The second task's completion: its own Wake, its own work, a new boundary.
+    let mut second_wake = shell_wake(4_900);
+    second_wake.shell_id = Some("sh_bg2".into());
+    second_wake.job_id = Some("sh_bg2".into());
+    second_wake.label = Some("再次运行".into());
     script_transcript(
         &backend,
         vec![
@@ -954,42 +1469,52 @@ async fn a_second_wake_continues_the_chain_again() {
                 user("msg_cola_anchor", 1_000, "跑一下 CI"),
                 assistant(2_000, "已经交给后台了。"),
                 assistant(3_100, "CI 通过了。"),
+                background_shell_launch(3_200, "call_bg2", "sh_bg2", "再次运行"),
                 assistant(5_100, "合并完成。"),
             ])
             .with_executions(vec![execution(2_500), execution(4_000), execution(6_000)])
-            .with_wakes(vec![shell_wake(2_900), shell_wake(4_900)]),
+            .with_wakes(vec![shell_wake(2_900), second_wake]),
         ],
     )
     .await;
     wait_for_card_update(
         &platform,
-        "the second continuation's done card",
+        "the resumed card's second ending",
         CardUpdates::Latest,
         |card| card_header(card).contains("✅") && card_text(card).contains("合并完成。"),
     )
     .await;
 
+    // Both runs live on the ONE request card: both entries, both runs' work.
     let last = platform.updated_cards().await.last().cloned().unwrap();
+    let text = card_text(&last);
     assert!(
-        !card_text(&last).contains("CI 通过了。"),
-        "the second continuation renders only its own run: {last}"
+        text.contains("CI 通过了。") && text.contains("合并完成。"),
+        "the same card carries both resumed runs: {last}"
     );
-    // Two SENDS: each Wake posts its own continuation card (the ✅ arrives by
-    // an in-place update of that card, never as another send).
+    assert_eq!(
+        text.matches("后台任务完成").count(),
+        2,
+        "each completion leaves its own entry, once: {last}"
+    );
     assert!(
-        continuation_sends(&platform).await.len() >= 2,
-        "both Wakes end on their own continuation card: {:?}",
+        !text.contains("⏳ 后台任务（"),
+        "the second retirement leaves no live list: {last}"
+    );
+    assert!(
+        !text.contains(WAKE_LEAD),
+        "no continuation was ever posted for either Wake: {last}"
+    );
+    assert_eq!(
+        posted_cards(&platform).await,
+        posts_before,
+        "two completions, still one card: {:?}",
         platform.calls.lock().await
     );
+    // Both completions' PATCHes went to the request's own card.
     assert!(
-        platform
-            .replied_cards()
-            .await
-            .iter()
-            .filter(|card| is_continuation(card))
-            .count()
-            >= 2,
-        "each continuation replies to the user's message: {:?}",
+        patches_to(&platform, "om_waiting").await.len() >= 2,
+        "the request's card is the one that flowed: {:?}",
         platform.calls.lock().await
     );
 }
@@ -1930,14 +2455,20 @@ async fn a_merged_subagent_wake_labels_the_entry_with_its_description() {
     result.unwrap();
 }
 
-/// The wake-continuation path (ADR-0059/0060): the card a Wake opens carries
-/// the 承接 line and NOT an entry for its own Wake; a later Wake that resumes
-/// that live continuation card does leave its entry — exactly once, on the
-/// continuation, while the entry from the old card never migrates.
+/// The lobby/restart regression (#426, ADR-0066): a RESTART continuation card
+/// is sent top-level — it has no reply target at all — and carries the 承接
+/// line, which announces its own Wake (so no entry for it). When that card's
+/// run yields 「⏳ 等待后台任务」, a later completion Wake resumes IT in place:
+/// its entry lands there, before its work, exactly once — where the old split
+/// path warned "no reachable reply target" on every pass and the resumed work
+/// never rendered. A repeated poll must not duplicate the entry.
 #[tokio::test]
-async fn a_chained_wake_leaves_its_entry_on_the_live_continuation_card_once() {
+async fn a_restart_cards_later_completion_resumes_it_in_place() {
     let _wd = test_work_dir();
     let (started, finished) = entry_span();
+    // The first Wake's own work, then the second run's, each with an answered
+    // boundary: the first read leaves the follow's task live, the second is the
+    // resumed run's true end.
     let timeline = |first: bool, second: bool| {
         let mut resumed = Vec::new();
         if first {
@@ -1946,77 +2477,103 @@ async fn a_chained_wake_leaves_its_entry_on_the_live_continuation_card_once() {
         if second {
             resumed.push(assistant(finished + 30_000, "第二段进展。"));
         }
-        merged_shell_timeline(started, resumed)
+        merged_entry_timeline(
+            started,
+            vec![background_shell_launch(
+                started,
+                "call_bg",
+                "sh_bg",
+                "gh run watch",
+            )],
+            resumed,
+        )
     };
-    let waiting = SessionTranscript::new(timeline(false, false))
-        .with_executions(vec![execution(started + 30_000)])
-        .with_background_tasks(vec![background_shell(started)]);
-    let (_dir, app, backend, platform) = scripted_app(vec![waiting], Some(SessionStatus::Idle)).await;
-    Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下 CI"))
-        .await
-        .unwrap();
+    // The restart fixture: no card chain in memory at all.
+    let resumed = SessionTranscript::new(timeline(true, false))
+        .with_executions(vec![execution(started + 30_000), execution(started + 180_000)])
+        .with_wakes(vec![shell_wake(started + 90_000)])
+        .with_background_tasks(vec![background_shell(started + 150_000)]);
+    let (_dir, app, backend, platform) = scripted_app(vec![resumed], Some(SessionStatus::Idle)).await;
+    assert!(
+        !Turn::has_card(&app.cards_handle(), "ses_test").await,
+        "the restart fixture has no card chain"
+    );
 
-    // The Wake opens the continuation card; its Execution has no boundary yet,
-    // so the card stays live.
-    script_transcript(
-        &backend,
-        vec![
-            SessionTranscript::new(timeline(true, false))
-                .with_executions(vec![execution(started + 30_000)])
-                .with_wakes(vec![shell_wake(started + 90_000)]),
-        ],
+    spawn_sync(&app);
+    // The restart continuation posts top-level, streams the Wake's work and
+    // yields 「⏳ 等待后台任务」 on the task its run left live.
+    wait_for_card_update(
+        &platform,
+        "the restart continuation's waiting card",
+        CardUpdates::Latest,
+        |card| {
+            card_header(card).contains("等待后台任务")
+                && card_text(card).contains(WAKE_LEAD)
+                && card_text(card).contains("第一段进展。")
+        },
     )
     .await;
-    spawn_sync(&app);
-    wait_for_card_text(&platform, "第一段进展。").await;
-
     let opened = platform.updated_cards().await.last().cloned().unwrap();
     assert!(
-        card_text(&opened).contains(WAKE_LEAD),
-        "the continuation opens with the 承接 line: {opened}"
+        !card_text(&opened).contains("后台任务完成"),
+        "the Wake that opened the card is announced by the 承接 line alone: {opened}"
     );
     assert!(
-        !card_text(&opened).contains("后台任务完成"),
-        "the Wake that opened the card is announced by the line alone: {opened}"
+        !Turn::card_is_owned(&app.cards_handle(), "ses_test").await,
+        "the yielded card is nobody's to render until the next Wake"
     );
+    let cards_posted = posted_cards(&platform).await;
 
-    // A SECOND Wake resumes the same live continuation card: its completion
-    // leaves one entry there, before its work.
+    // The second completion resumes THAT card in place — no reply target
+    // exists, and none is needed: the entry and the work land on the card the
+    // chain already has.
     script_transcript(
         &backend,
         vec![
             SessionTranscript::new(timeline(true, true))
-                .with_executions(vec![execution(started + 30_000)])
+                .with_executions(vec![execution(started + 30_000), execution(finished + 60_000)])
                 .with_wakes(vec![shell_wake(started + 90_000), shell_wake(finished)]),
         ],
     )
     .await;
-    wait_for_card_text(&platform, "第二段进展。").await;
+    wait_for_card_update(
+        &platform,
+        "the resumed restart card's ending",
+        CardUpdates::Latest,
+        |card| card_header(card).contains("✅") && card_text(card).contains("第二段进展。"),
+    )
+    .await;
 
+    assert_eq!(
+        posted_cards(&platform).await,
+        cards_posted,
+        "the later completion posts nothing: the chain resumes its own card: {:?}",
+        platform.calls.lock().await
+    );
     let last = platform.updated_cards().await.last().cloned().unwrap();
     assert_eq!(
         card_text(&last).matches("后台任务完成").count(),
         1,
-        "the chained Wake leaves exactly one entry: {last}"
+        "the resumed completion leaves exactly one entry: {last}"
     );
     assert!(
         card_text(&last).contains("shell sh_bg · 14:02 · 12m"),
-        "the chained entry carries identity and timing: {last}"
+        "the entry carries the retired task's identity and timing: {last}"
     );
-    let entry = body_index(&last, "后台任务完成").expect("the chained entry renders");
-    let work = body_index(&last, "第二段进展。").expect("the chained work renders");
+    let entry = body_index(&last, "后台任务完成").expect("the resumed entry renders");
+    let work = body_index(&last, "第二段进展。").expect("the resumed work renders");
     assert!(
         entry < work,
-        "the chained entry precedes its work (entry@{entry}, work@{work}): {last}"
+        "the entry precedes its work (entry@{entry}, work@{work}): {last}"
     );
 
-    // Later polls must not duplicate the chained entry.
+    // Later polls must not duplicate it.
     tokio::time::sleep(Duration::from_millis(80)).await;
     let later = platform.updated_cards().await.last().cloned().unwrap();
     assert_eq!(
         card_text(&later).matches("后台任务完成").count(),
         1,
-        "a repeated poll must not duplicate the chained entry: {later}"
+        "a repeated poll must not duplicate the entry: {later}"
     );
 }
 

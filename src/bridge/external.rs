@@ -800,17 +800,6 @@ impl ExternalFlow {
         else {
             return;
         };
-        // The Feishu reply target: the Turn's own when the chain still knows
-        // it (the user's message the exchange continues from), else an in-topic
-        // anchor — the external path's fallback order. `None` means only a
-        // top-level send can reach the thread, which a split cannot do.
-        let reply_target = match Turn::reply_target(&handles.cards, sid).await {
-            Some(target) => Some(target),
-            None => {
-                crate::bridge::pollers::resolve_topic_anchor(&handles.sessions, &handles.platform, thread_key)
-                    .await
-            }
-        };
         // The Wake starts new work: a `/stop` from before it is not this run's
         // ending — the same rule a fresh Turn applies to the sticky marker
         // (ADR-0043). A stop landing after this point ends the continuation
@@ -818,7 +807,47 @@ impl ExternalFlow {
         handles.waits.stopped_sessions.lock().await.remove(sid);
 
         match continuation {
+            WakeContinuation::ResumeInPlace => {
+                // ADR-0066, the one-card-per-request handoff: the yielded card
+                // resumes in place. Nothing is sent and nothing is replied to,
+                // so this path needs no Feishu reply target — which is exactly
+                // what closes the lobby/restart gap where a split had nowhere
+                // to go and the work never rendered.
+                if !Turn::resume_yielded_card(&handles.cards, sid, transcript, now_ms).await {
+                    return;
+                }
+                let (Some(anchor), Some(chain)) = (
+                    Turn::armed_turn_anchor(&handles.cards, sid).await,
+                    Turn::chain_id(&handles.cards, sid).await,
+                ) else {
+                    return;
+                };
+                tracing::info!(
+                    "wake continuation: session {} resumes its yielded card in place",
+                    sid
+                );
+                // The resumed run ends on the REQUEST's own card, which never
+                // sent a notification: its true end notifies under the
+                // ordinary rules (ADR-0066), unlike a split continuation —
+                // whose card send was its own notification — so this arm
+                // carries the notice rules the loop hands back to.
+                self.spawn_wake_render(
+                    handles,
+                    sid,
+                    thread_key,
+                    anchor,
+                    directory,
+                    chain,
+                    Some(self.notice.clone()),
+                );
+            }
             WakeContinuation::ContinueChain { line } => {
+                // The Feishu reply target: the Turn's own when the chain still
+                // knows it (the user's message the exchange continues from),
+                // else an in-topic anchor — the external path's fallback order.
+                // `None` means only a top-level send can reach the thread,
+                // which a split cannot do.
+                let reply_target = self.wake_reply_target(handles, sid, thread_key).await;
                 // The split carries the continuation: its flush re-stamps the
                 // previous card, sends the new card and tracks it. The loop's
                 // guard facts are read AFTER the split, so they describe the
@@ -848,9 +877,13 @@ impl ExternalFlow {
                     return;
                 };
                 tracing::info!("wake continuation: session {} continues its card chain", sid);
-                self.spawn_wake_render(handles, sid, thread_key, anchor, directory, chain);
+                self.spawn_wake_render(handles, sid, thread_key, anchor, directory, chain, None);
             }
             WakeContinuation::Fresh { anchor } => {
+                // The Feishu reply target, the split path's own fallback order:
+                // a restart leaves no reply target behind, and only a top-level
+                // send can reach the thread then (`send_card` below).
+                let reply_target = self.wake_reply_target(handles, sid, thread_key).await;
                 // No chain (a cola restart): arm a fresh card scoped at the
                 // newest Wake, so the lost card's content is never replayed.
                 //
@@ -944,7 +977,7 @@ impl ExternalFlow {
                             return;
                         };
                         tracing::info!("wake continuation: session {} continues after a restart", sid);
-                        self.spawn_wake_render(handles, sid, thread_key, anchor, directory, chain);
+                        self.spawn_wake_render(handles, sid, thread_key, anchor, directory, chain, None);
                     }
                     Err(e) => {
                         tracing::warn!("wake continuation send: {}", e);
@@ -955,9 +988,36 @@ impl ExternalFlow {
         }
     }
 
+    /// The Feishu message a Wake continuation card replies to: the Turn's own
+    /// when the chain still knows it (the user's message the exchange continues
+    /// from), else an in-topic anchor — the external path's fallback order.
+    /// `None` means only a top-level send can reach the thread, which a split
+    /// cannot do: the Fresh path sends top-level instead, and the in-place
+    /// resume (ADR-0066) PATCHes the card the chain already has, so it asks for
+    /// no target at all.
+    async fn wake_reply_target(
+        &self,
+        handles: &FlowHandles,
+        sid: &str,
+        thread_key: &crate::config::ThreadKey,
+    ) -> Option<String> {
+        match Turn::reply_target(&handles.cards, sid).await {
+            Some(target) => Some(target),
+            None => {
+                crate::bridge::pollers::resolve_topic_anchor(&handles.sessions, &handles.platform, thread_key)
+                    .await
+            }
+        }
+    }
+
     /// Spawn the Wake continuation's out-of-turn settle loop with this flow's
     /// injectable cadences: the render poll, the per-read bound, and the
     /// lost-contact grace (the external render timeout's second reading).
+    /// `notice` carries the Completion Notice's rules for a continuation that
+    /// must announce its own ending — the in-place resume, whose card never
+    /// sent (ADR-0066) — and `None` for a split continuation, whose card send
+    /// was the notification.
+    #[allow(clippy::too_many_arguments)] // the loop's fixture: the pass's facts + the chain it watches + the notice rules
     fn spawn_wake_render(
         &self,
         handles: &FlowHandles,
@@ -966,6 +1026,7 @@ impl ExternalFlow {
         anchor: TurnAnchor,
         directory: &str,
         chain: u64,
+        notice: Option<NoticeRules>,
     ) {
         let flow = handles.clone();
         let session_id = sid.to_string();
@@ -980,7 +1041,32 @@ impl ExternalFlow {
         let span = crate::bridge::span::external(sid, Some(thread_key));
         tokio::spawn(
             async move {
-                Turn::wake_settle_loop(&flow, &session_id, &directory, &anchor, chain, timing).await;
+                let ended =
+                    Turn::wake_settle_loop(&flow, &session_id, &directory, &anchor, chain, timing).await;
+                let Some(rules) = notice else { return };
+                if !ended {
+                    // The loop stopped owning the card (a new Turn, another
+                    // arm) or its accumulator vanished: nothing ended here, so
+                    // nothing is announced.
+                    return;
+                }
+                // The in-place resume's ending is the request's true end: it
+                // notifies under the ordinary rules, with the clock the quiet
+                // true end reads (ADR-0066). `send_completion_notice` itself
+                // declines a card that is not at an ending, so a yield back to
+                // 「⏳」 stays silent and the quiet true end that follows owns
+                // the one notice.
+                let Some(started_at) = Turn::turn_started_at(&flow.cards, &session_id).await else {
+                    return;
+                };
+                crate::bridge::turn::send_completion_notice(
+                    &flow.cards,
+                    &flow.platform,
+                    &rules,
+                    &session_id,
+                    started_at,
+                )
+                .await;
             }
             .instrument(span),
         );

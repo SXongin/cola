@@ -47,7 +47,6 @@ pub enum CardState {
     /// Supplement (ADR-0043) and a later Wake never double-renders. Not
     /// terminal — the resumed run ends ✅/❌/⏹ or yields back to `Waiting`
     /// while Background Tasks remain live — and it owns no recovery action.
-    #[allow(dead_code)] // prefactor: the in-place handoff (#485) is the first producer
     Resuming,
     /// A card whose Turn's submitted message never reached the session
     /// transcript and whose Session is not live (ADR-0062): a steered admit

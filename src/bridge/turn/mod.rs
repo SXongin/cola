@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use tracing::Instrument;
 
-use crate::backend::{MessageId, MessageRole, SessionTranscript, TurnAnchor, TurnSettle};
+use crate::backend::{MessageId, MessageRole, SessionTranscript, TurnAnchor, TurnSettle, WakeSource};
 use crate::bridge::handler::image_inputs;
 use crate::bridge::handles::{
     CardsHandle, FlowHandles, NoticeRules, RequestsHandle, SessionsHandle, TurnHandles, WaitsHandle,
@@ -1685,6 +1685,62 @@ impl Turn {
         true
     }
 
+    /// Resume a yielded card IN PLACE for a shell/subagent completion Wake
+    /// (ADR-0066): the one-card-per-request handoff, beside the split. One
+    /// write-lock-held sequence, exactly like the split handover: the read's
+    /// remaining live list and the retiring Wake's fixed completion entry are
+    /// written onto the card's OWN accumulator, so the entry lands at its own
+    /// moment on the card that hosted the task (ADR-0060) and the live list
+    /// stays; the card then takes [`CardState::Resuming`] and the flush
+    /// renders the whole live slice on the SAME card. No card is sent and
+    /// nothing is replied to: the PATCH is the announcement, so it drains the
+    /// staged Wake Watermark exactly as the 承接 line's send did (ADR-0061) —
+    /// a restart after it cannot re-post the Wake.
+    ///
+    /// The flush keeps [`SplitPolicy::Allow`]: a resumed run that outgrows one
+    /// card still finalizes it and continues the chain on a new one (ADR-0066
+    /// keeps the size split). The resumed run then reaches its ending through
+    /// the shared out-of-turn settle loop, which the caller spawns — back to
+    /// 「⏳ 等待后台任务」 while Background Tasks remain live, or the true end
+    /// (✅/❌/⏹).
+    ///
+    /// Returns false — nothing written — when the card is no longer the
+    /// yielded one this handoff admits
+    /// ([`state::CardSession::accepts_ledger_refresh`]: still `Waiting`, live,
+    /// no split owed), so a race with a collect, a new Turn or a handoff can
+    /// never resume a card somebody else took over. `now_ms` is the read's
+    /// clock — the Session Sync pass's own, shared with the split handover of
+    /// the same read.
+    pub(crate) async fn resume_yielded_card(
+        cards: &CardsHandle,
+        session_id: &str,
+        transcript: &SessionTranscript,
+        now_ms: i64,
+    ) -> bool {
+        let write_lock = cards.write_lock(session_id).await;
+        let _guard = write_lock.lock().await;
+        {
+            let mut live = cards.cards.lock().await;
+            let Some(card) = live.get_mut(session_id) else {
+                return false;
+            };
+            if !card.accepts_ledger_refresh() {
+                return false;
+            }
+            let anchor = card.acc.turn_anchor.clone();
+            render::apply_ledger_read(
+                &mut card.acc,
+                transcript,
+                anchor.as_ref(),
+                now_ms,
+                state::LedgerCadence::Second,
+            );
+            card.acc.set_resuming();
+        }
+        flush::flush_card_locked(cards, session_id, flush::SplitPolicy::Allow).await;
+        true
+    }
+
     /// Refresh a yielded card's ledger from a Session Sync read, in place
     /// (ADR-0060): the freeze's carve-out, beside the Wake handover. A Waiting
     /// card has no render loop — its Turn yielded to its live Background Tasks
@@ -2671,6 +2727,16 @@ impl Turn {
 /// that found the chain also says which handoff to use — nothing is
 /// re-derived under a second look.
 pub(crate) enum WakeContinuation {
+    /// A card chain exists whose newest placeable Wake is a shell/subagent
+    /// completion the card has NOT announced, and whose card is still yielded
+    /// 「⏳ 等待后台任务」: resume that card IN PLACE (ADR-0066) — no new card,
+    /// no 承接 line. The retiring task's completion entry and the remaining
+    /// live list land on the card the task lived on, the card takes the
+    /// resuming state, and the shared out-of-turn settle loop streams the
+    /// resumed work into it. Decided only for the state this delivery admits
+    /// ([`state::CardSession::accepts_ledger_refresh`]), so a decision and its
+    /// write can never disagree about which card resumes.
+    ResumeInPlace,
     /// A card chain exists: continue it by split. Only the content the chain
     /// has not rendered lands on the continuation, and the accumulator's own
     /// anchor scopes the settle decision. `line` is the new card's opening
@@ -2752,12 +2818,16 @@ impl Turn {
     /// The decision is a content diff over the Session Transcript (ADR-0059),
     /// never a terminal step:
     ///
-    /// - **A card chain exists.** The continuation continues it by split, so
-    ///   the only question is whether the chain missed anything: rendering
-    ///   the Turn into the chain's own rendered state must produce a part —
-    ///   a Wake's resumed work, or content that landed after the card was
-    ///   finalized. Nothing new renders -> nothing is owed, which is also what
-    ///   keeps a rendered Wake from being re-posted on every poll.
+    /// - **A card chain exists.** The only question is whether the chain
+    ///   missed anything: rendering the Turn into the chain's own rendered
+    ///   state must produce a part — a Wake's resumed work, or content that
+    ///   landed after the card was finalized. Nothing new renders -> nothing
+    ///   is owed, which is also what keeps a rendered Wake from being
+    ///   re-posted on every poll. What it owes is then one of two handoffs: a
+    ///   yielded card whose newest placeable Wake is an unannounced
+    ///   shell/subagent completion resumes in place
+    ///   ([`WakeContinuation::ResumeInPlace`], ADR-0066), and every other
+    ///   continuation continues the chain by split.
     /// - **No chain (a cola restart).** Nothing durable says what the lost
     ///   card showed, so only the newest placeable Wake's own work may be
     ///   rendered, scoped at the Wake's anchor — the whole Turn is never
@@ -2790,6 +2860,25 @@ impl Turn {
                 let anchor = card.acc.turn_anchor.as_ref().unwrap_or(turn_anchor);
                 if !render::renders_new_content(&card.acc, transcript, anchor) {
                     return None;
+                }
+                // A yielded card resumes IN PLACE (ADR-0066) iff the newest
+                // placeable Wake — the completion whose work this continuation
+                // would render — is a shell/subagent completion the card has
+                // not announced yet. One card per request: the entry, the
+                // resumed work and the ending all stay on the card the user's
+                // message opened. Every other continuation keeps the ADR-0059
+                // split: a restart/interrupt Wake is not a task completion (no
+                // entry to place), an already-announced Wake is the Wake-less
+                // content-diff fallback (its entry is on the card; there is
+                // nothing to name), and a card past its wait (terminal, or a
+                // handoff already owed) must not be re-opened — a ✅ flipping
+                // back to 🔄 would misread the ending it recorded.
+                if card.accepts_ledger_refresh()
+                    && let Some(wake) = newest_wake
+                    && matches!(wake.source, WakeSource::Shell | WakeSource::Subagent)
+                    && !card.acc.announced_wakes.contains(wake.id.as_str())
+                {
+                    return Some(WakeContinuation::ResumeInPlace);
                 }
                 // Key the 承接 receipt just before the work the continuation
                 // will render: the newest Wake's own server time when there is
@@ -2971,9 +3060,12 @@ impl Turn {
 
     /// Run the Wake continuation's out-of-turn settle loop (ADR-0059) on the
     /// caller's own task: the shared out-of-turn loop under the
-    /// continuation's chain identity, then its ending stamped on the card. No
-    /// Completion Notice follows — the continuation card is itself the
-    /// notification.
+    /// continuation's chain identity, then its ending stamped on the card.
+    /// Returns whether the loop reached an ending and stamped it; the caller
+    /// owns the announcement. A split continuation needs none — its own card
+    /// send was the notification — while an in-place resume, which never
+    /// sends, notifies at the true end (ADR-0066); the caller holds the notice
+    /// rules this module has no config for.
     pub(crate) async fn wake_settle_loop(
         flow: &FlowHandles,
         session_id: &str,
@@ -2981,15 +3073,29 @@ impl Turn {
         anchor: &TurnAnchor,
         chain: u64,
         timing: SettleTiming,
-    ) {
+    ) -> bool {
         let owns = settle::Ownership::Chain {
             chain,
             anchor: anchor.clone(),
         };
         let Some(ending) = settle::run(flow, session_id, directory, timing, &owns).await else {
-            return;
+            return false;
         };
         settle::stamp(&flow.cards, session_id, &ending).await;
+        true
+    }
+
+    /// The request's original Turn start on `session_id`'s card, when it
+    /// recorded one — the Completion Notice's long-task clock (ADR-0043). The
+    /// quiet true end and the in-place resume's ending both measure the whole
+    /// run from here, so the resumed work counts toward the threshold.
+    pub(crate) async fn turn_started_at(cards: &CardsHandle, session_id: &str) -> Option<std::time::Instant> {
+        cards
+            .cards
+            .lock()
+            .await
+            .get(session_id)
+            .and_then(|card| card.acc.turn_started_at)
     }
 
     /// Attach a sent card's identity to an armed-but-idless continuation and
