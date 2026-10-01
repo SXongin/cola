@@ -794,12 +794,15 @@ impl StreamAccumulator {
     }
 
     /// The header phase for the current state: None when the turn finished,
-    /// was stopped or errored (no timer shown).
+    /// was stopped or errored (no timer shown). A resumed card (`Resuming`,
+    /// ADR-0066) works on like streaming — same phase, same timer — so entering
+    /// the resume resets the clock and the resumed run's tools count as the
+    /// Tool phase, exactly as they do on a live card.
     pub(super) fn active_phase(&self) -> Option<HeaderPhase> {
         match self.card_state {
             CardState::Loading => Some(HeaderPhase::Loading),
             CardState::Reasoning => Some(HeaderPhase::Reasoning),
-            CardState::Streaming => {
+            CardState::Streaming | CardState::Resuming => {
                 // A running todowrite is a tail panel, not a timeline tool, but
                 // it is still a running tool: ADR-0014 gives it the Tool phase
                 // (and the timer reset that comes with it), like any other.
@@ -3036,6 +3039,17 @@ mod tests {
             None,
         ));
         assert_eq!(acc.active_phase(), Some(HeaderPhase::Streaming));
+        // A resumed card (ADR-0066) works on like streaming — same phase, same
+        // timer: entering it resets the clock the waiting yield stopped.
+        acc.card_state = CardState::Resuming;
+        acc.refresh_phase();
+        assert_eq!(acc.active_phase(), Some(HeaderPhase::Streaming));
+        // A tool of the resumed run is its own phase, like on a live card.
+        acc.push_tool(
+            "call_2",
+            ToolPanel::for_test("bash", ToolStatus::Running, None, None),
+        );
+        assert_eq!(acc.active_phase(), Some(HeaderPhase::Tool));
         // Finished turns show no timer phase.
         acc.card_state = CardState::Done;
         acc.refresh_phase();

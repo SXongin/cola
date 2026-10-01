@@ -38,6 +38,17 @@ pub enum CardState {
     /// chain on a new continuation card; a later Turn supersedes this one or a
     /// switch-away collects it (spec #405).
     Waiting,
+    /// A card whose Wait a shell/subagent completion Wake resumed IN PLACE
+    /// (ADR-0066): no new card is sent — the retiring task's completion entry
+    /// lands on this card and the shared out-of-turn settle loop streams the
+    /// resumed work into it. Header 「🔄 后台任务完成，继续处理中…」 with the
+    /// live phase timer, blue like the other working states. Render-owned: a
+    /// live renderer holds the chain, so a mid-resume user message is a
+    /// Supplement (ADR-0043) and a later Wake never double-renders. Not
+    /// terminal — the resumed run ends ✅/❌/⏹ or yields back to `Waiting`
+    /// while Background Tasks remain live — and it owns no recovery action.
+    #[allow(dead_code)] // prefactor: the in-place handoff (#485) is the first producer
+    Resuming,
     /// A card whose Turn's submitted message never reached the session
     /// transcript and whose Session is not live (ADR-0062): a steered admit
     /// no runner promoted, so nobody will answer it. Header
@@ -75,7 +86,9 @@ impl CardState {
     /// live and a Wake will continue its chain on a new card (ADR-0059). The
     /// collected waiting states (`Superseded`, `SwitchedAway`) ARE terminal:
     /// the wait is over even though its background work is not, so the card
-    /// stops updating (ADR-0059).
+    /// stops updating (ADR-0059). `Resuming` is NOT terminal either (ADR-0066):
+    /// the Wake resumed the run on this card, so it is live again and must be
+    /// able to end ✅/❌/⏹ or yield back to `Waiting`.
     /// One definition, so a new terminal state (#394's `Stopped`) cannot leave
     /// a probe reading the set differently.
     pub(crate) fn is_terminal(&self) -> bool {
@@ -96,10 +109,12 @@ impl CardState {
     /// neither ended nor yielded to its Background Tasks. `Waiting` is NOT
     /// owned in this sense — the Turn that owned it yielded and the next Wake
     /// continues the chain on a new card (ADR-0059) — and neither is a
-    /// terminal card. Session Sync's Wake step reads this to decide whether
-    /// the chain can be handed over without double-rendering. Distinct from
-    /// `CardSession::card_is_live` (the last send reached Feishu) and
-    /// `CardSession::is_running` (non-terminal, `Waiting` included).
+    /// terminal card. `Resuming` IS owned: an in-place Wake handed the chain
+    /// to the resumed run's renderer (ADR-0066). Session Sync's Wake step reads
+    /// this to decide whether the chain can be handed over without
+    /// double-rendering. Distinct from `CardSession::card_is_live` (the last
+    /// send reached Feishu) and `CardSession::is_running` (non-terminal,
+    /// `Waiting` included).
     pub(crate) fn is_render_owned(&self) -> bool {
         !self.is_terminal() && !matches!(self, Self::Waiting)
     }
@@ -109,8 +124,10 @@ impl CardState {
     /// every state that is no longer waiting for anyone must show itself
     /// instead — a terminal card (its wait is over: #386's fallback Error,
     /// #394's Stopped) and a Waiting card, which yields for its Background
-    /// Tasks rather than for the operator (ADR-0059). One definition, so a new
-    /// state cannot leave the header probe reading the set differently.
+    /// Tasks rather than for the operator (ADR-0059). `Resuming` is live: a
+    /// resumed run blocked on a permission/question keeps the override
+    /// (ADR-0066). One definition, so a new state cannot leave the header
+    /// probe reading the set differently.
     pub(crate) fn overrides_awaiting(&self) -> bool {
         self.is_terminal() || matches!(self, Self::Waiting)
     }
@@ -435,6 +452,7 @@ mod tests {
             CardState::Reasoning,
             CardState::Streaming,
             CardState::Continued,
+            CardState::Resuming,
         ] {
             assert!(
                 !state.overrides_awaiting(),
@@ -521,6 +539,22 @@ mod tests {
                 "{state:?} must not block a Wake continuation"
             );
         }
+    }
+
+    /// The resuming state (ADR-0066) is LIVE: an in-place resumed run holds the
+    /// chain — render-owned, so a mid-resume user message is a Supplement
+    /// (ADR-0043) and the Wake step never double-renders — and it is not
+    /// terminal: the resumed run ends ✅/❌/⏹ or yields back to Waiting while
+    /// tasks remain live. It owns no recovery action (the ending that needs one
+    /// is the resumed run's own Error) and never overrides the awaiting title:
+    /// a pending permission/question pauses the resumed run for the operator,
+    /// exactly as it pauses any other live card.
+    #[test]
+    fn the_resuming_state_is_live_render_owned_and_actionless() {
+        assert!(!CardState::Resuming.is_terminal());
+        assert!(CardState::Resuming.is_render_owned());
+        assert!(!CardState::Resuming.offers_recovery());
+        assert!(!CardState::Resuming.overrides_awaiting());
     }
 
     /// The liveness line's wait label (ADR-0054) must always be the header
