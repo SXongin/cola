@@ -71,14 +71,29 @@ Precisely:
   承接 line's send did, so a restart cannot re-post the Wake.
 - **Mid-resume user message.** The card is live again, so the existing
   Supplement rule applies unchanged (ADR-0043): the message steers into the
-  run and the chain splits below it. A message on a merely-waiting card still
-  starts a new Turn and collects the card (ADR-0059).
+  run and the chain splits below it, the continuation carrying the receipt
+  line. This supersedes #426's shorthand "merged into the card with a receipt
+  line, no new card" — and its testing bullet "a mid-wake user message becomes
+  a supplement on the same card" — because the design round invoked ADR-0043
+  as "the existing supplement rule", and that rule splits the chain: the
+  message merges into the *run*, not onto the card's timeline, and the split
+  is what keeps the live card the newest message. "Same card" holds at the
+  chain level (the same Turn continues), not at the Feishu-message level. A
+  message on a merely-waiting card still starts a new Turn and collects the
+  card (ADR-0059).
 
 ## Considered options
 
 - **Keep the new card per completion (ADR-0059's shape).** Rejected — the
   acceptance test's verbosity, and the lobby/restart gap that cannot continue
   at all, are the bug this changes.
+- **ADR-0059's rejected "Re-open the same card on a Wake".** It was rejected
+  because a card PATCH neither notifies nor bumps the conversation, so the
+  wake would stay invisible; reversed here — the visibility ADR-0059 wanted is
+  now the completion entry plus the true-end Completion Notice, and the
+  silence between them is the point (one card per request means per-completion
+  notifications were exactly the noise). The restart path keeps a real send
+  (the Fresh card), so a Wake with no card to resume still notifies.
 - **Resume any same-life card in place, terminal cards included.** Rejected —
   a ✅ card flipping back to 🔄 reads as broken; the terminal case is a race
   and a fresh continuation card is honest about it.
