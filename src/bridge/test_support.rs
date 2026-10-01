@@ -853,6 +853,10 @@ pub struct MockBackend {
     pub list_permission_calls: Arc<std::sync::atomic::AtomicUsize>,
     /// Counts `list_questions` calls, one per known directory per sweep.
     pub list_question_calls: Arc<std::sync::atomic::AtomicUsize>,
+    /// Records every `session_info` call's session id, in call order — the
+    /// parent-chain walk's read. A pending request whose session id cannot
+    /// name a session must never trigger one (#489).
+    pub session_info_calls: Arc<tokio::sync::Mutex<Vec<String>>>,
     /// When set, `messages` returns this as a fresh user message (simulates
     /// a message posted from OpenChamber).
     pub external_user_message: Option<String>,
@@ -1136,6 +1140,7 @@ impl MockBackend {
             fail_list_permissions: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             list_permission_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             list_question_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            session_info_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             external_user_message: None,
             external_user_messages: std::collections::HashMap::new(),
             cola_user_messages: std::collections::HashMap::new(),
@@ -2119,6 +2124,7 @@ impl crate::backend::Backend for MockBackend {
         session_id: &str,
         _d: Option<&str>,
     ) -> crate::error::Result<opencode::types::SessionInfo> {
+        self.session_info_calls.lock().await.push(session_id.to_string());
         hang_if_scripted(&self.hang_session_info).await;
         Ok(opencode::types::SessionInfo {
             id: session_id.to_string(),

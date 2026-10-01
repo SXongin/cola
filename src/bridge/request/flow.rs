@@ -109,6 +109,15 @@ pub struct RequestFlow {
     /// entry whose request left the pending list is reconciled away by the
     /// stale/inline cleanups, like every other in-memory surface.
     recovered: Arc<Mutex<HashMap<String, String>>>,
+    /// request_id → owning directory of pending requests whose session id
+    /// cannot name a session at all (#489): the `global` sentinel a
+    /// session-less MCP elicitation carries, or a permission with none. No
+    /// parent chain and no card target can ever resolve for them, so the sweep
+    /// warns once (naming the id) and skips them entirely instead of paying a
+    /// doomed session read every tick. Retained while the request — or its
+    /// failed directory — may still be pending, like every other per-request
+    /// registry here.
+    session_less: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl RequestFlow {
@@ -159,6 +168,7 @@ impl RequestFlow {
             list_failures: Arc::new(Mutex::new(crate::bridge::failure_latch::FailureLatch::default())),
             surfaces,
             recovered: Arc::new(Mutex::new(recovered)),
+            session_less: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -584,6 +594,32 @@ impl RequestFlow {
                     listed_now.insert(dir.clone());
                     for req in &requests {
                         pending.insert(req.id().to_string());
+                        // #489: a session id that cannot name a session at all
+                        // (the `global` sentinel, an empty optional id) is a
+                        // structural, terminal condition — no parent chain and
+                        // no card target can ever resolve, so every sweep would
+                        // pay a doomed session read. Warn once, naming the id,
+                        // and skip the request: it is never surfaced, never
+                        // pinned, never walked. `pending` still records it, so
+                        // unknown is never read as resolved (#130).
+                        if !can_be_a_session_id(req.session_id()) {
+                            let first = self
+                                .session_less
+                                .lock()
+                                .await
+                                .insert(req.id().to_string(), dir.clone())
+                                .is_none();
+                            if first {
+                                tracing::warn!(
+                                    "{} ({}): {} on session {:?} — not a session id; the request cannot be delivered, skipping it",
+                                    self.kind.label(),
+                                    dir,
+                                    req.id(),
+                                    req.session_id()
+                                );
+                            }
+                            continue;
+                        }
                         wait_candidates.push((req.id().to_string(), req.session_id().to_string()));
                         // Both pin surfaces need the listed candidates: the
                         // reminder's chat-level target and the waiting-card
@@ -850,6 +886,13 @@ impl RequestFlow {
         // cleanups above. A failed directory's entries stay: it said nothing
         // (#130).
         self.recovered
+            .lock()
+            .await
+            .retain(|id, dir| pending.contains(id) || failed_dirs.contains(dir));
+        // #489: the same rule for the session-less registry — a request that
+        // left the pending list, or a directory that said nothing, keeps its
+        // entry until a complete sweep can speak for it.
+        self.session_less
             .lock()
             .await
             .retain(|id, dir| pending.contains(id) || failed_dirs.contains(dir));
@@ -1288,6 +1331,14 @@ impl RequestFlow {
         }
         r
     }
+}
+
+/// Whether `id` can name a session at all (#489). Both generations mint
+/// `ses…` ids and V2's session route schema rejects anything else with a 400
+/// (`Expected a string starting with "ses"`), so an id that fails this can
+/// never be read — a structural, terminal condition, not a transient failure.
+fn can_be_a_session_id(id: &str) -> bool {
+    id.starts_with("ses")
 }
 
 /// Whether session `candidate` belongs to `session_id` — the session itself or
