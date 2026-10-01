@@ -22,6 +22,15 @@
 > restart reaps the card it orphaned instead of leaving it frozen. "Card state
 > stays in memory" is narrowed accordingly, as with ADR-0061.
 >
+> **Amended by ADR-0066**: a shell/subagent completion Wake no longer opens a
+> continuation card by default — it resumes the yielded (⏳) card IN PLACE,
+> where the completion entry, the resumed content and the true end all live
+> (「🔄 后台任务完成，继续处理中…」). "The next Wake continues the chain on a
+> new continuation card" now covers only restart/interrupt Wakes, the Wake-less
+> content-diff fallback, and cards already at a terminal. On the in-place path
+> the true end carries the Completion Notice and a failed resumed run keeps the
+> ordinary Retry (the request's card still carries its prompt).
+>
 > **Amended 2026-10-01 (#470)**: V2 persists a running tool call with empty
 > metadata and publishes `context.progress` on the event bus only — the message
 > projection folds in terminal events alone — so the polled message read cannot

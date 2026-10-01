@@ -1,5 +1,12 @@
 # The background-task ledger: one live list on the newest card, entries where they lived
 
+> **Amended by ADR-0066**: the freeze's carve-out widens — a yielded card also
+> receives its Wake's resumed content (ADR-0066 resumes shell/subagent
+> completion Wakes in place), so the live list and the completion entries stay
+> on the card the tasks lived on, and the handover to a newer card now only
+> runs for the splits that remain (size, supplement, terminal-card
+> continuation, restart Fresh).
+
 ## Context
 
 ADR-0059 made a Turn's Background Tasks gate its card (`⏳ 等待后台任务`) and
