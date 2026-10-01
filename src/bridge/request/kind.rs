@@ -1485,15 +1485,27 @@ async fn reply_question_scoped(
 }
 
 /// Map an OpenCode permission action to a friendly emoji + Chinese description.
+///
+/// The action is the name of the tool asking, so the arms carry both
+/// generations: V1's `bash` beside V2's `shell`, V1's `task` beside V2's
+/// `subagent`, and the V2 tools whose permission assert names them directly
+/// (`question`, `grep`, `glob`, `skill`, `websearch`). An action with no arm
+/// still renders — as the generic `🔐 执行操作`.
 fn describe_action(action: &str) -> (&'static str, &'static str) {
     match action {
-        "bash" => ("⚡", "执行 Shell 命令"),
+        "bash" | "shell" => ("⚡", "执行 Shell 命令"),
+        "subagent" | "task" => ("🤖", "调用子代理"),
+        "question" => ("❓", "向你提问"),
         "read" => ("📖", "读取文件"),
         "write" => ("✏️", "修改文件"),
         "edit" => ("✏️", "编辑文件"),
         "patch" => ("✏️", "应用补丁"),
         "webfetch" => ("🌐", "访问网页"),
         "fetch" => ("🌐", "获取网络资源"),
+        "websearch" => ("🌐", "网络搜索"),
+        "grep" => ("🔎", "搜索内容"),
+        "glob" => ("🔍", "查找文件"),
+        "skill" => ("🧩", "调用技能"),
         "external_directory" => ("📁", "访问外部目录"),
         "kill" => ("🛑", "终止进程"),
         "ls" => ("📂", "列出目录"),
@@ -1662,5 +1674,24 @@ Index: /proj/src/main.rs
         assert!(s.contains("cargo test"), "command shown: {}", s);
         assert!(!s.contains("```"), "no diff fence for bash: {}", s);
         assert!(s.contains("是否允许"));
+    }
+
+    /// V2's permission action is the tool name, so `shell`/`subagent` must not
+    /// fall through to the generic label — the V1 `bash` arm alone left every
+    /// V2 shell card reading `🔐 执行操作` (and the receipt said the same).
+    #[test]
+    fn describe_v2_permission_actions_get_specific_labels() {
+        for (action, label) in [
+            ("shell", "执行 Shell 命令"),
+            ("subagent", "调用子代理"),
+            ("question", "向你提问"),
+        ] {
+            let p = perm(action, serde_json::json!({ "command": "cargo test" }));
+            let s = describe_permission(&p);
+            assert!(s.contains(label), "{action} label: {s}");
+            assert!(!s.contains("执行操作"), "{action} fell through: {s}");
+            let target = permission_target(&p);
+            assert!(target.contains(label), "{action} receipt target: {target}");
+        }
     }
 }
