@@ -332,15 +332,18 @@ impl CardSession {
         self.chain_id
     }
 
-    /// Whether this card can still receive the Background Task Ledger
-    /// (ADR-0060): a yielded Waiting card, live, with no handoff owed — exactly
-    /// the admission [`super::Turn::refresh_yielded_ledger`] grants. The
-    /// runtime reconciliation only observes a retirement while this holds,
-    /// because the entry renders on the chain that observes it: observing with
-    /// no such card (a settled chain, or no card at all) would record the task
-    /// and swallow its entry forever (found on a real restart, 2026-10-01 —
-    /// the reconcile ran against a session whose card had just settled, and
-    /// the 已失联 entries never appeared).
+    /// Whether this card is still the YIELDED one, open to the in-place writes
+    /// its wait admits: a Waiting card, live, with no handoff owed. The
+    /// admission [`super::Turn::refresh_yielded_ledger`] grants a Background
+    /// Task Ledger read (ADR-0060) and [`super::Turn::resume_yielded_card`]
+    /// grants a completion Wake's resumption (ADR-0066) — one predicate, so a
+    /// decision and the write it authorizes cannot disagree about which card
+    /// is resumable. The runtime reconciliation only observes a retirement
+    /// while this holds, because the entry renders on the chain that observes
+    /// it: observing with no such card (a settled chain, or no card at all)
+    /// would record the task and swallow its entry forever (found on a real
+    /// restart, 2026-10-01 — the reconcile ran against a session whose card
+    /// had just settled, and the 已失联 entries never appeared).
     pub(crate) fn accepts_ledger_refresh(&self) -> bool {
         self.acc.card_state == crate::feishu::card::CardState::Waiting
             && self.card_is_live
@@ -864,6 +867,20 @@ impl StreamAccumulator {
     /// yields waiting over one).
     pub(super) fn set_waiting(&mut self) {
         self.card_state = CardState::Waiting;
+        self.refresh_phase();
+    }
+
+    /// The in-place resumption (ADR-0066): a shell/subagent completion Wake
+    /// resumed THIS yielded card, so it works on again — header
+    /// 「🔄 后台任务完成，继续处理中…」 with a fresh phase timer, because the
+    /// waiting yield stopped the old one. Render-owned (`Resuming` is not
+    /// `Waiting`), so the resumed run's own settle loop streams into the card
+    /// and Session Sync never double-renders; not terminal, so it can end
+    /// ✅/❌/⏹ or yield back to `Waiting` while Background Tasks remain live.
+    /// The content the Turn already produced, its prompt and its reply target
+    /// all stay: this is still the request's own card.
+    pub(super) fn set_resuming(&mut self) {
+        self.card_state = CardState::Resuming;
         self.refresh_phase();
     }
 

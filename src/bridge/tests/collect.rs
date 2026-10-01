@@ -221,53 +221,62 @@ async fn a_new_turn_collects_the_waiting_card() {
         platform.calls.lock().await
     );
 
-    // The Wake resumes the newest chain: the continuation is replied to the
-    // second message, carries the Wake's own work — and the collected card is
-    // never touched again.
+    // The Wake resumes the newest chain — the second Turn's own yielded card,
+    // in place (ADR-0066): no card is posted, no 承接 line is written, and the
+    // collected card is never touched again.
+    let posts_before = card_posts(&platform).await;
     script_transcript(&backend, vec![resumed_transcript()]).await;
     spawn_sync(&app);
-    // Wait for the CONTINUATION's own ending: the distinctive resumed text and
-    // the Wake lead tie the wait to that card, so no other update (and no
-    // initial reply payload) can satisfy it.
-    wait_for_card_update(&platform, "the Wake's done card", CardUpdates::Latest, |card| {
-        card_header(card).contains("✅")
-            && card_text(card).contains(WAKE_LEAD)
-            && card_text(card).contains("CI 通过了。")
-    })
+    wait_for_card_update(
+        &platform,
+        "the resumed card's done state",
+        CardUpdates::Latest,
+        |card| card_header(card).contains("✅") && card_text(card).contains("CI 通过了。"),
+    )
     .await;
 
-    // The continuation is replied to the second message (the wait panics if it
-    // never is); the settle loop renders the resumed work INTO that same card
-    // and ends it ✅, while the collected card's content never replays. The
-    // call ORDER between that reply and the final update is not asserted — the
-    // matched update is read back below, not "the latest call".
-    wait_for_replied_card(&platform, "msg_next", "the Wake continuation", |card| {
-        card_text(card).contains(WAKE_LEAD)
-    })
-    .await;
     let rendered = platform.updated_cards().await.last().cloned().unwrap();
     assert!(
-        card_header(&rendered).contains("✅"),
-        "the Wake ends ✅: {rendered}"
+        !card_text(&rendered).contains(WAKE_LEAD),
+        "an in-place resume writes no 承接 line: {rendered}"
     );
-    assert!(
-        card_text(&rendered).contains(WAKE_LEAD) && card_text(&rendered).contains("CI 通过了。"),
-        "the done card is the Wake's own continuation: {rendered}"
-    );
-    assert!(
-        !card_text(&rendered).contains("已经交给后台了。"),
-        "the continuation renders only the Wake's own work: {rendered}"
+    assert_eq!(
+        card_posts(&platform).await,
+        posts_before,
+        "the resume posts nothing: {:?}",
+        platform.calls.lock().await
     );
     assert_eq!(
         patches_to(&platform, "om_waiting").await.len(),
         1,
         "the collected card stops updating with the collect"
     );
+    // The resumed run is the SECOND request's, on the second Turn's own card:
+    // its true end notifies under the ordinary rules, exactly once.
+    let notices = platform.completion_notices().await;
+    assert_eq!(notices.len(), 1, "exactly one notice: {notices:?}");
     assert!(
-        !noticed(&platform).await,
-        "the continuation is the notification; no notice: {:?}",
-        platform.calls.lock().await
+        notices[0].3.contains("已完成"),
+        "the second request's true end is what it announces: {:?}",
+        notices[0].3
     );
+}
+
+/// Every card POST (a reply or a top-level send) the platform recorded — the
+/// counter for "was a new card posted?" (an in-place PATCH updates one).
+async fn card_posts(platform: &RecordingPlatform) -> usize {
+    platform
+        .calls
+        .lock()
+        .await
+        .iter()
+        .filter(|call| {
+            matches!(
+                call,
+                PlatformCall::ReplyCard { .. } | PlatformCall::SendCard { .. }
+            )
+        })
+        .count()
 }
 
 /// Acceptance 2 + the no-notice rule: `/switch`ing away collects the waiting
