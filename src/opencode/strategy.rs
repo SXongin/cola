@@ -240,7 +240,7 @@ impl Generation {
     pub(crate) fn strategy(self) -> Arc<dyn GenerationStrategy> {
         match self {
             Generation::V1 => Arc::new(super::v1::V1Strategy),
-            Generation::V2 => Arc::new(super::v2::V2Strategy),
+            Generation::V2 => Arc::new(super::v2::V2Strategy::new()),
         }
     }
 }

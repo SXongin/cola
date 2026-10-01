@@ -27,6 +27,7 @@
 //! (`OpenCodeBackend::create_session`). Compaction is here — the path is
 //! shared, but V2's body/response contract is not.
 
+mod progress;
 mod wire;
 
 #[cfg(test)]
@@ -105,7 +106,13 @@ const MAX_MESSAGE_PAGES: usize = 100;
 const MESSAGE_PAGE_LIMIT: &str = "200";
 
 /// The strategy that speaks the V2 generation.
-pub(crate) struct V2Strategy;
+pub(crate) struct V2Strategy {
+    /// V2's live tool progress, fed by the server's event stream and overlaid
+    /// onto running tool parts at transcript decode (issue #470): the message
+    /// record carries no progress while a call runs, so this is where a live
+    /// `subagent`'s child session id comes from.
+    progress: progress::Progress,
+}
 
 /// The location-scoped list URL: V2 selects an instance/workspace with the
 /// deepObject query `location[directory]=…` (V1's flat `directory=`). Without a
@@ -424,9 +431,13 @@ impl GenerationStrategy for V2Strategy {
     /// so the loop stops on the first empty page; a failed read names itself
     /// and carries a body preview, like the module's other reads.
     async fn transcript(&self, http: &Transport, session_id: &str) -> Result<SessionTranscript> {
-        Ok(wire::decode_messages(
-            &self.read_messages(http, session_id).await?,
-        ))
+        // The request read is the source of truth; the event stream only fills
+        // RUNNING tool parts' ephemeral progress (issue #470). Start the reader
+        // lazily: the first transcript read is where the live transport exists.
+        self.progress.ensure_started(http);
+        let mut transcript = wire::decode_messages(&self.read_messages(http, session_id).await?);
+        self.progress.apply(session_id, &mut transcript);
+        Ok(transcript)
     }
 
     /// The run state for ONE session (V2 `GET /api/session/active`), with the
@@ -787,6 +798,14 @@ impl GenerationStrategy for V2Strategy {
 }
 
 impl V2Strategy {
+    /// A fresh strategy, with an empty live-progress cache (the reader starts
+    /// lazily on the first transcript read).
+    pub(crate) fn new() -> Self {
+        Self {
+            progress: progress::Progress::new(),
+        }
+    }
+
     /// Durably admit one prompt (`POST /api/session/{id}/prompt`) with
     /// `delivery: "steer"` — the server's own default, sent explicitly: while
     /// the session is idle it starts the run, and while a turn is in flight it
