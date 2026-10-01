@@ -15,6 +15,7 @@ use crate::feishu::card::shell::CardBuilder;
 use crate::feishu::card::tool_render::{TaskLiveness, ToolPanel, is_task_tool};
 use crate::feishu::card::{AwaitingAction, CardState};
 use indexmap::IndexMap;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// One part already rendered into this card, addressed by content: a part
@@ -547,15 +548,24 @@ pub(super) struct StreamAccumulator {
     /// card. Empty renders nothing — V1 has no Background Task facts, so its
     /// ledger is always empty.
     pub(super) ledger: Vec<TaskLedgerRow>,
-    /// The ledger's render clock ([`Self::set_ledger`]): each row's elapsed in
-    /// whole seconds as of the read that last moved the section (ADR-0060) —
-    /// the very value the row last rendered. The rows alone cannot tell that a
-    /// yielded card's elapsed went stale, and the rendered seconds move on
-    /// every read — so each path compares this key at its own cadence
-    /// ([`LedgerCadence`]): the live render at whole minutes (no per-render
-    /// clock churn), the yielded refresh at whole seconds (its reads are the
-    /// card's only clock).
-    ledger_clock: Vec<Option<u64>>,
+    /// Each live Background Task's last successfully gathered child liveness,
+    /// keyed by the task's call id (spec #501): a read whose child gather
+    /// failed (or never names the child) keeps rendering this fragment — the
+    /// timestamps inside are never refreshed, so its age grows truthfully
+    /// (ADR-0054) — and a fresh gather replaces its call's entry. Pruned to the
+    /// live subagents on every read, so a retired task's fragment leaves with
+    /// its row and the map cannot grow past the session's current tasks.
+    ledger_activity: HashMap<String, TaskLiveness>,
+    /// The ledger's render clock ([`Self::set_ledger`]): each row's rendered
+    /// numbers — its elapsed and its activity fragment's age, in whole seconds
+    /// as of the read that last moved the section (ADR-0060, spec #501) — the
+    /// very values the rows last rendered. The rows alone cannot tell that a
+    /// yielded card's elapsed or activity age went stale, and the rendered
+    /// seconds move on every read — so each path compares this key at its own
+    /// cadence ([`LedgerCadence`]): the live render at whole minutes (no
+    /// per-render clock churn), the yielded refresh at whole seconds (its
+    /// reads are the card's only clock).
+    ledger_clock: Vec<crate::feishu::card::ledger::LedgerRowClock>,
     /// Text, reasoning, tool and receipt entries ordered by their key (the
     /// server-side part start time) — the card is built from this, so message ↔
     /// tool interleaving is preserved even when a part renders late.
@@ -1507,47 +1517,131 @@ impl StreamAccumulator {
     /// Replace the live Background Task ledger from a transcript read
     /// (ADR-0060) — the ONE site a read's rows and clock enter the accumulator,
     /// shared by the live render and Session Sync's Wake handover / yielded
-    /// refresh, so those paths cannot drift. `cadence` is the path's own
-    /// comparison granularity ([`LedgerCadence`]). Returns whether the card
-    /// owes a flush: a membership change, or a row's rendered elapsed moving at
-    /// that cadence.
+    /// refresh, so those paths cannot drift. `activities` is this read's
+    /// gathered child liveness, keyed by call id (spec #501): the ledger's
+    /// `subagent` rows carry it, and a call the gather could not establish
+    /// keeps its previous fragment ([`Self::ledger_rows`]). `cadence` is the
+    /// path's own comparison granularity ([`LedgerCadence`]). Returns whether
+    /// the card owes a flush: a membership change, or a rendered number — the
+    /// elapsed or the activity age — moving at that cadence.
     pub(super) fn set_ledger_from_read(
         &mut self,
         transcript: &SessionTranscript,
+        activities: &HashMap<String, TaskLiveness>,
         now_ms: i64,
         cadence: LedgerCadence,
     ) -> bool {
-        self.set_ledger(ledger_rows(transcript), now_ms, cadence)
+        let rows = self.ledger_rows(transcript, activities);
+        self.set_ledger(rows, now_ms, cadence)
     }
 
     /// Replace the live Background Task ledger from an already-derived read
     /// (ADR-0060), stamped with the read's clock. The read is the authority: a
     /// task it no longer lists has retired and leaves the section, a new one
     /// joins in transcript order. Returns whether the card owes a flush:
-    /// membership, or a row's rendered elapsed moving at `cadence` since the
-    /// section last rendered. The clock stores the rendered seconds — what the
-    /// card last rendered — so the live path compares whole minutes of it (the
-    /// seconds inside a rendered minute never owe one and the card gains no
-    /// per-render clock churn) while the yielded path compares whole seconds
-    /// (its 8 s reads keep the visible elapsed true).
+    /// membership, or a rendered number — the elapsed, or the activity age
+    /// (spec #501) — moving at `cadence` since the section last rendered. The
+    /// clock stores the rendered seconds — what the card last rendered — so the
+    /// live path compares whole minutes of it (the seconds inside a rendered
+    /// minute never owe one and the card gains no per-render clock churn) while
+    /// the yielded path compares whole seconds (its 8 s reads keep the visible
+    /// elapsed and activity age true).
     fn set_ledger(&mut self, rows: Vec<TaskLedgerRow>, now_ms: i64, cadence: LedgerCadence) -> bool {
         let clock = crate::feishu::card::ledger::task_ledger_clock(&rows, now_ms);
+        let moved = |rendered: Option<u64>, new: Option<u64>| match cadence {
+            LedgerCadence::Minute => rendered.map(|secs| secs / 60) != new.map(|secs| secs / 60),
+            LedgerCadence::Second => rendered != new,
+        };
         // `rows` equality implies equal lengths, so the zip covers every row.
         let unchanged = self.ledger == rows
-            && self
-                .ledger_clock
-                .iter()
-                .zip(&clock)
-                .all(|(rendered, new)| match cadence {
-                    LedgerCadence::Minute => rendered.map(|secs| secs / 60) == new.map(|secs| secs / 60),
-                    LedgerCadence::Second => rendered == new,
-                });
+            && self.ledger_clock.iter().zip(&clock).all(|(rendered, new)| {
+                !moved(rendered.elapsed, new.elapsed) && !moved(rendered.activity, new.activity)
+            });
         if unchanged {
             return false;
         }
         self.ledger = rows;
         self.ledger_clock = clock;
         true
+    }
+
+    /// The live Background Task ledger a transcript read owes the card
+    /// (ADR-0060): one row per live task, in the read's own (transcript) order,
+    /// each labelled from the input of the tool part that started it — joined
+    /// by the task's `call_id` over the WHOLE read, because a task can outlive
+    /// the Turn that started it. The read is the authority: a task a Wake
+    /// retired is no longer in `background_tasks`, so its row leaves the
+    /// section.
+    ///
+    /// A `subagent` row carries the child liveness this read gathered
+    /// (`activities`, keyed by call id, spec #501); a call the gather could not
+    /// establish — a failed child read, or a path that gathers nothing — keeps
+    /// the last fragment that DID establish one ([`Self::ledger_activity`]),
+    /// whose stored timestamps are never refreshed, so its rendered age keeps
+    /// growing truthfully (ADR-0054). A shell row never carries one. The cache
+    /// is pruned to the live subagents on every read, so a retired task's
+    /// fragment leaves with its row. The one derivation
+    /// [`Self::set_ledger_from_read`] feeds, so the live render and Session
+    /// Sync's ledger paths cannot disagree.
+    fn ledger_rows(
+        &mut self,
+        transcript: &SessionTranscript,
+        activities: &HashMap<String, TaskLiveness>,
+    ) -> Vec<TaskLedgerRow> {
+        // The common case (V1, or a session with no live task) does no scan: an
+        // empty read clears an empty ledger — and every cached fragment with
+        // it, so a retired task's activity cannot outlive its row.
+        if transcript.background_tasks.is_empty() {
+            self.ledger_activity.clear();
+            return Vec::new();
+        }
+        let rows: Vec<TaskLedgerRow> = transcript
+            .background_tasks
+            .iter()
+            .map(|task| {
+                // The kind is derived ONCE per task: the row's type noun, the
+                // label arm and the activity arm below read the same value, so
+                // they cannot disagree.
+                let kind = task_kind(&task.tool.name);
+                let call_id = task.tool.call_id.as_str();
+                let activity = (kind == TaskKind::Subagent)
+                    .then(|| {
+                        activities
+                            .get(call_id)
+                            .or_else(|| self.ledger_activity.get(call_id))
+                            .cloned()
+                    })
+                    .flatten();
+                TaskLedgerRow {
+                    kind,
+                    label: task_label(kind, transcript.tool_input(call_id)),
+                    started_at: task.started_at,
+                    // A task the runtime could not confirm (issue #454): the row
+                    // renders its own facts plus the unconfirmed marker, and stays
+                    // live until its Wake or a positive terminal verdict retires it.
+                    unconfirmed: transcript.unconfirmed_tasks.contains(call_id),
+                    activity,
+                }
+            })
+            .collect();
+        // Keep the cache to the live subagents (a retired task's fragment
+        // leaves with its row) and fold in this read's fresh successes — a
+        // failed child read contributed no entry, so its call keeps its last
+        // successful fragment above.
+        let live_subagents: std::collections::HashSet<&str> = transcript
+            .background_tasks
+            .iter()
+            .filter(|task| task_kind(&task.tool.name) == TaskKind::Subagent)
+            .map(|task| task.tool.call_id.as_str())
+            .collect();
+        self.ledger_activity
+            .retain(|call_id, _| live_subagents.contains(call_id.as_str()));
+        for (call_id, liveness) in activities {
+            if live_subagents.contains(call_id.as_str()) {
+                self.ledger_activity.insert(call_id.clone(), liveness.clone());
+            }
+        }
+        rows
     }
 
     /// Build the whole card (tests + simple callers). Assembles the full
@@ -2136,40 +2230,6 @@ pub(super) async fn refresh_context_window(
     }
 }
 
-/// The live Background Task ledger a transcript read owes the card
-/// (ADR-0060): one row per live task, in the read's own (transcript) order,
-/// each labelled from the input of the tool part that started it — joined by
-/// the task's `call_id` over the WHOLE read, because a task can outlive the
-/// Turn that started it. The read is the authority: a task a Wake retired is
-/// no longer in `background_tasks`, so its row leaves the section. The one
-/// derivation [`StreamAccumulator::set_ledger_from_read`] feeds, so the live
-/// render and Session Sync's ledger paths cannot disagree.
-fn ledger_rows(transcript: &SessionTranscript) -> Vec<TaskLedgerRow> {
-    // The common case (V1, or a session with no live task) does no scan: an
-    // empty read clears an empty ledger, so nothing can owe a flush.
-    if transcript.background_tasks.is_empty() {
-        return Vec::new();
-    }
-    transcript
-        .background_tasks
-        .iter()
-        .map(|task| {
-            // The kind is derived ONCE per task: the row's type noun and the
-            // label arm below read the same value, so the two cannot disagree.
-            let kind = task_kind(&task.tool.name);
-            TaskLedgerRow {
-                kind,
-                label: task_label(kind, transcript.tool_input(task.tool.call_id.as_str())),
-                started_at: task.started_at,
-                // A task the runtime could not confirm (issue #454): the row
-                // renders its own facts plus the unconfirmed marker, and stays
-                // live until its Wake or a positive terminal verdict retires it.
-                unconfirmed: transcript.unconfirmed_tasks.contains(task.tool.call_id.as_str()),
-            }
-        })
-        .collect()
-}
-
 /// The ledger kind of a Background Task's tool. Only `shell` and `subagent`
 /// ever background through the V2 tool shape (`decode_background_task` returns
 /// `None` for every other name), so the pair is matched once, here.
@@ -2704,6 +2764,7 @@ mod tests {
                 label: Some("npm run build".into()),
                 started_at: None,
                 unconfirmed: false,
+                activity: None,
             }],
             0,
             LedgerCadence::Minute,
@@ -2753,6 +2814,7 @@ mod tests {
                 label: Some("npm run build".into()),
                 started_at: Some(start),
                 unconfirmed: false,
+                activity: None,
             }]
         };
         let cadence = |acc: &mut StreamAccumulator, at: i64, cadence| acc.set_ledger(rows(), at, cadence);
@@ -2793,6 +2855,7 @@ mod tests {
                 label: Some("review the diff".into()),
                 started_at: None,
                 unconfirmed: false,
+                activity: None,
             }]
         };
         let mut acc = StreamAccumulator::new("test");

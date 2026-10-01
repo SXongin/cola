@@ -929,6 +929,11 @@ pub struct MockBackend {
     /// Records every `transcript` call's session id — the neutral read the
     /// render poll, the drain and the follow poll on.
     pub transcript_calls: Arc<tokio::sync::Mutex<Vec<String>>>,
+    /// Session ids whose `transcript` read fails with a 500 (spec #501): the
+    /// child-read failure the ledger's activity carry-over pins — a failed
+    /// gather leaves the row's last successful fragment in place, its age
+    /// still growing. Armable mid-life via [`MockBackend::fail_transcript_for`].
+    pub fail_transcripts: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
     /// Pending questions served by `list_questions`.
     pub questions: Vec<opencode::types::QuestionRequest>,
     /// Records `reply_question` calls: (request_id, answers). The answers are
@@ -1160,6 +1165,7 @@ impl MockBackend {
             session_titles: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             transcript_scripts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             transcript_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            fail_transcripts: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             questions: Vec::new(),
             reply_question_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             reply_question_keyed_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
@@ -1428,6 +1434,21 @@ impl MockBackend {
             .lock()
             .await
             .insert(session_id.to_string(), snapshots);
+    }
+
+    /// Scenario: `transcript` for `session_id` fails with a 500 — the child
+    /// read a ledger row's activity gather must survive (spec #501): a failed
+    /// gather leaves the row's last successful fragment in place, its age
+    /// still growing. Armable mid-life (`&self`), and reversible:
+    /// [`Self::heal_transcript`] clears it.
+    pub(crate) async fn fail_transcript_for(&self, session_id: &str) {
+        self.fail_transcripts.lock().await.insert(session_id.to_string());
+    }
+
+    /// [`Self::fail_transcript_for`]'s reversal: the session's reads serve its
+    /// script again.
+    pub(crate) async fn heal_transcript(&self, session_id: &str) {
+        self.fail_transcripts.lock().await.remove(session_id);
     }
 
     /// Scenario: hold every `prompt` until the returned semaphore is released
@@ -1971,6 +1992,15 @@ impl crate::backend::Backend for MockBackend {
             let _permit = gate.acquire().await;
         }
         hang_if_scripted(&self.hang_transcript).await;
+        // A session a test marked failing serves a 500, recorded like any other
+        // read (the read was spent): the ledger's activity carry-over pins the
+        // failed gather (spec #501).
+        if self.fail_transcripts.lock().await.contains(session_id) {
+            self.transcript_calls.lock().await.push(session_id.to_string());
+            return Err(crate::error::BridgeError::OpenCode(format!(
+                "transcript {session_id} failed: 500 Internal Server Error"
+            )));
+        }
         let scripted = {
             let mut scripts = self.transcript_scripts.lock().await;
             match scripts.get_mut(session_id) {

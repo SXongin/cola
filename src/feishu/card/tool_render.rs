@@ -267,13 +267,13 @@ impl TaskLiveness {
     /// `推理中 12s`, `bash · 等待你的授权`. `now_ms` is passed in so the
     /// elapsed time is measured at card build time.
     pub fn title_fragment(&self, now_ms: i64) -> String {
-        let (label, at) = match &self.activity {
-            ChildActivity::Tool { name, started_at } => (name.clone(), *started_at),
-            ChildActivity::Thinking => ("思考中".to_string(), Some(self.last_activity_ms)),
-            ChildActivity::Reasoning => ("推理中".to_string(), Some(self.last_activity_ms)),
-            ChildActivity::Replying => ("回复中".to_string(), Some(self.last_activity_ms)),
+        let label = match &self.activity {
+            ChildActivity::Tool { name, .. } => name.clone(),
+            ChildActivity::Thinking => "思考中".to_string(),
+            ChildActivity::Reasoning => "推理中".to_string(),
+            ChildActivity::Replying => "回复中".to_string(),
         };
-        let mut parts = match at {
+        let mut parts = match self.age_clock_ms() {
             Some(at) => vec![format!("{label} {}", fmt_elapsed(secs_since(at, now_ms)))],
             None => vec![label],
         };
@@ -281,6 +281,20 @@ impl TaskLiveness {
             parts.push(wait.to_string());
         }
         parts.join(" · ")
+    }
+
+    /// The epoch-ms clock the fragment's rendered age counts from — the live
+    /// tool's server start, or the phase's newest activity. `None` when the
+    /// fragment shows no age at all (a tool with no server clock yet), so a
+    /// reader keyed on this fragment (the ledger's render clock, ADR-0060)
+    /// knows there is no number to tick.
+    pub fn age_clock_ms(&self) -> Option<i64> {
+        match &self.activity {
+            ChildActivity::Tool { started_at, .. } => *started_at,
+            ChildActivity::Thinking | ChildActivity::Reasoning | ChildActivity::Replying => {
+                Some(self.last_activity_ms)
+            }
+        }
     }
 }
 
@@ -1722,6 +1736,12 @@ mod tests {
             wait: None,
         };
         assert_eq!(untimed.title_fragment(now), "bash");
+        // The age key the fragment's elapsed counts from — the tool's start,
+        // or the phase's newest activity; an untimed tool has none, so a
+        // reader keyed on the fragment knows there is no number to tick.
+        assert_eq!(tool(5_000, "bash").age_clock_ms(), Some(now - 5_000));
+        assert_eq!(thinking.age_clock_ms(), Some(now - 90_000));
+        assert_eq!(untimed.age_clock_ms(), None);
     }
 
     /// The child session id is read from a child-spawning call's metadata only:
