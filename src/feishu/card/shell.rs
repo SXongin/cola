@@ -402,6 +402,11 @@ pub(crate) fn header_title_and_template(
         // (ADR-0059): the card yields, grey like the other non-working ends —
         // it is not ✅ and not a terminal. The next Wake continues the chain.
         CardState::Waiting => ("⏳ 等待后台任务".to_string(), "grey"),
+        // A yielded card resumed IN PLACE by a shell/subagent completion Wake
+        // (ADR-0066): the resumed run works on, so the card says so — blue like
+        // the other working states — and keeps the live phase timer (below),
+        // not the waiting header it left behind.
+        CardState::Resuming => ("🔄 后台任务完成，继续处理中…".to_string(), "blue"),
         // The Turn's submitted message never reached the transcript and the
         // Session is not live (ADR-0062): nobody will answer it. Orange, like
         // the other attention-needing non-failure ends — it is never ✅, and
@@ -422,7 +427,7 @@ pub(crate) fn header_title_and_template(
     };
     let mut title = label;
     match state {
-        CardState::Loading | CardState::Reasoning | CardState::Streaming => {
+        CardState::Loading | CardState::Reasoning | CardState::Streaming | CardState::Resuming => {
             if let Some(e) = progress.elapsed {
                 title.push_str(&format!(" {}", fmt_elapsed(e)));
             }
@@ -957,6 +962,53 @@ mod tests {
         );
     }
 
+    /// The in-place resumption (ADR-0066): a yielded card a completion Wake
+    /// resumed renders 「🔄 后台任务完成，继续处理中…」 like the other working
+    /// states — blue, with the live phase timer appended — not the waiting
+    /// copy it left behind.
+    #[test]
+    fn resuming_header_names_the_resumed_run_with_its_phase_timer() {
+        let card = CardBuilder::new()
+            .with_state(CardState::Resuming)
+            .with_progress(HeaderProgress {
+                elapsed: Some(83),
+                ..Default::default()
+            })
+            .build();
+        assert_eq!(card["header"]["template"].as_str().unwrap(), "blue");
+        assert_eq!(
+            card["header"]["title"]["content"].as_str().unwrap(),
+            "🔄 后台任务完成，继续处理中… 1m23s"
+        );
+    }
+
+    /// A pending permission/question pauses a resumed card like any other live
+    /// card (ADR-0014, ADR-0066): the wait's own title wins over the resuming
+    /// copy, so the header names what blocks the run.
+    #[test]
+    fn a_pending_request_beats_the_resuming_header() {
+        for (awaiting, title) in [
+            (AwaitingAction::Permission, AWAITING_PERMISSION_TITLE),
+            (AwaitingAction::Question, AWAITING_QUESTION_TITLE),
+            (AwaitingAction::Both, AWAITING_BOTH_TITLE),
+        ] {
+            let card = CardBuilder::new()
+                .with_state(CardState::Resuming)
+                .with_progress(HeaderProgress {
+                    awaiting,
+                    elapsed: Some(83),
+                    ..Default::default()
+                })
+                .build();
+            assert_eq!(
+                card["header"]["title"]["content"].as_str().unwrap(),
+                title,
+                "awaiting {awaiting:?} must beat the resuming header"
+            );
+            assert_eq!(card["header"]["template"].as_str().unwrap(), "orange");
+        }
+    }
+
     /// The retry marker (spec #391): a Retried card is grey-titled 「↩️ 已重试」,
     /// keeps the failed content and renders NO retry button — only the Error
     /// state offers the action.
@@ -1092,6 +1144,7 @@ mod tests {
             CardState::Retried,
             CardState::Stopped,
             CardState::Waiting,
+            CardState::Resuming,
             CardState::Superseded,
             CardState::SwitchedAway,
             CardState::TakenOver,
@@ -1271,6 +1324,11 @@ mod tests {
             header_of(CardState::Streaming, tick(Some(0))),
             header_of(CardState::Streaming, tick(Some(1))),
             "timer tick must change the header"
+        );
+        assert_ne!(
+            header_of(CardState::Resuming, tick(Some(0))),
+            header_of(CardState::Resuming, tick(Some(1))),
+            "the resuming card's timer must tick like any active state's"
         );
         assert_ne!(
             header_of(CardState::Streaming, tick(Some(1))),
