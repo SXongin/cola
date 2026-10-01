@@ -82,6 +82,21 @@ fn another_background_shell(started_at: i64) -> BackgroundTask {
     }
 }
 
+/// The live subagent beside the shared shell: the task that stays live across
+/// the shell's completion, so an overflowing resume's continuation still has a
+/// ledger row to carry (ticket #488).
+fn live_subagent(started_at: i64) -> BackgroundTask {
+    BackgroundTask {
+        tool: ToolIdentity {
+            name: "subagent".into(),
+            call_id: "call_sub".into(),
+        },
+        shell_id: None,
+        child_id: Some("ses_sub".into()),
+        started_at: Some(started_at),
+    }
+}
+
 /// The settled `shell` call that moved a run to the background: the panel the
 /// hosting card shows, and the launch a completion entry joins its identity
 /// and duration from (by the task's own shell id).
@@ -202,6 +217,40 @@ fn woken_shell_transcript(resumed: Vec<TranscriptMessage>, boundaries: &[i64]) -
         .with_wakes(vec![shell_wake(2_900)])
 }
 
+/// [`yielding_shell_transcript`] with the subagent beside the shell: the
+/// shell's completion leaves the subagent live, so an overflowing resume's
+/// continuation has a remaining live list to carry (ticket #488).
+fn yielding_shell_and_subagent_transcript() -> SessionTranscript {
+    SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI 并审阅"),
+        assistant(2_000, "已经交给后台了。"),
+        background_shell_launch(2_000, "call_bg", "sh_bg", "gh run watch"),
+        background_subagent_launch(2_100, "call_sub", "ses_sub", "review the diff"),
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_background_tasks(vec![background_shell(2_100), live_subagent(2_100)])
+}
+
+/// [`yielding_shell_and_subagent_transcript`]'s read after the shell's
+/// completion Wake (2_900) resumed it: the resumed run's own messages, the
+/// Execution boundaries it has reached, and the subagent still live.
+fn woken_shell_and_subagent_transcript(
+    resumed: Vec<TranscriptMessage>,
+    boundaries: &[i64],
+) -> SessionTranscript {
+    let mut messages = vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI 并审阅"),
+        assistant(2_000, "已经交给后台了。"),
+        background_shell_launch(2_000, "call_bg", "sh_bg", "gh run watch"),
+        background_subagent_launch(2_100, "call_sub", "ses_sub", "review the diff"),
+    ];
+    messages.extend(resumed);
+    SessionTranscript::new(messages)
+        .with_executions(boundaries.iter().copied().map(execution).collect())
+        .with_wakes(vec![shell_wake(2_900)])
+        .with_background_tasks(vec![live_subagent(2_100)])
+}
+
 /// The resumed run's own work: reasoning, a settled tool and the closing text,
 /// each carrying the SERVER start time it really has. This is what a Wake
 /// continuation renders after the 承接 receipt — and the element kinds the
@@ -265,6 +314,28 @@ fn long_resumed_work(created: i64) -> TranscriptMessage {
         vec![
             Part::Text(TextPart {
                 text: "很长的回答。".repeat(1_200),
+                started_at: Some(created),
+            }),
+            Part::StepFinish(StepFinish {
+                reason: FinishReason::Stop,
+            }),
+        ],
+    )
+}
+
+/// A resumed answer that fills one card exactly: 6000 CJK chars, the card text
+/// budget. The request card already carries the handoff line, so the text
+/// overflows it by those few chars and the card finalizes; the continuation —
+/// the text alone plus the ledger tail — fits, so the overflow produces
+/// exactly ONE continuation (ticket #488's row-accounting fixture).
+fn card_filling_resumed_work(created: i64) -> TranscriptMessage {
+    typed_message(
+        &format!("msg_a_{created}"),
+        MessageRole::Assistant,
+        Some(created),
+        vec![
+            Part::Text(TextPart {
+                text: "很长的回答。".repeat(1_000),
                 started_at: Some(created),
             }),
             Part::StepFinish(StepFinish {
@@ -666,57 +737,107 @@ async fn a_wake_after_a_restart_posts_a_continuation_card() {
 /// split): the in-place resume renders the whole live slice on the request's
 /// card, so an overflow finalizes it with the standard 「部分完成，继续中…」
 /// handoff — the retiring task's entry stays on the card that hosted it — and
-/// the remainder continues on a new card, which takes the ending.
+/// the remainder continues on a new card, which carries the REMAINING live
+/// list (ADR-0060) and yields back to 「⏳ 等待后台任务」. No ledger row is lost
+/// or duplicated across the two cards, and the entry never migrates onto the
+/// continuation (ticket #488).
 #[tokio::test]
 async fn an_in_place_resume_that_overflows_still_splits() {
     let _wd = test_work_dir();
-    let waiting = yielding_shell_transcript();
+    let waiting = yielding_shell_and_subagent_transcript();
     let (_dir, app, backend, platform) = scripted_app(vec![waiting], Some(SessionStatus::Idle)).await;
-    Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下 CI"))
+    Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下 CI 并审阅"))
         .await
         .unwrap();
     name_request_card(&app).await;
     let posts_before = posted_cards(&platform).await;
 
-    // The resumed run's answer is longer than one card.
+    // The resumed run's answer fills a card on its own; the subagent stays
+    // live, so the continuation still has a ledger to carry.
     script_transcript(
         &backend,
-        vec![woken_shell_transcript(
-            vec![long_resumed_work(3_100)],
+        vec![woken_shell_and_subagent_transcript(
+            vec![card_filling_resumed_work(3_100)],
             &[2_500, 4_000],
         )],
     )
     .await;
     spawn_sync(&app);
-    // The remainder continues on a new card, which takes the ending.
+    // The remainder continues on a new card, which yields back to ⏳ with the
+    // remaining list.
     wait_for_card_update(
         &platform,
-        "the continuation's done state",
+        "the continuation's remaining list",
         CardUpdates::Latest,
-        |card| card_header(card).contains("✅") && card_text(card).contains("很长的回答。"),
+        |card| {
+            card_header(card).contains("等待后台任务")
+                && card_text(card).contains("很长的回答。")
+                && card_text(card).contains("· 子代理：**review the diff**")
+        },
     )
     .await;
-    assert!(
-        posted_cards(&platform).await > posts_before,
-        "an overflowing resume continues on a new card: {:?}",
+    assert_eq!(
+        posted_cards(&platform).await,
+        posts_before + 1,
+        "an overflowing resume continues on exactly one new card: {:?}",
         platform.calls.lock().await
     );
     // The overflow's handoff is the request card's LAST PATCH — every later
-    // update belongs to its successor — and it carries both the standard split
-    // header and the retirement's entry: the entry stays on the card that
-    // hosted the task, and no continuation renders it.
+    // update belongs to its successor — and it carries the standard split
+    // header, the retirement's entry and the request's own timeline, but no
+    // live list: the section left with the handover.
     let handover = patches_to(&platform, "om_waiting")
         .await
         .pop()
         .expect("the request's card was PATCHed");
+    let handover_text = card_text(&handover);
     assert!(
-        card_header(&handover).contains("继续中"),
+        card_header(&handover).contains("部分完成，继续中"),
         "the overflowing card hands over with the standard split header: {handover}"
     );
     assert!(
-        card_text(&handover).contains("🔔 后台任务完成：gh run watch")
-            && card_text(&handover).contains("已经交给后台了。"),
+        handover_text.contains("🔔 后台任务完成：gh run watch") && handover_text.contains("已经交给后台了。"),
         "the entry and the request's timeline ride the finalized card: {handover}"
+    );
+    assert!(
+        !handover_text.contains("后台任务（") && !handover_text.contains("· 子代理：**review the diff**"),
+        "the finalized card hands its live list — remaining row included — over: {handover}"
+    );
+
+    // The continuation carries the REMAINING row and never the retired one,
+    // and no entry migrates onto it.
+    let continuation = platform.updated_cards().await.last().cloned().unwrap();
+    let continuation_text = card_text(&continuation);
+    assert!(
+        continuation_text.contains("⏳ 后台任务（1）")
+            && continuation_text.contains("· 子代理：**review the diff**"),
+        "the continuation carries the remaining live list: {continuation}"
+    );
+    assert!(
+        !continuation_text.contains("· shell：**gh run watch**"),
+        "the retired task's row does not migrate onto the continuation: {continuation}"
+    );
+    assert!(
+        !continuation_text.contains("后台任务完成"),
+        "the entry never migrates onto the continuation: {continuation}"
+    );
+    // Every ledger fact renders exactly once across the two cards.
+    assert_eq!(
+        handover_text.matches("后台任务完成").count() + continuation_text.matches("后台任务完成").count(),
+        1,
+        "one completion entry across the split: {handover} / {continuation}"
+    );
+    assert_eq!(
+        handover_text.matches("· 子代理：**review the diff**").count()
+            + continuation_text.matches("· 子代理：**review the diff**").count(),
+        1,
+        "one remaining live row across the split: {handover} / {continuation}"
+    );
+    assert_eq!(
+        handover_text.matches("· shell：**gh run watch**").count()
+            + continuation_text.matches("· shell：**gh run watch**").count(),
+        0,
+        "the retired row is gone from both cards: {handover} / {continuation}"
     );
 }
 
