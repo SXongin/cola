@@ -2664,6 +2664,30 @@ pub(crate) async fn wait_for_card_update_within(
         .unwrap_or_else(|_| panic!("card never reached {label}"));
 }
 
+/// Wait until `backend` has served `session_id`'s transcript at least `n`
+/// times — the proof-of-pass for a test whose flow (a restarted process's
+/// Session Sync, the reap) reads a session the test itself never drives.
+pub(crate) async fn wait_for_transcript_reads(backend: &Arc<MockBackend>, session_id: &str, n: usize) {
+    let probe = async {
+        loop {
+            let reads = backend
+                .transcript_calls
+                .lock()
+                .await
+                .iter()
+                .filter(|sid| sid.as_str() == session_id)
+                .count();
+            if reads >= n {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), probe)
+        .await
+        .unwrap_or_else(|_| panic!("the flow never read {session_id}'s transcript {n} times"));
+}
+
 /// Every button element on a card, in walk order (buttons nest in column sets
 /// and action blocks) — for assertions on a button's `value` payload or label
 /// without string-matching the card's JSON dump.
