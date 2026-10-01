@@ -190,6 +190,46 @@ the weekly fuzz job, and everything else by review. Do not re-add a scanner for
 Scorecard's `SAST` check alone — ADR-0034 records that check as a deliberate
 no.
 
+### Coverage
+
+`Coverage` is the primary-platform test gate and the coverage source: it runs
+the workspace tests under LLVM instrumentation and uploads lcov to Codecov,
+which posts the advisory `codecov/project` and `codecov/patch` statuses. Neither
+is required — merge-readiness is still `gh pr checks <branch> --required` — and
+`patch` stays at `target: auto` on purpose. Its reds have caught real untested
+branches (`src/bridge/turn/follow.rs`, `src/bridge/wake_watermark.rs`), and it
+is the only per-PR signal that new production lines are executed at all. Do not
+make it `informational`, lower its target, or drop whole files from the report:
+a diff touching `src/main.rs` or `src/bridge/discovery.rs` would otherwise stop
+being measured.
+
+One class of lines genuinely cannot light up in the hermetic job — the
+**process/OS boundary and the entry paths**:
+
+- the self-start spawn/kill glue (`spawn_self_server`, `spawn_own_server`,
+  `restart_self_spawned_server`, `force_kill`) and the lazy-start call in
+  `src/bridge/pollers.rs::reconcile`: they only run by raising a real
+  `opencode serve` against the default store, which no test may do (ADR-0013;
+  the fake `TestHttpServer` and the opted-in live harness are the sanctioned
+  stand-ins);
+- `main()`'s boot/logging/CLI arms: the process entry point;
+- `resolve_candidate` / `candidate_transport` in `src/bridge/attach.rs`: the
+  proxy-respecting attach entry the wire tests deliberately bypass in favour of
+  the `_over` seams (ADR-0031);
+- the `systemctl`/network glue in `src/autostart.rs` and `src/update.rs`;
+- lines already excluded by path in `codecov.yml` (`src/opencode/live/**`, the
+  machine-local `src/bridge/attach_live.rs`).
+
+When `codecov/patch` goes red, read its comment: if the missing lines are only
+that boundary, merge on the required checks; anything else is a real signal —
+cover the new logic, or say in the PR why it stays uncovered. Two rules, in the
+same spirit as *Security scanning*: never restructure or obfuscate code just to
+move a line out of the report, and never add an assertion-free "coverage
+filler" test. `#[coverage(off)]` is still nightly-only (verified on stable
+1.95), so line-level exclusion is not an option; a permanently-unreachable file
+or region goes on the `ignore` list with its reason, or into the boundary list
+above.
+
 Description template:
 
 ```markdown

@@ -2,6 +2,11 @@
 #
 # The `coverage` job in .github/workflows/ci.yml uploads the lcov report that
 # these settings apply to.
+#
+# `patch` stays at `auto` on purpose: its reds have caught real untested
+# branches, and the process/OS-boundary lines it can never see are handled by
+# the `ignore` list below — never by weakening the target. See
+# `CONTRIBUTING.md` ("Coverage").
 coverage:
   status:
     project:
@@ -32,3 +37,7 @@ ignore:
   # needs a pinned binary, so the instrumented hermetic `coverage` job can
   # never execute these lines — the advisory `Live V1`/`Live V2` jobs run them.
   - "src/opencode/live/**"
+  # The machine-local attach check (`#[ignore]`-gated, needs a live local
+  # server): same rationale as the live harness. A file of its own so those
+  # lines do not read as `src/bridge/attach.rs`'s coverage.
+  - "src/bridge/attach_live.rs"
