@@ -997,17 +997,8 @@ async fn a_supplement_split_hands_the_remaining_list_to_the_continuation() {
     );
 
     // Every ledger fact renders exactly once across the two cards.
-    assert_eq!(
-        finalized_text.matches("后台任务完成").count() + continuation_text.matches("后台任务完成").count(),
-        1,
-        "one completion entry across the split: {finalized} / {continuation}"
-    );
-    assert_eq!(
-        finalized_text.matches("· 子代理：**review the diff**").count()
-            + continuation_text.matches("· 子代理：**review the diff**").count(),
-        1,
-        "one remaining live row across the split: {finalized} / {continuation}"
-    );
+    assert_across_cards([&finalized, &continuation], "后台任务完成", 1);
+    assert_across_cards([&finalized, &continuation], "· 子代理：**review the diff**", 1);
 }
 
 // ---------------------------------------------------------------------------
