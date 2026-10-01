@@ -2905,6 +2905,76 @@ mod tests {
         assert!(acc.set_ledger(waiting, start + 1_400, LedgerCadence::Second));
     }
 
+    /// The flush decision compares only what the row RENDERS (spec #501,
+    /// acceptance 5): a label differing past the renderer's clip, an empty
+    /// label where none renders, and a start clock moving inside the displayed
+    /// minute and elapsed second all render identically and owe nothing —
+    /// while the clip itself changing, or the displayed minute or a rendered
+    /// second moving, owes.
+    #[test]
+    fn rendered_label_and_clock_differences_never_owe_a_flush() {
+        let base = crate::feishu::card::test_local_ms(2026, 9, 29, 14, 2);
+        let shell = |label: Option<&str>, started_at: Option<i64>| {
+            vec![TaskLedgerRow {
+                kind: TaskKind::Shell,
+                label: label.map(str::to_string),
+                started_at,
+                unconfirmed: false,
+                activity: None,
+            }]
+        };
+        let clipped = "x".repeat(crate::feishu::card::ledger::TASK_LABEL_CHARS);
+
+        // Labels: a difference beyond the clip is not on the row.
+        let mut acc = StreamAccumulator::new("test");
+        assert!(acc.set_ledger(
+            shell(Some(&format!("{clipped}AAA")), Some(base)),
+            base,
+            LedgerCadence::Second
+        ));
+        assert!(
+            !acc.set_ledger(
+                shell(Some(&format!("{clipped}BBB")), Some(base)),
+                base,
+                LedgerCadence::Second
+            ),
+            "text past the clip is clipped off the row"
+        );
+        // The visible prefix changing still owes.
+        assert!(acc.set_ledger(shell(Some("short"), Some(base)), base, LedgerCadence::Second));
+        // An empty label renders as no label at all — `None` is the same row.
+        assert!(acc.set_ledger(shell(Some(""), Some(base)), base, LedgerCadence::Second));
+        assert!(
+            !acc.set_ledger(shell(None, Some(base)), base, LedgerCadence::Second),
+            "an empty label and no label render the same row"
+        );
+
+        // Starts: the row shows `HH:MM`; the elapsed is the render clock's.
+        let mut acc = StreamAccumulator::new("test");
+        assert!(acc.set_ledger(shell(None, Some(base)), base, LedgerCadence::Second));
+        assert!(
+            !acc.set_ledger(shell(None, Some(base + 200)), base + 200, LedgerCadence::Second),
+            "a start moving inside the displayed minute and second renders the same row"
+        );
+        // A start whose displayed minute moved owes, even where the (clamped)
+        // elapsed second is unchanged.
+        assert!(
+            acc.set_ledger(
+                shell(None, Some(base + 60_000)),
+                base + 30_000,
+                LedgerCadence::Second
+            ),
+            "the displayed minute is a visible fact"
+        );
+        // A rendered second crossing owes through the render clock (the read
+        // clock has now passed the start's own second).
+        assert!(acc.set_ledger(
+            shell(None, Some(base + 60_000)),
+            base + 61_200,
+            LedgerCadence::Second
+        ));
+    }
+
     /// A row with no start time has no clock: a read that only re-reports it
     /// (the same label, no start) never owes a flush on either cadence — the
     /// clock tracks the rendered elapsed, and there is none.

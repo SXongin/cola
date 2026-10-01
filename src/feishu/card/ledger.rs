@@ -120,31 +120,52 @@ pub struct TaskLedgerRow {
 }
 
 impl TaskLedgerRow {
+    /// The label as the row renders it: the same folded/clipped bold shape
+    /// [`task_ledger_text`] emits, or `None` when the renderer omits it (no
+    /// label, or an empty one — the renderer's own `!is_empty` filter).
+    fn rendered_label(&self) -> Option<String> {
+        self.label
+            .as_deref()
+            .filter(|label| !label.is_empty())
+            .map(bold_label)
+    }
+
+    /// The start clock as the row renders it — local `HH:MM`, or `None` when
+    /// the start is absent (or out of range). The elapsed is the render
+    /// clock's business ([`task_ledger_clock`]).
+    fn rendered_clock(&self) -> Option<String> {
+        self.started_at.and_then(fmt_local_time)
+    }
+
     /// Whether this row RENDERS like `previous` (ADR-0060's flush rule, spec
-    /// #501): the visible facts — type, label, start clock, unconfirmed flag,
-    /// and the activity fragment's shape (its label and its wait) — and never
-    /// the gathered liveness's stored timestamps. The rendered numbers those
-    /// timestamps produce (the row's elapsed and the fragment's age) are the
-    /// render clock's business ([`task_ledger_clock`]), which is compared at
-    /// the path's own cadence: a child part landing inside the second the card
-    /// already shows must not owe a PATCH.
+    /// #501): the visible facts only — the type, the label as the row folds,
+    /// clips and bolds it (an empty label as absent), the local `HH:MM` start
+    /// clock, the unconfirmed flag, and, while the row is confirmed, the
+    /// fragment's label and wait — never the raw label/start values that
+    /// render identically, nor the gathered liveness's stored timestamps. The
+    /// rendered numbers (the row's elapsed and the fragment's age) are the
+    /// render clock's business ([`task_ledger_clock`]), compared at the path's
+    /// own cadence: text past the clip, an empty label, a start moving inside
+    /// the displayed minute and elapsed second, or a child part landing inside
+    /// the shown second must not owe a PATCH.
     pub(crate) fn renders_like(&self, previous: &Self) -> bool {
         self.kind == previous.kind
-            && self.label == previous.label
-            && self.started_at == previous.started_at
+            && self.rendered_label() == previous.rendered_label()
+            && self.rendered_clock() == previous.rendered_clock()
             && self.unconfirmed == previous.unconfirmed
-            && match (&self.activity, &previous.activity) {
-                (None, None) => true,
-                (Some(mine), Some(theirs)) => {
-                    let (mine, theirs) = (mine.title_parts(), theirs.title_parts());
-                    // Whether a fragment shows an age is its shape too, but the
-                    // clock comparison already catches a `None`/`Some` age
-                    // crossing (its rendered seconds go from nothing to a
-                    // number and back), so the shape here is the words.
-                    mine.label == theirs.label && mine.wait == theirs.wait
-                }
-                _ => false,
-            }
+            && (self.unconfirmed
+                || match (&self.activity, &previous.activity) {
+                    (None, None) => true,
+                    (Some(mine), Some(theirs)) => {
+                        let (mine, theirs) = (mine.title_parts(), theirs.title_parts());
+                        // Whether a fragment shows an age is its shape too, but
+                        // the clock comparison already catches a `None`/`Some`
+                        // age crossing (its rendered seconds go from nothing to
+                        // a number and back), so the shape here is the words.
+                        mine.label == theirs.label && mine.wait == theirs.wait
+                    }
+                    _ => false,
+                })
     }
 }
 

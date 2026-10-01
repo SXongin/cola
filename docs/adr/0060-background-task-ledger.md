@@ -233,13 +233,15 @@ row is unchanged (no fragment).
   live path still compares whole minutes and the yielded refresh whole seconds,
   so a yielded card PATCHes when its visible second turns and never once per
   read, while the live card gains no per-second churn. The comparison is on
-  what the row RENDERS — its type, label and start time, the fragment's label
-  and wait — never the gathered liveness's stored timestamps: a child part
-  landing inside the second the card already shows owes nothing. The read is
-  still stored whatever the decision, so the next age counts from the freshest
-  timestamps rather than from a stale accepted read. An unconfirmed row's
-  stored age never ticks (it renders none), and an untimed tool has no age to
-  tick.
+  what the row RENDERS — its type, its label folded and clipped, its local
+  `HH:MM` start clock, the fragment's label and wait — never the raw values
+  that render identically (text past the clip, an empty label, a start moving
+  inside the shown minute and second) nor the gathered liveness's stored
+  timestamps: a child part landing inside the second the card already shows
+  owes nothing. The read is still stored whatever the decision, so the next
+  age counts from the freshest timestamps rather than from a stale accepted
+  read. An unconfirmed row's stored age never ticks (it renders none), and an
+  untimed tool has no age to tick.
 
 GLOSSARY's **Background Task Ledger** entry follows. The child retirement read
 of #464 will reuse the same gather.
