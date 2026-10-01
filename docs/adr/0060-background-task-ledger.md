@@ -182,3 +182,20 @@ review round as the amendment above):
 - Identity and icons stay out of the live row: Feishu cards have no hover
   tooltips, and future task types have no recognizable glyphs. The completion
   entry's fold body keeps the identity.
+
+## Amendment (2026-10-02): the type words are the tools' own names
+
+The ledger's type words are the tool's own name everywhere it names one (#502,
+spec #501): the ledger and the Tool Panel call one task the same thing.
+
+- The live row reads `· shell：**npm run build** · 14:02 · 3m12s` /
+  `· subagent：**review the diff** · 14:04 · 1m05s` — the subagent no longer
+  reads 「子代理」; the omissions, bold escaping and clip are unchanged.
+- The completion entry's collapsed title reads `🔔 shell 完成：<label>` /
+  `🔔 subagent 完成：<label>`, with the same ending phrases as before (`已取消` /
+  `失败` / `结束` / `已失联`, only on their own evidence) and the same bare form
+  when the Wake names no label; the fold body's identity line reads
+  `shell sh_abc · 14:02 · 12m` / `subagent ses_child · 14:02 · 1m`.
+- Unchanged: the live list's title `⏳ 后台任务（N）`, the unconfirmed marker
+  `⚠️ 状态待确认`, the resumption header `🔄 后台任务完成，继续处理中…`, and the
+  permission card's 「调用子代理」.

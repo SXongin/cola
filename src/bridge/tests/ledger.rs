@@ -368,7 +368,7 @@ async fn several_tasks_list_in_transcript_order_beside_the_other_tail_sections()
         let text = card_text(card);
         text.contains("⏳ 后台任务（2）")
             && text.contains("· shell：**npm run build**")
-            && text.contains("· 子代理：**review the diff**")
+            && text.contains("· subagent：**review the diff**")
             && text.contains("todowrite")
     })
     .await;
@@ -382,7 +382,7 @@ async fn several_tasks_list_in_transcript_order_beside_the_other_tail_sections()
     );
     let shell_row = text.find("· shell：**npm run build**").expect("the shell row");
     let sub_row = text
-        .find("· 子代理：**review the diff**")
+        .find("· subagent：**review the diff**")
         .expect("the subagent row");
     assert!(
         shell_row < sub_row,
@@ -397,7 +397,7 @@ async fn several_tasks_list_in_transcript_order_beside_the_other_tail_sections()
         "the live Tool Panel coexists with the ledger: {text}"
     );
     assert_elapsed_shaped(&ledger_elapsed(&card, "· shell：**npm run build** · "));
-    assert_elapsed_shaped(&ledger_elapsed(&card, "· 子代理：**review the diff** · "));
+    assert_elapsed_shaped(&ledger_elapsed(&card, "· subagent：**review the diff** · "));
 }
 
 /// Acceptance 2 + 3: the label joins by `call_id` — a shell's `description`
@@ -450,7 +450,7 @@ async fn labels_join_by_call_id_and_clip_like_the_entry_title() {
         "a shell falls back to its description: {text}"
     );
     assert!(
-        text.contains("· 子代理：**review the diff** · "),
+        text.contains("· subagent：**review the diff** · "),
         "the subagent arm reads its description: {text}"
     );
     assert!(
@@ -542,7 +542,7 @@ async fn a_task_appears_and_retires_on_the_live_card_in_cadence() {
             let text = card_text(card);
             text.contains("⏳ 后台任务（1）")
                 && text.contains("· shell：**npm run build**")
-                && !text.contains("子代理")
+                && !text.contains("· subagent：")
         },
     )
     .await;
@@ -686,7 +686,7 @@ async fn a_completion_wake_keeps_the_live_list_on_the_resumed_card() {
         |card| {
             let text = card_text(card);
             card_header(card).contains("等待后台任务")
-                && text.contains("🔔 后台任务完成：gh run watch")
+                && text.contains("🔔 shell 完成：gh run watch")
                 && text.contains("CI 通过了。")
                 && !text.contains("· shell：**gh run watch**")
         },
@@ -713,7 +713,7 @@ async fn a_completion_wake_keeps_the_live_list_on_the_resumed_card() {
         "the card is back to its wait header: {resumed}"
     );
     assert!(
-        text.contains("🔔 后台任务完成：gh run watch") && text.contains("shell sh_bg · "),
+        text.contains("🔔 shell 完成：gh run watch") && text.contains("shell sh_bg · "),
         "the retired task's entry lands on the card that hosted it: {resumed}"
     );
     assert!(
@@ -721,7 +721,7 @@ async fn a_completion_wake_keeps_the_live_list_on_the_resumed_card() {
         "the retired task's live row is gone: {resumed}"
     );
     assert!(
-        text.contains("⏳ 后台任务（1）") && text.contains("· 子代理：**review the diff**"),
+        text.contains("⏳ 后台任务（1）") && text.contains("· subagent：**review the diff**"),
         "the remaining live list stays on the same card: {resumed}"
     );
     assert!(
@@ -733,7 +733,7 @@ async fn a_completion_wake_keeps_the_live_list_on_the_resumed_card() {
         "an in-place resume writes no 承接 line: {resumed}"
     );
     assert_eq!(
-        text.matches("后台任务完成").count(),
+        text.matches("shell 完成").count(),
         1,
         "exactly one entry: {resumed}"
     );
@@ -743,7 +743,7 @@ async fn a_completion_wake_keeps_the_live_list_on_the_resumed_card() {
     let patches = patches_to(&platform, "om_waiting").await;
     let resume = patches
         .iter()
-        .find(|patch| card_text(patch).contains("🔔 后台任务完成：gh run watch"))
+        .find(|patch| card_text(patch).contains("🔔 shell 完成：gh run watch"))
         .unwrap_or_else(|| panic!("the entry landed on the request's card: {patches:?}"));
     let resume_text = card_text(resume);
     assert!(
@@ -805,10 +805,10 @@ async fn a_resumed_card_carries_every_completion_of_the_read() {
         "no live list rides a session with nothing live: {resumed}"
     );
     let shell = text
-        .find("🔔 后台任务完成：gh run watch")
+        .find("🔔 shell 完成：gh run watch")
         .unwrap_or_else(|| panic!("the shell's entry lands where the task lived: {resumed}"));
     let subagent = text
-        .find("🔔 子代理完成：review the diff")
+        .find("🔔 subagent 完成：review the diff")
         .unwrap_or_else(|| panic!("the subagent's entry lands where the task lived: {resumed}"));
     let work = text
         .find("都完成了。")
@@ -887,7 +887,7 @@ async fn a_new_turn_takes_the_live_list_over_from_the_waiting_card() {
         CardUpdates::Latest,
         |card| {
             let text = card_text(card);
-            text.contains("⏳ 后台任务（1）") && text.contains("· 子代理：**review the diff**")
+            text.contains("⏳ 后台任务（1）") && text.contains("· subagent：**review the diff**")
         },
     )
     .await;
@@ -964,7 +964,7 @@ async fn a_supplement_split_hands_the_remaining_list_to_the_continuation() {
     );
     assert!(
         continuation_text.contains("⏳ 后台任务（1）")
-            && continuation_text.contains("· 子代理：**review the diff**"),
+            && continuation_text.contains("· subagent：**review the diff**"),
         "the continuation carries the remaining live list: {continuation}"
     );
     assert!(
@@ -972,7 +972,7 @@ async fn a_supplement_split_hands_the_remaining_list_to_the_continuation() {
         "the retired task's row does not migrate onto the continuation: {continuation}"
     );
     assert!(
-        !continuation_text.contains("后台任务完成"),
+        !continuation_text.contains("shell 完成"),
         "the entry never migrates onto the continuation: {continuation}"
     );
 
@@ -988,7 +988,7 @@ async fn a_supplement_split_hands_the_remaining_list_to_the_continuation() {
         "the split finalizes the resumed card with the standard handoff: {finalized}"
     );
     assert!(
-        finalized_text.contains("🔔 后台任务完成：gh run watch") && finalized_text.contains("正在合并。"),
+        finalized_text.contains("🔔 shell 完成：gh run watch") && finalized_text.contains("正在合并。"),
         "the entry and the work stay on the card that hosted the task: {finalized}"
     );
     assert!(
@@ -997,8 +997,8 @@ async fn a_supplement_split_hands_the_remaining_list_to_the_continuation() {
     );
 
     // Every ledger fact renders exactly once across the two cards.
-    assert_across_cards([&finalized, &continuation], "后台任务完成", 1);
-    assert_across_cards([&finalized, &continuation], "· 子代理：**review the diff**", 1);
+    assert_across_cards([&finalized, &continuation], "shell 完成", 1);
+    assert_across_cards([&finalized, &continuation], "· subagent：**review the diff**", 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -1248,7 +1248,7 @@ async fn a_quiet_true_end_settles_the_host_card_in_place() {
     script_quiet_true_end(&backend).await;
     spawn_sync(&app);
     wait_for_card_update(&platform, "the settled card", CardUpdates::Latest, |card| {
-        card_header(card).contains("✅") && card_text(card).contains("🔔 后台任务完成：gh run watch")
+        card_header(card).contains("✅") && card_text(card).contains("🔔 shell 完成：gh run watch")
     })
     .await;
 
@@ -1266,7 +1266,7 @@ async fn a_quiet_true_end_settles_the_host_card_in_place() {
         "the retired task's live list is gone: {settled}"
     );
     assert!(
-        text.contains("🔔 后台任务完成：gh run watch") && text.contains("shell sh_bg · "),
+        text.contains("🔔 shell 完成：gh run watch") && text.contains("shell sh_bg · "),
         "the fixed entry stays on the card that hosted the task: {settled}"
     );
     assert!(
@@ -1302,7 +1302,7 @@ async fn a_quiet_true_end_settles_the_host_card_in_place() {
 /// Issue #454: a shell the runtime reports ENDED — while its completion Wake
 /// never arrives — retires on the same Session Sync read that refreshes the
 /// yielded ledger, and the last retirement settles the waiting card in place
-/// with the runtime's own ending (「🔔 后台任务结束」), never a Wake entry. The
+/// with the runtime's own ending (「🔔 shell 结束」), never a Wake entry. The
 /// transcript still listed the task and keeps listing it; the runtime read is
 /// what ends the wait.
 #[tokio::test]
@@ -1327,7 +1327,7 @@ async fn a_runtime_confirmed_end_settles_the_waiting_card() {
     )];
     spawn_sync(&app);
     wait_for_card_update(&platform, "the settled card", CardUpdates::Latest, |card| {
-        card_header(card).contains("✅") && card_text(card).contains("🔔 后台任务结束：gh run watch")
+        card_header(card).contains("✅") && card_text(card).contains("🔔 shell 结束：gh run watch")
     })
     .await;
 
@@ -1345,7 +1345,7 @@ async fn a_runtime_confirmed_end_settles_the_waiting_card() {
         "the runtime-retired task's live list is gone: {settled}"
     );
     assert!(
-        text.contains("shell sh_call_bg · ") && !text.contains("后台任务已失联"),
+        text.contains("shell sh_call_bg · ") && !text.contains("shell 已失联"),
         "the runtime entry carries the task's identity and its own ending: {settled}"
     );
     assert!(
@@ -1404,9 +1404,7 @@ async fn a_runtime_retirement_waits_for_a_waiting_card() {
         &platform,
         "the entry after the card exists",
         CardUpdates::Latest,
-        |card| {
-            card_header(card).contains("✅") && card_text(card).contains("🔔 后台任务已失联：gh run watch")
-        },
+        |card| card_header(card).contains("✅") && card_text(card).contains("🔔 shell 已失联：gh run watch"),
     )
     .await;
     assert!(
@@ -1432,7 +1430,7 @@ async fn a_runtime_retirement_renders_on_a_later_chain() {
     backend.task_runtime.lock().unwrap().shells = vec![("sh_call_bg".into(), ShellRuntime::Missing)];
     spawn_sync(&app);
     wait_for_card_update(&platform, "the later-chain entry", CardUpdates::Latest, |card| {
-        card_header(card).contains("✅") && card_text(card).contains("🔔 后台任务已失联：gh run watch")
+        card_header(card).contains("✅") && card_text(card).contains("🔔 shell 已失联：gh run watch")
     })
     .await;
 
@@ -1457,7 +1455,7 @@ async fn a_runtime_lost_shell_settles_as_lost() {
     backend.task_runtime.lock().unwrap().shells = vec![("sh_call_bg".into(), ShellRuntime::Missing)];
     spawn_sync(&app);
     wait_for_card_update(&platform, "the lost settle", CardUpdates::Latest, |card| {
-        card_header(card).contains("✅") && card_text(card).contains("🔔 后台任务已失联：gh run watch")
+        card_header(card).contains("✅") && card_text(card).contains("🔔 shell 已失联：gh run watch")
     })
     .await;
 
@@ -1509,7 +1507,7 @@ async fn an_inactive_child_marks_its_row_unconfirmed_without_settling() {
     );
     assert!(
         text.lines()
-            .any(|line| line.contains("子代理：**review the diff**") && line.ends_with("⚠️ 状态待确认")),
+            .any(|line| line.contains("subagent：**review the diff**") && line.ends_with("⚠️ 状态待确认")),
         "the marker trails the child's own facts: {latest}"
     );
     // The runtime read asked for exactly this session's tasks.
@@ -1542,7 +1540,7 @@ async fn a_stop_during_the_wait_settles_the_card_as_stopped() {
     script_quiet_true_end(&backend).await;
     spawn_sync(&app);
     wait_for_card_update(&platform, "the stop terminal", CardUpdates::Latest, |card| {
-        card_header(card).contains("已停止") && card_text(card).contains("🔔 后台任务完成：gh run watch")
+        card_header(card).contains("已停止") && card_text(card).contains("🔔 shell 完成：gh run watch")
     })
     .await;
 
@@ -1658,7 +1656,7 @@ async fn a_retirement_with_a_live_task_left_never_settles() {
     .await;
     spawn_sync(&app);
     wait_for_card_update(&platform, "the refreshed wait", CardUpdates::Latest, |card| {
-        card_text(card).contains("🔔 后台任务完成：gh run watch")
+        card_text(card).contains("🔔 shell 完成：gh run watch")
     })
     .await;
 
@@ -1835,7 +1833,7 @@ async fn a_retirement_before_the_wakes_boundary_does_not_settle() {
     .await;
     spawn_sync(&app);
     wait_for_card_update(&platform, "the refreshed wait", CardUpdates::Latest, |card| {
-        card_text(card).contains("🔔 后台任务完成：gh run watch")
+        card_text(card).contains("🔔 shell 完成：gh run watch")
     })
     .await;
     assert_eq!(
@@ -1995,7 +1993,7 @@ async fn a_quiet_retirement_updates_the_waiting_card_in_place() {
     .await;
     spawn_sync(&app);
     wait_for_card_update(&platform, "the quiet retirement", CardUpdates::Latest, |card| {
-        card_text(card).contains("🔔 后台任务完成：gh run watch")
+        card_text(card).contains("🔔 shell 完成：gh run watch")
             && !card_text(card).contains("· shell：**gh run watch**")
     })
     .await;
@@ -2017,11 +2015,11 @@ async fn a_quiet_retirement_updates_the_waiting_card_in_place() {
         "the retired task's row leaves: {updated}"
     );
     assert!(
-        text.contains("⏳ 后台任务（1）") && text.contains("· 子代理：**review the diff**"),
+        text.contains("⏳ 后台任务（1）") && text.contains("· subagent：**review the diff**"),
         "the remaining list rides the same card: {updated}"
     );
     assert!(
-        text.contains("🔔 后台任务完成：gh run watch") && text.contains("shell sh_bg · "),
+        text.contains("🔔 shell 完成：gh run watch") && text.contains("shell sh_bg · "),
         "the fixed entry lands on the card the task lived on: {updated}"
     );
     assert!(
@@ -2126,7 +2124,7 @@ async fn repeated_reads_inside_the_same_rendered_second_patch_nothing() {
     let patches = patches_to(&platform, "om_waiting").await;
     let event = patches
         .iter()
-        .position(|patch| card_text(patch).contains("🔔 后台任务完成：gh run watch"))
+        .position(|patch| card_text(patch).contains("🔔 shell 完成：gh run watch"))
         .expect("the retirement PATCHed");
     assert_eq!(
         event,
@@ -2239,7 +2237,7 @@ async fn a_ledger_only_refresh_never_splits_the_waiting_card() {
     .await;
     spawn_sync(&app);
     wait_for_card_update(&platform, "the oversized entry", CardUpdates::Latest, |card| {
-        card_text(card).contains("🔔 后台任务完成：gh run watch")
+        card_text(card).contains("🔔 shell 完成：gh run watch")
     })
     .await;
 
@@ -2266,7 +2264,7 @@ async fn a_ledger_only_refresh_never_splits_the_waiting_card() {
     );
     let text = card_text(updated);
     assert!(
-        text.contains("🔔 后台任务完成：gh run watch") && text.contains("⏳ 后台任务（1）"),
+        text.contains("🔔 shell 完成：gh run watch") && text.contains("⏳ 后台任务（1）"),
         "the entry and the remaining list land in place: {updated}"
     );
     assert!(
@@ -2309,7 +2307,7 @@ async fn a_quiet_retirement_survives_a_later_takeover() {
     .await;
     spawn_sync(&app);
     wait_for_card_update(&platform, "the quiet retirement", CardUpdates::Latest, |card| {
-        card_text(card).contains("🔔 后台任务完成：gh run watch")
+        card_text(card).contains("🔔 shell 完成：gh run watch")
     })
     .await;
     // The retirement is exactly ONE PATCH: several more passes (the injected
@@ -2350,7 +2348,7 @@ async fn a_quiet_retirement_survives_a_later_takeover() {
     );
     let retirement = &patches[0];
     assert!(
-        card_text(retirement).contains("🔔 后台任务完成：gh run watch")
+        card_text(retirement).contains("🔔 shell 完成：gh run watch")
             && card_header(retirement).contains("等待后台任务"),
         "the retirement is the first PATCH: {retirement}"
     );
@@ -2364,7 +2362,7 @@ async fn a_quiet_retirement_survives_a_later_takeover() {
         "the collect drops the live list: {collected}"
     );
     assert!(
-        card_text(collected).contains("🔔 后台任务完成：gh run watch"),
+        card_text(collected).contains("🔔 shell 完成：gh run watch"),
         "the entry stays on the card it happened on: {collected}"
     );
 }

@@ -740,7 +740,7 @@ mod tests {
         assert_eq!(elements[1]["element_id"], "entry_1", "stable fold identity");
         assert_eq!(
             elements[1]["header"]["title"]["content"],
-            "🔔 后台任务完成：gh run watch"
+            "🔔 shell 完成：gh run watch"
         );
         assert_eq!(
             elements[1]["elements"][0]["content"],
@@ -756,7 +756,7 @@ mod tests {
             .build();
         assert_eq!(
             card["body"]["elements"][0]["header"]["title"]["content"],
-            "🔔 后台任务完成"
+            "🔔 shell 完成"
         );
         assert!(
             card["body"]["elements"][0]["element_id"].is_null(),

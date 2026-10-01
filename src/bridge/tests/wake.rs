@@ -478,11 +478,11 @@ async fn a_completion_wake_resumes_the_yielded_card_in_place() {
     // The retiring task's own entry, exactly once, ahead of the work it
     // announces, and its live row gone.
     assert_eq!(
-        card_text(&last).matches("后台任务完成").count(),
+        card_text(&last).matches("shell 完成").count(),
         1,
         "exactly one completion entry: {last}"
     );
-    let entry = body_index(&last, "后台任务完成").expect("the retired task's entry renders");
+    let entry = body_index(&last, "shell 完成").expect("the retired task's entry renders");
     let work = body_index(&last, "CI 通过了。").expect("the resumed work renders");
     assert!(
         entry < work,
@@ -631,7 +631,7 @@ async fn a_completion_wake_resumes_in_place_after_its_entry_was_placed() {
         CardUpdates::Latest,
         |card| {
             card_header(card).contains("等待后台任务")
-                && card_text(card).contains("🔔 后台任务完成：gh run watch")
+                && card_text(card).contains("🔔 shell 完成：gh run watch")
         },
     )
     .await;
@@ -686,7 +686,7 @@ async fn a_completion_wake_resumes_in_place_after_its_entry_was_placed() {
         "an in-place resume writes no 承接 line: {last}"
     );
     assert_eq!(
-        card_text(&last).matches("后台任务完成").count(),
+        card_text(&last).matches("shell 完成").count(),
         1,
         "the already-placed entry is not doubled: {last}"
     );
@@ -942,7 +942,7 @@ async fn an_in_place_resume_that_overflows_still_splits() {
         |card| {
             card_header(card).contains("等待后台任务")
                 && card_text(card).contains("很长的回答。")
-                && card_text(card).contains("· 子代理：**review the diff**")
+                && card_text(card).contains("· subagent：**review the diff**")
         },
     )
     .await;
@@ -966,11 +966,11 @@ async fn an_in_place_resume_that_overflows_still_splits() {
         "the overflowing card hands over with the standard split header: {handover}"
     );
     assert!(
-        handover_text.contains("🔔 后台任务完成：gh run watch") && handover_text.contains("已经交给后台了。"),
+        handover_text.contains("🔔 shell 完成：gh run watch") && handover_text.contains("已经交给后台了。"),
         "the entry and the request's timeline ride the finalized card: {handover}"
     );
     assert!(
-        !handover_text.contains("后台任务（") && !handover_text.contains("· 子代理：**review the diff**"),
+        !handover_text.contains("后台任务（") && !handover_text.contains("· subagent：**review the diff**"),
         "the finalized card hands its live list — remaining row included — over: {handover}"
     );
 
@@ -980,7 +980,7 @@ async fn an_in_place_resume_that_overflows_still_splits() {
     let continuation_text = card_text(&continuation);
     assert!(
         continuation_text.contains("⏳ 后台任务（1）")
-            && continuation_text.contains("· 子代理：**review the diff**"),
+            && continuation_text.contains("· subagent：**review the diff**"),
         "the continuation carries the remaining live list: {continuation}"
     );
     assert!(
@@ -988,12 +988,12 @@ async fn an_in_place_resume_that_overflows_still_splits() {
         "the retired task's row does not migrate onto the continuation: {continuation}"
     );
     assert!(
-        !continuation_text.contains("后台任务完成"),
+        !continuation_text.contains("shell 完成"),
         "the entry never migrates onto the continuation: {continuation}"
     );
     // Every ledger fact renders exactly once across the two cards.
-    assert_across_cards([&handover, &continuation], "后台任务完成", 1);
-    assert_across_cards([&handover, &continuation], "· 子代理：**review the diff**", 1);
+    assert_across_cards([&handover, &continuation], "shell 完成", 1);
+    assert_across_cards([&handover, &continuation], "· subagent：**review the diff**", 1);
     assert_across_cards([&handover, &continuation], "· shell：**gh run watch**", 0);
 }
 
@@ -1451,7 +1451,7 @@ async fn restart_like_wake_on_a_waiting_card_still_splits(source: WakeSource) {
             card_header(card).contains("等待后台任务")
                 && card_text(card).contains(WAKE_LEAD)
                 && card_text(card).contains("重启后继续。")
-                && card_text(card).contains("· 子代理：**review the diff**")
+                && card_text(card).contains("· subagent：**review the diff**")
         },
     )
     .await;
@@ -1476,7 +1476,7 @@ async fn restart_like_wake_on_a_waiting_card_still_splits(source: WakeSource) {
     );
     assert!(
         !card_text(&handover).contains("后台任务（")
-            && !card_text(&handover).contains("· 子代理：**review the diff**"),
+            && !card_text(&handover).contains("· subagent：**review the diff**"),
         "the finalized card hands its live list over: {handover}"
     );
 
@@ -1487,17 +1487,17 @@ async fn restart_like_wake_on_a_waiting_card_still_splits(source: WakeSource) {
     let continuation_text = card_text(&continuation);
     assert!(
         continuation_text.contains("⏳ 后台任务（1）")
-            && continuation_text.contains("· 子代理：**review the diff**"),
+            && continuation_text.contains("· subagent：**review the diff**"),
         "the continuation carries the remaining live list: {continuation}"
     );
     assert!(
         !continuation_text.contains("· shell：**gh run watch**"),
         "the retired task's row does not migrate onto the continuation: {continuation}"
     );
-    assert_across_cards([&handover, &continuation], "· 子代理：**review the diff**", 1);
+    assert_across_cards([&handover, &continuation], "· subagent：**review the diff**", 1);
     assert_across_cards([&handover, &continuation], "· shell：**gh run watch**", 0);
-    assert_across_cards([&handover, &continuation], "后台任务完成", 0);
-    assert_across_cards([&handover, &continuation], "子代理完成", 0);
+    assert_across_cards([&handover, &continuation], "shell 完成", 0);
+    assert_across_cards([&handover, &continuation], "subagent 完成", 0);
 }
 
 /// The restart source of [`restart_like_wake_on_a_waiting_card_still_splits`].
@@ -2104,7 +2104,7 @@ async fn a_second_wake_resumes_the_same_card_again() {
         "the same card carries both resumed runs: {last}"
     );
     assert_eq!(
-        text.matches("后台任务完成").count(),
+        text.matches("shell 完成").count(),
         2,
         "each completion leaves its own entry, once: {last}"
     );
@@ -2730,28 +2730,24 @@ async fn a_merged_shell_wake_leaves_one_entry_on_the_live_turn_card() {
         &platform,
         "the merged completion entry",
         CardUpdates::Any,
-        |card| card_text(card).contains("后台任务完成"),
+        |card| card_text(card).contains("shell 完成"),
     )
     .await;
 
     let last = platform.updated_cards().await.last().cloned().unwrap();
     let text = card_text(&last);
     assert!(
-        text.contains("🔔 后台任务完成：gh run watch"),
+        text.contains("🔔 shell 完成：gh run watch"),
         "the Wake's own command is the entry's collapsed title: {last}"
     );
     assert!(
         text.contains("shell sh_bg · 14:02 · 12m"),
         "the fold body carries identity and timing (ADR-0060): {last}"
     );
-    assert_eq!(
-        text.matches("后台任务完成").count(),
-        1,
-        "exactly one entry: {last}"
-    );
+    assert_eq!(text.matches("shell 完成").count(), 1, "exactly one entry: {last}");
     // The entry is one folded collapsible panel, and the live row it retired
     // is gone: one mechanism, not two renderings.
-    let entry = body_index(&last, "后台任务完成").expect("the entry renders");
+    let entry = body_index(&last, "shell 完成").expect("the entry renders");
     let element = &last["body"]["elements"][entry];
     assert_eq!(
         element["tag"], "collapsible_panel",
@@ -2775,7 +2771,7 @@ async fn a_merged_shell_wake_leaves_one_entry_on_the_live_turn_card() {
     tokio::time::sleep(Duration::from_millis(80)).await;
     let later = platform.updated_cards().await.last().cloned().unwrap();
     assert_eq!(
-        card_text(&later).matches("后台任务完成").count(),
+        card_text(&later).matches("shell 完成").count(),
         1,
         "a repeated poll must not duplicate the entry: {later}"
     );
@@ -2817,11 +2813,11 @@ async fn a_merged_shell_wake_leaves_one_entry_on_the_live_turn_card() {
     // still exactly one, in its place.
     let settled = platform.updated_cards().await.last().cloned().unwrap();
     assert_eq!(
-        card_text(&settled).matches("后台任务完成").count(),
+        card_text(&settled).matches("shell 完成").count(),
         1,
         "the settled re-render keeps exactly one entry: {settled}"
     );
-    let entry = body_index(&settled, "后台任务完成").expect("the entry survives the settle");
+    let entry = body_index(&settled, "shell 完成").expect("the entry survives the settle");
     let work = body_index(&settled, "CI 通过了。").expect("the work stays below it");
     assert!(
         entry < work,
@@ -2890,21 +2886,21 @@ async fn several_completions_leave_one_entry_each_in_wake_order() {
     let last = platform.updated_cards().await.last().cloned().unwrap();
     let text = card_text(&last);
     assert_eq!(
-        text.matches("后台任务完成").count(),
+        text.matches("shell 完成").count(),
         1,
         "the shell Wake leaves exactly one shell entry: {last}"
     );
     assert_eq!(
-        text.matches("子代理完成").count(),
+        text.matches("subagent 完成").count(),
         1,
         "the subagent Wake leaves exactly one subagent entry: {last}"
     );
     assert!(
-        text.contains("shell sh_bg · 14:02 · 12m") && text.contains("子代理 ses_child · 14:00 · 5m"),
+        text.contains("shell sh_bg · 14:02 · 12m") && text.contains("subagent ses_child · 14:00 · 5m"),
         "each entry carries its own identity and span: {last}"
     );
-    let subagent = body_index(&last, "子代理完成").expect("the subagent entry renders");
-    let shell = body_index(&last, "后台任务完成").expect("the shell entry renders");
+    let subagent = body_index(&last, "subagent 完成").expect("the subagent entry renders");
+    let shell = body_index(&last, "shell 完成").expect("the shell entry renders");
     assert!(
         subagent < shell,
         "entries keep the read's order (subagent finished first) (subagent@{subagent}, shell@{shell}): {last}"
@@ -2977,19 +2973,19 @@ async fn a_merged_subagent_wake_labels_the_entry_with_its_description() {
     wait_for_card_text(&platform, "子代理跑完了。").await;
 
     let last = platform.updated_cards().await.last().cloned().unwrap();
-    let clipped = format!("🔔 子代理完成：{}…", long.chars().take(60).collect::<String>());
+    let clipped = format!("🔔 subagent 完成：{}…", long.chars().take(60).collect::<String>());
     assert!(
         card_text(&last).contains(&clipped),
         "the subagent's description is the collapsed title, clipped to 60 chars: {last}"
     );
     assert_eq!(
-        card_text(&last).matches("子代理完成").count(),
+        card_text(&last).matches("subagent 完成").count(),
         1,
         "exactly one entry: {last}"
     );
     // The clip holds for the entry itself: the launch panel below may still
     // carry the full description as its input, the title must not.
-    let entry = body_index(&last, "子代理完成").expect("the entry renders");
+    let entry = body_index(&last, "subagent 完成").expect("the entry renders");
     let element = &last["body"]["elements"][entry];
     assert_eq!(
         element["tag"], "collapsible_panel",
@@ -3000,7 +2996,7 @@ async fn a_merged_subagent_wake_labels_the_entry_with_its_description() {
         "the full label must not leak past the clip: {element}"
     );
     assert!(
-        card_text(&last).contains("子代理 ses_child · 14:02 · 12m"),
+        card_text(&last).contains("subagent ses_child · 14:02 · 12m"),
         "the fold names the child session and times: {last}"
     );
 
@@ -3085,7 +3081,7 @@ async fn a_restart_cards_later_completion_resumes_it_in_place() {
     .await;
     let opened = platform.updated_cards().await.last().cloned().unwrap();
     assert!(
-        !card_text(&opened).contains("后台任务完成"),
+        !card_text(&opened).contains("shell 完成"),
         "the Wake that opened the card is announced by the 承接 line alone: {opened}"
     );
     assert!(
@@ -3127,7 +3123,7 @@ async fn a_restart_cards_later_completion_resumes_it_in_place() {
     );
     let last = platform.updated_cards().await.last().cloned().unwrap();
     assert_eq!(
-        card_text(&last).matches("后台任务完成").count(),
+        card_text(&last).matches("shell 完成").count(),
         1,
         "the resumed completion leaves exactly one entry: {last}"
     );
@@ -3135,7 +3131,7 @@ async fn a_restart_cards_later_completion_resumes_it_in_place() {
         card_text(&last).contains("shell sh_bg · 14:02 · 12m"),
         "the entry carries the retired task's identity and timing: {last}"
     );
-    let entry = body_index(&last, "后台任务完成").expect("the resumed entry renders");
+    let entry = body_index(&last, "shell 完成").expect("the resumed entry renders");
     let work = body_index(&last, "第二段进展。").expect("the resumed work renders");
     assert!(
         entry < work,
@@ -3146,7 +3142,7 @@ async fn a_restart_cards_later_completion_resumes_it_in_place() {
     tokio::time::sleep(Duration::from_millis(80)).await;
     let later = platform.updated_cards().await.last().cloned().unwrap();
     assert_eq!(
-        card_text(&later).matches("后台任务完成").count(),
+        card_text(&later).matches("shell 完成").count(),
         1,
         "a repeated poll must not duplicate the entry: {later}"
     );
@@ -3188,7 +3184,7 @@ async fn a_restart_or_interrupt_wake_gets_no_entry() {
 
     let last = platform.updated_cards().await.last().cloned().unwrap();
     assert!(
-        !card_text(&last).contains("后台任务完成") && !card_text(&last).contains("子代理完成"),
+        !card_text(&last).contains("shell 完成") && !card_text(&last).contains("subagent 完成"),
         "a restart/interrupt notice gets no entry: {last}"
     );
 
@@ -3244,22 +3240,18 @@ async fn an_unnamed_merged_wake_renders_the_bare_title() {
     let last = platform.updated_cards().await.last().cloned().unwrap();
     let text = card_text(&last);
     assert!(
-        text.contains("🔔 后台任务完成"),
+        text.contains("🔔 shell 完成"),
         "the unnamed Wake renders the bare completion line: {last}"
     );
     assert!(
-        !text.contains("🔔 后台任务完成："),
+        !text.contains("🔔 shell 完成："),
         "a bare title carries no dangling label separator: {last}"
     );
     assert!(
         text.contains("shell sh_bg · 14:02 · 12m"),
         "identity and timing survive an unnamed completion: {last}"
     );
-    assert_eq!(
-        text.matches("后台任务完成").count(),
-        1,
-        "exactly one entry: {last}"
-    );
+    assert_eq!(text.matches("shell 完成").count(), 1, "exactly one entry: {last}");
 
     // End the turn.
     script_transcript(
