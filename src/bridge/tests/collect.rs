@@ -262,23 +262,6 @@ async fn a_new_turn_collects_the_waiting_card() {
     );
 }
 
-/// Every card POST (a reply or a top-level send) the platform recorded — the
-/// counter for "was a new card posted?" (an in-place PATCH updates one).
-async fn card_posts(platform: &RecordingPlatform) -> usize {
-    platform
-        .calls
-        .lock()
-        .await
-        .iter()
-        .filter(|call| {
-            matches!(
-                call,
-                PlatformCall::ReplyCard { .. } | PlatformCall::SendCard { .. }
-            )
-        })
-        .count()
-}
-
 /// Acceptance 2 + the no-notice rule: `/switch`ing away collects the waiting
 /// card as 「⏳ 已切换会话 · 后台任务仍在运行」, sends no Completion Notice, and
 /// the collected card stops updating (exactly the one collect PATCH).

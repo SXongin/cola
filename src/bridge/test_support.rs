@@ -163,6 +163,25 @@ pub(crate) async fn continuation_sends(platform: &RecordingPlatform) -> Vec<serd
         .collect()
 }
 
+/// Every card POST (a reply or a top-level send) the platform recorded — the
+/// counter for "was a new card posted?" (an in-place PATCH updates one, so it
+/// is never counted). Shared by the collect and Wake tests so their new-card
+/// assertions read the same call set.
+pub(crate) async fn card_posts(platform: &RecordingPlatform) -> usize {
+    platform
+        .calls
+        .lock()
+        .await
+        .iter()
+        .filter(|call| {
+            matches!(
+                call,
+                PlatformCall::ReplyCard { .. } | PlatformCall::SendCard { .. }
+            )
+        })
+        .count()
+}
+
 /// A recorded `reply_question` call: (request_id, answers).
 type QuestionReplyRecord = (String, Vec<Vec<String>>);
 
