@@ -11,6 +11,13 @@
 //! line (ADR-0060, ticket #417); each Wake marks exactly once and a
 //! restart/interrupt Wake leaves no entry at all.
 //!
+//! An in-place resume never notifies: a PATCH pushes nothing. Its true end
+//! carries the request's ONE Completion Notice under the ordinary rules
+//! (ADR-0066) — the card never sent, so it announces at its ending — while a
+//! split continuation's own send was its notification, a yield back to
+//! 「⏳ 等待后台任务」 is not an ending, and the restart Fresh card stays
+//! notice-free because its send was the notification.
+//!
 //! Every test scripts the Backend's reads and injects tiny poll cadences, so no
 //! test waits on a production interval.
 
@@ -788,7 +795,9 @@ async fn a_message_during_a_resumed_run_supplements_it() {
 /// pushes nothing — and its TRUE END notifies once under the ordinary rules,
 /// with the clock the request's ORIGINAL Turn start reads: here a p2p run past
 /// the long-task threshold fires exactly one notice, and a resume clock
-/// ("now") could not have passed it.
+/// ("now") could not have passed it. Later Session Sync passes over the same
+/// finished read send no second notice: the card is past its wait, so neither
+/// the Wake step nor the quiet true end has an ending left to announce.
 #[tokio::test]
 async fn an_in_place_resumes_true_end_notifies_once() {
     let _wd = test_work_dir();
@@ -832,6 +841,190 @@ async fn an_in_place_resumes_true_end_notifies_once() {
         notices[0].3.contains("已完成"),
         "the card's ✅ is what it announces: {:?}",
         notices[0].3
+    );
+
+    // Later Session Sync passes over the same finished read stay silent: the
+    // card is past its wait (Done), so neither the Wake step nor the quiet
+    // true end has an ending left to announce — the one notice stands.
+    let reads = backend.transcript_calls.lock().await.len();
+    wait_for_transcript_reads(&backend, "ses_test", reads + 2).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        platform.completion_notices().await.len(),
+        1,
+        "a later pass must not announce the true end twice"
+    );
+}
+
+/// The group opt-in on the true end (ADR-0043, ADR-0066): a group turn's
+/// in-place resume ends ✅ and notifies exactly once — the resumed card is the
+/// request's OWN, so it is the request's ending that announces, with the
+/// ordinary 已完成 copy on the request's message.
+#[tokio::test]
+async fn a_group_resume_true_end_notifies_once() {
+    let _wd = test_work_dir();
+    let waiting = yielding_shell_transcript();
+    let (_dir, app, backend, platform) = scripted_app(vec![waiting], Some(SessionStatus::Idle)).await;
+    let mut context = ctx("ses_test", "跑一下 CI");
+    context.is_group = true;
+    context.requester_open_id = Some(TEST_HOST.to_string());
+    Turn::run(&app.turn_handles(), context).await.unwrap();
+    assert!(!noticed(&platform).await, "the waiting yield never notifies");
+
+    script_transcript(
+        &backend,
+        vec![woken_shell_transcript(
+            vec![assistant(3_100, "CI 通过了。")],
+            &[2_500, 4_000],
+        )],
+    )
+    .await;
+    spawn_sync(&app);
+    wait_for_card_update(
+        &platform,
+        "the resumed card's done state",
+        CardUpdates::Latest,
+        |card| card_header(card).contains("✅") && card_text(card).contains("CI 通过了。"),
+    )
+    .await;
+
+    // The notice trails the settle PATCH in the same pass: give it the moment.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let notices = platform.completion_notices().await;
+    assert_eq!(notices.len(), 1, "exactly one notice: {notices:?}");
+    assert_eq!(notices[0].0, "msg_1", "it replies to the request's message");
+    assert_eq!(notices[0].1, TEST_HOST, "it addresses the requester");
+    assert!(
+        notices[0].3.contains("已完成"),
+        "the card's ✅ is what it announces: {:?}",
+        notices[0].3
+    );
+}
+
+/// Not the true end (ADR-0066): a resumed run that ends with a Background Task
+/// still live yields the card back to 「⏳ 等待后台任务」 and sends NO notice —
+/// the notice belongs to the true end, and `send_completion_notice` itself
+/// declines a card that is not at an ending. The turn is a group with the
+/// opt-in on, so the silence is the state's, not the rules'. When the
+/// remaining task then retires, the quiet true end owns the one notice.
+#[tokio::test]
+async fn a_resume_that_yields_back_to_waiting_sends_no_notice() {
+    let _wd = test_work_dir();
+    let waiting = yielding_shell_transcript();
+    let (_dir, app, backend, platform) = scripted_app(vec![waiting], Some(SessionStatus::Idle)).await;
+    let mut context = ctx("ses_test", "跑一下 CI");
+    context.is_group = true;
+    context.requester_open_id = Some(TEST_HOST.to_string());
+    Turn::run(&app.turn_handles(), context).await.unwrap();
+
+    // The resume retires the first task and backgrounds a second one: the
+    // resumed run ends with that task live, so the card yields back to ⏳.
+    script_transcript(
+        &backend,
+        vec![
+            woken_shell_transcript(
+                vec![
+                    assistant(3_100, "CI 通过了。"),
+                    background_shell_launch(3_200, "call_bg2", "sh_bg2", "再次运行"),
+                ],
+                &[2_500, 4_000],
+            )
+            .with_background_tasks(vec![another_background_shell(3_200)]),
+        ],
+    )
+    .await;
+    spawn_sync(&app);
+    wait_for_card_update(
+        &platform,
+        "the card waiting on the second task",
+        CardUpdates::Latest,
+        |card| card_header(card).contains("等待后台任务") && card_text(card).contains("CI 通过了。"),
+    )
+    .await;
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Waiting),
+        "a live task yields the resumed card back to ⏳"
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        platform.completion_notices().await.is_empty(),
+        "a yield back to ⏳ is not the true end: {:?}",
+        platform.calls.lock().await
+    );
+
+    // The second task retires quietly (no Wake, no continuation owed): the
+    // same Waiting card's read settles the true end — and THAT read announces.
+    script_transcript(
+        &backend,
+        vec![woken_shell_transcript(
+            vec![
+                assistant(3_100, "CI 通过了。"),
+                background_shell_launch(3_200, "call_bg2", "sh_bg2", "再次运行"),
+            ],
+            &[2_500, 4_000],
+        )],
+    )
+    .await;
+    wait_for_card_update(
+        &platform,
+        "the card's quiet true end",
+        CardUpdates::Latest,
+        |card| card_header(card).contains("✅") && card_text(card).contains("CI 通过了。"),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let notices = platform.completion_notices().await;
+    assert_eq!(notices.len(), 1, "the true end owns the one notice: {notices:?}");
+    assert_eq!(notices[0].0, "msg_1", "it replies to the request's message");
+    assert!(
+        notices[0].3.contains("已完成"),
+        "the quiet true end's copy: {:?}",
+        notices[0].3
+    );
+}
+
+/// The restart Fresh card stays notice-free (ADR-0066): it was SENT, so its
+/// own send was the notification, and its ending — reached through the shared
+/// settle loop — must not announce a second one. The p2p long-task notice is
+/// ON here, the strictest ordinary setup: an ordinary request card's ending
+/// would fire, and the Fresh card still must not.
+#[tokio::test]
+async fn a_restart_fresh_cards_ending_sends_no_notice() {
+    let _wd = test_work_dir();
+    let resumed = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+        assistant(3_100, "CI 通过了。"),
+    ])
+    .with_executions(vec![execution(2_500), execution(4_000)])
+    .with_wakes(vec![shell_wake(2_900)]);
+    let (_dir, app, _backend, platform) =
+        scripted_app_with(vec![resumed], Some(SessionStatus::Idle), |cfg| {
+            cfg.bridge.long_task_notice = true;
+        })
+        .await;
+    app.long_task_notice_ms.store(1, Ordering::Relaxed);
+    assert!(
+        !Turn::has_card(&app.cards_handle(), "ses_test").await,
+        "the restart fixture has no card chain"
+    );
+
+    spawn_sync(&app);
+    wait_for_card_update(
+        &platform,
+        "the restart continuation's done card",
+        CardUpdates::Latest,
+        |card| card_header(card).contains("✅") && card_text(card).contains("CI 通过了。"),
+    )
+    .await;
+    // Give the settle loop's post-stamp announcement its moment …
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // … and assert there was none: the Fresh card's send was the notification.
+    assert!(
+        platform.completion_notices().await.is_empty(),
+        "a Fresh card's ending sends no notice: {:?}",
+        platform.calls.lock().await
     );
 }
 
@@ -949,15 +1142,18 @@ async fn a_wake_less_tail_on_a_waiting_card_still_splits() {
 }
 
 /// Acceptance 4a: `/stop` during a resumed run finalizes ⏹ 已停止 — never ✅ or
-/// ❌ — and sends no Completion Notice.
+/// ❌ — and its ending keeps the ordinary notice copy (ADR-0066): the in-place
+/// card is the request's own, so under the group opt-in the stop announces
+/// 「⏹ 已停止。」 exactly once.
 #[tokio::test]
 async fn a_stop_during_a_resumed_run_finalizes_stopped() {
     let _wd = test_work_dir();
     let waiting = yielding_shell_transcript();
     let (_dir, app, backend, platform) = scripted_app(vec![waiting], Some(SessionStatus::Idle)).await;
-    Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下 CI"))
-        .await
-        .unwrap();
+    let mut context = ctx("ses_test", "跑一下 CI");
+    context.is_group = true;
+    context.requester_open_id = Some(TEST_HOST.to_string());
+    Turn::run(&app.turn_handles(), context).await.unwrap();
 
     // The Wake's Execution has no boundary yet: the resumed run is still going,
     // so the continuation keeps observing.
@@ -985,9 +1181,15 @@ async fn a_stop_during_a_resumed_run_finalizes_stopped() {
         !card_header(&last).contains("✅") && !card_header(&last).contains("出错"),
         "a deliberate stop is its own terminal: {last}"
     );
+    // The notice trails the stop's PATCH in the same pass: give it the moment.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let notices = platform.completion_notices().await;
+    assert_eq!(notices.len(), 1, "exactly one notice: {notices:?}");
+    assert_eq!(notices[0].0, "msg_1", "it replies to the request's message");
     assert!(
-        platform.completion_notices().await.is_empty(),
-        "the continuation card is the notification; no notice is sent"
+        notices[0].3.contains("已停止"),
+        "a deliberate stop keeps its ordinary copy: {:?}",
+        notices[0].3
     );
 }
 
