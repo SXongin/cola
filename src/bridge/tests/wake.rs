@@ -325,6 +325,18 @@ async fn posted_cards(platform: &RecordingPlatform) -> usize {
         .count()
 }
 
+/// The one Completion Notice a scenario sent: exactly one, replying to the
+/// request's message (`msg_1`) — the shape every notice assertion shares. The
+/// COPY stays with the scenario (已完成, 已停止, the ❌ retry line), so the
+/// helper dedupes the shape without hiding what each test pins.
+async fn one_notice(platform: &RecordingPlatform) -> (String, String, Option<String>, String) {
+    let mut notices = platform.completion_notices().await;
+    assert_eq!(notices.len(), 1, "exactly one notice: {notices:?}");
+    let notice = notices.pop().expect("asserted one notice");
+    assert_eq!(notice.0, "msg_1", "it replies to the request's message");
+    notice
+}
+
 /// The one-card-per-request contract (ADR-0066, #485): a Turn idles with a
 /// live Background Task and yields 「⏳ 等待后台任务」; the task's completing
 /// shell Wake resumes THAT card in place — **no card is posted and nothing is
@@ -834,13 +846,11 @@ async fn an_in_place_resumes_true_end_notifies_once() {
 
     // The notice trails the settle PATCH in the same pass: give it the moment.
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let notices = platform.completion_notices().await;
-    assert_eq!(notices.len(), 1, "exactly one notice: {notices:?}");
-    assert_eq!(notices[0].0, "msg_1", "it replies to the request's message");
+    let notice = one_notice(&platform).await;
     assert!(
-        notices[0].3.contains("已完成"),
+        notice.3.contains("已完成"),
         "the card's ✅ is what it announces: {:?}",
-        notices[0].3
+        notice.3
     );
 
     // Later Session Sync passes over the same finished read stay silent: the
@@ -853,6 +863,51 @@ async fn an_in_place_resumes_true_end_notifies_once() {
         platform.completion_notices().await.len(),
         1,
         "a later pass must not announce the true end twice"
+    );
+}
+
+/// The other half of the long-task rule (ADR-0043, ADR-0066): with
+/// `long_task_notice` ON but the request's original Turn start still well
+/// inside the threshold, the in-place resume's ✅ stays silent — the notice is
+/// for LONG tasks, not every resumed ending. A resume-time clock could not
+/// make it fire either; the threshold is what refuses.
+#[tokio::test]
+async fn a_short_p2p_resume_true_end_stays_silent() {
+    let _wd = test_work_dir();
+    let waiting = yielding_shell_transcript();
+    let (_dir, app, backend, platform) = scripted_app_with(vec![waiting], Some(SessionStatus::Idle), |cfg| {
+        cfg.bridge.long_task_notice = true;
+    })
+    .await;
+    // Far beyond any elapsed test time: the run is short by the clock.
+    app.long_task_notice_ms.store(60_000, Ordering::Relaxed);
+    let mut context = ctx("ses_test", "跑一下 CI");
+    context.requester_open_id = Some(TEST_HOST.to_string());
+    Turn::run(&app.turn_handles(), context).await.unwrap();
+
+    script_transcript(
+        &backend,
+        vec![woken_shell_transcript(
+            vec![assistant(3_100, "CI 通过了。")],
+            &[2_500, 4_000],
+        )],
+    )
+    .await;
+    spawn_sync(&app);
+    wait_for_card_update(
+        &platform,
+        "the resumed card's done state",
+        CardUpdates::Latest,
+        |card| card_header(card).contains("✅") && card_text(card).contains("CI 通过了。"),
+    )
+    .await;
+
+    // The ending has landed; give a (wrong) announcement its moment to appear.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        platform.completion_notices().await.is_empty(),
+        "a short p2p run stays silent even with the rule on: {:?}",
+        platform.calls.lock().await
     );
 }
 
@@ -890,14 +945,12 @@ async fn a_group_resume_true_end_notifies_once() {
 
     // The notice trails the settle PATCH in the same pass: give it the moment.
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let notices = platform.completion_notices().await;
-    assert_eq!(notices.len(), 1, "exactly one notice: {notices:?}");
-    assert_eq!(notices[0].0, "msg_1", "it replies to the request's message");
-    assert_eq!(notices[0].1, TEST_HOST, "it addresses the requester");
+    let notice = one_notice(&platform).await;
+    assert_eq!(notice.1, TEST_HOST, "it addresses the requester");
     assert!(
-        notices[0].3.contains("已完成"),
+        notice.3.contains("已完成"),
         "the card's ✅ is what it announces: {:?}",
-        notices[0].3
+        notice.3
     );
 }
 
@@ -974,13 +1027,11 @@ async fn a_resume_that_yields_back_to_waiting_sends_no_notice() {
     )
     .await;
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let notices = platform.completion_notices().await;
-    assert_eq!(notices.len(), 1, "the true end owns the one notice: {notices:?}");
-    assert_eq!(notices[0].0, "msg_1", "it replies to the request's message");
+    let notice = one_notice(&platform).await;
     assert!(
-        notices[0].3.contains("已完成"),
+        notice.3.contains("已完成"),
         "the quiet true end's copy: {:?}",
-        notices[0].3
+        notice.3
     );
 }
 
@@ -1183,13 +1234,10 @@ async fn a_stop_during_a_resumed_run_finalizes_stopped() {
     );
     // The notice trails the stop's PATCH in the same pass: give it the moment.
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let notices = platform.completion_notices().await;
-    assert_eq!(notices.len(), 1, "exactly one notice: {notices:?}");
-    assert_eq!(notices[0].0, "msg_1", "it replies to the request's message");
-    assert!(
-        notices[0].3.contains("已停止"),
-        "a deliberate stop keeps its ordinary copy: {:?}",
-        notices[0].3
+    let notice = one_notice(&platform).await;
+    assert_eq!(
+        notice.3, "⏹ 已停止。",
+        "a deliberate stop keeps its ordinary copy"
     );
 }
 
@@ -1247,13 +1295,10 @@ async fn a_failed_in_place_resume_keeps_retry() {
         "the failed resume posted no card: {:?}",
         platform.calls.lock().await
     );
-    let notices = platform.completion_notices().await;
-    assert_eq!(notices.len(), 1, "exactly one notice: {notices:?}");
-    assert_eq!(notices[0].0, "msg_1", "it replies to the request's message");
-    assert!(
-        notices[0].3.contains("出错") && notices[0].3.contains("重试"),
-        "the notice follows the card's terminal and names its Retry: {:?}",
-        notices[0].3
+    let notice = one_notice(&platform).await;
+    assert_eq!(
+        notice.3, "❌ 上一条请求处理出错了，可点击卡片上的「重试」。",
+        "the notice follows the card's terminal and keeps the actionable 可点击重试 line"
     );
 }
 
