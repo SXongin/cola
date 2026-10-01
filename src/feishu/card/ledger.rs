@@ -20,8 +20,8 @@
 //! did before, and V1 (which carries no Background Task facts) never shows
 //! one.
 
-use super::sanitize::{AMPERSAND_ESCAPE, ASTERISK_ESCAPE, UNDERSCORE_ESCAPE};
-use super::tool_render::{ChildActivity, TaskLiveness};
+use super::sanitize::escaped_entities;
+use super::tool_render::TaskLiveness;
 use super::{first_n_chars_bytes, fmt_local_time, truncate_md};
 
 /// Characters of a task label the ledger row shows before clipping — shared
@@ -117,6 +117,35 @@ pub struct TaskLedgerRow {
     /// establish one; the timestamps inside are never refreshed by a failed
     /// read, so the rendered age keeps growing truthfully (ADR-0054).
     pub activity: Option<TaskLiveness>,
+}
+
+impl TaskLedgerRow {
+    /// Whether this row RENDERS like `previous` (ADR-0060's flush rule, spec
+    /// #501): the visible facts — type, label, start clock, unconfirmed flag,
+    /// and the activity fragment's shape (its label and its wait) — and never
+    /// the gathered liveness's stored timestamps. The rendered numbers those
+    /// timestamps produce (the row's elapsed and the fragment's age) are the
+    /// render clock's business ([`task_ledger_clock`]), which is compared at
+    /// the path's own cadence: a child part landing inside the second the card
+    /// already shows must not owe a PATCH.
+    pub(crate) fn renders_like(&self, previous: &Self) -> bool {
+        self.kind == previous.kind
+            && self.label == previous.label
+            && self.started_at == previous.started_at
+            && self.unconfirmed == previous.unconfirmed
+            && match (&self.activity, &previous.activity) {
+                (None, None) => true,
+                (Some(mine), Some(theirs)) => {
+                    let (mine, theirs) = (mine.title_parts(), theirs.title_parts());
+                    // Whether a fragment shows an age is its shape too, but the
+                    // clock comparison already catches a `None`/`Some` age
+                    // crossing (its rendered seconds go from nothing to a
+                    // number and back), so the shape here is the words.
+                    mine.label == theirs.label && mine.wait == theirs.wait
+                }
+                _ => false,
+            }
+    }
 }
 
 /// One completed Background Task as its ledger entry renders it (ADR-0060):
@@ -326,19 +355,6 @@ fn bold_label(label: &str) -> String {
     format!("**{}**", escaped_entities(&folded_label(label)))
 }
 
-/// A transcript-authored string's own `&` / `*` / `_` swapped for the
-/// sanitizer's numeric entities, `&` first: a string carrying entity text of
-/// its own (`&#42;`, `&amp;`) renders that text literally instead of seeding a
-/// new construct, and Feishu decodes the entities back to the characters, so
-/// the text reads unchanged. Shared by a row's bolded label and its activity
-/// fragment's tool name, so neither can close a span or bleed formatting into
-/// the next row.
-fn escaped_entities(text: &str) -> String {
-    text.replace('&', AMPERSAND_ESCAPE)
-        .replace('*', ASTERISK_ESCAPE)
-        .replace('_', UNDERSCORE_ESCAPE)
-}
-
 /// Estimated serialized size (bytes) of the ledger section, for the card
 /// splitter's tail reserve: the folded panel's title and element overhead, plus
 /// one row per task — its ` · HH:MM` start clock, its ` · XmYYs` elapsed, its
@@ -363,24 +379,29 @@ pub(crate) fn task_ledger_estimate(rows: &[TaskLedgerRow]) -> usize {
     300 + labels + activities + rows.len() * 120 + 80
 }
 
-/// Estimated bytes of one row's activity fragment, mirroring
-/// [`TaskLiveness::title_fragment`]: the activity label (a tool's name or the
-/// phase word), its ` · <age>` segment when the fragment shows an age (the
-/// longest `fmt_elapsed` shape under a day is 6 chars), and its ` · <wait>`
-/// segment when a wait is stored.
+/// Estimated bytes of one row's activity fragment, measured from the same
+/// parts [`TaskLiveness::title_fragment`] renders (via
+/// [`TaskLiveness::title_parts`]) so the reserve cannot undercount what the
+/// row shows:
+///
+/// ```text
+/// <escaped label>[ <age>][ · <wait>]
+/// ```
+///
+/// The label's cost is [`escaped_entities`]'s exactly (the row escapes the
+/// fragment's tool name for the markdown body, and `*`/`_`/`&` expand three-
+/// to fivefold), the age reserves the widest `fmt_elapsed` shape under a day
+/// (`59m59s`), and the wait is its own words behind the same ` · ` separator
+/// the renderer joins with. The age's exact width varies with the clock; the
+/// reserve takes the widest, like the rest of the card's sizing.
 fn activity_estimate(activity: &TaskLiveness) -> usize {
-    let label = match &activity.activity {
-        ChildActivity::Tool { name, .. } => name.len(),
-        ChildActivity::Thinking | ChildActivity::Reasoning | ChildActivity::Replying => {
-            // `思考中` / `推理中` / `回复中`, all three CJK characters.
-            "思考中".len()
-        }
-    };
-    let age = activity.age_clock_ms().map_or(0, |_| 1 + 6);
-    let wait = activity
-        .wait
-        .and_then(|wait| wait.label())
-        .map_or(0, |wait| 3 + wait.len());
+    /// The widest second-granular age [`fmt_elapsed`](super::shell::fmt_elapsed)
+    /// renders below a day: `59m59s`.
+    const AGE_MAX_CHARS: usize = 6;
+    let parts = activity.title_parts();
+    let label = escaped_entities(parts.label).len();
+    let age = parts.age_clock_ms.map_or(0, |_| 1 + AGE_MAX_CHARS);
+    let wait = parts.wait.map_or(0, |wait| " · ".len() + wait.len());
     label + age + wait
 }
 
@@ -429,6 +450,7 @@ fn secs_since(at_ms: i64, now_ms: i64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::feishu::card::tool_render::ChildActivity;
 
     /// The pinned copy (ADR-0060, #412/#423): the title is the count, the body
     /// one row per task — type noun, bolded label, start clock and bare elapsed
@@ -1055,6 +1077,60 @@ mod tests {
             task_ledger_estimate(&[untimed]) > task_ledger_estimate(std::slice::from_ref(&plain)),
             "an untimed tool still reserves its name"
         );
+        // The fragment's reserve covers what the row renders: the label's
+        // entity escaping (`*`/`_`/`&` expand three- to fivefold) and the real
+        // ` · ` separators — measured through the renderer's own parts, so a
+        // long markdown-heavy tool name cannot outgrow the reserve.
+        let widest_age = TaskLiveness {
+            activity: ChildActivity::Tool {
+                name: "a*b_c&d".into(),
+                started_at: Some(0),
+            },
+            last_activity_ms: 0,
+            wait: Some(crate::feishu::card::AwaitingAction::Both),
+        };
+        let now = 3_599_000; // the age renders `59m59s`, the widest shape
+        assert_eq!(
+            activity_estimate(&widest_age),
+            escaped_entities(&widest_age.title_fragment(now)).len(),
+            "the reserve covers the rendered fragment's escaped bytes exactly"
+        );
+        // Every shape the row can render is covered at every age width: the
+        // estimate never undercounts the escaped fragment.
+        for activity in [
+            widest_age.clone(),
+            TaskLiveness {
+                activity: ChildActivity::Tool {
+                    name: "bash".into(),
+                    started_at: None,
+                },
+                last_activity_ms: 0,
+                wait: Some(crate::feishu::card::AwaitingAction::Permission),
+            },
+            TaskLiveness {
+                activity: ChildActivity::Thinking,
+                last_activity_ms: 0,
+                wait: None,
+            },
+            TaskLiveness {
+                activity: ChildActivity::Reasoning,
+                last_activity_ms: 0,
+                wait: Some(crate::feishu::card::AwaitingAction::Both),
+            },
+            TaskLiveness {
+                activity: ChildActivity::Replying,
+                last_activity_ms: 0,
+                wait: None,
+            },
+        ] {
+            for now in [0, 5_000, 90_000, 3_599_000] {
+                let rendered = escaped_entities(&activity.title_fragment(now)).len();
+                assert!(
+                    activity_estimate(&activity) >= rendered,
+                    "the reserve covers {rendered} rendered bytes for {activity:?} at {now}"
+                );
+            }
+        }
     }
 
     /// The pinned completion entry (ADR-0060, #412): the mechanical completion

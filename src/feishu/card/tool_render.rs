@@ -262,25 +262,44 @@ pub enum ChildActivity {
 }
 
 impl TaskLiveness {
+    /// The fragment's parts, spelled once (ADR-0054, spec #501): the
+    /// activity's display label (a tool's own name, or the word for a phase
+    /// with no live tool), the clock its age counts from (`None` when the
+    /// fragment renders no age), and the wait's words. [`Self::title_fragment`]
+    /// assembles these for the card; the ledger's size reserve measures these,
+    /// so the two cannot drift apart over how an activity is displayed.
+    pub(crate) fn title_parts(&self) -> TitleParts<'_> {
+        TitleParts {
+            label: match &self.activity {
+                ChildActivity::Tool { name, .. } => name,
+                ChildActivity::Thinking => "思考中",
+                ChildActivity::Reasoning => "推理中",
+                ChildActivity::Replying => "回复中",
+            },
+            age_clock_ms: match &self.activity {
+                ChildActivity::Tool { started_at, .. } => *started_at,
+                ChildActivity::Thinking | ChildActivity::Reasoning | ChildActivity::Replying => {
+                    Some(self.last_activity_ms)
+                }
+            },
+            wait: self.wait.and_then(|wait| wait.label()),
+        }
+    }
+
     /// The title fragment a live task panel appends, in the header's own
     /// shape — the activity first, then how long it has run: `bash 28s`,
     /// `推理中 12s`, `bash · 等待你的授权`. `now_ms` is passed in so the
     /// elapsed time is measured at card build time.
     pub fn title_fragment(&self, now_ms: i64) -> String {
-        let label = match &self.activity {
-            ChildActivity::Tool { name, .. } => name.clone(),
-            ChildActivity::Thinking => "思考中".to_string(),
-            ChildActivity::Reasoning => "推理中".to_string(),
-            ChildActivity::Replying => "回复中".to_string(),
+        let parts = self.title_parts();
+        let mut segments = match parts.age_clock_ms {
+            Some(at) => vec![format!("{} {}", parts.label, fmt_elapsed(secs_since(at, now_ms)))],
+            None => vec![parts.label.to_string()],
         };
-        let mut parts = match self.age_clock_ms() {
-            Some(at) => vec![format!("{label} {}", fmt_elapsed(secs_since(at, now_ms)))],
-            None => vec![label],
-        };
-        if let Some(wait) = self.wait.and_then(|wait| wait.label()) {
-            parts.push(wait.to_string());
+        if let Some(wait) = parts.wait {
+            segments.push(wait.to_string());
         }
-        parts.join(" · ")
+        segments.join(" · ")
     }
 
     /// The epoch-ms clock the fragment's rendered age counts from — the live
@@ -289,13 +308,22 @@ impl TaskLiveness {
     /// reader keyed on this fragment (the ledger's render clock, ADR-0060)
     /// knows there is no number to tick.
     pub fn age_clock_ms(&self) -> Option<i64> {
-        match &self.activity {
-            ChildActivity::Tool { started_at, .. } => *started_at,
-            ChildActivity::Thinking | ChildActivity::Reasoning | ChildActivity::Replying => {
-                Some(self.last_activity_ms)
-            }
-        }
+        self.title_parts().age_clock_ms
     }
+}
+
+/// A liveness fragment's own parts, the shape [`TaskLiveness::title_fragment`]
+/// renders and the ledger's `activity_estimate` reserves room for — one
+/// description, so the display and its cost cannot disagree.
+pub(crate) struct TitleParts<'a> {
+    /// The activity's display label: a tool's own name, or the phase word.
+    /// Raw here; the ledger escapes it where it reaches a markdown body.
+    pub(crate) label: &'a str,
+    /// The clock the rendered age counts from; `None` when the fragment shows
+    /// no age at all.
+    pub(crate) age_clock_ms: Option<i64>,
+    /// The wait's words without the header's icon, when one is pending.
+    pub(crate) wait: Option<&'a str>,
 }
 
 /// Seconds between two epoch-ms clocks, never negative.
