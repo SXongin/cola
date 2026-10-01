@@ -20,6 +20,15 @@ Keep steps 1–3 in one unbroken context window, so the grilling, spec, and tick
 
 All of it runs under the `CONTRIBUTING.md` branch loop: start on `main`, branch, work, rebase, PR (`AGENTS.md` holds the verification loop).
 
+## PR body
+
+`/pr` is model-invoked whenever a PR body is written. It layers on the repo's own template (`.github/pull_request_template.md`), never replaces it: keep `## What` / `## Why` / `## How tested` and the `CONTRIBUTING.md` rules (a Conventional Commits title, one `Closes #N` per issue, an ADR for a one-way door), and take the skill's rendering:
+
+- `## What` opens with the smallest visual — a diff sketch, tree, sequence diagram, or pseudocode — then the paragraph.
+- `## How tested` reads as **Before:** → **After:** — failing → passing test, old log → new log, card screenshots for visual changes — ahead of the verification-loop commands.
+- Add `## Merge Danger` only when the change is non-trivial: **Door** (two-way, or one-way naming what reversal would cost) and **Blast Radius**. A one-way door is where an ADR is due.
+- The skill's `GLOSSARY.md` maps to this repo's `CONTEXT.md`.
+
 ## On-ramps
 
 A starting situation that generates work, then merges onto the main flow.
