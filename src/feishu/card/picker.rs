@@ -122,13 +122,23 @@ fn picker_card(
 /// override (`override_agent`) when set, else the server's default agent name
 /// (`default_agent`, annotated 默认). Falls back to an empty intro when no
 /// agents are listed (the backend is unreachable).
+///
+/// The options are the official picker's set — visible, non-`subagent` mode
+/// agents (`packages/tui/src/context/local.tsx` filters `mode !== "subagent"`
+/// and `hidden`): a subagent-mode agent is a delegated worker, not something a
+/// session should run as.
 pub fn build_agent_card(
     thread_key: &crate::config::ThreadKey,
     agents: &[crate::opencode::types::AgentInfo],
     override_agent: Option<&str>,
     default_agent: Option<&str>,
 ) -> serde_json::Value {
-    let intro = if agents.is_empty() {
+    let options: Vec<(String, String)> = agents
+        .iter()
+        .filter(|a| a.hidden != Some(true) && a.mode.as_deref() != Some("subagent"))
+        .map(|a| (a.name.clone(), a.name.clone()))
+        .collect();
+    let intro = if options.is_empty() {
         "_(没有可用 agent)_".to_string()
     } else {
         let current = match (override_agent, default_agent) {
@@ -138,12 +148,7 @@ pub fn build_agent_card(
         };
         format!("{current}**选择 agent**（下一条消息开始生效）：")
     };
-    let options: Vec<(String, String)> = agents
-        .iter()
-        .filter(|a| a.hidden != Some(true))
-        .map(|a| (a.name.clone(), a.name.clone()))
-        .collect();
-    let empty = agents.is_empty();
+    let empty = options.is_empty();
     picker_card(
         "🤖 选择 Agent",
         &intro,
@@ -523,6 +528,12 @@ mod tests {
                 mode: Some("primary".into()),
                 hidden: Some(true),
             },
+            crate::opencode::types::AgentInfo {
+                name: "explore".into(),
+                description: None,
+                mode: Some("subagent".into()),
+                hidden: Some(false),
+            },
         ];
         // No override → the server default `default` is the current agent.
         let card = build_agent_card(&key, &agents, None, Some("default"));
@@ -540,6 +551,10 @@ mod tests {
         assert!(
             !text.contains("\"value\":\"build\""),
             "hidden agent must not be listed: {text}"
+        );
+        assert!(
+            !text.contains("\"value\":\"explore\""),
+            "subagent-mode agent must not be listed: {text}"
         );
         assert!(text.contains("\"action\":\"agent\""), "agent action tag: {text}");
 
@@ -559,6 +574,35 @@ mod tests {
         assert!(
             !text.contains("agent_clear"),
             "no clear button when empty: {text}"
+        );
+    }
+
+    /// A list whose every entry is hidden or subagent-mode degrades exactly
+    /// like an empty one: no options, the empty intro, and no clear button.
+    #[test]
+    fn agent_card_degrades_when_every_agent_is_filtered() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let agents = vec![
+            crate::opencode::types::AgentInfo {
+                name: "explore".into(),
+                description: None,
+                mode: Some("subagent".into()),
+                hidden: Some(false),
+            },
+            crate::opencode::types::AgentInfo {
+                name: "hidden-primary".into(),
+                description: None,
+                mode: Some("primary".into()),
+                hidden: Some(true),
+            },
+        ];
+        let card = build_agent_card(&key, &agents, None, Some("explore"));
+        let text = card.to_string();
+        assert!(text.contains("没有可用 agent"), "degrade intro: {text}");
+        assert!(!text.contains("agent_clear"), "no clear button: {text}");
+        assert!(
+            !text.contains("\"value\":\"explore\""),
+            "no filtered agent leaks into options: {text}"
         );
     }
 }
