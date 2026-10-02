@@ -217,6 +217,11 @@ impl SharedCore {
         opencode: Arc<dyn crate::backend::Backend>,
         feishu: Arc<dyn feishu::Platform>,
     ) -> anyhow::Result<Self> {
+        // ADR-0067: every card write goes through the delivery decorator, so a
+        // failed one is remembered as a Pending Card Update and retried until
+        // it lands. The raw platform stays the single Feishu transport; the
+        // decorator is what the bridge (and the WS loop) holds.
+        let feishu: Arc<dyn feishu::Platform> = Arc::new(crate::feishu::delivery::CardDelivery::new(feishu));
         let session_store = SessionStore::new(cfg.bridge.session_file.clone())?;
         // The interactive surfaces a previous process persisted (ADR-0038
         // restart re-adoption), beside the session mapping like the reminder's

@@ -207,6 +207,10 @@ async fn connect_and_listen(
         .await
         .map_err(|e| crate::error::BridgeError::Feishu(format!("WS connect failed: {}", e)))?;
     tracing::info!("Connected to Feishu WebSocket");
+    // A reconnect may mean the REST path is back too: attempt the Pending Card
+    // Updates at once (ADR-0067), ignoring their backoff. REST and WS
+    // reachability are independent, so neither trigger alone suffices.
+    feishu.drain_pending_card_updates(true).await;
     handle_connection(ws_stream, sink, feishu, state).await
 }
 
@@ -1978,5 +1982,75 @@ mod transport_tests {
         assert_eq!(recorder.texts.lock().await[0], "hi");
 
         reconnect.abort();
+    }
+
+    /// ADR-0067: a successful (re)connect attempts the Pending Card Updates at
+    /// once — the REST half of Feishu reachability is independent of the WS
+    /// half, so the reconnect is the earliest moment a restored REST path can
+    /// be used. The first PATCH is transiently refused; the connect's drain
+    /// retries and delivers it.
+    #[tokio::test]
+    async fn a_ws_connect_drains_pending_card_updates() {
+        let rig = rig().await;
+        // The drain's retry needs a working token fetch: the rig's HTTP server
+        // only answers the WS-endpoint route by default.
+        rig._http.route(
+            "POST",
+            "/open-apis/auth/v3/tenant_access_token/internal",
+            200,
+            r#"{"code":0,"msg":"ok","tenant_access_token":"t-abc","expire":7200}"#,
+        );
+        let patch_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&patch_calls);
+        rig._http
+            .route_dynamic("PATCH", "/open-apis/im/v1/messages/om_pending", move |_| {
+                if counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    crate::test_http::DynamicResponse::new(
+                        503,
+                        "application/json",
+                        r#"{"code":99999,"msg":"service unavailable"}"#,
+                    )
+                } else {
+                    crate::test_http::DynamicResponse::new(
+                        200,
+                        "application/json",
+                        r#"{"code":0,"msg":"ok"}"#,
+                    )
+                }
+            });
+
+        let delivery = Arc::new(crate::feishu::delivery::CardDelivery::new(rig.feishu.clone()));
+        let card = serde_json::json!({ "elements": [] });
+        let _ = delivery.update_message("om_pending", &card).await;
+        assert!(delivery.pending("om_pending"), "the 503 is remembered");
+
+        let sink: Arc<dyn EventSink> = Arc::new(RecordingSink::default());
+        let listener = tokio::spawn({
+            let feishu: Arc<dyn Platform> = delivery.clone();
+            let state = Arc::clone(&rig.state);
+            async move { connect_and_listen(&sink, &feishu, &state).await }
+        });
+        let mut socket = rig.ws.accept().await;
+
+        // The connect's drain delivered the pending update.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while delivery.pending("om_pending") {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the connect drain must deliver the pending update");
+        assert_eq!(
+            patch_calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the PATCH was retried exactly once"
+        );
+
+        socket.close().await;
+        let result = tokio::time::timeout(Duration::from_secs(5), listener)
+            .await
+            .expect("listener task did not finish after close")
+            .expect("listener task panicked");
+        assert!(result.is_ok(), "a clean close should end the loop with Ok");
     }
 }

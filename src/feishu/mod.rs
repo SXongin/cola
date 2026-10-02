@@ -1,5 +1,6 @@
 pub mod card;
 pub mod client;
+pub(crate) mod delivery;
 pub mod event;
 pub(crate) mod message;
 pub(crate) mod pbbp2;
@@ -113,6 +114,20 @@ pub trait Platform: Send + Sync {
     /// reports success for a message that was not pinned (e.g. the user
     /// unpinned it by hand), so this is safe to call unconditionally.
     async fn unpin_message(&self, message_id: &str) -> Result<()>;
+
+    /// Retry the Pending Card Updates that are due now (ADR-0067). A no-op
+    /// default — only the delivery decorator owns such a set; the Session Sync
+    /// pass calls this every tick, and the WS loop calls it with `force` after
+    /// a reconnect so a restored REST path converges immediately.
+    async fn drain_pending_card_updates(&self, _force: bool) {}
+
+    /// Whether `message_id`'s newest card write is still undelivered. The
+    /// Live Card record's removal consults this (ADR-0063 amendment): a
+    /// terminal card's record stays until its ending write is confirmed.
+    /// Default `false` — a platform with no delivery decorator owes nothing.
+    fn has_pending_card_update(&self, _message_id: &str) -> bool {
+        false
+    }
 }
 
 #[async_trait]

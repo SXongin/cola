@@ -115,11 +115,11 @@ pub(crate) async fn reconcile(
     if let Some(current_id) = current_id {
         if current_id == record.card_message_id {
             // The recorded card IS this process's card: its own lifecycle owns
-            // it. A terminal card's record is spent (a write that raced the
-            // terminal, or an ending stamped without the removal hook); a live
-            // or yielded card keeps it.
+            // it. A terminal card's record is spent once its ending write is
+            // confirmed (ADR-0063 amendment — a write still pending in the
+            // outbox keeps the record); a live or yielded card keeps it.
             if !current_running {
-                handles.cards.live_cards.remove(session_id);
+                Turn::discard_spent_record(&handles.cards, session_id).await;
             }
             return;
         }

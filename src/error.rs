@@ -9,6 +9,14 @@ pub enum BridgeError {
     #[error("feishu error: {0}")]
     Feishu(String),
 
+    /// A Feishu REST call refused with a non-success HTTP status, the status
+    /// typed so a failed card write can tell a recoverable 5xx/429/408 from a
+    /// permanent 4xx (ADR-0067's Pending Card Update classification). The
+    /// display text matches the `Feishu` variant's, so log lines and messages
+    /// do not change shape.
+    #[error("feishu error: {detail}")]
+    FeishuHttp { status: u16, detail: String },
+
     /// Feishu rejected the CARD CONTENT itself (HTTP 400 `code: 230099`,
     /// "Failed to create card content"): the platform's parser or a card limit
     /// refused the JSON, so re-sending the same content never succeeds. The
@@ -65,5 +73,61 @@ impl BridgeError {
             BridgeError::Http(e) => e.status() == Some(reqwest::StatusCode::NOT_FOUND),
             _ => false,
         }
+    }
+
+    /// Whether a failed card write may succeed on a retry (ADR-0067): transport
+    /// errors, timeouts, 5xx, 429 and 408 are recoverable; a content rejection
+    /// or any other refusal is permanent. `Feishu(String)` covers API-level
+    /// errors reported inside a 2xx body — a semantic refusal, never retried.
+    pub(crate) fn is_recoverable_card_write(&self) -> bool {
+        match self {
+            BridgeError::Http(_) | BridgeError::Io(_) => true,
+            BridgeError::FeishuHttp { status, .. } => *status >= 500 || *status == 429 || *status == 408,
+            _ => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ADR-0067's retry rule: transport, timeouts, 5xx and rate limits recover;
+    /// a refused content or any other refusal is permanent.
+    #[test]
+    fn card_write_recoverability_follows_the_retry_rule() {
+        assert!(BridgeError::Io(std::io::Error::other("connection reset")).is_recoverable_card_write());
+
+        for status in [500u16, 502, 503, 429, 408] {
+            assert!(
+                BridgeError::FeishuHttp {
+                    status,
+                    detail: String::new()
+                }
+                .is_recoverable_card_write(),
+                "{status} must be retryable"
+            );
+        }
+        for status in [400u16, 401, 403, 404, 422] {
+            assert!(
+                !BridgeError::FeishuHttp {
+                    status,
+                    detail: String::new()
+                }
+                .is_recoverable_card_write(),
+                "{status} must be permanent"
+            );
+        }
+
+        assert!(
+            !BridgeError::CardContentRejected {
+                code: 230099,
+                detail: String::new()
+            }
+            .is_recoverable_card_write()
+        );
+        assert!(
+            !BridgeError::Feishu("update error 230002: message not found".into()).is_recoverable_card_write()
+        );
     }
 }
