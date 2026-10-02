@@ -209,8 +209,12 @@ async fn connect_and_listen(
     tracing::info!("Connected to Feishu WebSocket");
     // A reconnect may mean the REST path is back too: attempt the Pending Card
     // Updates at once (ADR-0067), ignoring their backoff. REST and WS
-    // reachability are independent, so neither trigger alone suffices.
-    feishu.drain_pending_card_updates(true).await;
+    // reachability are independent, so neither trigger alone suffices. Spawned,
+    // not awaited: a slow or hung retry must not delay event processing.
+    let drain_feishu = Arc::clone(feishu);
+    tokio::spawn(async move {
+        drain_feishu.drain_pending_card_updates(true).await;
+    });
     handle_connection(ws_stream, sink, feishu, state).await
 }
 
