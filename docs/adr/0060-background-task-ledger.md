@@ -48,8 +48,10 @@ live Tool Panels (ADR-0045): a folded-by-default collapsible panel titled
 how many tasks are running, and a stable `element_id` keeps the reader's fold
 state across re-renders — whose body is one row per task, the pinned copy
 `· shell：**npm run build** · 14:02 · 3m12s` / `· 子代理：**review the diff** ·
-14:04 · 1m05s`: the type word plain, the label bolded and clipped, then the
-task's server `started_at` as local `HH:MM` and the bare elapsed. The label is
+14:04 · 1m05s` *(the subagent type word and its total elapsed were later
+superseded — see the 2026-10-02 amendments below)*: the type word plain, the label
+bolded and clipped, then the task's server `started_at` as local `HH:MM` and
+the bare elapsed. The label is
 joined from the tool part's input by `call_id` (shell: `command`/`description`;
 `subagent` needs its own rendering arm), clipped like the receipt; elapsed is
 rendered second-granular and driven by the existing reads (the 8 s Session Sync
@@ -64,7 +66,9 @@ the one the card last rendered — membership, or any row's rendered elapsed at
 **second** granularity (≈0.125 QPS per waiting card at the 8 s cadence, far
 below Feishu's per-message cap). Repeated reads inside one rendered second owe
 nothing. The live render keeps whole-minute gating: its flushes are
-content-driven, and a per-render second clock would be clock churn.
+content-driven, and a per-render second clock would be clock churn. *(A
+subagent row renders no elapsed since the 2026-10-02 amendment below; its
+fragment's age is the rendered number there.)*
 
 **A completion leaves a fixed entry where the task lived.** The task leaves the
 live list and becomes a collapsible entry on the card that hosted it — the
