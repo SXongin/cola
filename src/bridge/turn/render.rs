@@ -927,13 +927,13 @@ impl RenderPoll {
 mod tests {
     use super::*;
     use crate::backend::{
-        MessageId, MessageRole, MessageTime, ReasoningPart, StepFinish, StepStart, ToolCall, ToolIdentity,
-        ToolOutput, TranscriptMessage, TurnAnchor,
+        BackgroundTask, MessageId, MessageRole, MessageTime, ReasoningPart, StepFinish, StepStart, ToolCall,
+        ToolIdentity, ToolOutput, TranscriptMessage, TurnAnchor,
     };
     use crate::bridge::App;
     use crate::bridge::test_support::{
-        MockBackend, PlatformCall, RecordingPlatform, build_app, realistic_parts, seed_cover_title,
-        seed_entry, test_config, test_work_dir, text_part, turn_anchor, typed_message,
+        MockBackend, PlatformCall, RecordingPlatform, build_app, card_text, realistic_parts,
+        seed_cover_title, seed_entry, test_config, test_work_dir, text_part, turn_anchor, typed_message,
     };
     use crate::bridge::turn::state::StreamAccumulator;
     use crate::feishu::card::CardState;
@@ -2267,6 +2267,112 @@ Index: /x/src/main.rs
             "the flushed card carries the new text: {}",
             updates.last().unwrap()
         );
+    }
+
+    /// Criterion 3 (spec #501, ticket #504): on the LIVE render path one typed
+    /// liveness change owes exactly one card PATCH — the seeded card's header
+    /// is frozen, so the count is the ledger's own — while the activity age's
+    /// seconds inside a rendered minute owe none. The fragment's clock sits
+    /// half a minute back, far from a minute boundary, so the window cannot
+    /// cross one.
+    #[tokio::test]
+    async fn render_and_flush_flushes_once_on_a_typed_liveness_change_and_never_on_age_seconds() {
+        let _wd = test_work_dir();
+        let now = chrono::Utc::now().timestamp_millis();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let backend = Arc::new(MockBackend::new(realistic_parts()));
+        backend
+            .given_transcript_after_build("ses_call_sub", vec![child_running_tool(now - 30_000, "bash")])
+            .await;
+        let platform = Arc::new(RecordingPlatform::new());
+        let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+        let sid = "ses_ledger_flush";
+        let cards = app.core.cards_handle();
+        Turn::seed_card(&cards, sid, Some("om_ledger_flush")).await;
+        Turn::set_turn_anchor(&cards, sid, &turn_anchor(0)).await;
+        // The phase timer is a live card's per-second header tick; freezing it
+        // keeps every PATCH counted below the ledger's own.
+        Turn::clear_phase(&cards, sid).await;
+
+        let transcript = SessionTranscript::default().with_background_tasks(vec![BackgroundTask {
+            tool: ToolIdentity {
+                name: "subagent".into(),
+                call_id: "call_sub".into(),
+            },
+            shell_id: None,
+            child_id: Some("ses_call_sub".into()),
+            started_at: Some(now - 30_000),
+        }]);
+        let render = async || {
+            let _ = render_and_flush(
+                &cards,
+                &app.sessions_handle(),
+                &app.opencode,
+                &app.requests_handle(),
+                sid,
+                &transcript,
+            )
+            .await;
+        };
+
+        // The row arrives with its child's fragment: one PATCH.
+        render().await;
+        assert_eq!(
+            platform.updated_cards().await.len(),
+            1,
+            "the row's arrival flushes once"
+        );
+        // The same read again: the fragment's age ticked a second inside its
+        // rendered minute — the ledger owes nothing, and nothing else moved.
+        render().await;
+        assert_eq!(
+            platform.updated_cards().await.len(),
+            1,
+            "same-minute age seconds owe no PATCH"
+        );
+
+        // The child switches tools: one typed change, exactly one PATCH.
+        backend
+            .given_transcript_after_build("ses_call_sub", vec![child_running_tool(now - 30_000, "edit")])
+            .await;
+        render().await;
+        let updates = platform.updated_cards().await;
+        assert_eq!(
+            updates.len(),
+            2,
+            "one typed liveness change owes exactly one PATCH: {updates:?}"
+        );
+        assert!(
+            card_text(updates.last().unwrap()).contains("· edit "),
+            "the PATCH carries the new fragment: {}",
+            updates.last().unwrap()
+        );
+
+        // The new fragment's seconds tick on inside its minute: no PATCH.
+        render().await;
+        assert_eq!(
+            platform.updated_cards().await.len(),
+            2,
+            "the typed change's own age seconds owe none"
+        );
+    }
+
+    /// A child-session transcript whose newest part is a running tool — the
+    /// activity a ledger row renders as `<name> <age>`.
+    fn child_running_tool(started_at: i64, name: &str) -> SessionTranscript {
+        SessionTranscript::new(vec![message(
+            "a_child",
+            started_at,
+            vec![tool(
+                name,
+                "call_child",
+                ToolStatus::Running,
+                Some(started_at),
+                None,
+                None,
+            )],
+        )])
     }
 
     /// ADR-0054: the child session's liveness is the age of its newest activity
