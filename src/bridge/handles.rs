@@ -65,6 +65,10 @@ pub(crate) struct SessionsHandle {
     /// the write paths below. Private: [`Self::cached_session_list`] and
     /// [`Self::invalidate_cache`] are the accessors.
     cache: Arc<Mutex<Option<SessionListCache>>>,
+    /// `[bridge] default_auto_accept` (#513): the Auto-Accept flag every
+    /// session cola CREATES starts with. Adoption paths never read it — an
+    /// existing session keeps its own state.
+    default_auto_accept: bool,
 }
 
 /// The result of applying a settings pick (`/model`, `/think`, `/agent`): one
@@ -121,8 +125,22 @@ pub(crate) fn classify_pick(
 }
 
 impl SessionsHandle {
-    pub(crate) fn new(store: Arc<Mutex<SessionStore>>, cache: Arc<Mutex<Option<SessionListCache>>>) -> Self {
-        Self { store, cache }
+    pub(crate) fn new(
+        store: Arc<Mutex<SessionStore>>,
+        cache: Arc<Mutex<Option<SessionListCache>>>,
+        default_auto_accept: bool,
+    ) -> Self {
+        Self {
+            store,
+            cache,
+            default_auto_accept,
+        }
+    }
+
+    /// The configured create-time Auto-Accept default (#513), for the paths
+    /// that build a session directly instead of through a Pending Session.
+    pub(crate) fn default_auto_accept(&self) -> bool {
+        self.default_auto_accept
     }
 
     /// The mapped entry for `session_id`, cloned out of the store.
@@ -249,8 +267,7 @@ impl SessionsHandle {
         directory: impl Into<String>,
         title: Option<String>,
     ) -> crate::error::Result<PendingEntry> {
-        let mut pending = PendingEntry::new(thread_key.clone(), directory);
-        pending.title = title;
+        let mut pending = self.new_pending(thread_key, directory, title);
         {
             let store = self.store.lock().await;
             if let Some(replaced) = store.pending_for(thread_key) {
@@ -260,6 +277,23 @@ impl SessionsHandle {
         }
         self.set_pending(pending.clone()).await?;
         Ok(pending)
+    }
+
+    /// The Pending Session a conversation's next prompt will materialise,
+    /// carrying the configured `default_auto_accept` (#513). Every production
+    /// declaration path (`/new`, `/dir`, `/topic`, the switch card's 新建)
+    /// builds through here, so a create path cannot forget the default; an
+    /// adoption builds its [`SessionEntry`] directly and stays exempt.
+    pub(crate) fn new_pending(
+        &self,
+        thread_key: &ThreadKey,
+        directory: impl Into<String>,
+        title: Option<String>,
+    ) -> PendingEntry {
+        let mut pending = PendingEntry::new(thread_key.clone(), directory);
+        pending.title = title;
+        pending.auto_accept = self.default_auto_accept;
+        pending
     }
 
     /// The conversation's current directory: the Pending Session's when one is
@@ -1250,6 +1284,9 @@ impl FlowHandles {
             .create_session(&self.backend.new_session_input(Some(&directory)))
             .await?;
         let mut entry = SessionEntry::new(thread_key.clone(), session.id.clone(), directory);
+        // A session cola creates gets the configured Auto-Accept default
+        // (#513): this path has no Pending Session to carry it.
+        entry.auto_accept = self.sessions.default_auto_accept();
         entry.topic_anchor = topic_anchor;
         entry.topic_root = topic_root;
         self.activate(entry).await?;

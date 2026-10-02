@@ -165,6 +165,10 @@ pub struct SharedCore {
     pub cover_titles: Arc<Mutex<HashMap<String, CoverTitle>>>,
     /// Default directory for new sessions (from `[bridge] work_dir`).
     pub work_dir: Option<String>,
+    /// New sessions cola creates start with Auto-Accept on (from
+    /// `[bridge] default_auto_accept`, #513). Adoptions ignore it and keep
+    /// the session's own state.
+    pub default_auto_accept: bool,
     /// Whether to send the group completion notice (from `[bridge] group_completion_notice`).
     pub group_completion_notice: bool,
     /// Whether to send the long-task completion notice in p2p (from `[bridge] long_task_notice`).
@@ -283,6 +287,7 @@ impl SharedCore {
                 .work_dir
                 .clone()
                 .map(|p| p.to_string_lossy().to_string()),
+            default_auto_accept: cfg.bridge.default_auto_accept,
             group_completion_notice: cfg.bridge.group_completion_notice,
             long_task_notice: cfg.bridge.long_task_notice,
             long_task_notice_ms,
@@ -376,6 +381,7 @@ impl SharedCore {
         crate::bridge::handles::SessionsHandle::new(
             Arc::clone(&self.sessions),
             Arc::clone(&self.session_list_cache),
+            self.default_auto_accept,
         )
     }
 

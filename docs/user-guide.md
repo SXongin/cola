@@ -212,6 +212,7 @@ start_server = "auto"            # auto (default) | never | eager
 # session_file = "~/.cola/sessions.json"
 # access_file = "~/.cola/access.json"
 # work_dir = "/path/to/a/project"
+# default_auto_accept = true
 # group_completion_notice = true
 # long_task_notice = true
 # instant_reminder = true
@@ -227,6 +228,12 @@ start_server = "auto"            # auto (default) | never | eager
   cwd. `/new` inherits the active session's directory (or the pending's);
   `/dir` names an explicit one. Both only declare the session: it is created by
   the conversation's next message.
+- **`default_auto_accept`** — **off by default**: sessions cola creates (a fresh
+  chat's first message, `/new`, `/dir`, `/topic`, and a 404 recreate) start with
+  Auto-Accept on, so their tool-permission requests are answered automatically
+  instead of surfacing a card. Adopting an existing session never enables it —
+  the session keeps its own state — and `/autoaccept off` still turns it off per
+  session.
 - **`group_completion_notice`** — in group chats, reply to the requester with a
   short completion notice (the streaming card is patched in place, so it does not
   push a new notification). `false` disables it. p2p chats don't need it.

@@ -152,6 +152,7 @@ start_server = "auto"            # auto (default) | never | eager
 # session_file = "~/.cola/sessions.json"
 # access_file = "~/.cola/access.json"
 # work_dir = "/path/to/a/project"
+# default_auto_accept = true
 # group_completion_notice = true
 # long_task_notice = true
 # instant_reminder = true
@@ -165,6 +166,10 @@ start_server = "auto"            # auto (default) | never | eager
   新会话的默认目录。默认取进程的当前工作目录。`/new` 继承活动会话的目录
   （或待建状态的目录）；`/dir` 指定显式目录。两者都只是声明会话：会话由该
   会话的下一条消息创建。
+- **`default_auto_accept`** —— **默认关闭**：cola 创建的会话（全新聊天的首条
+  消息、`/new`、`/dir`、`/topic`、404 重建）以自动授权启动，其工具权限请求会被
+  自动应答而不是弹出卡片。接管已有会话不会开启它——会话保留自身状态；
+  `/autoaccept off` 仍可按会话关闭。
 - **`group_completion_notice`** —— 群聊中，向请求者回复一条简短的完成通知
   （流式卡片是就地更新的，不会推送新通知）。`false` 关闭它。私聊不需要。
 - **`instant_reminder`** —— 可选，**默认关闭**：在权限请求或提问等待期间，

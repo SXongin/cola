@@ -193,7 +193,7 @@ A request from the AI backend to perform an action on a resource. Presented to t
 _Avoid_: Approval, authorization, consent
 
 **Auto-Accept**:
-cola's per-session blanket flag (`auto_accept` in the SessionStore, `/autoaccept`). When on, cola answers EVERY pending permission for that session with "once" automatically — no permission card is surfaced at all. Lives in cola's store and persists. Distinct from the backend's per-type "Always" rule: Auto-Accept is session-wide (all permission types) and cola-side, while "Always" is scoped to one permission type, lives on the backend instance, and makes the backend skip the ask entirely.
+cola's per-session blanket flag (`auto_accept` in the SessionStore, `/autoaccept`). When on, cola answers EVERY pending permission for that session with "once" automatically — no permission card is surfaced at all. Lives in cola's store and persists. Sessions cola creates can start with it on via `[bridge] default_auto_accept` (never an adopted session — that keeps its own state). Distinct from the backend's per-type "Always" rule: Auto-Accept is session-wide (all permission types) and cola-side, while "Always" is scoped to one permission type, lives on the backend instance, and makes the backend skip the ask entirely.
 _Avoid_: Auto-approve mode, always-allow (that is the backend's per-type rule, not this)
 
 **Permission Toggle**:

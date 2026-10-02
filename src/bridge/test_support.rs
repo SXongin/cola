@@ -2380,6 +2380,7 @@ pub fn test_config(session_file: &std::path::Path) -> crate::config::Config {
             session_file: session_file.to_path_buf(),
             access_file: session_file.with_file_name("access.json"),
             work_dir: None,
+            default_auto_accept: false,
             group_completion_notice: true,
             long_task_notice: false,
             instant_reminder: false,
