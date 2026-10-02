@@ -99,12 +99,10 @@ async fn advance_card_fallback(cards: &CardsHandle, session_id: &str) -> Fallbac
 /// `split_policy` decides whether an over-budget slice may finalize the card
 /// and continue on a new one ([`SplitPolicy`]).
 pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, split_policy: SplitPolicy) {
-    // A terminal card's durable record is spent (ADR-0063): drop it here, at
-    // the ONE entry every card write goes through, so an ending stamped
-    // through this flush can never leave the record behind — whatever caller
-    // queued the write. A live or yielded card keeps its record, and a card
-    // that continues the chain below re-tracks the new one.
-    Turn::discard_spent_record(cards, session_id).await;
+    // A terminal card's durable record is dropped only once its ending write
+    // is confirmed (ADR-0063 amendment): each ending PATCH below re-checks the
+    // pending outbox before discarding, so a failed final write keeps the
+    // record the reap needs.
     // The card-chain state a flush resumes from: a pending Supplement split
     // (ADR-0043) and whether the tracked card is still the live (growing) one.
     // Both survive the flush — a chain that exhausted the size bound, or died
@@ -200,12 +198,20 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, spl
                                 FallbackAdvance::RetryFenced => continue,
                                 // The fenced retry was rejected too — the card is
                                 // suspended; stop instead of PATCHing forever.
-                                FallbackAdvance::Stop => return,
+                                FallbackAdvance::Stop => {
+                                    // A suspended ending can never deliver, so a
+                                    // terminal record is spent (never retried).
+                                    Turn::discard_spent_record(cards, session_id).await;
+                                    return;
+                                }
                             }
                         }
                         false
                     }
                 };
+                // The ending write is settled — delivered, or permanently
+                // refused: a terminal record may go once nothing is pending.
+                Turn::discard_spent_record(cards, session_id).await;
                 // Record what this card now renders: the live blocks.
                 cards
                     .card_handles
@@ -306,6 +312,9 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, spl
                             // The fenced retry was rejected too: the card is
                             // suspended, so stop the chain instead of building the
                             // next card out of content the platform may refuse too.
+                            // A suspended ending can never deliver, so a terminal
+                            // record is spent (never retried).
+                            Turn::discard_spent_record(cards, session_id).await;
                             cards
                                 .card_handles
                                 .lock()
@@ -319,6 +328,9 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, spl
             } else {
                 false
             };
+            // The ending write is settled — delivered, or permanently refused:
+            // a terminal record may go once nothing is pending.
+            Turn::discard_spent_record(cards, session_id).await;
             cards
                 .card_handles
                 .lock()

@@ -47,10 +47,10 @@ async fn read_body_with_diag(resp: reqwest::Response, what: &str) -> crate::erro
                 detail: format!("{what} HTTP {status}: {}", body_snippet(&text, 200)),
             });
         }
-        return Err(crate::error::BridgeError::Feishu(format!(
-            "{what} HTTP {status}: {}",
-            body_snippet(&text, 200)
-        )));
+        return Err(crate::error::BridgeError::FeishuHttp {
+            status: status.as_u16(),
+            detail: format!("{what} HTTP {status}: {}", body_snippet(&text, 200)),
+        });
     }
     Ok(text)
 }
@@ -1002,7 +1002,10 @@ mod tests {
     fn feishu_error(err: crate::error::BridgeError) -> String {
         match err {
             crate::error::BridgeError::Feishu(message) => message,
-            other => panic!("expected BridgeError::Feishu, got: {other:?}"),
+            // The HTTP-status variant carries the same `"<what> HTTP <status>: <body>"`
+            // detail; both spellings are "a Feishu error" to these tests.
+            crate::error::BridgeError::FeishuHttp { detail, .. } => detail,
+            other => panic!("expected a Feishu error, got: {other:?}"),
         }
     }
 
@@ -1210,6 +1213,35 @@ mod tests {
                 crate::error::BridgeError::CardContentRejected { code: 230099, .. }
             ),
             "a 230099 rejection must be typed: {err}"
+        );
+    }
+
+    /// A transient Feishu failure keeps its HTTP status typed, so the delivery
+    /// decorator can classify it as recoverable and retry (ADR-0067). The
+    /// message text stays the pre-existing `"<what> HTTP <status>: <body>"`.
+    #[tokio::test]
+    async fn update_message_types_a_transient_http_failure() {
+        let (server, client) = wire_client().await;
+        server.route(
+            "PATCH",
+            "/open-apis/im/v1/messages/om_42",
+            503,
+            r#"{"code":99999,"msg":"service unavailable"}"#,
+        );
+
+        let err = client
+            .update_message("om_42", &serde_json::json!({"elements": []}))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::error::BridgeError::FeishuHttp { status: 503, .. }),
+            "a 503 must carry its status: {err}"
+        );
+        assert!(err.is_recoverable_card_write());
+        assert!(
+            feishu_error(err).contains("update message HTTP 503"),
+            "the diagnostic text is preserved"
         );
     }
 

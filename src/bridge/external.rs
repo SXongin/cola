@@ -176,6 +176,12 @@ impl ExternalFlow {
             .instrument(span)
             .await;
         }
+        // Pending Card Updates (ADR-0067): every pass retries the card writes
+        // Feishu refused since the last one — the reap's own endings included.
+        // The decorator owns the per-entry backoff; the WS loop forces an
+        // immediate drain on reconnect, since REST and WS reachability are
+        // independent.
+        handles.platform.drain_pending_card_updates(false).await;
     }
 
     /// Reconcile the transcript's live Background Tasks against the server's

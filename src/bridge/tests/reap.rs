@@ -1519,3 +1519,114 @@ async fn a_live_turn_tracks_its_card_and_every_terminal_drops_the_record() {
         "the emptied record removes the sidecar"
     );
 }
+
+/// ADR-0063 amendment + ADR-0067: a terminal card whose final PATCH failed
+/// keeps its durable record — the ending is still owed as a Pending Card
+/// Update — and the record stays until the write is confirmed. Before the
+/// amendment the record was dropped before the PATCH, so a restart (and the
+/// still-running process alike) found nothing to repair.
+#[tokio::test]
+async fn a_failed_final_patch_keeps_the_record_until_delivery() {
+    let _wd = test_work_dir();
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "你好"),
+        assistant(2_000, "答复。"),
+    ]);
+    let (_dir, app, _backend, platform) = scripted_app(vec![transcript], Some(SessionStatus::Idle)).await;
+    // Every card write fails at the transport: nothing lands, and the turn's
+    // ending is the newest failed payload.
+    platform
+        .fail_update_transport_count
+        .store(100, std::sync::atomic::Ordering::SeqCst);
+
+    Turn::run(&app.turn_handles(), ctx("ses_test", "你好"))
+        .await
+        .unwrap();
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Done),
+        "the turn still reaches its ending"
+    );
+    let record = app
+        .cards_handle()
+        .live_cards
+        .get("ses_test")
+        .expect("a failed ending write keeps the record");
+    let card_id = record.card_message_id.clone();
+    assert!(
+        app.core.feishu.has_pending_card_update(&card_id),
+        "the ending is still owed"
+    );
+
+    // Feishu returns: a forced drain (the WS reconnect path) delivers the
+    // newest payload.
+    platform
+        .fail_update_transport_count
+        .store(0, std::sync::atomic::Ordering::SeqCst);
+    app.core.feishu.drain_pending_card_updates(true).await;
+    assert!(
+        !app.core.feishu.has_pending_card_update(&card_id),
+        "the drain delivered the ending"
+    );
+
+    // The next Session Sync pass's reap drops the now-confirmed record.
+    spawn_sync(&app);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if app.cards_handle().live_cards.get("ses_test").is_none() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the reap must clean the confirmed record");
+}
+
+/// The Session Sync pass itself retries a failed final PATCH once its backoff
+/// is due — no restart and no forced drain: the pending outbox converges, and
+/// the reap then cleans the record. The paused clock elapses the backoff
+/// virtually.
+#[tokio::test(start_paused = true)]
+async fn the_session_sync_pass_retries_a_failed_final_patch() {
+    let _wd = test_work_dir();
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "你好"),
+        assistant(2_000, "答复。"),
+    ]);
+    let (_dir, app, _backend, platform) = scripted_app(vec![transcript], Some(SessionStatus::Idle)).await;
+    platform
+        .fail_update_transport_count
+        .store(100, std::sync::atomic::Ordering::SeqCst);
+
+    Turn::run(&app.turn_handles(), ctx("ses_test", "你好"))
+        .await
+        .unwrap();
+    let card_id = app
+        .cards_handle()
+        .live_cards
+        .get("ses_test")
+        .expect("a failed ending write keeps the record")
+        .card_message_id
+        .clone();
+    assert!(app.core.feishu.has_pending_card_update(&card_id));
+
+    platform
+        .fail_update_transport_count
+        .store(0, std::sync::atomic::Ordering::SeqCst);
+    spawn_sync(&app);
+    // The pass drain retries once the 5s backoff elapses; the reap then drops
+    // the confirmed record — both observed here, or the test times out.
+    tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            if app.cards_handle().live_cards.get("ses_test").is_none()
+                && !app.core.feishu.has_pending_card_update(&card_id)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the pass drain converges the card and the reap cleans the record");
+}
