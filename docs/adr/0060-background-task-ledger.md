@@ -252,12 +252,13 @@ of #464 will reuse the same gather.
 Ticket #504 supersedes the "This cut wires Session Sync" bullet above: the live
 render path gathers the ledger's child liveness too, so a background `subagent`
 row is as fresh as the card while the parent turn still runs. Each render poll
-hands the shared batch — one transcript light read per distinct child plus its
-pending-wait query, the same one the yielded refresh and the front task panel
-use — to the ledger on the read that refreshes the live list. The fragment's
-age is measured at the card's build clock, so it stays true, and a later read of
-the same row renders the child's new typed activity (a phase gives way to a
-running tool, a wait joins, a failed gather heals).
+runs ONE shared batch over the union of the children both surfaces name — the
+card's live task panels and the read's live background subagents — and hands it
+to both: one transcript light read and one pending-wait query per distinct
+child, so a child named by a panel and a ledger row is read once per render.
+The fragment's age is measured at the card's build clock, so it stays true, and
+a later read of the same row renders the child's new typed activity (a phase
+gives way to a running tool, a wait joins, a failed gather heals).
 
 - **The whole-minute gate stands.** The live path's clock comparison is
   unchanged: the activity age's seconds never owe a PATCH by themselves, only

@@ -471,8 +471,21 @@ pub(super) fn apply_ledger_read(
 }
 
 /// Render the parts of this turn's assistant messages that haven't been
-/// rendered yet, and refresh the live Background Task ledger from the read.
+/// rendered yet, and refresh the live Background Task ledger from the read
+/// with NO gathered child liveness (the sync callers — tests, the turn-end
+/// reconcile — have no gather): every `subagent` row keeps the last fragment
+/// that established one. The live render's own entry is [`render_turn_parts`],
+/// whose caller applies the ledger from the render's shared gather.
 /// Returns true if anything new was rendered.
+pub(super) fn render_new_turn_parts(acc: &mut StreamAccumulator, transcript: &SessionTranscript) -> bool {
+    let rendered = render_turn_parts(acc, transcript);
+    rendered | refresh_ledger(acc, transcript, &std::collections::HashMap::new())
+}
+
+/// Render the parts of this turn's assistant messages that haven't been
+/// rendered yet (the live Background Task ledger is the caller's: the render's
+/// shared gather has to run between the parts and the ledger). Returns true if
+/// anything new was rendered.
 ///
 /// Turn membership is the Session Transcript's shared `turn_for_user`
 /// projection, anchored on the Turn's own anchor — the SERVER's message
@@ -492,23 +505,7 @@ pub(super) fn apply_ledger_read(
 /// the anchor — either created within the turn or still being produced as the
 /// turn began — while one that finished before the anchor stays the previous
 /// turn's and never bleeds in (#190).
-pub(super) fn render_new_turn_parts(acc: &mut StreamAccumulator, transcript: &SessionTranscript) -> bool {
-    render_new_turn_parts_with_liveness(acc, transcript, &std::collections::HashMap::new())
-}
-
-/// [`render_new_turn_parts`] with the live Background Task Ledger's gathered
-/// child liveness (spec #501, ticket #504). The live render hands over its own
-/// batch — one shared transcript read per live background subagent, the same
-/// gather the yielded refresh and the front task panel use — so a live card's
-/// `subagent` row carries its child's activity with the render clock's age.
-/// `activities` is keyed by call id; an empty map (V1, a session with no live
-/// subagent, a caller that gathers nothing) keeps each row's last established
-/// fragment.
-pub(super) fn render_new_turn_parts_with_liveness(
-    acc: &mut StreamAccumulator,
-    transcript: &SessionTranscript,
-    activities: &std::collections::HashMap<String, TaskLiveness>,
-) -> bool {
+fn render_turn_parts(acc: &mut StreamAccumulator, transcript: &SessionTranscript) -> bool {
     capture_turn_anchor(acc, transcript);
     let Some(anchor) = acc.turn_anchor.clone() else {
         return false;
@@ -542,24 +539,36 @@ pub(super) fn render_new_turn_parts_with_liveness(
             }
         }
     }
-    // The live Background Task Ledger (ADR-0060) rides the card tail this
-    // render feeds. The transcript read is its authority: a membership change
-    // — or a row's rendered elapsed crossing a whole minute — must flush even
-    // when no part moved, so it counts as rendered content. The clock is
-    // compared at the live path's whole-minute cadence on purpose: this loop
-    // flushes on content, and a per-render second clock would be churn. The
-    // decision's clock is this read's own; the card renders the rows from its
-    // build clock, the same second. `activities` is this render's own child
-    // gather (spec #501, ticket #504): a fresh fragment is a rendered change
-    // that owes its flush, while a gather that established nothing keeps each
-    // row's stored fragment growing truthfully.
-    rendered_any |= acc.set_ledger_from_read(
+    rendered_any
+}
+
+/// Apply one read's live Background Task Ledger to `acc` (ADR-0060), under the
+/// same anchor gate the parts render uses: until the Turn's server anchor is
+/// observed nothing renders, the ledger included. `activities` is the render's
+/// shared child gather (spec #501, ticket #504), keyed by call id, or an empty
+/// map on a caller that gathers nothing — then each row keeps its stored
+/// fragment. The transcript read is the ledger's authority: a membership change
+/// — or a row's rendered elapsed crossing a whole minute — owes a flush even
+/// when no part moved. The clock is compared at the live path's whole-minute
+/// cadence on purpose: this loop flushes on content, and a per-render second
+/// clock would be churn. The decision's clock is this read's own; the card
+/// renders the rows from its build clock, the same second. A fresh fragment is
+/// a rendered change that owes its flush, while a gather that established
+/// nothing keeps each row's stored fragment growing truthfully.
+fn refresh_ledger(
+    acc: &mut StreamAccumulator,
+    transcript: &SessionTranscript,
+    activities: &std::collections::HashMap<String, TaskLiveness>,
+) -> bool {
+    if acc.turn_anchor.is_none() {
+        return false;
+    }
+    acc.set_ledger_from_read(
         transcript,
         activities,
         chrono::Utc::now().timestamp_millis(),
         LedgerCadence::Minute,
-    );
-    rendered_any
+    )
 }
 
 /// Whether rendering `transcript` scoped at `anchor` would add ANY part to
@@ -604,18 +613,11 @@ pub(super) async fn render_and_flush(
     // OpenCode auto-renames sessions after a turn; follow the server's live
     // title so the card subtitle doesn't stay on the "new session" default.
     refresh_session_title(cards, sessions, backend, session_id).await;
-    // The live ledger's background subagent rows carry their children's
-    // liveness (spec #501, ticket #504): the shared gather the yielded refresh
-    // and the front task panel use, on this render's own read, so a row's
-    // fragment is as fresh as the card and its age is measured at the build
-    // clock. A read that names no live child (V1, or a session without a
-    // background subagent) spends no child request at all.
-    let ledger_activities = gather_ledger_liveness(backend, requests, transcript).await;
     let (changed, header_changed, new_parts, text_len, reasoning_len, anchor) = {
         let mut live = cards.cards.lock().await;
         let card = live.get_mut(session_id)?;
         let before = card.acc.rendered_parts.len();
-        let changed = render_new_turn_parts_with_liveness(&mut card.acc, transcript, &ledger_activities);
+        let changed = render_turn_parts(&mut card.acc, transcript);
         // The Turn anchor this render captured (or already carried) plus the
         // card it belongs to: the durable live-card record's anchor is written
         // below, outside the lock (ADR-0063).
@@ -664,11 +666,31 @@ pub(super) async fn render_and_flush(
             None => false,
         }
     };
-    // ADR-0054: refresh every live task panel's child-session liveness. A
-    // change must flush even when no part, header second or context figure
+    // The live child liveness this render needs, gathered ONCE for both
+    // surfaces that show it (spec #501, ticket #504): the card's live task
+    // panels and the read's live background subagents. It runs AFTER the parts
+    // render, so a panel that first appeared this poll is in the union; the
+    // union means a child named by both is read — and its wait queried — at
+    // most once this render, while a render that names no child at all (V1, a
+    // session with no live task) spends no request. The fragment's age is
+    // measured at the build clock.
+    let (panel_children, liveness) =
+        gather_render_liveness(cards, backend, requests, session_id, transcript).await;
+    // Apply that ONE gather to both surfaces under one lock: the ledger's
+    // `subagent` rows and every live task panel (ADR-0060/0054). A change on
+    // either must flush even when no part, header second or context figure
     // moved — the line is the only thing that changed.
-    let liveness_changed = refresh_task_liveness(cards, requests, backend, session_id).await;
-    if changed || header_changed || context_changed || liveness_changed {
+    let (ledger_changed, liveness_changed) = {
+        let mut live = cards.cards.lock().await;
+        match live.get_mut(session_id) {
+            Some(card) => (
+                refresh_ledger(&mut card.acc, transcript, &liveness),
+                apply_task_liveness(&mut card.acc, &panel_children, &liveness),
+            ),
+            None => (false, false),
+        }
+    };
+    if changed || header_changed || context_changed || ledger_changed || liveness_changed {
         Turn::flush_card(cards, session_id).await;
     }
     Some((new_parts, text_len, reasoning_len))
@@ -786,55 +808,58 @@ pub(super) fn background_subagent_children(transcript: &SessionTranscript) -> Ve
         .collect()
 }
 
-/// The live ledger's gathered child liveness for one render read (spec #501,
-/// ticket #504): the shared batch over the read's live background subagents
-/// ([`background_subagent_children`]) — one transcript light read per distinct
-/// child plus its pending-wait query — or an empty map when the read names no
-/// child, so V1 and a session without a background subagent spend no request
-/// at all.
-async fn gather_ledger_liveness(
-    backend: &Arc<dyn crate::backend::Backend>,
-    requests: &RequestsHandle,
-    transcript: &SessionTranscript,
-) -> std::collections::HashMap<String, TaskLiveness> {
-    let children = background_subagent_children(transcript);
-    if children.is_empty() {
-        return std::collections::HashMap::new();
+/// The card's live `task`/`subagent` panels' `(call id, child Session id)`
+/// pairs (ADR-0054), snapshotted under a short lock: the gather they feed is
+/// network and never runs under it.
+async fn live_panel_children(cards: &CardsHandle, session_id: &str) -> Vec<(String, String)> {
+    let live = cards.cards.lock().await;
+    match live.get(session_id) {
+        Some(card) => card.acc.live_task_children(),
+        None => Vec::new(),
     }
-    gather_child_liveness(backend, requests, &children).await
 }
 
-/// Read and attach the child-session liveness of every live `task` panel on
-/// `session_id`'s card (ADR-0054): the shared batched gather does one
-/// transcript read per distinct child and the wait from the request flows'
-/// pending record. Returns true when a panel changed. Every read is
-/// best-effort: a failure keeps the previous line (its stored activity time
-/// keeps the age growing truthfully) instead of clearing it or inventing one.
-async fn refresh_task_liveness(
+/// The child liveness one live render needs, gathered ONCE for both surfaces
+/// that show it (spec #501, ticket #504): the union of the card's live task
+/// panels' children ([`live_panel_children`]) and the read's live background
+/// subagents ([`background_subagent_children`]). One transcript light read and
+/// one pending-wait query per distinct child, so a child named by both a panel
+/// and a ledger row is read once; a render that names no child at all (V1, or
+/// a session with no live task) spends no request. Returns the panel pairs the
+/// caller attaches the result to, alongside the map keyed by every pair's call
+/// id.
+async fn gather_render_liveness(
     cards: &CardsHandle,
-    requests: &RequestsHandle,
     backend: &Arc<dyn crate::backend::Backend>,
+    requests: &RequestsHandle,
     session_id: &str,
-) -> bool {
-    let tasks: Vec<(String, String)> = {
-        let live = cards.cards.lock().await;
-        match live.get(session_id) {
-            Some(card) => card.acc.live_task_children(),
-            None => return false,
-        }
-    };
-    if tasks.is_empty() {
-        return false;
+    transcript: &SessionTranscript,
+) -> (
+    Vec<(String, String)>,
+    std::collections::HashMap<String, TaskLiveness>,
+) {
+    let panels = live_panel_children(cards, session_id).await;
+    let mut children = panels.clone();
+    children.extend(background_subagent_children(transcript));
+    if children.is_empty() {
+        return (panels, std::collections::HashMap::new());
     }
-    let gathered = gather_child_liveness(backend, requests, &tasks).await;
-    let mut live = cards.cards.lock().await;
-    let Some(card) = live.get_mut(session_id) else {
-        return false;
-    };
+    (panels, gather_child_liveness(backend, requests, &children).await)
+}
+
+/// Attach the render's shared gather to every live `task` panel in `acc`
+/// (ADR-0054). Returns true when a panel changed. A panel the gather could not
+/// establish keeps its previous line (its stored activity time keeps the age
+/// growing truthfully) instead of clearing it or inventing one.
+fn apply_task_liveness(
+    acc: &mut StreamAccumulator,
+    panels: &[(String, String)],
+    gathered: &std::collections::HashMap<String, TaskLiveness>,
+) -> bool {
     let mut changed = false;
-    for (call_id, _) in tasks {
-        if let Some(liveness) = gathered.get(&call_id).cloned() {
-            changed |= card.acc.set_tool_liveness(&call_id, Some(liveness));
+    for (call_id, _) in panels {
+        if let Some(liveness) = gathered.get(call_id).cloned() {
+            changed |= acc.set_tool_liveness(call_id, Some(liveness));
         }
     }
     changed
@@ -937,6 +962,7 @@ mod tests {
     };
     use crate::bridge::turn::state::StreamAccumulator;
     use crate::feishu::card::CardState;
+    use crate::feishu::card::tool_render::ToolPanel;
 
     /// A typed assistant message: identity, role, server time and parts, with
     /// no backend field name in the fixture (spec #332).
@@ -2373,6 +2399,108 @@ Index: /x/src/main.rs
                 None,
             )],
         )])
+    }
+
+    /// Spec #501: the render's child gather is SHARED by the ledger's rows and
+    /// the live task panels, so a child named by both surfaces is read — and
+    /// its wait queried — at most once per render. The card carries a live
+    /// `task` panel whose child is the same `ses_shared` its ledger row names;
+    /// one render must spend one read and one wait for it, and both surfaces
+    /// must render the fragment.
+    #[tokio::test]
+    async fn one_render_reads_a_child_shared_by_a_panel_and_a_ledger_row_once() {
+        let _wd = test_work_dir();
+        let now = chrono::Utc::now().timestamp_millis();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let backend = Arc::new(MockBackend::new(realistic_parts()));
+        backend
+            .given_transcript_after_build("ses_shared", vec![child_running_tool(now - 20_000, "bash")])
+            .await;
+        let platform = Arc::new(RecordingPlatform::new());
+        let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+        let sid = "ses_shared_gather";
+        let cards = app.core.cards_handle();
+        Turn::seed_card(&cards, sid, Some("om_shared_gather")).await;
+        Turn::set_turn_anchor(&cards, sid, &turn_anchor(0)).await;
+        Turn::clear_phase(&cards, sid).await;
+
+        // A live `task` panel on the card names the same child as the ledger.
+        {
+            let mut live = cards.cards.lock().await;
+            let acc = &mut live.get_mut(sid).expect("the seeded card").acc;
+            acc.push_tool_at(
+                Some(now - 20_000),
+                "call_panel",
+                ToolPanel::new(ToolCall {
+                    identity: ToolIdentity {
+                        name: "task".into(),
+                        call_id: "call_panel".into(),
+                    },
+                    status: ToolStatus::Running,
+                    started_at: Some(now - 20_000),
+                    input: Some(serde_json::json!({ "description": "review the shared child" })),
+                    metadata: Some(serde_json::json!({ "sessionID": "ses_shared" })),
+                    output: ToolOutput::default(),
+                }),
+            );
+        }
+        let transcript = SessionTranscript::default().with_background_tasks(vec![BackgroundTask {
+            tool: ToolIdentity {
+                name: "subagent".into(),
+                call_id: "call_sub".into(),
+            },
+            shell_id: None,
+            child_id: Some("ses_shared".into()),
+            started_at: Some(now - 30_000),
+        }]);
+
+        let _ = render_and_flush(
+            &cards,
+            &app.sessions_handle(),
+            &app.opencode,
+            &app.requests_handle(),
+            sid,
+            &transcript,
+        )
+        .await;
+
+        // One transcript read and one wait query for the shared child, however
+        // many surfaces name it (`wait_for` checks both flows per query).
+        let reads = backend
+            .transcript_calls
+            .lock()
+            .await
+            .iter()
+            .filter(|id| id.as_str() == "ses_shared")
+            .count();
+        assert_eq!(reads, 1, "the shared child is read once per render");
+        let requests = app.requests_handle();
+        for flow in [&requests.permission, &requests.question] {
+            let checks = flow
+                .wait_checks
+                .lock()
+                .await
+                .iter()
+                .filter(|id| id.as_str() == "ses_shared")
+                .count();
+            assert_eq!(checks, 1, "the shared child's wait is queried once per render");
+        }
+
+        // Both surfaces render the fragment from that one gather, on one PATCH.
+        assert_eq!(platform.updated_cards().await.len(), 1, "one render, one PATCH");
+        let card = platform.updated_cards().await.last().cloned().unwrap();
+        let text = card_text(&card);
+        assert!(
+            text.lines()
+                .any(|line| line.starts_with("· subagent") && line.contains("bash ")),
+            "the ledger row carries the fragment: {text}"
+        );
+        assert!(
+            text.lines()
+                .any(|line| line.contains("task") && line.contains("bash ")),
+            "the live panel carries the same fragment: {text}"
+        );
     }
 
     /// ADR-0054: the child session's liveness is the age of its newest activity

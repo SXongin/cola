@@ -4,10 +4,11 @@
 //! folded-by-default `collapsible_panel` whose title is the pinned count
 //! (`⏳ 后台任务（N）`) and whose body is one row per task — bold label joined
 //! from the originating tool part's input by `call_id`, start clock, bare
-//! elapsed — and a retirement leaves the section on the card's existing render
-//! cadence. The launch panel itself (ticket #416) keeps its timeline place and
-//! renders 🌙 in its status slot instead of ✅, before and after the
-//! retirement.
+//! elapsed, then a live `subagent` row's child activity in the front task
+//! panel's own vocabulary (spec #501) — and a retirement leaves the section on
+//! the card's existing render cadence. The launch panel itself (ticket #416)
+//! keeps its timeline place and renders 🌙 in its status slot instead of ✅,
+//! before and after the retirement.
 //!
 //! The section stays on the card the tasks lived on (ADR-0066, ticket #488):
 //! a shell/subagent completion Wake resumes its yielded card in place, so the
