@@ -3,12 +3,13 @@
 //! (live) card's tail like the Todo Panel and the live Tool Panels — one
 //! folded-by-default `collapsible_panel` whose title is the pinned count
 //! (`⏳ 后台任务（N）`) and whose body is one row per task — bold label joined
-//! from the originating tool part's input by `call_id`, start clock, bare
-//! elapsed, then a live `subagent` row's child activity in the front task
-//! panel's own vocabulary (spec #501) — and a retirement leaves the section on
-//! the card's existing render cadence. The launch panel itself (ticket #416)
-//! keeps its timeline place and renders 🌙 in its status slot instead of ✅,
-//! before and after the retirement.
+//! from the originating tool part's input by `call_id`, start clock; a shell
+//! row follows it with its bare elapsed (its only liveness), while a `subagent`
+//! row renders its child's activity in the front task panel's own vocabulary
+//! instead and never a total elapsed (spec #501) — and a retirement leaves the
+//! section on the card's existing render cadence. The launch panel itself
+//! (ticket #416) keeps its timeline place and renders 🌙 in its status slot
+//! instead of ✅, before and after the retirement.
 //!
 //! The section stays on the card the tasks lived on (ADR-0066, ticket #488):
 //! a shell/subagent completion Wake resumes its yielded card in place, so the
@@ -162,10 +163,11 @@ fn todowrite(created: i64, call_id: &str) -> TranscriptMessage {
     )
 }
 
-/// The elapsed tail of the row starting with `prefix` — the row's LAST ` · `
-/// segment, after the type word, the bolded label and the ` · HH:MM` start
-/// clock. Panics when the row is missing (the section itself is the test's
-/// first assertion).
+/// A shell ledger row's elapsed tail — the row's LAST ` · ` segment, after the
+/// type word, the bolded label and the ` · HH:MM` start clock. Only shell rows
+/// render an elapsed (a subagent row's liveness is its activity fragment).
+/// Panics when the row is missing (the section itself is the test's first
+/// assertion).
 fn ledger_elapsed(card: &serde_json::Value, prefix: &str) -> String {
     let text = card_text(card);
     let row = text
@@ -190,6 +192,23 @@ fn assert_elapsed_shaped(elapsed: &str) {
         elapsed.chars().next().is_some_and(|c| c.is_ascii_digit()),
         "the elapsed starts with a number: {elapsed:?}"
     );
+}
+
+/// Whether `seg` is a ledger row's `HH:MM` start clock.
+fn is_start_clock(seg: &str) -> bool {
+    let bytes = seg.as_bytes();
+    bytes.len() == 5
+        && bytes[2] == b':'
+        && bytes[..2].iter().all(u8::is_ascii_digit)
+        && bytes[3..].iter().all(u8::is_ascii_digit)
+}
+
+/// Whether `seg` is a ledger row's bare TOTAL elapsed (`3m12s` / `1h05m`): one
+/// number+unit token with no space. An activity fragment's segments always
+/// carry the tool/phase word (or a wait), so they never match — which is how a
+/// test tells a shell row's elapsed from a subagent row's fragment age.
+fn is_total_elapsed(seg: &str) -> bool {
+    !seg.contains(' ') && parsed_task_elapsed(seg).is_some()
 }
 
 /// Acceptance 1: a live card with a live Background Task shows the section —
@@ -398,16 +417,19 @@ async fn several_tasks_list_in_transcript_order_beside_the_other_tail_sections()
         "the live Tool Panel coexists with the ledger: {text}"
     );
     assert_elapsed_shaped(&ledger_elapsed(&card, "· shell：**npm run build** · "));
-    // The subagent's row may carry its child's activity after the elapsed
-    // (ticket #504), so assert the elapsed is AMONG the row's segments rather
-    // than its last one.
+    // A subagent row never renders a total elapsed (spec #501): after its
+    // start clock comes only its child's activity fragment, if any.
     let sub_row = text
         .lines()
         .find(|line| line.starts_with("· subagent：**review the diff** · "))
         .expect("the subagent row");
     assert!(
-        sub_row.split(" · ").any(|seg| parsed_task_elapsed(seg).is_some()),
-        "the subagent row keeps its start clock and elapsed: {sub_row:?}"
+        !sub_row
+            .split(" · ")
+            .skip_while(|seg| !is_start_clock(seg))
+            .skip(1)
+            .any(is_total_elapsed),
+        "a subagent row renders no elapsed: {sub_row:?}"
     );
 }
 
@@ -1037,9 +1059,10 @@ fn waiting_shell(started_at: i64) -> SessionTranscript {
         .with_background_tasks(vec![live_shell(started_at, "call_bg")])
 }
 
-/// The row's rendered elapsed in whole seconds: `XmYYs` under an hour (the only
-/// shape these tests reach). Panics on the `XhYYm` shape so a test that waits
-/// an hour out fails loudly instead of parsing it wrong.
+/// The row's rendered elapsed in whole seconds (`XmYYs` under an hour — the only
+/// shape these tests reach): a shell row's rendered clock. Panics on the
+/// `XhYYm` shape so a test that waits an hour out fails loudly instead of
+/// parsing it wrong.
 fn elapsed_secs(elapsed: &str) -> u64 {
     let (minutes, seconds) = elapsed
         .trim_end_matches('s')
@@ -1048,9 +1071,10 @@ fn elapsed_secs(elapsed: &str) -> u64 {
     minutes.parse::<u64>().unwrap() * 60 + seconds.parse::<u64>().unwrap()
 }
 
-/// A start clock ahead of cola's (`now + 1h`): the row's elapsed clamps to
-/// `0m00s` forever, so its second-granular clock can never tick. The
-/// event-count tests use it for a task that stays live across the event, so
+/// A start clock ahead of cola's (`now + 1h`): a shell row's elapsed clamps to
+/// `0m00s` forever, so its second-granular clock can never tick (a subagent
+/// row's elapsed is never rendered at all). The event-count tests use it for a
+/// task that stays live across the event, so
 /// "exactly one PATCH for this retirement / collect" is deterministic; the
 /// second-granular cadence itself is pinned by the rate tests, where the
 /// starts are real.
@@ -2094,8 +2118,9 @@ async fn repeated_reads_inside_the_same_rendered_second_patch_nothing() {
     let sub_started = now - 4_000;
     let live = waiting_shell_and_subagent(now - 5_000, sub_started);
     let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
-    // Every rendered number is the rows' own elapsed: the child read carries
-    // no activity, so no second age joins the rate bound.
+    // The only rendered number is the shell row's elapsed: the child read
+    // carries no activity, and a subagent row never renders an elapsed, so
+    // nothing else can join the rate bound.
     script_child_without_activity(&backend).await;
     yield_waiting_card(&app, &platform, 2).await;
     let yielded = platform.updated_cards().await.last().cloned().unwrap();
@@ -2487,17 +2512,20 @@ fn child_replying(at: i64) -> SessionTranscript {
 }
 
 /// The row starting with `prefix`'s activity fragment — everything it renders
-/// after its elapsed (`bash 5s`, `思考中 30s · 等待你的授权`), or `None` when
-/// the row carries none (a shell row, an unconfirmed row, or a row whose
-/// elapsed never rendered).
+/// after its start clock (`bash 5s`, `思考中 30s · 等待你的授权`), or `None` when
+/// the row carries none (a shell row, an unconfirmed row, a subagent row with
+/// no stored fragment). A subagent row renders no total elapsed, so the
+/// fragment follows the `HH:MM` clock directly; a row with no clock has the
+/// fragment after its label.
 fn ledger_activity(card: &serde_json::Value, prefix: &str) -> Option<String> {
     let text = card_text(card);
     let row = text.lines().find(|line| line.starts_with(prefix))?;
     let segments: Vec<&str> = row.split(" · ").collect();
-    let elapsed = segments
+    let start = segments
         .iter()
-        .position(|seg| parsed_task_elapsed(seg).is_some())?;
-    let activity = segments[elapsed + 1..].join(" · ");
+        .position(|seg| is_start_clock(seg))
+        .map_or(1, |at| at + 1);
+    let activity = segments[start..].join(" · ");
     (!activity.is_empty() && activity != "⚠️ 状态待确认").then_some(activity)
 }
 
@@ -2526,10 +2554,10 @@ fn activity_age_secs(activity: &str) -> u64 {
 
 /// Acceptance 1 (spec #501): a yielded card's live background subagent row
 /// carries its child's running tool and that call's age — the front task
-/// panel's own vocabulary — after the row's elapsed; the shell row stays
-/// exactly as it was (no fragment). The child read rides the same gather the
-/// LIVE render uses (ticket #504); the Session Sync passes below are what keep
-/// the waiting card's fragment fresh.
+/// panel's own vocabulary — after the row's start clock, and never a total
+/// elapsed; the shell row stays exactly as it was (its elapsed, no fragment).
+/// The child read rides the same gather the LIVE render uses (ticket #504); the
+/// Session Sync passes below are what keep the waiting card's fragment fresh.
 #[tokio::test]
 async fn a_yielded_subagents_row_shows_its_childs_liveness() {
     let _wd = test_work_dir();
@@ -2565,7 +2593,8 @@ async fn a_yielded_subagents_row_shows_its_childs_liveness() {
         age.ends_with('s'),
         "the age is second-granular at the yield: {activity:?}"
     );
-    // The row still reads type, bold label, start clock, elapsed, fragment.
+    // The row reads type, bold label, start clock, then the fragment directly:
+    // a subagent row renders no total elapsed.
     let row = card_text(&card)
         .lines()
         .find(|line| line.starts_with("· subagent：**review the diff** · "))
@@ -2573,17 +2602,26 @@ async fn a_yielded_subagents_row_shows_its_childs_liveness() {
         .to_string();
     assert!(
         row.ends_with(&format!(" · {activity}")),
-        "the fragment is appended after the elapsed: {row:?}"
+        "the fragment is appended after the start clock: {row:?}"
     );
+    let segments: Vec<&str> = row.split(" · ").collect();
+    let clock = segments
+        .iter()
+        .position(|seg| is_start_clock(seg))
+        .expect("the start clock");
     assert!(
-        row.split(" · ").any(|seg| parsed_task_elapsed(seg).is_some()),
-        "the row keeps its start clock and elapsed before the fragment: {row:?}"
+        segments.get(clock + 1).is_some_and(|seg| *seg == activity),
+        "the fragment follows the start clock directly — no elapsed: {row:?}"
     );
-    // The shell row is untouched: no activity fragment of its own.
-    assert_eq!(
-        ledger_activity(&card, "· shell：**gh run watch**"),
-        None,
-        "a shell row never carries an activity fragment: {card}"
+    // The shell row keeps its elapsed and carries no activity fragment.
+    let shell_row = card_text(&card)
+        .lines()
+        .find(|line| line.starts_with("· shell：**gh run watch** · "))
+        .expect("the shell row")
+        .to_string();
+    assert!(
+        shell_row.rsplit(" · ").next().is_some_and(is_total_elapsed),
+        "a shell row keeps its elapsed and no fragment: {shell_row:?}"
     );
 }
 
@@ -2932,8 +2970,8 @@ async fn a_retired_subagents_activity_leaves_with_its_row() {
 async fn a_yielded_rows_activity_age_advances_on_the_rendered_second() {
     let _wd = test_work_dir();
     let now = chrono::Utc::now().timestamp_millis();
-    // The shell's clock is frozen; the subagent's own elapsed and its child's
-    // activity age are the only rendered numbers that move.
+    // The shell's clock is frozen; the child's activity age is the only
+    // rendered number that moves (a subagent row renders no elapsed).
     let live = waiting_shell_and_subagent(frozen_start(now), now - 30_000);
     let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
     backend
@@ -2997,8 +3035,9 @@ async fn a_yielded_rows_activity_age_advances_on_the_rendered_second() {
 // ---------------------------------------------------------------------------
 
 /// Acceptance 1 (spec #501): a live card's background subagent row carries its
-/// child's running tool and age — the fragment appended after the row's
-/// elapsed, never to the shell row — while the parent turn is still running.
+/// child's running tool and age — the fragment appended after the row's start
+/// clock and no total elapsed, never to the shell row — while the parent turn
+/// is still running.
 #[tokio::test]
 async fn a_live_subagents_row_shows_its_childs_liveness() {
     let _wd = test_work_dir();
@@ -3050,25 +3089,32 @@ async fn a_live_subagents_row_shows_its_childs_liveness() {
         age.ends_with('s') && activity_age_secs(&activity) >= 5,
         "the live fragment's age is second-granular and true: {activity:?}"
     );
-    // The row keeps its start clock and elapsed, with the fragment appended.
+    // The row keeps its start clock, with the fragment directly after it — a
+    // subagent row renders no total elapsed.
     let row = card_text(&card)
         .lines()
         .find(|line| line.starts_with("· subagent：**review the diff** · "))
         .expect("the subagent row")
         .to_string();
+    let segments: Vec<&str> = row.split(" · ").collect();
+    let clock = segments
+        .iter()
+        .position(|seg| is_start_clock(seg))
+        .expect("the start clock");
     assert!(
-        row.split(" · ").any(|seg| parsed_task_elapsed(seg).is_some()),
-        "the row keeps its start clock and elapsed before the fragment: {row:?}"
+        segments.get(clock + 1).is_some_and(|seg| *seg == activity),
+        "the fragment follows the start clock directly — no elapsed: {row:?}"
     );
+    // The shell row keeps its elapsed and no fragment, and the card is still
+    // the LIVE one.
+    let shell_row = card_text(&card)
+        .lines()
+        .find(|line| line.starts_with("· shell：**gh run watch** · "))
+        .expect("the shell row")
+        .to_string();
     assert!(
-        row.ends_with(&format!(" · {activity}")),
-        "the fragment is appended after the elapsed: {row:?}"
-    );
-    // The shell row is untouched, and the card is still the LIVE one.
-    assert_eq!(
-        ledger_activity(&card, "· shell：**gh run watch**"),
-        None,
-        "a shell row never carries an activity fragment: {card}"
+        shell_row.rsplit(" · ").next().is_some_and(is_total_elapsed),
+        "a shell row keeps its elapsed and no fragment: {shell_row:?}"
     );
     assert!(
         !card_header(&card).contains("完成"),

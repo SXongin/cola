@@ -548,7 +548,8 @@ fn render_turn_parts(acc: &mut StreamAccumulator, transcript: &SessionTranscript
 /// shared child gather (spec #501, ticket #504), keyed by call id, or an empty
 /// map on a caller that gathers nothing — then each row keeps its stored
 /// fragment. The transcript read is the ledger's authority: a membership change
-/// — or a row's rendered elapsed crossing a whole minute — owes a flush even
+/// — or a rendered number (a shell row's elapsed, a fragment's age) crossing a
+/// whole minute — owes a flush even
 /// when no part moved. The clock is compared at the live path's whole-minute
 /// cadence on purpose: this loop flushes on content, and a per-render second
 /// clock would be churn. The decision's clock is this read's own; the card
