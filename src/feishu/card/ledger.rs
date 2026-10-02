@@ -120,6 +120,15 @@ pub struct TaskLedgerRow {
 }
 
 impl TaskLedgerRow {
+    /// The activity fragment this row RENDERS: `None` while the row is
+    /// unconfirmed — an unverified liveness must not read as certain (issue
+    /// #454) — and `None` before any gather established one. The one predicate
+    /// the body, the render clock and the size estimate share, so the three
+    /// cannot drift over when a fragment is shown.
+    fn rendered_activity(&self) -> Option<&TaskLiveness> {
+        self.activity.as_ref().filter(|_| !self.unconfirmed)
+    }
+
     /// The label as the row renders it: the same folded/clipped bold shape
     /// [`task_ledger_text`] emits, or `None` when the renderer omits it (no
     /// label, or an empty one — the renderer's own `!is_empty` filter).
@@ -302,7 +311,7 @@ pub(crate) fn task_ledger_text(rows: &[TaskLedgerRow], now_ms: i64) -> Option<St
             }
             text.push_str(&format!(" · {}", fmt_task_elapsed(secs_since(at, now_ms))));
         }
-        if let Some(activity) = row.activity.as_ref().filter(|_| !row.unconfirmed) {
+        if let Some(activity) = row.rendered_activity() {
             // A tool name is transcript text reaching a markdown body: neuter
             // its own `&`/`*`/`_` exactly like a label's, so it cannot bleed
             // formatting into the row either.
@@ -344,9 +353,7 @@ pub(crate) fn task_ledger_clock(rows: &[TaskLedgerRow], now_ms: i64) -> Vec<Ledg
         .map(|row| LedgerRowClock {
             elapsed: row.started_at.map(|at| secs_since(at, now_ms)),
             activity: row
-                .activity
-                .as_ref()
-                .filter(|_| !row.unconfirmed)
+                .rendered_activity()
                 .and_then(TaskLiveness::age_clock_ms)
                 .map(|at| secs_since(at, now_ms)),
         })
@@ -392,8 +399,7 @@ pub(crate) fn task_ledger_estimate(rows: &[TaskLedgerRow]) -> usize {
         .sum();
     let activities: usize = rows
         .iter()
-        .filter(|row| !row.unconfirmed)
-        .filter_map(|row| row.activity.as_ref().map(activity_estimate))
+        .filter_map(|row| row.rendered_activity().map(activity_estimate))
         .sum();
     // The +80 is the folded panel's own element overhead, exactly like the
     // completion entry's estimate charges it (`task_entry_estimate`).

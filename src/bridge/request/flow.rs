@@ -122,6 +122,12 @@ pub struct RequestFlow {
     /// failed directory — may still be pending, like every other per-request
     /// registry here.
     session_less: Arc<Mutex<HashMap<String, String>>>,
+    /// Test-only record of the session ids [`Self::is_pending_for`] checked
+    /// (spec #501): the per-render shared gather must ask each distinct child's
+    /// wait at most once, so a test counts the checks this flow served. Absent
+    /// from production builds.
+    #[cfg(test)]
+    pub(crate) wait_checks: Arc<Mutex<Vec<String>>>,
 }
 
 impl RequestFlow {
@@ -174,6 +180,8 @@ impl RequestFlow {
             surfaces,
             recovered: Arc::new(Mutex::new(recovered)),
             session_less: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            wait_checks: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -198,6 +206,8 @@ impl RequestFlow {
     /// complete sweep (ADR-0054). A session never read as pending, or one whose
     /// sweep failed, reads as false.
     pub(crate) async fn is_pending_for(&self, session_id: &str) -> bool {
+        #[cfg(test)]
+        self.wait_checks.lock().await.push(session_id.to_string());
         self.pending_sessions.lock().await.contains(session_id)
     }
 
