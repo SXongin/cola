@@ -219,7 +219,8 @@ row is unchanged (no fragment).
   no child and spends no new request, and a pass whose card cannot receive the
   refresh gathers nothing.
 - **This cut wires Session Sync.** The live render path gathers no liveness for
-  the ledger: the fragment first appears on the yielding card's ~8 s Session
+  the ledger *(superseded by the ticket #504 amendment below: the live render
+  gathers too)*: the fragment first appears on the yielding card's ~8 s Session
   Sync reads (a waiting card's only clock). A path that does not gather keeps
   whatever fragment is already stored — its age keeps counting — so the
   handover, the in-place resume and a live re-render never drop it.
@@ -245,3 +246,32 @@ row is unchanged (no fragment).
 
 GLOSSARY's **Background Task Ledger** entry follows. The child retirement read
 of #464 will reuse the same gather.
+
+## Amendment (2026-10-02, the live render's own gather): the live path reads the same liveness
+
+Ticket #504 supersedes the "This cut wires Session Sync" bullet above: the live
+render path gathers the ledger's child liveness too, so a background `subagent`
+row is as fresh as the card while the parent turn still runs. Each render poll
+hands the shared batch — one transcript light read per distinct child plus its
+pending-wait query, the same one the yielded refresh and the front task panel
+use — to the ledger on the read that refreshes the live list. The fragment's
+age is measured at the card's build clock, so it stays true, and a later read of
+the same row renders the child's new typed activity (a phase gives way to a
+running tool, a wait joins, a failed gather heals).
+
+- **The whole-minute gate stands.** The live path's clock comparison is
+  unchanged: the activity age's seconds never owe a PATCH by themselves, only
+  its whole minute turning (the same gate the row's elapsed has), while a typed
+  liveness change — a tool switch, a wait entering or leaving, the gather
+  establishing or losing the child — owes one immediately, inside the same
+  minute.
+- **The yield still has no gather of its own.** The live render has usually
+  established the fragment before the card yields, and the ~8 s Session Sync
+  reads keep it fresh while the card waits; the yield's own rendering keeps
+  whatever fragment is stored. A handover, an in-place resume or any path that
+  gathers nothing still never drops it.
+- **The zero-read rule is unchanged.** A read that names no live background
+  subagent — shell-only, or V1 with no Background Task facts — spends no child
+  request; only a live subagent row's child is read.
+
+Related: #501, #503, #504, ADR-0054, ADR-0066.

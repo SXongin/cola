@@ -493,6 +493,22 @@ pub(super) fn apply_ledger_read(
 /// turn began — while one that finished before the anchor stays the previous
 /// turn's and never bleeds in (#190).
 pub(super) fn render_new_turn_parts(acc: &mut StreamAccumulator, transcript: &SessionTranscript) -> bool {
+    render_new_turn_parts_with_liveness(acc, transcript, &std::collections::HashMap::new())
+}
+
+/// [`render_new_turn_parts`] with the live Background Task Ledger's gathered
+/// child liveness (spec #501, ticket #504). The live render hands over its own
+/// batch — one shared transcript read per live background subagent, the same
+/// gather the yielded refresh and the front task panel use — so a live card's
+/// `subagent` row carries its child's activity with the render clock's age.
+/// `activities` is keyed by call id; an empty map (V1, a session with no live
+/// subagent, a caller that gathers nothing) keeps each row's last established
+/// fragment.
+pub(super) fn render_new_turn_parts_with_liveness(
+    acc: &mut StreamAccumulator,
+    transcript: &SessionTranscript,
+    activities: &std::collections::HashMap<String, TaskLiveness>,
+) -> bool {
     capture_turn_anchor(acc, transcript);
     let Some(anchor) = acc.turn_anchor.clone() else {
         return false;
@@ -533,12 +549,13 @@ pub(super) fn render_new_turn_parts(acc: &mut StreamAccumulator, transcript: &Se
     // compared at the live path's whole-minute cadence on purpose: this loop
     // flushes on content, and a per-render second clock would be churn. The
     // decision's clock is this read's own; the card renders the rows from its
-    // build clock, the same second. This path gathers no child liveness (the
-    // yielded refresh does, spec #501): a fragment already established is kept
-    // and its age keeps growing, and no read is spent on a live card's ledger.
+    // build clock, the same second. `activities` is this render's own child
+    // gather (spec #501, ticket #504): a fresh fragment is a rendered change
+    // that owes its flush, while a gather that established nothing keeps each
+    // row's stored fragment growing truthfully.
     rendered_any |= acc.set_ledger_from_read(
         transcript,
-        &std::collections::HashMap::new(),
+        activities,
         chrono::Utc::now().timestamp_millis(),
         LedgerCadence::Minute,
     );
@@ -587,11 +604,18 @@ pub(super) async fn render_and_flush(
     // OpenCode auto-renames sessions after a turn; follow the server's live
     // title so the card subtitle doesn't stay on the "new session" default.
     refresh_session_title(cards, sessions, backend, session_id).await;
+    // The live ledger's background subagent rows carry their children's
+    // liveness (spec #501, ticket #504): the shared gather the yielded refresh
+    // and the front task panel use, on this render's own read, so a row's
+    // fragment is as fresh as the card and its age is measured at the build
+    // clock. A read that names no live child (V1, or a session without a
+    // background subagent) spends no child request at all.
+    let ledger_activities = gather_ledger_liveness(backend, requests, transcript).await;
     let (changed, header_changed, new_parts, text_len, reasoning_len, anchor) = {
         let mut live = cards.cards.lock().await;
         let card = live.get_mut(session_id)?;
         let before = card.acc.rendered_parts.len();
-        let changed = render_new_turn_parts(&mut card.acc, transcript);
+        let changed = render_new_turn_parts_with_liveness(&mut card.acc, transcript, &ledger_activities);
         // The Turn anchor this render captured (or already carried) plus the
         // card it belongs to: the durable live-card record's anchor is written
         // below, outside the lock (ADR-0063).
@@ -760,6 +784,24 @@ pub(super) fn background_subagent_children(transcript: &SessionTranscript) -> Ve
                 .map(|child| (task.tool.call_id.clone(), child.to_string()))
         })
         .collect()
+}
+
+/// The live ledger's gathered child liveness for one render read (spec #501,
+/// ticket #504): the shared batch over the read's live background subagents
+/// ([`background_subagent_children`]) — one transcript light read per distinct
+/// child plus its pending-wait query — or an empty map when the read names no
+/// child, so V1 and a session without a background subagent spend no request
+/// at all.
+async fn gather_ledger_liveness(
+    backend: &Arc<dyn crate::backend::Backend>,
+    requests: &RequestsHandle,
+    transcript: &SessionTranscript,
+) -> std::collections::HashMap<String, TaskLiveness> {
+    let children = background_subagent_children(transcript);
+    if children.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    gather_child_liveness(backend, requests, &children).await
 }
 
 /// Read and attach the child-session liveness of every live `task` panel on

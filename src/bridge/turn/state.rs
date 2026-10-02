@@ -2905,6 +2905,73 @@ mod tests {
         assert!(acc.set_ledger(waiting, start + 1_400, LedgerCadence::Second));
     }
 
+    /// The LIVE path's flush rule (spec #501, ticket #504): the activity age
+    /// grows by whole seconds on every render, but the live card compares its
+    /// clock at whole minutes, so the seconds alone never owe a PATCH — only
+    /// the age's minute turning does (the same gate the row's elapsed has).
+    /// A typed liveness change — a tool switch, a wait joining the fragment,
+    /// the gather establishing or losing the child — is a rendered change and
+    /// owes its flush at once, inside the same minute.
+    #[test]
+    fn live_ledger_activity_seconds_never_owe_but_typed_changes_do() {
+        let start = 1_800_000_000_000;
+        let row = |activity: Option<TaskLiveness>| {
+            vec![TaskLedgerRow {
+                kind: TaskKind::Subagent,
+                label: Some("review the diff".into()),
+                // No elapsed: the activity age is the card's only rendered
+                // number, so each assertion isolates it.
+                started_at: None,
+                unconfirmed: false,
+                activity,
+            }]
+        };
+        let tool = |name: &str, wait: Option<crate::feishu::card::AwaitingAction>| TaskLiveness {
+            activity: crate::feishu::card::tool_render::ChildActivity::Tool {
+                name: name.into(),
+                started_at: Some(start),
+            },
+            last_activity_ms: start,
+            wait,
+        };
+        let mut acc = StreamAccumulator::new("test");
+
+        // The first read: the row arrives before its child is established.
+        assert!(acc.set_ledger(row(None), start, LedgerCadence::Minute));
+        // The gather establishes the child's running tool: a typed change owes.
+        assert!(acc.set_ledger(row(Some(tool("bash", None))), start, LedgerCadence::Minute));
+        // The age grows through the rendered minute: the live card's gate
+        // never owes a PATCH for the seconds alone.
+        assert!(!acc.set_ledger(
+            row(Some(tool("bash", None))),
+            start + 30_000,
+            LedgerCadence::Minute
+        ));
+        // The age's whole minute turning owes — the same gate as the elapsed.
+        assert!(acc.set_ledger(
+            row(Some(tool("bash", None))),
+            start + 60_000,
+            LedgerCadence::Minute
+        ));
+        // A typed change inside the same minute owes at once: the tool switches…
+        assert!(acc.set_ledger(
+            row(Some(tool("edit", None))),
+            start + 60_100,
+            LedgerCadence::Minute
+        ));
+        // …a wait joins the otherwise identical fragment…
+        assert!(acc.set_ledger(
+            row(Some(tool(
+                "edit",
+                Some(crate::feishu::card::AwaitingAction::Permission)
+            ))),
+            start + 60_200,
+            LedgerCadence::Minute
+        ));
+        // …and the gather losing the child renders the bare row again.
+        assert!(acc.set_ledger(row(None), start + 60_300, LedgerCadence::Minute));
+    }
+
     /// The flush decision compares only what the row RENDERS (spec #501,
     /// acceptance 5): a label differing past the renderer's clip, an empty
     /// label where none renders, and a start clock moving inside the displayed

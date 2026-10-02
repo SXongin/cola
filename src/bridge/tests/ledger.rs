@@ -397,7 +397,17 @@ async fn several_tasks_list_in_transcript_order_beside_the_other_tail_sections()
         "the live Tool Panel coexists with the ledger: {text}"
     );
     assert_elapsed_shaped(&ledger_elapsed(&card, "· shell：**npm run build** · "));
-    assert_elapsed_shaped(&ledger_elapsed(&card, "· subagent：**review the diff** · "));
+    // The subagent's row may carry its child's activity after the elapsed
+    // (ticket #504), so assert the elapsed is AMONG the row's segments rather
+    // than its last one.
+    let sub_row = text
+        .lines()
+        .find(|line| line.starts_with("· subagent：**review the diff** · "))
+        .expect("the subagent row");
+    assert!(
+        sub_row.split(" · ").any(|seg| parsed_task_elapsed(seg).is_some()),
+        "the subagent row keeps its start clock and elapsed: {sub_row:?}"
+    );
 }
 
 /// Acceptance 2 + 3: the label joins by `call_id` — a shell's `description`
@@ -2516,8 +2526,9 @@ fn activity_age_secs(activity: &str) -> u64 {
 /// Acceptance 1 (spec #501): a yielded card's live background subagent row
 /// carries its child's running tool and that call's age — the front task
 /// panel's own vocabulary — after the row's elapsed; the shell row stays
-/// exactly as it was (no fragment). The gather happens on the Session Sync
-/// reads the waiting card already has, not on the yield's own render.
+/// exactly as it was (no fragment). The child read rides the same gather the
+/// LIVE render uses (ticket #504); the Session Sync passes below are what keep
+/// the waiting card's fragment fresh.
 #[tokio::test]
 async fn a_yielded_subagents_row_shows_its_childs_liveness() {
     let _wd = test_work_dir();
@@ -2529,15 +2540,9 @@ async fn a_yielded_subagents_row_shows_its_childs_liveness() {
         .given_transcript_after_build("ses_call_sub", vec![child_running_tool(tool_started, "bash")])
         .await;
     yield_waiting_card(&app, &platform, 2).await;
-    assert!(
-        !backend
-            .transcript_calls
-            .lock()
-            .await
-            .iter()
-            .any(|sid| sid == "ses_call_sub"),
-        "the yield's own render reads no background child"
-    );
+    // The yield's own rendering no longer establishes the fragment on its own —
+    // since ticket #504 the LIVE render's gather does, before the card yields —
+    // and the Session Sync passes below keep it fresh while the card waits.
 
     spawn_sync(&app);
     wait_for_card_update(
@@ -2976,5 +2981,230 @@ async fn a_yielded_rows_activity_age_advances_on_the_rendered_second() {
     assert!(
         previous > first,
         "the activity age advanced by rendered seconds over the window: {first} -> {previous}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A live background subagent's child activity on the LIVE render path (spec
+// #501, ticket #504): while the parent turn is still running and the card is
+// live, the render poll calls the same shared gather the yielded refresh uses —
+// one child read per live subagent and one pending-wait query — so the row is
+// as fresh as the card and its age is measured at the render's own clock. The
+// live path's whole-minute clock gate still holds: the age's seconds never owe
+// a PATCH by themselves, while a typed change does (pinned in `state.rs`), and
+// a read that names no child spends no request at all (V1 included).
+// ---------------------------------------------------------------------------
+
+/// Acceptance 1 (spec #501): a live card's background subagent row carries its
+/// child's running tool and age — the fragment appended after the row's
+/// elapsed, never to the shell row — while the parent turn is still running.
+#[tokio::test]
+async fn a_live_subagents_row_shows_its_childs_liveness() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下构建并审阅"),
+        background_launch(
+            2_000,
+            "shell",
+            "call_bg",
+            serde_json::json!({ "command": "gh run watch" }),
+        ),
+        background_launch(
+            2_100,
+            "subagent",
+            "call_sub",
+            serde_json::json!({ "description": "review the diff" }),
+        ),
+    ])
+    .with_background_tasks(vec![
+        live_shell(now - 60_000, "call_bg"),
+        live_subagent(now - 30_000, "call_sub"),
+    ]);
+    let (_dir, app, backend, platform) = scripted_app(vec![transcript], Some(SessionStatus::Busy)).await;
+    backend
+        .given_transcript_after_build("ses_call_sub", vec![child_running_tool(now - 5_000, "bash")])
+        .await;
+
+    let _turn = spawn_turn(&app, ctx("ses_test", "跑一下构建并审阅"));
+    wait_for_card_update(
+        &platform,
+        "the live subagent activity",
+        CardUpdates::Latest,
+        |card| {
+            ledger_activity(card, "· subagent：**review the diff**")
+                .is_some_and(|activity| activity.starts_with("bash "))
+        },
+    )
+    .await;
+
+    let card = platform.updated_cards().await.last().cloned().unwrap();
+    let activity = ledger_activity(&card, "· subagent：**review the diff**")
+        .unwrap_or_else(|| panic!("the live subagent row carries its child's activity: {card}"));
+    let (name, age) = activity
+        .split_once(' ')
+        .unwrap_or_else(|| panic!("activity names the tool before its age: {activity:?}"));
+    assert_eq!(name, "bash", "the running tool's own name: {activity:?}");
+    assert!(
+        age.ends_with('s') && activity_age_secs(&activity) >= 5,
+        "the live fragment's age is second-granular and true: {activity:?}"
+    );
+    // The row keeps its start clock and elapsed, with the fragment appended.
+    let row = card_text(&card)
+        .lines()
+        .find(|line| line.starts_with("· subagent：**review the diff** · "))
+        .expect("the subagent row")
+        .to_string();
+    assert!(
+        row.split(" · ").any(|seg| parsed_task_elapsed(seg).is_some()),
+        "the row keeps its start clock and elapsed before the fragment: {row:?}"
+    );
+    assert!(
+        row.ends_with(&format!(" · {activity}")),
+        "the fragment is appended after the elapsed: {row:?}"
+    );
+    // The shell row is untouched, and the card is still the LIVE one.
+    assert_eq!(
+        ledger_activity(&card, "· shell：**gh run watch**"),
+        None,
+        "a shell row never carries an activity fragment: {card}"
+    );
+    assert!(
+        !card_header(&card).contains("完成"),
+        "the row rides the live card, not a settled one: {card}"
+    );
+}
+
+/// Acceptance 2 (spec #501): the fragment follows the child on the card's own
+/// refresh — a later read of the same row renders the child's new typed
+/// activity (its `回复中` phase, then the running tool), each age measured at
+/// that render's clock.
+#[tokio::test]
+async fn a_live_subagents_row_refreshes_to_the_childs_new_activity() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下审阅"),
+        background_launch(
+            2_000,
+            "subagent",
+            "call_sub",
+            serde_json::json!({ "description": "review the diff" }),
+        ),
+    ])
+    .with_background_tasks(vec![live_subagent(now - 30_000, "call_sub")]);
+    let (_dir, app, backend, platform) = scripted_app(vec![transcript], Some(SessionStatus::Busy)).await;
+    backend
+        .given_transcript_after_build("ses_call_sub", vec![child_replying(now - 3_000)])
+        .await;
+
+    let _turn = spawn_turn(&app, ctx("ses_test", "跑一下审阅"));
+    wait_for_card_update(&platform, "the child's phase", CardUpdates::Latest, |card| {
+        ledger_activity(card, "· subagent：**review the diff**")
+            .is_some_and(|activity| activity.starts_with("回复中 "))
+    })
+    .await;
+
+    // The child starts a tool: the next renders carry the typed change.
+    backend
+        .given_transcript_after_build("ses_call_sub", vec![child_running_tool(now - 1_000, "bash")])
+        .await;
+    wait_for_card_update(
+        &platform,
+        "the child's new activity",
+        CardUpdates::Latest,
+        |card| {
+            ledger_activity(card, "· subagent：**review the diff**")
+                .is_some_and(|activity| activity.starts_with("bash "))
+        },
+    )
+    .await;
+    let card = platform.updated_cards().await.last().cloned().unwrap();
+    let activity = ledger_activity(&card, "· subagent：**review the diff**").unwrap();
+    assert!(
+        activity_age_secs(&activity) >= 1,
+        "the new fragment counts from the new tool's start: {activity:?}"
+    );
+}
+
+/// Acceptance 1 (spec #501): the live row's age is measured at each render's
+/// own clock — a later card update of the same read shows it advancing, never
+/// frozen on the read that established the fragment.
+#[tokio::test]
+async fn a_live_subagents_activity_age_advances_with_the_render_clock() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下审阅"),
+        background_launch(
+            2_000,
+            "subagent",
+            "call_sub",
+            serde_json::json!({ "description": "review the diff" }),
+        ),
+    ])
+    .with_background_tasks(vec![live_subagent(now - 30_000, "call_sub")]);
+    let (_dir, app, backend, platform) = scripted_app(vec![transcript], Some(SessionStatus::Busy)).await;
+    backend
+        .given_transcript_after_build("ses_call_sub", vec![child_running_tool(now - 5_000, "bash")])
+        .await;
+
+    let _turn = spawn_turn(&app, ctx("ses_test", "跑一下审阅"));
+    wait_for_card_update(&platform, "the fragment first", CardUpdates::Latest, |card| {
+        ledger_activity(card, "· subagent：**review the diff**").is_some()
+    })
+    .await;
+    let first = activity_age_secs(
+        &ledger_activity(
+            &platform.updated_cards().await.last().cloned().unwrap(),
+            "· subagent：**review the diff**",
+        )
+        .expect("the fragment landed"),
+    );
+
+    wait_for_card_update(
+        &platform,
+        "the render clock advancing the age",
+        CardUpdates::Latest,
+        |card| {
+            ledger_activity(card, "· subagent：**review the diff**")
+                .is_some_and(|activity| activity_age_secs(&activity) > first)
+        },
+    )
+    .await;
+}
+
+/// Acceptance 4 (spec #501): a live session whose ledger names no child — a
+/// lone shell, or V1 with no Background Task facts at all — spends no child
+/// read: the render's gather is empty and only the session itself is read.
+#[tokio::test]
+async fn a_live_session_without_background_subagents_spends_no_child_read() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下构建"),
+        background_launch(
+            2_000,
+            "shell",
+            "call_bg",
+            serde_json::json!({ "command": "npm run build" }),
+        ),
+    ])
+    .with_background_tasks(vec![live_shell(now - 60_000, "call_bg")]);
+    let (_dir, app, backend, platform) = scripted_app(vec![transcript], Some(SessionStatus::Busy)).await;
+
+    let _turn = spawn_turn(&app, ctx("ses_test", "跑一下构建"));
+    wait_for_card_update(&platform, "the live shell row", CardUpdates::Latest, |card| {
+        card_text(card).contains("· shell：**npm run build**")
+    })
+    .await;
+    // Several more renders at the injected cadence with a live row: the live
+    // path still never names a child, so it reads only the session itself.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let calls = backend.transcript_calls.lock().await.clone();
+    assert!(
+        calls.len() > 1 && calls.iter().all(|sid| sid == "ses_test"),
+        "no task names a child, so only the session itself is read: {calls:?}"
     );
 }
