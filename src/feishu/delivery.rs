@@ -36,16 +36,22 @@ const BACKOFF_BASE: Duration = Duration::from_secs(5);
 /// The backoff cap. Entries retry indefinitely at this cadence — a time limit
 /// would strand the card permanently stale, which is the defect being fixed.
 const BACKOFF_MAX: Duration = Duration::from_secs(300);
+/// One retry's own bound. The client has no default timeout, and the drain is
+/// a background convergence path: a hung PATCH must not hold the card's
+/// delivery lock (blocking new writes), the Session Sync pass, or all future
+/// drains. On expiry the payload stays pending and is retried later — a
+/// cancelled update may have landed, and re-sending one is idempotent.
+const DRAIN_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// One card's newest write state.
 ///
 /// `card` is `Some` while that write's payload is undelivered — the Pending
 /// Card Update proper — and `None` once a write of the same sequence settled
 /// (delivered, or permanently refused). The settled form is kept as a
-/// sequence tombstone: a *slow* write that started before the settled one and
-/// fails after it must not re-register its older payload (ADR-0067: a slow
-/// failure may never resurrect a superseded payload over a newer delivered
-/// one). Tombstones age out under the same cap as pending payloads.
+/// sequence tombstone: an outcome that is not newer than the stored sequence
+/// must not re-register its older payload (ADR-0067: a slow failure may never
+/// resurrect a superseded payload over a newer delivered one). Tombstones age
+/// out under the same cap as pending payloads.
 #[derive(Clone)]
 struct PendingEntry {
     /// The monotonic write sequence this state belongs to. A retry may clear
@@ -57,11 +63,22 @@ struct PendingEntry {
     attempts: u32,
     /// The earliest instant the next retry may go out (unless forced).
     next_attempt: tokio::time::Instant,
+    /// The card's delivery lock (shared with [`State::locks`]): every write to
+    /// this message — a normal `update_message` and a drain retry alike —
+    /// holds it across the Feishu call, so an older retry can never land after
+    /// a newer write (ADR-0038's ordering, for the outbox writer).
+    lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Default)]
 struct State {
     entries: HashMap<String, PendingEntry>,
+    /// One delivery lock per card while its entry lives — plus while any call
+    /// still holds it. Every write to a message is serialized on it, so the
+    /// outbox's retries and the live writers cannot reorder each other at
+    /// Feishu. Pruned once no entry names the card and no call holds the lock
+    /// (see [`CardDelivery::prune_locks`]), so it stays bounded.
+    locks: HashMap<String, Arc<tokio::sync::Mutex<()>>>,
     seq: u64,
 }
 
@@ -114,11 +131,29 @@ impl CardDelivery {
             .is_some_and(|entry| entry.card.is_some())
     }
 
+    /// The card's delivery lock, created on first use. Stable while an entry
+    /// names the card or any call holds the lock.
+    fn card_lock(&self, message_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.state
+            .lock()
+            .unwrap()
+            .locks
+            .entry(message_id.to_string())
+            .or_default()
+            .clone()
+    }
+
+    /// Drop locks nothing needs: a card with no entry and no holder.
+    fn prune_locks(state: &mut State) {
+        let State { entries, locks, .. } = state;
+        locks.retain(|message_id, lock| entries.contains_key(message_id) || Arc::strong_count(lock) > 1);
+    }
+
     /// Fold one write's outcome into the state. The newest sequence wins: a
     /// recoverable failure records the payload as the card's newest Pending
     /// Card Update; a delivery (or a permanent refusal) leaves a settled
-    /// tombstone at that sequence instead, so a slower older write that fails
-    /// later cannot re-register a superseded payload.
+    /// tombstone at that sequence instead, so an outcome that is not newer
+    /// than the stored one cannot re-register a superseded payload.
     fn observe(&self, message_id: &str, seq: u64, card: &Value, result: &Result<()>) {
         let mut state = self.state.lock().unwrap();
         let newest = match state.entries.get(message_id) {
@@ -134,6 +169,7 @@ impl CardDelivery {
                 card: Some(card.clone()),
                 attempts: 0,
                 next_attempt: tokio::time::Instant::now() + self.backoff_base,
+                lock: state.locks.entry(message_id.to_string()).or_default().clone(),
             }
         } else {
             // Delivered, or a permanent refusal (a rejected card, a gone
@@ -144,10 +180,12 @@ impl CardDelivery {
                 card: None,
                 attempts: 0,
                 next_attempt: tokio::time::Instant::now(),
+                lock: state.locks.entry(message_id.to_string()).or_default().clone(),
             }
         };
         state.entries.insert(message_id.to_string(), entry);
         self.evict_over_cap(&mut state);
+        Self::prune_locks(&mut state);
     }
 
     /// Keep the state under the cap. Settled tombstones leave first — the cap
@@ -204,6 +242,11 @@ impl Platform for CardDelivery {
             state.seq += 1;
             state.seq
         };
+        // Serialize with any in-flight drain retry for this card: the newest
+        // write must land at Feishu last (ADR-0038's ordering; ADR-0067's
+        // newest-wins).
+        let lock = self.card_lock(message_id);
+        let _delivery = lock.lock().await;
         let result = self.inner.update_message(message_id, card).await;
         self.observe(message_id, seq, card, &result);
         result
@@ -303,22 +346,60 @@ impl Platform for CardDelivery {
             // Only a pending entry is due (the filter above); the clone keeps
             // the payload for the retry.
             let Some(card) = entry.card.clone() else { continue };
-            let result = self.inner.update_message(&message_id, &card).await;
+            // Serialize with the card's other writers: the retry must land at
+            // Feishu before any newer write, or an older payload would be the
+            // last state on the card (ADR-0067's newest-wins at the wire).
+            // A live writer already mid-flight makes the retry unnecessary —
+            // it is about to deliver a newer state — so skip and let the next
+            // pass retry anything its outcome left owed.
+            let Ok(_delivery) = entry.lock.try_lock() else {
+                continue;
+            };
+            // Re-check under the lock: a write that settled (or replaced) the
+            // entry while this drain was waiting must not be overwritten by
+            // the payload we snapshotted.
+            {
+                let state = self.state.lock().unwrap();
+                if !state
+                    .entries
+                    .get(&message_id)
+                    .is_some_and(|current| current.seq == entry.seq && current.card.is_some())
+                {
+                    continue;
+                }
+            }
+            // Bounded: a hung PATCH must not hold the card's delivery lock —
+            // and so the Session Sync pass — forever. On expiry the payload
+            // stays pending and is retried later.
+            let result = match tokio::time::timeout(
+                DRAIN_RETRY_TIMEOUT,
+                self.inner.update_message(&message_id, &card),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(crate::error::BridgeError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "card update retry timed out",
+                ))),
+            };
             let mut state = self.state.lock().unwrap();
-            // A write raced this retry and replaced the entry (a newer failure
-            // or a newer settlement): the in-flight retry's outcome belongs to
-            // the payload it carried, never to the newer state.
+            // The entry could still have left the set under cap eviction while
+            // the retry was in flight; its outcome belongs to the payload it
+            // carried, not to a newer state.
             let still_current = state
                 .entries
                 .get(&message_id)
                 .is_some_and(|current| current.seq == entry.seq && current.card.is_some());
             if !still_current {
+                Self::prune_locks(&mut state);
                 continue;
             }
             match result {
                 Ok(()) => {
-                    // Keep the sequence as a settled tombstone: a slower write
-                    // that started earlier must not re-register behind it.
+                    // Keep the sequence as a settled tombstone: an outcome that
+                    // is not newer than the stored one must not re-register
+                    // behind it.
                     if let Some(current) = state.entries.get_mut(&message_id) {
                         current.card = None;
                     }
@@ -345,6 +426,7 @@ impl Platform for CardDelivery {
                     tracing::warn!("pending card update for {message_id} dropped: {e}");
                 }
             }
+            Self::prune_locks(&mut state);
         }
     }
 
@@ -368,12 +450,10 @@ mod tests {
     }
 
     /// A one-shot mid-call park: `entered` fires when the call is in flight,
-    /// `release` lets it finish, and `fail` is that call's own result (a shared
-    /// script queue cannot target a call that is parked while newer calls run).
+    /// `release` lets it finish.
     struct Gate {
         entered: Arc<tokio::sync::Notify>,
         release: Arc<tokio::sync::Notify>,
-        fail: Option<Fail>,
     }
 
     /// Records every `update_message` attempt and serves a queued script;
@@ -400,22 +480,11 @@ mod tests {
 
         /// Park the next `update_message` call, returning `(entered, release)`.
         fn park_next(&self) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
-            self.park_next_with(None)
-        }
-
-        /// [`Self::park_next`] where the parked call itself fails with `fail`
-        /// once released.
-        fn park_next_failing(&self, fail: Fail) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
-            self.park_next_with(Some(fail))
-        }
-
-        fn park_next_with(&self, fail: Option<Fail>) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
             let entered = Arc::new(tokio::sync::Notify::new());
             let release = Arc::new(tokio::sync::Notify::new());
             *self.gate.lock().unwrap() = Some(Gate {
                 entered: entered.clone(),
                 release: release.clone(),
-                fail,
             });
             (entered, release)
         }
@@ -433,14 +502,11 @@ mod tests {
                 .unwrap()
                 .push((message_id.to_string(), card.clone()));
             let gate = self.gate.lock().unwrap().take();
-            let gated = if let Some(gate) = gate {
+            if let Some(gate) = gate {
                 gate.entered.notify_one();
                 gate.release.notified().await;
-                gate.fail
-            } else {
-                None
-            };
-            match gated.or_else(|| self.script.lock().unwrap().pop_front()) {
+            }
+            match self.script.lock().unwrap().pop_front() {
                 None => Ok(()),
                 Some(Fail::Transport) => Err(BridgeError::Io(std::io::Error::other("transport down"))),
                 Some(Fail::ContentRejected) => Err(BridgeError::CardContentRejected {
@@ -582,76 +648,82 @@ mod tests {
         assert!(!delivery.pending("om_1"));
     }
 
-    /// A slow failed retry must never resurrect the payload it carried: while
-    /// it is in flight a newer failure replaces the entry, and the retry's
-    /// success leaves that newer entry alone.
+    /// The card's writers are serialized: a drain retry in flight blocks a
+    /// newer write, so the newer payload always lands at Feishu last — the
+    /// ADR-0067 order (ADR-0038's write serialization, extended to the outbox
+    /// writer). Without the lock the newer write would overtake the retry and
+    /// the older payload would be the card's final state.
     #[tokio::test]
-    async fn a_slow_retry_never_resurrects_a_superseded_payload() {
+    async fn a_drain_retry_serializes_with_a_newer_write() {
         let inner = Arc::new(FakePlatform::new());
         inner.fail_next(Fail::Transport);
         let delivery = Arc::new(CardDelivery::new(inner.clone()));
-        let first = serde_json::json!({ "body": "first" });
-        let second = serde_json::json!({ "body": "second" });
-        let _ = delivery.update_message("om_1", &first).await;
+        let old = serde_json::json!({ "body": "old" });
+        let new = serde_json::json!({ "body": "new" });
+        let _ = delivery.update_message("om_1", &old).await;
+        assert!(delivery.pending("om_1"));
 
-        let (entered, release) = inner.park_next();
-        let draining = tokio::spawn({
+        let (entered, release) = inner.park_next(); // the retry will succeed
+        let retrying = tokio::spawn({
             let delivery = Arc::clone(&delivery);
             async move { delivery.drain_pending_card_updates(true).await }
         });
         entered.notified().await; // the retry is parked mid-flight
 
-        inner.fail_next(Fail::Transport);
-        let _ = delivery.update_message("om_1", &second).await;
-        release.notify_one();
-        draining.await.unwrap();
+        let writing = tokio::spawn({
+            let delivery = Arc::clone(&delivery);
+            let new = new.clone();
+            async move { delivery.update_message("om_1", &new).await }
+        });
+        // The newer write must not reach the wire while the retry is in
+        // flight: it waits on the card's delivery lock.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            inner.attempts().len(),
+            2,
+            "the newer write waits for the retry to land"
+        );
 
-        assert!(delivery.pending("om_1"), "the newer failure stays pending");
-        delivery.drain_pending_card_updates(true).await;
+        release.notify_one();
+        retrying.await.unwrap();
+        writing.await.unwrap().unwrap();
         let attempts = inner.attempts();
         assert_eq!(
             attempts.last(),
-            Some(&("om_1".to_string(), second.clone())),
-            "the newer payload is what converges"
+            Some(&("om_1".to_string(), new.clone())),
+            "the newest write landed last"
         );
         assert!(!delivery.pending("om_1"));
     }
 
-    /// A slow FIRST write that fails only after a newer write delivered must
-    /// not re-register its older payload: the delivered sequence is kept as a
-    /// settled tombstone that rejects the late failure.
-    #[tokio::test]
-    async fn a_late_failure_of_a_superseded_write_is_ignored() {
+    /// A hung retry gives up at the bound: the payload stays owed, the card's
+    /// delivery lock is released, and a newer write can proceed.
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_retry_times_out_and_keeps_the_payload_pending() {
         let inner = Arc::new(FakePlatform::new());
+        inner.fail_next(Fail::Transport);
         let delivery = Arc::new(CardDelivery::new(inner.clone()));
-        let first = serde_json::json!({ "body": "first" });
-        let second = serde_json::json!({ "body": "second" });
+        let old = serde_json::json!({ "body": "old" });
+        let new = serde_json::json!({ "body": "new" });
+        let _ = delivery.update_message("om_1", &old).await;
 
-        let (entered, release) = inner.park_next_failing(Fail::Transport);
-        let slow = tokio::spawn({
+        let (entered, _never_released) = inner.park_next();
+        let retrying = tokio::spawn({
             let delivery = Arc::clone(&delivery);
-            let first = first.clone();
-            async move { delivery.update_message("om_1", &first).await }
+            async move { delivery.drain_pending_card_updates(true).await }
         });
-        entered.notified().await; // the older write is parked mid-flight
+        entered.notified().await;
 
-        // The newer write delivered while the older one still hangs.
-        delivery.update_message("om_1", &second).await.unwrap();
-        release.notify_one();
-        assert!(slow.await.unwrap().is_err(), "the parked write fails after it");
+        // The paused clock elapses the retry bound; the drain must return.
+        tokio::time::timeout(std::time::Duration::from_secs(120), retrying)
+            .await
+            .expect("the hung retry must time out, not hang the drain")
+            .unwrap();
+        assert!(delivery.pending("om_1"), "the payload is still owed");
 
-        assert!(
-            !delivery.pending("om_1"),
-            "the late failure must not resurrect the older payload"
-        );
-        delivery.drain_pending_card_updates(true).await;
-        let attempts = inner.attempts();
-        assert_eq!(attempts.len(), 2, "nothing was retried");
-        assert_eq!(
-            attempts[1],
-            ("om_1".to_string(), second.clone()),
-            "the newer payload was the delivered one"
-        );
+        // The lock is free again: a newer write goes through and settles.
+        delivery.update_message("om_1", &new).await.unwrap();
+        assert!(!delivery.pending("om_1"));
     }
 
     /// A content rejection is deterministic — it never enters the set and is
