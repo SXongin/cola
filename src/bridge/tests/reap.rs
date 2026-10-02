@@ -118,6 +118,31 @@ async fn build_restarted_with_sessions(
     (app, platform, backend)
 }
 
+/// A turn-capable app over an explicit session file — the two-life test needs
+/// the SAME path for the process whose final PATCH failed and the fresh
+/// process that reaps the record. Cadences are the tiny test ones.
+async fn turn_capable_app(
+    session_file: &Path,
+    transcript: SessionTranscript,
+) -> (Arc<App>, Arc<RecordingPlatform>, Arc<MockBackend>) {
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_transcript("ses_test", vec![transcript]);
+    backend.with_session_status("ses_test", Some(SessionStatus::Idle));
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(
+        App::new(test_config(session_file), backend.clone(), platform.clone()).expect("the turn app builds"),
+    );
+    seed_session(&app, "ses_test", "/work").await;
+    app.turn_render_poll_ms
+        .store(5, std::sync::atomic::Ordering::Relaxed);
+    app.turn_drain_timeout_ms
+        .store(60_000, std::sync::atomic::Ordering::Relaxed);
+    app.turn_follow_read_timeout_ms
+        .store(20, std::sync::atomic::Ordering::Relaxed);
+    (app, platform, backend)
+}
+
 /// The card the platform PATCHed onto `message_id` last, if any.
 async fn last_update_of(platform: &RecordingPlatform, message_id: &str) -> Option<serde_json::Value> {
     platform
@@ -1629,4 +1654,68 @@ async fn the_session_sync_pass_retries_a_failed_final_patch() {
     })
     .await
     .expect("the pass drain converges the card and the reap cleans the record");
+}
+
+/// ADR-0067's full restart acceptance: life 1's final PATCH fails and its
+/// record survives on disk; a fresh process (the in-memory pending payload died
+/// with life 1, as the ADR accepts) reaps the card from transcript truth and
+/// drops the record.
+#[tokio::test]
+async fn a_restart_after_a_failed_final_patch_reaps_the_card() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "你好"),
+        assistant(2_000, "答复。"),
+    ]);
+
+    // Life 1: the turn ends while every card write fails at the transport.
+    let (app, platform, _backend) = turn_capable_app(&session_file, transcript.clone()).await;
+    platform
+        .fail_update_transport_count
+        .store(100, std::sync::atomic::Ordering::SeqCst);
+    Turn::run(&app.turn_handles(), ctx("ses_test", "你好"))
+        .await
+        .unwrap();
+    let card_id = app
+        .cards_handle()
+        .live_cards
+        .get("ses_test")
+        .expect("a failed ending write keeps the record")
+        .card_message_id
+        .clone();
+    drop(app); // life 1 ends; the pending payload was memory-only (ADR-0067)
+
+    // Life 2: a fresh app over the same files. Nothing in memory knows the
+    // card; the reap settles it from the transcript and cleans the record.
+    let (restarted, platform2, _backend2) =
+        restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Idle)).await;
+    assert_eq!(
+        restarted
+            .cards_handle()
+            .live_cards
+            .get("ses_test")
+            .map(|record| record.card_message_id),
+        Some(card_id.clone()),
+        "the restart loaded life 1's record"
+    );
+
+    spawn_sync(&restarted);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let settled = platform2.calls.lock().await.iter().any(|call| match call {
+                PlatformCall::UpdateMessage { message_id, card } => {
+                    message_id == &card_id && card_header(card).contains("✅")
+                }
+                _ => false,
+            });
+            if settled && restarted.cards_handle().live_cards.get("ses_test").is_none() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the reap settles the orphaned card and drops its record");
 }
