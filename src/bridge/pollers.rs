@@ -4,7 +4,7 @@ use tokio::sync::Mutex;
 
 use crate::bridge::discovery::{self, ServerCandidate};
 use crate::bridge::handler::CardActionResult;
-use crate::bridge::handles::{CardsHandle, PollHandles, RequestsHandle, SessionsHandle, WaitsHandle};
+use crate::bridge::handles::{CardsHandle, PollHandles, SessionsHandle, WaitsHandle};
 use crate::bridge::request::flow::SentCard;
 use crate::bridge::turn::Turn;
 use crate::config::ServerStartPolicy;
@@ -507,38 +507,71 @@ pub(crate) fn result_card(title: &str, template: &str, body: &str) -> CardAction
     }
 }
 
+/// Whether the run that owned a request is provably over: a successful,
+/// recognised `session_status` read that is not live (ADR-0059). Any failed or
+/// unrecognised read answers `false` — unknown is never read as an
+/// interruption, exactly as a failed list is never read as resolved (#130).
+/// Bounded like every sweep read: a half-open connection must not stall the
+/// pass.
+pub(crate) async fn run_is_over(
+    backend: &Arc<dyn crate::backend::Backend>,
+    session_id: &str,
+    directory: Option<&str>,
+    timeout_ms: u64,
+) -> bool {
+    let read = crate::bridge::bounded_call(
+        &format!("session status ({session_id})"),
+        timeout_ms,
+        backend.session_status(session_id, directory),
+    )
+    .await;
+    match read {
+        Some(Ok(Some(status))) => !status.is_live(),
+        // Present with an unrecognised type: never guessed.
+        Some(Ok(None)) => false,
+        Some(Err(e)) => {
+            tracing::debug!("session status ({session_id}): {e}; keeping the neutral receipt");
+            false
+        }
+        None => {
+            tracing::debug!("session status ({session_id}) timed out; keeping the neutral receipt");
+            false
+        }
+    }
+}
+
 /// Mark permission/question cards as "already handled" when the underlying
-/// request disappeared without cola answering it (another client resolved it).
-/// The stale card keeps the original request description so the user can see
-/// what was handled. A card owned by a directory whose list call failed stays
-/// live — that directory said nothing, so its requests may still be pending
-/// (#130, #144). Shared by the permission and question flows.
+/// request disappeared without cola answering it. The copy is classified by
+/// the owning session's run state (the sweep's `dead` set): a still-live run
+/// was resolved by another client (`✅ 已处理` / "已在其他端处理"), a run that is
+/// over left the request unhandled (`⏱ 已随会话中断` / "未处理") — never
+/// claiming a decision nobody made. An empty owning session (a record written
+/// before the id was persisted) is UNKNOWN and keeps the neutral copy. The
+/// stale card keeps the original request description so the user can see what
+/// it was about. The caller passes the stale list it already classified; this
+/// pass only repaints and forgets the surfaces. Shared by the permission and
+/// question flows.
 pub(crate) async fn mark_stale_cards(
-    requests: &RequestsHandle,
     platform: &Arc<dyn crate::feishu::Platform>,
-    pending: &std::collections::HashSet<String>,
+    stale: Vec<(String, SentCard)>,
     sent: &Arc<Mutex<HashMap<String, SentCard>>>,
     surfaces: &crate::bridge::surfaces::Surfaces,
-    failed_dirs: &std::collections::HashSet<String>,
     kind: &str,
+    dead: &std::collections::HashSet<String>,
 ) {
-    let stale: Vec<(String, String, String)> = {
-        let sent_map = sent.lock().await.clone();
-        let answered = requests.answered_requests.lock().await;
-        sent_map
-            .into_iter()
-            .filter(|(rid, card)| {
-                !pending.contains(rid) && !answered.contains(rid) && !failed_dirs.contains(&card.directory)
-            })
-            .map(|(rid, card)| (rid, card.message_id, card.summary))
-            .collect()
-    };
-    for (rid, mid, desc) in stale {
+    for (rid, card) in stale {
         sent.lock().await.remove(&rid);
         surfaces.remove_standalone(&rid);
-        let card = crate::feishu::card::notify::build_resolved_elsewhere_card(kind, &desc);
-        if let Err(e) = platform.update_message(&mid, &card).await {
+        let over = !card.session_id.is_empty() && dead.contains(&card.session_id);
+        let card_json = if over {
+            crate::feishu::card::notify::build_interrupted_card(kind, &card.summary)
+        } else {
+            crate::feishu::card::notify::build_resolved_elsewhere_card(kind, &card.summary)
+        };
+        if let Err(e) = platform.update_message(&card.message_id, &card_json).await {
             tracing::warn!("mark stale {} card {}: {}", kind, rid, e);
+        } else if over {
+            tracing::info!("Marked stale {} card {} as interrupted", kind, rid);
         } else {
             tracing::info!("Marked stale {} card {} as handled", kind, rid);
         }

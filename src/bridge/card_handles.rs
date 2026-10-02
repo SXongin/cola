@@ -306,19 +306,62 @@ impl CardHandles {
         Some(edited)
     }
 
+    /// Whether `id`'s block is one the vanished pass resolves: left the
+    /// pending list, not cola's own settlement, its directory listed
+    /// successfully, and no accumulator owns it on this same card. One
+    /// predicate, shared by the session collector and the resolver below, so
+    /// the classifier and the resolution can never disagree about what
+    /// vanished.
+    fn is_vanished(
+        id: &str,
+        h: &BlockHandle,
+        kind: ClaimKind,
+        pending: &HashSet<String>,
+        failed_dirs: &HashSet<String>,
+        cola_claimed: &HashSet<String>,
+        flush_owned: &HashMap<String, String>,
+    ) -> bool {
+        h.kind == kind
+            && !pending.contains(id)
+            && !cola_claimed.contains(id)
+            && !failed_dirs.contains(&h.directory)
+            && flush_owned.get(id) != Some(&h.message_id)
+    }
+
+    /// The owning sessions (with their directory) of the blocks
+    /// [`Self::drop_vanished`] would resolve — the sweep classifies these
+    /// before choosing the receipt line. Same predicate, so a block can never
+    /// be classified without being resolved or vice versa.
+    pub fn vanished_sessions(
+        &self,
+        kind: ClaimKind,
+        pending: &HashSet<String>,
+        failed_dirs: &HashSet<String>,
+        cola_claimed: &HashSet<String>,
+        flush_owned: &HashMap<String, String>,
+    ) -> Vec<(String, String)> {
+        self.blocks
+            .iter()
+            .filter(|(id, h)| Self::is_vanished(id, h, kind, pending, failed_dirs, cola_claimed, flush_owned))
+            .map(|(_, h)| (h.session_id.clone(), h.directory.clone()))
+            .collect()
+    }
+
     /// Resolve every registered block of `kind` whose request left the pending
-    /// list into its `⏱ 已由其他客户端处理` receipt, editing each hosting card
-    /// from its cache. Two sources of truth own a still-live block and are left
-    /// to them: an accumulator's own flush repaints the card its
-    /// `card_message_id` names (passed in `flush_owned`, `request_id → card`),
-    /// and a directory whose list call failed said nothing, so its request may
-    /// still be pending (#130, #144). A block cola itself is answering
-    /// (`answered`) is also left to its settlement — cola's disappearance from
-    /// the pending list is not "another client handled it". A block the
-    /// accumulator owns but whose handle points at a DIFFERENT, older card is
-    /// not skipped: that stale card shows the block too and must be repainted
-    /// (ADR-0038, rule 2). Returns `(message_id, card)` per affected card for
-    /// the caller to patch.
+    /// list into its receipt, editing each hosting card from its cache. `line`
+    /// picks the receipt text from the block's owning session and its target:
+    /// the sweep passes the interrupted line for a session whose run is over,
+    /// the neutral one while the run is still live. Two sources of truth own a
+    /// still-live block and are left to them: an accumulator's own flush
+    /// repaints the card its `card_message_id` names (passed in `flush_owned`,
+    /// `request_id → card`), and a directory whose list call failed said
+    /// nothing, so its request may still be pending (#130, #144). A block cola
+    /// itself is answering (`answered`) is also left to its settlement — cola's
+    /// disappearance from the pending list is not "another client handled it".
+    /// A block the accumulator owns but whose handle points at a DIFFERENT,
+    /// older card is not skipped: that stale card shows the block too and must
+    /// be repainted (ADR-0038, rule 2). Returns `(message_id, card)` per
+    /// affected card for the caller to patch.
     pub fn drop_vanished(
         &mut self,
         kind: ClaimKind,
@@ -326,22 +369,16 @@ impl CardHandles {
         failed_dirs: &HashSet<String>,
         cola_claimed: &HashSet<String>,
         flush_owned: &HashMap<String, String>,
-        line: impl Fn(&str) -> String,
+        line: impl Fn(&str, &str) -> String,
     ) -> Vec<(String, serde_json::Value)> {
-        let vanished: Vec<(String, String)> = self
+        let vanished: Vec<(String, String, String)> = self
             .blocks
             .iter()
-            .filter(|(id, h)| {
-                h.kind == kind
-                    && !pending.contains(*id)
-                    && !cola_claimed.contains(*id)
-                    && !failed_dirs.contains(&h.directory)
-                    && flush_owned.get(*id) != Some(&h.message_id)
-            })
-            .map(|(id, h)| (id.clone(), h.target.clone()))
+            .filter(|(id, h)| Self::is_vanished(id, h, kind, pending, failed_dirs, cola_claimed, flush_owned))
+            .map(|(id, h)| (id.clone(), h.session_id.clone(), h.target.clone()))
             .collect();
         let mut patches: Vec<(String, serde_json::Value)> = Vec::new();
-        for (id, target) in vanished {
+        for (id, session_id, target) in vanished {
             let Some(handle) = self.blocks.remove(&id) else {
                 continue;
             };
@@ -355,7 +392,7 @@ impl CardHandles {
                 handle.session_id,
                 message_id
             );
-            let text = line(&target);
+            let text = line(&session_id, &target);
             if let Some(card) = self.resolve_on(&message_id, &id, &text) {
                 merge_patch(&mut patches, message_id, card);
             }
@@ -609,7 +646,7 @@ mod tests {
             &failed_dirs,
             &cola_claimed,
             &flush_owned,
-            |t| format!("⏱ {t}"),
+            |_session, t| format!("⏱ {t}"),
         );
 
         assert_eq!(dropped.len(), 1, "only the stale card is repainted once");

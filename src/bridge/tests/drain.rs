@@ -1151,17 +1151,12 @@ async fn a_pending_permission_waits_past_the_grace_without_error() {
         platform.updated_cards().await
     );
 
-    // The operator answers elsewhere and the run settles: the follow finalizes
-    // Done, not Error — the wait was never a failure.
-    backend.permission_resolved_by_another("per_1").await;
-    backend
-        .set_session_status("ses_test", Some(SessionStatus::Idle))
-        .await;
-    wait_for_card_header(&platform, "完成").await;
-    // The permission poller's sweep repaints the card with the
+    // The operator answers elsewhere while the run is still live: the
+    // permission poller's sweep repaints the card with the neutral
     // 「已由其他客户端处理」 receipt independently of the follow (one more
     // legitimate PATCH); account for it before asserting the drain stopped —
     // otherwise this races the sweep, not the drain.
+    backend.permission_resolved_by_another("per_1").await;
     wait_for_card_update(
         &platform,
         "the handled-elsewhere receipt",
@@ -1169,6 +1164,12 @@ async fn a_pending_permission_waits_past_the_grace_without_error() {
         |card| card_text(card).contains("已由其他客户端处理"),
     )
     .await;
+    // Then the run settles: the follow finalizes Done, not Error — the wait
+    // was never a failure.
+    backend
+        .set_session_status("ses_test", Some(SessionStatus::Idle))
+        .await;
+    wait_for_card_header(&platform, "完成").await;
     assert_no_further_rendering(&backend, &platform).await;
 }
 

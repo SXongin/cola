@@ -13,14 +13,16 @@ use tracing::Instrument;
 
 use crate::bridge::handler::CardActionResult;
 use crate::bridge::handles::{CardsHandle, FlowHandles, RequestsHandle, SessionsHandle};
-use crate::bridge::pollers::{CardTarget, inline_host_session, mark_stale_cards, resolve_card_target};
+use crate::bridge::pollers::{
+    CardTarget, inline_host_session, mark_stale_cards, resolve_card_target, run_is_over,
+};
 use crate::bridge::question::{QuestionState, stale_question_card};
 use crate::bridge::surfaces::{StandaloneSurface, Surfaces};
 use crate::bridge::turn::Turn;
 use crate::opencode;
 
 use super::delivery::{
-    Origin, Residue, already_handled_result, denied_receipt, handled_elsewhere_receipt, resolve_blocks,
+    Origin, Residue, already_handled_result, denied_receipt, resolve_blocks, vanished_receipt,
 };
 use super::kind::{PendingRequest, RequestKind};
 
@@ -34,15 +36,17 @@ pub(crate) struct QuestionSnapshot {
 }
 
 /// A request card cola sent: the live Message id, the summary shown when the
-/// card is marked stale, and the owning directory. The directory lets the
-/// sweep skip cleanups for a directory whose list call failed — "absent from
-/// the pending list" only speaks for directories that listed successfully
-/// (#130, #144).
+/// card is marked stale, and the owning session + directory. The directory
+/// lets the sweep skip cleanups for a directory whose list call failed —
+/// "absent from the pending list" only speaks for directories that listed
+/// successfully (#130, #144) — and the session id lets `mark_stale_cards`
+/// classify the stale copy by the owning run's state.
 #[derive(Clone)]
 pub struct SentCard {
     pub message_id: String,
     pub summary: String,
     pub directory: String,
+    pub session_id: String,
 }
 
 /// The fused permission/question flow. The poll sweep, the in-flight state and
@@ -138,6 +142,7 @@ impl RequestFlow {
                         message_id: s.message_id.clone(),
                         summary: s.summary.clone(),
                         directory: s.directory.clone(),
+                        session_id: s.session_id.clone(),
                     },
                 )
             })
@@ -517,6 +522,55 @@ impl RequestFlow {
         .await
     }
 
+    /// The standalone cards whose request has provably left the pending list:
+    /// not pending, not answered by cola, and owned by a directory that listed
+    /// successfully. The sweep classifies these cards' sessions together with
+    /// the inline candidates — one status read per session per pass — and then
+    /// hands the list to [`mark_stale_cards`] to repaint.
+    async fn stale_standalone_cards(
+        &self,
+        requests: &RequestsHandle,
+        pending: &std::collections::HashSet<String>,
+        failed_dirs: &std::collections::HashSet<String>,
+    ) -> Vec<(String, SentCard)> {
+        let answered = requests.answered_requests.lock().await;
+        self.sent_cards
+            .lock()
+            .await
+            .iter()
+            .filter(|(rid, card)| {
+                !pending.contains(*rid) && !answered.contains(*rid) && !failed_dirs.contains(&card.directory)
+            })
+            .map(|(rid, card)| (rid.clone(), card.clone()))
+            .collect()
+    }
+
+    /// The candidate sessions whose run is provably over: one bounded
+    /// `session_status` read per distinct `(session → directory)` candidate. A
+    /// failed or unrecognised read leaves its session out — unknown is never
+    /// read as an interruption (the neutral receipt stands, exactly as before
+    /// the classifier existed). An empty session id (a standalone record
+    /// written before the owner was persisted) cannot name a run either:
+    /// skipped, so its request keeps the neutral copy. Reads nothing when no
+    /// request vanished.
+    async fn dead_run_sessions(
+        &self,
+        handles: &FlowHandles,
+        candidates: &HashMap<String, String>,
+    ) -> std::collections::HashSet<String> {
+        let timeout_ms = self.list_timeout_ms.load(std::sync::atomic::Ordering::Relaxed);
+        let mut dead = std::collections::HashSet::new();
+        for (session_id, directory) in candidates {
+            if session_id.is_empty() {
+                continue;
+            }
+            if run_is_over(&handles.backend, session_id, Some(directory), timeout_ms).await {
+                dead.insert(session_id.clone());
+            }
+        }
+        dead
+    }
+
     /// One poll iteration: list pending requests per known session directory,
     /// surface the unseen ones, then reconcile everything that left the list
     /// (stale standalone cards, inline sections, snapshot claims, and the
@@ -711,19 +765,6 @@ impl RequestFlow {
                 .sync(&handles.platform, self.kind.claim_kind(), &pin_targets)
                 .await;
         }
-        // Mark stale: a card cola sent whose request is no longer pending
-        // (resolved by another client) and was NOT answered by cola. A card
-        // owned by a directory whose list failed stays live (#144).
-        mark_stale_cards(
-            &handles.requests,
-            &handles.platform,
-            &pending,
-            &self.sent_cards,
-            &self.surfaces,
-            &failed_dirs,
-            self.kind.label(),
-        )
-        .await;
         // Requests cola itself is answering or has answered (a click's claim,
         // an auto-accept approval): their block belongs to the settlement
         // writing the true receipt, so the sweep must not read their
@@ -738,13 +779,65 @@ impl RequestFlow {
         // to the flush (never resolved twice), while one whose handle names an
         // older card still gets that stale card repainted.
         let flush_owned = Turn::flush_owned_blocks(&handles.cards).await;
+        // Classify the sessions the vanished blocks belong to BEFORE resolving
+        // them: a request that left the pending list while its run is over
+        // (an interruption, a location eviction, a restart) was never answered
+        // — the neutral "another client handled it" line would claim a
+        // decision nobody made. The candidates are gathered across all three
+        // surfaces first, so one sweep reads each session's status at most
+        // once, and a sweep with nothing vanished makes no status call at all.
+        let stale_cards = self
+            .stale_standalone_cards(&handles.requests, &pending, &failed_dirs)
+            .await;
+        let mut candidates: HashMap<String, String> = HashMap::new();
+        for (_, card) in &stale_cards {
+            // An empty id lands in the map but `dead_run_sessions` skips it:
+            // UNKNOWN, classified as live (the neutral copy).
+            candidates
+                .entry(card.session_id.clone())
+                .or_insert(card.directory.clone());
+        }
+        for (session_id, directory) in handles.cards.card_handles.lock().await.vanished_sessions(
+            self.kind.claim_kind(),
+            &pending,
+            &failed_dirs,
+            &cola_claimed,
+            &flush_owned,
+        ) {
+            candidates.entry(session_id).or_insert(directory);
+        }
+        for (session_id, directory) in Turn::vanished_block_sessions(
+            &handles.cards,
+            self.kind.claim_kind(),
+            &pending,
+            &failed_dirs,
+            &cola_claimed,
+        )
+        .await
+        {
+            candidates.entry(session_id).or_insert(directory);
+        }
+        let dead = self.dead_run_sessions(handles, &candidates).await;
+        // Mark stale: a card cola sent whose request is no longer pending and
+        // was NOT answered by cola. The stale copy is classified the same way
+        // (the card's own session). A card owned by a directory whose list
+        // failed stays live (#144).
+        mark_stale_cards(
+            &handles.platform,
+            stale_cards,
+            &self.sent_cards,
+            &self.surfaces,
+            self.kind.label(),
+            &dead,
+        )
+        .await;
         let dropped = handles.cards.card_handles.lock().await.drop_vanished(
             self.kind.claim_kind(),
             &pending,
             &failed_dirs,
             &cola_claimed,
             &flush_owned,
-            handled_elsewhere_receipt,
+            |session_id, target| vanished_receipt(session_id, target, &dead),
         );
         for (message_id, card) in dropped {
             if let Err(e) = handles.platform.update_message(&message_id, &card).await {
@@ -757,14 +850,13 @@ impl RequestFlow {
                 );
             }
         }
-        // Resolve inline blocks whose request vanished (resolved by another
-        // client) into their Interaction Receipts and repaint the cards that
-        // host them — the receipt lands within this sweep, with no reliance on
-        // the render tick (which stops when a turn ends). Blocks owned by a
-        // failed directory stay (#144).
+        // Resolve inline blocks whose request vanished into their Interaction
+        // Receipts and repaint the cards that host them — the receipt lands
+        // within this sweep, with no reliance on the render tick (which stops
+        // when a turn ends). Blocks owned by a failed directory stay (#144).
         let repaint = self
             .kind
-            .resolve_vanished_inline(&handles.cards, &pending, &failed_dirs, &cola_claimed)
+            .resolve_vanished_inline(&handles.cards, &pending, &failed_dirs, &cola_claimed, &dead)
             .await;
         for session_id in &repaint {
             Turn::flush_card(&handles.cards, session_id).await;
@@ -1010,6 +1102,7 @@ impl RequestFlow {
                     message_id: mid.clone(),
                     summary: summary.clone(),
                     directory: dir.to_string(),
+                    session_id: req.session_id().to_string(),
                 },
             );
             // Persist the standalone surface so a restart re-adopts it instead
@@ -1021,6 +1114,7 @@ impl RequestFlow {
                     message_id: mid,
                     summary,
                     directory: dir.to_string(),
+                    session_id: req.session_id().to_string(),
                 },
             );
         } else {

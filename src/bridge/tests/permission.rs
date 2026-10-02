@@ -892,15 +892,19 @@ async fn autoaccept_command_keeps_the_standalone_card_for_the_sweep() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
     backend.ask_permission(perm_request("per_1", "ses_1", "ls -la"));
+    // The session is still live (an external/other-client run): the stale copy
+    // keeps the neutral vocabulary.
+    backend.with_session_status("ses_1", Some(opencode::types::SessionStatus::Busy));
     let (app, platform) = build_app(cfg, backend).await;
     seed_session(&app, "ses_1", "/work").await;
-    // The poller surfaced this one as a standalone card (no live turn).
+    // The poller surfaced this one as a standalone card (no live turn card).
     app.permission.sent_cards.lock().await.insert(
         "per_1".into(),
         crate::bridge::request::flow::SentCard {
             message_id: "om_sent".into(),
             summary: "bash ls -la".into(),
             directory: "/work".into(),
+            session_id: "ses_1".into(),
         },
     );
 
@@ -1121,14 +1125,18 @@ async fn stale_permission_card_marked_handled_when_resolved_elsewhere() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
-    // No pending permissions on the server — the card cola sent is stale.
-    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    // No pending permissions on the server — the card cola sent is stale —
+    // and the run is still live: another client answered it.
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_session_status("ses_1", Some(opencode::types::SessionStatus::Busy));
+    let (app, platform) = build_app(cfg, backend).await;
     app.permission.sent_cards.lock().await.insert(
         "per_stale".into(),
         crate::bridge::request::flow::SentCard {
             message_id: "om_sent_card".into(),
             summary: "bash ls -la".into(),
             directory: "/work".into(),
+            session_id: "ses_1".into(),
         },
     );
 
@@ -1171,7 +1179,11 @@ async fn failed_directory_list_keeps_permission_surfaces() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
-    let backend = Arc::new(MockBackend::new(realistic_parts()));
+    // The requests are resolved elsewhere while the run stays live, so the
+    // healed directory's cleanup leaves the neutral receipt.
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_session_status("ses_1", Some(opencode::types::SessionStatus::Busy));
+    let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
     seed_session(&app, "ses_1", "/work").await;
@@ -1224,6 +1236,7 @@ async fn skipped_dead_directory_keeps_live_permission_surfaces() {
             message_id: "om_card".into(),
             summary: "待处理的请求".into(),
             directory: work.clone(),
+            session_id: "ses_1".into(),
         },
     );
     std::fs::remove_dir(&work).unwrap();
@@ -1613,11 +1626,14 @@ async fn seed_inline_permission_card(app: &Arc<App>, session_id: &str, request_i
     .await;
 }
 
-/// #175: drive one sweep over a session whose block vanished (resolved by
-/// another client) and assert the hosting card was repainted with the neutral
-/// receipt — the render poll is never spawned, so the sweep is the only thing
-/// that can have done it.
-async fn sweep_and_assert_receipt_on_the_card(app: &Arc<App>, platform: &Arc<RecordingPlatform>) {
+/// Drive one sweep over a session whose block vanished and assert the hosting
+/// card was repainted with `receipt` — the render poll is never spawned, so
+/// the sweep is the only thing that can have done it.
+async fn sweep_and_assert_receipt_on_the_card(
+    app: &Arc<App>,
+    platform: &Arc<RecordingPlatform>,
+    receipt: &str,
+) {
     let mut seen = std::collections::HashSet::new();
     app.permission.sweep(&app.flow_handles(), &mut seen).await;
 
@@ -1633,7 +1649,7 @@ async fn sweep_and_assert_receipt_on_the_card(app: &Arc<App>, platform: &Arc<Rec
         .next_back()
         .expect("the sweep itself must repaint the hosting card");
     assert!(
-        patched.contains("⏱ 已由其他客户端处理：⚡ 执行 Shell 命令 `ls -la`"),
+        patched.contains(receipt),
         "the receipt must be on the repainted card: {patched}"
     );
     assert!(
@@ -1649,29 +1665,41 @@ async fn sweep_and_assert_receipt_on_the_card(app: &Arc<App>, platform: &Arc<Rec
 }
 
 /// #175: a request resolved by another client (OpenChamber, CLI) becomes its
-/// Interaction Receipt on the live turn's card within ONE sweep — no reliance
-/// on the ~1.5 s render tick.
+/// neutral Interaction Receipt on the live turn's card within ONE sweep — no
+/// reliance on the ~1.5 s render tick. The session is still running, which is
+/// what makes the neutral line the truth.
 #[tokio::test]
 async fn sweep_repaints_a_live_turn_card_when_the_request_resolves_elsewhere() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
-    // The server no longer lists the request: another client resolved it.
-    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    // The server no longer lists the request AND the run is still live:
+    // another client resolved it while the turn continued.
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_session_status("ses_1", Some(opencode::types::SessionStatus::Busy));
+    let (app, platform) = build_app(cfg, backend).await;
     seed_session(&app, "ses_1", "/work").await;
     seed_inline_permission_card(&app, "ses_1", "per_1").await;
 
-    sweep_and_assert_receipt_on_the_card(&app, &platform).await;
+    sweep_and_assert_receipt_on_the_card(
+        &app,
+        &platform,
+        "⏱ 已由其他客户端处理：⚡ 执行 Shell 命令 `ls -la`",
+    )
+    .await;
 }
 
-/// #175: a FINISHED turn's card gets the same receipt within one sweep — the
-/// render poll stopped ticking, so only the sweep can repaint it. This is the
-/// "the block lingers forever" case.
+/// A request that vanished while its session no longer runs (an interrupted
+/// execution, a location eviction, a server restart) died with its run:
+/// nobody decided it, so the receipt must say so — never the neutral
+/// "another client handled it" line. The session is idle, the render poll is
+/// gone, and only the sweep can repaint the card.
 #[tokio::test]
-async fn sweep_repaints_a_finished_turns_card_when_the_request_resolves_elsewhere() {
+async fn sweep_stamps_the_interrupted_receipt_when_the_run_is_gone() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
+    // MockBackend's absent status entry reads Idle: the run is over.
     let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
     seed_session(&app, "ses_1", "/work").await;
     seed_inline_permission_card(&app, "ses_1", "per_1").await;
@@ -1681,7 +1709,103 @@ async fn sweep_repaints_a_finished_turns_card_when_the_request_resolves_elsewher
     Turn::set_card_state(&cards, "ses_1", crate::feishu::card::CardState::Done).await;
     Turn::clear_phase(&cards, "ses_1").await;
 
-    sweep_and_assert_receipt_on_the_card(&app, &platform).await;
+    sweep_and_assert_receipt_on_the_card(&app, &platform, "⏱ 已随会话中断：⚡ 执行 Shell 命令 `ls -la`")
+        .await;
+    let calls = platform.calls.lock().await.clone();
+    let patched = calls
+        .iter()
+        .filter_map(|c| match c {
+            PlatformCall::UpdateMessage { message_id, card } if message_id == "msg_live" => {
+                Some(card.to_string())
+            }
+            _ => None,
+        })
+        .next_back()
+        .expect("the repaint is recorded");
+    assert!(
+        !patched.contains("已由其他客户端处理"),
+        "an idle run must not claim another client handled the request: {patched}"
+    );
+}
+
+/// A failed status read is UNKNOWN, never read as an interruption: the
+/// receipt stays the neutral one, exactly as before the classifier existed.
+#[tokio::test]
+async fn sweep_keeps_the_neutral_receipt_when_the_status_read_fails() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.status_read_fails("simulated session_status failure");
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_session(&app, "ses_1", "/work").await;
+    seed_inline_permission_card(&app, "ses_1", "per_1").await;
+
+    sweep_and_assert_receipt_on_the_card(
+        &app,
+        &platform,
+        "⏱ 已由其他客户端处理：⚡ 执行 Shell 命令 `ls -la`",
+    )
+    .await;
+}
+
+/// One sweep reads a vanished session's status at most once, even when the
+/// session carries candidates on several surfaces (an inline block and a
+/// standalone card): the classification is per session, not per block.
+#[tokio::test]
+async fn a_sweep_reads_each_vanished_sessions_status_once() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = Arc::new(MockBackend::new(realistic_parts()));
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    seed_session(&app, "ses_1", "/work").await;
+    seed_inline_permission_card(&app, "ses_1", "per_1").await;
+    // A second vanished request of the SAME session, on the standalone surface.
+    app.permission.sent_cards.lock().await.insert(
+        "per_2".into(),
+        crate::bridge::request::flow::SentCard {
+            message_id: "om_sent".into(),
+            summary: "bash ls".into(),
+            directory: "/work".into(),
+            session_id: "ses_1".into(),
+        },
+    );
+
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+
+    assert_eq!(
+        backend.session_status_reads.lock().await.as_slice(),
+        ["ses_1".to_string()],
+        "one read per distinct session per pass"
+    );
+}
+
+/// The classifier reads a session's status ONLY for requests that actually
+/// vanished: a sweep where every request is still pending makes no status
+/// read at all.
+#[tokio::test]
+async fn a_sweep_without_a_vanished_request_reads_no_session_status() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.ask_permission(perm_request("per_1", "ses_1", "ls -la"));
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    seed_session(&app, "ses_1", "/work").await;
+
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+
+    assert!(
+        backend.session_status_reads.lock().await.is_empty(),
+        "a pending request is not a vanished one: {:?}",
+        backend.session_status_reads.lock().await
+    );
 }
 
 /// A click whose card is over the split budget cannot ride the ack (Feishu

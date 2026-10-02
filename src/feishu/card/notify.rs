@@ -37,3 +37,20 @@ pub fn build_resolved_elsewhere_card(kind: &str, detail: &str) -> serde_json::Va
         vec![json!({ "tag": "markdown", "content": body })],
     )
 }
+
+/// Replacement for a permission/question card whose request died with its
+/// session's run (an interruption, a location eviction, a restart): nobody
+/// answered it, so the card must not claim another client did. `detail` is the
+/// original request text, so the user can see WHAT was left unhandled.
+pub fn build_interrupted_card(kind: &str, detail: &str) -> serde_json::Value {
+    let mut body = format!("会话已中断，该{}请求未处理。", kind);
+    if !detail.is_empty() {
+        body.push_str(&format!("\n\n{}", detail));
+    }
+    let body = sanitize_markdown(&body);
+    card_shell(
+        "⏱ 已随会话中断",
+        "orange",
+        vec![json!({ "tag": "markdown", "content": body })],
+    )
+}

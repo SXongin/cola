@@ -171,3 +171,33 @@ stale; either way the persisted record is removed as its surface resolves. A
 Session Snapshot adoption no longer embeds a request whose block has a card
 handle — a re-adopted card is already surfaced (ADR-0028's
 `is_already_surfaced`).
+
+## Amendment (2026-10-02): a vanished request is classified by its session's run state
+
+Rule 4's receipt vocabulary gains one line: `⏱ 已随会话中断：…`. When a
+Permission/Question leaves the pending list and cola did not answer it, the
+sweep reads the owning session's run state (ADR-0059's live predicate, one
+bounded read per distinct session with a vanished block) before choosing the
+line:
+
+- the run is still live (`Busy`/`Retry`) → the neutral
+  `⏱ 已由其他客户端处理` stands: another client answered while the run
+  continued;
+- the run reads `Idle` → `⏱ 已随会话中断`: the execution that owned the request
+  is gone (a stop, a crash, a server restart, or the server's own inactivity
+  eviction — the 60-minute recycle that interrupts a session parked on an
+  unanswered request), so nobody consumed it and claiming another client did
+  would be a lie;
+- a failed or unrecognised read is UNKNOWN and keeps the neutral line —
+  unknown is never read as an interrupted run, the same rule a failed list
+  gets (#130).
+
+The classifier only runs when a block actually vanished, so a sweep with
+nothing resolved makes no status call. It covers all three sweep surfaces: the
+inline receipt (accumulator and card-handle paths) and the standalone card,
+whose stale copy becomes `⏱ 已随会话中断` / 「会话已中断，该…请求未处理。」
+(`build_interrupted_card`) and whose persisted surface record now carries the
+owning session id, so a restarted process can classify it too. An empty owner
+(a record written before the id was persisted) is UNKNOWN and keeps the
+neutral copy. Snapshot claims (ADR-0028) and a late click's 404 card keep
+their existing line.

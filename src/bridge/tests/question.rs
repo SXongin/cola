@@ -1386,7 +1386,11 @@ async fn failed_directory_list_keeps_question_surfaces() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
-    let backend = Arc::new(MockBackend::new(realistic_parts()));
+    // The requests are resolved elsewhere while the run stays live, so the
+    // healed directory's cleanup leaves the neutral receipt.
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_session_status("ses_1", Some(opencode::types::SessionStatus::Busy));
+    let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
     seed_work_dir(&app).await;

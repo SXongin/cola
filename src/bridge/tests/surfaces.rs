@@ -520,8 +520,12 @@ async fn restart_reconciles_an_inline_block_resolved_while_down() {
     sweep(&app.permission, &app).await;
     assert!(persisted(&session_file).is_some());
 
-    // The restarted process finds the request already resolved.
-    let (app, platform, _backend) = restart_app(&session_file, |_| {}).await;
+    // The restarted process finds the request already resolved while the run
+    // is still live (another client answered it).
+    let (app, platform, _backend) = restart_app(&session_file, |backend| {
+        backend.with_session_status("ses_1", Some(opencode::types::SessionStatus::Busy));
+    })
+    .await;
     sweep(&app.permission, &app).await;
 
     assert!(
@@ -571,7 +575,12 @@ async fn restart_marks_a_standalone_card_stale_when_resolved_while_down() {
         .cloned()
         .unwrap();
 
-    let (app, platform, _backend) = restart_app(&session_file, |_| {}).await;
+    // Resolved while cola was down by another client, and the run is still
+    // live: the neutral copy.
+    let (app, platform, _backend) = restart_app(&session_file, |backend| {
+        backend.with_session_status("ses_1", Some(opencode::types::SessionStatus::Busy));
+    })
+    .await;
     sweep(&app.permission, &app).await;
 
     assert!(posted_cards(&platform).await.is_empty());
@@ -588,6 +597,81 @@ async fn restart_marks_a_standalone_card_stale_when_resolved_while_down() {
         "the stale record is dropped"
     );
     assert_eq!(persisted(&session_file), None);
+}
+
+/// A standalone card whose request died with its session's run (nobody
+/// answered it — an interruption, an eviction, a restart) is marked with the
+/// interrupted copy: the old "已在其他端处理" line would claim a decision
+/// nobody made.
+#[tokio::test]
+async fn a_vanished_standalone_card_reads_the_interrupted_copy_when_the_run_is_gone() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    // MockBackend's absent status entry reads Idle: the run is over.
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    seed_session(&app, "ses_1", "/work").await;
+    app.permission.sent_cards.lock().await.insert(
+        "per_1".into(),
+        crate::bridge::request::flow::SentCard {
+            message_id: "om_perm".into(),
+            summary: "⚡ 执行 Shell 命令 `ls -la`".into(),
+            directory: "/work".into(),
+            session_id: "ses_1".into(),
+        },
+    );
+
+    sweep(&app.permission, &app).await;
+
+    let stale = last_update_of(&platform, "om_perm")
+        .await
+        .expect("the standalone card is marked stale");
+    let text = card_text(&stale);
+    assert!(
+        text.contains("已随会话中断") && text.contains("ls -la"),
+        "interrupted copy missing: {text}"
+    );
+    assert!(
+        !text.contains("已在其他端处理"),
+        "an idle run must not claim another client handled it: {text}"
+    );
+}
+
+/// A standalone record written before the owning session was persisted
+/// (empty id) is UNKNOWN: the stale copy keeps the neutral line, never
+/// guessing an interruption.
+#[tokio::test]
+async fn a_legacy_standalone_card_without_an_owner_keeps_the_neutral_copy() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    seed_session(&app, "ses_1", "/work").await;
+    app.permission.sent_cards.lock().await.insert(
+        "per_1".into(),
+        crate::bridge::request::flow::SentCard {
+            message_id: "om_perm".into(),
+            summary: "⚡ 执行 Shell 命令 `ls -la`".into(),
+            directory: "/work".into(),
+            // The pre-persistence record shape: no owner to classify.
+            session_id: String::new(),
+        },
+    );
+
+    sweep(&app.permission, &app).await;
+
+    let stale = last_update_of(&platform, "om_perm")
+        .await
+        .expect("the standalone card is marked stale");
+    let text = card_text(&stale);
+    assert!(
+        text.contains("已在其他端处理"),
+        "an unknown owner keeps the neutral copy: {text}"
+    );
+    assert!(
+        !text.contains("已随会话中断"),
+        "an unknown owner is never read as an interruption: {text}"
+    );
 }
 
 /// ADR-0054: each sweep records which sessions hold a pending request of its
