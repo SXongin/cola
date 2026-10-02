@@ -37,15 +37,22 @@ const BACKOFF_BASE: Duration = Duration::from_secs(5);
 /// would strand the card permanently stale, which is the defect being fixed.
 const BACKOFF_MAX: Duration = Duration::from_secs(300);
 
-/// One card's newest payload whose delivery failed and has not been
-/// superseded.
+/// One card's newest write state.
+///
+/// `card` is `Some` while that write's payload is undelivered — the Pending
+/// Card Update proper — and `None` once a write of the same sequence settled
+/// (delivered, or permanently refused). The settled form is kept as a
+/// sequence tombstone: a *slow* write that started before the settled one and
+/// fails after it must not re-register its older payload (ADR-0067: a slow
+/// failure may never resurrect a superseded payload over a newer delivered
+/// one). Tombstones age out under the same cap as pending payloads.
 #[derive(Clone)]
 struct PendingEntry {
-    /// The monotonic write sequence this payload was sent with. A retry may
-    /// clear the entry only while it still names this sequence.
+    /// The monotonic write sequence this state belongs to. A retry may clear
+    /// the payload only while the entry still names this sequence.
     seq: u64,
-    /// The newest card JSON.
-    card: Value,
+    /// The undelivered newest card JSON; `None` for a settled tombstone.
+    card: Option<Value>,
     /// Failed retry attempts so far — the backoff exponent.
     attempts: u32,
     /// The earliest instant the next retry may go out (unless forced).
@@ -99,71 +106,73 @@ impl CardDelivery {
     /// Live Card record's removal consults (ADR-0063 amendment): a terminal
     /// card's record stays until its ending write is confirmed.
     pub(crate) fn pending(&self, message_id: &str) -> bool {
-        self.state.lock().unwrap().entries.contains_key(message_id)
+        self.state
+            .lock()
+            .unwrap()
+            .entries
+            .get(message_id)
+            .is_some_and(|entry| entry.card.is_some())
     }
 
-    /// Fold one write's outcome into the pending set. A delivery (or a
-    /// permanent refusal) of sequence `seq` clears whatever entry `seq` or an
-    /// older write left; a recoverable failure records the payload as the
-    /// card's newest pending state, never displacing a newer one.
+    /// Fold one write's outcome into the state. The newest sequence wins: a
+    /// recoverable failure records the payload as the card's newest Pending
+    /// Card Update; a delivery (or a permanent refusal) leaves a settled
+    /// tombstone at that sequence instead, so a slower older write that fails
+    /// later cannot re-register a superseded payload.
     fn observe(&self, message_id: &str, seq: u64, card: &Value, result: &Result<()>) {
         let mut state = self.state.lock().unwrap();
-        let superseded = match state.entries.get(message_id) {
-            Some(entry) => entry.seq <= seq,
+        let newest = match state.entries.get(message_id) {
+            Some(entry) => entry.seq < seq,
             None => true,
         };
-        match result {
-            Ok(()) => {
-                if superseded {
-                    state.entries.remove(message_id);
-                }
-            }
-            Err(e) if e.is_recoverable_card_write() => {
-                let newest = match state.entries.get(message_id) {
-                    Some(entry) => entry.seq < seq,
-                    None => true,
-                };
-                if newest {
-                    state.entries.insert(
-                        message_id.to_string(),
-                        PendingEntry {
-                            seq,
-                            card: card.clone(),
-                            attempts: 0,
-                            next_attempt: tokio::time::Instant::now() + self.backoff_base,
-                        },
-                    );
-                    self.evict_over_cap(&mut state);
-                }
-            }
-            // A permanent refusal (a rejected card, a gone message, a
-            // non-recoverable 4xx) can never deliver: drop whatever this
-            // write superseded instead of retrying it forever.
-            Err(_) => {
-                if superseded {
-                    state.entries.remove(message_id);
-                }
-            }
+        if !newest {
+            return;
         }
+        let entry = if matches!(result, Err(e) if e.is_recoverable_card_write()) {
+            PendingEntry {
+                seq,
+                card: Some(card.clone()),
+                attempts: 0,
+                next_attempt: tokio::time::Instant::now() + self.backoff_base,
+            }
+        } else {
+            // Delivered, or a permanent refusal (a rejected card, a gone
+            // message, a non-recoverable 4xx): the payload can never usefully
+            // be retried, so only the sequence is remembered.
+            PendingEntry {
+                seq,
+                card: None,
+                attempts: 0,
+                next_attempt: tokio::time::Instant::now(),
+            }
+        };
+        state.entries.insert(message_id.to_string(), entry);
+        self.evict_over_cap(&mut state);
     }
 
-    /// Keep the set under the cap, evicting the oldest pending state first
-    /// (the lowest sequence) with a WARN naming what was lost.
+    /// Keep the state under the cap. Settled tombstones leave first — the cap
+    /// bounds undelivered payloads, and a tombstone only guards against a
+    /// still-in-flight older write. A pending payload evicted (only when more
+    /// than the cap are owed) warns; a tombstone leaves quietly.
     fn evict_over_cap(&self, state: &mut State) {
         while state.entries.len() > self.max_pending {
-            let Some(oldest) = state
+            let victim = state
                 .entries
                 .iter()
+                .filter(|(_, entry)| entry.card.is_none())
                 .min_by_key(|(_, entry)| entry.seq)
-                .map(|(message_id, _)| message_id.clone())
-            else {
+                .or_else(|| state.entries.iter().min_by_key(|(_, entry)| entry.seq))
+                .map(|(message_id, _)| message_id.clone());
+            let Some(victim) = victim else {
                 return;
             };
-            state.entries.remove(&oldest);
-            tracing::warn!(
-                "pending card update for {oldest} evicted: {} pending cards reached",
-                self.max_pending
-            );
+            let evicted = state.entries.remove(&victim);
+            if evicted.is_some_and(|entry| entry.card.is_some()) {
+                tracing::warn!(
+                    "pending card update for {victim} evicted: {} card writes reached",
+                    self.max_pending
+                );
+            }
         }
     }
 
@@ -286,26 +295,33 @@ impl Platform for CardDelivery {
             state
                 .entries
                 .iter()
-                .filter(|(_, entry)| force || entry.next_attempt <= now)
+                .filter(|(_, entry)| entry.card.is_some() && (force || entry.next_attempt <= now))
                 .map(|(message_id, entry)| (message_id.clone(), entry.clone()))
                 .collect()
         };
         for (message_id, entry) in due {
-            let result = self.inner.update_message(&message_id, &entry.card).await;
+            // Only a pending entry is due (the filter above); the clone keeps
+            // the payload for the retry.
+            let Some(card) = entry.card.clone() else { continue };
+            let result = self.inner.update_message(&message_id, &card).await;
             let mut state = self.state.lock().unwrap();
             // A write raced this retry and replaced the entry (a newer failure
-            // or a newer delivery): the in-flight retry's outcome belongs to
+            // or a newer settlement): the in-flight retry's outcome belongs to
             // the payload it carried, never to the newer state.
             let still_current = state
                 .entries
                 .get(&message_id)
-                .is_some_and(|current| current.seq == entry.seq);
+                .is_some_and(|current| current.seq == entry.seq && current.card.is_some());
             if !still_current {
                 continue;
             }
             match result {
                 Ok(()) => {
-                    state.entries.remove(&message_id);
+                    // Keep the sequence as a settled tombstone: a slower write
+                    // that started earlier must not re-register behind it.
+                    if let Some(current) = state.entries.get_mut(&message_id) {
+                        current.card = None;
+                    }
                     if entry.attempts > 0 {
                         tracing::info!(
                             "pending card update for {message_id} delivered after {} retries",
@@ -321,7 +337,11 @@ impl Platform for CardDelivery {
                     tracing::debug!("pending card update for {message_id} still failing: {e}");
                 }
                 Err(e) => {
-                    state.entries.remove(&message_id);
+                    // A permanent refusal is settled too: the tombstone keeps
+                    // an older slow failure from re-registering.
+                    if let Some(current) = state.entries.get_mut(&message_id) {
+                        current.card = None;
+                    }
                     tracing::warn!("pending card update for {message_id} dropped: {e}");
                 }
             }
@@ -347,15 +367,22 @@ mod tests {
         Http(u16),
     }
 
+    /// A one-shot mid-call park: `entered` fires when the call is in flight,
+    /// `release` lets it finish, and `fail` is that call's own result (a shared
+    /// script queue cannot target a call that is parked while newer calls run).
+    struct Gate {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        fail: Option<Fail>,
+    }
+
     /// Records every `update_message` attempt and serves a queued script;
     /// an empty script means success. Every other Platform method is
     /// unreachable in these tests.
     struct FakePlatform {
         attempts: Mutex<Vec<(String, Value)>>,
         script: Mutex<VecDeque<Fail>>,
-        /// A one-shot mid-call park: the next `update_message` signals
-        /// `entered` and waits for `release` before deciding its result.
-        gate: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+        gate: Mutex<Option<Gate>>,
     }
 
     impl FakePlatform {
@@ -373,9 +400,23 @@ mod tests {
 
         /// Park the next `update_message` call, returning `(entered, release)`.
         fn park_next(&self) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+            self.park_next_with(None)
+        }
+
+        /// [`Self::park_next`] where the parked call itself fails with `fail`
+        /// once released.
+        fn park_next_failing(&self, fail: Fail) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+            self.park_next_with(Some(fail))
+        }
+
+        fn park_next_with(&self, fail: Option<Fail>) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
             let entered = Arc::new(tokio::sync::Notify::new());
             let release = Arc::new(tokio::sync::Notify::new());
-            *self.gate.lock().unwrap() = Some((entered.clone(), release.clone()));
+            *self.gate.lock().unwrap() = Some(Gate {
+                entered: entered.clone(),
+                release: release.clone(),
+                fail,
+            });
             (entered, release)
         }
 
@@ -392,11 +433,14 @@ mod tests {
                 .unwrap()
                 .push((message_id.to_string(), card.clone()));
             let gate = self.gate.lock().unwrap().take();
-            if let Some((entered, release)) = gate {
-                entered.notify_one();
-                release.notified().await;
-            }
-            match self.script.lock().unwrap().pop_front() {
+            let gated = if let Some(gate) = gate {
+                gate.entered.notify_one();
+                gate.release.notified().await;
+                gate.fail
+            } else {
+                None
+            };
+            match gated.or_else(|| self.script.lock().unwrap().pop_front()) {
                 None => Ok(()),
                 Some(Fail::Transport) => Err(BridgeError::Io(std::io::Error::other("transport down"))),
                 Some(Fail::ContentRejected) => Err(BridgeError::CardContentRejected {
@@ -573,6 +617,43 @@ mod tests {
         assert!(!delivery.pending("om_1"));
     }
 
+    /// A slow FIRST write that fails only after a newer write delivered must
+    /// not re-register its older payload: the delivered sequence is kept as a
+    /// settled tombstone that rejects the late failure.
+    #[tokio::test]
+    async fn a_late_failure_of_a_superseded_write_is_ignored() {
+        let inner = Arc::new(FakePlatform::new());
+        let delivery = Arc::new(CardDelivery::new(inner.clone()));
+        let first = serde_json::json!({ "body": "first" });
+        let second = serde_json::json!({ "body": "second" });
+
+        let (entered, release) = inner.park_next_failing(Fail::Transport);
+        let slow = tokio::spawn({
+            let delivery = Arc::clone(&delivery);
+            let first = first.clone();
+            async move { delivery.update_message("om_1", &first).await }
+        });
+        entered.notified().await; // the older write is parked mid-flight
+
+        // The newer write delivered while the older one still hangs.
+        delivery.update_message("om_1", &second).await.unwrap();
+        release.notify_one();
+        assert!(slow.await.unwrap().is_err(), "the parked write fails after it");
+
+        assert!(
+            !delivery.pending("om_1"),
+            "the late failure must not resurrect the older payload"
+        );
+        delivery.drain_pending_card_updates(true).await;
+        let attempts = inner.attempts();
+        assert_eq!(attempts.len(), 2, "nothing was retried");
+        assert_eq!(
+            attempts[1],
+            ("om_1".to_string(), second.clone()),
+            "the newer payload was the delivered one"
+        );
+    }
+
     /// A content rejection is deterministic — it never enters the set and is
     /// never retried.
     #[tokio::test]
@@ -653,6 +734,37 @@ mod tests {
             inner.attempts().len(),
             5,
             "three failures plus two retries (om_1 was evicted)"
+        );
+    }
+
+    /// Settled tombstones never crowd out an undelivered payload: under the
+    /// cap, the oldest tombstone leaves first.
+    #[tokio::test]
+    async fn the_cap_evicts_tombstones_before_pending_payloads() {
+        let inner = Arc::new(FakePlatform::new());
+        let delivery = CardDelivery::with_limits(inner.clone(), 2, BACKOFF_BASE, BACKOFF_MAX);
+        inner.fail_next(Fail::Transport);
+        let owed = serde_json::json!({ "body": "owed" });
+        let _ = delivery.update_message("om_pending", &owed).await;
+        // Two newer successful writes settle into tombstones.
+        delivery
+            .update_message("om_a", &serde_json::json!({ "body": "a" }))
+            .await
+            .unwrap();
+        delivery
+            .update_message("om_b", &serde_json::json!({ "body": "b" }))
+            .await
+            .unwrap();
+
+        assert!(
+            delivery.pending("om_pending"),
+            "the owed payload survived the cap"
+        );
+        delivery.drain_pending_card_updates(true).await;
+        assert_eq!(
+            inner.attempts().last(),
+            Some(&("om_pending".to_string(), owed)),
+            "and was delivered"
         );
     }
 
