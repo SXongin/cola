@@ -14,8 +14,16 @@ use super::flow::RequestFlow;
 /// Prefix of the receipt left when a click discovers the request was already
 /// resolved by another client (a 404 reply): neutral — never claims cola
 /// decided. The sweep adopts the same line for a block resolved remotely
-/// (#175).
+/// (#175) while its session's run is still live.
 pub(super) const HANDLED_ELSEWHERE_PREFIX: &str = "⏱ 已由其他客户端处理";
+
+/// Prefix of the receipt left when the request vanished together with its
+/// session's run: an interrupted execution (a stop, a location eviction, a
+/// crash), a server restart, or a run that ended before anyone consumed the
+/// request. Neutral too, but it must not claim another client decided — the
+/// sweep only uses it when the owning session is provably NOT running
+/// (ADR-0059's live predicate, read as `Idle`).
+pub(super) const INTERRUPTED_PREFIX: &str = "⏱ 已随会话中断";
 
 /// Receipt prefix for a denied permission or a rejected question.
 pub(super) const DENIED_PREFIX: &str = "🚫 已拒绝";
@@ -38,6 +46,28 @@ pub(super) fn receipt_line(prefix: &str, detail: &str) -> String {
 /// Receipt for a block a click found already resolved elsewhere.
 pub(crate) fn handled_elsewhere_receipt(target: &str) -> String {
     receipt_line(HANDLED_ELSEWHERE_PREFIX, target)
+}
+
+/// Receipt for a block whose request died with its session's run — nobody
+/// answered it.
+pub(crate) fn interrupted_receipt(target: &str) -> String {
+    receipt_line(INTERRUPTED_PREFIX, target)
+}
+
+/// The receipt for a block that vanished without cola deciding: the
+/// interrupted line when its owning session's run is over (`dead`), the
+/// neutral handled-elsewhere line while the run is still live. One chooser, so
+/// the accumulator path and the card-handle path cannot disagree.
+pub(crate) fn vanished_receipt(
+    session_id: &str,
+    target: &str,
+    dead: &std::collections::HashSet<String>,
+) -> String {
+    if dead.contains(session_id) {
+        interrupted_receipt(target)
+    } else {
+        handled_elsewhere_receipt(target)
+    }
 }
 
 /// Receipt for a denied permission or a rejected question.

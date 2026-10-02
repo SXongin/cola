@@ -253,6 +253,7 @@ async fn adopt_skips_already_surfaced_pending() {
             message_id: "om_existing".into(),
             summary: "bash".into(),
             directory: "/work/ext".into(),
+            session_id: "ses_alpha01".into(),
         },
     );
 

@@ -2587,19 +2587,22 @@ impl Turn {
         }
     }
 
-    /// Resolve every live permission block whose request vanished (resolved by
-    /// another client) into its Interaction Receipt; an item owned by a
-    /// directory whose list failed, or that cola itself is answering, stays
-    /// live (#130, #144). Returns the affected session ids — the sweep repaints
-    /// each affected card so the receipt lands within one poll (ADR-0038).
+    /// Resolve every live permission block whose request vanished into its
+    /// Interaction Receipt — `dead` names the owning sessions whose run is
+    /// over, which get the interrupted line; every other session keeps the
+    /// neutral "another client" one. An item owned by a directory whose list
+    /// failed, or that cola itself is answering, stays live (#130, #144).
+    /// Returns the affected session ids — the sweep repaints each affected card
+    /// so the receipt lands within one poll (ADR-0038).
     pub(crate) async fn resolve_vanished_permissions(
         cards: &CardsHandle,
         pending: &HashSet<String>,
         failed_dirs: &HashSet<String>,
         cola_claimed: &HashSet<String>,
+        dead: &HashSet<String>,
     ) -> Vec<String> {
-        Self::resolve_vanished(cards, pending, failed_dirs, cola_claimed, |block| {
-            matches!(block, state::InteractionBlock::Permission(_))
+        Self::resolve_vanished(cards, pending, failed_dirs, cola_claimed, dead, |block| {
+            state::block_of_kind(crate::bridge::snapshot_claims::ClaimKind::Permission, block)
         })
         .await
     }
@@ -2610,27 +2613,65 @@ impl Turn {
         pending: &HashSet<String>,
         failed_dirs: &HashSet<String>,
         cola_claimed: &HashSet<String>,
+        dead: &HashSet<String>,
     ) -> Vec<String> {
-        Self::resolve_vanished(cards, pending, failed_dirs, cola_claimed, |block| {
-            matches!(block, state::InteractionBlock::Question(_))
+        Self::resolve_vanished(cards, pending, failed_dirs, cola_claimed, dead, |block| {
+            state::block_of_kind(crate::bridge::snapshot_claims::ClaimKind::Question, block)
         })
         .await
     }
 
+    /// The owning sessions (with their directory) of the live blocks a kind's
+    /// vanished pass would resolve — the sweep classifies these before choosing
+    /// the receipt line. One predicate with the resolver below, so the
+    /// classifier and the resolution can never disagree.
+    pub(crate) async fn vanished_block_sessions(
+        cards: &CardsHandle,
+        kind: crate::bridge::snapshot_claims::ClaimKind,
+        pending: &HashSet<String>,
+        failed_dirs: &HashSet<String>,
+        cola_claimed: &HashSet<String>,
+    ) -> Vec<(String, String)> {
+        let own = move |block: &state::InteractionBlock| state::block_of_kind(kind, block);
+        let live = cards.cards.lock().await;
+        let mut sessions = Vec::new();
+        for card in live.values() {
+            sessions.extend(state::vanished_block_sessions(
+                &card.acc,
+                pending,
+                failed_dirs,
+                cola_claimed,
+                own,
+            ));
+        }
+        sessions
+    }
+
     /// The shared sweep body: resolve every live block `own` accepts whose
-    /// request vanished, over every card session. Returns the affected session
-    /// ids.
+    /// request vanished, over every card session, picking the interrupted line
+    /// for a block whose owning session is in `dead`. Returns the affected
+    /// session ids.
     async fn resolve_vanished(
         cards: &CardsHandle,
         pending: &HashSet<String>,
         failed_dirs: &HashSet<String>,
         cola_claimed: &HashSet<String>,
+        dead: &HashSet<String>,
         own: impl Fn(&state::InteractionBlock) -> bool,
     ) -> Vec<String> {
         let mut live = cards.cards.lock().await;
         let mut affected = Vec::new();
         for (session_id, card) in live.iter_mut() {
-            if state::resolve_vanished_blocks(&mut card.acc, pending, failed_dirs, cola_claimed, &own) > 0 {
+            let line = |block: &state::InteractionBlock| {
+                crate::bridge::request::delivery::vanished_receipt(
+                    block.session_id(),
+                    &block.receipt_target(),
+                    dead,
+                )
+            };
+            if state::resolve_vanished_blocks(&mut card.acc, pending, failed_dirs, cola_claimed, &own, line)
+                > 0
+            {
                 affected.push(session_id.clone());
             }
         }

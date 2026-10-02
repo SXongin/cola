@@ -274,6 +274,8 @@ async fn sweep_repaints_a_non_current_card_from_its_cache() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
     backend.ask_permission(perm_request("per_old", "ses_old", "ls -la"));
+    // The run is still live: another client answered it.
+    backend.with_session_status("ses_old", Some(opencode::types::SessionStatus::Busy));
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
@@ -389,7 +391,8 @@ async fn a_split_registers_the_continuation_card() {
     );
 
     // The turn is gone (a replaced/aborted turn): the sweep resolves the block
-    // from the continuation's cache, not the frozen slice.
+    // from the continuation's cache, not the frozen slice. The run is over, so
+    // the receipt names the interruption, not a decision nobody made.
     let filled_patches = patches_of(&platform, "om_filled").await;
     Turn::drop_card(&app.cards_handle(), "ses_split").await;
     let mut seen = std::collections::HashSet::new();
@@ -401,7 +404,7 @@ async fn a_split_registers_the_continuation_card() {
             c,
             PlatformCall::UpdateMessage { message_id, card }
                 if message_id == "msg_reply"
-                    && card_text(card).contains("⏱ 已由其他客户端处理")
+                    && card_text(card).contains("⏱ 已随会话中断")
         )),
         "the continuation is repainted with the receipt: {calls:?}"
     );

@@ -1998,30 +1998,74 @@ impl StreamAccumulator {
     }
 }
 
+/// Whether `block` belongs to `kind` — the one ClaimKind → block-family
+/// predicate the kind wrappers, the session collector and the resolver share.
+pub(super) fn block_of_kind(
+    kind: crate::bridge::snapshot_claims::ClaimKind,
+    block: &InteractionBlock,
+) -> bool {
+    use crate::bridge::snapshot_claims::ClaimKind;
+    match kind {
+        ClaimKind::Permission => matches!(block, InteractionBlock::Permission(_)),
+        ClaimKind::Question => matches!(block, InteractionBlock::Question(_)),
+    }
+}
+
+/// Whether `block` is one the vanished pass resolves: live, left the pending
+/// list, not cola's own settlement, and its directory listed successfully. One
+/// predicate, shared by the session collector and the resolver, so the
+/// classifier and the resolution can never disagree about what vanished.
+fn is_vanished(
+    block: &InteractionBlock,
+    pending: &std::collections::HashSet<String>,
+    failed_dirs: &std::collections::HashSet<String>,
+    cola_claimed: &std::collections::HashSet<String>,
+) -> bool {
+    block.is_live()
+        && !pending.contains(block.request_id())
+        && !cola_claimed.contains(block.request_id())
+        && !failed_dirs.contains(block.directory())
+}
+
+/// The owning sessions (with their directory) of the live blocks
+/// [`resolve_vanished_blocks`] would resolve — the sweep classifies these
+/// before choosing the receipt line. Same predicate, so a block can never be
+/// classified without being resolved or vice versa.
+pub(super) fn vanished_block_sessions(
+    acc: &StreamAccumulator,
+    pending: &std::collections::HashSet<String>,
+    failed_dirs: &std::collections::HashSet<String>,
+    cola_claimed: &std::collections::HashSet<String>,
+    own: impl Fn(&InteractionBlock) -> bool,
+) -> Vec<(String, String)> {
+    acc.interactions
+        .iter()
+        .filter(|b| own(b) && is_vanished(b, pending, failed_dirs, cola_claimed))
+        .map(|b| (b.session_id().to_string(), b.directory().to_string()))
+        .collect()
+}
+
 /// The shared sweep shape for both kinds (#175): resolve every LIVE block the
-/// kind owns (`own`) whose request vanished into its
-/// `⏱ 已由其他客户端处理` Interaction Receipt. A block owned by a directory
-/// whose list call failed stays: that directory said nothing, so its request
-/// may still be pending (#130, #144). A block cola itself is answering (or
+/// kind owns (`own`) whose request vanished, writing `line`'s Interaction
+/// Receipt — the sweep classifies the owning session's run state and passes
+/// the neutral or the interrupted line. A block owned by a directory whose
+/// list call failed stays: that directory said nothing, so its request may
+/// still be pending (#130, #144). A block cola itself is answering (or
 /// answered) also stays: its disappearance from the pending list is cola's own
-/// doing, and the sweep's neutral line would be a lie — the settlement leaves
-/// the true receipt. Returns how many were resolved — the caller repaints each
-/// affected card so the receipt lands within one poll.
+/// doing, and the sweep's line would be a lie — the settlement leaves the true
+/// receipt. Returns how many were resolved — the caller repaints each affected
+/// card so the receipt lands within one poll.
 pub(super) fn resolve_vanished_blocks(
     acc: &mut StreamAccumulator,
     pending: &std::collections::HashSet<String>,
     failed_dirs: &std::collections::HashSet<String>,
     cola_claimed: &std::collections::HashSet<String>,
     own: impl Fn(&InteractionBlock) -> bool,
+    line: impl Fn(&InteractionBlock) -> String,
 ) -> usize {
     acc.resolve_vanished(
-        |block| {
-            own(block)
-                && !pending.contains(block.request_id())
-                && !cola_claimed.contains(block.request_id())
-                && !failed_dirs.contains(block.directory())
-        },
-        |block| crate::bridge::request::delivery::handled_elsewhere_receipt(&block.receipt_target()),
+        |block| own(block) && is_vanished(block, pending, failed_dirs, cola_claimed),
+        line,
     )
 }
 

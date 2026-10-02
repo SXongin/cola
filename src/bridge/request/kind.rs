@@ -204,19 +204,21 @@ pub trait RequestKind: Send + Sync {
     /// another client).
     fn summary(&self, req: &PendingRequest) -> String;
 
-    /// Resolve the kind's own inline blocks whose request vanished (resolved
-    /// by another client) into their Interaction Receipts; an item owned by a
-    /// directory whose list call failed stays live: unknown must never be read
-    /// as resolved (#130, #144). An item cola itself is answering (`answered`)
-    /// also stays: the settlement owns its receipt, the sweep's neutral one
-    /// would be a lie. Returns the affected session ids — the sweep repaints
-    /// each affected card so the receipt lands within one poll.
+    /// Resolve the kind's own inline blocks whose request vanished into their
+    /// Interaction Receipts; `dead` names the owning sessions whose run is
+    /// over, which get the interrupted line, every other session the neutral
+    /// one. An item owned by a directory whose list call failed stays live:
+    /// unknown must never be read as resolved (#130, #144). An item cola itself
+    /// is answering (`answered`) also stays: the settlement owns its receipt,
+    /// the sweep's line would be a lie. Returns the affected session ids — the
+    /// sweep repaints each affected card so the receipt lands within one poll.
     async fn resolve_vanished_inline(
         &self,
         cards: &CardsHandle,
         pending: &std::collections::HashSet<String>,
         failed_dirs: &std::collections::HashSet<String>,
         cola_claimed: &std::collections::HashSet<String>,
+        dead: &std::collections::HashSet<String>,
     ) -> Vec<String>;
 
     /// The live state this kind contributes to a Session Snapshot re-render
@@ -364,8 +366,9 @@ impl RequestKind for PermissionKind {
         pending: &std::collections::HashSet<String>,
         failed_dirs: &std::collections::HashSet<String>,
         cola_claimed: &std::collections::HashSet<String>,
+        dead: &std::collections::HashSet<String>,
     ) -> Vec<String> {
-        Turn::resolve_vanished_permissions(cards, pending, failed_dirs, cola_claimed).await
+        Turn::resolve_vanished_permissions(cards, pending, failed_dirs, cola_claimed, dead).await
     }
 
     fn claim_kind(&self) -> ClaimKind {
@@ -967,8 +970,9 @@ impl RequestKind for QuestionKind {
         pending: &std::collections::HashSet<String>,
         failed_dirs: &std::collections::HashSet<String>,
         cola_claimed: &std::collections::HashSet<String>,
+        dead: &std::collections::HashSet<String>,
     ) -> Vec<String> {
-        Turn::resolve_vanished_questions(cards, pending, failed_dirs, cola_claimed).await
+        Turn::resolve_vanished_questions(cards, pending, failed_dirs, cola_claimed, dead).await
     }
 
     async fn snapshot_state(

@@ -2966,6 +2966,7 @@ pub(crate) async fn assert_failed_dir_keeps_surfaces(
             message_id: surfaces.card_message_id.into(),
             summary: "待处理的请求".into(),
             directory: "/work".into(),
+            session_id: "ses_1".into(),
         },
     );
     let cards = app.core.cards_handle();

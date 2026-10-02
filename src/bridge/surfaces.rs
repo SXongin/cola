@@ -58,6 +58,11 @@ pub struct StandaloneSurface {
     pub message_id: String,
     pub summary: String,
     pub directory: String,
+    /// The owning session, so a restarted process can classify the stale copy
+    /// by the run's state. Defaults to empty for a record written by an older
+    /// build: an unknown owner keeps the neutral copy.
+    #[serde(default)]
+    pub session_id: String,
 }
 
 /// The whole persisted record. Every map defaults, so a file written by an
@@ -221,6 +226,7 @@ mod tests {
                     message_id: "om_2".into(),
                     summary: "ls".into(),
                     directory: "/work".into(),
+                    session_id: "ses_1".into(),
                 },
             );
         }
