@@ -16,7 +16,6 @@ use tracing::Instrument;
 
 use crate::bridge::display::{dir_basename, id_tail, model_display};
 use crate::bridge::handles::{CardsHandle, SessionsHandle, TopicHandles};
-use crate::bridge::session::PendingEntry;
 use crate::config::{SessionEntry, ThreadKey};
 use crate::error::BridgeError;
 use crate::feishu;
@@ -194,8 +193,10 @@ async fn open_topic_inner(
             // ADR-0041: no backend session yet — the topic's first prompt
             // creates it in this directory, applies the title and moves the
             // overrides onto the SessionEntry.
-            let mut pending = PendingEntry::new(topic_key.clone(), parts.directory);
-            pending.title = title;
+            let mut pending = handles
+                .flow
+                .sessions
+                .new_pending(&topic_key, parts.directory, title);
             pending.topic_anchor = Some(anchor.clone());
             pending.topic_root = Some(topic_root);
             handles.flow.sessions.set_pending(pending).await?;

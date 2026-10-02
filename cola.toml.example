@@ -48,6 +48,10 @@ app_secret = "your-app-secret"
 # cwd. /new inherits the active session's directory; /dir still overrides
 # per session.
 # work_dir = "/path/to/a/project"
+# New sessions start with Auto-Accept on: cola answers their tool-permission
+# requests automatically instead of showing a card. Off by default; adopted
+# sessions keep their own state and /autoaccept off still disables a session.
+# default_auto_accept = true
 # In group chats, reply to the requester's message with a short completion
 # notice (the streaming card is patched in place, so it does not push a new
 # notification). Set false to disable.

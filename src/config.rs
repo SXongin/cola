@@ -163,6 +163,13 @@ pub struct BridgeConfig {
     /// process working directory. `/dir` overrides per session.
     #[serde(default)]
     pub work_dir: Option<PathBuf>,
+    /// New sessions start with Auto-Accept on (`/autoaccept`): cola answers
+    /// their pending permission requests automatically instead of showing a
+    /// Feishu card. OFF by default — an upgrade must never change permission
+    /// behavior without consent. Sessions cola merely ADOPTS keep their own
+    /// state; `/autoaccept off` remains the per-session escape hatch.
+    #[serde(default)]
+    pub default_auto_accept: bool,
     /// In group chats, reply to the requester's message with a short
     /// completion notice (the streaming card is patched in place and so does
     /// not push a new notification). p2p chats don't need it.
@@ -192,6 +199,7 @@ impl Default for BridgeConfig {
             session_file: default_session_file(),
             access_file: default_access_file(),
             work_dir: None,
+            default_auto_accept: false,
             group_completion_notice: default_group_completion_notice(),
             long_task_notice: false,
             instant_reminder: false,
@@ -485,6 +493,24 @@ mod tests {
 
         let on: BridgeConfig = toml::from_str("instant_reminder = true").unwrap();
         assert!(on.instant_reminder);
+    }
+
+    /// Auto-Accept's create-time default is opt-in (#513): absent or explicit
+    /// `false` must mean off, so an upgrade never changes permission behavior;
+    /// only an explicit `true` marks new sessions.
+    #[test]
+    fn default_auto_accept_defaults_to_off_and_requires_an_explicit_true() {
+        let absent: BridgeConfig = toml::from_str("").unwrap();
+        assert!(
+            !absent.default_auto_accept,
+            "an absent default_auto_accept key means off"
+        );
+
+        let off: BridgeConfig = toml::from_str("default_auto_accept = false").unwrap();
+        assert!(!off.default_auto_accept);
+
+        let on: BridgeConfig = toml::from_str("default_auto_accept = true").unwrap();
+        assert!(on.default_auto_accept);
     }
 
     #[test]
