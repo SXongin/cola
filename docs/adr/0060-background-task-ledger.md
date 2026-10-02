@@ -189,8 +189,9 @@ The ledger's type words are the tool's own name everywhere it names one (#502,
 spec #501): the ledger and the Tool Panel call one task the same thing.
 
 - The live row reads `· shell：**npm run build** · 14:02 · 3m12s` /
-  `· subagent：**review the diff** · 14:04 · 1m05s` — the subagent no longer
-  reads 「子代理」; the omissions, bold escaping and clip are unchanged.
+  `· subagent：**review the diff** · 14:04 · 1m05s` *(the subagent row's
+  total elapsed was later dropped — see the amendment below)* — the subagent no
+  longer reads 「子代理」; the omissions, bold escaping and clip are unchanged.
 - The completion entry's collapsed title reads `🔔 shell 完成：<label>` /
   `🔔 subagent 完成：<label>`, with the same ending phrases as before (`已取消` /
   `失败` / `结束` / `已失联`, only on their own evidence) and the same bare form
@@ -203,13 +204,15 @@ spec #501): the ledger and the Tool Panel call one task the same thing.
 ## Amendment (2026-10-02, the yielded row's child activity): live subagent liveness on the ledger row
 
 A background `subagent`'s live row carries the same child-session liveness the
-live task panel shows (spec #501, ticket #503): appended after the row's
-elapsed — `· subagent：**review the diff** · 14:04 · 1m05s · bash 5s`, or
+live task panel shows (spec #501, ticket #503): appended after the row's start
+clock — `· subagent：**review the diff** · 14:04 · bash 5s`, or
 `· 思考中 30s · 等待你的授权` for a phase and its wait — through the front's own
 fragment vocabulary, so one child state reads the same wherever cola renders
-it. The fragment sits after the elapsed and before `· ⚠️ 状态待确认`; a row the
-runtime reconciliation could not confirm renders no activity, and a `shell`
-row is unchanged (no fragment).
+it. The fragment sits after the start clock and before `· ⚠️ 状态待确认`; a row
+the runtime reconciliation could not confirm renders no activity, and a `shell`
+row is unchanged (no fragment). A subagent row renders no total elapsed at all
+(see the amendment below): its clock is its start and its liveness is the
+fragment.
 
 - **One shared gather.** The front task panel's per-child read loop becomes a
   batch — a set of `(call_id, child)` pairs, one transcript light read per
@@ -230,10 +233,11 @@ row is unchanged (no fragment).
   times are never refreshed, so the rendered age keeps growing truthfully and a
   failed read never ends the wait (ADR-0054's rule).
 - **The ledger clock covers the fragment's age, and the flush reads the
-  rendered row.** A row's clock now holds its elapsed and its activity age; the
-  live path still compares whole minutes and the yielded refresh whole seconds,
-  so a yielded card PATCHes when its visible second turns and never once per
-  read, while the live card gains no per-second churn. The comparison is on
+  rendered row.** A shell row's clock now holds its elapsed, and every row's
+  holds its activity age; the live path still compares whole minutes and the
+  yielded refresh whole seconds, so a yielded card PATCHes when its visible
+  second turns and never once per read, while the live card gains no per-second
+  churn. The comparison is on
   what the row RENDERS — its type, its label folded and clipped, its local
   `HH:MM` start clock, the fragment's label and wait — never the raw values
   that render identically (text past the clip, an empty label, a start moving
@@ -262,8 +266,8 @@ gives way to a running tool, a wait joins, a failed gather heals).
 
 - **The whole-minute gate stands.** The live path's clock comparison is
   unchanged: the activity age's seconds never owe a PATCH by themselves, only
-  its whole minute turning (the same gate the row's elapsed has), while a typed
-  liveness change — a tool switch, a wait entering or leaving, the gather
+  its whole minute turning (the same gate a shell row's elapsed has), while a
+  typed liveness change — a tool switch, a wait entering or leaving, the gather
   establishing or losing the child — owes one immediately, inside the same
   minute.
 - **The yield still has no gather of its own.** The live render has usually
@@ -276,3 +280,31 @@ gives way to a running tool, a wait joins, a failed gather heals).
   request; only a live subagent row's child is read.
 
 Related: #501, #503, #504, ADR-0054, ADR-0066.
+
+## Amendment (2026-10-02, the subagent row's clock): no total elapsed
+
+A `subagent` row never renders the task's total runtime. Its start clock and its
+child's activity fragment already say what the row needs to: the fragment
+carries the live age (`shell 26s`), and the total beside it (`0m34s`) is
+redundant and long. The rule is kind-scoped: a `shell` row keeps its elapsed —
+the elapsed is its only liveness, since it has no fragment — while a subagent
+row's clock is its start `HH:MM` and its liveness is the fragment.
+
+- The row copy: `· subagent：**review the diff** · 14:04 · shell 26s` (was
+  `· … · 14:04 · 1m05s · shell 26s`); a fragment-less subagent row stops at its
+  clock, `· subagent：**review the diff** · 14:04`; a shell row is unchanged
+  (`· shell：**npm run build** · 14:02 · 3m12s`). Completion entries and their
+  identity lines (`subagent ses_child · 22:46 · 1m`) keep their timing — a
+  completion is history, not liveness.
+- The render clock follows the render: a subagent row's `elapsed` clock is
+  always `None`, so its total runtime can never owe a flush; only its fragment's
+  age ticks (whole seconds on the yielded path, whole minutes on the live one),
+  and the shell row's elapsed keeps the two-tier gate exactly as before.
+- The size reserve keeps its shell-sized per-row constant; a subagent row's
+  missing elapsed is over-reserve, which is safe.
+
+This supersedes the subagent total elapsed in the earlier amendments: the #501
+amendment's example is updated above, and the #502 amendment's example is marked
+superseded.
+
+Related: #501, #503, #504, ADR-0054, ADR-0060.

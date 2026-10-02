@@ -557,14 +557,15 @@ pub(super) struct StreamAccumulator {
     /// its row and the map cannot grow past the session's current tasks.
     ledger_activity: HashMap<String, TaskLiveness>,
     /// The ledger's render clock ([`Self::set_ledger`]): each row's rendered
-    /// numbers — its elapsed and its activity fragment's age, in whole seconds
-    /// as of the read that last moved the section (ADR-0060, spec #501) — the
-    /// very values the rows last rendered. The rows alone cannot tell that a
-    /// yielded card's elapsed or activity age went stale, and the rendered
-    /// seconds move on every read — so each path compares this key at its own
-    /// cadence ([`LedgerCadence`]): the live render at whole minutes (no
-    /// per-render clock churn), the yielded refresh at whole seconds (its
-    /// reads are the card's only clock).
+    /// numbers — a shell row's elapsed, and any row's activity fragment age, in
+    /// whole seconds as of the read that last moved the section (ADR-0060, spec
+    /// #501) — the very values the rows last rendered. A subagent row's total
+    /// runtime is never one of them. The rows alone cannot tell that a yielded
+    /// card's elapsed or activity age went stale, and the rendered seconds move
+    /// on every read — so each path compares this key at its own cadence
+    /// ([`LedgerCadence`]): the live render at whole minutes (no per-render
+    /// clock churn), the yielded refresh at whole seconds (its reads are the
+    /// card's only clock).
     ledger_clock: Vec<crate::feishu::card::ledger::LedgerRowClock>,
     /// Text, reasoning, tool and receipt entries ordered by their key (the
     /// server-side part start time) — the card is built from this, so message ↔
@@ -1522,8 +1523,8 @@ impl StreamAccumulator {
     /// `subagent` rows carry it, and a call the gather could not establish
     /// keeps its previous fragment ([`Self::ledger_rows`]). `cadence` is the
     /// path's own comparison granularity ([`LedgerCadence`]). Returns whether
-    /// the card owes a flush: a membership change, or a rendered number — the
-    /// elapsed or the activity age — moving at that cadence.
+    /// the card owes a flush: a membership change, or a rendered number — a
+    /// shell row's elapsed, or a fragment's age — moving at that cadence.
     pub(super) fn set_ledger_from_read(
         &mut self,
         transcript: &SessionTranscript,
@@ -1540,7 +1541,7 @@ impl StreamAccumulator {
     /// task it no longer lists has retired and leaves the section, a new one
     /// joins in transcript order. Returns whether the card owes a flush: a
     /// RENDERED change — membership, a row's visible facts, or a rendered
-    /// number (the elapsed, or the activity age, spec #501) moving at
+    /// number (a shell row's elapsed, or a fragment's age, spec #501) moving at
     /// `cadence`. The comparison reads what the row renders, never the
     /// gathered liveness's hidden timestamps: a child part landing inside the
     /// second the card already shows owes nothing. The clock stores the
@@ -1548,7 +1549,7 @@ impl StreamAccumulator {
     /// so the live path compares whole minutes of it (the seconds inside a
     /// rendered minute never owe one and the card gains no per-render clock
     /// churn) while the yielded path compares whole seconds (its 8 s reads keep
-    /// the visible elapsed and activity age true). The read's rows and clock
+    /// the visible numbers true). The read's rows and clock
     /// are stored whatever the decision, so the next age is measured from the
     /// freshest gathered timestamps rather than from a stale accepted read.
     fn set_ledger(&mut self, rows: Vec<TaskLedgerRow>, now_ms: i64, cadence: LedgerCadence) -> bool {
@@ -2908,7 +2909,7 @@ mod tests {
     /// The LIVE path's flush rule (spec #501, ticket #504): the activity age
     /// grows by whole seconds on every render, but the live card compares its
     /// clock at whole minutes, so the seconds alone never owe a PATCH — only
-    /// the age's minute turning does (the same gate the row's elapsed has).
+    /// the age's minute turning does (the same gate a shell row's elapsed has).
     /// A typed liveness change — a tool switch, a wait joining the fragment,
     /// the gather establishing or losing the child — is a rendered change and
     /// owes its flush at once, inside the same minute.
@@ -3123,9 +3124,47 @@ mod tests {
         ));
     }
 
+    /// A subagent row never renders its total runtime (spec #501 format), so a
+    /// start moving — even by whole seconds — can never owe a flush: only the
+    /// fragment's age ticks. (The displayed start minute is still a visible
+    /// fact, like any row's.)
+    #[test]
+    fn a_subagents_elapsed_movement_never_owes_a_flush() {
+        // Mid-minute, so a few seconds of movement stay inside one `HH:MM`.
+        let base = crate::feishu::card::test_local_ms(2026, 9, 29, 14, 2) + 30_000;
+        let row = |started_at: i64, activity_at: i64| {
+            vec![TaskLedgerRow {
+                kind: TaskKind::Subagent,
+                label: Some("review the diff".into()),
+                started_at: Some(started_at),
+                unconfirmed: false,
+                activity: Some(TaskLiveness {
+                    activity: crate::feishu::card::tool_render::ChildActivity::Thinking,
+                    last_activity_ms: activity_at,
+                    wait: None,
+                }),
+            }]
+        };
+        let mut acc = StreamAccumulator::new("test");
+        // Membership: empty -> one row, age 0s.
+        assert!(acc.set_ledger(row(base, base), base, LedgerCadence::Second));
+        // The start moves 5 s back (same displayed minute): a shell row's
+        // elapsed would owe here — the subagent renders no elapsed, so it
+        // does not.
+        assert!(
+            !acc.set_ledger(row(base - 5_000, base), base, LedgerCadence::Second),
+            "a subagent row's elapsed is not rendered, so it cannot owe"
+        );
+        // The fragment's rendered second turning still owes.
+        assert!(
+            acc.set_ledger(row(base - 5_000, base), base + 1_000, LedgerCadence::Second),
+            "the fragment's age is the subagent row's rendered clock"
+        );
+    }
+
     /// A row with no start time has no clock: a read that only re-reports it
     /// (the same label, no start) never owes a flush on either cadence — the
-    /// clock tracks the rendered elapsed, and there is none.
+    /// clock tracks the rendered numbers, and there are none.
     #[test]
     fn a_start_less_row_never_ticks_the_ledger_clock() {
         let rows = || {

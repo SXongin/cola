@@ -1,14 +1,15 @@
 //! The Background Task Ledger (ADR-0060).
 //!
 //! The card-tail section that lists a Session's live Background Tasks — task
-//! type, bolded label, start clock, elapsed, and a background subagent's child
-//! activity (spec #501) — riding the newest card of its Card Chain like the
-//! Todo Panel and the live Tool Panels. One folded collapsible panel: the
-//! pinned count (`⏳ 后台任务（N）`) is its title, so it stays readable folded, and
-//! the rows are its body. The Bridge gathers the facts (which tasks are live,
-//! what label their originating tool part's input names, what the task's child
-//! is doing when it has one) and hands them over as [`TaskLedgerRow`]s; this
-//! module owns the pinned copy, the formats and nothing else.
+//! type, bolded label, start clock, a shell row's elapsed, and a background
+//! subagent's child activity (spec #501) — riding the newest card of its Card
+//! Chain like the Todo Panel and the live Tool Panels. One folded collapsible
+//! panel: the pinned count (`⏳ 后台任务（N）`) is its title, so it stays readable
+//! folded, and the rows are its body. The Bridge gathers the facts (which tasks
+//! are live, what label their originating tool part's input names, what the
+//! task's child is doing when it has one) and hands them over as
+//! [`TaskLedgerRow`]s; this module owns the pinned copy, the formats and
+//! nothing else.
 //!
 //! A completed task leaves that list: its mechanical completion line becomes
 //! the collapsed title of one folded entry on the card the task lived on
@@ -95,7 +96,8 @@ pub enum TaskEnding {
 /// One live Background Task as its ledger row renders it: the task's type, the
 /// label joined from the originating tool part's input by `call_id` (`None`
 /// when that input names no label — the row then renders bare), when the run
-/// started (`None` renders no elapsed), whether a runtime reconciliation could
+/// started (`None` renders no start clock; a shell row also renders its elapsed
+/// from it, a subagent row never does), whether a runtime reconciliation could
 /// not confirm it as running (issue #454 — the row then carries the
 /// 状态待确认 marker, and only its own Wake or a positive terminal verdict can
 /// retire it), and the task's child-session liveness when it has one (spec
@@ -112,7 +114,7 @@ pub struct TaskLedgerRow {
     pub unconfirmed: bool,
     /// The child session's last successfully gathered liveness (spec #501),
     /// rendered as the front task panel's own fragment — `bash 5s`,
-    /// `思考中 1m30s · 等待你的授权` — after the row's elapsed. `None` for a
+    /// `思考中 1m30s · 等待你的授权` — after the row's start clock. `None` for a
     /// shell row, before the child has been read, and while a read cannot
     /// establish one; the timestamps inside are never refreshed by a failed
     /// read, so the rendered age keeps growing truthfully (ADR-0054).
@@ -140,8 +142,8 @@ impl TaskLedgerRow {
     }
 
     /// The start clock as the row renders it — local `HH:MM`, or `None` when
-    /// the start is absent (or out of range). The elapsed is the render
-    /// clock's business ([`task_ledger_clock`]).
+    /// the start is absent (or out of range). The elapsed is the render clock's
+    /// business ([`task_ledger_clock`]), and only a shell row renders one.
     fn rendered_clock(&self) -> Option<String> {
         self.started_at.and_then(fmt_local_time)
     }
@@ -152,7 +154,7 @@ impl TaskLedgerRow {
     /// clock, the unconfirmed flag, and, while the row is confirmed, the
     /// fragment's label and wait — never the raw label/start values that
     /// render identically, nor the gathered liveness's stored timestamps. The
-    /// rendered numbers (the row's elapsed and the fragment's age) are the
+    /// rendered numbers (a shell row's elapsed and the fragment's age) are the
     /// render clock's business ([`task_ledger_clock`]), compared at the path's
     /// own cadence: text past the clip, an empty label, a start moving inside
     /// the displayed minute and elapsed second, or a child part landing inside
@@ -270,18 +272,20 @@ pub(crate) fn task_ledger_title(rows: &[TaskLedgerRow]) -> Option<String> {
 ///
 /// ```text
 /// · shell：**npm run build** · 14:02 · 3m12s
-/// · subagent：**review the diff** · 14:04 · 1m05s
+/// · subagent：**review the diff** · 14:04 · bash 5s
 /// ```
 ///
 /// `None` when no task is live (the title's own emptiness rule, kept here so
 /// the two renderings cannot drift). The type word stays plain, the label is
 /// bolded through [`bold_label`], then the task's server `started_at` renders
-/// as its local `HH:MM` start clock (the completion entry body's own clock)
-/// and the bare elapsed follows. A `subagent` row with a gathered child
-/// liveness appends the front task panel's own fragment ([`TaskLiveness::
-/// title_fragment`]) after that: `bash 5s`, `思考中 1m30s · 等待你的授权`. A part
-/// the read named none of is omitted whole: `· shell · 14:02 · 0m05s`,
-/// `· shell：**npm run build**`, `· shell`. A row a runtime reconciliation
+/// as its local `HH:MM` start clock (the completion entry body's own clock).
+/// A `shell` row's bare elapsed follows it — the elapsed is a shell row's only
+/// liveness — while a `subagent` row never renders a total: its liveness is its
+/// child's activity fragment ([`TaskLiveness::title_fragment`]), appended after
+/// the clock (`bash 5s`, `思考中 1m30s · 等待你的授权`), so the fragment's age is
+/// the only runtime it shows. A part the read named none of is omitted whole:
+/// `· shell · 14:02 · 0m05s`, `· shell：**npm run build**`, `· shell`,
+/// `· subagent：**review the diff** · 14:04`. A row a runtime reconciliation
 /// could not confirm as running carries the trailing 状态待确认 marker (issue
 /// #454), after every part it did carry — and renders no activity, whatever
 /// fragment is still stored: an unverified liveness must not read as certain.
@@ -309,7 +313,13 @@ pub(crate) fn task_ledger_text(rows: &[TaskLedgerRow], now_ms: i64) -> Option<St
             if let Some(clock) = fmt_local_time(at) {
                 text.push_str(&format!(" · {clock}"));
             }
-            text.push_str(&format!(" · {}", fmt_task_elapsed(secs_since(at, now_ms))));
+            // A shell row's elapsed is its only liveness, so it renders it; a
+            // subagent row's liveness is its child's activity fragment, and its
+            // total runtime would only restate the fragment's age — never
+            // rendered.
+            if row.kind == TaskKind::Shell {
+                text.push_str(&format!(" · {}", fmt_task_elapsed(secs_since(at, now_ms))));
+            }
         }
         if let Some(activity) = row.rendered_activity() {
             // A tool name is transcript text reaching a markdown body: neuter
@@ -328,30 +338,36 @@ pub(crate) fn task_ledger_text(rows: &[TaskLedgerRow], now_ms: i64) -> Option<St
 }
 
 /// One row's rendered clock (ADR-0060, spec #501): every rendered number that
-/// time moves — the row's own elapsed, and its activity fragment's age when it
-/// shows one — in whole seconds. The Bridge compares it at the cadence each
+/// time moves — a shell row's elapsed, and any row's activity fragment age when
+/// it shows one — in whole seconds. The Bridge compares it at the cadence each
 /// path owes (the Turn's `LedgerCadence`): a row whose rendered seconds did not
-/// move owes nothing. `None` where the row renders no such number (no start
-/// time; no activity; an unconfirmed row, which renders no activity whatever it
-/// stores; an untimed tool).
+/// move owes nothing. `None` where the row renders no such number (a subagent
+/// row never renders an elapsed; no start time; no activity; an unconfirmed
+/// row, which renders no activity whatever it stores; an untimed tool).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LedgerRowClock {
     pub elapsed: Option<u64>,
     pub activity: Option<u64>,
 }
 
-/// The ledger's render clock (ADR-0060): each row's elapsed — and its activity
-/// fragment's age — in whole seconds against `now_ms`, in row order, so the
-/// clock records what the card last rendered. The Bridge compares it at the
+/// The ledger's render clock (ADR-0060): a shell row's elapsed — and any row's
+/// activity fragment age — in whole seconds against `now_ms`, in row order, so
+/// the clock records what the card last rendered. The Bridge compares it at the
 /// cadence each path owes (`LedgerCadence`): the live render at whole minutes
 /// (its flushes are content-driven; a per-render second clock would be churn),
 /// the yielded refresh at whole seconds (its ~8 s reads are a waiting card's
-/// only clock). A part the row does not render has no clock (`None`), and a
-/// start skewed into the future clamps like the render it keys.
+/// only clock). A part the row does not render has no clock (`None`) — a
+/// subagent row's total runtime included — and a start skewed into the future
+/// clamps like the render it keys.
 pub(crate) fn task_ledger_clock(rows: &[TaskLedgerRow], now_ms: i64) -> Vec<LedgerRowClock> {
     rows.iter()
         .map(|row| LedgerRowClock {
-            elapsed: row.started_at.map(|at| secs_since(at, now_ms)),
+            // Only what the row renders ticks: the elapsed is the shell row's
+            // alone, so a subagent's start moving can never owe a flush.
+            elapsed: match row.kind {
+                TaskKind::Shell => row.started_at.map(|at| secs_since(at, now_ms)),
+                TaskKind::Subagent => None,
+            },
             activity: row
                 .rendered_activity()
                 .and_then(TaskLiveness::age_clock_ms)
@@ -385,12 +401,14 @@ fn bold_label(label: &str) -> String {
 
 /// Estimated serialized size (bytes) of the ledger section, for the card
 /// splitter's tail reserve: the folded panel's title and element overhead, plus
-/// one row per task — its ` · HH:MM` start clock, its ` · XmYYs` elapsed, its
-/// bolded label, counted exactly as [`bold_label`] renders it (clipped at
-/// [`TASK_LABEL_CHARS`], entity-escaped and wrapped), and its activity fragment
-/// when it renders one ([`activity_estimate`]) — so the estimate and the row
-/// cannot drift apart. Rough like the Bridge's `panel_estimate` for the tail's
-/// other sections.
+/// one row per task — its ` · HH:MM` start clock, a shell row's ` · XmYYs`
+/// elapsed, its bolded label, counted exactly as [`bold_label`] renders it
+/// (clipped at [`TASK_LABEL_CHARS`], entity-escaped and wrapped), and its
+/// activity fragment when it renders one ([`activity_estimate`]) — so the
+/// estimate and the row cannot drift apart. The per-row constant stays the
+/// shell-sized one: a subagent row's missing elapsed is over-reserve, which is
+/// safe. Rough like the Bridge's `panel_estimate` for the tail's other
+/// sections.
 pub(crate) fn task_ledger_estimate(rows: &[TaskLedgerRow]) -> usize {
     let labels: usize = rows
         .iter()
@@ -446,9 +464,10 @@ pub(crate) fn task_entry_estimate(entry: &TaskCompletionEntry) -> usize {
     300 + label + id + 80
 }
 
-/// The ledger row's elapsed: bare, with no Chinese label (ADR-0060) — `3m12s`,
-/// `1m05s` under an hour, `1h05m` above it. Seconds are zero-padded so the
-/// rows stay visually aligned; the minutes above an hour are too.
+/// A shell ledger row's elapsed: bare, with no Chinese label (ADR-0060) —
+/// `3m12s`, `1m05s` under an hour, `1h05m` above it. A subagent row never
+/// renders one (its liveness is the activity fragment). Seconds are zero-padded
+/// so the rows stay visually aligned; the minutes above an hour are too.
 fn fmt_task_elapsed(secs: u64) -> String {
     if secs < 3600 {
         format!("{}m{:02}s", secs / 60, secs % 60)
@@ -458,8 +477,8 @@ fn fmt_task_elapsed(secs: u64) -> String {
 }
 
 /// The completion entry's duration: minute-granular, so a fixed entry reads
-/// the same on every re-render and matches the pinned body (`12m`). Bare like
-/// the row's elapsed, with the same `XhYYm` shape above an hour.
+/// the same on every re-render and matches the pinned body (`12m`). Bare like a
+/// shell row's elapsed, with the same `XhYYm` shape above an hour.
 fn fmt_entry_elapsed(secs: u64) -> String {
     if secs < 3600 {
         format!("{}m", secs / 60)
@@ -479,14 +498,15 @@ mod tests {
     use super::*;
     use crate::feishu::card::tool_render::ChildActivity;
 
-    /// The pinned copy (ADR-0060, #412/#423): the title is the count, the body
-    /// one row per task — type noun, bolded label, start clock and bare elapsed
-    /// — `3m12s` / `1m05s` for this pair.
+    /// The pinned copy (ADR-0060, #412/#423/#501): the title is the count, the
+    /// body one row per task — type noun, bolded label, start clock; a shell
+    /// row's bare elapsed follows (`3m12s`), while a subagent row stops at its
+    /// clock (its liveness is the activity fragment).
     #[test]
     fn the_section_renders_the_pinned_copy() {
         let start = crate::feishu::card::test_local_ms(2026, 9, 29, 14, 2);
         // 127 s apart at 14:04:07, so the second row's clock is 14:04 and its
-        // elapsed 1m05s at `now` (14:05:12).
+        // (unrendered) elapsed would be 1m05s at `now` (14:05:12).
         let second_start = start + 127_000;
         let now = start + 192_000;
         let rows = vec![
@@ -508,7 +528,7 @@ mod tests {
         assert_eq!(task_ledger_title(&rows).unwrap(), "⏳ 后台任务（2）");
         assert_eq!(
             task_ledger_text(&rows, now).unwrap(),
-            "· shell：**gh run watch** · 14:02 · 3m12s\n· subagent：**review the diff** · 14:04 · 1m05s"
+            "· shell：**gh run watch** · 14:02 · 3m12s\n· subagent：**review the diff** · 14:04"
         );
     }
 
@@ -516,7 +536,9 @@ mod tests {
     /// start clock ` · HH:MM` and the ` · XmYYs` elapsed arrive together only
     /// when the read carried a start, and a missing label drops its `：…` span
     /// whole — never a dangling colon or separator. The type word stays plain
-    /// and only the label is bolded.
+    /// and only the label is bolded. A subagent row keeps its own noun and
+    /// stops at the start clock: no total elapsed is ever rendered for it
+    /// (spec #501).
     #[test]
     fn the_row_renders_its_four_shapes() {
         let at = crate::feishu::card::test_local_ms(2026, 9, 29, 14, 2);
@@ -540,7 +562,7 @@ mod tests {
             "· shell：**npm run build**"
         );
         assert_eq!(render(&row(None, None)), "· shell");
-        // The subagent keeps its own noun.
+        // The subagent keeps its own noun and no total elapsed.
         assert_eq!(
             task_ledger_text(
                 &[TaskLedgerRow {
@@ -553,19 +575,20 @@ mod tests {
                 now,
             )
             .unwrap(),
-            "· subagent：**review the diff** · 14:02 · 3m12s"
+            "· subagent：**review the diff** · 14:02"
         );
     }
 
     /// A subagent row's child liveness (spec #501) renders as the front task
-    /// panel's own fragment, appended after the elapsed: the running tool and
-    /// its age (`bash 5s`), the phase and its age, then the wait — and the
-    /// unconfirmed marker still trails LAST. A row the reconciliation could not
-    /// confirm renders NO activity, whatever fragment it stores.
+    /// panel's own fragment, appended after the start clock — a subagent row
+    /// never renders a total elapsed: the running tool and its age (`bash 5s`),
+    /// the phase and its age, then the wait — and the unconfirmed marker still
+    /// trails LAST. A row the reconciliation could not confirm renders NO
+    /// activity, whatever fragment it stores.
     #[test]
-    fn a_rows_activity_fragment_follows_its_elapsed() {
+    fn a_rows_activity_fragment_follows_its_clock() {
         let at = crate::feishu::card::test_local_ms(2026, 9, 29, 14, 4);
-        let now = at + 65_000; // 14:05:05, elapsed 1m05s
+        let now = at + 65_000; // 14:05:05
         let row = |activity: Option<TaskLiveness>, unconfirmed: bool| TaskLedgerRow {
             kind: TaskKind::Subagent,
             label: Some("review the diff".into()),
@@ -574,6 +597,12 @@ mod tests {
             activity,
         };
         let render = |row: &TaskLedgerRow| task_ledger_text(std::slice::from_ref(row), now).unwrap();
+
+        // The fragment-less shape: label, start clock, and no total runtime.
+        assert_eq!(
+            render(&row(None, false)),
+            "· subagent：**review the diff** · 14:04"
+        );
 
         let tool = TaskLiveness {
             activity: ChildActivity::Tool {
@@ -585,7 +614,7 @@ mod tests {
         };
         assert_eq!(
             render(&row(Some(tool), false)),
-            "· subagent：**review the diff** · 14:04 · 1m05s · bash 5s"
+            "· subagent：**review the diff** · 14:04 · bash 5s"
         );
 
         let thinking = TaskLiveness {
@@ -595,11 +624,11 @@ mod tests {
         };
         assert_eq!(
             render(&row(Some(thinking.clone()), false)),
-            "· subagent：**review the diff** · 14:04 · 1m05s · 思考中 30s · 等待你的授权"
+            "· subagent：**review the diff** · 14:04 · 思考中 30s · 等待你的授权"
         );
         assert_eq!(
             render(&row(Some(thinking), true)),
-            "· subagent：**review the diff** · 14:04 · 1m05s · ⚠️ 状态待确认",
+            "· subagent：**review the diff** · 14:04 · ⚠️ 状态待确认",
             "an unconfirmed row renders no activity at all"
         );
         // A tool whose server clock has not landed shows its name alone, and a
@@ -614,7 +643,7 @@ mod tests {
         };
         assert_eq!(
             render(&row(Some(untimed), false)),
-            "· subagent：**review the diff** · 14:04 · 1m05s · bash"
+            "· subagent：**review the diff** · 14:04 · bash"
         );
         // The tool name is transcript text inside the markdown body: its own
         // emphasis characters are neutered like a label's.
@@ -628,9 +657,10 @@ mod tests {
         };
         assert_eq!(
             render(&row(Some(starry), false)),
-            "· subagent：**review the diff** · 14:04 · 1m05s · we&#42;bash&#95;2"
+            "· subagent：**review the diff** · 14:04 · we&#42;bash&#95;2"
         );
-        // A shell row renders none of this: its own activity field stays None.
+        // A shell row renders its own elapsed and none of this: its activity
+        // field stays None.
         assert_eq!(
             task_ledger_text(
                 &[TaskLedgerRow {
@@ -916,11 +946,11 @@ mod tests {
         );
     }
 
-    /// The render clock records every rendered number in whole SECONDS — the
-    /// row's elapsed and its activity fragment's age (ADR-0060, spec #501): the
-    /// Bridge compares it at the cadence each path owes, a row with neither
-    /// number has an all-`None` clock, and a future start clamps like the
-    /// render it keys.
+    /// The render clock records every rendered number in whole SECONDS — a
+    /// shell row's elapsed and any row's activity fragment age (ADR-0060, spec
+    /// #501): the Bridge compares it at the cadence each path owes, a subagent
+    /// row never clocks its total runtime, a row with neither number has an
+    /// all-`None` clock, and a future start clamps like the render it keys.
     #[test]
     fn the_render_clock_reads_whole_seconds() {
         let start = 1_800_000_000_000;
@@ -969,7 +999,9 @@ mod tests {
                     activity: None
                 },
                 LedgerRowClock {
-                    elapsed: Some(59),
+                    // The subagent's start is not rendered as an elapsed, so
+                    // it has no elapsed clock — only its fragment's age ticks.
+                    elapsed: None,
                     activity: Some(52)
                 },
             ],
@@ -978,12 +1010,12 @@ mod tests {
         assert_eq!(
             task_ledger_clock(&rows, start + 60_000)[0].elapsed,
             Some(60),
-            "the elapsed seconds keep moving through a minute"
+            "the shell's elapsed seconds keep moving through a minute"
         );
         assert_eq!(
             task_ledger_clock(&rows, start - 5_000)[2],
             LedgerRowClock {
-                elapsed: Some(0),
+                elapsed: None,
                 activity: Some(0)
             },
             "a future activity start clamps like the render"
@@ -993,11 +1025,55 @@ mod tests {
         assert_eq!(
             task_ledger_clock(&[activity_row(true)], start + 59_000)[0],
             LedgerRowClock {
-                elapsed: Some(59),
+                elapsed: None,
                 activity: None
             }
         );
         assert_eq!(task_ledger_clock(&[], start), Vec::<LedgerRowClock>::new());
+    }
+
+    /// A subagent row renders no total elapsed (spec #501 format): the row
+    /// stops at its start clock, or carries its child's activity fragment, and
+    /// its clock never includes a total runtime.
+    #[test]
+    fn a_subagent_row_renders_no_total_elapsed() {
+        let at = crate::feishu::card::test_local_ms(2026, 9, 29, 14, 2);
+        let now = at + 192_000; // 14:05:12, a 3m12s runtime
+        let row = |kind: TaskKind, activity: Option<TaskLiveness>| TaskLedgerRow {
+            kind,
+            label: Some("review the diff".into()),
+            started_at: Some(at),
+            unconfirmed: false,
+            activity,
+        };
+        assert_eq!(
+            task_ledger_text(&[row(TaskKind::Shell, None)], now).unwrap(),
+            "· shell：**review the diff** · 14:02 · 3m12s",
+            "a shell row keeps its elapsed: it has no activity fragment"
+        );
+        assert_eq!(
+            task_ledger_text(&[row(TaskKind::Subagent, None)], now).unwrap(),
+            "· subagent：**review the diff** · 14:02",
+            "a fragment-less subagent row stops at its start clock"
+        );
+        let activity = TaskLiveness {
+            activity: ChildActivity::Tool {
+                name: "bash".into(),
+                started_at: Some(now - 5_000),
+            },
+            last_activity_ms: now - 5_000,
+            wait: None,
+        };
+        assert_eq!(
+            task_ledger_text(&[row(TaskKind::Subagent, Some(activity))], now).unwrap(),
+            "· subagent：**review the diff** · 14:02 · bash 5s",
+            "a subagent row's liveness is its child's fragment, not a total"
+        );
+        // The clock follows the render: only the fragment's age ticks, so the
+        // subagent's runtime can never owe a flush.
+        let clocks = task_ledger_clock(&[row(TaskKind::Subagent, None)], now);
+        assert_eq!(clocks[0].elapsed, None);
+        assert_eq!(clocks[0].activity, None);
     }
 
     /// An untimed tool renders its name alone, so its age never ticks.
