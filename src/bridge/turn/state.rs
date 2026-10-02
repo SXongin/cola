@@ -2275,7 +2275,7 @@ pub(super) fn task_label(kind: TaskKind, input: Option<&serde_json::Value>) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::ToolStatus;
+    use crate::backend::{BackgroundTask, ToolIdentity, ToolStatus};
     use crate::feishu::card::MAX_CARD_TEXT_CHARS;
 
     #[test]
@@ -2968,8 +2968,89 @@ mod tests {
             start + 60_200,
             LedgerCadence::Minute
         ));
+        // …the wait leaves again — a rendered change like the wait joining…
+        assert!(acc.set_ledger(
+            row(Some(tool("edit", None))),
+            start + 60_300,
+            LedgerCadence::Minute
+        ));
         // …and the gather losing the child renders the bare row again.
-        assert!(acc.set_ledger(row(None), start + 60_300, LedgerCadence::Minute));
+        assert!(acc.set_ledger(row(None), start + 60_400, LedgerCadence::Minute));
+    }
+
+    /// Read recovery on the live path (spec #501, ticket #504): a FAILED gather
+    /// (an empty map) keeps the last established fragment and owes nothing —
+    /// the stored row still renders — while the gather healing to a new typed
+    /// activity owes its flush at once, on the live path's minute gate.
+    #[test]
+    fn live_ledger_read_recovery_owes_a_flush() {
+        let start = 1_800_000_000_000;
+        let transcript = SessionTranscript::default().with_background_tasks(vec![BackgroundTask {
+            tool: ToolIdentity {
+                name: "subagent".into(),
+                call_id: "call_sub".into(),
+            },
+            shell_id: None,
+            child_id: Some("ses_child".into()),
+            started_at: None,
+        }]);
+        let bash = TaskLiveness {
+            activity: crate::feishu::card::tool_render::ChildActivity::Tool {
+                name: "bash".into(),
+                started_at: Some(start),
+            },
+            last_activity_ms: start,
+            wait: None,
+        };
+        let mut acc = StreamAccumulator::new("test");
+
+        // The child is established (membership: empty -> a row with a fragment).
+        assert!(acc.set_ledger_from_read(
+            &transcript,
+            &HashMap::from([("call_sub".to_string(), bash.clone())]),
+            start,
+            LedgerCadence::Minute
+        ));
+        // The gather fails: the stored fragment is kept, so the same rendered
+        // row owes nothing — a failed read is not a change.
+        assert!(!acc.set_ledger_from_read(
+            &transcript,
+            &HashMap::new(),
+            start + 30_000,
+            LedgerCadence::Minute
+        ));
+        assert!(
+            acc.ledger[0].activity.is_some(),
+            "a failed gather keeps the last established fragment"
+        );
+        // The gather heals to a new typed activity: that change owes at once.
+        let replying = TaskLiveness {
+            activity: crate::feishu::card::tool_render::ChildActivity::Replying,
+            last_activity_ms: start + 31_000,
+            wait: None,
+        };
+        assert!(acc.set_ledger_from_read(
+            &transcript,
+            &HashMap::from([("call_sub".to_string(), replying.clone())]),
+            start + 31_000,
+            LedgerCadence::Minute
+        ));
+        // A wait joins the healed fragment, then leaves it: each is a rendered
+        // change and owes its flush.
+        let mut waiting = replying.clone();
+        waiting.wait = Some(crate::feishu::card::AwaitingAction::Permission);
+        assert!(acc.set_ledger_from_read(
+            &transcript,
+            &HashMap::from([("call_sub".to_string(), waiting)]),
+            start + 31_100,
+            LedgerCadence::Minute
+        ));
+        assert!(acc.set_ledger_from_read(
+            &transcript,
+            &HashMap::from([("call_sub".to_string(), replying)]),
+            start + 31_200,
+            LedgerCadence::Minute
+        ));
     }
 
     /// The flush decision compares only what the row RENDERS (spec #501,

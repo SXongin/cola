@@ -3349,10 +3349,12 @@ impl Turn {
         }
     }
 
-    /// Clear the card's phase timer (a finalized-card fixture).
+    /// Clear the card's phase timer (a fixture that needs a frozen header: a
+    /// live card's timer otherwise ticks the header once a second).
     pub(crate) async fn clear_phase(cards: &CardsHandle, session_id: &str) {
         if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
             card.acc.current_phase = None;
+            card.acc.phase_started_at = None;
         }
     }
 
