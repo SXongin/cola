@@ -14,9 +14,10 @@
 # keeps the Go key inside the proxy process, and runs Codex read-only
 # (`permission-profile: ":read-only"` + the default `drop-sudo`).
 #
-# Timing caveat: the OpenCode gate reads the *last* `github-actions[bot]`
-# comment for its verdict, so wait until the `OpenCode Review` run for the
-# current commit has finished before labeling or dispatching a trial.
+# Timing: the OpenCode gate reads the *last* `github-actions[bot]` comment for
+# its verdict, so a trial comment landing mid-run would hide it. The workflow
+# prevents this structurally: before running (and before posting), it waits
+# for any in-flight `OpenCode Review` run on this PR's branch to finish.
 name: Codex Review Trial
 
 on:
@@ -62,11 +63,37 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # The gate's approval step scans the last `github-actions[bot]` comment
+      # for its verdict; a trial comment arriving between the gate's review
+      # comment and that readback would hide the verdict and silently skip the
+      # approval. Wait out any in-flight gate run on this branch; if one never
+      # finishes, fail instead of posting.
+      - name: Wait for an in-flight OpenCode gate run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          head_ref=$(gh pr view "$PR" --json headRefName --jq .headRefName)
+          for _ in $(seq 1 40); do
+            running=$(gh run list --repo "$GITHUB_REPOSITORY" \
+              --workflow opencode-review.yml --branch "$head_ref" --limit 10 \
+              --json status \
+              --jq '[.[] | select(.status == "queued" or .status == "in_progress")] | length')
+            if [ "$running" = "0" ]; then
+              echo "No OpenCode Review run in flight on $head_ref."
+              exit 0
+            fi
+            echo "OpenCode Review still in flight; waiting 15s..."
+            sleep 15
+          done
+          echo "OpenCode Review still in flight after 10 minutes; not reviewing." >&2
+          exit 1
+
       # The prompt = the committed rubric + this PR's metadata + its linked
       # issue when one can be fetched, so the reviewer does not depend on
-      # network access inside the read-only sandbox. GH_TOKEN stays on this
-      # step and the posting step only — never in the Codex step's
-      # environment, where prompt-injected PR content could read it.
+      # network access inside the read-only sandbox. GH_TOKEN stays on the gh
+      # steps only — never in the Codex step's environment, where
+      # prompt-injected PR content could read it.
       - name: Build the review prompt
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -134,6 +161,7 @@ jobs:
             echo '## Codex advisory review (trial)'
             echo
             echo '_Not a merge gate — the `OpenCode Review` workflow still approves. This is an independent-reviewer trial: Codex Action on `gpt-6-luna` through the OpenCode Go subscription. See issue #516._'
+            printf '_Reviewed commit: `%s`._\n' "$(git rev-parse HEAD)"
             echo
             cat codex-output.md
           } > comment.md
