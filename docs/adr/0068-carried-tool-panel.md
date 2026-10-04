@@ -61,15 +61,19 @@ leaves the tail and joins the successor's timeline at its server start key
 extend the new Turn's anchor, its durable record, or its settle decision, and
 it is never an adoption of the old run.
 
-**The old card is collected without the running markers.** The takeover's
-collect strips from the preserved body every `collapsible_panel` whose
-plain-text title begins `⏳` — the running Tool Panel's marker; the panel now
-lives on the successor. This is ADR-0063's body-preservation rule narrowed for
-this one collect (recorded as an amendment there). The removal is gated on the
-carry actually handing at least one call over: a failed, timed-out, or
-cap-stopped read carries nothing and strips nothing, leaving today's collected
-body untouched, and a failed old-card PATCH is the same best-effort degrade as
-every collect.
+**The old card is collected without the live tail the successor takes over.**
+The takeover's collect drops two things from the preserved body. The
+**Background Task Ledger** (its stable `task_ledger` element) goes always: the
+successor's own reads rebuild the live list, so ADR-0060's handover rule —
+exactly one card carries it — applies to the restart collect exactly as it does
+to an in-process supersede. The **running tool panels**
+(`collapsible_panel`s whose plain-text title begins `⏳`) go only when the carry
+actually handed at least one call over: a failed, timed-out, or cap-stopped
+read carries nothing and strips no tool panel, leaving today's collected body
+for them. This is
+ADR-0063's body-preservation rule narrowed for this one collect (recorded as an
+amendment there), and a failed old-card PATCH is the same best-effort degrade
+as every collect.
 
 **Only the fresh-Turn takeover carries.** A Wake continuation's arm keeps
 ADR-0061's scope at the newest Wake — it never replays the lost chain's
@@ -128,9 +132,11 @@ survives the process.
   carried; the carry read scans to the anchor-minus-window boundary (a long
   transcript stays a bounded newest-first scan, a queued message above the
   unfinished call does not hide it, and a cap stop carries nothing and strips
-  nothing); the collected old card carries no running marker; a failed carry
-  read degrades to today; and the already-working in-window case stays a
-  regression test. The probe for a tool that settled while cola was down is
-  dropped with a pointer to #505.
+  no panel); the takeover collect drops the ledger on every collect — the
+  successor rebuilds the live list — and drops the running markers only when a
+  call was carried; a failed carry read degrades to today, the ledger still
+  dropped; and the already-working in-window case stays a regression test. The
+  probe for a tool that settled while cola was down is dropped with a pointer
+  to #505.
 
 Related: #428, #434, #443, #444, #505, ADR-0045, ADR-0061, ADR-0062, ADR-0063.

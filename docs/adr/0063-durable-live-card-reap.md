@@ -138,11 +138,13 @@ the card existed.
 
 The body-preservation rule above ("every ending is stamped over the card's own
 view... the body the card already rendered stays") covers the takeover collect
-too. ADR-0068 narrows it for exactly one case: when a fresh Turn's takeover
-carried the orphaned Turn's running tool panels onto the successor, the
-collect's preserved body drops those panels (the `⏳` foldable elements) — they
-are live on the successor now, and keeping them would leave the collected card
-looking busy. Every other preserved body — the reap's settle / Unreceived /
-Waiting endings and the #443 restart stamp — is unchanged, and a takeover that
-carried nothing — a failed, timed-out, or cap-stopped read, or simply no
-running call — preserves the body as before.
+too. ADR-0068 narrows it for one collect: the takeover's preserved body drops
+the **Background Task Ledger** element always — the successor's own reads
+rebuild the live list, so ADR-0060's one-card handover rule applies to the
+restart collect exactly as it does to an in-process supersede — and drops the
+orphaned Turn's **running tool panels** (the `⏳` foldables) when the takeover
+carried them onto the successor; they are live there now, and keeping them
+would leave the collected card looking busy. Every other preserved body — the
+reap's settle / Unreceived / Waiting endings and the #443 restart stamp — is
+unchanged, and a takeover that carried no running call keeps those panels (the
+ledger still goes).
