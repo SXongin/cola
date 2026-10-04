@@ -221,7 +221,12 @@ pub(crate) async fn reconcile(
             // Bounded like every other Session Sync request (the Feishu client
             // carries no default timeout): a stuck call must not freeze the
             // pass behind one orphan. A cut-loose attempt claims nothing and
-            // is retried next pass; re-stamping is idempotent.
+            // is retried next pass; re-stamping is idempotent. The bound makes
+            // ordering against a concurrent takeover best-effort — a
+            // cancelled write may still land (ADR-0063's amendment; the same
+            // at-least-once caveat as ADR-0067's drain) — while every
+            // takeover this process can observe is covered by the stamp's
+            // pre- and post-PATCH ownership checks.
             let _ = crate::bridge::bounded_call("live-card reap stamp", read_timeout_ms, async {
                 pass.stamp_restarted().await;
                 Ok(())
