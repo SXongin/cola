@@ -23,13 +23,30 @@ content; this decision covers only the running tail at the takeover moment.
 
 ## Decision
 
-**A fresh Turn's takeover carries the orphaned card's running tool calls onto
-the successor.** When the takeover finds the durable record naming a different
-card, the Turn makes **one bounded Session Transcript read** (before its prompt
-is submitted), collects every `running`/`pending` tool call by its call
-identity, and seeds those calls into the new accumulator's live tail — the
-same slots ADR-0045's running panels use — so the successor renders them as
-ordinary live panels.
+**A fresh Turn's takeover carries the orphaned Turn's running tool calls onto
+the successor.** The successor stays the fresh reply card the new Turn already
+sends — never a split-style continuation of the old chain, whose accumulator is
+gone and whose continuation semantics (pending split, render boundary) have no
+object. When the takeover finds the durable record naming a different card, the
+Turn reads the newest end of the Session Transcript (**a bounded tail read**,
+below), collects the `running`/`pending` tool calls **belonging to the orphan
+Turn's projection** — the membership rule (`belongs_to_turn`, anchored on the
+record's anchor) the orphaned card itself rendered under, so an older card's
+stale running part is never resurrected as live on an unrelated successor; a
+record with no anchor carries nothing — and seeds those calls by call identity
+into the new accumulator's live tail, the same slots ADR-0045's running panels
+use.
+
+**The read is bounded and newest-first, and happens before the prompt is
+submitted.** It pages messages descending (`desc` order, following
+`cursor.next` for older pages) and stops at the first of: a
+page with no unfinished message — running calls live only on unfinished
+messages, which are the session's newest — or a page whose oldest message
+predates the orphan anchor minus the in-flight window, past which nothing can
+belong. A small hard page cap and the existing read timeout bound the worst
+case; the common case is one request. A read stopped by the cap before covering
+the newest unfinished messages carries nothing rather than guessing. V1's
+transcript read is a single request and needs no pagination.
 
 **The carried calls reconcile against the transcript, not the Turn window.**
 Every render read resolves each carried call identity against the transcript
@@ -72,6 +89,15 @@ survives the process.
   this is one user event whose prompt submit is the only thing waiting, and a
   detached carry needs an ownership/liveness guard against a Turn that finishes
   first. A bounded synchronous read is simpler and race-free.
+- **Read the whole Session Transcript** (the render path's own read).
+  Rejected: the V2 read pages through the entire history (up to its page cap on
+  a long session), and the takeover's read sits before the user's prompt
+  submit — a one-message action must not become a history walk. The
+  newest-first tail read keeps the common case to one request.
+- **Carry every `running`/`pending` call in the transcript.** Rejected: a killed
+  run leaves its `running` part behind (verified in #378), so an unrelated old
+  card's stale part could be resurrected as live on a successor. The carry is
+  scoped to the orphan Turn's projection.
 - **Carry the whole live tail (todo, ledger, interaction blocks).** Rejected:
   the successor's own reads rebuild the todo list and the ledger, and
   interaction blocks are stripped from every preserved body already.
@@ -90,9 +116,12 @@ survives the process.
   whatever it reports — possibly nothing — and keeps today's behavior; no
   generation-specific branch is added.
 - Tests pin: a stale in-flight running call appears on the successor; its
-  completion renders exactly once; the collected old card carries no running
-  marker; a failed carry read degrades to today; and the already-working
-  in-window case stays a regression test. The probe for a tool that settled
-  while cola was down is dropped with a pointer to #505.
+  completion renders exactly once; an older card's stale running part is never
+  carried; the carry read never walks the whole history (a long transcript
+  stays a bounded newest-first scan, and a cap stop carries nothing); the
+  collected old card carries no running marker; a failed carry read degrades to
+  today; and the already-working in-window case stays a regression test. The
+  probe for a tool that settled while cola was down is dropped with a pointer
+  to #505.
 
 Related: #428, #434, #443, #444, #505, ADR-0045, ADR-0061, ADR-0062, ADR-0063.

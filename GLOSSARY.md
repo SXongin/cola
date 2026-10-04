@@ -254,7 +254,7 @@ The card element recording one tool call in a **Turn** — a folded collapsible 
 _Avoid_: tool card, call card, tool bubble
 
 **Carried Tool Panel**:
-The **Tool Panel** of a call that was still `running`/`pending` when the card showing it was orphaned by a cola restart, handed to the successor **Turn**'s card when the takeover happens, so a running tool's live signal is never split across two cards: it rides the successor's live tail by call identity, the collected old card's body is left without its stale running marker, and it settles once on the successor (ADR-0068). Like every live panel it is display-only — never an adoption of the old run. Only the fresh-Turn message takeover carries; a **Wake** continuation keeps its no-replay scope (ADR-0061).
+The **Tool Panel** of a call that was still `running`/`pending` when the card showing it was orphaned by a cola restart, handed to the successor **Turn**'s card when the takeover happens, so a running tool's live signal is never split across two cards: only calls belonging to the orphaned **Turn** are carried, and they ride the successor's live tail by call identity — the collected old card's body is left without its stale running marker, and each settles once on the successor (ADR-0068). Like every live panel it is display-only — never an adoption of the old run. Only the fresh-Turn message takeover carries; a **Wake** continuation keeps its no-replay scope (ADR-0061).
 _Avoid_: Transferred panel, migrated panel, adopted panel
 
 **Built-in Tool**:
