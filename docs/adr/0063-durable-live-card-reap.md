@@ -144,4 +144,5 @@ collect's preserved body drops those panels (the `⏳` foldable elements) — th
 are live on the successor now, and keeping them would leave the collected card
 looking busy. Every other preserved body — the reap's settle / Unreceived /
 Waiting endings and the #443 restart stamp — is unchanged, and a takeover that
-carried nothing (failed or skipped read) preserves the body as before.
+carried nothing — a failed, timed-out, or cap-stopped read, or simply no
+running call — preserves the body as before.
