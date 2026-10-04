@@ -1455,6 +1455,165 @@ Index: /x/src/main.rs
         ));
     }
 
+    /// PROBE for #444 (hand a running tool panel to a successor card after a
+    /// restart; cross-card continuation).
+    ///
+    /// After a restart the old accumulator is gone and a new message starts a
+    /// new Turn (#435/ADR-0062); the successor card is a fresh accumulator
+    /// reading the same transcript. Whether the old run's running tool panel
+    /// reaches it is `belongs_to_turn`'s in-flight rule: a previous message
+    /// with no completion stamp belongs while its newest activity
+    /// ([`IN_FLIGHT_STALE_AFTER_MS`] = 10 min) is recent. This probe pins what
+    /// today's read does, so #444's spec can narrow the gap instead of
+    /// re-deriving a mechanism for a case that already works.
+    ///
+    /// Case 1 — the tool started 30 s before the new anchor: the running panel
+    /// already renders onto the successor's live tail, and its later
+    /// completion settles it into the timeline exactly once.
+    #[test]
+    fn probe_444_a_recent_inflight_tool_already_renders_on_the_successor() {
+        let anchor = 2_000_000;
+        let transcript = |status: ToolStatus, output: Option<&str>| {
+            SessionTranscript::new(vec![
+                typed_message(
+                    "msg_cola_new",
+                    MessageRole::User,
+                    Some(anchor),
+                    vec![text_part("新的问题")],
+                ),
+                message_in_flight(
+                    "a_inflight",
+                    anchor - 60_000,
+                    None,
+                    vec![tool(
+                        "shell",
+                        "call_sleep",
+                        status,
+                        Some(anchor - 30_000),
+                        Some(serde_json::json!({"command": "sleep 600"})),
+                        output,
+                    )],
+                ),
+            ])
+        };
+
+        let mut acc = StreamAccumulator::new("proj");
+        acc.cola_message_id = Some("msg_cola_new".into());
+        assert!(render_new_turn_parts(
+            &mut acc,
+            &transcript(ToolStatus::Running, None)
+        ));
+        assert_eq!(acc.tools["call_sleep"].status(), &ToolStatus::Running);
+        let (card, full) = acc.build_card_with_split();
+        assert!(!full, "a live card with only a tail panel must not split");
+        assert!(
+            card_text(&card).contains("⏳ shell"),
+            "the running panel must ride the successor's live tail: {card}"
+        );
+
+        // The tool completes while its message is still inside the window: the
+        // settled panel joins the successor's timeline, exactly once.
+        assert!(render_new_turn_parts(
+            &mut acc,
+            &transcript(ToolStatus::Completed, Some("slept"))
+        ));
+        assert_eq!(acc.tools["call_sleep"].status(), &ToolStatus::Completed);
+        let text = card_text(&acc.build_card_with_split().0);
+        assert_eq!(text.matches("slept").count(), 1, "settled once: {text}");
+        assert!(!render_new_turn_parts(
+            &mut acc,
+            &transcript(ToolStatus::Completed, Some("slept"))
+        ));
+    }
+
+    /// PROBE for #444, case 2 — the GAP while a long tool runs. The same
+    /// restart takeover, but the tool started 11 min before the new anchor
+    /// (longer than the stale window): the previous message falls out of the
+    /// new Turn's window, so neither the running panel nor its completion
+    /// reaches the successor card while the message is still in flight. The
+    /// fix #444 specifies inverts this test: the running panel is carried onto
+    /// the successor even when its message has gone stale.
+    #[test]
+    fn probe_444_a_stale_inflight_tool_is_dropped_by_the_successor_today() {
+        let anchor = 2_000_000;
+        let transcript = |status: ToolStatus, output: Option<&str>| {
+            SessionTranscript::new(vec![
+                typed_message(
+                    "msg_cola_new",
+                    MessageRole::User,
+                    Some(anchor),
+                    vec![text_part("新的问题")],
+                ),
+                message_in_flight(
+                    "a_stale",
+                    anchor - 30 * 60_000,
+                    None,
+                    vec![tool(
+                        "shell",
+                        "call_sleep",
+                        status,
+                        Some(anchor - 11 * 60_000),
+                        Some(serde_json::json!({"command": "sleep 3600"})),
+                        output,
+                    )],
+                ),
+            ])
+        };
+
+        let mut acc = StreamAccumulator::new("proj");
+        acc.cola_message_id = Some("msg_cola_new".into());
+        assert!(
+            !render_new_turn_parts(&mut acc, &transcript(ToolStatus::Running, None)),
+            "today the stale in-flight message renders nothing"
+        );
+        assert!(
+            !acc.tools.contains_key("call_sleep"),
+            "the running panel never reaches the successor card: {:?}",
+            acc.tools.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// PROBE for #444, case 3 — the tool completed while cola was down. The
+    /// previous message carries its completion stamp BEFORE the new anchor, so
+    /// it is a previous turn's message and its settled panel is excluded from
+    /// the successor; the old card's preserved body keeps the pre-restart ⏳
+    /// it froze at. Together the outcome reaches neither card. Whether #444
+    /// owns this (transfer at takeover) or #505 (faithful restore) is part of
+    /// the scope decision this probe informs.
+    #[test]
+    fn probe_444_a_tool_settled_while_cola_was_down_reaches_neither_card() {
+        let anchor = 2_000_000;
+        let transcript = SessionTranscript::new(vec![
+            typed_message(
+                "msg_cola_new",
+                MessageRole::User,
+                Some(anchor),
+                vec![text_part("新的问题")],
+            ),
+            message_in_flight(
+                "a_prev",
+                anchor - 30 * 60_000,
+                Some(anchor - 20 * 60_000),
+                vec![tool(
+                    "shell",
+                    "call_sleep",
+                    ToolStatus::Completed,
+                    Some(anchor - 25 * 60_000),
+                    Some(serde_json::json!({"command": "sleep 600"})),
+                    Some("slept"),
+                )],
+            ),
+        ]);
+
+        let mut acc = StreamAccumulator::new("proj");
+        acc.cola_message_id = Some("msg_cola_new".into());
+        assert!(
+            !render_new_turn_parts(&mut acc, &transcript),
+            "a previous turn's settled panel is excluded from the successor"
+        );
+        assert!(acc.tools.is_empty(), "nothing renders: {:?}", acc.tools.keys());
+    }
+
     /// The header date reads the SERVER's time for the turn's user message
     /// (#183 follow-up): captured on the first poll that sees it, so cola's
     /// own clock never reaches the card. The same captured anchor is #190's

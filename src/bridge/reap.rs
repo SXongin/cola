@@ -879,4 +879,34 @@ mod tests {
         assert_eq!(elements[0]["content"], "保留的正文");
         assert_eq!(card["header"]["title"]["content"], "✅ 完成");
     }
+
+    /// PROBE for #444: the takeover collect preserves the old card's body
+    /// best-effort, and a preserved running tool panel keeps its `⏳` marker —
+    /// the old card is collected yet still looks like it is working. #444
+    /// requires the marker removed/downgraded when the panel is handed to the
+    /// successor; the fix inverts this test.
+    #[test]
+    fn probe_444_the_collected_card_keeps_a_stale_running_marker_today() {
+        use crate::bridge::test_support::card_text;
+
+        let bare = ending_card(CardState::TakenOver, None, None);
+        // A rendered running panel as a whole-card read returns it: a
+        // plain_text header, a folded markdown body, a stable element id.
+        let view = serde_json::json!({
+            "config": { "wide_screen_mode": true },
+            "body": { "elements": [
+                { "tag": "markdown", "content": "**正文** 已经写完的部分" },
+                { "tag": "collapsible_panel", "expanded": false, "element_id": "tool_1",
+                  "header": { "title": { "tag": "plain_text", "content": "⏳ shell · 12:00" } },
+                  "elements": [ { "tag": "markdown", "content": "**Input**\n`sleep 600`" } ] }
+            ] }
+        });
+
+        let card = restamped_keeping_body(&bare, &view);
+        let text = card_text(&card);
+        assert!(
+            text.contains("⏳ shell"),
+            "today the stale running marker survives the collect: {text}"
+        );
+    }
 }
