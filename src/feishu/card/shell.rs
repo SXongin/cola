@@ -507,13 +507,16 @@ mod tests {
     /// Feishu's card parser recognizes its own tag names inside markdown and
     /// rejects a card whose tag is malformed (`<number_tag>` without a 1-99
     /// body is `230099/11311 markdown content parse error`). Text reaches the
-    /// card from the model, so every `<` outside a fenced code block is
-    /// neutralized with Feishu's own escape — visually identical, never a tag.
-    /// Inline code is not exempt: measured 2026-09-22 it does not protect a
-    /// tag once an earlier unclosed tag fragment changes the parser's context,
-    /// so only fences are trusted.
+    /// card from the model, so every `<` outside a code context is neutralized
+    /// with Feishu's own escape — visually identical in normal text, never a
+    /// tag. Both code contexts (fenced blocks and inline spans) pass through
+    /// verbatim: the platform renders code literally and does not decode
+    /// entities there, so an injected escape would be displayed as the escape
+    /// itself (#519, observed 2026-10-04 on a live card). A span that still
+    /// trips the parser falls through to the fenced retry like any other
+    /// rejection.
     #[test]
-    fn text_escapes_tag_openers_outside_fences() {
+    fn text_escapes_tag_openers_outside_code() {
         let card = CardBuilder::new()
             .with_state(CardState::Done)
             .with_text("a <number_tag> b\n\n```\n<number_tag>\n```\n\n`<at id=x></at>`")
@@ -525,8 +528,8 @@ mod tests {
             "fenced code untouched: {content}"
         );
         assert!(
-            content.contains("`&#60;at id=x>&#60;/at>`"),
-            "inline code escaped: {content}"
+            content.contains("`<at id=x></at>`"),
+            "inline code untouched: {content}"
         );
     }
 
