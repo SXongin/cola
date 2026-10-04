@@ -212,11 +212,11 @@ replaces the OpenCode gate remains an open decision (issue #516).
 
 ## Amendment (2026-10-04, superseding the marker filter): the Codex Action review is the gate
 
-The gate in item 6 is now `.github/workflows/codex-review.yml`, replacing
-`.github/workflows/opencode-review.yml`: `openai/codex-action` (v1.12) runs
-Codex read-only on `gpt-6-luna` through the OpenCode Go subscription's
-Responses-compatible inference endpoint, with the two axes plus an adversarial
-pass rubric at `.github/codex/prompts/review.md`. The approval contract is
+The gate in item 6 is now `.github/workflows/codex-review.yml` (PR #518),
+replacing `.github/workflows/opencode-review.yml`: `openai/codex-action`
+(v1.12) runs Codex read-only on `gpt-6-luna` through the OpenCode Go
+subscription's Responses-compatible inference endpoint, with the two axes plus
+an adversarial pass rubric at `.github/codex/prompts/review.md`. The approval contract is
 carried over: a line-final `CODEX_REVIEW_VERDICT: PASS|FAIL` in the review
 comment, approval only on `PASS`, pinned to the reviewed commit. This
 supersedes the 2026-09-15 amendment's OpenCode specifics (model, prompt
