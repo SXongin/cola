@@ -244,7 +244,8 @@ pub enum PlatformCall {
 /// mid-send and interleave another writer (the concurrency races ADR-0038's
 /// "one writer per card" invariant depends on).
 pub struct CallGate {
-    /// `"update"` (= `update_message`) or `"reply"` (= `reply_card`).
+    /// `"update"` (= `update_message`), `"reply"` (= `reply_card`) or
+    /// `"card_view"` (= `get_card_view`).
     pub method: &'static str,
     /// The message the gated call targets (`message_id` / `reply_to`).
     pub target: String,
@@ -793,6 +794,9 @@ impl feishu::Platform for RecordingPlatform {
     }
 
     async fn get_card_view(&self, message_id: &str) -> crate::error::Result<serde_json::Value> {
+        if let Some(gate) = self.take_gate("card_view", message_id) {
+            wait_gate(gate).await;
+        }
         // Scripted via `given_card_view`; a missing entry is a hard failure
         // (like a real read of a deleted or non-card message), so the reap's
         // bare-ending fallback is what every unscripted test exercises.
