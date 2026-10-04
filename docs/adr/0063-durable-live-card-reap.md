@@ -105,19 +105,22 @@ stamp as today. No timer refresh, no recurring PATCHes, no adoption:
 re-following the run is deferred until a faithful no-duplicate/no-omission
 restore exists (#505).
 
-The stamp's write is bounded by the pass's request timeout (the Feishu
-client carries no default timeout), so a stuck request cannot freeze Session
-Sync. Ordering it against a concurrent takeover is therefore **best-effort
-by construction**: a write cancelled at the bound may still land at Feishu —
-the same at-least-once caveat ADR-0067's retry drain documents — so in the
-rare interleaving where a takeover's collect lands first, a late stamp can
-overtake it. Guaranteed ordering would need server-side conditional writes
-(Feishu has none) or never cancelling a write, which holds the card's
-delivery lock across an unbounded stall and blocks the very collect the race
-concerns; the bound is the deliberate trade. What the stamp does guarantee:
-a successor admitted in-process before its write is never stamped over (the
-pre-PATCH ownership check), and one admitted while the write is in flight
-gets the card's last word from the post-PATCH re-collect.
+The stamp's attempt is handed to a **detached task** and its write is
+**never cancelled**. The pass must not await the write — a stuck Feishu call
+would otherwise freeze Session Sync behind one orphan — while the write,
+once issued, must run to its own result: the card-delivery lock is held
+until it resolves, and that lock is what orders a successor's later collect
+after the stamp, so the ordering no longer rests on timing. An in-memory
+in-flight claim holds every other reap decision for the record until the
+attempt resolves — a second attempt, or a settle decided meanwhile, could be
+overtaken by the write still owed. The attempt marks the record when the
+PATCH lands (a failed read or PATCH claims nothing and releases the claim
+for the next pass), and a takeover admitted while it was in flight is
+repaired by the post-PATCH re-collect. A hung write therefore holds the old
+card's delivery lock until it resolves — exactly like every normal card
+write (the flush, a settle, a collect); the pass and the pending-update
+drain are never blocked by it. The view read stays bounded: nothing has been
+sent yet, so a timed-out read is safe to abandon.
 
 ## Amendment (2026-10-02): the record is removed after delivery, not before (ADR-0067)
 

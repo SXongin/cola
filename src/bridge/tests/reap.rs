@@ -1187,47 +1187,133 @@ async fn a_failed_stamp_patch_retries_until_it_lands() {
     );
 }
 
-/// A stamp PATCH that hangs is cut loose by the pass's request bound: it
-/// records nothing, claims nothing, and the next pass retries and lands
-/// (#443) — a stuck Feishu request never freezes Session Sync.
+/// A stamp PATCH that hangs never wedges the pass: the attempt is detached
+/// and the pass keeps reconciling other records while the write waits. The
+/// write is never cancelled — when Feishu finally answers, the stamp lands
+/// exactly once (#443).
 #[tokio::test]
-async fn a_hung_stamp_patch_is_bounded_and_retried() {
+async fn a_hung_stamp_patch_never_wedges_the_pass() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("sessions.json");
     seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
+    // A second live orphan whose reads prove the pass kept ticking while the
+    // first record's stamp hung.
+    LiveCards::load(sidecar(&session_file)).replace(
+        "ses_other",
+        LiveCard::new("om_other", MessageId::new("msg_cola_other"), Some(2_000))
+            .with_directory(Some("/work".into())),
+    );
 
     let transcript = SessionTranscript::new(vec![user("msg_cola_anchor", 1_000, "问题")]);
     let (app, platform, backend) =
         restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Busy)).await;
+    backend
+        .set_session_status("ses_other", Some(SessionStatus::Busy))
+        .await;
     platform.given_card_view("om_frozen", realistic_card_view());
-    // Park the first stamp PATCH forever; only the pass's own bound (50ms in
-    // tests) can release the tick.
-    let (entered, _release) = platform.pause("update", "om_frozen");
+    // Park the stamp PATCH forever; nobody (the pass included) awaits it.
+    let (entered, release) = platform.pause("update", "om_frozen");
 
     spawn_sync(&app);
     entered.notified().await;
-    // The hung attempt was cut loose; the next pass retries and lands.
-    wait_for_card_update(
-        &platform,
-        "the stamp after the hung attempt",
-        CardUpdates::Any,
-        |card| card_header(card).contains("已重启，等待运行结束"),
-    )
+    // The pass keeps reconciling while the write hangs.
+    let before = backend
+        .session_status_reads
+        .lock()
+        .await
+        .iter()
+        .filter(|sid| sid.as_str() == "ses_other")
+        .count();
+    wait_for_status_reads(&backend, "ses_other", before + 3).await;
+    assert!(
+        patches_to(&platform, "om_frozen").await.is_empty(),
+        "the hung attempt has not landed: {:?}",
+        platform.calls.lock().await
+    );
+
+    // Feishu answers: the never-cancelled write lands and is marked once.
+    release.notify_one();
+    wait_for_card_update(&platform, "the stamp after the hang", CardUpdates::Any, |card| {
+        card_header(card).contains("已重启，等待运行结束")
+    })
     .await;
-    // Further observed passes: the mark holds — the retry is the only write.
-    wait_for_status_reads(&backend, "ses_test", 5).await;
+    wait_for_status_reads(&backend, "ses_other", before + 6).await;
 
     let patches = patches_to(&platform, "om_frozen").await;
     assert_eq!(
         patches.len(),
         1,
-        "the hung attempt recorded nothing; exactly the retry landed: {patches:?}"
+        "the hung write lands once, never a retry: {patches:?}"
     );
     assert_preserved_body(&patches[0]);
     assert!(
         app.cards_handle().live_cards.get("ses_test").is_some(),
         "a still-live Session keeps its record"
+    );
+}
+
+/// A run that ends while the stamp's write hangs is settled only after the
+/// attempt resolves: the terminal must not race the never-cancelled write
+/// (which could then land over it), so nothing is written while the stamp is
+/// in flight, and the ✅ follows the stamp as the card's last word (#443).
+#[tokio::test]
+async fn a_terminal_waits_for_an_in_flight_stamp() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
+    // The pass clock: this record's reads keep ticking — the claimed record
+    // returns before its own status read.
+    LiveCards::load(sidecar(&session_file)).replace(
+        "ses_other",
+        LiveCard::new("om_other", MessageId::new("msg_cola_other"), Some(2_000))
+            .with_directory(Some("/work".into())),
+    );
+
+    let (app, platform, backend) =
+        restarted_app_with_backend(&session_file, completed(1_000), Some(SessionStatus::Busy)).await;
+    backend
+        .set_session_status("ses_other", Some(SessionStatus::Busy))
+        .await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+    let (entered, release) = platform.pause("update", "om_frozen");
+
+    spawn_sync(&app);
+    entered.notified().await;
+    // The run ends while the stamp write hangs: the settle must wait for the
+    // attempt, never race it.
+    backend
+        .set_session_status("ses_test", Some(SessionStatus::Idle))
+        .await;
+    let before = backend
+        .session_status_reads
+        .lock()
+        .await
+        .iter()
+        .filter(|sid| sid.as_str() == "ses_other")
+        .count();
+    wait_for_status_reads(&backend, "ses_other", before + 3).await;
+    assert!(
+        patches_to(&platform, "om_frozen").await.is_empty(),
+        "no settle while the stamp is in flight: {:?}",
+        platform.calls.lock().await
+    );
+
+    // The write lands, and the settled ✅ is the card's last word.
+    release.notify_one();
+    wait_for_card_update(&platform, "the ✅ over the stamp", CardUpdates::Latest, |card| {
+        card_header(card).contains("✅")
+    })
+    .await;
+
+    let patches = patches_to(&platform, "om_frozen").await;
+    assert_eq!(patches.len(), 2, "the stamp then its terminal: {patches:?}");
+    assert_eq!(card_header(&patches[0]), "⏳ 已重启，等待运行结束");
+    assert_eq!(card_header(&patches[1]), "✅ 完成");
+    assert!(
+        app.cards_handle().live_cards.get("ses_test").is_none(),
+        "the terminal spends the record"
     );
 }
 
