@@ -1123,6 +1123,34 @@ fn in_flight_shell(
     }
 }
 
+/// The whole-card view of an orphaned live card carrying the live tail
+/// ADR-0068's takeover collect decides on: written content, a running tool
+/// panel (`⏳`), a settled backgrounded launch (`🌙`) and the Background Task
+/// Ledger.
+fn live_tail_orphan_view() -> serde_json::Value {
+    serde_json::json!({
+        "schema": "2.0",
+        "config": { "wide_screen_mode": true, "streaming_mode": true },
+        "header": {
+            "template": "blue",
+            "title": { "tag": "plain_text", "content": "✍️ 回复中" }
+        },
+        "body": { "elements": [
+            { "tag": "markdown", "content": "**正文** 已经写完的部分" },
+            { "tag": "collapsible_panel", "expanded": false, "element_id": "tool_1",
+              "header": { "title": { "tag": "plain_text", "content": "⏳ shell · 12:00" } },
+              "elements": [ { "tag": "markdown", "content": "**Input**\n`sleep 3600`" } ] },
+            { "tag": "collapsible_panel", "expanded": false, "element_id": "tool_2",
+              "header": { "title": { "tag": "plain_text", "content": "🌙 shell · 12:01" } },
+              "elements": [ { "tag": "markdown", "content": "moved to background" } ] },
+            { "tag": "collapsible_panel", "expanded": false, "element_id": "task_ledger",
+              "header": { "title": { "tag": "plain_text", "content": "⏳ 后台任务（1）" } },
+              "elements": [ { "tag": "markdown",
+                              "content": "· shell：**npm run build** · 12:00 · 3m12s" } ] }
+        ] }
+    })
+}
+
 /// The ONE INFO line the restart carry's decision logs (ADR-0068) — the
 /// outcome line, never the debug/warn detail a failed or hanging read also
 /// emits. Panics when the count is not one.
@@ -1216,6 +1244,9 @@ async fn a_restart_takeover_carries_the_orphans_running_tool() {
         user("msg_cola_new", new_anchor, "新问题"),
     ]);
     let (app, platform, backend, gate) = carried_app(&session_file, live, tail, SessionStatus::Busy).await;
+    // The orphaned card's rendered view: the carried running panel rides the
+    // successor, so the collect must drop it there (ADR-0068).
+    platform.given_card_view("om_frozen", live_tail_orphan_view());
 
     let mut context = ctx("ses_test", "新问题");
     context.cola_message_id = Some("msg_cola_new".into());
@@ -1237,6 +1268,22 @@ async fn a_restart_takeover_carries_the_orphans_running_tool() {
         "the takeover collect is the orphan's only write: {orphan_patches:?}"
     );
     assert_eq!(card_header(&orphan_patches[0]), "⏳ 已由新卡片接管 · 已停止更新");
+    // ADR-0068: the carried panel is live on the successor, so the orphan's
+    // preserved body drops it — and the ledger always — while the written body
+    // and the settled launch stay.
+    let orphan_text = card_text(&orphan_patches[0]);
+    assert!(
+        !orphan_text.contains("⏳ shell"),
+        "the carried running panel leaves the collected card: {orphan_text}"
+    );
+    assert!(
+        !orphan_text.contains("⏳ 后台任务"),
+        "the ledger leaves every takeover collect: {orphan_text}"
+    );
+    assert!(
+        orphan_text.contains("**正文** 已经写完的部分") && orphan_text.contains("🌙 shell"),
+        "non-tail body content and the settled launch stay: {orphan_text}"
+    );
     // Display-only: the durable record names the NEW Turn's message, never the
     // orphan's.
     wait_for_record_card(&app, "ses_test", "msg_reply").await;
@@ -1301,6 +1348,184 @@ async fn a_restart_takeover_carries_the_orphans_running_tool() {
         final_text.contains("新回答"),
         "the new Turn's own reply renders as usual: {final_text}"
     );
+}
+
+/// ADR-0068: the takeover's collect always drops the Background Task Ledger —
+/// a ledger-only orphan (its launch settled 🌙 while the run is still live) is
+/// collected without the stale live list, and the successor's own reads
+/// rebuild it. Nothing is running to carry, so the settled launch and the
+/// written body stay untouched.
+#[tokio::test]
+async fn a_restart_takeover_drops_a_ledger_only_orphans_live_list() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let orphan_anchor = 1_000_000;
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(orphan_anchor));
+    let new_anchor = 2_000_000;
+    // The orphan Turn's shell call settled into the background: nothing is
+    // still running to carry; only the ledger lists its run.
+    let launch = typed_message(
+        "msg_launch",
+        MessageRole::Assistant,
+        Some(orphan_anchor + 500),
+        vec![tool_part(
+            "shell",
+            "call_bg",
+            ToolStatus::Completed,
+            serde_json::json!({ "command": "npm run build" }),
+            "moved to background",
+        )],
+    );
+    let tail = TranscriptTail {
+        transcript: SessionTranscript::new(vec![
+            user("msg_cola_anchor", orphan_anchor, "跑个构建"),
+            launch.clone(),
+        ]),
+        complete: true,
+    };
+    // The Session's newest end: the background run is still live, so the
+    // successor's own reads rebuild the ledger.
+    let live = SessionTranscript::new(vec![
+        user("msg_cola_anchor", orphan_anchor, "跑个构建"),
+        launch,
+        user("msg_cola_new", new_anchor, "新问题"),
+        assistant(new_anchor + 1_000, "新回答"),
+    ])
+    .with_background_tasks(vec![background_shell(orphan_anchor + 600)]);
+    let (app, platform, backend, gate) = carried_app(&session_file, live, tail, SessionStatus::Idle).await;
+    platform.given_card_view("om_frozen", live_tail_orphan_view());
+
+    let mut context = ctx("ses_test", "新问题");
+    context.cola_message_id = Some("msg_cola_new".into());
+    let turn = spawn_turn(&app, context);
+
+    // While the prompt is held, the successor's own read rebuilds the live
+    // list from the still-running task.
+    wait_for_card_update(
+        &platform,
+        "the successor's rebuilt ledger",
+        CardUpdates::Any,
+        |card| card_text(card).contains("⏳ 后台任务（1）"),
+    )
+    .await;
+
+    // The collect drops the orphan's stale live list; the settled 🌙 launch
+    // and the written body stay (nothing was carried).
+    let orphan_patches = patches_to(&platform, "om_frozen").await;
+    assert_eq!(
+        orphan_patches.len(),
+        1,
+        "the collect is the orphan's only write: {orphan_patches:?}"
+    );
+    assert_eq!(card_header(&orphan_patches[0]), "⏳ 已由新卡片接管 · 已停止更新");
+    let orphan_text = card_text(&orphan_patches[0]);
+    assert!(
+        !orphan_text.contains("⏳ 后台任务"),
+        "the stale live list leaves the collected card: {orphan_text}"
+    );
+    assert!(
+        orphan_text.contains("🌙 shell") && orphan_text.contains("**正文** 已经写完的部分"),
+        "the settled launch and the body stay: {orphan_text}"
+    );
+    // The carry read ran and found nothing running to hand over.
+    assert_eq!(
+        backend.transcript_tail_calls.lock().await.as_slice(),
+        &[("ses_test".to_string(), orphan_anchor - 10 * 60_000)],
+        "the carry read is bounded by the orphan record's anchor"
+    );
+
+    gate.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), turn)
+        .await
+        .expect("the turn must end")
+        .unwrap()
+        .unwrap();
+}
+
+/// ADR-0068 + the best-effort collect rule: a takeover collect whose PATCH
+/// fails only warns — the successor keeps ownership of the chain and its
+/// carried panel — and never blocks the Turn.
+#[tokio::test]
+async fn a_failed_takeover_collect_warns_and_keeps_the_successor() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let orphan_anchor = 1_000_000;
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(orphan_anchor));
+    let new_anchor = 2_000_000;
+    let orphan = in_flight_shell(
+        "a_orphan",
+        orphan_anchor + 500,
+        "call_sleep",
+        ToolStatus::Running,
+        1_300_000,
+        "",
+    );
+    let tail = TranscriptTail {
+        transcript: SessionTranscript::new(vec![
+            user("msg_cola_anchor", orphan_anchor, "跑个长命令"),
+            orphan.clone(),
+        ]),
+        complete: true,
+    };
+    let live = SessionTranscript::new(vec![
+        user("msg_cola_anchor", orphan_anchor, "跑个长命令"),
+        orphan,
+        user("msg_cola_new", new_anchor, "新问题"),
+    ]);
+    let (app, platform, backend, gate) = carried_app(&session_file, live, tail, SessionStatus::Busy).await;
+    platform.given_card_view("om_frozen", live_tail_orphan_view());
+    // Exactly the collect's PATCH fails: it is the first card write after the
+    // new reply, and the failure must not touch anything else.
+    platform
+        .fail_update_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+
+    let mut context = ctx("ses_test", "新问题");
+    context.cola_message_id = Some("msg_cola_new".into());
+    let ((), logs) = capture_logs(async {
+        let turn = spawn_turn(&app, context);
+        // The carried panel is live on the successor: the collect (and its
+        // failure) already ran, and the successor still owns the chain.
+        wait_for_card_text(&platform, "⏳ shell").await;
+        wait_for_record_card(&app, "ses_test", "msg_reply").await;
+        // The call settles and the session idles: the Turn ends as usual.
+        backend
+            .given_transcript_after_build(
+                "ses_test",
+                vec![SessionTranscript::new(vec![
+                    user("msg_cola_anchor", orphan_anchor, "跑个长命令"),
+                    in_flight_shell(
+                        "a_orphan",
+                        orphan_anchor + 500,
+                        "call_sleep",
+                        ToolStatus::Completed,
+                        1_300_000,
+                        "slept",
+                    ),
+                    user("msg_cola_new", new_anchor, "新问题"),
+                    assistant(new_anchor + 1_000, "新回答"),
+                ])],
+            )
+            .await;
+        backend
+            .set_session_status("ses_test", Some(SessionStatus::Idle))
+            .await;
+        gate.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(5), turn)
+            .await
+            .expect("a failed collect must not block the turn")
+            .unwrap()
+            .unwrap();
+    })
+    .await;
+
+    let warnings = logs
+        .lines()
+        .filter(|line| line_level(line) == "WARN" && line.contains("could not collect card om_frozen"))
+        .count();
+    assert_eq!(warnings, 1, "a failed collect warns exactly once:\n{logs}");
 }
 
 /// The carry read is scoped to the orphan Turn's projection: an older,
@@ -1391,6 +1616,7 @@ async fn a_capped_carry_read_carries_nothing() {
         assistant(new_anchor + 1_000, "新回答"),
     ]);
     let (app, platform, backend, gate) = carried_app(&session_file, live, tail, SessionStatus::Idle).await;
+    platform.given_card_view("om_frozen", live_tail_orphan_view());
     gate.add_permits(1);
 
     let mut context = ctx("ses_test", "新问题");
@@ -1409,6 +1635,18 @@ async fn a_capped_carry_read_carries_nothing() {
     let cards = platform.updated_cards().await;
     let text = card_text(cards.last().unwrap());
     assert!(!text.contains("call_sleep"), "nothing was carried: {text}");
+    // A cap-stopped read carries nothing, so the orphan's running marker
+    // stays in its preserved body — the ledger leaves it either way.
+    let orphan_patches = patches_to(&platform, "om_frozen").await;
+    let orphan_text = card_text(&orphan_patches[0]);
+    assert!(
+        orphan_text.contains("⏳ shell"),
+        "a cap stop keeps the running marker: {orphan_text}"
+    );
+    assert!(
+        !orphan_text.contains("⏳ 后台任务"),
+        "the ledger leaves the collect: {orphan_text}"
+    );
     let line = carry_info_line(&logs);
     assert!(
         line.contains("ses_test") && line.contains("page cap"),
@@ -1446,6 +1684,7 @@ async fn a_failed_carry_read_carries_nothing() {
         SessionStatus::Idle,
     )
     .await;
+    platform.given_card_view("om_frozen", live_tail_orphan_view());
     backend.fail_transcript_tail_for("ses_test").await;
     gate.add_permits(1);
 
@@ -1460,10 +1699,27 @@ async fn a_failed_carry_read_carries_nothing() {
     let cards = platform.updated_cards().await;
     let text = card_text(cards.last().unwrap());
     assert!(!text.contains("call_sleep"), "nothing was carried: {text}");
+    // A failed carry carries nothing, so the orphan's running marker stays in
+    // its preserved body — while the ledger leaves it either way (ADR-0068).
+    let orphan_patches = patches_to(&platform, "om_frozen").await;
     assert_eq!(
-        card_header(&patches_to(&platform, "om_frozen").await[0]),
+        orphan_patches.len(),
+        1,
+        "the takeover collect is the orphan's only write: {orphan_patches:?}"
+    );
+    assert_eq!(
+        card_header(&orphan_patches[0]),
         "⏳ 已由新卡片接管 · 已停止更新",
-        "the takeover collect is unchanged"
+        "the takeover collect is otherwise unchanged"
+    );
+    let orphan_text = card_text(&orphan_patches[0]);
+    assert!(
+        orphan_text.contains("⏳ shell"),
+        "a failed carry keeps the running marker: {orphan_text}"
+    );
+    assert!(
+        !orphan_text.contains("⏳ 后台任务"),
+        "the ledger leaves the collect even when nothing was carried: {orphan_text}"
     );
     let line = carry_info_line(&logs);
     assert!(
@@ -1502,6 +1758,7 @@ async fn a_timed_out_carry_read_carries_nothing() {
         SessionStatus::Idle,
     )
     .await;
+    platform.given_card_view("om_frozen", live_tail_orphan_view());
     // The tail read hangs; the 20 ms read timeout ends it.
     backend
         .hang_transcript_tail
@@ -1519,6 +1776,18 @@ async fn a_timed_out_carry_read_carries_nothing() {
     let cards = platform.updated_cards().await;
     let text = card_text(cards.last().unwrap());
     assert!(!text.contains("call_sleep"), "nothing was carried: {text}");
+    // A timed-out read carries nothing, so the orphan's running marker stays
+    // in its preserved body — the ledger leaves it either way.
+    let orphan_patches = patches_to(&platform, "om_frozen").await;
+    let orphan_text = card_text(&orphan_patches[0]);
+    assert!(
+        orphan_text.contains("⏳ shell"),
+        "a timed-out carry keeps the running marker: {orphan_text}"
+    );
+    assert!(
+        !orphan_text.contains("⏳ 后台任务"),
+        "the ledger leaves the collect: {orphan_text}"
+    );
     let line = carry_info_line(&logs);
     assert!(
         line.contains("ses_test") && line.contains("read timed out"),

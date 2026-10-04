@@ -54,19 +54,32 @@ use crate::backend::TurnSettle;
 use crate::bridge::handles::{CardsHandle, FlowHandles};
 use crate::bridge::live_cards::LiveCard;
 use crate::bridge::turn::Turn;
-use crate::feishu::card::{CardState, error_line, move_line, shell::CardBuilder};
+use crate::feishu::card::{
+    CardState, error_line, ledger::TASK_LEDGER_ELEMENT_ID, move_line, shell::CardBuilder,
+};
 
 /// Collect the orphaned card `card_message_id` because a new card took the
 /// chain over (ADR-0063): one PATCH naming the successor, terminal and grey,
-/// keeping whatever the card already showed (#434 acceptance feedback). A
-/// failed PATCH only warns; the record follows the successor either way, so the
+/// keeping whatever the card already showed (#434 acceptance feedback) — minus
+/// the live tail the successor takes over (ADR-0068): the Background Task
+/// Ledger element goes always (the successor's own reads rebuild the list,
+/// ADR-0060's one-card handover), and the running `⏳` panels go only when
+/// `strip_running_panels` says the restart carry moved them onto the successor
+/// — a takeover that carried nothing keeps today's body for them. A failed
+/// PATCH only warns; the record follows the successor either way, so the
 /// freeze it leaves behind is the pre-#438 behavior, never a crash.
-pub(crate) async fn collect_orphan(cards: &CardsHandle, session_id: &str, card_message_id: &str) {
+pub(crate) async fn collect_orphan(
+    cards: &CardsHandle,
+    session_id: &str,
+    card_message_id: &str,
+    strip_running_panels: bool,
+) {
     if card_message_id.is_empty() {
         return;
     }
     let card = ending_card(CardState::TakenOver, None, None);
-    match patch_ending_keeping_body(cards.feishu.as_ref(), card_message_id, &card).await {
+    let keep = KeepBody::WithoutLiveTail { strip_running_panels };
+    match patch_ending_keeping_body(cards.feishu.as_ref(), card_message_id, &card, keep).await {
         // The one reap vocabulary: the INFO line's ending word comes from the
         // state itself, exactly like every `ReapPass::settle` line.
         Ok(()) => tracing::info!(
@@ -147,7 +160,7 @@ pub(crate) async fn reconcile(
         // place (ADR-0063's goal: never leave a card looking live), then name
         // the live successor; a settled successor keeps no record. The collect
         // is best-effort and harmless when the handover already collected it.
-        collect_orphan(&handles.cards, session_id, &record.card_message_id).await;
+        collect_orphan(&handles.cards, session_id, &record.card_message_id, false).await;
         match (
             current_running,
             Turn::armed_turn_anchor(&handles.cards, session_id).await,
@@ -320,6 +333,7 @@ impl ReapPass<'_> {
             self.handles.cards.feishu.as_ref(),
             &self.record.card_message_id,
             &card,
+            KeepBody::Everything,
         )
         .await
         {
@@ -483,7 +497,7 @@ async fn stamp_restart_attempt(
     // last word. A collect that lands after this PATCH wins on its own; this
     // only repairs the reversed order.
     if Turn::card_message_id(cards, session_id).await.is_some() {
-        collect_orphan(cards, session_id, card_message_id).await;
+        collect_orphan(cards, session_id, card_message_id, false).await;
     }
 }
 
@@ -512,8 +526,11 @@ fn ending_card(state: CardState, detail: Option<&str>, move_note: Option<&str>) 
 
 /// PATCH `bare` onto `card_message_id`, keeping the card's existing body
 /// best-effort (#434 acceptance feedback): read the card's own view, merge the
-/// ending over it, PATCH the merge. A failed read PATCHes `bare` directly —
-/// today's behavior — because the ending must never depend on the read.
+/// ending over it, PATCH the merge. `keep` is the merge's view-element rule —
+/// [`KeepBody::Everything`] for every ending and the #443 stamp,
+/// [`KeepBody::WithoutLiveTail`] for the takeover collect (ADR-0068). A failed
+/// read PATCHes `bare` directly — today's behavior — because the ending must
+/// never depend on the read.
 ///
 /// A PATCH the platform *definitely* refuses as card content (the typed
 /// `CardContentRejected`, e.g. `230099`) is retried once bare: the refusal is
@@ -525,10 +542,11 @@ async fn patch_ending_keeping_body(
     platform: &dyn crate::feishu::Platform,
     card_message_id: &str,
     bare: &serde_json::Value,
+    keep: KeepBody,
 ) -> crate::error::Result<()> {
     match platform.get_card_view(card_message_id).await {
         Ok(view) => {
-            let card = restamped_keeping_body(bare, &view);
+            let card = restamped_keeping_body_with(bare, &view, keep);
             match platform.update_message(card_message_id, &card).await {
                 Ok(()) => Ok(()),
                 Err(e @ crate::error::BridgeError::CardContentRejected { .. }) => {
@@ -547,6 +565,55 @@ async fn patch_ending_keeping_body(
     }
 }
 
+/// The view-element rule a preserved card's merge applies (#434 acceptance
+/// feedback, ADR-0068).
+#[derive(Clone, Copy)]
+enum KeepBody {
+    /// Every ending but the takeover collect, and the #443 restart stamp: the
+    /// card's own view stays as it was, its controls stripped.
+    Everything,
+    /// The takeover collect (ADR-0068): the view's live tail goes — the
+    /// Background Task Ledger element always, because the successor's own
+    /// reads rebuild the live list (ADR-0060), and the running `⏳` panels
+    /// when the restart carry actually moved them onto the successor. Every
+    /// other preserved element stays.
+    WithoutLiveTail { strip_running_panels: bool },
+}
+
+impl KeepBody {
+    /// Whether the preserved body keeps `element` (before the interactive
+    /// strip).
+    fn keeps(self, element: &serde_json::Value) -> bool {
+        match self {
+            Self::Everything => true,
+            Self::WithoutLiveTail { strip_running_panels } => {
+                if is_task_ledger_element(element) {
+                    return false;
+                }
+                !strip_running_panels || !is_running_panel_element(element)
+            }
+        }
+    }
+}
+
+/// Whether `element` is the Background Task Ledger's panel (ADR-0060): the
+/// stable `element_id` names it, whatever its title currently counts. The
+/// successor's own reads rebuild the live list, so a collect never keeps it.
+fn is_task_ledger_element(element: &serde_json::Value) -> bool {
+    element.get("element_id").and_then(|id| id.as_str()) == Some(TASK_LEDGER_ELEMENT_ID)
+}
+
+/// Whether `element` is a running tool panel as a whole-card read returns it
+/// (ADR-0068): a `collapsible_panel` whose plain-text title begins `⏳`. The
+/// ledger shares the glyph and is matched by its element id first.
+fn is_running_panel_element(element: &serde_json::Value) -> bool {
+    element["tag"] == "collapsible_panel"
+        && element["header"]["title"]["tag"] == "plain_text"
+        && element["header"]["title"]["content"]
+            .as_str()
+            .is_some_and(|title| title.starts_with('⏳'))
+}
+
 /// The bare card — an ending, or the still-live orphan's restart stamp (#443)
 /// — restamped over the card's existing view (#434 acceptance feedback): the
 /// bare card's header leads, its own elements (the failure's message and/or
@@ -558,10 +625,26 @@ async fn patch_ending_keeping_body(
 /// a view without one keeps the bare card's. Schema 2.0, the one the PATCH API
 /// accepts back.
 fn restamped_keeping_body(bare: &serde_json::Value, view: &serde_json::Value) -> serde_json::Value {
+    restamped_keeping_body_with(bare, view, KeepBody::Everything)
+}
+
+/// [`restamped_keeping_body`] with an explicit view-element rule: `keep`
+/// decides which of the view's elements the preserved merge carries before the
+/// interactive strip.
+fn restamped_keeping_body_with(
+    bare: &serde_json::Value,
+    view: &serde_json::Value,
+    keep: KeepBody,
+) -> serde_json::Value {
     let mut elements: Vec<serde_json::Value> =
         bare["body"]["elements"].as_array().cloned().unwrap_or_default();
     if let Some(view_elements) = view["body"]["elements"].as_array() {
-        elements.extend(view_elements.iter().filter_map(stripped_of_controls));
+        elements.extend(
+            view_elements
+                .iter()
+                .filter(|element| keep.keeps(element))
+                .filter_map(stripped_of_controls),
+        );
     }
     let mut config = view
         .get("config")
@@ -878,5 +961,102 @@ mod tests {
         assert_eq!(elements.len(), 1);
         assert_eq!(elements[0]["content"], "保留的正文");
         assert_eq!(card["header"]["title"]["content"], "✅ 完成");
+    }
+
+    /// ADR-0068: the takeover collect's preserved body drops the Background
+    /// Task Ledger element always — the successor's own reads rebuild the live
+    /// list — and a running `⏳` panel only when `strip_running_panels` says
+    /// the restart carry moved it onto the successor. The #444 probe
+    /// ("the collected card keeps a stale running marker today") is inverted
+    /// here: with the carry's answer the marker goes, without it today's
+    /// preserved body stays; the reap's endings and the #443 stamp
+    /// ([`KeepBody::Everything`]) keep both.
+    #[test]
+    fn the_collect_drops_the_ledger_and_only_a_carried_running_panel() {
+        use crate::bridge::test_support::card_text;
+
+        let bare = ending_card(CardState::TakenOver, None, None);
+        // A rendered live card's tail as a whole-card read returns it: the
+        // written body, a running tool panel, a settled backgrounded launch
+        // and the ledger.
+        let view = serde_json::json!({
+            "config": { "wide_screen_mode": true },
+            "body": { "elements": [
+                { "tag": "markdown", "content": "**正文** 已经写完的部分" },
+                { "tag": "collapsible_panel", "expanded": false, "element_id": "tool_1",
+                  "header": { "title": { "tag": "plain_text", "content": "⏳ shell · 12:00" } },
+                  "elements": [ { "tag": "markdown", "content": "**Input**\n`sleep 600`" } ] },
+                { "tag": "collapsible_panel", "expanded": false, "element_id": "tool_2",
+                  "header": { "title": { "tag": "plain_text", "content": "🌙 shell · 12:01" } },
+                  "elements": [ { "tag": "markdown", "content": "moved to background" } ] },
+                { "tag": "collapsible_panel", "expanded": false, "element_id": "task_ledger",
+                  "header": { "title": { "tag": "plain_text", "content": "⏳ 后台任务（1）" } },
+                  "elements": [ { "tag": "markdown",
+                                  "content": "· shell：**npm run build** · 12:00 · 3m12s" } ] }
+            ] }
+        });
+
+        // The carry moved the running panel: it and the ledger leave the
+        // collected body; the written content and the settled launch stay.
+        let carried = restamped_keeping_body_with(
+            &bare,
+            &view,
+            KeepBody::WithoutLiveTail {
+                strip_running_panels: true,
+            },
+        );
+        let text = card_text(&carried);
+        assert!(
+            !text.contains("⏳ shell"),
+            "a carried running marker leaves the collected card: {text}"
+        );
+        assert!(
+            !text.contains("⏳ 后台任务"),
+            "the ledger leaves every takeover collect: {text}"
+        );
+        assert!(
+            text.contains("🌙 shell") && text.contains("moved to background"),
+            "the settled backgrounded launch stays: {text}"
+        );
+        assert!(
+            text.contains("**正文** 已经写完的部分"),
+            "non-tail body content is preserved: {text}"
+        );
+        assert!(
+            !carried["body"]["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|element| element["element_id"] == "task_ledger"),
+            "the ledger element itself is gone: {carried}"
+        );
+
+        // Nothing carried: the running marker stays (today's preserved body);
+        // the ledger still goes.
+        let kept = restamped_keeping_body_with(
+            &bare,
+            &view,
+            KeepBody::WithoutLiveTail {
+                strip_running_panels: false,
+            },
+        );
+        let text = card_text(&kept);
+        assert!(
+            text.contains("⏳ shell"),
+            "an uncarried running marker stays: {text}"
+        );
+        assert!(
+            !text.contains("⏳ 后台任务"),
+            "the ledger leaves either way: {text}"
+        );
+
+        // Every other preserved card — the reap's endings and the #443 stamp —
+        // keeps the view as it was.
+        let ending = restamped_keeping_body(&bare, &view);
+        let text = card_text(&ending);
+        assert!(
+            text.contains("⏳ shell") && text.contains("⏳ 后台任务"),
+            "the endings keep the marker and the ledger: {text}"
+        );
     }
 }
