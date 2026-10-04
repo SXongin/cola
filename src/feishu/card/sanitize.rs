@@ -8,15 +8,24 @@
 //! leaving the turn's card frozen on its last accepted state.
 //!
 //! [`CardMarkdown`] neutralizes the constructs cola knows the platform
-//! rejects, leaving fenced code untouched:
+//! rejects, leaving code untouched — fenced blocks and inline spans alike:
 //!
-//! - `<` outside a fenced code block becomes Feishu's documented escape
-//!   `&#60;`, so a tag opener can never start a tag (visually identical to a
-//!   literal `<`). Inline code is NOT exempt: measured 2026-09-22, a tag
-//!   inside backticks still reached the parser once an earlier unclosed tag
-//!   fragment changed the context, so only fences are trusted.
-//! - markdown images become plain links (an image key must be uploaded by the
-//!   app; the model cannot hold one, so `![…](…)` is always an invalid key),
+//! - `<` outside a fenced code block and outside an inline code span becomes
+//!   Feishu's documented escape `&#60;`, so a tag opener can never start a tag
+//!   (in normal text the entity decodes back to `<` — visually identical). A
+//!   code span's content passes through verbatim: the platform renders code
+//!   literally and does not decode entities there, so an escape injected
+//!   inside backticks is displayed as the escape itself (#519, observed
+//!   2026-10-04 on a live card: `` `<read_file>` `` reached the reader as
+//!   `&#60;read_file>`).
+//!   The 2026-09-22 reason for escaping inside backticks (a tag still reached
+//!   the parser once an earlier unclosed tag fragment changed the context) no
+//!   longer applies: every `<` outside a well-formed code context stays
+//!   escaped, and a span that does break the parser falls through to the
+//!   fenced retry like any other rejection.
+//! - markdown images outside code become plain links (an image key must be
+//!   uploaded by the app; the model cannot hold one, so `![…](…)` is always an
+//!   invalid key),
 //! - markdown tables beyond the per-card budget or over the row cap are
 //!   wrapped in a code fence, where Feishu counts no tables and no rows,
 //! - the numeric entities that neutralize markdown emphasis inside a span that
@@ -219,13 +228,44 @@ fn closes_fence(line: &str, open: usize) -> bool {
     run >= open && trimmed[run..].trim().is_empty()
 }
 
-/// Escape `<` and downgrade images in one line. The caller guarantees the
-/// line is outside a fenced code block.
+/// Escape `<` and downgrade images in one line, leaving inline code spans
+/// verbatim. The caller guarantees the line is outside a fenced code block.
+///
+/// A code span's content is literal text in CommonMark — the renderer does not
+/// decode entities there, so an injected `&#60;` would be shown as the escape
+/// itself (#519). The span is therefore passed through exactly as authored,
+/// images included.
 fn escape_line(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let mut i = 0;
     while i < line.len() {
         let c = line[i..].chars().next().expect("index on a char boundary");
+        if c == '`' {
+            if escaped_by_backslash(line, i) {
+                // The escape consumes `\` + this single backtick (the
+                // backslash itself was already emitted as text); any remaining
+                // backticks still form a delimiter candidate.
+                out.push(c);
+                i += 1;
+                continue;
+            }
+            match code_span(line, i) {
+                Some((end, span)) => {
+                    out.push_str(span);
+                    i = end;
+                }
+                // A backtick string that finds no match is literal text as a
+                // whole: advance past the ENTIRE run, never retry from its
+                // suffix, or the suffix could pair with a later run and
+                // smuggle the run's raw `<` through as span content.
+                None => {
+                    let run = line[i..].chars().take_while(|c| *c == '`').count();
+                    out.push_str(&line[i..i + run]);
+                    i += run;
+                }
+            }
+            continue;
+        }
         if c == '<' {
             out.push_str(LESS_THAN_ESCAPE);
         } else if c == '!' && line[i..].starts_with("![") {
@@ -243,6 +283,46 @@ fn escape_line(line: &str) -> String {
         i += c.len_utf8();
     }
     out
+}
+
+/// Whether the character at `at` is escaped by an immediately preceding run
+/// of an odd number of backslashes. The reference CommonMark parser consumes
+/// `\` + the escaped character before backtick handling, so an escaped
+/// backtick is never a delimiter (an even run leaves it one). Backslashes
+/// INSIDE a span are literal and do not shield its closer — that is
+/// [`code_span`]'s business, not this check's.
+fn escaped_by_backslash(line: &str, at: usize) -> bool {
+    line[..at].chars().rev().take_while(|c| *c == '\\').count() % 2 == 1
+}
+
+/// The inline code span starting at `start` (a backtick), if it closes on this
+/// line: the byte offset just past the closing run and the span text
+/// (delimiters included), verbatim.
+///
+/// CommonMark pairing: a maximal run of `n` backticks closes at the next run
+/// of exactly `n` backticks; runs of other lengths inside the span are
+/// content, and a backslash before the closer does not shield it. `None` means
+/// the run is literal text — an unclosed opener, or a run that can only close
+/// a span opened elsewhere. The caller consumes a failed run whole, and a span
+/// crossing a line break is never trusted (both runs stay unmatched per line),
+/// so unsupported shapes are escaped conservatively instead of trusted.
+fn code_span(line: &str, start: usize) -> Option<(usize, &str)> {
+    let open = line[start..].chars().take_while(|c| *c == '`').count();
+    let mut i = start + open;
+    while i < line.len() {
+        if line.as_bytes()[i] == b'`' {
+            let run = line[i..].chars().take_while(|c| *c == '`').count();
+            if run == open {
+                let end = i + run;
+                return Some((end, &line[start..end]));
+            }
+            i += run;
+            continue;
+        }
+        let c = line[i..].chars().next().expect("index on a char boundary");
+        i += c.len_utf8();
+    }
+    None
 }
 
 /// Rewrite the markdown image starting at `start` (the `!`) into a plain
@@ -280,4 +360,94 @@ fn image_span(line: &str, start: usize) -> Option<(usize, String)> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A closed inline code span is literal text: `<` keeps its authored shape
+    /// and images are not downgraded. Observed 2026-10-04 (#519) on a live
+    /// card: the platform does not decode entities inside code spans, so the
+    /// escape there was displayed as the escape itself.
+    #[test]
+    fn inline_code_spans_pass_through_verbatim() {
+        for line in [
+            "a `<read_file>` b",
+            "`<at id=x></at>`",
+            "看 `<number_tag>` 和 `<link>`",
+            "`![x](./x.png)`",
+            "`&#60;`",
+            "x `<a>` y `<b>` z",
+        ] {
+            assert_eq!(escape_line(line), line, "{line:?}");
+        }
+    }
+
+    /// Outside spans the existing rewrites still apply: `<` is escaped and an
+    /// image becomes a link.
+    #[test]
+    fn text_outside_spans_is_still_rewritten() {
+        assert_eq!(
+            escape_line("a <number_tag> b ![x](./x.png)"),
+            "a &#60;number_tag> b [x](./x.png)"
+        );
+        assert_eq!(escape_line("`<a>` <b>"), "`<a>` &#60;b>");
+    }
+
+    /// CommonMark pairing: a run of `n` backticks closes at the next run of
+    /// exactly `n`; runs of other lengths are span content.
+    #[test]
+    fn code_span_pairing_matches_run_lengths() {
+        assert_eq!(escape_line("`` a ` <x> ``"), "`` a ` <x> ``");
+        assert_eq!(escape_line("`a `` <x> `"), "`a `` <x> `");
+        assert_eq!(escape_line("``a `` <x>``"), "``a `` &#60;x>``");
+    }
+
+    /// Unpaired runs are literal text, not a span: what follows is escaped as
+    /// usual (conservative — an opener needs its closer to be trusted).
+    #[test]
+    fn unpaired_backticks_leave_the_text_escaped() {
+        assert_eq!(escape_line("`open <number_tag> b"), "`open &#60;number_tag> b");
+        assert_eq!(escape_line("``"), "``");
+    }
+
+    /// A failed backtick string is literal as a WHOLE: its suffix must never
+    /// be retried as a delimiter, or it could pair with a later run and pass
+    /// raw `<` through as span content (the maximal run is the delimiter,
+    /// CommonMark 0.31 §6.2).
+    #[test]
+    fn a_failed_run_is_never_split_into_a_delimiter() {
+        assert_eq!(escape_line("``a <number_tag> `"), "``a &#60;number_tag> `");
+    }
+
+    /// Backslash escapes are consumed before backtick pairing: an odd run
+    /// escapes the backtick, an even run leaves it a delimiter. A backslash
+    /// does NOT shield a closer inside a span.
+    #[test]
+    fn backslash_escapes_follow_commonmark() {
+        assert_eq!(escape_line(r"\`<x>\`"), r"\`&#60;x>\`");
+        assert_eq!(escape_line(r"\\`<x>`"), r"\\`<x>`");
+        assert_eq!(escape_line(r"`a\` <x> `"), r"`a\` &#60;x> `");
+    }
+
+    /// A span crossing a line break is never trusted: both runs stay unmatched
+    /// per line and the content is escaped conservatively.
+    #[test]
+    fn spans_crossing_lines_are_escaped_conservatively() {
+        assert_eq!(
+            CardMarkdown::new().clean("`open <number_tag>\nmore` <link>"),
+            "`open &#60;number_tag>\nmore` &#60;link>"
+        );
+    }
+
+    /// The whole-blob entry point (`clean`): a span survives while a later
+    /// plain line is still sanitized.
+    #[test]
+    fn clean_keeps_spans_verbatim_and_escapes_plain_text() {
+        assert_eq!(
+            CardMarkdown::new().clean("看 `<read_file>` 变体\n\n<number_tag>"),
+            "看 `<read_file>` 变体\n\n&#60;number_tag>"
+        );
+    }
 }
