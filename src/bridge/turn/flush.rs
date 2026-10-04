@@ -6,7 +6,7 @@
 //! outside the Turn module. The card-delivery helpers other flows genuinely use
 //! (target resolution, stale marking) stay in their owning modules.
 
-use super::{MAX_CARD_CHAIN, Turn};
+use super::{MAX_CARD_CHAIN, PredecessorCollect, Turn};
 
 use crate::bridge::card_handles::RenderedBlock;
 use crate::bridge::handles::CardsHandle;
@@ -403,7 +403,7 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, spl
                 // The chain continues on a new card: the durable record
                 // follows it (ADR-0063). No predecessor is collected — the
                 // split above finalized the outgoing card itself.
-                Turn::track_live_card(cards, session_id, &new_id, false, None).await;
+                Turn::track_live_card(cards, session_id, &new_id, PredecessorCollect::Never, None).await;
                 // The continuation takes the blocks over from the finalized
                 // slice it follows (its spans are the tail this card renders).
                 cards
