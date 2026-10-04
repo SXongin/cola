@@ -142,9 +142,11 @@ jobs:
           # Only a verdict on its own final line counts; the handler appends a
           # session footer after the model's response, so scan for the last
           # line-final marker instead of a substring. Nothing found means no
-          # approval.
+          # approval. Comments carrying the Codex trial marker are skipped:
+          # any other bot commenter must never be read as this workflow's
+          # verdict source, whatever the interleaving.
           verdict=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments?per_page=100" --paginate \
-            --jq '[.[] | select(.user.login == "github-actions[bot]" or .user.login == "github-actions")] | last | (.body // "")' \
+            --jq '[.[] | select(.user.login == "github-actions[bot]" or .user.login == "github-actions") | select((.body // "") | contains("<!-- codex-review-trial -->") | not)] | last | (.body // "")' \
             | sed -nE 's/.*OPENCODE_REVIEW_VERDICT: (PASS|FAIL)[[:space:]]*$/\1/p' | tail -n 1 || true)
           if [ "$verdict" != "PASS" ]; then
             echo "Verdict: ${verdict:-none}; not approving."
