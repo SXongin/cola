@@ -1,0 +1,197 @@
+# Codex reviews every non-draft in-repo PR on the two axes from CONTRIBUTING.md
+# "Reviewing" plus an adversarial pass, and approves it when the review finds
+# nothing blocking. That approval is the automated non-author review the
+# `main: review` ruleset needs (ADR-0034 item 6); it replaces the OpenCode
+# review workflow (trial: issue #516 / PR #517).
+#
+# Codex reaches the model through the OpenCode Go subscription: Console's
+# inference API serves an OpenAI Responses-compatible endpoint and documents
+# Codex as a validated client; `gpt-6-luna` is the top GPT model in Go. The
+# action's Responses proxy points at that endpoint (`responses-api-endpoint`),
+# keeps the Go key inside the proxy process, and runs Codex read-only
+# (`permission-profile: ":read-only"` with the action's default safety
+# strategy). GH_TOKEN stays on the gh steps only — never in the Codex step's
+# environment, where prompt-injected PR content could read it.
+#
+# Approval contract: this workflow posts the review itself and records the new
+# comment's ID as a step output; the approve step fetches exactly that comment
+# and approves only when its final line is `CODEX_REVIEW_VERDICT: PASS`. The
+# OpenCode gate read the *last* bot comment, which forced a first-line marker
+# filter so the advisory trial's comments could not shadow the verdict
+# (ADR-0034, 2026-10-04 amendment); comment-ID anchoring removes the scan, so
+# the marker rule died with the trial workflow.
+#
+# Trust model: like the OpenCode gate before it, this is a `pull_request`
+# workflow, so a same-repo PR runs the workflow definition from its merge ref.
+# Same-repo PR authors already have write access (they can edit any workflow);
+# fork PRs get no secrets and are excluded below. If a stricter model is ever
+# needed, moving the trigger to `pull_request_target` is the hardening to
+# evaluate.
+#
+# Requires the repository setting Actions -> General -> "Allow GitHub Actions
+# to create and approve pull requests". `require_last_push_approval` on the
+# `main: review` ruleset means every synchronize must approve the newest
+# commit; the last step skips the approval when the PR head moved mid-run.
+name: Codex Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  review:
+    # Fork PRs never see secrets, so the model would have no API key to run
+    # with. Dependabot PRs are skipped for the same reason: their runs get no
+    # repository secrets, so `OPENCODE_API_KEY` would be empty. Drafts wait for
+    # ready_for_review. Release PRs are skipped: their diff is a version bump
+    # of code already reviewed on main, and the cut merges with the admin
+    # bypass.
+    if: >-
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.actor != 'dependabot[bot]' &&
+      !startsWith(github.head_ref || '', 'release/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: write
+    env:
+      PR: ${{ github.event.pull_request.number }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Review the PR's head commit, not the synthetic merge ref, so the
+          # comment and the approval both name a real commit.
+          ref: refs/pull/${{ github.event.pull_request.number }}/head
+          fetch-depth: 0
+          persist-credentials: false
+
+      # The prompt = the committed rubric + this PR's metadata + its linked
+      # issue when one can be fetched, so the reviewer does not depend on
+      # network access inside the read-only sandbox.
+      - name: Build the review prompt
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh pr view "$PR" --json number,title,body,url,baseRefOid > pr.json
+          base=$(jq -r .baseRefOid pr.json)
+          # The prompt must describe the tree actually checked out, not a head
+          # that moved between checkout and this call.
+          head=$(git rev-parse HEAD)
+          issue=$(jq -r '.body // ""' pr.json \
+            | grep -oiE '(Closes|Fixes|Resolves|Refs|Part of) #[0-9]+' \
+            | grep -oE '[0-9]+' | head -1 || true)
+          {
+            cat .github/codex/prompts/review.md
+            echo
+            echo "---"
+            echo
+            echo "# This pull request"
+            echo
+            echo "- Repository: $GITHUB_REPOSITORY"
+            echo "- Number: #$PR"
+            printf -- '- Title: %s\n' "$(jq -r .title pr.json)"
+            printf -- '- URL: %s\n' "$(jq -r .url pr.json)"
+            printf -- '- Base commit: %s\n' "$base"
+            printf -- '- Head commit: %s\n' "$head"
+            printf 'Review the changes with: `git diff %s...%s`.\n' "$base" "$head"
+            echo
+            echo "## PR body"
+            echo
+            jq -r '.body // "(empty)"' pr.json
+            if [ -n "$issue" ] \
+              && gh issue view "$issue" --json title,body \
+                --jq '"### " + .title + "\n\n" + (.body // "(empty)")' > issue.md 2>/dev/null; then
+              echo
+              echo "## Linked issue #$issue"
+              echo
+              cat issue.md
+            fi
+          } > codex-prompt.md
+
+      - name: Run Codex (read-only)
+        uses: openai/codex-action@86365089eb2b84e0a8fb0717b304f8bdcb13b20e # v1.12
+        with:
+          openai-api-key: ${{ secrets.OPENCODE_API_KEY }}
+          responses-api-endpoint: https://opencode.ai/inference/openai/v1/responses
+          model: gpt-6-luna
+          codex-version: 0.160.0
+          permission-profile: ":read-only"
+          prompt-file: codex-prompt.md
+          output-file: codex-output.md
+
+      # Post the review and hand its comment ID to the approve step. The ID
+      # anchors the readback: only this run's comment can decide this run's
+      # approval, so no other comment can shadow or forge the verdict.
+      - name: Post the review as a comment
+        id: review-comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ ! -s codex-output.md ]; then
+            echo "Codex produced no output." >&2
+            exit 1
+          fi
+          # A review of a commit the PR has moved past is noise on the PR;
+          # refuse it rather than posting a stale comment.
+          reviewed=$(git rev-parse HEAD)
+          current=$(gh pr view "$PR" --json headRefOid --jq .headRefOid)
+          if [ "$current" != "$reviewed" ]; then
+            echo "PR head moved from $reviewed to $current; not posting a stale review." >&2
+            exit 1
+          fi
+          cat codex-output.md >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo '## Codex review'
+            echo
+            printf '_Reviewed commit: `%s`._\n' "$reviewed"
+            echo
+            cat codex-output.md
+          } > comment.md
+          comment_id=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" \
+            -F body=@comment.md --jq .id)
+          echo "comment_id=$comment_id" >> "$GITHUB_OUTPUT"
+
+      # The approve step reads back exactly the comment posted above. A FAIL
+      # stays silent on purpose: GitHub Actions bots may not request changes,
+      # because they cannot dismiss their own review and would lock the PR.
+      - name: Approve when the verdict is clean
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COMMENT_ID: ${{ steps.review-comment.outputs.comment_id }}
+          REVIEWED_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          head=$(gh pr view "$PR" --json headRefOid --jq .headRefOid)
+          if [ "$head" != "$REVIEWED_SHA" ]; then
+            echo "PR head moved from $REVIEWED_SHA to $head; the run for it decides."
+            exit 0
+          fi
+          # Only a verdict on the comment's final line counts (trailing blank
+          # lines and whitespace are insignificant, as they are when reading a
+          # file); anything else - a FAIL, a missing marker, prose after the
+          # marker - never approves.
+          body=$(gh api "repos/$GITHUB_REPOSITORY/issues/comments/$COMMENT_ID" --jq '.body // ""')
+          verdict=$(printf '%s\n' "$body" | tail -n 1 \
+            | sed -nE 's/^CODEX_REVIEW_VERDICT: (PASS|FAIL)[[:space:]]*$/\1/p')
+          if [ "$verdict" != "PASS" ]; then
+            echo "Verdict: ${verdict:-none}; not approving."
+            exit 0
+          fi
+          # Pin the approval to the reviewed commit, so a push racing this call
+          # cannot land an approval on a commit no review has seen.
+          gh api -X POST "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews" \
+            -f event=APPROVE \
+            -f commit_id="$REVIEWED_SHA" \
+            -f body="Automated review found no blocking findings."
