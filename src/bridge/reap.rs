@@ -17,12 +17,15 @@
 //! the bare ending. The still-live orphan's one-time stamp (#443) reads the
 //! same view the other way around: only the header changes, and a failed read
 //! or PATCH claims nothing — a bare stamp would wipe the body the stamp exists
-//! to keep — so the next pass retries it, under the pass's request bound (a
-//! stuck Feishu request must never freeze Session Sync). Work that landed
-//! while cola was down is published by the existing continuation machinery (a
-//! Wake's continuation card) or simply left in the transcript: content the
-//! card never showed is never rebuilt, and the reap never replays a turn onto
-//! a stale card.
+//! to keep — so the next pass retries it. The attempt is handed to a detached
+//! task and its write is never cancelled: the pass must not await a stuck
+//! Feishu call, while an issued write must run to its own result so the
+//! card-delivery lock can order a successor's later collect after it. A
+//! per-record in-flight claim holds every other reap decision until the
+//! attempt resolves. Work that landed while cola was down is published by the
+//! existing continuation machinery (a Wake's continuation card) or simply left
+//! in the transcript: content the card never showed is never rebuilt, and the
+//! reap never replays a turn onto a stale card.
 //!
 //! A Session that relocated while the run was in flight (#428: `session_move`
 //! into a git worktree) gains one line naming the move when its card reaches a
@@ -99,6 +102,15 @@ pub(crate) async fn reconcile(
     if handles.waits.inflight.lock().await.contains(session_id)
         || handles.waits.inbound_pending(session_id).await
     {
+        return;
+    }
+    // A restart-stamp attempt is in flight for this record (#443): its write
+    // is never cancelled and may still land, ordered by the card's delivery
+    // lock. Any decision here — a settle, a collect after a takeover — could
+    // be overtaken if the in-flight write acquires the lock after ours, and a
+    // duplicate attempt would be wasted; wait for the attempt to resolve (it
+    // marks the record or releases the claim), then decide.
+    if record.restart_stamping {
         return;
     }
     // Why not [`Turn::chain_ownership`]? Routing and the Wake step need only
@@ -218,20 +230,7 @@ pub(crate) async fn reconcile(
     // attempt claims nothing and is retried next pass.
     if status.is_live() {
         if !record.restarted_reaped {
-            // Bounded like every other Session Sync request (the Feishu client
-            // carries no default timeout): a stuck call must not freeze the
-            // pass behind one orphan. A cut-loose attempt claims nothing and
-            // is retried next pass; re-stamping is idempotent. The bound makes
-            // ordering against a concurrent takeover best-effort — a
-            // cancelled write may still land (ADR-0063's amendment; the same
-            // at-least-once caveat as ADR-0067's drain) — while every
-            // takeover this process can observe is covered by the stamp's
-            // pre- and post-PATCH ownership checks.
-            let _ = crate::bridge::bounded_call("live-card reap stamp", read_timeout_ms, async {
-                pass.stamp_restarted().await;
-                Ok(())
-            })
-            .await;
+            pass.stamp_restarted();
         }
         return;
     }
@@ -347,78 +346,34 @@ impl ReapPass<'_> {
         true
     }
 
-    /// Stamp a still-live restart orphan (#443) — this record's card, owned by
-    /// no renderer in this process, whose Session reads live: the run may
-    /// still answer the card, but nothing will move it until transcript truth
-    /// ends it, and the user deserves to know why. The card's own view is read
-    /// back and only the header changes — body kept, controls stripped,
-    /// exactly like a preserved ending — so the card keeps its body under the
-    /// restart status. Unlike [`patch_ending_keeping_body`], a failed read or
-    /// PATCH claims nothing: the stamp's whole value is the body it preserves,
-    /// so a bare fallback would destroy the very thing it protects; the next
-    /// pass retries. The whole stamp is bounded by the pass's request timeout
-    /// at its call site — the Feishu client carries no default timeout — so a
-    /// stuck request cannot freeze Session Sync behind one card, and a
-    /// cut-loose attempt claims nothing either (a cancelled PATCH may have
-    /// landed; re-stamping is idempotent). The in-memory mark is set only when
-    /// the PATCH landed, so the stamp is one per process life; the later
-    /// transcript-truth settle (or a successor's collect) reads the view again
-    /// and replaces the header, superseding the stamp as any other card state.
-    async fn stamp_restarted(&self) {
-        let card_message_id = &self.record.card_message_id;
-        let platform = self.handles.cards.feishu.as_ref();
-        let view = match platform.get_card_view(card_message_id).await {
-            Ok(view) => view,
-            Err(e) => {
-                tracing::warn!(
-                    "live-card reap: session {} could not read card {card_message_id} to stamp the restart: {e}",
-                    self.session_id
-                );
-                return;
-            }
-        };
-        // The pass's ownership check is stale by now: a Turn may have started
-        // — or a successor armed — while the view read was in flight. A
-        // takeover attaches the successor id BEFORE it collects this card
-        // (`take_over_card`'s attach-then-collect order), so any admitted
-        // successor is visible here, and its collect is the later terminal:
-        // the stamp yields to it rather than overwriting it with an interim
-        // status.
-        if Turn::card_message_id(&self.handles.cards, self.session_id)
-            .await
-            .is_some()
-        {
-            return;
-        }
-        let card = restamped_keeping_body(&ending_card(CardState::Restarted, None, None), &view);
-        if let Err(e) = platform.update_message(card_message_id, &card).await {
-            tracing::warn!(
-                "live-card reap: session {} could not stamp card {card_message_id}: {e}",
-                self.session_id
-            );
-            return;
-        }
-        tracing::info!(
-            "live-card reap: session {} {}",
-            self.session_id,
-            CardState::Restarted.reap_word()
-        );
-        self.handles
+    /// Claim the one in-flight stamp attempt for this record and hand it to a
+    /// detached task (#443): the pass must never await the write, and the
+    /// write must never be cancelled. Both properties matter — a stuck Feishu
+    /// call cannot freeze Session Sync if nobody awaits it, and the card's
+    /// delivery lock is what orders a successor's later collect after the
+    /// stamp, so a cancelled write that still committed at Feishu could land
+    /// over that collect. The task marks the record when the PATCH lands,
+    /// repairs a takeover admitted while it was in flight, and releases the
+    /// claim (landed or failed) so the next pass may retry.
+    fn stamp_restarted(&self) {
+        let card_message_id = self.record.card_message_id.clone();
+        if !self
+            .handles
             .cards
             .live_cards
-            .mark_restarted_reaped(self.session_id, card_message_id);
-        // A takeover that started while the PATCH was in flight may have seen
-        // its older collect overwritten by this stamp (the delivery lock
-        // serializes the two writes, not their order of intent): if a
-        // successor owns the session now, collect the orphan again so the
-        // takeover has the card's last word. A collect that lands after this
-        // PATCH wins on its own; this only repairs the reversed order.
-        if Turn::card_message_id(&self.handles.cards, self.session_id)
-            .await
-            .is_some()
+            .begin_restart_stamp(self.session_id, &card_message_id)
         {
-            collect_orphan(&self.handles.cards, self.session_id, card_message_id).await;
+            return;
         }
+        let cards = self.handles.cards.clone();
+        let session_id = self.session_id.to_string();
+        let read_timeout_ms = self.read_timeout_ms;
+        tokio::spawn(async move {
+            stamp_restart_attempt(&cards, &session_id, &card_message_id, read_timeout_ms).await;
+            cards
+                .live_cards
+                .finish_restart_stamp(&session_id, &card_message_id);
+        });
     }
 
     /// The one line a settling card carries when the Session's location changed
@@ -463,6 +418,72 @@ impl ReapPass<'_> {
             return None;
         }
         Some(move_line(current))
+    }
+}
+
+/// One restart-stamp attempt (#443), detached from the Session Sync pass: the
+/// still-live orphan's card view is read back (bounded — nothing has been sent
+/// yet, so abandoning a timed-out read is safe) and only the header changes —
+/// body kept, controls stripped, exactly like a preserved ending. The PATCH is
+/// deliberately **not** bounded: cancelling an issued card write releases the
+/// card's delivery lock early, and the write could still commit at Feishu
+/// after a successor's collect landed, overwriting it. A failed read or PATCH
+/// claims nothing — no bare fallback: the stamp's whole value is the body it
+/// preserves — and the caller releases the attempt's claim so the next pass
+/// retries. On success the in-memory mark is set, and a takeover admitted
+/// while the write was in flight is repaired by the post-PATCH re-collect.
+async fn stamp_restart_attempt(
+    cards: &CardsHandle,
+    session_id: &str,
+    card_message_id: &str,
+    read_timeout_ms: u64,
+) {
+    let platform = cards.feishu.as_ref();
+    let view = match crate::bridge::bounded_call(
+        "live-card reap stamp view",
+        read_timeout_ms,
+        platform.get_card_view(card_message_id),
+    )
+    .await
+    {
+        Some(Ok(view)) => view,
+        Some(Err(e)) => {
+            tracing::warn!(
+                "live-card reap: session {session_id} could not read card {card_message_id} to stamp the restart: {e}"
+            );
+            return;
+        }
+        None => return,
+    };
+    // The pass's ownership check is stale by now: a Turn may have started —
+    // or a successor armed — while the view read was in flight. A takeover
+    // attaches the successor id BEFORE it collects this card
+    // (`take_over_card`'s attach-then-collect order), so any admitted
+    // successor is visible here, and its collect is the later terminal: the
+    // stamp yields to it rather than overwriting it with an interim status.
+    if Turn::card_message_id(cards, session_id).await.is_some() {
+        return;
+    }
+    let card = restamped_keeping_body(&ending_card(CardState::Restarted, None, None), &view);
+    if let Err(e) = platform.update_message(card_message_id, &card).await {
+        tracing::warn!("live-card reap: session {session_id} could not stamp card {card_message_id}: {e}");
+        return;
+    }
+    tracing::info!(
+        "live-card reap: session {session_id} {}",
+        CardState::Restarted.reap_word()
+    );
+    cards
+        .live_cards
+        .mark_restarted_reaped(session_id, card_message_id);
+    // A takeover that started while the PATCH was in flight may have seen its
+    // older collect overwritten by this stamp (the delivery lock serializes
+    // the two writes, not their order of intent): if a successor owns the
+    // session now, collect the orphan again so the takeover has the card's
+    // last word. A collect that lands after this PATCH wins on its own; this
+    // only repairs the reversed order.
+    if Turn::card_message_id(cards, session_id).await.is_some() {
+        collect_orphan(cards, session_id, card_message_id).await;
     }
 }
 

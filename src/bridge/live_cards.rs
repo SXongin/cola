@@ -61,6 +61,14 @@ pub(crate) struct LiveCard {
     /// idempotent (the stamp changes only the header).
     #[serde(skip)]
     pub(crate) restarted_reaped: bool,
+    /// In-memory only: a restart-stamp attempt for this card is in flight
+    /// (#443) — its view read or PATCH is running in a detached task. The
+    /// claim keeps the reap from starting a second attempt, and from deciding
+    /// anything (a settle, a successor collect) that the never-cancelled
+    /// write could still land after; it is released when the attempt resolves
+    /// and never survives a restart.
+    #[serde(skip)]
+    pub(crate) restart_stamping: bool,
 }
 
 impl LiveCard {
@@ -76,6 +84,7 @@ impl LiveCard {
             directory: None,
             waiting_reaped: false,
             restarted_reaped: false,
+            restart_stamping: false,
         }
     }
 
@@ -229,6 +238,38 @@ impl LiveCards {
                 true
             }
             _ => false,
+        }
+    }
+
+    /// Claim the one in-flight restart-stamp attempt for `card_message_id`
+    /// (#443): true when the caller now owns the attempt, false when the
+    /// record moved on, the stamp already landed, or another attempt holds
+    /// the claim. In-memory only.
+    pub(crate) fn begin_restart_stamp(&self, session_id: &str, card_message_id: &str) -> bool {
+        let mut sessions = self.lock();
+        match sessions.get_mut(session_id) {
+            Some(card)
+                if card.card_message_id == card_message_id
+                    && !card.restarted_reaped
+                    && !card.restart_stamping =>
+            {
+                card.restart_stamping = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Release `card_message_id`'s in-flight restart-stamp claim once its
+    /// attempt resolved — landed (the record carries the mark) or failed, so
+    /// the next pass may retry. A record that no longer names the card is
+    /// left untouched.
+    pub(crate) fn finish_restart_stamp(&self, session_id: &str, card_message_id: &str) {
+        let mut sessions = self.lock();
+        if let Some(card) = sessions.get_mut(session_id)
+            && card.card_message_id == card_message_id
+        {
+            card.restart_stamping = false;
         }
     }
 
