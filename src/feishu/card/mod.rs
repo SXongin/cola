@@ -78,6 +78,16 @@ pub enum CardState {
     /// never both claim the session. Terminal, grey, no Completion Notice and
     /// no recovery action: the successor owns the chain.
     TakenOver,
+    /// A persisted live card still owned by no in-process renderer whose
+    /// Session reads live after a cola restart (#443): the run is still being
+    /// awaited — the reap never invents an ending for it — but the accumulator
+    /// that would keep the card moving died with the restart, so the card sat
+    /// frozen. Session Sync stamps it once per process life — header
+    /// 「⏳ 已重启，等待运行结束」, body kept, controls stripped like every
+    /// ending — and the transcript-truth settle (or a successor's collect)
+    /// replaces the stamp when the run ends. Not terminal: the record stays,
+    /// still owed a reap; not render-owned: no renderer survived the restart.
+    Restarted,
 }
 
 impl CardState {
@@ -115,14 +125,16 @@ impl CardState {
     /// owned in this sense — the Turn that owned it yielded; a shell/subagent
     /// completion Wake re-owns it as `Resuming` (ADR-0066) and the remaining
     /// continuations keep the ADR-0059 split onto a new card — and neither is
-    /// a terminal card. `Resuming` IS owned: an in-place Wake handed the chain
-    /// to the resumed run's renderer (ADR-0066). Session Sync's Wake step reads
-    /// this to decide whether the chain can be handed over without
-    /// double-rendering. Distinct from `CardSession::card_is_live` (the last
-    /// send reached Feishu) and `CardSession::is_running` (non-terminal,
+    /// a terminal card. `Restarted` is not owned either: no renderer survived
+    /// the restart that orphaned the card, so the stamped orphan is no live
+    /// chain for Session Sync to guard. `Resuming` IS owned: an in-place Wake
+    /// handed the chain to the resumed run's renderer (ADR-0066). Session
+    /// Sync's Wake step reads this to decide whether the chain can be handed
+    /// over without double-rendering. Distinct from `CardSession::card_is_live`
+    /// (the last send reached Feishu) and `CardSession::is_running` (non-terminal,
     /// `Waiting` included).
     pub(crate) fn is_render_owned(&self) -> bool {
-        !self.is_terminal() && !matches!(self, Self::Waiting)
+        !self.is_terminal() && !matches!(self, Self::Waiting | Self::Restarted)
     }
 
     /// Whether this state's own header beats the awaiting-permission/question
@@ -147,11 +159,11 @@ impl CardState {
         matches!(self, Self::Error | Self::Unreceived)
     }
 
-    /// The ending's word in Session Sync's reap INFO line (ADR-0063): one
-    /// match here, so the reap cannot restate the state vocabulary. The five
-    /// states the reap stamps — the settle endings and the takeover collect —
-    /// have their own words; a state it never stamps falls back to the bare
-    /// word rather than inventing a meaning.
+    /// The reap's word in Session Sync's INFO line (ADR-0063): one match
+    /// here, so the reap cannot restate the state vocabulary. The states the
+    /// reap writes — the settle endings, the takeover collect and the restart
+    /// stamp — have their own words; a state it never writes falls back to the
+    /// bare word rather than inventing a meaning.
     pub(crate) fn reap_word(&self) -> &'static str {
         match self {
             Self::Done => "settled done",
@@ -159,6 +171,7 @@ impl CardState {
             Self::Waiting => "settled waiting",
             Self::Unreceived => "ended unreceived",
             Self::TakenOver => "collected the orphaned card",
+            Self::Restarted => "stamped the restarted orphan",
             _ => "settled",
         }
     }
@@ -484,7 +497,7 @@ mod tests {
     /// (ADR-0063): each ending the reap stamps has its own word, so the log
     /// vocabulary cannot drift from the card vocabulary.
     #[test]
-    fn reap_words_name_each_ending_the_reap_stamps() {
+    fn reap_words_name_each_ending_and_the_restart_stamp() {
         assert_eq!(CardState::Done.reap_word(), "settled done");
         assert_eq!(CardState::Error.reap_word(), "settled error");
         assert_eq!(CardState::Waiting.reap_word(), "settled waiting");
@@ -493,6 +506,11 @@ mod tests {
             CardState::TakenOver.reap_word(),
             "collected the orphaned card",
             "the takeover collect has its own word too"
+        );
+        assert_eq!(
+            CardState::Restarted.reap_word(),
+            "stamped the restarted orphan",
+            "the restart stamp has its own word too"
         );
         assert_eq!(
             CardState::Streaming.reap_word(),
@@ -519,6 +537,19 @@ mod tests {
         assert!(CardState::TakenOver.is_terminal());
         assert!(!CardState::TakenOver.is_render_owned());
         assert!(!CardState::TakenOver.offers_recovery());
+    }
+
+    /// The restart stamp (#443) is not terminal — the still-live orphan's
+    /// record stays, still owed a real ending — and not render-owned: no
+    /// renderer survived the restart that orphaned the card, so Session Sync
+    /// must not read the stamped card as a live renderer's chain. It owns no
+    /// recovery action: the stamp's card keeps its body but loses its
+    /// controls (a whole-card read cannot preserve a control's value).
+    #[test]
+    fn the_restart_stamp_is_not_terminal_and_not_render_owned() {
+        assert!(!CardState::Restarted.is_terminal());
+        assert!(!CardState::Restarted.is_render_owned());
+        assert!(!CardState::Restarted.offers_recovery());
     }
 
     /// The Unreceived ending (ADR-0062) is terminal — the card stops updating

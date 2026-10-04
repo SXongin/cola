@@ -6,17 +6,21 @@
 //! The pass reaps *state*, never content: a readable transcript's real ending
 //! settles the card in place (✅ / ❌ / ⏳ 等待后台任务), an idle Session whose
 //! Turn message never landed ends it 「⚠️ 这条消息未被接收」 — never ✅ — and a
-//! still-live Session keeps the record. A card a successor took over is
+//! still-live Session keeps the record, its orphaned card stamped once with
+//! the restart status (#443). A card a successor took over is
 //! collected as 「⏳ 已由新卡片接管 · 已停止更新」 at the takeover itself
 //! ([`collect_orphan`], called by the card paths that arm over an orphan), so
 //! two cards never both look live. Every ending PATCH keeps the card's
 //! already-rendered body best-effort (#434 acceptance feedback): the reap reads
 //! the card's own view, strips the controls a whole-card read cannot preserve
 //! and restamps the header over the kept elements; a failed read degrades to
-//! the bare ending. Work that landed while cola was down is published by the
-//! existing continuation machinery (a Wake's continuation card) or simply left
-//! in the transcript: content the card never showed is never rebuilt, and the
-//! reap never replays a turn onto a stale card.
+//! the bare ending. The still-live orphan's one-time stamp (#443) reads the
+//! same view the other way around: only the header changes, and a failed read
+//! or PATCH claims nothing — a bare stamp would wipe the body the stamp exists
+//! to keep — so the next pass retries it. Work that landed while cola was down
+//! is published by the existing continuation machinery (a Wake's continuation
+//! card) or simply left in the transcript: content the card never showed is
+//! never rebuilt, and the reap never replays a turn onto a stale card.
 //!
 //! A Session that relocated while the run was in flight (#428: `session_move`
 //! into a git worktree) gains one line naming the move when its card reaches a
@@ -174,6 +178,16 @@ pub(crate) async fn reconcile(
         return;
     };
     let baseline_directory = tracked.or(tracked_directory).unwrap_or(directory);
+    // One record's reconcile: the facts every ending — and the restart stamp
+    // — reads, so the calls below carry only what differs (the ending and its
+    // detail).
+    let pass = ReapPass {
+        handles,
+        session_id,
+        record,
+        baseline_directory,
+        read_timeout_ms,
+    };
     let status = match crate::bridge::bounded_call(
         "live-card reap status",
         read_timeout_ms,
@@ -194,8 +208,16 @@ pub(crate) async fn reconcile(
     let Some(status) = status else {
         return;
     };
-    // A live Session keeps the card: the run may still answer it.
+    // A live Session keeps the card: the run may still answer it. This
+    // process holds no card for the session, so the record is a restart
+    // orphan — its card froze when the previous process died and nothing
+    // will move it until transcript truth ends it. Stamp that once per
+    // process life (#443) so the user knows why it stopped moving: a failed
+    // attempt claims nothing and is retried next pass.
     if status.is_live() {
+        if !record.restarted_reaped {
+            pass.stamp_restarted().await;
+        }
         return;
     }
     let transcript = match crate::bridge::bounded_call(
@@ -219,15 +241,6 @@ pub(crate) async fn reconcile(
     let scope = record
         .anchor()
         .or_else(|| transcript.anchor_of_user(record.message_id.as_str()));
-    // One record's reconcile: the facts every ending shares, so the settle
-    // calls below carry only what differs (the ending and its detail).
-    let pass = ReapPass {
-        handles,
-        session_id,
-        record,
-        baseline_directory,
-        read_timeout_ms,
-    };
     match transcript.settle(scope.as_ref()) {
         // The read's boundary rule is unsatisfied (a Wake's Execution has not
         // closed): the ending is not decided — keep observing.
@@ -261,10 +274,11 @@ pub(crate) async fn reconcile(
     }
 }
 
-/// One record's reconcile, as the facts every settle reads: the handles, the
-/// Session id, the record, the baseline directory the move verdict compares
-/// against, and the pass's read bound. Grouped so the four endings' settle
-/// calls carry only what differs between them.
+/// One record's reconcile, as the facts every ending — and the restart stamp
+/// (#443) — reads: the handles, the Session id, the record, the baseline
+/// directory the move verdict compares against, and the pass's read bound.
+/// Grouped so the settle and stamp calls carry only what differs between
+/// them.
 struct ReapPass<'a> {
     handles: &'a FlowHandles,
     session_id: &'a str,
@@ -318,6 +332,64 @@ impl ReapPass<'_> {
         true
     }
 
+    /// Stamp a still-live restart orphan (#443) — this record's card, owned by
+    /// no renderer in this process, whose Session reads live: the run may
+    /// still answer the card, but nothing will move it until transcript truth
+    /// ends it, and the user deserves to know why. The card's own view is read
+    /// back and only the header changes — body kept, controls stripped,
+    /// exactly like a preserved ending — so the card keeps its body under the
+    /// restart status. Unlike [`patch_ending_keeping_body`], a failed read or
+    /// PATCH claims nothing: the stamp's whole value is the body it preserves,
+    /// so a bare fallback would destroy the very thing it protects; the next
+    /// pass retries. The in-memory mark is set only when the PATCH landed, so
+    /// the stamp is one per process life; the later transcript-truth settle
+    /// (or a successor's collect) reads the view again and replaces the
+    /// header, superseding the stamp as any other card state.
+    async fn stamp_restarted(&self) {
+        let card_message_id = &self.record.card_message_id;
+        let platform = self.handles.cards.feishu.as_ref();
+        let view = match platform.get_card_view(card_message_id).await {
+            Ok(view) => view,
+            Err(e) => {
+                tracing::warn!(
+                    "live-card reap: session {} could not read card {card_message_id} to stamp the restart: {e}",
+                    self.session_id
+                );
+                return;
+            }
+        };
+        // The pass's ownership check is stale by now: a Turn may have started
+        // — or a successor armed — while the view read was in flight. A
+        // takeover attaches the successor id BEFORE it collects this card
+        // (`take_over_card`'s attach-then-collect order), so any admitted
+        // successor is visible here, and its collect is the later terminal:
+        // the stamp yields to it rather than overwriting it with an interim
+        // status.
+        if Turn::card_message_id(&self.handles.cards, self.session_id)
+            .await
+            .is_some()
+        {
+            return;
+        }
+        let card = restamped_keeping_body(&ending_card(CardState::Restarted, None, None), &view);
+        if let Err(e) = platform.update_message(card_message_id, &card).await {
+            tracing::warn!(
+                "live-card reap: session {} could not stamp card {card_message_id}: {e}",
+                self.session_id
+            );
+            return;
+        }
+        tracing::info!(
+            "live-card reap: session {} {}",
+            self.session_id,
+            CardState::Restarted.reap_word()
+        );
+        self.handles
+            .cards
+            .live_cards
+            .mark_restarted_reaped(self.session_id, card_message_id);
+    }
+
     /// The one line a settling card carries when the Session's location changed
     /// since the card was tracked (#428, #439): the move named, so an
     /// interruption the ending alone would leave mysterious is explained. The
@@ -368,7 +440,7 @@ impl ReapPass<'_> {
 /// rebuilt (ADR-0063): the ending's header, the failure's own message when
 /// there is one, the move line when the Session relocated (#439), and no
 /// action. On the PATCH path this bare ending is merged with the card's
-/// currently rendered view best-effort ([`ending_card_keeping_body`], #434
+/// currently rendered view best-effort ([`restamped_keeping_body`], #434
 /// acceptance feedback): the card keeps whatever it already showed, while
 /// content it never showed — the lost turn's missing work — is still never
 /// rebuilt. The Unreceived ending is therefore actionless here — the restart
@@ -404,7 +476,7 @@ async fn patch_ending_keeping_body(
 ) -> crate::error::Result<()> {
     match platform.get_card_view(card_message_id).await {
         Ok(view) => {
-            let card = ending_card_keeping_body(bare, &view);
+            let card = restamped_keeping_body(bare, &view);
             match platform.update_message(card_message_id, &card).await {
                 Ok(()) => Ok(()),
                 Err(e @ crate::error::BridgeError::CardContentRejected { .. }) => {
@@ -423,16 +495,17 @@ async fn patch_ending_keeping_body(
     }
 }
 
-/// The bare ending restamped over the card's existing view (#434 acceptance
-/// feedback): the ending's header leads, its own elements (the failure's
-/// message and/or the move line) come before the view's body, and every
+/// The bare card — an ending, or the still-live orphan's restart stamp (#443)
+/// — restamped over the card's existing view (#434 acceptance feedback): the
+/// bare card's header leads, its own elements (the failure's message and/or
+/// the move line; none for the stamp) come before the view's body, and every
 /// interactive element is stripped from the view's elements — a whole-card read
 /// does not return a control's `value`, so a preserved control could only
 /// render dead. The view's `config` rules the restamped card (`streaming_mode`
 /// forced off so a preserved card never keeps a live-streaming presentation);
-/// a view without one keeps the ending's. Schema 2.0, the one the PATCH API
+/// a view without one keeps the bare card's. Schema 2.0, the one the PATCH API
 /// accepts back.
-fn ending_card_keeping_body(bare: &serde_json::Value, view: &serde_json::Value) -> serde_json::Value {
+fn restamped_keeping_body(bare: &serde_json::Value, view: &serde_json::Value) -> serde_json::Value {
     let mut elements: Vec<serde_json::Value> =
         bare["body"]["elements"].as_array().cloned().unwrap_or_default();
     if let Some(view_elements) = view["body"]["elements"].as_array() {
@@ -589,7 +662,7 @@ mod tests {
     /// forced off while the view's other config survives. A view without a
     /// config keeps the ending's.
     #[test]
-    fn ending_card_keeping_body_prepends_the_line_and_strips_controls() {
+    fn restamped_keeping_body_prepends_the_line_and_strips_controls() {
         use crate::bridge::test_support::{card_buttons, card_has_tag, card_text};
 
         let bare = ending_card(CardState::Error, Some("**错误**: 503"), None);
@@ -619,7 +692,7 @@ mod tests {
             ] }
         });
 
-        let card = ending_card_keeping_body(&bare, &view);
+        let card = restamped_keeping_body(&bare, &view);
         assert_eq!(card["schema"], "2.0");
         assert_eq!(
             card["header"]["title"]["content"], "❌ 出错",
@@ -670,7 +743,7 @@ mod tests {
         let no_config = serde_json::json!({
             "body": { "elements": [{ "tag": "markdown", "content": "旧的正文" }] }
         });
-        let card = ending_card_keeping_body(&bare, &no_config);
+        let card = restamped_keeping_body(&bare, &no_config);
         assert_eq!(card["config"]["wide_screen_mode"], true);
         assert_eq!(card["config"]["streaming_mode"], false);
         assert_eq!(card["body"]["elements"][1]["content"], "旧的正文");
@@ -682,7 +755,7 @@ mod tests {
     /// it can hold is stripped anyway), and a `checker`/`select_img` nested in
     /// a column go too — while the display content around them survives.
     #[test]
-    fn ending_card_keeping_body_drops_containers_without_nulls() {
+    fn restamped_keeping_body_drops_containers_without_nulls() {
         use crate::bridge::test_support::{card_has_tag, card_text};
 
         fn contains_null(value: &serde_json::Value) -> bool {
@@ -719,7 +792,7 @@ mod tests {
             ] }
         });
 
-        let card = ending_card_keeping_body(&bare, &view);
+        let card = restamped_keeping_body(&bare, &view);
         for tag in ["form", "input", "button", "checker", "select_img"] {
             assert!(!card_has_tag(&card, tag), "{tag} must be stripped whole: {card}");
         }
@@ -742,13 +815,13 @@ mod tests {
     /// A bare ending with no line of its own prepends nothing: the preserved
     /// body leads the card.
     #[test]
-    fn ending_card_keeping_body_without_a_line_leads_with_the_view() {
+    fn restamped_keeping_body_without_a_line_leads_with_the_view() {
         let bare = ending_card(CardState::Done, None, None);
         let view = serde_json::json!({
             "config": { "wide_screen_mode": true },
             "body": { "elements": [{ "tag": "markdown", "content": "保留的正文" }] }
         });
-        let card = ending_card_keeping_body(&bare, &view);
+        let card = restamped_keeping_body(&bare, &view);
         let elements = card["body"]["elements"].as_array().unwrap();
         assert_eq!(elements.len(), 1);
         assert_eq!(elements[0]["content"], "保留的正文");

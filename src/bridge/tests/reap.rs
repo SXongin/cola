@@ -3,7 +3,8 @@
 //! the Session's own reads — the transcript's real ending settles the card in
 //! place (✅ / ❌ / ⏳ 等待后台任务), a never-promoted message ends Unreceived
 //! (never ✅), a Wake continuation collects the old card as taken over, a
-//! still-live Session keeps the record, and every terminal drops it.
+//! still-live Session keeps the record and its orphaned card gets the
+//! one-time restart stamp (#443), and every terminal drops it.
 //!
 //! Every test drives the real Session Sync pass (`spawn_sync`) over a scripted
 //! Backend and a recording Platform, so the assertions read the cards sent and
@@ -892,10 +893,12 @@ async fn a_landed_message_settles_done_even_when_the_anchor_never_persisted() {
     );
 }
 
-/// A still-live Session keeps the card and the record: the run may still be
-/// answering it, and a restart must not invent an ending for it.
+/// A still-live Session keeps the record and its orphaned card is stamped
+/// once (#443): the run may still answer it, so a restart must not invent an
+/// ending — but the card froze when the previous process died, and the stamp
+/// tells the user why. The card keeps its own body under the new header.
 #[tokio::test]
-async fn a_still_live_session_keeps_its_persisted_card() {
+async fn a_still_live_session_stamps_its_persisted_card_once() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("sessions.json");
@@ -904,19 +907,212 @@ async fn a_still_live_session_keeps_its_persisted_card() {
     let transcript = SessionTranscript::new(vec![user("msg_cola_anchor", 1_000, "问题")]);
     let (app, platform, backend) =
         restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Busy)).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
 
     spawn_sync(&app);
-    // Several observed passes, each reading the live status: none may touch
-    // the card.
+    wait_for_card_update(&platform, "the restart stamp", CardUpdates::Any, |card| {
+        card_header(card).contains("已重启，等待运行结束")
+    })
+    .await;
+    // Several more observed passes, each reading the live status: the stamp
+    // is one per process life, so no further PATCH may follow.
     wait_for_status_reads(&backend, "ses_test", 3).await;
+
+    let patches = patches_to(&platform, "om_frozen").await;
+    assert_eq!(
+        patches.len(),
+        1,
+        "the restart stamp lands exactly once: {patches:?}"
+    );
+    assert_eq!(card_header(&patches[0]), "⏳ 已重启，等待运行结束");
+    assert_preserved_body(&patches[0]);
     assert!(
-        last_update_of(&platform, "om_frozen").await.is_none(),
-        "a live Session's card is never touched: {:?}",
+        app.cards_handle().live_cards.get("ses_test").is_some(),
+        "a still-live Session keeps its record"
+    );
+}
+
+/// A successor that arms while the stamp's view read is in flight collects
+/// the orphan before the read returns; the stamp re-checks ownership before
+/// its PATCH and yields to that later terminal — an interim status never
+/// overwrites a takeover (#443).
+#[tokio::test]
+async fn a_takeover_during_the_stamp_read_wins_over_the_stamp() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
+    // A second live orphan the reap keeps reading: the pass clock proving
+    // ticks ran after the parked stamp was released.
+    LiveCards::load(sidecar(&session_file)).replace(
+        "ses_other",
+        LiveCard::new("om_other", MessageId::new("msg_cola_other"), Some(2_000))
+            .with_directory(Some("/work".into())),
+    );
+
+    let transcript = SessionTranscript::new(vec![user("msg_cola_anchor", 1_000, "问题")]);
+    let (app, platform, backend) =
+        restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Busy)).await;
+    backend
+        .set_session_status("ses_other", Some(SessionStatus::Busy))
+        .await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+    // Park the stamp's view read.
+    let (entered, release) = platform.pause("card_view", "om_frozen");
+
+    spawn_sync(&app);
+    entered.notified().await;
+
+    // A successor arms over the orphan while the stamp's read is parked:
+    // attach first, then collect — the order `take_over_card` owns.
+    Turn::seed_card(&app.cards_handle(), "ses_test", None).await;
+    Turn::set_turn_anchor(&app.cards_handle(), "ses_test", &turn_anchor(1_000)).await;
+    Turn::take_over_card(&app.cards_handle(), "ses_test", "om_new", Some("/work")).await;
+
+    let before = backend
+        .session_status_reads
+        .lock()
+        .await
+        .iter()
+        .filter(|sid| sid.as_str() == "ses_other")
+        .count();
+    release.notify_one();
+    // Three more observed passes, the takeover already landed: the released
+    // stamp had every chance to (wrongly) land before these.
+    wait_for_status_reads(&backend, "ses_other", before + 3).await;
+
+    let patches = patches_to(&platform, "om_frozen").await;
+    assert_eq!(
+        patches.len(),
+        1,
+        "the takeover collect is the orphan's only write, never a stale stamp: {patches:?}"
+    );
+    assert_eq!(card_header(&patches[0]), "⏳ 已由新卡片接管 · 已停止更新");
+}
+
+/// A record naming a card this process still holds is that card's own
+/// lifecycle, never a restart orphan: a run that did not restart is unchanged
+/// — no view read, no stamp, no PATCH — even while the Session reads live.
+#[tokio::test]
+async fn a_card_this_process_still_holds_is_never_stamped() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_live_card(
+        &session_file,
+        LiveCard::new("om_live", MessageId::new("msg_cola_anchor"), Some(1_000))
+            .with_directory(Some("/work".into())),
+    );
+
+    let (app, platform, backend) =
+        restarted_app_with_backend(&session_file, completed(1_000), Some(SessionStatus::Busy)).await;
+    // The process's own live card, tracked under the record's id.
+    Turn::seed_card(&app.cards_handle(), "ses_test", Some("om_live")).await;
+    // A stamp attempt would succeed if one were made.
+    platform.given_card_view("om_live", realistic_card_view());
+
+    spawn_sync(&app);
+    // The mapped session's transcript reads prove the passes ran.
+    wait_for_transcript_reads(&backend, "ses_test", 3).await;
+    assert!(
+        patches_to(&platform, "om_live").await.is_empty(),
+        "a card this process holds is never stamped: {:?}",
         platform.calls.lock().await
     );
     assert!(
         app.cards_handle().live_cards.get("ses_test").is_some(),
-        "a still-live Session keeps its record"
+        "the live card keeps its record"
+    );
+}
+
+/// A stamp read the platform cannot serve claims nothing: the card is left
+/// exactly as it was — no bare stamp ever lands, because the stamp's whole
+/// value is the body it keeps — and the next pass retries until the view is
+/// readable (#443).
+#[tokio::test]
+async fn a_failed_stamp_read_leaves_the_card_untouched_until_readable() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
+
+    let transcript = SessionTranscript::new(vec![user("msg_cola_anchor", 1_000, "问题")]);
+    let (app, platform, backend) =
+        restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Busy)).await;
+    // No `given_card_view` yet: the read fails, like a missing permission.
+
+    spawn_sync(&app);
+    wait_for_status_reads(&backend, "ses_test", 3).await;
+    assert!(
+        patches_to(&platform, "om_frozen").await.is_empty(),
+        "a failed stamp read claims nothing: {:?}",
+        platform.calls.lock().await
+    );
+    assert!(
+        app.cards_handle().live_cards.get("ses_test").is_some(),
+        "the un-stamped orphan keeps its record"
+    );
+
+    // The read recovers: the next pass stamps.
+    platform.given_card_view("om_frozen", realistic_card_view());
+    wait_for_card_update(&platform, "the retried restart stamp", CardUpdates::Any, |card| {
+        card_header(card).contains("已重启，等待运行结束")
+    })
+    .await;
+    let patches = patches_to(&platform, "om_frozen").await;
+    assert_eq!(patches.len(), 1, "the retried stamp lands once: {patches:?}");
+    assert_preserved_body(&patches[0]);
+}
+
+/// The stamp is not an ending: when the run ends, the transcript-truth settle
+/// reads the card back, replaces the header and spends the record as always
+/// (#443).
+#[tokio::test]
+async fn a_later_ending_replaces_the_restart_stamp() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
+
+    let (app, platform, backend) =
+        restarted_app_with_backend(&session_file, completed(1_000), Some(SessionStatus::Busy)).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+
+    spawn_sync(&app);
+    wait_for_card_update(&platform, "the restart stamp", CardUpdates::Any, |card| {
+        card_header(card).contains("已重启，等待运行结束")
+    })
+    .await;
+
+    // The run ends while cola watches: the status leaves live and the reap
+    // settles the card from transcript truth.
+    backend
+        .set_session_status("ses_test", Some(SessionStatus::Idle))
+        .await;
+    wait_for_card_update(
+        &platform,
+        "the settle over the stamp",
+        CardUpdates::Latest,
+        |card| card_header(card).contains("✅"),
+    )
+    .await;
+
+    let patches = patches_to(&platform, "om_frozen").await;
+    assert_eq!(patches.len(), 2, "the stamp and its settle: {patches:?}");
+    assert_eq!(
+        card_header(&patches[0]),
+        "⏳ 已重启，等待运行结束",
+        "the stamp came first"
+    );
+    assert_eq!(
+        card_header(&patches[1]),
+        "✅ 完成",
+        "the ending supersedes the stamp"
+    );
+    assert_preserved_body(&patches[1]);
+    assert!(
+        app.cards_handle().live_cards.get("ses_test").is_none(),
+        "the terminal spends the record"
     );
 }
 

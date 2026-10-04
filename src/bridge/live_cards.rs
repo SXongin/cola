@@ -53,6 +53,14 @@ pub(crate) struct LiveCard {
     /// every Session Sync tick, and never survives a restart.
     #[serde(skip)]
     pub(crate) waiting_reaped: bool,
+    /// In-memory only: the reap already stamped this card's still-live
+    /// restart orphan (#443) with the restart status. A record that is
+    /// rewritten (a new card becomes live) starts unmarked; the flag only
+    /// suppresses re-stamping the same orphan on every Session Sync tick, and
+    /// never survives a restart — a fresh life stamps once again, which is
+    /// idempotent (the stamp changes only the header).
+    #[serde(skip)]
+    pub(crate) restarted_reaped: bool,
 }
 
 impl LiveCard {
@@ -67,6 +75,7 @@ impl LiveCard {
             created_ms,
             directory: None,
             waiting_reaped: false,
+            restarted_reaped: false,
         }
     }
 
@@ -192,10 +201,26 @@ impl LiveCards {
     /// re-PATCHes once, which is idempotent. Returns whether the record still
     /// names that card (a stale mark for a replaced card is dropped).
     pub(crate) fn mark_waiting_reaped(&self, session_id: &str, card_message_id: &str) -> bool {
+        self.mark(session_id, card_message_id, |card| card.waiting_reaped = true)
+    }
+
+    /// Mark that `card_message_id`'s restart stamp was already PATCHed, so the
+    /// reap stamps a still-live restart orphan once per process life (#443).
+    /// In-memory only: a restart re-stamps once, which is idempotent. Returns
+    /// whether the record still names that card (a stale mark for a replaced
+    /// card is dropped).
+    pub(crate) fn mark_restarted_reaped(&self, session_id: &str, card_message_id: &str) -> bool {
+        self.mark(session_id, card_message_id, |card| card.restarted_reaped = true)
+    }
+
+    /// Set `flag` on the record naming `card_message_id` — the shared body of
+    /// the reap's one-per-life marks. Returns whether the record still names
+    /// that card (a stale mark for a replaced card is dropped).
+    fn mark(&self, session_id: &str, card_message_id: &str, flag: impl FnOnce(&mut LiveCard)) -> bool {
         let mut sessions = self.lock();
         match sessions.get_mut(session_id) {
             Some(card) if card.card_message_id == card_message_id => {
-                card.waiting_reaped = true;
+                flag(card);
                 true
             }
             _ => false,

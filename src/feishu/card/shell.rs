@@ -424,6 +424,13 @@ pub(crate) fn header_title_and_template(
         // over after a restart (ADR-0063): the orphan stops looking live —
         // the successor card below is the session's one live card now.
         CardState::TakenOver => ("⏳ 已由新卡片接管 · 已停止更新".to_string(), "grey"),
+        // A persisted live card still orphaned after a cola restart while its
+        // Session reads live (#443): the run is still being awaited, but no
+        // accumulator survived the restart to keep the card moving. Grey like
+        // the other not-working ends — cola is not working on this card, it is
+        // waiting on the run — and this header is the whole point of the
+        // one-time stamp.
+        CardState::Restarted => ("⏳ 已重启，等待运行结束".to_string(), "grey"),
     };
     let mut title = label;
     match state {
@@ -1152,6 +1159,7 @@ mod tests {
             CardState::Superseded,
             CardState::SwitchedAway,
             CardState::TakenOver,
+            CardState::Restarted,
         ] {
             let card = CardBuilder::new()
                 .with_state(state.clone())
