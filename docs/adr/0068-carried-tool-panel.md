@@ -39,13 +39,14 @@ use.
 
 **The read is bounded and newest-first, and happens before the prompt is
 submitted.** It pages messages descending (`desc` order, following
-`cursor.next` for older pages) and stops at the first of: a
-page with no unfinished message — running calls live only on unfinished
-messages, which are the session's newest — or a page whose oldest message
-predates the orphan anchor minus the in-flight window, past which nothing can
-belong. A small hard page cap and the existing read timeout bound the worst
-case; the common case is one request. A read stopped by the cap before covering
-the newest unfinished messages carries nothing rather than guessing. V1's
+`cursor.next` for older pages) and stops only when the page's oldest message's
+newest activity predates the orphan anchor minus the in-flight window — past
+that point no part can belong to the orphan Turn. A page with no unfinished
+message does **not** end the scan: another client can queue messages above the
+orphan's unfinished call, so the window boundary — not the page's shape — is
+the stop. A small hard page cap and the existing read timeout bound the worst
+case; the common case is one request. A read stopped by the cap before reaching
+the boundary carries nothing rather than guessing. V1's
 session read has no wire pagination — one request decoding the whole message
 array — but that is already the read class V1's render polls perform every tick
 (1.5 s in production), so the carry adds one standard, timeout-bounded read
@@ -124,8 +125,9 @@ survives the process.
   generation-specific branch is added.
 - Tests pin: a stale in-flight running call appears on the successor; its
   completion renders exactly once; an older card's stale running part is never
-  carried; the carry read never walks the whole history (a long transcript
-  stays a bounded newest-first scan, and a cap stop carries nothing and strips
+  carried; the carry read scans to the anchor-minus-window boundary (a long
+  transcript stays a bounded newest-first scan, a queued message above the
+  unfinished call does not hide it, and a cap stop carries nothing and strips
   nothing); the collected old card carries no running marker; a failed carry
   read degrades to today; and the already-working in-window case stays a
   regression test. The probe for a tool that settled while cola was down is
