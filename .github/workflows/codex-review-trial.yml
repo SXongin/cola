@@ -71,6 +71,18 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # The label path's job `if` already excludes fork PRs, but a dispatch
+      # can name any PR number: never hand the Go key to Codex on fork content.
+      - name: Verify the PR is in-repo
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ "$(gh pr view "$PR" --json isCrossRepository --jq .isCrossRepository)" != "false" ]; then
+            echo "PR #$PR comes from a fork; refusing." >&2
+            exit 1
+          fi
+
       # The prompt = the committed rubric + this PR's metadata + its linked
       # issue when one can be fetched, so the reviewer does not depend on
       # network access inside the read-only sandbox. GH_TOKEN stays on the gh
