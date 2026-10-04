@@ -14,7 +14,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::drain::{assistant, ctx, script_transcript, scripted_app, spawn_sync, user};
+use super::drain::{
+    assistant, ctx, script_transcript, scripted_app, spawn_sync, spawn_sync_with_timeout, user,
+};
 use crate::backend::{MessageId, SessionTranscript};
 use crate::bridge::live_cards::{LiveCard, LiveCards};
 use crate::bridge::test_support::*;
@@ -957,10 +959,11 @@ async fn a_takeover_during_the_stamp_read_wins_over_the_stamp() {
         .set_session_status("ses_other", Some(SessionStatus::Busy))
         .await;
     platform.given_card_view("om_frozen", realistic_card_view());
-    // Park the stamp's view read.
+    // Park the stamp's view read. A generous bound: the takeover below runs
+    // while the read is parked, and this test must not race the bound.
     let (entered, release) = platform.pause("card_view", "om_frozen");
 
-    spawn_sync(&app);
+    spawn_sync_with_timeout(&app, 5_000);
     entered.notified().await;
 
     // A successor arms over the orphan while the stamp's read is parked:
@@ -988,6 +991,80 @@ async fn a_takeover_during_the_stamp_read_wins_over_the_stamp() {
         "the takeover collect is the orphan's only write, never a stale stamp: {patches:?}"
     );
     assert_eq!(card_header(&patches[0]), "⏳ 已由新卡片接管 · 已停止更新");
+}
+
+/// A successor that owns the session by the time the stamp's PATCH returns is
+/// re-collected: the post-PATCH ownership re-check gives the takeover the
+/// card's last word even when the stamp's write landed over its collect
+/// (#443). The check-to-PATCH interleaving itself cannot be parked (the
+/// card's delivery lock serializes the two actual writes), so this test pins
+/// the repair branch the interleaving would take.
+#[tokio::test]
+async fn a_successor_owning_the_session_recollects_after_the_stamp() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
+    // A second live orphan: the pass clock.
+    LiveCards::load(sidecar(&session_file)).replace(
+        "ses_other",
+        LiveCard::new("om_other", MessageId::new("msg_cola_other"), Some(2_000))
+            .with_directory(Some("/work".into())),
+    );
+
+    let transcript = SessionTranscript::new(vec![user("msg_cola_anchor", 1_000, "问题")]);
+    let (app, platform, backend) =
+        restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Busy)).await;
+    backend
+        .set_session_status("ses_other", Some(SessionStatus::Busy))
+        .await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+    // Park the stamp's PATCH after its pre-PATCH ownership check passed.
+    let (entered, release) = platform.pause("update", "om_frozen");
+
+    spawn_sync_with_timeout(&app, 5_000);
+    entered.notified().await;
+
+    // The successor arms and re-points the record while the stamp is parked;
+    // its collect queues on the card's delivery lock behind the stamp.
+    let takeover = {
+        let app = app.clone();
+        tokio::spawn(async move {
+            Turn::seed_card(&app.cards_handle(), "ses_test", None).await;
+            Turn::set_turn_anchor(&app.cards_handle(), "ses_test", &turn_anchor(1_000)).await;
+            Turn::take_over_card(&app.cards_handle(), "ses_test", "om_new", Some("/work")).await;
+        })
+    };
+    wait_for_record_card(&app, "ses_test", "om_new").await;
+
+    let before = backend
+        .session_status_reads
+        .lock()
+        .await
+        .iter()
+        .filter(|sid| sid.as_str() == "ses_other")
+        .count();
+    release.notify_one();
+    takeover.await.unwrap();
+    // Three more observed passes: the repair landed with the parked pass.
+    wait_for_status_reads(&backend, "ses_other", before + 3).await;
+
+    let patches = patches_to(&platform, "om_frozen").await;
+    assert_eq!(
+        patches.len(),
+        3,
+        "the stamp, the takeover's collect and the post-PATCH re-collect: {patches:?}"
+    );
+    assert_eq!(
+        card_header(&patches[0]),
+        "⏳ 已重启，等待运行结束",
+        "the stamp landed in the window this test creates: {patches:?}"
+    );
+    assert_eq!(
+        card_header(patches.last().unwrap()),
+        "⏳ 已由新卡片接管 · 已停止更新",
+        "the takeover has the card's last word: {patches:?}"
+    );
 }
 
 /// A record naming a card this process still holds is that card's own

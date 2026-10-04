@@ -2659,9 +2659,17 @@ pub(crate) async fn noticed(platform: &RecordingPlatform) -> bool {
 /// the continuation render tick and every read bound) — shared by the Wake
 /// continuation tests and the collect tests.
 pub(crate) fn spawn_sync(app: &Arc<App>) {
+    spawn_sync_with_timeout(app, 50);
+}
+
+/// [`spawn_sync`] with an explicit request bound: a test that parks a bounded
+/// platform call (a `RecordingPlatform` gate) must not race the bound.
+pub(crate) fn spawn_sync_with_timeout(app: &Arc<App>, timeout_ms: u64) {
     app.external.poll_interval_ms.store(20, Ordering::Relaxed);
     app.external.render_poll_ms.store(5, Ordering::Relaxed);
-    app.external.request_timeout_ms.store(50, Ordering::Relaxed);
+    app.external
+        .request_timeout_ms
+        .store(timeout_ms, Ordering::Relaxed);
     let app = app.clone();
     tokio::spawn(async move {
         let _ = app.external.poll_loop(&app.flow_handles()).await;

@@ -201,7 +201,7 @@ impl LiveCards {
     /// re-PATCHes once, which is idempotent. Returns whether the record still
     /// names that card (a stale mark for a replaced card is dropped).
     pub(crate) fn mark_waiting_reaped(&self, session_id: &str, card_message_id: &str) -> bool {
-        self.mark(session_id, card_message_id, |card| card.waiting_reaped = true)
+        self.set_reap_flag(session_id, card_message_id, |card| card.waiting_reaped = true)
     }
 
     /// Mark that `card_message_id`'s restart stamp was already PATCHed, so the
@@ -210,13 +210,18 @@ impl LiveCards {
     /// whether the record still names that card (a stale mark for a replaced
     /// card is dropped).
     pub(crate) fn mark_restarted_reaped(&self, session_id: &str, card_message_id: &str) -> bool {
-        self.mark(session_id, card_message_id, |card| card.restarted_reaped = true)
+        self.set_reap_flag(session_id, card_message_id, |card| card.restarted_reaped = true)
     }
 
     /// Set `flag` on the record naming `card_message_id` — the shared body of
     /// the reap's one-per-life marks. Returns whether the record still names
     /// that card (a stale mark for a replaced card is dropped).
-    fn mark(&self, session_id: &str, card_message_id: &str, flag: impl FnOnce(&mut LiveCard)) -> bool {
+    fn set_reap_flag(
+        &self,
+        session_id: &str,
+        card_message_id: &str,
+        flag: impl FnOnce(&mut LiveCard),
+    ) -> bool {
         let mut sessions = self.lock();
         match sessions.get_mut(session_id) {
             Some(card) if card.card_message_id == card_message_id => {
