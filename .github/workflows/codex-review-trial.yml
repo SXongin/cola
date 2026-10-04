@@ -1,0 +1,130 @@
+# Advisory Codex review trial — NOT the merge gate.
+#
+# Runs Codex on a PR when the `codex-trial` label is added (or manually via
+# workflow_dispatch) and posts the review as a comment. It never approves: the
+# `OpenCode Review` workflow stays the required non-author review (ADR-0034).
+# The point is an independent second reviewer — a different agent (Codex), a
+# different model family (GPT), and a different prompt lens than the OpenCode
+# gate and the local two-axis review, which share one model and one rubric.
+#
+# Codex reaches the model through the OpenCode Go subscription: Console's
+# inference API serves an OpenAI Responses-compatible endpoint and documents
+# Codex as a validated client; `gpt-6-luna` is the top GPT model in Go. The
+# action's Responses proxy points at that endpoint (`responses-api-endpoint`),
+# keeps the Go key inside the proxy process, and runs Codex read-only
+# (`permission-profile: ":read-only"` + the default `drop-sudo`).
+#
+# Timing caveat: the OpenCode gate reads the *last* `github-actions[bot]`
+# comment for its verdict, so when using the label trigger wait until the
+# `OpenCode Review` run for the current commit has finished before labeling.
+name: Codex Review Trial
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: Pull request number to review
+        required: true
+        type: string
+  pull_request:
+    types: [labeled]
+
+concurrency:
+  group: codex-trial-${{ github.event.pull_request.number || inputs.pr }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  review:
+    # Label runs are opt-in per PR and never for fork PRs (they see no
+    # secrets). Dispatch runs are a maintainer action.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.label.name == 'codex-trial' &&
+       github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: write
+    env:
+      PR: ${{ github.event.pull_request.number || inputs.pr }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/pull/${{ github.event.pull_request.number || inputs.pr }}/head
+          fetch-depth: 0
+          persist-credentials: false
+
+      # The prompt = the committed rubric + this PR's metadata + its linked
+      # issue when one can be fetched, so the reviewer does not depend on
+      # network access inside the read-only sandbox.
+      - name: Build the review prompt
+        run: |
+          set -euo pipefail
+          gh pr view "$PR" --json number,title,body,url,baseRefOid,headRefOid > pr.json
+          base=$(jq -r .baseRefOid pr.json)
+          head=$(jq -r .headRefOid pr.json)
+          issue=$(jq -r '.body // ""' pr.json \
+            | grep -oE '(Closes|Fixes|Resolves|Refs|Part of) #[0-9]+' \
+            | grep -oE '[0-9]+' | head -1 || true)
+          {
+            cat .github/codex/prompts/review.md
+            echo
+            echo "---"
+            echo
+            echo "# This pull request"
+            echo
+            echo "- Repository: $GITHUB_REPOSITORY"
+            echo "- Number: #$PR"
+            printf -- '- Title: %s\n' "$(jq -r .title pr.json)"
+            printf -- '- URL: %s\n' "$(jq -r .url pr.json)"
+            printf -- '- Base commit: %s\n' "$base"
+            printf -- '- Head commit: %s\n' "$head"
+            printf 'Review the changes with: `git diff %s...%s`.\n' "$base" "$head"
+            echo
+            echo "## PR body"
+            echo
+            jq -r '.body // "(empty)"' pr.json
+            if [ -n "$issue" ] \
+              && gh issue view "$issue" --json title,body \
+                --jq '"### " + .title + "\n\n" + (.body // "(empty)")' > issue.md 2>/dev/null; then
+              echo
+              echo "## Linked issue #$issue"
+              echo
+              cat issue.md
+            fi
+          } > codex-prompt.md
+
+      - name: Run Codex (read-only)
+        uses: openai/codex-action@86365089eb2b84e0a8fb0717b304f8bdcb13b20e # v1.12
+        with:
+          openai-api-key: ${{ secrets.OPENCODE_API_KEY }}
+          responses-api-endpoint: https://opencode.ai/inference/openai/v1/responses
+          model: gpt-6-luna
+          codex-version: 0.160.0
+          permission-profile: ":read-only"
+          prompt-file: codex-prompt.md
+          output-file: codex-output.md
+
+      - name: Post the review as a comment
+        run: |
+          set -euo pipefail
+          if [ ! -s codex-output.md ]; then
+            echo "Codex produced no output." >&2
+            exit 1
+          fi
+          cat codex-output.md >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo '<!-- codex-review-trial -->'
+            echo '## Codex advisory review (trial)'
+            echo
+            echo '_Not a merge gate — the `OpenCode Review` workflow still approves. This is an independent-reviewer trial: Codex Action on `gpt-6-luna` through the OpenCode Go subscription. See issue #516._'
+            echo
+            cat codex-output.md
+          } > comment.md
+          gh pr comment "$PR" --body-file comment.md
