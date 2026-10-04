@@ -105,6 +105,20 @@ stamp as today. No timer refresh, no recurring PATCHes, no adoption:
 re-following the run is deferred until a faithful no-duplicate/no-omission
 restore exists (#505).
 
+The stamp's write is bounded by the pass's request timeout (the Feishu
+client carries no default timeout), so a stuck request cannot freeze Session
+Sync. Ordering it against a concurrent takeover is therefore **best-effort
+by construction**: a write cancelled at the bound may still land at Feishu —
+the same at-least-once caveat ADR-0067's retry drain documents — so in the
+rare interleaving where a takeover's collect lands first, a late stamp can
+overtake it. Guaranteed ordering would need server-side conditional writes
+(Feishu has none) or never cancelling a write, which holds the card's
+delivery lock across an unbounded stall and blocks the very collect the race
+concerns; the bound is the deliberate trade. What the stamp does guarantee:
+a successor admitted in-process before its write is never stamped over (the
+pre-PATCH ownership check), and one admitted while the write is in flight
+gets the card's last word from the post-PATCH re-collect.
+
 ## Amendment (2026-10-02): the record is removed after delivery, not before (ADR-0067)
 
 The removal rule above ("removed when that card reaches a terminal") is
