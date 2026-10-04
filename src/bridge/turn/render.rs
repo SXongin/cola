@@ -534,6 +534,13 @@ fn render_turn_parts(acc: &mut StreamAccumulator, transcript: &SessionTranscript
             }
         }
         for part in &message.parts {
+            // A carried call the Turn's own window now renders is the Turn's own
+            // live panel again: it leaves the display-only carry set, so the
+            // ordinary rules (the #284 live-panel guard included) apply to it
+            // exactly as they did before the carry existed.
+            if let Part::Tool(call) = part {
+                acc.carried_calls.remove(&call.identity.call_id);
+            }
             if render_part(acc, part) {
                 rendered_any = true;
             }
@@ -547,12 +554,22 @@ fn render_turn_parts(acc: &mut StreamAccumulator, transcript: &SessionTranscript
     // timeline at the server start key it was born with (ADR-0045). The
     // ordinary tool dedup applies, so a call the window ALSO renders is not
     // duplicated and a repeated read of an unchanged call is skipped.
+    //
+    // The identity is live-only: once the transcript settles it the panel is
+    // an ordinary timeline record, so it leaves the carried set and the
+    // end-of-turn omission (`build_card_inner`, the `has_live_tools` guard)
+    // no longer sees it. A carried call still running when the Turn ends never
+    // outlives it: the settled card omits it, because no renderer will ever
+    // update that `⏳` again.
     let carried: Vec<String> = acc.carried_calls.iter().cloned().collect();
     for call_id in carried {
         if let Some(call) = transcript.tool_call(&call_id)
             && render_part(acc, &Part::Tool(call.clone()))
         {
             rendered_any = true;
+        }
+        if acc.tools.get(&call_id).is_some_and(|panel| !panel.is_live()) {
+            acc.carried_calls.remove(&call_id);
         }
     }
     rendered_any
@@ -1742,6 +1759,159 @@ Index: /x/src/main.rs
         assert!(!acc.tools["call_sleep"].is_live());
         let text = card_text(&acc.build_card_with_split().0);
         assert_eq!(text.matches("killed").count(), 1, "reconciled once: {text}");
+    }
+
+    /// A carried call the Turn's own window renders is the Turn's own live
+    /// panel again: it leaves the display-only carry set, so the ordinary
+    /// live-panel rules (#284's guard included) apply exactly as before the
+    /// carry existed (ADR-0068's in-window regression).
+    #[test]
+    fn an_in_window_render_readopts_a_carried_call() {
+        let anchor = 2_000_000;
+        let orphan = TurnAnchor {
+            message_id: MessageId::new("msg_cola_old"),
+            created_ms: anchor - 60_000,
+        };
+        let transcript = |status: ToolStatus, output: Option<&str>| {
+            SessionTranscript::new(vec![
+                typed_message(
+                    "msg_cola_new",
+                    MessageRole::User,
+                    Some(anchor),
+                    vec![text_part("新的问题")],
+                ),
+                message_in_flight(
+                    "a_inflight",
+                    anchor - 60_000,
+                    None,
+                    vec![tool(
+                        "shell",
+                        "call_sleep",
+                        status,
+                        Some(anchor - 30_000),
+                        Some(serde_json::json!({"command": "sleep 600"})),
+                        output,
+                    )],
+                ),
+            ])
+        };
+
+        let mut acc = StreamAccumulator::new("proj");
+        acc.cola_message_id = Some("msg_cola_new".into());
+        assert_eq!(
+            acc.carry_tools(&transcript(ToolStatus::Running, None).turn_running_tools(&orphan)),
+            1
+        );
+        assert!(acc.carried_calls.contains("call_sleep"));
+
+        render_new_turn_parts(&mut acc, &transcript(ToolStatus::Running, None));
+        assert!(
+            acc.carried_calls.is_empty(),
+            "the Turn's own window render owns the call now, not the carry"
+        );
+    }
+
+    /// The successor's own reads rebuild the todo list, so a running
+    /// `todowrite` is never carried (ADR-0068's carry set: the todo list, the
+    /// ledger and the interaction blocks stay out).
+    #[test]
+    fn a_running_todowrite_is_never_carried() {
+        let mut acc = StreamAccumulator::new("proj");
+        let call = ToolCall {
+            identity: ToolIdentity {
+                name: "todowrite".into(),
+                call_id: "call_todo".into(),
+            },
+            status: ToolStatus::Running,
+            started_at: Some(1_000),
+            input: Some(serde_json::json!({"todos": []})),
+            metadata: None,
+            output: ToolOutput::default(),
+        };
+
+        assert_eq!(
+            acc.carry_tools(&[call]),
+            0,
+            "the successor's own reads rebuild the todo list"
+        );
+        assert!(acc.tools.is_empty() && acc.carried_calls.is_empty());
+    }
+
+    /// A killed run's carried call does not outlive the Turn (ADR-0068): while
+    /// a live renderer owns the card the panel rides the tail and reconciles,
+    /// but once the card settles no renderer will ever update it again, so a
+    /// still-running carried panel is not built — no permanent `⏳` on the
+    /// final card. A carried call that settled before the end is a timeline
+    /// entry and still renders exactly once.
+    #[test]
+    fn a_still_running_carried_call_is_not_built_once_the_card_is_settled() {
+        let anchor = 2_000_000;
+        let orphan = TurnAnchor {
+            message_id: MessageId::new("msg_cola_old"),
+            created_ms: anchor - 31 * 60_000,
+        };
+        let transcript = |status: ToolStatus, output: Option<&str>| {
+            SessionTranscript::new(vec![
+                typed_message(
+                    "msg_cola_new",
+                    MessageRole::User,
+                    Some(anchor),
+                    vec![text_part("新的问题")],
+                ),
+                message_in_flight(
+                    "a_stale",
+                    anchor - 30 * 60_000,
+                    None,
+                    vec![tool(
+                        "shell",
+                        "call_sleep",
+                        status,
+                        Some(anchor - 11 * 60_000),
+                        Some(serde_json::json!({"command": "sleep 3600"})),
+                        output,
+                    )],
+                ),
+            ])
+        };
+
+        let mut acc = StreamAccumulator::new("proj");
+        acc.cola_message_id = Some("msg_cola_new".into());
+        acc.carry_tools(&transcript(ToolStatus::Running, None).turn_running_tools(&orphan));
+        render_new_turn_parts(&mut acc, &transcript(ToolStatus::Running, None));
+        assert!(
+            card_text(&acc.build_card_with_split().0).contains("⏳ shell"),
+            "a live renderer owns the card, so the carried panel rides the tail"
+        );
+
+        // The Turn ends with the call still running (the killed-run case): the
+        // settled card omits the panel — the `⏳` never outlives the Turn.
+        acc.card_state = CardState::Done;
+        let text = card_text(&acc.build_card_with_split().0);
+        assert!(
+            !text.contains("⏳ shell"),
+            "the settled card must not keep a permanent running panel: {text}"
+        );
+        // A yielded card has no renderer either: same rule.
+        acc.card_state = CardState::Waiting;
+        assert!(
+            !card_text(&acc.build_card_with_split().0).contains("⏳ shell"),
+            "a card no renderer owns never shows a still-running carried panel"
+        );
+
+        // A completion that landed before the end is a timeline record and
+        // still renders on the settled card, exactly once.
+        acc.card_state = CardState::Streaming;
+        assert!(render_new_turn_parts(
+            &mut acc,
+            &transcript(ToolStatus::Completed, Some("slept"))
+        ));
+        acc.card_state = CardState::Done;
+        let text = card_text(&acc.build_card_with_split().0);
+        assert_eq!(
+            text.matches("slept").count(),
+            1,
+            "a settled carried call still renders on the final card: {text}"
+        );
     }
 
     /// The header date reads the SERVER's time for the turn's user message
