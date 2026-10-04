@@ -19,6 +19,13 @@
 # so a trial comment landing mid-run could hide its verdict. That is prevented
 # on the gate side — its readback skips comments carrying this workflow's
 # `<!-- codex-review-trial -->` marker — so the trial can post at any time.
+#
+# Trust model: like the OpenCode gate, this is a `pull_request` workflow, so a
+# same-repo PR runs the workflow definition from its merge ref. Same-repo PR
+# authors already have write access (they can edit any workflow); fork PRs get
+# no secrets and are excluded below, and labeling is a maintainer action. If
+# Codex ever becomes the gate, moving the trigger to `pull_request_target` is
+# the hardening to evaluate.
 name: Codex Review Trial
 
 on:
