@@ -65,9 +65,10 @@ collect strips from the preserved body every `collapsible_panel` whose
 plain-text title begins `⏳` — the running Tool Panel's marker; the panel now
 lives on the successor. This is ADR-0063's body-preservation rule narrowed for
 this one collect (recorded as an amendment there). The removal is gated on the
-carry read succeeding: a
-failed read carries nothing and leaves today's collected body untouched, and a
-failed old-card PATCH is the same best-effort degrade as every collect.
+carry actually handing at least one call over: a failed, timed-out, or
+cap-stopped read carries nothing and strips nothing, leaving today's collected
+body untouched, and a failed old-card PATCH is the same best-effort degrade as
+every collect.
 
 **Only the fresh-Turn takeover carries.** A Wake continuation's arm keeps
 ADR-0061's scope at the newest Wake — it never replays the lost chain's
@@ -124,10 +125,10 @@ survives the process.
 - Tests pin: a stale in-flight running call appears on the successor; its
   completion renders exactly once; an older card's stale running part is never
   carried; the carry read never walks the whole history (a long transcript
-  stays a bounded newest-first scan, and a cap stop carries nothing); the
-  collected old card carries no running marker; a failed carry read degrades to
-  today; and the already-working in-window case stays a regression test. The
-  probe for a tool that settled while cola was down is dropped with a pointer
-  to #505.
+  stays a bounded newest-first scan, and a cap stop carries nothing and strips
+  nothing); the collected old card carries no running marker; a failed carry
+  read degrades to today; and the already-working in-window case stays a
+  regression test. The probe for a tool that settled while cola was down is
+  dropped with a pointer to #505.
 
 Related: #428, #434, #443, #444, #505, ADR-0045, ADR-0061, ADR-0062, ADR-0063.
