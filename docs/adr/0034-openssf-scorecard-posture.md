@@ -69,6 +69,9 @@ byproduct**. Concretely:
 
    > **Amended 2026-09-15**: the gate is now the OpenCode review workflow; see
    > the amendment at the end of this ADR.
+   >
+   > **Amended 2026-10-04**: the gate is now the Codex Action review; see the
+   > amendment at the end of this ADR.
 
 **Explicit no-s.** We are not pursuing the CII Best Practices badge (hours of
 self-attestation for at most +0.2), multi-organization `Contributors` (not
@@ -91,9 +94,10 @@ filter bot reviewers — see the 2026-09-15 amendment.
 - The provenance attachment depends on the attestation store read permission
   (`attestations: read`) and `gh attestation download` naming bundles by digest;
   the release workflow renames them per artifact.
-- CodeRabbit was removed on 2026-09-15 (see the amendment). Its repository read
-  access and approval voice are replaced by the OpenCode review workflow, which
-  holds `pull-requests: write` and an API key shared with local development.
+- CodeRabbit was removed on 2026-09-15 (see the amendments). Its repository
+  read access and approval voice are replaced by the review gate — OpenCode
+  until 2026-10-04, Codex Action since — which holds `pull-requests: write` and
+  an API key shared with local development.
 - The Scorecard number will be lower than its theoretical maximum by design.
   Do not "fix" the remaining zeros without revisiting this ADR.
 
@@ -205,3 +209,39 @@ line-final `OPENCODE_REVIEW_VERDICT: PASS|FAIL`, and the step approves only on
 `PASS`, only for the reviewed commit. The filter only narrows which comments
 the readback may see. The trial is advisory and never approves; whether Codex
 replaces the OpenCode gate remains an open decision (issue #516).
+
+## Amendment (2026-10-04, superseding the marker filter): the Codex Action review is the gate
+
+The gate in item 6 is now `.github/workflows/codex-review.yml`, replacing
+`.github/workflows/opencode-review.yml`: `openai/codex-action` (v1.12) runs
+Codex read-only on `gpt-6-luna` through the OpenCode Go subscription's
+Responses-compatible inference endpoint, with the two axes plus an adversarial
+pass rubric at `.github/codex/prompts/review.md`. The approval contract is
+carried over: a line-final `CODEX_REVIEW_VERDICT: PASS|FAIL` in the review
+comment, approval only on `PASS`, pinned to the reviewed commit. This
+supersedes the 2026-09-15 amendment's OpenCode specifics (model, prompt
+injection, permission allowlist); the skips (fork, Dependabot, `release/*`)
+carry over. The local `/code-review` skill stays the author-side OpenCode
+two-axis pass — the CI gate is deliberately a different agent and model
+family, so the two are independent review signals.
+
+The advisory trial (issue #516, PR #517) is the evidence: nine review rounds
+at ~1.5 minutes per run, including a FAIL that caught a real defect in the
+gate's own comment filter. The trial-only plumbing is deleted with it:
+`.github/workflows/codex-review-trial.yml` and the `codex-trial` label.
+
+The approval readback no longer scans comments at all. The workflow posts the
+review via `gh api` and records the new comment's ID as a step output; the
+approve step fetches exactly that comment and approves only when its final
+line is `PASS`. That removes the last-comment scan whose interference the
+previous amendment's first-line trial-marker filter guarded against: with
+comment-ID anchoring no other comment can shadow or forge the verdict, so the
+marker rule dies with the trial workflow.
+
+The trial header recorded `pull_request_target` as the hardening to evaluate
+if Codex became the gate; this replacement keeps the `pull_request` + fork-skip
+trust model instead. Endpoint, key and read-only posture are unchanged from the
+trial: the Console inference API round-trips `gpt-6-luna` with the
+`OPENCODE_API_KEY` Go key, which stays inside the action's Responses proxy and
+never reaches the Codex step's environment. As before, a FAIL is a comment
+without an approval, never a `request-changes`.
