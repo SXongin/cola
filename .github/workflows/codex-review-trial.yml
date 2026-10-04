@@ -39,10 +39,11 @@ on:
     types: [labeled]
 
 concurrency:
-  # Never cancel an in-flight trial: this workflow listens to every `labeled`
-  # event (the job `if` filters them), so cancel-in-progress would let an
-  # unrelated label kill a running trial.
-  group: codex-trial-${{ github.event.pull_request.number || inputs.pr }}
+  # Never cancel an in-flight trial, and keep unrelated label events out of the
+  # trial's queue: this workflow listens to every `labeled` event (the job `if`
+  # filters them), and a newer queued run can replace an older pending one.
+  group: >-
+    codex-trial-${{ github.event.pull_request.number || inputs.pr }}-${{ github.event.label.name || 'dispatch' }}
   cancel-in-progress: false
 
 permissions:
