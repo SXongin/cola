@@ -66,28 +66,12 @@ jobs:
       # The gate's approval step scans the last `github-actions[bot]` comment
       # for its verdict; a trial comment arriving between the gate's review
       # comment and that readback would hide the verdict and silently skip the
-      # approval. Wait out any in-flight gate run on this branch; if one never
-      # finishes, fail instead of posting.
+      # approval. Wait out any in-flight gate run on this branch before
+      # spending tokens on a review that could not be posted.
       - name: Wait for an in-flight OpenCode gate run
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          head_ref=$(gh pr view "$PR" --json headRefName --jq .headRefName)
-          for _ in $(seq 1 40); do
-            running=$(gh run list --repo "$GITHUB_REPOSITORY" \
-              --workflow opencode-review.yml --branch "$head_ref" --limit 10 \
-              --json status \
-              --jq '[.[] | select(.status == "queued" or .status == "in_progress")] | length')
-            if [ "$running" = "0" ]; then
-              echo "No OpenCode Review run in flight on $head_ref."
-              exit 0
-            fi
-            echo "OpenCode Review still in flight; waiting 15s..."
-            sleep 15
-          done
-          echo "OpenCode Review still in flight after 10 minutes; not reviewing." >&2
-          exit 1
+        run: bash .github/codex/wait-for-gate.sh "$PR"
 
       # The prompt = the committed rubric + this PR's metadata + its linked
       # issue when one can be fetched, so the reviewer does not depend on
@@ -105,7 +89,7 @@ jobs:
           # that moved between checkout and this call.
           head=$(git rev-parse HEAD)
           issue=$(jq -r '.body // ""' pr.json \
-            | grep -oE '(Closes|Fixes|Resolves|Refs|Part of) #[0-9]+' \
+            | grep -oiE '(Closes|Fixes|Resolves|Refs|Part of) #[0-9]+' \
             | grep -oE '[0-9]+' | head -1 || true)
           {
             cat .github/codex/prompts/review.md
@@ -155,6 +139,11 @@ jobs:
             echo "Codex produced no output." >&2
             exit 1
           fi
+          # Re-check right before posting: a gate run that started while Codex
+          # worked must finish first. Any run able to hide its own verdict
+          # (already past its review post, before its readback) is still
+          # `in_progress` here, so this closes the check-to-post window.
+          bash .github/codex/wait-for-gate.sh "$PR"
           cat codex-output.md >> "$GITHUB_STEP_SUMMARY"
           {
             echo '<!-- codex-review-trial -->'
