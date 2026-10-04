@@ -46,7 +46,11 @@ predates the orphan anchor minus the in-flight window, past which nothing can
 belong. A small hard page cap and the existing read timeout bound the worst
 case; the common case is one request. A read stopped by the cap before covering
 the newest unfinished messages carries nothing rather than guessing. V1's
-transcript read is a single request and needs no pagination.
+session read has no wire pagination — one request decoding the whole message
+array — but that is already the read class V1's render polls perform every tick
+(1.5 s in production), so the carry adds one standard, timeout-bounded read
+rather than a history walk of its own; the wire-level page bound is a V2
+commitment, and on both generations a timed-out read carries nothing.
 
 **The carried calls reconcile against the transcript, not the Turn window.**
 Every render read resolves each carried call identity against the transcript
@@ -59,7 +63,9 @@ it is never an adoption of the old run.
 **The old card is collected without the running markers.** The takeover's
 collect strips from the preserved body every `collapsible_panel` whose
 plain-text title begins `⏳` — the running Tool Panel's marker; the panel now
-lives on the successor. The removal is gated on the carry read succeeding: a
+lives on the successor. This is ADR-0063's body-preservation rule narrowed for
+this one collect (recorded as an amendment there). The removal is gated on the
+carry read succeeding: a
 failed read carries nothing and leaves today's collected body untouched, and a
 failed old-card PATCH is the same best-effort degrade as every collect.
 
