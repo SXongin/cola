@@ -60,25 +60,47 @@ use crate::feishu::card::{
 
 /// Collect the orphaned card `card_message_id` because a new card took the
 /// chain over (ADR-0063): one PATCH naming the successor, terminal and grey,
-/// keeping whatever the card already showed (#434 acceptance feedback) — minus
-/// the live tail the successor takes over (ADR-0068): the Background Task
-/// Ledger element goes always (the successor's own reads rebuild the list,
-/// ADR-0060's one-card handover), and the running `⏳` panels go only when
-/// `strip_running_panels` says the restart carry moved them onto the successor
-/// — a takeover that carried nothing keeps today's body for them. A failed
-/// PATCH only warns; the record follows the successor either way, so the
-/// freeze it leaves behind is the pre-#438 behavior, never a crash.
-pub(crate) async fn collect_orphan(
+/// keeping whatever the card already showed (#434 acceptance feedback). The
+/// spec's Trigger scopes ADR-0068's live-tail strip to the fresh-Turn message
+/// takeover alone, so this ordinary collect leaves the preserved body exactly
+/// as today — the Wake continuation's arm, the external arm, the reap's
+/// reconcile and the #443 stamp's repair all come through here. The fresh
+/// Turn's own collect is [`collect_orphan_after_carry`].
+///
+/// A failed PATCH only warns; the record follows the successor either way, so
+/// the freeze it leaves behind is the pre-#438 behavior, never a crash.
+pub(crate) async fn collect_orphan(cards: &CardsHandle, session_id: &str, card_message_id: &str) {
+    collect_orphan_with(cards, session_id, card_message_id, KeepBody::Everything).await;
+}
+
+/// Collect the orphaned card `card_message_id` for the **fresh-Turn message
+/// takeover** (ADR-0068, the only collect the strip is scoped to): the
+/// Background Task Ledger element goes always (the successor's own reads
+/// rebuild the live list, ADR-0060's one-card handover) and the running `⏳`
+/// panels go only when the restart carry actually moved at least one call
+/// onto the successor — `carried_running_panels` is the carry's own result, so
+/// a failed, timed-out, cap-stopped or empty carry keeps today's body for
+/// them. A failed PATCH only warns, like every collect.
+pub(crate) async fn collect_orphan_after_carry(
     cards: &CardsHandle,
     session_id: &str,
     card_message_id: &str,
-    strip_running_panels: bool,
+    carried_running_panels: bool,
 ) {
+    let keep = KeepBody::WithoutLiveTail {
+        strip_running_panels: carried_running_panels,
+    };
+    collect_orphan_with(cards, session_id, card_message_id, keep).await;
+}
+
+/// The shared takeover collect behind [`collect_orphan`] and
+/// [`collect_orphan_after_carry`]: one PATCH naming the successor, terminal
+/// and grey, its preserved body under `keep`.
+async fn collect_orphan_with(cards: &CardsHandle, session_id: &str, card_message_id: &str, keep: KeepBody) {
     if card_message_id.is_empty() {
         return;
     }
     let card = ending_card(CardState::TakenOver, None, None);
-    let keep = KeepBody::WithoutLiveTail { strip_running_panels };
     match patch_ending_keeping_body(cards.feishu.as_ref(), card_message_id, &card, keep).await {
         // The one reap vocabulary: the INFO line's ending word comes from the
         // state itself, exactly like every `ReapPass::settle` line.
@@ -160,7 +182,7 @@ pub(crate) async fn reconcile(
         // place (ADR-0063's goal: never leave a card looking live), then name
         // the live successor; a settled successor keeps no record. The collect
         // is best-effort and harmless when the handover already collected it.
-        collect_orphan(&handles.cards, session_id, &record.card_message_id, false).await;
+        collect_orphan(&handles.cards, session_id, &record.card_message_id).await;
         match (
             current_running,
             Turn::armed_turn_anchor(&handles.cards, session_id).await,
@@ -497,7 +519,7 @@ async fn stamp_restart_attempt(
     // last word. A collect that lands after this PATCH wins on its own; this
     // only repairs the reversed order.
     if Turn::card_message_id(cards, session_id).await.is_some() {
-        collect_orphan(cards, session_id, card_message_id, false).await;
+        collect_orphan(cards, session_id, card_message_id).await;
     }
 }
 
@@ -527,8 +549,9 @@ fn ending_card(state: CardState, detail: Option<&str>, move_note: Option<&str>) 
 /// PATCH `bare` onto `card_message_id`, keeping the card's existing body
 /// best-effort (#434 acceptance feedback): read the card's own view, merge the
 /// ending over it, PATCH the merge. `keep` is the merge's view-element rule —
-/// [`KeepBody::Everything`] for every ending and the #443 stamp,
-/// [`KeepBody::WithoutLiveTail`] for the takeover collect (ADR-0068). A failed
+/// [`KeepBody::Everything`] for every ordinary collect, ending and the #443
+/// stamp, [`KeepBody::WithoutLiveTail`] for the fresh-Turn takeover's collect
+/// (ADR-0068). A failed
 /// read PATCHes `bare` directly — today's behavior — because the ending must
 /// never depend on the read.
 ///
@@ -569,11 +592,12 @@ async fn patch_ending_keeping_body(
 /// feedback, ADR-0068).
 #[derive(Clone, Copy)]
 enum KeepBody {
-    /// Every ending but the takeover collect, and the #443 restart stamp: the
+    /// Every ordinary collect, every ending and the #443 restart stamp: the
     /// card's own view stays as it was, its controls stripped.
     Everything,
-    /// The takeover collect (ADR-0068): the view's live tail goes — the
-    /// Background Task Ledger element always, because the successor's own
+    /// The fresh-Turn message takeover's collect (ADR-0068, the one collect
+    /// the spec's Trigger scopes the strip to): the view's live tail goes —
+    /// the Background Task Ledger element always, because the successor's own
     /// reads rebuild the live list (ADR-0060), and the running `⏳` panels
     /// when the restart carry actually moved them onto the successor. Every
     /// other preserved element stays.

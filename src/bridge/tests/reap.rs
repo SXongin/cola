@@ -1151,9 +1151,9 @@ fn live_tail_orphan_view() -> serde_json::Value {
     })
 }
 
-/// The ONE INFO line the restart carry's decision logs (ADR-0068) — the
-/// outcome line, never the debug/warn detail a failed or hanging read also
-/// emits. Panics when the count is not one.
+/// The carry's ONE INFO decision line (spec #523, story 14) — `capture_logs`'s
+/// output for the one test whose requirement is a log line. The behavioral
+/// tests assert the cards, never the logs. Panics when the count is not one.
 fn carry_info_line(logs: &str) -> &str {
     let matches: Vec<&str> = logs
         .lines()
@@ -1443,9 +1443,12 @@ async fn a_restart_takeover_drops_a_ledger_only_orphans_live_list() {
         .unwrap();
 }
 
-/// ADR-0068 + the best-effort collect rule: a takeover collect whose PATCH
-/// fails only warns — the successor keeps ownership of the chain and its
-/// carried panel — and never blocks the Turn.
+/// ADR-0068 + the best-effort collect rule (ticket #526): a takeover collect
+/// whose PATCH fails only warns — the successor keeps ownership of the chain
+/// and its carried panel — and never blocks the Turn. The ticket's acceptance
+/// names exactly one warning for the failed collect, so that count is read
+/// directly; the ownership behavior stands on the cards and the record, not
+/// the log.
 #[tokio::test]
 async fn a_failed_takeover_collect_warns_and_keeps_the_successor() {
     let _wd = test_work_dir();
@@ -1562,10 +1565,7 @@ async fn a_restart_takeover_never_carries_an_older_turns_stale_call() {
 
     let mut context = ctx("ses_test", "新问题");
     context.cola_message_id = Some("msg_cola_new".into());
-    let ((), logs) = capture_logs(async {
-        Turn::run(&app.turn_handles(), context).await.unwrap();
-    })
-    .await;
+    Turn::run(&app.turn_handles(), context).await.unwrap();
 
     assert_eq!(
         backend.transcript_tail_calls.lock().await.as_slice(),
@@ -1578,11 +1578,6 @@ async fn a_restart_takeover_never_carries_an_older_turns_stale_call() {
     assert!(
         !text.contains("call_ghost") && !text.contains("⏳ shell"),
         "an older turn's stale running part is never resurrected: {text}"
-    );
-    let line = carry_info_line(&logs);
-    assert!(
-        line.contains("ses_test") && line.contains("carried 0"),
-        "the carry decision is logged with its session and outcome: {line}"
     );
 }
 
@@ -1621,10 +1616,7 @@ async fn a_capped_carry_read_carries_nothing() {
 
     let mut context = ctx("ses_test", "新问题");
     context.cola_message_id = Some("msg_cola_new".into());
-    let ((), logs) = capture_logs(async {
-        Turn::run(&app.turn_handles(), context).await.unwrap();
-    })
-    .await;
+    Turn::run(&app.turn_handles(), context).await.unwrap();
 
     wait_for_card_header(&platform, "✅").await;
     assert_eq!(
@@ -1646,11 +1638,6 @@ async fn a_capped_carry_read_carries_nothing() {
     assert!(
         !orphan_text.contains("⏳ 后台任务"),
         "the ledger leaves the collect: {orphan_text}"
-    );
-    let line = carry_info_line(&logs);
-    assert!(
-        line.contains("ses_test") && line.contains("page cap"),
-        "the cap stop is the logged outcome: {line}"
     );
 }
 
@@ -1690,10 +1677,7 @@ async fn a_failed_carry_read_carries_nothing() {
 
     let mut context = ctx("ses_test", "新问题");
     context.cola_message_id = Some("msg_cola_new".into());
-    let ((), logs) = capture_logs(async {
-        Turn::run(&app.turn_handles(), context).await.unwrap();
-    })
-    .await;
+    Turn::run(&app.turn_handles(), context).await.unwrap();
 
     wait_for_card_header(&platform, "✅").await;
     let cards = platform.updated_cards().await;
@@ -1720,11 +1704,6 @@ async fn a_failed_carry_read_carries_nothing() {
     assert!(
         !orphan_text.contains("⏳ 后台任务"),
         "the ledger leaves the collect even when nothing was carried: {orphan_text}"
-    );
-    let line = carry_info_line(&logs);
-    assert!(
-        line.contains("ses_test") && line.contains("read failed"),
-        "the failed read is the logged outcome: {line}"
     );
 }
 
@@ -1767,10 +1746,7 @@ async fn a_timed_out_carry_read_carries_nothing() {
 
     let mut context = ctx("ses_test", "新问题");
     context.cola_message_id = Some("msg_cola_new".into());
-    let ((), logs) = capture_logs(async {
-        Turn::run(&app.turn_handles(), context).await.unwrap();
-    })
-    .await;
+    Turn::run(&app.turn_handles(), context).await.unwrap();
 
     wait_for_card_header(&platform, "✅").await;
     let cards = platform.updated_cards().await;
@@ -1787,11 +1763,6 @@ async fn a_timed_out_carry_read_carries_nothing() {
     assert!(
         !orphan_text.contains("⏳ 后台任务"),
         "the ledger leaves the collect: {orphan_text}"
-    );
-    let line = carry_info_line(&logs);
-    assert!(
-        line.contains("ses_test") && line.contains("read timed out"),
-        "the timeout is the logged outcome: {line}"
     );
 }
 
@@ -1842,20 +1813,60 @@ async fn an_anchorless_record_reads_no_tail() {
 
     let mut context = ctx("ses_test", "新问题");
     context.cola_message_id = Some("msg_cola_new".into());
-    let ((), logs) = capture_logs(async {
-        Turn::run(&app.turn_handles(), context).await.unwrap();
-    })
-    .await;
+    Turn::run(&app.turn_handles(), context).await.unwrap();
 
     wait_for_card_header(&platform, "✅").await;
     assert!(
         backend.transcript_tail_calls.lock().await.is_empty(),
         "an anchorless record cannot scope a carry read"
     );
+}
+
+/// The carry's operator-facing contract (spec #523, story 14): every takeover
+/// logs exactly ONE INFO decision line — the session and a decision word,
+/// never chat content. The spec's testing rule keeps log text out of the
+/// behavioral tests; this is the one test that reads it, because the logging
+/// requirement is itself a log line. The fixture is the simplest decision: an
+/// orphan Turn with nothing running to carry.
+#[tokio::test]
+async fn a_carry_decision_logs_one_info_line() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
+    let new_anchor = 2_000_000;
+    let tail = TranscriptTail {
+        transcript: SessionTranscript::new(vec![user("msg_cola_anchor", 1_000, "问题")]),
+        complete: true,
+    };
+    let live = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "问题"),
+        user("msg_cola_new", new_anchor, "新问题"),
+        assistant(new_anchor + 1_000, "新回答"),
+    ]);
+    let (app, platform, backend, gate) = carried_app(&session_file, live, tail, SessionStatus::Idle).await;
+    gate.add_permits(1);
+
+    let mut context = ctx("ses_test", "新问题");
+    context.cola_message_id = Some("msg_cola_new".into());
+    let ((), logs) = capture_logs(async {
+        Turn::run(&app.turn_handles(), context).await.unwrap();
+    })
+    .await;
+
+    // The user-visible outcome stands on its own: the takeover ran its one
+    // bounded read and the successor settled.
+    assert_eq!(
+        backend.transcript_tail_calls.lock().await.len(),
+        1,
+        "the carry read ran"
+    );
+    wait_for_card_header(&platform, "✅").await;
+
     let line = carry_info_line(&logs);
     assert!(
-        line.contains("ses_test") && line.contains("no anchor"),
-        "the anchorless decision is the logged outcome: {line}"
+        line.contains("ses_test") && line.contains("carried 0"),
+        "the one INFO line names the session and its decision: {line}"
     );
 }
 
@@ -2389,6 +2400,9 @@ async fn a_restart_continuation_collects_the_old_card() {
     .with_executions(vec![execution(2_500), execution(4_000)])
     .with_wakes(vec![shell_wake(2_900)]);
     let (app, platform) = restarted_app(&session_file, transcript, None).await;
+    // The orphaned card's view: the Wake arm's collect is NOT the fresh-Turn
+    // takeover, so ADR-0068's strip must leave this body untouched.
+    platform.given_card_view("om_frozen", live_tail_orphan_view());
 
     spawn_sync(&app);
     // The continuation posts, streams the resumed work and ends ✅.
@@ -2411,6 +2425,14 @@ async fn a_restart_continuation_collects_the_old_card() {
         .await
         .expect("the orphaned card is collected in place");
     assert_eq!(card_header(&collected), "⏳ 已由新卡片接管 · 已停止更新");
+    // The Wake continuation's collect keeps the preserved body as today (the
+    // spec's Trigger scopes the ADR-0068 strip to the fresh-Turn takeover):
+    // the running panel and the ledger both stay.
+    let collected_text = card_text(&collected);
+    assert!(
+        collected_text.contains("⏳ shell") && collected_text.contains("⏳ 后台任务"),
+        "the Wake arm's collect is untouched by ADR-0068: {collected_text}"
+    );
 
     // The record followed the successor: after the continuation's own settle
     // (it ended ✅ in the same read) the record is spent, but the send that
