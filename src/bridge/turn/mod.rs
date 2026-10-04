@@ -19,6 +19,7 @@ use crate::bridge::handler::image_inputs;
 use crate::bridge::handles::{
     CardsHandle, FlowHandles, NoticeRules, RequestsHandle, SessionsHandle, TurnHandles, WaitsHandle,
 };
+use crate::bridge::live_cards::LiveCard;
 use crate::bridge::span;
 use crate::bridge::turn::state::StreamAccumulator;
 use crate::config::ThreadKey;
@@ -486,7 +487,14 @@ impl Turn {
         // and persist the durable record (ADR-0063) — the anchor follows on the
         // first read that carries the submitted message. A previously recorded
         // orphan this Turn's card replaces is collected as taken over.
-        Self::take_over_card(&handles.cards, &session_id, &new_card_id, Some(&session_dir)).await;
+        let orphan =
+            Self::take_over_card(&handles.cards, &session_id, &new_card_id, Some(&session_dir)).await;
+        // The restart carry (ADR-0068): hand the orphaned Turn's still-running
+        // tool calls to this fresh card's live tail — a display-only seed, no
+        // anchor/record/settle input moves — before the prompt is submitted.
+        if let Some(orphan) = orphan {
+            Self::carry_orphan_tools(handles, &session_id, &orphan).await;
+        }
 
         // The work context (ADR-0019) is captured before the prompt runs but
         // AFTER the card is live and its id known: the git read neither delays
@@ -1457,6 +1465,9 @@ impl Turn {
     /// re-adopt), whose predecessor the split — or the static snapshot it
     /// replaces — already ended. The three takeover sends go through
     /// [`Self::take_over_card`], which owns the attach-then-collect order.
+    /// Returns the predecessor record this send took over — `Some` exactly
+    /// when a DIFFERENT recorded card was collected — so the caller can read
+    /// the orphan's anchor (the fresh-Turn carry, ADR-0068).
     ///
     /// `directory` is the Session's directory when the caller knows it (a
     /// Turn's mapping, an external arm); `None` falls back to the card's own
@@ -1468,7 +1479,7 @@ impl Turn {
         card_message_id: &str,
         collect_predecessor: bool,
         directory: Option<&str>,
-    ) {
+    ) -> Option<LiveCard> {
         let (message_id, created_ms, context_directory) = {
             let live = cards.cards.lock().await;
             match live.get(session_id) {
@@ -1487,9 +1498,7 @@ impl Turn {
         };
         // A card with no Turn message to scope a settle decision with cannot be
         // reaped: no record, no reap attempt after a restart.
-        let Some(message_id) = message_id else {
-            return;
-        };
+        let message_id = message_id?;
         let directory = directory
             .map(str::to_string)
             .filter(|directory| !directory.is_empty())
@@ -1504,7 +1513,9 @@ impl Turn {
             && previous.card_message_id != card_message_id
         {
             crate::bridge::reap::collect_orphan(cards, session_id, &previous.card_message_id).await;
+            return Some(previous);
         }
+        None
     }
 
     /// Make `card_message_id` the session's live card, taking the chain over
@@ -1519,14 +1530,18 @@ impl Turn {
     ///
     /// `directory` is the Session's directory when the caller knows it; `None`
     /// falls back to the card's own work context (see [`Self::track_live_card`]).
+    /// Returns the predecessor record this takeover collected, when it named a
+    /// different card (see [`Self::track_live_card`]) — the fresh-Turn path
+    /// reads the orphan's anchor from it to carry its running tools (ADR-0068);
+    /// every other caller ignores it.
     pub(crate) async fn take_over_card(
         cards: &CardsHandle,
         session_id: &str,
         card_message_id: &str,
         directory: Option<&str>,
-    ) {
+    ) -> Option<LiveCard> {
         Self::attach_card_message_id(cards, session_id, card_message_id).await;
-        Self::track_live_card(cards, session_id, card_message_id, true, directory).await;
+        Self::track_live_card(cards, session_id, card_message_id, true, directory).await
     }
 
     /// Attach `card_message_id` to the session's in-memory card, when it still
@@ -1535,6 +1550,57 @@ impl Turn {
         if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
             card.card_message_id = Some(card_message_id.to_string());
         }
+    }
+
+    /// Carry the orphaned Turn's still-running tool calls onto this fresh
+    /// card's live tail (ADR-0068): a bounded, newest-first Session Transcript
+    /// tail read scoped by the orphan's anchor, its `running`/`pending` calls
+    /// seeded by call identity, display-only. A record with no anchor carries
+    /// nothing; a failed, timed-out or page-cap-stopped read carries nothing
+    /// and leaves today's takeover exactly as it was. One INFO line records
+    /// the decision (session + outcome, never chat content).
+    ///
+    /// Only a fresh Turn's takeover calls this: a Wake continuation keeps
+    /// ADR-0061's no-replay scope and the reap/external arms never carry.
+    async fn carry_orphan_tools(handles: &TurnHandles, session_id: &str, orphan: &LiveCard) {
+        let Some(anchor) = orphan.anchor() else {
+            tracing::info!("restart carry: session {session_id} none (no anchor)");
+            return;
+        };
+        let read = crate::bridge::bounded_call(
+            "restart carry transcript tail",
+            handles.config.follow_read_timeout_ms(),
+            handles
+                .backend
+                .transcript_tail(session_id, anchor.in_flight_boundary_ms()),
+        )
+        .await;
+        let tail = match read {
+            Some(Ok(tail)) => tail,
+            Some(Err(error)) => {
+                tracing::debug!("restart carry: session {session_id} tail read failed: {error}");
+                tracing::info!("restart carry: session {session_id} none (read failed)");
+                return;
+            }
+            None => {
+                tracing::info!("restart carry: session {session_id} none (read timed out)");
+                return;
+            }
+        };
+        if !tail.complete {
+            tracing::info!("restart carry: session {session_id} none (page cap)");
+            return;
+        }
+        let calls = tail.transcript.turn_running_tools(&anchor);
+        let carried = {
+            let mut live = handles.cards.cards.lock().await;
+            match live.get_mut(session_id) {
+                Some(card) => card.acc.carry_tools(&calls),
+                // The card was replaced in the released moment: nothing to seed.
+                None => 0,
+            }
+        };
+        tracing::info!("restart carry: session {session_id} carried {carried}");
     }
 
     /// Drop `session_id`'s durable record once its terminal card's ending write

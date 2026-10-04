@@ -337,6 +337,23 @@ impl OpenCodeBackend {
         Ok(transcript)
     }
 
+    /// The newest end of the session's transcript as a bounded, newest-first
+    /// tail scan (ADR-0068), with this cola life's runtime retirements applied
+    /// like every other transcript read. See
+    /// [`crate::backend::Backend::transcript_tail`].
+    pub async fn transcript_tail(
+        &self,
+        session_id: &str,
+        boundary_ms: i64,
+    ) -> crate::error::Result<crate::backend::TranscriptTail> {
+        let mut tail = self
+            .strategy()
+            .transcript_tail(&self.transport, session_id, boundary_ms)
+            .await?;
+        self.retirements.apply(session_id, &mut tail.transcript);
+        Ok(tail)
+    }
+
     /// Record the Background Tasks a runtime reconciliation retired (issue
     /// #454). See [`crate::backend::Backend::retire_background_tasks`].
     pub fn retire_background_tasks(&self, session_id: &str, call_ids: &[String]) {

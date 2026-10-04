@@ -539,6 +539,22 @@ fn render_turn_parts(acc: &mut StreamAccumulator, transcript: &SessionTranscript
             }
         }
     }
+    // Carried Tool Panels (ADR-0068): a restart takeover seeds the orphaned
+    // Turn's running calls; every render read resolves each carried identity
+    // against the WHOLE read — PAST the Turn window, whose membership would
+    // drop the long-running call's message — so the panel keeps the
+    // transcript's current status and output, and its settlement joins the
+    // timeline at the server start key it was born with (ADR-0045). The
+    // ordinary tool dedup applies, so a call the window ALSO renders is not
+    // duplicated and a repeated read of an unchanged call is skipped.
+    let carried: Vec<String> = acc.carried_calls.iter().cloned().collect();
+    for call_id in carried {
+        if let Some(call) = transcript.tool_call(&call_id)
+            && render_part(acc, &Part::Tool(call.clone()))
+        {
+            rendered_any = true;
+        }
+    }
     rendered_any
 }
 
@@ -954,7 +970,7 @@ mod tests {
     use super::*;
     use crate::backend::{
         BackgroundTask, MessageId, MessageRole, MessageTime, ReasoningPart, StepFinish, StepStart, ToolCall,
-        ToolIdentity, ToolOutput, TranscriptMessage, TurnAnchor,
+        ToolIdentity, ToolOutput, TranscriptMessage, TurnAnchor, TurnSettle,
     };
     use crate::bridge::App;
     use crate::bridge::test_support::{
@@ -1453,6 +1469,279 @@ Index: /x/src/main.rs
             &mut acc,
             &transcript(Some(2_500), ToolStatus::Completed, "research done")
         ));
+    }
+
+    // --- The restart carry (ADR-0068) ---------------------------------------
+    //
+    // A tool that settled while cola was down is deliberately out of scope
+    // here: the faithful no-duplicate/no-omission restore of missed content is
+    // #505's question, not a tail carry's (ADR-0068's scope decision).
+
+    /// Regression for the restart carry (ADR-0068): a running call inside the
+    /// in-flight window already renders onto the successor through the ordinary
+    /// transcript render — no carry needed — and its completion settles it into
+    /// the timeline exactly once. The probe that pinned this behavior becomes
+    /// the regression the carry must not break.
+    #[test]
+    fn a_recent_inflight_tool_already_renders_on_the_successor() {
+        let anchor = 2_000_000;
+        let transcript = |status: ToolStatus, output: Option<&str>| {
+            SessionTranscript::new(vec![
+                typed_message(
+                    "msg_cola_new",
+                    MessageRole::User,
+                    Some(anchor),
+                    vec![text_part("新的问题")],
+                ),
+                message_in_flight(
+                    "a_inflight",
+                    anchor - 60_000,
+                    None,
+                    vec![tool(
+                        "shell",
+                        "call_sleep",
+                        status,
+                        Some(anchor - 30_000),
+                        Some(serde_json::json!({"command": "sleep 600"})),
+                        output,
+                    )],
+                ),
+            ])
+        };
+
+        let mut acc = StreamAccumulator::new("proj");
+        acc.cola_message_id = Some("msg_cola_new".into());
+        assert!(render_new_turn_parts(
+            &mut acc,
+            &transcript(ToolStatus::Running, None)
+        ));
+        assert_eq!(acc.tools["call_sleep"].status(), &ToolStatus::Running);
+        let (card, full) = acc.build_card_with_split();
+        assert!(!full, "a live card with only a tail panel must not split");
+        assert!(
+            card_text(&card).contains("⏳ shell"),
+            "the running panel must ride the successor's live tail: {card}"
+        );
+
+        // The tool completes while its message is still inside the window: the
+        // settled panel joins the successor's timeline, exactly once.
+        assert!(render_new_turn_parts(
+            &mut acc,
+            &transcript(ToolStatus::Completed, Some("slept"))
+        ));
+        assert_eq!(acc.tools["call_sleep"].status(), &ToolStatus::Completed);
+        let text = card_text(&acc.build_card_with_split().0);
+        assert_eq!(text.matches("slept").count(), 1, "settled once: {text}");
+        assert!(!render_new_turn_parts(
+            &mut acc,
+            &transcript(ToolStatus::Completed, Some("slept"))
+        ));
+    }
+
+    /// ADR-0068: a call older than the in-flight window is dropped by the
+    /// successor's own render, so the takeover carries the orphan Turn's
+    /// running call — the successor's live tail shows `⏳`, and its completion
+    /// renders exactly once, joining the timeline at its server start key. A
+    /// later transcript render of the same call does not duplicate it.
+    #[test]
+    fn a_stale_inflight_tool_is_carried_and_settles_once_into_the_timeline() {
+        let anchor = 2_000_000;
+        let orphan = TurnAnchor {
+            message_id: MessageId::new("msg_cola_old"),
+            created_ms: anchor - 31 * 60_000,
+        };
+        let stale_tool = |status: ToolStatus, output: Option<&str>| {
+            vec![tool(
+                "shell",
+                "call_sleep",
+                status,
+                Some(anchor - 11 * 60_000),
+                Some(serde_json::json!({"command": "sleep 3600"})),
+                output,
+            )]
+        };
+        let transcript = |status: ToolStatus, output: Option<&str>| {
+            SessionTranscript::new(vec![
+                typed_message(
+                    "msg_cola_new",
+                    MessageRole::User,
+                    Some(anchor),
+                    vec![text_part("新的问题")],
+                ),
+                message_in_flight("a_stale", anchor - 30 * 60_000, None, stale_tool(status, output)),
+            ])
+        };
+
+        let mut acc = StreamAccumulator::new("proj");
+        acc.cola_message_id = Some("msg_cola_new".into());
+        // The takeover seeds the orphan Turn's running calls before the prompt.
+        assert_eq!(
+            acc.carry_tools(&transcript(ToolStatus::Running, None).turn_running_tools(&orphan)),
+            1,
+            "the orphan's running call is the carry set"
+        );
+        render_new_turn_parts(&mut acc, &transcript(ToolStatus::Running, None));
+        assert_eq!(acc.tools["call_sleep"].status(), &ToolStatus::Running);
+        let (card, full) = acc.build_card_with_split();
+        assert!(!full, "a live card with only a tail panel must not split");
+        assert!(
+            card_text(&card).contains("⏳ shell"),
+            "the carried call rides the successor's live tail: {card}"
+        );
+
+        // The tool completes while its message stays stale: the carried
+        // identity reconciles it past the Turn window, so the panel leaves the
+        // tail and joins the timeline at its server start key — exactly once.
+        let settled = SessionTranscript::new(vec![
+            typed_message(
+                "msg_cola_new",
+                MessageRole::User,
+                Some(anchor),
+                vec![text_part("新的问题")],
+            ),
+            message_in_flight(
+                "a_stale",
+                anchor - 30 * 60_000,
+                None,
+                stale_tool(ToolStatus::Completed, Some("slept")),
+            ),
+            message("a_new", anchor + 1_000, vec![text_part("新回答")]),
+        ]);
+        assert!(render_new_turn_parts(&mut acc, &settled));
+        assert!(!acc.tools["call_sleep"].is_live());
+        let text = card_text(&acc.build_card_with_split().0);
+        assert_eq!(text.matches("slept").count(), 1, "settled once: {text}");
+        assert!(
+            text.find("slept") < text.find("新回答"),
+            "the settled call joins at its server start key, before later content: {text}"
+        );
+        assert!(!render_new_turn_parts(&mut acc, &settled));
+        let text = card_text(&acc.build_card_with_split().0);
+        assert_eq!(
+            text.matches("slept").count(),
+            1,
+            "a later transcript render does not duplicate the call: {text}"
+        );
+    }
+
+    /// The carry is scoped to the orphan Turn's projection: an older, unrelated
+    /// turn's stale `running` part is never resurrected on the successor.
+    #[test]
+    fn only_the_orphan_turns_running_calls_are_carried() {
+        let orphan = TurnAnchor {
+            message_id: MessageId::new("msg_cola_old"),
+            created_ms: 1_000_000,
+        };
+        let transcript = SessionTranscript::new(vec![
+            // An unrelated older turn's stale running part: created before the
+            // orphan's anchor, its newest activity long past the window.
+            message_in_flight(
+                "a_older",
+                1_000_000 - 30 * 60_000,
+                None,
+                vec![tool(
+                    "shell",
+                    "call_ghost",
+                    ToolStatus::Running,
+                    Some(1_000_000 - 29 * 60_000),
+                    Some(serde_json::json!({"command": "sleep 9999"})),
+                    None,
+                )],
+            ),
+            // The orphan Turn's own still-running call.
+            message_in_flight(
+                "a_orphan",
+                1_000_000 + 5_000,
+                None,
+                vec![tool(
+                    "shell",
+                    "call_sleep",
+                    ToolStatus::Running,
+                    Some(1_000_000 + 5_000),
+                    Some(serde_json::json!({"command": "sleep 3600"})),
+                    None,
+                )],
+            ),
+        ]);
+
+        let carried: Vec<String> = transcript
+            .turn_running_tools(&orphan)
+            .iter()
+            .map(|call| call.identity.call_id.clone())
+            .collect();
+        assert_eq!(
+            carried,
+            ["call_sleep"],
+            "only the orphan Turn's running call belongs to the carry set"
+        );
+    }
+
+    /// A killed run's carried call reconciles to the transcript's final status
+    /// on every render read — beyond the Turn window — and never outlives the
+    /// Turn: the panel invents no ending while the transcript says `running`,
+    /// and the successor's own settle decision is untouched by it. When the
+    /// transcript finally records a status, the panel takes it and settles.
+    #[test]
+    fn a_carried_call_beyond_the_window_reconciles_on_every_render_read() {
+        let anchor = 2_000_000;
+        let new_anchor = TurnAnchor {
+            message_id: MessageId::new("msg_cola_new"),
+            created_ms: anchor,
+        };
+        let orphan = TurnAnchor {
+            message_id: MessageId::new("msg_cola_old"),
+            created_ms: anchor - 31 * 60_000,
+        };
+        let transcript = |status: ToolStatus, output: Option<&str>| {
+            SessionTranscript::new(vec![
+                typed_message(
+                    "msg_cola_new",
+                    MessageRole::User,
+                    Some(anchor),
+                    vec![text_part("新的问题")],
+                ),
+                message_in_flight(
+                    "a_stale",
+                    anchor - 30 * 60_000,
+                    None,
+                    vec![tool(
+                        "shell",
+                        "call_sleep",
+                        status,
+                        Some(anchor - 11 * 60_000),
+                        Some(serde_json::json!({"command": "sleep 3600"})),
+                        output,
+                    )],
+                ),
+            ])
+        };
+
+        let mut acc = StreamAccumulator::new("proj");
+        acc.cola_message_id = Some("msg_cola_new".into());
+        acc.carry_tools(&transcript(ToolStatus::Running, None).turn_running_tools(&orphan));
+        // Repeated reads while the transcript says running: the carried panel
+        // stays truthfully live and never invents an ending.
+        for _ in 0..3 {
+            render_new_turn_parts(&mut acc, &transcript(ToolStatus::Running, None));
+            assert!(
+                acc.tools["call_sleep"].is_live(),
+                "a killed run's carried call keeps the transcript's running status"
+            );
+        }
+        assert_eq!(
+            transcript(ToolStatus::Running, None).settle(Some(&new_anchor)),
+            TurnSettle::Complete,
+            "the carried panel is display-only: the Turn's settle decision is unchanged"
+        );
+
+        // The transcript finally records the failed run: the panel reconciles.
+        assert!(render_new_turn_parts(
+            &mut acc,
+            &transcript(ToolStatus::Error, Some("killed"))
+        ));
+        assert!(!acc.tools["call_sleep"].is_live());
+        let text = card_text(&acc.build_card_with_split().0);
+        assert_eq!(text.matches("killed").count(), 1, "reconciled once: {text}");
     }
 
     /// The header date reads the SERVER's time for the turn's user message

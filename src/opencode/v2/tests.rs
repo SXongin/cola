@@ -348,6 +348,211 @@ async fn transcript_follows_the_body_cursor_in_ascending_order() {
     }
 }
 
+/// The carry's tail read (ADR-0068): pages DESCENDING, first request carries
+/// `order=desc` (a cursor must never be combined with it), and the scan stops
+/// on the page whose oldest message's newest activity predates the boundary —
+/// one request when the newest page already crosses it. The collected pages
+/// are returned in transcript (ascending) order.
+#[tokio::test]
+async fn transcript_tail_scans_descending_to_the_boundary_in_one_page() {
+    let server = TestHttpServer::start().await;
+    server.route(
+        "GET",
+        "/api/session/ses_1/message",
+        200,
+        serde_json::json!({
+            "data": [
+                {"id": "msg_a2", "type": "assistant",
+                 "time": {"created": 1700000002000i64, "completed": 1700000002500i64},
+                 "content": [{"type": "text", "text": "新"}]},
+                {"id": "msg_u1", "type": "user", "time": {"created": 1700000000000i64}, "text": "旧"},
+            ],
+            "cursor": {"next": "c1"},
+        })
+        .to_string(),
+    );
+    let client = v2_wire_client(&server);
+
+    // The boundary sits between the two messages' newest activity.
+    let tail = client.transcript_tail("ses_1", 1700000001000).await.unwrap();
+
+    assert!(tail.complete, "the crossing page completes the scan");
+    let ids: Vec<&str> = tail.transcript.messages.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(ids, ["msg_u1", "msg_a2"], "the tail returns in transcript order");
+    assert_eq!(
+        wired_requests(&server).len(),
+        1,
+        "the crossing page ends the scan"
+    );
+    let request = request_at(&server, 0);
+    assert_eq!(request.path, "/api/session/ses_1/message");
+    assert_eq!(request.query_param("order").as_deref(), Some("desc"));
+    assert_eq!(request.query_param("limit").as_deref(), Some("200"));
+    assert_eq!(
+        request.query_param("cursor"),
+        None,
+        "the first page has no cursor"
+    );
+}
+
+/// A page with no unfinished message does NOT end the scan — another client
+/// can queue messages above the orphan's unfinished call — so the scan
+/// follows `cursor.next` until a page's oldest message crosses the boundary.
+#[tokio::test]
+async fn transcript_tail_keeps_scanning_past_a_page_with_no_unfinished_message() {
+    let server = TestHttpServer::start().await;
+    server.route_sequence(
+        "GET",
+        "/api/session/ses_1/message",
+        vec![
+            MockResponse::json(
+                serde_json::json!({
+                    "data": [
+                        {"id": "msg_a3", "type": "assistant",
+                         "time": {"created": 1700000003000i64, "completed": 1700000003500i64},
+                         "content": [{"type": "text", "text": "新"}]},
+                        {"id": "msg_a2", "type": "assistant",
+                         "time": {"created": 1700000002000i64, "completed": 1700000002500i64},
+                         "content": [{"type": "text", "text": "稍旧"}]},
+                    ],
+                    "cursor": {"next": "c1"},
+                })
+                .to_string(),
+            ),
+            MockResponse::json(
+                serde_json::json!({
+                    "data": [
+                        {"id": "msg_u1", "type": "user", "time": {"created": 1700000000000i64}, "text": "旧"},
+                    ],
+                    "cursor": {"next": "c2"},
+                })
+                .to_string(),
+            ),
+        ],
+    );
+    let client = v2_wire_client(&server);
+
+    let tail = client.transcript_tail("ses_1", 1700000001000).await.unwrap();
+
+    assert!(tail.complete, "the boundary page completes the scan");
+    let ids: Vec<&str> = tail.transcript.messages.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(ids, ["msg_u1", "msg_a2", "msg_a3"]);
+    assert_eq!(wired_requests(&server).len(), 2, "the scan followed one cursor");
+    let second = request_at(&server, 1);
+    assert_eq!(second.query_param("cursor").as_deref(), Some("c1"));
+    assert_eq!(
+        second.query_param("order"),
+        None,
+        "a cursor must never be combined with order (V2 answers InvalidCursorError)"
+    );
+}
+
+/// A page whose oldest message carries no server time cannot be placed, so the
+/// scan continues rather than stopping on an unknown.
+#[tokio::test]
+async fn transcript_tail_keeps_scanning_when_the_oldest_message_has_no_time() {
+    let server = TestHttpServer::start().await;
+    server.route_sequence(
+        "GET",
+        "/api/session/ses_1/message",
+        vec![
+            MockResponse::json(
+                serde_json::json!({
+                    "data": [{"id": "msg_n", "type": "assistant", "content": []}],
+                    "cursor": {"next": "c1"},
+                })
+                .to_string(),
+            ),
+            MockResponse::json(
+                serde_json::json!({
+                    "data": [{"id": "msg_u1", "type": "user", "time": {"created": 1700000000000i64}, "text": "旧"}],
+                    "cursor": {},
+                })
+                .to_string(),
+            ),
+        ],
+    );
+    let client = v2_wire_client(&server);
+
+    let tail = client.transcript_tail("ses_1", 1700000001000).await.unwrap();
+
+    assert!(tail.complete);
+    assert_eq!(
+        tail.transcript.messages.first().map(|m| m.id.as_str()),
+        Some("msg_u1"),
+        "the older, placed page is followed"
+    );
+    assert_eq!(wired_requests(&server).len(), 2);
+}
+
+/// The session's start completes the scan: an empty end page means there is
+/// nothing older to cross the boundary with.
+#[tokio::test]
+async fn transcript_tail_completes_on_the_empty_end_page() {
+    let server = TestHttpServer::start().await;
+    server.route_sequence(
+        "GET",
+        "/api/session/ses_1/message",
+        vec![
+            MockResponse::json(
+                serde_json::json!({
+                    "data": [{"id": "msg_a1", "type": "assistant",
+                              "time": {"created": 1700000003000i64, "completed": 1700000003500i64},
+                              "content": [{"type": "text", "text": "新"}]}],
+                    "cursor": {"next": "c1"},
+                })
+                .to_string(),
+            ),
+            MockResponse::json(serde_json::json!({"data": [], "cursor": {"previous": "c1"}}).to_string()),
+        ],
+    );
+    let client = v2_wire_client(&server);
+
+    let tail = client.transcript_tail("ses_1", 1700000001000).await.unwrap();
+
+    assert!(tail.complete, "an empty page is the session's start");
+    assert_eq!(tail.transcript.messages.len(), 1);
+    assert_eq!(wired_requests(&server).len(), 2);
+}
+
+/// A scan the page cap stops reports `complete: false`: the carry then carries
+/// nothing rather than guessing from a partial tail.
+#[tokio::test]
+async fn transcript_tail_reports_a_page_cap_stop_as_incomplete() {
+    let server = TestHttpServer::start().await;
+    let page = |index: usize| {
+        MockResponse::json(
+            serde_json::json!({
+                "data": [{"id": format!("msg_{index}"), "type": "assistant",
+                          "time": {"created": 1700000000000i64 - index as i64 * 1000,
+                                   "completed": 1700000000000i64 - index as i64 * 1000}}],
+                "cursor": {"next": format!("c{index}")},
+            })
+            .to_string(),
+        )
+    };
+    server.route_sequence(
+        "GET",
+        "/api/session/ses_1/message",
+        (0..super::MAX_TAIL_PAGES + 2).map(page).collect(),
+    );
+    let client = v2_wire_client(&server);
+
+    // Every page stays newer than the boundary: nothing ever crosses it.
+    let tail = client.transcript_tail("ses_1", 1).await.unwrap();
+
+    assert!(!tail.complete, "a cap stop must never read as a complete tail");
+    assert_eq!(
+        wired_requests(&server).len(),
+        super::MAX_TAIL_PAGES,
+        "the scan is bounded by the page cap"
+    );
+    assert!(
+        !tail.transcript.messages.is_empty(),
+        "the partial tail is returned as read"
+    );
+}
+
 /// A failed transcript read names itself and carries the body preview; a
 /// garbled body is a parse error, never a silently empty transcript.
 #[tokio::test]

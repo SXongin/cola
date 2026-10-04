@@ -7,7 +7,7 @@
 //! Turn module, and every read or write goes through a `Turn::` method. The
 //! accumulator's own tests are the module's internal seam.
 
-use crate::backend::{SessionTranscript, TurnAnchor};
+use crate::backend::{SessionTranscript, ToolCall, ToolStatus, TurnAnchor};
 use crate::bridge::handles::CardsHandle;
 use crate::feishu::card::first_n_chars_bytes;
 use crate::feishu::card::ledger::{TaskCompletionEntry, TaskKind, TaskLedgerRow};
@@ -531,6 +531,15 @@ pub(super) struct StreamAccumulator {
     /// strand it on a closed card; it joins `timeline` — with the identity it
     /// was born with — only when the tool settles (ADR-0045).
     live_tools: IndexMap<String, LiveTool>,
+    /// The **Carried Tool Panels**' call ids (ADR-0068): the orphaned Turn's
+    /// still-running calls a restart takeover seeded into this successor. The
+    /// set is the reconciliation scope — every render read resolves each id
+    /// against the WHOLE transcript, past the Turn window whose membership
+    /// would drop a long-running call's message — so the panel keeps the
+    /// transcript's current status and output and joins the timeline at its
+    /// server start key once it settles. In-memory only, never durable; empty
+    /// for every card that did not take over an orphan.
+    pub(super) carried_calls: std::collections::HashSet<String>,
     /// The latest `todowrite` panel of this turn, rendered as a card-TAIL
     /// status section instead of a timeline row. A timeline row would freeze on
     /// whichever card the call landed on: once that card finalizes (a long
@@ -1485,6 +1494,32 @@ impl StreamAccumulator {
         // A running-tool phase starts/exits here (running → completed), so the
         // header timer must follow even though card_state stays Streaming.
         self.refresh_phase();
+    }
+
+    /// Seed the orphaned Turn's still-running calls into this successor
+    /// (ADR-0068): each call enters the live tail by call identity exactly as
+    /// a rendered running panel would ([`Self::push_tool_at`]), and its id is
+    /// remembered so every later render read reconciles it past the Turn
+    /// window. Returns how many calls were carried; an already-settled call is
+    /// never carried — the carry set is the orphan's live tool signals only.
+    pub(super) fn carry_tools(&mut self, calls: &[ToolCall]) -> usize {
+        let mut carried = 0;
+        for call in calls.iter().filter(|call| call.status.is_live()) {
+            self.carried_calls.insert(call.identity.call_id.clone());
+            self.push_tool_at(
+                call.started_at,
+                &call.identity.call_id,
+                ToolPanel::new(call.clone()),
+            );
+            // Mirror the render's running-tool arm: a carried running call is
+            // live content, so the card reads Streaming (ADR-0014) and its
+            // first flush cannot leave the header at Loading.
+            if call.status == ToolStatus::Running {
+                self.card_state = crate::feishu::card::CardState::Streaming;
+            }
+            carried += 1;
+        }
+        carried
     }
 
     /// The live `task`/`subagent` panels' (call id, child Session id) pairs

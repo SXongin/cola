@@ -286,6 +286,16 @@ pub trait Backend: Send + Sync {
     /// the caller.
     async fn transcript(&self, session_id: &str) -> Result<SessionTranscript>;
 
+    /// Read the newest end of one Session's transcript as a bounded,
+    /// newest-first tail scan that stops once a page's oldest message predates
+    /// `boundary_ms` (ADR-0068). The common case is one request; a small page
+    /// cap bounds the worst case and reports it via
+    /// [`TranscriptTail::complete`], so the caller carries nothing from a
+    /// partial scan. A generation with no wire pagination reads its one
+    /// standard message array and reports it complete; every generation's read
+    /// is bounded by the caller's own timeout.
+    async fn transcript_tail(&self, session_id: &str, boundary_ms: i64) -> Result<TranscriptTail>;
+
     /// The server's live run state for one session (`GET /session/status`).
     /// `directory` selects the instance (ADR-0010). A successful read always
     /// yields a status (absent = idle); `Ok(None)` is an unrecognised status
