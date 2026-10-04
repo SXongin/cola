@@ -15,8 +15,8 @@
 # (`permission-profile: ":read-only"` + the default `drop-sudo`).
 #
 # Timing caveat: the OpenCode gate reads the *last* `github-actions[bot]`
-# comment for its verdict, so when using the label trigger wait until the
-# `OpenCode Review` run for the current commit has finished before labeling.
+# comment for its verdict, so wait until the `OpenCode Review` run for the
+# current commit has finished before labeling or dispatching a trial.
 name: Codex Review Trial
 
 on:
@@ -30,8 +30,11 @@ on:
     types: [labeled]
 
 concurrency:
+  # Never cancel an in-flight trial: this workflow listens to every `labeled`
+  # event (the job `if` filters them), so cancel-in-progress would let an
+  # unrelated label kill a running trial.
   group: codex-trial-${{ github.event.pull_request.number || inputs.pr }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -52,7 +55,6 @@ jobs:
       pull-requests: write
     env:
       PR: ${{ github.event.pull_request.number || inputs.pr }}
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -62,13 +64,19 @@ jobs:
 
       # The prompt = the committed rubric + this PR's metadata + its linked
       # issue when one can be fetched, so the reviewer does not depend on
-      # network access inside the read-only sandbox.
+      # network access inside the read-only sandbox. GH_TOKEN stays on this
+      # step and the posting step only — never in the Codex step's
+      # environment, where prompt-injected PR content could read it.
       - name: Build the review prompt
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          gh pr view "$PR" --json number,title,body,url,baseRefOid,headRefOid > pr.json
+          gh pr view "$PR" --json number,title,body,url,baseRefOid > pr.json
           base=$(jq -r .baseRefOid pr.json)
-          head=$(jq -r .headRefOid pr.json)
+          # The prompt must describe the tree actually checked out, not a head
+          # that moved between checkout and this call.
+          head=$(git rev-parse HEAD)
           issue=$(jq -r '.body // ""' pr.json \
             | grep -oE '(Closes|Fixes|Resolves|Refs|Part of) #[0-9]+' \
             | grep -oE '[0-9]+' | head -1 || true)
@@ -112,6 +120,8 @@ jobs:
           output-file: codex-output.md
 
       - name: Post the review as a comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           if [ ! -s codex-output.md ]; then
