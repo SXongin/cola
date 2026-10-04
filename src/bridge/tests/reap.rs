@@ -1590,12 +1590,14 @@ async fn an_anchorless_record_reads_no_tail() {
     );
 }
 
-/// A killed run's carried call does not hang the Turn: the transcript never
-/// settles it, yet the successor still ends ✅ by its own settle decision, so
-/// no carried panel outlives the Turn. (The panel itself stays faithful to the
-/// transcript's final status — the run was never completed.)
+/// A killed run's carried call does not outlive the Turn: the transcript never
+/// settles it, yet the follow still ends ✅ by the Turn's own settle decision
+/// (the carried panel is display-only), and the settled card omits the
+/// still-running panel — no permanent `⏳` survives the Turn. A genuinely
+/// running call keeps its panel while the successor is live; only the
+/// end-of-turn card drops it, because no renderer will ever update it again.
 #[tokio::test]
-async fn a_killed_runs_carried_call_does_not_hang_the_turn() {
+async fn a_killed_runs_carried_call_does_not_outlive_the_turn() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("sessions.json");
@@ -1625,7 +1627,11 @@ async fn a_killed_runs_carried_call_does_not_hang_the_turn() {
         user("msg_cola_new", new_anchor, "新问题"),
         assistant(new_anchor + 1_000, "新回答"),
     ]);
-    let (app, platform, _backend, gate) = carried_app(&session_file, live, tail, SessionStatus::Idle).await;
+    let (app, platform, backend, gate) = carried_app(&session_file, live, tail, SessionStatus::Busy).await;
+    // The drain bound hands the card to the follow, where the live-panel guard
+    // would otherwise keep waiting on the carried call.
+    app.turn_drain_timeout_ms
+        .store(30, std::sync::atomic::Ordering::Relaxed);
 
     let mut context = ctx("ses_test", "新问题");
     context.cola_message_id = Some("msg_cola_new".into());
@@ -1636,10 +1642,27 @@ async fn a_killed_runs_carried_call_does_not_hang_the_turn() {
     gate.add_permits(1);
     tokio::time::timeout(Duration::from_secs(5), turn)
         .await
-        .expect("the turn must end")
+        .expect("the turn must hand off at the drain bound")
         .unwrap()
         .unwrap();
+    // The follow observes an idle session; the carried call is display-only, so
+    // it neither extends the settle decision nor outlives the Turn.
+    backend
+        .set_session_status("ses_test", Some(SessionStatus::Idle))
+        .await;
     wait_for_card_header(&platform, "✅").await;
+
+    let cards = platform.updated_cards().await;
+    let settled = cards
+        .iter()
+        .rev()
+        .find(|card| card_header(card).contains("✅"))
+        .expect("the follow settled the card ✅");
+    let text = card_text(settled);
+    assert!(
+        !text.contains("⏳ shell"),
+        "a killed run's carried call must not leave a permanent running panel: {text}"
+    );
 }
 
 /// A record naming a card this process still holds is that card's own

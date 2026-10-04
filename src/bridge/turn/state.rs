@@ -532,13 +532,17 @@ pub(super) struct StreamAccumulator {
     /// was born with — only when the tool settles (ADR-0045).
     live_tools: IndexMap<String, LiveTool>,
     /// The **Carried Tool Panels**' call ids (ADR-0068): the orphaned Turn's
-    /// still-running calls a restart takeover seeded into this successor. The
-    /// set is the reconciliation scope — every render read resolves each id
-    /// against the WHOLE transcript, past the Turn window whose membership
-    /// would drop a long-running call's message — so the panel keeps the
-    /// transcript's current status and output and joins the timeline at its
-    /// server start key once it settles. In-memory only, never durable; empty
-    /// for every card that did not take over an orphan.
+    /// still-running calls a restart takeover seeded into this successor, while
+    /// they remain live. The set is the reconciliation scope — every render
+    /// read resolves each id against the WHOLE transcript, past the Turn window
+    /// whose membership would drop a long-running call's message — so the panel
+    /// keeps the transcript's current status and output and joins the timeline
+    /// at its server start key once it settles (the id then leaves the set).
+    /// Carried panels are display-only: they render only while a live renderer
+    /// owns the card (a settled/end-of-turn card omits a still-running one, so
+    /// no `⏳` outlives the Turn) and never count as the Turn's own unfinished
+    /// tools for the settle guard. In-memory only, never durable; empty for
+    /// every card that did not take over an orphan.
     pub(super) carried_calls: std::collections::HashSet<String>,
     /// The latest `todowrite` panel of this turn, rendered as a card-TAIL
     /// status section instead of a timeline row. A timeline row would freeze on
@@ -1501,10 +1505,15 @@ impl StreamAccumulator {
     /// a rendered running panel would ([`Self::push_tool_at`]), and its id is
     /// remembered so every later render read reconciles it past the Turn
     /// window. Returns how many calls were carried; an already-settled call is
-    /// never carried — the carry set is the orphan's live tool signals only.
+    /// never carried — the carry set is the orphan's live tool signals only —
+    /// and neither is a `todowrite`: the successor's own reads rebuild the todo
+    /// list (ADR-0068's carry set).
     pub(super) fn carry_tools(&mut self, calls: &[ToolCall]) -> usize {
         let mut carried = 0;
-        for call in calls.iter().filter(|call| call.status.is_live()) {
+        for call in calls
+            .iter()
+            .filter(|call| call.status.is_live() && call.identity.name != "todowrite")
+        {
             self.carried_calls.insert(call.identity.call_id.clone());
             self.push_tool_at(
                 call.started_at,
@@ -1823,6 +1832,9 @@ impl StreamAccumulator {
             // card's budget: the todo list, the Background Task Ledger, then
             // every running tool's panel (ADR-0045). When they don't fit, the
             // card finalizes without the tail and the continuation carries it.
+            // A still-running Carried Tool Panel is excluded on a card no live
+            // renderer owns, exactly as `build_card_inner` omits it (ADR-0068):
+            // the reserve must not charge for what the build will not render.
             if let Some(panel) = &self.todo_panel {
                 comps += 1;
                 size += panel_estimate(panel);
@@ -1831,7 +1843,11 @@ impl StreamAccumulator {
                 comps += 1;
                 size += crate::feishu::card::ledger::task_ledger_estimate(&self.ledger);
             }
+            let render_owned = self.card_state.is_render_owned();
             for call_id in self.live_tools.keys() {
+                if !render_owned && self.carried_calls.contains(call_id) {
+                    continue;
+                }
                 if let Some(panel) = self.tools.get(call_id) {
                     comps += 1;
                     size += panel_estimate(panel);
@@ -1889,6 +1905,9 @@ impl StreamAccumulator {
         state_override: Option<CardState>,
     ) -> (serde_json::Value, Vec<crate::bridge::card_handles::BlockSpan>) {
         let state = state_override.unwrap_or_else(|| self.card_state.clone());
+        // Whether a live renderer owns this built card; a still-running
+        // Carried Tool Panel is omitted when none does (ADR-0068).
+        let render_owned = state.is_render_owned();
         // The header shows the Turn's running tool even when THIS slice has no
         // panel for it (a split continuation after `sleep 30` started): pass
         // the accumulator's global selection as the builder's override.
@@ -1989,7 +2008,17 @@ impl StreamAccumulator {
             // running tool's Permission/Question below its own panel. A split
             // finalizes the card without them; they continue on the newest
             // card and join the timeline once they settle (ADR-0045).
+            //
+            // A still-running Carried Tool Panel (ADR-0068) rides the tail only
+            // while a live renderer owns the card: once the card is settled (or
+            // yielded), no renderer will ever update the panel again, so it must
+            // not keep showing a `⏳` that can never move — it never outlives the
+            // Turn. A carried call that settled before the end is a timeline
+            // entry and still renders below/above like any other.
             for (call_id, live) in &self.live_tools {
+                if !render_owned && self.carried_calls.contains(call_id) {
+                    continue;
+                }
                 if let Some(panel) = self.tools.get(call_id) {
                     builder = builder.with_tool_at(
                         panel.clone(),

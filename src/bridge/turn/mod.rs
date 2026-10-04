@@ -2254,20 +2254,26 @@ impl Turn {
         })
     }
 
-    /// Whether the session's card still carries an unfinished Tool Panel — a
-    /// call whose status is `running` or `pending` (both render `⏳`). The
-    /// drain follow's Done decision waits for these to settle (#284): the card
-    /// must never read `✅ 完成` over a `⏳` panel.
+    /// Whether the session's card still carries an unfinished Tool Panel the
+    /// Turn owns — a call whose status is `running` or `pending` (both render
+    /// `⏳`). The drain follow's Done decision waits for these to settle (#284):
+    /// the card must never read `✅ 完成` over a `⏳` panel. A still-running
+    /// **Carried Tool Panel** (ADR-0068) is deliberately not one of the Turn's
+    /// own: it is display-only, so it must not extend the settle decision — a
+    /// carried call the Turn's window never renders stops being counted the
+    /// moment it was seeded, and the settled card omits it instead of waiting
+    /// on it. A carried call the window DID render has already left the carry
+    /// set, so today's guard applies to it as before.
     pub(crate) async fn has_live_tools(cards: &CardsHandle, session_id: &str) -> bool {
         cards.cards.lock().await.get(session_id).is_some_and(|c| {
-            c.acc
-                .tools
-                .values()
-                .any(crate::feishu::card::tool_render::ToolPanel::is_live)
-                || c.acc
-                    .todo_panel
-                    .as_ref()
-                    .is_some_and(crate::feishu::card::tool_render::ToolPanel::is_live)
+            c.acc.tools.iter().any(|(call_id, panel)| {
+                !c.acc.carried_calls.contains(call_id)
+                    && crate::feishu::card::tool_render::ToolPanel::is_live(panel)
+            }) || c
+                .acc
+                .todo_panel
+                .as_ref()
+                .is_some_and(crate::feishu::card::tool_render::ToolPanel::is_live)
         })
     }
 
