@@ -14,10 +14,10 @@
 # keeps the Go key inside the proxy process, and runs Codex read-only
 # (`permission-profile: ":read-only"` + the default `drop-sudo`).
 #
-# Timing: the OpenCode gate reads the *last* `github-actions[bot]` comment for
-# its verdict, so a trial comment landing mid-run would hide it. The workflow
-# prevents this structurally: before running (and before posting), it waits
-# for any in-flight `OpenCode Review` run on this PR's branch to finish.
+# Interference: the OpenCode gate approves by reading the *last* bot comment,
+# so a trial comment landing mid-run could hide its verdict. That is prevented
+# on the gate side — its readback skips comments carrying this workflow's
+# `<!-- codex-review-trial -->` marker — so the trial can post at any time.
 name: Codex Review Trial
 
 on:
@@ -62,16 +62,6 @@ jobs:
           ref: refs/pull/${{ github.event.pull_request.number || inputs.pr }}/head
           fetch-depth: 0
           persist-credentials: false
-
-      # The gate's approval step scans the last `github-actions[bot]` comment
-      # for its verdict; a trial comment arriving between the gate's review
-      # comment and that readback would hide the verdict and silently skip the
-      # approval. Wait out any in-flight gate run on this branch before
-      # spending tokens on a review that could not be posted.
-      - name: Wait for an in-flight OpenCode gate run
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: bash .github/codex/wait-for-gate.sh "$PR"
 
       # The prompt = the committed rubric + this PR's metadata + its linked
       # issue when one can be fetched, so the reviewer does not depend on
@@ -139,18 +129,21 @@ jobs:
             echo "Codex produced no output." >&2
             exit 1
           fi
-          # Re-check right before posting: a gate run that started while Codex
-          # worked must finish first. Any run able to hide its own verdict
-          # (already past its review post, before its readback) is still
-          # `in_progress` here, so this closes the check-to-post window.
-          bash .github/codex/wait-for-gate.sh "$PR"
+          # A review of a commit the PR has moved past is noise on the PR;
+          # refuse it rather than posting a stale comment.
+          reviewed=$(git rev-parse HEAD)
+          current=$(gh pr view "$PR" --json headRefOid --jq .headRefOid)
+          if [ "$current" != "$reviewed" ]; then
+            echo "PR head moved from $reviewed to $current; not posting a stale review." >&2
+            exit 1
+          fi
           cat codex-output.md >> "$GITHUB_STEP_SUMMARY"
           {
             echo '<!-- codex-review-trial -->'
             echo '## Codex advisory review (trial)'
             echo
             echo '_Not a merge gate — the `OpenCode Review` workflow still approves. This is an independent-reviewer trial: Codex Action on `gpt-6-luna` through the OpenCode Go subscription. See issue #516._'
-            printf '_Reviewed commit: `%s`._\n' "$(git rev-parse HEAD)"
+            printf '_Reviewed commit: `%s`._\n' "$reviewed"
             echo
             cat codex-output.md
           } > comment.md
