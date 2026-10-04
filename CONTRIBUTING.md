@@ -253,19 +253,27 @@ Reviews check two axes separately:
 Flag any place where the diff contradicts an existing ADR explicitly rather than
 silently overriding it.
 
-Every non-draft PR gets an OpenCode review
-(`.github/workflows/opencode-review.yml`, ADR-0034). It runs on `opened`,
+Every non-draft in-repo PR gets a Codex review, except the skips noted below
+(`.github/workflows/codex-review.yml`, ADR-0034). It runs on `opened`,
 `synchronize`, `reopened` and `ready_for_review` with the OpenCode Go
-subscription, reviews the diff on the two axes above, and — when it finds
-nothing blocking — `github-actions[bot]` approves. That approval is what
-satisfies the `main: review` ruleset's required review for solo work. A
-blocking review is a comment with a `FAIL` verdict and no approval, not a
-`request-changes`: Actions bots cannot dismiss their own review and would lock
-the PR. Fork PRs are skipped (no secrets) and Dependabot PRs are skipped
-(upstream's permission check rejects bot actors). Release PRs (`release/*`) are
-skipped too: their diff is a version bump of code already reviewed on `main`,
-and the cut merges with the admin bypass. The admin bypass remains for
-emergencies; the bot can never lock the maintainer out.
+subscription's Responses-compatible endpoint
+(`https://opencode.ai/inference/openai/v1/responses`), reviews the diff
+read-only on
+the two axes above plus an adversarial correctness/test-adequacy pass
+(`.github/codex/prompts/review.md`, model `gpt-6-luna`), and — when it finds
+nothing blocking — `github-actions[bot]` approves. The approval is
+deterministic: the workflow posts the review as a comment, records that
+comment's ID, and the approve step reads back exactly that comment and approves
+only when its final line is `CODEX_REVIEW_VERDICT: PASS`, pinned to the
+reviewed commit. A `FAIL`, a missing marker, or prose after the marker never
+approves. That approval is what satisfies the `main: review` ruleset's required
+review for solo work. A blocking review is a comment with a `FAIL` verdict and
+no approval, not a `request-changes`: Actions bots cannot dismiss their own
+review and would lock the PR. Fork PRs are skipped (no secrets) and Dependabot
+PRs are skipped (their runs get no repository secrets). Release PRs
+(`release/*`) are skipped too: their diff is a version bump of code already
+reviewed on `main`, and the cut merges with the admin bypass. The admin bypass
+remains for emergencies; the bot can never lock the maintainer out.
 
 ## Releasing
 
