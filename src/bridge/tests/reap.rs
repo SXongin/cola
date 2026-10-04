@@ -1064,6 +1064,96 @@ async fn a_failed_stamp_read_leaves_the_card_untouched_until_readable() {
     assert_preserved_body(&patches[0]);
 }
 
+/// A stamp PATCH that fails recoverably is not marked: the next pass retries
+/// it until one lands, and the mark then holds (#443).
+#[tokio::test]
+async fn a_failed_stamp_patch_retries_until_it_lands() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
+
+    let transcript = SessionTranscript::new(vec![user("msg_cola_anchor", 1_000, "问题")]);
+    let (app, platform, backend) =
+        restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Busy)).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+    // The first stamp PATCH fails recoverably (transport class): the write may
+    // not have landed, so the record stays unmarked and the next pass retries.
+    platform
+        .fail_update_transport_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+
+    spawn_sync(&app);
+    wait_for_card_update(&platform, "the retried restart stamp", CardUpdates::Any, |card| {
+        card_header(card).contains("已重启，等待运行结束")
+    })
+    .await;
+    // Further observed passes: the mark holds — no third PATCH.
+    wait_for_status_reads(&backend, "ses_test", 5).await;
+
+    let patches = patches_to(&platform, "om_frozen").await;
+    assert_eq!(
+        patches.len(),
+        2,
+        "the failed attempt and the landing retry, nothing more: {patches:?}"
+    );
+    assert!(
+        patches
+            .iter()
+            .all(|patch| card_header(patch) == "⏳ 已重启，等待运行结束"),
+        "both attempts carry the stamp: {patches:?}"
+    );
+    assert_preserved_body(&patches[1]);
+    assert!(
+        app.cards_handle().live_cards.get("ses_test").is_some(),
+        "a still-live Session keeps its record"
+    );
+}
+
+/// A stamp PATCH that hangs is cut loose by the pass's request bound: it
+/// records nothing, claims nothing, and the next pass retries and lands
+/// (#443) — a stuck Feishu request never freezes Session Sync.
+#[tokio::test]
+async fn a_hung_stamp_patch_is_bounded_and_retried() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
+
+    let transcript = SessionTranscript::new(vec![user("msg_cola_anchor", 1_000, "问题")]);
+    let (app, platform, backend) =
+        restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Busy)).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+    // Park the first stamp PATCH forever; only the pass's own bound (50ms in
+    // tests) can release the tick.
+    let (entered, _release) = platform.pause("update", "om_frozen");
+
+    spawn_sync(&app);
+    entered.notified().await;
+    // The hung attempt was cut loose; the next pass retries and lands.
+    wait_for_card_update(
+        &platform,
+        "the stamp after the hung attempt",
+        CardUpdates::Any,
+        |card| card_header(card).contains("已重启，等待运行结束"),
+    )
+    .await;
+    // Further observed passes: the mark holds — the retry is the only write.
+    wait_for_status_reads(&backend, "ses_test", 5).await;
+
+    let patches = patches_to(&platform, "om_frozen").await;
+    assert_eq!(
+        patches.len(),
+        1,
+        "the hung attempt recorded nothing; exactly the retry landed: {patches:?}"
+    );
+    assert_preserved_body(&patches[0]);
+    assert!(
+        app.cards_handle().live_cards.get("ses_test").is_some(),
+        "a still-live Session keeps its record"
+    );
+}
+
 /// The stamp is not an ending: when the run ends, the transcript-truth settle
 /// reads the card back, replaces the header and spends the record as always
 /// (#443).
