@@ -162,6 +162,39 @@ impl SessionTranscript {
             })
     }
 
+    /// The tool call `call_id`, joined over the WHOLE read — not the Turn
+    /// window, because a caller that owns a call identity (a **Carried Tool
+    /// Panel**, ADR-0068) must still resolve its current status and output
+    /// once the message it came from has gone stale. `None` when the read
+    /// carries no such part; call ids are unique, so the first match is the
+    /// call. The one join the carry's per-read reconciliation reads.
+    pub fn tool_call(&self, call_id: &str) -> Option<&ToolCall> {
+        self.messages
+            .iter()
+            .flat_map(|message| &message.parts)
+            .find_map(|part| match part {
+                Part::Tool(call) if call.identity.call_id == call_id => Some(call),
+                _ => None,
+            })
+    }
+
+    /// The `running`/`pending` tool calls of the Turn anchored at `anchor` —
+    /// the orphaned Turn's projection, membership rule included: only calls
+    /// whose message [`belongs_to_turn`] may be handed to a successor as
+    /// **Carried Tool Panels** (ADR-0068), so an older card's stale `running`
+    /// part is never resurrected. In transcript order.
+    pub fn turn_running_tools(&self, anchor: &TurnAnchor) -> Vec<ToolCall> {
+        self.turn_for_user(anchor)
+            .messages
+            .iter()
+            .flat_map(|message| &message.parts)
+            .filter_map(|part| match part {
+                Part::Tool(call) if call.status.is_live() => Some(call.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The Turn anchor the user message `message_id` carries: the message's
     /// identity together with its server time, one fact (ADR-0026's
     /// `msg_cola_` id is how the Turn knows which message is its own). `None`
@@ -409,8 +442,9 @@ impl TranscriptMessage {
     /// The newest server activity this message reports: its creation time and
     /// the latest part start it carries. The neutral read carries no part end
     /// time, so a part contributes its start only; boundary kinds contribute
-    /// nothing.
-    fn newest_activity_ms(&self, created: i64) -> i64 {
+    /// nothing. `pub` for the tail read's boundary test (ADR-0068), which must
+    /// read exactly the rule the membership check uses.
+    pub fn newest_activity_ms(&self, created: i64) -> i64 {
         self.parts
             .iter()
             .filter_map(Part::started_at)
@@ -516,6 +550,32 @@ impl TokenUsage {
 pub struct TurnAnchor {
     pub message_id: MessageId,
     pub created_ms: i64,
+}
+
+impl TurnAnchor {
+    /// The oldest server activity a message may carry and still belong to this
+    /// Turn's projection (see [`belongs_to_turn`]): the anchor minus the
+    /// in-flight window. A tail read can stop once it is past this line — no
+    /// older message can be the Turn's. One derivation, so the read's bound
+    /// and the membership rule cannot drift.
+    pub fn in_flight_boundary_ms(&self) -> i64 {
+        self.created_ms.saturating_sub(IN_FLIGHT_STALE_AFTER_MS)
+    }
+}
+
+/// The newest end of one Session's transcript, as read by a bounded
+/// newest-first tail scan (ADR-0068): the messages from the newest end back to
+/// (and including) the page that crossed `boundary_ms`.
+///
+/// `complete` reports whether the scan actually reached `boundary_ms` (or the
+/// session's start). `false` means a page cap stopped it early: the tail is a
+/// prefix of the history, NOT a complete view of the window, so a caller that
+/// needs the whole window — the restart carry — must treat it as carrying
+/// nothing rather than guessing from a partial read.
+#[derive(Debug, Clone, Default)]
+pub struct TranscriptTail {
+    pub transcript: SessionTranscript,
+    pub complete: bool,
 }
 
 /// One Turn as read from a transcript: the assistant messages that belong to

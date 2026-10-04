@@ -15,9 +15,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::drain::{
-    assistant, ctx, script_transcript, scripted_app, spawn_sync, spawn_sync_with_timeout, user,
+    assistant, ctx, script_transcript, scripted_app, spawn_sync, spawn_sync_with_timeout, spawn_turn, user,
+    wait_for_card_header, wait_for_card_text,
 };
-use crate::backend::{MessageId, SessionTranscript};
+use crate::backend::{
+    ContentBlock, MessageId, MessageRole, MessageTime, Part, SessionTranscript, ToolCall, ToolIdentity,
+    ToolOutput, ToolStatus, TranscriptMessage, TranscriptTail,
+};
 use crate::bridge::live_cards::{LiveCard, LiveCards};
 use crate::bridge::test_support::*;
 use crate::bridge::turn::Turn;
@@ -1067,6 +1071,577 @@ async fn a_successor_owning_the_session_recollects_after_the_stamp() {
     );
 }
 
+// --- The restart carry (ADR-0068) ------------------------------------------
+//
+// A fresh Turn's takeover over an orphaned card hands the orphan Turn's
+// still-running tool calls to the successor: the bounded, newest-first tail
+// read is scoped by the durable record's anchor, the calls ride the
+// successor's live tail by identity, and a failed/timeout/cap-stopped read
+// carries nothing. A tool that settled while cola was down stays out of scope
+// (#505); the carry is display-only.
+
+/// An assistant message with no completion stamp whose only content is one
+/// `shell` call started at `started_at` — the orphaned Turn's still-running
+/// call (ADR-0068).
+fn in_flight_shell(
+    id: &str,
+    created: i64,
+    call_id: &str,
+    status: ToolStatus,
+    started_at: i64,
+    output: &str,
+) -> TranscriptMessage {
+    TranscriptMessage {
+        id: MessageId::new(id),
+        role: MessageRole::Assistant,
+        time: Some(MessageTime {
+            created,
+            completed: None,
+        }),
+        model: None,
+        tokens: None,
+        error: None,
+        parts: vec![Part::Tool(ToolCall {
+            identity: ToolIdentity {
+                name: "shell".into(),
+                call_id: call_id.into(),
+            },
+            status,
+            started_at: Some(started_at),
+            input: Some(serde_json::json!({"command": "sleep 3600"})),
+            metadata: None,
+            output: ToolOutput {
+                raw: None,
+                blocks: if output.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![ContentBlock::Text(output.to_string())]
+                },
+                error: None,
+            },
+        })],
+    }
+}
+
+/// The ONE INFO line the restart carry's decision logs (ADR-0068) — the
+/// outcome line, never the debug/warn detail a failed or hanging read also
+/// emits. Panics when the count is not one.
+fn carry_info_line(logs: &str) -> &str {
+    let matches: Vec<&str> = logs
+        .lines()
+        .filter(|line| line_level(line) == "INFO" && line.contains("restart carry"))
+        .collect();
+    assert_eq!(
+        matches.len(),
+        1,
+        "exactly one INFO carry decision per takeover:\n{logs}"
+    );
+    matches[0]
+}
+
+/// A restarted app over `session_file` whose session serves `transcript` and
+/// its bounded tail read `tail` (ADR-0068), with the tiny turn cadences the
+/// carry tests need. The returned gate holds every prompt until the test
+/// releases it — the live window in which the carry is observed.
+async fn carried_app(
+    session_file: &Path,
+    transcript: SessionTranscript,
+    tail: TranscriptTail,
+    status: SessionStatus,
+) -> (
+    Arc<App>,
+    Arc<RecordingPlatform>,
+    Arc<MockBackend>,
+    Arc<tokio::sync::Semaphore>,
+) {
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_transcript("ses_test", vec![transcript]);
+    backend.given_transcript_tail("ses_test", vec![tail]);
+    backend.with_session_status("ses_test", Some(status));
+    let gate = backend.hold_prompts();
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(
+        App::new(test_config(session_file), backend.clone(), platform.clone()).expect("the carry app builds"),
+    );
+    seed_session(&app, "ses_test", "/work").await;
+    app.turn_render_poll_ms
+        .store(5, std::sync::atomic::Ordering::Relaxed);
+    app.turn_drain_timeout_ms
+        .store(60_000, std::sync::atomic::Ordering::Relaxed);
+    app.turn_follow_read_timeout_ms
+        .store(20, std::sync::atomic::Ordering::Relaxed);
+    (app, platform, backend, gate)
+}
+
+/// ADR-0068 acceptance: a user message that starts a fresh Turn over the
+/// orphaned card hands the orphan Turn's still-running call to the successor.
+/// The panel rides the successor's live tail, its completion renders exactly
+/// once after its message has gone stale, and the carry is display-only (the
+/// durable record names the new Turn's message; the card still settles ✅).
+#[tokio::test]
+async fn a_restart_takeover_carries_the_orphans_running_tool() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let orphan_anchor = 1_000_000;
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(orphan_anchor));
+    let new_anchor = 2_000_000;
+    // The call started long before the new message: outside its in-flight
+    // window, so only the carry can reach the successor.
+    let started_at = 1_300_000;
+    let orphan = |status: ToolStatus, output: &str| {
+        in_flight_shell(
+            "a_orphan",
+            orphan_anchor + 500,
+            "call_sleep",
+            status,
+            started_at,
+            output,
+        )
+    };
+    // The tail the carry reads: the orphan Turn's own newest end.
+    let tail = TranscriptTail {
+        transcript: SessionTranscript::new(vec![
+            user("msg_cola_anchor", orphan_anchor, "跑个长命令"),
+            orphan(ToolStatus::Running, ""),
+        ]),
+        complete: true,
+    };
+    // The session's newest end: the stale running call, then the new message
+    // whose turn the held prompt keeps in flight.
+    let live = SessionTranscript::new(vec![
+        user("msg_cola_anchor", orphan_anchor, "跑个长命令"),
+        orphan(ToolStatus::Running, ""),
+        user("msg_cola_new", new_anchor, "新问题"),
+    ]);
+    let (app, platform, backend, gate) = carried_app(&session_file, live, tail, SessionStatus::Busy).await;
+
+    let mut context = ctx("ses_test", "新问题");
+    context.cola_message_id = Some("msg_cola_new".into());
+    let turn = spawn_turn(&app, context);
+
+    // The successor's live card carries the orphan's panel while the new
+    // prompt is still in flight.
+    wait_for_card_text(&platform, "⏳ shell").await;
+    assert_eq!(
+        backend.transcript_tail_calls.lock().await.as_slice(),
+        &[("ses_test".to_string(), orphan_anchor - 10 * 60_000)],
+        "the carry read is bounded by the orphan record's anchor"
+    );
+    // The takeover itself is today's: the old card is collected in place, once.
+    let orphan_patches = patches_to(&platform, "om_frozen").await;
+    assert_eq!(
+        orphan_patches.len(),
+        1,
+        "the takeover collect is the orphan's only write: {orphan_patches:?}"
+    );
+    assert_eq!(card_header(&orphan_patches[0]), "⏳ 已由新卡片接管 · 已停止更新");
+    // Display-only: the durable record names the NEW Turn's message, never the
+    // orphan's.
+    wait_for_record_card(&app, "ses_test", "msg_reply").await;
+    let record = app.cards_handle().live_cards.get("ses_test").unwrap();
+    assert_eq!(
+        record.message_id,
+        MessageId::new("msg_cola_new"),
+        "the carry moves no record: the successor owns the Turn"
+    );
+
+    // The call settles while its message stays stale (beyond the Turn window);
+    // the new turn also ends. Every render read must reconcile the carried
+    // identity past the window, exactly once.
+    backend
+        .given_transcript_after_build(
+            "ses_test",
+            vec![SessionTranscript::new(vec![
+                user("msg_cola_anchor", orphan_anchor, "跑个长命令"),
+                orphan(ToolStatus::Completed, "slept"),
+                user("msg_cola_new", new_anchor, "新问题"),
+                assistant(new_anchor + 1_000, "新回答"),
+            ])],
+        )
+        .await;
+    backend
+        .set_session_status("ses_test", Some(SessionStatus::Idle))
+        .await;
+
+    wait_for_card_text(&platform, "slept").await;
+    let seen = platform.updated_cards().await;
+    assert_eq!(
+        card_text(seen.last().unwrap()).matches("slept").count(),
+        1,
+        "the settled result renders exactly once: {seen:?}"
+    );
+    // Further render reads of the same call must not duplicate it.
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let after = platform.updated_cards().await;
+    assert_eq!(
+        card_text(after.last().unwrap()).matches("slept").count(),
+        1,
+        "a later transcript render does not duplicate the carried call"
+    );
+
+    // Release the held prompt: the Turn settles ✅ as usual, with the carried
+    // panel settled into the successor's timeline.
+    gate.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), turn)
+        .await
+        .expect("the turn must end")
+        .unwrap()
+        .unwrap();
+    wait_for_card_header(&platform, "✅").await;
+    let final_card = platform.updated_cards().await;
+    let final_text = card_text(final_card.last().unwrap());
+    assert_eq!(
+        final_text.matches("slept").count(),
+        1,
+        "the settled carried result stays exactly once: {final_text}"
+    );
+    assert!(
+        final_text.contains("新回答"),
+        "the new Turn's own reply renders as usual: {final_text}"
+    );
+}
+
+/// The carry read is scoped to the orphan Turn's projection: an older,
+/// unrelated turn's stale `running` part is never resurrected on the
+/// successor.
+#[tokio::test]
+async fn a_restart_takeover_never_carries_an_older_turns_stale_call() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
+    let new_anchor = 2_000_000;
+    // Only an unrelated older turn's stale running part: created before the
+    // orphan anchor, long past the in-flight window.
+    let ghost = in_flight_shell(
+        "a_ghost",
+        1_000 - 30 * 60_000,
+        "call_ghost",
+        ToolStatus::Running,
+        1_000 - 29 * 60_000,
+        "",
+    );
+    let tail = TranscriptTail {
+        transcript: SessionTranscript::new(vec![ghost.clone()]),
+        complete: true,
+    };
+    let live = SessionTranscript::new(vec![
+        ghost,
+        user("msg_cola_new", new_anchor, "新问题"),
+        assistant(new_anchor + 1_000, "新回答"),
+    ]);
+    let (app, platform, backend, gate) = carried_app(&session_file, live, tail, SessionStatus::Idle).await;
+    gate.add_permits(1);
+
+    let mut context = ctx("ses_test", "新问题");
+    context.cola_message_id = Some("msg_cola_new".into());
+    let ((), logs) = capture_logs(async {
+        Turn::run(&app.turn_handles(), context).await.unwrap();
+    })
+    .await;
+
+    assert_eq!(
+        backend.transcript_tail_calls.lock().await.as_slice(),
+        &[("ses_test".to_string(), 1_000 - 10 * 60_000)],
+        "the tail read ran, scoped by the orphan record's anchor"
+    );
+    wait_for_card_header(&platform, "✅").await;
+    let cards = platform.updated_cards().await;
+    let text = card_text(cards.last().unwrap());
+    assert!(
+        !text.contains("call_ghost") && !text.contains("⏳ shell"),
+        "an older turn's stale running part is never resurrected: {text}"
+    );
+    let line = carry_info_line(&logs);
+    assert!(
+        line.contains("ses_test") && line.contains("carried 0"),
+        "the carry decision is logged with its session and outcome: {line}"
+    );
+}
+
+/// A cap-stopped tail read carries nothing: the page cap is a successful read
+/// that never reached the boundary, and the carry must not guess from a
+/// partial scan.
+#[tokio::test]
+async fn a_capped_carry_read_carries_nothing() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let orphan_anchor = 1_000_000;
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(orphan_anchor));
+    let new_anchor = 2_000_000;
+    let orphan = in_flight_shell(
+        "a_orphan",
+        orphan_anchor + 500,
+        "call_sleep",
+        ToolStatus::Running,
+        1_300_000,
+        "",
+    );
+    let tail = TranscriptTail {
+        transcript: SessionTranscript::new(vec![orphan.clone()]),
+        // The scan hit the page cap before the boundary.
+        complete: false,
+    };
+    let live = SessionTranscript::new(vec![
+        orphan,
+        user("msg_cola_new", new_anchor, "新问题"),
+        assistant(new_anchor + 1_000, "新回答"),
+    ]);
+    let (app, platform, backend, gate) = carried_app(&session_file, live, tail, SessionStatus::Idle).await;
+    gate.add_permits(1);
+
+    let mut context = ctx("ses_test", "新问题");
+    context.cola_message_id = Some("msg_cola_new".into());
+    let ((), logs) = capture_logs(async {
+        Turn::run(&app.turn_handles(), context).await.unwrap();
+    })
+    .await;
+
+    wait_for_card_header(&platform, "✅").await;
+    assert_eq!(
+        backend.transcript_tail_calls.lock().await.len(),
+        1,
+        "the read ran"
+    );
+    let cards = platform.updated_cards().await;
+    let text = card_text(cards.last().unwrap());
+    assert!(!text.contains("call_sleep"), "nothing was carried: {text}");
+    let line = carry_info_line(&logs);
+    assert!(
+        line.contains("ses_test") && line.contains("page cap"),
+        "the cap stop is the logged outcome: {line}"
+    );
+}
+
+/// A failed carry read degrades to today's behavior: nothing is carried, the
+/// takeover still collects the orphan, and the successor settles as usual.
+#[tokio::test]
+async fn a_failed_carry_read_carries_nothing() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let orphan_anchor = 1_000_000;
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(orphan_anchor));
+    let new_anchor = 2_000_000;
+    let live = SessionTranscript::new(vec![
+        user("msg_cola_anchor", orphan_anchor, "跑个长命令"),
+        in_flight_shell(
+            "a_orphan",
+            orphan_anchor + 500,
+            "call_sleep",
+            ToolStatus::Running,
+            1_300_000,
+            "",
+        ),
+        user("msg_cola_new", new_anchor, "新问题"),
+        assistant(new_anchor + 1_000, "新回答"),
+    ]);
+    let (app, platform, backend, gate) = carried_app(
+        &session_file,
+        live,
+        TranscriptTail::default(),
+        SessionStatus::Idle,
+    )
+    .await;
+    backend.fail_transcript_tail_for("ses_test").await;
+    gate.add_permits(1);
+
+    let mut context = ctx("ses_test", "新问题");
+    context.cola_message_id = Some("msg_cola_new".into());
+    let ((), logs) = capture_logs(async {
+        Turn::run(&app.turn_handles(), context).await.unwrap();
+    })
+    .await;
+
+    wait_for_card_header(&platform, "✅").await;
+    let cards = platform.updated_cards().await;
+    let text = card_text(cards.last().unwrap());
+    assert!(!text.contains("call_sleep"), "nothing was carried: {text}");
+    assert_eq!(
+        card_header(&patches_to(&platform, "om_frozen").await[0]),
+        "⏳ 已由新卡片接管 · 已停止更新",
+        "the takeover collect is unchanged"
+    );
+    let line = carry_info_line(&logs);
+    assert!(
+        line.contains("ses_test") && line.contains("read failed"),
+        "the failed read is the logged outcome: {line}"
+    );
+}
+
+/// A timed-out carry read carries nothing and leaves the takeover as today —
+/// the existing read timeout bounds the prompt's wait.
+#[tokio::test]
+async fn a_timed_out_carry_read_carries_nothing() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let orphan_anchor = 1_000_000;
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(orphan_anchor));
+    let new_anchor = 2_000_000;
+    let live = SessionTranscript::new(vec![
+        user("msg_cola_anchor", orphan_anchor, "跑个长命令"),
+        in_flight_shell(
+            "a_orphan",
+            orphan_anchor + 500,
+            "call_sleep",
+            ToolStatus::Running,
+            1_300_000,
+            "",
+        ),
+        user("msg_cola_new", new_anchor, "新问题"),
+        assistant(new_anchor + 1_000, "新回答"),
+    ]);
+    let (app, platform, backend, gate) = carried_app(
+        &session_file,
+        live,
+        TranscriptTail::default(),
+        SessionStatus::Idle,
+    )
+    .await;
+    // The tail read hangs; the 20 ms read timeout ends it.
+    backend
+        .hang_transcript_tail
+        .store(1, std::sync::atomic::Ordering::Relaxed);
+    gate.add_permits(1);
+
+    let mut context = ctx("ses_test", "新问题");
+    context.cola_message_id = Some("msg_cola_new".into());
+    let ((), logs) = capture_logs(async {
+        Turn::run(&app.turn_handles(), context).await.unwrap();
+    })
+    .await;
+
+    wait_for_card_header(&platform, "✅").await;
+    let cards = platform.updated_cards().await;
+    let text = card_text(cards.last().unwrap());
+    assert!(!text.contains("call_sleep"), "nothing was carried: {text}");
+    let line = carry_info_line(&logs);
+    assert!(
+        line.contains("ses_test") && line.contains("read timed out"),
+        "the timeout is the logged outcome: {line}"
+    );
+}
+
+/// An ordinary turn with no durable record never carries and never reads a
+/// tail: a takeover without an orphan behaves exactly as today.
+#[tokio::test]
+async fn a_takeover_with_no_orphan_record_reads_no_tail() {
+    let _wd = test_work_dir();
+    let new_anchor = 2_000_000;
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_new", new_anchor, "新问题"),
+        assistant(new_anchor + 1_000, "新回答"),
+    ]);
+    let (_dir, app, backend, platform) = scripted_app(vec![transcript], Some(SessionStatus::Idle)).await;
+
+    let mut context = ctx("ses_test", "新问题");
+    context.cola_message_id = Some("msg_cola_new".into());
+    Turn::run(&app.turn_handles(), context).await.unwrap();
+
+    wait_for_card_header(&platform, "✅").await;
+    assert!(
+        backend.transcript_tail_calls.lock().await.is_empty(),
+        "no orphan record, no carry read"
+    );
+}
+
+/// A record with no captured anchor carries nothing — it cannot scope the
+/// orphan Turn's projection — and reads no tail.
+#[tokio::test]
+async fn an_anchorless_record_reads_no_tail() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", None);
+    let new_anchor = 2_000_000;
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_new", new_anchor, "新问题"),
+        assistant(new_anchor + 1_000, "新回答"),
+    ]);
+    let (app, platform, backend, gate) = carried_app(
+        &session_file,
+        transcript,
+        TranscriptTail::default(),
+        SessionStatus::Idle,
+    )
+    .await;
+    gate.add_permits(1);
+
+    let mut context = ctx("ses_test", "新问题");
+    context.cola_message_id = Some("msg_cola_new".into());
+    let ((), logs) = capture_logs(async {
+        Turn::run(&app.turn_handles(), context).await.unwrap();
+    })
+    .await;
+
+    wait_for_card_header(&platform, "✅").await;
+    assert!(
+        backend.transcript_tail_calls.lock().await.is_empty(),
+        "an anchorless record cannot scope a carry read"
+    );
+    let line = carry_info_line(&logs);
+    assert!(
+        line.contains("ses_test") && line.contains("no anchor"),
+        "the anchorless decision is the logged outcome: {line}"
+    );
+}
+
+/// A killed run's carried call does not hang the Turn: the transcript never
+/// settles it, yet the successor still ends ✅ by its own settle decision, so
+/// no carried panel outlives the Turn. (The panel itself stays faithful to the
+/// transcript's final status — the run was never completed.)
+#[tokio::test]
+async fn a_killed_runs_carried_call_does_not_hang_the_turn() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let orphan_anchor = 1_000_000;
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(orphan_anchor));
+    let new_anchor = 2_000_000;
+    let orphan = in_flight_shell(
+        "a_orphan",
+        orphan_anchor + 500,
+        "call_sleep",
+        ToolStatus::Running,
+        1_300_000,
+        "",
+    );
+    let tail = TranscriptTail {
+        transcript: SessionTranscript::new(vec![
+            user("msg_cola_anchor", orphan_anchor, "跑个长命令"),
+            orphan.clone(),
+        ]),
+        complete: true,
+    };
+    // The call NEVER settles (a killed run leaves its part behind), while the
+    // new turn's reply lands terminal.
+    let live = SessionTranscript::new(vec![
+        user("msg_cola_anchor", orphan_anchor, "跑个长命令"),
+        orphan,
+        user("msg_cola_new", new_anchor, "新问题"),
+        assistant(new_anchor + 1_000, "新回答"),
+    ]);
+    let (app, platform, _backend, gate) = carried_app(&session_file, live, tail, SessionStatus::Idle).await;
+
+    let mut context = ctx("ses_test", "新问题");
+    context.cola_message_id = Some("msg_cola_new".into());
+    let turn = spawn_turn(&app, context);
+    // The carried panel is live on the successor while the prompt is held.
+    wait_for_card_text(&platform, "⏳ shell").await;
+
+    gate.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), turn)
+        .await
+        .expect("the turn must end")
+        .unwrap()
+        .unwrap();
+    wait_for_card_header(&platform, "✅").await;
+}
+
 /// A record naming a card this process still holds is that card's own
 /// lifecycle, never a restart orphan: a run that did not restart is unchanged
 /// — no view read, no stamp, no PATCH — even while the Session reads live.
@@ -1555,6 +2130,54 @@ async fn a_restart_continuation_collects_the_old_card() {
             .as_ref()
             .is_none_or(|record| record.card_message_id != "om_frozen"),
         "the record never keeps naming the collected orphan: {record:?}"
+    );
+}
+
+/// The Wake continuation arm never carries (ADR-0061's no-replay scope): the
+/// restart's Session Sync posts its continuation with no tail read, so a stale
+/// running call from the lost chain is not replayed onto it.
+#[tokio::test]
+async fn a_restart_wake_continuation_never_carries() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000_000));
+
+    // The lost chain: its running call sits beyond the Wake's own in-flight
+    // window, so only a carry could ever replay it.
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000_000, "跑一下 CI"),
+        in_flight_shell(
+            "a_bg",
+            1_300_000,
+            "call_sleep",
+            ToolStatus::Running,
+            1_300_000,
+            "",
+        ),
+        assistant(2_100_000, "CI 通过了。"),
+    ])
+    .with_executions(vec![execution(1_400_000), execution(2_200_000)])
+    .with_wakes(vec![shell_wake(2_000_000)]);
+    let (app, platform, backend) = restarted_app_with_backend(&session_file, transcript, None).await;
+
+    spawn_sync(&app);
+    wait_for_card_update(
+        &platform,
+        "the restart continuation's done card",
+        CardUpdates::Latest,
+        |card| card_header(card).contains("✅") && card_text(card).contains("CI 通过了。"),
+    )
+    .await;
+
+    assert!(
+        backend.transcript_tail_calls.lock().await.is_empty(),
+        "the Wake continuation arm never reads (or carries) the tail"
+    );
+    let cards = platform.updated_cards().await;
+    assert!(
+        !card_text(cards.last().unwrap()).contains("call_sleep"),
+        "the lost chain's stale running call is never replayed: {cards:?}"
     );
 }
 

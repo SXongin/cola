@@ -10,7 +10,7 @@ pub(crate) use crate::opencode;
 use crate::backend::{
     BackgroundTask, ContentBlock, Execution, ExecutionOutcome, FinishReason, MessageId, MessageRole,
     MessageTime, Part, ReasoningPart, SessionTranscript, StepFinish, StepStart, TextPart, ToolCall,
-    ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage, TurnAnchor, Wake, WakeSource,
+    ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage, TranscriptTail, TurnAnchor, Wake, WakeSource,
 };
 
 /// One typed transcript message for view-shaped fixtures (spec #332): identity,
@@ -938,6 +938,23 @@ pub struct MockBackend {
     /// gather leaves the row's last successful fragment in place, its age
     /// still growing. Armable mid-life via [`MockBackend::fail_transcript_for`].
     pub fail_transcripts: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Session id → scripted [`TranscriptTail`]s served by `transcript_tail`,
+    /// consumed one per call (the last repeating) — the restart carry's
+    /// bounded tail read (ADR-0068). A session absent from the map serves an
+    /// empty, complete tail.
+    pub transcript_tail_scripts:
+        Arc<tokio::sync::Mutex<std::collections::HashMap<String, Vec<TranscriptTail>>>>,
+    /// Records every `transcript_tail` call as `(session id, boundary_ms)` —
+    /// the carry read's bound, so a test can pin the anchor-minus-window line
+    /// the takeover asked for and that exactly one tail read happened.
+    pub transcript_tail_calls: Arc<tokio::sync::Mutex<Vec<(String, i64)>>>,
+    /// Number of initial `transcript_tail` calls to hang forever (then it
+    /// serves normally) — the timed-out carry read (ADR-0068's degrade arm).
+    pub hang_transcript_tail: Arc<std::sync::atomic::AtomicUsize>,
+    /// Session ids whose `transcript_tail` read fails with a 500 — the failed
+    /// carry read (ADR-0068's other degrade arm). Armable mid-life via
+    /// [`MockBackend::fail_transcript_tail_for`].
+    pub fail_transcript_tails: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
     /// Pending questions served by `list_questions`.
     pub questions: Vec<opencode::types::QuestionRequest>,
     /// Records `reply_question` calls: (request_id, answers). The answers are
@@ -1170,6 +1187,10 @@ impl MockBackend {
             transcript_scripts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             transcript_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             fail_transcripts: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+            transcript_tail_scripts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            transcript_tail_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            hang_transcript_tail: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            fail_transcript_tails: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             questions: Vec::new(),
             reply_question_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             reply_question_keyed_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
@@ -1453,6 +1474,31 @@ impl MockBackend {
     /// script again.
     pub(crate) async fn heal_transcript(&self, session_id: &str) {
         self.fail_transcripts.lock().await.remove(session_id);
+    }
+
+    /// Scenario: `transcript_tail` serves `tails` for `session_id`, one per
+    /// call (the last repeating) — the restart carry's bounded, newest-first
+    /// tail read (ADR-0068). Sessions without a script serve an empty,
+    /// complete tail.
+    pub(crate) fn given_transcript_tail(
+        &mut self,
+        session_id: &str,
+        tails: Vec<TranscriptTail>,
+    ) -> &mut Self {
+        self.transcript_tail_scripts
+            .try_lock()
+            .expect("given_transcript_tail before the app is built")
+            .insert(session_id.to_string(), tails);
+        self
+    }
+
+    /// Scenario: `transcript_tail` for `session_id` fails with a 500 — the
+    /// failed carry read (ADR-0068), which must carry nothing.
+    pub(crate) async fn fail_transcript_tail_for(&self, session_id: &str) {
+        self.fail_transcript_tails
+            .lock()
+            .await
+            .insert(session_id.to_string());
     }
 
     /// Scenario: hold every `prompt` until the returned semaphore is released
@@ -2025,6 +2071,39 @@ impl crate::backend::Backend for MockBackend {
         self.retirements.apply(session_id, &mut transcript);
         self.transcript_calls.lock().await.push(session_id.to_string());
         Ok(transcript)
+    }
+
+    /// The restart carry's bounded tail read (ADR-0068): a scripted tail wins,
+    /// recorded with the boundary the takeover asked for; a session the test
+    /// marked failing or hanging answers like the real read's error/timeout
+    /// arms. The default is an empty, complete tail.
+    async fn transcript_tail(
+        &self,
+        session_id: &str,
+        boundary_ms: i64,
+    ) -> crate::error::Result<TranscriptTail> {
+        hang_if_scripted(&self.hang_transcript_tail).await;
+        self.transcript_tail_calls
+            .lock()
+            .await
+            .push((session_id.to_string(), boundary_ms));
+        if self.fail_transcript_tails.lock().await.contains(session_id) {
+            return Err(crate::error::BridgeError::OpenCode(format!(
+                "transcript tail {session_id} failed: 500 Internal Server Error"
+            )));
+        }
+        let scripted = {
+            let mut scripts = self.transcript_tail_scripts.lock().await;
+            match scripts.get_mut(session_id) {
+                Some(script) if !script.is_empty() => Some(if script.len() == 1 {
+                    script[0].clone()
+                } else {
+                    script.remove(0)
+                }),
+                _ => None,
+            }
+        };
+        Ok(scripted.unwrap_or_default())
     }
 
     async fn list_permissions(
