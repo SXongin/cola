@@ -12,7 +12,8 @@
 # Codex as a validated client; `gpt-6-luna` is the top GPT model in Go. The
 # action's Responses proxy points at that endpoint (`responses-api-endpoint`),
 # keeps the Go key inside the proxy process, and runs Codex read-only
-# (`permission-profile: ":read-only"` + the default `drop-sudo`).
+# (`permission-profile: ":read-only"` with the action's default safety
+# strategy).
 #
 # Interference: the OpenCode gate approves by reading the *last* bot comment,
 # so a trial comment landing mid-run could hide its verdict. That is prevented

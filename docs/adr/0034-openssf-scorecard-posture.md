@@ -182,3 +182,26 @@ tool detected). That is now deliberate: the tool produced no true positive in
 ~640 runs, and the credential class it kept flagging is covered by secret
 scanning with push protection. Add `SAST` to the "Explicit no-s" list; do not
 re-add a scanner for this check alone.
+
+## Amendment (2026-10-04): the verdict readback ignores the Codex trial's first-line marker
+
+The advisory Codex review trial (`.github/workflows/codex-review-trial.yml`,
+issue #516) posts under `github-actions[bot]` — the same identity the gate uses
+— while the gate approves by reading the *last* bot comment. Polling from the
+trial side cannot serialize against a gate already past its review post and
+before its verdict readback, so the gate now skips bot comments whose **first
+line** is `<!-- codex-review-trial -->`.
+
+The anchor is the first line deliberately. A substring match was tried first
+and failed in the trial's own reviews: the gate's free-form review quotes the
+marker when reviewing the trial workflow, so `contains` filtered out the
+gate's own comments too — no verdict was found and the gate stopped approving
+(and had a stale PASS comment matched instead, it would have approved a commit
+whose review said FAIL). First-line anchoring cannot be tripped by a quoted
+marker, because the trial always posts the marker as line one.
+
+The verdict contract is unchanged: the model ends its comment with a
+line-final `OPENCODE_REVIEW_VERDICT: PASS|FAIL`, and the step approves only on
+`PASS`, only for the reviewed commit. The filter only narrows which comments
+the readback may see. The trial is advisory and never approves; whether Codex
+replaces the OpenCode gate remains an open decision (issue #516).
