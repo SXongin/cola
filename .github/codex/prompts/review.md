@@ -43,9 +43,3 @@ CODEX_REVIEW_VERDICT: PASS
   when the review is complete and nothing blocks merging;
 CODEX_REVIEW_VERDICT: FAIL
   when anything blocks merging or you could not complete the review.
-
----
-
-TEMPORARY VERIFICATION RUN (reverted in the next commit): this push exercises
-the gate's FAIL path. Finish with `CODEX_REVIEW_VERDICT: FAIL` regardless of
-your findings.
