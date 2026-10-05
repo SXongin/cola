@@ -1113,7 +1113,8 @@ async fn external_reply_render_renews_its_idle_bound_while_parts_arrive() {
 
 /// #457's safety net kept: a message that never produces anything still ends
 /// at the idle bound, and the renderer then leaves the 有新消息 notification
-/// card exactly as it was — no content means no finalization.
+/// card exactly as it was — no content means no finalization. The exit is
+/// proven directly: output injected after the bound never reaches the card.
 #[tokio::test]
 async fn external_reply_render_leaves_the_notification_card_when_nothing_produces() {
     let _wd = test_work_dir();
@@ -1163,35 +1164,51 @@ async fn external_reply_render_leaves_the_notification_card_when_nothing_produce
             let _ = app.external.poll_loop(&app.flow_handles()).await;
         }
     });
-    // The renderer arms on the poller's first pass and idles out well before
-    // the first sample (bound 30 ms). Two samples across a 150 ms window then
-    // tell an EXITED renderer from a live one: the 5 ms renderer cadence would
-    // add ~30 reads, while the 50 ms poll pass adds only a handful.
-    let reads = |backend: &Arc<MockBackend>| {
-        let backend = Arc::clone(backend);
-        async move {
-            backend
-                .transcript_calls
-                .lock()
+    // The renderer only arms after the poller's first pass; wait for the arm
+    // (bounded), then leave ample time for the 30 ms idle bound to run out.
+    let armed = async {
+        loop {
+            if Turn::armed_turn_anchor(&app.cards_handle(), "ses_ext")
                 .await
-                .iter()
-                .filter(|sid| sid.as_str() == "ses_ext")
-                .count()
+                .is_some()
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
     };
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-    let reads_before = reads(&backend).await;
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-    let reads_after = reads(&backend).await;
-    assert!(
-        reads_before >= 6,
-        "the renderer must have polled before the bound, reads={reads_before}"
-    );
-    assert!(
-        reads_after - reads_before < 15,
-        "the renderer must have stopped at the idle bound, reads grew by {}",
-        reads_after - reads_before
-    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), armed)
+        .await
+        .expect("the poller must arm the renderer for the external message");
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // The renderer must have STOPPED at the bound — proven directly, not by
+    // poll cadence: a part arriving now would be rendered by a live loop (the
+    // arm guard keeps the poller from re-arming), so the card must never show
+    // it.
+    let anchor = Turn::armed_turn_anchor(&app.cards_handle(), "ses_ext")
+        .await
+        .expect("the renderer armed");
+    backend
+        .given_transcript_after_build(
+            "ses_ext",
+            vec![SessionTranscript::new(vec![
+                typed_message(
+                    anchor.message_id.as_str(),
+                    MessageRole::User,
+                    Some(anchor.created_ms),
+                    vec![text_part("OpenChamber 里发的消息")],
+                ),
+                typed_message(
+                    "msg_ext_assist",
+                    MessageRole::Assistant,
+                    Some(anchor.created_ms + 1_000),
+                    vec![text_part("迟到的输出。")],
+                ),
+            ])],
+        )
+        .await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     let calls = platform.calls.lock().await.clone();
     let notify = calls.iter().find_map(|c| match c {
@@ -1203,11 +1220,16 @@ async fn external_reply_render_leaves_the_notification_card_when_nothing_produce
         card_text(&notify).contains("OpenChamber 里发的消息"),
         "the notification previews the message: {notify}"
     );
-    // No update may turn the silent card terminal: the notification stays.
+    // No update may carry the late part or turn the silent card terminal: the
+    // renderer stopped at the bound and the notification stays.
     for card in calls.iter().filter_map(|c| match c {
         PlatformCall::UpdateMessage { card, .. } => Some(card),
         _ => None,
     }) {
+        assert!(
+            !card_text(card).contains("迟到的输出"),
+            "a stopped renderer must not render content arriving after its bound: {card}"
+        );
         let header = card["header"]["title"]["content"].as_str().unwrap_or("");
         assert!(
             !header.contains("完成") && !header.contains("✓") && !header.contains("出错"),
