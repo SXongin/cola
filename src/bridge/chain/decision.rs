@@ -78,6 +78,13 @@ pub(crate) enum CardProbe {
     /// A successor card owns the session while the record still names another
     /// — the record write raced the handover, or a path attached the new id
     /// without tracking.
+    ///
+    /// The id and `running` are the pre-collect facts the pre-split pass read,
+    /// while `anchor` is re-read **after** the successor's collect (see
+    /// [`RecoveryReads::needs_successor_collect`]): a takeover can arm its
+    /// anchor while the collect's awaited write is in flight, and an anchor
+    /// that appears in that window must re-point the record, never be read as
+    /// absent and release it.
     Successor {
         /// The successor's card message id — where the record re-points.
         card_message_id: String,
@@ -165,10 +172,24 @@ impl RecoveryReads<'_> {
     pub(crate) fn needs_transcript(&self) -> bool {
         matches!(self.status, Some(StatusRead::Named(status)) if !status.is_live())
     }
+
+    /// Whether the successor branch's collect is owed: no claim owns the
+    /// record, and a successor card owns the session. The collect precedes the
+    /// decision because it is an awaited card write and the successor's armed
+    /// anchor cannot be trusted before it returns — a takeover can arm the
+    /// anchor while the write is in flight. The caller collects and then
+    /// re-reads the anchor ([`CardProbe::Successor`]), so the decision sees the
+    /// post-collect fact; the id and `running` stay the pre-collect ones,
+    /// exactly the facts the pass read before the split.
+    pub(crate) fn needs_successor_collect(&self) -> bool {
+        !self.claimed && !self.stamping && matches!(self.card, CardProbe::Successor { .. })
+    }
 }
 
 /// One record's reconcile decision (ADR-0063, ADR-0069): the whole ladder as
-/// a pure function of the record and the evidence the apply gathered.
+/// a pure function of the record and the evidence the apply gathered — for a
+/// successor probe, after its collect and anchor re-read
+/// ([`RecoveryReads::needs_successor_collect`]).
 pub(crate) fn reconcile(record: &ChainRecord, reads: &RecoveryReads<'_>) -> ChainDisposition {
     // A live Turn (or the follow that inherited its guard) owns the session,
     // and an inbound message is about to: either way the card is not orphaned.
