@@ -284,12 +284,16 @@ impl ChainRecords {
     /// re-announced under the new one.
     pub(crate) fn rename(&self, from: &str, to: &str) {
         let mut state = self.lock();
-        let Some(card) = state.records.remove(from) else {
+        let record = state.records.remove(from);
+        let announcement = state.announcements.remove(from);
+        if record.is_none() && announcement.is_none() {
             return;
-        };
-        state.records.insert(to.to_string(), card);
-        if let Some(mark) = state.announcements.remove(from) {
-            state.announcements.insert(to.to_string(), mark);
+        }
+        if let Some(record) = record {
+            state.records.insert(to.to_string(), record);
+        }
+        if let Some(announcement) = announcement {
+            state.announcements.insert(to.to_string(), announcement);
         }
         self.write(&state);
     }
