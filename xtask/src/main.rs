@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, exit};
 
+mod codex_gate;
 mod doc_drift;
 mod generation_guard;
 mod release;
