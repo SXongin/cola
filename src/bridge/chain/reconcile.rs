@@ -401,7 +401,7 @@ async fn settle_card(
         return;
     };
     // The waiting mark follows a landed Waiting PATCH alone (ADR-0059).
-    let waiting = state == CardState::Waiting;
+    let waiting = matches!(disposition, Disposition::Waiting);
     let detail = disposition.failure().map(error_line);
     if pass.settle(state, detail.as_deref()).await && waiting {
         handles
