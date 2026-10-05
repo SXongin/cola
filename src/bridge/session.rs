@@ -2,6 +2,8 @@ use crate::config::{SessionEntry, ThreadKey};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::bridge::sidecar;
+
 /// A conversation's declared intent to create a session (ADR-0041). It is not
 /// a Session: no backend identity, invisible to the server and every session
 /// list. The conversation's first prompt materialises it; until then it
@@ -466,7 +468,9 @@ impl SessionStore {
             entries: &self.entries,
             pending: &self.pending,
         })?;
-        std::fs::write(&self.path, data)?;
+        // Atomic, and the failure is returned: this is the one sidecar whose
+        // loss is not recoverable, so its writer must not log-and-continue.
+        sidecar::write_atomic(&self.path, data.as_bytes())?;
         Ok(())
     }
 
@@ -804,6 +808,33 @@ mod tests {
             .activate(make_entry("chat1", "root1", "ses_fail", "/tmp/f"))
             .unwrap_err();
         assert!(matches!(err, crate::error::BridgeError::Io(_)));
+    }
+
+    /// The mapping is written atomically: a failed write leaves the previous
+    /// file intact rather than a half-written mapping.
+    #[test]
+    fn a_failed_mapping_write_leaves_the_previous_file_intact() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let mut store = SessionStore::new(path.clone()).unwrap();
+        store
+            .activate(make_entry("chat1", "root1", "ses_old", "/tmp/old"))
+            .unwrap();
+
+        // Occupy the temp path so the atomic replace fails before its rename.
+        std::fs::create_dir(path.with_extension("tmp")).unwrap();
+        let err = store
+            .activate(make_entry("chat1", "root1", "ses_new", "/tmp/new"))
+            .unwrap_err();
+        assert!(matches!(err, crate::error::BridgeError::Io(_)));
+
+        let reloaded = SessionStore::new(path).unwrap();
+        let key = ThreadKey::new("chat1".into(), "root1".into());
+        assert_eq!(
+            reloaded.get_active(&key).unwrap().session_id,
+            "ses_old",
+            "the previous mapping survives the failed write"
+        );
     }
 
     #[test]
