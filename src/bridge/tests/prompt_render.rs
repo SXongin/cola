@@ -1281,8 +1281,8 @@ async fn stop_after_a_reattach_ends_the_card_promptly() {
         "/stop must interrupt the re-attached session"
     );
 
-    // The final PATCH is the observation point: `finalize_stopped` sets the
-    // state before it refreshes the work context and flushes, so waiting on
+    // The final PATCH is the observation point: the ending application stamps
+    // Stopped before it refreshes the work context and flushes, so waiting on
     // the internal state alone would read the stale live card. The sibling
     // drain test waits on the card the same way.
     wait_for_card_update(
