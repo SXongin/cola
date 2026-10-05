@@ -331,4 +331,32 @@ mod tests {
             assert_eq!(silent.notice_copy(), None, "{silent:?} must stay silent");
         }
     }
+
+    /// The loop's one log line, every disposition pinned as a table: a copy
+    /// change is a deliberate edit here, visible in the operator's logs.
+    #[test]
+    fn the_loop_log_line_is_pinned_per_disposition() {
+        let cases: &[(Disposition, &str)] = &[
+            (Disposition::Observe, "still observing"),
+            (Disposition::Stopped, "stopped; finalized Stopped"),
+            (
+                Disposition::Waiting,
+                "idle with live background tasks; yielded waiting",
+            ),
+            (Disposition::Failed("503".into()), "failed; finalized Error"),
+            (Disposition::Done, "idle; finalized"),
+            (
+                Disposition::Unreceived,
+                "message never landed at idle; finalized Unreceived",
+            ),
+            (Disposition::LostContact, "lost contact; finalized Error"),
+            (
+                Disposition::StuckPanel,
+                "ended with an unreconcilable panel; finalized Error",
+            ),
+        ];
+        for (disposition, line) in cases {
+            assert_eq!(disposition.log_line(), *line, "{disposition:?} log line");
+        }
+    }
 }
