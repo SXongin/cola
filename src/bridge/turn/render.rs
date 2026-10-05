@@ -492,8 +492,10 @@ pub(super) fn render_new_turn_parts(acc: &mut StreamAccumulator, transcript: &Se
 /// identity and time for this turn (#190). Filtering against cola's submit
 /// clock instead dropped the new turn's parts when the server ran behind cola,
 /// and bled the previous turn's parts into the new card when it ran ahead.
-/// Until the anchor is observed nothing renders: with two skewed clocks there
-/// is no threshold that tells the two turns apart.
+/// Until the anchor is observed none of the Turn's OWN content renders: with
+/// two skewed clocks there is no threshold that tells the two turns apart.
+/// The carried calls are the exception — call identity, not time, resolves
+/// them — so they reconcile before the gate ([`reconcile_carried_calls`]).
 ///
 /// A message still in flight (no server completion stamp) is rendered while
 /// it can still be producing: one created within the turn always is, and one
@@ -507,12 +509,20 @@ pub(super) fn render_new_turn_parts(acc: &mut StreamAccumulator, transcript: &Se
 /// turn's and never bleeds in (#190).
 fn render_turn_parts(acc: &mut StreamAccumulator, transcript: &SessionTranscript) -> bool {
     capture_turn_anchor(acc, transcript);
+    // Carried Tool Panels (ADR-0068) reconcile on EVERY render read, before
+    // the anchor gate below: a carried call is resolved by call identity
+    // against the whole read, so it needs no Turn anchor. In the canonical
+    // restart window the fresh Turn's message is queued behind the still
+    // running orphan run, leaving the anchor unobserved for as long as that
+    // run lasts — gating the carry on it would freeze the panel at its
+    // takeover status for exactly that window.
+    let mut rendered_any = reconcile_carried_calls(acc, transcript);
     let Some(anchor) = acc.turn_anchor.clone() else {
-        return false;
+        return rendered_any;
     };
     // A merged Wake's completion entry is written before its work renders, so
     // the entry sorts above the parts it announces.
-    let mut rendered_any = render_wake_entries(acc, transcript, &anchor);
+    rendered_any |= render_wake_entries(acc, transcript, &anchor);
     for message in transcript.turn_for_user(&anchor).messages {
         // An error-card retry carries the failed attempt's baseline (#387):
         // its messages stay suppressed, so the rebuilt card streams only the
@@ -546,33 +556,40 @@ fn render_turn_parts(acc: &mut StreamAccumulator, transcript: &SessionTranscript
             }
         }
     }
-    // Carried Tool Panels (ADR-0068): a restart takeover seeds the orphaned
-    // Turn's running calls; every render read resolves each carried identity
-    // against the WHOLE read — PAST the Turn window, whose membership would
-    // drop the long-running call's message — so the panel keeps the
-    // transcript's current status and output, and its settlement joins the
-    // timeline at the server start key it was born with (ADR-0045). The
-    // ordinary tool dedup applies, so a call the window ALSO renders is not
-    // duplicated and a repeated read of an unchanged call is skipped.
-    //
-    // The identity is live-only: once the transcript settles it the panel is
-    // an ordinary timeline record, so it leaves the carried set and the
-    // end-of-turn omission (`build_card_inner`, the `has_live_tools` guard)
-    // no longer sees it. A carried call still running when the Turn ends never
-    // outlives it: the settled card omits it, because no renderer will ever
-    // update that `⏳` again.
+    rendered_any
+}
+
+/// Carried Tool Panels (ADR-0068): a restart takeover seeds the orphaned
+/// Turn's running calls; every render read resolves each carried identity
+/// against the WHOLE read — PAST the Turn window, whose membership would drop
+/// the long-running call's message — so the panel keeps the transcript's
+/// current status and output, and its settlement joins the timeline at the
+/// server start key it was born with (ADR-0045). It runs on every read, before
+/// the anchor gate: the carry is display-only and identity, not time, resolves
+/// it, so it works while the fresh Turn's own message is still queued behind a
+/// busy orphan run. The ordinary tool dedup applies, so a call the window ALSO
+/// renders is not duplicated and a repeated read of an unchanged call is
+/// skipped. Returns true when any carried call rendered.
+///
+/// The identity is live-only: once the transcript settles it the panel is an
+/// ordinary timeline record, so it leaves the carried set and the end-of-turn
+/// omission (`build_card_inner`, the `has_live_tools` guard) no longer sees
+/// it. A carried call still running when the Turn ends never outlives it: the
+/// settled card omits it, because no renderer will ever update that `⏳` again.
+fn reconcile_carried_calls(acc: &mut StreamAccumulator, transcript: &SessionTranscript) -> bool {
+    let mut rendered = false;
     let carried: Vec<String> = acc.carried_calls.iter().cloned().collect();
     for call_id in carried {
         if let Some(call) = transcript.tool_call(&call_id)
             && render_part(acc, &Part::Tool(call.clone()))
         {
-            rendered_any = true;
+            rendered = true;
         }
         if acc.tools.get(&call_id).is_some_and(|panel| !panel.is_live()) {
             acc.carried_calls.remove(&call_id);
         }
     }
-    rendered_any
+    rendered
 }
 
 /// Apply one read's live Background Task Ledger to `acc` (ADR-0060), under the
@@ -1759,6 +1776,103 @@ Index: /x/src/main.rs
         assert!(!acc.tools["call_sleep"].is_live());
         let text = card_text(&acc.build_card_with_split().0);
         assert_eq!(text.matches("killed").count(), 1, "reconciled once: {text}");
+    }
+
+    /// The canonical restart window (ADR-0068): the fresh Turn's message is
+    /// queued behind the still-running orphan run, so the transcript carries no
+    /// anchor for as long as that run lasts. A carried call is resolved by call
+    /// identity against the whole read, so its completion reconciles into the
+    /// timeline anyway — while the anchor is unobserved — exactly once; the
+    /// later anchor capture neither duplicates nor re-orders it.
+    #[test]
+    fn a_carried_call_reconciles_before_the_turn_anchor_is_observed() {
+        let anchor = 2_000_000;
+        let orphan = TurnAnchor {
+            message_id: MessageId::new("msg_cola_old"),
+            created_ms: anchor - 31 * 60_000,
+        };
+        let stale_tool = |status: ToolStatus, output: Option<&str>| {
+            vec![tool(
+                "shell",
+                "call_sleep",
+                status,
+                Some(anchor - 11 * 60_000),
+                Some(serde_json::json!({"command": "sleep 3600"})),
+                output,
+            )]
+        };
+        // The orphan's own message only: the fresh Turn's user message is NOT
+        // in the transcript yet (queued behind the orphan run), so
+        // `capture_turn_anchor` cannot find an anchor.
+        let anchorless = |status: ToolStatus, output: Option<&str>| {
+            SessionTranscript::new(vec![message_in_flight(
+                "a_stale",
+                anchor - 30 * 60_000,
+                None,
+                stale_tool(status, output),
+            )])
+        };
+
+        let mut acc = StreamAccumulator::new("proj");
+        acc.cola_message_id = Some("msg_cola_new".into());
+        assert_eq!(
+            acc.carry_tools(&anchorless(ToolStatus::Running, None).turn_running_tools(&orphan)),
+            1
+        );
+        assert_eq!(acc.turn_anchor, None);
+
+        // The call completes while the fresh message is still absent: the
+        // carried identity reconciles anyway, joining the timeline at its
+        // server start key.
+        assert!(render_new_turn_parts(
+            &mut acc,
+            &anchorless(ToolStatus::Completed, Some("slept"))
+        ));
+        assert_eq!(acc.turn_anchor, None, "still no anchor to gate on");
+        assert!(!acc.tools["call_sleep"].is_live());
+        let text = card_text(&acc.build_card_with_split().0);
+        assert_eq!(text.matches("slept").count(), 1, "reconciled once: {text}");
+
+        // Repeated anchorless reads must not duplicate it.
+        assert!(!render_new_turn_parts(
+            &mut acc,
+            &anchorless(ToolStatus::Completed, Some("slept"))
+        ));
+        let text = card_text(&acc.build_card_with_split().0);
+        assert_eq!(text.matches("slept").count(), 1, "no duplicate: {text}");
+
+        // The fresh message finally lands (the orphan run released the queue):
+        // the anchor is captured, the window renders, and the settled call
+        // neither duplicates nor loses its server start order.
+        let with_anchor = SessionTranscript::new(vec![
+            message_in_flight(
+                "a_stale",
+                anchor - 30 * 60_000,
+                None,
+                stale_tool(ToolStatus::Completed, Some("slept")),
+            ),
+            typed_message(
+                "msg_cola_new",
+                MessageRole::User,
+                Some(anchor),
+                vec![text_part("新的问题")],
+            ),
+            message("a_new", anchor + 1_000, vec![text_part("新回答")]),
+        ]);
+        assert!(render_new_turn_parts(&mut acc, &with_anchor));
+        assert_eq!(
+            acc.turn_anchor,
+            Some(TurnAnchor {
+                message_id: MessageId::new("msg_cola_new"),
+                created_ms: anchor,
+            })
+        );
+        let text = card_text(&acc.build_card_with_split().0);
+        assert_eq!(text.matches("slept").count(), 1, "still settled once: {text}");
+        assert!(
+            text.find("slept") < text.find("新回答"),
+            "the settled call keeps its server start order: {text}"
+        );
     }
 
     /// A carried call the Turn's own window renders is the Turn's own live

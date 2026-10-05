@@ -1350,6 +1350,115 @@ async fn a_restart_takeover_carries_the_orphans_running_tool() {
     );
 }
 
+/// ADR-0068's canonical restart window: the fresh Turn's message is queued
+/// behind the still-running orphan run, so the server's transcript carries no
+/// anchor for as long as that run lasts. A carried call is resolved by call
+/// identity against the whole read, so its completion still reconciles onto
+/// the successor's card — while the anchor is unobserved — exactly once, and
+/// nothing duplicates when the message finally lands.
+#[tokio::test]
+async fn a_carried_call_reconciles_while_the_fresh_turn_is_still_queued() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let orphan_anchor = 1_000_000;
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(orphan_anchor));
+    let new_anchor = 2_000_000;
+    let started_at = 1_300_000;
+    let orphan = |status: ToolStatus, output: &str| {
+        in_flight_shell(
+            "a_orphan",
+            orphan_anchor + 500,
+            "call_sleep",
+            status,
+            started_at,
+            output,
+        )
+    };
+    // The tail the carry reads: the orphan Turn's own newest end.
+    let tail = TranscriptTail {
+        transcript: SessionTranscript::new(vec![
+            user("msg_cola_anchor", orphan_anchor, "跑个长命令"),
+            orphan(ToolStatus::Running, ""),
+        ]),
+        complete: true,
+    };
+    // The session's newest end while the orphan run still holds the queue: the
+    // fresh Turn's message is NOT in the transcript yet — the canonical
+    // restart window, with no anchor to observe.
+    let queued = SessionTranscript::new(vec![
+        user("msg_cola_anchor", orphan_anchor, "跑个长命令"),
+        orphan(ToolStatus::Running, ""),
+    ]);
+    let (app, platform, backend, gate) = carried_app(&session_file, queued, tail, SessionStatus::Busy).await;
+    platform.given_card_view("om_frozen", live_tail_orphan_view());
+
+    let mut context = ctx("ses_test", "新问题");
+    context.cola_message_id = Some("msg_cola_new".into());
+    let turn = spawn_turn(&app, context);
+
+    // The carry seeds the successor's live tail while the submitted prompt is
+    // held in flight.
+    wait_for_card_text(&platform, "⏳ shell").await;
+    assert_eq!(
+        Turn::armed_turn_anchor(&app.cards_handle(), "ses_test").await,
+        None,
+        "the fresh message is queued behind the orphan run, so no anchor is observable"
+    );
+
+    // The call completes while its message stays stale AND the fresh message is
+    // still absent: the carried identity must reconcile anyway, joining the
+    // successor's timeline at its server start key.
+    script_transcript(
+        &backend,
+        vec![SessionTranscript::new(vec![
+            user("msg_cola_anchor", orphan_anchor, "跑个长命令"),
+            orphan(ToolStatus::Completed, "slept"),
+        ])],
+    )
+    .await;
+    wait_for_card_text(&platform, "slept").await;
+    assert_eq!(
+        Turn::armed_turn_anchor(&app.cards_handle(), "ses_test").await,
+        None,
+        "the completion renders while the anchor is still unobserved"
+    );
+
+    // The message finally lands (the orphan run released the queue), the new
+    // Turn completes, and the settled call renders exactly once, in place.
+    script_transcript(
+        &backend,
+        vec![SessionTranscript::new(vec![
+            user("msg_cola_anchor", orphan_anchor, "跑个长命令"),
+            orphan(ToolStatus::Completed, "slept"),
+            user("msg_cola_new", new_anchor, "新问题"),
+            assistant(new_anchor + 1_000, "新回答"),
+        ])],
+    )
+    .await;
+    backend
+        .set_session_status("ses_test", Some(SessionStatus::Idle))
+        .await;
+    gate.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), turn)
+        .await
+        .expect("the turn must end")
+        .unwrap()
+        .unwrap();
+    wait_for_card_header(&platform, "✅").await;
+    let final_card = platform.updated_cards().await;
+    let final_text = card_text(final_card.last().unwrap());
+    assert_eq!(
+        final_text.matches("slept").count(),
+        1,
+        "the carried completion stays exactly once: {final_text}"
+    );
+    assert!(
+        final_text.contains("新回答"),
+        "the new Turn's own reply renders as usual: {final_text}"
+    );
+}
+
 /// ADR-0068: the takeover's collect always drops the Background Task Ledger —
 /// a ledger-only orphan (its launch settled 🌙 while the run is still live) is
 /// collected without the stale live list, and the successor's own reads
