@@ -1,14 +1,16 @@
-//! The file I/O every best-effort JSON sidecar shares (the session mapping's
-//! companions: the Wake Watermark, the Live Card record, the interactive
-//! surfaces, the Instant Reminder's pin set).
+//! The file I/O the Session mapping and its best-effort JSON companions share
+//! (the Wake Watermark, the Live Card record, the interactive surfaces, the
+//! Instant Reminder's pin set).
 //!
 //! One convention, one implementation (CODING_STANDARDS: extract shared logic
 //! instead of duplicating it): a **load** that fails open — a missing,
 //! unreadable or corrupt file reads as the empty record, because a sidecar
 //! only feeds a restart's recovery and must never wedge the process reading
-//! it — and a **store** that is best-effort and atomic (temp file + rename),
-//! so a crash mid-write cannot leave a half-file, and an empty record removes
-//! the file instead of persisting one.
+//! it — and an atomic **write** (temp file + rename), so a crash mid-write
+//! cannot leave a half-file. [`store`] wraps it best-effort for the sidecars
+//! whose in-memory state is authoritative; the Session mapping calls
+//! [`write_atomic`] directly because its loss is not recoverable, and an
+//! empty record removes the file instead of persisting one.
 //!
 //! Each module keeps its own record type, its own semantics and its own
 //! format tests; only the bytes-on-disk mechanics live here.
@@ -60,9 +62,6 @@ pub(crate) fn store<T: Serialize>(path: &Path, what: &str, record: &T, empty: bo
         }
         return;
     }
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
     let data = match serde_json::to_string(record) {
         Ok(data) => data,
         Err(e) => {
@@ -70,14 +69,23 @@ pub(crate) fn store<T: Serialize>(path: &Path, what: &str, record: &T, empty: bo
             return;
         }
     };
+    if let Err(e) = write_atomic(path, data.as_bytes()) {
+        tracing::warn!("{what}: could not write {}: {}", path.display(), e);
+    }
+}
+
+/// Replace `path` with `data` atomically: write a sibling temp file, then
+/// rename it over the target, so a crash mid-write can never leave a half
+/// file. The checked sibling of [`store`] — it reports the failure instead of
+/// logging it, for the one sidecar whose loss is not recoverable: the session
+/// mapping, whose reader routes every Chat/Topic to its Session.
+pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let tmp = path.with_extension("tmp");
-    if let Err(e) = std::fs::write(&tmp, data) {
-        tracing::warn!("{what}: could not write {}: {}", tmp.display(), e);
-        return;
-    }
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        tracing::warn!("{what}: could not replace {}: {}", path.display(), e);
-    }
+    std::fs::write(&tmp, data)?;
+    std::fs::rename(&tmp, path)
 }
 
 #[cfg(test)]
@@ -128,5 +136,25 @@ mod tests {
             Record::default(),
             "a corrupt file reads as the empty record"
         );
+    }
+
+    /// The checked writer's contract: it replaces the file, no temp file
+    /// survives, and an unwritable target reports the failure instead of
+    /// pretending success.
+    #[test]
+    fn write_atomic_replaces_the_file_and_reports_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("record.json");
+        write_atomic(&path, b"one").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one");
+        assert!(!path.with_extension("tmp").exists());
+
+        write_atomic(&path, b"two").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "two");
+
+        // A directory at the target cannot be replaced by a file.
+        let occupied = dir.path().join("occupied");
+        std::fs::create_dir(&occupied).unwrap();
+        assert!(write_atomic(&occupied, b"x").is_err());
     }
 }
