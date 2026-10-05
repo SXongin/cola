@@ -8,9 +8,9 @@
 //! ([`super::Turn::apply_disposition`] /
 //! [`super::state::StreamAccumulator::apply_ending`]): the card's state and
 //! failure line, its phase timer, then the work-context refresh and the flush.
-//! The durable reap has no live card to apply to: it reads the same table for
-//! its ending card's state and failure line and keeps its own body-preserving
-//! PATCH and record mechanics (ADR-0063).
+//! The durable reap has no live accumulator to apply to: it reads the same
+//! table for its ending card's state and failure line and keeps its own
+//! body-preserving PATCH and record mechanics (ADR-0063).
 //! This table is the ONE place an ending is translated into what the card
 //! shows: the out-of-turn settle loop's private ending vocabulary and its
 //! per-ending finalization dispatch retired with #539, the in-Turn drain's
@@ -154,6 +154,23 @@ impl Disposition {
             Self::Stopped => Some(NOTICE_STOPPED),
             Self::Failed(_) | Self::LostContact | Self::StuckPanel => Some(NOTICE_ERROR),
             Self::Observe | Self::Waiting | Self::Unreceived => None,
+        }
+    }
+
+    /// The one line the out-of-turn loop logs for a disposition; the caller's
+    /// announcement (if any) follows the apply. `Observe` never reaches the
+    /// loop — it keeps observing instead of ending — but the arm stays so the
+    /// match is exhaustive.
+    pub(crate) fn log_line(&self) -> &'static str {
+        match self {
+            Disposition::Observe => "still observing",
+            Disposition::Stopped => "stopped; finalized Stopped",
+            Disposition::Waiting => "idle with live background tasks; yielded waiting",
+            Disposition::Failed(_) => "failed; finalized Error",
+            Disposition::Done => "idle; finalized",
+            Disposition::Unreceived => "message never landed at idle; finalized Unreceived",
+            Disposition::LostContact => "lost contact; finalized Error",
+            Disposition::StuckPanel => "ended with an unreconcilable panel; finalized Error",
         }
     }
 

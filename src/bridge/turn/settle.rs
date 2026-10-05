@@ -115,25 +115,9 @@ impl Ownership {
     }
 }
 
-/// The one line the loop logs for a disposition; the caller's announcement
-/// (if any) follows the apply. `Observe` never reaches here — the loop keeps
-/// observing instead of ending.
-fn log_line(disposition: &Disposition) -> &'static str {
-    match disposition {
-        Disposition::Observe => "still observing",
-        Disposition::Stopped => "stopped; finalized Stopped",
-        Disposition::Waiting => "idle with live background tasks; yielded waiting",
-        Disposition::Failed(_) => "failed; finalized Error",
-        Disposition::Done => "idle; finalized",
-        Disposition::Unreceived => "message never landed at idle; finalized Unreceived",
-        Disposition::LostContact => "lost contact; finalized Error",
-        Disposition::StuckPanel => "ended with an unreconcilable panel; finalized Error",
-    }
-}
-
 /// Log the ending and hand it back — the one exit for every branch below.
 fn finish(disposition: Disposition, session_id: &str, label: &str) -> Option<Disposition> {
-    tracing::info!("{label}: session {session_id} {}", log_line(&disposition));
+    tracing::info!("{label}: session {session_id} {}", disposition.log_line());
     Some(disposition)
 }
 
