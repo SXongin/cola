@@ -111,14 +111,16 @@ still producing, so everything after the cut never reached Feishu (#451; the
 run in the #447 incident lasted 78 minutes). It is now an **idle bound**
 (#457): every poll whose render makes observable progress resets the deadline —
 a new text/reasoning part, a tool panel revision (a call appearing, changing
-status or gaining output), a live task panel's child activity or ledger
-movement, or a context-token update: everything the pass flushes for except
-the per-second header timer, which ticks on an idle run by design. A run whose
-card shows nothing new for the whole window is treated as not producing and
-ends under the old rule: partial content finalizes Done, and a message that
-never produced still leaves its 有新消息 notification untouched. A transcript
-read that keeps failing is no progress either — the bound ends it, so a wedged
-Backend cannot hold the card live forever. The Wake continuation's settle
-grace (the shared loop's lost-contact / stuck-panel bound) now lives in its
-own field, separate from the renderer's idle bound, so retuning one can no
-longer move the other.
+status or gaining output), a live task panel's child activity changing, a
+ledger row's visible facts moving, or a context-token update: everything the
+pass flushes for except the per-second header timer and the rendered numbers
+(a row's elapsed or age) crossing their cadence — those tick on a silent run
+by design and must not renew the bound, or the card of a run that stopped
+producing would stay live forever. A run whose card shows nothing new for the
+whole window is treated as not producing and ends under the old rule: partial
+content finalizes Done, and a message that never produced still leaves its
+有新消息 notification untouched. A transcript read that keeps failing is no
+progress either — the bound ends it, so a wedged Backend cannot hold the card
+live forever. The Wake continuation's settle grace (the shared loop's
+lost-contact / stuck-panel bound) now lives in its own field, separate from
+the renderer's idle bound, so retuning one can no longer move the other.

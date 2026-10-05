@@ -1268,10 +1268,13 @@ async fn external_render_loop(
             break;
         }
         // Renew the idle bound on a render that made observable progress:
-        // content, a panel/ledger/liveness movement — anything the card owed.
-        // The renewal sits past the ending checks above — those already ended
-        // the loop — and before the bound below, so a productive tick at the
-        // very edge extends the window instead of being cut.
+        // content, a panel revision, a child's liveness moving, a ledger
+        // row's visible facts — but NOT the rendered clock numbers, whose
+        // whole-minute tick on a silent task would keep the card live
+        // forever. The renewal sits past the ending checks above — those
+        // already ended the loop — and before the bound below, so a
+        // productive tick at the very edge extends the window instead of
+        // being cut.
         if stats.progressed {
             last_progress = tokio::time::Instant::now();
         }
