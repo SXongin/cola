@@ -1,6 +1,6 @@
 //! The file I/O the Session mapping and its best-effort JSON companions share
-//! (the Wake Watermark, the Live Card record, the interactive surfaces, the
-//! Instant Reminder's pin set).
+//! (the Chain Record, the interactive surfaces, the Instant Reminder's pin
+//! set).
 //!
 //! One convention, one implementation (CODING_STANDARDS: extract shared logic
 //! instead of duplicating it): a **load** that fails open — a missing,

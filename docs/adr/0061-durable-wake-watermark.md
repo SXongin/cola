@@ -34,9 +34,10 @@ one collected).
 ## Decision
 
 **Persist a per-session Wake Watermark.** The newest Wake whose completion a
-card has announced, as `(wake id, created_ms)`, keyed by session id in its own
-sidecar file (`~/.cola/wake_watermarks.json`, atomic tmp+rename, the
-`interactive_surfaces.json` / `pinned_chats.json` pattern). It is advanced only
+card has announced, as `(wake id, created_ms)`, keyed by session id — its own
+sidecar file at the time (`~/.cola/wake_watermarks.json`); since ADR-0069 the
+`announcements` section of `chain_records.json`, atomic tmp+rename, the
+`interactive_surfaces.json` / `pinned_chats.json` pattern. It is advanced only
 after the card write that carries the announcement lands — a split's
 continuation send, the PATCH carrying a merged completion entry, the Fresh
 card's own send — so it tracks a user-visible fact, never an intention. It
