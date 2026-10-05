@@ -1557,6 +1557,229 @@ async fn external_reply_render_renews_on_child_liveness() {
     .await;
 }
 
+/// #457: a transcript read that never resolves must not park the loop past
+/// its idle bound — the read is bounded, so a half-open connection idles out
+/// like any failed read. A part injected after the bound (gate released) must
+/// never render.
+#[tokio::test]
+async fn external_reply_render_idles_out_when_reads_hang() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut mock = MockBackend::new(realistic_parts());
+    mock.given_transcript(
+        "ses_ext",
+        vec![SessionTranscript::new(vec![user(
+            "msg_ext_user",
+            2_000_000,
+            "OpenChamber 里发的消息",
+        )])],
+    );
+    let backend = Arc::new(mock);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
+            session_id: "ses_ext".into(),
+            directory: "/tmp/ext".into(),
+            agent: None,
+            model: None,
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        },
+    )
+    .await;
+    app.external
+        .render_poll_ms
+        .store(5, std::sync::atomic::Ordering::Relaxed);
+    app.external
+        .request_timeout_ms
+        .store(10, std::sync::atomic::Ordering::Relaxed);
+    app.external
+        .render_idle_timeout_ms
+        .store(30, std::sync::atomic::Ordering::Relaxed);
+
+    // Park every transcript read on the gate BEFORE the renderer polls.
+    let gate = backend.hold_transcripts();
+    app.external
+        .start_reply_render(
+            &app.flow_handles(),
+            "ses_ext",
+            &anchor(2_000_000),
+            "msg_sent",
+            "OpenChamber 里发的消息",
+        )
+        .await;
+    let anchor = Turn::armed_turn_anchor(&app.cards_handle(), "ses_ext")
+        .await
+        .expect("the renderer armed");
+
+    // Well past the bound: every read hit its 10 ms timeout, so the renderer
+    // must have given up rather than park on the half-open connection.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    gate.add_permits(64);
+    backend
+        .given_transcript_after_build(
+            "ses_ext",
+            vec![SessionTranscript::new(vec![
+                typed_message(
+                    anchor.message_id.as_str(),
+                    MessageRole::User,
+                    Some(anchor.created_ms),
+                    vec![text_part("OpenChamber 里发的消息")],
+                ),
+                typed_message(
+                    "msg_ext_assist",
+                    MessageRole::Assistant,
+                    Some(anchor.created_ms + 1_000),
+                    vec![text_part("迟到的输出。")],
+                ),
+            ])],
+        )
+        .await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let calls = platform.calls.lock().await.clone();
+    for card in calls.iter().filter_map(|c| match c {
+        PlatformCall::UpdateMessage { card, .. } => Some(card),
+        _ => None,
+    }) {
+        assert!(
+            !card_text(card).contains("迟到的输出"),
+            "a renderer that idled out on hung reads must not render a later part: {card}"
+        );
+    }
+    assert_ne!(
+        Turn::card_state(&app.cards_handle(), "ses_ext").await,
+        Some(crate::feishu::card::CardState::Done),
+        "the silent card must not be stamped Done"
+    );
+}
+
+/// #457: a failed read must not let this renderer finalize SOMEONE ELSE'S
+/// card. Renderer A's reads fail while a newer arm replaces its accumulator;
+/// A's bound firing must exit silently — the replacement card, already
+/// carrying content, stays live.
+#[tokio::test]
+async fn external_reply_render_does_not_finalize_a_replacement_card() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut mock = MockBackend::new(realistic_parts());
+    mock.given_transcript(
+        "ses_ext",
+        vec![SessionTranscript::new(vec![user(
+            "msg_ext_user",
+            2_000_000,
+            "OpenChamber 里发的消息",
+        )])],
+    );
+    let backend = Arc::new(mock);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
+            session_id: "ses_ext".into(),
+            directory: "/tmp/ext".into(),
+            agent: None,
+            model: None,
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        },
+    )
+    .await;
+    app.external
+        .render_poll_ms
+        .store(5, std::sync::atomic::Ordering::Relaxed);
+    app.external
+        .render_idle_timeout_ms
+        .store(30, std::sync::atomic::Ordering::Relaxed);
+
+    app.external
+        .start_reply_render(
+            &app.flow_handles(),
+            "ses_ext",
+            &anchor(2_000_000),
+            "msg_sent_a",
+            "OpenChamber 里发的消息",
+        )
+        .await;
+    backend.fail_transcript_for("ses_ext").await;
+
+    // A newer external message replaces the accumulator while A's reads fail,
+    // and its card already carries content.
+    let anchor_b = anchor(3_000_000);
+    Turn::arm_external_render(
+        &app.cards_handle(),
+        "ses_ext",
+        "msg_sent_b",
+        &anchor_b,
+        "sub",
+        "/tmp/ext",
+        None,
+        Some("👤 新消息"),
+    )
+    .await;
+    {
+        let flow = app.flow_handles();
+        let transcript = SessionTranscript::new(vec![
+            typed_message(
+                anchor_b.message_id.as_str(),
+                MessageRole::User,
+                Some(anchor_b.created_ms),
+                vec![text_part("新消息")],
+            ),
+            typed_message(
+                "msg_ext_assist_b",
+                MessageRole::Assistant,
+                Some(anchor_b.created_ms + 1_000),
+                vec![text_part("B 的进行中内容。")],
+            ),
+        ]);
+        assert!(
+            Turn::render_and_flush(
+                &flow.cards,
+                &flow.sessions,
+                &flow.backend,
+                &flow.requests,
+                "ses_ext",
+                &transcript,
+            )
+            .await
+            .is_some(),
+            "the replacement card renders content"
+        );
+    }
+
+    // Let A's bound fire: it must leave the replacement card alone.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_ext").await,
+        Some(crate::feishu::card::CardState::Streaming),
+        "the replacement card must stay live — A must not finalize it"
+    );
+    let calls = platform.calls.lock().await.clone();
+    for card in calls.iter().filter_map(|c| match c {
+        PlatformCall::UpdateMessage { card, .. } => Some(card),
+        _ => None,
+    }) {
+        let header = card["header"]["title"]["content"].as_str().unwrap_or("");
+        assert!(
+            !header.contains("完成") && !header.contains("✓") && !header.contains("出错"),
+            "A's bound must not stamp a terminal on the replacement card: {card}"
+        );
+    }
+}
+
 /// #451: a Feishu Supplement landing during an external follow is a
 /// cola-authored message merged into the SAME run — only a newer EXTERNAL
 /// message is a turn boundary (ADR-0028). Before the fix the follow's renderer
