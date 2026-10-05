@@ -27,8 +27,9 @@ use crate::opencode::types::SessionStatus;
 /// (`StampRestart`), or the transcript decided the ending (`Settle`).
 ///
 /// `Keep` also carries the marked outcomes: an orphan whose stamp already
-/// landed, a yielded waiting card whose yield already landed, and an ending
-/// the read left undecided ([`TurnSettle::Running`]).
+/// landed or was permanently refused (#522), a yielded waiting card whose
+/// yield already landed, and an ending the read left undecided
+/// ([`TurnSettle::Running`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ChainDisposition {
     /// Nothing is owed this pass: a claim owns the record, the card is this
@@ -221,7 +222,10 @@ pub(crate) fn reconcile(record: &ChainRecord, reads: &RecoveryReads<'_>) -> Chai
                 // it. Stamp that once per process life (#443) so the user
                 // knows why it stopped moving.
                 Some(StatusRead::Named(status)) if status.is_live() => {
-                    if record.restarted_reaped {
+                    // The one-time outcome: a stamp that landed, or was
+                    // permanently refused and given up for this process life
+                    // (#522), is never attempted again.
+                    if record.restarted_reaped || record.restart_stamp_rejected {
                         ChainDisposition::Keep
                     } else {
                         ChainDisposition::StampRestart
@@ -489,12 +493,18 @@ mod tests {
         };
         assert_eq!(reconcile(&record, &live), ChainDisposition::StampRestart);
 
-        // The one-time mark holds: a stamped orphan is kept, never re-stamped.
+        // The one-time marks hold: a stamped orphan, and (#522) one whose
+        // stamp was permanently refused, are both kept, never retried.
         let stamped = ChainRecord {
             restarted_reaped: true,
             ..record.clone()
         };
         assert_eq!(reconcile(&stamped, &live), ChainDisposition::Keep);
+        let rejected = ChainRecord {
+            restart_stamp_rejected: true,
+            ..record.clone()
+        };
+        assert_eq!(reconcile(&rejected, &live), ChainDisposition::Keep);
     }
 
     /// The transcript decides the ending at a definite non-live status: each
