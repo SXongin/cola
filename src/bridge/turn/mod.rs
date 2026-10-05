@@ -3263,18 +3263,13 @@ impl Turn {
                 });
             }
         }
-        let anchor = newest_wake?.anchor()?;
-        // A restart must not re-announce a Wake a previous cola life already
-        // showed (#424): the watermark is the durable half of this chain's own
-        // `announced_wakes`, so only a strictly newer Wake is owed. Equal
-        // server times read as announced — the conservative side.
-        if cards
-            .chains
-            .announced(session_id)
-            .is_some_and(|mark| anchor.created_ms <= mark.created_ms)
-        {
-            return None;
-        }
+        // No chain in this process (a cola restart). The Fresh gate is the
+        // Chain Record module's second decision entry (ADR-0069): it shares
+        // this store's Wake Watermark and the Keep / NoDecision vocabulary,
+        // and owns the rules the read facts are judged by. The corroboration
+        // the gate cannot decide — the in-process inbound claim and the
+        // anchor re-read — stays with `render_wake_continuation`'s caller.
+        let wake = newest_wake.and_then(|wake| wake.anchor());
         // A Wake older than the newest user message is STALE: the conversation
         // has moved past it — a later cola life already saw or superseded it —
         // and re-posting it after a restart would replay every turn that
@@ -3284,15 +3279,30 @@ impl Turn {
         // this: a chain continuation renders just what the chain missed, so a
         // stale Wake can never replay history through it, and the content-diff
         // fallback (which also fires with a chain) stays untouched.
-        let stale = transcript
-            .newest_user()
-            .and_then(|message| message.time)
-            .is_some_and(|time| time.created > anchor.created_ms);
-        if stale {
-            return None;
+        let stale = wake.as_ref().is_some_and(|anchor| {
+            transcript
+                .newest_user()
+                .and_then(|message| message.time)
+                .is_some_and(|time| time.created > anchor.created_ms)
+        });
+        // The Wake's own work, scoped at its anchor, against an empty
+        // accumulator: a restart never replays the whole Turn.
+        let renders = wake.as_ref().is_some_and(|anchor| {
+            let probe = StreamAccumulator::new("");
+            render::renders_new_content(&probe, transcript, anchor)
+        });
+        match crate::bridge::chain::fresh(&crate::bridge::chain::FreshReads {
+            announced: cards.chains.announced(session_id),
+            wake,
+            stale,
+            renders,
+        }) {
+            crate::bridge::chain::FreshDisposition::Announce(anchor) => {
+                Some(WakeContinuation::Fresh { anchor })
+            }
+            crate::bridge::chain::FreshDisposition::Keep
+            | crate::bridge::chain::FreshDisposition::NoDecision => None,
         }
-        let probe = StreamAccumulator::new("");
-        render::renders_new_content(&probe, transcript, &anchor).then_some(WakeContinuation::Fresh { anchor })
     }
 
     /// Whether `session_id`'s card chain is owned by a live renderer — a Turn
