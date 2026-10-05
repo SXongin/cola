@@ -76,14 +76,21 @@ pub(crate) fn store<T: Serialize>(path: &Path, what: &str, record: &T, empty: bo
 
 /// Replace `path` with `data` atomically: write a sibling temp file, then
 /// rename it over the target, so a crash mid-write can never leave a half
-/// file. The checked sibling of [`store`] — it reports the failure instead of
-/// logging it, for the one sidecar whose loss is not recoverable: the session
-/// mapping, whose reader routes every Chat/Topic to its Session.
+/// file (and a failed replace removes the temp file it wrote). The checked
+/// sibling of [`store`] — it reports the failure instead of logging it, for
+/// the one sidecar whose loss is not recoverable: the session mapping, whose
+/// reader routes every Chat/Topic to its Session.
 pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     ensure_parent(path)?;
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, data)?;
-    std::fs::rename(&tmp, path)
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        // A failed rename leaves the target in place; drop the temp so the
+        // failure leaves nothing behind.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// Create `path`'s parent directory. A bare relative filename has an **empty**
@@ -165,6 +172,10 @@ mod tests {
         let occupied = dir.path().join("occupied");
         std::fs::create_dir(&occupied).unwrap();
         assert!(write_atomic(&occupied, b"x").is_err());
+        assert!(
+            !occupied.with_extension("tmp").exists(),
+            "a failed replace leaves no temp file behind"
+        );
     }
 
     /// A bare relative filename has an empty parent: the writer must skip the
