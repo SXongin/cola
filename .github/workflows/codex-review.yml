@@ -21,6 +21,15 @@
 # (ADR-0034, 2026-10-04 amendment); comment-ID anchoring removes the scan, so
 # the marker rule died with the trial workflow.
 #
+# Robustness (#530): the Codex action can hang AFTER Codex has written its
+# complete output — a surviving descendant keeps the runner's stdio open, so
+# the action never returns and the job dies on its timeout with the result
+# already on disk (upstream openai/codex-action#150/#169; the wrapper fix,
+# #151, is unreleased). The action is pinned to v1.11, whose wrapper handles
+# the same heavy workload cleanly, and the Codex step is bounded and its
+# output salvaged, so a recurrence cannot discard a finished review. Revisit
+# the pin when the wrapper fix ships.
+#
 # Trust model: like the OpenCode gate before it, this is a `pull_request`
 # workflow, so a same-repo PR runs the workflow definition from its merge ref.
 # Same-repo PR authors already have write access (they can edit any workflow);
@@ -59,7 +68,8 @@ jobs:
       github.actor != 'dependabot[bot]' &&
       !startsWith(github.head_ref || '', 'release/')
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Two bounded Codex attempts (12 min each) plus the post/approve steps.
+    timeout-minutes: 30
     permissions:
       contents: read
       issues: read
@@ -119,8 +129,48 @@ jobs:
             fi
           } > codex-prompt.md
 
+      # Bounded, and salvageable when it does not return (#530): a completed
+      # review is still published if the step is cancelled at its bound, while
+      # a cut stream (no verdict) trips the one retry below.
       - name: Run Codex (read-only)
-        uses: openai/codex-action@86365089eb2b84e0a8fb0717b304f8bdcb13b20e # v1.12
+        id: codex
+        continue-on-error: true
+        timeout-minutes: 12
+        uses: openai/codex-action@52fe01ec70a42f454c9d2ebd47598f9fd6893d56 # v1.11
+        with:
+          openai-api-key: ${{ secrets.OPENCODE_API_KEY }}
+          responses-api-endpoint: https://opencode.ai/inference/openai/v1/responses
+          model: gpt-6-luna
+          codex-version: 0.160.0
+          permission-profile: ":read-only"
+          prompt-file: codex-prompt.md
+          output-file: codex-output.md
+
+      # The review is complete iff its last non-blank line carries the verdict
+      # marker — the line the approve step reads. This gates the retry; the
+      # post step re-checks it before publishing.
+      - name: Check the Codex output
+        id: codex_output
+        run: |
+          set -euo pipefail
+          last=$(grep -v '^[[:space:]]*$' codex-output.md 2>/dev/null | tail -n 1 || true)
+          if [ -n "$last" ] \
+            && printf '%s\n' "$last" \
+              | grep -Eq '^CODEX_REVIEW_VERDICT: (PASS|FAIL)[[:space:]]*$'; then
+            echo "complete=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "complete=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # One bounded retry for an incomplete first attempt (a cut stream often
+      # succeeds on the second try). A step that hung AFTER writing a complete
+      # review does not retry — the post step salvages that output instead.
+      - name: Retry Codex once without a complete output
+        id: codex_retry
+        if: steps.codex_output.outputs.complete != 'true'
+        continue-on-error: true
+        timeout-minutes: 12
+        uses: openai/codex-action@52fe01ec70a42f454c9d2ebd47598f9fd6893d56 # v1.11
         with:
           openai-api-key: ${{ secrets.OPENCODE_API_KEY }}
           responses-api-endpoint: https://opencode.ai/inference/openai/v1/responses
@@ -137,12 +187,29 @@ jobs:
         id: review-comment
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CODEX_OUTCOME: ${{ steps.codex.outcome }}
+          CODEX_RETRY_OUTCOME: ${{ steps.codex_retry.outcome }}
         run: |
           set -euo pipefail
           if [ ! -s codex-output.md ]; then
             echo "Codex produced no output." >&2
             exit 1
           fi
+          # Publish only a COMPLETE review: its last non-blank line must carry
+          # the verdict marker, the line the approve step reads. A step that
+          # hung after writing the file (#150/#169) is salvaged here; a cut
+          # stream that stayed cut fails loudly instead of posting half a
+          # review. Trailing blank lines are trimmed below so the verdict stays
+          # the comment's final line.
+          last=$(grep -v '^[[:space:]]*$' codex-output.md | tail -n 1 || true)
+          if ! printf '%s\n' "$last" \
+            | grep -Eq '^CODEX_REVIEW_VERDICT: (PASS|FAIL)[[:space:]]*$'; then
+            echo "Codex output is incomplete (no verdict on its last non-blank line); not posting." >&2
+            exit 1
+          fi
+          awk 'NF{last=NR} {lines[NR]=$0} END{for (i=1; i<=last; i++) print lines[i]}' \
+            codex-output.md > codex-output.trimmed.md
+          mv codex-output.trimmed.md codex-output.md
           # A review of a commit the PR has moved past is noise on the PR;
           # refuse it rather than posting a stale comment.
           reviewed=$(git rev-parse HEAD)
@@ -156,6 +223,10 @@ jobs:
             echo '## Codex review'
             echo
             printf '_Reviewed commit: `%s`._\n' "$reviewed"
+            if [ "$CODEX_OUTCOME" != "success" ] && [ "$CODEX_RETRY_OUTCOME" != "success" ]; then
+              echo
+              echo '_The Codex step did not return; this review was salvaged from the complete output it had already written._'
+            fi
             echo
             cat codex-output.md
           } > comment.md
