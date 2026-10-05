@@ -699,6 +699,14 @@ pub(super) struct StreamAccumulator {
     /// re-render happens exactly when the typed call's visible content changed
     /// (including a `todowrite` list rewritten with same-length items).
     pub(super) rendered_parts: std::collections::HashSet<RenderedPart>,
+    /// Monotonic count of observable progress this accumulator has produced
+    /// (#457): bumped by every render stage that changes content, a tool
+    /// panel revision, a live fragment, ledger rows, or context tokens —
+    /// never by the header tick or a rendered clock number. The external
+    /// renderer renews its idle bound when this advances, so progress a pass
+    /// had already rendered before it was abandoned by its timeout still
+    /// counts (a cancelled pass cannot return its stats).
+    pub(super) progress_mark: u64,
     /// Assistant message ids this accumulator must NOT render and the ones it
     /// has observed — the retry render baseline (#387). Kept as one fact: the
     /// two sets are seeded and consumed together, and only this type's docs

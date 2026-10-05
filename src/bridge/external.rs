@@ -1187,6 +1187,9 @@ async fn external_render_loop(
     // bound never fire.
     let idle_bound = tokio::time::Duration::from_millis(idle_timeout_ms);
     let mut last_progress = tokio::time::Instant::now();
+    let mut last_mark = Turn::progress_mark(&handles.cards, &session_id)
+        .await
+        .unwrap_or(0);
     loop {
         tokio::time::sleep(tokio::time::Duration::from_millis(poll_ms)).await;
         // Completion, the newer-turn boundary and the streaming render all
@@ -1254,16 +1257,29 @@ async fn external_render_loop(
         )
         .await;
         let stats = match rendered {
-            Ok(Some(stats)) => stats,
+            Ok(Some(stats)) => Some(stats),
             // The accumulator vanished: nothing left to render.
             Ok(None) => break,
             Err(_) => {
                 tracing::warn!("external render: pass timed out after {} ms", read_timeout_ms);
-                if !stalled_poll(handles, &session_id, &anchor, last_progress, idle_bound).await {
-                    break;
-                }
-                continue;
+                None
             }
+        };
+        // Renew on the accumulator's progress mark (#457): it advances the
+        // moment a stage renders, so content a pass had already rendered
+        // before its timeout abandoned it still counts — a cancelled pass can
+        // never return its stats.
+        if let Some(mark) = Turn::progress_mark(&handles.cards, &session_id).await
+            && mark != last_mark
+        {
+            last_mark = mark;
+            last_progress = tokio::time::Instant::now();
+        }
+        let Some(stats) = stats else {
+            if !stalled_poll(handles, &session_id, &anchor, last_progress, idle_bound).await {
+                break;
+            }
+            continue;
         };
         if stats.new_parts > 0 {
             tracing::info!("external render: session {} gained parts", session_id);
@@ -1303,17 +1319,6 @@ async fn external_render_loop(
             .is_some_and(|newest| newest.created_ms > anchor.created_ms);
         if newer_turn {
             break;
-        }
-        // Renew the idle bound on a render that made observable progress:
-        // content, a panel revision, a child's liveness moving, a ledger
-        // row's visible facts — but NOT the rendered clock numbers, whose
-        // whole-minute tick on a silent task would keep the card live
-        // forever. The renewal sits past the ending checks above — those
-        // already ended the loop — and before the bound below, so a
-        // productive tick at the very edge extends the window instead of
-        // being cut.
-        if stats.progressed {
-            last_progress = tokio::time::Instant::now();
         }
         // Safety net for messages that never trigger a run, and for a run that
         // goes quiet: if a partial reply was rendered, finalize it so the card
