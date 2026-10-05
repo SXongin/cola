@@ -1,5 +1,5 @@
 //! Session Sync's durable Live Card reap (ADR-0063, #438): every tick, each
-//! record in [`LiveCards`](crate::bridge::live_cards::LiveCards) is reconciled
+//! record in [`ChainRecords`](crate::bridge::chain::ChainRecords) is reconciled
 //! against the Session's own reads, so a card a cola restart orphaned stops
 //! looking live.
 //!
@@ -51,8 +51,8 @@
 //! once, so there is no read-send-record sequence to serialize.
 
 use crate::backend::TurnSettle;
+use crate::bridge::chain::ChainRecord;
 use crate::bridge::handles::{CardsHandle, FlowHandles};
-use crate::bridge::live_cards::LiveCard;
 use crate::bridge::turn::Turn;
 use crate::feishu::card::{
     CardState, error_line, ledger::TASK_LEDGER_ELEMENT_ID, move_line, shell::CardBuilder,
@@ -95,7 +95,7 @@ pub(crate) async fn collect_orphan_after_carry(
     carried_running_panels: bool,
 ) {
     cards
-        .live_cards
+        .chains
         .note_predecessor_keep(session_id, card_message_id, carried_running_panels);
     let keep = KeepBody::WithoutLiveTail {
         strip_running_panels: carried_running_panels,
@@ -139,7 +139,7 @@ pub(crate) async fn reconcile(
     session_id: &str,
     directory: Option<&str>,
     tracked_directory: Option<&str>,
-    record: &LiveCard,
+    record: &ChainRecord,
     read_timeout_ms: u64,
 ) {
     // A live Turn (or the follow that inherited its guard) owns the session,
@@ -198,9 +198,9 @@ pub(crate) async fn reconcile(
             Turn::armed_turn_anchor(&handles.cards, session_id).await,
         ) {
             (true, Some(anchor)) => {
-                handles.cards.live_cards.replace(
+                handles.cards.chains.replace(
                     session_id,
-                    LiveCard::new(current_id, anchor.message_id.clone(), Some(anchor.created_ms))
+                    ChainRecord::new(current_id, anchor.message_id.clone(), Some(anchor.created_ms))
                         // The route belongs to the session, not the card: keep
                         // it across the re-point.
                         .with_directory(record.directory.clone()),
@@ -208,7 +208,7 @@ pub(crate) async fn reconcile(
             }
             // A settled successor has nothing to track, and an anchorless one
             // cannot scope a reap: the next track writes it when it can.
-            _ => handles.cards.live_cards.remove(session_id),
+            _ => handles.cards.chains.remove(session_id),
         }
         return;
     }
@@ -321,7 +321,7 @@ pub(crate) async fn reconcile(
             if pass.settle(CardState::Waiting, None).await {
                 handles
                     .cards
-                    .live_cards
+                    .chains
                     .mark_waiting_reaped(session_id, &record.card_message_id);
             }
         }
@@ -341,7 +341,7 @@ pub(crate) async fn reconcile(
 struct ReapPass<'a> {
     handles: &'a FlowHandles,
     session_id: &'a str,
-    record: &'a LiveCard,
+    record: &'a ChainRecord,
     baseline_directory: &'a str,
     read_timeout_ms: u64,
 }
@@ -387,7 +387,7 @@ impl ReapPass<'_> {
             state.reap_word()
         );
         if terminal {
-            self.handles.cards.live_cards.remove(self.session_id);
+            self.handles.cards.chains.remove(self.session_id);
         }
         true
     }
@@ -406,7 +406,7 @@ impl ReapPass<'_> {
         if !self
             .handles
             .cards
-            .live_cards
+            .chains
             .begin_restart_stamp(self.session_id, &card_message_id)
         {
             return;
@@ -416,9 +416,7 @@ impl ReapPass<'_> {
         let read_timeout_ms = self.read_timeout_ms;
         tokio::spawn(async move {
             stamp_restart_attempt(&cards, &session_id, &card_message_id, read_timeout_ms).await;
-            cards
-                .live_cards
-                .finish_restart_stamp(&session_id, &card_message_id);
+            cards.chains.finish_restart_stamp(&session_id, &card_message_id);
         });
     }
 
@@ -521,9 +519,7 @@ async fn stamp_restart_attempt(
         "live-card reap: session {session_id} {}",
         CardState::Restarted.reap_word()
     );
-    cards
-        .live_cards
-        .mark_restarted_reaped(session_id, card_message_id);
+    cards.chains.mark_restarted_reaped(session_id, card_message_id);
     // A takeover that started while the PATCH was in flight may have seen its
     // older collect overwritten by this stamp (the delivery lock serializes
     // the two writes, not their order of intent): if a successor owns the
@@ -538,10 +534,7 @@ async fn stamp_restart_attempt(
     // that recorded no rule — the Wake continuation's arm, the external arm —
     // keeps today's preserved body ([`KeepBody::Everything`]).
     if Turn::card_message_id(cards, session_id).await.is_some() {
-        let keep = match cards
-            .live_cards
-            .predecessor_keep_strip(session_id, card_message_id)
-        {
+        let keep = match cards.chains.predecessor_keep_strip(session_id, card_message_id) {
             Some(strip_running_panels) => KeepBody::WithoutLiveTail { strip_running_panels },
             None => KeepBody::Everything,
         };

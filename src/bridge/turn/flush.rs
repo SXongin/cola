@@ -500,7 +500,7 @@ pub(super) async fn drain_wake_watermark(cards: &CardsHandle, session_id: &str) 
         card.acc.pending_watermark.take()
     };
     if let Some((wake_id, created_ms)) = staged {
-        cards.wake_watermarks.advance(session_id, &wake_id, created_ms);
+        cards.chains.advance(session_id, &wake_id, created_ms);
     }
 }
 

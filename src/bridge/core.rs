@@ -71,15 +71,11 @@ pub struct SharedCore {
     /// remote resolution, a sweep strip — whether or not it is still the
     /// accumulator's current card.
     pub card_handles: Arc<Mutex<crate::bridge::card_handles::CardHandles>>,
-    /// The durable per-session Wake Watermark (ADR-0061), beside the session
-    /// mapping: what a card has already announced survives a restart, so the
-    /// no-chain Fresh continuation never re-posts it (#424).
-    pub wake_watermarks: Arc<crate::bridge::wake_watermark::WakeWatermarks>,
-    /// The durable per-session Live Card record (ADR-0063), beside the session
-    /// mapping and the Wake Watermark: which card each Session is streaming
-    /// into, so Session Sync can reap the card a restart orphaned instead of
-    /// leaving it frozen (#438).
-    pub live_cards: Arc<crate::bridge::live_cards::LiveCards>,
+    /// The durable Chain Record (ADR-0069), beside the session mapping: the
+    /// live card record (ADR-0063) and the Wake Watermark (ADR-0061) in one
+    /// store, so a restart can reap the card it orphaned and never re-announce
+    /// a Wake an earlier life already showed.
+    pub chains: Arc<crate::bridge::chain::ChainRecords>,
     /// Permission flow: owns `sent_cards`, polls pending requests, auto-accepts
     /// for `/autoaccept` sessions, and handles the "perm" card action.
     pub permission: Arc<crate::bridge::request::flow::RequestFlow>,
@@ -248,11 +244,8 @@ impl SharedCore {
             card_handles: Arc::new(Mutex::new(
                 crate::bridge::card_handles::CardHandles::with_surfaces(Arc::clone(&surfaces)),
             )),
-            wake_watermarks: Arc::new(crate::bridge::wake_watermark::WakeWatermarks::load(
-                cfg.bridge.session_file.with_file_name("wake_watermarks.json"),
-            )),
-            live_cards: Arc::new(crate::bridge::live_cards::LiveCards::load(
-                cfg.bridge.session_file.with_file_name("live_cards.json"),
+            chains: Arc::new(crate::bridge::chain::ChainRecords::load(
+                cfg.bridge.session_file.with_file_name("chain_records.json"),
             )),
             permission: Arc::new(crate::bridge::request::flow::RequestFlow::new(
                 Box::new(crate::bridge::request::kind::PermissionKind),
@@ -393,8 +386,7 @@ impl SharedCore {
             Arc::clone(&self.card_handles),
             Arc::clone(&self.cover_titles),
             Arc::clone(&self.feishu),
-            Arc::clone(&self.wake_watermarks),
-            Arc::clone(&self.live_cards),
+            Arc::clone(&self.chains),
             Arc::clone(&self.card_write_locks),
         )
     }

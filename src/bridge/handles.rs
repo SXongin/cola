@@ -821,16 +821,12 @@ pub(crate) struct CardsHandle {
     /// bot cover card as their root (ADR-0023).
     pub(crate) cover_titles: Arc<Mutex<HashMap<String, CoverTitle>>>,
     pub(crate) feishu: Arc<dyn feishu::Platform>,
-    /// The durable per-session Wake Watermark (ADR-0061). Reachable from every
-    /// path that announces a Wake: the flush advances it after a delivering
-    /// card write, the Fresh decision reads it, and the Fresh arm advances it
-    /// after its card's own send lands.
-    pub(crate) wake_watermarks: Arc<crate::bridge::wake_watermark::WakeWatermarks>,
-    /// The durable per-session Live Card record (ADR-0063). Written whenever a
-    /// card becomes the session's live card, re-pointed when the chain
-    /// continues on a successor, and dropped at every terminal or collection;
-    /// Session Sync's reap reads it to settle the card a restart orphaned.
-    pub(crate) live_cards: Arc<crate::bridge::live_cards::LiveCards>,
+    /// The Chain Record (ADR-0069): the durable per-session facts about the
+    /// Session's Card Chain — the live card record (ADR-0063) and the Wake
+    /// Watermark (ADR-0061) — in one store. Written whenever a card becomes
+    /// the session's live card or an announcement lands; read by the reap,
+    /// the Fresh gate and the render's anchor refresh.
+    pub(crate) chains: Arc<crate::bridge::chain::ChainRecords>,
     /// session_id → the lock serializing that session's card writes. Private:
     /// [`CardsHandle::write_lock`] is the accessor.
     write_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
@@ -842,8 +838,7 @@ impl CardsHandle {
         card_handles: Arc<Mutex<CardHandles>>,
         cover_titles: Arc<Mutex<HashMap<String, CoverTitle>>>,
         feishu: Arc<dyn feishu::Platform>,
-        wake_watermarks: Arc<crate::bridge::wake_watermark::WakeWatermarks>,
-        live_cards: Arc<crate::bridge::live_cards::LiveCards>,
+        chains: Arc<crate::bridge::chain::ChainRecords>,
         write_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     ) -> Self {
         Self {
@@ -851,8 +846,7 @@ impl CardsHandle {
             card_handles,
             cover_titles,
             feishu,
-            wake_watermarks,
-            live_cards,
+            chains,
             write_locks,
         }
     }

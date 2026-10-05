@@ -720,7 +720,7 @@ pub(super) async fn render_and_flush(
     // restart's reap can ask the transcript what became of this Turn's message
     // instead of probing for it. A no-op while the record names another card.
     if let Some((card_message_id, anchor)) = &anchor {
-        cards.live_cards.set_anchor(session_id, card_message_id, anchor);
+        cards.chains.set_anchor(session_id, card_message_id, anchor);
     }
     // Keep the footer's context segment current (ADR-0044): the token usage
     // landed in the render above, and the window lookup is memoized per

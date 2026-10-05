@@ -1,6 +1,7 @@
 pub mod access;
 pub(crate) mod attach;
 pub mod card_handles;
+pub(crate) mod chain;
 pub mod command;
 pub mod core;
 pub mod discovery;
@@ -9,7 +10,6 @@ pub mod external;
 pub mod failure_latch;
 pub mod handler;
 pub(crate) mod handles;
-pub(crate) mod live_cards;
 pub mod message_pins;
 pub mod poll;
 pub mod pollers;
@@ -25,7 +25,6 @@ pub mod span;
 pub mod surfaces;
 pub mod topic;
 pub mod turn;
-pub(crate) mod wake_watermark;
 
 #[cfg(test)]
 mod attach_live;
