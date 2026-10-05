@@ -1163,18 +1163,35 @@ async fn external_reply_render_leaves_the_notification_card_when_nothing_produce
             let _ = app.external.poll_loop(&app.flow_handles()).await;
         }
     });
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-
-    // The renderer polled repeatedly past its idle bound (5 ms cadence) and
-    // then stopped with nothing rendered — evidence it armed and idled out.
-    let reads = backend
-        .transcript_calls
-        .lock()
-        .await
-        .iter()
-        .filter(|sid| sid.as_str() == "ses_ext")
-        .count();
-    assert!(reads >= 6, "the renderer must have polled, reads={reads}");
+    // The renderer arms on the poller's first pass and idles out well before
+    // the first sample (bound 30 ms). Two samples across a 150 ms window then
+    // tell an EXITED renderer from a live one: the 5 ms renderer cadence would
+    // add ~30 reads, while the 50 ms poll pass adds only a handful.
+    let reads = |backend: &Arc<MockBackend>| {
+        let backend = Arc::clone(backend);
+        async move {
+            backend
+                .transcript_calls
+                .lock()
+                .await
+                .iter()
+                .filter(|sid| sid.as_str() == "ses_ext")
+                .count()
+        }
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let reads_before = reads(&backend).await;
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let reads_after = reads(&backend).await;
+    assert!(
+        reads_before >= 6,
+        "the renderer must have polled before the bound, reads={reads_before}"
+    );
+    assert!(
+        reads_after - reads_before < 15,
+        "the renderer must have stopped at the idle bound, reads grew by {}",
+        reads_after - reads_before
+    );
 
     let calls = platform.calls.lock().await.clone();
     let notify = calls.iter().find_map(|c| match c {

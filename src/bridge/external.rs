@@ -521,8 +521,9 @@ impl ExternalFlow {
     /// external message INTO the notification card (update in place — no
     /// second card). The loop exits when the turn finishes, cola's own prompt
     /// (or a newer external message) replaces the accumulator, a newer EXTERNAL
-    /// message starts a new turn, or a hard timeout elapses — a cola-authored
-    /// Supplement merges into the run it is already streaming (#451).
+    /// message starts a new turn, or the idle bound elapses with nothing new
+    /// rendered (#457) — a cola-authored Supplement merges into the run it is
+    /// already streaming (#451).
     pub(crate) async fn start_reply_render(
         &self,
         handles: &FlowHandles,
@@ -1212,7 +1213,7 @@ async fn external_render_loop(
         // lands here.
         let stopped = handles.waits.is_stopped(&session_id).await;
         // Stream the reply's reasoning/tools/text into the notification card.
-        let Some((new_parts, _, _, changed)) = Turn::render_and_flush(
+        let Some(stats) = Turn::render_and_flush(
             &handles.cards,
             &handles.sessions,
             &handles.backend,
@@ -1224,7 +1225,7 @@ async fn external_render_loop(
         else {
             break;
         };
-        if new_parts > 0 {
+        if stats.new_parts > 0 {
             tracing::info!("external render: session {} gained parts", session_id);
         }
         if stopped {
@@ -1263,7 +1264,7 @@ async fn external_render_loop(
         // renewal sits past the ending checks above — those already ended the
         // loop — and before the bound below, so a productive tick at the very
         // edge extends the window instead of being cut.
-        if changed {
+        if stats.changed {
             last_progress = tokio::time::Instant::now();
         }
         // Safety net for messages that never trigger a run. If a partial reply
