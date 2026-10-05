@@ -1658,6 +1658,89 @@ Index: /x/src/main.rs
         );
     }
 
+    /// ADR-0068's carry set is every LIVE call — `pending` as well as
+    /// `running` (`ToolStatus::is_live`) — so a pending orphan is seeded into
+    /// the successor's live tail exactly like a running one, and its
+    /// settlement reconciles exactly once at its server start key.
+    #[test]
+    fn a_pending_orphan_call_is_carried_and_settles_once() {
+        let anchor = 2_000_000;
+        let orphan = TurnAnchor {
+            message_id: MessageId::new("msg_cola_old"),
+            created_ms: anchor - 31 * 60_000,
+        };
+        let stale_tool = |status: ToolStatus, output: Option<&str>| {
+            vec![tool(
+                "shell",
+                "call_sleep",
+                status,
+                Some(anchor - 11 * 60_000),
+                Some(serde_json::json!({"command": "sleep 3600"})),
+                output,
+            )]
+        };
+        let transcript = |status: ToolStatus, output: Option<&str>| {
+            SessionTranscript::new(vec![
+                typed_message(
+                    "msg_cola_new",
+                    MessageRole::User,
+                    Some(anchor),
+                    vec![text_part("新的问题")],
+                ),
+                message_in_flight("a_stale", anchor - 30 * 60_000, None, stale_tool(status, output)),
+            ])
+        };
+
+        let mut acc = StreamAccumulator::new("proj");
+        acc.cola_message_id = Some("msg_cola_new".into());
+        // The takeover seeds the orphan Turn's pending call: `pending` is live,
+        // so it is part of ADR-0068's carry set.
+        assert_eq!(
+            acc.carry_tools(&transcript(ToolStatus::Pending, None).turn_running_tools(&orphan)),
+            1,
+            "a pending orphan call is carried like a running one"
+        );
+        assert_eq!(acc.tools["call_sleep"].status(), &ToolStatus::Pending);
+        let (card, full) = acc.build_card_with_split();
+        assert!(!full, "a live card with only a tail panel must not split");
+        assert!(
+            card_text(&card).contains("⏳ shell"),
+            "the carried pending call rides the successor's live tail: {card}"
+        );
+
+        // The call completes while its message stays stale: the carried
+        // identity reconciles it past the Turn window, exactly once.
+        let settled = SessionTranscript::new(vec![
+            typed_message(
+                "msg_cola_new",
+                MessageRole::User,
+                Some(anchor),
+                vec![text_part("新的问题")],
+            ),
+            message_in_flight(
+                "a_stale",
+                anchor - 30 * 60_000,
+                None,
+                stale_tool(ToolStatus::Completed, Some("slept")),
+            ),
+        ]);
+        assert!(render_new_turn_parts(&mut acc, &settled));
+        assert!(!acc.tools["call_sleep"].is_live());
+        assert!(
+            acc.carried_calls.is_empty(),
+            "a settled carried call leaves the display-only carry set"
+        );
+        let text = card_text(&acc.build_card_with_split().0);
+        assert_eq!(text.matches("slept").count(), 1, "settled once: {text}");
+        assert!(!render_new_turn_parts(&mut acc, &settled));
+        let text = card_text(&acc.build_card_with_split().0);
+        assert_eq!(
+            text.matches("slept").count(),
+            1,
+            "a later transcript render does not duplicate the call: {text}"
+        );
+    }
+
     /// The carry is scoped to the orphan Turn's projection: an older, unrelated
     /// turn's stale `running` part is never resurrected on the successor.
     #[test]
