@@ -6,6 +6,8 @@
 //! answers every reader through one seam. The restart reap that reconciles
 //! those records against each Session's own reads lives beside them.
 
+mod reconcile;
 mod records;
 
+pub(crate) use reconcile::{collect_orphan, collect_orphan_after_carry, reconcile};
 pub(crate) use records::{ChainRecord, ChainRecords};

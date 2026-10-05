@@ -50,8 +50,8 @@
 //! the reap's precondition) and the ending is computed whole, then PATCHed
 //! once, so there is no read-send-record sequence to serialize.
 
+use super::records::ChainRecord;
 use crate::backend::TurnSettle;
-use crate::bridge::chain::ChainRecord;
 use crate::bridge::handles::{CardsHandle, FlowHandles};
 use crate::bridge::turn::Turn;
 use crate::feishu::card::{
