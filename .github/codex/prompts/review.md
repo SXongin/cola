@@ -37,7 +37,7 @@ linked issue, when the workflow could fetch it) is appended below.
 - A missing or failed part of the review is a blocking finding.
 
 Finish with exactly one final line, on its own line and with nothing after it —
-no punctuation, no code fence:
+no punctuation, no code fence, no bold or code-span formatting:
 
 CODEX_REVIEW_VERDICT: PASS
   when the review is complete and nothing blocks merging;
