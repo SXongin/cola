@@ -513,6 +513,26 @@ pub(super) enum LedgerCadence {
     Second,
 }
 
+/// What a ledger refresh moved (#457), split so the live render can tell real
+/// work from clock churn: `rows` — a visible fact moved (membership, a row's
+/// label or status, the fragment's words) — is progress; `clock` — only a
+/// rendered elapsed or age crossed the path's cadence — owes the flush but is
+/// not new work. Both halves flush the card; the external renderer's idle
+/// bound renews on `rows` alone, or a silent task's ticking age would keep its
+/// card live forever.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct LedgerChange {
+    pub(super) rows: bool,
+    pub(super) clock: bool,
+}
+
+impl LedgerChange {
+    /// Whether the card owes a flush (either half moved).
+    pub(super) fn owes(self) -> bool {
+        self.rows || self.clock
+    }
+}
+
 /// Accumulates streaming state for one session.
 #[derive(Default, Clone)]
 pub(super) struct StreamAccumulator {
@@ -1566,18 +1586,18 @@ impl StreamAccumulator {
     /// gathered child liveness, keyed by call id (spec #501): the ledger's
     /// `subagent` rows carry it, and a call the gather could not establish
     /// keeps its previous fragment ([`Self::ledger_rows`]). `cadence` is the
-    /// path's own comparison granularity ([`LedgerCadence`]). Returns whether
-    /// the card owes a flush: a membership change, or a rendered number — a
-    /// shell row's elapsed, or a fragment's age — moving at that cadence.
+    /// path's own comparison granularity ([`LedgerCadence`]). Returns what the
+    /// read moved, split so the caller can tell a flush from progress
+    /// ([`LedgerChange`]).
     pub(super) fn set_ledger_from_read(
         &mut self,
         transcript: &SessionTranscript,
         activities: &HashMap<String, TaskLiveness>,
         now_ms: i64,
         cadence: LedgerCadence,
-    ) -> bool {
+    ) -> LedgerChange {
         let rows = self.ledger_rows(transcript, activities);
-        self.set_ledger(rows, now_ms, cadence)
+        self.set_ledger_change(rows, now_ms, cadence)
     }
 
     /// Replace the live Background Task ledger from an already-derived read
@@ -1596,7 +1616,24 @@ impl StreamAccumulator {
     /// the visible numbers true). The read's rows and clock
     /// are stored whatever the decision, so the next age is measured from the
     /// freshest gathered timestamps rather than from a stale accepted read.
+    /// Test-only convenience over [`Self::set_ledger_change`]: the flush
+    /// decision alone, for the many cases that only pin what owes a PATCH. The
+    /// live render reads the split (`rows` vs `clock`) so its idle bound can
+    /// ignore clock churn (#457).
+    #[cfg(test)]
     fn set_ledger(&mut self, rows: Vec<TaskLedgerRow>, now_ms: i64, cadence: LedgerCadence) -> bool {
+        self.set_ledger_change(rows, now_ms, cadence).owes()
+    }
+
+    /// [`Self::set_ledger`]'s body, returning the two halves of the decision
+    /// (#457): `rows` is a visible-fact change, `clock` a rendered number
+    /// crossing `cadence`. See [`LedgerChange`] for why they are split.
+    fn set_ledger_change(
+        &mut self,
+        rows: Vec<TaskLedgerRow>,
+        now_ms: i64,
+        cadence: LedgerCadence,
+    ) -> LedgerChange {
         let clock = crate::feishu::card::ledger::task_ledger_clock(&rows, now_ms);
         let moved = |rendered: Option<u64>, new: Option<u64>| match cadence {
             LedgerCadence::Minute => rendered.map(|secs| secs / 60) != new.map(|secs| secs / 60),
@@ -1613,10 +1650,12 @@ impl StreamAccumulator {
         let clock_alike = self.ledger_clock.iter().zip(&clock).all(|(rendered, new)| {
             !moved(rendered.elapsed, new.elapsed) && !moved(rendered.activity, new.activity)
         });
-        let owes = !rows_alike || !clock_alike;
         self.ledger = rows;
         self.ledger_clock = clock;
-        owes
+        LedgerChange {
+            rows: !rows_alike,
+            clock: !clock_alike,
+        }
     }
 
     /// The live Background Task ledger a transcript read owes the card
@@ -2931,6 +2970,37 @@ mod tests {
         assert!(!cadence(&mut acc, start + 61_500, LedgerCadence::Second));
     }
 
+    /// #457: the live render's idle-bound renewal reads the ledger's `rows`
+    /// half only. A silent task's rendered elapsed/age crossing a whole minute
+    /// is clock churn — it owes the flush but must not renew the bound, or the
+    /// card of a run that stopped producing would stay live forever.
+    #[test]
+    fn a_ledger_clock_turn_is_not_progress() {
+        let start = 1_800_000_000_000;
+        let rows = || {
+            vec![TaskLedgerRow {
+                kind: TaskKind::Shell,
+                label: Some("npm run build".into()),
+                started_at: Some(start),
+                unconfirmed: false,
+                activity: None,
+            }]
+        };
+        let mut acc = StreamAccumulator::new("test");
+        // The first read is a membership change: progress.
+        let first = acc.set_ledger_change(rows(), start, LedgerCadence::Minute);
+        assert!(first.rows, "membership is progress");
+        // The rendered minute turns with the same rows: clock only.
+        let minute = acc.set_ledger_change(rows(), start + 60_000, LedgerCadence::Minute);
+        assert!(!minute.rows, "a ticking elapsed is not progress");
+        assert!(minute.clock && minute.owes(), "it still owes the live flush");
+        // A visible fact moving is progress again.
+        let mut relabelled = rows();
+        relabelled[0].label = Some("npm run test".into());
+        let moved = acc.set_ledger_change(relabelled, start + 60_000, LedgerCadence::Minute);
+        assert!(moved.rows, "a visible fact is progress");
+    }
+
     /// The flush decision reads the RENDERED row, not the gathered liveness's
     /// hidden timestamps (spec #501): a child's newest-part time moving inside
     /// the rendered second the card already shows owes nothing, while a
@@ -3083,20 +3153,26 @@ mod tests {
         let mut acc = StreamAccumulator::new("test");
 
         // The child is established (membership: empty -> a row with a fragment).
-        assert!(acc.set_ledger_from_read(
-            &transcript,
-            &HashMap::from([("call_sub".to_string(), bash.clone())]),
-            start,
-            LedgerCadence::Minute
-        ));
+        assert!(
+            acc.set_ledger_from_read(
+                &transcript,
+                &HashMap::from([("call_sub".to_string(), bash.clone())]),
+                start,
+                LedgerCadence::Minute
+            )
+            .owes()
+        );
         // The gather fails: the stored fragment is kept, so the same rendered
         // row owes nothing — a failed read is not a change.
-        assert!(!acc.set_ledger_from_read(
-            &transcript,
-            &HashMap::new(),
-            start + 30_000,
-            LedgerCadence::Minute
-        ));
+        assert!(
+            !acc.set_ledger_from_read(
+                &transcript,
+                &HashMap::new(),
+                start + 30_000,
+                LedgerCadence::Minute
+            )
+            .owes()
+        );
         assert!(
             acc.ledger[0].activity.is_some(),
             "a failed gather keeps the last established fragment"
@@ -3107,28 +3183,37 @@ mod tests {
             last_activity_ms: start + 31_000,
             wait: None,
         };
-        assert!(acc.set_ledger_from_read(
-            &transcript,
-            &HashMap::from([("call_sub".to_string(), replying.clone())]),
-            start + 31_000,
-            LedgerCadence::Minute
-        ));
+        assert!(
+            acc.set_ledger_from_read(
+                &transcript,
+                &HashMap::from([("call_sub".to_string(), replying.clone())]),
+                start + 31_000,
+                LedgerCadence::Minute
+            )
+            .owes()
+        );
         // A wait joins the healed fragment, then leaves it: each is a rendered
         // change and owes its flush.
         let mut waiting = replying.clone();
         waiting.wait = Some(crate::feishu::card::AwaitingAction::Permission);
-        assert!(acc.set_ledger_from_read(
-            &transcript,
-            &HashMap::from([("call_sub".to_string(), waiting)]),
-            start + 31_100,
-            LedgerCadence::Minute
-        ));
-        assert!(acc.set_ledger_from_read(
-            &transcript,
-            &HashMap::from([("call_sub".to_string(), replying)]),
-            start + 31_200,
-            LedgerCadence::Minute
-        ));
+        assert!(
+            acc.set_ledger_from_read(
+                &transcript,
+                &HashMap::from([("call_sub".to_string(), waiting)]),
+                start + 31_100,
+                LedgerCadence::Minute
+            )
+            .owes()
+        );
+        assert!(
+            acc.set_ledger_from_read(
+                &transcript,
+                &HashMap::from([("call_sub".to_string(), replying)]),
+                start + 31_200,
+                LedgerCadence::Minute
+            )
+            .owes()
+        );
     }
 
     /// The flush decision compares only what the row RENDERS (spec #501,

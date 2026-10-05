@@ -462,7 +462,9 @@ pub(super) fn apply_ledger_read(
     now_ms: i64,
     cadence: LedgerCadence,
 ) -> bool {
-    let mut changed = acc.set_ledger_from_read(transcript, activities, now_ms, cadence);
+    let mut changed = acc
+        .set_ledger_from_read(transcript, activities, now_ms, cadence)
+        .owes();
     if let Some(anchor) = anchor {
         changed |= render_wake_entries(acc, transcript, anchor);
         changed |= render_runtime_entries(acc, transcript, anchor);
@@ -479,7 +481,7 @@ pub(super) fn apply_ledger_read(
 /// Returns true if anything new was rendered.
 pub(super) fn render_new_turn_parts(acc: &mut StreamAccumulator, transcript: &SessionTranscript) -> bool {
     let rendered = render_turn_parts(acc, transcript);
-    rendered | refresh_ledger(acc, transcript, &std::collections::HashMap::new())
+    rendered | refresh_ledger(acc, transcript, &std::collections::HashMap::new()).owes()
 }
 
 /// Render the parts of this turn's assistant messages that haven't been
@@ -605,14 +607,17 @@ fn reconcile_carried_calls(acc: &mut StreamAccumulator, transcript: &SessionTran
 /// clock would be churn. The decision's clock is this read's own; the card
 /// renders the rows from its build clock, the same second. A fresh fragment is
 /// a rendered change that owes its flush, while a gather that established
-/// nothing keeps each row's stored fragment growing truthfully.
+/// nothing keeps each row's stored fragment growing truthfully. Returns the
+/// split decision ([`super::state::LedgerChange`]): a caller that only flushes
+/// reads `owes`, while one telling new work from clock churn reads `rows`
+/// (#457).
 fn refresh_ledger(
     acc: &mut StreamAccumulator,
     transcript: &SessionTranscript,
     activities: &std::collections::HashMap<String, TaskLiveness>,
-) -> bool {
+) -> super::state::LedgerChange {
     if acc.turn_anchor.is_none() {
-        return false;
+        return super::state::LedgerChange::default();
     }
     acc.set_ledger_from_read(
         transcript,
@@ -656,11 +661,12 @@ pub(crate) struct RenderStats {
     /// The card's cumulative reasoning length after the pass (logging).
     pub(crate) reasoning_len: usize,
     /// Whether the pass produced observable progress: rendered content, a tool
-    /// panel revision, a live task fragment / ledger movement, or a
-    /// context-token update — everything the pass flushes for EXCEPT the
-    /// per-second header timer. The external renderer renews its idle bound on
-    /// this; header-timer churn alone must never renew it, or the bound could
-    /// never fire.
+    /// panel revision, a live task fragment change, a ledger row's visible
+    /// facts moving, or a context-token update — everything the pass flushes
+    /// for EXCEPT the per-second header timer and a rendered elapsed/age
+    /// crossing its cadence (clock churn is not new work). The external
+    /// renderer renews its idle bound on this; header-timer churn alone must
+    /// never renew it, or the bound could never fire.
     pub(crate) progressed: bool,
 }
 
@@ -751,22 +757,25 @@ pub(super) async fn render_and_flush(
     // `subagent` rows and every live task panel (ADR-0060/0054). A change on
     // either must flush even when no part, header second or context figure
     // moved — the line is the only thing that changed.
-    let (ledger_changed, liveness_changed) = {
+    let (ledger, liveness_changed) = {
         let mut live = cards.cards.lock().await;
         match live.get_mut(session_id) {
             Some(card) => (
                 refresh_ledger(&mut card.acc, transcript, &liveness),
                 apply_task_liveness(&mut card.acc, &panel_children, &liveness),
             ),
-            None => (false, false),
+            None => (super::state::LedgerChange::default(), false),
         }
     };
     // Observable progress: everything this pass flushes for except the
     // per-second header timer, which ticks on an idle run by design. The
     // external renderer's idle bound renews on this and must not read the
-    // header second as progress (#457).
-    let progressed = changed || context_changed || ledger_changed || liveness_changed;
-    if progressed || header_changed {
+    // header second as progress (#457). The ledger contributes only its ROW
+    // half — a rendered elapsed/age crossing its cadence is clock churn, not
+    // new work, and renewing on it would keep a silent task's card live
+    // forever.
+    let progressed = changed || context_changed || ledger.rows || liveness_changed;
+    if progressed || header_changed || ledger.clock {
         Turn::flush_card(cards, session_id).await;
     }
     Some(RenderStats {
