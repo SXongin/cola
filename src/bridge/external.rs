@@ -1210,19 +1210,10 @@ async fn external_render_loop(
         };
         let Some(transcript) = transcript else {
             // A failed or timed-out read is the "nothing observable is
-            // happening" state, but the card is not necessarily THIS
-            // renderer's anymore: a cola prompt or a newer external message
-            // may have replaced the accumulator, and finalizing by session id
-            // could stamp the replacement's live card (#457 review).
-            if Turn::armed_turn_anchor(&handles.cards, &session_id)
-                .await
-                .as_ref()
-                != Some(&anchor)
-            {
-                break;
-            }
-            if last_progress.elapsed() >= idle_bound {
-                idle_bound_reached(handles, &session_id).await;
+            // happening" state: the stalled-poll rule owns what happens next
+            // (a replacement ends this renderer silently; otherwise the idle
+            // bound may end the card).
+            if !stalled_poll(handles, &session_id, &anchor, last_progress, idle_bound).await {
                 break;
             }
             continue;
@@ -1246,31 +1237,52 @@ async fn external_render_loop(
         // lands here.
         let stopped = handles.waits.is_stopped(&session_id).await;
         // Stream the reply's reasoning/tools/text into the notification card.
-        let Some(stats) = Turn::render_and_flush(
-            &handles.cards,
-            &handles.sessions,
-            &handles.backend,
-            &handles.requests,
-            &session_id,
-            &transcript,
+        // The WHOLE pass is bounded (#457): the liveness gather reads child
+        // transcripts and the footer refresh reads the server, so a wedged
+        // read anywhere inside must not park the loop past its idle bound —
+        // an abandoned pass is just another no-progress poll.
+        let rendered = tokio::time::timeout(
+            std::time::Duration::from_millis(read_timeout_ms),
+            Turn::render_and_flush(
+                &handles.cards,
+                &handles.sessions,
+                &handles.backend,
+                &handles.requests,
+                &session_id,
+                &transcript,
+            ),
         )
-        .await
-        else {
-            break;
+        .await;
+        let stats = match rendered {
+            Ok(Some(stats)) => stats,
+            // The accumulator vanished: nothing left to render.
+            Ok(None) => break,
+            Err(_) => {
+                tracing::warn!("external render: pass timed out after {} ms", read_timeout_ms);
+                if !stalled_poll(handles, &session_id, &anchor, last_progress, idle_bound).await {
+                    break;
+                }
+                continue;
+            }
         };
         if stats.new_parts > 0 {
             tracing::info!("external render: session {} gained parts", session_id);
         }
         if stopped {
-            Turn::finalize_stopped(&handles.cards, &session_id).await;
-            tracing::info!("external reply render stopped: session {}", session_id);
+            if Turn::finalize_stopped_if_anchor(&handles.cards, &session_id, &anchor).await {
+                tracing::info!("external reply render stopped: session {}", session_id);
+            }
             break;
         }
         // The model finished answering this turn: the transcript's turn
-        // projection says so — finalize the card, then stop.
+        // projection says so — finalize the card, then stop. The guarded
+        // finalize re-checks the anchor under the stamp's own lock, so a
+        // successor that replaced the accumulator during the render keeps its
+        // own card (#457).
         if transcript.turn_for_user(&anchor).complete {
-            finalize_done(&handles.cards, &session_id).await;
-            tracing::info!("external reply rendered: session {} done", session_id);
+            if Turn::finalize_done_if_anchor(&handles.cards, &session_id, &anchor).await {
+                tracing::info!("external reply rendered: session {} done", session_id);
+            }
             break;
         }
         // A NEWER EXTERNAL user message is a turn boundary — the poller
@@ -1308,39 +1320,54 @@ async fn external_render_loop(
         // never sits on an eternal spinner; otherwise leave the "有新消息"
         // notification as-is.
         if last_progress.elapsed() >= idle_bound {
-            idle_bound_reached(handles, &session_id).await;
+            idle_bound_reached(handles, &session_id, &anchor).await;
             break;
         }
     }
 }
 
+/// A stalled poll's disposition (#457): `true` keeps the loop polling, `false`
+/// stops it. A successor that replaced this renderer's accumulator ends it
+/// silently — stamping by session id could hit the successor's live card. The
+/// idle bound (checked second, so a replacement always wins) ends the card
+/// through the anchor-guarded ending.
+async fn stalled_poll(
+    handles: &FlowHandles,
+    session_id: &str,
+    anchor: &TurnAnchor,
+    last_progress: tokio::time::Instant,
+    idle_bound: tokio::time::Duration,
+) -> bool {
+    if Turn::armed_turn_anchor(&handles.cards, session_id).await.as_ref() != Some(anchor) {
+        return false;
+    }
+    if last_progress.elapsed() >= idle_bound {
+        idle_bound_reached(handles, session_id, anchor).await;
+        return false;
+    }
+    true
+}
+
 /// The idle bound's ending (#457): a card that rendered partial content is
 /// finalized Done so it never sits on an eternal spinner; a card that never
 /// rendered anything is left as the 有新消息 notification untouched. Shared by
-/// the no-progress tick and the failed-read arm — a wedged Backend is the same
-/// "nothing observable is happening" state.
-async fn idle_bound_reached(handles: &FlowHandles, session_id: &str) {
+/// the no-progress tick and the stalled-read arms; the Done stamp is
+/// anchor-guarded, so a stale renderer can never finalize a successor.
+async fn idle_bound_reached(handles: &FlowHandles, session_id: &str, anchor: &TurnAnchor) {
     let has_content = Turn::has_rendered_content(&handles.cards, session_id).await;
     if has_content {
-        finalize_done(&handles.cards, session_id).await;
-        tracing::info!(
-            "external reply render: idle bound reached; finalized session {}",
-            session_id
-        );
+        if Turn::finalize_done_if_anchor(&handles.cards, session_id, anchor).await {
+            tracing::info!(
+                "external reply render: idle bound reached; finalized session {}",
+                session_id
+            );
+        }
     } else {
         tracing::info!(
             "external reply render: idle bound reached with no content; notification stays for session {}",
             session_id
         );
     }
-}
-
-/// Mark the accumulator's card Done and flush it — the terminal state for a
-/// reply that finished (or timed out with content rendered). The work context
-/// is refreshed first (ADR-0019), so the final card shows where the turn
-/// landed (branch/dirty) rather than only where it started.
-async fn finalize_done(cards: &CardsHandle, session_id: &str) {
-    Turn::finalize_done(cards, session_id).await;
 }
 
 /// Preview of the External Message for the notification card: every user

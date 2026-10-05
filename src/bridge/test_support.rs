@@ -949,6 +949,10 @@ pub struct MockBackend {
     /// gather leaves the row's last successful fragment in place, its age
     /// still growing. Armable mid-life via [`MockBackend::fail_transcript_for`].
     pub fail_transcripts: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Session ids whose `transcript` read NEVER resolves (a half-open child
+    /// read in a render's liveness gather, #457). The caller's own bound must
+    /// abandon it. Reversible via [`MockBackend::release_transcript_for`].
+    pub hang_transcripts: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
     /// Session id → scripted [`TranscriptTail`]s served by `transcript_tail`,
     /// consumed one per call (the last repeating) — the restart carry's
     /// bounded tail read (ADR-0068). A session absent from the map serves an
@@ -1198,6 +1202,7 @@ impl MockBackend {
             transcript_scripts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             transcript_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             fail_transcripts: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+            hang_transcripts: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             transcript_tail_scripts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             transcript_tail_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             hang_transcript_tail: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1485,6 +1490,20 @@ impl MockBackend {
     /// script again.
     pub(crate) async fn heal_transcript(&self, session_id: &str) {
         self.fail_transcripts.lock().await.remove(session_id);
+    }
+
+    /// Scenario: `transcript` for `session_id` never resolves — a half-open
+    /// read (a wedged child session in the liveness gather, #457). Every
+    /// caller must bound the read; the parked future is dropped when it does.
+    /// Reversible via [`Self::release_transcript_for`].
+    pub(crate) async fn hang_transcript_for(&self, session_id: &str) {
+        self.hang_transcripts.lock().await.insert(session_id.to_string());
+    }
+
+    /// [`Self::hang_transcript_for`]'s reversal: the session's reads serve
+    /// their script again (a previously parked future stays dropped).
+    pub(crate) async fn release_transcript_for(&self, session_id: &str) {
+        self.hang_transcripts.lock().await.remove(session_id);
     }
 
     /// Scenario: `transcript_tail` serves `tails` for `session_id`, one per
@@ -2053,6 +2072,13 @@ impl crate::backend::Backend for MockBackend {
             let _permit = gate.acquire().await;
         }
         hang_if_scripted(&self.hang_transcript).await;
+        // A per-session hang (#457): the read never resolves — the caller's own
+        // bound must abandon it. The guard is dropped before parking, so a
+        // release can still clear the set.
+        let hanging = self.hang_transcripts.lock().await.contains(session_id);
+        if hanging {
+            std::future::pending::<()>().await;
+        }
         // A session a test marked failing serves a 500, recorded like any other
         // read (the read was spent): the ledger's activity carry-over pins the
         // failed gather (spec #501).
