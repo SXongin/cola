@@ -245,3 +245,22 @@ trial: the Console inference API round-trips `gpt-6-luna` with the
 `OPENCODE_API_KEY` Go key, which stays inside the action's Responses proxy and
 never reaches the Codex step's environment. As before, a FAIL is a comment
 without an approval, never a `request-changes`.
+
+## Amendment (2026-10-05): the gate is pinned to codex-action v1.11 and salvages a completed review
+
+The v1.12 wrapper can hang **after** Codex has written its complete output — a
+surviving descendant keeps the runner's stdio open, so the action never returns
+and the job dies on its timeout with the result already on disk (upstream
+`openai/codex-action` #150/#169; the wrapper fix, #151, is unreleased). On a
+heavy PR (spec #523's batch, ~236k tokens) the gate failed three times that
+way; one run had already written a complete `CODEX_REVIEW_VERDICT: PASS` that
+the hang discarded.
+
+`.github/workflows/codex-review.yml` therefore pins the action to **v1.11**
+(from the 2026-10-04 amendment's v1.12), whose wrapper handled the same heavy
+workload cleanly, and bounds the Codex step (12 minutes, `continue-on-error`)
+with a completeness check on the verdict's last non-blank line, one bounded
+retry when the output is incomplete, and a post step that publishes a complete
+salvaged review instead of discarding it. The job bound grows to 30 minutes to
+cover both attempts. Revisit the pin when the wrapper fix (#151) ships; the
+salvage stays useful against stream drops regardless (#530).
