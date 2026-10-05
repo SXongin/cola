@@ -1,5 +1,11 @@
 # Carried Tool Panels: a restart takeover hands the orphan's running tools to the successor card
 
+> **Amended 2026-10-05 (#527)**: the bounded tail read's stop rule is now the
+> membership rule itself, exactly — the scan stops only at a page whose oldest
+> message cannot belong to the orphan Turn under either arm. The Decision's
+> stop-rule prose below is superseded on that point (and "reaching the
+> boundary" now means reaching that page); see the amendment at the end.
+
 ## Context
 
 ADR-0045 made an unfinished **Tool Panel** card-tail live content: it rides
@@ -39,16 +45,11 @@ use.
 
 **The read is bounded and newest-first, and happens before the prompt is
 submitted.** It pages messages descending (`desc` order, following
-`cursor.next` for older pages) and stops at the first page whose oldest
-message cannot belong to the orphan Turn under the membership rule's own three
-arms — created at/after the anchor, completed at/after it, or unfinished with
-newest activity inside the in-flight window — so the stop cannot cut a message
-the projection needs (a completed message that finished as the Turn began
-qualifies even when every part it carries started before the window). A page
-whose oldest message carries no server time cannot be placed, so the scan
-keeps going rather than stopping on an unknown. A page with no unfinished
+`cursor.next` for older pages) and stops only when the page's oldest message's
+newest activity predates the orphan anchor minus the in-flight window — past
+that point no part can belong to the orphan Turn. A page with no unfinished
 message does **not** end the scan: another client can queue messages above the
-orphan's unfinished call, so the membership rule — not the page's shape — is
+orphan's unfinished call, so the window boundary — not the page's shape — is
 the stop. A small hard page cap and the existing read timeout bound the worst
 case; the common case is one request. A read stopped by the cap before reaching
 the boundary carries nothing rather than guessing. V1's
@@ -134,15 +135,54 @@ survives the process.
   generation-specific branch is added.
 - Tests pin: a stale in-flight running call appears on the successor; its
   completion renders exactly once; an older card's stale running part is never
-  carried; the carry read scans to the first page that cannot belong to the
-  orphan Turn under the membership rule's own arms (a long transcript stays a
-  bounded newest-first scan, a queued message above the unfinished call does
-  not hide it, and a cap stop carries nothing and strips no panel); the
-  takeover collect drops the ledger on every collect — the successor rebuilds
-  the live list — and drops the running markers only when a call was carried;
-  a failed carry read degrades to today, the ledger still dropped; and the
-  already-working in-window case stays a regression test. The
+  carried; the carry read scans to the anchor-minus-window boundary (a long
+  transcript stays a bounded newest-first scan, a queued message above the
+  unfinished call does not hide it, and a cap stop carries nothing and strips
+  no panel); the takeover collect drops the ledger on every collect — the
+  successor rebuilds the live list — and drops the running markers only when a
+  call was carried; a failed carry read degrades to today, the ledger still
+  dropped; and the already-working in-window case stays a regression test. The
   probe for a tool that settled while cola was down is dropped with a pointer
   to #505.
 
 Related: #428, #434, #443, #444, #505, ADR-0045, ADR-0061, ADR-0062, ADR-0063.
+
+## Amendment (2026-10-05): the stop rule IS the membership rule
+
+The Decision above says the scan "stops only when the page's oldest message's
+newest activity predates the orphan anchor minus the in-flight window — past
+that point no part can belong to the orphan Turn". That stated invariant was
+looser than the membership rule it claimed to mirror, as #527's gate review
+found: `belongs_to_turn` ALSO admits a **completed** message whose completion
+is at/after the anchor even when every part it carries started before that
+window, so a completed message carrying a live `running`/`pending` tool could
+be cut off before the scan reached the page below it. The rule is narrowed to
+the membership rule itself.
+
+The V2 scan stops at the first page whose OLDEST message cannot belong to the
+orphan Turn under either arm — `TurnAnchor::may_still_belong`, the
+single-sourced test `belongs_to_turn` now reads:
+
+- a message with `time.created >= anchor.created_ms` always may belong;
+- a **completed** message (`time.completed = Some(c)`) may belong iff
+  `c >= anchor.created_ms`; the scan stops only when `c < anchor.created_ms`;
+- an **unfinished** message may belong while
+  `newest_activity_ms(created) >= anchor.in_flight_boundary_ms()`;
+- a message with **no server time at all** cannot be placed, so the scan keeps
+  going rather than stopping on an unknown (it still never belongs to the
+  projection — the membership rule's own `time.is_some()` guard).
+
+The rest of the Decision stands unchanged: the crossing page is kept whole
+(older messages are filtered by the projection's membership rule, not by the
+scan), a page with no unfinished message never ends the scan by its shape, and
+a scan the page cap stops still reports `complete: false` and carries nothing.
+"Reaching the boundary" in the Decision above now means reaching that first
+page that cannot belong; a cap stop reaches no such page, so it is incomplete
+exactly as stated.
+
+Tests pin the exact rule: a page whose oldest message completed at/after the
+anchor does not end the scan and the older page's live call is found, while a
+page whose oldest message completed before the anchor ends it (complete, one
+request, page kept whole); the descending-scan, unknown-time, empty-end-page
+and cap-stop tests were re-fixtured to real anchors, and the mock backend
+records the anchor itself rather than a derived boundary.

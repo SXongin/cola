@@ -1805,16 +1805,18 @@ impl StreamAccumulator {
     }
 
     /// Whether a still-running Carried Tool Panel (ADR-0068) is omitted from
-    /// the card being built: it rides the tail only while a live renderer owns
-    /// the card — once the card is settled (or yielded), no renderer will ever
-    /// update the panel again, so it must not keep showing a `⏳` that can
-    /// never move; it never outlives the Turn. One predicate for the split
-    /// estimator's tail reserve and the card builder's tail, so the budget
-    /// never charges for what the build will not render and the two cannot
-    /// drift. A carried call that settled before the end is a timeline entry
-    /// and is not covered by this rule.
-    fn omitted_live_carried(&self, call_id: &str) -> bool {
-        !self.card_state.is_render_owned() && self.carried_calls.contains(call_id)
+    /// the card being built under `state`: it rides the tail only while a live
+    /// renderer owns the card — once the card is settled (or yielded), no
+    /// renderer will ever update the panel again, so it must not keep showing
+    /// a `⏳` that can never move; it never outlives the Turn. `state` is the
+    /// caller's EFFECTIVE state (the builder's `state_override` included), so
+    /// the split estimator's tail reserve and the card builder's tail decide
+    /// on the same state their card is built with and cannot drift; the
+    /// estimator passes `self.card_state`. The reserve therefore never charges
+    /// for what the build will not render. A carried call that settled before
+    /// the end is a timeline entry and is not covered by this rule.
+    fn omitted_live_carried(&self, state: &CardState, call_id: &str) -> bool {
+        !state.is_render_owned() && self.carried_calls.contains(call_id)
     }
 
     /// First timeline index whose items would push the estimated component
@@ -1858,7 +1860,7 @@ impl StreamAccumulator {
                 size += crate::feishu::card::ledger::task_ledger_estimate(&self.ledger);
             }
             for call_id in self.live_tools.keys() {
-                if self.omitted_live_carried(call_id) {
+                if self.omitted_live_carried(&self.card_state, call_id) {
                     continue;
                 }
                 if let Some(panel) = self.tools.get(call_id) {
@@ -1920,9 +1922,11 @@ impl StreamAccumulator {
         let state = state_override.unwrap_or_else(|| self.card_state.clone());
         // The header shows the Turn's running tool even when THIS slice has no
         // panel for it (a split continuation after `sleep 30` started): pass
-        // the accumulator's global selection as the builder's override.
+        // the accumulator's global selection as the builder's override. The
+        // state is cloned for the builder so the tail below can keep reading
+        // the EFFECTIVE state through `omitted_live_carried` after the move.
         let mut builder = CardBuilder::new()
-            .with_state(state)
+            .with_state(state.clone())
             .with_progress(self.header_progress())
             .with_fenced_markdown(self.card_fallback.fenced())
             .with_header_running_tool(self.running_tool().cloned());
@@ -2020,11 +2024,12 @@ impl StreamAccumulator {
             // card and join the timeline once they settle (ADR-0045).
             //
             // A still-running Carried Tool Panel (ADR-0068) is omitted when no
-            // live renderer owns the card ([`Self::omitted_live_carried`]);
-            // a carried call that settled before the end is a timeline entry
-            // and still renders below/above like any other.
+            // live renderer owns the card ([`Self::omitted_live_carried`],
+            // under this build's effective `state`); a carried call that
+            // settled before the end is a timeline entry and still renders
+            // below/above like any other.
             for (call_id, live) in &self.live_tools {
-                if self.omitted_live_carried(call_id) {
+                if self.omitted_live_carried(&state, call_id) {
                     continue;
                 }
                 if let Some(panel) = self.tools.get(call_id) {

@@ -6,7 +6,7 @@
 //! beside its strategy has the same shape.
 
 use super::*;
-use crate::bridge::test_support::{assert_line_level, capture_logs, level_count};
+use crate::bridge::test_support::{assert_line_level, capture_logs, level_count, tail_anchor};
 use crate::error::BridgeError;
 use crate::opencode::client::OpenCodeBackend;
 use crate::opencode::parsing::parse_model;
@@ -1201,8 +1201,6 @@ async fn transcript_surfaces_a_failed_message_read() {
 /// it reports.
 #[tokio::test]
 async fn transcript_tail_is_the_one_request_read_reported_complete() {
-    use crate::backend::{MessageId, TurnAnchor};
-
     let server = TestHttpServer::start().await;
     server.route(
         "GET",
@@ -1212,10 +1210,7 @@ async fn transcript_tail_is_the_one_request_read_reported_complete() {
     );
     let client = v1_wire_client(&server, None);
 
-    let anchor = TurnAnchor {
-        message_id: MessageId::new("msg_cola_anchor"),
-        created_ms: 0,
-    };
+    let anchor = tail_anchor(0);
     let tail = client.transcript_tail("ses_1", &anchor).await.unwrap();
 
     assert!(tail.complete, "an unpaginated read is always complete");

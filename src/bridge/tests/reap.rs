@@ -20,7 +20,7 @@ use super::drain::{
 };
 use crate::backend::{
     ContentBlock, MessageId, MessageRole, MessageTime, Part, SessionTranscript, ToolCall, ToolIdentity,
-    ToolOutput, ToolStatus, TranscriptMessage, TranscriptTail, TurnAnchor,
+    ToolOutput, ToolStatus, TranscriptMessage, TranscriptTail,
 };
 use crate::bridge::live_cards::{LiveCard, LiveCards};
 use crate::bridge::test_support::*;
@@ -48,16 +48,6 @@ fn seed_record(session_file: &Path, card_message_id: &str, message_id: &str, cre
 /// [`seed_record`] with the record built by the caller (a stored directory).
 fn seed_live_card(session_file: &Path, card: LiveCard) {
     LiveCards::load(sidecar(session_file)).replace("ses_test", card);
-}
-
-/// The `TurnAnchor` of the orphan record every carry test seeds
-/// (`seed_record`'s `msg_cola_anchor`): the scope the takeover's tail read must
-/// ask for.
-fn orphan_tail_anchor(created_ms: i64) -> TurnAnchor {
-    TurnAnchor {
-        message_id: MessageId::new("msg_cola_anchor"),
-        created_ms,
-    }
 }
 
 /// Seed the durable Wake Watermark a previous cola life left behind — the
@@ -1267,7 +1257,7 @@ async fn a_restart_takeover_carries_the_orphans_running_tool() {
     wait_for_card_text(&platform, "⏳ shell").await;
     assert_eq!(
         backend.transcript_tail_calls.lock().await.as_slice(),
-        &[("ses_test".to_string(), orphan_tail_anchor(orphan_anchor))],
+        &[("ses_test".to_string(), tail_anchor(orphan_anchor))],
         "the carry read is scoped by the orphan record's anchor"
     );
     // The takeover itself is today's: the old card is collected in place, once.
@@ -1550,7 +1540,7 @@ async fn a_restart_takeover_drops_a_ledger_only_orphans_live_list() {
     // The carry read ran and found nothing running to hand over.
     assert_eq!(
         backend.transcript_tail_calls.lock().await.as_slice(),
-        &[("ses_test".to_string(), orphan_tail_anchor(orphan_anchor))],
+        &[("ses_test".to_string(), tail_anchor(orphan_anchor))],
         "the carry read is scoped by the orphan record's anchor"
     );
 
@@ -1688,7 +1678,7 @@ async fn a_restart_takeover_never_carries_an_older_turns_stale_call() {
 
     assert_eq!(
         backend.transcript_tail_calls.lock().await.as_slice(),
-        &[("ses_test".to_string(), orphan_tail_anchor(1_000))],
+        &[("ses_test".to_string(), tail_anchor(1_000))],
         "the tail read ran, scoped by the orphan record's anchor"
     );
     wait_for_card_header(&platform, "✅").await;
