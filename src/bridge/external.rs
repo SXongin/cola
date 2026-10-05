@@ -588,7 +588,8 @@ impl ExternalFlow {
         let sid = session_id.to_string();
         let anchor = anchor.clone();
         let poll_ms = self.render_poll_ms.load(std::sync::atomic::Ordering::Relaxed);
-        let timeout_ms = self
+        let read_timeout_ms = self.request_timeout_ms.load(std::sync::atomic::Ordering::Relaxed);
+        let idle_timeout_ms = self
             .render_idle_timeout_ms
             .load(std::sync::atomic::Ordering::Relaxed);
         // A spawn inherits no span, so the render loop is instrumented
@@ -597,7 +598,7 @@ impl ExternalFlow {
         let span = crate::bridge::span::external(session_id, session_thread_key.as_ref());
         tokio::spawn(
             async move {
-                external_render_loop(&handles, sid, anchor, poll_ms, timeout_ms).await;
+                external_render_loop(&handles, sid, anchor, poll_ms, read_timeout_ms, idle_timeout_ms).await;
             }
             .instrument(span),
         );
@@ -740,7 +741,8 @@ impl ExternalFlow {
         let handles = handles.clone();
         let sid = session_id.to_string();
         let poll_ms = self.render_poll_ms.load(std::sync::atomic::Ordering::Relaxed);
-        let timeout_ms = self
+        let read_timeout_ms = self.request_timeout_ms.load(std::sync::atomic::Ordering::Relaxed);
+        let idle_timeout_ms = self
             .render_idle_timeout_ms
             .load(std::sync::atomic::Ordering::Relaxed);
         // The follow's render loop is its own task, so it is instrumented
@@ -749,7 +751,7 @@ impl ExternalFlow {
         let span = crate::bridge::span::external(session_id, session_thread_key.as_ref());
         tokio::spawn(
             async move {
-                external_render_loop(&handles, sid, anchor, poll_ms, timeout_ms).await;
+                external_render_loop(&handles, sid, anchor, poll_ms, read_timeout_ms, idle_timeout_ms).await;
             }
             .instrument(span),
         );
@@ -1173,34 +1175,57 @@ async fn external_render_loop(
     session_id: String,
     anchor: TurnAnchor,
     poll_ms: u64,
-    timeout_ms: u64,
+    read_timeout_ms: u64,
+    idle_timeout_ms: u64,
 ) {
     // The IDLE bound (#457): every poll whose render made observable progress
     // resets the clock, so a running model that keeps producing is never cut
     // at 10 minutes; only a run whose card shows nothing new for the whole
-    // window gives up. A failed read is no progress either, so a wedged
-    // Backend idles out too; the header's per-second tick and other footer
-    // churn are not progress — reading them as such would make the bound
-    // never fire.
-    let idle_bound = tokio::time::Duration::from_millis(timeout_ms);
+    // window gives up. A failed or timed-out read is no progress either, so a
+    // wedged Backend idles out too; the header's per-second tick and other
+    // footer churn are not progress — reading them as such would make the
+    // bound never fire.
+    let idle_bound = tokio::time::Duration::from_millis(idle_timeout_ms);
     let mut last_progress = tokio::time::Instant::now();
     loop {
         tokio::time::sleep(tokio::time::Duration::from_millis(poll_ms)).await;
         // Completion, the newer-turn boundary and the streaming render all
-        // come from the one Session Transcript read (ADR-0053).
-        let transcript = match handles.backend.transcript(&session_id).await {
-            Ok(transcript) => transcript,
-            Err(e) => {
+        // come from the one Session Transcript read (ADR-0053). The read is
+        // BOUNDED: a half-open connection must not park the loop past its
+        // idle bound — a timed-out read is just another failed one.
+        let read = crate::bridge::bounded_call(
+            "external render transcript",
+            read_timeout_ms,
+            handles.backend.transcript(&session_id),
+        )
+        .await;
+        let transcript = match read {
+            Some(Ok(transcript)) => Some(transcript),
+            Some(Err(e)) => {
                 tracing::warn!("external render poll transcript: {}", e);
-                // A failed read is the "nothing observable is happening"
-                // state: the idle bound ends it, so a wedged Backend cannot
-                // hold the card live forever.
-                if last_progress.elapsed() >= idle_bound {
-                    idle_bound_reached(handles, &session_id).await;
-                    break;
-                }
-                continue;
+                None
             }
+            // `bounded_call` already logged the timeout.
+            None => None,
+        };
+        let Some(transcript) = transcript else {
+            // A failed or timed-out read is the "nothing observable is
+            // happening" state, but the card is not necessarily THIS
+            // renderer's anymore: a cola prompt or a newer external message
+            // may have replaced the accumulator, and finalizing by session id
+            // could stamp the replacement's live card (#457 review).
+            if Turn::armed_turn_anchor(&handles.cards, &session_id)
+                .await
+                .as_ref()
+                != Some(&anchor)
+            {
+                break;
+            }
+            if last_progress.elapsed() >= idle_bound {
+                idle_bound_reached(handles, &session_id).await;
+                break;
+            }
+            continue;
         };
         // The accumulator was replaced (cola's own `run_prompt` inserted a fresh
         // one, or a newer external message's renderer took over): exit so this

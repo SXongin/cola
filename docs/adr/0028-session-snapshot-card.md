@@ -119,8 +119,11 @@ by design and must not renew the bound, or the card of a run that stopped
 producing would stay live forever. A run whose card shows nothing new for the
 whole window is treated as not producing and ends under the old rule: partial
 content finalizes Done, and a message that never produced still leaves its
-有新消息 notification untouched. A transcript read that keeps failing is no
-progress either — the bound ends it, so a wedged Backend cannot hold the card
-live forever. The Wake continuation's settle grace (the shared loop's
-lost-contact / stuck-panel bound) now lives in its own field, separate from
-the renderer's idle bound, so retuning one can no longer move the other.
+有新消息 notification untouched. A transcript read that fails or times out is
+no progress either — every read is bounded and the bound ends it, so a wedged
+Backend cannot hold the card live forever — and the failure path keeps the
+same accumulator-replacement guard as the success path, so a replaced
+renderer never finalizes its successor's card. The Wake continuation's settle
+grace (the shared loop's lost-contact / stuck-panel bound) now lives in its
+own field, separate from the renderer's idle bound, so retuning one can no
+longer move the other.
