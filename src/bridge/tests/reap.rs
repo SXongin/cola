@@ -213,6 +213,53 @@ async fn wait_for_record_card(app: &Arc<App>, session_id: &str, card_message_id:
         .unwrap_or_else(|_| panic!("the record never named {card_message_id}"));
 }
 
+/// Wait until `message_id` has at least `n` recorded in-place PATCHes, or
+/// panic after 5 s — the observation a stamp test needs before it asserts on
+/// the writes a parked stamp PATCH let queue up behind it.
+async fn wait_for_patches(platform: &RecordingPlatform, message_id: &str, n: usize) {
+    let probe = async {
+        loop {
+            if patches_to(platform, message_id).await.len() >= n {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), probe)
+        .await
+        .unwrap_or_else(|_| panic!("{message_id} never reached {n} PATCHes"));
+}
+
+/// Wait until the fresh-Turn takeover's collect recorded its keep rule for
+/// `card_message_id` (ADR-0068), or panic after 5 s. The recorded rule is the
+/// observed point the takeover's collect reached its decision — before it
+/// queues behind a parked stamp PATCH — so the stamp's post-PATCH ownership
+/// check can no longer miss the successor.
+async fn wait_for_predecessor_keep(
+    app: &Arc<App>,
+    session_id: &str,
+    card_message_id: &str,
+    strip_running_panels: bool,
+) {
+    let probe = async {
+        loop {
+            let recorded = app
+                .cards_handle()
+                .live_cards
+                .get(session_id)
+                .and_then(|record| record.predecessor_keep)
+                .map(|keep| (keep.card_message_id, keep.strip_running_panels));
+            if recorded == Some((card_message_id.to_string(), strip_running_panels)) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), probe)
+        .await
+        .unwrap_or_else(|_| panic!("the takeover never recorded its collect rule for {card_message_id}"));
+}
+
 /// The transcript that has finished while cola was down: the submitted
 /// message and a clean assistant answer.
 fn completed(created_ms: i64) -> SessionTranscript {
@@ -1022,7 +1069,11 @@ async fn a_successor_owning_the_session_recollects_after_the_stamp() {
     backend
         .set_session_status("ses_other", Some(SessionStatus::Busy))
         .await;
-    platform.given_card_view("om_frozen", realistic_card_view());
+    // The orphan's view carries a running `⏳` panel and the ledger too: the
+    // plain takeover settles `Everything`, so the repair must keep the whole
+    // preserved body (ADR-0068's strip is scoped to the fresh-Turn path and
+    // its repair).
+    platform.given_card_view("om_frozen", live_tail_orphan_view());
     // Park the stamp's PATCH after its pre-PATCH ownership check passed.
     let (entered, release) = platform.pause("update", "om_frozen");
 
@@ -1068,6 +1119,14 @@ async fn a_successor_owning_the_session_recollects_after_the_stamp() {
         card_header(patches.last().unwrap()),
         "⏳ 已由新卡片接管 · 已停止更新",
         "the takeover has the card's last word: {patches:?}"
+    );
+    // No fresh-Turn keep rule was recorded (the plain arm: `take_over_card`),
+    // so the repair keeps today's preserved body — the running panel and the
+    // ledger both stay, exactly as every Wake/external collect always did.
+    let text = card_text(patches.last().unwrap());
+    assert!(
+        text.contains("⏳ shell") && text.contains("⏳ 后台任务") && text.contains("**正文** 已经写完的部分"),
+        "the plain takeover's repair preserves the whole body: {text}"
     );
 }
 
@@ -1873,6 +1932,238 @@ async fn a_timed_out_carry_read_carries_nothing() {
         !orphan_text.contains("⏳ 后台任务"),
         "the ledger leaves the collect: {orphan_text}"
     );
+}
+
+/// The #443 stamp's PATCH passes its pre-PATCH ownership check, then a fresh
+/// Turn takes the orphan over while the stamp is in flight: the takeover's
+/// collect queues behind the stamp's delivery lock, and the stamp's
+/// post-PATCH repair lands last. The repair must reproduce the takeover
+/// collect's keep rule (ADR-0068) — not `Everything` — so the stamp's stale
+/// body never restores the tail the takeover removed. Carrying one running
+/// call, that means no running `⏳` panel and no ledger on the orphan.
+#[tokio::test]
+async fn a_stamp_over_a_carrying_takeover_repairs_without_the_carried_tail() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let orphan_anchor = 1_000_000;
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(orphan_anchor));
+    let new_anchor = 2_000_000;
+    let orphan = in_flight_shell(
+        "a_orphan",
+        orphan_anchor + 500,
+        "call_sleep",
+        ToolStatus::Running,
+        1_300_000,
+        "",
+    );
+    let tail = TranscriptTail {
+        transcript: SessionTranscript::new(vec![
+            user("msg_cola_anchor", orphan_anchor, "跑个长命令"),
+            orphan.clone(),
+        ]),
+        complete: true,
+    };
+    let live = SessionTranscript::new(vec![
+        user("msg_cola_anchor", orphan_anchor, "跑个长命令"),
+        orphan,
+        user("msg_cola_new", new_anchor, "新问题"),
+    ]);
+    let (app, platform, backend, gate) = carried_app(&session_file, live, tail, SessionStatus::Busy).await;
+    platform.given_card_view("om_frozen", live_tail_orphan_view());
+    // Park the stamp PATCH after its pre-PATCH ownership check passed: it
+    // holds the card's delivery lock, so the takeover's collect queues behind
+    // it and the stamp's repair follows the collect.
+    let (entered, release) = platform.pause("update", "om_frozen");
+
+    spawn_sync_with_timeout(&app, 5_000);
+    entered.notified().await;
+
+    let mut context = ctx("ses_test", "新问题");
+    context.cola_message_id = Some("msg_cola_new".into());
+    let turn = spawn_turn(&app, context);
+    // The recorded rule is the observed proof the takeover attached, carried
+    // (at least one call) and reached its collect before the stamp is
+    // released — so the post-PATCH repair can no longer miss the successor.
+    wait_for_predecessor_keep(&app, "ses_test", "om_frozen", true).await;
+    release.notify_one();
+    // The repair is the orphan's third write: the parked stamp, the
+    // takeover's queued collect, then the stamp's repair. Waiting for it pins
+    // the interleaving this test creates.
+    wait_for_patches(&platform, "om_frozen", 3).await;
+
+    let patches = patches_to(&platform, "om_frozen").await;
+    assert_eq!(
+        patches.len(),
+        3,
+        "the stamp, the takeover's collect and its repair: {patches:?}"
+    );
+    assert_eq!(
+        card_header(&patches[0]),
+        "⏳ 已重启，等待运行结束",
+        "the parked stamp landed first: {patches:?}"
+    );
+    // Every write after the stamp is the takeover's collect or the stamp's
+    // repair: none may restore the live tail the takeover removed.
+    for patch in &patches[1..] {
+        assert_eq!(
+            card_header(patch),
+            "⏳ 已由新卡片接管 · 已停止更新",
+            "a post-stamp write is a takeover collect: {patch}"
+        );
+        let text = card_text(patch);
+        assert!(
+            !text.contains("⏳ shell"),
+            "a carried running marker never returns to the collected card: {text}"
+        );
+        assert!(
+            !text.contains("⏳ 后台任务"),
+            "the ledger leaves every takeover collect and its repair: {text}"
+        );
+        assert!(
+            text.contains("**正文** 已经写完的部分") && text.contains("🌙 shell"),
+            "non-tail body content and the settled launch stay: {text}"
+        );
+    }
+
+    // End the turn as usual: the carried call settles and the session idles.
+    backend
+        .given_transcript_after_build(
+            "ses_test",
+            vec![SessionTranscript::new(vec![
+                user("msg_cola_anchor", orphan_anchor, "跑个长命令"),
+                in_flight_shell(
+                    "a_orphan",
+                    orphan_anchor + 500,
+                    "call_sleep",
+                    ToolStatus::Completed,
+                    1_300_000,
+                    "slept",
+                ),
+                user("msg_cola_new", new_anchor, "新问题"),
+                assistant(new_anchor + 1_000, "新回答"),
+            ])],
+        )
+        .await;
+    backend
+        .set_session_status("ses_test", Some(SessionStatus::Idle))
+        .await;
+    gate.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), turn)
+        .await
+        .expect("the turn must end")
+        .unwrap()
+        .unwrap();
+}
+
+/// The same stamp/takeover interleaving for a carry that moved nothing (a
+/// failed read): the repair reproduces the takeover's rule, so the running
+/// `⏳` marker stays — spec #523: "When nothing was carried … the running
+/// marker stays" — while the ledger still leaves the collected card.
+#[tokio::test]
+async fn a_stamp_over_an_empty_takeover_repairs_without_the_ledger() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let orphan_anchor = 1_000_000;
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(orphan_anchor));
+    let new_anchor = 2_000_000;
+    let live = SessionTranscript::new(vec![
+        user("msg_cola_anchor", orphan_anchor, "跑个长命令"),
+        in_flight_shell(
+            "a_orphan",
+            orphan_anchor + 500,
+            "call_sleep",
+            ToolStatus::Running,
+            1_300_000,
+            "",
+        ),
+        user("msg_cola_new", new_anchor, "新问题"),
+    ]);
+    let (app, platform, backend, gate) = carried_app(
+        &session_file,
+        live,
+        TranscriptTail::default(),
+        SessionStatus::Busy,
+    )
+    .await;
+    platform.given_card_view("om_frozen", live_tail_orphan_view());
+    // The carry read fails: nothing moves to the successor, so the collect —
+    // and the repair behind it — keep the running panel and drop the ledger.
+    backend.fail_transcript_tail_for("ses_test").await;
+    let (entered, release) = platform.pause("update", "om_frozen");
+
+    spawn_sync_with_timeout(&app, 5_000);
+    entered.notified().await;
+
+    let mut context = ctx("ses_test", "新问题");
+    context.cola_message_id = Some("msg_cola_new".into());
+    let turn = spawn_turn(&app, context);
+    wait_for_predecessor_keep(&app, "ses_test", "om_frozen", false).await;
+    release.notify_one();
+    wait_for_patches(&platform, "om_frozen", 3).await;
+
+    let patches = patches_to(&platform, "om_frozen").await;
+    assert_eq!(
+        patches.len(),
+        3,
+        "the stamp, the takeover's collect and its repair: {patches:?}"
+    );
+    assert_eq!(
+        card_header(&patches[0]),
+        "⏳ 已重启，等待运行结束",
+        "the parked stamp landed first: {patches:?}"
+    );
+    for patch in &patches[1..] {
+        assert_eq!(
+            card_header(patch),
+            "⏳ 已由新卡片接管 · 已停止更新",
+            "a post-stamp write is a takeover collect: {patch}"
+        );
+        let text = card_text(patch);
+        assert!(
+            text.contains("⏳ shell"),
+            "an uncarried running marker stays: {text}"
+        );
+        assert!(
+            !text.contains("⏳ 后台任务"),
+            "the ledger leaves the collect and its repair: {text}"
+        );
+        assert!(
+            text.contains("**正文** 已经写完的部分") && text.contains("🌙 shell"),
+            "non-tail body content and the settled launch stay: {text}"
+        );
+    }
+
+    // End the turn as usual: the never-carried call stays running in the
+    // scripted read, so settle it and idle the session before the prompt.
+    backend
+        .given_transcript_after_build(
+            "ses_test",
+            vec![SessionTranscript::new(vec![
+                user("msg_cola_anchor", orphan_anchor, "跑个长命令"),
+                in_flight_shell(
+                    "a_orphan",
+                    orphan_anchor + 500,
+                    "call_sleep",
+                    ToolStatus::Completed,
+                    1_300_000,
+                    "slept",
+                ),
+                user("msg_cola_new", new_anchor, "新问题"),
+                assistant(new_anchor + 1_000, "新回答"),
+            ])],
+        )
+        .await;
+    backend
+        .set_session_status("ses_test", Some(SessionStatus::Idle))
+        .await;
+    gate.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), turn)
+        .await
+        .expect("the turn must end")
+        .unwrap()
+        .unwrap();
 }
 
 /// An ordinary turn with no durable record never carries and never reads a
