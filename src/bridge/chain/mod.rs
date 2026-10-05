@@ -6,6 +6,7 @@
 //! answers every reader through one seam. The restart reap that reconciles
 //! those records against each Session's own reads lives beside them.
 
+mod decision;
 mod reconcile;
 mod records;
 

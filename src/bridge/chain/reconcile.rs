@@ -27,6 +27,15 @@
 //! in the transcript: content the card never showed is never rebuilt, and the
 //! reap never replays a turn onto a stale card.
 //!
+//! The pass is a pure decision plus a thin apply (ADR-0069's delivery cuts):
+//! [`decision::reconcile`] mirrors every outcome as one [`ChainDisposition`]
+//! over the evidence [`RecoveryReads`] carries — no I/O, failures are values —
+//! while this module gathers the reads the decision's own plan warrants,
+//! performs the card writes, and keeps the card mechanics (the preserved
+//! body, the detached stamp attempt). The plan lives beside the decision, so
+//! the reads are exactly the ones the decision consumes and a read the pass
+//! could not make degrades to "nothing claimed" instead of a wrong claim.
+//!
 //! A Session that relocated while the run was in flight (#428: `session_move`
 //! into a git worktree) gains one line naming the move when its card reaches a
 //! terminal ending (#439): the record's directory — the mapping's when the
@@ -50,6 +59,7 @@
 //! the reap's precondition) and the ending is computed whole, then PATCHed
 //! once, so there is no read-send-record sequence to serialize.
 
+use super::decision::{self, CardProbe, ChainDisposition, RecoveryReads, Route, StatusRead, TranscriptRead};
 use super::records::ChainRecord;
 use crate::backend::TurnSettle;
 use crate::bridge::handles::{CardsHandle, FlowHandles};
@@ -113,7 +123,7 @@ async fn collect_orphan_with(cards: &CardsHandle, session_id: &str, card_message
     let card = ending_card(CardState::TakenOver, None, None);
     match patch_ending_keeping_body(cards.feishu.as_ref(), card_message_id, &card, keep).await {
         // The one reap vocabulary: the INFO line's ending word comes from the
-        // state itself, exactly like every `ReapPass::settle` line.
+        // state itself, exactly like every `ApplyPass::settle` line.
         Ok(()) => tracing::info!(
             "live-card reap: session {session_id} {}",
             CardState::TakenOver.reap_word()
@@ -134,6 +144,11 @@ async fn collect_orphan_with(cards: &CardsHandle, session_id: &str, card_message
 /// of the reads, the Session Sync pass's own request bound (injectable in
 /// tests), so a hung server degrades to "nothing claimed" instead of freezing
 /// the tick.
+///
+/// The pass: gather the evidence the decision's plan warrants, decide
+/// ([`decision::reconcile`]), apply. The card writes are the apply's, and a
+/// read that failed or timed out is a value the decision maps to "nothing
+/// claimed".
 pub(crate) async fn reconcile(
     handles: &FlowHandles,
     session_id: &str,
@@ -142,86 +157,33 @@ pub(crate) async fn reconcile(
     record: &ChainRecord,
     read_timeout_ms: u64,
 ) {
+    let mut reads = gather_reads(handles, session_id, record, directory, tracked_directory).await;
+    if reads.needs_status()
+        && let Some(route) = reads.route
+    {
+        reads.status = Some(read_status(handles, session_id, route.directory, read_timeout_ms).await);
+    }
+    if reads.needs_transcript() {
+        reads.transcript = Some(read_transcript(handles, session_id, read_timeout_ms).await);
+    }
+    let disposition = decision::reconcile(record, &reads);
+    apply(handles, session_id, record, &reads, disposition, read_timeout_ms).await;
+}
+
+/// The evidence no server read is needed for: the claims, the in-process card
+/// probe, and the route. The plan ([`RecoveryReads::needs_status`]) decides
+/// from here whether the server reads follow.
+async fn gather_reads<'a>(
+    handles: &FlowHandles,
+    session_id: &str,
+    record: &'a ChainRecord,
+    directory: Option<&'a str>,
+    tracked_directory: Option<&'a str>,
+) -> RecoveryReads<'a> {
     // A live Turn (or the follow that inherited its guard) owns the session,
     // and an inbound message is about to: either way the card is not orphaned.
-    if handles.waits.inflight.lock().await.contains(session_id)
-        || handles.waits.inbound_pending(session_id).await
-    {
-        return;
-    }
-    // A restart-stamp attempt is in flight for this record (#443): its write
-    // is never cancelled and may still land, ordered by the card's delivery
-    // lock. Any decision here — a settle, a collect after a takeover — could
-    // be overtaken if the in-flight write acquires the lock after ours, and a
-    // duplicate attempt would be wasted; wait for the attempt to resolve (it
-    // marks the record or releases the claim), then decide.
-    if record.restart_stamping {
-        return;
-    }
-    // Why not [`Turn::chain_ownership`]? Routing and the Wake step need only
-    // "owned or not"; a reconcile needs the record's card id and the lifecycle
-    // distinctions below — keep a live or yielded record, drop a spent one,
-    // collect a lagged one and re-point. The two agree where it matters: the
-    // orphan branch below runs only when this process holds no card identity
-    // for the session (and the record can never name a card this process is
-    // mid-admitting: `take_over_card` attaches the id before tracking), while
-    // a card this process still holds is never PATCHed by the ladder — a
-    // Waiting card included, which routing reads as unowned but whose true end
-    // this process's ledger watch still owes. A future ownership rule must be
-    // mirrored here, or the reap restructured to consume the verdict, rather
-    // than assumed to reach it.
-    // What does THIS process know about the session's card?
-    let current_id = Turn::card_message_id(&handles.cards, session_id).await;
-    // A live or yielded card is still running; a terminal one (and a missing
-    // card) is not.
-    let current_running = Turn::is_running(&handles.cards, session_id).await;
-    if let Some(current_id) = current_id {
-        if current_id == record.card_message_id {
-            // The recorded card IS this process's card: its own lifecycle owns
-            // it. A terminal card's record is spent once its ending write is
-            // confirmed (ADR-0063 amendment — a write still pending in the
-            // outbox keeps the record); a live or yielded card keeps it.
-            if !current_running {
-                Turn::discard_spent_record(&handles.cards, session_id).await;
-            }
-            return;
-        }
-        // A successor card owns the session while the record still names
-        // another card — the record write raced the handover, or a path
-        // attached the new id without tracking. Collect the recorded card in
-        // place (ADR-0063's goal: never leave a card looking live), then name
-        // the live successor; a settled successor keeps no record. The collect
-        // is best-effort and harmless when the handover already collected it.
-        collect_orphan(&handles.cards, session_id, &record.card_message_id).await;
-        match (
-            current_running,
-            Turn::armed_turn_anchor(&handles.cards, session_id).await,
-        ) {
-            (true, Some(anchor)) => {
-                handles.cards.chains.replace(
-                    session_id,
-                    ChainRecord::new(current_id, anchor.message_id.clone(), Some(anchor.created_ms))
-                        // The route belongs to the session, not the card: keep
-                        // it across the re-point.
-                        .with_directory(record.directory.clone()),
-                );
-            }
-            // A settled successor has nothing to track, and an anchorless one
-            // cannot scope a reap: the next track writes it when it can.
-            _ => handles.cards.chains.remove(session_id),
-        }
-        return;
-    }
-    // No card in this process owns the session: the restart orphan (or a chain
-    // that vanished). The Session's own reads decide, and a read the reap
-    // could not make claims nothing.
-    //
-    // The reads route by the directory the record carried from track time; the
-    // mapping's is the fallback. With neither, the reap decides nothing: on a
-    // generation whose reads are per-directory instance (V1) a cwd-routed
-    // status could belong to a different instance's run, and stamping over a
-    // live run is worse than leaving a record for a later life (growth is
-    // bounded by the live-card sessions).
+    let claimed = handles.waits.inflight.lock().await.contains(session_id)
+        || handles.waits.inbound_pending(session_id).await;
     // The directory the card was TRACKED under: the record's own when it has
     // one, else the caller's pre-follow value. The followed route can never
     // prove a move — it already names the new location (#433).
@@ -229,95 +191,195 @@ pub(crate) async fn reconcile(
         .directory
         .as_deref()
         .filter(|directory| !directory.is_empty());
-    let directory = tracked.or(directory);
-    let Some(directory) = directory else {
-        tracing::debug!(
-            "live-card reap: session {session_id} has no directory to route its reads; keeping the record"
-        );
-        return;
+    let route = tracked.or(directory).map(|directory| Route {
+        directory,
+        baseline: tracked.or(tracked_directory).unwrap_or(directory),
+    });
+    RecoveryReads {
+        claimed,
+        stamping: record.restart_stamping,
+        card: probe_card(handles, session_id, record).await,
+        route,
+        status: None,
+        transcript: None,
+    }
+}
+
+/// What THIS process knows about the session's card, as values. Why not
+/// [`Turn::chain_ownership`]? Routing and the Wake step need only "owned or
+/// not"; a reconcile needs the record's card id and the lifecycle
+/// distinctions below — keep a live or yielded record, drop a spent one,
+/// collect a lagged one and re-point. The two agree where it matters: the
+/// orphan branch runs only when this process holds no card identity for the
+/// session (and the record can never name a card this process is mid-admitting:
+/// `take_over_card` attaches the id before tracking), while a card this
+/// process still holds is never PATCHed by the ladder — a Waiting card
+/// included, which routing reads as unowned but whose true end this process's
+/// ledger watch still owes. A future ownership rule must be mirrored here, or
+/// the reap restructured to consume the verdict, rather than assumed to reach
+/// it.
+async fn probe_card(handles: &FlowHandles, session_id: &str, record: &ChainRecord) -> CardProbe {
+    let Some(current_id) = Turn::card_message_id(&handles.cards, session_id).await else {
+        return CardProbe::None;
     };
-    let baseline_directory = tracked.or(tracked_directory).unwrap_or(directory);
-    // One record's reconcile: the facts every ending — and the restart stamp
-    // — reads, so the calls below carry only what differs (the ending and its
-    // detail).
-    let pass = ReapPass {
-        handles,
-        session_id,
-        record,
-        baseline_directory,
-        read_timeout_ms,
-    };
-    let status = match crate::bridge::bounded_call(
+    // A live or yielded card is still running; a terminal one is not.
+    let running = Turn::is_running(&handles.cards, session_id).await;
+    if current_id == record.card_message_id {
+        return CardProbe::Recorded {
+            terminal: !running,
+            // Only a terminal card consults the outbox: a live card is kept by
+            // its own lifecycle either way.
+            update_pending: !running && handles.cards.feishu.has_pending_card_update(&current_id),
+        };
+    }
+    CardProbe::Successor {
+        card_message_id: current_id,
+        running,
+        anchor: Turn::armed_turn_anchor(&handles.cards, session_id).await,
+    }
+}
+
+/// The status read — made only when the plan warrants it ([`gather_reads`] +
+/// [`RecoveryReads::needs_status`]), bounded by the pass's own request bound,
+/// so a hung server degrades to "nothing claimed" instead of freezing the
+/// tick. An unrecognised status kind (`Ok(None)`) is unknown, not idle: it
+/// claims nothing.
+async fn read_status(
+    handles: &FlowHandles,
+    session_id: &str,
+    directory: &str,
+    read_timeout_ms: u64,
+) -> StatusRead {
+    match crate::bridge::bounded_call(
         "live-card reap status",
         read_timeout_ms,
         handles.backend.session_status(session_id, Some(directory)),
     )
     .await
     {
-        Some(Ok(status)) => status,
+        Some(Ok(Some(status))) => StatusRead::Named(status),
+        Some(Ok(None)) => StatusRead::NoEvidence,
         Some(Err(e)) => {
             tracing::warn!("live-card reap: session {session_id} status read failed: {e}");
-            return;
+            StatusRead::NoEvidence
         }
-        None => return,
-    };
-    // Only a definite non-live status decides an ending. An unrecognised
-    // status kind (`Ok(None)`) is unknown, not idle: `never guessed` — the
-    // record stays for the next tick.
-    let Some(status) = status else {
-        return;
-    };
-    // A live Session keeps the card: the run may still answer it. This
-    // process holds no card for the session, so the record is a restart
-    // orphan — its card froze when the previous process died and nothing
-    // will move it until transcript truth ends it. Stamp that once per
-    // process life (#443) so the user knows why it stopped moving: a failed
-    // attempt claims nothing and is retried next pass.
-    if status.is_live() {
-        if !record.restarted_reaped {
-            pass.stamp_restarted();
-        }
-        return;
+        None => StatusRead::NoEvidence,
     }
-    let transcript = match crate::bridge::bounded_call(
+}
+
+/// The transcript read — made only when the plan warrants it
+/// ([`RecoveryReads::needs_transcript`]), bounded like [`read_status`]. A
+/// failed or timed-out read claims nothing.
+async fn read_transcript(handles: &FlowHandles, session_id: &str, read_timeout_ms: u64) -> TranscriptRead {
+    match crate::bridge::bounded_call(
         "live-card reap transcript",
         read_timeout_ms,
         handles.backend.transcript(session_id),
     )
     .await
     {
-        Some(Ok(transcript)) => transcript,
+        Some(Ok(transcript)) => TranscriptRead::Read(transcript),
         Some(Err(e)) => {
             tracing::warn!("live-card reap: session {session_id} transcript read failed: {e}");
-            return;
+            TranscriptRead::NoEvidence
         }
-        None => return,
+        None => TranscriptRead::NoEvidence,
+    }
+}
+
+/// The card writes one disposition owns. `Keep` is the whole silent arm;
+/// `NoDecision` logs the one diagnosis the reads did not (a missing route);
+/// the collect arms go through [`collect_orphan`] and then move the record;
+/// the stamp hands off to the detached attempt; the settle PATCHes the ending
+/// in place.
+async fn apply(
+    handles: &FlowHandles,
+    session_id: &str,
+    record: &ChainRecord,
+    reads: &RecoveryReads<'_>,
+    disposition: ChainDisposition,
+    read_timeout_ms: u64,
+) {
+    match disposition {
+        ChainDisposition::Keep => {}
+        ChainDisposition::NoDecision => {
+            // The one silent no-decision the reads did not log: no directory
+            // to route by. A failed status or transcript read logged itself.
+            if matches!(reads.card, CardProbe::None) && reads.route.is_none() {
+                tracing::debug!(
+                    "live-card reap: session {session_id} has no directory to route its reads; keeping the record"
+                );
+            }
+        }
+        ChainDisposition::DiscardRecord => {
+            // The apply's own re-check: the decision read the card's terminal
+            // state and the outbox from a snapshot, and a card that moved on
+            // in between must not lose a record it still owes (an ending write
+            // that raced this pass).
+            Turn::discard_spent_record(&handles.cards, session_id).await;
+        }
+        ChainDisposition::CollectThenRepoint { anchor } => {
+            let CardProbe::Successor { card_message_id, .. } = &reads.card else {
+                return;
+            };
+            collect_orphan(&handles.cards, session_id, &record.card_message_id).await;
+            handles.cards.chains.replace(
+                session_id,
+                ChainRecord::new(
+                    card_message_id.clone(),
+                    anchor.message_id.clone(),
+                    Some(anchor.created_ms),
+                )
+                // The route belongs to the session, not the card: keep it
+                // across the re-point.
+                .with_directory(record.directory.clone()),
+            );
+        }
+        ChainDisposition::CollectThenRelease => {
+            collect_orphan(&handles.cards, session_id, &record.card_message_id).await;
+            handles.cards.chains.remove(session_id);
+        }
+        ChainDisposition::StampRestart => {
+            stamp_restarted(handles, session_id, record, read_timeout_ms);
+        }
+        ChainDisposition::Settle(settle) => {
+            settle_card(handles, session_id, record, reads.route, settle, read_timeout_ms).await;
+        }
+    }
+}
+
+/// PATCH the transcript's ending onto the record's card — keeping the body
+/// ([`ApplyPass::settle`]) — or mark a landed yield. `TurnSettle::Running`
+/// never arrives (the decision maps an undecided ending to `Keep`); it is
+/// spelled out for the match to stay exhaustive.
+async fn settle_card(
+    handles: &FlowHandles,
+    session_id: &str,
+    record: &ChainRecord,
+    route: Option<Route<'_>>,
+    settle: TurnSettle,
+    read_timeout_ms: u64,
+) {
+    // The decision only settles an orphan with a route; a missing one here is
+    // a plan/decision mismatch that must claim nothing.
+    let Some(route) = route else {
+        return;
     };
-    // The settle decision's scope: the recorded anchor, else the submitted
-    // message's own anchor re-derived from this read (it may have landed after
-    // the record's last write). Absent, the message never landed — the
-    // anchorless Unreceived scope.
-    let scope = record
-        .anchor()
-        .or_else(|| transcript.anchor_of_user(record.message_id.as_str()));
-    match transcript.settle(scope.as_ref()) {
-        // The read's boundary rule is unsatisfied (a Wake's Execution has not
-        // closed): the ending is not decided — keep observing.
-        TurnSettle::Running => {}
+    let pass = ApplyPass {
+        handles,
+        session_id,
+        record,
+        baseline_directory: route.baseline,
+        read_timeout_ms,
+    };
+    match settle {
         TurnSettle::Complete => {
             pass.settle(CardState::Done, None).await;
         }
         TurnSettle::Failed(error) => {
             pass.settle(CardState::Error, Some(&error_line(&error))).await;
         }
-        // The wait is still on: the card yields 「⏳ 等待后台任务」 and keeps its
-        // record, so a later read (this pass, every tick) settles the true end.
-        // The ending is PATCHed once per life; a restart re-stamps it once. A
-        // yield is not a settle: it carries no move line.
         TurnSettle::Waiting => {
-            if record.waiting_reaped {
-                return;
-            }
             if pass.settle(CardState::Waiting, None).await {
                 handles
                     .cards
@@ -325,20 +387,18 @@ pub(crate) async fn reconcile(
                     .mark_waiting_reaped(session_id, &record.card_message_id);
             }
         }
-        // The submitted message never reached the transcript and the Session
-        // is idle: nobody will answer it — never ✅ (ADR-0062).
         TurnSettle::Unreceived => {
             pass.settle(CardState::Unreceived, None).await;
         }
+        TurnSettle::Running => {}
     }
 }
 
-/// One record's reconcile, as the facts every ending — and the restart stamp
-/// (#443) — reads: the handles, the Session id, the record, the baseline
-/// directory the move verdict compares against, and the pass's read bound.
-/// Grouped so the settle and stamp calls carry only what differs between
-/// them.
-struct ReapPass<'a> {
+/// One record's apply state: the handles, the Session id, the record, the
+/// baseline directory the move verdict compares against, and the pass's read
+/// bound. Grouped so the settle and stamp calls carry only what differs
+/// between them.
+struct ApplyPass<'a> {
     handles: &'a FlowHandles,
     session_id: &'a str,
     record: &'a ChainRecord,
@@ -346,7 +406,7 @@ struct ReapPass<'a> {
     read_timeout_ms: u64,
 }
 
-impl ReapPass<'_> {
+impl ApplyPass<'_> {
     /// PATCH the record's card into `state` — keeping the card's existing body
     /// best-effort (#434 acceptance feedback) — and, when the state is terminal,
     /// drop the record: nothing is owed a reap any more. A terminal ending whose
@@ -390,34 +450,6 @@ impl ReapPass<'_> {
             self.handles.cards.chains.remove(self.session_id);
         }
         true
-    }
-
-    /// Claim the one in-flight stamp attempt for this record and hand it to a
-    /// detached task (#443): the pass must never await the write, and the
-    /// write must never be cancelled. Both properties matter — a stuck Feishu
-    /// call cannot freeze Session Sync if nobody awaits it, and the card's
-    /// delivery lock is what orders a successor's later collect after the
-    /// stamp, so a cancelled write that still committed at Feishu could land
-    /// over that collect. The task marks the record when the PATCH lands,
-    /// repairs a takeover admitted while it was in flight, and releases the
-    /// claim (landed or failed) so the next pass may retry.
-    fn stamp_restarted(&self) {
-        let card_message_id = self.record.card_message_id.clone();
-        if !self
-            .handles
-            .cards
-            .chains
-            .begin_restart_stamp(self.session_id, &card_message_id)
-        {
-            return;
-        }
-        let cards = self.handles.cards.clone();
-        let session_id = self.session_id.to_string();
-        let read_timeout_ms = self.read_timeout_ms;
-        tokio::spawn(async move {
-            stamp_restart_attempt(&cards, &session_id, &card_message_id, read_timeout_ms).await;
-            cards.chains.finish_restart_stamp(&session_id, &card_message_id);
-        });
     }
 
     /// The one line a settling card carries when the Session's location changed
@@ -465,6 +497,31 @@ impl ReapPass<'_> {
     }
 }
 
+/// Claim the one in-flight stamp attempt for this record and hand it to a
+/// detached task (#443): the pass must never await the write, and the write
+/// must never be cancelled. Both properties matter — a stuck Feishu call
+/// cannot freeze Session Sync if nobody awaits it, and the card's delivery
+/// lock is what orders a successor's later collect after the stamp, so a
+/// cancelled write that still committed at Feishu could land over that
+/// collect. The task marks the record when the PATCH lands, repairs a takeover
+/// admitted while it was in flight, and releases the claim (landed or failed)
+/// so the next pass may retry.
+fn stamp_restarted(handles: &FlowHandles, session_id: &str, record: &ChainRecord, read_timeout_ms: u64) {
+    let card_message_id = record.card_message_id.clone();
+    if !handles
+        .cards
+        .chains
+        .begin_restart_stamp(session_id, &card_message_id)
+    {
+        return;
+    }
+    let cards = handles.cards.clone();
+    let session_id = session_id.to_string();
+    tokio::spawn(async move {
+        stamp_restart_attempt(&cards, &session_id, &card_message_id, read_timeout_ms).await;
+        cards.chains.finish_restart_stamp(&session_id, &card_message_id);
+    });
+}
 /// One restart-stamp attempt (#443), detached from the Session Sync pass: the
 /// still-live orphan's card view is read back (bounded — nothing has been sent
 /// yet, so abandoning a timed-out read is safe) and only the header changes —
