@@ -166,7 +166,7 @@ impl ExternalFlow {
         // reconciled (no directory to route its status read), so the sidecar
         // cannot keep a record nothing will ever settle.
         let read_timeout_ms = self.request_timeout_ms.load(std::sync::atomic::Ordering::Relaxed);
-        for (sid, record) in handles.cards.live_cards.entries() {
+        for (sid, record) in handles.cards.chains.entries() {
             let mapping = mapped.get(&sid);
             let span = crate::bridge::span::external(&sid, mapping.map(|(thread_key, _)| thread_key));
             // The route is the followed directory; the move verdict's baseline
@@ -989,11 +989,10 @@ impl ExternalFlow {
                         // The card carried the 承接 line: the Wake is now
                         // user-visible, so the durable Wake Watermark advances
                         // (ADR-0061).
-                        handles.cards.wake_watermarks.advance(
-                            sid,
-                            anchor.message_id.as_str(),
-                            anchor.created_ms,
-                        );
+                        handles
+                            .cards
+                            .chains
+                            .advance(sid, anchor.message_id.as_str(), anchor.created_ms);
                         if handles.waits.inbound_pending(sid).await
                             || handles.waits.inflight.lock().await.contains(sid)
                         {

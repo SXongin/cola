@@ -22,17 +22,16 @@ use crate::backend::{
     ContentBlock, MessageId, MessageRole, MessageTime, Part, SessionTranscript, ToolCall, ToolIdentity,
     ToolOutput, ToolStatus, TranscriptMessage, TranscriptTail,
 };
-use crate::bridge::live_cards::{LiveCard, LiveCards};
+use crate::bridge::chain::{ChainRecord, ChainRecords};
 use crate::bridge::test_support::*;
 use crate::bridge::turn::Turn;
-use crate::bridge::wake_watermark::WakeWatermarks;
 use crate::config::{SessionEntry, ThreadKey};
 use crate::feishu::card::CardState;
 use crate::opencode::types::{SessionListInfo, SessionStatus};
 
 /// The sidecar path the app's own rule derives from the session file.
 fn sidecar(session_file: &Path) -> PathBuf {
-    session_file.with_file_name("live_cards.json")
+    session_file.with_file_name("chain_records.json")
 }
 
 /// Seed the record a previous cola life left behind — the card that was live
@@ -41,13 +40,13 @@ fn sidecar(session_file: &Path) -> PathBuf {
 fn seed_record(session_file: &Path, card_message_id: &str, message_id: &str, created_ms: Option<i64>) {
     seed_live_card(
         session_file,
-        LiveCard::new(card_message_id, MessageId::new(message_id), created_ms),
+        ChainRecord::new(card_message_id, MessageId::new(message_id), created_ms),
     );
 }
 
 /// [`seed_record`] with the record built by the caller (a stored directory).
-fn seed_live_card(session_file: &Path, card: LiveCard) {
-    LiveCards::load(sidecar(session_file)).replace("ses_test", card);
+fn seed_live_card(session_file: &Path, card: ChainRecord) {
+    ChainRecords::load(sidecar(session_file)).replace("ses_test", card);
 }
 
 /// Seed the durable Wake Watermark a previous cola life left behind — the
@@ -55,7 +54,7 @@ fn seed_live_card(session_file: &Path, card: LiveCard) {
 /// sidecar file, so the next app loads it at construction exactly like a real
 /// restart.
 fn seed_wake_mark(session_file: &Path, wake_id: &str, created_ms: i64) {
-    WakeWatermarks::load(session_file.with_file_name("wake_watermarks.json"))
+    ChainRecords::load(session_file.with_file_name("chain_records.json"))
         .advance("ses_test", wake_id, created_ms);
 }
 
@@ -199,7 +198,7 @@ async fn wait_for_record_card(app: &Arc<App>, session_id: &str, card_message_id:
         loop {
             if app
                 .cards_handle()
-                .live_cards
+                .chains
                 .get(session_id)
                 .is_some_and(|record| record.card_message_id == card_message_id)
             {
@@ -245,7 +244,7 @@ async fn wait_for_predecessor_keep(
         loop {
             let recorded = app
                 .cards_handle()
-                .live_cards
+                .chains
                 .get(session_id)
                 .and_then(|record| record.predecessor_keep)
                 .map(|keep| (keep.card_message_id, keep.strip_running_panels));
@@ -355,12 +354,12 @@ async fn a_restart_reaps_a_persisted_card_to_done() {
         .expect("the persisted card is settled in place");
     assert_eq!(card_header(&card), "✅ 完成");
     assert!(
-        app.cards_handle().live_cards.get("ses_test").is_none(),
+        app.cards_handle().chains.get("ses_test").is_none(),
         "a terminal removes the record"
     );
     assert!(
-        !sidecar(&session_file).exists(),
-        "the emptied record removes the sidecar"
+        sidecar(&session_file).exists(),
+        "the Chain Record file is kept when emptied (ADR-0069)"
     );
 }
 
@@ -395,7 +394,7 @@ async fn a_restart_reaps_a_persisted_card_to_error() {
         card_text(&card).contains("503 request queue full"),
         "the failure's own message rides the card: {card}"
     );
-    assert!(app.cards_handle().live_cards.get("ses_test").is_none());
+    assert!(app.cards_handle().chains.get("ses_test").is_none());
 }
 
 /// The #428/#439 shape: the Session moved itself (into a git worktree) while
@@ -410,7 +409,7 @@ async fn a_reap_of_a_moved_session_names_the_move() {
     let session_file = dir.path().join("sessions.json");
     seed_live_card(
         &session_file,
-        LiveCard::new("om_frozen", MessageId::new("msg_cola_anchor"), Some(1_000))
+        ChainRecord::new("om_frozen", MessageId::new("msg_cola_anchor"), Some(1_000))
             .with_directory(Some("/work".into())),
     );
 
@@ -458,7 +457,7 @@ async fn a_reap_of_a_moved_session_names_the_move() {
         "the move line rebuilds no chat content: {card}"
     );
     assert!(
-        app.cards_handle().live_cards.get("ses_test").is_none(),
+        app.cards_handle().chains.get("ses_test").is_none(),
         "the terminal drops the record"
     );
 }
@@ -472,7 +471,7 @@ async fn a_moved_never_promoted_card_names_the_move_too() {
     let session_file = dir.path().join("sessions.json");
     seed_live_card(
         &session_file,
-        LiveCard::new("om_frozen", MessageId::new("msg_cola_anchor"), None)
+        ChainRecord::new("om_frozen", MessageId::new("msg_cola_anchor"), None)
             .with_directory(Some("/work".into())),
     );
 
@@ -513,7 +512,7 @@ async fn a_moved_never_promoted_card_names_the_move_too() {
         "the Unreceived card still names the move: {card}"
     );
     assert!(
-        app.cards_handle().live_cards.get("ses_test").is_none(),
+        app.cards_handle().chains.get("ses_test").is_none(),
         "the terminal drops the record"
     );
 }
@@ -527,7 +526,7 @@ async fn a_reap_of_an_unmoved_session_carries_no_move_line() {
     let session_file = dir.path().join("sessions.json");
     seed_live_card(
         &session_file,
-        LiveCard::new("om_frozen", MessageId::new("msg_cola_anchor"), Some(1_000))
+        ChainRecord::new("om_frozen", MessageId::new("msg_cola_anchor"), Some(1_000))
             .with_directory(Some("/work".into())),
     );
 
@@ -567,7 +566,7 @@ async fn an_unknown_current_directory_claims_no_move() {
     let session_file = dir.path().join("sessions.json");
     seed_live_card(
         &session_file,
-        LiveCard::new("om_frozen", MessageId::new("msg_cola_anchor"), Some(1_000))
+        ChainRecord::new("om_frozen", MessageId::new("msg_cola_anchor"), Some(1_000))
             .with_directory(Some("/work".into())),
     );
 
@@ -641,7 +640,7 @@ async fn a_waiting_yield_carries_no_move_line() {
     let session_file = dir.path().join("sessions.json");
     seed_live_card(
         &session_file,
-        LiveCard::new("om_frozen", MessageId::new("msg_cola_anchor"), Some(1_000))
+        ChainRecord::new("om_frozen", MessageId::new("msg_cola_anchor"), Some(1_000))
             .with_directory(Some("/work".into())),
     );
 
@@ -711,7 +710,7 @@ async fn a_restart_reaps_a_persisted_card_to_waiting_and_keeps_its_record() {
 
     let record = app
         .cards_handle()
-        .live_cards
+        .chains
         .get("ses_test")
         .expect("a waiting card keeps its record");
     assert!(record.waiting_reaped, "the waiting ending is marked as stamped");
@@ -796,7 +795,7 @@ async fn a_waiting_orphan_settles_at_its_true_end() {
     )
     .await;
     assert!(
-        app.cards_handle().live_cards.get("ses_test").is_none(),
+        app.cards_handle().chains.get("ses_test").is_none(),
         "the true end spends the record"
     );
 }
@@ -833,7 +832,7 @@ async fn a_card_persisted_mid_resume_is_reaped_to_its_true_end() {
     // the no-repost assertion below is the durable path's, not a pre-set field.
     assert_eq!(
         app.cards_handle()
-            .wake_watermarks
+            .chains
             .announced("ses_test")
             .map(|mark| mark.created_ms),
         Some(2_900),
@@ -858,7 +857,7 @@ async fn a_card_persisted_mid_resume_is_reaped_to_its_true_end() {
         "the reap stamps the transcript's true end, not the resuming header"
     );
     assert!(
-        app.cards_handle().live_cards.get("ses_test").is_none(),
+        app.cards_handle().chains.get("ses_test").is_none(),
         "the true end spends the record"
     );
     // No 承接 card: the mark LOADED from disk is what suppresses the Fresh
@@ -912,7 +911,7 @@ async fn a_never_promoted_card_ends_unreceived_after_a_restart() {
         "a message nobody received must never read ✅: {:?}",
         platform.calls.lock().await
     );
-    assert!(app.cards_handle().live_cards.get("ses_test").is_none());
+    assert!(app.cards_handle().chains.get("ses_test").is_none());
 }
 
 /// The restart-before-the-anchor variant: the message landed (and finished)
@@ -980,7 +979,7 @@ async fn a_still_live_session_stamps_its_persisted_card_once() {
     assert_eq!(card_header(&patches[0]), "⏳ 已重启，等待运行结束");
     assert_preserved_body(&patches[0]);
     assert!(
-        app.cards_handle().live_cards.get("ses_test").is_some(),
+        app.cards_handle().chains.get("ses_test").is_some(),
         "a still-live Session keeps its record"
     );
 }
@@ -997,9 +996,9 @@ async fn a_takeover_during_the_stamp_read_wins_over_the_stamp() {
     seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
     // A second live orphan the reap keeps reading: the pass clock proving
     // ticks ran after the parked stamp was released.
-    LiveCards::load(sidecar(&session_file)).replace(
+    ChainRecords::load(sidecar(&session_file)).replace(
         "ses_other",
-        LiveCard::new("om_other", MessageId::new("msg_cola_other"), Some(2_000))
+        ChainRecord::new("om_other", MessageId::new("msg_cola_other"), Some(2_000))
             .with_directory(Some("/work".into())),
     );
 
@@ -1057,9 +1056,9 @@ async fn a_successor_owning_the_session_recollects_after_the_stamp() {
     let session_file = dir.path().join("sessions.json");
     seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
     // A second live orphan: the pass clock.
-    LiveCards::load(sidecar(&session_file)).replace(
+    ChainRecords::load(sidecar(&session_file)).replace(
         "ses_other",
-        LiveCard::new("om_other", MessageId::new("msg_cola_other"), Some(2_000))
+        ChainRecord::new("om_other", MessageId::new("msg_cola_other"), Some(2_000))
             .with_directory(Some("/work".into())),
     );
 
@@ -1346,7 +1345,7 @@ async fn a_restart_takeover_carries_the_orphans_running_tool() {
     // Display-only: the durable record names the NEW Turn's message, never the
     // orphan's.
     wait_for_record_card(&app, "ses_test", "msg_reply").await;
-    let record = app.cards_handle().live_cards.get("ses_test").unwrap();
+    let record = app.cards_handle().chains.get("ses_test").unwrap();
     assert_eq!(
         record.message_id,
         MessageId::new("msg_cola_new"),
@@ -2355,7 +2354,7 @@ async fn a_card_this_process_still_holds_is_never_stamped() {
     let session_file = dir.path().join("sessions.json");
     seed_live_card(
         &session_file,
-        LiveCard::new("om_live", MessageId::new("msg_cola_anchor"), Some(1_000))
+        ChainRecord::new("om_live", MessageId::new("msg_cola_anchor"), Some(1_000))
             .with_directory(Some("/work".into())),
     );
 
@@ -2375,7 +2374,7 @@ async fn a_card_this_process_still_holds_is_never_stamped() {
         platform.calls.lock().await
     );
     assert!(
-        app.cards_handle().live_cards.get("ses_test").is_some(),
+        app.cards_handle().chains.get("ses_test").is_some(),
         "the live card keeps its record"
     );
 }
@@ -2404,7 +2403,7 @@ async fn a_failed_stamp_read_leaves_the_card_untouched_until_readable() {
         platform.calls.lock().await
     );
     assert!(
-        app.cards_handle().live_cards.get("ses_test").is_some(),
+        app.cards_handle().chains.get("ses_test").is_some(),
         "the un-stamped orphan keeps its record"
     );
 
@@ -2460,7 +2459,7 @@ async fn a_failed_stamp_patch_retries_until_it_lands() {
     );
     assert_preserved_body(&patches[1]);
     assert!(
-        app.cards_handle().live_cards.get("ses_test").is_some(),
+        app.cards_handle().chains.get("ses_test").is_some(),
         "a still-live Session keeps its record"
     );
 }
@@ -2477,9 +2476,9 @@ async fn a_hung_stamp_patch_never_wedges_the_pass() {
     seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
     // A second live orphan whose reads prove the pass kept ticking while the
     // first record's stamp hung.
-    LiveCards::load(sidecar(&session_file)).replace(
+    ChainRecords::load(sidecar(&session_file)).replace(
         "ses_other",
-        LiveCard::new("om_other", MessageId::new("msg_cola_other"), Some(2_000))
+        ChainRecord::new("om_other", MessageId::new("msg_cola_other"), Some(2_000))
             .with_directory(Some("/work".into())),
     );
 
@@ -2526,7 +2525,7 @@ async fn a_hung_stamp_patch_never_wedges_the_pass() {
     );
     assert_preserved_body(&patches[0]);
     assert!(
-        app.cards_handle().live_cards.get("ses_test").is_some(),
+        app.cards_handle().chains.get("ses_test").is_some(),
         "a still-live Session keeps its record"
     );
 }
@@ -2543,9 +2542,9 @@ async fn a_terminal_waits_for_an_in_flight_stamp() {
     seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
     // The pass clock: this record's reads keep ticking — the claimed record
     // returns before its own status read.
-    LiveCards::load(sidecar(&session_file)).replace(
+    ChainRecords::load(sidecar(&session_file)).replace(
         "ses_other",
-        LiveCard::new("om_other", MessageId::new("msg_cola_other"), Some(2_000))
+        ChainRecord::new("om_other", MessageId::new("msg_cola_other"), Some(2_000))
             .with_directory(Some("/work".into())),
     );
 
@@ -2590,7 +2589,7 @@ async fn a_terminal_waits_for_an_in_flight_stamp() {
     assert_eq!(card_header(&patches[0]), "⏳ 已重启，等待运行结束");
     assert_eq!(card_header(&patches[1]), "✅ 完成");
     assert!(
-        app.cards_handle().live_cards.get("ses_test").is_none(),
+        app.cards_handle().chains.get("ses_test").is_none(),
         "the terminal spends the record"
     );
 }
@@ -2642,7 +2641,7 @@ async fn a_later_ending_replaces_the_restart_stamp() {
     );
     assert_preserved_body(&patches[1]);
     assert!(
-        app.cards_handle().live_cards.get("ses_test").is_none(),
+        app.cards_handle().chains.get("ses_test").is_none(),
         "the terminal spends the record"
     );
 }
@@ -2669,7 +2668,7 @@ async fn an_unrecognised_status_never_decides_an_ending() {
         platform.calls.lock().await
     );
     assert!(
-        app.cards_handle().live_cards.get("ses_test").is_some(),
+        app.cards_handle().chains.get("ses_test").is_some(),
         "the record stays for the next tick"
     );
 }
@@ -2697,7 +2696,7 @@ async fn an_unreadable_transcript_keeps_the_record() {
         platform.calls.lock().await
     );
     assert!(
-        app.cards_handle().live_cards.get("ses_test").is_some(),
+        app.cards_handle().chains.get("ses_test").is_some(),
         "the record stays for the next tick"
     );
 }
@@ -2711,7 +2710,7 @@ async fn a_stored_directory_routes_the_reap_without_the_mapping() {
     let session_file = dir.path().join("sessions.json");
     seed_live_card(
         &session_file,
-        LiveCard::new("om_frozen", MessageId::new("msg_cola_anchor"), Some(1_000))
+        ChainRecord::new("om_frozen", MessageId::new("msg_cola_anchor"), Some(1_000))
             .with_directory(Some("/gone".into())),
     );
 
@@ -2726,7 +2725,7 @@ async fn a_stored_directory_routes_the_reap_without_the_mapping() {
         |card| card_header(card).contains("✅"),
     )
     .await;
-    assert!(app.cards_handle().live_cards.get("ses_test").is_none());
+    assert!(app.cards_handle().chains.get("ses_test").is_none());
 }
 
 /// A record with neither a stored directory nor a mapping decides nothing: on
@@ -2777,7 +2776,7 @@ async fn a_record_without_a_directory_is_never_decided() {
         platform.calls.lock().await
     );
     assert!(
-        app.cards_handle().live_cards.get("ses_test").is_some(),
+        app.cards_handle().chains.get("ses_test").is_some(),
         "the record stays for a later life"
     );
 }
@@ -2838,7 +2837,7 @@ async fn a_restart_continuation_collects_the_old_card() {
     // (it ended ✅ in the same read) the record is spent, but the send that
     // took over re-pointed it first — proven by the successor's own send
     // having tracked a card id that is not the orphan's.
-    let record = app.cards_handle().live_cards.get("ses_test");
+    let record = app.cards_handle().chains.get("ses_test");
     assert!(
         record
             .as_ref()
@@ -2906,7 +2905,7 @@ async fn a_record_that_lagged_a_handover_collects_the_orphan_and_repoints() {
     let session_file = dir.path().join("sessions.json");
     seed_live_card(
         &session_file,
-        LiveCard::new("om_old", MessageId::new("msg_cola_anchor"), Some(1_000))
+        ChainRecord::new("om_old", MessageId::new("msg_cola_anchor"), Some(1_000))
             .with_directory(Some("/work".into())),
     );
 
@@ -2926,7 +2925,7 @@ async fn a_record_that_lagged_a_handover_collects_the_orphan_and_repoints() {
         "the live card is never touched: {:?}",
         platform.calls.lock().await
     );
-    let record = app.cards_handle().live_cards.get("ses_test").unwrap();
+    let record = app.cards_handle().chains.get("ses_test").unwrap();
     assert_eq!(
         record.directory.as_deref(),
         Some("/work"),
@@ -2945,7 +2944,7 @@ async fn a_collected_orphan_keeps_its_body_without_the_controls() {
     let session_file = dir.path().join("sessions.json");
     seed_live_card(
         &session_file,
-        LiveCard::new("om_old", MessageId::new("msg_cola_anchor"), Some(1_000))
+        ChainRecord::new("om_old", MessageId::new("msg_cola_anchor"), Some(1_000))
             .with_directory(Some("/work".into())),
     );
 
@@ -3002,7 +3001,7 @@ async fn a_reaped_done_card_keeps_its_body() {
     assert_eq!(card_header(&card), "✅ 完成");
     assert_preserved_body(&card);
     assert!(
-        app.cards_handle().live_cards.get("ses_test").is_none(),
+        app.cards_handle().chains.get("ses_test").is_none(),
         "a terminal removes the record"
     );
 }
@@ -3017,7 +3016,7 @@ async fn a_reaped_error_card_keeps_its_body_after_the_detail_and_move_line() {
     let session_file = dir.path().join("sessions.json");
     seed_live_card(
         &session_file,
-        LiveCard::new("om_frozen", MessageId::new("msg_cola_anchor"), Some(1_000))
+        ChainRecord::new("om_frozen", MessageId::new("msg_cola_anchor"), Some(1_000))
             .with_directory(Some("/work".into())),
     );
 
@@ -3104,7 +3103,7 @@ async fn a_reaped_unreceived_card_keeps_its_body() {
         .expect("the persisted card is settled in place");
     assert_eq!(card_header(&card), "⚠️ 这条消息未被接收");
     assert_preserved_body(&card);
-    assert!(app.cards_handle().live_cards.get("ses_test").is_none());
+    assert!(app.cards_handle().chains.get("ses_test").is_none());
 }
 
 /// A Waiting yield keeps the body too, and the record stays for the later true
@@ -3140,7 +3139,7 @@ async fn a_reaped_waiting_card_keeps_its_body() {
     assert_eq!(card_header(&card), "⏳ 等待后台任务");
     assert_preserved_body(&card);
     assert!(
-        app.cards_handle().live_cards.get("ses_test").is_some(),
+        app.cards_handle().chains.get("ses_test").is_some(),
         "a waiting yield keeps its record"
     );
 }
@@ -3256,7 +3255,7 @@ async fn a_transport_failed_preserved_ending_does_not_retry_bare() {
         "no transport failure falls back to the bare ending: {patches:?}"
     );
     assert!(
-        app.cards_handle().live_cards.get("ses_test").is_some(),
+        app.cards_handle().chains.get("ses_test").is_some(),
         "a failed settle keeps the record for the next tick"
     );
 }
@@ -3288,7 +3287,7 @@ async fn a_live_turn_tracks_its_card_and_every_terminal_drops_the_record() {
     );
     let record = app
         .cards_handle()
-        .live_cards
+        .chains
         .get("ses_test")
         .expect("a live Turn tracks its card");
     assert_eq!(record.card_message_id, "msg_reply", "the sent card is tracked");
@@ -3322,12 +3321,12 @@ async fn a_live_turn_tracks_its_card_and_every_terminal_drops_the_record() {
     )
     .await;
     assert!(
-        app.cards_handle().live_cards.get("ses_test").is_none(),
+        app.cards_handle().chains.get("ses_test").is_none(),
         "the quiet true end is a terminal: its record is spent"
     );
     assert!(
-        !sidecar(&session_file).exists(),
-        "the emptied record removes the sidecar"
+        sidecar(&session_file).exists(),
+        "the Chain Record file is kept when emptied (ADR-0069)"
     );
 }
 
@@ -3360,7 +3359,7 @@ async fn a_failed_final_patch_keeps_the_record_until_delivery() {
     );
     let record = app
         .cards_handle()
-        .live_cards
+        .chains
         .get("ses_test")
         .expect("a failed ending write keeps the record");
     let card_id = record.card_message_id.clone();
@@ -3384,7 +3383,7 @@ async fn a_failed_final_patch_keeps_the_record_until_delivery() {
     spawn_sync(&app);
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if app.cards_handle().live_cards.get("ses_test").is_none() {
+            if app.cards_handle().chains.get("ses_test").is_none() {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -3415,7 +3414,7 @@ async fn the_session_sync_pass_retries_a_failed_final_patch() {
         .unwrap();
     let card_id = app
         .cards_handle()
-        .live_cards
+        .chains
         .get("ses_test")
         .expect("a failed ending write keeps the record")
         .card_message_id
@@ -3430,7 +3429,7 @@ async fn the_session_sync_pass_retries_a_failed_final_patch() {
     // the confirmed record — both observed here, or the test times out.
     tokio::time::timeout(Duration::from_secs(120), async {
         loop {
-            if app.cards_handle().live_cards.get("ses_test").is_none()
+            if app.cards_handle().chains.get("ses_test").is_none()
                 && !app.core.feishu.has_pending_card_update(&card_id)
             {
                 return;
@@ -3466,7 +3465,7 @@ async fn a_restart_after_a_failed_final_patch_reaps_the_card() {
         .unwrap();
     let card_id = app
         .cards_handle()
-        .live_cards
+        .chains
         .get("ses_test")
         .expect("a failed ending write keeps the record")
         .card_message_id
@@ -3480,7 +3479,7 @@ async fn a_restart_after_a_failed_final_patch_reaps_the_card() {
     assert_eq!(
         restarted
             .cards_handle()
-            .live_cards
+            .chains
             .get("ses_test")
             .map(|record| record.card_message_id),
         Some(card_id.clone()),
@@ -3496,7 +3495,7 @@ async fn a_restart_after_a_failed_final_patch_reaps_the_card() {
                 }
                 _ => false,
             });
-            if settled && restarted.cards_handle().live_cards.get("ses_test").is_none() {
+            if settled && restarted.cards_handle().chains.get("ses_test").is_none() {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;

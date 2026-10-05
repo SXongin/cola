@@ -531,7 +531,7 @@ async fn a_completion_wake_resumes_the_yielded_card_in_place() {
     // advanced (ADR-0061): a restart cannot re-post this Wake.
     assert_eq!(
         app.cards_handle()
-            .wake_watermarks
+            .chains
             .announced("ses_test")
             .map(|mark| mark.created_ms),
         Some(2_900),
@@ -567,7 +567,7 @@ async fn a_completion_wake_resumes_the_yielded_card_in_place() {
     assert_eq!(
         restarted
             .cards_handle()
-            .wake_watermarks
+            .chains
             .announced("ses_test")
             .map(|mark| mark.created_ms),
         Some(2_900),
@@ -648,7 +648,7 @@ async fn a_completion_wake_resumes_in_place_after_its_entry_was_placed() {
     );
     assert_eq!(
         app.cards_handle()
-            .wake_watermarks
+            .chains
             .announced("ses_test")
             .map(|mark| mark.created_ms),
         Some(2_900),
@@ -894,7 +894,7 @@ async fn a_wake_after_a_restart_posts_a_continuation_card() {
     // advanced (ADR-0061), so a later restart cannot re-post this Wake.
     assert_eq!(
         app.cards_handle()
-            .wake_watermarks
+            .chains
             .announced("ses_test")
             .map(|mark| mark.created_ms),
         Some(2_900),
@@ -2517,7 +2517,7 @@ async fn an_announced_wake_is_not_reposted_after_a_restart() {
     let (_dir, app, _backend, platform) = scripted_app(vec![resumed], Some(SessionStatus::Idle)).await;
     // The previous life's card announced this Wake before the restart.
     app.cards_handle()
-        .wake_watermarks
+        .chains
         .advance("ses_test", "msg_wake_2900", 2_900);
 
     spawn_sync(&app);
@@ -2546,7 +2546,7 @@ async fn a_wake_newer_than_the_watermark_still_continues() {
     let (_dir, app, _backend, platform) = scripted_app(vec![resumed], Some(SessionStatus::Idle)).await;
     // An older Wake was announced before the restart; this one was not.
     app.cards_handle()
-        .wake_watermarks
+        .chains
         .advance("ses_test", "msg_wake_1900", 1_900);
 
     spawn_sync(&app);
@@ -2831,7 +2831,7 @@ async fn a_merged_shell_wake_leaves_one_entry_on_the_live_turn_card() {
     // (ADR-0061): a restart must not re-announce this Wake.
     assert_eq!(
         app.cards_handle()
-            .wake_watermarks
+            .chains
             .announced("ses_test")
             .map(|mark| mark.created_ms),
         Some(finished),

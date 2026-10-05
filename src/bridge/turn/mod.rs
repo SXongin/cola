@@ -15,11 +15,11 @@ use std::sync::Arc;
 use tracing::Instrument;
 
 use crate::backend::{MessageId, MessageRole, SessionTranscript, TurnAnchor, TurnSettle, WakeSource};
+use crate::bridge::chain::ChainRecord;
 use crate::bridge::handler::image_inputs;
 use crate::bridge::handles::{
     CardsHandle, FlowHandles, NoticeRules, RequestsHandle, SessionsHandle, TurnHandles, WaitsHandle,
 };
-use crate::bridge::live_cards::LiveCard;
 use crate::bridge::span;
 use crate::bridge::turn::state::StreamAccumulator;
 use crate::config::ThreadKey;
@@ -640,7 +640,7 @@ impl Turn {
         }
         // The live-card record is a fact about the card, not the session id it
         // was filed under: re-key it so the fresh session's card is reap-able.
-        handles.cards.live_cards.rename(&self.session_id, &fresh_id);
+        handles.cards.chains.rename(&self.session_id, &fresh_id);
         {
             let mut inflight = handles.waits.inflight.lock().await;
             inflight.remove(&self.session_id);
@@ -1521,7 +1521,7 @@ impl Turn {
         card_message_id: &str,
         collect: PredecessorCollect,
         directory: Option<&str>,
-    ) -> Option<LiveCard> {
+    ) -> Option<ChainRecord> {
         let (message_id, created_ms, context_directory) = {
             let live = cards.cards.lock().await;
             match live.get(session_id) {
@@ -1545,9 +1545,9 @@ impl Turn {
             .map(str::to_string)
             .filter(|directory| !directory.is_empty())
             .or(context_directory);
-        let previous = cards.live_cards.replace(
+        let previous = cards.chains.replace(
             session_id,
-            crate::bridge::live_cards::LiveCard::new(card_message_id, message_id, created_ms)
+            crate::bridge::chain::ChainRecord::new(card_message_id, message_id, created_ms)
                 .with_directory(directory),
         );
         if collect == PredecessorCollect::Never {
@@ -1582,7 +1582,7 @@ impl Turn {
         session_id: &str,
         card_message_id: &str,
         directory: Option<&str>,
-    ) -> Option<LiveCard> {
+    ) -> Option<ChainRecord> {
         Self::attach_card_message_id(cards, session_id, card_message_id).await;
         Self::track_live_card(
             cards,
@@ -1609,7 +1609,7 @@ impl Turn {
         session_id: &str,
         card_message_id: &str,
         directory: Option<&str>,
-    ) -> Option<LiveCard> {
+    ) -> Option<ChainRecord> {
         Self::attach_card_message_id(cards, session_id, card_message_id).await;
         Self::track_live_card(
             cards,
@@ -1649,7 +1649,7 @@ impl Turn {
         handles: &TurnHandles,
         session_id: &str,
         successor_card_id: &str,
-        orphan: &LiveCard,
+        orphan: &ChainRecord,
     ) -> usize {
         let Some(anchor) = orphan.anchor() else {
             tracing::info!("restart carry: session {session_id} none (no anchor)");
@@ -1732,7 +1732,7 @@ impl Turn {
         {
             return;
         }
-        cards.live_cards.remove(session_id);
+        cards.chains.remove(session_id);
     }
 
     /// Split `session_id`'s Card Chain at a user message (ADR-0043): append the
@@ -3269,7 +3269,7 @@ impl Turn {
         // `announced_wakes`, so only a strictly newer Wake is owed. Equal
         // server times read as announced — the conservative side.
         if cards
-            .wake_watermarks
+            .chains
             .announced(session_id)
             .is_some_and(|mark| anchor.created_ms <= mark.created_ms)
         {
