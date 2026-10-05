@@ -338,6 +338,10 @@ async fn stale_session_mapping_is_recreated_on_404() {
     )
     .await;
 
+    // The recreated id names the same logical Session: an announcement the
+    // dead id already made must move with its record (ADR-0069).
+    app.cards_handle().chains.advance("ses_old", "msg_wake_1", 1_000);
+
     app.handle_message(incoming(
         "msg_1".into(),
         "chat_1".into(),
@@ -376,6 +380,17 @@ async fn stale_session_mapping_is_recreated_on_404() {
     let inflight = app.inflight.lock().await;
     assert!(!inflight.contains("ses_old"), "dead id guard must be released");
     assert!(!inflight.contains("ses_new"), "fresh id guard must be released");
+    drop(inflight);
+
+    // The recreate also re-keyed the Chain Record's announcement: the fresh id
+    // carries the mark the dead id made, and the dead id carries nothing.
+    let chains = app.cards_handle().chains.clone();
+    assert_eq!(
+        chains.announced("ses_new").map(|mark| mark.created_ms),
+        Some(1_000),
+        "the recreate re-keys the announcement with the record"
+    );
+    assert_eq!(chains.announced("ses_old"), None);
 }
 
 /// A failed attempt after a 404 recreate must still offer a working retry. The
