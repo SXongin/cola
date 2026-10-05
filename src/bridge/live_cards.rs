@@ -25,6 +25,19 @@ use serde::{Deserialize, Serialize};
 use crate::backend::{MessageId, TurnAnchor};
 use crate::bridge::sidecar;
 
+/// The keep rule the fresh-Turn takeover's collect applied to the card it
+/// replaced (ADR-0068), in memory only: which predecessor card the collect
+/// targeted and whether the restart carry moved its running `⏳` panels onto
+/// the successor. The #443 restart stamp's post-PATCH repair reads it so a
+/// stamp landing over that takeover reproduces the collect's strip instead of
+/// restoring the tail it removed; every other takeover (the Wake and external
+/// arms) records none.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PredecessorKeep {
+    pub(crate) card_message_id: String,
+    pub(crate) strip_running_panels: bool,
+}
+
 /// One Session's durable live-card facts. `card_message_id` is the Feishu
 /// message the reap PATCHes; `message_id` is the Turn's own message (the
 /// `msg_cola_` user message a cola Turn submitted, or the external message an
@@ -69,6 +82,15 @@ pub(crate) struct LiveCard {
     /// and never survives a restart.
     #[serde(skip)]
     pub(crate) restart_stamping: bool,
+    /// In-memory only: the keep rule the fresh-Turn takeover's collect applied
+    /// to the card this record replaced (ADR-0068). The #443 restart stamp's
+    /// post-PATCH repair reads it so a stamp that lands over that takeover
+    /// reproduces the collect's strip — never restoring the tail the collect
+    /// removed. Every other takeover leaves it `None`, and the repair then
+    /// keeps today's body. A record that is rewritten (a later handover)
+    /// starts `None`; it never persists.
+    #[serde(skip)]
+    pub(crate) predecessor_keep: Option<PredecessorKeep>,
 }
 
 impl LiveCard {
@@ -85,6 +107,7 @@ impl LiveCard {
             waiting_reaped: false,
             restarted_reaped: false,
             restart_stamping: false,
+            predecessor_keep: None,
         }
     }
 
@@ -220,6 +243,40 @@ impl LiveCards {
     /// card is dropped).
     pub(crate) fn mark_restarted_reaped(&self, session_id: &str, card_message_id: &str) -> bool {
         self.set_reap_flag(session_id, card_message_id, |card| card.restarted_reaped = true)
+    }
+
+    /// Record the keep rule the fresh-Turn takeover's collect is about to
+    /// apply to `card_message_id` (ADR-0068), so the #443 stamp's post-PATCH
+    /// repair can reproduce it. Recorded before the collect's PATCH so a stamp
+    /// that lands after it finds the rule. In-memory only; a later handover
+    /// that rewrites the record drops it.
+    pub(crate) fn note_predecessor_keep(
+        &self,
+        session_id: &str,
+        card_message_id: &str,
+        strip_running_panels: bool,
+    ) {
+        let mut sessions = self.lock();
+        if let Some(card) = sessions.get_mut(session_id) {
+            card.predecessor_keep = Some(PredecessorKeep {
+                card_message_id: card_message_id.to_string(),
+                strip_running_panels,
+            });
+        }
+    }
+
+    /// The live-tail strip the takeover collect recorded for the predecessor
+    /// card `card_message_id`, when this record still remembers it:
+    /// `Some(strip_running_panels)` after a fresh-Turn takeover's collect,
+    /// `None` for every other takeover (the #443 repair then keeps today's
+    /// body) and for a record that moved on.
+    pub(crate) fn predecessor_keep_strip(&self, session_id: &str, card_message_id: &str) -> Option<bool> {
+        self.lock().get(session_id).and_then(|card| {
+            card.predecessor_keep
+                .as_ref()
+                .filter(|keep| keep.card_message_id == card_message_id)
+                .map(|keep| keep.strip_running_panels)
+        })
     }
 
     /// Set `flag` on the record naming `card_message_id` — the shared body of
@@ -427,6 +484,47 @@ mod tests {
             LiveCard::new("om_card_2", MessageId::new("msg_cola_1"), Some(1_000)),
         );
         assert!(!cards.get("ses_a").unwrap().waiting_reaped);
+    }
+
+    /// ADR-0068's takeover keep rule is in-memory only and scoped to the
+    /// predecessor card it was recorded for: the #443 stamp's repair asks for
+    /// the orphan's id and gets `None` for any other card, a restart forgets
+    /// it, and a rewrite (a later handover) resets it.
+    #[test]
+    fn the_takeover_keep_rule_is_in_memory_and_card_scoped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live_cards.json");
+        let cards = LiveCards::load(path.clone());
+        cards.replace(
+            "ses_a",
+            LiveCard::new("om_successor", MessageId::new("msg_cola_1"), Some(1_000)),
+        );
+
+        assert_eq!(cards.predecessor_keep_strip("ses_a", "om_old"), None);
+        cards.note_predecessor_keep("ses_a", "om_old", true);
+        assert_eq!(cards.predecessor_keep_strip("ses_a", "om_old"), Some(true));
+        assert_eq!(
+            cards.predecessor_keep_strip("ses_a", "om_other"),
+            None,
+            "the rule only answers for the card it was recorded for"
+        );
+        cards.note_predecessor_keep("ses_a", "om_old", false);
+        assert_eq!(
+            cards.predecessor_keep_strip("ses_a", "om_old"),
+            Some(false),
+            "a second takeover collect replaces the recorded rule"
+        );
+
+        // A reload (a restart) forgets it; a rewrite (a later handover) resets it.
+        assert_eq!(
+            LiveCards::load(path.clone()).predecessor_keep_strip("ses_a", "om_old"),
+            None
+        );
+        cards.replace(
+            "ses_a",
+            LiveCard::new("om_next", MessageId::new("msg_cola_1"), Some(1_000)),
+        );
+        assert_eq!(cards.predecessor_keep_strip("ses_a", "om_old"), None);
     }
 
     /// The stored directory round-trips (the reap's V1 route); an empty string

@@ -64,8 +64,10 @@ use crate::feishu::card::{
 /// spec's Trigger scopes ADR-0068's live-tail strip to the fresh-Turn message
 /// takeover alone, so this ordinary collect leaves the preserved body exactly
 /// as today — the Wake continuation's arm, the external arm, the reap's
-/// reconcile and the #443 stamp's repair all come through here. The fresh
-/// Turn's own collect is [`collect_orphan_after_carry`].
+/// reconcile all come through here. The fresh Turn's own collect is
+/// [`collect_orphan_after_carry`], and the #443 stamp's repair reproduces
+/// that collect's recorded rule where one exists (this plain collect
+/// otherwise).
 ///
 /// A failed PATCH only warns; the record follows the successor either way, so
 /// the freeze it leaves behind is the pre-#438 behavior, never a crash.
@@ -81,12 +83,20 @@ pub(crate) async fn collect_orphan(cards: &CardsHandle, session_id: &str, card_m
 /// onto the successor — `carried_running_panels` is the carry's own result, so
 /// a failed, timed-out, cap-stopped or empty carry keeps today's body for
 /// them. A failed PATCH only warns, like every collect.
+///
+/// The rule is recorded on the successor's record **before** the collect's
+/// PATCH: a #443 stamp admitted while the takeover ran may land after this
+/// collect, and its post-PATCH repair reads the rule to reproduce this strip
+/// instead of restoring the tail it removed ([`stamp_restart_attempt`]).
 pub(crate) async fn collect_orphan_after_carry(
     cards: &CardsHandle,
     session_id: &str,
     card_message_id: &str,
     carried_running_panels: bool,
 ) {
+    cards
+        .live_cards
+        .note_predecessor_keep(session_id, card_message_id, carried_running_panels);
     let keep = KeepBody::WithoutLiveTail {
         strip_running_panels: carried_running_panels,
     };
@@ -467,7 +477,9 @@ impl ReapPass<'_> {
 /// claims nothing — no bare fallback: the stamp's whole value is the body it
 /// preserves — and the caller releases the attempt's claim so the next pass
 /// retries. On success the in-memory mark is set, and a takeover admitted
-/// while the write was in flight is repaired by the post-PATCH re-collect.
+/// while the write was in flight is repaired by the post-PATCH re-collect —
+/// under the fresh-Turn takeover's own keep rule when it recorded one
+/// (ADR-0068), never restoring the tail that collect removed.
 async fn stamp_restart_attempt(
     cards: &CardsHandle,
     session_id: &str,
@@ -518,8 +530,22 @@ async fn stamp_restart_attempt(
     // session now, collect the orphan again so the takeover has the card's
     // last word. A collect that lands after this PATCH wins on its own; this
     // only repairs the reversed order.
+    //
+    // The repair reproduces the takeover's own keep rule (ADR-0068), never
+    // the plain one: a fresh Turn's collect recorded whether its carry moved
+    // the running `⏳` panels ([`collect_orphan_after_carry`]), and the stamp's
+    // stale body must not restore the tail that collect removed. A takeover
+    // that recorded no rule — the Wake continuation's arm, the external arm —
+    // keeps today's preserved body ([`KeepBody::Everything`]).
     if Turn::card_message_id(cards, session_id).await.is_some() {
-        collect_orphan(cards, session_id, card_message_id).await;
+        let keep = match cards
+            .live_cards
+            .predecessor_keep_strip(session_id, card_message_id)
+        {
+            Some(strip_running_panels) => KeepBody::WithoutLiveTail { strip_running_panels },
+            None => KeepBody::Everything,
+        };
+        collect_orphan_with(cards, session_id, card_message_id, keep).await;
     }
 }
 
@@ -551,7 +577,7 @@ fn ending_card(state: CardState, detail: Option<&str>, move_note: Option<&str>) 
 /// ending over it, PATCH the merge. `keep` is the merge's view-element rule —
 /// [`KeepBody::Everything`] for every ordinary collect, ending and the #443
 /// stamp, [`KeepBody::WithoutLiveTail`] for the fresh-Turn takeover's collect
-/// (ADR-0068). A failed
+/// and the #443 stamp's repair of it (ADR-0068). A failed
 /// read PATCHes `bare` directly — today's behavior — because the ending must
 /// never depend on the read.
 ///
@@ -592,11 +618,13 @@ async fn patch_ending_keeping_body(
 /// feedback, ADR-0068).
 #[derive(Clone, Copy)]
 enum KeepBody {
-    /// Every ordinary collect, every ending and the #443 restart stamp: the
-    /// card's own view stays as it was, its controls stripped.
+    /// Every ordinary collect, every ending and the #443 restart stamp —
+    /// plus the stamp's repair when no takeover recorded a rule: the card's
+    /// own view stays as it was, its controls stripped.
     Everything,
-    /// The fresh-Turn message takeover's collect (ADR-0068, the one collect
-    /// the spec's Trigger scopes the strip to): the view's live tail goes —
+    /// The fresh-Turn message takeover's collect and the #443 stamp's repair
+    /// of it (ADR-0068, the one collect the spec's Trigger scopes the strip
+    /// to): the view's live tail goes —
     /// the Background Task Ledger element always, because the successor's own
     /// reads rebuild the live list (ADR-0060), and the running `⏳` panels
     /// when the restart carry actually moved them onto the successor. Every
