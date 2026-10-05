@@ -918,27 +918,6 @@ impl StreamAccumulator {
         self.refresh_phase();
     }
 
-    /// The stop terminal (#394): a deliberate `/stop` is not a failure, so the
-    /// transition to `Stopped` discards any recorded error text — the
-    /// invariant (`Stopped` implies `error == None`) holds wherever the state
-    /// is set, by construction: here and through
-    /// [`Disposition::Stopped`]'s application.
-    pub(super) fn set_stopped(&mut self) {
-        self.error = None;
-        self.card_state = CardState::Stopped;
-    }
-
-    /// The waiting yield (ADR-0059): the Execution ended but Background Tasks
-    /// are still live. Not a terminal and never ✅ — the card stops updating
-    /// (the phase timer clears with the state) and the next Wake continues the
-    /// chain on a new card. The content the Turn produced stays; any recorded
-    /// failure is the caller's fact and dominates this call (the caller never
-    /// yields waiting over one).
-    pub(super) fn set_waiting(&mut self) {
-        self.card_state = CardState::Waiting;
-        self.refresh_phase();
-    }
-
     /// The in-place resumption (ADR-0066): a shell/subagent completion Wake
     /// resumed THIS yielded card, so it works on again — header
     /// 「🔄 后台任务完成，继续处理中…」 with a fresh phase timer, because the
@@ -953,23 +932,13 @@ impl StreamAccumulator {
         self.refresh_phase();
     }
 
-    /// The Unreceived ending (ADR-0062): the Turn's submitted message never
-    /// reached the transcript and the Session is not live, so nobody will
-    /// answer it. Terminal, never ✅, not a failure — the card says the
-    /// message was not received and offers the 重新发起 action (#437).
-    pub(super) fn set_unreceived(&mut self) {
-        self.error = None;
-        self.card_state = CardState::Unreceived;
-        self.refresh_phase();
-    }
-
     /// Apply an ending disposition to this card — the one application every
-    /// ending path shares (spec #538, #539): the card's state, its failure
-    /// field and its phase timer, all read from the table alone. A deliberate
-    /// stop discards a recorded error and an Unreceived ending never was one;
-    /// a failure ending records its line (the loop's two graces carry fixed
-    /// copy); `Done` and `Waiting` leave the recorded line exactly as it was.
-    /// [`Disposition::Observe`] is no ending: nothing is stamped.
+    /// ending path shares (spec #538, #539, #541): the card's state, its
+    /// failure field and its phase timer, all read from the table alone. A
+    /// deliberate stop discards a recorded error and an Unreceived ending
+    /// never was one; a failure ending records its line (the loop's two graces
+    /// carry fixed copy); `Done` and `Waiting` leave the recorded line exactly
+    /// as it was. [`Disposition::Observe`] is no ending: nothing is stamped.
     pub(super) fn apply_ending(&mut self, disposition: &Disposition) {
         let Some(state) = disposition.card_state() else {
             return;
