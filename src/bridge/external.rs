@@ -1165,8 +1165,8 @@ pub(crate) async fn settle_snapshot_after_send(
 /// Done when the model finishes — or ⏹ 已停止 when a deliberate `/stop` lands
 /// on the run it renders (#394). Exits when the turn completes, the accumulator
 /// was replaced (cola's own prompt or a newer external message), a newer
-/// EXTERNAL user message starts a new turn, or the idle bound elapses with
-/// nothing new rendered (#457) — a cola-authored Supplement merges into the
+/// EXTERNAL user message starts a new turn, or the idle bound elapses with no
+/// observable progress (#457) — a cola-authored Supplement merges into the
 /// run this loop is already streaming (#451).
 async fn external_render_loop(
     handles: &FlowHandles,
@@ -1175,12 +1175,13 @@ async fn external_render_loop(
     poll_ms: u64,
     timeout_ms: u64,
 ) {
-    // The IDLE bound (#457): every poll whose render adds or updates content
+    // The IDLE bound (#457): every poll whose render made observable progress
     // resets the clock, so a running model that keeps producing is never cut
-    // at 10 minutes; only a run that renders nothing NEW for the whole window
-    // gives up. A failed read counts as no progress, so a wedged Backend still
-    // idles out, and the header's per-second tick / footer churn are not the
-    // render diff — reading them as progress would make the bound never fire.
+    // at 10 minutes; only a run whose card shows nothing new for the whole
+    // window gives up. A failed read is no progress either, so a wedged
+    // Backend idles out too; the header's per-second tick and other footer
+    // churn are not progress — reading them as such would make the bound
+    // never fire.
     let idle_bound = tokio::time::Duration::from_millis(timeout_ms);
     let mut last_progress = tokio::time::Instant::now();
     loop {
@@ -1191,6 +1192,13 @@ async fn external_render_loop(
             Ok(transcript) => transcript,
             Err(e) => {
                 tracing::warn!("external render poll transcript: {}", e);
+                // A failed read is the "nothing observable is happening"
+                // state: the idle bound ends it, so a wedged Backend cannot
+                // hold the card live forever.
+                if last_progress.elapsed() >= idle_bound {
+                    idle_bound_reached(handles, &session_id).await;
+                    break;
+                }
                 continue;
             }
         };
@@ -1259,33 +1267,43 @@ async fn external_render_loop(
         if newer_turn {
             break;
         }
-        // Renew the idle bound on a render that produced or updated content:
-        // something reached the card this poll, so the run is not idle. The
-        // renewal sits past the ending checks above — those already ended the
-        // loop — and before the bound below, so a productive tick at the very
-        // edge extends the window instead of being cut.
-        if stats.changed {
+        // Renew the idle bound on a render that made observable progress:
+        // content, a panel/ledger/liveness movement — anything the card owed.
+        // The renewal sits past the ending checks above — those already ended
+        // the loop — and before the bound below, so a productive tick at the
+        // very edge extends the window instead of being cut.
+        if stats.progressed {
             last_progress = tokio::time::Instant::now();
         }
-        // Safety net for messages that never trigger a run. If a partial reply
-        // was rendered, finalize it so the card never sits on an eternal
-        // spinner; otherwise leave the "有新消息" notification as-is.
+        // Safety net for messages that never trigger a run, and for a run that
+        // goes quiet: if a partial reply was rendered, finalize it so the card
+        // never sits on an eternal spinner; otherwise leave the "有新消息"
+        // notification as-is.
         if last_progress.elapsed() >= idle_bound {
-            let has_content = Turn::has_rendered_content(&handles.cards, &session_id).await;
-            if has_content {
-                finalize_done(&handles.cards, &session_id).await;
-                tracing::info!(
-                    "external reply render: idle bound reached; finalized session {}",
-                    session_id
-                );
-            } else {
-                tracing::info!(
-                    "external reply render: idle bound reached with no content; notification stays for session {}",
-                    session_id
-                );
-            }
+            idle_bound_reached(handles, &session_id).await;
             break;
         }
+    }
+}
+
+/// The idle bound's ending (#457): a card that rendered partial content is
+/// finalized Done so it never sits on an eternal spinner; a card that never
+/// rendered anything is left as the 有新消息 notification untouched. Shared by
+/// the no-progress tick and the failed-read arm — a wedged Backend is the same
+/// "nothing observable is happening" state.
+async fn idle_bound_reached(handles: &FlowHandles, session_id: &str) {
+    let has_content = Turn::has_rendered_content(&handles.cards, session_id).await;
+    if has_content {
+        finalize_done(&handles.cards, session_id).await;
+        tracing::info!(
+            "external reply render: idle bound reached; finalized session {}",
+            session_id
+        );
+    } else {
+        tracing::info!(
+            "external reply render: idle bound reached with no content; notification stays for session {}",
+            session_id
+        );
     }
 }
 
