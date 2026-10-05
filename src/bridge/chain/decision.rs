@@ -1,5 +1,5 @@
 //! The Chain Record module's pure decisions (ADR-0069): the reap's reconcile
-//! disposition.
+//! disposition, and the Fresh gate over the Wake Watermark.
 //!
 //! [`reconcile`] answers "what does this record owe a restart?" as one
 //! [`ChainDisposition`] over a [`RecoveryReads`] snapshot: it does no I/O,
@@ -8,8 +8,13 @@
 //! ([`RecoveryReads::needs_status`], [`RecoveryReads::needs_transcript`]), so
 //! the apply makes exactly the reads the decision consumes and the whole
 //! ladder's outcomes can be unit-tested without a server.
+//!
+//! [`fresh`] is the module's second decision entry: the Fresh path of a Wake
+//! continuation asks the same question of a chain with no live card in this
+//! process, sharing the [`ChainRecords`](super::ChainRecords) facts (the Wake
+//! Watermark) and the `Keep` / `NoDecision` vocabulary.
 
-use super::records::ChainRecord;
+use super::records::{ChainRecord, WakeMark};
 use crate::backend::{SessionTranscript, TurnAnchor, TurnSettle};
 use crate::opencode::types::SessionStatus;
 
@@ -254,6 +259,68 @@ pub(crate) fn reconcile(record: &ChainRecord, reads: &RecoveryReads<'_>) -> Chai
             }
         }
     }
+}
+
+/// The Fresh gate's reads (ADR-0069's second decision entry): the facts the
+/// Wake continuation's no-chain path decides on, as values.
+pub(crate) struct FreshReads {
+    /// The durable Wake Watermark for the session (ADR-0061): the newest Wake
+    /// a previous cola life already showed.
+    pub(crate) announced: Option<WakeMark>,
+    /// The newest placeable Wake's anchor — the newest Wake whose server time
+    /// the read carried. `None` when the read has no Wake to decide on.
+    pub(crate) wake: Option<TurnAnchor>,
+    /// The conversation moved past the Wake: a later user message means a
+    /// later cola life already saw or superseded it, and re-posting would
+    /// replay every turn that followed (the live 102k-char replay). The
+    /// genuine restart case (the Wake's run is still pending, or it finished
+    /// while cola was down) has no newer user message.
+    pub(crate) stale: bool,
+    /// The Wake's own work renders against an empty accumulator — the content
+    /// diff the Fresh card is scoped by. `false` means the read owes nothing.
+    pub(crate) renders: bool,
+}
+
+/// What a chain with no live card in this process is owed (ADR-0069's second
+/// decision entry). Mirrors [`ChainDisposition`]'s `Keep` / `NoDecision`
+/// spine; the one positive outcome is the Fresh continuation itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FreshDisposition {
+    /// The restart owes a Fresh Wake continuation, scoped at this Wake anchor.
+    /// The caller still owns the inbound claim and the anchor re-read that
+    /// corroborate it before a card is sent.
+    Announce(TurnAnchor),
+    /// Nothing is owed: the Wake is already announced (the watermark is
+    /// monotonic), the conversation moved past it, or its work renders
+    /// nothing.
+    Keep,
+    /// The read carried no placeable Wake to decide on.
+    NoDecision,
+}
+
+/// The Fresh gate (ADR-0069): whether a restart owes a Fresh Wake
+/// continuation. Pure over the read's facts — the durable watermark, the
+/// newest placeable Wake, whether the conversation moved past it, and whether
+/// its own work renders.
+pub(crate) fn fresh(reads: &FreshReads) -> FreshDisposition {
+    let Some(wake) = reads.wake.clone() else {
+        return FreshDisposition::NoDecision;
+    };
+    // A restart must not re-announce a Wake a previous cola life already
+    // showed (#424): the watermark is the durable half of a chain's own
+    // `announced_wakes`, so only a strictly newer Wake is owed. Equal server
+    // times read as announced — the conservative side.
+    if reads
+        .announced
+        .as_ref()
+        .is_some_and(|mark| wake.created_ms <= mark.created_ms)
+    {
+        return FreshDisposition::Keep;
+    }
+    if reads.stale || !reads.renders {
+        return FreshDisposition::Keep;
+    }
+    FreshDisposition::Announce(wake)
 }
 
 #[cfg(test)]
@@ -565,5 +632,58 @@ mod tests {
                 "no server read is warranted: {blocked:?}"
             );
         }
+    }
+
+    /// The Fresh gate: no Wake decides nothing; an announced, stale or
+    /// unrendering Wake owes nothing; a strictly newer rendering one is
+    /// announced at its anchor.
+    #[test]
+    fn the_fresh_gate_announces_only_newer_rendering_wakes() {
+        let anchor = TurnAnchor {
+            message_id: MessageId::new("msg_wake"),
+            created_ms: 2_000,
+        };
+        let reads = |announced: Option<i64>, stale: bool, renders: bool| FreshReads {
+            announced: announced.map(|created_ms| WakeMark {
+                wake_id: "msg_wake".into(),
+                created_ms,
+            }),
+            wake: Some(anchor.clone()),
+            stale,
+            renders,
+        };
+
+        assert_eq!(
+            fresh(&FreshReads {
+                wake: None,
+                ..reads(None, false, true)
+            }),
+            FreshDisposition::NoDecision
+        );
+        assert_eq!(
+            fresh(&reads(Some(2_000), false, true)),
+            FreshDisposition::Keep,
+            "an equal-time Wake reads as already announced"
+        );
+        assert_eq!(fresh(&reads(Some(3_000), false, true)), FreshDisposition::Keep);
+        assert_eq!(
+            fresh(&reads(Some(1_000), true, true)),
+            FreshDisposition::Keep,
+            "a stale Wake must not replay the conversation"
+        );
+        assert_eq!(
+            fresh(&reads(Some(1_000), false, false)),
+            FreshDisposition::Keep,
+            "nothing renders owes nothing"
+        );
+        assert_eq!(
+            fresh(&reads(Some(1_000), false, true)),
+            FreshDisposition::Announce(anchor.clone())
+        );
+        assert_eq!(
+            fresh(&reads(None, false, true)),
+            FreshDisposition::Announce(anchor),
+            "no watermark at all announces a rendering Wake"
+        );
     }
 }
