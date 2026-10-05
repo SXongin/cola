@@ -38,11 +38,12 @@ facts about its Card Chain, in one sidecar.**
   sections are empty, because its presence is the one-time migration marker.
 - **One-time migration.** When `chain_records.json` is absent, the module
   reads the pre-ADR-0069 sidecars (`live_cards.json`, `wake_watermarks.json`)
-  into the two sections, and never writes them again. The legacy files stay
-  on disk for one release so a rollback still finds them; a later release
-  deletes them. Because the merged file is never removed, a deliberately
-  emptied record cannot be resurrected from the stale legacy file on the
-  next restart.
+  into the two sections and materializes the merged file immediately, so the
+  marker exists from the first load; the legacy files are never written
+  again. They stay on disk for one release so a rollback still finds them; a
+  later release deletes them. Because the merged file is never removed, a
+  deliberately emptied record cannot be resurrected from the stale legacy
+  file on the next restart.
 - **One facade.** Callers hold one `ChainRecords`; `CardsHandle::chains`
   replaces the separate `live_cards` and `wake_watermarks` handles. The store
   methods keep today's names and semantics — the refactor moves the seam, it
@@ -59,8 +60,11 @@ facts about its Card Chain, in one sidecar.**
   The waiting-card ledger/wake refresh stays outside: its evidence is the
   in-memory accumulator, not the durable record.
 
-This step of the refactor is mechanically behavior-preserving: sidecar
-merge, module move, call-site rename.
+This step of the refactor is mechanically behavior-preserving — sidecar
+merge, module move, call-site rename — with two alignments the merge makes
+possible: the fold materializes the marker file at its first load, and a
+re-keyed record (the 404 recreate) carries its announcement, because the
+recreated id names the same logical Session.
 
 ## Considered options
 

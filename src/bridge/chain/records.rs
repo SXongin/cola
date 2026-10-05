@@ -157,18 +157,22 @@ struct ChainRecordFile {
     announcements: HashMap<String, WakeMark>,
 }
 
-/// The pre-ADR-0069 shapes, read once when `chain_records.json` is absent and
-/// never written again.
-#[derive(Debug, Default, Deserialize)]
-struct LegacyLiveCardFile {
+/// The pre-ADR-0069 shape, read once when `chain_records.json` is absent and
+/// never written again. The explicit `bound` keeps serde's `#[serde(default)]`
+/// inference from demanding `T: Default` (only the map is defaulted).
+#[derive(Debug, Deserialize)]
+#[serde(bound(deserialize = "T: Deserialize<'de>"))]
+struct LegacySessions<T> {
     #[serde(default)]
-    sessions: HashMap<String, ChainRecord>,
+    sessions: HashMap<String, T>,
 }
 
-#[derive(Debug, Default, Deserialize)]
-struct LegacyWakeMarkFile {
-    #[serde(default)]
-    sessions: HashMap<String, WakeMark>,
+impl<T> Default for LegacySessions<T> {
+    fn default() -> Self {
+        Self {
+            sessions: HashMap::new(),
+        }
+    }
 }
 
 /// The in-memory mirror of the Chain Record, under one lock: every mutation
@@ -196,19 +200,14 @@ impl ChainRecords {
     /// empty record, never an error: a lost record only means a restart reaps
     /// nothing and a Fresh path may re-announce once.
     pub(crate) fn load(path: PathBuf) -> Self {
-        let state = if path.exists() {
-            let file = sidecar::load::<ChainRecordFile>(&path, "Chain Record");
-            State {
-                records: file.records,
-                announcements: file.announcements,
-            }
-        } else {
-            let records = sidecar::load::<LegacyLiveCardFile>(
+        let folded = !path.exists();
+        let state = if folded {
+            let records = sidecar::load::<LegacySessions<ChainRecord>>(
                 &path.with_file_name("live_cards.json"),
                 "live-card record",
             )
             .sessions;
-            let announcements = sidecar::load::<LegacyWakeMarkFile>(
+            let announcements = sidecar::load::<LegacySessions<WakeMark>>(
                 &path.with_file_name("wake_watermarks.json"),
                 "Wake watermark",
             )
@@ -217,11 +216,25 @@ impl ChainRecords {
                 records,
                 announcements,
             }
+        } else {
+            let file = sidecar::load::<ChainRecordFile>(&path, "Chain Record");
+            State {
+                records: file.records,
+                announcements: file.announcements,
+            }
         };
-        Self {
+        let store = Self {
             path,
             state: Mutex::new(state),
+        };
+        if folded {
+            // Materialize the marker now: the folded state is what the legacy
+            // files held, and the first load is what settles the migration, not
+            // the first later mutation. The subsequent loads never look back.
+            let state = store.lock();
+            store.write(&state);
         }
+        store
     }
 
     /// The session's record, when its card is (believed to be) live. The test
@@ -266,12 +279,18 @@ impl ChainRecords {
 
     /// Re-key a record when the session it names is recreated under a fresh id
     /// (the 404 recreate): the card is still live, only its session id moved.
+    /// The Session's announcement moves with it — the recreated id names the
+    /// same logical Session, so a Wake the old id announced must not be
+    /// re-announced under the new one.
     pub(crate) fn rename(&self, from: &str, to: &str) {
         let mut state = self.lock();
         let Some(card) = state.records.remove(from) else {
             return;
         };
         state.records.insert(to.to_string(), card);
+        if let Some(mark) = state.announcements.remove(from) {
+            state.announcements.insert(to.to_string(), mark);
+        }
         self.write(&state);
     }
 
@@ -347,8 +366,9 @@ impl ChainRecords {
     }
 
     /// Set `flag` on the record naming `card_message_id` — the shared body of
-    /// the reap's one-per-life marks. Returns whether the record still names
-    /// that card (a stale mark for a replaced card is dropped).
+    /// the record-scoped flag mutations (the reap's one-per-life marks and the
+    /// restart-stamp release). Returns whether the record still names that
+    /// card (a stale mutation for a replaced card is dropped).
     fn set_reap_flag(
         &self,
         session_id: &str,
@@ -389,12 +409,9 @@ impl ChainRecords {
     /// the next pass may retry. A record that no longer names the card is
     /// left untouched.
     pub(crate) fn finish_restart_stamp(&self, session_id: &str, card_message_id: &str) {
-        let mut state = self.lock();
-        if let Some(card) = state.records.get_mut(session_id)
-            && card.card_message_id == card_message_id
-        {
+        self.set_reap_flag(session_id, card_message_id, |card| {
             card.restart_stamping = false;
-        }
+        });
     }
 
     /// The session's mark, when one exists — the Fresh path's gate: a Wake at
@@ -538,6 +555,32 @@ mod tests {
                 Some(1_000)
             ))
         );
+    }
+
+    /// A 404 recreate names the same logical Session: its announcement moves
+    /// with the record, so the fresh id cannot re-announce a Wake the old id
+    /// already showed.
+    #[test]
+    fn rename_rekeys_the_announcement_with_the_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE);
+        let chains = ChainRecords::load(path.clone());
+        chains.replace(
+            "ses_old",
+            ChainRecord::new("om_card_1", MessageId::new("msg_cola_1"), Some(1_000)),
+        );
+        chains.advance("ses_old", "msg_wake_1", 1_000);
+
+        chains.rename("ses_old", "ses_fresh");
+        let reloaded = ChainRecords::load(path);
+        assert_eq!(
+            reloaded.announced("ses_fresh"),
+            Some(WakeMark {
+                wake_id: "msg_wake_1".into(),
+                created_ms: 1_000,
+            })
+        );
+        assert_eq!(reloaded.announced("ses_old"), None);
     }
 
     #[test]
@@ -748,6 +791,10 @@ mod tests {
         .unwrap();
 
         let chains = ChainRecords::load(path.clone());
+        assert!(
+            path.exists(),
+            "the fold materializes the Chain Record file immediately"
+        );
         assert_eq!(
             chains.get("ses_a"),
             Some(
@@ -771,6 +818,31 @@ mod tests {
         assert!(path.exists());
         let reloaded = ChainRecords::load(path);
         assert_eq!(reloaded.get("ses_a"), None);
+    }
+
+    /// The fold settles the migration at the first load: the marker file is
+    /// materialized then, so the legacy files can vanish before any later
+    /// mutation without losing the folded facts.
+    #[test]
+    fn the_fold_materializes_the_marker_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE);
+        let legacy = dir.path().join("live_cards.json");
+        std::fs::write(
+            &legacy,
+            r#"{"sessions":{"ses_a":{"card_message_id":"om_card_1","message_id":"msg_cola_1"}}}"#,
+        )
+        .unwrap();
+
+        let chains = ChainRecords::load(path.clone());
+        assert!(path.exists(), "the first load writes the merged file");
+        assert_eq!(chains.get("ses_a").unwrap().card_message_id, "om_card_1");
+
+        // The legacy file is no longer needed; a restart reads only the new
+        // file.
+        std::fs::remove_file(&legacy).unwrap();
+        let reloaded = ChainRecords::load(path);
+        assert_eq!(reloaded.get("ses_a").unwrap().card_message_id, "om_card_1");
     }
 
     /// Once `chain_records.json` exists, it wins: the legacy files beside it

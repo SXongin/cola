@@ -1,10 +1,10 @@
-//! The durable Live Card reap (ADR-0063, #438): a fresh app over the sidecar
-//! a previous cola life left behind reconciles each persisted record against
-//! the Session's own reads — the transcript's real ending settles the card in
-//! place (✅ / ❌ / ⏳ 等待后台任务), a never-promoted message ends Unreceived
-//! (never ✅), a Wake continuation collects the old card as taken over, a
-//! still-live Session keeps the record and its orphaned card gets the
-//! one-time restart stamp (#443), and every terminal drops it.
+//! The durable Chain Record reap (ADR-0063, ADR-0069, #438): a fresh app over
+//! the sidecar a previous cola life left behind reconciles each persisted
+//! record against the Session's own reads — the transcript's real ending
+//! settles the card in place (✅ / ❌ / ⏳ 等待后台任务), a never-promoted
+//! message ends Unreceived (never ✅), a Wake continuation collects the old
+//! card as taken over, a still-live Session keeps the record and its orphaned
+//! card gets the one-time restart stamp (#443), and every terminal drops it.
 //!
 //! Every test drives the real Session Sync pass (`spawn_sync`) over a scripted
 //! Backend and a recording Platform, so the assertions read the cards sent and
@@ -38,14 +38,14 @@ fn sidecar(session_file: &Path) -> PathBuf {
 /// when the process died — directly into the sidecar, so the next app loads it
 /// at construction exactly like a real restart.
 fn seed_record(session_file: &Path, card_message_id: &str, message_id: &str, created_ms: Option<i64>) {
-    seed_live_card(
+    seed_chain_record(
         session_file,
         ChainRecord::new(card_message_id, MessageId::new(message_id), created_ms),
     );
 }
 
 /// [`seed_record`] with the record built by the caller (a stored directory).
-fn seed_live_card(session_file: &Path, card: ChainRecord) {
+fn seed_chain_record(session_file: &Path, card: ChainRecord) {
     ChainRecords::load(sidecar(session_file)).replace("ses_test", card);
 }
 
@@ -54,8 +54,7 @@ fn seed_live_card(session_file: &Path, card: ChainRecord) {
 /// sidecar file, so the next app loads it at construction exactly like a real
 /// restart.
 fn seed_wake_mark(session_file: &Path, wake_id: &str, created_ms: i64) {
-    ChainRecords::load(session_file.with_file_name("chain_records.json"))
-        .advance("ses_test", wake_id, created_ms);
+    ChainRecords::load(sidecar(session_file)).advance("ses_test", wake_id, created_ms);
 }
 
 /// The restarted process: a fresh app over `session_file`, with the transcript
@@ -407,7 +406,7 @@ async fn a_reap_of_a_moved_session_names_the_move() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("sessions.json");
-    seed_live_card(
+    seed_chain_record(
         &session_file,
         ChainRecord::new("om_frozen", MessageId::new("msg_cola_anchor"), Some(1_000))
             .with_directory(Some("/work".into())),
@@ -469,7 +468,7 @@ async fn a_moved_never_promoted_card_names_the_move_too() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("sessions.json");
-    seed_live_card(
+    seed_chain_record(
         &session_file,
         ChainRecord::new("om_frozen", MessageId::new("msg_cola_anchor"), None)
             .with_directory(Some("/work".into())),
@@ -524,7 +523,7 @@ async fn a_reap_of_an_unmoved_session_carries_no_move_line() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("sessions.json");
-    seed_live_card(
+    seed_chain_record(
         &session_file,
         ChainRecord::new("om_frozen", MessageId::new("msg_cola_anchor"), Some(1_000))
             .with_directory(Some("/work".into())),
@@ -564,7 +563,7 @@ async fn an_unknown_current_directory_claims_no_move() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("sessions.json");
-    seed_live_card(
+    seed_chain_record(
         &session_file,
         ChainRecord::new("om_frozen", MessageId::new("msg_cola_anchor"), Some(1_000))
             .with_directory(Some("/work".into())),
@@ -638,7 +637,7 @@ async fn a_waiting_yield_carries_no_move_line() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("sessions.json");
-    seed_live_card(
+    seed_chain_record(
         &session_file,
         ChainRecord::new("om_frozen", MessageId::new("msg_cola_anchor"), Some(1_000))
             .with_directory(Some("/work".into())),
@@ -2352,7 +2351,7 @@ async fn a_card_this_process_still_holds_is_never_stamped() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("sessions.json");
-    seed_live_card(
+    seed_chain_record(
         &session_file,
         ChainRecord::new("om_live", MessageId::new("msg_cola_anchor"), Some(1_000))
             .with_directory(Some("/work".into())),
@@ -2708,7 +2707,7 @@ async fn a_stored_directory_routes_the_reap_without_the_mapping() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("sessions.json");
-    seed_live_card(
+    seed_chain_record(
         &session_file,
         ChainRecord::new("om_frozen", MessageId::new("msg_cola_anchor"), Some(1_000))
             .with_directory(Some("/gone".into())),
@@ -2903,7 +2902,7 @@ async fn a_record_that_lagged_a_handover_collects_the_orphan_and_repoints() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("sessions.json");
-    seed_live_card(
+    seed_chain_record(
         &session_file,
         ChainRecord::new("om_old", MessageId::new("msg_cola_anchor"), Some(1_000))
             .with_directory(Some("/work".into())),
@@ -2942,7 +2941,7 @@ async fn a_collected_orphan_keeps_its_body_without_the_controls() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("sessions.json");
-    seed_live_card(
+    seed_chain_record(
         &session_file,
         ChainRecord::new("om_old", MessageId::new("msg_cola_anchor"), Some(1_000))
             .with_directory(Some("/work".into())),
@@ -3014,7 +3013,7 @@ async fn a_reaped_error_card_keeps_its_body_after_the_detail_and_move_line() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("sessions.json");
-    seed_live_card(
+    seed_chain_record(
         &session_file,
         ChainRecord::new("om_frozen", MessageId::new("msg_cola_anchor"), Some(1_000))
             .with_directory(Some("/work".into())),

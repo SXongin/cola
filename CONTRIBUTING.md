@@ -197,7 +197,7 @@ the workspace tests under LLVM instrumentation and uploads lcov to Codecov,
 which posts the advisory `codecov/project` and `codecov/patch` statuses. Neither
 is required — merge-readiness is still `gh pr checks <branch> --required` — and
 `patch` stays at `target: auto` on purpose. Its reds have caught real untested
-branches (`src/bridge/turn/follow.rs`, `src/bridge/wake_watermark.rs`), and it
+branches (`src/bridge/turn/follow.rs`, `src/bridge/chain/records.rs`), and it
 is the only per-PR signal that new production lines are executed at all. Do not
 make it `informational`, lower its target, or drop whole files from the report:
 a diff touching `src/main.rs` or `src/bridge/discovery.rs` would otherwise stop

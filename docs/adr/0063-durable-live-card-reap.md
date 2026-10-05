@@ -85,8 +85,10 @@ re-render the Fresh path deliberately avoids.
   acceptance feedback): the card's own view is read and the ending restamped
   over it with its controls stripped, while a failed read still settles the
   bare ending and content the card never showed is still never rebuilt.
-- `live_cards.json` holds at most one record per Session and shrinks at every
-  terminal or collection; no separate pruning pass is needed.
+- The Chain Record's records section (ADR-0069; formerly `live_cards.json`)
+  holds at most one record per Session and sheds it at every terminal or
+  collection — the file itself stays as the migration marker; no separate
+  pruning pass is needed.
 - Tests pin: a persisted live card over a restart settles in place by the
   transcript's ending; a never-promoted one ends Unreceived; a continuation
   collects the old card; a still-live Session leaves the record in place.
