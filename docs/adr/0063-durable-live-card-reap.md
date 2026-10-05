@@ -156,3 +156,16 @@ would leave the collected card looking busy. Every other preserved body — the
 reap's settle / Unreceived / Waiting endings and the #443 restart stamp — is
 unchanged, and a takeover that carried no running call keeps those panels (the
 ledger still goes).
+
+## Amendment (2026-10-05): a permanently refused stamp is given up (#522)
+
+The #443 retry rule above ("a failed attempt retries on the next pass") is
+narrowed for one failure class: a stamp PATCH Feishu **permanently** refuses
+as card content (`CardContentRejected`, e.g. `230099`) is deterministic — the
+same preserved payload can never land — so the reap marks the record "stamp
+given up" for this process life and stops retrying it on every Session Sync
+tick; a fresh life starts unmarked. The card simply stays without its stamp,
+the record stays with it, and the transcript-truth ending (or a successor's
+collect) still supersedes it. Every transient failure — transport, timeout,
+auth, server — keeps the retry. The carve-out lands with the Chain Record
+module's decision seam (ADR-0069), which maps the marked record to `Keep`.

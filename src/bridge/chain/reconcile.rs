@@ -17,7 +17,9 @@
 //! the bare ending. The still-live orphan's one-time stamp (#443) reads the
 //! same view the other way around: only the header changes, and a failed read
 //! or PATCH claims nothing — a bare stamp would wipe the body the stamp exists
-//! to keep — so the next pass retries it. The attempt is handed to a detached
+//! to keep — so the next pass retries it; a PATCH Feishu *permanently* refuses
+//! as card content is given up for the process life instead (#522). The attempt
+//! is handed to a detached
 //! task and its write is never cancelled: the pass must not await a stuck
 //! Feishu call, while an issued write must run to its own result so the
 //! card-delivery lock can order a successor's later collect after it. A
@@ -548,7 +550,8 @@ fn stamp_restarted(handles: &FlowHandles, session_id: &str, record: &ChainRecord
 /// after a successor's collect landed, overwriting it. A failed read or PATCH
 /// claims nothing — no bare fallback: the stamp's whole value is the body it
 /// preserves — and the caller releases the attempt's claim so the next pass
-/// retries. On success the in-memory mark is set, and a takeover admitted
+/// retries; a PATCH permanently refused as card content (#522) is marked given
+/// up instead. On success the in-memory mark is set, and a takeover admitted
 /// while the write was in flight is repaired by the post-PATCH re-collect —
 /// under the fresh-Turn takeover's own keep rule when it recorded one
 /// (ADR-0068), never restoring the tail that collect removed.
