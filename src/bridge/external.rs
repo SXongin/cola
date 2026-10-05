@@ -427,19 +427,26 @@ impl ExternalFlow {
                 YieldedUpdate::Refreshed => {
                     tracing::info!("yielded ledger refreshed: session {sid}");
                 }
-                YieldedUpdate::Settled { notice_at } => {
+                YieldedUpdate::Settled {
+                    disposition,
+                    notice_at,
+                } => {
                     tracing::info!("yielded ledger settled the true end: session {sid}");
                     // The Completion Notice's existing rules (ADR-0043): groups
                     // per the opt-in, p2p per the long-task threshold. A Wake
                     // continuation carries the clock as `None` — its own card
-                    // send was the notification (ADR-0059).
+                    // send was the notification (ADR-0059). The disposition is
+                    // the one the settle decided and applied (#540), so the
+                    // notice's classification and copy cannot disagree with the
+                    // card.
                     if let Some(started_at) = notice_at {
-                        crate::bridge::turn::send_completion_notice_for_ending_state(
+                        crate::bridge::turn::send_completion_notice(
                             &handles.cards,
                             &handles.platform,
                             &self.notice,
                             sid,
                             started_at,
+                            &disposition,
                         )
                         .await;
                     }

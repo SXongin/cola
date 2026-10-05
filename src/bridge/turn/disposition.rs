@@ -152,10 +152,27 @@ impl Disposition {
         }
     }
 
+    /// The quiet true end's ending (#540, ADR-0060): Session Sync settles a
+    /// yielded card in place from its own settle read plus the sticky `/stop`
+    /// marker — a deliberate stop dominates a simultaneous Complete or Failed
+    /// read, exactly as the out-of-turn loop's own stop check does. `None` when
+    /// the read is not this path's ending: a `Running` read keeps observing,
+    /// and a `Waiting` or `Unreceived` outcome leaves the card exactly where
+    /// the yield left it (a Waiting card always carries an anchor, so the
+    /// anchorless Unreceived decision cannot arise here).
+    pub(crate) fn of_quiet_settle(settle: TurnSettle, stopped: bool) -> Option<Self> {
+        match (settle, stopped) {
+            (TurnSettle::Complete | TurnSettle::Failed(_), true) => Some(Self::Stopped),
+            (TurnSettle::Complete, false) => Some(Self::Done),
+            (TurnSettle::Failed(error), false) => Some(Self::Failed(error)),
+            (TurnSettle::Waiting | TurnSettle::Running | TurnSettle::Unreceived, _) => None,
+        }
+    }
+
     /// The disposition a card already stamped at its ending implies — the
     /// transitional read for the ending paths that have not yet decided a
-    /// disposition (the drain's finalization and the quiet true end; #540/#541
-    /// migrate them). `error` is the card's recorded failure line, read back
+    /// disposition (the drain's finalization; #541 migrates it). `error` is
+    /// the card's recorded failure line, read back
     /// into [`Self::Failed`]; a card whose ending is one of the loop's
     /// fixed-copy graces is indistinguishable in the record, and shares the
     /// notice copy, so nothing observable differs. `None` for a card that is
@@ -186,6 +203,39 @@ mod tests {
         assert_eq!(Disposition::from(TurnSettle::Waiting), Disposition::Waiting);
         assert_eq!(Disposition::from(TurnSettle::Unreceived), Disposition::Unreceived);
         assert_eq!(Disposition::from(TurnSettle::Complete), Disposition::Done);
+    }
+
+    /// The quiet true end's mapping (#540): a `/stop` marker dominates a
+    /// simultaneous Complete or Failed read — the deliberate stop is the
+    /// ending, never the settled run's outcome — while a read that is not this
+    /// path's ending leaves the card exactly where the yield left it.
+    #[test]
+    fn the_quiet_settle_maps_the_stop_marker_over_the_settle_outcome() {
+        assert_eq!(
+            Disposition::of_quiet_settle(TurnSettle::Complete, true),
+            Some(Disposition::Stopped)
+        );
+        assert_eq!(
+            Disposition::of_quiet_settle(TurnSettle::Failed("503".into()), true),
+            Some(Disposition::Stopped)
+        );
+        assert_eq!(
+            Disposition::of_quiet_settle(TurnSettle::Complete, false),
+            Some(Disposition::Done)
+        );
+        assert_eq!(
+            Disposition::of_quiet_settle(TurnSettle::Failed("503".into()), false),
+            Some(Disposition::Failed("503".into()))
+        );
+        for settle in [TurnSettle::Running, TurnSettle::Waiting, TurnSettle::Unreceived] {
+            for stopped in [false, true] {
+                assert_eq!(
+                    Disposition::of_quiet_settle(settle.clone(), stopped),
+                    None,
+                    "{settle:?} with stopped={stopped} is not the quiet true end"
+                );
+            }
+        }
     }
 
     /// Every disposition, walked as one list: its card state, its failure line
