@@ -943,11 +943,11 @@ async fn external_reply_render_guard_distinguishes_same_millisecond_messages() {
     );
 }
 
-/// The external-reply renderer's hard-timeout branch: a partial reply is
-/// rendered but the model never finishes, so the loop finalizes the card as
-/// Done when the (injected, tiny) timeout elapses — the card never sits on
-/// an eternal spinner. Exercises the timeout with millisecond fields instead
-/// of the production 10-minute default.
+/// The external-reply renderer's idle-bound branch: a partial reply is
+/// rendered but the model never produces anything more, so the loop finalizes
+/// the card as Done when the (injected, tiny) idle bound elapses — the card
+/// never sits on an eternal spinner. Exercises the bound with millisecond
+/// fields instead of the production 10-minute default.
 #[tokio::test]
 async fn external_reply_render_times_out_and_finalizes_partial_content() {
     let _wd = test_work_dir();
@@ -992,7 +992,7 @@ async fn external_reply_render_times_out_and_finalizes_partial_content() {
         .render_poll_ms
         .store(5, std::sync::atomic::Ordering::Relaxed);
     app.external
-        .render_timeout_ms
+        .render_idle_timeout_ms
         .store(20, std::sync::atomic::Ordering::Relaxed);
     let watermark = chrono::Utc::now().timestamp_millis() - 60_000;
     app.external
@@ -1031,9 +1031,176 @@ async fn external_reply_render_times_out_and_finalizes_partial_content() {
     let done_header = last["header"]["title"]["content"].as_str().unwrap_or("");
     assert!(
         done_header.contains("完成") || done_header.contains("✓"),
-        "timeout must finalize the card as Done, header: {}",
+        "the idle bound must finalize the card as Done, header: {}",
         done_header
     );
+}
+
+/// #457: the external renderer's bound is an IDLE bound, not a total deadline.
+/// A run that keeps gaining parts resets the clock on every poll that renders
+/// content, so production past the old total bound keeps streaming. Scripted
+/// small: the idle bound is 60 ms while the scripted turn keeps producing for
+/// ~120 ms (one snapshot per 5 ms poll), so the last part is only reachable
+/// with the renewal.
+#[tokio::test]
+async fn external_reply_render_renews_its_idle_bound_while_parts_arrive() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut mock = MockBackend::new(realistic_parts());
+    // Every snapshot is the same external turn with one more text part; the
+    // loop consumes one snapshot per poll, so production outlives the bound.
+    let snapshots: Vec<SessionTranscript> = (1..=24)
+        .map(|i| {
+            let mut messages = vec![user("msg_ext_user", 2_000_000, "OpenChamber 里发的消息")];
+            let parts: Vec<Part> = (1..=i).map(|j| text_part(&format!("第{j}段。"))).collect();
+            messages.push(typed_message(
+                "msg_ext_assist",
+                MessageRole::Assistant,
+                Some(2_001_000 + i),
+                parts,
+            ));
+            SessionTranscript::new(messages)
+        })
+        .collect();
+    mock.given_transcript("ses_ext", snapshots);
+    let (app, platform) = build_app(cfg, mock).await;
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
+            session_id: "ses_ext".into(),
+            directory: "/tmp/ext".into(),
+            agent: None,
+            model: None,
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        },
+    )
+    .await;
+    app.external
+        .render_poll_ms
+        .store(5, std::sync::atomic::Ordering::Relaxed);
+    app.external
+        .render_idle_timeout_ms
+        .store(60, std::sync::atomic::Ordering::Relaxed);
+
+    app.external
+        .start_reply_render(
+            &app.flow_handles(),
+            "ses_ext",
+            &anchor(2_000_000),
+            "msg_sent",
+            "OpenChamber 里发的消息",
+        )
+        .await;
+
+    // Only the renewal can carry the renderer past its original 60 ms bound
+    // to the scripted last part.
+    wait_for_card_update(&platform, "the last produced part", CardUpdates::Latest, |card| {
+        card_text(card).contains("第24段")
+    })
+    .await;
+    // The script stops producing after that: the idle bound then closes the
+    // card Done under the partial-content rule.
+    wait_for_card_update(&platform, "the idle bound's Done", CardUpdates::Latest, |card| {
+        card_header(card).contains("完成") || card_header(card).contains("✓")
+    })
+    .await;
+}
+
+/// #457's safety net kept: a message that never produces anything still ends
+/// at the idle bound, and the renderer then leaves the 有新消息 notification
+/// card exactly as it was — no content means no finalization.
+#[tokio::test]
+async fn external_reply_render_leaves_the_notification_card_when_nothing_produces() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut mock = MockBackend::new(realistic_parts());
+    // The external message with NO reply scripted: no assistant turn ever
+    // appears, so the renderer has nothing to render.
+    mock.external_message("OpenChamber 里发的消息");
+    let backend = Arc::new(mock);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
+            session_id: "ses_ext".into(),
+            directory: "/tmp/ext".into(),
+            agent: None,
+            model: None,
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        },
+    )
+    .await;
+    app.external
+        .poll_interval_ms
+        .store(50, std::sync::atomic::Ordering::Relaxed);
+    app.external
+        .render_poll_ms
+        .store(5, std::sync::atomic::Ordering::Relaxed);
+    app.external
+        .render_idle_timeout_ms
+        .store(30, std::sync::atomic::Ordering::Relaxed);
+    let watermark = chrono::Utc::now().timestamp_millis() - 60_000;
+    app.external
+        .last_user_msg_epoch
+        .lock()
+        .await
+        .insert("ses_ext".into(), watermark);
+
+    tokio::spawn({
+        let app = app.clone();
+        async move {
+            let _ = app.external.poll_loop(&app.flow_handles()).await;
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // The renderer polled repeatedly past its idle bound (5 ms cadence) and
+    // then stopped with nothing rendered — evidence it armed and idled out.
+    let reads = backend
+        .transcript_calls
+        .lock()
+        .await
+        .iter()
+        .filter(|sid| sid.as_str() == "ses_ext")
+        .count();
+    assert!(reads >= 6, "the renderer must have polled, reads={reads}");
+
+    let calls = platform.calls.lock().await.clone();
+    let notify = calls.iter().find_map(|c| match c {
+        PlatformCall::SendCard { card, .. } if card_text(card).contains("有新消息") => Some(card.clone()),
+        _ => None,
+    });
+    let notify = notify.expect("the external message produces the notification card");
+    assert!(
+        card_text(&notify).contains("OpenChamber 里发的消息"),
+        "the notification previews the message: {notify}"
+    );
+    // No update may turn the silent card terminal: the notification stays.
+    for card in calls.iter().filter_map(|c| match c {
+        PlatformCall::UpdateMessage { card, .. } => Some(card),
+        _ => None,
+    }) {
+        let header = card["header"]["title"]["content"].as_str().unwrap_or("");
+        assert!(
+            !header.contains("完成") && !header.contains("✓") && !header.contains("出错"),
+            "a run that never produced must not finalize: {card}"
+        );
+        assert!(
+            card_text(card).contains("OpenChamber 里发的消息"),
+            "the notification stays intact: {card}"
+        );
+    }
 }
 
 /// #451: a Feishu Supplement landing during an external follow is a
@@ -1081,7 +1248,7 @@ async fn external_render_follows_a_supplement_into_the_continuation() {
     // The production 10-minute cap stays out of the way: the terminal
     // step-finish is the true end this test drives.
     app.external
-        .render_timeout_ms
+        .render_idle_timeout_ms
         .store(3_600_000, std::sync::atomic::Ordering::Relaxed);
 
     let anchor = TurnAnchor {

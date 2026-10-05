@@ -34,11 +34,19 @@ pub struct ExternalFlow {
     pub request_timeout_ms: std::sync::atomic::AtomicU64,
     /// External-reply render poll cadence (ms).
     pub render_poll_ms: std::sync::atomic::AtomicU64,
-    /// How long the external-reply renderer waits for a reply before giving up
-    /// (ms). A message posted in OpenChamber may never actually be sent, so the
-    /// loop idles and times out; the card then simply stays the "有新消息"
-    /// notification. Injected small in tests to exercise the timeout branch.
-    pub render_timeout_ms: std::sync::atomic::AtomicU64,
+    /// The external renderer's IDLE bound (ms): how long a run may go without
+    /// rendering anything new before the loop gives up. The deadline is
+    /// renewed on every poll whose render adds or updates content (#457), so a
+    /// producing run is never cut; a message posted in OpenChamber that never
+    /// actually sends still idles out, and the card then simply stays the
+    /// "有新消息" notification. Injected small in tests to exercise the idle
+    /// branch.
+    pub render_idle_timeout_ms: std::sync::atomic::AtomicU64,
+    /// The Wake continuation's settle grace (ms): the shared out-of-turn
+    /// settle loop's lost-contact / stuck-panel bound. A different semantic
+    /// from [`Self::render_idle_timeout_ms`] — "nobody can act" vs "nothing is
+    /// produced" — so the two never share one value (#457).
+    pub wake_settle_grace_ms: std::sync::atomic::AtomicU64,
     /// The Completion Notice's opt-in rules (ADR-0043), wired by the
     /// coordinator: this pass settles a yielded card's quiet true end (ADR-0060)
     /// and announces it with the same notice every other turn end sends.
@@ -52,7 +60,8 @@ impl ExternalFlow {
             poll_interval_ms: std::sync::atomic::AtomicU64::new(8_000),
             request_timeout_ms: std::sync::atomic::AtomicU64::new(30_000),
             render_poll_ms: std::sync::atomic::AtomicU64::new(1_500),
-            render_timeout_ms: std::sync::atomic::AtomicU64::new(600_000),
+            render_idle_timeout_ms: std::sync::atomic::AtomicU64::new(600_000),
+            wake_settle_grace_ms: std::sync::atomic::AtomicU64::new(600_000),
             notice,
         }
     }
@@ -578,7 +587,9 @@ impl ExternalFlow {
         let sid = session_id.to_string();
         let anchor = anchor.clone();
         let poll_ms = self.render_poll_ms.load(std::sync::atomic::Ordering::Relaxed);
-        let timeout_ms = self.render_timeout_ms.load(std::sync::atomic::Ordering::Relaxed);
+        let timeout_ms = self
+            .render_idle_timeout_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
         // A spawn inherits no span, so the render loop is instrumented
         // explicitly with this Session's `external` span (ADR-0048) — rooted, so
         // its lines do not repeat the ambient chain of whoever armed it.
@@ -728,7 +739,9 @@ impl ExternalFlow {
         let handles = handles.clone();
         let sid = session_id.to_string();
         let poll_ms = self.render_poll_ms.load(std::sync::atomic::Ordering::Relaxed);
-        let timeout_ms = self.render_timeout_ms.load(std::sync::atomic::Ordering::Relaxed);
+        let timeout_ms = self
+            .render_idle_timeout_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
         // The follow's render loop is its own task, so it is instrumented
         // explicitly with the adopted Session's `external` span (ADR-0048),
         // rooted like the plain reply renderer's.
@@ -1051,7 +1064,9 @@ impl ExternalFlow {
         let timing = SettleTiming {
             poll_ms: self.render_poll_ms.load(std::sync::atomic::Ordering::Relaxed),
             read_timeout_ms: self.request_timeout_ms.load(std::sync::atomic::Ordering::Relaxed),
-            grace_ms: self.render_timeout_ms.load(std::sync::atomic::Ordering::Relaxed),
+            grace_ms: self
+                .wake_settle_grace_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
         };
         // A spawn inherits no span: instrument the loop with this Session's
         // `external` span (ADR-0048), rooted like the other render loops'.
@@ -1149,9 +1164,9 @@ pub(crate) async fn settle_snapshot_after_send(
 /// Done when the model finishes — or ⏹ 已停止 when a deliberate `/stop` lands
 /// on the run it renders (#394). Exits when the turn completes, the accumulator
 /// was replaced (cola's own prompt or a newer external message), a newer
-/// EXTERNAL user message starts a new turn, or the hard timeout elapses — a
-/// cola-authored Supplement merges into the run this loop is already streaming
-/// (#451).
+/// EXTERNAL user message starts a new turn, or the idle bound elapses with
+/// nothing new rendered (#457) — a cola-authored Supplement merges into the
+/// run this loop is already streaming (#451).
 async fn external_render_loop(
     handles: &FlowHandles,
     session_id: String,
@@ -1159,7 +1174,14 @@ async fn external_render_loop(
     poll_ms: u64,
     timeout_ms: u64,
 ) {
-    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(timeout_ms);
+    // The IDLE bound (#457): every poll whose render adds or updates content
+    // resets the clock, so a running model that keeps producing is never cut
+    // at 10 minutes; only a run that renders nothing NEW for the whole window
+    // gives up. A failed read counts as no progress, so a wedged Backend still
+    // idles out, and the header's per-second tick / footer churn are not the
+    // render diff — reading them as progress would make the bound never fire.
+    let idle_bound = tokio::time::Duration::from_millis(timeout_ms);
+    let mut last_progress = tokio::time::Instant::now();
     loop {
         tokio::time::sleep(tokio::time::Duration::from_millis(poll_ms)).await;
         // Completion, the newer-turn boundary and the streaming render all
@@ -1190,7 +1212,7 @@ async fn external_render_loop(
         // lands here.
         let stopped = handles.waits.is_stopped(&session_id).await;
         // Stream the reply's reasoning/tools/text into the notification card.
-        let Some((new_parts, _, _)) = Turn::render_and_flush(
+        let Some((new_parts, _, _, changed)) = Turn::render_and_flush(
             &handles.cards,
             &handles.sessions,
             &handles.backend,
@@ -1236,15 +1258,28 @@ async fn external_render_loop(
         if newer_turn {
             break;
         }
+        // Renew the idle bound on a render that produced or updated content:
+        // something reached the card this poll, so the run is not idle. The
+        // renewal sits past the ending checks above — those already ended the
+        // loop — and before the bound below, so a productive tick at the very
+        // edge extends the window instead of being cut.
+        if changed {
+            last_progress = tokio::time::Instant::now();
+        }
         // Safety net for messages that never trigger a run. If a partial reply
         // was rendered, finalize it so the card never sits on an eternal
         // spinner; otherwise leave the "有新消息" notification as-is.
-        if tokio::time::Instant::now() >= deadline {
+        if last_progress.elapsed() >= idle_bound {
             let has_content = Turn::has_rendered_content(&handles.cards, &session_id).await;
             if has_content {
                 finalize_done(&handles.cards, &session_id).await;
                 tracing::info!(
-                    "external reply render timed out; finalized session {}",
+                    "external reply render: idle bound reached; finalized session {}",
+                    session_id
+                );
+            } else {
+                tracing::info!(
+                    "external reply render: idle bound reached with no content; notification stays for session {}",
                     session_id
                 );
             }

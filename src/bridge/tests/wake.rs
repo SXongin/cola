@@ -2200,7 +2200,7 @@ async fn a_live_panel_outranks_the_wake_settle() {
     )
     .await;
     // The panel grace, injected tiny (the follow's own rule).
-    app.external.render_timeout_ms.store(40, Ordering::Relaxed);
+    app.external.wake_settle_grace_ms.store(40, Ordering::Relaxed);
 
     spawn_sync(&app);
     wait_for_card_header(&platform, "出错").await;
@@ -2244,7 +2244,7 @@ async fn an_unreadable_status_never_settles_a_wake_before_the_grace() {
     .await;
     // ... but the status read never answers, so no ending may be claimed.
     backend.session_status_fails.store(true, Ordering::SeqCst);
-    app.external.render_timeout_ms.store(400, Ordering::Relaxed);
+    app.external.wake_settle_grace_ms.store(400, Ordering::Relaxed);
 
     spawn_sync(&app);
     // The resumed work still streams (the transcript is readable) ...

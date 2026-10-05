@@ -2125,7 +2125,7 @@ impl Turn {
         requests: &RequestsHandle,
         session_id: &str,
         transcript: &SessionTranscript,
-    ) -> Option<(usize, usize, usize)> {
+    ) -> Option<(usize, usize, usize, bool)> {
         render::render_and_flush(cards, sessions, backend, requests, session_id, transcript).await
     }
 }
