@@ -7,6 +7,7 @@
 //! Turn module, and every read or write goes through a `Turn::` method. The
 //! accumulator's own tests are the module's internal seam.
 
+use super::disposition::Disposition;
 use crate::backend::{SessionTranscript, ToolCall, ToolStatus, TurnAnchor};
 use crate::bridge::handles::CardsHandle;
 use crate::feishu::card::first_n_chars_bytes;
@@ -920,7 +921,8 @@ impl StreamAccumulator {
     /// The stop terminal (#394): a deliberate `/stop` is not a failure, so the
     /// transition to `Stopped` discards any recorded error text — the
     /// invariant (`Stopped` implies `error == None`) holds wherever the state
-    /// is set, by construction.
+    /// is set, by construction: here and through
+    /// [`Disposition::Stopped`]'s application.
     pub(super) fn set_stopped(&mut self) {
         self.error = None;
         self.card_state = CardState::Stopped;
@@ -958,6 +960,26 @@ impl StreamAccumulator {
     pub(super) fn set_unreceived(&mut self) {
         self.error = None;
         self.card_state = CardState::Unreceived;
+        self.refresh_phase();
+    }
+
+    /// Apply an ending disposition to this card — the one application every
+    /// ending path shares (spec #538, #539): the card's state, its failure
+    /// field and its phase timer, all read from the table alone. A deliberate
+    /// stop discards a recorded error and an Unreceived ending never was one;
+    /// a failure ending records its line (the loop's two graces carry fixed
+    /// copy); `Done` and `Waiting` leave the recorded line exactly as it was.
+    /// [`Disposition::Observe`] is no ending: nothing is stamped.
+    pub(super) fn apply_ending(&mut self, disposition: &Disposition) {
+        let Some(state) = disposition.card_state() else {
+            return;
+        };
+        if let Some(failure) = disposition.failure() {
+            self.error = Some(failure.to_string());
+        } else if disposition.clears_error() {
+            self.error = None;
+        }
+        self.card_state = state;
         self.refresh_phase();
     }
 
@@ -3697,6 +3719,50 @@ mod tests {
         acc.refresh_phase();
         assert_eq!(acc.active_phase(), None);
         assert_eq!(acc.current_phase, None);
+    }
+
+    /// The one ending application (spec #538, #539): every disposition stamps
+    /// its card state and failure line, a stop clears a recorded error, `Done`
+    /// and `Waiting` leave it as it was, and `Observe` stamps nothing at all.
+    #[test]
+    fn apply_ending_stamps_every_disposition() {
+        use super::super::disposition::{LOST_CONTACT_ERROR, STUCK_PANEL_ERROR};
+
+        let apply = |disposition: &Disposition| {
+            let mut acc = StreamAccumulator::new("test");
+            acc.error = Some("previous failure".into());
+            acc.apply_ending(disposition);
+            (acc.card_state.clone(), acc.error.clone())
+        };
+        assert_eq!(
+            apply(&Disposition::Observe),
+            (CardState::Loading, Some("previous failure".into())),
+            "Observe is no ending: nothing is stamped"
+        );
+        assert_eq!(
+            apply(&Disposition::Waiting),
+            (CardState::Waiting, Some("previous failure".into())),
+            "the waiting yield leaves a recorded failure as it was"
+        );
+        assert_eq!(apply(&Disposition::Unreceived), (CardState::Unreceived, None));
+        assert_eq!(
+            apply(&Disposition::Done),
+            (CardState::Done, Some("previous failure".into())),
+            "the true end leaves a recorded failure as it was"
+        );
+        assert_eq!(
+            apply(&Disposition::Failed("503".into())),
+            (CardState::Error, Some("503".into()))
+        );
+        assert_eq!(apply(&Disposition::Stopped), (CardState::Stopped, None));
+        assert_eq!(
+            apply(&Disposition::LostContact),
+            (CardState::Error, Some(LOST_CONTACT_ERROR.into()))
+        );
+        assert_eq!(
+            apply(&Disposition::StuckPanel),
+            (CardState::Error, Some(STUCK_PANEL_ERROR.into()))
+        );
     }
 
     /// The header signature carries the phase label, and flips to a title

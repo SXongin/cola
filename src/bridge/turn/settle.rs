@@ -21,18 +21,19 @@
 //!   from a new Turn's;
 //! - **what an ending means**: the follow announces the Turn's true end with a
 //!   Completion Notice, while a Wake continuation is itself the notification.
-//!   The loop therefore only decides ([`Ending`]) and stamps
-//!   ([`stamp`]) — its callers add their own announcement.
+//!   The loop therefore only decides a [`Disposition`] and applies it through
+//!   the one disposition application ([`Turn::apply_disposition`]) — its
+//!   callers add their own announcement.
 //!
 //! Everything else — the reads, the contact bookkeeping, the panel grace, the
-//! unreceived watch's waiting hint and the settle dispatch — lives here once,
+//! unreceived watch's waiting hint and the settle decision — lives here once,
 //! so a fix to one loop cannot leave the other diverged.
 
-use crate::backend::{TurnAnchor, TurnSettle};
+use crate::backend::TurnAnchor;
 use crate::bridge::handles::{CardsHandle, FlowHandles};
 use crate::opencode::types::SessionStatus;
 
-use super::{SettleTiming, Turn};
+use super::{SettleTiming, Turn, disposition::Disposition};
 
 /// What the loop watches to know it still owns the card. The variant is also
 /// the loop's identity: each carries its own label, so a caller cannot pair
@@ -114,71 +115,26 @@ impl Ownership {
     }
 }
 
-/// How the loop stopped observing.
-pub(super) enum Ending {
-    /// `/stop` marked the session: the deliberate stop's terminal (#394).
-    Stopped,
-    /// The Execution idled with live Background Tasks: the waiting yield.
-    Waiting,
-    /// The Turn's settled failure (ADR-0056). The card's kind decides whether
-    /// it offers Retry — a Wake continuation never does.
-    Failed(String),
-    /// The true end: idle with no live Background Task.
-    Done,
-    /// The submitted message never reached the transcript and the Session is
-    /// not live (ADR-0062): the card ends 「⚠️ 这条消息未被接收」 — never ✅.
-    Unreceived,
-    /// No full read pair answered for the grace: a wedged Backend.
-    LostContact,
-    /// A readable, settled card still carried a `⏳` panel past the grace.
-    StuckPanel,
-}
-
-impl Ending {
-    /// The one line the loop logs for this ending; the caller's announcement
-    /// (if any) follows the stamp.
-    fn log_line(&self) -> &'static str {
-        match self {
-            Self::Stopped => "stopped; finalized Stopped",
-            Self::Waiting => "idle with live background tasks; yielded waiting",
-            Self::Failed(_) => "failed; finalized Error",
-            Self::Done => "idle; finalized",
-            Self::Unreceived => "message never landed at idle; finalized Unreceived",
-            Self::LostContact => "lost contact; finalized Error",
-            Self::StuckPanel => "ended with an unreconcilable panel; finalized Error",
-        }
-    }
-}
-
-/// What a loop records when its reads stopped answering for the grace: the
-/// card never sits on an eternal spinner over a Backend it cannot see.
-pub(super) const LOST_CONTACT_ERROR: &str = "与运行失去联系，已停止更新。";
-
-/// What a loop records when a readable, settled card still carries a live Tool
-/// Panel past the grace (a crash-orphaned call): the card ends Error, never
-/// Done over a `⏳` panel.
-pub(super) const STUCK_PANEL_ERROR: &str = "运行已结束但工具状态未收尾，已停止更新。";
-
-/// Stamp `session_id`'s card for `ending` — the one ending-to-card mapping
-/// both loops share, so a new ending cannot leave one loop's card unstamped.
-/// A caller that announces (the follow's Completion Notice) does so after
-/// this, reading the card's own terminal.
-pub(super) async fn stamp(cards: &CardsHandle, session_id: &str, ending: &Ending) {
-    match ending {
-        Ending::Stopped => Turn::finalize_stopped(cards, session_id).await,
-        Ending::Waiting => Turn::finalize_waiting(cards, session_id).await,
-        Ending::Failed(error) => Turn::finalize_error(cards, session_id, error).await,
-        Ending::Done => Turn::finalize_done(cards, session_id).await,
-        Ending::Unreceived => Turn::finalize_unreceived(cards, session_id).await,
-        Ending::LostContact => Turn::finalize_error(cards, session_id, LOST_CONTACT_ERROR).await,
-        Ending::StuckPanel => Turn::finalize_error(cards, session_id, STUCK_PANEL_ERROR).await,
+/// The one line the loop logs for a disposition; the caller's announcement
+/// (if any) follows the apply. `Observe` never reaches here — the loop keeps
+/// observing instead of ending.
+fn log_line(disposition: &Disposition) -> &'static str {
+    match disposition {
+        Disposition::Observe => "still observing",
+        Disposition::Stopped => "stopped; finalized Stopped",
+        Disposition::Waiting => "idle with live background tasks; yielded waiting",
+        Disposition::Failed(_) => "failed; finalized Error",
+        Disposition::Done => "idle; finalized",
+        Disposition::Unreceived => "message never landed at idle; finalized Unreceived",
+        Disposition::LostContact => "lost contact; finalized Error",
+        Disposition::StuckPanel => "ended with an unreconcilable panel; finalized Error",
     }
 }
 
 /// Log the ending and hand it back — the one exit for every branch below.
-fn finish(ending: Ending, session_id: &str, label: &str) -> Option<Ending> {
-    tracing::info!("{label}: session {session_id} {}", ending.log_line());
-    Some(ending)
+fn finish(disposition: Disposition, session_id: &str, label: &str) -> Option<Disposition> {
+    tracing::info!("{label}: session {session_id} {}", log_line(&disposition));
+    Some(disposition)
 }
 
 /// One last reconcile render before a stop terminal (#394): the abort's
@@ -205,15 +161,17 @@ async fn render_once(flow: &FlowHandles, session_id: &str, read_timeout_ms: u64,
 
 /// Run one out-of-turn settle loop until it no longer owns the card or reaches
 /// an ending. `None` means it stopped without an ending: its card was replaced,
-/// or the accumulator vanished. `owns` carries the loop's name (its variant),
-/// which labels the bounded calls and log lines.
+/// or the accumulator vanished. Otherwise the returned [`Disposition`] is the
+/// one ending the caller applies through [`Turn::apply_disposition`]. `owns`
+/// carries the loop's name (its variant), which labels the bounded calls and
+/// log lines.
 pub(super) async fn run(
     flow: &FlowHandles,
     session_id: &str,
     directory: &str,
     timing: SettleTiming,
     owns: &Ownership,
-) -> Option<Ending> {
+) -> Option<Disposition> {
     let label = owns.label();
     let grace = tokio::time::Duration::from_millis(timing.grace_ms);
     let mut last_contact = tokio::time::Instant::now();
@@ -235,7 +193,7 @@ pub(super) async fn run(
         // not a failure and its abort's error never reaches the card (#394).
         if flow.waits.is_stopped(session_id).await {
             render_once(flow, session_id, timing.read_timeout_ms, label).await;
-            return finish(Ending::Stopped, session_id, label);
+            return finish(Disposition::Stopped, session_id, label);
         }
         // Both reads must answer for the tick to count as contact: a wedged
         // transcript freezes the card and a wedged status hides the ending —
@@ -305,7 +263,7 @@ pub(super) async fn run(
         if in_contact {
             last_contact = tokio::time::Instant::now();
         } else if last_contact.elapsed() >= grace {
-            return finish(Ending::LostContact, session_id, label);
+            return finish(Disposition::LostContact, session_id, label);
         }
         // Still running: keep rendering. There is no total budget; the graces
         // above and below only watch the states nobody can act on.
@@ -347,7 +305,7 @@ pub(super) async fn run(
         if Turn::has_live_tools(&flow.cards, session_id).await {
             let since = *stuck_since.get_or_insert_with(tokio::time::Instant::now);
             if since.elapsed() >= grace {
-                return finish(Ending::StuckPanel, session_id, label);
+                return finish(Disposition::StuckPanel, session_id, label);
             }
             continue;
         }
@@ -357,24 +315,23 @@ pub(super) async fn run(
         // is the ending, never the settled Done/Error below (#394). The tick
         // already rendered the abort's settled tool states above.
         if flow.waits.is_stopped(session_id).await {
-            return finish(Ending::Stopped, session_id, label);
+            return finish(Disposition::Stopped, session_id, label);
         }
-        // The single settle decision (ADR-0059, ADR-0062): this match is
-        // exhaustive on purpose, so every decision variant is answered here
-        // explicitly.
-        match transcript.settle(anchor.as_ref()) {
+        // The single settle decision (ADR-0059, ADR-0062), through the one
+        // ending table: an undecided read keeps observing (nothing is
+        // stamped), and every decided outcome is that disposition — the
+        // caller's shared application owns its card translation.
+        let disposition = Disposition::from(transcript.settle(anchor.as_ref()));
+        match disposition {
             // A Wake's Execution has not reached its boundary yet: the ending
             // is not decided, and the Wake's content must not declare it.
-            TurnSettle::Running => stuck_since = None,
+            Disposition::Observe => stuck_since = None,
             // The Execution ended but Background Tasks are still live: the
             // card yields 「⏳ 等待后台任务」 and stops updating (no Completion
             // Notice — the next Wake continues the chain on a new card).
-            TurnSettle::Waiting => return finish(Ending::Waiting, session_id, label),
-            TurnSettle::Failed(error) => return finish(Ending::Failed(error), session_id, label),
-            // The submitted message never landed and the session is idle: the
-            // card ends Unreceived — never ✅ (ADR-0062).
-            TurnSettle::Unreceived => return finish(Ending::Unreceived, session_id, label),
-            TurnSettle::Complete => return finish(Ending::Done, session_id, label),
+            // Every other ending — the settled failure, the Unreceived watch
+            // (ADR-0062) and the true end — ends the loop here.
+            disposition => return finish(disposition, session_id, label),
         }
     }
 }

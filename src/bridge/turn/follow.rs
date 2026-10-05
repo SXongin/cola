@@ -11,8 +11,8 @@
 //! this Turn's anchor — the same reads, the same no-total-budget graces and
 //! the same settle decision — and adds the one fact only it owns: an ending is
 //! the Turn's TRUE end (or its fallback Error), so it announces it with the
-//! Completion Notice; the notice itself declines a card that is not at an
-//! ending, so the waiting yield stays silent (ADR-0059).
+//! Completion Notice; the notice itself declines a disposition that is not a
+//! true end, so the waiting yield stays silent (ADR-0059).
 //!
 //! The follow runs out of turn but holds the Session's inflight guard for its
 //! whole window (ADR-0059): a message arriving meanwhile is a Supplement that
@@ -127,14 +127,14 @@ async fn ownership(
 
 /// The follow's loop: the shared settle loop under the accumulator's anchor
 /// (or, before the submitted message lands, under the unreceived watch's
-/// chain identity — ADR-0062), then the ending stamped on the card and the
-/// Turn announced. The notice is sent for every ending (the helper itself
-/// declines a card that is not at an ending, so a waiting yield and an
-/// Unreceived card stay silent) and reads the card's real terminal for its
-/// copy (#394).
+/// chain identity — ADR-0062), then the ending disposition applied through the
+/// one shared application and the Turn announced. The notice is sent for every
+/// ending (its own classification declines one that is not a true end, so a
+/// waiting yield and an Unreceived card stay silent) and carries the copy of
+/// the disposition the loop applied (#394).
 ///
 /// The loop owns the Session's guard for the whole run and hands it back as
-/// soon as the loop ends — BEFORE the ending is stamped. A message arriving at
+/// soon as the loop ends — BEFORE the ending is applied. A message arriving at
 /// the end boundary must be a normal new Turn (the waiting window is exactly
 /// that state), never a Supplement racing a card that is about to be
 /// finalized. By then the run is over, so nothing is lost: the loop stamps
@@ -158,21 +158,22 @@ async fn run(handles: TurnHandles, facts: FollowFacts, timing: SettleTiming) {
         anchor: _,
     } = facts;
     let flow = handles.flow();
-    let ending = settle::run(&flow, &session_id, &directory, timing, &owns).await;
+    let disposition = settle::run(&flow, &session_id, &directory, timing, &owns).await;
     super::release_inflight(&handles, &session_id).await;
-    let Some(ending) = ending else {
+    let Some(disposition) = disposition else {
         return;
     };
     if !owns.held(&flow.cards, &session_id).await {
         return;
     }
-    settle::stamp(&flow.cards, &session_id, &ending).await;
+    super::Turn::apply_disposition(&flow.cards, &session_id, &disposition).await;
     super::send_completion_notice(
         &handles.cards,
         &handles.platform,
         &handles.config.notice_rules(),
         &session_id,
         started_at,
+        &disposition,
     )
     .await;
 }
