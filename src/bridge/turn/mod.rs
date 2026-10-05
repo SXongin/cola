@@ -2430,8 +2430,8 @@ impl Turn {
         Self::flush_card(cards, session_id).await;
     }
 
-    /// [`Self::apply_disposition`] with `Done` only while the card's
-    /// accumulator is still `anchor`'s: the check and the Done stamp share ONE
+    /// The anchor-guarded `Done` terminal: stamp the card Done only while its
+    /// accumulator is still `anchor`'s — the check and the stamp share ONE
     /// lock, so a renderer whose bound fired after a successor replaced the
     /// accumulator can never stamp the successor's live card (#457). Reads the
     /// anchor the external arm stored on the accumulator. Returns whether it
