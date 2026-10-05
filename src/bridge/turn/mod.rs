@@ -729,16 +729,23 @@ impl Turn {
         // drain last observed: `prompt_err` above), then the settle decision's
         // Waiting/Unreceived ending, else the true end. A stop or a failure
         // suppresses the yield, exactly as the replaced branches' guard did.
-        // An undecided, unfollowed read (`Observe`) finalizes Done, the old
-        // else branch; a decided `Failed` whose anchor the final read lost is
-        // owned by `prompt_err`'s same projection, so it falls through to Done
-        // here exactly as before.
         let mut disposition = match &prompt_err {
             Some(error) => Disposition::Failed(error.clone()),
             None => match ending {
                 Disposition::Waiting => Disposition::Waiting,
                 Disposition::Unreceived => Disposition::Unreceived,
-                _ => Disposition::Done,
+                // No ending yet (the undecided, unfollowed read), the true
+                // end, and a decided `Failed` whose message did not surface
+                // through `prompt_err` (the same projection: the final read
+                // lost the anchor) all finalize Done, exactly as the replaced
+                // else branch did.
+                Disposition::Observe | Disposition::Done | Disposition::Failed(_) => Disposition::Done,
+                // The loop-only endings are never settle outcomes. Naming them
+                // keeps this mapping exhaustive, so a new disposition is a
+                // compile error here, not a silent Done.
+                Disposition::Stopped | Disposition::LostContact | Disposition::StuckPanel => {
+                    Disposition::Done
+                }
             },
         };
 
