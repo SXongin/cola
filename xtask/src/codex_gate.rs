@@ -74,12 +74,36 @@ mod tests {
     fn the_workflow_uses_the_shared_parser() {
         let workflow =
             std::fs::read_to_string(crate::repo_root().join(".github/workflows/codex-review.yml")).unwrap();
-        for function in [
-            "codex_verdict_of_file",
-            "codex_last_line_stdin",
-            "codex_trim_trailing_blanks",
+        // The Codex step itself: the bound and the pin must stay, or a hang
+        // burns the whole job and discards a finished review again (#530).
+        // The live salvage path is exercised by the gate's own runs on every
+        // PR; this guards the wiring against a silent revert.
+        let codex = step(&workflow, "Run Codex (read-only)");
+        for needle in [
+            "52fe01ec70a42f454c9d2ebd47598f9fd6893d56", // v1.11: v1.12 hangs (#150/#169)
+            "continue-on-error: true",
+            "timeout-minutes: 12",
         ] {
-            assert!(workflow.contains(function), "the workflow must use {function}");
+            assert!(codex.contains(needle), "the Codex step must keep {needle}");
         }
+        // The post step publishes only complete reviews, through the parser.
+        let post = step(&workflow, "Post the review as a comment");
+        for function in ["codex_verdict_of_file", "codex_trim_trailing_blanks"] {
+            assert!(post.contains(function), "the post step must use {function}");
+        }
+        // The approve step reads the verdict the same way.
+        let approve = step(&workflow, "Approve when the verdict is clean");
+        for function in ["codex_last_line_stdin", "codex_verdict_of_line"] {
+            assert!(approve.contains(function), "the approve step must use {function}");
+        }
+    }
+
+    /// The YAML text of the step named `name`, up to the next step.
+    fn step<'a>(workflow: &'a str, name: &str) -> &'a str {
+        workflow
+            .split(&format!("- name: {name}"))
+            .nth(1)
+            .and_then(|rest| rest.split("\n      - ").next())
+            .unwrap_or_else(|| panic!("the {name} step exists"))
     }
 }
