@@ -100,3 +100,19 @@ blocks, while a standalone card or an earlier snapshot's claim already has an
 authoritative, pinned surface. Where Message Pin is disabled the pointer copy
 must not promise a pin: it reads `⏳ 等待你的确认（见原卡片）` instead, naming
 the hosting card without promising a pin.
+
+## Update (2026-10-05): the busy follow's deadline is an idle bound
+
+The Decision above says the busy adoption streams "until completion
+(`external_turn_completed` or the hard timeout)". That deadline was a
+**total** budget, inherited by analogy from a different renderer: at the bound
+a card that had rendered anything was finalized Done even while the run was
+still producing, so everything after the cut never reached Feishu (#451; the
+run in the #447 incident lasted 78 minutes). It is now an **idle bound**
+(#457): every poll whose render adds or updates content — a new text/reasoning
+part or a tool panel revision — resets the deadline, so a producing run is
+never cut. A message that never produces anything still times out at the
+bound, and then simply stays the 有新消息 notification untouched. The Wake
+continuation's settle grace (the shared loop's lost-contact / stuck-panel
+bound) now lives in its own field, separate from the renderer's idle bound, so
+retuning one can no longer move the other.
