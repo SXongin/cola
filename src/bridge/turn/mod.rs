@@ -505,7 +505,7 @@ impl Turn {
         // own reads rebuild the live list).
         if let Some(orphan) = orphan {
             let carried = Self::carry_orphan_tools(handles, &session_id, &new_card_id, &orphan).await;
-            crate::bridge::reap::collect_orphan_after_carry(
+            crate::bridge::chain::collect_orphan_after_carry(
                 &handles.cards,
                 &session_id,
                 &orphan.card_message_id,
@@ -1558,7 +1558,7 @@ impl Turn {
             return None;
         }
         if collect == PredecessorCollect::Now {
-            crate::bridge::reap::collect_orphan(cards, session_id, &previous.card_message_id).await;
+            crate::bridge::chain::collect_orphan(cards, session_id, &previous.card_message_id).await;
         }
         Some(previous)
     }
@@ -1603,7 +1603,7 @@ impl Turn {
     /// returns, so nothing else can own the orphan in between. Returns the
     /// predecessor to carry from — `None` when no different card was taken
     /// over — and the caller must collect it with
-    /// [`crate::bridge::reap::collect_orphan`] once the carry has run.
+    /// [`crate::bridge::chain::collect_orphan`] once the carry has run.
     pub(crate) async fn take_over_card_deferring_collect(
         cards: &CardsHandle,
         session_id: &str,

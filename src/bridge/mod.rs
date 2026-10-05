@@ -14,7 +14,6 @@ pub mod message_pins;
 pub mod poll;
 pub mod pollers;
 pub mod question;
-pub(crate) mod reap;
 pub mod reminder;
 pub mod request;
 pub mod session;

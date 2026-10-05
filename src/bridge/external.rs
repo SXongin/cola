@@ -174,7 +174,7 @@ impl ExternalFlow {
             // this pass followed the session (#433), else the reap falls back
             // to the route itself.
             let baseline = moved_from.get(&sid).map(String::as_str);
-            crate::bridge::reap::reconcile(
+            crate::bridge::chain::reconcile(
                 handles,
                 &sid,
                 mapping.map(|(_, directory)| directory.as_str()),
