@@ -168,9 +168,26 @@ card write that carried the announcement succeeds. **Session Sync**'s
 post-restart continuation reads it: a Wake at or below the watermark is never
 re-announced, only a strictly newer one continues (with the content probe still
 required). Distinct from the **Sync Watermark**, which accounts user messages,
-lives in memory, and is never moved by a Wake (ADR-0061).
+lives in memory, and is never moved by a Wake (ADR-0061). One section of the
+**Chain Record** since ADR-0069.
 _Avoid_: Sync Watermark (the user-message-scoped one), announced set (the
 in-memory per-chain predecessor)
+
+**Chain Record**:
+The one durable record a **Session** has about its **Card Chain**, owned by the
+Chain Record module and persisted as one sidecar (`chain_records.json`) with two
+sections of distinct lifetimes: the **live card record** (the live card's
+identity, its **Turn**'s anchor and the Session's directory, plus the per-process
+reconciliation marks) — written when a card becomes the Session's live card and
+removed when that card reaches a terminal or is collected (ADR-0063) — and the
+**Wake Watermark** (monotonic, never removed; ADR-0061). A missing or corrupt
+file reads as empty; the file itself is kept even when both sections are empty,
+because its presence is the one-time migration marker from the pre-ADR-0069
+`live_cards.json` / `wake_watermarks.json` sidecars. **Session Sync**'s reap
+reconciles its records against the Session's own reads, so a card a cola restart
+orphaned stops looking live.
+_Avoid_: Live Card record (the pre-module name for the records section alone),
+store, mapping (the Session Mapping is the Chat/Topic side)
 
 **Session Sync** (会话同步):
 The Bridge flow that keeps a thread's **Active Session**'s card chain current without a user message: it notifies **External Messages**, renders **Wakes** as continuation cards, and catches content its card missed (ADR-0059). The successor of the external-message sync; still scoped to the thread's active Session (ADR-0017).
