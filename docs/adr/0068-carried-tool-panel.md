@@ -39,11 +39,16 @@ use.
 
 **The read is bounded and newest-first, and happens before the prompt is
 submitted.** It pages messages descending (`desc` order, following
-`cursor.next` for older pages) and stops only when the page's oldest message's
-newest activity predates the orphan anchor minus the in-flight window — past
-that point no part can belong to the orphan Turn. A page with no unfinished
+`cursor.next` for older pages) and stops at the first page whose oldest
+message cannot belong to the orphan Turn under the membership rule's own three
+arms — created at/after the anchor, completed at/after it, or unfinished with
+newest activity inside the in-flight window — so the stop cannot cut a message
+the projection needs (a completed message that finished as the Turn began
+qualifies even when every part it carries started before the window). A page
+whose oldest message carries no server time cannot be placed, so the scan
+keeps going rather than stopping on an unknown. A page with no unfinished
 message does **not** end the scan: another client can queue messages above the
-orphan's unfinished call, so the window boundary — not the page's shape — is
+orphan's unfinished call, so the membership rule — not the page's shape — is
 the stop. A small hard page cap and the existing read timeout bound the worst
 case; the common case is one request. A read stopped by the cap before reaching
 the boundary carries nothing rather than guessing. V1's
@@ -129,13 +134,14 @@ survives the process.
   generation-specific branch is added.
 - Tests pin: a stale in-flight running call appears on the successor; its
   completion renders exactly once; an older card's stale running part is never
-  carried; the carry read scans to the anchor-minus-window boundary (a long
-  transcript stays a bounded newest-first scan, a queued message above the
-  unfinished call does not hide it, and a cap stop carries nothing and strips
-  no panel); the takeover collect drops the ledger on every collect — the
-  successor rebuilds the live list — and drops the running markers only when a
-  call was carried; a failed carry read degrades to today, the ledger still
-  dropped; and the already-working in-window case stays a regression test. The
+  carried; the carry read scans to the first page that cannot belong to the
+  orphan Turn under the membership rule's own arms (a long transcript stays a
+  bounded newest-first scan, a queued message above the unfinished call does
+  not hide it, and a cap stop carries nothing and strips no panel); the
+  takeover collect drops the ledger on every collect — the successor rebuilds
+  the live list — and drops the running markers only when a call was carried;
+  a failed carry read degrades to today, the ledger still dropped; and the
+  already-working in-window case stays a regression test. The
   probe for a tool that settled while cola was down is dropped with a pointer
   to #505.
 

@@ -944,10 +944,10 @@ pub struct MockBackend {
     /// empty, complete tail.
     pub transcript_tail_scripts:
         Arc<tokio::sync::Mutex<std::collections::HashMap<String, Vec<TranscriptTail>>>>,
-    /// Records every `transcript_tail` call as `(session id, boundary_ms)` —
-    /// the carry read's bound, so a test can pin the anchor-minus-window line
+    /// Records every `transcript_tail` call as `(session id, anchor)` — the
+    /// carry read's Turn scope, so a test can pin the orphan record's anchor
     /// the takeover asked for and that exactly one tail read happened.
-    pub transcript_tail_calls: Arc<tokio::sync::Mutex<Vec<(String, i64)>>>,
+    pub transcript_tail_calls: Arc<tokio::sync::Mutex<Vec<(String, TurnAnchor)>>>,
     /// Number of initial `transcript_tail` calls to hang forever (then it
     /// serves normally) — the timed-out carry read (ADR-0068's degrade arm).
     pub hang_transcript_tail: Arc<std::sync::atomic::AtomicUsize>,
@@ -2074,19 +2074,19 @@ impl crate::backend::Backend for MockBackend {
     }
 
     /// The restart carry's bounded tail read (ADR-0068): a scripted tail wins,
-    /// recorded with the boundary the takeover asked for; a session the test
+    /// recorded with the anchor the takeover asked for; a session the test
     /// marked failing or hanging answers like the real read's error/timeout
     /// arms. The default is an empty, complete tail.
     async fn transcript_tail(
         &self,
         session_id: &str,
-        boundary_ms: i64,
+        anchor: &TurnAnchor,
     ) -> crate::error::Result<TranscriptTail> {
         hang_if_scripted(&self.hang_transcript_tail).await;
         self.transcript_tail_calls
             .lock()
             .await
-            .push((session_id.to_string(), boundary_ms));
+            .push((session_id.to_string(), anchor.clone()));
         if self.fail_transcript_tails.lock().await.contains(session_id) {
             return Err(crate::error::BridgeError::OpenCode(format!(
                 "transcript tail {session_id} failed: 500 Internal Server Error"

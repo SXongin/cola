@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::backend::{SessionTranscript, TaskRuntime, TranscriptTail};
+use crate::backend::{SessionTranscript, TaskRuntime, TranscriptTail, TurnAnchor};
 use crate::error::Result;
 
 use super::transport::Transport;
@@ -110,17 +110,17 @@ pub(crate) trait GenerationStrategy: Send + Sync {
     async fn transcript(&self, http: &Transport, session_id: &str) -> Result<SessionTranscript>;
 
     /// The bounded, newest-first tail read (ADR-0068): the newest end of the
-    /// Session's messages back to `boundary_ms`. A generation that pages its
-    /// message read scans descending and stops at the page whose oldest
-    /// message predates the boundary, reporting a cap stop through
+    /// Session's messages back to the first page whose oldest message cannot
+    /// belong to `anchor`'s Turn. A generation that pages its message read
+    /// scans descending and stops there, reporting a cap stop through
     /// [`TranscriptTail::complete`]; V1's unpaginated read decodes its one
-    /// message array and is always complete. See
+    /// message array, ignores the anchor, and is always complete. See
     /// [`crate::backend::Backend::transcript_tail`].
     async fn transcript_tail(
         &self,
         http: &Transport,
         session_id: &str,
-        boundary_ms: i64,
+        anchor: &TurnAnchor,
     ) -> Result<TranscriptTail>;
 
     /// The session's durable model/agent selection (`GET /api/session/{id}` on
