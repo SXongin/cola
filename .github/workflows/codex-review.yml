@@ -27,8 +27,9 @@
 # already on disk (upstream openai/codex-action#150/#169; the wrapper fix,
 # #151, is unreleased). The action is pinned to v1.11, whose wrapper handles
 # the same heavy workload cleanly, and the Codex step is bounded with its
-# output salvaged through `.github/codex/verdict.sh` (shared with the approve
-# step, tested by xtask), so a recurrence cannot discard a finished review.
+# output salvaged through the parser this workflow writes to `$RUNNER_TEMP`
+# (never sourced from the reviewed tree, which may predate it; tested by
+# xtask), so a recurrence cannot discard a finished review.
 # Publication and approval are two tiers: a review whose last line ends with
 # the verdict is published, while approval requires the marker to stand on its
 # own line, so a quoted marker can never approve a change. A same-job retry is
@@ -89,6 +90,77 @@ jobs:
           ref: refs/pull/${{ github.event.pull_request.number }}/head
           fetch-depth: 0
           persist-credentials: false
+
+      # The verdict parser (#530) is written from THIS workflow, not sourced
+      # from the reviewed tree: the post and approve steps run against
+      # `refs/pull/N/head`, a checkout that may predate the parser (a PR
+      # branched before it failed with "verdict.sh: No such file or directory"
+      # — #527 did, discarding a completed PASS review). The workflow
+      # definition always comes from the merge ref, so the parser travels with
+      # it; xtask extracts this heredoc and tests it (`cargo test -p xtask
+      # codex_gate`), keeping one definition.
+      - name: Write the verdict parser
+        run: |
+          cat > "$RUNNER_TEMP/codex-verdict.sh" <<'VERDICT_SH'
+          # Shared verdict parsing for the Codex review gate (#530).
+          #
+          # One definition of "a complete review" and of the verdict it carries,
+          # used by both the post step (may this review be published?) and the
+          # approve step (which verdict does the published comment end with?).
+          #
+          # A review is COMPLETE when its last non-blank line ends with the
+          # verdict marker. Blank means empty or whitespace-only — grep's
+          # `[[:space:]]` includes `\r`, so a CRLF tail cannot smuggle a line
+          # after the verdict. Markdown emphasis (`**…**`, a code span) around
+          # the value is tolerated because the model emits it that way in
+          # practice; prose may precede the marker on the same line, but
+          # anything after the value except emphasis or whitespace (a period,
+          # more prose) makes the review incomplete.
+          #
+          # Publication and approval deliberately differ: a complete review is
+          # POSTED even when the marker shares its line with prose (nothing a
+          # review says is discarded), but the APPROVE step requires the marker
+          # to stand on its own line (emphasis tolerated), because a review
+          # that merely quotes `…CODEX_REVIEW_VERDICT: PASS` while blocking the
+          # change must never approve it. Approval is fail-closed.
+
+          # The last non-blank line of stdin (empty when there is none).
+          codex_last_line_stdin() {
+            grep -v '^[[:space:]]*$' 2>/dev/null | tail -n 1 || true
+          }
+
+          # The last non-blank line of file $1 (empty when there is none).
+          codex_last_line() {
+            codex_last_line_stdin < "$1"
+          }
+
+          # The PASS/FAIL verdict that line $1 ends with (empty when it carries
+          # none). Used for publication/completeness, never for approval.
+          codex_verdict_of_line() {
+            printf '%s\n' "$1" | sed -nE 's/.*CODEX_REVIEW_VERDICT: (PASS|FAIL)[*`[:space:]]*$/\1/p'
+          }
+
+          # The PASS/FAIL verdict of a line that IS exactly the marker, modulo
+          # markdown emphasis and whitespace (empty otherwise) — the only form
+          # the approve step accepts.
+          codex_strict_verdict_of_line() {
+            printf '%s\n' "$1" | sed -nE 's/^[*`[:space:]]*CODEX_REVIEW_VERDICT: (PASS|FAIL)[*`[:space:]]*$/\1/p'
+          }
+
+          # The verdict file $1 carries on its last non-blank line (empty when
+          # the output is incomplete).
+          codex_verdict_of_file() {
+            codex_verdict_of_line "$(codex_last_line "$1")"
+          }
+
+          # File $1 through its last non-blank line — trailing blank lines
+          # dropped (a CR-only tail included), so the verdict stays the final
+          # line of anything built from this output.
+          codex_trim_trailing_blanks() {
+            awk '{lines[NR]=$0} $0 !~ /^[[:space:]]*$/ {last=NR} END{for (i=1; i<=last; i++) print lines[i]}' "$1"
+          }
+          VERDICT_SH
+          echo "parser written to $RUNNER_TEMP/codex-verdict.sh"
 
       # The prompt = the committed rubric + this PR's metadata + its linked
       # issue when one can be fetched, so the reviewer does not depend on
@@ -161,7 +233,7 @@ jobs:
           CODEX_OUTCOME: ${{ steps.codex.outcome }}
         run: |
           set -euo pipefail
-          . .github/codex/verdict.sh
+          . "$RUNNER_TEMP/codex-verdict.sh"
           if [ ! -s codex-output.md ]; then
             echo "Codex produced no output." >&2
             exit 1
@@ -212,7 +284,7 @@ jobs:
           REVIEWED_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
-          . .github/codex/verdict.sh
+          . "$RUNNER_TEMP/codex-verdict.sh"
           head=$(gh pr view "$PR" --json headRefOid --jq .headRefOid)
           if [ "$head" != "$REVIEWED_SHA" ]; then
             echo "PR head moved from $REVIEWED_SHA to $head; the run for it decides."

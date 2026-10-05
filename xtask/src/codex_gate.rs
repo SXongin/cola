@@ -3,15 +3,58 @@
 //! line" (approval), exercised against the shapes the live gate has produced
 //! (plain, bolded, code span, CRLF, cut streams, quoted markers) plus a
 //! wiring check that the workflow actually uses the parser.
+//!
+//! The parser's single definition is the heredoc the workflow writes to
+//! `$RUNNER_TEMP` at run time — never a file from the reviewed checkout, which
+//! may predate it (#527 lost a completed review that way). These tests
+//! extract that heredoc from `.github/workflows/codex-review.yml` and run it,
+//! so the tested text and the executed text are one.
 
 #[cfg(all(test, unix))]
 mod tests {
     use std::path::PathBuf;
     use std::process::Command;
 
-    /// Run `expr` with `.github/codex/verdict.sh` sourced; stdout verbatim.
+    /// The parser as the workflow writes it: the body between `<<'VERDICT_SH'`
+    /// and its terminator line. The YAML block indents the body, which bash
+    /// ignores, so the extracted text runs as-is.
+    fn verdict_script() -> String {
+        let workflow =
+            std::fs::read_to_string(crate::repo_root().join(".github/workflows/codex-review.yml")).unwrap();
+        let lines = workflow
+            .split("<<'VERDICT_SH'")
+            .nth(1)
+            .expect("the workflow writes the parser")
+            .lines()
+            .skip(1);
+        let mut body = String::new();
+        for line in lines {
+            if line.trim() == "VERDICT_SH" {
+                assert!(!body.is_empty(), "the parser heredoc has a body");
+                return body;
+            }
+            body.push_str(line);
+            body.push('\n');
+        }
+        panic!("the parser heredoc is terminated");
+    }
+
+    /// The extracted parser, written once for all tests.
+    fn parser_file() -> PathBuf {
+        static PARSER: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        PARSER
+            .get_or_init(|| {
+                let dir = temp_dir("parser");
+                let file = dir.join("codex-verdict.sh");
+                std::fs::write(&file, verdict_script()).unwrap();
+                file
+            })
+            .clone()
+    }
+
+    /// Run `expr` with the extracted parser sourced; stdout verbatim.
     fn run_raw(expr: &str) -> String {
-        let script = crate::repo_root().join(".github/codex/verdict.sh");
+        let script = parser_file();
         let out = Command::new("bash")
             .arg("-c")
             .arg(format!(". '{}'; {expr}", script.display()))
@@ -115,20 +158,35 @@ mod tests {
         ] {
             assert!(codex.contains(needle), "the Codex step must keep {needle}");
         }
-        // The post step publishes only complete reviews, through the parser.
+        // The post step publishes only complete reviews, through the parser
+        // the workflow itself wrote (never a file from the reviewed tree).
         let post = step(&workflow, "Post the review as a comment");
+        assert!(
+            post.contains(r#". "$RUNNER_TEMP/codex-verdict.sh""#),
+            "the post step must source the parser the workflow wrote"
+        );
         for function in ["codex_verdict_of_file", "codex_trim_trailing_blanks"] {
             assert!(post.contains(function), "the post step must use {function}");
         }
         // The approve step reads the verdict strictly: only a marker on its
         // own line approves, never the publication parser (fail-closed).
         let approve = step(&workflow, "Approve when the verdict is clean");
+        assert!(
+            approve.contains(r#". "$RUNNER_TEMP/codex-verdict.sh""#),
+            "the approve step must source the parser the workflow wrote"
+        );
         for function in ["codex_last_line_stdin", "codex_strict_verdict_of_line"] {
             assert!(approve.contains(function), "the approve step must use {function}");
         }
         assert!(
             !approve.contains("codex_verdict_of_line"),
             "approval must not use the publication parser"
+        );
+        // The parser is written by the workflow itself (the heredoc
+        // `verdict_script` extracts); a tree-file source is the bug #527 hit.
+        assert!(
+            step(&workflow, "Write the verdict parser").contains("VERDICT_SH"),
+            "the workflow must write its own parser"
         );
     }
 
