@@ -1430,24 +1430,17 @@ pub(crate) enum YieldedUpdate {
     /// entry arrived): the card is PATCHed in place and the wait goes on.
     Refreshed,
     /// The last Background Task retired and the read judged the true end: the
-    /// card settled in place and stopped updating. `notice_at` is the
-    /// Completion Notice's clock — `Some` when this card owes the notice (the
-    /// Turn's own waiting card), `None` when it must stay silent (a Wake
+    /// card settled in place and stopped updating. `disposition` is the ending
+    /// the read decided and the accumulator applied (#540), so the caller
+    /// announces with the one table's classification and copy. `notice_at` is
+    /// the Completion Notice's clock — `Some` when this card owes the notice
+    /// (the Turn's own waiting card), `None` when it must stay silent (a Wake
     /// continuation, whose own send was the notification, or a card with no
     /// recorded turn start).
-    Settled { notice_at: Option<std::time::Instant> },
-}
-
-/// The ending a quiet true-end read stamps in place — the settle outcomes the
-/// disposition table maps, with the failure's message kept (the out-of-turn
-/// loops re-read it from the transcript; this path has it in hand).
-enum QuietEnding {
-    /// The true end: idle with no live Background Task.
-    Done,
-    /// The Turn's settled failure.
-    Failed(String),
-    /// `/stop` marked the session: the deliberate stop's terminal.
-    Stopped,
+    Settled {
+        disposition: Disposition,
+        notice_at: Option<std::time::Instant>,
+    },
 }
 
 /// How a card that becomes a Session's live card disposes of the DIFFERENT
@@ -2040,27 +2033,14 @@ impl Turn {
             );
             // The read's own settle decision judges the true end (ADR-0059):
             // only a read whose Wakes are answered and that retired the last
-            // Background Task settles, and the ending stamped is the one the
-            // out-of-turn loops would stamp ([`QuietEnding`] mirrors the
-            // disposition table's mapping) — a settled failure or a deliberate
+            // Background Task settles, and the ending is the one disposition
+            // table's quiet mapping (#540): a settled failure or a deliberate
             // stop dominates ✅. A Waiting card always carries an anchor (the
             // yield is only decided from one), so the anchorless Unreceived
             // decision cannot arise here; a Running read keeps observing.
-            let ending = match transcript.settle(anchor.as_ref()) {
-                TurnSettle::Complete | TurnSettle::Failed(_) if stopped => Some(QuietEnding::Stopped),
-                TurnSettle::Complete => Some(QuietEnding::Done),
-                TurnSettle::Failed(error) => Some(QuietEnding::Failed(error)),
-                TurnSettle::Waiting | TurnSettle::Running | TurnSettle::Unreceived => None,
-            };
-            if let Some(ending) = &ending {
-                match ending {
-                    QuietEnding::Done => card.acc.card_state = crate::feishu::card::CardState::Done,
-                    QuietEnding::Failed(error) => {
-                        card.acc.error = Some(error.clone());
-                        card.acc.card_state = crate::feishu::card::CardState::Error;
-                    }
-                    QuietEnding::Stopped => card.acc.set_stopped(),
-                }
+            let settled = Disposition::of_quiet_settle(transcript.settle(anchor.as_ref()), stopped);
+            if let Some(disposition) = &settled {
+                card.acc.apply_ending(disposition);
             }
             // A settled Wake continuation owes no notice: its own card send was
             // the notification (ADR-0059). The Turn's own waiting card carries
@@ -2070,14 +2050,9 @@ impl Turn {
             } else {
                 card.acc.turn_started_at
             };
-            (changed, ending, notice_at)
+            (changed, settled, notice_at)
         };
-        if let Some(ending) = settled {
-            let what = match ending {
-                QuietEnding::Done => "done",
-                QuietEnding::Failed(_) => "failed",
-                QuietEnding::Stopped => "stopped",
-            };
+        if let Some(disposition) = settled {
             // The footer is refreshed one last time (ADR-0019): the card
             // stopped updating at the yield, and the work behind it may have
             // moved the branch or the tree. Under the same write lock as the
@@ -2086,8 +2061,11 @@ impl Turn {
             // drops the card's now-spent durable record (ADR-0063).
             state::refresh_work_context(cards, session_id).await;
             flush::flush_card_locked(cards, session_id, flush::SplitPolicy::Forbid).await;
-            tracing::info!("yielded card settled in place: session {session_id} ({what})");
-            return YieldedUpdate::Settled { notice_at };
+            tracing::info!("yielded card settled in place: session {session_id} ({disposition:?})");
+            return YieldedUpdate::Settled {
+                disposition,
+                notice_at,
+            };
         }
         if !changed {
             return YieldedUpdate::Unchanged;
@@ -2430,22 +2408,23 @@ impl Turn {
         Self::flush_card(cards, session_id).await;
     }
 
-    /// The anchor-guarded `Done` terminal: stamp the card Done only while its
-    /// accumulator is still `anchor`'s — the check and the stamp share ONE
-    /// lock, so a renderer whose bound fired after a successor replaced the
-    /// accumulator can never stamp the successor's live card (#457). Reads the
-    /// anchor the external arm stored on the accumulator. Returns whether it
-    /// finalized (false: a successor owns the card now — nothing is touched).
-    pub(crate) async fn finalize_done_if_anchor(
+    /// Apply an ending `disposition` only while the card's accumulator is
+    /// still `anchor`'s — the check and the application share ONE lock, so a
+    /// renderer whose bound fired after a successor replaced the accumulator
+    /// can never stamp the successor's live card (#457). Reads the anchor the
+    /// external arm stored on the accumulator. Returns whether it applied
+    /// (false: a successor owns the card now — nothing is touched).
+    async fn apply_disposition_if_anchor(
         cards: &CardsHandle,
         session_id: &str,
         anchor: &TurnAnchor,
+        disposition: &Disposition,
     ) -> bool {
         let stamped = {
             let mut live = cards.cards.lock().await;
             match live.get_mut(session_id) {
                 Some(card) if card.acc.turn_anchor.as_ref() == Some(anchor) => {
-                    card.acc.card_state = crate::feishu::card::CardState::Done;
+                    card.acc.apply_ending(disposition);
                     true
                 }
                 _ => false,
@@ -2459,6 +2438,18 @@ impl Turn {
         true
     }
 
+    /// The anchor-guarded `Done` terminal: stamp the card Done through the one
+    /// ending application, behind [`Self::apply_disposition_if_anchor`]'s
+    /// guard. Returns whether it finalized (false: a successor owns the card
+    /// now — nothing is touched).
+    pub(crate) async fn finalize_done_if_anchor(
+        cards: &CardsHandle,
+        session_id: &str,
+        anchor: &TurnAnchor,
+    ) -> bool {
+        Self::apply_disposition_if_anchor(cards, session_id, anchor, &Disposition::Done).await
+    }
+
     /// The stop terminal under the same anchor guard as
     /// [`Self::finalize_done_if_anchor`] (#457): a `/stop` seen by a stale
     /// renderer must not stamp its successor's card.
@@ -2467,22 +2458,7 @@ impl Turn {
         session_id: &str,
         anchor: &TurnAnchor,
     ) -> bool {
-        let stamped = {
-            let mut live = cards.cards.lock().await;
-            match live.get_mut(session_id) {
-                Some(card) if card.acc.turn_anchor.as_ref() == Some(anchor) => {
-                    card.acc.set_stopped();
-                    true
-                }
-                _ => false,
-            }
-        };
-        if !stamped {
-            return false;
-        }
-        Self::refresh_work_context(cards, session_id).await;
-        Self::flush_card(cards, session_id).await;
-        true
+        Self::apply_disposition_if_anchor(cards, session_id, anchor, &Disposition::Stopped).await
     }
 
     /// Collect `session_id`'s Waiting card (ADR-0059, spec #405): restamp it
@@ -3526,9 +3502,9 @@ pub(crate) async fn send_completion_notice(
 }
 
 /// [`send_completion_notice`] for a card whose ending path has not yet decided
-/// a disposition — the drain's finalization (`finish`) and the quiet true end,
-/// until #540/#541 migrate them: the card's recorded ending state is read back
-/// through [`Disposition::of_ending_state`], so eligibility and copy still come
+/// a disposition — the drain's finalization (`finish`), until #541 migrates
+/// it: the card's recorded ending state is read back through
+/// [`Disposition::of_ending_state`], so eligibility and copy still come
 /// from the one table (a failure line reads back with it). A card that is not
 /// at an ending stays silent.
 pub(crate) async fn send_completion_notice_for_ending_state(
