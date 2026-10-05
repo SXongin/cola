@@ -37,7 +37,9 @@ mod tests;
 
 use async_trait::async_trait;
 
-use crate::backend::{ChildRuntime, SessionTranscript, ShellRuntime, TaskRuntime, TranscriptTail};
+use crate::backend::{
+    ChildRuntime, SessionTranscript, ShellRuntime, TaskRuntime, TranscriptTail, TurnAnchor,
+};
 use crate::error::Result;
 
 use super::strategy::GenerationStrategy;
@@ -101,8 +103,8 @@ const MAX_SESSION_PAGES: usize = 100;
 const MAX_MESSAGE_PAGES: usize = 100;
 
 /// Hard stop for the newest-first tail scan (ADR-0068's restart-carry read):
-/// the common case is ONE page — a page of 200 crosses the anchor-minus-window
-/// boundary on any real session — and five are a generous bound for the rest.
+/// the common case is ONE page — a page of 200 reaches the anchor's scope on
+/// any real session — and five are a generous bound for the rest.
 /// A scan this cap stops reports `complete: false`, and the carry then carries
 /// nothing rather than guessing.
 const MAX_TAIL_PAGES: usize = 5;
@@ -449,9 +451,11 @@ impl GenerationStrategy for V2Strategy {
 
     /// The bounded, newest-first tail read (ADR-0068): pages the projected-
     /// message read in `order=desc`, following `cursor.next` for older pages,
-    /// and stops at the page whose oldest message's newest activity predates
-    /// `boundary_ms` — past that point no part can belong to the caller's
-    /// Turn scope. A page with no unfinished message does NOT end the scan
+    /// and stops at the first page whose oldest message CANNOT belong to
+    /// `anchor`'s Turn — under either membership rule, exactly as
+    /// [`TurnAnchor::message_may_belong`] reads them: a message with no server
+    /// time cannot be placed, so the scan keeps going rather than stopping on
+    /// an unknown. A page with no unfinished message does NOT end the scan
     /// (another client can queue messages above an unfinished call), and a
     /// scan the page cap stops reports `complete: false`. The collected pages
     /// are reversed into transcript order before decoding, so the returned
@@ -460,7 +464,7 @@ impl GenerationStrategy for V2Strategy {
         &self,
         http: &Transport,
         session_id: &str,
-        boundary_ms: i64,
+        anchor: &TurnAnchor,
     ) -> Result<TranscriptTail> {
         self.progress.ensure_started(http);
         let mut data: Vec<serde_json::Value> = Vec::new();
@@ -477,25 +481,23 @@ impl GenerationStrategy for V2Strategy {
                 .message_page(http, session_id, "transcript tail", &query)
                 .await?;
             let empty = page.data.is_empty();
-            // The page's OLDEST message (server order; a desc page's last) and
-            // its newest server activity — the one fact the stop rule reads.
-            // A page whose oldest message carries no time cannot be placed, so
-            // the scan continues rather than stopping on an unknown.
-            let oldest_activity = wire::decode_messages(&page.data)
+            // The page's OLDEST message (server order; a desc page's last)
+            // ends the scan when it cannot belong to the anchor's Turn: it
+            // decides under the SAME membership rule the caller's projection
+            // applies, so a completed message whose completion is at/after the
+            // anchor cannot be cut short even when its newest activity (a part
+            // start) predates the in-flight boundary. A message with no time
+            // cannot be placed, so the scan continues rather than stopping on
+            // an unknown.
+            let cannot_belong = wire::decode_messages(&page.data)
                 .messages
                 .last()
-                .and_then(|message| {
-                    message
-                        .time
-                        .as_ref()
-                        .map(|time| message.newest_activity_ms(time.created))
-                });
+                .is_some_and(|oldest| !anchor.message_may_belong(oldest));
             // Keep the whole crossing page: it holds every message at/after the
             // boundary, and older ones are excluded by the scope's own
             // membership rule.
-            let reached = oldest_activity.is_some_and(|oldest| oldest < boundary_ms);
             data.extend(page.data);
-            if reached {
+            if cannot_belong {
                 complete = true;
                 break;
             }

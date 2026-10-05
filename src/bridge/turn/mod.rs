@@ -1658,9 +1658,7 @@ impl Turn {
         let read = crate::bridge::bounded_call(
             "restart carry transcript tail",
             handles.config.follow_read_timeout_ms(),
-            handles
-                .backend
-                .transcript_tail(session_id, anchor.in_flight_boundary_ms()),
+            handles.backend.transcript_tail(session_id, &anchor),
         )
         .await;
         let tail = match read {

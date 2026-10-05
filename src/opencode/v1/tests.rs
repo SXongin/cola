@@ -1196,11 +1196,13 @@ async fn transcript_surfaces_a_failed_message_read() {
 }
 
 /// V1's message read has no wire pagination, so the carry's tail read
-/// (ADR-0068) is the same one-request read, reported complete: the
-/// generation that cannot surface running calls simply carries what it
-/// reports.
+/// (ADR-0068) is the same one-request read, reported complete, and ignores the
+/// anchor: the generation that cannot surface running calls simply carries what
+/// it reports.
 #[tokio::test]
 async fn transcript_tail_is_the_one_request_read_reported_complete() {
+    use crate::backend::{MessageId, TurnAnchor};
+
     let server = TestHttpServer::start().await;
     server.route(
         "GET",
@@ -1210,7 +1212,11 @@ async fn transcript_tail_is_the_one_request_read_reported_complete() {
     );
     let client = v1_wire_client(&server, None);
 
-    let tail = client.transcript_tail("ses_1", 0).await.unwrap();
+    let anchor = TurnAnchor {
+        message_id: MessageId::new("msg_cola_anchor"),
+        created_ms: 0,
+    };
+    let tail = client.transcript_tail("ses_1", &anchor).await.unwrap();
 
     assert!(tail.complete, "an unpaginated read is always complete");
     assert_eq!(tail.transcript.messages.len(), 3);

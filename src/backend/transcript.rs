@@ -234,7 +234,7 @@ impl SessionTranscript {
                 continue;
             }
             let Some(time) = &message.time else { continue };
-            if !belongs_to_turn(message, anchor.created_ms) {
+            if !belongs_to_turn(message, anchor) {
                 continue;
             }
             if time.created >= anchor.created_ms && message.finishes_turn() {
@@ -364,24 +364,18 @@ impl SessionTranscript {
     }
 }
 
-/// Whether an assistant message belongs to the Turn anchored at `anchor_ms`.
+/// Whether an assistant message belongs to the Turn `anchor` scopes: the
+/// membership rule, single-sourced through [`TurnAnchor::message_may_belong`].
 /// A message still in flight (no completion stamp) belongs when it was created
 /// within the Turn, or while its newest server activity is recent enough — the
 /// previous run may still be streaming when this Turn's user message lands —
 /// while an orphaned one (no activity for [`IN_FLIGHT_STALE_AFTER_MS`]) stops
 /// belonging, so a run the server was killed in cannot replay its parts into
 /// every later Turn. A completed message belongs only when it was created
-/// within the Turn or was still being produced as the Turn began.
-fn belongs_to_turn(message: &TranscriptMessage, anchor_ms: i64) -> bool {
-    let Some(time) = message.time else { return false };
-    match time.completed {
-        None => {
-            time.created >= anchor_ms
-                || anchor_ms.saturating_sub(message.newest_activity_ms(time.created))
-                    <= IN_FLIGHT_STALE_AFTER_MS
-        }
-        Some(completed) => time.created >= anchor_ms || completed >= anchor_ms,
-    }
+/// within the Turn or was still being produced as the Turn began. A message
+/// with no server time at all cannot be placed, so it never belongs.
+fn belongs_to_turn(message: &TranscriptMessage, anchor: &TurnAnchor) -> bool {
+    message.time.is_some() && anchor.message_may_belong(message)
 }
 
 /// How long a message created before a Turn's anchor may go without a
@@ -553,21 +547,45 @@ pub struct TurnAnchor {
 }
 
 impl TurnAnchor {
-    /// The oldest server activity a message may carry and still belong to this
-    /// Turn's projection (see [`belongs_to_turn`]): the anchor minus the
-    /// in-flight window. A tail read can stop once it is past this line — no
-    /// older message can be the Turn's. One derivation, so the read's bound
-    /// and the membership rule cannot drift.
+    /// The oldest server activity an UNFINISHED message (no completion stamp)
+    /// may carry and still belong to this Turn's projection (see
+    /// [`TurnAnchor::message_may_belong`]): the anchor minus the in-flight
+    /// window. A completed message is measured against `created_ms` alone, so
+    /// the tail scan's unfinished arm reads this line while its completed arm
+    /// reads the anchor itself. One derivation, so the scan's stop rule and
+    /// the membership rule cannot drift.
     pub fn in_flight_boundary_ms(&self) -> i64 {
         self.created_ms.saturating_sub(IN_FLIGHT_STALE_AFTER_MS)
+    }
+
+    /// Whether `message` may belong to this Turn's projection — the
+    /// membership rule ([`belongs_to_turn`]) as the bounded tail read needs
+    /// it, mirroring all three of its arms: a message created at/after the
+    /// anchor may always belong; a completed one may when it completed
+    /// at/after the anchor; an unfinished one may while its newest activity is
+    /// inside the in-flight window ([`Self::in_flight_boundary_ms`]). The scan
+    /// may stop only at a page whose oldest message this answers `false` for.
+    /// A message with no server time cannot be placed — the membership rule
+    /// excludes it — but it is no evidence of an older Turn either, so the
+    /// scan must keep going and this answers `true` for it.
+    pub fn message_may_belong(&self, message: &TranscriptMessage) -> bool {
+        let Some(time) = message.time else { return true };
+        if time.created >= self.created_ms {
+            return true;
+        }
+        match time.completed {
+            Some(completed) => completed >= self.created_ms,
+            None => message.newest_activity_ms(time.created) >= self.in_flight_boundary_ms(),
+        }
     }
 }
 
 /// The newest end of one Session's transcript, as read by a bounded
 /// newest-first tail scan (ADR-0068): the messages from the newest end back to
-/// (and including) the page that crossed `boundary_ms`.
+/// (and including) the page whose oldest message cannot belong to the read's
+/// [`TurnAnchor`].
 ///
-/// `complete` reports whether the scan actually reached `boundary_ms` (or the
+/// `complete` reports whether the scan actually reached that page (or the
 /// session's start). `false` means a page cap stopped it early: the tail is a
 /// prefix of the history, NOT a complete view of the window, so a caller that
 /// needs the whole window — the restart carry — must treat it as carrying

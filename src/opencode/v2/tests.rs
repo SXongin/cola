@@ -6,7 +6,7 @@
 //! 204 mutations, the run-state derivation, the admit-then-return prompt, the
 //! session-scoped switches, and the permission/form surface.
 
-use crate::backend::{ChildRuntime, ShellEnd, ShellRuntime};
+use crate::backend::{ChildRuntime, MessageId, ShellEnd, ShellRuntime, TurnAnchor};
 use crate::bridge::test_support::{assert_line_level, capture_logs, level_count};
 use crate::error::BridgeError;
 use crate::opencode::client::OpenCodeBackend;
@@ -55,6 +55,15 @@ fn last_request(server: &TestHttpServer) -> RecordedRequest {
     wired_requests(server)
         .pop()
         .expect("a request should have been sent")
+}
+
+/// The Turn anchor the carry's tail read scopes on: the orphan user message's
+/// identity together with the server time the stop rule measures against.
+fn tail_anchor(created_ms: i64) -> TurnAnchor {
+    TurnAnchor {
+        message_id: MessageId::new("msg_cola_anchor"),
+        created_ms,
+    }
 }
 
 fn body_json(request: &RecordedRequest) -> serde_json::Value {
@@ -350,9 +359,10 @@ async fn transcript_follows_the_body_cursor_in_ascending_order() {
 
 /// The carry's tail read (ADR-0068): pages DESCENDING, first request carries
 /// `order=desc` (a cursor must never be combined with it), and the scan stops
-/// on the page whose oldest message's newest activity predates the boundary —
-/// one request when the newest page already crosses it. The collected pages
-/// are returned in transcript (ascending) order.
+/// at the page whose oldest message cannot belong to the anchor's Turn — here
+/// an unfinished user message whose newest activity sits below the anchor's
+/// in-flight window — one request when the newest page already crosses it. The
+/// collected pages are returned in transcript (ascending) order.
 #[tokio::test]
 async fn transcript_tail_scans_descending_to_the_boundary_in_one_page() {
     let server = TestHttpServer::start().await;
@@ -363,9 +373,11 @@ async fn transcript_tail_scans_descending_to_the_boundary_in_one_page() {
         serde_json::json!({
             "data": [
                 {"id": "msg_a2", "type": "assistant",
-                 "time": {"created": 1700000002000i64, "completed": 1700000002500i64},
+                 "time": {"created": 1700000101000i64, "completed": 1700000101500i64},
                  "content": [{"type": "text", "text": "新"}]},
-                {"id": "msg_u1", "type": "user", "time": {"created": 1700000000000i64}, "text": "旧"},
+                // Unfinished, and last active well before the anchor minus the
+                // in-flight window: it cannot belong to this Turn.
+                {"id": "msg_u1", "type": "user", "time": {"created": 1699999400000i64}, "text": "旧"},
             ],
             "cursor": {"next": "c1"},
         })
@@ -373,8 +385,10 @@ async fn transcript_tail_scans_descending_to_the_boundary_in_one_page() {
     );
     let client = v2_wire_client(&server);
 
-    // The boundary sits between the two messages' newest activity.
-    let tail = client.transcript_tail("ses_1", 1700000001000).await.unwrap();
+    let tail = client
+        .transcript_tail("ses_1", &tail_anchor(1700000100000))
+        .await
+        .unwrap();
 
     assert!(tail.complete, "the crossing page completes the scan");
     let ids: Vec<&str> = tail.transcript.messages.iter().map(|m| m.id.as_str()).collect();
@@ -395,9 +409,121 @@ async fn transcript_tail_scans_descending_to_the_boundary_in_one_page() {
     );
 }
 
+/// The stop rule is the membership rule, exactly (ADR-0068): a page whose
+/// oldest message is COMPLETED at/after the anchor may still belong even though
+/// its newest activity predates the in-flight boundary — it was still being
+/// produced as the Turn began — so the scan must continue to the older page
+/// rather than stop there. The older page's live call is then found.
+#[tokio::test]
+async fn transcript_tail_continues_past_a_completed_message_that_completed_after_the_anchor() {
+    let server = TestHttpServer::start().await;
+    server.route_sequence(
+        "GET",
+        "/api/session/ses_1/message",
+        vec![
+            MockResponse::json(
+                serde_json::json!({
+                    "data": [
+                        {"id": "msg_new", "type": "assistant",
+                         "time": {"created": 1700000102000i64, "completed": 1700000102500i64},
+                         "content": [{"type": "text", "text": "新"}]},
+                        // Created (and last active) before the anchor's in-flight
+                        // window, but completed AFTER the anchor: the membership
+                        // rule's completed arm admits it, so the scan must not
+                        // stop on this page.
+                        {"id": "msg_done", "type": "assistant",
+                         "time": {"created": 1699999400000i64, "completed": 1700000101500i64},
+                         "content": [{"type": "text", "text": "完成"}]},
+                    ],
+                    "cursor": {"next": "c1"},
+                })
+                .to_string(),
+            ),
+            MockResponse::json(
+                serde_json::json!({
+                    "data": [
+                        // The orphan Turn's still-live call: unfinished, newest
+                        // activity inside the in-flight window.
+                        {"id": "msg_live", "type": "assistant",
+                         "time": {"created": 1699999200000i64},
+                         "content": [{"type": "tool", "id": "call_sleep", "name": "shell",
+                                      "state": {"status": "running", "input": {"command": "sleep 3600"}},
+                                      "time": {"created": 1699999800000i64}}]},
+                    ],
+                    "cursor": {},
+                })
+                .to_string(),
+            ),
+        ],
+    );
+    let client = v2_wire_client(&server);
+    let anchor = tail_anchor(1700000100000);
+
+    let tail = client.transcript_tail("ses_1", &anchor).await.unwrap();
+
+    assert!(tail.complete, "the older page's live call completes the scan");
+    assert_eq!(
+        wired_requests(&server).len(),
+        2,
+        "a completed message at/after the anchor did not end the scan"
+    );
+    let second = request_at(&server, 1);
+    assert_eq!(second.query_param("cursor").as_deref(), Some("c1"));
+    let calls = tail.transcript.turn_running_tools(&anchor);
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| call.identity.call_id.as_str())
+            .collect::<Vec<_>>(),
+        ["call_sleep"],
+        "the older page's live call is found"
+    );
+}
+
+/// A page whose oldest message is completed BEFORE the anchor cannot belong,
+/// even when one of its parts started inside the in-flight window: the
+/// completed arm is decided by the completion stamp alone, so the scan stops
+/// there (complete, no follow-up request) and keeps the page whole.
+#[tokio::test]
+async fn transcript_tail_stops_at_a_completed_message_that_completed_before_the_anchor() {
+    let server = TestHttpServer::start().await;
+    server.route(
+        "GET",
+        "/api/session/ses_1/message",
+        200,
+        serde_json::json!({
+            "data": [
+                {"id": "msg_settled", "type": "assistant",
+                 "time": {"created": 1699999400000i64, "completed": 1699999800000i64},
+                 "content": [{"type": "tool", "id": "call_sleep", "name": "shell",
+                              "state": {"status": "running", "input": {"command": "sleep 3600"}},
+                              "time": {"created": 1699999900000i64}}]},
+            ],
+            "cursor": {"next": "c1"},
+        })
+        .to_string(),
+    );
+    let client = v2_wire_client(&server);
+
+    let tail = client
+        .transcript_tail("ses_1", &tail_anchor(1700000100000))
+        .await
+        .unwrap();
+
+    assert!(tail.complete, "the completed-before-anchor message ends the scan");
+    assert_eq!(
+        wired_requests(&server).len(),
+        1,
+        "the completed message must not be followed by an older page"
+    );
+    let ids: Vec<&str> = tail.transcript.messages.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(ids, ["msg_settled"], "the whole page is kept");
+}
+
 /// A page with no unfinished message does NOT end the scan — another client
 /// can queue messages above the orphan's unfinished call — so the scan
-/// follows `cursor.next` until a page's oldest message crosses the boundary.
+/// follows `cursor.next` while each page's oldest message may still belong
+/// (here, completed messages at/after the anchor).
 #[tokio::test]
 async fn transcript_tail_keeps_scanning_past_a_page_with_no_unfinished_message() {
     let server = TestHttpServer::start().await;
@@ -409,10 +535,10 @@ async fn transcript_tail_keeps_scanning_past_a_page_with_no_unfinished_message()
                 serde_json::json!({
                     "data": [
                         {"id": "msg_a3", "type": "assistant",
-                         "time": {"created": 1700000003000i64, "completed": 1700000003500i64},
+                         "time": {"created": 1700000103000i64, "completed": 1700000103500i64},
                          "content": [{"type": "text", "text": "新"}]},
                         {"id": "msg_a2", "type": "assistant",
-                         "time": {"created": 1700000002000i64, "completed": 1700000002500i64},
+                         "time": {"created": 1700000102000i64, "completed": 1700000102500i64},
                          "content": [{"type": "text", "text": "稍旧"}]},
                     ],
                     "cursor": {"next": "c1"},
@@ -422,7 +548,7 @@ async fn transcript_tail_keeps_scanning_past_a_page_with_no_unfinished_message()
             MockResponse::json(
                 serde_json::json!({
                     "data": [
-                        {"id": "msg_u1", "type": "user", "time": {"created": 1700000000000i64}, "text": "旧"},
+                        {"id": "msg_u1", "type": "user", "time": {"created": 1699999400000i64}, "text": "旧"},
                     ],
                     "cursor": {"next": "c2"},
                 })
@@ -432,9 +558,12 @@ async fn transcript_tail_keeps_scanning_past_a_page_with_no_unfinished_message()
     );
     let client = v2_wire_client(&server);
 
-    let tail = client.transcript_tail("ses_1", 1700000001000).await.unwrap();
+    let tail = client
+        .transcript_tail("ses_1", &tail_anchor(1700000100000))
+        .await
+        .unwrap();
 
-    assert!(tail.complete, "the boundary page completes the scan");
+    assert!(tail.complete, "the page that cannot belong completes the scan");
     let ids: Vec<&str> = tail.transcript.messages.iter().map(|m| m.id.as_str()).collect();
     assert_eq!(ids, ["msg_u1", "msg_a2", "msg_a3"]);
     assert_eq!(wired_requests(&server).len(), 2, "the scan followed one cursor");
@@ -465,7 +594,7 @@ async fn transcript_tail_keeps_scanning_when_the_oldest_message_has_no_time() {
             ),
             MockResponse::json(
                 serde_json::json!({
-                    "data": [{"id": "msg_u1", "type": "user", "time": {"created": 1700000000000i64}, "text": "旧"}],
+                    "data": [{"id": "msg_u1", "type": "user", "time": {"created": 1699999400000i64}, "text": "旧"}],
                     "cursor": {},
                 })
                 .to_string(),
@@ -474,7 +603,10 @@ async fn transcript_tail_keeps_scanning_when_the_oldest_message_has_no_time() {
     );
     let client = v2_wire_client(&server);
 
-    let tail = client.transcript_tail("ses_1", 1700000001000).await.unwrap();
+    let tail = client
+        .transcript_tail("ses_1", &tail_anchor(1700000100000))
+        .await
+        .unwrap();
 
     assert!(tail.complete);
     assert_eq!(
@@ -497,7 +629,7 @@ async fn transcript_tail_completes_on_the_empty_end_page() {
             MockResponse::json(
                 serde_json::json!({
                     "data": [{"id": "msg_a1", "type": "assistant",
-                              "time": {"created": 1700000003000i64, "completed": 1700000003500i64},
+                              "time": {"created": 1700000103000i64, "completed": 1700000103500i64},
                               "content": [{"type": "text", "text": "新"}]}],
                     "cursor": {"next": "c1"},
                 })
@@ -508,7 +640,10 @@ async fn transcript_tail_completes_on_the_empty_end_page() {
     );
     let client = v2_wire_client(&server);
 
-    let tail = client.transcript_tail("ses_1", 1700000001000).await.unwrap();
+    let tail = client
+        .transcript_tail("ses_1", &tail_anchor(1700000100000))
+        .await
+        .unwrap();
 
     assert!(tail.complete, "an empty page is the session's start");
     assert_eq!(tail.transcript.messages.len(), 1);
@@ -538,8 +673,9 @@ async fn transcript_tail_reports_a_page_cap_stop_as_incomplete() {
     );
     let client = v2_wire_client(&server);
 
-    // Every page stays newer than the boundary: nothing ever crosses it.
-    let tail = client.transcript_tail("ses_1", 1).await.unwrap();
+    // Every page's oldest message may still belong (created at/after the
+    // anchor): nothing ever ends the scan.
+    let tail = client.transcript_tail("ses_1", &tail_anchor(1)).await.unwrap();
 
     assert!(!tail.complete, "a cap stop must never read as a complete tail");
     assert_eq!(
