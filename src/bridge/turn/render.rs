@@ -646,8 +646,8 @@ pub(super) fn renders_new_content(
 }
 
 /// What one render pass did, read by the loops that drive it: the statistics
-/// both log, plus whether the pass rendered anything at all — the external
-/// renderer's progress signal for its idle bound (#457).
+/// both log, plus whether the pass produced observable progress — the external
+/// renderer's signal for its idle bound (#457).
 pub(crate) struct RenderStats {
     /// Parts appended to the card this pass (text/reasoning chunks).
     pub(crate) new_parts: usize,
@@ -655,10 +655,13 @@ pub(crate) struct RenderStats {
     pub(crate) text_len: usize,
     /// The card's cumulative reasoning length after the pass (logging).
     pub(crate) reasoning_len: usize,
-    /// Whether the pass rendered anything at all: a new part OR a tool panel
-    /// revision. The polls that do NOT renew the idle bound are the ones this
-    /// is false for.
-    pub(crate) changed: bool,
+    /// Whether the pass produced observable progress: rendered content, a tool
+    /// panel revision, a live task fragment / ledger movement, or a
+    /// context-token update — everything the pass flushes for EXCEPT the
+    /// per-second header timer. The external renderer renews its idle bound on
+    /// this; header-timer churn alone must never renew it, or the bound could
+    /// never fire.
+    pub(crate) progressed: bool,
 }
 
 /// Render the session's transcript into the streaming card and flush it when
@@ -667,9 +670,9 @@ pub(crate) struct RenderStats {
 /// (`bridge::external`) — so the two never drift apart.
 ///
 /// Returns `Some(stats)` when the accumulator is still present; `None` when it
-/// vanished (the caller should stop). [`RenderStats::changed`] is the external
-/// renderer's progress signal: a poll that rendered nothing does not renew its
-/// idle bound.
+/// vanished (the caller should stop). [`RenderStats::progressed`] is the
+/// external renderer's progress signal: a poll that made no observable
+/// progress does not renew its idle bound.
 pub(super) async fn render_and_flush(
     cards: &CardsHandle,
     sessions: &SessionsHandle,
@@ -758,14 +761,19 @@ pub(super) async fn render_and_flush(
             None => (false, false),
         }
     };
-    if changed || header_changed || context_changed || ledger_changed || liveness_changed {
+    // Observable progress: everything this pass flushes for except the
+    // per-second header timer, which ticks on an idle run by design. The
+    // external renderer's idle bound renews on this and must not read the
+    // header second as progress (#457).
+    let progressed = changed || context_changed || ledger_changed || liveness_changed;
+    if progressed || header_changed {
         Turn::flush_card(cards, session_id).await;
     }
     Some(RenderStats {
         new_parts,
         text_len,
         reasoning_len,
-        changed,
+        progressed,
     })
 }
 

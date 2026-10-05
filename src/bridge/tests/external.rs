@@ -1,6 +1,6 @@
 use crate::backend::{
-    FinishReason, MessageId, MessageRole, Part, ReasoningPart, SessionTranscript, StepFinish, StepStart,
-    ToolStatus, TranscriptMessage, TurnAnchor,
+    ContentBlock, FinishReason, MessageId, MessageRole, Part, ReasoningPart, SessionTranscript, StepFinish,
+    StepStart, ToolCall, ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage, TurnAnchor,
 };
 use crate::bridge::test_support::*;
 
@@ -32,6 +32,70 @@ fn anchor(created_ms: i64) -> TurnAnchor {
         message_id: MessageId::new(format!("msg_user_{created_ms}")),
         created_ms,
     }
+}
+
+/// An assistant turn whose only moving part is a running tool call's output:
+/// a panel revision every snapshot, with no new text part.
+fn running_tool_reply(created: i64, output: &str) -> TranscriptMessage {
+    typed_message(
+        "msg_ext_assist",
+        MessageRole::Assistant,
+        Some(created),
+        vec![Part::Tool(ToolCall {
+            identity: ToolIdentity {
+                name: "shell".into(),
+                call_id: "call_ext".into(),
+            },
+            status: ToolStatus::Running,
+            started_at: Some(created),
+            input: None,
+            metadata: None,
+            output: ToolOutput {
+                raw: None,
+                blocks: vec![ContentBlock::Text(output.into())],
+                error: None,
+            },
+        })],
+    )
+}
+
+/// An assistant turn carrying a live `subagent` panel for `child`: the panel
+/// whose child liveness every render gathers (spec #501).
+fn live_subagent_reply(created: i64, child: &str) -> TranscriptMessage {
+    subagent_reply(created, child, ToolStatus::Running)
+}
+
+/// [`live_subagent_reply`]'s settled shape — the panel the turn ends with.
+fn settled_subagent_reply(created: i64, child: &str, text: &str) -> TranscriptMessage {
+    let mut message = subagent_reply(created, child, ToolStatus::Completed);
+    message.parts.push(text_part(text));
+    message.parts.push(Part::StepFinish(StepFinish {
+        reason: FinishReason::Stop,
+    }));
+    message
+}
+
+fn subagent_reply(created: i64, child: &str, status: ToolStatus) -> TranscriptMessage {
+    typed_message(
+        "msg_ext_assist",
+        MessageRole::Assistant,
+        Some(created),
+        vec![Part::Tool(ToolCall {
+            identity: ToolIdentity {
+                name: "subagent".into(),
+                call_id: "call_sub".into(),
+            },
+            status,
+            started_at: Some(created),
+            input: None,
+            metadata: Some(serde_json::json!({ "sessionId": child })),
+            output: ToolOutput {
+                raw: None,
+                blocks: vec![],
+                error: None,
+            },
+        })],
+    )
 }
 
 fn now_ms() -> i64 {
@@ -1240,6 +1304,257 @@ async fn external_reply_render_leaves_the_notification_card_when_nothing_produce
             "the notification stays intact: {card}"
         );
     }
+}
+
+/// #457's tool-revision renewal: a panel whose call gains output is progress
+/// even when no new text part arrives. Scripted small: the idle bound is 60 ms
+/// while the tool keeps gaining output for ~120 ms, so the last revision is
+/// only reachable with the renewal.
+#[tokio::test]
+async fn external_reply_render_renews_on_tool_panel_revisions() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut mock = MockBackend::new(realistic_parts());
+    let snapshots: Vec<SessionTranscript> = (1..=24)
+        .map(|i| {
+            SessionTranscript::new(vec![
+                user("msg_ext_user", 2_000_000, "OpenChamber 里发的消息"),
+                running_tool_reply(2_001_000, &format!("工具输出第{i}段。")),
+            ])
+        })
+        .collect();
+    mock.given_transcript("ses_ext", snapshots);
+    let (app, platform) = build_app(cfg, mock).await;
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
+            session_id: "ses_ext".into(),
+            directory: "/tmp/ext".into(),
+            agent: None,
+            model: None,
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        },
+    )
+    .await;
+    app.external
+        .render_poll_ms
+        .store(5, std::sync::atomic::Ordering::Relaxed);
+    app.external
+        .render_idle_timeout_ms
+        .store(60, std::sync::atomic::Ordering::Relaxed);
+
+    app.external
+        .start_reply_render(
+            &app.flow_handles(),
+            "ses_ext",
+            &anchor(2_000_000),
+            "msg_sent",
+            "OpenChamber 里发的消息",
+        )
+        .await;
+
+    // Only the renewal can carry the renderer to the scripted last revision.
+    wait_for_card_update(&platform, "the last tool revision", CardUpdates::Latest, |card| {
+        card_text(card).contains("工具输出第24段")
+    })
+    .await;
+    wait_for_card_update(&platform, "the idle bound's Done", CardUpdates::Latest, |card| {
+        card_header(card).contains("完成") || card_header(card).contains("✓")
+    })
+    .await;
+}
+
+/// #457: failed transcript reads are no progress either — the renderer must
+/// idle out on them. A part arriving after the bound (reads healed) would be
+/// rendered by a still-polling loop, so the card never showing it, with no
+/// terminal stamp, is the exit.
+#[tokio::test]
+async fn external_reply_render_idles_out_when_reads_fail() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut mock = MockBackend::new(realistic_parts());
+    mock.given_transcript(
+        "ses_ext",
+        vec![SessionTranscript::new(vec![user(
+            "msg_ext_user",
+            2_000_000,
+            "OpenChamber 里发的消息",
+        )])],
+    );
+    let backend = Arc::new(mock);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
+            session_id: "ses_ext".into(),
+            directory: "/tmp/ext".into(),
+            agent: None,
+            model: None,
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        },
+    )
+    .await;
+    app.external
+        .render_poll_ms
+        .store(5, std::sync::atomic::Ordering::Relaxed);
+    app.external
+        .render_idle_timeout_ms
+        .store(30, std::sync::atomic::Ordering::Relaxed);
+    app.external
+        .start_reply_render(
+            &app.flow_handles(),
+            "ses_ext",
+            &anchor(2_000_000),
+            "msg_sent",
+            "OpenChamber 里发的消息",
+        )
+        .await;
+    let anchor = Turn::armed_turn_anchor(&app.cards_handle(), "ses_ext")
+        .await
+        .expect("the renderer armed");
+
+    backend.fail_transcript_for("ses_ext").await;
+    // Well past the bound: every read failed, so the renderer must have given
+    // up instead of polling the wedged Backend forever.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    backend.heal_transcript("ses_ext").await;
+    backend
+        .given_transcript_after_build(
+            "ses_ext",
+            vec![SessionTranscript::new(vec![
+                typed_message(
+                    anchor.message_id.as_str(),
+                    MessageRole::User,
+                    Some(anchor.created_ms),
+                    vec![text_part("OpenChamber 里发的消息")],
+                ),
+                typed_message(
+                    "msg_ext_assist",
+                    MessageRole::Assistant,
+                    Some(anchor.created_ms + 1_000),
+                    vec![text_part("迟到的输出。")],
+                ),
+            ])],
+        )
+        .await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let calls = platform.calls.lock().await.clone();
+    for card in calls.iter().filter_map(|c| match c {
+        PlatformCall::UpdateMessage { card, .. } => Some(card),
+        _ => None,
+    }) {
+        assert!(
+            !card_text(card).contains("迟到的输出"),
+            "a renderer that idled out on failed reads must not render a later part: {card}"
+        );
+        let header = card["header"]["title"]["content"].as_str().unwrap_or("");
+        assert!(
+            !header.contains("完成") && !header.contains("✓") && !header.contains("出错"),
+            "an unobservable run must not finalize: {card}"
+        );
+    }
+    assert_ne!(
+        Turn::card_state(&app.cards_handle(), "ses_ext").await,
+        Some(crate::feishu::card::CardState::Done),
+        "the silent card must not be stamped Done"
+    );
+}
+
+/// #457's liveness renewal: a live subagent panel whose child keeps working is
+/// progress even while the parent transcript is byte-identical. Scripted
+/// small: the child advances for ~500 ms against a 200 ms idle bound, and the
+/// parent turn completes only at the end — its final text is reachable only
+/// with the renewal, since a total deadline would cut the loop at the bound
+/// with the parent unchanged.
+#[tokio::test]
+async fn external_reply_render_renews_on_child_liveness() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut mock = MockBackend::new(realistic_parts());
+    let live_parent = || {
+        SessionTranscript::new(vec![
+            user("msg_ext_user", 2_000_000, "OpenChamber 里发的消息"),
+            live_subagent_reply(2_001_000, "ses_child"),
+        ])
+    };
+    let mut parents: Vec<SessionTranscript> = (0..100).map(|_| live_parent()).collect();
+    parents.push(SessionTranscript::new(vec![
+        user("msg_ext_user", 2_000_000, "OpenChamber 里发的消息"),
+        settled_subagent_reply(2_050_000, "ses_child", "父回合的最后输出。"),
+    ]));
+    mock.given_transcript("ses_ext", parents);
+    // The child's transcript advances on every liveness read.
+    let children: Vec<SessionTranscript> = (0..200)
+        .map(|i| {
+            SessionTranscript::new(vec![typed_message(
+                "msg_child_assist",
+                MessageRole::Assistant,
+                Some(2_100_000 + i * 1_000),
+                vec![text_part("子任务进行中。")],
+            )])
+        })
+        .collect();
+    mock.given_transcript("ses_child", children);
+    let (app, platform) = build_app(cfg, mock).await;
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
+            session_id: "ses_ext".into(),
+            directory: "/tmp/ext".into(),
+            agent: None,
+            model: None,
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        },
+    )
+    .await;
+    app.external
+        .render_poll_ms
+        .store(5, std::sync::atomic::Ordering::Relaxed);
+    app.external
+        .render_idle_timeout_ms
+        .store(200, std::sync::atomic::Ordering::Relaxed);
+
+    app.external
+        .start_reply_render(
+            &app.flow_handles(),
+            "ses_ext",
+            &anchor(2_000_000),
+            "msg_sent",
+            "OpenChamber 里发的消息",
+        )
+        .await;
+
+    wait_for_card_update(
+        &platform,
+        "the parent turn's true end",
+        CardUpdates::Latest,
+        |card| card_text(card).contains("父回合的最后输出"),
+    )
+    .await;
+    wait_for_card_update(
+        &platform,
+        "the finalized liveness-renewed card",
+        CardUpdates::Latest,
+        |card| card_header(card).contains("完成") || card_header(card).contains("✓"),
+    )
+    .await;
 }
 
 /// #451: a Feishu Supplement landing during an external follow is a

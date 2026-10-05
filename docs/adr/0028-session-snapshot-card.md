@@ -109,13 +109,16 @@ The Decision above says the busy adoption streams "until completion
 a card that had rendered anything was finalized Done even while the run was
 still producing, so everything after the cut never reached Feishu (#451; the
 run in the #447 incident lasted 78 minutes). It is now an **idle bound**
-(#457): every poll whose render adds or updates content — a new text/reasoning
-part, or a tool panel revision (a call appearing, changing status or gaining
-output; not the elapsed clock ticking) — resets the deadline, so a run that
-keeps reaching the card keeps streaming. A run whose transcript shows no new
-content for the whole window is treated as not producing and ends under the
-old rule: partial content finalizes Done, and a message that never produced
-still leaves its 有新消息 notification untouched. The Wake
-continuation's settle grace (the shared loop's lost-contact / stuck-panel
-bound) now lives in its own field, separate from the renderer's idle bound, so
-retuning one can no longer move the other.
+(#457): every poll whose render makes observable progress resets the deadline —
+a new text/reasoning part, a tool panel revision (a call appearing, changing
+status or gaining output), a live task panel's child activity or ledger
+movement, or a context-token update: everything the pass flushes for except
+the per-second header timer, which ticks on an idle run by design. A run whose
+card shows nothing new for the whole window is treated as not producing and
+ends under the old rule: partial content finalizes Done, and a message that
+never produced still leaves its 有新消息 notification untouched. A transcript
+read that keeps failing is no progress either — the bound ends it, so a wedged
+Backend cannot hold the card live forever. The Wake continuation's settle
+grace (the shared loop's lost-contact / stuck-panel bound) now lives in its
+own field, separate from the renderer's idle bound, so retuning one can no
+longer move the other.
