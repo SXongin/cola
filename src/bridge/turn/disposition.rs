@@ -9,8 +9,9 @@
 //! failure line, its phase timer, then the work-context refresh and the flush.
 //! This table is the ONE place an ending is translated into what the card
 //! shows: the out-of-turn settle loop's private ending vocabulary and its
-//! per-ending finalization dispatch retired with #539, and every ending path
-//! that still stamps a card state directly migrates onto the same table.
+//! per-ending finalization dispatch retired with #539, the in-Turn drain's
+//! private ending vocabulary retired with #541, and every ending path that
+//! still stamps a card state directly migrates onto the same table.
 //!
 //! The variants are exactly the endings the Turn layer can reach:
 //!
@@ -168,23 +169,6 @@ impl Disposition {
             (TurnSettle::Waiting | TurnSettle::Running | TurnSettle::Unreceived, _) => None,
         }
     }
-
-    /// The disposition a card already stamped at its ending implies — the
-    /// transitional read for the ending paths that have not yet decided a
-    /// disposition (the drain's finalization; #541 migrates it). `error` is
-    /// the card's recorded failure line, read back
-    /// into [`Self::Failed`]; a card whose ending is one of the loop's
-    /// fixed-copy graces is indistinguishable in the record, and shares the
-    /// notice copy, so nothing observable differs. `None` for a card that is
-    /// not at an ending.
-    pub(crate) fn of_ending_state(state: &CardState, error: Option<&str>) -> Option<Self> {
-        match state {
-            CardState::Done => Some(Self::Done),
-            CardState::Stopped => Some(Self::Stopped),
-            CardState::Error => Some(Self::Failed(error.unwrap_or_default().to_string())),
-            _ => None,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -324,43 +308,6 @@ mod tests {
             Disposition::Unreceived,
         ] {
             assert_eq!(silent.notice_copy(), None, "{silent:?} must stay silent");
-        }
-    }
-
-    /// The transitional ending-state bridge reads the same notice
-    /// classification: a Done/Stopped/Error card announces (a failure line
-    /// reads back with it), and every other state stays silent.
-    #[test]
-    fn the_ending_state_bridge_reads_the_same_classification() {
-        assert_eq!(
-            Disposition::of_ending_state(&CardState::Done, None),
-            Some(Disposition::Done)
-        );
-        assert_eq!(
-            Disposition::of_ending_state(&CardState::Stopped, None),
-            Some(Disposition::Stopped)
-        );
-        assert_eq!(
-            Disposition::of_ending_state(&CardState::Error, Some("503")),
-            Some(Disposition::Failed("503".into()))
-        );
-        assert_eq!(
-            Disposition::of_ending_state(&CardState::Error, None).and_then(|d| d.notice_copy()),
-            Some("❌ 上一条请求处理出错了，可点击卡片上的「重试」。")
-        );
-        for state in [
-            CardState::Loading,
-            CardState::Reasoning,
-            CardState::Streaming,
-            CardState::Waiting,
-            CardState::Unreceived,
-            CardState::Continued,
-        ] {
-            assert_eq!(
-                Disposition::of_ending_state(&state, None),
-                None,
-                "{state:?} is not an ending"
-            );
         }
     }
 }
