@@ -1,5 +1,11 @@
 # A durable Live Card record: a restart reaps the card it orphaned
 
+> **Amended by ADR-0069**: the record is the `records` section of the
+> **Chain Record** (`chain_records.json`, one module owning a Card Chain's
+> durable facts) and the reap lives in that module. Its semantics — written
+> when a card becomes the Session's live card, removed only after a confirmed
+> ending, fail-open load — are unchanged.
+
 ## Context
 
 ADR-0059 decided that card state stays in memory — "a cola restart loses live

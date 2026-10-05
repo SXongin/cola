@@ -1,5 +1,10 @@
 # A durable Wake watermark: a restart never re-announces an announced Wake
 
+> **Amended by ADR-0069**: the watermark is the `announcements` section of the
+> **Chain Record** (`chain_records.json`, one module owning a Card Chain's
+> durable facts). Its semantics — advance only after a card write lands,
+> monotonic per Session — are unchanged.
+
 ## Context
 
 ADR-0059 decided that card state stays in memory and the Wake path is
