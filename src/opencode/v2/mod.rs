@@ -453,7 +453,7 @@ impl GenerationStrategy for V2Strategy {
     /// message read in `order=desc`, following `cursor.next` for older pages,
     /// and stops at the first page whose oldest message CANNOT belong to
     /// `anchor`'s Turn — under either membership rule, exactly as
-    /// [`TurnAnchor::message_may_belong`] reads them: a message with no server
+    /// [`TurnAnchor::may_still_belong`] reads them: a message with no server
     /// time cannot be placed, so the scan keeps going rather than stopping on
     /// an unknown. A page with no unfinished message does NOT end the scan
     /// (another client can queue messages above an unfinished call), and a
@@ -492,7 +492,7 @@ impl GenerationStrategy for V2Strategy {
             let cannot_belong = wire::decode_messages(&page.data)
                 .messages
                 .last()
-                .is_some_and(|oldest| !anchor.message_may_belong(oldest));
+                .is_some_and(|oldest| !anchor.may_still_belong(oldest));
             // Keep the whole crossing page: it holds every message at/after the
             // boundary, and older ones are excluded by the scope's own
             // membership rule.

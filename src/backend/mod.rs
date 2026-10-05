@@ -289,7 +289,7 @@ pub trait Backend: Send + Sync {
     /// Read the newest end of one Session's transcript as a bounded,
     /// newest-first tail scan that stops at the first page whose oldest message
     /// cannot belong to `anchor`'s Turn under the membership rule — both its
-    /// rules (`TurnAnchor::message_may_belong`), so the read never cuts a
+    /// rules (`TurnAnchor::may_still_belong`), so the read never cuts a
     /// message the caller's scope needs (ADR-0068). The common case is one
     /// request; a small page cap bounds the worst case and reports it via
     /// [`TranscriptTail::complete`], so the caller carries nothing from a

@@ -6,8 +6,8 @@
 //! 204 mutations, the run-state derivation, the admit-then-return prompt, the
 //! session-scoped switches, and the permission/form surface.
 
-use crate::backend::{ChildRuntime, MessageId, ShellEnd, ShellRuntime, TurnAnchor};
-use crate::bridge::test_support::{assert_line_level, capture_logs, level_count};
+use crate::backend::{ChildRuntime, ShellEnd, ShellRuntime};
+use crate::bridge::test_support::{assert_line_level, capture_logs, level_count, tail_anchor};
 use crate::error::BridgeError;
 use crate::opencode::client::OpenCodeBackend;
 use crate::opencode::strategy::Generation;
@@ -55,15 +55,6 @@ fn last_request(server: &TestHttpServer) -> RecordedRequest {
     wired_requests(server)
         .pop()
         .expect("a request should have been sent")
-}
-
-/// The Turn anchor the carry's tail read scopes on: the orphan user message's
-/// identity together with the server time the stop rule measures against.
-fn tail_anchor(created_ms: i64) -> TurnAnchor {
-    TurnAnchor {
-        message_id: MessageId::new("msg_cola_anchor"),
-        created_ms,
-    }
 }
 
 fn body_json(request: &RecordedRequest) -> serde_json::Value {

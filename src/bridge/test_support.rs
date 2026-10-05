@@ -46,6 +46,17 @@ pub(crate) fn text_part(text: &str) -> Part {
     })
 }
 
+/// The Turn anchor the carry's tail-read fixtures scope on: the orphan record's
+/// `msg_cola_anchor` message id together with the given server time. Shared by
+/// the V2 strategy tests and the bridge's carry tests, so the two fixtures
+/// cannot drift.
+pub(crate) fn tail_anchor(created_ms: i64) -> TurnAnchor {
+    TurnAnchor {
+        message_id: MessageId::new("msg_cola_anchor"),
+        created_ms,
+    }
+}
+
 /// One typed tool part — name, correlation id, status, raw input and a single
 /// text output block: the shape most fixtures need. Fixtures that exercise
 /// metadata, richer output blocks or server times build the call directly.
