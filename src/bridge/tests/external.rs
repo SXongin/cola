@@ -301,23 +301,15 @@ async fn external_reply_completion_comes_from_the_transcript() {
             let _ = app.external.poll_loop(&app.flow_handles()).await;
         }
     });
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-
-    let calls = platform.calls.lock().await.clone();
-    let updates: Vec<serde_json::Value> = calls
-        .iter()
-        .filter_map(|c| match c {
-            PlatformCall::UpdateMessage { card, .. } => Some(card.clone()),
-            _ => None,
-        })
-        .collect();
-    let last = updates.last().expect("the card must be updated at least once");
-    let done_header = last["header"]["title"]["content"].as_str().unwrap_or("");
-    assert!(
-        done_header.contains("完成") || done_header.contains("✓"),
-        "the transcript's terminal finish must finalize the card as Done, header: {}",
-        done_header
-    );
+    // The completion arrives from the transcript's turn projection: wait for
+    // the final update instead of a fixed sleep — a loaded runner can delay
+    // the poll's first pass past any short sleep (this test flaked on
+    // Windows CI with zero recorded updates).
+    wait_for_card_update(&platform, "the finalized card", CardUpdates::Latest, |card| {
+        let header = card["header"]["title"]["content"].as_str().unwrap_or("");
+        header.contains("完成") || header.contains("✓")
+    })
+    .await;
 }
 
 /// ADR-0026 regression (observed 2026-09-09): when a server dies mid-turn and
