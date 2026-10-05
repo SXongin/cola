@@ -1751,6 +1751,13 @@ async fn external_reply_render_does_not_finalize_a_replacement_card() {
         );
     }
 
+    // The guard's contract directly: a stale anchor must not finalize the
+    // card its successor owns.
+    assert!(
+        !Turn::finalize_done_if_anchor(&app.cards_handle(), "ses_ext", &anchor(2_000_000)).await,
+        "a stale anchor must not finalize the replacement card"
+    );
+
     // Let A's bound fire: it must leave the replacement card alone.
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
@@ -1770,6 +1777,83 @@ async fn external_reply_render_does_not_finalize_a_replacement_card() {
             "A's bound must not stamp a terminal on the replacement card: {card}"
         );
     }
+}
+
+/// #457: a hung CHILD read in the liveness gather must not park the loop past
+/// its idle bound either — the whole render pass is bounded, so a live
+/// subagent whose child transcript never resolves still lets the bound fire
+/// and close the partial card. Without the pass bound the card stays live
+/// indefinitely (the loop never reaches its bound check).
+#[tokio::test]
+async fn external_reply_render_idles_out_when_a_child_read_hangs() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut mock = MockBackend::new(realistic_parts());
+    // The parent carries a live subagent panel; its child read is the hang.
+    mock.given_transcript(
+        "ses_ext",
+        vec![SessionTranscript::new(vec![
+            user("msg_ext_user", 2_000_000, "OpenChamber 里发的消息"),
+            live_subagent_reply(2_001_000, "ses_child"),
+        ])],
+    );
+    mock.given_transcript(
+        "ses_child",
+        vec![SessionTranscript::new(vec![typed_message(
+            "msg_child_assist",
+            MessageRole::Assistant,
+            Some(2_100_000),
+            vec![text_part("子任务进行中。")],
+        )])],
+    );
+    let backend = Arc::new(mock);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
+            session_id: "ses_ext".into(),
+            directory: "/tmp/ext".into(),
+            agent: None,
+            model: None,
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        },
+    )
+    .await;
+    app.external
+        .render_poll_ms
+        .store(5, std::sync::atomic::Ordering::Relaxed);
+    app.external
+        .request_timeout_ms
+        .store(10, std::sync::atomic::Ordering::Relaxed);
+    app.external
+        .render_idle_timeout_ms
+        .store(30, std::sync::atomic::Ordering::Relaxed);
+
+    // The child read never resolves: every pass parks in the gather and must
+    // be abandoned by the pass bound, so the idle ending still runs. The live
+    // subagent panel rendered on the first pass, so the ending is Done.
+    backend.hang_transcript_for("ses_child").await;
+    app.external
+        .start_reply_render(
+            &app.flow_handles(),
+            "ses_ext",
+            &anchor(2_000_000),
+            "msg_sent",
+            "OpenChamber 里发的消息",
+        )
+        .await;
+
+    wait_for_card_update(&platform, "the idle bound's Done", CardUpdates::Latest, |card| {
+        card_header(card).contains("完成") || card_header(card).contains("✓")
+    })
+    .await;
+    backend.release_transcript_for("ses_child").await;
 }
 
 /// #451: a Feishu Supplement landing during an external follow is a

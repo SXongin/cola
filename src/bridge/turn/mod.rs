@@ -2414,6 +2414,61 @@ impl Turn {
         Self::flush_card(cards, session_id).await;
     }
 
+    /// [`Self::finalize_done`] only while the card's accumulator is still
+    /// `anchor`'s: the check and the Done stamp share ONE lock, so a renderer
+    /// whose bound fired after a successor replaced the accumulator can never
+    /// stamp the successor's live card (#457). Reads the anchor the external
+    /// arm stored on the accumulator. Returns whether it finalized (false: a
+    /// successor owns the card now — nothing is touched).
+    pub(crate) async fn finalize_done_if_anchor(
+        cards: &CardsHandle,
+        session_id: &str,
+        anchor: &TurnAnchor,
+    ) -> bool {
+        let stamped = {
+            let mut live = cards.cards.lock().await;
+            match live.get_mut(session_id) {
+                Some(card) if card.acc.turn_anchor.as_ref() == Some(anchor) => {
+                    card.acc.card_state = crate::feishu::card::CardState::Done;
+                    true
+                }
+                _ => false,
+            }
+        };
+        if !stamped {
+            return false;
+        }
+        Self::refresh_work_context(cards, session_id).await;
+        Self::flush_card(cards, session_id).await;
+        true
+    }
+
+    /// [`Self::finalize_stopped`] under the same anchor guard as
+    /// [`Self::finalize_done_if_anchor`] (#457): a `/stop` seen by a stale
+    /// renderer must not stamp its successor's card.
+    pub(crate) async fn finalize_stopped_if_anchor(
+        cards: &CardsHandle,
+        session_id: &str,
+        anchor: &TurnAnchor,
+    ) -> bool {
+        let stamped = {
+            let mut live = cards.cards.lock().await;
+            match live.get_mut(session_id) {
+                Some(card) if card.acc.turn_anchor.as_ref() == Some(anchor) => {
+                    card.acc.set_stopped();
+                    true
+                }
+                _ => false,
+            }
+        };
+        if !stamped {
+            return false;
+        }
+        Self::refresh_work_context(cards, session_id).await;
+        Self::flush_card(cards, session_id).await;
+        true
+    }
+
     /// Finalize a followed card as `Stopped` (#394): a deliberate `/stop` is
     /// not a failure, so any recorded error text is discarded, the state is
     /// marked Stopped and the card flushed. The content stays, the header
