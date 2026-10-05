@@ -76,21 +76,45 @@ pub(crate) fn store<T: Serialize>(path: &Path, what: &str, record: &T, empty: bo
 
 /// Replace `path` with `data` atomically: write a sibling temp file, then
 /// rename it over the target, so a crash mid-write can never leave a half
-/// file (and a failed replace removes the temp file it wrote). The checked
-/// sibling of [`store`] — it reports the failure instead of logging it, for
-/// the one sidecar whose loss is not recoverable: the session mapping, whose
-/// reader routes every Chat/Topic to its Session.
+/// file. A failed write or replace removes the temp file it wrote. The
+/// checked sibling of [`store`] — it reports the failure instead of logging
+/// it, for the one sidecar whose loss is not recoverable: the session
+/// mapping, whose reader routes every Chat/Topic to its Session.
 pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     ensure_parent(path)?;
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, data)?;
-    if let Err(e) = std::fs::rename(&tmp, path) {
+    let target = replace_target(path);
+    let tmp = target.with_extension("tmp");
+    if let Err(e) = std::fs::write(&tmp, data) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    // Keep the replaced file's permissions (the temp file was born with the
+    // umask's, and the rename would otherwise install those).
+    if let Ok(metadata) = std::fs::metadata(&target) {
+        let _ = std::fs::set_permissions(&tmp, metadata.permissions());
+    }
+    if let Err(e) = std::fs::rename(&tmp, &target) {
         // A failed rename leaves the target in place; drop the temp so the
         // failure leaves nothing behind.
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
     Ok(())
+}
+
+/// The path the atomic replace actually targets: a symlinked sidecar is
+/// written through, not replaced — renaming onto the link would install a
+/// regular file in its place. Unix-only; Windows symlinked sidecars need
+/// privileges and do not have this surprise, so their paths stay verbatim.
+fn replace_target(path: &Path) -> std::path::PathBuf {
+    #[cfg(unix)]
+    {
+        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    }
+    #[cfg(not(unix))]
+    {
+        path.to_path_buf()
+    }
 }
 
 /// Create `path`'s parent directory. A bare relative filename has an **empty**
@@ -176,6 +200,41 @@ mod tests {
             !occupied.with_extension("tmp").exists(),
             "a failed replace leaves no temp file behind"
         );
+    }
+
+    /// A symlinked sidecar is written through: the link survives and its
+    /// target is replaced.
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_writes_through_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.json");
+        std::fs::write(&real, "old").unwrap();
+        let link = dir.path().join("link.json");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        write_atomic(&link, b"new").unwrap();
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "new");
+        assert!(
+            std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(),
+            "the link is not replaced by a regular file"
+        );
+    }
+
+    /// Replacing a file keeps its mode instead of installing the temp file's
+    /// umask-derived one.
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_keeps_the_replaced_files_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("record.json");
+        std::fs::write(&path, "old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        write_atomic(&path, b"new").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the replaced file keeps its mode");
     }
 
     /// A bare relative filename has an empty parent: the writer must skip the
