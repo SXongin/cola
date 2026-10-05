@@ -80,12 +80,21 @@ pub(crate) fn store<T: Serialize>(path: &Path, what: &str, record: &T, empty: bo
 /// logging it, for the one sidecar whose loss is not recoverable: the session
 /// mapping, whose reader routes every Chat/Topic to its Session.
 pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    ensure_parent(path)?;
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, data)?;
     std::fs::rename(&tmp, path)
+}
+
+/// Create `path`'s parent directory. A bare relative filename has an **empty**
+/// parent (`Path::new("sessions.json").parent() == Some("")`): nothing to
+/// create, and `create_dir_all("")` errors — attempting it would fail every
+/// write for a relative `session_file`.
+fn ensure_parent(path: &Path) -> std::io::Result<()> {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => std::fs::create_dir_all(parent),
+        _ => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -156,5 +165,18 @@ mod tests {
         let occupied = dir.path().join("occupied");
         std::fs::create_dir(&occupied).unwrap();
         assert!(write_atomic(&occupied, b"x").is_err());
+    }
+
+    /// A bare relative filename has an empty parent: the writer must skip the
+    /// parent creation instead of failing on `create_dir_all("")`, and a
+    /// parent that genuinely cannot be created is still reported.
+    #[test]
+    fn ensure_parent_skips_an_empty_parent_and_reports_a_real_failure() {
+        assert!(ensure_parent(Path::new("sessions.json")).is_ok());
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("not-a-dir");
+        std::fs::write(&file, "x").unwrap();
+        assert!(ensure_parent(&file.join("child/record.json")).is_err());
     }
 }
