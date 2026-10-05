@@ -259,8 +259,13 @@ the hang discarded.
 `.github/workflows/codex-review.yml` therefore pins the action to **v1.11**
 (from the 2026-10-04 amendment's v1.12), whose wrapper handled the same heavy
 workload cleanly, and bounds the Codex step (12 minutes, `continue-on-error`)
-with a completeness check on the verdict's last non-blank line, one bounded
-retry when the output is incomplete, and a post step that publishes a complete
-salvaged review instead of discarding it. The job bound grows to 30 minutes to
-cover both attempts. Revisit the pin when the wrapper fix (#151) ships; the
-salvage stays useful against stream drops regardless (#530).
+so a stall cannot burn the job. Its output is published only when complete —
+the last non-blank line must end with the verdict marker, markdown emphasis
+tolerated — through the shared parser `.github/codex/verdict.sh`, which the
+approve step reads the verdict with too and which `cargo test -p xtask
+codex_gate` exercises; trailing blank lines (a CRLF tail included) are trimmed
+so the verdict stays the comment's final line. A same-job retry was considered
+and rejected: the action's drop-sudo safety strategy removes passwordless sudo,
+so a second invocation in the job cannot start. Revisit the pin when the
+wrapper fix (#151) ships; the salvage stays useful against stream drops
+regardless (#530).
