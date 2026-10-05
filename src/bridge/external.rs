@@ -434,7 +434,7 @@ impl ExternalFlow {
                     // continuation carries the clock as `None` — its own card
                     // send was the notification (ADR-0059).
                     if let Some(started_at) = notice_at {
-                        crate::bridge::turn::send_completion_notice(
+                        crate::bridge::turn::send_completion_notice_for_ending_state(
                             &handles.cards,
                             &handles.platform,
                             &self.notice,
@@ -1075,21 +1075,21 @@ impl ExternalFlow {
         let span = crate::bridge::span::external(sid, Some(thread_key));
         tokio::spawn(
             async move {
-                let ended =
-                    Turn::wake_settle_loop(&flow, &session_id, &directory, &anchor, chain, timing).await;
-                let Some(rules) = notice else { return };
-                if !ended {
+                let Some(disposition) =
+                    Turn::wake_settle_loop(&flow, &session_id, &directory, &anchor, chain, timing).await
+                else {
                     // The loop stopped owning the card (a new Turn, another
                     // arm) or its accumulator vanished: nothing ended here, so
                     // nothing is announced.
                     return;
-                }
+                };
+                let Some(rules) = notice else { return };
                 // The in-place resume's ending is the request's true end: it
                 // notifies under the ordinary rules, with the clock the quiet
-                // true end reads (ADR-0066). `send_completion_notice` itself
-                // declines a card that is not at an ending, so a yield back to
-                // 「⏳」 stays silent and the quiet true end that follows owns
-                // the one notice.
+                // true end reads (ADR-0066). The disposition's own
+                // classification declines an ending that is not a true end, so
+                // a yield back to 「⏳」 stays silent and the quiet true end that
+                // follows owns the one notice.
                 let Some(started_at) = Turn::turn_started_at(&flow.cards, &session_id).await else {
                     return;
                 };
@@ -1099,6 +1099,7 @@ impl ExternalFlow {
                     &rules,
                     &session_id,
                     started_at,
+                    &disposition,
                 )
                 .await;
             }

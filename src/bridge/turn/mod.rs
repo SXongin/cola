@@ -1,3 +1,4 @@
+mod disposition;
 mod flush;
 mod follow;
 mod render;
@@ -26,6 +27,7 @@ use crate::config::ThreadKey;
 use crate::feishu::client::ImageAttachment;
 use crate::opencode;
 use crate::opencode::types::SessionStatus;
+use disposition::Disposition;
 
 /// How long one Backend read in the post-prompt drain may take before it is
 /// abandoned. The drain's own bound caps this further per call: a hung
@@ -86,19 +88,20 @@ enum IdleRead {
 }
 
 /// The disposition one [`TurnSettle`] decision gives a Turn ending, as the
-/// drain and finalization read it — distinct from the settle loop's own
-/// [`settle::Ending`], which names the eight ways the out-of-turn loop can
-/// stop. The read model decides once; this is the ONE place the Turn maps that
-/// decision, so the drain (`settle_or_yield`) and finalization (`finish`)
-/// cannot read it differently and a new decision variant needs one mapping edit
-/// here.
+/// drain and finalization read it — a coarser projection of the settle loop's
+/// [`Disposition`](disposition::Disposition), which names the eight endings the
+/// Turn layer can reach. The read model decides once; this is the ONE place the
+/// drain maps that decision, so the drain (`settle_or_yield`) and finalization
+/// (`finish`) cannot read it differently and a new decision variant needs one
+/// mapping edit here.
 ///
 /// [`TurnSettle::Failed`] folds into [`Self::Settle`] deliberately: both
 /// callers only need "the ending is decided" — the failure's message is read
 /// from the same final transcript through the existing [`Turn::turn_error`]
-/// projection, so it is not re-plumbed here. The out-of-turn follow matches
-/// the full decision instead: it needs the message to write the card and acts
-/// per disposition (❌ / ✅ / yield / observe).
+/// projection, so it is not re-plumbed here. The out-of-turn follow reads the
+/// full [`Disposition`](disposition::Disposition) instead: it needs the
+/// message to write the card and acts per disposition (❌ / ✅ / yield /
+/// observe).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DrainEnding {
     /// The ending is not decided (a Wake's Execution has not reached its
@@ -939,11 +942,11 @@ impl Turn {
         // card is patched in place, which pushes no notification and does not
         // bump the conversation — so reply to the requester's message to
         // notify them. A followed turn notifies when the FOLLOW finalizes (its
-        // real end), not at the drain bound; `send_completion_notice` itself
+        // real end), not at the drain bound; the ending-state entry point
         // declines a card that is not at an ending, so a Waiting yield never
         // notifies — the notice belongs to the true end (ADR-0059).
         if !follow {
-            send_completion_notice(
+            send_completion_notice_for_ending_state(
                 &handles.cards,
                 &handles.platform,
                 &handles.config.notice_rules(),
@@ -1435,10 +1438,9 @@ pub(crate) enum YieldedUpdate {
     Settled { notice_at: Option<std::time::Instant> },
 }
 
-/// The ending a quiet true-end read stamps in place — the same choices
-/// [`settle::stamp`] maps its [`settle::Ending`]s to, with the failure's message kept
-/// (the out-of-turn loops re-read it from the transcript; this path has it in
-/// hand).
+/// The ending a quiet true-end read stamps in place — the settle outcomes the
+/// disposition table maps, with the failure's message kept (the out-of-turn
+/// loops re-read it from the transcript; this path has it in hand).
 enum QuietEnding {
     /// The true end: idle with no live Background Task.
     Done,
@@ -2039,8 +2041,8 @@ impl Turn {
             // The read's own settle decision judges the true end (ADR-0059):
             // only a read whose Wakes are answered and that retired the last
             // Background Task settles, and the ending stamped is the one the
-            // out-of-turn loops would stamp ([`QuietEnding`] mirrors
-            // `settle::stamp`'s mapping) — a settled failure or a deliberate
+            // out-of-turn loops would stamp ([`QuietEnding`] mirrors the
+            // disposition table's mapping) — a settled failure or a deliberate
             // stop dominates ✅. A Waiting card always carries an anchor (the
             // yield is only decided from one), so the anchorless Unreceived
             // decision cannot arise here; a Running read keeps observing.
@@ -2395,13 +2397,6 @@ impl Turn {
         })
     }
 
-    /// Mark the session's card Done in place (no flush).
-    pub(crate) async fn mark_done(cards: &CardsHandle, session_id: &str) {
-        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
-            card.acc.card_state = crate::feishu::card::CardState::Done;
-        }
-    }
-
     /// Re-point the live card identity at a new message (ADR-0028: a re-adopt
     /// mid-turn sends a fresh snapshot; the follow renderer keeps updating the
     /// new card instead of the old one). The content is untouched. The durable
@@ -2421,20 +2416,26 @@ impl Turn {
         state::refresh_work_context(cards, session_id).await;
     }
 
-    /// Finalize an externally-rendered card: refresh its work context, mark it
-    /// Done and flush it.
-    pub(crate) async fn finalize_done(cards: &CardsHandle, session_id: &str) {
+    /// Apply an ending disposition to `session_id`'s card — the one
+    /// application every ending path shares (spec #538): the accumulator
+    /// stamps the ending (state, failure line, phase timer), then the work
+    /// context is refreshed and the card flushed, exactly the order the
+    /// per-ending helpers had. [`Disposition::Observe`] is not an ending and
+    /// the accumulator stamps nothing for it.
+    pub(crate) async fn apply_disposition(cards: &CardsHandle, session_id: &str, disposition: &Disposition) {
+        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
+            card.acc.apply_ending(disposition);
+        }
         Self::refresh_work_context(cards, session_id).await;
-        Self::mark_done(cards, session_id).await;
         Self::flush_card(cards, session_id).await;
     }
 
-    /// [`Self::finalize_done`] only while the card's accumulator is still
-    /// `anchor`'s: the check and the Done stamp share ONE lock, so a renderer
-    /// whose bound fired after a successor replaced the accumulator can never
-    /// stamp the successor's live card (#457). Reads the anchor the external
-    /// arm stored on the accumulator. Returns whether it finalized (false: a
-    /// successor owns the card now — nothing is touched).
+    /// [`Self::apply_disposition`] with `Done` only while the card's
+    /// accumulator is still `anchor`'s: the check and the Done stamp share ONE
+    /// lock, so a renderer whose bound fired after a successor replaced the
+    /// accumulator can never stamp the successor's live card (#457). Reads the
+    /// anchor the external arm stored on the accumulator. Returns whether it
+    /// finalized (false: a successor owns the card now — nothing is touched).
     pub(crate) async fn finalize_done_if_anchor(
         cards: &CardsHandle,
         session_id: &str,
@@ -2458,7 +2459,7 @@ impl Turn {
         true
     }
 
-    /// [`Self::finalize_stopped`] under the same anchor guard as
+    /// The stop terminal under the same anchor guard as
     /// [`Self::finalize_done_if_anchor`] (#457): a `/stop` seen by a stale
     /// renderer must not stamp its successor's card.
     pub(crate) async fn finalize_stopped_if_anchor(
@@ -2482,51 +2483,6 @@ impl Turn {
         Self::refresh_work_context(cards, session_id).await;
         Self::flush_card(cards, session_id).await;
         true
-    }
-
-    /// Finalize a followed card as `Stopped` (#394): a deliberate `/stop` is
-    /// not a failure, so any recorded error text is discarded, the state is
-    /// marked Stopped and the card flushed. The content stays, the header
-    /// reads 「⏹ 已停止」 and no retry button is rendered. Used by the
-    /// out-of-turn follow's stop branch.
-    pub(crate) async fn finalize_stopped(cards: &CardsHandle, session_id: &str) {
-        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
-            card.acc.set_stopped();
-        }
-        Self::refresh_work_context(cards, session_id).await;
-        Self::flush_card(cards, session_id).await;
-    }
-
-    /// Yield a card as Waiting on Background Work (ADR-0059): the settle
-    /// decision found the Session idle with live Background Tasks, so the card
-    /// takes its waiting disposition — header 「⏳ 等待后台任务」, phase timer
-    /// cleared, work context refreshed, flushed once — and stops updating.
-    /// Not a terminal and never ✅, and no Completion Notice is sent: the
-    /// notice belongs to the true end. Used by the out-of-turn follow; the
-    /// Wake continuation ends through the same settle rule.
-    pub(crate) async fn finalize_waiting(cards: &CardsHandle, session_id: &str) {
-        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
-            card.acc.set_waiting();
-        }
-        Self::refresh_work_context(cards, session_id).await;
-        Self::flush_card(cards, session_id).await;
-    }
-
-    /// End a card as Unreceived (ADR-0062): the settle decision found the
-    /// Turn's submitted message never reached the transcript and the Session
-    /// idle, so nobody will answer it. The card takes its own terminal —
-    /// header 「⚠️ 这条消息未被接收」, phase timer cleared, work context
-    /// refreshed, flushed once, never ✅ — and stops updating; the 重新发起
-    /// action (#437) is its recovery. No Completion Notice is sent (the card
-    /// is no 完成/出错/已停止 ending). Used by the out-of-turn follow's
-    /// unreceived watch and the drain's own finalization; the durable
-    /// live-card reap (#438, ADR-0063) settles by the same rule.
-    pub(crate) async fn finalize_unreceived(cards: &CardsHandle, session_id: &str) {
-        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
-            card.acc.set_unreceived();
-        }
-        Self::refresh_work_context(cards, session_id).await;
-        Self::flush_card(cards, session_id).await;
     }
 
     /// Collect `session_id`'s Waiting card (ADR-0059, spec #405): restamp it
@@ -2571,20 +2527,6 @@ impl Turn {
         for session_id in sessions.session_ids_for_thread(thread_key).await {
             Self::collect_waiting(cards, &session_id, CollectReason::Superseded).await;
         }
-    }
-
-    /// Finalize a followed card as Error: record `error`, mark it Error and
-    /// flush it. Used by the out-of-turn drain follow (#284/#386) when its
-    /// fallback ends the card (lost contact, or a live panel that never
-    /// settles) — the card must never read Done while a tool panel is still
-    /// running.
-    pub(crate) async fn finalize_error(cards: &CardsHandle, session_id: &str, error: &str) {
-        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
-            card.acc.error = Some(error.to_string());
-            card.acc.card_state = crate::feishu::card::CardState::Error;
-        }
-        Self::refresh_work_context(cards, session_id).await;
-        Self::flush_card(cards, session_id).await;
     }
 
     /// `request_id → card_message_id` for every live block a card session's
@@ -3442,12 +3384,14 @@ impl Turn {
 
     /// Run the Wake continuation's out-of-turn settle loop (ADR-0059) on the
     /// caller's own task: the shared out-of-turn loop under the
-    /// continuation's chain identity, then its ending stamped on the card.
-    /// Returns whether the loop reached an ending and stamped it; the caller
-    /// owns the announcement. A split continuation needs none — its own card
-    /// send was the notification — while an in-place resume, which never
-    /// sends, notifies at the true end (ADR-0066); the caller holds the notice
-    /// rules this module has no config for.
+    /// continuation's chain identity, then its ending applied through the one
+    /// disposition application. Returns the ending disposition the loop
+    /// reached and applied, or `None` when it stopped owning the card (its
+    /// accumulator vanished or a successor took it over) and stamped nothing;
+    /// the caller owns the announcement. A split continuation needs none — its
+    /// own card send was the notification — while an in-place resume, which
+    /// never sends, notifies at the true end (ADR-0066); the caller holds the
+    /// notice rules this module has no config for.
     pub(crate) async fn wake_settle_loop(
         flow: &FlowHandles,
         session_id: &str,
@@ -3455,16 +3399,14 @@ impl Turn {
         anchor: &TurnAnchor,
         chain: u64,
         timing: SettleTiming,
-    ) -> bool {
+    ) -> Option<Disposition> {
         let owns = settle::Ownership::Chain {
             chain,
             anchor: anchor.clone(),
         };
-        let Some(ending) = settle::run(flow, session_id, directory, timing, &owns).await else {
-            return false;
-        };
-        settle::stamp(&flow.cards, session_id, &ending).await;
-        true
+        let disposition = settle::run(flow, session_id, directory, timing, &owns).await?;
+        Self::apply_disposition(&flow.cards, session_id, &disposition).await;
+        Some(disposition)
     }
 
     /// The request's original Turn start on `session_id`'s card, when it
@@ -3529,17 +3471,23 @@ async fn release_inflight(handles: &TurnHandles, session_id: &str) {
 /// start, so the long-task threshold measures the whole run; a retry re-attach
 /// (#393) arms the follow with "now" instead, because the original turn's
 /// start is no longer known there; the quiet true end reads the start the card
-/// recorded at turn start. The copy follows the card's real terminal
-/// (#394): 完成, 出错, or 已停止 for a deliberate `/stop` — and the function
-/// itself declines a card that is not at an ending, so a Waiting card can
-/// never be announced as 完成 even by a caller that forgot to guard (ADR-0059).
+/// recorded at turn start. The copy follows the ending's [`Disposition`]
+/// (#394): ✅ for the true end, ⏹ for a deliberate `/stop`, ❌ for a failure —
+/// and the disposition's classification is the refusal, so a Waiting yield
+/// (whose true end is not reached, ADR-0059) and an Unreceived ending
+/// (ADR-0062) can never be announced even by a caller that forgot to guard.
 pub(crate) async fn send_completion_notice(
     cards: &CardsHandle,
     platform: &Arc<dyn crate::feishu::Platform>,
     rules: &NoticeRules,
     session_id: &str,
     started_at: std::time::Instant,
+    disposition: &Disposition,
 ) {
+    // Not an ending the notice may announce: stay silent before any lookup.
+    let Some(text) = disposition.notice_copy() else {
+        return;
+    };
     if !(rules.group_completion_notice || rules.long_task_notice) {
         return;
     }
@@ -3555,26 +3503,10 @@ pub(crate) async fn send_completion_notice(
             {
                 return None;
             }
-            Some((reply_to, requester, a.is_group, a.card_state.clone()))
+            Some((reply_to, requester, a.is_group))
         })
     };
-    if let Some((reply_to, requester, is_group, state)) = notice {
-        // The card's real disposition decides the copy (#394): a deliberate
-        // stop is announced as 已停止, never as 完成 or 出错. A card that is
-        // NOT at an ending declines here — a Waiting card has not reached its
-        // true end (the notice belongs to the true end, and the next Wake
-        // continues the chain, ADR-0059), nor has a collected waiting card
-        // (`Superseded`/`SwitchedAway`) — a Retried card's failure was already
-        // announced when it failed; and a live/split card (Loading…Continued)
-        // is no ending at all. The refusal lives HERE, not only at the call
-        // sites, so a caller that forgets to guard cannot announce one as
-        // 已完成.
-        let text = match state {
-            crate::feishu::card::CardState::Done => "✅ 已完成。",
-            crate::feishu::card::CardState::Stopped => "⏹ 已停止。",
-            crate::feishu::card::CardState::Error => "❌ 上一条请求处理出错了，可点击卡片上的「重试」。",
-            _ => return,
-        };
+    if let Some((reply_to, requester, is_group)) = notice {
         // Best-effort @-mention: the display name needs the contact API
         // (permission granted). On any lookup failure cola falls back to a
         // plain reply, which still notifies the message author. p2p needs no
@@ -3591,6 +3523,30 @@ pub(crate) async fn send_completion_notice(
             tracing::warn!("completion notice: {}", e);
         }
     }
+}
+
+/// [`send_completion_notice`] for a card whose ending path has not yet decided
+/// a disposition — the drain's finalization (`finish`) and the quiet true end,
+/// until #540/#541 migrate them: the card's recorded ending state is read back
+/// through [`Disposition::of_ending_state`], so eligibility and copy still come
+/// from the one table (a failure line reads back with it). A card that is not
+/// at an ending stays silent.
+pub(crate) async fn send_completion_notice_for_ending_state(
+    cards: &CardsHandle,
+    platform: &Arc<dyn crate::feishu::Platform>,
+    rules: &NoticeRules,
+    session_id: &str,
+    started_at: std::time::Instant,
+) {
+    let ending = {
+        let live = cards.cards.lock().await;
+        live.get(session_id)
+            .and_then(|card| Disposition::of_ending_state(&card.acc.card_state, card.acc.error.as_deref()))
+    };
+    let Some(disposition) = ending else {
+        return;
+    };
+    send_completion_notice(cards, platform, rules, session_id, started_at, &disposition).await;
 }
 
 /// The Turn's test seam (spec #298, A3): the fixtures tests outside the Turn
@@ -3931,16 +3887,16 @@ mod tests {
         assert!(live["ses_test"].acc.tools.is_empty());
     }
 
-    /// The notice itself declines a card that is not at an ending, so a caller
-    /// that forgets to guard cannot announce a Waiting card as 已完成
-    /// (ADR-0059) — while the same card at its true end still notifies.
+    /// The ending-state entry point declines a card that is not at an ending,
+    /// so a caller that forgets to guard cannot announce a Waiting card as
+    /// 已完成 (ADR-0059) — while the same card at its true end still notifies.
     #[tokio::test]
     async fn the_completion_notice_declines_a_card_that_has_not_ended() {
         let _wd = test_work_dir();
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_config(&dir.path().join("sessions.json"));
         let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
-        // A group turn: the opt-in rules WOULD notify, so only the state can
+        // A group turn: the opt-in rules WOULD notify, so only the ending can
         // refuse.
         Turn::seed_card(&app.cards_handle(), "ses_test", Some("om_1")).await;
         Turn::set_reply_target(&app.cards_handle(), "ses_test", "msg_1").await;
@@ -3959,7 +3915,7 @@ mod tests {
         )
         .await;
 
-        send_completion_notice(
+        send_completion_notice_for_ending_state(
             &app.cards_handle(),
             &app.feishu,
             &app.turn_config().notice_rules(),
@@ -3978,14 +3934,14 @@ mod tests {
         );
 
         // The same card at its true end does notify: the refusal is the
-        // disposition, not a broken notice.
+        // ending, not a broken notice.
         Turn::set_card_state(
             &app.cards_handle(),
             "ses_test",
             crate::feishu::card::CardState::Done,
         )
         .await;
-        send_completion_notice(
+        send_completion_notice_for_ending_state(
             &app.cards_handle(),
             &app.feishu,
             &app.turn_config().notice_rules(),
@@ -3999,6 +3955,65 @@ mod tests {
                 crate::bridge::test_support::PlatformCall::CompletionNotice { .. }
             )),
             "a Done card notifies: {:?}",
+            platform.calls.lock().await
+        );
+    }
+
+    /// The disposition-driven notice walks the table's classification: a
+    /// Waiting disposition (a caller that forgot to guard) stays silent, while
+    /// a Done disposition notifies with the true end's copy.
+    #[tokio::test]
+    async fn the_completion_notice_declines_a_disposition_that_has_not_ended() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        Turn::seed_card(&app.cards_handle(), "ses_test", Some("om_1")).await;
+        Turn::set_reply_target(&app.cards_handle(), "ses_test", "msg_1").await;
+        Turn::set_turn_identity(
+            &app.cards_handle(),
+            "ses_test",
+            crate::bridge::test_support::TEST_HOST,
+            true,
+            1,
+        )
+        .await;
+
+        send_completion_notice(
+            &app.cards_handle(),
+            &app.feishu,
+            &app.turn_config().notice_rules(),
+            "ses_test",
+            std::time::Instant::now(),
+            &Disposition::Waiting,
+        )
+        .await;
+        assert!(
+            !platform.calls.lock().await.iter().any(|call| matches!(
+                call,
+                crate::bridge::test_support::PlatformCall::CompletionNotice { .. }
+            )),
+            "a waiting disposition must never be announced"
+        );
+
+        send_completion_notice(
+            &app.cards_handle(),
+            &app.feishu,
+            &app.turn_config().notice_rules(),
+            "ses_test",
+            std::time::Instant::now(),
+            &Disposition::Done,
+        )
+        .await;
+        assert!(
+            platform.calls.lock().await.iter().any(|call| matches!(
+                call,
+                crate::bridge::test_support::PlatformCall::CompletionNotice {
+                    text,
+                    ..
+                } if text == "✅ 已完成。"
+            )),
+            "a Done disposition notifies with the true end's copy: {:?}",
             platform.calls.lock().await
         );
     }
