@@ -302,6 +302,32 @@ pub(crate) enum FreshDisposition {
     NoDecision,
 }
 
+impl FreshReads {
+    /// Whether the durable watermark already covers the Wake — a Wake a
+    /// previous cola life showed. A restart must not re-announce it (#424):
+    /// the watermark is the durable half of a chain's own `announced_wakes`,
+    /// so only a strictly newer Wake is owed. Equal server times read as
+    /// announced — the conservative side.
+    fn covered(&self) -> bool {
+        let Some(wake) = &self.wake else {
+            return false;
+        };
+        self.announced
+            .as_ref()
+            .is_some_and(|mark| wake.created_ms <= mark.created_ms)
+    }
+
+    /// Whether the content-diff probe is warranted: a placeable Wake the
+    /// watermark does not already cover and the conversation has not moved
+    /// past. An already-announced or stale Wake owes nothing whatever its
+    /// work renders, so the caller skips the probe (a full transcript scan) —
+    /// a probe never run leaves `renders` false, which the gate maps to
+    /// `Keep` anyway.
+    pub(crate) fn needs_render_probe(&self) -> bool {
+        self.wake.is_some() && !self.covered() && !self.stale
+    }
+}
+
 /// The Fresh gate (ADR-0069): whether a restart owes a Fresh Wake
 /// continuation. Pure over the read's facts — the durable watermark, the
 /// newest placeable Wake, whether the conversation moved past it, and whether
@@ -310,18 +336,7 @@ pub(crate) fn fresh(reads: &FreshReads) -> FreshDisposition {
     let Some(wake) = reads.wake.clone() else {
         return FreshDisposition::NoDecision;
     };
-    // A restart must not re-announce a Wake a previous cola life already
-    // showed (#424): the watermark is the durable half of a chain's own
-    // `announced_wakes`, so only a strictly newer Wake is owed. Equal server
-    // times read as announced — the conservative side.
-    if reads
-        .announced
-        .as_ref()
-        .is_some_and(|mark| wake.created_ms <= mark.created_ms)
-    {
-        return FreshDisposition::Keep;
-    }
-    if reads.stale || !reads.renders {
+    if reads.covered() || reads.stale || !reads.renders {
         return FreshDisposition::Keep;
     }
     FreshDisposition::Announce(wake)
@@ -658,7 +673,10 @@ mod tests {
                 wake_id: "msg_wake".into(),
                 created_ms,
             }),
-            wake: Some(anchor.clone()),
+            wake: Some(TurnAnchor {
+                message_id: MessageId::new("msg_wake"),
+                created_ms: 2_000,
+            }),
             stale,
             renders,
         };
@@ -694,6 +712,20 @@ mod tests {
             fresh(&reads(None, false, true)),
             FreshDisposition::Announce(anchor),
             "no watermark at all announces a rendering Wake"
+        );
+
+        // The plan skips the content probe for any Wake that can owe nothing:
+        // already announced, stale, or absent.
+        assert!(reads(None, false, false).needs_render_probe());
+        assert!(!reads(Some(2_000), false, false).needs_render_probe());
+        assert!(!reads(Some(3_000), false, false).needs_render_probe());
+        assert!(!reads(Some(1_000), true, false).needs_render_probe());
+        assert!(
+            !FreshReads {
+                wake: None,
+                ..reads(None, false, false)
+            }
+            .needs_render_probe()
         );
     }
 }

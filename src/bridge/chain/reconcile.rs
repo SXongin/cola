@@ -319,6 +319,8 @@ async fn apply(
             Turn::discard_spent_record(&handles.cards, session_id).await;
         }
         ChainDisposition::CollectThenRepoint { anchor } => {
+            // The decision only repoints a successor probe; a mismatch (the
+            // impossible case) claims nothing.
             let CardProbe::Successor { card_message_id, .. } = &reads.card else {
                 return;
             };
@@ -394,10 +396,10 @@ async fn settle_card(
     }
 }
 
-/// One record's apply state: the handles, the Session id, the record, the
-/// baseline directory the move verdict compares against, and the pass's read
-/// bound. Grouped so the settle and stamp calls carry only what differs
-/// between them.
+/// One record's apply state for the transcript settle: the handles, the
+/// Session id, the record, the baseline directory the move verdict compares
+/// against, and the pass's read bound. Grouped so each ending carries only
+/// its state and detail.
 struct ApplyPass<'a> {
     handles: &'a FlowHandles,
     session_id: &'a str,

@@ -3285,18 +3285,24 @@ impl Turn {
                 .and_then(|message| message.time)
                 .is_some_and(|time| time.created > anchor.created_ms)
         });
-        // The Wake's own work, scoped at its anchor, against an empty
-        // accumulator: a restart never replays the whole Turn.
-        let renders = wake.as_ref().is_some_and(|anchor| {
-            let probe = StreamAccumulator::new("");
-            render::renders_new_content(&probe, transcript, anchor)
-        });
-        match crate::bridge::chain::fresh(&crate::bridge::chain::FreshReads {
+        let mut reads = crate::bridge::chain::FreshReads {
             announced: cards.chains.announced(session_id),
             wake,
             stale,
-            renders,
-        }) {
+            renders: false,
+        };
+        // The Wake's own work, scoped at its anchor, against an empty
+        // accumulator: a restart never replays the whole Turn. The probe is a
+        // full transcript scan, so it runs only when the plan warrants it — an
+        // already-announced or stale Wake owes nothing regardless.
+        if reads.needs_render_probe() {
+            let probe = StreamAccumulator::new("");
+            reads.renders = reads
+                .wake
+                .as_ref()
+                .is_some_and(|anchor| render::renders_new_content(&probe, transcript, anchor));
+        }
+        match crate::bridge::chain::fresh(&reads) {
             crate::bridge::chain::FreshDisposition::Announce(anchor) => {
                 Some(WakeContinuation::Fresh { anchor })
             }
