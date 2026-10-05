@@ -228,6 +228,28 @@ async fn wait_for_patches(platform: &RecordingPlatform, message_id: &str, n: usi
         .unwrap_or_else(|_| panic!("{message_id} never reached {n} PATCHes"));
 }
 
+/// Wait until the record's restart stamp is marked permanently refused by
+/// Feishu (#522), or panic after 5 s — proof the rejected attempt resolved
+/// before the passes that must not retry it are asserted on.
+async fn wait_for_rejected_stamp(app: &Arc<App>, session_id: &str) {
+    let probe = async {
+        loop {
+            if app
+                .cards_handle()
+                .chains
+                .get(session_id)
+                .is_some_and(|record| record.restart_stamp_rejected)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), probe)
+        .await
+        .unwrap_or_else(|_| panic!("the stamp was never marked permanently refused"));
+}
+
 /// Wait until the fresh-Turn takeover's collect recorded its keep rule for
 /// `card_message_id` (ADR-0068), or panic after 5 s. The recorded rule is the
 /// observed point the takeover's collect reached its decision — before it
@@ -2460,6 +2482,62 @@ async fn a_failed_stamp_patch_retries_until_it_lands() {
     assert!(
         app.cards_handle().chains.get("ses_test").is_some(),
         "a still-live Session keeps its record"
+    );
+}
+
+/// #522: a stamp PATCH Feishu permanently refuses — a typed
+/// `CardContentRejected`, deterministic by ADR-0067's own treatment — is
+/// attempted once and given up for this process life: no later Session Sync
+/// tick retries the identical payload. The record stays (the pre-#443
+/// behavior for that rare card), and the real ending still supersedes it.
+#[tokio::test]
+async fn a_rejected_stamp_is_attempted_once_and_given_up() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
+
+    let (app, platform, backend) =
+        restarted_app_with_backend(&session_file, completed(1_000), Some(SessionStatus::Busy)).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+    // The one stamp attempt is refused as card content (230099): every later
+    // pass would send the identical payload, so none may be made.
+    platform
+        .fail_update_card_content_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+
+    spawn_sync(&app);
+    wait_for_rejected_stamp(&app, "ses_test").await;
+    // Several observed passes after the rejection: the mark holds.
+    wait_for_status_reads(&backend, "ses_test", 4).await;
+
+    let patches = patches_to(&platform, "om_frozen").await;
+    assert_eq!(
+        patches.len(),
+        1,
+        "the refused stamp is attempted once, never retried: {patches:?}"
+    );
+    assert!(
+        app.cards_handle().chains.get("ses_test").is_some(),
+        "a given-up stamp keeps its record — the card waits for its real ending"
+    );
+
+    // The run ends: transcript truth settles ✅, superseding the missing stamp.
+    backend
+        .set_session_status("ses_test", Some(SessionStatus::Idle))
+        .await;
+    wait_for_card_update(
+        &platform,
+        "the ✅ over the given-up stamp",
+        CardUpdates::Latest,
+        |card| card_header(card).contains("✅"),
+    )
+    .await;
+    let patches = patches_to(&platform, "om_frozen").await;
+    assert_eq!(patches.len(), 2, "the refused stamp then its settle: {patches:?}");
+    assert!(
+        app.cards_handle().chains.get("ses_test").is_none(),
+        "the ending spends the record"
     );
 }
 

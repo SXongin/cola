@@ -570,6 +570,16 @@ async fn stamp_restart_attempt(
     let card = restamped_keeping_body(&ending_card(CardState::Restarted, None, None), &view);
     if let Err(e) = platform.update_message(card_message_id, &card).await {
         tracing::warn!("live-card reap: session {session_id} could not stamp card {card_message_id}: {e}");
+        // #522: a definite content rejection is deterministic — the same
+        // preserved payload can never land — so this process life gives the
+        // stamp up instead of retrying it every Session Sync tick. Transient
+        // failures change nothing: the caller releases the claim either way,
+        // and the next pass retries them.
+        if matches!(e, crate::error::BridgeError::CardContentRejected { .. }) {
+            cards
+                .chains
+                .mark_restart_stamp_rejected(session_id, card_message_id);
+        }
         return;
     }
     tracing::info!(

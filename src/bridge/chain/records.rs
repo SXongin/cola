@@ -90,6 +90,17 @@ pub(crate) struct ChainRecord {
     /// and never survives a restart.
     #[serde(skip)]
     pub(crate) restart_stamping: bool,
+    /// In-memory only: a restart-stamp attempt for this card was permanently
+    /// refused by Feishu (`CardContentRejected`, #522) — the deterministic
+    /// refusal means the preserved payload can never land — so this process
+    /// life gives the stamp up instead of retrying it every Session Sync tick.
+    /// The record still keeps the card: it stays frozen until its real ending
+    /// supersedes the stamp, exactly the pre-#443 behavior for that rare card.
+    /// A fresh life starts unmarked (the refusal was about the payload, and
+    /// the stamp is idempotent), and a record rewritten for a new card starts
+    /// unmarked too.
+    #[serde(skip)]
+    pub(crate) restart_stamp_rejected: bool,
     /// In-memory only: the keep rule the fresh-Turn takeover's collect applied
     /// to the card this record replaced (ADR-0068). The #443 restart stamp's
     /// post-PATCH repair reads it so a stamp that lands over that takeover
@@ -115,6 +126,7 @@ impl ChainRecord {
             waiting_reaped: false,
             restarted_reaped: false,
             restart_stamping: false,
+            restart_stamp_rejected: false,
             predecessor_keep: None,
         }
     }
@@ -335,6 +347,18 @@ impl ChainRecords {
         self.set_reap_flag(session_id, card_message_id, |card| card.restarted_reaped = true)
     }
 
+    /// Mark that `card_message_id`'s restart stamp was permanently refused by
+    /// Feishu (`CardContentRejected`, #522): the same payload can never land,
+    /// so the reap gives the stamp up for this process life instead of
+    /// retrying it every Session Sync tick. In-memory only, like
+    /// [`Self::mark_restarted_reaped`]. Returns whether the record still names
+    /// that card (a stale mark for a replaced card is dropped).
+    pub(crate) fn mark_restart_stamp_rejected(&self, session_id: &str, card_message_id: &str) -> bool {
+        self.set_reap_flag(session_id, card_message_id, |card| {
+            card.restart_stamp_rejected = true
+        })
+    }
+
     /// Record the keep rule the fresh-Turn takeover's collect is about to
     /// apply to `card_message_id` (ADR-0068), so the #443 stamp's post-PATCH
     /// repair can reproduce it. Recorded before the collect's PATCH so a stamp
@@ -391,15 +415,16 @@ impl ChainRecords {
 
     /// Claim the one in-flight restart-stamp attempt for `card_message_id`
     /// (#443): true when the caller now owns the attempt, false when the
-    /// record moved on, the stamp already landed, or another attempt holds
-    /// the claim. In-memory only.
+    /// record moved on, the stamp already landed or was permanently refused
+    /// (#522), or another attempt holds the claim. In-memory only.
     pub(crate) fn begin_restart_stamp(&self, session_id: &str, card_message_id: &str) -> bool {
         let mut state = self.lock();
         match state.records.get_mut(session_id) {
             Some(card)
                 if card.card_message_id == card_message_id
                     && !card.restarted_reaped
-                    && !card.restart_stamping =>
+                    && !card.restart_stamping
+                    && !card.restart_stamp_rejected =>
             {
                 card.restart_stamping = true;
                 true
@@ -640,6 +665,49 @@ mod tests {
             ChainRecord::new("om_card_2", MessageId::new("msg_cola_1"), Some(1_000)),
         );
         assert!(!chains.get("ses_a").unwrap().waiting_reaped);
+    }
+
+    /// #522: the given-up stamp mark is in-memory only and card-scoped — once
+    /// set, no attempt may be claimed again for that card; a released claim
+    /// (a transient failure) stays retryable, a reload (a restart) and a
+    /// rewrite (a new live card) both forget the mark.
+    #[test]
+    fn the_rejected_stamp_mark_is_in_memory_and_card_scoped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE);
+        let chains = ChainRecords::load(path.clone());
+        chains.replace(
+            "ses_a",
+            ChainRecord::new("om_card_1", MessageId::new("msg_cola_1"), Some(1_000)),
+        );
+
+        // A released claim (the transient-failure path) may be retried.
+        assert!(chains.begin_restart_stamp("ses_a", "om_card_1"));
+        chains.finish_restart_stamp("ses_a", "om_card_1");
+        assert!(chains.begin_restart_stamp("ses_a", "om_card_1"));
+        chains.finish_restart_stamp("ses_a", "om_card_1");
+
+        assert!(!chains.mark_restart_stamp_rejected("ses_a", "om_other"));
+        assert!(!chains.get("ses_a").unwrap().restart_stamp_rejected);
+        assert!(chains.mark_restart_stamp_rejected("ses_a", "om_card_1"));
+        assert!(chains.get("ses_a").unwrap().restart_stamp_rejected);
+        assert!(
+            !chains.begin_restart_stamp("ses_a", "om_card_1"),
+            "a given-up stamp is never claimed again"
+        );
+
+        // A reload (a restart) forgets it; a rewrite (a new live card) resets it.
+        assert!(
+            !ChainRecords::load(path.clone())
+                .get("ses_a")
+                .unwrap()
+                .restart_stamp_rejected
+        );
+        chains.replace(
+            "ses_a",
+            ChainRecord::new("om_card_2", MessageId::new("msg_cola_1"), Some(1_000)),
+        );
+        assert!(!chains.get("ses_a").unwrap().restart_stamp_rejected);
     }
 
     /// ADR-0068's takeover keep rule is in-memory only and scoped to the
