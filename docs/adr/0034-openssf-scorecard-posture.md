@@ -261,10 +261,12 @@ the hang discarded.
 workload cleanly, and bounds the Codex step (12 minutes, `continue-on-error`)
 so a stall cannot burn the job. Its output is published only when complete —
 the last non-blank line must end with the verdict marker, markdown emphasis
-tolerated — through the shared parser `.github/codex/verdict.sh`, which the
-approve step reads the verdict with too and which `cargo test -p xtask
-codex_gate` exercises; trailing blank lines (a CRLF tail included) are trimmed
-so the verdict stays the comment's final line. A same-job retry was considered
+tolerated — through the shared parser `.github/codex/verdict.sh`, which
+`cargo test -p xtask codex_gate` exercises; trailing blank lines (a CRLF tail
+included) are trimmed so the verdict stays the comment's final line. Approval
+is stricter than publication: the marker must stand on its own line (emphasis
+tolerated), so a review that merely quotes the marker while blocking the
+change is published but never approved. A same-job retry was considered
 and rejected: the action's drop-sudo safety strategy removes passwordless sudo,
 so a second invocation in the job cannot start. Revisit the pin when the
 wrapper fix (#151) ships; the salvage stays useful against stream drops

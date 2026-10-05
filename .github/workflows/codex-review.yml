@@ -28,8 +28,11 @@
 # #151, is unreleased). The action is pinned to v1.11, whose wrapper handles
 # the same heavy workload cleanly, and the Codex step is bounded with its
 # output salvaged through `.github/codex/verdict.sh` (shared with the approve
-# step, tested by xtask), so a recurrence cannot discard a finished review. A
-# same-job retry is impossible: the action's drop-sudo safety strategy removes
+# step, tested by xtask), so a recurrence cannot discard a finished review.
+# Publication and approval are two tiers: a review whose last line ends with
+# the verdict is published, while approval requires the marker to stand on its
+# own line, so a quoted marker can never approve a change. A same-job retry is
+# impossible: the action's drop-sudo safety strategy removes
 # passwordless sudo, so a second invocation in the job cannot start. Revisit
 # the pin when the wrapper fix ships.
 #
@@ -164,11 +167,11 @@ jobs:
             exit 1
           fi
           # Publish only a COMPLETE review (the shared parser): its last
-          # non-blank line must end with the verdict marker, the line the
-          # approve step reads. A step that hung after writing the file
-          # (#150/#169) is salvaged here; a cut stream that stayed cut fails
-          # loudly instead of posting half a review. Trailing blank lines are
-          # trimmed so the verdict stays the comment's final line.
+          # non-blank line must end with the verdict marker. A step that hung
+          # after writing the file (#150/#169) is salvaged here; a cut stream
+          # that stayed cut fails loudly instead of posting half a review.
+          # Trailing blank lines are trimmed so the verdict stays the comment's
+          # final line; approval then requires the marker on its own line.
           if [ -z "$(codex_verdict_of_file codex-output.md)" ]; then
             echo "Codex output is incomplete (its last non-blank line does not end with the verdict); not posting." >&2
             exit 1
@@ -215,12 +218,12 @@ jobs:
             echo "PR head moved from $REVIEWED_SHA to $head; the run for it decides."
             exit 0
           fi
-          # Only the verdict the comment's last non-blank line ends with counts
-          # (the shared parser tolerates markdown emphasis around the value;
-          # anything after it — prose, punctuation — never approves).
+          # Only a marker that stands on its own line approves (markdown
+          # emphasis tolerated): a review that merely quotes the marker in
+          # prose is published but never approved — approval is fail-closed.
           body=$(gh api "repos/$GITHUB_REPOSITORY/issues/comments/$COMMENT_ID" --jq '.body // ""')
           last=$(printf '%s\n' "$body" | codex_last_line_stdin)
-          verdict=$(codex_verdict_of_line "$last")
+          verdict=$(codex_strict_verdict_of_line "$last")
           if [ "$verdict" != "PASS" ]; then
             echo "Verdict: ${verdict:-none}; not approving."
             exit 0

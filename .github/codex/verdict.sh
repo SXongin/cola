@@ -12,8 +12,14 @@
 # emphasis (`**…**`, a code span) around the value is tolerated because the
 # model emits it that way in practice; prose may precede the marker on the
 # same line, but anything after the value except emphasis or whitespace (a
-# period, more prose) makes the review incomplete, so a marker merely quoted
-# in a sentence never counts. The value itself stays exact.
+# period, more prose) makes the review incomplete.
+#
+# Publication and approval deliberately differ: a complete review is POSTED
+# even when the marker shares its line with prose (nothing a review says is
+# discarded), but the APPROVE step requires the marker to stand on its own
+# line (emphasis tolerated), because a review that merely quotes
+# `…CODEX_REVIEW_VERDICT: PASS` while blocking the change must never approve
+# it. Approval is fail-closed.
 
 # The last non-blank line of stdin (empty when there is none).
 codex_last_line_stdin() {
@@ -26,8 +32,16 @@ codex_last_line() {
 }
 
 # The PASS/FAIL verdict that line $1 ends with (empty when it carries none).
+# Used for publication/completeness, never for approval.
 codex_verdict_of_line() {
   printf '%s\n' "$1" | sed -nE 's/.*CODEX_REVIEW_VERDICT: (PASS|FAIL)[*`[:space:]]*$/\1/p'
+}
+
+# The PASS/FAIL verdict of a line that IS exactly the marker, modulo markdown
+# emphasis and whitespace (empty otherwise) — the only form the approve step
+# accepts.
+codex_strict_verdict_of_line() {
+  printf '%s\n' "$1" | sed -nE 's/^[*`[:space:]]*CODEX_REVIEW_VERDICT: (PASS|FAIL)[*`[:space:]]*$/\1/p'
 }
 
 # The verdict file $1 carries on its last non-blank line (empty when the

@@ -1,7 +1,8 @@
 //! The Codex gate's shared verdict parser (#530): one definition of "a
-//! complete review" and of the verdict it carries, exercised against the
-//! shapes the live gate has produced (plain, bolded, code span, CRLF, cut
-//! streams), plus a wiring check that the workflow actually uses the parser.
+//! complete review" (publication) and one of "the marker stands on its own
+//! line" (approval), exercised against the shapes the live gate has produced
+//! (plain, bolded, code span, CRLF, cut streams, quoted markers) plus a
+//! wiring check that the workflow actually uses the parser.
 
 #[cfg(all(test, unix))]
 mod tests {
@@ -39,6 +40,12 @@ mod tests {
         out.trim().to_string()
     }
 
+    fn strict_verdict_of(line: &str) -> String {
+        run_raw(&format!("codex_strict_verdict_of_line '{}'", line))
+            .trim()
+            .to_string()
+    }
+
     #[test]
     fn the_verdict_is_read_from_the_last_non_blank_line() {
         for (content, want) in [
@@ -55,6 +62,28 @@ mod tests {
             ("CODEX_REVIEW_VERDICT: PASS.\n", ""),
         ] {
             assert_eq!(verdict_of(content), want, "content: {content:?}");
+        }
+    }
+
+    #[test]
+    fn the_approval_marker_must_stand_on_its_own_line() {
+        for (line, want) in [
+            ("CODEX_REVIEW_VERDICT: PASS", "PASS"),
+            ("CODEX_REVIEW_VERDICT: FAIL", "FAIL"),
+            ("**CODEX_REVIEW_VERDICT: PASS**", "PASS"),
+            ("`CODEX_REVIEW_VERDICT: FAIL`", "FAIL"),
+            ("  CODEX_REVIEW_VERDICT: PASS  ", "PASS"),
+            // The false-approval case the #531 review raised: a review that
+            // quotes a PASS marker while blocking the change must not approve.
+            (
+                "This review is blocked; the quoted footer is **CODEX_REVIEW_VERDICT: PASS**",
+                "",
+            ),
+            ("CODEX_REVIEW_VERDICT: PASS and then prose", ""),
+            ("CODEX_REVIEW_VERDICT: PASS.", ""),
+            ("no marker at all", ""),
+        ] {
+            assert_eq!(strict_verdict_of(line), want, "line: {line:?}");
         }
     }
 
@@ -91,11 +120,16 @@ mod tests {
         for function in ["codex_verdict_of_file", "codex_trim_trailing_blanks"] {
             assert!(post.contains(function), "the post step must use {function}");
         }
-        // The approve step reads the verdict the same way.
+        // The approve step reads the verdict strictly: only a marker on its
+        // own line approves, never the publication parser (fail-closed).
         let approve = step(&workflow, "Approve when the verdict is clean");
-        for function in ["codex_last_line_stdin", "codex_verdict_of_line"] {
+        for function in ["codex_last_line_stdin", "codex_strict_verdict_of_line"] {
             assert!(approve.contains(function), "the approve step must use {function}");
         }
+        assert!(
+            !approve.contains("codex_verdict_of_line"),
+            "approval must not use the publication parser"
+        );
     }
 
     /// The YAML text of the step named `name`, up to the next step.
