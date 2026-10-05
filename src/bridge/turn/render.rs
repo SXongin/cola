@@ -650,9 +650,12 @@ pub(super) fn renders_new_content(
 /// (cola's own prompts) and the external-message renderer
 /// (`bridge::external`) — so the two never drift apart.
 ///
-/// Returns `Some((new_parts, text_len, reasoning_len))` when the accumulator is
-/// still present (the statistics are for logging); `None` when it vanished (the
-/// caller should stop).
+/// Returns `Some((new_parts, text_len, reasoning_len, changed))` when the
+/// accumulator is still present (the first three are the statistics the loops
+/// log); `None` when it vanished (the caller should stop). `changed` is
+/// whether this pass rendered anything at all — a new part OR a tool panel
+/// revision — the external renderer's progress signal for its idle bound
+/// (#457): the polls that do NOT renew are the ones that rendered nothing.
 pub(super) async fn render_and_flush(
     cards: &CardsHandle,
     sessions: &SessionsHandle,
@@ -660,7 +663,7 @@ pub(super) async fn render_and_flush(
     requests: &RequestsHandle,
     session_id: &str,
     transcript: &SessionTranscript,
-) -> Option<(usize, usize, usize)> {
+) -> Option<(usize, usize, usize, bool)> {
     // OpenCode auto-renames sessions after a turn; follow the server's live
     // title so the card subtitle doesn't stay on the "new session" default.
     refresh_session_title(cards, sessions, backend, session_id).await;
@@ -744,7 +747,7 @@ pub(super) async fn render_and_flush(
     if changed || header_changed || context_changed || ledger_changed || liveness_changed {
         Turn::flush_card(cards, session_id).await;
     }
-    Some((new_parts, text_len, reasoning_len))
+    Some((new_parts, text_len, reasoning_len, changed))
 }
 
 /// A child session's liveness as its transcript reports it (ADR-0054): the
@@ -948,7 +951,7 @@ async fn render_poll_loop(
             // Accumulator gone (turn completed and was cleaned up); keep polling
             // until the prompt returns so late parts are still caught.
             None => continue,
-            Some((new_parts, text_len, reasoning_len)) => {
+            Some((new_parts, text_len, reasoning_len, _)) => {
                 if new_parts > 0 {
                     tracing::info!(
                         "render poll: {} new parts, text={} reasoning={}",
