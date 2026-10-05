@@ -65,7 +65,7 @@ use super::decision::{self, CardProbe, ChainDisposition, RecoveryReads, Route, S
 use super::records::ChainRecord;
 use crate::backend::TurnSettle;
 use crate::bridge::handles::{CardsHandle, FlowHandles};
-use crate::bridge::turn::Turn;
+use crate::bridge::turn::{Disposition, Turn};
 use crate::feishu::card::{
     CardState, error_line, ledger::TASK_LEDGER_ELEMENT_ID, move_line, shell::CardBuilder,
 };
@@ -368,9 +368,13 @@ async fn apply(
 }
 
 /// PATCH the transcript's ending onto the record's card — keeping the body
-/// ([`ApplyPass::settle`]) — or mark a landed yield. `TurnSettle::Running`
-/// never arrives (the decision maps an undecided ending to `Keep`); it is
-/// spelled out for the match to stay exhaustive.
+/// ([`ApplyPass::settle`]) — or mark a landed yield. The ending is the one
+/// disposition table's ([`Disposition::from`]): the state the card wears and
+/// the failure line it records come from there, exactly as the live paths
+/// render them, so a restart-recovered card ends like a live one.
+/// `TurnSettle::Running` never arrives (the decision maps an undecided ending
+/// to `Keep`); its disposition is [`Disposition::Observe`], which is no ending
+/// and claims nothing.
 async fn settle_card(
     handles: &FlowHandles,
     session_id: &str,
@@ -391,25 +395,19 @@ async fn settle_card(
         baseline_directory: route.baseline,
         read_timeout_ms,
     };
-    match settle {
-        TurnSettle::Complete => {
-            pass.settle(CardState::Done, None).await;
-        }
-        TurnSettle::Failed(error) => {
-            pass.settle(CardState::Error, Some(&error_line(&error))).await;
-        }
-        TurnSettle::Waiting => {
-            if pass.settle(CardState::Waiting, None).await {
-                handles
-                    .cards
-                    .chains
-                    .mark_waiting_reaped(session_id, &record.card_message_id);
-            }
-        }
-        TurnSettle::Unreceived => {
-            pass.settle(CardState::Unreceived, None).await;
-        }
-        TurnSettle::Running => {}
+    let disposition = Disposition::from(settle);
+    let Some(state) = disposition.card_state() else {
+        // `Observe`: the ending is not decided, so no card is claimed.
+        return;
+    };
+    // The waiting mark follows a landed Waiting PATCH alone (ADR-0059).
+    let waiting = state == CardState::Waiting;
+    let detail = disposition.failure().map(error_line);
+    if pass.settle(state, detail.as_deref()).await && waiting {
+        handles
+            .cards
+            .chains
+            .mark_waiting_reaped(session_id, &record.card_message_id);
     }
 }
 

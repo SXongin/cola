@@ -10,6 +10,14 @@ mod state;
 /// through the interface above (spec #298, A3).
 pub(crate) use state::CardSession;
 
+/// The one ending vocabulary (spec #538): the table every path that ends a
+/// card reads — the in-Turn paths through [`Turn::apply_disposition`], the
+/// out-of-turn loop and the durable reap through its `From<TurnSettle>`
+/// mapping. Crate-visible so a path outside the Turn module (the reap's card
+/// translation in `chain::reconcile`) reads the same table instead of a second
+/// state/failure mapping.
+pub(crate) use disposition::Disposition;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -27,7 +35,6 @@ use crate::config::ThreadKey;
 use crate::feishu::client::ImageAttachment;
 use crate::opencode;
 use crate::opencode::types::SessionStatus;
-use disposition::Disposition;
 
 /// How long one Backend read in the post-prompt drain may take before it is
 /// abandoned. The drain's own bound caps this further per call: a hung
