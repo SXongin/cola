@@ -3010,6 +3010,41 @@ async fn a_record_that_lagged_a_handover_collects_the_orphan_and_repoints() {
     );
 }
 
+/// A successor can be attached before its Turn anchor is armed, and the
+/// collect's awaited PATCH is the window where the anchor lands. The pre-split
+/// pass re-read the armed anchor AFTER the collect, so an anchor that appears
+/// while the collect is parked must still re-point the record at the
+/// successor — never be read as absent and release it, which would leave the
+/// live card unreaped after a later restart.
+#[tokio::test]
+async fn an_anchor_armed_during_the_collect_still_repoints_the_record() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_chain_record(
+        &session_file,
+        ChainRecord::new("om_old", MessageId::new("msg_cola_anchor"), Some(1_000))
+            .with_directory(Some("/work".into())),
+    );
+
+    let (app, platform) = restarted_app(&session_file, completed(1_000), None).await;
+    // The process's live card: a handover the record missed — attached, but
+    // its anchor is armed only while the collect is in flight.
+    Turn::seed_card(&app.cards_handle(), "ses_test", Some("om_live")).await;
+    // Park the collect's PATCH after the pass entered the successor branch.
+    let (entered, release) = platform.pause("update", "om_old");
+
+    spawn_sync_with_timeout(&app, 5_000);
+    entered.notified().await;
+    // The takeover arms its anchor while the collect awaits.
+    Turn::set_turn_anchor(&app.cards_handle(), "ses_test", &turn_anchor(1_000)).await;
+    release.notify_one();
+
+    // The record follows the successor with its freshly armed anchor — never
+    // released as an anchorless one.
+    wait_for_record_card(&app, "ses_test", "om_live").await;
+}
+
 /// The acceptance feedback fix (#434): a collected orphan keeps what it already
 /// showed — the takeover restamps the header over the fetched body, with the
 /// old card's controls stripped (a whole-card read returns no button `value`,

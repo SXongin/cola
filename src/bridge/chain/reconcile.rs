@@ -158,6 +158,19 @@ pub(crate) async fn reconcile(
     read_timeout_ms: u64,
 ) {
     let mut reads = gather_reads(handles, session_id, record, directory, tracked_directory).await;
+    // The successor branch's collect runs before the decision: its awaited
+    // orphan PATCH is exactly where a takeover can arm the successor's anchor,
+    // and the pre-split pass re-read the anchor after the collect so an anchor
+    // landing in that window re-points the record instead of being missed.
+    // Only the anchor is re-read — the id and running stay the pre-collect
+    // facts the pre-split pass entered the branch with.
+    if reads.needs_successor_collect() {
+        collect_orphan(&handles.cards, session_id, &record.card_message_id).await;
+        let anchor = Turn::armed_turn_anchor(&handles.cards, session_id).await;
+        if let CardProbe::Successor { anchor: slot, .. } = &mut reads.card {
+            *slot = anchor;
+        }
+    }
     if reads.needs_status()
         && let Some(route) = reads.route
     {
@@ -289,9 +302,9 @@ async fn read_transcript(handles: &FlowHandles, session_id: &str, read_timeout_m
 
 /// The card writes one disposition owns. `Keep` is the whole silent arm;
 /// `NoDecision` logs the one diagnosis the reads did not (a missing route);
-/// the collect arms go through [`collect_orphan`] and then move the record;
-/// the stamp hands off to the detached attempt; the settle PATCHes the ending
-/// in place.
+/// the collect arms only move the record — the successor's [`collect_orphan`]
+/// already ran before the decision (see [`reconcile`]); the stamp hands off to
+/// the detached attempt; the settle PATCHes the ending in place.
 async fn apply(
     handles: &FlowHandles,
     session_id: &str,
@@ -319,12 +332,13 @@ async fn apply(
             Turn::discard_spent_record(&handles.cards, session_id).await;
         }
         ChainDisposition::CollectThenRepoint { anchor } => {
-            // The decision only repoints a successor probe; a mismatch (the
-            // impossible case) claims nothing.
+            // The successor's collect already ran (before the decision, in
+            // `reconcile`); only the record moves here. The decision only
+            // repoints a successor probe; a mismatch (the impossible case)
+            // claims nothing.
             let CardProbe::Successor { card_message_id, .. } = &reads.card else {
                 return;
             };
-            collect_orphan(&handles.cards, session_id, &record.card_message_id).await;
             handles.cards.chains.replace(
                 session_id,
                 ChainRecord::new(
@@ -338,7 +352,8 @@ async fn apply(
             );
         }
         ChainDisposition::CollectThenRelease => {
-            collect_orphan(&handles.cards, session_id, &record.card_message_id).await;
+            // The collect already ran; the successor cannot carry a record —
+            // it settled, or it still has no anchor to scope a reap with.
             handles.cards.chains.remove(session_id);
         }
         ChainDisposition::StampRestart => {
