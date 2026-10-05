@@ -650,9 +650,7 @@ pub(super) fn renders_new_content(
     })
 }
 
-/// What one render pass did, read by the loops that drive it: the statistics
-/// both log, plus whether the pass produced observable progress — the external
-/// renderer's signal for its idle bound (#457).
+/// What one render pass did, for the loops that log it.
 pub(crate) struct RenderStats {
     /// Parts appended to the card this pass (text/reasoning chunks).
     pub(crate) new_parts: usize,
@@ -660,14 +658,6 @@ pub(crate) struct RenderStats {
     pub(crate) text_len: usize,
     /// The card's cumulative reasoning length after the pass (logging).
     pub(crate) reasoning_len: usize,
-    /// Whether the pass produced observable progress: rendered content, a tool
-    /// panel revision, a live task fragment change, a ledger row's visible
-    /// facts moving, or a context-token update — everything the pass flushes
-    /// for EXCEPT the per-second header timer and a rendered elapsed/age
-    /// crossing its cadence (clock churn is not new work). The external
-    /// renderer renews its idle bound on this; header-timer churn alone must
-    /// never renew it, or the bound could never fire.
-    pub(crate) progressed: bool,
 }
 
 /// Render the session's transcript into the streaming card and flush it when
@@ -676,9 +666,11 @@ pub(crate) struct RenderStats {
 /// (`bridge::external`) — so the two never drift apart.
 ///
 /// Returns `Some(stats)` when the accumulator is still present; `None` when it
-/// vanished (the caller should stop). [`RenderStats::progressed`] is the
-/// external renderer's progress signal: a poll that made no observable
-/// progress does not renew its idle bound.
+/// vanished (the caller should stop). The pass bumps the accumulator's
+/// observable-progress mark ([`StreamAccumulator::progress_mark`], exposed as
+/// `Turn::progress_mark`) as each stage renders, which is what the external
+/// renderer's idle bound renews on; a pass abandoned by a timeout still
+/// leaves the marks its completed stages made.
 pub(super) async fn render_and_flush(
     cards: &CardsHandle,
     sessions: &SessionsHandle,
@@ -695,6 +687,13 @@ pub(super) async fn render_and_flush(
         let card = live.get_mut(session_id)?;
         let before = card.acc.rendered_parts.len();
         let changed = render_turn_parts(&mut card.acc, transcript);
+        if changed {
+            // Mark the progress NOW: a later stage of this pass may be
+            // abandoned by the caller's timeout (#457), and the external
+            // renderer renews from the accumulator's mark, not from a flag a
+            // cancelled pass can never return.
+            card.acc.progress_mark += 1;
+        }
         // The Turn anchor this render captured (or already carried) plus the
         // card it belongs to: the durable live-card record's anchor is written
         // below, outside the lock (ADR-0063).
@@ -738,6 +737,9 @@ pub(super) async fn render_and_flush(
                 let sig = card.acc.context_sig();
                 let changed = card.last_context_sig != sig;
                 card.last_context_sig = sig;
+                if changed {
+                    card.acc.progress_mark += 1;
+                }
                 changed
             }
             None => false,
@@ -760,29 +762,28 @@ pub(super) async fn render_and_flush(
     let (ledger, liveness_changed) = {
         let mut live = cards.cards.lock().await;
         match live.get_mut(session_id) {
-            Some(card) => (
-                refresh_ledger(&mut card.acc, transcript, &liveness),
-                apply_task_liveness(&mut card.acc, &panel_children, &liveness),
-            ),
+            Some(card) => {
+                let ledger = refresh_ledger(&mut card.acc, transcript, &liveness);
+                let liveness_changed = apply_task_liveness(&mut card.acc, &panel_children, &liveness);
+                // Only the ROW half is progress: a rendered elapsed/age
+                // crossing its cadence (the clock half) must not renew the
+                // external renderer's idle bound, or a silent task's ticking
+                // age would keep its card live forever (#457).
+                if ledger.rows || liveness_changed {
+                    card.acc.progress_mark += 1;
+                }
+                (ledger, liveness_changed)
+            }
             None => (super::state::LedgerChange::default(), false),
         }
     };
-    // Observable progress: everything this pass flushes for except the
-    // per-second header timer, which ticks on an idle run by design. The
-    // external renderer's idle bound renews on this and must not read the
-    // header second as progress (#457). The ledger contributes only its ROW
-    // half — a rendered elapsed/age crossing its cadence is clock churn, not
-    // new work, and renewing on it would keep a silent task's card live
-    // forever.
-    let progressed = changed || context_changed || ledger.rows || liveness_changed;
-    if progressed || header_changed || ledger.clock {
+    if changed || header_changed || context_changed || ledger.owes() || liveness_changed {
         Turn::flush_card(cards, session_id).await;
     }
     Some(RenderStats {
         new_parts,
         text_len,
         reasoning_len,
-        progressed,
     })
 }
 

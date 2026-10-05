@@ -2220,6 +2220,57 @@ async fn a_live_panel_outranks_the_wake_settle() {
     );
 }
 
+/// #457: the renderer's idle bound and the Wake settle grace are independent
+/// knobs. A tiny idle bound must not shorten the grace — the stuck panel still
+/// gets its full window, and the grace is what ends the card (setting either
+/// knob always moves its own timing, never the other's).
+#[tokio::test]
+async fn a_tiny_idle_bound_does_not_shorten_the_wake_settle_grace() {
+    let _wd = test_work_dir();
+    let waiting = yielding_shell_transcript();
+    let (_dir, app, backend, platform) = scripted_app(vec![waiting], Some(SessionStatus::Idle)).await;
+    Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下 CI"))
+        .await
+        .unwrap();
+
+    // The resumed run leaves a live `⏳` panel the settle must grace.
+    script_transcript(
+        &backend,
+        vec![
+            woken_shell_transcript(vec![assistant_with_live_tool(3_100)], &[2_500, 4_000])
+                .with_background_tasks(vec![another_background_shell(3_200)]),
+        ],
+    )
+    .await;
+    // The two knobs are separate: the idle bound is 1 ms (it must not matter
+    // here), the settle grace is the long one. `spawn_sync` injects the loop
+    // cadences (20 ms sync / 5 ms settle), so the grace's own timing is
+    // observable.
+    app.external.render_idle_timeout_ms.store(1, Ordering::Relaxed);
+    app.external.wake_settle_grace_ms.store(300, Ordering::Relaxed);
+    spawn_sync(&app);
+
+    // The resume lands, then the panel waits out its grace: well before 300 ms
+    // a tiny idle bound must not have ended anything.
+    wait_for_card_update(&platform, "the resuming card", CardUpdates::Latest, |card| {
+        card_header(card).contains("继续处理")
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let live = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        !card_header(&live).contains("出错"),
+        "a 1 ms renderer idle bound must not shorten the 300 ms settle grace: {live}"
+    );
+    // The grace itself still ends the stuck panel.
+    wait_for_card_header(&platform, "出错").await;
+    let last = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_text(&last).contains("未收尾"),
+        "the grace's own stuck-panel ending: {last}"
+    );
+}
+
 /// The status-read rule the shared loop adopted from the follow: a Wake
 /// continuation whose status read fails never claims an ending from the
 /// transcript — it reads settleable here — and the lost-contact grace owns the

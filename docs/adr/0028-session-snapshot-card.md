@@ -116,10 +116,12 @@ ledger row's visible facts moving, or a context-token update: everything the
 pass flushes for except the per-second header timer and the rendered numbers
 (a row's elapsed or age) crossing their cadence — those tick on a silent run
 by design and must not renew the bound, or the card of a run that stopped
-producing would stay live forever. A run whose card shows nothing new for the
-whole window is treated as not producing and ends under the old rule: partial
-content finalizes Done, and a message that never produced still leaves its
-有新消息 notification untouched. Every read in a poll is bounded — the parent
+producing would stay live forever. The renewal reads the accumulator's own
+progress mark — advanced as each render stage produces — so content a pass had
+already rendered before its timeout abandoned it still counts. A run whose
+card shows nothing new for the whole window is treated as not producing and
+ends under the old rule: partial content finalizes Done, and a message that
+never produced still leaves its 有新消息 notification untouched. Every read in a poll is bounded — the parent
 transcript explicitly and the render pass as a whole, so a hung child-session
 read in the liveness gather cannot park the loop — and a failed or timed-out
 poll counts as no progress, so a wedged Backend cannot hold the card live

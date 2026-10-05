@@ -2357,6 +2357,21 @@ impl Turn {
         })
     }
 
+    /// The accumulator's observable-progress serial (#457): bumped by every
+    /// render stage that changes content, a panel revision, a live fragment,
+    /// ledger rows, or context tokens — never by the header tick or a rendered
+    /// clock number. The external renderer renews its idle bound when this
+    /// advances; reading the card (not a pass's return value) means progress a
+    /// timed-out pass had already rendered still counts.
+    pub(crate) async fn progress_mark(cards: &CardsHandle, session_id: &str) -> Option<u64> {
+        cards
+            .cards
+            .lock()
+            .await
+            .get(session_id)
+            .map(|c| c.acc.progress_mark)
+    }
+
     /// Whether the session's card still carries an unfinished Tool Panel the
     /// Turn owns — a call whose status is `running` or `pending` (both render
     /// `⏳`). The drain follow's Done decision waits for these to settle (#284):

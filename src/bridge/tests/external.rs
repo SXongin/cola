@@ -1856,6 +1856,97 @@ async fn external_reply_render_idles_out_when_a_child_read_hangs() {
     backend.release_transcript_for("ses_child").await;
 }
 
+/// #457: progress a pass rendered BEFORE its timeout abandoned it still
+/// renews. The parent gains a text part every tick while the child read hangs,
+/// so every pass renders then stalls: the accumulator's progress mark is what
+/// keeps the loop alive past its bound, and the scripted last part is only
+/// reachable with it.
+#[tokio::test]
+async fn external_reply_render_renews_on_progress_rendered_before_a_stall() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut mock = MockBackend::new(realistic_parts());
+    // Each snapshot adds one text part; the parent's live subagent hangs the
+    // pass in the gather AFTER the part rendered.
+    let snapshots: Vec<SessionTranscript> = (1..=30)
+        .map(|i| {
+            let mut messages = vec![
+                user("msg_ext_user", 2_000_000, "OpenChamber 里发的消息"),
+                live_subagent_reply(2_001_000, "ses_child"),
+            ];
+            let parts: Vec<Part> = (1..=i).map(|j| text_part(&format!("第{j}段。"))).collect();
+            messages.push(typed_message(
+                "msg_ext_assist",
+                MessageRole::Assistant,
+                Some(2_002_000),
+                parts,
+            ));
+            SessionTranscript::new(messages)
+        })
+        .collect();
+    mock.given_transcript("ses_ext", snapshots);
+    mock.given_transcript(
+        "ses_child",
+        vec![SessionTranscript::new(vec![typed_message(
+            "msg_child_assist",
+            MessageRole::Assistant,
+            Some(2_100_000),
+            vec![text_part("子任务进行中。")],
+        )])],
+    );
+    let backend = Arc::new(mock);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
+            session_id: "ses_ext".into(),
+            directory: "/tmp/ext".into(),
+            agent: None,
+            model: None,
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        },
+    )
+    .await;
+    app.external
+        .render_poll_ms
+        .store(5, std::sync::atomic::Ordering::Relaxed);
+    app.external
+        .request_timeout_ms
+        .store(10, std::sync::atomic::Ordering::Relaxed);
+    app.external
+        .render_idle_timeout_ms
+        .store(60, std::sync::atomic::Ordering::Relaxed);
+
+    backend.hang_transcript_for("ses_child").await;
+    app.external
+        .start_reply_render(
+            &app.flow_handles(),
+            "ses_ext",
+            &anchor(2_000_000),
+            "msg_sent",
+            "OpenChamber 里发的消息",
+        )
+        .await;
+
+    // Each pass renders one more part and is then abandoned by the 10 ms pass
+    // bound; the 60 ms idle bound must not fire while that rendering keeps
+    // happening, so the last part is only reachable through the progress mark.
+    wait_for_card_update(
+        &platform,
+        "the last part rendered before the stalls",
+        CardUpdates::Latest,
+        |card| card_text(card).contains("第30段"),
+    )
+    .await;
+    backend.release_transcript_for("ses_child").await;
+}
+
 /// #451: a Feishu Supplement landing during an external follow is a
 /// cola-authored message merged into the SAME run — only a newer EXTERNAL
 /// message is a turn boundary (ADR-0028). Before the fix the follow's renderer
