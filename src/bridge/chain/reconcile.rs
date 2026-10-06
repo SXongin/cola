@@ -523,6 +523,12 @@ async fn send_projected_chain(
             // left is no longer ours to render.
             return ProjectedChain::Stopped(last);
         };
+        // The same write-ahead intent as the first create (spec #561, review
+        // #569), scoped to the last TRACKED slice's card: this slice's create
+        // may land before its own re-point, so a crash must leave the durable
+        // single-shot fact behind. The re-point consumes it; a definite
+        // non-delivery clears it below so a later life may resume the chain.
+        handles.cards.chains.note_projection_intent(session_id, &last);
         let delivered = match target {
             ProjectTarget::Reply(reply_to) => handles.cards.feishu.reply_card(reply_to, &slice.card).await,
             ProjectTarget::TopLevel(chat) => {
@@ -535,6 +541,11 @@ async fn send_projected_chain(
                 tracing::warn!(
                     "live-card reap: session {session_id} could not continue its successor chain: {e}"
                 );
+                if e.is_definite_non_delivery() {
+                    // No message was created: the intent is cleared, so a later
+                    // life can resume the chain from the last tracked slice.
+                    handles.cards.chains.clear_projection_intent(session_id, &last);
+                }
                 return ProjectedChain::Stopped(last);
             }
         };
@@ -672,6 +683,17 @@ async fn send_projected_successor(
         watermark_stage: projected.watermark_stage,
         full: projected.full,
     };
+    // The write-ahead intent (spec #561, review #569), persisted BEFORE the
+    // create: a process that dies between the create landing and the takeover's
+    // re-point leaves this durable single-shot fact on the record, so the next
+    // life treats the create as ambiguous and never re-posts a duplicate
+    // successor (the old card takes the state-repair path). The success path
+    // consumes it — the takeover rewrites the record — and a definite
+    // non-delivery clears it below so a retry stays safe.
+    handles
+        .cards
+        .chains
+        .note_projection_intent(session_id, &record.card_message_id);
     let new_card_id = loop {
         let delivered = match target {
             ProjectTarget::Reply(reply_to) => handles.cards.feishu.reply_card(reply_to, &slice.card).await,
@@ -699,6 +721,13 @@ async fn send_projected_successor(
                             .cards
                             .chains
                             .mark_projection_attempted(session_id, &record.card_message_id);
+                        // The rejection proves the platform created no message,
+                        // so a later life may retry (and re-refuse) rather than
+                        // being blocked by a stale intent.
+                        handles
+                            .cards
+                            .chains
+                            .clear_projection_intent(session_id, &record.card_message_id);
                         Turn::drop_armed_session(&handles.cards, session_id, chain_id).await;
                         return Some(Projection::Stopped);
                     };
@@ -708,13 +737,20 @@ async fn send_projected_successor(
                 if e.is_definite_non_delivery() {
                     // The platform created no message: the record stays
                     // retryable and the next pass re-attempts (spec #561,
-                    // review #569).
+                    // review #569) — and the write-ahead intent is cleared, so
+                    // a restart may retry too.
+                    handles
+                        .cards
+                        .chains
+                        .clear_projection_intent(session_id, &record.card_message_id);
                     Turn::drop_armed_session(&handles.cards, session_id, chain_id).await;
                     return Some(Projection::Retryable);
                 }
                 // Ambiguous — the send may have landed: single-shot. The mark
-                // keeps every later pass from re-posting; the record stays for
-                // the reap's in-place state repair. The phantom session is
+                // keeps every later pass from re-posting, the durable intent
+                // keeps every later LIFE from re-posting (review #569), and the
+                // record stays for the reap's in-place state repair. The phantom
+                // session is
                 // dropped only while it is still this pass's armed one.
                 handles
                     .cards

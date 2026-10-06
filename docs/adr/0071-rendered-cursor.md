@@ -163,14 +163,24 @@ projects the chain's delta after it onto a successor card.**
   reconcile marks, and no later pass this life re-posts: the record stays, the
   old card is state-repaired in place by transcript truth, and the ambiguous
   card is left as it fell. The trade: an ambiguous create can leave the
-  successor unposted and the old card state-repaired, never duplicated. A
+  successor unposted and the old card state-repaired, never duplicated. The
+  single-shot fact is also written AHEAD durably (review #569): before every
+  successor create — the first and each chain continuation — the record
+  carries a projection intent (the same sidecar, the same atomic write), so a
+  process that dies between the create landing and the takeover's re-point
+  leaves it behind; the next life treats the create as ambiguous and never
+  re-posts, and the old card takes the state-repair path. The intent is
+  consumed by the takeover's re-point (a fresh record carries none) and cleared
+  on a definite non-delivery, so a retry stays safe and a later life may resume
+  a chain stopped by a definite slice failure from the last tracked slice. A
   **definite** non-delivery is not single-shot: a card-content rejection or an
   explicit 4xx refusal proves the platform created no message, so the record
   stays retryable — the next pass re-attempts, and a content rejection is
   re-rendered once through the flush's fenced fallback so the tail can still
   land (a content rejection that survives the fenced retry is suspended:
-  single-shot, the payload can never land). A restart forgets the mark,
-  exactly like every in-memory reconcile mark. A successor create that lands
+  single-shot, the payload can never land). A restart forgets the in-memory
+  mark, exactly like every in-memory reconcile mark — the durable intent is
+  what carries the single-shot fact across lives. A successor create that lands
   AFTER a fresh Turn already won the chain is collected **without its body** —
   the winner's message-first seed re-rendered the same tail, so preserving it
   would make the reader read the text twice — the one deliberate departure

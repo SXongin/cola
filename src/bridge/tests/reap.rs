@@ -4914,6 +4914,18 @@ async fn an_ambiguous_adoption_create_is_never_retried() {
         0,
         "a failed adoption never stamps or collects the old card"
     );
+    // The attempt's write-ahead intent is durable (spec #561, review #569): a
+    // crash between the create and the re-point leaves it behind, so the next
+    // life treats the create as ambiguous too.
+    let persisted =
+        crate::bridge::chain::ChainRecords::load(session_file.with_file_name("chain_records.json"));
+    assert!(
+        persisted
+            .get("ses_test")
+            .expect("the failed attempt keeps the record")
+            .projection_intent,
+        "the ambiguous create leaves its durable write-ahead intent"
+    );
 
     // The run ends: the reap settles the old card in place, still no successor.
     backend
@@ -7283,5 +7295,129 @@ async fn an_identical_new_answer_renders_after_the_seeded_takeover() {
         text.matches(answer).count(),
         1,
         "the new Turn's identical answer renders exactly once: {text}"
+    );
+}
+
+/// A crash after the successor create landed but before the takeover re-pointed
+/// the record (spec #561, review #569): the next process still sees the old
+/// card and cursor, but the write-ahead intent the projection persisted BEFORE
+/// the create makes the attempt single-shot across lives — no second successor
+/// is ever posted, and the old card takes the documented state-repair path.
+#[tokio::test]
+async fn a_crash_after_the_successor_create_never_re_posts_on_restart() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let delivered = "已经写了一半。";
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
+        Some(text_frontier(delivered)),
+        &[],
+    );
+    // The state the crash leaves: the create landed (nothing re-pointed the
+    // record) and only the intent is durable.
+    crate::bridge::chain::ChainRecords::load(session_file.with_file_name("chain_records.json"))
+        .note_projection_intent("ses_test", "om_frozen");
+
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "问题"),
+        assistant(2_000, &format!("{delivered}后半段。")),
+    ])
+    .with_executions(vec![execution(2_500)]);
+    let (app, platform, backend) =
+        restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Idle)).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+
+    spawn_sync(&app);
+    // The reap wrote the old card: on the fix its state-repair settle (✅); on
+    // the bug the projection's collect of a re-posted successor.
+    let _ = &backend;
+    wait_for_update(
+        &platform,
+        "om_frozen",
+        "the reap's write to the old card",
+        |card| card_header(card).contains("✅") || card_header(card).contains("已由新卡片接管"),
+    )
+    .await;
+
+    assert_eq!(
+        card_posts(&platform).await,
+        0,
+        "the successor create is never re-posted after a crash: {:?}",
+        platform.calls.lock().await
+    );
+    // The old card follows the documented state-repair path, and the record
+    // releases.
+    let settled = last_update_of(&platform, "om_frozen")
+        .await
+        .expect("the old card is written");
+    assert_eq!(
+        card_header(&settled),
+        "✅ 完成",
+        "the old card takes the state-repair path: {settled}"
+    );
+    wait_for_record_gone(&app, "ses_test").await;
+}
+
+/// A DEFINITE create failure leaves no durable intent (spec #561, review #569):
+/// the platform proved it created no message, so a restart may retry and the
+/// missed tail still lands exactly once.
+#[tokio::test]
+async fn a_definite_refusal_leaves_no_durable_intent_across_a_restart() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let delivered = "已经写了一半。";
+    let missed = "后半段是在停机期间写完的。";
+    let full = format!("{delivered}{missed}");
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
+        Some(text_frontier(delivered)),
+        &[],
+    );
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "问题"),
+        assistant(2_000, &full),
+    ])
+    .with_executions(vec![execution(2_500)]);
+    // Life 1: the create is refused with an explicit 4xx (no message made) and
+    // the process dies before the retry lands.
+    {
+        let (app, platform, _backend) =
+            restarted_app_with_backend(&session_file, transcript.clone(), Some(SessionStatus::Idle)).await;
+        platform.given_card_view("om_frozen", realistic_card_view());
+        platform.given_reply_card_outcome(crate::bridge::test_support::ReplyOutcome::Refused(400));
+        spawn_sync_with_timeout(&app, 300);
+        wait_for_transcript_reads(&_backend, "ses_test", 1).await;
+    }
+    let persisted =
+        crate::bridge::chain::ChainRecords::load(session_file.with_file_name("chain_records.json"));
+    assert!(
+        !persisted
+            .get("ses_test")
+            .expect("the refused attempt keeps the record")
+            .projection_intent,
+        "a definite non-delivery leaves no durable intent"
+    );
+
+    // Life 2: the restart retries and the missed tail lands exactly once.
+    let (app, platform, _backend) =
+        restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Idle)).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+    spawn_sync(&app);
+    wait_for_posted_text(&platform, missed).await;
+    assert_eq!(
+        platform.replied_cards().await.len(),
+        1,
+        "the retry is the once-and-only post: {:?}",
+        platform.calls.lock().await
     );
 }

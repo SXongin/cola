@@ -195,6 +195,17 @@ pub(crate) struct ChainRecord {
     /// unmarked, and the mark never survives a restart.
     #[serde(skip)]
     pub(crate) projection_attempted: bool,
+    /// Durable (spec #561, review #569): a successor create is in flight for
+    /// this chain. Persisted BEFORE the create — the projection's write-ahead
+    /// intent — so a process that dies between the create and the takeover's
+    /// re-point leaves the single-shot fact behind: the next life treats the
+    /// create as ambiguous and never re-posts a duplicate, and the old card
+    /// takes the state-repair path. Consumed when the projection succeeds (the
+    /// takeover rewrites the record, and a fresh record starts unmarked) or
+    /// cleared when a DEFINITE non-delivery proves no message was created, so a
+    /// retry stays safe. Scoped to the record's generation by its own lifetime.
+    #[serde(default)]
+    pub(crate) projection_intent: bool,
     /// The Rendered Cursor (spec #561): how far this chain's card has
     /// confirmed rendered. `None` — cursorless — is an older release's record
     /// or a chain whose first confirmed write has not landed; both read as the
@@ -220,6 +231,7 @@ impl ChainRecord {
             restart_stamp_rejected: false,
             predecessor_keep: None,
             projection_attempted: false,
+            projection_intent: false,
             cursor: None,
         }
     }
@@ -576,6 +588,42 @@ impl ChainRecords {
         })
     }
 
+    /// Persist the projection's write-ahead intent BEFORE its successor create
+    /// (spec #561, review #569): a process that dies between the create and the
+    /// takeover's re-point leaves this durable single-shot fact behind, so the
+    /// next life treats the create as ambiguous and never re-posts. Scoped to
+    /// the record naming `card_message_id`: a later re-point rewrites the
+    /// record, which starts unmarked.
+    pub(crate) fn note_projection_intent(&self, session_id: &str, card_message_id: &str) -> bool {
+        self.set_projection_intent(session_id, card_message_id, true)
+    }
+
+    /// Clear the write-ahead intent once a DEFINITE non-delivery proves the
+    /// platform created no message, so a later pass or restart may retry
+    /// (spec #561, review #569). Scoped to the record naming `card_message_id`,
+    /// exactly like [`Self::note_projection_intent`].
+    pub(crate) fn clear_projection_intent(&self, session_id: &str, card_message_id: &str) -> bool {
+        self.set_projection_intent(session_id, card_message_id, false)
+    }
+
+    /// The shared body of the write-ahead intent's set/clear: apply it while
+    /// the record still names `card_message_id` and persist the change. A value
+    /// already current is left alone, so repeated notes never rewrite the file.
+    /// Returns whether the record was the named one.
+    fn set_projection_intent(&self, session_id: &str, card_message_id: &str, intent: bool) -> bool {
+        let mut state = self.lock();
+        match state.records.get_mut(session_id) {
+            Some(card) if card.card_message_id == card_message_id => {
+                if card.projection_intent != intent {
+                    card.projection_intent = intent;
+                    self.write(&state);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Record the keep rule the fresh-Turn takeover's collect is about to
     /// apply to `card_message_id` (ADR-0068): `resolved_calls` are the live-set
     /// calls the seed resolved onto the successor, whose running panels the
@@ -761,6 +809,55 @@ mod tests {
     use super::*;
 
     const FILE: &str = "chain_records.json";
+
+    /// The projection's write-ahead intent (spec #561, review #569) persists
+    /// across a restart, clears on demand, and is scoped to the record's card:
+    /// a re-point (or a clear naming another card) never touches a newer
+    /// generation.
+    #[test]
+    fn the_projection_intent_persists_clears_and_stays_scoped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE);
+        let chains = ChainRecords::load(path.clone());
+        chains.track("ses_a", "om_old", MessageId::new("msg_cola_1"), Some(1_000), None);
+
+        assert!(chains.note_projection_intent("ses_a", "om_old"));
+        assert!(
+            chains.get("ses_a").expect("the record").projection_intent,
+            "the intent is set in memory"
+        );
+        assert!(
+            ChainRecords::load(path.clone())
+                .get("ses_a")
+                .expect("the reloaded record")
+                .projection_intent,
+            "the intent survives a restart"
+        );
+        assert!(
+            !chains.clear_projection_intent("ses_a", "om_other"),
+            "a clear for another card never touches this record"
+        );
+        assert!(chains.get("ses_a").expect("the record").projection_intent);
+        assert!(chains.clear_projection_intent("ses_a", "om_old"));
+        assert!(
+            !ChainRecords::load(path.clone())
+                .get("ses_a")
+                .expect("the reloaded record")
+                .projection_intent,
+            "the clear persists"
+        );
+
+        // A re-point rewrites the record: no stale intent rides along.
+        assert!(chains.note_projection_intent("ses_a", "om_old"));
+        chains.track("ses_a", "om_new", MessageId::new("msg_cola_1"), Some(1_000), None);
+        assert!(
+            !ChainRecords::load(path)
+                .get("ses_a")
+                .expect("the re-pointed record")
+                .projection_intent,
+            "a re-pointed record carries no stale intent"
+        );
+    }
 
     #[test]
     fn track_persists_and_reloads_the_record() {
