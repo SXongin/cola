@@ -613,6 +613,11 @@ async fn project_card(
     // The confirmed create carries the successor's body: advance the chain's
     // cursor exactly like a flush-confirmed write (spec #561).
     crate::bridge::turn::confirm_card_cursor(&handles.cards, session_id, &new_card_id).await;
+    // The same write carried every Wake completion entry the seeded render
+    // staged: the confirmed create is what makes the announcement durable
+    // (ADR-0061, ticket #566), so a later recordless restart cannot
+    // re-announce the Wake through the Fresh gate.
+    crate::bridge::turn::drain_wake_watermark(&handles.cards, session_id).await;
     if state.is_terminal() {
         // The successor reached a terminal: nothing is owed a reap, and the
         // cursor goes with the record.
@@ -767,6 +772,11 @@ async fn project_live_card(
     // The confirmed create carries the successor's body: advance the chain's
     // cursor exactly like a flush-confirmed write (spec #561).
     crate::bridge::turn::confirm_card_cursor(&handles.cards, session_id, &new_card_id).await;
+    // The same write carried every Wake completion entry the seeded render
+    // staged: the confirmed create is what makes the announcement durable
+    // (ADR-0061, ticket #566), so a later recordless restart cannot
+    // re-announce the Wake through the Fresh gate.
+    crate::bridge::turn::drain_wake_watermark(&handles.cards, session_id).await;
     tracing::info!("live-card reap: session {session_id} adopted its still-live run onto a successor card");
     Some(AdoptedFollow {
         card_message_id: new_card_id,
