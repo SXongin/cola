@@ -18,11 +18,11 @@ pub(crate) use ownership::CardOwnership;
 
 /// The one ending vocabulary (spec #538): the table every path that ends a
 /// card reads — the in-Turn paths through `StreamAccumulator::apply_ending`,
-/// the out-of-turn loops through `Ownership::apply_if_held` (the ownership
-/// check and the stamp under one lock), and the durable reap through its
-/// `From<TurnSettle>` mapping. Crate-visible so a path outside the Turn module
-/// (the reap's card translation in `chain::reconcile`) reads the same table
-/// instead of a second state/failure mapping.
+/// the out-of-turn loops through `Ticket::apply_ending_if_owned` (the
+/// ownership check and the stamp under one lock), and the durable reap through
+/// its `From<TurnSettle>` mapping. Crate-visible so a path outside the Turn
+/// module (the reap's card translation in `chain::reconcile`) reads the same
+/// table instead of a second state/failure mapping.
 pub(crate) use disposition::Disposition;
 
 use std::collections::{HashMap, HashSet};
@@ -3305,8 +3305,9 @@ impl Turn {
     /// Run the Wake continuation's out-of-turn settle loop (ADR-0059) on the
     /// caller's own task: the shared out-of-turn loop under the
     /// continuation's chain identity, then its ending applied through the one
-    /// shared, ownership-checked application ([`settle::Ownership::apply_if_held`],
-    /// #539). Returns the ending disposition the loop
+    /// shared, ownership-checked application
+    /// ([`ownership::Ticket::apply_ending_if_owned`], #539). Returns the ending
+    /// disposition the loop
     /// reached and applied, or `None` when it stopped owning the card (its
     /// accumulator vanished or a successor took it over) and stamped nothing;
     /// the caller owns the announcement. A split continuation needs none — its
@@ -3321,16 +3322,19 @@ impl Turn {
         chain: u64,
         timing: SettleTiming,
     ) -> Option<Disposition> {
-        let owns = settle::Ownership::Chain {
+        let ticket = ownership::Ticket::Chain {
             chain,
             anchor: anchor.clone(),
         };
-        let disposition = settle::run(flow, session_id, directory, timing, &owns).await?;
+        let disposition = settle::run(flow, session_id, directory, timing, &ticket).await?;
         // The same post-run gap as the follow's: the loop's last probe may be
         // stale by now, so the ending is applied atomically with a fresh
         // ownership check. Ownership lost is a loop that ended nothing — the
         // same `None` `run` returns.
-        if !owns.apply_if_held(&flow.cards, session_id, &disposition).await {
+        if !ticket
+            .apply_ending_if_owned(&flow.cards, session_id, &disposition)
+            .await
+        {
             return None;
         }
         Some(disposition)

@@ -24,12 +24,17 @@
 //!   owned when a guard is held or the card is render-owned; a pending-inbound
 //!   claim alone never owns a card to split (the #428 strand), so it routes a
 //!   new Turn. The prompt router and the Wake gate read it.
+//! - [`CardOwnership::covers`] — the out-of-turn settle ticket's read-time
+//!   ownership check (ADR-0059): whether the live card still carries the
+//!   [`Ticket`]'s identity. [`Ticket::apply_ending_if_owned`] re-checks through
+//!   the same predicate under the cards lock before it stamps (#539), so the
+//!   loop's check and its atomic apply cannot disagree.
 //!
 //! The classification carries the identities the remaining rules need — the
 //! card's message id, its Turn anchor and its chain identity — so those rules
 //! land as methods over one value, not as new reads. Later tickets of the spec
-//! consume the yielded-card write admission, the reap's claim, the settle
-//! ticket and the `/stop` disposition (ADR-0070).
+//! consume the yielded-card write admission, the reap's claim and the `/stop`
+//! disposition (ADR-0070).
 //!
 //! Sources, exactly:
 //!
@@ -44,6 +49,8 @@ use crate::backend::TurnAnchor;
 use crate::bridge::handles::{CardsHandle, WaitsHandle};
 use crate::feishu::card::CardState;
 
+use super::Turn;
+use super::disposition::Disposition;
 use super::state::CardSession;
 
 /// The in-process claim half of the verdict: what THIS process holds for the
@@ -185,6 +192,16 @@ impl CardOwnership {
         }
     }
 
+    /// Whether the live card still carries `ticket`'s identity (ADR-0059): the
+    /// out-of-turn settle loop's read-time ownership check.
+    /// [`Ticket::apply_ending_if_owned`] re-checks the locked card through the
+    /// same [`Ticket::matches`] predicate before it stamps (#539), so the
+    /// loop's check and its atomic apply cannot disagree. A missing card
+    /// matches nothing.
+    pub(crate) fn covers(&self, ticket: &Ticket) -> bool {
+        ticket.matches(self.turn_anchor.as_ref(), self.chain_id)
+    }
+
     /// The durable reap's claim (ADR-0063): the Session's card is not orphaned
     /// while this process holds a guard — a Turn, or the out-of-turn follow
     /// that inherited it — or a message is still being routed to it. The
@@ -195,6 +212,118 @@ impl CardOwnership {
     /// never re-reads the waits state.
     pub(crate) fn reap_claim(&self) -> bool {
         self.claim() != Claim::None
+    }
+}
+
+/// The out-of-turn settle loop's ownership ticket (ADR-0059, ADR-0062): what
+/// the loop watches to know it still owns the card. The variant is also the
+/// loop's identity: each carries its own label, so a caller cannot pair one
+/// loop's guard with the other's name. [`super::settle`] keeps the loop; the
+/// ticket's identity kinds and its two rule reads
+/// ([`CardOwnership::covers`] and [`Self::apply_ending_if_owned`]) live with
+/// the verdict.
+pub(crate) enum Ticket {
+    /// The accumulator's Turn anchor is unchanged: a new Turn (or an external
+    /// renderer arming over it) replaces the session's card.
+    TurnAnchor(TurnAnchor),
+    /// The chain identity is unchanged (see the settle loop's docs). `anchor`
+    /// is the settle decision's scope: the Turn's own anchor for a chain
+    /// continuation, the newest Wake's for a fresh (restart) card.
+    Chain { chain: u64, anchor: TurnAnchor },
+    /// The unreceived watch (ADR-0062): a follow whose Turn's submitted
+    /// message has not landed yet. No Turn anchor exists, so the card's chain
+    /// identity is the ownership — it survives a Supplement split and dies
+    /// with a new Turn — and the settle decision's anchor is captured from
+    /// the transcript the moment `submitted` appears. `hint_at` is when the
+    /// neutral waiting line is due: the Turn's start plus the follow grace,
+    /// so cola does not nag while a genuine long tool call could still merge
+    /// the message.
+    Unlanded {
+        chain: u64,
+        submitted: String,
+        hint_at: std::time::Instant,
+    },
+}
+
+impl Ticket {
+    /// Whether a card's identities (`anchor`, `chain`) are this ticket's — the
+    /// ONE spelling of the ownership predicate (ADR-0059):
+    /// [`CardOwnership::covers`] compares the read-time verdict's carried
+    /// identity through it, and [`Self::apply_ending_if_owned`] re-checks the
+    /// locked card through it, so the loop's check and its atomic apply can
+    /// never disagree.
+    fn matches(&self, anchor: Option<&TurnAnchor>, chain: Option<u64>) -> bool {
+        match self {
+            Self::TurnAnchor(own) => anchor == Some(own),
+            Self::Chain { chain: own, .. } | Self::Unlanded { chain: own, .. } => chain == Some(*own),
+        }
+    }
+
+    /// Apply the ending `disposition` to `session_id`'s card only while the
+    /// ticket still covers it — the check and the stamp under ONE `cards` lock
+    /// (#539). The callers run after the Session's guard was released, so a
+    /// new Turn may replace the card at any moment; a separate re-check would
+    /// let the old ending land on the successor's live card in the gap.
+    /// Returns whether it applied (false: the card was replaced or vanished —
+    /// nothing is touched, and the caller must not announce an ending).
+    pub(super) async fn apply_ending_if_owned(
+        &self,
+        cards: &CardsHandle,
+        session_id: &str,
+        disposition: &Disposition,
+    ) -> bool {
+        let stamped = {
+            let mut live = cards.cards.lock().await;
+            match live.get_mut(session_id) {
+                Some(card) if self.matches(card.acc.turn_anchor.as_ref(), Some(card.chain_id())) => {
+                    card.acc.apply_ending(disposition);
+                    true
+                }
+                _ => false,
+            }
+        };
+        if !stamped {
+            return false;
+        }
+        Turn::refresh_work_context(cards, session_id).await;
+        Turn::flush_card(cards, session_id).await;
+        true
+    }
+
+    /// The Turn anchor the settle decision reads; `None` for the unreceived
+    /// watch until the loop captures the landed message's anchor.
+    pub(super) fn anchor(&self) -> Option<&TurnAnchor> {
+        match self {
+            Self::TurnAnchor(anchor) | Self::Chain { anchor, .. } => Some(anchor),
+            Self::Unlanded { .. } => None,
+        }
+    }
+
+    /// The submitted message id the unreceived watch captures its anchor
+    /// from; `None` for a loop that already has one.
+    pub(super) fn submitted(&self) -> Option<&str> {
+        match self {
+            Self::Unlanded { submitted, .. } => Some(submitted),
+            _ => None,
+        }
+    }
+
+    /// When the neutral waiting line is due; `None` for a loop whose message
+    /// already landed (it never shows the line).
+    pub(super) fn hint_at(&self) -> Option<std::time::Instant> {
+        match self {
+            Self::Unlanded { hint_at, .. } => Some(*hint_at),
+            _ => None,
+        }
+    }
+
+    /// The loop's name in the bounded-call labels and log lines. Owned by the
+    /// variant, so the guard and the name always travel together.
+    pub(super) fn label(&self) -> &'static str {
+        match self {
+            Self::TurnAnchor(_) | Self::Unlanded { .. } => "drain follow",
+            Self::Chain { .. } => "wake continuation",
+        }
     }
 }
 
@@ -498,6 +627,189 @@ mod tests {
         assert!(
             !waits.inbound.lock().await.contains_key(SID),
             "the expired entry is dropped by the read"
+        );
+    }
+
+    /// The read-time ownership rule (ADR-0059): [`CardOwnership::covers`]
+    /// compares the verdict's carried identity against the ticket's variant —
+    /// each kind matches only its own identity, and a missing card matches
+    /// nothing. The lock-scoped [`Ticket::apply_ending_if_owned`] re-checks
+    /// through the same predicate, so the loop's read-time check and its
+    /// atomic apply cannot disagree.
+    #[tokio::test]
+    async fn covers_compares_each_ticket_variant_against_the_live_card() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        let cards = app.cards_handle();
+        let waits = app.waits_handle();
+
+        let anchor = turn_anchor(1);
+        Turn::seed_card(&cards, SID, Some("om_live")).await;
+        Turn::set_turn_anchor(&cards, SID, &anchor).await;
+        let chain = Turn::chain_id(&cards, SID).await.expect("seeded card");
+        let unlanded = |chain| Ticket::Unlanded {
+            chain,
+            submitted: "om_user".into(),
+            hint_at: std::time::Instant::now(),
+        };
+
+        let ownership = CardOwnership::read(&cards, &waits, SID).await;
+        assert!(
+            ownership.covers(&Ticket::TurnAnchor(anchor.clone())),
+            "the armed anchor is covered"
+        );
+        assert!(
+            !ownership.covers(&Ticket::TurnAnchor(turn_anchor(2))),
+            "another anchor is not"
+        );
+        assert!(
+            ownership.covers(&Ticket::Chain {
+                chain,
+                anchor: turn_anchor(9),
+            }),
+            "the live chain is covered"
+        );
+        assert!(
+            !ownership.covers(&Ticket::Chain {
+                chain: chain + 1,
+                anchor: turn_anchor(9),
+            }),
+            "another chain is not"
+        );
+        assert!(
+            ownership.covers(&unlanded(chain)),
+            "the unlanded watch's chain is covered"
+        );
+        assert!(!ownership.covers(&unlanded(chain + 1)), "another chain is not");
+
+        // The card vanishes: nothing is covered any more.
+        Turn::drop_card(&cards, SID).await;
+        let gone = CardOwnership::read(&cards, &waits, SID).await;
+        assert!(
+            !gone.covers(&Ticket::TurnAnchor(anchor)) && !gone.covers(&unlanded(chain)),
+            "a missing card is covered by nothing"
+        );
+    }
+
+    /// The card's recorded failure line, read under the cards lock.
+    async fn card_error(cards: &CardsHandle, session_id: &str) -> Option<String> {
+        cards
+            .cards
+            .lock()
+            .await
+            .get(session_id)
+            .and_then(|card| card.acc.error.clone())
+    }
+
+    /// Seed a recorded failure on the live card, so an ending that clears it
+    /// (Stopped) is visible as a change.
+    async fn set_card_error(cards: &CardsHandle, session_id: &str, error: &str) {
+        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
+            card.acc.error = Some(error.to_string());
+        }
+    }
+
+    /// #539: the ownership re-check and the ending stamp share ONE cards lock
+    /// ([`Ticket::apply_ending_if_owned`]), so the released moment between the
+    /// settle loop and the stamp cannot hand a successor's live card the old
+    /// ending. A stale anchor applies nothing (state and failure untouched,
+    /// false); the matching anchor applies (true).
+    #[tokio::test]
+    async fn apply_ending_if_owned_stamps_only_the_anchor_it_still_owns() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        let cards = app.cards_handle();
+
+        let live = turn_anchor(1);
+        let successor = turn_anchor(2);
+        let owns = Ticket::TurnAnchor(live.clone());
+
+        // The ending the loop decided is applied to the card it watched.
+        Turn::seed_card(&cards, SID, Some("om_live")).await;
+        Turn::set_turn_anchor(&cards, SID, &live).await;
+        assert!(
+            owns.apply_ending_if_owned(&cards, SID, &Disposition::Failed("loop failure".into()))
+                .await,
+            "the matching anchor applies"
+        );
+        assert_eq!(Turn::card_state(&cards, SID).await, Some(CardState::Error));
+        assert_eq!(card_error(&cards, SID).await.as_deref(), Some("loop failure"));
+
+        // A new Turn replaced the card — and armed its own anchor — while the
+        // released moment ran. The stale ending must not clear the successor's
+        // recorded failure (Stopped would) nor touch its state.
+        Turn::seed_card(&cards, SID, Some("om_successor")).await;
+        Turn::set_turn_anchor(&cards, SID, &successor).await;
+        Turn::set_card_state(&cards, SID, CardState::Streaming).await;
+        set_card_error(&cards, SID, "successor failure").await;
+        assert!(
+            !owns
+                .apply_ending_if_owned(&cards, SID, &Disposition::Stopped)
+                .await,
+            "a stale anchor applies nothing"
+        );
+        assert_eq!(
+            Turn::card_state(&cards, SID).await,
+            Some(CardState::Streaming),
+            "the successor's state is untouched"
+        );
+        assert_eq!(
+            card_error(&cards, SID).await.as_deref(),
+            Some("successor failure"),
+            "the successor's recorded failure is untouched"
+        );
+    }
+
+    /// The chain-identity arm of the same predicate (ADR-0059): a Wake
+    /// continuation — and the unreceived watch sharing the variant — applies
+    /// its ending only while the card's chain id is unchanged. A replacement
+    /// session carries a NEW chain id, so the stale loop stamps nothing; a
+    /// vanished card is ownership lost too, and the matching chain applies.
+    #[tokio::test]
+    async fn apply_ending_if_owned_stamps_only_the_chain_it_still_owns() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        let cards = app.cards_handle();
+
+        Turn::seed_card(&cards, SID, Some("om_live")).await;
+        let chain = Turn::chain_id(&cards, SID).await.expect("seeded card");
+        let owns = Ticket::Chain {
+            chain,
+            anchor: turn_anchor(3),
+        };
+        assert!(
+            owns.apply_ending_if_owned(&cards, SID, &Disposition::Done).await,
+            "the matching chain applies"
+        );
+        assert_eq!(Turn::card_state(&cards, SID).await, Some(CardState::Done));
+
+        // A replacement card carries a fresh chain id: the stale loop's ending
+        // must not stamp it.
+        Turn::seed_card(&cards, SID, Some("om_successor")).await;
+        Turn::set_card_state(&cards, SID, CardState::Streaming).await;
+        assert!(
+            !owns
+                .apply_ending_if_owned(&cards, SID, &Disposition::Stopped)
+                .await,
+            "a stale chain applies nothing"
+        );
+        assert_eq!(
+            Turn::card_state(&cards, SID).await,
+            Some(CardState::Streaming),
+            "the replacement's state is untouched"
+        );
+
+        // The card vanishing is ownership lost as well.
+        Turn::drop_card(&cards, SID).await;
+        assert!(
+            !owns.apply_ending_if_owned(&cards, SID, &Disposition::Done).await,
+            "a vanished card applies nothing"
         );
     }
 }
