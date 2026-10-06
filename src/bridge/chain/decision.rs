@@ -82,6 +82,19 @@ pub(crate) enum ChainDisposition {
         /// resolvable.
         seed: CursorSeed,
     },
+    /// A record carrying a Rendered Cursor whose run is still live and not
+    /// owned by this process: arm a successor seeded at the cursor and FOLLOW
+    /// the run through the existing external-render arm (spec #561, ticket
+    /// #564) — the content produced after the seed lands on the successor as
+    /// it arrives, and the run settles by transcript truth. No user message is
+    /// sent: the successor's create is the restart notification. A cursorless
+    /// record, an anchorless one, a cursor this read cannot place, and a
+    /// missing transcript read all fall back ([`Self::StampRestart`] /
+    /// [`Self::NoDecision`]) — never a guessed replay.
+    ProjectLive {
+        /// The chain's cursor, resolved against this read: the render's seed.
+        seed: CursorSeed,
+    },
 }
 
 /// What this process knows about the Session's card, as one value: the probe
@@ -177,6 +190,11 @@ pub(crate) struct RecoveryReads<'a> {
     pub(crate) status: Option<StatusRead>,
     /// The transcript read; `None` when the plan did not warrant it.
     pub(crate) transcript: Option<TranscriptRead>,
+    /// The record carries a Rendered Cursor (spec #561). A still-live run
+    /// with one is the projection's live case (ticket #564): the transcript
+    /// read is warranted to resolve the seed and follow the run, and a
+    /// cursorless record keeps today's one-time restart stamp.
+    pub(crate) cursor: bool,
 }
 
 impl RecoveryReads<'_> {
@@ -192,11 +210,19 @@ impl RecoveryReads<'_> {
     }
 
     /// Whether the transcript read is warranted: the status read ran and its
-    /// named status is definite non-live. A live Session keeps the card — the
-    /// run may still answer it — and an unknown status claims nothing, so
-    /// neither reads history.
+    /// named status is definite non-live — only the transcript decides the
+    /// ending then. A live Session keeps the card — the run may still answer
+    /// it — and an unknown status claims nothing, so neither reads history.
+    /// The one exception is the projection's live case (spec #561, ticket
+    /// #564): a cursor-carrying record's still-live run is followed from its
+    /// confirmed frontier, and the seed resolves against this read. A
+    /// cursorless record keeps today's stamp and reads no history.
     pub(crate) fn needs_transcript(&self) -> bool {
-        matches!(self.status, Some(StatusRead::Named(status)) if !status.is_live())
+        match self.status {
+            Some(StatusRead::Named(status)) if !status.is_live() => true,
+            Some(StatusRead::Named(status)) if status.is_live() && self.cursor => true,
+            _ => false,
+        }
     }
 
     /// Whether the successor branch's collect is owed: no claim owns the
@@ -267,9 +293,30 @@ pub(crate) fn reconcile(record: &ChainRecord, reads: &RecoveryReads<'_>) -> Chai
                 // This process holds no card for the session, so the record is
                 // a restart orphan — its card froze when the previous process
                 // died and nothing will move it until transcript truth ends
-                // it. Stamp that once per process life (#443) so the user
-                // knows why it stopped moving.
+                // it, or the projection follows it (spec #561, ticket #564).
                 Some(StatusRead::Named(status)) if status.is_live() => {
+                    // The projection's live case: a record carrying a cursor
+                    // and a scope follows the still-live run from its confirmed
+                    // frontier. It is tried before the one-time stamp marks —
+                    // a stamp that landed earlier this life is only the
+                    // fallback, never a reason to leave a resolvable run
+                    // unfollowed. A missing transcript read the plan warranted
+                    // claims nothing (a failed read must not burn the stamp
+                    // the projection could still make unnecessary); a cursor
+                    // this read cannot place falls back to today's stamp.
+                    if let Some(cursor) = record.cursor.as_ref() {
+                        let Some(TranscriptRead::Read(transcript)) = reads.transcript.as_ref() else {
+                            return ChainDisposition::NoDecision;
+                        };
+                        let scope = record
+                            .anchor()
+                            .or_else(|| transcript.anchor_of_user(record.message_id.as_str()));
+                        if scope.is_some()
+                            && let Some(seed) = CursorSeed::resolve(transcript, cursor)
+                        {
+                            return ChainDisposition::ProjectLive { seed };
+                        }
+                    }
                     // The one-time outcome: a stamp that landed, or was
                     // permanently refused and given up for this process life
                     // (#522), is never attempted again.
@@ -436,6 +483,7 @@ mod tests {
             route: Some(route()),
             status: None,
             transcript: None,
+            cursor: false,
         }
     }
 
@@ -463,6 +511,7 @@ mod tests {
                 status: Some(StatusRead::Named(SessionStatus::Idle)),
                 transcript: None,
                 stamping: false,
+                cursor: false,
             },
             RecoveryReads {
                 stamping: true,
@@ -528,10 +577,11 @@ mod tests {
                 | ChainDisposition::StampRestart
                 | ChainDisposition::CollectThenRepoint { .. }
                 | ChainDisposition::CollectThenRelease
-                // The projection collects the recorded card as taken over and
-                // settles a NEW successor; it arises from a `None` probe only,
-                // never while this process holds the session's card.
-                | ChainDisposition::Project { .. } => Some(record.card_message_id.as_str()),
+                // The projections collect the recorded card as taken over and
+                // settle/follow a NEW successor; they arise from a `None` probe
+                // only, never while this process holds the session's card.
+                | ChainDisposition::Project { .. }
+                | ChainDisposition::ProjectLive { .. } => Some(record.card_message_id.as_str()),
                 ChainDisposition::Keep | ChainDisposition::NoDecision | ChainDisposition::DiscardRecord => {
                     None
                 }
@@ -911,21 +961,126 @@ mod tests {
         );
     }
 
-    /// The #564 boundary (ticket #563): a cursor-carrying record whose run is
-    /// STILL LIVE keeps today's one-time restart stamp — the adoption/follow
-    /// is the next ticket's disposition, never a side effect of the
-    /// projection.
+    /// The #564 fallback (ticket #563): a live record the projection cannot
+    /// take — no cursor, or a cursor whose warranted transcript read is
+    /// missing — keeps today's one-time restart stamp.
     #[test]
-    fn a_still_live_cursor_record_keeps_todays_stamp() {
+    fn a_live_record_without_a_projection_keeps_todays_stamp() {
         let with_cursor = ChainRecord {
             cursor: Some(RenderedCursor::default()),
             ..record()
         };
-        let live = RecoveryReads {
+        let live = |cursor: bool, transcript: Option<SessionTranscript>| RecoveryReads {
             status: Some(StatusRead::Named(SessionStatus::Busy)),
+            transcript: transcript.map(TranscriptRead::Read),
+            cursor,
             ..orphan()
         };
-        assert_eq!(reconcile(&with_cursor, &live), ChainDisposition::StampRestart);
+        assert_eq!(
+            reconcile(&record(), &live(false, None)),
+            ChainDisposition::StampRestart,
+            "a cursorless live record keeps today's stamp"
+        );
+        assert_eq!(
+            reconcile(&with_cursor, &live(true, None)),
+            ChainDisposition::NoDecision,
+            "a live cursor record whose warranted transcript read is missing claims nothing"
+        );
+    }
+
+    /// The live adoption (spec #561, ticket #564): a record carrying a Rendered
+    /// Cursor whose run is still live projects AND follows — the successor is
+    /// seeded at the cursor. A cursor the read cannot place falls back to
+    /// today's stamp, and the one-time stamp marks hold for the fallback.
+    #[test]
+    fn a_still_live_cursor_record_projects_and_follows() {
+        let transcript = SessionTranscript::new(vec![
+            user("msg_cola_anchor", 1_000, "问题"),
+            assistant(2_000, "答复。"),
+        ]);
+        let cursor = RenderedCursor {
+            frontier: Some(CursorFrontier {
+                message_id: MessageId::new("msg_a_2000"),
+                part_index: 0,
+                kind: CursorPartKind::Text,
+                started_at: Some(2_000),
+                delivered_chars: 2,
+            }),
+            live_calls: Default::default(),
+        };
+        let with_cursor = ChainRecord {
+            cursor: Some(cursor.clone()),
+            ..record()
+        };
+        let seed = CursorSeed::resolve(&transcript, &cursor).expect("the frontier resolves");
+        let live = |transcript: Option<SessionTranscript>| RecoveryReads {
+            status: Some(StatusRead::Named(SessionStatus::Busy)),
+            transcript: transcript.map(TranscriptRead::Read),
+            cursor: true,
+            ..orphan()
+        };
+        assert_eq!(
+            reconcile(&with_cursor, &live(Some(transcript.clone()))),
+            ChainDisposition::ProjectLive { seed },
+            "a live run with a placed cursor is adopted for following"
+        );
+
+        // The cursor names a part this read does not carry: the read moved on,
+        // so nothing may be skipped — today's one-time stamp.
+        let dangling = RenderedCursor {
+            frontier: Some(CursorFrontier {
+                message_id: MessageId::new("msg_gone"),
+                part_index: 0,
+                kind: CursorPartKind::Text,
+                started_at: None,
+                delivered_chars: 1,
+            }),
+            live_calls: Default::default(),
+        };
+        let dangling_record = ChainRecord {
+            cursor: Some(dangling.clone()),
+            ..record()
+        };
+        assert_eq!(
+            reconcile(&dangling_record, &live(Some(transcript.clone()))),
+            ChainDisposition::StampRestart
+        );
+
+        // A resolvable cursor whose submitted message never landed and whose
+        // record captured no server time has no scope to arm a successor with:
+        // today's stamp, never an unscoped follow.
+        let anchorless = ChainRecord::new("om_card", MessageId::new("msg_cola_anchor"), None)
+            .with_directory(Some("/work".into()));
+        let anchorless = ChainRecord {
+            cursor: Some(cursor.clone()),
+            ..anchorless
+        };
+        let other_turn =
+            SessionTranscript::new(vec![user("msg_other", 500, "上一条"), assistant(2_000, "答复。")]);
+        assert_eq!(
+            reconcile(&anchorless, &live(Some(other_turn))),
+            ChainDisposition::StampRestart
+        );
+
+        // The fallback's one-time marks hold: an unplaceable cursor whose
+        // stamp already landed (or was permanently refused) is kept.
+        for marked in [
+            ChainRecord {
+                cursor: Some(dangling.clone()),
+                restarted_reaped: true,
+                ..record()
+            },
+            ChainRecord {
+                cursor: Some(dangling),
+                restart_stamp_rejected: true,
+                ..record()
+            },
+        ] {
+            assert_eq!(
+                reconcile(&marked, &live(Some(transcript.clone()))),
+                ChainDisposition::Keep
+            );
+        }
     }
 
     /// The boundary rule the plan promises: the status read is warranted only
@@ -939,6 +1094,12 @@ mod tests {
 
         reads.status = Some(StatusRead::Named(SessionStatus::Busy));
         assert!(!reads.needs_transcript(), "a live status reads no history");
+        reads.cursor = true;
+        assert!(
+            reads.needs_transcript(),
+            "a live cursor-carrying record reads history for the projection (#564)"
+        );
+        reads.cursor = false;
         reads.status = Some(StatusRead::NoEvidence);
         assert!(!reads.needs_transcript(), "an unknown status reads no history");
         reads.status = Some(StatusRead::Named(SessionStatus::Idle));

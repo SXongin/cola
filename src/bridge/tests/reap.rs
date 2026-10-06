@@ -15,8 +15,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::drain::{
-    assistant, ctx, script_transcript, scripted_app, spawn_sync, spawn_sync_with_timeout, spawn_turn,
-    tool_assistant, user, wait_for_card_header, wait_for_card_text,
+    assistant, ctx, script_transcript, scripted_app, settle_tool, spawn_sync, spawn_sync_with_timeout,
+    spawn_turn, tool_assistant, user, wait_for_card_header, wait_for_card_text,
 };
 use crate::backend::{
     ContentBlock, MessageId, MessageRole, MessageTime, Part, SessionTranscript, ToolCall, ToolIdentity,
@@ -4165,4 +4165,622 @@ async fn a_record_with_no_deliverable_target_projects_nothing() {
         settled.iter().any(|card| card_header(card).contains("✅")),
         "the in-place settle still ends the record's card: {settled:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The live-run adoption (spec #561, ticket #564): a record whose run is still
+// running is followed from its confirmed cursor — the successor streams what
+// the run produces after the seed and settles by transcript truth.
+// ---------------------------------------------------------------------------
+
+/// An assistant message still in flight: content without a terminal
+/// `step-finish`, so its Turn reads as running.
+fn assistant_in_flight(created: i64, text: &str) -> TranscriptMessage {
+    typed_message(
+        &format!("msg_a_{created}"),
+        MessageRole::Assistant,
+        Some(created),
+        vec![text_part(text)],
+    )
+}
+
+/// Wait until `message_id` has a recorded update satisfying `check`, or panic
+/// after 5 s. The follow's writes land out of turn, so a live-adoption test
+/// waits on the card, not on a handle.
+async fn wait_for_update(
+    platform: &RecordingPlatform,
+    message_id: &str,
+    label: &str,
+    check: impl Fn(&serde_json::Value) -> bool,
+) {
+    let probe = async {
+        loop {
+            if patches_to(platform, message_id).await.iter().any(&check) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), probe)
+        .await
+        .unwrap_or_else(|_| panic!("{message_id} never reached {label}"));
+}
+
+/// Wait until the session's record is gone (a terminal settle released it),
+/// or panic after 5 s.
+async fn wait_for_record_gone(app: &Arc<App>, session_id: &str) {
+    let probe = async {
+        loop {
+            if app.cards_handle().chains.get(session_id).is_none() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), probe)
+        .await
+        .unwrap_or_else(|_| panic!("the record was never released"));
+}
+
+/// The headline acceptance (spec #561, ticket #564): a restart while the run
+/// is still live arms a successor at the confirmed cursor and FOLLOWS the run
+/// — content produced after the seed lands on the successor, the old card is
+/// collected as taken over, and the run settles by transcript truth (✅) with
+/// the missed tail exactly once.
+#[tokio::test]
+async fn a_restart_mid_run_follows_the_live_run_onto_a_successor() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let delivered = "已经写了一半。";
+    let missed = "后半段是重启后继续写出来的。";
+    let full = format!("{delivered}{missed}");
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
+        Some(text_frontier(delivered.chars().count())),
+        &[],
+    );
+    // The run is live and has produced nothing past the confirmed cursor yet.
+    let running = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "问题"),
+        assistant_in_flight(2_000, delivered),
+    ]);
+    let (app, platform, backend) =
+        restarted_app_with_backend(&session_file, running, Some(SessionStatus::Busy)).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+
+    spawn_sync(&app);
+    let (successor, successor_text) = wait_for_projection(&platform, "msg_cola_anchor").await;
+
+    // The successor is a live continuation — a working card, not a stamped
+    // orphan — and the delivered prefix is never repeated.
+    assert!(
+        card_header(&successor).contains("回复中"),
+        "the successor is a working card: {successor}"
+    );
+    assert!(
+        !successor_text.contains(delivered),
+        "the delivered prefix is never repeated: {successor}"
+    );
+    let collect = last_update_of(&platform, "om_frozen")
+        .await
+        .expect("the old card is collected as taken over");
+    assert!(
+        card_header(&collect).contains("已由新卡片接管"),
+        "the old card is collected as taken over: {collect}"
+    );
+    assert_eq!(
+        card_posts(&platform).await,
+        1,
+        "the successor's create is the one send — the restart notification: {:?}",
+        platform.calls.lock().await
+    );
+    wait_for_record_card(&app, "ses_test", "msg_reply").await;
+
+    // The run keeps producing: the follow streams the growth onto the
+    // successor (the reply's recorded card id).
+    backend
+        .given_transcript_after_build(
+            "ses_test",
+            vec![SessionTranscript::new(vec![
+                user("msg_cola_anchor", 1_000, "问题"),
+                assistant_in_flight(2_000, &full),
+            ])],
+        )
+        .await;
+    wait_for_update(&platform, "msg_reply", "the missed tail", |card| {
+        card_text(card).contains(missed)
+    })
+    .await;
+
+    // The transcript's true ending settles it: ✅ on the successor, the tail
+    // exactly once, and the record spent.
+    backend
+        .given_transcript_after_build(
+            "ses_test",
+            vec![SessionTranscript::new(vec![
+                user("msg_cola_anchor", 1_000, "问题"),
+                assistant(2_000, &full),
+            ])],
+        )
+        .await;
+    wait_for_update(&platform, "msg_reply", "the ✅ ending", |card| {
+        card_header(card).contains("✅")
+    })
+    .await;
+    let settled = patches_to(&platform, "msg_reply").await;
+    let settled = settled.last().expect("the successor was patched");
+    let settled_text = card_text(settled);
+    assert_eq!(
+        settled_text.matches(missed).count(),
+        1,
+        "the tail lands exactly once: {settled}"
+    );
+    assert!(
+        !settled_text.contains(delivered),
+        "the delivered prefix is never repeated: {settled}"
+    );
+    wait_for_record_gone(&app, "ses_test").await;
+}
+
+/// The old card's running `⏳` panel for the tool-carry tests: a card that was
+/// showing a live `bash` panel when the process died.
+fn running_panel_card_view() -> serde_json::Value {
+    serde_json::json!({
+        "schema": "2.0",
+        "config": { "wide_screen_mode": true, "streaming_mode": true },
+        "header": {
+            "template": "blue",
+            "title": { "tag": "plain_text", "content": "✍️ 回复中" }
+        },
+        "body": { "elements": [
+            { "tag": "markdown", "content": "**正文** 已经写了一半。" },
+            { "tag": "collapsible_panel", "expanded": false,
+              "header": { "title": { "tag": "plain_text", "content": "⏳ bash" } },
+              "elements": [ { "tag": "markdown", "content": "还在跑" } ] }
+        ] }
+    })
+}
+
+/// A tool still running across the restart rides the successor as a live carry
+/// and joins its timeline exactly once at settle; the collected old card keeps
+/// no frozen running marker (spec #561, ticket #564).
+#[tokio::test]
+async fn a_restart_mid_run_carries_a_running_tool_and_settles_it_once() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let delivered = "已经写了一半。";
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
+        Some(text_frontier(delivered.chars().count())),
+        &["call_1"],
+    );
+    let running = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "问题"),
+        assistant_in_flight(2_000, delivered),
+        tool_assistant(3_000, ToolStatus::Running, ""),
+    ]);
+    let (app, platform, backend) =
+        restarted_app_with_backend(&session_file, running, Some(SessionStatus::Busy)).await;
+    platform.given_card_view("om_frozen", running_panel_card_view());
+
+    spawn_sync(&app);
+    let (successor, successor_text) = wait_for_projection(&platform, "msg_cola_anchor").await;
+
+    assert!(
+        successor_text.contains("⏳ bash"),
+        "the still-running call is carried live onto the successor: {successor}"
+    );
+    assert!(
+        !successor_text.contains(delivered),
+        "the delivered prefix is never repeated: {successor}"
+    );
+    // The old card is collected as taken over and drops the running marker the
+    // successor resolves — no collected card looks busy.
+    let collect = last_update_of(&platform, "om_frozen")
+        .await
+        .expect("the old card is collected as taken over");
+    assert!(
+        !card_text(&collect).contains("⏳ bash") && !card_text(&collect).contains("还在跑"),
+        "the resolved running panel leaves the collected card: {collect}"
+    );
+    assert!(
+        card_text(&collect).contains("**正文** 已经写了一半。"),
+        "{collect}"
+    );
+
+    // The call settles: the carry joins the successor's timeline exactly once.
+    settle_tool(&backend, ToolStatus::Completed, "done").await;
+    wait_for_update(&platform, "msg_reply", "the settled tool result", |card| {
+        card_text(card).contains("done")
+    })
+    .await;
+
+    // The run's true ending settles it, with the settled panel exactly once.
+    backend
+        .given_transcript_after_build(
+            "ses_test",
+            vec![SessionTranscript::new(vec![
+                user("msg_cola_anchor", 1_000, "问题"),
+                assistant_in_flight(2_000, delivered),
+                tool_assistant(3_000, ToolStatus::Completed, "done"),
+                assistant(4_000, "收尾。"),
+            ])],
+        )
+        .await;
+    wait_for_update(&platform, "msg_reply", "the ✅ ending", |card| {
+        card_header(card).contains("✅")
+    })
+    .await;
+    let settled = patches_to(&platform, "msg_reply").await;
+    let settled = settled.last().expect("the successor was patched");
+    let settled_text = card_text(settled);
+    assert_eq!(
+        settled_text.matches("done").count(),
+        1,
+        "the settled tool joins the timeline exactly once: {settled}"
+    );
+    assert!(
+        !settled_text.contains('⏳'),
+        "no frozen running marker on the settled successor: {settled}"
+    );
+    wait_for_record_gone(&app, "ses_test").await;
+}
+
+/// A tool that settled while cola was down shows its result on the successor
+/// exactly once — the live-status twin of the ended projection's carry — and
+/// the collected old card loses its frozen running marker (spec #561, ticket
+/// #564).
+#[tokio::test]
+async fn a_restart_mid_run_settles_a_tool_that_finished_while_cola_was_down() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let delivered = "已经写了一半。";
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
+        Some(text_frontier(delivered.chars().count())),
+        &["call_1"],
+    );
+    let running = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "问题"),
+        assistant_in_flight(2_000, delivered),
+        tool_assistant(3_000, ToolStatus::Completed, "done"),
+    ]);
+    let (app, platform, _backend) =
+        restarted_app_with_backend(&session_file, running, Some(SessionStatus::Busy)).await;
+    platform.given_card_view("om_frozen", running_panel_card_view());
+
+    spawn_sync(&app);
+    let (successor, successor_text) = wait_for_projection(&platform, "msg_cola_anchor").await;
+
+    assert_eq!(
+        successor_text.matches("done").count(),
+        1,
+        "the result that landed while cola was down shows exactly once: {successor}"
+    );
+    assert!(
+        !successor_text.contains('⏳'),
+        "no frozen running marker on the successor: {successor}"
+    );
+    assert!(
+        !successor_text.contains(delivered),
+        "the delivered prefix is never repeated: {successor}"
+    );
+    let collect = last_update_of(&platform, "om_frozen")
+        .await
+        .expect("the old card is collected as taken over");
+    assert!(
+        !card_text(&collect).contains("⏳ bash"),
+        "the resolved running panel leaves the collected card: {collect}"
+    );
+}
+
+/// A run that dies with the server settles by transcript truth (spec #561,
+/// ticket #564): the follow needs no status read, so the transcript's own
+/// ending still lands — with no invented interruption anywhere.
+#[tokio::test]
+async fn a_run_that_dies_with_the_server_settles_by_transcript_truth() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let delivered = "已经写了一半。";
+    let missed = "后半段是在服务器结束前写完的。";
+    let full = format!("{delivered}{missed}");
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
+        Some(text_frontier(delivered.chars().count())),
+        &[],
+    );
+    let running = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "问题"),
+        assistant_in_flight(2_000, delivered),
+    ]);
+    let (app, platform, backend) =
+        restarted_app_with_backend(&session_file, running, Some(SessionStatus::Busy)).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+
+    spawn_sync(&app);
+    wait_for_projection(&platform, "msg_cola_anchor").await;
+
+    // The server goes away: its status reads fail from here on, while the
+    // transcript (the follow's one read) carries the run's true end.
+    backend
+        .session_status_fails
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    backend
+        .given_transcript_after_build(
+            "ses_test",
+            vec![SessionTranscript::new(vec![
+                user("msg_cola_anchor", 1_000, "问题"),
+                assistant(2_000, &full),
+            ])],
+        )
+        .await;
+    wait_for_update(&platform, "msg_reply", "the ✅ ending", |card| {
+        card_header(card).contains("✅")
+    })
+    .await;
+
+    let settled = patches_to(&platform, "msg_reply").await;
+    let settled = settled.last().expect("the successor was patched");
+    let settled_text = card_text(settled);
+    assert_eq!(
+        settled_text.matches(missed).count(),
+        1,
+        "the tail that landed before the server died shows exactly once: {settled}"
+    );
+    assert!(
+        !settled_text.contains("重启"),
+        "no invented interruption on the successor: {settled}"
+    );
+    // The old card's last word is the takeover collect, never a restart stamp.
+    let collect = last_update_of(&platform, "om_frozen")
+        .await
+        .expect("the old card is collected as taken over");
+    assert!(
+        card_header(&collect).contains("已由新卡片接管"),
+        "the old card is collected as taken over: {collect}"
+    );
+    wait_for_record_gone(&app, "ses_test").await;
+}
+
+/// A wedged read is no ending (spec #561, ticket #564): while the transcript
+/// read fails, the follow keeps polling its idle grace — the successor stays
+/// live, the old card keeps its takeover collect, and no restart stamp is
+/// invented — and the run still settles by transcript truth once the read
+/// heals.
+#[tokio::test]
+async fn a_live_adoption_keeps_following_through_failed_reads() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let delivered = "已经写了一半。";
+    let missed = "后半段。";
+    let full = format!("{delivered}{missed}");
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
+        Some(text_frontier(delivered.chars().count())),
+        &[],
+    );
+    let running = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "问题"),
+        assistant_in_flight(2_000, delivered),
+    ]);
+    let (app, platform, backend) =
+        restarted_app_with_backend(&session_file, running, Some(SessionStatus::Busy)).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+
+    spawn_sync(&app);
+    wait_for_projection(&platform, "msg_cola_anchor").await;
+    let collects = patches_to(&platform, "om_frozen").await.len();
+
+    // The transcript read starts failing: the follow keeps polling without
+    // inventing an ending, and the old card is never stamped.
+    backend.fail_transcript_for("ses_test").await;
+    let reads = backend.transcript_calls.lock().await.len();
+    wait_for_transcript_reads(&backend, "ses_test", reads + 3).await;
+    assert!(
+        patches_to(&platform, "msg_reply")
+            .await
+            .iter()
+            .all(|card| { !card_header(card).contains("✅") && !card_header(card).contains("出错") }),
+        "a failed read never settles the successor: {:?}",
+        patches_to(&platform, "msg_reply").await
+    );
+    assert_eq!(
+        patches_to(&platform, "om_frozen").await.len(),
+        collects,
+        "the old card keeps its takeover collect, never a restart stamp"
+    );
+
+    // The read heals with the run's true end: the successor settles.
+    backend.heal_transcript("ses_test").await;
+    backend
+        .given_transcript_after_build(
+            "ses_test",
+            vec![SessionTranscript::new(vec![
+                user("msg_cola_anchor", 1_000, "问题"),
+                assistant(2_000, &full),
+            ])],
+        )
+        .await;
+    wait_for_update(&platform, "msg_reply", "the ✅ ending", |card| {
+        card_header(card).contains("✅")
+    })
+    .await;
+    let settled = patches_to(&platform, "msg_reply").await;
+    let settled = settled.last().expect("the successor was patched");
+    assert_eq!(card_text(settled).matches(missed).count(), 1, "{settled}");
+    wait_for_record_gone(&app, "ses_test").await;
+}
+
+/// A create that fails leaves the record for the next pass — never a stamp,
+/// never a collect — and the retry adopts once Feishu returns (spec #561,
+/// ticket #564).
+#[tokio::test]
+async fn a_failed_adoption_create_retries_and_never_stamps() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let delivered = "已经写了一半。";
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
+        Some(text_frontier(delivered.chars().count())),
+        &[],
+    );
+    let running = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "问题"),
+        assistant_in_flight(2_000, delivered),
+    ]);
+    let (app, platform, backend) =
+        restarted_app_with_backend(&session_file, running, Some(SessionStatus::Busy)).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+    // Every successor create fails at the platform.
+    platform
+        .fail_reply_card_count
+        .store(100, std::sync::atomic::Ordering::SeqCst);
+
+    spawn_sync(&app);
+    wait_for_status_reads(&backend, "ses_test", 3).await;
+
+    let record = app
+        .cards_handle()
+        .chains
+        .get("ses_test")
+        .expect("a failed adoption keeps the record");
+    assert_eq!(
+        record.card_message_id, "om_frozen",
+        "the record still names the old card"
+    );
+    assert_eq!(
+        record.cursor,
+        Some(RenderedCursor {
+            frontier: Some(text_frontier(delivered.chars().count())),
+            live_calls: Default::default(),
+        }),
+        "a failed create advanced no cursor"
+    );
+    assert_eq!(
+        patches_to(&platform, "om_frozen").await.len(),
+        0,
+        "a failed adoption never stamps or collects the old card"
+    );
+
+    // Feishu returns: the next pass adopts.
+    platform
+        .fail_reply_card_count
+        .store(0, std::sync::atomic::Ordering::SeqCst);
+    let (successor, successor_text) = wait_for_projection(&platform, "msg_cola_anchor").await;
+    assert!(
+        card_header(&successor).contains("回复中"),
+        "the retry adopts onto a live successor: {successor}"
+    );
+    assert!(!successor_text.contains(delivered), "{successor}");
+    wait_for_record_card(&app, "ses_test", "msg_reply").await;
+}
+
+/// V1 and V2 share one rule (spec #561, ticket #564): the projection's reads
+/// are generation-neutral, so the same restart mid-run adopts and follows
+/// identically on either.
+#[tokio::test]
+async fn a_live_adoption_is_generation_neutral() {
+    let _wd = test_work_dir();
+    for durable in [false, true] {
+        let generation = if durable { "V2" } else { "V1" };
+        let dir = tempfile::tempdir().unwrap();
+        let session_file = dir.path().join("sessions.json");
+        let delivered = "已经写了一半。";
+        let missed = "后半段。";
+        let full = format!("{delivered}{missed}");
+        seed_cursor_record(
+            &session_file,
+            "om_frozen",
+            "msg_cola_anchor",
+            Some(1_000),
+            Some("/work"),
+            Some(text_frontier(delivered.chars().count())),
+            &[],
+        );
+        // The mock's generation capabilities: V2 keeps the session selection
+        // (and no upsert-continue); V1 is the opposite. Neither read the
+        // projection makes is generation-specific.
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.durable_selection = durable;
+        backend.reuse_continues_an_admitted_turn = !durable;
+        backend.resume_supported = durable;
+        backend.given_transcript(
+            "ses_test",
+            vec![SessionTranscript::new(vec![
+                user("msg_cola_anchor", 1_000, "问题"),
+                assistant_in_flight(2_000, delivered),
+            ])],
+        );
+        backend.with_session_status("ses_test", Some(SessionStatus::Busy));
+        let backend = Arc::new(backend);
+        let platform = Arc::new(RecordingPlatform::new());
+        let app = Arc::new(
+            App::new(test_config(&session_file), backend.clone(), platform.clone())
+                .expect("the restarted app builds"),
+        );
+        seed_session(&app, "ses_test", "/work").await;
+
+        spawn_sync(&app);
+        let (successor, successor_text) = wait_for_projection(&platform, "msg_cola_anchor").await;
+        assert!(
+            card_header(&successor).contains("回复中"),
+            "a working successor on the {generation} mock: {successor}"
+        );
+        assert!(
+            !successor_text.contains(delivered),
+            "the delivered prefix is never repeated on the {generation} mock: {successor}"
+        );
+
+        backend
+            .given_transcript_after_build(
+                "ses_test",
+                vec![SessionTranscript::new(vec![
+                    user("msg_cola_anchor", 1_000, "问题"),
+                    assistant(2_000, &full),
+                ])],
+            )
+            .await;
+        wait_for_update(&platform, "msg_reply", "the ✅ ending", |card| {
+            card_header(card).contains("✅")
+        })
+        .await;
+        let settled = patches_to(&platform, "msg_reply").await;
+        let settled = settled.last().expect("the successor was patched");
+        assert_eq!(
+            card_text(settled).matches(missed).count(),
+            1,
+            "the tail lands exactly once on the {generation} mock: {settled}"
+        );
+        wait_for_record_gone(&app, "ses_test").await;
+    }
 }

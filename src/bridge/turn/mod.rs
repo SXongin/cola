@@ -2934,13 +2934,19 @@ impl Turn {
             .and_then(|(card, full)| (!full).then_some(card))
     }
 
-    /// Arm the ended-while-down projection's successor card (spec #561, ticket
-    /// #563): a fresh accumulator seeded from the chain's Rendered Cursor
-    /// renders the transcript's delta once — the cut tail with its markdown
-    /// lead, the live set resolved by identity — takes the ledger and work
-    /// context, stamps the true ending and is inserted as the session's live
-    /// card, ready for the caller's create. `None` when the session already has
-    /// a card (a chain appeared meanwhile) — the caller must send nothing.
+    /// Arm a projection's successor card (spec #561): a fresh accumulator
+    /// seeded from the chain's Rendered Cursor renders the transcript's delta
+    /// once — the cut tail with its markdown lead, the live set resolved by
+    /// identity — takes the ledger and work context, applies `ending` when the
+    /// run is over (the ended-while-down projection, ticket #563) and is
+    /// inserted as the session's live card, ready for the caller's create.
+    /// `None` when the session already has a card (a chain appeared meanwhile)
+    /// — the caller must send nothing.
+    ///
+    /// With `ending: None` the successor follows a still-live run (ticket
+    /// #564): it wears a working header from its first send — never an initial
+    /// 「思考中」, the run it continues is not starting — and the caller arms
+    /// the external follow on this same accumulator.
     ///
     /// The first send itself stays with the caller (the reap's apply): the
     /// successor replies to the original Turn anchor, the recorded card, or
@@ -2960,7 +2966,7 @@ impl Turn {
         cursor: &RenderedCursor,
         seed: &state::CursorSeed,
         transcript: &SessionTranscript,
-        ending: &Disposition,
+        ending: Option<&Disposition>,
         title: &str,
         directory: &str,
         fallback_chat: Option<&str>,
@@ -2978,8 +2984,8 @@ impl Turn {
         // successor and any later split continue from where the chain began.
         acc.reply_to_message_id = Some(anchor.message_id.to_string());
         acc.variant = variant;
-        // The successor continues a chain that ended: it carries no question
-        // to re-ask, so an Error ending never offers Retry (ADR-0059).
+        // The successor continues a chain: it carries no question to re-ask,
+        // so an Error ending never offers Retry (ADR-0059).
         acc.wake_continuation = true;
         acc.apply_work_context(work_context);
         acc.seed_projection(cursor, seed.clone());
@@ -2996,7 +3002,17 @@ impl Turn {
             chrono::Utc::now().timestamp_millis(),
             state::LedgerCadence::Minute,
         );
-        acc.apply_ending(ending);
+        match ending {
+            Some(ending) => acc.apply_ending(ending),
+            None => {
+                // A live adoption follows a run already in flight: the
+                // successor is a working card from its first send, never an
+                // initial 「思考中」.
+                if acc.card_state == crate::feishu::card::CardState::Loading {
+                    acc.card_state = crate::feishu::card::CardState::Streaming;
+                }
+            }
+        }
         let built = acc.build_card_unsplit();
         // Stage the body's cursor exactly like a flush does: only the
         // confirmed create drains it into the Chain Record.
@@ -3098,13 +3114,15 @@ pub(crate) struct ContinuationLine {
 }
 
 /// What [`Turn::arm_projected_card`] armed and what the caller must confirm
-/// after the successor's create lands (spec #561, ticket #563).
+/// after the successor's create lands (spec #561).
 pub(crate) struct ProjectedCard {
     /// The successor card to send (create semantics, never outbox-retried).
     pub(crate) card: serde_json::Value,
     /// Whether any content actually entered the successor. `false` means the
-    /// cursor covered the whole read: nothing was missed, so the caller keeps
-    /// today's in-place settle instead of posting an empty successor.
+    /// cursor covered the whole read: nothing was missed, so the ended
+    /// projection keeps today's in-place settle instead of posting an empty
+    /// successor. The live adoption sends either way — the run is live and the
+    /// follow streams what it produces next (ticket #564).
     pub(crate) rendered: bool,
     /// Whether a live-set call settled while cola was down: the successor
     /// resolved it, so the collected old card drops the running `⏳` panels

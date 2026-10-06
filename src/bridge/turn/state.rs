@@ -173,6 +173,15 @@ impl CursorSeed {
             std::cmp::Ordering::Greater => SeedCut::Undelivered,
         }
     }
+
+    /// Whether the cursor's live set named any call (spec #561, ticket #564):
+    /// the successor resolves each one by identity — a still-running call
+    /// renders display-only there, a settled one joins its timeline exactly
+    /// once — so the collected old card must drop the running markers it left
+    /// behind.
+    pub(crate) fn resolves_live_calls(&self) -> bool {
+        !self.live_calls.is_empty()
+    }
 }
 
 /// What a seeded render owes one transcript part.
@@ -1884,7 +1893,7 @@ impl StreamAccumulator {
     }
 
     /// Seed a projection's render from the chain's Rendered Cursor (spec #561,
-    /// ticket #563): the resolved seed makes everything at or before its
+    /// tickets #563/#564): the resolved seed makes everything at or before its
     /// frontier count as delivered, and the live set enters the identity
     /// carry — whose reconciliation already renders a settled call once into
     /// the timeline and keeps a still-running one display-only. The base
