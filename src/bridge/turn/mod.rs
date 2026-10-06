@@ -15,7 +15,7 @@ pub(crate) use state::CardSession;
 /// Pending Card Update drain, Session Sync advances every staged cursor whose
 /// owed payload has delivered — and the projection's successor create confirms
 /// its staged cursor through the same drain (ticket #563).
-pub(crate) use flush::{confirm_card_cursor, drain_wake_watermark, reconcile_staged_cursors};
+pub(crate) use flush::{confirm_armed_cursor, drain_armed_watermark, reconcile_staged_cursors};
 
 /// The projection's resolved render seed (spec #561, ticket #563): the chain's
 /// Rendered Cursor placed in one transcript read, which the Chain Record
@@ -3152,11 +3152,26 @@ pub(crate) struct ProjectedCard {
     /// resolved it, so the collected old card drops the running `⏳` panels
     /// (ADR-0068's generalized collect).
     pub(crate) resolved_calls: bool,
-    /// The armed [`state::CardSession::chain_id`] — the identity the caller
-    /// re-checks after its awaited create: a fresh Turn that replaced the
-    /// armed session meanwhile owns the chain, so the projection must leave
-    /// the session and the record alone (spec #561, review #569).
+    /// The armed [`state::CardSession::chain_id`] — the identity
+    /// [`Turn::take_over_armed_card`] verifies inside its one cards-map
+    /// critical section: a fresh Turn that replaced the armed session
+    /// meanwhile owns the chain, so the projection must leave the session and
+    /// the record alone (spec #561, review #569).
     pub(crate) chain_id: u64,
+}
+
+/// The outcome of [`Turn::take_over_armed_card`] (spec #561, review #569): the
+/// armed session was still current — the successor attached and the record
+/// re-pointed inside one cards-map critical section — or a fresh Turn had
+/// replaced it, in which case nothing was touched.
+#[derive(Debug)]
+pub(crate) enum ArmedTakeover {
+    /// The session is no longer the armed one: the caller must not touch the
+    /// session or the record, and collects only its late card.
+    Lost,
+    /// The takeover landed. The predecessor record is handed back when the
+    /// record named a different card (the caller's deferred collect target).
+    Took(Option<Box<ChainRecord>>),
 }
 
 /// The destination and identity a Wake continuation card is armed with:
@@ -3483,19 +3498,97 @@ impl Turn {
         }
     }
 
-    /// Whether the session's card is still the exact session an arm inserted
-    /// and nothing has attached a card to it since (spec #561, review #569).
-    /// A projection's create is awaited, and a fresh Turn can replace the
-    /// armed session in that window: the projection then owns nothing — it
-    /// must not attach its late card to the Turn's session, re-point the
-    /// record, or confirm a cursor there.
-    pub(crate) async fn still_armed(cards: &CardsHandle, session_id: &str, chain_id: u64) -> bool {
-        cards
-            .cards
-            .lock()
-            .await
+    /// Drop an armed projection's phantom session — its card never sent — only
+    /// while it is still `chain_id`'s, never-attached session (spec #561,
+    /// review #569). One cards-map critical section: a fresh Turn that replaced
+    /// the session takes this same lock to insert its own card, so it can
+    /// never be removed here. Returns whether the armed session was dropped.
+    pub(crate) async fn drop_armed_session(cards: &CardsHandle, session_id: &str, chain_id: u64) -> bool {
+        let mut live = cards.cards.lock().await;
+        let is_armed = live
             .get(session_id)
-            .is_some_and(|card| card.chain_id() == chain_id && card.card_message_id.is_none())
+            .is_some_and(|card| card.chain_id() == chain_id && card.card_message_id.is_none());
+        if is_armed {
+            live.remove(session_id);
+        }
+        is_armed
+    }
+
+    /// Take an armed projection's successor over — verify, attach and re-point
+    /// — inside ONE cards-map critical section (spec #561, review #569). A
+    /// projection's create is awaited, so a fresh Turn can insert its own
+    /// [`state::CardSession`] at any moment; that insert takes this same map
+    /// lock, so holding it across the check, the attach and the durable record
+    /// write leaves the replacement no gap to interleave in. The chain store's
+    /// operations are synchronous (their own std mutex plus a file write) and
+    /// never touch the cards map, so cards → chains is the only nesting order;
+    /// the session write-lock is deliberately NOT taken here ([`Self::flush_card`]
+    /// takes it before the cards lock).
+    ///
+    /// `chain_id` is the armed session's [`state::CardSession::chain_id`].
+    /// [`ArmedTakeover::Lost`] means the session was replaced or attached
+    /// meanwhile: nothing was touched. Otherwise the successor id is attached,
+    /// the record re-pointed (the Rendered Cursor carried into the armed
+    /// accumulator exactly as [`Self::track_live_card`] does) and the
+    /// predecessor record handed back for the caller's deferred collect.
+    pub(crate) async fn take_over_armed_card(
+        cards: &CardsHandle,
+        session_id: &str,
+        chain_id: u64,
+        card_message_id: &str,
+        directory: Option<&str>,
+    ) -> ArmedTakeover {
+        let mut live = cards.cards.lock().await;
+        let Some(card) = live.get_mut(session_id) else {
+            return ArmedTakeover::Lost;
+        };
+        if card.chain_id() != chain_id || card.card_message_id.is_some() {
+            return ArmedTakeover::Lost;
+        }
+        let (message_id, created_ms, context_directory) = (
+            card.acc.cola_message_id.clone().map(MessageId::new).or_else(|| {
+                card.acc
+                    .turn_anchor
+                    .as_ref()
+                    .map(|anchor| anchor.message_id.clone())
+            }),
+            card.acc.turn_anchor.as_ref().map(|anchor| anchor.created_ms),
+            card.acc.directory.clone(),
+        );
+        card.card_message_id = Some(card_message_id.to_string());
+        // A card with no Turn message to scope a settle decision with cannot
+        // be reaped: attached, but no record — `track_live_card`'s own rule.
+        let Some(message_id) = message_id else {
+            return ArmedTakeover::Took(None);
+        };
+        let directory = directory
+            .map(str::to_string)
+            .filter(|directory| !directory.is_empty())
+            .or(context_directory);
+        let previous = cards.chains.track(
+            session_id,
+            card_message_id,
+            message_id,
+            created_ms,
+            directory.as_deref(),
+        );
+        // A re-point within the chain carries the Rendered Cursor (spec #561):
+        // seed the armed accumulator's empty base with the carried fact, so
+        // the successor's first body does not clear the chain's frontier.
+        if let Some(cursor) = previous.as_ref().and_then(|record| record.cursor.clone()) {
+            let card = live
+                .get_mut(session_id)
+                .expect("the cards map still holds the armed session");
+            if card.acc.cursor == RenderedCursor::default() {
+                card.acc.cursor = cursor;
+            }
+        }
+        match previous {
+            Some(previous) if previous.card_message_id != card_message_id => {
+                ArmedTakeover::Took(Some(Box::new(previous)))
+            }
+            _ => ArmedTakeover::Took(None),
+        }
     }
 }
 
@@ -3906,6 +3999,168 @@ mod tests {
         );
         assert!(live["ses_test"].acc.seeded_calls.is_empty());
         assert!(live["ses_test"].acc.tools.is_empty());
+    }
+
+    /// An armed projection's takeover is ONE cards-map critical section (spec
+    /// #561, review #569): the verify, the successor attach and the record
+    /// re-point share one lock acquisition, so a fresh Turn's card insert —
+    /// which takes the same lock — can only land entirely before (Lost,
+    /// untouched) or entirely after, never between the check and the attach.
+    ///
+    /// The race is made deterministic with the map lock itself: while the test
+    /// holds it, the takeover and the replacement queue on it in spawn order.
+    /// A separate check-then-act implementation releases the lock between its
+    /// check and its attach; the queued replacement then slips in first and
+    /// the attach lands on the replacement's session — the assertion below
+    /// pins that it never does. (The single-threaded test runtime makes the
+    /// signal→lock sequence of each task uninterrupted, so the queue order is
+    /// the spawn order; the queue itself is FIFO.)
+    #[tokio::test]
+    async fn the_armed_takeover_is_one_critical_section() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        let cards = app.cards_handle();
+        Turn::seed_card(&cards, "ses_test", None).await;
+        Turn::set_turn_anchor(
+            &cards,
+            "ses_test",
+            &crate::bridge::test_support::turn_anchor(1_000),
+        )
+        .await;
+        let chain_id = {
+            let live = cards.cards.lock().await;
+            live.get("ses_test").expect("the armed session").chain_id()
+        };
+
+        // Hold the map lock so both tasks queue on it, in spawn order.
+        let held = cards.cards.lock().await;
+        let (ready_tx, mut ready_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let takeover = {
+            let cards = cards.clone();
+            let ready = ready_tx.clone();
+            tokio::spawn(async move {
+                ready.send(()).expect("the test is receiving");
+                Turn::take_over_armed_card(&cards, "ses_test", chain_id, "om_late", Some("/work")).await
+            })
+        };
+        let replacement = {
+            let cards = cards.clone();
+            let ready = ready_tx;
+            tokio::spawn(async move {
+                ready.send(()).expect("the test is receiving");
+                let card = state::CardSession::new(state::StreamAccumulator::new("turn"), None);
+                let chain_id = card.chain_id();
+                cards.cards.lock().await.insert("ses_test".to_string(), card);
+                chain_id
+            })
+        };
+        // Both tasks signalled and parked on the map lock: the takeover first,
+        // the fresh Turn's insert second.
+        ready_rx.recv().await.expect("the takeover queued");
+        ready_rx.recv().await.expect("the replacement queued");
+        drop(held);
+
+        assert!(
+            matches!(takeover.await.unwrap(), ArmedTakeover::Took(_)),
+            "the first-queued takeover wins its own critical section"
+        );
+        let replacement_chain_id = replacement.await.unwrap();
+        assert_ne!(
+            replacement_chain_id, chain_id,
+            "the replacement really is a different chain"
+        );
+        let live = cards.cards.lock().await;
+        let fresh = live.get("ses_test").expect("the replacement session");
+        assert_eq!(
+            fresh.chain_id(),
+            replacement_chain_id,
+            "the replacement session is the one that remains"
+        );
+        assert!(
+            fresh.card_message_id.is_none(),
+            "the takeover never attached its card to a session it does not own"
+        );
+        drop(live);
+        assert_eq!(
+            cards
+                .chains
+                .get("ses_test")
+                .expect("the takeover tracked its successor")
+                .card_message_id,
+            "om_late",
+            "the record carries the takeover the projection committed before the replacement"
+        );
+    }
+
+    /// A session that is no longer the armed one is never taken over (spec
+    /// #561, review #569): the replacement landing immediately before the
+    /// takeover leaves the fresh Turn's session unattached, unseeded and the
+    /// record where the Turn put it. The queued-race test above covers the
+    /// same verify with lock contention.
+    #[tokio::test]
+    async fn a_replaced_armed_session_is_never_taken_over() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        let cards = app.cards_handle();
+        Turn::seed_card(&cards, "ses_test", None).await;
+        Turn::set_turn_anchor(
+            &cards,
+            "ses_test",
+            &crate::bridge::test_support::turn_anchor(1_000),
+        )
+        .await;
+        let chain_id = {
+            let live = cards.cards.lock().await;
+            live.get("ses_test").expect("the armed session").chain_id()
+        };
+        // The chain the previous life left: the fresh Turn owns it now.
+        cards.chains.track(
+            "ses_test",
+            "om_turn",
+            MessageId::new("msg_cola_new"),
+            Some(2_000),
+            Some("/work"),
+        );
+
+        // A fresh Turn replaced the armed session — its own insert, exactly as
+        // `Turn::start` performs it.
+        cards.cards.lock().await.insert(
+            "ses_test".to_string(),
+            state::CardSession::new(state::StreamAccumulator::new("turn"), None),
+        );
+
+        assert!(
+            matches!(
+                Turn::take_over_armed_card(&cards, "ses_test", chain_id, "om_late", Some("/work")).await,
+                ArmedTakeover::Lost
+            ),
+            "a replaced armed session is lost, never taken over"
+        );
+        let live = cards.cards.lock().await;
+        let fresh = live.get("ses_test").expect("the replacement session");
+        assert!(
+            fresh.card_message_id.is_none(),
+            "a replaced session is never attached"
+        );
+        assert_eq!(
+            fresh.acc.cursor,
+            RenderedCursor::default(),
+            "no carried cursor is seeded into a replaced session"
+        );
+        drop(live);
+        assert_eq!(
+            cards
+                .chains
+                .get("ses_test")
+                .expect("the Turn's record survives")
+                .card_message_id,
+            "om_turn",
+            "a replaced session's record is never re-pointed"
+        );
     }
 
     /// The disposition-driven notice walks the table's classification: a

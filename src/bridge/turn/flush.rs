@@ -110,13 +110,24 @@ async fn stage_rendered_cursor(
 /// Confirm the staged Rendered Cursor once the write carrying it landed
 /// (spec #561): the staged value is taken exactly once, mirrored into the
 /// accumulator's confirmed base and advanced on the Chain Record, scoped to
-/// the card the flush wrote.
-async fn confirm_staged_cursor(cards: &CardsHandle, session_id: &str, card_message_id: &str) {
+/// the card the flush wrote. `chain_id` narrows the call to one chain when the
+/// caller knows it (a projection's armed successor, review #569): a fresh Turn
+/// that replaced the session meanwhile owns its staged cursor itself, so its
+/// accumulator is never read, mutated or advanced by a foreign confirmation.
+async fn confirm_staged_cursor(
+    cards: &CardsHandle,
+    session_id: &str,
+    card_message_id: &str,
+    chain_id: Option<u64>,
+) {
     let cursor = {
         let mut live = cards.cards.lock().await;
         let Some(card) = live.get_mut(session_id) else {
             return;
         };
+        if chain_id.is_some_and(|chain_id| card.chain_id() != chain_id) {
+            return;
+        }
         let matches = card.acc.pending_cursor.as_ref().is_some_and(|staged| {
             staged
                 .card_message_id
@@ -163,13 +174,21 @@ async fn note_cursor_write_failure(
     }
 }
 
-/// Confirm the Rendered Cursor a projection's successor create carried
-/// (spec #561, ticket #563): the body's cursor was staged by
+/// Confirm the Rendered Cursor a projection's successor create carried, scoped
+/// to the armed successor's chain identity (spec #561, ticket #563, review
+/// #569): the body's cursor was staged by
 /// [`Turn::arm_projected_card`](super::Turn::arm_projected_card) and the
 /// create landed, so the chain's record advances exactly as a flush-confirmed
-/// write does. A no-op when nothing is staged for that card.
-pub(crate) async fn confirm_card_cursor(cards: &CardsHandle, session_id: &str, card_message_id: &str) {
-    confirm_staged_cursor(cards, session_id, card_message_id).await;
+/// write does. A no-op when nothing is staged for that card — and when a fresh
+/// Turn replaced the session meanwhile, whose staged cursor is its own and is
+/// never taken or advanced by the projection's late create.
+pub(crate) async fn confirm_armed_cursor(
+    cards: &CardsHandle,
+    session_id: &str,
+    chain_id: u64,
+    card_message_id: &str,
+) {
+    confirm_staged_cursor(cards, session_id, card_message_id, Some(chain_id)).await;
 }
 
 /// Advance every staged Rendered Cursor whose owed Pending Card Update has
@@ -193,7 +212,7 @@ pub(crate) async fn reconcile_staged_cursors(cards: &CardsHandle) {
     };
     for (session_id, card_message_id, seq) in due {
         if cards.feishu.card_write_delivered(&card_message_id, seq) {
-            confirm_staged_cursor(cards, &session_id, &card_message_id).await;
+            confirm_staged_cursor(cards, &session_id, &card_message_id, None).await;
         }
     }
 }
@@ -341,7 +360,7 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, spl
                 if delivered {
                     // The confirmed PATCH carries this body's Rendered Cursor
                     // (spec #561): advance the chain's record.
-                    confirm_staged_cursor(cards, session_id, &card_id).await;
+                    confirm_staged_cursor(cards, session_id, &card_id, None).await;
                     // The PATCH carried this slice's completion entries: the
                     // staged Wake Watermark is now user-visible (ADR-0061).
                     drain_wake_watermark(cards, session_id).await;
@@ -471,7 +490,7 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, spl
             if delivered {
                 // The confirmed PATCH carries this body's Rendered Cursor
                 // (spec #561): advance the chain's record.
-                confirm_staged_cursor(cards, session_id, &card_id).await;
+                confirm_staged_cursor(cards, session_id, &card_id, None).await;
                 // The finalized PATCH delivered this slice's entries; with no
                 // split queued the mark is fully user-visible, so it may drain
                 // (a queued split's 承接 line still owes the continuation send
@@ -558,7 +577,7 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, spl
                 // The confirmed create carries this body's Rendered Cursor
                 // (spec #561): advance the chain's record, now naming the new
                 // card.
-                confirm_staged_cursor(cards, session_id, &new_id).await;
+                confirm_staged_cursor(cards, session_id, &new_id, None).await;
                 // The send delivered the 承接 line (or the size-split slice):
                 // the staged Wake Watermark is user-visible now (ADR-0061).
                 drain_wake_watermark(cards, session_id).await;
@@ -643,11 +662,28 @@ async fn push_queued_receipts(cards: &CardsHandle, session_id: &str) {
 /// #561, ticket #566), so a Wake their successor rendered cannot be
 /// re-announced by a later recordless Fresh post.
 pub(crate) async fn drain_wake_watermark(cards: &CardsHandle, session_id: &str) {
+    drain_staged_watermark(cards, session_id, None).await;
+}
+
+/// [`drain_wake_watermark`] scoped to the armed successor's chain identity
+/// (spec #561, review #569): after a projection's atomic takeover a fresh Turn
+/// can still replace the session before this runs — its staged watermark is
+/// its own chain's, so only the armed accumulator's is ever drained.
+pub(crate) async fn drain_armed_watermark(cards: &CardsHandle, session_id: &str, chain_id: u64) {
+    drain_staged_watermark(cards, session_id, Some(chain_id)).await;
+}
+
+/// The shared drain body: take the session's staged Wake Watermark and persist
+/// it, optionally only while the session is still `chain_id`'s.
+async fn drain_staged_watermark(cards: &CardsHandle, session_id: &str, chain_id: Option<u64>) {
     let staged = {
         let mut live = cards.cards.lock().await;
         let Some(card) = live.get_mut(session_id) else {
             return;
         };
+        if chain_id.is_some_and(|chain_id| card.chain_id() != chain_id) {
+            return;
+        }
         if !card.pending_split.is_empty() {
             return;
         }
