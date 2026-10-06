@@ -52,9 +52,14 @@ projects the chain's delta after it onto a successor card.**
   tell growth from a same-slot replacement there: the frontier also stores a
   small **digest of the delivered prefix** — derived metadata, never content —
   and resolution requires the read's prefix of that length to hash to it. A
-  cursor written by an older release carries no digest and therefore resolves
-  nothing (a one-release migration seam, the cursorless fallback by another
-  name); the first confirmed write after the upgrade gives it one.
+  text/reasoning frontier whose start time or digest no longer matches the read
+  is not dropped — that would lose its tail — but resolved as **cut 0**: that
+  part renders in full while everything before it stays delivered, so a rewrite
+  duplicates nothing (the old content is gone from the read) and a growth still
+  renders only its tail. A cursor written by an older release carries no digest
+  and therefore resolves nothing (a one-release migration seam, the cursorless
+  fallback by another name); the first confirmed write after the upgrade gives
+  it one.
 
 - **Advance only on a confirmed write, through the existing delivery choke
   point.** The accumulator stages the cursor of the body it is about to write,
@@ -125,7 +130,11 @@ projects the chain's delta after it onto a successor card.**
   re-rendered once through the flush's fenced fallback so the tail can still
   land (a content rejection that survives the fenced retry is suspended:
   single-shot, the payload can never land). A restart forgets the mark,
-  exactly like every in-memory reconcile mark. A chain that stopped mid-way
+  exactly like every in-memory reconcile mark. A successor create that lands
+  AFTER a fresh Turn already won the chain is collected **without its body** —
+  the winner's message-first seed re-rendered the same tail, so preserving it
+  would make the reader read the text twice — the one deliberate departure
+  from ADR-0063's body-preserving collect. A chain that stopped mid-way
   (below) keeps its record instead: the tail past the last confirmed slice is
   still owed, so a terminal card's usual record discard is suppressed for it
   and the next life resumes from the cursor.
@@ -143,7 +152,11 @@ projects the chain's delta after it onto a successor card.**
   resolve: a V2 transcript truncated at its page cap leaves a running call
   outside it, and that call's panel then stays on the collected old card as a
   frozen witness rather than being stripped from a card the successor cannot
-  repair (review #569).
+  repair (review #569). Truncation is not reportable at this seam — the read
+  stops at its page cap with a log, and the generation-neutral
+  `SessionTranscript` carries no truncation fact — so the projection cannot
+  withhold itself on a truncated read, and the frozen marker is the honest
+  signal; a later complete read adopts normally.
 
 - **The message-first race uses the same primitive.** When a user message wins
   the race against the adoption, the fresh Turn's takeover seeds its card from

@@ -140,6 +140,16 @@ pub(crate) async fn collect_orphan_after_takeover(
     collect_orphan_with(cards, session_id, card_message_id, keep).await;
 }
 
+/// Collect a projection's LATE successor — the create that landed after a
+/// fresh Turn had already won the chain — **without keeping its body** (spec
+/// #561, review #569): the winning Turn's card re-rendered the same tail
+/// through the message-first seed, so preserving this body would show the
+/// reader the same text twice. The late card is reduced to the bare
+/// taken-over marker; every other collect keeps its body (ADR-0063).
+pub(crate) async fn collect_late_projection(cards: &CardsHandle, session_id: &str, card_message_id: &str) {
+    collect_orphan_with(cards, session_id, card_message_id, KeepBody::Nothing).await;
+}
+
 /// The shared takeover collect behind [`collect_orphan`] and
 /// [`collect_orphan_after_takeover`]: one PATCH naming the successor, terminal
 /// and grey, its preserved body under `keep`.
@@ -536,9 +546,11 @@ async fn send_projected_chain(
         )
         .await
         {
-            // A fresh Turn owns the session: the late card is collected so it
-            // cannot look live, and the chain stops.
-            collect_orphan(&handles.cards, session_id, &new_card_id).await;
+            // A fresh Turn owns the session: the late card is collected
+            // bodyless — the winner re-rendered the same slice — so it cannot
+            // look live and the reader never sees the text twice, and the
+            // chain stops.
+            collect_late_projection(&handles.cards, session_id, &new_card_id).await;
             return ProjectedChain::Stopped(last);
         }
         crate::bridge::turn::confirm_armed_cursor(
@@ -725,7 +737,10 @@ async fn send_projected_successor(
     )
     .await
     else {
-        collect_orphan(&handles.cards, session_id, &new_card_id).await;
+        // The late card is collected WITHOUT its body: the winning Turn's
+        // message-first seed already re-rendered the same tail, so preserving
+        // it would show the reader the text twice (review #569).
+        collect_late_projection(&handles.cards, session_id, &new_card_id).await;
         tracing::info!(
             "live-card reap: session {session_id} lost the create window to a fresh Turn; its late card is collected"
         );
@@ -1332,6 +1347,13 @@ enum KeepBody {
     /// when the takeover's seed actually resolved them onto the successor.
     /// Every other preserved element stays.
     WithoutLiveTail { strip_running_panels: bool },
+    /// The late projection successor's collect (spec #561, review #569): the
+    /// card is reduced to the bare taken-over marker, NO element kept. The
+    /// winner (a fresh Turn whose message-first seed re-rendered the same
+    /// tail) already shows that content, so preserving this body would make
+    /// the reader read the same text twice. The one deliberate departure from
+    /// ADR-0063's body-preserving collect.
+    Nothing,
 }
 
 impl KeepBody {
@@ -1346,6 +1368,7 @@ impl KeepBody {
                 }
                 !strip_running_panels || !is_running_panel_element(element)
             }
+            Self::Nothing => false,
         }
     }
 }
