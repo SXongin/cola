@@ -8,7 +8,8 @@
 //! accumulator's own tests are the module's internal seam.
 
 use super::disposition::Disposition;
-use crate::backend::{SessionTranscript, ToolCall, ToolStatus, TurnAnchor};
+use crate::backend::{MessageId, SessionTranscript, ToolCall, ToolStatus, TurnAnchor};
+use crate::bridge::chain::{CursorFrontier, CursorPartKind, RenderedCursor};
 use crate::bridge::handles::CardsHandle;
 use crate::feishu::card::first_n_chars_bytes;
 use crate::feishu::card::ledger::{TaskCompletionEntry, TaskKind, TaskLedgerRow};
@@ -46,6 +47,23 @@ pub(super) struct TimelineItem {
     /// when the card re-renders.
     pub(super) seq: u64,
     pub(super) kind: TimelineKind,
+    /// The typed transcript part this entry rendered from, for text/reasoning
+    /// entries pushed by the render (spec #561's cursor frontier); `None` for
+    /// synthetic entries (receipts, ledger entries) and for entries no
+    /// frontier can name (tools).
+    pub(super) source: Option<PartSource>,
+}
+
+/// Where a timeline text/reasoning entry came from: the typed transcript
+/// part's own position (spec #561's cursor frontier). The payload carries no
+/// stable part id (AGENTS.md #9), so identity is the message plus the part's
+/// ordinal in it. Test and synthetic pushes carry none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PartSource {
+    /// The assistant message that carried the part.
+    pub(super) message_id: MessageId,
+    /// The part's index in its message's typed `parts` vec.
+    pub(super) index: usize,
 }
 
 /// Bookkeeping for a Tool Panel that is still live (ADR-0045): the timeline
@@ -86,6 +104,11 @@ pub(super) struct BuiltCard {
     pub(super) card: serde_json::Value,
     pub(super) full: bool,
     pub(super) spans: Vec<crate::bridge::card_handles::BlockSpan>,
+    /// The Rendered Cursor this body delivers (spec #561): the frontier of the
+    /// newest text/reasoning part it renders and the tool ids whose delivered
+    /// state it shows. The flush stages it before the write and drains it into
+    /// the Chain Record once that write is confirmed.
+    pub(super) cursor: RenderedCursor,
 }
 
 /// Estimated serialized size (bytes) of one collapsible tool panel, mirroring
@@ -531,6 +554,21 @@ impl LedgerChange {
     }
 }
 
+/// The Rendered Cursor staged for the card body most recently built and not
+/// yet confirmed (spec #561): the flush stages it before the write, and a
+/// confirmed write drains it into the Chain Record. In-memory only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct StagedCursor {
+    /// The card the body is written to; `None` for a create (the id is only
+    /// known once the send lands, and creates are never outbox-retried).
+    pub(super) card_message_id: Option<String>,
+    pub(super) cursor: RenderedCursor,
+    /// The Pending Card Update sequence a recoverably failed write left owed:
+    /// the drain reconcile confirms the cursor only once THAT payload
+    /// delivers. `None` while no failure is owed.
+    pub(super) awaiting_seq: Option<u64>,
+}
+
 /// Accumulates streaming state for one session.
 #[derive(Default, Clone)]
 pub(super) struct StreamAccumulator {
@@ -745,6 +783,17 @@ pub(super) struct StreamAccumulator {
     /// is the restart-surviving high-water mark, so it must never advance
     /// before the write that makes the announcement user-visible.
     pub(super) pending_watermark: Option<(String, i64)>,
+    /// The chain's last confirmed Rendered Cursor (spec #561): the in-memory
+    /// mirror of the record's fact. Every staged candidate derives from it,
+    /// and a fresh accumulator taking over a chain is seeded from the record
+    /// (`Turn::track_live_card`), so a successor's first write can never clear
+    /// the chain's frontier.
+    pub(super) cursor: RenderedCursor,
+    /// The Rendered Cursor of the card body most recently built, awaiting a
+    /// confirmed write (spec #561): staged by the flush before each write and
+    /// drained into [`Self::cursor`] and the durable record once that write
+    /// lands. A failed or still-owed write leaves it staged.
+    pub(super) pending_cursor: Option<StagedCursor>,
     /// The Turn's anchor, captured as one fact: the identity of the user
     /// message this turn answers together with that message's server time. An
     /// external render arms with the external message's anchor directly; a
@@ -1109,6 +1158,41 @@ impl StreamAccumulator {
         true
     }
 
+    /// Stage the Rendered Cursor of the body about to be written (spec #561):
+    /// `card_message_id` is `None` for a create, whose id is only known once
+    /// the send lands. The staged value supersedes any earlier one — the
+    /// newest body is the one a write can confirm — and only a confirmed
+    /// write drains it.
+    pub(super) fn stage_cursor(&mut self, card_message_id: Option<&str>, cursor: RenderedCursor) {
+        self.pending_cursor = Some(StagedCursor {
+            card_message_id: card_message_id.map(str::to_string),
+            cursor,
+            awaiting_seq: None,
+        });
+    }
+
+    /// Tie the staged cursor to the Pending Card Update sequence a recoverably
+    /// failed write left owed (spec #561): the drain reconcile advances the
+    /// cursor only once THAT payload delivers. A stage that names another card
+    /// is left untouched.
+    pub(super) fn await_cursor_write(&mut self, card_message_id: &str, seq: u64) {
+        if let Some(staged) = self.pending_cursor.as_mut()
+            && staged
+                .card_message_id
+                .as_deref()
+                .is_none_or(|id| id == card_message_id)
+        {
+            staged.awaiting_seq = Some(seq);
+        }
+    }
+
+    /// Drop the staged cursor: the write it described can never land (a
+    /// permanent refusal), so nothing may advance it. The next build re-stages
+    /// from the confirmed base.
+    pub(super) fn discard_pending_cursor(&mut self) {
+        self.pending_cursor = None;
+    }
+
     /// The completed Background Task ledger entry a shell/subagent Wake leaves
     /// on the card that hosted its task (ADR-0060): one folded panel, keyed at
     /// the Wake's own server time so it sorts where the completion happened —
@@ -1318,15 +1402,34 @@ impl StreamAccumulator {
     /// (or `None` for a synthetic key) as the instant a panel header may
     /// display.
     fn insert_kind(&mut self, key: i64, shown_at: Option<i64>, kind: TimelineKind) {
+        self.insert_kind_src(key, shown_at, None, kind);
+    }
+
+    /// [`Self::insert_kind`] carrying the typed transcript part a
+    /// text/reasoning entry rendered from (spec #561's cursor frontier).
+    fn insert_kind_src(
+        &mut self,
+        key: i64,
+        shown_at: Option<i64>,
+        source: Option<PartSource>,
+        kind: TimelineKind,
+    ) {
         self.item_seq += 1;
-        self.insert_item(key, shown_at, self.item_seq, kind);
+        self.insert_item(key, shown_at, source, self.item_seq, kind);
     }
 
     /// [`Self::insert_kind`] with a pre-allocated identity: a live Tool Panel
     /// keeps the seq it was born with when it settles into the timeline, so
     /// its card element — and the reader's fold state — survives the move
     /// (ADR-0045).
-    fn insert_item(&mut self, key: i64, shown_at: Option<i64>, seq: u64, kind: TimelineKind) {
+    fn insert_item(
+        &mut self,
+        key: i64,
+        shown_at: Option<i64>,
+        source: Option<PartSource>,
+        seq: u64,
+        kind: TimelineKind,
+    ) {
         let idx = self.timeline.partition_point(|item| item.key <= key);
         let (idx, key) = if idx < self.render_from {
             (
@@ -1344,6 +1447,7 @@ impl StreamAccumulator {
                 shown_at,
                 seq,
                 kind,
+                source,
             },
         );
         self.last_key = self.last_key.max(key);
@@ -1387,6 +1491,13 @@ impl StreamAccumulator {
     /// `None` for a payload with no server time: the item is then keyed by a
     /// monotonic fallback (call order) and shows no clock.
     pub(super) fn push_text_at(&mut self, at_ms: Option<i64>, chunk: &str) {
+        self.push_text_from(at_ms, None, chunk);
+    }
+
+    /// [`Self::push_text_at`] carrying the typed transcript part this chunk
+    /// rendered from (spec #561's cursor frontier). Synthetic pushes pass
+    /// `None`.
+    pub(super) fn push_text_from(&mut self, at_ms: Option<i64>, source: Option<PartSource>, chunk: &str) {
         let key = at_ms.unwrap_or_else(|| self.next_order());
         self.text.push_str(chunk);
         let max = crate::feishu::card::MAX_CARD_TEXT_CHARS;
@@ -1401,7 +1512,7 @@ impl StreamAccumulator {
             };
             if space == 0 {
                 let take: String = remaining.chars().take(max).collect();
-                self.insert_kind(key, at_ms, TimelineKind::Text(take.clone()));
+                self.insert_kind_src(key, at_ms, source.clone(), TimelineKind::Text(take.clone()));
                 remaining = &remaining[take.len()..];
                 continue;
             }
@@ -1410,9 +1521,15 @@ impl StreamAccumulator {
             match self.timeline.get_mut(idx) {
                 Some(TimelineItem {
                     kind: TimelineKind::Text(last),
+                    source: item_source,
                     ..
-                }) => last.push_str(&take),
-                _ => self.insert_kind(key, at_ms, TimelineKind::Text(take.clone())),
+                }) => {
+                    last.push_str(&take);
+                    if item_source.is_none() {
+                        *item_source = source.clone();
+                    }
+                }
+                _ => self.insert_kind_src(key, at_ms, source.clone(), TimelineKind::Text(take.clone())),
             }
             remaining = &remaining[take.len()..];
         }
@@ -1420,7 +1537,7 @@ impl StreamAccumulator {
 
     /// Append a reasoning chunk, keeping it in the chronological timeline
     /// (chunks of the same part merge into one panel; a part keyed apart is
-    /// its own panel). Production renders go through [`Self::push_reasoning_at`];
+    /// its own panel). Production renders go through [`Self::push_reasoning_from`];
     /// this convenience form is for tests and synthetic content.
     #[cfg(test)]
     pub(super) fn push_reasoning(&mut self, chunk: &str) {
@@ -1429,17 +1546,37 @@ impl StreamAccumulator {
 
     /// [`Self::push_reasoning`] for a reasoning part that started at `at_ms`
     /// (the server's `time.start`); `None` keys it by fallback and shows no
-    /// clock.
+    /// clock. Test-only like [`Self::push_reasoning`]: production renders go
+    /// through [`Self::push_reasoning_from`].
+    #[cfg(test)]
     pub(super) fn push_reasoning_at(&mut self, at_ms: Option<i64>, chunk: &str) {
+        self.push_reasoning_from(at_ms, None, chunk);
+    }
+
+    /// [`Self::push_reasoning_at`] carrying the typed transcript part this
+    /// chunk rendered from (spec #561's cursor frontier). Synthetic pushes
+    /// pass `None`.
+    pub(super) fn push_reasoning_from(
+        &mut self,
+        at_ms: Option<i64>,
+        source: Option<PartSource>,
+        chunk: &str,
+    ) {
         let key = at_ms.unwrap_or_else(|| self.next_order());
         self.reasoning.push_str(chunk);
         let idx = self.item_with_key(key);
         match idx.and_then(|i| self.timeline.get_mut(i)) {
             Some(TimelineItem {
                 kind: TimelineKind::Reasoning(last),
+                source: item_source,
                 ..
-            }) => last.push_str(chunk),
-            _ => self.insert_kind(key, at_ms, TimelineKind::Reasoning(chunk.to_string())),
+            }) => {
+                last.push_str(chunk);
+                if item_source.is_none() {
+                    *item_source = source;
+                }
+            }
+            _ => self.insert_kind_src(key, at_ms, source, TimelineKind::Reasoning(chunk.to_string())),
         }
     }
 
@@ -1499,6 +1636,7 @@ impl StreamAccumulator {
                 self.insert_item(
                     entry.key,
                     entry.shown_at,
+                    None,
                     entry.seq,
                     TimelineKind::Tool(call_id.to_string()),
                 );
@@ -1769,14 +1907,19 @@ impl StreamAccumulator {
             }
         }
         let state = if full { Some(CardState::Continued) } else { None };
-        let (card, spans) = self.build_card_inner(self.render_from, split, !full, state);
+        let (card, spans, cursor) = self.build_card_inner(self.render_from, split, !full, state);
         // Advance `render_from` ONLY on an actual split: while the card still
         // fits, subsequent flushes must re-render from the SAME start so the
         // content accumulates instead of only showing the latest delta.
         if full {
             self.render_from = split;
         }
-        BuiltCard { card, full, spans }
+        BuiltCard {
+            card,
+            full,
+            spans,
+            cursor,
+        }
     }
 
     /// [`Self::build_card_with_info`] for callers that don't need the block
@@ -1796,11 +1939,12 @@ impl StreamAccumulator {
     /// stays under Feishu's hard cap even when its estimate crosses the split
     /// budget.
     pub(super) fn build_card_unsplit(&self) -> BuiltCard {
-        let (card, spans) = self.build_card_inner(self.render_from, self.timeline.len(), true, None);
+        let (card, spans, cursor) = self.build_card_inner(self.render_from, self.timeline.len(), true, None);
         BuiltCard {
             card,
             full: false,
             spans,
+            cursor,
         }
     }
 
@@ -1814,18 +1958,21 @@ impl StreamAccumulator {
     /// card (`None` takes the standard 「部分完成，继续中…」); a terminal card
     /// keeps its own recorded ending when the ledger handover still owes it a
     /// PATCH (ADR-0060).
-    pub(super) fn build_finalized_handoff(&mut self, state: Option<CardState>) -> serde_json::Value {
+    pub(super) fn build_finalized_handoff(&mut self, state: Option<CardState>) -> BuiltCard {
         let end = self.timeline.len();
-        let card = self
-            .build_card_inner(
-                self.render_from,
-                end,
-                false,
-                Some(state.unwrap_or(CardState::Continued)),
-            )
-            .0;
+        let built = self.build_card_inner(
+            self.render_from,
+            end,
+            false,
+            Some(state.unwrap_or(CardState::Continued)),
+        );
         self.render_from = end;
-        card
+        BuiltCard {
+            card: built.0,
+            full: false,
+            spans: built.1,
+            cursor: built.2,
+        }
     }
 
     /// The request ids of every block the accumulator still awaits. A block
@@ -1944,17 +2091,24 @@ impl StreamAccumulator {
     /// Assemble the card JSON for `timeline[start..end]`. `include_tail` adds
     /// the non-timeline sections (inline permission/question, error, retry
     /// button) — only the live card should carry them. `state_override` forces
-    /// the header state (e.g. "部分完成" on split cards). Returns the card and
-    /// the element range of every live block the tail rendered (empty without a
-    /// tail).
+    /// the header state (e.g. "部分完成" on split cards). Returns the card, the
+    /// element range of every live block the tail rendered (empty without a
+    /// tail), and the Rendered Cursor this body delivers (spec #561).
     fn build_card_inner(
         &self,
         start: usize,
         end: usize,
         include_tail: bool,
         state_override: Option<CardState>,
-    ) -> (serde_json::Value, Vec<crate::bridge::card_handles::BlockSpan>) {
+    ) -> (
+        serde_json::Value,
+        Vec<crate::bridge::card_handles::BlockSpan>,
+        RenderedCursor,
+    ) {
         let state = state_override.unwrap_or_else(|| self.card_state.clone());
+        // The body's Rendered Cursor, captured before the builder consumes
+        // nothing but `&self`: position and identity only (spec #561).
+        let cursor = self.cursor_for_slice(end, include_tail, &state);
         // The header shows the Turn's running tool even when THIS slice has no
         // panel for it (a split continuation after `sleep 30` started): pass
         // the accumulator's global selection as the builder's override. The
@@ -2210,7 +2364,58 @@ impl StreamAccumulator {
             builder = builder.with_footer(&footer_parts.join(" · "));
         }
 
-        (builder.build(), spans)
+        (builder.build(), spans, cursor)
+    }
+
+    /// The Rendered Cursor of the card body [`Self::build_card_inner`] is
+    /// about to render for `timeline[..end]` (spec #561): the chain's
+    /// confirmed cursor plus what this body adds. The frontier names the
+    /// newest text/reasoning part included, with its cumulative delivered
+    /// character extent — a body with none of its own keeps the base frontier
+    /// (it must never regress). The live set adds the running calls this
+    /// body's tail delivers and removes the calls it delivers settled into the
+    /// timeline; a call the body omits (a finalized slice has no tail, a
+    /// settled card omits a carried `⏳`) keeps its last delivered state.
+    fn cursor_for_slice(&self, end: usize, include_tail: bool, state: &CardState) -> RenderedCursor {
+        let mut cursor = self.cursor.clone();
+        if let Some((source, kind, started_at)) = self.timeline[..end].iter().rev().find_map(|item| {
+            let source = item.source.as_ref()?;
+            let kind = match &item.kind {
+                TimelineKind::Text(_) => CursorPartKind::Text,
+                TimelineKind::Reasoning(_) => CursorPartKind::Reasoning,
+                _ => return None,
+            };
+            Some((source, kind, item.shown_at))
+        }) {
+            let delivered_chars = self.timeline[..end]
+                .iter()
+                .filter(|item| item.source.as_ref() == Some(source))
+                .filter_map(|item| match &item.kind {
+                    TimelineKind::Text(text) | TimelineKind::Reasoning(text) => Some(text.chars().count()),
+                    _ => None,
+                })
+                .sum();
+            cursor.frontier = Some(CursorFrontier {
+                message_id: source.message_id.clone(),
+                part_index: source.index,
+                kind,
+                started_at,
+                delivered_chars,
+            });
+        }
+        for item in &self.timeline[..end] {
+            if let TimelineKind::Tool(call_id) = &item.kind {
+                cursor.live_calls.remove(call_id);
+            }
+        }
+        if include_tail {
+            for call_id in self.live_tools.keys() {
+                if !self.omitted_live_carried(state, call_id) {
+                    cursor.live_calls.insert(call_id.clone());
+                }
+            }
+        }
+        cursor
     }
 }
 
