@@ -19,8 +19,8 @@ use super::drain::{
     spawn_turn, tool_assistant, user, wait_for_card_header, wait_for_card_text,
 };
 use crate::backend::{
-    ContentBlock, MessageId, MessageRole, MessageTime, Part, SessionTranscript, ToolCall, ToolIdentity,
-    ToolOutput, ToolStatus, TranscriptMessage, TranscriptTail,
+    ContentBlock, MessageId, MessageRole, MessageTime, Part, SessionTranscript, TextPart, ToolCall,
+    ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage, TranscriptTail,
 };
 use crate::bridge::chain::{ChainRecords, CursorFrontier, CursorPartKind, RenderedCursor};
 use crate::bridge::test_support::*;
@@ -4783,4 +4783,245 @@ async fn a_live_adoption_is_generation_neutral() {
         );
         wait_for_record_gone(&app, "ses_test").await;
     }
+}
+
+// ---------------------------------------------------------------------------
+// The message-first race (spec #561, ticket #565): a user message wins the
+// race against the adoption. The fresh Turn takes the orphan chain over and
+// its card surfaces the run's final undelivered tail through the Rendered
+// Cursor — once, as a continuation, before the new Turn's own answer — so the
+// collected orphan card leaves no running marker and the reap posts no second
+// card.
+// ---------------------------------------------------------------------------
+
+/// The race's transcript: the orphaned run's own end — its in-flight answer
+/// carrying the delivered prefix and the unseen tail, plus its still-running
+/// call — and the user message that won the race. `answer` appends the new
+/// Turn's reply once the run released the queue.
+fn race_transcript(
+    orphan_anchor: i64,
+    text: &str,
+    tool_status: ToolStatus,
+    tool_output: &str,
+    new_anchor: i64,
+    answer: Option<&str>,
+) -> SessionTranscript {
+    let mut messages = vec![
+        user("msg_cola_anchor", orphan_anchor, "跑个长命令"),
+        TranscriptMessage {
+            id: MessageId::new("msg_a_orphan"),
+            role: MessageRole::Assistant,
+            time: Some(MessageTime {
+                created: orphan_anchor + 500,
+                completed: None,
+            }),
+            model: None,
+            tokens: None,
+            error: None,
+            parts: vec![Part::Text(TextPart {
+                text: text.to_string(),
+                started_at: Some(orphan_anchor + 500),
+            })],
+        },
+        in_flight_shell(
+            "a_orphan_tool",
+            orphan_anchor + 800,
+            "call_sleep",
+            tool_status,
+            orphan_anchor + 900,
+            tool_output,
+        ),
+        user("msg_cola_new", new_anchor, "新问题"),
+    ];
+    if let Some(answer) = answer {
+        messages.push(assistant(new_anchor + 1_000, answer));
+    }
+    SessionTranscript::new(messages)
+}
+
+/// The orphaned card's view when the message landed: a written body and a
+/// running `shell` panel riding its live tail.
+fn orphan_running_card_view() -> serde_json::Value {
+    serde_json::json!({
+        "schema": "2.0",
+        "config": { "wide_screen_mode": true, "streaming_mode": true },
+        "header": {
+            "template": "blue",
+            "title": { "tag": "plain_text", "content": "✍️ 回复中" }
+        },
+        "body": { "elements": [
+            { "tag": "markdown", "content": "**正文** 已经写了一半。" },
+            { "tag": "collapsible_panel", "expanded": false,
+              "header": { "title": { "tag": "plain_text", "content": "⏳ shell" } },
+              "elements": [ { "tag": "markdown", "content": "还在跑" } ] }
+        ] }
+    })
+}
+
+/// The headline acceptance (spec #561, ticket #565): a message sent in the
+/// window before the adoption yields one card that shows the orphan's tail
+/// exactly once, then the new Turn's answer — while the collected orphan card
+/// loses the running marker the successor resolved, and the reap never posts
+/// an adoption card over the winning Turn.
+#[tokio::test]
+async fn a_message_before_the_adoption_shows_the_orphans_tail_once() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let orphan_anchor = 1_000_000;
+    let new_anchor = 2_000_000;
+    let delivered = "已经写了一半。";
+    let missed = "停机前没送达的尾巴。";
+    let full = format!("{delivered}{missed}");
+    // The orphan record confirmed the frontier inside its in-flight answer,
+    // plus its still-running call (the Rendered Cursor, spec #561).
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(orphan_anchor),
+        Some("/work"),
+        Some(CursorFrontier {
+            message_id: MessageId::new("msg_a_orphan"),
+            part_index: 0,
+            kind: CursorPartKind::Text,
+            started_at: Some(orphan_anchor + 500),
+            delivered_chars: delivered.chars().count(),
+        }),
+        &["call_sleep"],
+    );
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_transcript(
+        "ses_test",
+        vec![race_transcript(
+            orphan_anchor,
+            &full,
+            ToolStatus::Running,
+            "",
+            new_anchor,
+            None,
+        )],
+    );
+    backend.with_session_status("ses_test", Some(SessionStatus::Busy));
+    // The prompt is held: the takeover and its render window are observable
+    // before the new run answers.
+    let gate = backend.hold_prompts();
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(
+        App::new(test_config(&session_file), backend.clone(), platform.clone()).expect("the race app builds"),
+    );
+    seed_session(&app, "ses_test", "/work").await;
+    app.turn_render_poll_ms
+        .store(5, std::sync::atomic::Ordering::Relaxed);
+    app.turn_drain_timeout_ms
+        .store(60_000, std::sync::atomic::Ordering::Relaxed);
+    app.turn_follow_read_timeout_ms
+        .store(200, std::sync::atomic::Ordering::Relaxed);
+    platform.given_card_view("om_frozen", orphan_running_card_view());
+
+    // The message wins the race: the fresh Turn takes the chain over before
+    // any reap pass would adopt the unowned record.
+    let mut context = ctx("ses_test", "新问题");
+    context.cola_message_id = Some("msg_cola_new".into());
+    let turn = spawn_turn(&app, context);
+    wait_for_update(&platform, "om_frozen", "the takeover collect", |card| {
+        card_header(card).contains("已由新卡片接管")
+    })
+    .await;
+    // Only now does the reap run; it must find the successor owning the chain.
+    spawn_sync(&app);
+
+    // The successor shows the orphan's undelivered tail exactly once, as a
+    // continuation — the delivered prefix never repeats.
+    wait_for_card_text(&platform, missed).await;
+    let patched = patches_to(&platform, "msg_reply").await;
+    let successor = patched.last().expect("the successor was patched");
+    let successor_text = card_text(successor);
+    assert_eq!(
+        successor_text.matches(missed).count(),
+        1,
+        "the orphan's tail lands exactly once: {successor}"
+    );
+    assert!(
+        !successor_text.contains(delivered),
+        "the delivered prefix is never repeated: {successor}"
+    );
+    assert!(
+        successor_text.contains("⏳ shell"),
+        "the still-running call rides the successor's live tail: {successor}"
+    );
+    // The collected orphan card keeps its body but loses the running marker
+    // the successor resolved; the collect is its only write.
+    let collect = last_update_of(&platform, "om_frozen")
+        .await
+        .expect("the old card is collected as taken over");
+    let collect_text = card_text(&collect);
+    assert!(
+        !collect_text.contains("⏳ shell") && !collect_text.contains("还在跑"),
+        "the resolved running panel leaves the collected card: {collect}"
+    );
+    assert!(
+        collect_text.contains("**正文** 已经写了一半。"),
+        "the collect keeps the body the old card already showed: {collect}"
+    );
+    assert_eq!(
+        patches_to(&platform, "om_frozen").await.len(),
+        1,
+        "the takeover collect is the orphan's only write: {:?}",
+        patches_to(&platform, "om_frozen").await
+    );
+    assert_eq!(
+        card_posts(&platform).await,
+        1,
+        "the message won the race: the adoption never posts a second card: {:?}",
+        platform.calls.lock().await
+    );
+
+    // The new run answers: the tail stays once and the new answer follows.
+    backend
+        .given_transcript_after_build(
+            "ses_test",
+            vec![race_transcript(
+                orphan_anchor,
+                &full,
+                ToolStatus::Completed,
+                "slept",
+                new_anchor,
+                Some("新回答"),
+            )],
+        )
+        .await;
+    backend
+        .set_session_status("ses_test", Some(SessionStatus::Idle))
+        .await;
+    gate.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), turn)
+        .await
+        .expect("the turn must end")
+        .unwrap()
+        .unwrap();
+    wait_for_card_header(&platform, "✅").await;
+    let seen = platform.updated_cards().await;
+    let final_text = card_text(seen.last().unwrap());
+    assert_eq!(
+        final_text.matches(missed).count(),
+        1,
+        "the tail stays exactly once at settle: {final_text}"
+    );
+    assert!(
+        !final_text.contains(delivered),
+        "the delivered prefix stays out: {final_text}"
+    );
+    assert!(
+        final_text.contains("新回答"),
+        "the new Turn's own answer follows the tail: {final_text}"
+    );
+    assert_eq!(
+        card_posts(&platform).await,
+        1,
+        "no adoption card ever appears: {:?}",
+        platform.calls.lock().await
+    );
+    wait_for_record_gone(&app, "ses_test").await;
 }
