@@ -15,14 +15,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::drain::{
-    assistant, ctx, script_transcript, scripted_app, spawn_sync, spawn_sync_with_timeout, spawn_turn, user,
-    wait_for_card_header, wait_for_card_text,
+    assistant, ctx, script_transcript, scripted_app, spawn_sync, spawn_sync_with_timeout, spawn_turn,
+    tool_assistant, user, wait_for_card_header, wait_for_card_text,
 };
 use crate::backend::{
     ContentBlock, MessageId, MessageRole, MessageTime, Part, SessionTranscript, ToolCall, ToolIdentity,
     ToolOutput, ToolStatus, TranscriptMessage, TranscriptTail,
 };
-use crate::bridge::chain::ChainRecords;
+use crate::bridge::chain::{ChainRecords, CursorFrontier, CursorPartKind, RenderedCursor};
 use crate::bridge::test_support::*;
 use crate::bridge::turn::Turn;
 use crate::config::{SessionEntry, ThreadKey};
@@ -3695,4 +3695,474 @@ async fn a_restart_after_a_failed_final_patch_reaps_the_card() {
     })
     .await
     .expect("the reap settles the orphaned card and drops its record");
+}
+
+// ---------------------------------------------------------------------------
+// The ended-while-down projection (spec #561, ticket #563): a record whose
+// confirmed Rendered Cursor covers a delivered prefix, over a transcript that
+// grew while cola was down, projects exactly the missed tail plus the true
+// ending onto a successor card — never repeating the prefix, never rebuilding
+// the old card.
+// ---------------------------------------------------------------------------
+
+/// Seed a record the previous life left with a confirmed Rendered Cursor: its
+/// card's last delivered frontier and live set (spec #561). The next app
+/// loads it at construction exactly like a real restart.
+fn seed_cursor_record(
+    session_file: &Path,
+    card_message_id: &str,
+    message_id: &str,
+    created_ms: Option<i64>,
+    directory: Option<&str>,
+    frontier: Option<CursorFrontier>,
+    live_calls: &[&str],
+) {
+    seed_chain_record(session_file, card_message_id, message_id, created_ms, directory);
+    let cursor = RenderedCursor {
+        frontier,
+        live_calls: live_calls.iter().map(|call_id| call_id.to_string()).collect(),
+    };
+    ChainRecords::load(sidecar(session_file)).advance_cursor("ses_test", card_message_id, &cursor);
+}
+
+/// The cursor frontier of the fixture: a text part at `msg_a_2000` delivered
+/// up to `delivered_chars`.
+fn text_frontier(delivered_chars: usize) -> CursorFrontier {
+    CursorFrontier {
+        message_id: MessageId::new("msg_a_2000"),
+        part_index: 0,
+        kind: CursorPartKind::Text,
+        started_at: Some(2_000),
+        delivered_chars,
+    }
+}
+
+/// Wait for the projection's successor create — a reply carrying an ending
+/// header — returning its card and text. Panics after 5 s.
+async fn wait_for_projection(platform: &RecordingPlatform, reply_to: &str) -> (serde_json::Value, String) {
+    let wait = async {
+        loop {
+            let calls = platform.calls.lock().await;
+            if let Some(card) = calls.iter().find_map(|call| match call {
+                PlatformCall::ReplyCard { reply_to: to, card } if to == reply_to => Some(card.clone()),
+                _ => None,
+            }) {
+                let text = card_text(&card);
+                return (card, text);
+            }
+            drop(calls);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), wait)
+        .await
+        .unwrap_or_else(|_| panic!("the projection never posted a successor for {reply_to}"))
+}
+
+/// The headline acceptance (spec #561, ticket #563): a restart with a
+/// delivered prefix and a longer transcript projects exactly the delta plus
+/// the true ending onto a successor — character-level no-dup, no omission —
+/// while the old card is collected as taken over, keeping its own body.
+#[tokio::test]
+async fn a_restart_projects_the_missed_tail_of_an_ended_run() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let delivered = "已经写了一半。";
+    let missed = "后半段是在停机期间写完的。";
+    let full = format!("{delivered}{missed}");
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
+        Some(text_frontier(delivered.chars().count())),
+        &[],
+    );
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "问题"),
+        assistant(2_000, &full),
+    ])
+    .with_executions(vec![execution(2_500)]);
+    let (app, platform, backend) =
+        restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Idle)).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+
+    spawn_sync(&app);
+    let (successor, successor_text) = wait_for_projection(&platform, "msg_cola_anchor").await;
+
+    assert_eq!(
+        card_header(&successor),
+        "✅ 完成",
+        "the successor carries the transcript's true ending"
+    );
+    assert_eq!(
+        successor_text.matches(missed).count(),
+        1,
+        "the missed tail lands exactly once: {successor}"
+    );
+    assert!(
+        !successor_text.contains(delivered),
+        "the delivered prefix is never repeated: {successor}"
+    );
+
+    // The old card is collected as taken over, keeping its own body — never
+    // rebuilt with the tail.
+    let collect = last_update_of(&platform, "om_frozen")
+        .await
+        .expect("the old card is collected as taken over");
+    assert!(
+        card_header(&collect).contains("已由新卡片接管"),
+        "the old card is collected as taken over: {collect}"
+    );
+    let collect_text = card_text(&collect);
+    assert!(
+        collect_text.contains("**正文** 第一段"),
+        "the collect keeps the body the old card already showed: {collect}"
+    );
+    assert!(
+        !collect_text.contains(missed),
+        "the old card is never rebuilt with the missed tail: {collect}"
+    );
+    assert!(
+        app.cards_handle().chains.get("ses_test").is_none(),
+        "a terminal successor spends the record once its create is confirmed"
+    );
+
+    // Later passes never replay: the successor's cursor covers the read, so
+    // the Wake step's content diff owes nothing.
+    let posts = card_posts(&platform).await;
+    let reads = backend.transcript_calls.lock().await.len();
+    wait_for_transcript_reads(&backend, "ses_test", reads + 2).await;
+    assert_eq!(
+        card_posts(&platform).await,
+        posts,
+        "no second successor after the projection: {:?}",
+        platform.calls.lock().await
+    );
+}
+
+/// A tail cut inside a code fence (spec #561, ticket #563): the successor's
+/// markdown reopens the fence, so the missed code stays code and the text
+/// after the original closer is not swallowed.
+#[tokio::test]
+async fn a_projection_cut_inside_a_fence_renders_intact() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let delivered = "说明\n```python\nprint(1)\n";
+    let missed = "print(2)\n```\n后的文字";
+    let full = format!("{delivered}{missed}");
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
+        Some(text_frontier(delivered.chars().count())),
+        &[],
+    );
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "问题"),
+        assistant(2_000, &full),
+    ])
+    .with_executions(vec![execution(2_500)]);
+    let (app, platform, _backend) =
+        restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Idle)).await;
+
+    spawn_sync(&app);
+    let (_successor, successor_text) = wait_for_projection(&platform, "msg_cola_anchor").await;
+
+    assert!(
+        successor_text.contains("```\nprint(2)\n```\n后的文字"),
+        "the cut tail reopens the fence and keeps the after-text intact: {successor_text}"
+    );
+    assert!(
+        !successor_text.contains("print(1)"),
+        "the delivered fence prefix is not repeated: {successor_text}"
+    );
+}
+
+/// A tool the old card showed running (the cursor's live set) and which
+/// settled while cola was down shows its result on the successor exactly
+/// once, and the collected old card loses the frozen `⏳` panel (spec #561,
+/// ticket #563).
+#[tokio::test]
+async fn a_projection_settles_a_tool_that_finished_while_cola_was_down() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
+        Some(text_frontier("第一段回答。".chars().count())),
+        &["call_1"],
+    );
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "问题"),
+        assistant(2_000, "第一段回答。"),
+        tool_assistant(3_000, ToolStatus::Completed, "done"),
+    ])
+    .with_executions(vec![execution(3_500)]);
+    let (app, platform, _backend) =
+        restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Idle)).await;
+    // The old card showed a running `⏳ bash` panel; the successor resolves it.
+    platform.given_card_view(
+        "om_frozen",
+        serde_json::json!({
+            "schema": "2.0",
+            "config": { "wide_screen_mode": true },
+            "header": { "template": "blue",
+                        "title": { "tag": "plain_text", "content": "✍️ 回复中" } },
+            "body": { "elements": [
+                { "tag": "markdown", "content": "**正文** 第一段" },
+                { "tag": "collapsible_panel", "expanded": false,
+                  "header": { "title": { "tag": "plain_text", "content": "⏳ bash" } },
+                  "elements": [ { "tag": "markdown", "content": "还在跑" } ] }
+            ] }
+        }),
+    );
+
+    spawn_sync(&app);
+    let (successor, successor_text) = wait_for_projection(&platform, "msg_cola_anchor").await;
+
+    assert_eq!(card_header(&successor), "✅ 完成");
+    assert_eq!(
+        successor_text.matches("done").count(),
+        1,
+        "the settled result lands exactly once: {successor}"
+    );
+    assert!(
+        !successor_text.contains("⏳"),
+        "no frozen running marker on the successor: {successor}"
+    );
+    assert!(
+        !successor_text.contains("第一段回答。"),
+        "the delivered prefix is not repeated: {successor}"
+    );
+
+    // The collected old card drops the running panel the successor resolved,
+    // keeping its display body.
+    let collect = last_update_of(&platform, "om_frozen")
+        .await
+        .expect("the old card is collected as taken over");
+    let collect_text = card_text(&collect);
+    assert!(
+        collect_text.contains("**正文** 第一段"),
+        "the collect keeps the old body: {collect}"
+    );
+    assert!(
+        !collect_text.contains("⏳ bash") && !collect_text.contains("还在跑"),
+        "the resolved running panel leaves the collected card: {collect}"
+    );
+}
+
+/// A Waiting successor (live Background Tasks) keeps its record with the
+/// cursor its confirmed create carried (spec #561, ticket #563): a restart
+/// after the yield finds the whole body already delivered and cannot project
+/// the same tail again.
+#[tokio::test]
+async fn a_projection_confirm_advances_the_cursor_it_was_confirmed_on() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let delivered = "已经写了一半。";
+    let missed = "后半段是在停机期间写完的。";
+    let full = format!("{delivered}{missed}");
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
+        Some(text_frontier(delivered.chars().count())),
+        &[],
+    );
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "问题"),
+        assistant(2_000, &full),
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_background_tasks(vec![background_shell(2_100)]);
+    let (app, platform, _backend) =
+        restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Idle)).await;
+
+    spawn_sync(&app);
+    let (successor, successor_text) = wait_for_projection(&platform, "msg_cola_anchor").await;
+
+    assert_eq!(card_header(&successor), "⏳ 等待后台任务");
+    assert!(successor_text.contains(missed), "{successor}");
+    let record = app
+        .cards_handle()
+        .chains
+        .get("ses_test")
+        .expect("a waiting successor keeps its record");
+    assert_eq!(
+        record.card_message_id, "msg_reply",
+        "the record follows the successor the projection created"
+    );
+    assert!(
+        record.waiting_reaped,
+        "the projected yield is marked so no later pass projects it again"
+    );
+    assert_eq!(
+        record
+            .cursor
+            .as_ref()
+            .and_then(|cursor| cursor.frontier.as_ref())
+            .map(|frontier| frontier.delivered_chars),
+        Some(full.chars().count()),
+        "the confirmed create advanced the cursor over the whole body"
+    );
+}
+
+/// A create that fails advances nothing (spec #561, ticket #563): the record
+/// keeps the old card and its cursor, the old card is never collected, and
+/// the next pass may retry.
+#[tokio::test]
+async fn a_failed_projection_create_advances_nothing() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let delivered = "已经写了一半。";
+    let missed = "后半段是在停机期间写完的。";
+    let full = format!("{delivered}{missed}");
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
+        Some(text_frontier(delivered.chars().count())),
+        &[],
+    );
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "问题"),
+        assistant(2_000, &full),
+    ])
+    .with_executions(vec![execution(2_500)]);
+    let (app, platform, backend) =
+        restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Idle)).await;
+    // Every successor create fails at the platform.
+    platform
+        .fail_reply_card_count
+        .store(100, std::sync::atomic::Ordering::SeqCst);
+
+    spawn_sync(&app);
+    wait_for_status_reads(&backend, "ses_test", 3).await;
+
+    let record = app
+        .cards_handle()
+        .chains
+        .get("ses_test")
+        .expect("a failed projection keeps the record");
+    assert_eq!(
+        record.card_message_id, "om_frozen",
+        "the record still names the old card"
+    );
+    assert_eq!(
+        record
+            .cursor
+            .as_ref()
+            .and_then(|cursor| cursor.frontier.as_ref())
+            .map(|frontier| frontier.delivered_chars),
+        Some(delivered.chars().count()),
+        "a failed create advanced nothing"
+    );
+    assert_eq!(
+        patches_to(&platform, "om_frozen").await.len(),
+        0,
+        "a failed projection never collects the old card"
+    );
+}
+
+/// A cursorless record follows today's settle path (spec #561, ticket #563):
+/// the transcript's ending is PATCHed onto the recorded card in place, and no
+/// successor is ever created.
+#[tokio::test]
+async fn a_cursorless_record_keeps_todays_in_place_settle() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "问题"),
+        assistant(2_000, "答复。"),
+    ])
+    .with_executions(vec![execution(2_500)]);
+    let (app, platform, _backend) =
+        restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Idle)).await;
+
+    spawn_sync(&app);
+    wait_for_card_update(
+        &platform,
+        "the reaped card's ✅ ending",
+        CardUpdates::Any,
+        |card| card_header(card).contains("✅"),
+    )
+    .await;
+
+    let card = last_update_of(&platform, "om_frozen")
+        .await
+        .expect("the persisted card is settled in place");
+    assert_eq!(card_header(&card), "✅ 完成");
+    assert_eq!(
+        card_posts(&platform).await,
+        0,
+        "a cursorless record never projects a successor: {:?}",
+        platform.calls.lock().await
+    );
+    assert!(app.cards_handle().chains.get("ses_test").is_none());
+}
+
+/// No deliverable target at all projects nothing (spec #561, ticket #563):
+/// with no recorded anchor, no card and no session mapping, the pass takes
+/// today's in-place settle and never creates a successor.
+#[tokio::test]
+async fn a_record_with_no_deliverable_target_projects_nothing() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    // The previous life recorded no card and never captured an anchor; the
+    // submitted message did land later, so the transcript alone decides the
+    // ending (Complete).
+    seed_cursor_record(
+        &session_file,
+        "",
+        "msg_cola_anchor",
+        None,
+        Some("/work"),
+        Some(text_frontier("已经写了一半。".chars().count())),
+        &[],
+    );
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "问题"),
+        assistant(2_000, "已经写了一半。后半段。"),
+    ])
+    .with_executions(vec![execution(2_500)]);
+    // NO session mapping either: no reply anchor, no card, no Chat.
+    let (app, platform, _backend) = restarted_app_unmapped(&session_file, transcript).await;
+
+    spawn_sync(&app);
+    // Today's behavior still runs: the ending lands on the recorded card.
+    wait_for_card_update(&platform, "the in-place settle", CardUpdates::Any, |card| {
+        card_header(card).contains("✅")
+    })
+    .await;
+
+    assert_eq!(
+        card_posts(&platform).await,
+        0,
+        "an undeliverable projection is never attempted: {:?}",
+        platform.calls.lock().await
+    );
+    let settled = patches_to(&platform, "").await;
+    assert!(
+        settled.iter().any(|card| card_header(card).contains("✅")),
+        "the in-place settle still ends the record's card: {settled:?}"
+    );
 }
