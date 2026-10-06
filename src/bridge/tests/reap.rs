@@ -6859,3 +6859,203 @@ async fn a_live_rewrite_of_the_frontier_part_replaces_the_successors_run() {
     })
     .await;
 }
+
+/// A cursor this read cannot place keeps an ENDED record (spec #561, review
+/// #569): settling the old card in place would release the record and lose the
+/// tail the cursor still guards, while a later read that places the cursor can
+/// still project it. The cursorless fallback and the Unreceived terminal are
+/// untouched (their own tests).
+#[tokio::test]
+async fn an_unplaceable_cursor_keeps_an_ended_records_record() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    // The frontier names a message this read does not carry: unplaceable.
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
+        Some(CursorFrontier {
+            message_id: MessageId::new("msg_gone"),
+            part_index: 0,
+            kind: CursorPartKind::Text,
+            started_at: None,
+            delivered_chars: 1,
+            prefix_digest: Some(cursor_prefix_digest("答")),
+        }),
+        &[],
+    );
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "问题"),
+        assistant(2_000, "答复。"),
+    ])
+    .with_executions(vec![execution(2_500)]);
+    let (app, platform, backend) =
+        restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Idle)).await;
+    // A settle PATCH would succeed if one were made.
+    platform.given_card_view("om_frozen", realistic_card_view());
+
+    spawn_sync(&app);
+    // The reap either releases the record on its first pass (the loss this
+    // test forbids) or keeps it and keeps observing it.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        assert!(
+            app.cards_handle().chains.get("ses_test").is_some(),
+            "an unplaceable cursor must never settle and release the record"
+        );
+        if backend.transcript_calls.lock().await.len() >= 3 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the reap never observed the kept record"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    assert!(
+        patches_to(&platform, "om_frozen").await.is_empty(),
+        "an unplaceable cursor never settles the old card: {:?}",
+        platform.calls.lock().await
+    );
+    let record = app
+        .cards_handle()
+        .chains
+        .get("ses_test")
+        .expect("the record is kept for a later read that places the cursor");
+    assert!(
+        record.cursor.is_some(),
+        "the unplaceable cursor is kept, never dropped"
+    );
+}
+
+/// A cursor-bearing orphan whose first seed read fails keeps its seed pending
+/// (spec #561, review #569): the chain's cursor stays pinned at the unseeded
+/// gap while later reads cannot place it, and the first read that can lands
+/// the orphan's undelivered tail on the new card exactly once — never settled
+/// away, never skipped by the cursor.
+#[tokio::test]
+async fn a_failed_seed_read_keeps_a_cursor_bearing_tail_pending() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let orphan_anchor = 1_000_000;
+    let new_anchor = 2_000_000;
+    let delivered = "已经写了一半。";
+    let missed = "停机前没送达的尾巴。";
+    let full = format!("{delivered}{missed}");
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(orphan_anchor),
+        Some("/work"),
+        Some(CursorFrontier {
+            message_id: MessageId::new("msg_a_orphan"),
+            part_index: 0,
+            kind: CursorPartKind::Text,
+            started_at: Some(orphan_anchor + 500),
+            delivered_chars: delivered.chars().count(),
+            prefix_digest: Some(cursor_prefix_digest(delivered)),
+        }),
+        &[],
+    );
+    // Phase A: the read does not carry the cursor's message, so the pending
+    // seed cannot resolve while the new Turn's own content still streams.
+    let phase_a = |answer: &str| {
+        SessionTranscript::new(vec![
+            user("msg_cola_new", new_anchor, "新问题"),
+            assistant_in_flight(new_anchor + 1_000, answer),
+        ])
+    };
+    let phase_b = SessionTranscript::new(vec![
+        user("msg_cola_anchor", orphan_anchor, "跑个长命令"),
+        TranscriptMessage {
+            id: MessageId::new("msg_a_orphan"),
+            role: MessageRole::Assistant,
+            time: Some(MessageTime {
+                created: orphan_anchor + 500,
+                completed: None,
+            }),
+            model: None,
+            tokens: None,
+            error: None,
+            parts: vec![Part::Text(TextPart {
+                text: full.clone(),
+                started_at: Some(orphan_anchor + 500),
+            })],
+        },
+        user("msg_cola_new", new_anchor, "新问题"),
+        assistant_in_flight(new_anchor + 1_000, "新回答一。新回答二。"),
+    ]);
+    let (app, platform, backend, gate) =
+        seeded_app(&session_file, phase_a("新回答一。"), SessionStatus::Busy).await;
+    backend
+        .given_transcript_after_build(
+            "ses_test",
+            vec![phase_a("新回答一。"), phase_a("新回答一。新回答二。")],
+        )
+        .await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+    // Exactly the SEED's read fails; every later read serves normally.
+    backend.fail_transcript_reads(1);
+    gate.add_permits(1);
+
+    let mut context = ctx("ses_test", "新问题");
+    context.cola_message_id = Some("msg_cola_new".into());
+    let turn = spawn_turn(&app, context);
+    // The Turn's own content lands across two writes: by the second, the first
+    // confirmed write's cursor decision has run.
+    wait_for_card_text(&platform, "新回答二。").await;
+    let record = app
+        .cards_handle()
+        .chains
+        .get("ses_test")
+        .expect("the fresh Turn's record");
+    assert_eq!(
+        record
+            .cursor
+            .clone()
+            .expect("the carried cursor survives")
+            .frontier,
+        Some(CursorFrontier {
+            message_id: MessageId::new("msg_a_orphan"),
+            part_index: 0,
+            kind: CursorPartKind::Text,
+            started_at: Some(orphan_anchor + 500),
+            delivered_chars: delivered.chars().count(),
+            prefix_digest: Some(cursor_prefix_digest(delivered)),
+        }),
+        "the chain's cursor stays pinned at the unseeded gap"
+    );
+    assert!(
+        !card_text(platform.updated_cards().await.last().expect("a card")).contains(missed),
+        "the unseeded tail is not on the card yet"
+    );
+
+    // A read that carries the cursor now lands the pending seed: the orphan's
+    // undelivered tail renders on the new card exactly once.
+    backend
+        .given_transcript_after_build("ses_test", vec![phase_b])
+        .await;
+    wait_for_card_text(&platform, missed).await;
+    let updates = patches_to(&platform, "msg_reply").await;
+    let text = card_text(updates.last().expect("the new card was patched"));
+    assert_eq!(
+        text.matches(missed).count(),
+        1,
+        "the orphan's tail lands exactly once: {text}"
+    );
+    assert!(
+        !text.contains(delivered),
+        "the delivered prefix is never repeated: {text}"
+    );
+    assert!(
+        text.contains("新回答二。"),
+        "the Turn's own content stays: {text}"
+    );
+    drop(turn);
+}

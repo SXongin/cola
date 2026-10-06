@@ -308,31 +308,18 @@ impl CursorSeed {
     /// Rendered Cursor (spec #561, ticket #565): the cursor against this read
     /// plus the orphaned Turn's own window as the seed's scope, so the
     /// successor's render continues the orphan's content past its own Turn.
-    /// A cursor this read cannot place falls back to the live set alone —
-    /// nothing replays, but the calls the old card showed running still
-    /// resolve by identity.
-    pub(crate) fn for_orphan(
+    /// `None` when the read cannot place the cursor, so the caller keeps the
+    /// gap pending and retries on a later read instead of consuming it (spec
+    /// #561, review #569).
+    pub(crate) fn for_orphan_resolving(
         transcript: &SessionTranscript,
         cursor: &RenderedCursor,
         scope: &TurnAnchor,
-    ) -> Self {
-        match Self::resolve(transcript, cursor) {
-            Some(seed) => Self {
-                scope: Some(scope.clone()),
-                ..seed
-            },
-            None => Self {
-                frontier: None,
-                live_calls: cursor.live_calls.clone(),
-                resolved_live_calls: cursor
-                    .live_calls
-                    .iter()
-                    .filter(|call_id| transcript.tool_call(call_id).is_some())
-                    .cloned()
-                    .collect(),
-                scope: None,
-            },
-        }
+    ) -> Option<Self> {
+        Self::resolve(transcript, cursor).map(|seed| Self {
+            scope: Some(scope.clone()),
+            ..seed
+        })
     }
 
     /// The cursorless record's fallback seed (spec #561, ticket #565): no
@@ -405,6 +392,22 @@ impl CursorSeed {
     pub(crate) fn resolved_calls(&self) -> Vec<String> {
         self.resolved_live_calls.iter().cloned().collect()
     }
+}
+
+/// A seed a failed takeover read could not resolve (spec #561, review #569):
+/// the fresh Turn keeps the orphan's cursor and Turn anchor so a later render
+/// read can place the cursor and render the orphan's undelivered tail onto its
+/// card exactly once. Until it lands, the chain's cursor stays pinned at
+/// [`PendingOrphanSeed::cursor`]'s base, so a confirmed write never skips the
+/// gap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingOrphanSeed {
+    /// The orphaned chain's confirmed cursor: the frontier the tail starts
+    /// after, and the base the chain's pinned cursor keeps.
+    pub(super) cursor: RenderedCursor,
+    /// The orphaned Turn's anchor: the window the seed's walk covers (spec
+    /// #561, ticket #565).
+    pub(super) anchor: TurnAnchor,
 }
 
 /// What a seeded render owes one transcript part.
@@ -710,6 +713,13 @@ impl CardSession {
     /// This session's chain identity (see the field's docs).
     pub(super) fn chain_id(&self) -> u64 {
         self.chain_id
+    }
+
+    /// Whether the accumulator still owes a pending orphan seed (spec #561,
+    /// review #569): the chain's cursor is pinned at that gap, so the record
+    /// must not be released while it does.
+    pub(crate) fn owes_pending_seed(&self) -> bool {
+        self.acc.pending_orphan_seed.is_some()
     }
 
     /// True while this card belongs to a Turn that has not finished: the pull
@@ -1178,6 +1188,13 @@ pub(super) struct StreamAccumulator {
     /// undelivered suffix — while the live set resolves by identity against
     /// the whole read. `None` on every ordinary accumulator.
     pub(super) seed: Option<CursorSeed>,
+    /// An orphan seed a failed takeover read left pending (spec #561, review
+    /// #569): the fresh Turn retries it on every render read — the orphan's
+    /// undelivered tail then renders on its card exactly once — and until one
+    /// places the cursor, [`Self::cursor_for_slice`] pins the chain's cursor
+    /// at the base the seed continues from, so no confirmed write advances the
+    /// record past the gap.
+    pub(super) pending_orphan_seed: Option<PendingOrphanSeed>,
     /// The Rendered Cursor of the card body most recently built, awaiting a
     /// confirmed write (spec #561): staged by the flush before each write and
     /// drained into [`Self::cursor`] and the durable record once that write
@@ -3109,6 +3126,13 @@ impl StreamAccumulator {
     /// timeline; a call the body omits (a finalized slice has no tail, a
     /// settled card omits a carried `⏳`) keeps its last delivered state.
     fn cursor_for_slice(&self, end: usize, include_tail: bool, state: &CardState) -> RenderedCursor {
+        // While an orphan seed is pending (spec #561, review #569), the chain's
+        // cursor stays pinned at the base the seed will continue from: a
+        // confirmed write must never advance the record past the undelivered
+        // gap the pending seed still owes.
+        if self.pending_orphan_seed.is_some() {
+            return self.cursor.clone();
+        }
         let mut cursor = self.cursor.clone();
         if let Some((idx, source, kind, started_at)) =
             self.timeline[..end]

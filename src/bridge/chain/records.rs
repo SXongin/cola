@@ -732,7 +732,10 @@ impl ChainRecords {
 /// life's drain, or the next restart's reap, repairs the card and the reap
 /// cleans the record once the write confirmed. A yielded `Waiting` card
 /// keeps it (the reap settles its true end later) and a live card keeps it
-/// (still owed). Called after every ending PATCH in the flush path and by the
+/// (still owed). A card whose accumulator still holds a PENDING orphan seed
+/// keeps it too (spec #561, review #569): the cursor it pins is the only record
+/// of the gap the tail will land in, so releasing it would strand that tail.
+/// Called after every ending PATCH in the flush path and by the
 /// reap's same-card probe; the rule lives here, beside the record it releases.
 pub(crate) async fn release_spent(cards: &CardsHandle, session_id: &str) {
     let card_message_id = {
@@ -740,7 +743,7 @@ pub(crate) async fn release_spent(cards: &CardsHandle, session_id: &str) {
         let Some(card) = cards.get(session_id) else {
             return;
         };
-        if !card.is_terminal() {
+        if !card.is_terminal() || card.owes_pending_seed() {
             return;
         }
         card.card_message_id().map(str::to_string)

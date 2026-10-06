@@ -382,14 +382,36 @@ pub(crate) fn reconcile(record: &ChainRecord, reads: &RecoveryReads<'_>) -> Chai
                         // projection too (review #569): it is never retried, and
                         // the reap state-repairs the old card in place instead.
                         settle => {
-                            if !matches!(settle, TurnSettle::Unreceived)
-                                && !record.projection_attempted
-                                && let Some(cursor) = record.cursor.as_ref()
-                                && let Some(seed) = CursorSeed::resolve(transcript, cursor)
-                            {
-                                return ChainDisposition::Project { settle, seed };
+                            // A record's two fallbacks are NOT the same (spec
+                            // #561, review #569): a CURSORLESS record is the
+                            // one-release migration seam and keeps today's
+                            // in-place ending, while a record whose CURSOR this
+                            // read cannot place claims nothing — settling (and
+                            // releasing) it would lose the tail the cursor
+                            // still guards, and a later read may resolve it.
+                            // Unreceived is its own terminal (ADR-0062): the
+                            // submitted message never landed, so no anchor
+                            // exists to continue onto.
+                            if matches!(settle, TurnSettle::Unreceived) {
+                                return ChainDisposition::Settle(settle);
                             }
-                            ChainDisposition::Settle(settle)
+                            let Some(cursor) = record.cursor.as_ref() else {
+                                return ChainDisposition::Settle(settle);
+                            };
+                            // A create this life already attempted blocks the
+                            // projection (review #569): it is never retried,
+                            // and the reap state-repairs the old card in place
+                            // instead.
+                            if record.projection_attempted {
+                                return ChainDisposition::Settle(settle);
+                            }
+                            match CursorSeed::resolve(transcript, cursor) {
+                                Some(seed) => ChainDisposition::Project { settle, seed },
+                                // Unplaceable: the tail past the cursor is on
+                                // neither the card nor this read's walk — keep
+                                // observing, never conclude the chain on it.
+                                None => ChainDisposition::Keep,
+                            }
                         }
                     }
                 }
@@ -945,11 +967,14 @@ mod tests {
         );
     }
 
-    /// The projection's fallbacks (spec #561, ticket #563): a cursorless
-    /// record, a cursor this read cannot place, and an Unreceived ending all
-    /// keep today's settle path.
+    /// The projection's fallbacks (spec #561, ticket #563; review #569): a
+    /// CURSORLESS record keeps today's in-place ending (the one-release
+    /// migration seam) and an Unreceived ending is its own terminal — while a
+    /// record whose CURSOR this read cannot place claims nothing: settling and
+    /// releasing it would lose the tail the cursor still guards, and a later
+    /// read may resolve it.
     #[test]
-    fn a_cursorless_or_unresolvable_record_settles_in_place() {
+    fn a_cursorless_record_settles_in_place_while_an_unresolvable_cursor_is_kept() {
         let transcript = SessionTranscript::new(vec![
             user("msg_cola_anchor", 1_000, "问题"),
             assistant(2_000, "答复。"),
@@ -960,8 +985,8 @@ mod tests {
             "a cursorless record keeps the in-place ending"
         );
 
-        // The cursor names a part this read does not carry: settle in place,
-        // never skip content on a guess.
+        // The cursor names a part this read does not carry: claim nothing and
+        // keep the record — a later read that places it projects the tail.
         let dangling = RenderedCursor {
             frontier: Some(CursorFrontier {
                 message_id: MessageId::new("msg_gone"),
@@ -979,7 +1004,8 @@ mod tests {
         };
         assert_eq!(
             reconcile(&dangling_record, &idle_transcript(transcript.clone())),
-            ChainDisposition::Settle(TurnSettle::Complete)
+            ChainDisposition::Keep,
+            "an unplaceable cursor keeps the record for a later read"
         );
 
         // An Unreceived ending has no transcript content to continue. The
