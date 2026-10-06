@@ -12,9 +12,10 @@ mod state;
 pub(crate) use state::CardSession;
 
 /// The one card ownership verdict (ADR-0070, spec #545): computed by one read
-/// over the waits state and the card map; the prompt router and the Wake gate
-/// read its routing rule. Its module docs state the sources.
-pub(crate) use ownership::CardOwnership;
+/// over the waits state and the card map; the prompt router, the Wake gate,
+/// the reap and the `/stop` acknowledgement read its named rules. Its module
+/// docs state the sources.
+pub(crate) use ownership::{CardOwnership, StopDisposition};
 
 /// The one ending vocabulary (spec #538): the table every path that ends a
 /// card reads — the in-Turn paths through `StreamAccumulator::apply_ending`,
@@ -3050,7 +3051,8 @@ impl Turn {
     /// nothing unrendered, `Some([`WakeContinuation`])` otherwise. The caller
     /// owns the scope predicates: the Session must be the thread's Active
     /// Session, its newest user message must be a Cola-Authored Message, and
-    /// no live Turn/follow/renderer may own the card ([`Self::card_is_owned`]).
+    /// no live Turn/follow/renderer may own the card
+    /// ([`CardOwnership::routing_label`]).
     ///
     /// The decision is a content diff over the Session Transcript (ADR-0059),
     /// never a terminal step:
@@ -3192,37 +3194,6 @@ impl Turn {
             crate::bridge::chain::FreshDisposition::Keep
             | crate::bridge::chain::FreshDisposition::NoDecision => None,
         }
-    }
-
-    /// Whether `session_id`'s card chain is owned by a live renderer — a Turn
-    /// (Loading/streaming), an out-of-turn follow, or an external/snapshot
-    /// renderer. A finalized card and a Waiting card are NOT owned: a Wake
-    /// continues either chain (ADR-0059), and the Wake step must not be
-    /// blocked by them nor split a card someone else is streaming into. The
-    /// card-chain half of the ownership question; [`CardOwnership`] is the
-    /// full verdict (the guard and the pending claim included) — call it
-    /// where a fresh read is wanted.
-    pub(crate) async fn card_is_owned(cards: &CardsHandle, session_id: &str) -> bool {
-        cards
-            .cards
-            .lock()
-            .await
-            .get(session_id)
-            .is_some_and(|card| card.acc.card_state.is_render_owned())
-    }
-
-    /// Whether `session_id`'s card yielded to live Background Tasks
-    /// (ADR-0059): not terminal, but owned by no renderer — only the quiet
-    /// true end settles it, once the last task retires (ADR-0060). A `/stop`
-    /// cannot be stamped on such a card promptly, so the command acks the
-    /// deferred ending instead of leaving the operator with nothing to see.
-    pub(crate) async fn card_is_waiting(cards: &CardsHandle, session_id: &str) -> bool {
-        cards
-            .cards
-            .lock()
-            .await
-            .get(session_id)
-            .is_some_and(|card| card.acc.card_state == crate::feishu::card::CardState::Waiting)
     }
 
     /// `session_id`'s chain identity, when it has a card session — the Wake

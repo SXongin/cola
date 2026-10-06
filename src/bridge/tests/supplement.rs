@@ -235,8 +235,9 @@ async fn supplement_splits_the_chain_and_the_continuation_takes_over() {
 ///
 /// Both unowned shapes are covered: a terminal card from a finished turn (a
 /// chain no renderer owns) and no card at all — the #428 incident, where the
-/// card died with the restart. `card_is_owned` takes a different branch for
-/// each (`is_none` vs non-render-owned), so both must reach the same route.
+/// card died with the restart. The ownership verdict classifies them
+/// differently (an ended card vs the absent key), so both must reach the same
+/// route.
 #[tokio::test]
 async fn a_stale_live_read_with_no_owned_chain_starts_a_turn_with_the_merge_line() {
     for seed_terminal_card in [true, false] {

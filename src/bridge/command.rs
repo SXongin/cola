@@ -457,6 +457,7 @@ pub fn command_help(name: &str) -> Option<String> {
 
 use crate::bridge::display::id_tail;
 use crate::bridge::handles::{CommandHandles, PickReply, classify_pick};
+use crate::bridge::turn::{CardOwnership, StopDisposition};
 use crate::config::{ConversationKind, SessionEntry, ThreadKey};
 use crate::feishu;
 use std::sync::Arc;
@@ -865,19 +866,20 @@ pub(crate) async fn handle_command(
         Command::Stop => {
             if let Some(id) = handles.flow.sessions.get_session_id(&thread_key).await {
                 // What the card will do with the stop decides the ack, read
-                // BEFORE the marker/interrupt round-trip: a render-owned card
-                // (a live Turn, follow or external renderer) is stamped
+                // BEFORE the marker/interrupt round-trip: the ownership
+                // verdict's one classified read (ADR-0070). A render-owned
+                // card (a live Turn, follow or external renderer) is stamped
                 // 「⏹ 已停止」 by that owner on its next tick (#394) and IS the
-                // acknowledgement; a Waiting card has no render owner and only
+                // acknowledgement; a yielded card has no render owner and only
                 // settles at the quiet true end (ADR-0060), so it needs an ack
-                // naming that ending; anything else (no card, terminal card)
+                // naming that ending; anything else (no card, a spent chain)
                 // will never show the stop. The pre-stop read is deliberate —
                 // after the interrupt a render-owned card may already be
                 // stamped, and a post-read could not tell that from a card
                 // that was terminal all along.
-                let cards = &handles.flow.cards;
-                let render_owned = crate::bridge::turn::Turn::card_is_owned(cards, &id).await;
-                let waiting = !render_owned && crate::bridge::turn::Turn::card_is_waiting(cards, &id).await;
+                let disposition = CardOwnership::read(&handles.flow.cards, &handles.flow.waits, &id)
+                    .await
+                    .stop_disposition();
                 // Mark the session stopped BEFORE the interrupt round-trip: the
                 // abort settles the run server-side, and a drain/follow tick
                 // that observes that settled run can beat the marker back and
@@ -897,9 +899,22 @@ pub(crate) async fn handle_command(
                 // One reply per state (the consts carry the rationale). The
                 // interrupt still ran in every arm: the run may be live
                 // server-side even when cola's card is not.
-                if !render_owned {
-                    let text = if waiting { STOPPED_WAITING } else { NO_RUNNING_TASK };
-                    handles.flow.platform.reply_text(message_id, text).await?;
+                match disposition {
+                    StopDisposition::OwnerStamps => {}
+                    StopDisposition::QuietEndAck => {
+                        handles
+                            .flow
+                            .platform
+                            .reply_text(message_id, STOPPED_WAITING)
+                            .await?;
+                    }
+                    StopDisposition::Nothing => {
+                        handles
+                            .flow
+                            .platform
+                            .reply_text(message_id, NO_RUNNING_TASK)
+                            .await?;
+                    }
                 }
             } else {
                 handles

@@ -41,7 +41,7 @@ use crate::backend::{
     WakeSource,
 };
 use crate::bridge::test_support::*;
-use crate::bridge::turn::Turn;
+use crate::bridge::turn::{CardOwnership, Turn};
 use crate::feishu::card::CardState;
 use crate::opencode::types::SessionStatus;
 
@@ -3135,8 +3135,9 @@ async fn a_restart_cards_later_completion_resumes_it_in_place() {
         !card_text(&opened).contains("shell 完成"),
         "the Wake that opened the card is announced by the 承接 line alone: {opened}"
     );
+    let ownership = CardOwnership::read(&app.cards_handle(), &app.waits_handle(), "ses_test").await;
     assert!(
-        !Turn::card_is_owned(&app.cards_handle(), "ses_test").await,
+        ownership.routing_label().is_none(),
         "the yielded card is nobody's to render until the next Wake"
     );
     assert_eq!(
