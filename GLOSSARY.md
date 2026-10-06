@@ -178,8 +178,11 @@ The one durable record a **Session** has about its **Card Chain**, owned by the
 Chain Record module and persisted as one sidecar (`chain_records.json`) with two
 sections of distinct lifetimes: the **live card record** (the live card's
 identity, its **Turn**'s anchor and the Session's directory, plus the per-process
-reconciliation marks) — written when a card becomes the Session's live card and
-removed when that card reaches a terminal or is collected (ADR-0063) — and the
+reconciliation marks) — written, or re-pointed to a successor, when a card
+becomes the Session's live card, and released only when its card reaches a
+terminal ending whose write is confirmed (delivered or permanently refused;
+ADR-0063's amendment, ADR-0067) or when a successor collect cannot carry the
+record (the successor settled, or has no armed anchor) — and the
 **Wake Watermark** (monotonic, never removed; ADR-0061). A missing or corrupt
 file reads as empty; the file itself is kept even when both sections are empty,
 because its presence is the one-time migration marker from the pre-ADR-0069

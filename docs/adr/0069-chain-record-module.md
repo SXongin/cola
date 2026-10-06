@@ -30,8 +30,9 @@ facts about its Card Chain, in one sidecar.**
   `chain_records.json` holds `records` — the live card's identity, its Turn
   anchor, the Session's directory and the per-process-life reconciliation
   marks — and `announcements` — the Wake Watermark. A record is written when
-  a card becomes the Session's live card and removed when that card reaches a
-  terminal or is collected (ADR-0063's rule, unchanged); an announcement is
+  a card becomes the Session's live card and released when its card's terminal
+  ending write is confirmed or a successor collect cannot carry it
+  (ADR-0063's rule, as amended by ADR-0067); an announcement is
   monotonic per Session and never removed (ADR-0061's rule, unchanged). The
   load stays fail-open (a missing or corrupt file reads as empty) and the
   write stays best-effort and atomic; the file is kept even when both
@@ -49,16 +50,31 @@ facts about its Card Chain, in one sidecar.**
   methods keep today's names and semantics — the refactor moves the seam, it
   does not change behavior.
 - **The reconcile lives with the record.** Session Sync's reap (`reap.rs`)
-  moves into the module. The follow-up cuts, recorded here as the module's
-  intended shape rather than this step's delivery: the pass is split into a
-  pure decision (`ChainDisposition`, mirroring today's observable outcomes:
+  moves into the module, and the record's lifecycle with it. The pass is a
+  pure decision (`ChainDisposition`, one variant per observable outcome:
   Keep / NoDecision / DiscardRecord / CollectThenRepoint /
   CollectThenRelease / StampRestart / Settle(TurnSettle)) plus a thin apply
-  that owns reads and card writes, and the Fresh path's Wake-watermark gate
-  becomes the module's second decision entry sharing the same store. The
-  restart-stamp attempt's retry policy (#522) then becomes one typed outcome.
-  The waiting-card ledger/wake refresh stays outside: its evidence is the
-  in-memory accumulator, not the durable record.
+  that owns reads and card writes; the Fresh path's Wake-watermark gate is the
+  module's second decision entry (`fresh`) sharing the same store; and the
+  restart-stamp attempt's permanently refused carve-out (#522) is a mark on
+  the record that the ladder maps to `Keep`. The record's lifecycle is three
+  entries on the module: `ChainRecords::track` creates or re-points a record
+  from the facts, returning the predecessor the takeover paths act on;
+  `ChainRecords::release` is the only removal; and `chain::release_spent`
+  owns the spent rule: a record leaves when its card reaches a terminal
+  ending whose write is confirmed (ADR-0063's amendment, ADR-0067), never
+  while the delivery outbox still owes one. The flush path calls it after
+  every ending PATCH, as does the reap's `DiscardRecord` arm. The reap's
+  ladder calls `release` directly only where it established the cause itself:
+  a successor collect that cannot carry the record (settled, or no armed
+  anchor), or a terminal ending whose PATCH just landed. The in-memory
+  overlays stay with their owners and are read at the seam as predicates,
+  never moved into the record: the Pending Card Update outbox (the delivery
+  adapter's, ADR-0067) answers whether an ending write is still owed, and the
+  runtime-retirement overlay (the Backend adapter's, ADR-0065) corroborates a
+  background task's liveness. The waiting-card ledger/wake refresh likewise
+  reads the accumulator's announced and handed-over Wake sets, its evidence
+  the in-memory accumulator, not the durable record.
 
 This step of the refactor is mechanically behavior-preserving — sidecar
 merge, module move, call-site rename — with two alignments the merge makes
