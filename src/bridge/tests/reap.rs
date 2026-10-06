@@ -2400,6 +2400,50 @@ async fn a_card_this_process_still_holds_is_never_stamped() {
     );
 }
 
+/// A message still being routed claims the Session for the reap (#424): the
+/// pending inbound claim suppresses the restart stamp exactly like a live
+/// Turn's guard, so the persisted card is left for the message's own Turn to
+/// continue — no stamp races the admission (ADR-0070).
+#[tokio::test]
+async fn a_pending_inbound_claim_is_never_stamped_over() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
+    // A second live orphan the reap keeps reading: the pass clock proving
+    // ticks ran while the claim held.
+    ChainRecords::load(sidecar(&session_file)).replace(
+        "ses_other",
+        ChainRecord::new("om_other", MessageId::new("msg_cola_other"), Some(2_000))
+            .with_directory(Some("/work".into())),
+    );
+
+    let transcript = SessionTranscript::new(vec![user("msg_cola_anchor", 1_000, "问题")]);
+    let (app, platform, backend) =
+        restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Busy)).await;
+    backend
+        .set_session_status("ses_other", Some(SessionStatus::Busy))
+        .await;
+    // The claim an inbound message leaves while it is being routed (#424):
+    // the reap must count it, or its stamp races the message's admission.
+    app.waits_handle().note_inbound("ses_test").await;
+    // A stamp attempt would succeed if one were made.
+    platform.given_card_view("om_frozen", realistic_card_view());
+
+    spawn_sync(&app);
+    // The un-claimed orphan keeps reading: the claimed record's passes ran.
+    wait_for_status_reads(&backend, "ses_other", 3).await;
+    assert!(
+        patches_to(&platform, "om_frozen").await.is_empty(),
+        "a pending inbound claim is never stamped over: {:?}",
+        platform.calls.lock().await
+    );
+    assert!(
+        app.cards_handle().chains.get("ses_test").is_some(),
+        "the claimed orphan keeps its record for the message's Turn"
+    );
+}
+
 /// A stamp read the platform cannot serve claims nothing: the card is left
 /// exactly as it was — no bare stamp ever lands, because the stamp's whole
 /// value is the body it keeps — and the next pass retries until the view is
