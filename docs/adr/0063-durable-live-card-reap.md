@@ -6,6 +6,12 @@
 > when a card becomes the Session's live card, removed only after a confirmed
 > ending, fail-open load — are unchanged.
 
+> **Amended by ADR-0071**: the reap gains the projection disposition — a
+> record carrying a **Rendered Cursor** whose run is unowned is projected onto
+> a successor (and a still-live one adopted and followed) instead of being
+> settled in place — and the #443 stamp below narrows to the cursorless
+> fallback. See the amendment at the end.
+
 ## Context
 
 ADR-0059 decided that card state stays in memory — "a cola restart loses live
@@ -169,3 +175,38 @@ the record stays with it, and the transcript-truth ending (or a successor's
 collect) still supersedes it. Every transient failure — transport, timeout,
 auth, server — keeps the retry. The carve-out lands with the Chain Record
 module's decision seam (ADR-0069), which maps the marked record to `Keep`.
+
+## Amendment (2026-10-06): the reap gains the projection disposition, and the #443 stamp demotes to the cursorless fallback (ADR-0071)
+
+The reconcile's decision vocabulary (ADR-0069) gains two outcomes for a
+record carrying a **Rendered Cursor** whose run this process does not own.
+`Project` renders the missed tail plus the transcript's true ending onto a
+successor card — reply to the Turn anchor, then the recorded card, then the
+chain's top-level Chat — and settles it by transcript truth; `ProjectLive`
+arms a successor seeded at the cursor, whose create is the restart
+notification, and follows the still-live run through the existing
+external-render arm. The recorded card is collected as taken over (its body
+kept minus the running markers the successor resolved, ADR-0068's rule), and
+the record re-points to the successor with the cursor carried, so a split or
+a later Turn recovers the chain as one.
+
+The #443 restart stamp is now the **cursorless fallback alone**: a still-live
+orphan whose record carries no cursor is stamped once per process life,
+exactly as amended above. A cursor-carrying record is never stamped — a
+missing transcript read, a record with no scope to arm against, a frontier the
+read cannot place, or no deliverable target claims nothing and leaves the
+record for a later pass the projection can seed, because the stamp would
+freeze the run the projection is supposed to follow. The first confirmed card
+write on a record gives it a cursor, so the fallback window closes by itself.
+
+The Decision's "missed content is not rebuilt onto the old card" stands and
+extends: only the delta after the confirmed frontier renders, and it renders
+onto the successor — the old card keeps its body (minus the resolved live
+markers) and is collected as taken over. The 2026-10-02 amendment's deferral
+("re-following the run is deferred until a faithful no-duplicate/no-omission
+restore exists (#505)") is lifted: the projection is that restore.
+
+The reap's scope is otherwise unchanged — every record, every Session Sync
+pass, the same fail-open store and per-pass read bounds — and Interaction
+Receipts stay in ADR-0038's request-flow domain, re-hosted onto the successor
+by the existing sweeps and never rebuilt.

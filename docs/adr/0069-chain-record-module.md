@@ -1,5 +1,11 @@
 # The Chain Record module: one home for a Card Chain's durable facts
 
+> **Amended by ADR-0071**: the `records` section gains the **Rendered
+> Cursor** — the chain's confirmed render frontier and live-call set — on the
+> same atomic best-effort write and with the same lifetime as the record:
+> `track` carries it across a re-point, `release` drops it, and a record
+> without it reads cursorless. See the amendment at the end.
+
 ## Context
 
 A cola restart has, over ADR-0058–0068, grown one durable fact per symptom:
@@ -122,3 +128,30 @@ recreated id names the same logical Session.
 
 Related: #522, #505, #528, #529, #510, ADR-0061, ADR-0063, ADR-0065,
 ADR-0067, ADR-0068.
+
+## Amendment (2026-10-06): the record gains the Rendered Cursor (ADR-0071)
+
+The `records` entry — until now the Live Card record (ADR-0063) — also carries
+the chain's **Rendered Cursor** (ADR-0071): the frontier of the newest
+text/reasoning content the chain confirmed delivered (message identity, part
+position, kind, server start and the delivered character extent) plus the set
+of tool call ids whose newest delivered state was `running`. It is one more
+durable fact on the same atomic best-effort write, never a new sidecar — the
+records section now answers both "which card is live?" and "how far has this
+chain rendered?".
+
+The store owns the fact's lifecycle exactly as it owns the record's: `track`
+carries the cursor across a re-point within the chain (a split continuation, a
+new Turn on the same chain, a takeover), while a genuinely new chain starts
+cursorless; `release` drops it with the record; `advance_cursor` writes only
+the record naming the card a confirmed write landed on, so a stale flush
+cannot touch a successor; and `recorded` is the Fresh gate's one read — a
+durable record exists, so its Wake belongs to the projection (or, cursorless,
+to the reap's fallback), never to a Fresh post. A record written by an older
+release has no cursor field and reads cursorless, which keeps the pre-#561
+fallback behavior; the fallback window closes on the record's first confirmed
+write.
+
+Nothing else about the module moves: the sections' lifetimes, the fail-open
+load, the atomic write, the one-time legacy fold and the interface's claim on
+the chain's reconciliation are as decided above.
