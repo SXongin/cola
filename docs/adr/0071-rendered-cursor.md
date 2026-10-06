@@ -89,9 +89,12 @@ projects the chain's delta after it onto a successor card.**
   staged — the reconcile walks every retained stage and confirms each by its
   own sequence, drops one whose entry settled without delivering it, and keeps
   a still-owed one — so a later delivery can never lose an earlier write's
-  confirmation. The outbox remembers the highest sequence each card delivered
-  (not just its newest write's verdict), so a newer failed write that replaces
-  the entry does not erase the delivery evidence a stage confirms by. A stage
+  confirmation. The outbox answers only for a sequence's OWN outcome (review
+  #569, round 6): the reconcile confirms a stage by the exact sequence it was
+  tied to, and a failure note asks about the sequence ITS payload failed at —
+  remembered alongside that payload — so a newer write's success, a cached
+  repaint that may omit the older body's delta, can never confirm an older
+  stage and let a restart skip content no card received. A stage
   older than the one the base already reflects is dropped unapplied, and the
   stage comparison and the durable record write happen in ONE cards critical
   section (review #569, round 5): a concurrent confirmation can never

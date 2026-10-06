@@ -64,11 +64,6 @@ struct PendingEntry {
     /// carries it so the Rendered Cursor's drain reconcile can tell a
     /// delivery from a permanent refusal (spec #561).
     delivered: bool,
-    /// The highest sequence this card is known to have DELIVERED (spec #561,
-    /// review #569), carried across entry replacements: a newer write — even a
-    /// failed one that now owes a payload — never unsays a delivery a staged
-    /// cursor still needs to confirm. It goes with the entry on eviction.
-    delivered_through: u64,
     /// Failed retry attempts so far — the backoff exponent.
     attempts: u32,
     /// The earliest instant the next retry may go out (unless forced).
@@ -83,6 +78,11 @@ struct PendingEntry {
 #[derive(Default)]
 struct State {
     entries: HashMap<String, PendingEntry>,
+    /// The most recent RECOVERABLE failure per card — `(seq, payload)` — the
+    /// exact write a failure note asks about (spec #561, review #569): a newer
+    /// write may replace `entries` before the note runs, and the note must
+    /// still learn whether that payload's own sequence delivered.
+    failed: HashMap<String, (u64, Value)>,
     /// One delivery lock per card while its entry lives — plus while any call
     /// still holds it. Every write to a message is serialized on it, so the
     /// outbox's retries and the live writers cannot reorder each other at
@@ -173,20 +173,19 @@ impl CardDelivery {
         if !newest {
             return;
         }
-        // A delivery is never unsaid (spec #561, review #569): the evidence a
-        // staged cursor confirms by survives the newer write that replaces
-        // this entry — even a newer failed one that now owes its own payload.
-        let delivered_through = state
-            .entries
-            .get(message_id)
-            .map_or(0, |entry| entry.delivered_through)
-            .max(if result.is_ok() { seq } else { 0 });
-        let entry = if matches!(result, Err(e) if e.is_recoverable_card_write()) {
+        let recoverable = matches!(result, Err(e) if e.is_recoverable_card_write());
+        if recoverable {
+            // Remember the exact write a failure note will ask about (spec
+            // #561, review #569): a newer write may replace the entry before
+            // the note runs, and the note must still be able to tell whether
+            // THIS payload's sequence delivered.
+            state.failed.insert(message_id.to_string(), (seq, card.clone()));
+        }
+        let entry = if recoverable {
             PendingEntry {
                 seq,
                 card: Some(card.clone()),
                 delivered: false,
-                delivered_through,
                 attempts: 0,
                 next_attempt: tokio::time::Instant::now() + self.backoff_base,
                 lock: state.locks.entry(message_id.to_string()).or_default().clone(),
@@ -201,7 +200,6 @@ impl CardDelivery {
                 seq,
                 card: None,
                 delivered: result.is_ok(),
-                delivered_through,
                 attempts: 0,
                 next_attempt: tokio::time::Instant::now(),
                 lock: state.locks.entry(message_id.to_string()).or_default().clone(),
@@ -229,6 +227,9 @@ impl CardDelivery {
                 return;
             };
             let evicted = state.entries.remove(&victim);
+            // The failure memory leaves with its card's entry: the note it
+            // serves names the same payload, and the entry is gone.
+            state.failed.remove(&victim);
             if evicted.is_some_and(|entry| entry.card.is_some()) {
                 tracing::warn!(
                     "pending card update for {victim} evicted: {} card writes reached",
@@ -424,13 +425,11 @@ impl Platform for CardDelivery {
                     // Keep the sequence as a settled tombstone: an outcome that
                     // is not newer than the stored one must not re-register
                     // behind it. `delivered` is what the Rendered Cursor's
-                    // drain reconcile confirms against (spec #561), and
-                    // `delivered_through` keeps that evidence after a newer
-                    // write replaces this entry (review #569).
+                    // drain reconcile confirms against, for this exact
+                    // sequence (spec #561).
                     if let Some(current) = state.entries.get_mut(&message_id) {
                         current.card = None;
                         current.delivered = true;
-                        current.delivered_through = current.delivered_through.max(entry.seq);
                     }
                     if entry.attempts > 0 {
                         tracing::info!(
@@ -475,15 +474,28 @@ impl Platform for CardDelivery {
     }
 
     fn card_write_delivered(&self, message_id: &str, seq: u64) -> bool {
-        // The delivered watermark, not just the newest entry's own verdict
-        // (spec #561, review #569): a staged cursor confirms by the sequence
-        // its write carried, which a newer write must not erase.
+        // ONLY this exact sequence's own verdict (spec #561, review #569): a
+        // newer write's delivery — a cached repaint that may omit this
+        // payload's delta — must never answer for it.
         self.state
             .lock()
             .unwrap()
             .entries
             .get(message_id)
-            .is_some_and(|entry| entry.delivered_through >= seq)
+            .is_some_and(|entry| entry.seq == seq && entry.card.is_none() && entry.delivered)
+    }
+
+    fn failed_card_write(&self, message_id: &str, card: &Value) -> Option<u64> {
+        // The sequence of the card's most recent RECOVERABLE failure, when the
+        // payload it carried is exactly `card` (spec #561, review #569): the
+        // failure note asks about ITS OWN write, whose sequence a newer write
+        // may have replaced in the entry.
+        self.state
+            .lock()
+            .unwrap()
+            .failed
+            .get(message_id)
+            .and_then(|(seq, payload)| (payload == card).then_some(*seq))
     }
 
     fn settled_card_write_delivered(&self, message_id: &str) -> Option<bool> {
@@ -724,13 +736,13 @@ mod tests {
         );
     }
 
-    /// A delivered write stays confirmable after a NEWER failure replaces the
-    /// entry (spec #561, review #569): the outbox owes the newer payload, but
-    /// the delivered sequence is still what the Rendered Cursor's staged write
-    /// needs — the durable cursor must not lose a delivery to a later
-    /// supersede.
+    /// A newer write never answers for an OLDER sequence (spec #561, review
+    /// #569): a failure note asks about its own payload's sequence, because a
+    /// newer write — a cached repaint that may omit the older payload's delta —
+    /// must never advance that payload's staged cursor. The failure memory
+    /// names only the payload that actually failed.
     #[tokio::test]
-    async fn a_delivered_write_stays_confirmable_after_a_newer_failure() {
+    async fn a_newer_write_never_answers_for_an_older_sequence() {
         let inner = Arc::new(FakePlatform::new());
         let delivery = CardDelivery::new(inner.clone());
         let first = serde_json::json!({ "body": "first" });
@@ -746,18 +758,34 @@ mod tests {
             delivery.card_write_delivered("om_1", seq),
             "the drained write delivered"
         );
+        assert_eq!(
+            delivery.failed_card_write("om_1", &first),
+            Some(seq),
+            "the failure memory names the failed payload's sequence"
+        );
 
-        // A newer write fails: the newest entry now owes another payload, but
-        // the delivered sequence stays verified for the stage it belongs to.
+        // A newer write fails: the entry now names another sequence, so the
+        // delivered one is no longer answered for — only the newer payload's
+        // own sequence is.
         inner.fail_next(Fail::Transport);
         let _ = delivery.update_message("om_1", &second).await;
         assert!(
-            delivery.card_write_delivered("om_1", seq),
-            "a delivered write is still a delivery after a newer failure"
+            !delivery.card_write_delivered("om_1", seq),
+            "a newer write's outcome never answers for the older sequence"
         );
         assert!(
             !delivery.card_write_delivered("om_1", seq + 1),
             "the owed newer write is not a delivery"
+        );
+        assert_eq!(
+            delivery.failed_card_write("om_1", &first),
+            None,
+            "the failure memory moved on to the newer payload"
+        );
+        assert_eq!(
+            delivery.failed_card_write("om_1", &second),
+            Some(seq + 1),
+            "the newer payload's own failure is the one remembered"
         );
     }
 

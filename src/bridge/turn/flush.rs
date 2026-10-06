@@ -231,9 +231,16 @@ async fn note_cursor_write_failure(
             }
             return;
         }
-        if cards.feishu.settled_card_write_delivered(card_message_id) == Some(true) {
-            // The drain delivered it first: the write landed, so confirm the
-            // exact stage this body carried.
+        // The payload is no longer owed: only ITS OWN sequence's delivered
+        // verdict confirms the stage (spec #561, review #569). A newer write's
+        // success — a cached repaint that may omit this body's delta — must
+        // never advance the cursor, so the sequence asked about is the one
+        // THIS payload failed at, not the entry's newest.
+        if let Some(seq) = cards.feishu.failed_card_write(card_message_id, card)
+            && cards.feishu.card_write_delivered(card_message_id, seq)
+        {
+            // The drain delivered this payload first: the write landed, so
+            // confirm the exact stage this body carried.
             confirm_staged_cursor(cards, session_id, card_message_id, None, stage, None).await;
             return;
         }
@@ -1222,6 +1229,68 @@ mod tests {
             cards.chains.announced("ses_test").map(|mark| mark.created_ms),
             Some(2_000),
             "the newer stage then advances the mark"
+        );
+    }
+
+    /// A newer cached repaint succeeds before the failure note runs (spec
+    /// #561, review #569): its success must never confirm the OLDER failed
+    /// write's stage — the repaint's body may omit that write's delta, and a
+    /// restart would then skip content that never reached a card.
+    #[tokio::test]
+    async fn a_newer_repaint_never_confirms_an_older_failed_stages_cursor() {
+        use crate::backend::MessageId;
+        use crate::bridge::chain::{CursorFrontier, CursorPartKind, RenderedCursor, cursor_prefix_digest};
+        let (app, platform) = app_with_live_card("回答。").await;
+        let cards = app.cards_handle();
+        cards.chains.track(
+            "ses_test",
+            "om_live",
+            MessageId::new("msg_cola_anchor"),
+            Some(1_000),
+            None,
+        );
+        let card = serde_json::json!({ "schema": "2.0" });
+        // The write fails recoverably: the payload is owed...
+        platform
+            .fail_update_transport_count
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        let error = cards
+            .feishu
+            .update_message("om_live", &card)
+            .await
+            .expect_err("the transport failure");
+        // ...and a NEWER cached repaint — a different, older body that may omit
+        // this write's delta — succeeds before the failure note runs.
+        let repaint = serde_json::json!({ "schema": "2.0", "header": { "title": "repaint" } });
+        cards
+            .feishu
+            .update_message("om_live", &repaint)
+            .await
+            .expect("the repaint lands");
+        assert_eq!(
+            cards.feishu.settled_card_write_delivered("om_live"),
+            Some(true),
+            "the newest write settled delivered"
+        );
+
+        let cursor = RenderedCursor {
+            frontier: Some(CursorFrontier {
+                message_id: MessageId::new("msg_a_2000"),
+                part_index: 0,
+                kind: CursorPartKind::Text,
+                started_at: Some(2_000),
+                delivered_chars: "回答".chars().count(),
+                prefix_digest: Some(cursor_prefix_digest("回答")),
+            }),
+            live_calls: Default::default(),
+        };
+        let stage = Turn::stage_cursor(&cards, "ses_test", Some("om_live"), &cursor).await;
+        note_cursor_write_failure(&cards, "ses_test", Some("om_live"), &card, &error, stage).await;
+
+        assert_eq!(
+            cards.chains.cursor("ses_test"),
+            None,
+            "a newer repaint's success never confirms the older failed write's cursor"
         );
     }
 

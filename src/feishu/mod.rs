@@ -138,12 +138,23 @@ pub trait Platform: Send + Sync {
         None
     }
 
-    /// Whether `message_id`'s card write `seq` settled **delivered** — the
-    /// confirmation the drain reconcile advances the Rendered Cursor on
-    /// (spec #561). `false` while the write is still owed, was permanently
+    /// The sequence of `message_id`'s card write `seq` settled **delivered** —
+    /// the confirmation the drain reconcile advances the Rendered Cursor on
+    /// (spec #561, review #569): ONLY this exact sequence's own verdict, never
+    /// a newer write's. `false` while the write is still owed, was permanently
     /// refused, was superseded or evicted, or is not observed.
     fn card_write_delivered(&self, _message_id: &str, _seq: u64) -> bool {
         false
+    }
+
+    /// The sequence of `message_id`'s most recent RECOVERABLE failure when the
+    /// payload it carried is exactly `card` (spec #561, review #569): the write
+    /// a failure note asks about even after a newer write — a cached repaint
+    /// that may omit this payload's delta — replaced the card's entry. `None`
+    /// when the newest failure carried another payload, or the platform does
+    /// not observe card writes.
+    fn failed_card_write(&self, _message_id: &str, _card: &Value) -> Option<u64> {
+        None
     }
 
     /// The settled delivery verdict of `message_id`'s newest card write once
