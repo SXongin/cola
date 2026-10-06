@@ -13,8 +13,14 @@ pub(crate) use state::CardSession;
 
 /// The Rendered Cursor's drain reconcile (spec #561): after the Platform's
 /// Pending Card Update drain, Session Sync advances every staged cursor whose
-/// owed payload has delivered.
-pub(crate) use flush::reconcile_staged_cursors;
+/// owed payload has delivered — and the projection's successor create confirms
+/// its staged cursor through the same drain (ticket #563).
+pub(crate) use flush::{confirm_card_cursor, reconcile_staged_cursors};
+
+/// The projection's resolved render seed (spec #561, ticket #563): the chain's
+/// Rendered Cursor placed in one transcript read, which the Chain Record
+/// module's decision carries and this module's render consumes.
+pub(crate) use state::CursorSeed;
 
 /// The one card ownership verdict (ADR-0070, spec #545): computed by one read
 /// over the waits state and the card map; the prompt router, the Wake gate,
@@ -2928,6 +2934,83 @@ impl Turn {
             .and_then(|(card, full)| (!full).then_some(card))
     }
 
+    /// Arm the ended-while-down projection's successor card (spec #561, ticket
+    /// #563): a fresh accumulator seeded from the chain's Rendered Cursor
+    /// renders the transcript's delta once — the cut tail with its markdown
+    /// lead, the live set resolved by identity — takes the ledger and work
+    /// context, stamps the true ending and is inserted as the session's live
+    /// card, ready for the caller's create. `None` when the session already has
+    /// a card (a chain appeared meanwhile) — the caller must send nothing.
+    ///
+    /// The first send itself stays with the caller (the reap's apply): the
+    /// successor replies to the original Turn anchor, the recorded card, or
+    /// the chain's top-level chat, and its create is never outbox-retried.
+    /// The accumulator's own reply target is the Turn anchor, so a later size
+    /// split of the successor continues from the user's message. The returned
+    /// [`ProjectedCard`] carries what the caller confirms after the create:
+    /// whether any content actually rendered (nothing missed keeps today's
+    /// settle path), and whether a live-set call settled (the old card then
+    /// drops the running panels the successor resolved, ADR-0068's
+    /// generalized collect).
+    #[allow(clippy::too_many_arguments)] // the successor's whole arming fixture
+    pub(crate) async fn arm_projected_card(
+        cards: &CardsHandle,
+        session_id: &str,
+        anchor: &TurnAnchor,
+        cursor: &RenderedCursor,
+        seed: &state::CursorSeed,
+        transcript: &SessionTranscript,
+        ending: &Disposition,
+        title: &str,
+        directory: &str,
+        fallback_chat: Option<&str>,
+        variant: Option<String>,
+    ) -> Option<ProjectedCard> {
+        let work_context = StreamAccumulator::capture_work_context(directory).await;
+        let mut live = cards.cards.lock().await;
+        if live.contains_key(session_id) {
+            return None;
+        }
+        let mut acc = StreamAccumulator::new(title);
+        acc.turn_anchor = Some(anchor.clone());
+        acc.session_id = Some(session_id.to_string());
+        // The chain's reply target: the original Turn's user message, so the
+        // successor and any later split continue from where the chain began.
+        acc.reply_to_message_id = Some(anchor.message_id.to_string());
+        acc.variant = variant;
+        // The successor continues a chain that ended: it carries no question
+        // to re-ask, so an Error ending never offers Retry (ADR-0059).
+        acc.wake_continuation = true;
+        acc.apply_work_context(work_context);
+        acc.seed_projection(cursor, seed.clone());
+        let carried_before: std::collections::HashSet<String> = acc.carried_calls.iter().cloned().collect();
+        let rendered = render::render_turn_parts(&mut acc, transcript);
+        let resolved_calls = carried_before
+            .iter()
+            .any(|call_id| !acc.carried_calls.contains(call_id));
+        render::apply_ledger_read(
+            &mut acc,
+            transcript,
+            &std::collections::HashMap::new(),
+            Some(anchor),
+            chrono::Utc::now().timestamp_millis(),
+            state::LedgerCadence::Minute,
+        );
+        acc.apply_ending(ending);
+        let built = acc.build_card_unsplit();
+        // Stage the body's cursor exactly like a flush does: only the
+        // confirmed create drains it into the Chain Record.
+        acc.stage_cursor(None, built.cursor.clone());
+        let mut session = state::CardSession::new(acc, None);
+        session.fallback_chat = fallback_chat.map(str::to_string);
+        live.insert(session_id.to_string(), session);
+        Some(ProjectedCard {
+            card: built.card,
+            rendered,
+            resolved_calls,
+        })
+    }
+
     /// Arm an external renderer's card: build the turn's accumulator, attach
     /// the work context, push the anchor text (the message preview / snapshot
     /// identity) just before the turn's server-time anchor so the reply's parts
@@ -3012,6 +3095,21 @@ pub(crate) enum WakeContinuation {
 pub(crate) struct ContinuationLine {
     pub(crate) at: i64,
     pub(crate) wake: Option<(String, i64)>,
+}
+
+/// What [`Turn::arm_projected_card`] armed and what the caller must confirm
+/// after the successor's create lands (spec #561, ticket #563).
+pub(crate) struct ProjectedCard {
+    /// The successor card to send (create semantics, never outbox-retried).
+    pub(crate) card: serde_json::Value,
+    /// Whether any content actually entered the successor. `false` means the
+    /// cursor covered the whole read: nothing was missed, so the caller keeps
+    /// today's in-place settle instead of posting an empty successor.
+    pub(crate) rendered: bool,
+    /// Whether a live-set call settled while cola was down: the successor
+    /// resolved it, so the collected old card drops the running `⏳` panels
+    /// (ADR-0068's generalized collect).
+    pub(crate) resolved_calls: bool,
 }
 
 /// The destination and identity a Wake continuation card is armed with:

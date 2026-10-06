@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::Instrument;
 
 use crate::backend::{
-    Part, SessionTranscript, TaskRetirementEnding, ToolStatus, TurnAnchor, Wake, WakeSource,
+    MessageId, Part, SessionTranscript, TaskRetirementEnding, ToolStatus, TurnAnchor, Wake, WakeSource,
 };
 use crate::bridge::core::SESSION_INFO_TIMEOUT;
 use crate::bridge::handles::{CardsHandle, RequestsHandle, SessionsHandle, TurnHandles};
@@ -512,7 +512,7 @@ pub(super) fn render_new_turn_parts(acc: &mut StreamAccumulator, transcript: &Se
 /// the anchor — either created within the turn or still being produced as the
 /// turn began — while one that finished before the anchor stays the previous
 /// turn's and never bleeds in (#190).
-fn render_turn_parts(acc: &mut StreamAccumulator, transcript: &SessionTranscript) -> bool {
+pub(super) fn render_turn_parts(acc: &mut StreamAccumulator, transcript: &SessionTranscript) -> bool {
     capture_turn_anchor(acc, transcript);
     // Carried Tool Panels (ADR-0068) reconcile on EVERY render read, before
     // the anchor gate below: a carried call is resolved by call identity
@@ -520,7 +520,10 @@ fn render_turn_parts(acc: &mut StreamAccumulator, transcript: &SessionTranscript
     // restart window the fresh Turn's message is queued behind the still
     // running orphan run, leaving the anchor unobserved for as long as that
     // run lasts — gating the carry on it would freeze the panel at its
-    // takeover status for exactly that window.
+    // takeover status for exactly that window. The projection's seed (spec
+    // #561) enters the same set: its live-set calls resolve by identity here,
+    // a settled one joining the timeline exactly once and a running one
+    // riding the live tail display-only.
     let mut rendered_any = reconcile_carried_calls(acc, transcript);
     let Some(anchor) = acc.turn_anchor.clone() else {
         return rendered_any;
@@ -528,6 +531,19 @@ fn render_turn_parts(acc: &mut StreamAccumulator, transcript: &SessionTranscript
     // A merged Wake's completion entry is written before its work renders, so
     // the entry sorts above the parts it announces.
     rendered_any |= render_wake_entries(acc, transcript, &anchor);
+    // The projection seed (spec #561): resolved against THIS read, so its
+    // at-or-before-the-frontier rule uses the read's own message order.
+    let seed = acc.seed.clone();
+    let message_positions: std::collections::HashMap<&str, usize> = if seed.is_some() {
+        transcript
+            .messages
+            .iter()
+            .enumerate()
+            .map(|(pos, message)| (message.id.as_str(), pos))
+            .collect()
+    } else {
+        std::collections::HashMap::new()
+    };
     for message in transcript.turn_for_user(&anchor).messages {
         // An error-card retry carries the failed attempt's baseline (#387):
         // its messages stay suppressed, so the rebuilt card streams only the
@@ -548,6 +564,7 @@ fn render_turn_parts(acc: &mut StreamAccumulator, transcript: &SessionTranscript
                 acc.context_tokens = used;
             }
         }
+        let message_pos = message_positions.get(message.id.as_str()).copied();
         for (index, part) in message.parts.iter().enumerate() {
             // A carried call the Turn's own window now renders is the Turn's own
             // live panel again: it leaves the display-only carry set, so the
@@ -556,19 +573,85 @@ fn render_turn_parts(acc: &mut StreamAccumulator, transcript: &SessionTranscript
             if let Part::Tool(call) = part {
                 acc.carried_calls.remove(&call.identity.call_id);
             }
-            // The part's own position identifies it for the Rendered Cursor
-            // frontier (spec #561): parts carry no id (AGENTS.md #9), so the
-            // message identity plus the ordinal is the whole position.
-            let source = PartSource {
-                message_id: message.id.clone(),
-                index,
+            let cut = match (seed.as_ref(), message_pos) {
+                (Some(seed), Some(pos)) => seed.cut(pos, index),
+                _ => crate::bridge::turn::state::SeedCut::Undelivered,
             };
-            if render_part(acc, Some(source), part) {
-                rendered_any = true;
+            match cut {
+                // At or before the frontier: already delivered. It is marked
+                // delivered (not rendered), so the content-keyed dedup and the
+                // content-diff probe both see the earlier body's delivery.
+                crate::bridge::turn::state::SeedCut::Delivered => acc.mark_delivered_part(part),
+                crate::bridge::turn::state::SeedCut::Frontier(delivered) => {
+                    if render_seeded_part(acc, message.id.clone(), index, part, delivered) {
+                        rendered_any = true;
+                    }
+                }
+                crate::bridge::turn::state::SeedCut::Undelivered => {
+                    // The part's own position identifies it for the Rendered
+                    // Cursor frontier (spec #561): parts carry no id (AGENTS.md
+                    // #9), so the message identity plus the ordinal is the
+                    // whole position.
+                    let source = PartSource::at(message.id.clone(), index);
+                    if render_part(acc, Some(source), part) {
+                        rendered_any = true;
+                    }
+                }
             }
         }
     }
     rendered_any
+}
+
+/// Render the frontier part of a projection seed (spec #561, ticket #563):
+/// only its undelivered `text[delivered..]` suffix enters the card — with the
+/// markdown lead its cut needs ([`crate::feishu::card::sanitize::neutralize_tail`])
+/// — while the part is marked delivered up to its current end so a later
+/// read's growth renders only the new suffix. Returns whether content entered
+/// the card.
+fn render_seeded_part(
+    acc: &mut StreamAccumulator,
+    message_id: MessageId,
+    index: usize,
+    part: &Part,
+    delivered: usize,
+) -> bool {
+    let (full, started_at, is_text) = match part {
+        Part::Text(text) => (text.text.as_str(), text.started_at, true),
+        Part::Reasoning(reasoning) => (reasoning.text.as_str(), reasoning.started_at, false),
+        // The seed resolved this position to text/reasoning; a tool here
+        // means the read changed under the cursor — mark it delivered rather
+        // than guess a suffix.
+        _ => {
+            acc.mark_delivered_part(part);
+            return false;
+        }
+    };
+    let delivered = delivered.min(full.chars().count());
+    let prefix: String = full.chars().take(delivered).collect();
+    let suffix: String = full.chars().skip(delivered).collect();
+    // Everything up to the part's current end is delivered now: a later read
+    // grows the part and renders only the growth.
+    acc.mark_delivered_part(part);
+    if !suffix.is_empty() {
+        let lead = crate::feishu::card::sanitize::neutralize_tail(&prefix, &suffix);
+        let source = PartSource {
+            message_id,
+            index,
+            delivered_before: delivered,
+        };
+        if is_text {
+            acc.push_text_lead(started_at, Some(source), &suffix, lead);
+        } else {
+            acc.push_reasoning_lead(started_at, Some(source), &suffix, lead);
+        }
+    }
+    if let Some(seed) = acc.seed.as_mut()
+        && let Some(frontier) = seed.frontier.as_mut()
+    {
+        frontier.delivered_chars = full.chars().count();
+    }
+    !suffix.is_empty()
 }
 
 /// Carried Tool Panels (ADR-0068): a restart takeover seeds the orphaned
@@ -1062,7 +1145,7 @@ mod tests {
         MockBackend, PlatformCall, RecordingPlatform, build_app, card_text, realistic_parts,
         seed_cover_title, seed_entry, test_config, test_work_dir, text_part, turn_anchor, typed_message,
     };
-    use crate::bridge::turn::state::StreamAccumulator;
+    use crate::bridge::turn::state::{CursorSeed, StreamAccumulator};
     use crate::feishu::card::CardState;
     use crate::feishu::card::tool_render::ToolPanel;
 
@@ -2159,6 +2242,331 @@ Index: /x/src/main.rs
             text.matches("slept").count(),
             1,
             "a settled carried call still renders on the final card: {text}"
+        );
+    }
+
+    /// The Rendered Cursor fixture of the projection tests (spec #561): a
+    /// text/reasoning frontier at `(message, part)` with `delivered_chars`
+    /// confirmed and the given live calls.
+    fn projection_cursor(
+        message: &str,
+        part_index: usize,
+        kind: CursorPartKind,
+        delivered_chars: usize,
+        live: &[&str],
+    ) -> RenderedCursor {
+        RenderedCursor {
+            frontier: Some(CursorFrontier {
+                message_id: MessageId::new(message),
+                part_index,
+                kind,
+                started_at: Some(2_000),
+                delivered_chars,
+            }),
+            live_calls: live.iter().map(|id| id.to_string()).collect(),
+        }
+    }
+
+    /// The ended-while-down projection's seed (spec #561, ticket #563):
+    /// everything at or before the frontier counts as delivered — it is not
+    /// rendered again — and the newest part renders only its undelivered
+    /// suffix.
+    #[test]
+    fn a_seeded_render_continues_a_cut_text_part_at_the_cursor() {
+        let prefix = "第一段回答。";
+        let suffix = "第二段回答。";
+        let full = format!("{prefix}{suffix}");
+        let transcript = |text: &str| {
+            SessionTranscript::new(vec![
+                typed_message(
+                    "msg_cola_anchor",
+                    MessageRole::User,
+                    Some(1_000),
+                    vec![text_part("问题")],
+                ),
+                message("msg_a_2000", 2_000, vec![text_part(text)]),
+            ])
+        };
+
+        let mut acc = StreamAccumulator::new("proj");
+        acc.turn_anchor = Some(turn_anchor(1_000));
+        let cursor = projection_cursor("msg_a_2000", 0, CursorPartKind::Text, prefix.chars().count(), &[]);
+        let seed = CursorSeed::resolve(&transcript(&full), &cursor).expect("the frontier resolves");
+        acc.seed_projection(&cursor, seed);
+
+        assert!(render_new_turn_parts(&mut acc, &transcript(&full)));
+        let built = acc.build_card_with_info();
+        let text = card_text(&built.card);
+        assert!(
+            !text.contains(prefix),
+            "the delivered prefix is not rendered again: {text}"
+        );
+        assert!(text.contains(suffix), "the undelivered suffix renders: {text}");
+        assert_eq!(
+            built.cursor.frontier,
+            Some(CursorFrontier {
+                message_id: MessageId::new("msg_a_2000"),
+                part_index: 0,
+                kind: CursorPartKind::Text,
+                // The fixture's part carries no server clock; the cursor
+                // keeps the part's position either way.
+                started_at: None,
+                delivered_chars: full.chars().count(),
+            }),
+            "the body's cursor continues from the cut, not from zero"
+        );
+
+        // An unchanged read renders nothing new (the Wake content-diff must
+        // not replay the delivered prefix); growth renders only the new tail.
+        assert!(!render_new_turn_parts(&mut acc, &transcript(&full)));
+        let grown = format!("{full}第三段回答。");
+        assert!(render_new_turn_parts(&mut acc, &transcript(&grown)));
+        let text = card_text(&acc.build_card_with_info().card);
+        assert!(text.contains("第三段回答。"), "{text}");
+        assert_eq!(
+            text.matches(suffix).count(),
+            1,
+            "growth never duplicates the delivered suffix: {text}"
+        );
+    }
+
+    /// A tail cut inside a code fence (spec #561, ticket #563): the seeded
+    /// suffix renders intact — the fence reopens, so the code stays code and
+    /// the text after the original closer is not swallowed.
+    #[test]
+    fn a_seeded_tail_cut_inside_a_fence_renders_intact() {
+        let prefix = "说明\n```python\nprint(1)\n";
+        let full = format!("{prefix}print(2)\n```\n后的文字");
+        let transcript = SessionTranscript::new(vec![
+            typed_message(
+                "msg_cola_anchor",
+                MessageRole::User,
+                Some(1_000),
+                vec![text_part("问题")],
+            ),
+            message("msg_a_2000", 2_000, vec![text_part(&full)]),
+        ]);
+
+        let mut acc = StreamAccumulator::new("proj");
+        acc.turn_anchor = Some(turn_anchor(1_000));
+        let cursor = projection_cursor("msg_a_2000", 0, CursorPartKind::Text, prefix.chars().count(), &[]);
+        let seed = CursorSeed::resolve(&transcript, &cursor).expect("the frontier resolves");
+        acc.seed_projection(&cursor, seed);
+
+        assert!(render_new_turn_parts(&mut acc, &transcript));
+        let text = card_text(&acc.build_card_with_info().card);
+        assert!(
+            text.contains("```\nprint(2)\n```\n后的文字"),
+            "the cut tail reopens the fence and keeps the after-text intact: {text}"
+        );
+        assert!(
+            !text.contains(prefix),
+            "the delivered fence prefix is not repeated: {text}"
+        );
+    }
+
+    /// A reasoning frontier renders only its undelivered suffix too; a part
+    /// after the frontier renders in full (spec #561, ticket #563).
+    #[test]
+    fn a_seeded_reasoning_part_renders_its_tail_and_later_parts_in_full() {
+        let full_reasoning = "先想第一步。再想第二步。";
+        let transcript = SessionTranscript::new(vec![
+            typed_message(
+                "msg_cola_anchor",
+                MessageRole::User,
+                Some(1_000),
+                vec![text_part("问题")],
+            ),
+            message(
+                "msg_a_2000",
+                2_000,
+                vec![reasoning_at(full_reasoning, 2_000), text_part("表后的答案。")],
+            ),
+        ]);
+
+        let mut acc = StreamAccumulator::new("proj");
+        acc.turn_anchor = Some(turn_anchor(1_000));
+        // The reasoning part delivered up to its first sentence.
+        let cursor = projection_cursor(
+            "msg_a_2000",
+            0,
+            CursorPartKind::Reasoning,
+            "先想第一步。".chars().count(),
+            &[],
+        );
+        let seed = CursorSeed::resolve(&transcript, &cursor).expect("the frontier resolves");
+        acc.seed_projection(&cursor, seed);
+
+        assert!(render_new_turn_parts(&mut acc, &transcript));
+        let text = card_text(&acc.build_card_with_info().card);
+        assert!(
+            text.contains("再想第二步。"),
+            "the reasoning suffix renders: {text}"
+        );
+        assert!(
+            !text.contains("先想第一步。"),
+            "the delivered reasoning is not repeated: {text}"
+        );
+        assert!(
+            text.contains("表后的答案。"),
+            "a part after the frontier renders in full: {text}"
+        );
+    }
+
+    /// A tail cut inside a markdown table repeats the table's header and
+    /// delimiter, so the remaining rows parse as the table they continue
+    /// (spec #561, ticket #563).
+    #[test]
+    fn a_seeded_tail_cut_inside_a_table_repeats_its_header() {
+        let prefix = "| 名称 | 值 |\n|---|---|\n| 一 | 1 |\n";
+        let full = format!("{prefix}| 二 | 2 |\n\n尾注");
+        let transcript = SessionTranscript::new(vec![
+            typed_message(
+                "msg_cola_anchor",
+                MessageRole::User,
+                Some(1_000),
+                vec![text_part("问题")],
+            ),
+            message("msg_a_2000", 2_000, vec![text_part(&full)]),
+        ]);
+
+        let mut acc = StreamAccumulator::new("proj");
+        acc.turn_anchor = Some(turn_anchor(1_000));
+        let cursor = projection_cursor("msg_a_2000", 0, CursorPartKind::Text, prefix.chars().count(), &[]);
+        let seed = CursorSeed::resolve(&transcript, &cursor).expect("the frontier resolves");
+        acc.seed_projection(&cursor, seed);
+
+        assert!(render_new_turn_parts(&mut acc, &transcript));
+        let text = card_text(&acc.build_card_with_info().card);
+        assert!(
+            text.contains("| 名称 | 值 |\n|---|---|\n| 二 | 2 |"),
+            "the table cut repeats its header: {text}"
+        );
+        assert!(
+            !text.contains("| 一 | 1 |"),
+            "the delivered rows are not repeated: {text}"
+        );
+        assert!(text.contains("尾注"), "{text}");
+    }
+
+    /// A tool the delivered body showed running (the cursor's live set) and
+    /// which settled while cola was down renders its result on the successor
+    /// exactly once (spec #561, ticket #563).
+    #[test]
+    fn a_seeded_render_settles_a_live_set_call_exactly_once() {
+        let text = "第一段回答。";
+        let timeline = |status: ToolStatus, output: Option<&str>| {
+            SessionTranscript::new(vec![
+                typed_message(
+                    "msg_cola_anchor",
+                    MessageRole::User,
+                    Some(1_000),
+                    vec![text_part("问题")],
+                ),
+                message("msg_a_2000", 2_000, vec![text_part(text)]),
+                message(
+                    "msg_tool_3000",
+                    3_000,
+                    vec![tool(
+                        "bash",
+                        "call_1",
+                        status,
+                        Some(3_000),
+                        Some(serde_json::json!({ "command": "sleep 300" })),
+                        output,
+                    )],
+                ),
+            ])
+        };
+        let running = timeline(ToolStatus::Running, None);
+        let mut acc = StreamAccumulator::new("proj");
+        acc.turn_anchor = Some(turn_anchor(1_000));
+        let cursor = projection_cursor(
+            "msg_a_2000",
+            0,
+            CursorPartKind::Text,
+            text.chars().count(),
+            &["call_1"],
+        );
+        let seed = CursorSeed::resolve(&running, &cursor).expect("the frontier resolves");
+        acc.seed_projection(&cursor, seed);
+
+        // The delivered body's newest state for the call was `running`.
+        assert!(render_new_turn_parts(&mut acc, &running));
+        assert!(
+            card_text(&acc.build_card_with_info().card).contains("⏳ bash"),
+            "the delivered running panel is still live on the successor"
+        );
+
+        // Settled while cola was down: the result joins the timeline exactly
+        // once and the `⏳` is gone.
+        let settled = timeline(ToolStatus::Completed, Some("done"));
+        assert!(render_new_turn_parts(&mut acc, &settled));
+        assert!(
+            acc.carried_calls.is_empty(),
+            "a settled live-set call leaves the display-only carry"
+        );
+        let text_after = card_text(&acc.build_card_with_info().card);
+        assert!(text_after.contains("done"), "{text_after}");
+        assert_eq!(
+            text_after.matches("done").count(),
+            1,
+            "settled once: {text_after}"
+        );
+        assert!(
+            !text_after.contains("⏳"),
+            "no frozen running marker: {text_after}"
+        );
+        assert!(!render_new_turn_parts(&mut acc, &settled));
+        let text_after = card_text(&acc.build_card_with_info().card);
+        assert_eq!(
+            text_after.matches("done").count(),
+            1,
+            "no duplication: {text_after}"
+        );
+    }
+
+    /// Everything at or before the frontier is delivered — including a tool
+    /// whose result the old card already showed — so the successor never
+    /// renders it again (spec #561, ticket #563).
+    #[test]
+    fn a_seeded_render_skips_a_settled_tool_before_the_frontier() {
+        let prefix = "第一段回答。";
+        let full = format!("{prefix}第二段回答。");
+        let transcript = SessionTranscript::new(vec![
+            typed_message(
+                "msg_cola_anchor",
+                MessageRole::User,
+                Some(1_000),
+                vec![text_part("问题")],
+            ),
+            message(
+                "msg_tool_1500",
+                1_500,
+                vec![tool(
+                    "bash",
+                    "call_old",
+                    ToolStatus::Completed,
+                    Some(1_500),
+                    Some(serde_json::json!({ "command": "echo old" })),
+                    Some("old-result"),
+                )],
+            ),
+            message("msg_a_2000", 2_000, vec![text_part(&full)]),
+        ]);
+
+        let mut acc = StreamAccumulator::new("proj");
+        acc.turn_anchor = Some(turn_anchor(1_000));
+        let cursor = projection_cursor("msg_a_2000", 0, CursorPartKind::Text, prefix.chars().count(), &[]);
+        let seed = CursorSeed::resolve(&transcript, &cursor).expect("the frontier resolves");
+        acc.seed_projection(&cursor, seed);
+
+        render_new_turn_parts(&mut acc, &transcript);
+        let text = card_text(&acc.build_card_with_info().card);
+        assert!(text.contains("第二段回答。"), "{text}");
+        assert!(
+            !text.contains("old-result"),
+            "a delivered settled tool is never rendered again: {text}"
         );
     }
 

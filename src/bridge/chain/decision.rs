@@ -24,6 +24,7 @@
 
 use super::records::{ChainRecord, WakeMark};
 use crate::backend::{SessionTranscript, TurnAnchor, TurnSettle};
+use crate::bridge::turn::CursorSeed;
 use crate::opencode::types::SessionStatus;
 
 /// The disposition of one reconcile pass over a
@@ -32,7 +33,9 @@ use crate::opencode::types::SessionStatus;
 /// deciding read is missing (`NoDecision`), the record is spent
 /// (`DiscardRecord`), a successor owns the session (`CollectThenRepoint` /
 /// `CollectThenRelease`), the still-live orphan is owed its one-time stamp
-/// (`StampRestart`), or the transcript decided the ending (`Settle`).
+/// (`StampRestart`), the transcript decided the ending (`Settle` — PATCHed in
+/// place), or a cursor-carrying record's ended run is projected onto a
+/// successor (`Project`, spec #561 / ticket #563).
 ///
 /// `Keep` also carries the marked outcomes: an orphan whose stamp already
 /// landed or was permanently refused (#522), a yielded waiting card whose
@@ -65,6 +68,20 @@ pub(crate) enum ChainDisposition {
     /// The transcript decided the card's ending. `TurnSettle::Running` never
     /// surfaces here — an undecided ending is `Keep`.
     Settle(TurnSettle),
+    /// A record carrying a Rendered Cursor whose run ended while cola was down
+    /// (or is gone): project the missed tail — and the transcript's true
+    /// ending — onto a successor card, seeded from the cursor, and collect the
+    /// recorded card as taken over (spec #561, ticket #563). A cursorless
+    /// record, an unresolvable cursor or an Unreceived ending keeps
+    /// [`Self::Settle`] — today's in-place path.
+    Project {
+        /// The transcript-decided ending the successor settles with.
+        settle: TurnSettle,
+        /// The chain's cursor, resolved against this read: the render's seed.
+        /// Carried here so the apply projects exactly what the decision proved
+        /// resolvable.
+        seed: CursorSeed,
+    },
 }
 
 /// What this process knows about the Session's card, as one value: the probe
@@ -286,7 +303,23 @@ pub(crate) fn reconcile(record: &ChainRecord, reads: &RecoveryReads<'_>) -> Chai
                         // the true end. The ending is PATCHed once per life —
                         // a record that already yielded keeps observing.
                         TurnSettle::Waiting if record.waiting_reaped => ChainDisposition::Keep,
-                        settle => ChainDisposition::Settle(settle),
+                        // The ended-while-down projection (spec #561, ticket
+                        // #563): a chain whose card confirmed a render frontier
+                        // projects the missed tail onto a successor. The cursor
+                        // must resolve against THIS read — an unplaceable
+                        // frontier settles in place rather than guess. An
+                        // Unreceived ending is no content to continue, and a
+                        // still-live run keeps today's stamp (the adoption/
+                        // follow is ticket #564's disposition, not this one).
+                        settle => {
+                            if !matches!(settle, TurnSettle::Unreceived)
+                                && let Some(cursor) = record.cursor.as_ref()
+                                && let Some(seed) = CursorSeed::resolve(transcript, cursor)
+                            {
+                                return ChainDisposition::Project { settle, seed };
+                            }
+                            ChainDisposition::Settle(settle)
+                        }
                     }
                 }
                 // The status read was unknown, failed, or not warranted.
@@ -377,6 +410,7 @@ pub(crate) fn fresh(reads: &FreshReads) -> FreshDisposition {
 mod tests {
     use super::*;
     use crate::backend::{MessageId, TranscriptMessage};
+    use crate::bridge::chain::{CursorFrontier, CursorPartKind, RenderedCursor};
     use crate::bridge::test_support::{background_shell, shell_wake};
     use crate::bridge::tests::drain::{assistant, user};
 
@@ -493,7 +527,11 @@ mod tests {
                 ChainDisposition::Settle(_)
                 | ChainDisposition::StampRestart
                 | ChainDisposition::CollectThenRepoint { .. }
-                | ChainDisposition::CollectThenRelease => Some(record.card_message_id.as_str()),
+                | ChainDisposition::CollectThenRelease
+                // The projection collects the recorded card as taken over and
+                // settles a NEW successor; it arises from a `None` probe only,
+                // never while this process holds the session's card.
+                | ChainDisposition::Project { .. } => Some(record.card_message_id.as_str()),
                 ChainDisposition::Keep | ChainDisposition::NoDecision | ChainDisposition::DiscardRecord => {
                     None
                 }
@@ -744,6 +782,150 @@ mod tests {
             ),
             ChainDisposition::NoDecision
         );
+    }
+
+    /// The ended-while-down projection (spec #561, ticket #563): a record
+    /// carrying a cursor whose run is not live projects the missed tail onto
+    /// a successor — Complete, Failed and Waiting alike — while a cursorless
+    /// record, an unresolvable cursor and an Unreceived ending all keep
+    /// today's in-place settle.
+    #[test]
+    fn a_cursor_carrying_record_projects_an_ended_run() {
+        let transcript = SessionTranscript::new(vec![
+            user("msg_cola_anchor", 1_000, "问题"),
+            assistant(2_000, "答复。"),
+        ]);
+        let cursor = RenderedCursor {
+            frontier: Some(CursorFrontier {
+                message_id: MessageId::new("msg_a_2000"),
+                part_index: 0,
+                kind: CursorPartKind::Text,
+                started_at: Some(2_000),
+                delivered_chars: 2,
+            }),
+            live_calls: Default::default(),
+        };
+        let with_cursor = ChainRecord {
+            cursor: Some(cursor.clone()),
+            ..record()
+        };
+        let seed = CursorSeed::resolve(&transcript, &cursor).expect("the frontier resolves");
+        assert_eq!(
+            reconcile(&with_cursor, &idle_transcript(transcript.clone())),
+            ChainDisposition::Project {
+                settle: TurnSettle::Complete,
+                seed: seed.clone(),
+            },
+            "a placed cursor projects the run's true end"
+        );
+
+        // The failed ending projects too, carrying the server's message.
+        let failed = SessionTranscript::new(vec![
+            user("msg_cola_anchor", 1_000, "问题"),
+            TranscriptMessage {
+                error: Some("503".into()),
+                ..assistant(2_000, "答复。")
+            },
+        ]);
+        assert_eq!(
+            reconcile(&with_cursor, &idle_transcript(failed.clone())),
+            ChainDisposition::Project {
+                settle: TurnSettle::Failed("503".into()),
+                seed: CursorSeed::resolve(&failed, &cursor).unwrap(),
+            }
+        );
+
+        // A waiting ending projects as well, with the successor yielding.
+        let waiting = SessionTranscript::new(vec![
+            user("msg_cola_anchor", 1_000, "问题"),
+            assistant(2_000, "跑着。"),
+        ])
+        .with_background_tasks(vec![background_shell(1_500)]);
+        assert_eq!(
+            reconcile(&with_cursor, &idle_transcript(waiting.clone())),
+            ChainDisposition::Project {
+                settle: TurnSettle::Waiting,
+                seed: CursorSeed::resolve(&waiting, &cursor).unwrap(),
+            }
+        );
+        // A yield already PATCHed keeps observing, exactly as today.
+        let yielded = ChainRecord {
+            waiting_reaped: true,
+            ..with_cursor.clone()
+        };
+        assert_eq!(
+            reconcile(&yielded, &idle_transcript(waiting)),
+            ChainDisposition::Keep
+        );
+    }
+
+    /// The projection's fallbacks (spec #561, ticket #563): a cursorless
+    /// record, a cursor this read cannot place, and an Unreceived ending all
+    /// keep today's settle path.
+    #[test]
+    fn a_cursorless_or_unresolvable_record_settles_in_place() {
+        let transcript = SessionTranscript::new(vec![
+            user("msg_cola_anchor", 1_000, "问题"),
+            assistant(2_000, "答复。"),
+        ]);
+        assert_eq!(
+            reconcile(&record(), &idle_transcript(transcript.clone())),
+            ChainDisposition::Settle(TurnSettle::Complete),
+            "a cursorless record keeps the in-place ending"
+        );
+
+        // The cursor names a part this read does not carry: settle in place,
+        // never skip content on a guess.
+        let dangling = RenderedCursor {
+            frontier: Some(CursorFrontier {
+                message_id: MessageId::new("msg_gone"),
+                part_index: 0,
+                kind: CursorPartKind::Text,
+                started_at: None,
+                delivered_chars: 1,
+            }),
+            live_calls: Default::default(),
+        };
+        let dangling_record = ChainRecord {
+            cursor: Some(dangling),
+            ..record()
+        };
+        assert_eq!(
+            reconcile(&dangling_record, &idle_transcript(transcript.clone())),
+            ChainDisposition::Settle(TurnSettle::Complete)
+        );
+
+        // An Unreceived ending has no transcript content to continue. The
+        // record is anchorless (the submitted message never landed) and the
+        // read carries no re-derivable anchor either.
+        let unreceived = SessionTranscript::new(vec![user("msg_other", 500, "上一条")]);
+        let any_cursor = ChainRecord::new("om_card", MessageId::new("msg_cola_anchor"), None)
+            .with_directory(Some("/work".into()));
+        let any_cursor = ChainRecord {
+            cursor: Some(RenderedCursor::default()),
+            ..any_cursor
+        };
+        assert_eq!(
+            reconcile(&any_cursor, &idle_transcript(unreceived)),
+            ChainDisposition::Settle(TurnSettle::Unreceived)
+        );
+    }
+
+    /// The #564 boundary (ticket #563): a cursor-carrying record whose run is
+    /// STILL LIVE keeps today's one-time restart stamp — the adoption/follow
+    /// is the next ticket's disposition, never a side effect of the
+    /// projection.
+    #[test]
+    fn a_still_live_cursor_record_keeps_todays_stamp() {
+        let with_cursor = ChainRecord {
+            cursor: Some(RenderedCursor::default()),
+            ..record()
+        };
+        let live = RecoveryReads {
+            status: Some(StatusRead::Named(SessionStatus::Busy)),
+            ..orphan()
+        };
+        assert_eq!(reconcile(&with_cursor, &live), ChainDisposition::StampRestart);
     }
 
     /// The boundary rule the plan promises: the status read is warranted only

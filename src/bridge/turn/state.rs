@@ -8,7 +8,7 @@
 //! accumulator's own tests are the module's internal seam.
 
 use super::disposition::Disposition;
-use crate::backend::{MessageId, SessionTranscript, ToolCall, ToolStatus, TurnAnchor};
+use crate::backend::{MessageId, Part, SessionTranscript, ToolCall, ToolStatus, TurnAnchor};
 use crate::bridge::chain::{CursorFrontier, CursorPartKind, RenderedCursor};
 use crate::bridge::handles::CardsHandle;
 use crate::feishu::card::first_n_chars_bytes;
@@ -52,6 +52,11 @@ pub(super) struct TimelineItem {
     /// synthetic entries (receipts, ledger entries) and for entries no
     /// frontier can name (tools).
     pub(super) source: Option<PartSource>,
+    /// A markdown lead to emit before this entry's content (spec #561's cut
+    /// tail): the fence opener or table header a projection's seeded render
+    /// needs because the delivered prefix ended inside that construct. It is
+    /// rendered, never counted as the part's own delivered characters.
+    pub(super) lead: Option<String>,
 }
 
 /// Where a timeline text/reasoning entry came from: the typed transcript
@@ -64,6 +69,121 @@ pub(super) struct PartSource {
     pub(super) message_id: MessageId,
     /// The part's index in its message's typed `parts` vec.
     pub(super) index: usize,
+    /// The part's model characters that were already delivered before this
+    /// entry was rendered (spec #561's projection seed): the frontier's cut
+    /// point. The cursor's delivered extent for the part is this offset plus
+    /// the entry's own (model) characters; the markdown lead is not counted.
+    /// `0` for every ordinary render.
+    pub(super) delivered_before: usize,
+}
+
+impl PartSource {
+    /// An ordinary render's source: nothing delivered before it.
+    pub(super) fn at(message_id: MessageId, index: usize) -> Self {
+        Self {
+            message_id,
+            index,
+            delivered_before: 0,
+        }
+    }
+}
+
+/// The Rendered Cursor resolved against one transcript read (spec #561): the
+/// frontier's absolute position in THIS read, so a seeded render can treat
+/// everything at or before it as delivered. `None` from
+/// [`CursorSeed::resolve`] when the cursor names a part this read cannot
+/// place — the projection must then fall back rather than guess.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CursorSeed {
+    pub(super) frontier: Option<SeedFrontier>,
+    /// The tool call ids whose newest delivered state was `running` (spec
+    /// #561's live set): resolved by identity against the whole read — still
+    /// running renders display-only, settled joins the timeline once.
+    pub(super) live_calls: std::collections::BTreeSet<String>,
+}
+
+/// The frontier's resolved place in one read: the message's index in the
+/// read's `messages` vec plus the part's ordinal in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SeedFrontier {
+    pub(super) message_id: MessageId,
+    pub(super) message_pos: usize,
+    pub(super) part_index: usize,
+    pub(super) kind: CursorPartKind,
+    pub(super) delivered_chars: usize,
+}
+
+impl CursorSeed {
+    /// Resolve `cursor` against `transcript` (spec #561): `None` when the
+    /// frontier names a message/part this read does not carry, or the part's
+    /// kind no longer matches — the read moved on, so nothing may be skipped.
+    pub(crate) fn resolve(transcript: &SessionTranscript, cursor: &RenderedCursor) -> Option<Self> {
+        let frontier = match &cursor.frontier {
+            None => None,
+            Some(frontier) => {
+                let message_pos = transcript
+                    .messages
+                    .iter()
+                    .position(|message| message.id == frontier.message_id)?;
+                let part = transcript.messages[message_pos].parts.get(frontier.part_index)?;
+                let (matches_kind, part_chars) = match part {
+                    crate::backend::Part::Text(text) => {
+                        (frontier.kind == CursorPartKind::Text, text.text.chars().count())
+                    }
+                    crate::backend::Part::Reasoning(reasoning) => (
+                        frontier.kind == CursorPartKind::Reasoning,
+                        reasoning.text.chars().count(),
+                    ),
+                    _ => (false, 0),
+                };
+                if !matches_kind {
+                    return None;
+                }
+                // A cursor delivered past this read's content means the read
+                // is not the one the cursor was taken from (compaction, a
+                // recreated part): skipping would hide content.
+                if frontier.delivered_chars > part_chars {
+                    return None;
+                }
+                Some(SeedFrontier {
+                    message_id: frontier.message_id.clone(),
+                    message_pos,
+                    part_index: frontier.part_index,
+                    kind: frontier.kind,
+                    delivered_chars: frontier.delivered_chars,
+                })
+            }
+        };
+        Some(Self {
+            frontier,
+            live_calls: cursor.live_calls.clone(),
+        })
+    }
+
+    /// Where the part at `(message_pos, part_index)` sits relative to the
+    /// cut: delivered (skip), the frontier itself (render the suffix), or
+    /// undelivered (render normally).
+    pub(super) fn cut(&self, message_pos: usize, part_index: usize) -> SeedCut {
+        let Some(frontier) = &self.frontier else {
+            return SeedCut::Undelivered;
+        };
+        match (message_pos, part_index).cmp(&(frontier.message_pos, frontier.part_index)) {
+            std::cmp::Ordering::Less => SeedCut::Delivered,
+            std::cmp::Ordering::Equal => SeedCut::Frontier(frontier.delivered_chars),
+            std::cmp::Ordering::Greater => SeedCut::Undelivered,
+        }
+    }
+}
+
+/// What a seeded render owes one transcript part.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SeedCut {
+    /// At or before the frontier: already delivered, never rendered again.
+    Delivered,
+    /// The frontier part itself: only its undelivered suffix renders.
+    Frontier(usize),
+    /// After the frontier: an ordinary render.
+    Undelivered,
 }
 
 /// Bookkeeping for a Tool Panel that is still live (ADR-0045): the timeline
@@ -789,6 +909,12 @@ pub(super) struct StreamAccumulator {
     /// (`Turn::track_live_card`), so a successor's first write can never clear
     /// the chain's frontier.
     pub(super) cursor: RenderedCursor,
+    /// The projection's render seed (spec #561, ticket #563): resolved against
+    /// the read being rendered, it makes everything at or before the cursor's
+    /// frontier count as delivered — the frontier part renders only its
+    /// undelivered suffix — while the live set resolves by identity against
+    /// the whole read. `None` on every ordinary accumulator.
+    pub(super) seed: Option<CursorSeed>,
     /// The Rendered Cursor of the card body most recently built, awaiting a
     /// confirmed write (spec #561): staged by the flush before each write and
     /// drained into [`Self::cursor`] and the durable record once that write
@@ -1414,8 +1540,22 @@ impl StreamAccumulator {
         source: Option<PartSource>,
         kind: TimelineKind,
     ) {
+        self.insert_kind_lead(key, shown_at, source, kind, None);
+    }
+
+    /// [`Self::insert_kind_src`] with a markdown lead rendered before the
+    /// entry's content (spec #561's cut tail): the seeded render's fence
+    /// opener / table header.
+    fn insert_kind_lead(
+        &mut self,
+        key: i64,
+        shown_at: Option<i64>,
+        source: Option<PartSource>,
+        kind: TimelineKind,
+        lead: Option<String>,
+    ) {
         self.item_seq += 1;
-        self.insert_item(key, shown_at, source, self.item_seq, kind);
+        self.insert_item(key, shown_at, source, self.item_seq, kind, lead);
     }
 
     /// [`Self::insert_kind`] with a pre-allocated identity: a live Tool Panel
@@ -1429,6 +1569,7 @@ impl StreamAccumulator {
         source: Option<PartSource>,
         seq: u64,
         kind: TimelineKind,
+        lead: Option<String>,
     ) {
         let idx = self.timeline.partition_point(|item| item.key <= key);
         let (idx, key) = if idx < self.render_from {
@@ -1448,6 +1589,7 @@ impl StreamAccumulator {
                 seq,
                 kind,
                 source,
+                lead,
             },
         );
         self.last_key = self.last_key.max(key);
@@ -1498,10 +1640,26 @@ impl StreamAccumulator {
     /// rendered from (spec #561's cursor frontier). Synthetic pushes pass
     /// `None`.
     pub(super) fn push_text_from(&mut self, at_ms: Option<i64>, source: Option<PartSource>, chunk: &str) {
+        self.push_text_lead(at_ms, source, chunk, None);
+    }
+
+    /// [`Self::push_text_from`] with a markdown lead emitted before the
+    /// chunk's content (spec #561's cut tail): the lead renders (closing the
+    /// construct the delivered prefix left open) while the entry's counted
+    /// characters stay the model's suffix, so the Rendered Cursor's arithmetic
+    /// is exact.
+    pub(super) fn push_text_lead(
+        &mut self,
+        at_ms: Option<i64>,
+        source: Option<PartSource>,
+        chunk: &str,
+        lead: Option<String>,
+    ) {
         let key = at_ms.unwrap_or_else(|| self.next_order());
         self.text.push_str(chunk);
         let max = crate::feishu::card::MAX_CARD_TEXT_CHARS;
         let mut remaining = chunk;
+        let mut lead = lead;
         while !remaining.is_empty() {
             let space = match self.item_with_key(key).and_then(|i| self.timeline.get(i)) {
                 Some(TimelineItem {
@@ -1512,7 +1670,13 @@ impl StreamAccumulator {
             };
             if space == 0 {
                 let take: String = remaining.chars().take(max).collect();
-                self.insert_kind_src(key, at_ms, source.clone(), TimelineKind::Text(take.clone()));
+                self.insert_kind_lead(
+                    key,
+                    at_ms,
+                    source.clone(),
+                    TimelineKind::Text(take.clone()),
+                    lead.take(),
+                );
                 remaining = &remaining[take.len()..];
                 continue;
             }
@@ -1522,14 +1686,24 @@ impl StreamAccumulator {
                 Some(TimelineItem {
                     kind: TimelineKind::Text(last),
                     source: item_source,
+                    lead: item_lead,
                     ..
                 }) => {
                     last.push_str(&take);
                     if item_source.is_none() {
                         *item_source = source.clone();
                     }
+                    if item_lead.is_none() {
+                        *item_lead = lead.take();
+                    }
                 }
-                _ => self.insert_kind_src(key, at_ms, source.clone(), TimelineKind::Text(take.clone())),
+                _ => self.insert_kind_lead(
+                    key,
+                    at_ms,
+                    source.clone(),
+                    TimelineKind::Text(take.clone()),
+                    lead.take(),
+                ),
             }
             remaining = &remaining[take.len()..];
         }
@@ -1562,6 +1736,19 @@ impl StreamAccumulator {
         source: Option<PartSource>,
         chunk: &str,
     ) {
+        self.push_reasoning_lead(at_ms, source, chunk, None);
+    }
+
+    /// [`Self::push_reasoning_from`] with a markdown lead emitted before the
+    /// chunk's content (spec #561's cut tail), exactly like
+    /// [`Self::push_text_lead`].
+    pub(super) fn push_reasoning_lead(
+        &mut self,
+        at_ms: Option<i64>,
+        source: Option<PartSource>,
+        chunk: &str,
+        lead: Option<String>,
+    ) {
         let key = at_ms.unwrap_or_else(|| self.next_order());
         self.reasoning.push_str(chunk);
         let idx = self.item_with_key(key);
@@ -1569,14 +1756,24 @@ impl StreamAccumulator {
             Some(TimelineItem {
                 kind: TimelineKind::Reasoning(last),
                 source: item_source,
+                lead: item_lead,
                 ..
             }) => {
                 last.push_str(chunk);
                 if item_source.is_none() {
                     *item_source = source;
                 }
+                if item_lead.is_none() {
+                    *item_lead = lead;
+                }
             }
-            _ => self.insert_kind_src(key, at_ms, source, TimelineKind::Reasoning(chunk.to_string())),
+            _ => self.insert_kind_lead(
+                key,
+                at_ms,
+                source,
+                TimelineKind::Reasoning(chunk.to_string()),
+                lead,
+            ),
         }
     }
 
@@ -1639,6 +1836,7 @@ impl StreamAccumulator {
                     None,
                     entry.seq,
                     TimelineKind::Tool(call_id.to_string()),
+                    None,
                 );
             }
         } else if at_ms.is_some()
@@ -1683,6 +1881,45 @@ impl StreamAccumulator {
             carried += 1;
         }
         carried
+    }
+
+    /// Seed a projection's render from the chain's Rendered Cursor (spec #561,
+    /// ticket #563): the resolved seed makes everything at or before its
+    /// frontier count as delivered, and the live set enters the identity
+    /// carry — whose reconciliation already renders a settled call once into
+    /// the timeline and keeps a still-running one display-only. The base
+    /// cursor is the confirmed fact every later candidate derives from.
+    pub(super) fn seed_projection(&mut self, cursor: &RenderedCursor, seed: CursorSeed) {
+        self.cursor = cursor.clone();
+        self.seed = Some(seed.clone());
+        self.carried_calls = seed.live_calls.into_iter().collect();
+    }
+
+    /// Mark one transcript part as delivered without rendering it (spec #561's
+    /// projection seed): the content-keyed dedup and the content-diff probe
+    /// then see it exactly as if the earlier body had rendered it — nothing at
+    /// or before the frontier renders again, and no Wake continuation replays
+    /// it.
+    pub(super) fn mark_delivered_part(&mut self, part: &Part) {
+        match part {
+            Part::Text(text) => {
+                self.rendered_parts.insert(RenderedPart::Text(text.text.clone()));
+            }
+            Part::Reasoning(reasoning) => {
+                self.rendered_parts
+                    .insert(RenderedPart::Reasoning(reasoning.text.clone()));
+            }
+            Part::Tool(call) => {
+                if call.identity.name == "todowrite" {
+                    self.todo_panel = Some(ToolPanel::new(call.clone()));
+                    self.todo_shown_at = call.started_at;
+                } else {
+                    self.tools
+                        .insert(call.identity.call_id.clone(), ToolPanel::new(call.clone()));
+                }
+            }
+            Part::StepStart(_) | Part::StepFinish(_) | Part::Patch(_) | Part::Other(_) => {}
+        }
     }
 
     /// The live `task`/`subagent` panels' (call id, child Session id) pairs
@@ -2146,10 +2383,20 @@ impl StreamAccumulator {
                         builder = builder.with_text(&pending);
                         pending.clear();
                     }
+                    // A seeded reasoning entry carries the lead its cut needs
+                    // (spec #561): the construct the delivered prefix left
+                    // open is closed inside this panel.
+                    let r = match &item.lead {
+                        Some(lead) => format!("{lead}{r}"),
+                        None => r.clone(),
+                    };
                     builder =
-                        builder.with_reasoning_at(r, item.shown_at, Some(&format!("reason_{}", item.seq)));
+                        builder.with_reasoning_at(&r, item.shown_at, Some(&format!("reason_{}", item.seq)));
                 }
                 TimelineKind::Text(t) => {
+                    if let Some(lead) = &item.lead {
+                        pending.push_str(lead);
+                    }
                     pending.push_str(t);
                 }
                 TimelineKind::Tool(call_id) => {
@@ -2391,7 +2638,14 @@ impl StreamAccumulator {
                 .iter()
                 .filter(|item| item.source.as_ref() == Some(source))
                 .filter_map(|item| match &item.kind {
-                    TimelineKind::Text(text) | TimelineKind::Reasoning(text) => Some(text.chars().count()),
+                    TimelineKind::Text(text) | TimelineKind::Reasoning(text) => {
+                        // The projection's seeded entry continues the part
+                        // mid-way: its counted extent is the delivered prefix
+                        // plus the entry's own model characters (the markdown
+                        // lead is rendered, never counted).
+                        let before = item.source.as_ref().map_or(0, |source| source.delivered_before);
+                        Some(before + text.chars().count())
+                    }
                     _ => None,
                 })
                 .sum();

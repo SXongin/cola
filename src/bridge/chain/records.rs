@@ -406,9 +406,9 @@ impl ChainRecords {
 
     /// The session's Rendered Cursor, when its record carries one (spec #561).
     /// `None` for a missing record or a cursorless one — a legacy record or a
-    /// chain whose first confirmed write has not landed. The upcoming
-    /// projection (#563) lifts the test gate.
-    #[cfg(test)]
+    /// chain whose first confirmed write has not landed. The projection reads
+    /// it at apply time (ticket #563): the record snapshot the reap took
+    /// before its server reads can be older than a concurrent confirmed write.
     pub(crate) fn cursor(&self, session_id: &str) -> Option<RenderedCursor> {
         self.lock()
             .records

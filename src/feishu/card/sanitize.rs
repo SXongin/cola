@@ -87,6 +87,95 @@ pub(crate) fn sanitize_markdown(text: &str) -> String {
     CardMarkdown::new().clean(text)
 }
 
+/// The markdown construction a delivered prefix leaves open at its cut point
+/// (spec #561, ticket #563): what a tail that starts mid-construct must
+/// re-establish to render as the content it continues.
+enum OpenConstruct<'a> {
+    /// A fenced code block opened with this many backticks and not closed.
+    Fence { ticks: usize },
+    /// A markdown table whose header (and, when the cut is past it, delimiter)
+    /// the tail continues.
+    Table {
+        header: &'a str,
+        delimiter: Option<&'a str>,
+    },
+}
+
+/// The construction `prefix` leaves open at its end, if any. A fence is
+/// tracked line by line exactly as [`CardMarkdown::clean`] tracks it; a table
+/// is recognised by its header/delimiter block ending on the prefix's last
+/// non-blank line.
+fn open_construct(prefix: &str) -> Option<OpenConstruct<'_>> {
+    let lines: Vec<&str> = prefix.split('\n').collect();
+    let mut fence: Option<usize> = None;
+    for line in &lines {
+        match fence {
+            Some(open) => {
+                if closes_fence(line, open) {
+                    fence = None;
+                }
+            }
+            None => {
+                if let Some(open) = opens_fence(line) {
+                    fence = Some(open);
+                }
+            }
+        }
+    }
+    if let Some(ticks) = fence {
+        return Some(OpenConstruct::Fence { ticks });
+    }
+    // A table is "open" when its last non-blank line is a row of one: walk
+    // back to the block's start and require the header/delimiter shape (a
+    // header alone counts — the cut landed between it and the delimiter).
+    let last = lines.iter().rposition(|line| !line.trim().is_empty())?;
+    if !lines[last].contains('|') {
+        return None;
+    }
+    let mut start = last;
+    while start > 0 && !lines[start - 1].trim().is_empty() {
+        start -= 1;
+    }
+    let delimiter = if last > start {
+        let candidate = lines[start + 1];
+        if !is_delimiter_row(candidate) {
+            return None;
+        }
+        Some(candidate)
+    } else {
+        None
+    };
+    Some(OpenConstruct::Table {
+        header: lines[start],
+        delimiter,
+    })
+}
+
+/// The markdown lead a projection's cut tail needs before its own text so the
+/// cut renders intact (spec #561, ticket #563): a fence opener matching the
+/// one the delivered prefix left unclosed, or the header/delimiter rows a
+/// table's remaining body rows need to parse as the table they continue.
+/// `None` when the prefix ends in a neutral state — or when the tail no
+/// longer carries the construct's content (a plain line after a table ends
+/// it), where a lead would only invent markdown.
+pub(crate) fn neutralize_tail(prefix: &str, suffix: &str) -> Option<String> {
+    match open_construct(prefix)? {
+        OpenConstruct::Fence { ticks } => Some(format!("{}\n", "`".repeat(ticks))),
+        OpenConstruct::Table { header, delimiter } => {
+            if !suffix.lines().next().is_some_and(|line| line.contains('|')) {
+                return None;
+            }
+            let mut lead = String::from(header);
+            lead.push('\n');
+            if let Some(delimiter) = delimiter {
+                lead.push_str(delimiter);
+                lead.push('\n');
+            }
+            Some(lead)
+        }
+    }
+}
+
 /// Per-card markdown hygiene state.
 pub(crate) struct CardMarkdown {
     /// Tables this card may still render natively; later ones become code.
@@ -448,6 +537,71 @@ mod tests {
         assert_eq!(
             CardMarkdown::new().clean("看 `<read_file>` 变体\n\n<number_tag>"),
             "看 `<read_file>` 变体\n\n&#60;number_tag>"
+        );
+    }
+
+    /// A tail cut inside a fenced code block (spec #561, ticket #563): the
+    /// lead reopens the fence, so the tail's code stays code and the text
+    /// after the original closer is not swallowed by an unclosed fence.
+    #[test]
+    fn a_tail_cut_inside_a_fence_reopens_it() {
+        // The opener's own run length is the lead's: a shorter opener could be
+        // closed by a run the code legitimately contains.
+        assert_eq!(
+            neutralize_tail("说明\n```python\nprint(1)\n", "print(2)\n```\n后的文字").as_deref(),
+            Some("```\n")
+        );
+        assert_eq!(
+            neutralize_tail("````\ncode\n", "more\n````\ntail").as_deref(),
+            Some("````\n")
+        );
+        // A closed fence (or no fence at all) leaves the tail standing alone.
+        assert_eq!(neutralize_tail("```\ncode\n```\n", "尾"), None);
+        assert_eq!(neutralize_tail("普通文字\n", "更多文字"), None);
+        assert_eq!(neutralize_tail("", "从零开始"), None);
+
+        // The neutralized tail renders as code followed by plain text; the
+        // naive cut would leave the fence open and swallow the after-text.
+        let lead = neutralize_tail("说明\n```python\nprint(1)\n", "print(2)\n```\n后的文字").unwrap();
+        assert_eq!(
+            CardMarkdown::new().clean(&format!("{lead}print(2)\n```\n后的文字")),
+            "```\nprint(2)\n```\n后的文字"
+        );
+        assert_eq!(
+            CardMarkdown::new().clean("print(2)\n```\n后的文字"),
+            "print(2)\n```\n后的文字",
+            "without the lead the fence stays open — the mangling the lead prevents"
+        );
+    }
+
+    /// A tail cut inside a markdown table (spec #561, ticket #563): the lead
+    /// repeats the table's header and delimiter, so the remaining body rows
+    /// parse as the table they continue instead of stray pipe text.
+    #[test]
+    fn a_tail_cut_inside_a_table_repeats_the_header() {
+        let prefix = "| 名称 | 值 |\n|---|---|\n| 一 | 1 |\n";
+        assert_eq!(
+            neutralize_tail(prefix, "| 二 | 2 |\n\n尾注").as_deref(),
+            Some("| 名称 | 值 |\n|---|---|\n")
+        );
+        // Cut between the header and the delimiter: the header alone is the
+        // lead (the suffix carries the delimiter).
+        assert_eq!(
+            neutralize_tail("| 名称 | 值 |\n", "|---|---|\n| 一 | 1 |").as_deref(),
+            Some("| 名称 | 值 |\n")
+        );
+        // A table that ended before the cut (blank line) needs no lead, and a
+        // suffix that no longer carries a row is plain text.
+        assert_eq!(
+            neutralize_tail("| a | b |\n|---|---|\n| 1 | 2 |\n\n", "尾注"),
+            None
+        );
+        assert_eq!(neutralize_tail(prefix, "尾注"), None);
+        // A closed table's remaining rows render as the same table.
+        let lead = neutralize_tail(prefix, "| 二 | 2 |\n").unwrap();
+        assert_eq!(
+            CardMarkdown::new().clean(&format!("{lead}| 二 | 2 |")),
+            "| 名称 | 值 |\n|---|---|\n| 二 | 2 |"
         );
     }
 }

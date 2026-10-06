@@ -775,31 +775,13 @@ impl ExternalFlow {
     /// has no real title yet. Bounded like every other poll read, so a hung
     /// server degrades the subtitle instead of the send.
     async fn session_subtitle(&self, handles: &FlowHandles, session_id: &str, session_dir: &str) -> String {
-        let title = crate::bridge::bounded_call(
-            "external render session_info",
+        session_subtitle(
+            &handles.backend,
+            session_id,
+            session_dir,
             self.request_timeout_ms.load(std::sync::atomic::Ordering::Relaxed),
-            handles
-                .backend
-                .clone()
-                .for_directory(session_dir)
-                .session_info(session_id),
         )
         .await
-        .and_then(|r| r.ok())
-        .and_then(|i| i.title)
-        .unwrap_or_default();
-        let clean = crate::feishu::card::clean_session_label(&title);
-        let id_tail: String = session_id
-            .strip_prefix("ses_")
-            .unwrap_or(session_id)
-            .chars()
-            .take(7)
-            .collect();
-        if clean.is_empty() {
-            id_tail
-        } else {
-            format!("{} · {}", clean, id_tail)
-        }
     }
 
     /// Render a Wake's resumed work as a Card Chain continuation (ADR-0059) —
@@ -1148,6 +1130,44 @@ impl ExternalFlow {
 /// would confuse two messages that share a millisecond.
 async fn armed_turn_anchor(cards: &CardsHandle, session_id: &str) -> Option<TurnAnchor> {
     Turn::armed_turn_anchor(cards, session_id).await
+}
+
+/// The card subtitle a continuation carries: the server's live session title
+/// (ADR-0007) plus the id tail, or the bare id tail when the server has no
+/// real title yet. Bounded by the caller's read timeout, so a hung server
+/// degrades the subtitle instead of the send. Shared by the external
+/// renderer's arms and the reap's ended-while-down projection (spec #561), so
+/// every continuation card reads the same way.
+pub(crate) async fn session_subtitle(
+    backend: &Arc<dyn crate::backend::Backend>,
+    session_id: &str,
+    session_dir: &str,
+    read_timeout_ms: u64,
+) -> String {
+    let title = crate::bridge::bounded_call(
+        "session subtitle read",
+        read_timeout_ms,
+        backend
+            .clone()
+            .for_directory(session_dir)
+            .session_info(session_id),
+    )
+    .await
+    .and_then(|result| result.ok())
+    .and_then(|info| info.title)
+    .unwrap_or_default();
+    let clean = crate::feishu::card::clean_session_label(&title);
+    let id_tail: String = session_id
+        .strip_prefix("ses_")
+        .unwrap_or(session_id)
+        .chars()
+        .take(7)
+        .collect();
+    if clean.is_empty() {
+        id_tail
+    } else {
+        format!("{} · {}", clean, id_tail)
+    }
 }
 
 /// ADR-0028: settle a snapshot card right after it was sent — arm the
