@@ -212,20 +212,18 @@ impl ExternalFlow {
         directory: &str,
         transcript: &mut SessionTranscript,
     ) {
-        // Observe only while a card can still receive the ledger
-        // ([`CardSession::accepts_ledger_refresh`]): the entry renders on the
-        // chain that observes the retirement, so observing with a settled chain
-        // — or no chain at all — would record the task and swallow its entry
-        // (found on a real restart, 2026-10-01). The next Waiting card
-        // reconciles instead; nothing is lost, the transcript stays as read.
-        let accepts = handles
-            .cards
-            .cards
-            .lock()
+        // Observe only while a card can still receive the ledger — the
+        // ownership verdict's yielded-card write admission
+        // ([`CardOwnership::admits_ledger_refresh`], ADR-0060/0070): the entry
+        // renders on the chain that observes the retirement, so observing with
+        // a settled chain — or no chain at all — would record the task and
+        // swallow its entry (found on a real restart, 2026-10-01). The next
+        // Waiting card reconciles instead; nothing is lost, the transcript
+        // stays as read.
+        if !CardOwnership::read(&handles.cards, &handles.waits, sid)
             .await
-            .get(sid)
-            .is_some_and(|card| card.accepts_ledger_refresh());
-        if !accepts {
+            .admits_ledger_refresh()
+        {
             return;
         }
         let shells: Vec<String> = transcript

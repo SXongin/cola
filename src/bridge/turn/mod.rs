@@ -1883,8 +1883,8 @@ impl Turn {
     ///
     /// Returns false — nothing written — when the card is no longer the
     /// yielded one this handoff admits
-    /// ([`state::CardSession::accepts_ledger_refresh`]: still `Waiting`, live,
-    /// no split owed), so a race with a collect, a new Turn or a handoff can
+    /// ([`CardOwnership::admits_ledger_refresh`]: still `Waiting`, live, no
+    /// split owed), so a race with a collect, a new Turn or a handoff can
     /// never resume a card somebody else took over. `wake_id` is the completion
     /// this resume takes over, marked as such in the same locked write, so a
     /// later tail past it splits (ADR-0059) and the resume is never re-decided.
@@ -1900,13 +1900,13 @@ impl Turn {
         let write_lock = cards.write_lock(session_id).await;
         let _guard = write_lock.lock().await;
         {
-            let mut live = cards.cards.lock().await;
-            let Some(card) = live.get_mut(session_id) else {
+            // The yielded-card write admission, re-checked under the write lock
+            // through the module's lock-scoped helper: the returned card is
+            // still locked, so this admission and the write below share one
+            // lock and no collect, split or ending can slip between them.
+            let Some(mut card) = CardOwnership::admit_ledger_write(cards, session_id).await else {
                 return false;
             };
-            if !card.accepts_ledger_refresh() {
-                return false;
-            }
             let anchor = card.acc.turn_anchor.clone();
             render::apply_ledger_read(
                 &mut card.acc,
@@ -1992,10 +1992,12 @@ impl Turn {
         stopped: bool,
         read_timeout_ms: u64,
     ) -> YieldedUpdate {
+        // The read-time form of the yielded-card write admission: whether this
+        // pass should spend the child-liveness reads at all. The write below
+        // re-checks the same rule under the card-write lock.
         let admitted = {
             let live = cards.cards.lock().await;
-            live.get(session_id)
-                .is_some_and(|card| card.accepts_ledger_refresh())
+            live.get(session_id).is_some_and(ownership::admits_ledger_refresh)
         };
         let activities = if admitted {
             let children = render::background_subagent_children(transcript);
@@ -2017,13 +2019,12 @@ impl Turn {
         let write_lock = cards.write_lock(session_id).await;
         let _guard = write_lock.lock().await;
         let (changed, settled, notice_at) = {
-            let mut live = cards.cards.lock().await;
-            let Some(card) = live.get_mut(session_id) else {
+            // The same admission, re-checked under the write lock through the
+            // module's lock-scoped helper: the returned card is still locked,
+            // so the check and the write below share one lock.
+            let Some(mut card) = CardOwnership::admit_ledger_write(cards, session_id).await else {
                 return YieldedUpdate::Unchanged;
             };
-            if !card.accepts_ledger_refresh() {
-                return YieldedUpdate::Unchanged;
-            }
             let anchor = card.acc.turn_anchor.clone();
             let changed = render::apply_ledger_read(
                 &mut card.acc,
@@ -2994,8 +2995,8 @@ pub(crate) enum WakeContinuation {
     /// over, marked as such under the delivery's own write lock — so a later
     /// tail past it splits (ADR-0059), while the entry a yielded ledger refresh
     /// already placed stays single. Decided only for the state this delivery
-    /// admits ([`state::CardSession::accepts_ledger_refresh`]), so a decision
-    /// and its write can never disagree about which card resumes.
+    /// admits ([`ownership::admits_ledger_refresh`]), so a decision and its
+    /// write can never disagree about which card resumes.
     ResumeInPlace { wake_id: String },
     /// A card chain exists: continue it by split. Only the content the chain
     /// has not rendered lands on the continuation, and the accumulator's own
@@ -3116,7 +3117,7 @@ impl Turn {
                 // its wait (terminal, or a handoff already owed) must not be
                 // re-opened either: a ✅ flipping back to 🔄 would misread the
                 // ending it recorded.
-                if card.accepts_ledger_refresh()
+                if ownership::admits_ledger_refresh(card)
                     && let Some(wake) = newest_wake
                     && matches!(wake.source, WakeSource::Shell | WakeSource::Subagent)
                     && !card.acc.handed_over_wakes.contains(wake.id.as_str())
