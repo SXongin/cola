@@ -311,6 +311,11 @@ pub struct RecordingPlatform {
     /// One-shot mid-send pause installed by a concurrency test (absent in
     /// every other test). Taken by the first matching call.
     pub pause_call: std::sync::Mutex<Option<CallGate>>,
+    /// Scripted `reply_card` return ids, popped in call order; none left means
+    /// the mock's default `msg_reply`. A concurrency test that must tell two
+    /// racing creates apart (the Turn's card vs. a projection's late one) names
+    /// each reply itself.
+    pub reply_ids: std::sync::Mutex<std::collections::VecDeque<String>>,
 }
 
 impl RecordingPlatform {
@@ -332,7 +337,14 @@ impl RecordingPlatform {
             quoted_messages: std::sync::Mutex::new(std::collections::HashMap::new()),
             card_views: std::sync::Mutex::new(std::collections::HashMap::new()),
             pause_call: std::sync::Mutex::new(None),
+            reply_ids: std::sync::Mutex::new(std::collections::VecDeque::new()),
         }
+    }
+
+    /// Queue the id the next `reply_card` call returns (call order); a call
+    /// with none queued keeps the mock's default `msg_reply`.
+    pub fn given_reply_id(&self, id: &str) {
+        self.reply_ids.lock().unwrap().push_back(id.to_string());
     }
 
     /// Park the first `method` call targeting `target` until `release`, after
@@ -563,6 +575,15 @@ impl feishu::Platform for RecordingPlatform {
                 "simulated reply_card failure".into(),
             ));
         }
+        // The scripted id is consumed when the call is MADE, before any gate
+        // parks it: a create parked in flight must not let the next reply take
+        // its identity.
+        let reply_id = self
+            .reply_ids
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| "msg_reply".into());
         if let Some(gate) = self.take_gate("reply", reply_to) {
             wait_gate(gate).await;
         }
@@ -570,7 +591,7 @@ impl feishu::Platform for RecordingPlatform {
             reply_to: reply_to.into(),
             card: card.clone(),
         });
-        Ok("msg_reply".into())
+        Ok(reply_id)
     }
 
     async fn send_card(
