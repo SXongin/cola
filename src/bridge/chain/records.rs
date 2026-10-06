@@ -257,6 +257,11 @@ struct State {
 pub(crate) struct ChainRecords {
     path: PathBuf,
     state: Mutex<State>,
+    /// Test-only: how often the sidecar was actually persisted (spec #561's
+    /// write-cost measurement). The counter exists only in test builds, so
+    /// production pays nothing for the measurement.
+    #[cfg(test)]
+    writes: std::sync::atomic::AtomicUsize,
 }
 
 impl ChainRecords {
@@ -292,6 +297,8 @@ impl ChainRecords {
         let store = Self {
             path,
             state: Mutex::new(state),
+            #[cfg(test)]
+            writes: std::sync::atomic::AtomicUsize::new(0),
         };
         if folded {
             // Materialize the marker now: the folded state is what the legacy
@@ -590,6 +597,8 @@ impl ChainRecords {
     /// migration marker that stops [`Self::load`] folding the legacy files
     /// again (ADR-0069).
     fn write(&self, state: &State) {
+        #[cfg(test)]
+        self.writes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         sidecar::store(
             &self.path,
             "Chain Record",
@@ -599,6 +608,13 @@ impl ChainRecords {
             },
             false,
         );
+    }
+
+    /// Test-only: how often this store persisted its sidecar (spec #561's
+    /// write-cost measurement). Reads the counter the test builds carry.
+    #[cfg(test)]
+    pub(crate) fn writes(&self) -> usize {
+        self.writes.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {

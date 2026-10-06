@@ -14,9 +14,12 @@ use std::time::Duration;
 use super::drain::{
     assistant, ctx, scripted_app, settle_tool, spawn_turn, tool_assistant, user, wait_for_card_text,
 };
-use crate::backend::{MessageId, SessionTranscript, ToolStatus};
+use crate::backend::{MessageId, MessageRole, SessionTranscript, ToolStatus};
 use crate::bridge::chain::{CursorFrontier, CursorPartKind, RenderedCursor};
-use crate::bridge::test_support::{PlatformCall, card_text, test_work_dir};
+use crate::bridge::test_support::{
+    MockBackend, PlatformCall, card_text, patches_to, test_work_dir, text_part, typed_message,
+    wait_for_transcript_reads,
+};
 use crate::bridge::turn::Turn;
 use crate::opencode::types::SessionStatus;
 
@@ -136,6 +139,102 @@ async fn a_live_turn_advances_the_record_cursor_to_the_delivered_body() {
     );
 }
 
+/// Append a still-in-flight assistant answer to the live session's scripted
+/// transcript — the server's own growth while the follow renders it (a finished
+/// message would settle the run by transcript truth).
+async fn grow_scripted_answer(backend: &Arc<MockBackend>, created: i64, text: &str) {
+    let mut scripts = backend.transcript_scripts.lock().await;
+    let transcript = &mut scripts.get_mut("ses_test").unwrap()[0];
+    transcript.messages.push(typed_message(
+        &format!("msg_a_{created}"),
+        MessageRole::Assistant,
+        Some(created),
+        vec![text_part(text)],
+    ));
+}
+
+/// The write-cost acceptance (spec #561; reopening ADR-0061's rejected
+/// render-frontier watermark): on a live-turn scenario the Chain Record
+/// sidecar is persisted once per confirmed card write that moved the frontier
+/// — never once per render poll. The seam is exact: the store counts its own
+/// persisted writes (test-only), every platform `UpdateMessage` in the window
+/// is a confirmed PATCH, and the follow's repeated transcript reads stand for
+/// the poll cadence the old rejection weighed.
+#[tokio::test]
+async fn a_live_turn_persists_the_record_once_per_confirmed_write_not_per_poll() {
+    let _wd = test_work_dir();
+    let timeline = vec![
+        user("msg_cola_anchor", 1_000, "第一条消息"),
+        assistant(2_000, "第一段回答。"),
+        tool_assistant(4_000, ToolStatus::Running, ""),
+    ];
+    let (_dir, app, backend, platform) =
+        scripted_app(vec![SessionTranscript::new(timeline)], Some(SessionStatus::Busy)).await;
+    app.turn_drain_timeout_ms.store(30, Ordering::Relaxed);
+
+    let turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
+    wait_for_card_text(&platform, "第一段回答。").await;
+    wait_for_card_text(&platform, "⏳ bash").await;
+    let result = tokio::time::timeout(Duration::from_secs(5), turn)
+        .await
+        .expect("the turn must hand off at the drain bound")
+        .unwrap();
+    result.unwrap();
+    wait_for_cursor(&app, |cursor| cursor.frontier.is_some()).await;
+    // The follow reads twice with nothing new before the baseline: any flush
+    // the hand-off still owed has landed, so the window starts quiescent.
+    let reads = backend.transcript_calls.lock().await.len();
+    wait_for_transcript_reads(&backend, "ses_test", reads + 2).await;
+
+    let chains = app.cards_handle().chains.clone();
+    let writes0 = chains.writes();
+    let patches0 = patches_to(&platform, "msg_reply").await.len();
+
+    // Growth 1: the running tool settles — one new confirmed body (the live
+    // set drops). Growth 2: the answer streams on — one more (the frontier
+    // moves). Each is persisted exactly once.
+    settle_tool(&backend, ToolStatus::Completed, "done").await;
+    wait_for_card_text(&platform, "done").await;
+    wait_for_cursor(&app, |cursor| cursor.live_calls.is_empty()).await;
+    grow_scripted_answer(&backend, 6_000, "第二段回答。").await;
+    wait_for_card_text(&platform, "第二段回答。").await;
+    let grown = wait_for_cursor(&app, |cursor| {
+        cursor
+            .frontier
+            .as_ref()
+            .is_some_and(|frontier| frontier.message_id.as_str() == "msg_a_6000")
+    })
+    .await;
+    assert_eq!(
+        grown.frontier.as_ref().map(|frontier| frontier.delivered_chars),
+        Some("第二段回答。".chars().count()),
+        "the frontier is the newly delivered part's extent"
+    );
+
+    let writes1 = chains.writes();
+    let patches1 = patches_to(&platform, "msg_reply").await.len();
+    assert!(
+        patches1 - patches0 >= 2,
+        "precondition: both confirmed bodies reached the card"
+    );
+    assert_eq!(
+        writes1 - writes0,
+        2,
+        "each confirmed body that moved the frontier persists exactly one write"
+    );
+
+    // Idle render polls: the follow keeps reading with nothing new to deliver
+    // and persists nothing — the per-poll write the reopened decision weighed
+    // is not there.
+    let reads = backend.transcript_calls.lock().await.len();
+    wait_for_transcript_reads(&backend, "ses_test", reads + 3).await;
+    assert_eq!(
+        chains.writes(),
+        writes1,
+        "a render poll with nothing confirmed persists nothing"
+    );
+}
+
 /// A failed write advances nothing (the failure is still owed as a Pending
 /// Card Update), and the drain's later delivery of exactly that payload
 /// advances the cursor once — to the delivered body's frontier (spec #561).
@@ -150,6 +249,8 @@ async fn a_failed_card_write_stages_and_the_drain_advances_the_cursor_once() {
     // Every content write fails at the transport: nothing lands, and the
     // ending is the newest owed payload.
     platform.fail_update_transport_count.store(100, Ordering::SeqCst);
+    let chains = app.cards_handle().chains.clone();
+    let writes0 = chains.writes();
 
     Turn::run(&app.turn_handles(), ctx("ses_test", "你好"))
         .await
@@ -170,13 +271,23 @@ async fn a_failed_card_write_stages_and_the_drain_advances_the_cursor_once() {
         app.core.feishu.has_pending_card_update(&card_id),
         "the ending is still owed"
     );
+    assert_eq!(
+        chains.writes() - writes0,
+        1,
+        "only the chain record's own track write persisted; no failed write did"
+    );
 
     // Feishu returns: the drain delivers the owed payload, and the reconcile
-    // advances the staged cursor exactly once.
+    // advances the staged cursor exactly once — one persisted write.
     platform.fail_update_transport_count.store(0, Ordering::SeqCst);
     app.core.feishu.drain_pending_card_updates(true).await;
     crate::bridge::turn::reconcile_staged_cursors(&app.cards_handle()).await;
 
+    assert_eq!(
+        chains.writes() - writes0,
+        2,
+        "the drain-delivered payload persisted exactly one write"
+    );
     let cursor = app
         .cards_handle()
         .chains
@@ -212,6 +323,11 @@ async fn a_failed_card_write_stages_and_the_drain_advances_the_cursor_once() {
         app.cards_handle().chains.cursor("ses_test"),
         Some(cursor),
         "a second pass must not advance anything"
+    );
+    assert_eq!(
+        chains.writes() - writes0,
+        2,
+        "a second pass must not persist anything either"
     );
 }
 
