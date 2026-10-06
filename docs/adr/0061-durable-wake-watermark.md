@@ -119,8 +119,13 @@ or a Pending Card Update the drain later delivers — that already orders every
 card write, so no new write path and no extra per-tick write is added. The
 payload is a frontier position plus a set of call ids, **small** and
 content-free, and the local atomic write is negligible beside the network
-PATCH it follows, whose cadence is content-driven and bounded. The decisive
-change is the **mechanism count**: one cursor retires the #443 restart stamp
+PATCH it follows, whose cadence is content-driven and bounded. The
+affordability is measured, not asserted: a bridge-seam test counts the
+sidecar writes on a live-turn scenario and pins **one persisted write per
+confirmed card write that advanced the frontier** (a PATCH `Ok`, a create
+`Ok`, or a drain-delivered payload) and **none across idle render polls**
+(spec #561). The decisive change is the **mechanism count**: one cursor
+retires the #443 restart stamp
 for cursor-carrying records, ADR-0068's carry, and the Fresh gate's no-replay
 for recorded chains, collapsing the pairwise restart rules into one
 projection.
