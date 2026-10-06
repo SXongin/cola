@@ -16,6 +16,7 @@ use crate::backend::{
 use crate::bridge::core::SESSION_INFO_TIMEOUT;
 use crate::bridge::handles::{CardsHandle, RequestsHandle, SessionsHandle, TurnHandles};
 use crate::bridge::span;
+use crate::bridge::turn::state;
 use crate::bridge::turn::state::{LedgerCadence, PartSource, RenderedPart, StreamAccumulator};
 use crate::config::ThreadKey;
 use crate::feishu::card::ledger::{TaskCompletionEntry, TaskEnding, TaskKind};
@@ -584,6 +585,11 @@ pub(super) fn render_new_turn_parts(acc: &mut StreamAccumulator, transcript: &Se
 /// turn began — while one that finished before the anchor stays the previous
 /// turn's and never bleeds in (#190).
 pub(super) fn render_turn_parts(acc: &mut StreamAccumulator, transcript: &SessionTranscript) -> bool {
+    // A seed a failed takeover read left pending (spec #561, review #569)
+    // retries against every read: the first that places the cursor applies it,
+    // so the orphan's undelivered tail renders on this card exactly once. Until
+    // then the accumulator's cursor stays pinned ([`Self::cursor_for_slice`]).
+    resolve_pending_orphan_seed(acc, transcript);
     capture_turn_anchor(acc, transcript);
     // The seed's live set (spec #561) reconciles on EVERY render read, before
     // the anchor gate below: a seeded call is resolved by call identity against
@@ -693,6 +699,28 @@ pub(super) fn render_turn_parts(acc: &mut StreamAccumulator, transcript: &Sessio
         }
     }
     rendered_any
+}
+
+/// Retry the orphan seed a failed takeover read left pending (spec #561,
+/// review #569): the fresh Turn's later reads resolve the same cursor, whose
+/// scope then walks the orphaned Turn ([`render_seed_scope`]) and renders the
+/// undelivered tail on this card exactly once. A read that still cannot place
+/// the cursor leaves the seed pending — and the chain's cursor pinned — for the
+/// next one. One INFO line records the landing (never content).
+fn resolve_pending_orphan_seed(acc: &mut StreamAccumulator, transcript: &SessionTranscript) {
+    let Some(pending) = acc.pending_orphan_seed.clone() else {
+        return;
+    };
+    let Some(seed) = state::CursorSeed::for_orphan_resolving(transcript, &pending.cursor, &pending.anchor)
+    else {
+        return;
+    };
+    acc.seed_projection(&pending.cursor, seed);
+    acc.pending_orphan_seed = None;
+    tracing::info!(
+        "orphan seed: session {} landed its pending tail on a later read",
+        acc.session_id.as_deref().unwrap_or("")
+    );
 }
 
 /// The seed's own Turn window, when it is not the accumulator's (spec #561,
@@ -2534,7 +2562,8 @@ Index: /x/src/main.rs
             prefix,
             &[],
         );
-        let seed = CursorSeed::for_orphan(&queued(&full), &cursor, &orphan);
+        let seed =
+            CursorSeed::for_orphan_resolving(&queued(&full), &cursor, &orphan).expect("the cursor resolves");
         acc.seed_projection(&cursor, seed);
 
         // Queued: the seed's own scope renders the tail with no anchor
@@ -2606,7 +2635,8 @@ Index: /x/src/main.rs
             prefix,
             &[],
         );
-        let seed = CursorSeed::for_orphan(&transcript, &cursor, &orphan);
+        let seed =
+            CursorSeed::for_orphan_resolving(&transcript, &cursor, &orphan).expect("the cursor resolves");
         acc.seed_projection(&cursor, seed);
 
         assert!(render_new_turn_parts(&mut acc, &transcript));
@@ -5122,7 +5152,8 @@ Index: /x/src/main.rs
         ]);
         // The cursor recorded a prefix that no longer exists in the read.
         let cursor = projection_cursor_at("a_orphan", 0, CursorPartKind::Text, None, "改写前的前缀", &[]);
-        let seed = CursorSeed::for_orphan(&transcript, &cursor, &orphan);
+        let seed =
+            CursorSeed::for_orphan_resolving(&transcript, &cursor, &orphan).expect("the cursor resolves");
         assert!(
             seed.frontier.is_some(),
             "a digest mismatch resolves as cut zero, not a fallback"

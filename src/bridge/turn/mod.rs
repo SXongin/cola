@@ -1674,15 +1674,18 @@ impl Turn {
     /// The seed lands only while `successor_card_id` is still the session's
     /// card: the read runs unlocked, and a card another Turn put there
     /// meanwhile must never receive the orphan's content — it belongs to no
-    /// successor of it. A record with no anchor seeds nothing; a failed or
-    /// timed-out read seeds nothing and leaves today's takeover exactly as it
-    /// was. A record with no cursor keeps today's carry as the seed's
-    /// live-set fallback: the orphaned Turn's still-live calls resolve by
-    /// identity, no content replays. One INFO line records the decision
-    /// (session + outcome, never chat content). Returns the live-set calls the
-    /// seed RESOLVED onto the successor — empty when nothing landed — which
-    /// the takeover's collect strips from the orphan card's running `⏳`
-    /// panels (spec #561, review #569).
+    /// successor of it. A record with no anchor seeds nothing. A CURSORLESS
+    /// record keeps today's carry as the seed's live-set fallback: the
+    /// orphaned Turn's still-live calls resolve by identity, no content
+    /// replays. A CURSOR-BEARING record's gap is never dropped (spec #561,
+    /// review #569): when the read fails, times out, or cannot place the
+    /// cursor, the seed stays PENDING on the accumulator — the chain's cursor
+    /// pinned at the gap's frontier — and a later render read lands the
+    /// undelivered tail ([`render`]'s pending-seed retry). One INFO line
+    /// records the decision (session + outcome, never chat content). Returns
+    /// the live-set calls the seed RESOLVED onto the successor — empty when
+    /// nothing landed — which the takeover's collect strips from the orphan
+    /// card's running `⏳` panels (spec #561, review #569).
     ///
     /// Only a fresh Turn's takeover calls this: a Wake continuation keeps
     /// ADR-0061's no-replay scope and the reap/external arms never seed.
@@ -1707,16 +1710,34 @@ impl Turn {
             Some(Err(error)) => {
                 tracing::debug!("restart seed: session {session_id} read failed: {error}");
                 tracing::info!("restart seed: session {session_id} none (read failed)");
+                // A cursor-bearing orphan's tail must not be lost: keep its
+                // seed pending for a later read (spec #561, review #569).
+                Self::note_pending_orphan_seed(handles, session_id, successor_card_id, orphan).await;
                 return Vec::new();
             }
             None => {
                 tracing::info!("restart seed: session {session_id} none (read timed out)");
+                Self::note_pending_orphan_seed(handles, session_id, successor_card_id, orphan).await;
                 return Vec::new();
             }
         };
-        let seed = match &orphan.cursor {
-            Some(cursor) => state::CursorSeed::for_orphan(&transcript, cursor, &anchor),
-            None => state::CursorSeed::live_calls_only(&transcript, &anchor),
+        // The seed and the cursor a read could not place: a cursor this read
+        // cannot resolve (a truncated read that dropped the part) keeps its gap
+        // pending while today's live-set fallback still resolves the running
+        // calls — nothing replays, and the tail lands once a later read places
+        // the cursor (spec #561, review #569).
+        let (seed, pending) = match &orphan.cursor {
+            Some(cursor) => match state::CursorSeed::for_orphan_resolving(&transcript, cursor, &anchor) {
+                Some(seed) => (seed, None),
+                None => (
+                    state::CursorSeed::live_calls_only(&transcript, &anchor),
+                    Some(state::PendingOrphanSeed {
+                        cursor: cursor.clone(),
+                        anchor: anchor.clone(),
+                    }),
+                ),
+            },
+            None => (state::CursorSeed::live_calls_only(&transcript, &anchor), None),
         };
         let resolved = seed.resolved_calls();
         // The cursor the seed derives from: the orphan's confirmed one, or the
@@ -1724,13 +1745,48 @@ impl Turn {
         let cursor = orphan.cursor.clone().unwrap_or_default();
         let applied = {
             let mut live = handles.cards.cards.lock().await;
-            Self::apply_orphan_seed(&mut live, session_id, successor_card_id, &cursor, seed)
+            let landed = Self::apply_orphan_seed(&mut live, session_id, successor_card_id, &cursor, seed);
+            if landed
+                && let Some(pending) = pending
+                && let Some(card) = live.get_mut(session_id)
+            {
+                // The same session/card check `apply_orphan_seed` just made.
+                card.acc.pending_orphan_seed = Some(pending);
+            }
+            landed
         };
         tracing::info!(
             "restart seed: session {session_id} resolved {} live calls (applied {applied})",
             resolved.len()
         );
         if applied { resolved } else { Vec::new() }
+    }
+
+    /// Keep a cursor-bearing orphan's seed pending on its successor's
+    /// accumulator (spec #561, review #569): the takeover's read failed or
+    /// timed out, so the undelivered tail the cursor guards cannot be resolved
+    /// now — a later render read applies the seed
+    /// ([`crate::bridge::turn::render`]'s pending-seed retry), and until then
+    /// the chain's cursor stays pinned at the gap's frontier. A cursorless
+    /// orphan has no frontier to lose and keeps today's behavior.
+    async fn note_pending_orphan_seed(
+        handles: &TurnHandles,
+        session_id: &str,
+        successor_card_id: &str,
+        orphan: &ChainRecord,
+    ) {
+        let Some(cursor) = orphan.cursor.clone() else {
+            return;
+        };
+        let Some(anchor) = orphan.anchor() else {
+            return;
+        };
+        let mut live = handles.cards.cards.lock().await;
+        if let Some(card) = live.get_mut(session_id)
+            && card.card_message_id.as_deref() == Some(successor_card_id)
+        {
+            card.acc.pending_orphan_seed = Some(state::PendingOrphanSeed { cursor, anchor });
+        }
     }
 
     /// Apply a resolved seed to `session_id`'s accumulator, but only while that

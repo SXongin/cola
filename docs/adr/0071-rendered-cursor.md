@@ -193,7 +193,14 @@ projects the chain's delta after it onto a successor card.**
   undelivered tail renders once, as a continuation, before the new Turn's
   content, and the live set resolves by identity. A record with no cursor
   keeps the retired carry's semantics — the orphaned Turn's still-live calls,
-  nothing replayed. No interlock is introduced: the projection relies on the
+  nothing replayed. A cursor-bearing orphan's gap is never dropped: a seed the
+  takeover's read could not resolve — a failed or timed-out read, or one that
+  cannot place the cursor — stays PENDING on the accumulator, and until a later
+  render read lands it (the tail then renders on the new card exactly once)
+  the chain's cursor stays pinned at the gap's frontier: no confirmed write may
+  advance the record past content no card has shown, and the record is not
+  released at a terminal while the seed is pending. No interlock is
+  introduced: the projection relies on the
   existing per-card delivery lock for ordering (#527's no-hold property).
 
 - **The Wake Watermark still closes the announcement.** The projection's
@@ -208,7 +215,12 @@ projects the chain's delta after it onto a successor card.**
   collect arms, and the Fresh path's Wake Watermark gate for recordless posts.
   A cursor-carrying record is never stamped, however unplaceable its frontier:
   an unresolved cursor, a missing read or no scope claims nothing and leaves
-  the record for a later pass the projection can seed. The fallback window
+  the record for a later pass the projection can seed. The ENDED case is the
+  same rule (review #569): a cursor this read cannot place keeps the record —
+  settling the card in place would release the tail the cursor still guards —
+  and only a cursorless record keeps the one-release in-place fallback, while
+  an Unreceived ending is its own terminal (ADR-0062: no anchor to continue
+  onto, so nothing can be projected). The fallback window
   closes by itself — the first confirmed write gives the record a cursor.
 
 - **One rule for both generations.** The reads the projection needs
