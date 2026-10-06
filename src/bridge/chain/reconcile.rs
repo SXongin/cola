@@ -3,18 +3,26 @@
 //! against the Session's own reads, so a card a cola restart orphaned stops
 //! looking live.
 //!
-//! The pass reaps *state*, never content: a readable transcript's real ending
-//! settles the card in place (✅ / ❌ / ⏳ 等待后台任务), an idle Session whose
-//! Turn message never landed ends it 「⚠️ 这条消息未被接收」 — never ✅ — and a
-//! still-live Session keeps the record, its orphaned card stamped once with
-//! the restart status (#443). A card a successor took over is
-//! collected as 「⏳ 已由新卡片接管 · 已停止更新」 at the takeover itself
-//! ([`collect_orphan`], called by the card paths that arm over an orphan), so
-//! two cards never both look live. Every ending PATCH keeps the card's
-//! already-rendered body best-effort (#434 acceptance feedback): the reap reads
-//! the card's own view, strips the controls a whole-card read cannot preserve
-//! and restamps the header over the kept elements; a failed read degrades to
-//! the bare ending. The still-live orphan's one-time stamp (#443) reads the
+//! The pass reaps *state*, never content — with one deliberate exception: a
+//! readable transcript's real ending settles the card in place (✅ / ❌ /
+//! ⏳ 等待后台任务), an idle Session whose Turn message never landed ends it
+//! 「⚠️ 这条消息未被接收」 — never ✅ — and a still-live Session keeps the
+//! record, its orphaned card stamped once with the restart status (#443). A
+//! card a successor took over is collected as 「⏳ 已由新卡片接管 · 已停止更新」
+//! at the takeover itself ([`collect_orphan`], called by the card paths that
+//! arm over an orphan), so two cards never both look live. Every ending PATCH
+//! keeps the card's already-rendered body best-effort (#434 acceptance
+//! feedback): the reap reads the card's own view, strips the controls a
+//! whole-card read cannot preserve and restamps the header over the kept
+//! elements; a failed read degrades to the bare ending. The exception is the
+//! **ended-while-down projection** (spec #561, ticket #563): a record carrying
+//! a Rendered Cursor whose run ended while cola was down renders the content
+//! after the confirmed frontier — the missed tail plus the transcript's true
+//! ending — onto a successor card and collects the recorded card as taken
+//! over (see [`project_card`]). A cursorless record, a projection that renders
+//! nothing new, and one with no deliverable target all keep the in-place
+//! behavior, so an upgrade restart and a no-delta reap read exactly as before.
+//! The still-live orphan's one-time stamp (#443) reads the
 //! same view the other way around: only the header changes, and a failed read
 //! or PATCH claims nothing — a bare stamp would wipe the body the stamp exists
 //! to keep — so the next pass retries it; a PATCH Feishu *permanently* refuses
@@ -24,10 +32,11 @@
 //! Feishu call, while an issued write must run to its own result so the
 //! card-delivery lock can order a successor's later collect after it. A
 //! per-record in-flight claim holds every other reap decision until the
-//! attempt resolves. Work that landed while cola was down is published by the
-//! existing continuation machinery (a Wake's continuation card) or simply left
-//! in the transcript: content the card never showed is never rebuilt, and the
-//! reap never replays a turn onto a stale card.
+//! attempt resolves. Content the chain never showed is published by the
+//! ended-while-down projection above (bounded by its confirmed cursor), by the
+//! existing continuation machinery (a Wake's continuation card), or left in
+//! the transcript — the reap never replays a turn onto a stale card, and never
+//! re-renders anything at or before a confirmed frontier.
 //!
 //! The pass's claim — a live Turn (or the follow that inherited its guard)
 //! owns the session, or an inbound message is about to — comes from the one
@@ -70,7 +79,7 @@
 
 use super::decision::{self, CardProbe, ChainDisposition, RecoveryReads, Route, StatusRead, TranscriptRead};
 use super::records::ChainRecord;
-use crate::backend::TurnSettle;
+use crate::backend::{TurnAnchor, TurnSettle};
 use crate::bridge::handles::{CardsHandle, FlowHandles};
 use crate::bridge::turn::{CardOwnership, Disposition, Turn};
 use crate::feishu::card::{
@@ -320,7 +329,9 @@ async fn read_transcript(handles: &FlowHandles, session_id: &str, read_timeout_m
 /// `NoDecision` logs the one diagnosis the reads did not (a missing route);
 /// the collect arms only move the record — the successor's [`collect_orphan`]
 /// already ran before the decision (see [`reconcile`]); the stamp hands off to
-/// the detached attempt; the settle PATCHes the ending in place.
+/// the detached attempt; the settle PATCHes the ending in place; the
+/// projection arms, creates, tracks and collects its successor
+/// ([`project_card`]).
 async fn apply(
     handles: &FlowHandles,
     session_id: &str,
@@ -376,7 +387,214 @@ async fn apply(
         ChainDisposition::Settle(settle) => {
             settle_card(handles, session_id, record, reads.route, settle, read_timeout_ms).await;
         }
+        ChainDisposition::Project { settle, seed } => {
+            project_card(handles, session_id, record, reads, settle, seed, read_timeout_ms).await;
+        }
     }
+}
+
+/// Where a projection's successor card is delivered (spec #561, ticket #563):
+/// a reply to the original Turn anchor, else to the recorded card, else a
+/// top-level send into the chain's Chat. No deliverable target at all means
+/// no projection — today's in-place behavior.
+enum ProjectTarget {
+    /// Reply to this Feishu message (the Turn anchor, or the recorded card).
+    Reply(String),
+    /// Send at the chain's top level into this Chat.
+    TopLevel(String),
+}
+
+/// The projection's successor delivery target (spec #561, ticket #563), in
+/// the spec's fallback order: the original Turn anchor, then the recorded
+/// card, then the chain's top-level Chat. `None` when nothing can reach a
+/// card — the caller keeps today's behavior.
+fn project_target(
+    record: &ChainRecord,
+    anchor: Option<&TurnAnchor>,
+    chat: Option<&str>,
+) -> Option<ProjectTarget> {
+    if let Some(message_id) = anchor
+        .map(|anchor| anchor.message_id.as_str())
+        .filter(|message_id| !message_id.is_empty())
+    {
+        return Some(ProjectTarget::Reply(message_id.to_string()));
+    }
+    if !record.card_message_id.is_empty() {
+        return Some(ProjectTarget::Reply(record.card_message_id.clone()));
+    }
+    chat.filter(|chat| !chat.is_empty())
+        .map(|chat| ProjectTarget::TopLevel(chat.to_string()))
+}
+
+/// Project a run that ended while cola was down (spec #561, ticket #563):
+/// arm a successor card seeded from the chain's Rendered Cursor, render the
+/// read's missed tail plus the transcript's true ending once, send it as a
+/// create, take the chain over and collect the recorded card as taken over.
+/// The send is the restart notification (never outbox-retried).
+///
+/// The guards: a missing route or transcript and an ending with no card
+/// state claim nothing; no deliverable target falls back to today's in-place
+/// settle; a projection that renders nothing new (the cursor covered the
+/// whole read) drops its armed card and settles in place; a failed create
+/// drops the armed card and leaves the record for the next tick.
+async fn project_card(
+    handles: &FlowHandles,
+    session_id: &str,
+    record: &ChainRecord,
+    reads: &RecoveryReads<'_>,
+    settle: TurnSettle,
+    seed: crate::bridge::turn::CursorSeed,
+    read_timeout_ms: u64,
+) {
+    // The decision only projects an orphan with a route and a readable
+    // transcript; a missing one here is a plan/decision mismatch.
+    let Some(route) = reads.route else {
+        return;
+    };
+    let Some(TranscriptRead::Read(transcript)) = reads.transcript.as_ref() else {
+        return;
+    };
+    let disposition = Disposition::from(settle.clone());
+    let Some(state) = disposition.card_state() else {
+        // `Observe`: the ending is not decided, so no card is claimed.
+        return;
+    };
+    // The projection's scope: the recorded Turn anchor, else the submitted
+    // message's own anchor re-derived from this read (a settle beyond
+    // `Unreceived` implies one exists — the decision settled on it). The
+    // DELIVERY target reads the recorded anchor alone: an anchor the previous
+    // life never persisted falls back to the recorded card, then the Chat.
+    let scope = record
+        .anchor()
+        .or_else(|| transcript.anchor_of_user(record.message_id.as_str()));
+    let recorded_anchor = record.anchor();
+    let chat = handles
+        .sessions
+        .entry_for_session(session_id)
+        .await
+        .map(|entry| entry.thread_key.chat_id);
+    let Some(target) = project_target(record, recorded_anchor.as_ref(), chat.as_deref()) else {
+        // No deliverable target at all: today's behavior, never a projection.
+        settle_card(handles, session_id, record, reads.route, settle, read_timeout_ms).await;
+        return;
+    };
+    let Some(anchor) = scope else {
+        // Defensive: a projectable ending carries an anchor, but nothing may
+        // be armed without one (the record could not be re-pointed).
+        settle_card(handles, session_id, record, reads.route, settle, read_timeout_ms).await;
+        return;
+    };
+    // The durable cursor, re-read at apply time: the record snapshot the reap
+    // took before its server reads can be older than a confirmed write that
+    // advanced the chain meanwhile. A moved cursor means this pass's decision
+    // is stale — claim nothing and let the next pass decide afresh, never
+    // re-render content a newer body already delivered.
+    let Some(cursor) = handles.cards.chains.cursor(session_id) else {
+        return;
+    };
+    if record.cursor.as_ref() != Some(&cursor) {
+        return;
+    }
+    let fallback_chat = match &target {
+        ProjectTarget::Reply(_) => None,
+        ProjectTarget::TopLevel(chat) => Some(chat.clone()),
+    };
+    let title = crate::bridge::external::session_subtitle(
+        &handles.backend,
+        session_id,
+        route.directory,
+        read_timeout_ms,
+    )
+    .await;
+    let variant = handles
+        .sessions
+        .store
+        .lock()
+        .await
+        .entry_for_session(session_id)
+        .and_then(|entry| entry.variant.clone());
+    let Some(projected) = Turn::arm_projected_card(
+        &handles.cards,
+        session_id,
+        &anchor,
+        &cursor,
+        &seed,
+        transcript,
+        &disposition,
+        &title,
+        route.directory,
+        fallback_chat.as_deref(),
+        variant,
+    )
+    .await
+    else {
+        // A card appeared for the session meanwhile: this pass claims nothing.
+        return;
+    };
+    if !projected.rendered {
+        // The cursor covered the whole read — nothing was missed. Drop the
+        // armed successor and take today's in-place ending.
+        Turn::drop_armed_card(&handles.cards, session_id, &anchor).await;
+        settle_card(handles, session_id, record, reads.route, settle, read_timeout_ms).await;
+        return;
+    }
+    let delivered = match &target {
+        ProjectTarget::Reply(reply_to) => handles.cards.feishu.reply_card(reply_to, &projected.card).await,
+        ProjectTarget::TopLevel(chat) => {
+            handles
+                .cards
+                .feishu
+                .send_card("chat_id", chat, &projected.card)
+                .await
+        }
+    };
+    let new_card_id = match delivered {
+        Ok(card_id) => card_id,
+        Err(e) => {
+            tracing::warn!(
+                "live-card reap: session {session_id} could not project its missed tail onto a successor: {e}"
+            );
+            // The send reached no card; the record keeps the old cursor and
+            // the next pass retries.
+            Turn::drop_armed_card(&handles.cards, session_id, &anchor).await;
+            return;
+        }
+    };
+    // The successor takes the chain over: attach its identity FIRST, re-point
+    // the record at it (carrying the cursor), then collect the recorded card
+    // as taken over — dropping the running `⏳` panels the successor resolved
+    // (ADR-0068's generalized collect).
+    let orphan = Turn::take_over_card_deferring_collect(
+        &handles.cards,
+        session_id,
+        &new_card_id,
+        Some(route.directory),
+    )
+    .await;
+    if let Some(orphan) = orphan {
+        crate::bridge::chain::collect_orphan_after_carry(
+            &handles.cards,
+            session_id,
+            &orphan.card_message_id,
+            projected.resolved_calls,
+        )
+        .await;
+    }
+    // The confirmed create carries the successor's body: advance the chain's
+    // cursor exactly like a flush-confirmed write (spec #561).
+    crate::bridge::turn::confirm_card_cursor(&handles.cards, session_id, &new_card_id).await;
+    if state.is_terminal() {
+        // The successor reached a terminal: nothing is owed a reap, and the
+        // cursor goes with the record.
+        crate::bridge::chain::release_spent(&handles.cards, session_id).await;
+    } else {
+        // Waiting: the successor yields, and its own yield is the one the
+        // record remembers, so a later pass does not project it again.
+        if matches!(disposition, Disposition::Waiting) {
+            handles.cards.chains.mark_waiting_reaped(session_id, &new_card_id);
+        }
+    }
+    tracing::info!("live-card reap: session {session_id} projected its missed tail onto a successor card");
 }
 
 /// PATCH the transcript's ending onto the record's card — keeping the body

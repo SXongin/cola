@@ -163,6 +163,15 @@ async fn note_cursor_write_failure(
     }
 }
 
+/// Confirm the Rendered Cursor a projection's successor create carried
+/// (spec #561, ticket #563): the body's cursor was staged by
+/// [`Turn::arm_projected_card`](super::Turn::arm_projected_card) and the
+/// create landed, so the chain's record advances exactly as a flush-confirmed
+/// write does. A no-op when nothing is staged for that card.
+pub(crate) async fn confirm_card_cursor(cards: &CardsHandle, session_id: &str, card_message_id: &str) {
+    confirm_staged_cursor(cards, session_id, card_message_id).await;
+}
+
 /// Advance every staged Rendered Cursor whose owed Pending Card Update has
 /// since delivered (spec #561). Runs after a drain: the failed payload a
 /// cursor was tied to landed out of band, so the confirmation comes from the
