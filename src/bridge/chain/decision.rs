@@ -314,13 +314,15 @@ pub(crate) fn reconcile(record: &ChainRecord, reads: &RecoveryReads<'_>) -> Chai
                     // unplaced frontier would guess, and stamping would freeze
                     // the run the projection is supposed to follow.
                     if let Some(cursor) = record.cursor.as_ref() {
-                        // A create this process life already attempted is never
-                        // retried (review #569): Feishu has no idempotency key
+                        // A create this process life already attempted — or one
+                        // a previous life left in flight, marked by the durable
+                        // write-ahead intent (review #569) — is never retried:
+                        // Feishu has no idempotency key
                         // (ADR-0067), so a retry could post a duplicate
                         // successor. The record keeps observing until the run
                         // ends, when the ended pass state-repairs the old card
                         // in place.
-                        if record.projection_attempted {
+                        if record.projection_attempted || record.projection_intent {
                             return ChainDisposition::Keep;
                         }
                         let Some(TranscriptRead::Read(transcript)) = reads.transcript.as_ref() else {
@@ -398,11 +400,13 @@ pub(crate) fn reconcile(record: &ChainRecord, reads: &RecoveryReads<'_>) -> Chai
                             let Some(cursor) = record.cursor.as_ref() else {
                                 return ChainDisposition::Settle(settle);
                             };
-                            // A create this life already attempted blocks the
-                            // projection (review #569): it is never retried,
+                            // A create this life already attempted — or one an
+                            // earlier life left in flight, marked by the durable
+                            // write-ahead intent (review #569) — blocks the
+                            // projection: it is never retried,
                             // and the reap state-repairs the old card in place
                             // instead.
-                            if record.projection_attempted {
+                            if record.projection_attempted || record.projection_intent {
                                 return ChainDisposition::Settle(settle);
                             }
                             match CursorSeed::resolve(transcript, cursor) {
