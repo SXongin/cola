@@ -38,11 +38,19 @@
 //!   [`CardOwnership::admit_ledger_write`], so the admission and the write it
 //!   authorizes share one lock. The claim half is deliberately irrelevant: the
 //!   yield's carve-out is the card's own write-readiness, not the owner's.
+//! - [`CardOwnership::reap_claim`] — the durable reap's claim (ADR-0063):
+//!   whether any in-process claim holds the Session — the in-flight guard or a
+//!   message still being routed, which the reap must count or its PATCH races
+//!   the message's admission. The reap pairs it with its own record-relative
+//!   probe in the Chain Record module.
+//! - [`CardOwnership::stop_disposition`] — the `/stop` acknowledgement's
+//!   three-way answer (#394): a render-owned card is stamped by its owner, a
+//!   yielded card is acked for the quiet true end it can only reach, and every
+//!   other class will never show the stop.
 //!
-//! The classification carries the identities the remaining rules need — the
-//! card's message id, its Turn anchor and its chain identity — so those rules
-//! land as methods over one value, not as new reads. Later tickets of the spec
-//! consume the reap's claim and the `/stop` disposition (ADR-0070).
+//! The classification carries the identities the rules compare — the card's
+//! message id, its Turn anchor and its chain identity — so those rules read
+//! one value instead of reopening the map (ADR-0070).
 //!
 //! Sources, exactly:
 //!
@@ -108,6 +116,23 @@ pub(crate) enum CardClass {
     Ended,
 }
 
+/// What a `/stop` should do about the Session's card (#394), from the
+/// verdict's card class: the command's three-way acknowledgement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StopDisposition {
+    /// A render-owned card: its owner stamps 「⏹ 已停止」 on its next tick, and
+    /// that stamp IS the acknowledgement — the command sends no reply.
+    OwnerStamps,
+    /// A yielded card: it has no render owner and only reaches the quiet true
+    /// end (ADR-0060), so the command acks the deferred settle instead of
+    /// staying silent.
+    QuietEndAck,
+    /// No card, or one whose chain has already spent itself (terminal or
+    /// restart-stamped): nothing will ever show the stop, so the command says
+    /// so itself.
+    Nothing,
+}
+
 /// Who owns a Session's card chain right now (ADR-0070): one read's verdict
 /// over the waits state and the card map. Fields are private — the named rules
 /// and the identities are the interface; the module docs state the sources.
@@ -166,21 +191,21 @@ impl CardOwnership {
 
     /// The card's message id, when a card exists — the identity the reap's
     /// record matching and the settle ticket's `covers` compare.
-    #[allow(dead_code)] // consumed by spec #545's later tickets; the module table test reads it today
+    #[allow(dead_code)] // the verdict's identity interface (ADR-0070); read by the module's tests
     pub(crate) fn card_message_id(&self) -> Option<&str> {
         self.card_message_id.as_deref()
     }
 
     /// The card's Turn anchor, when one is armed — the identity the settle
     /// ticket's anchor variant compares (ADR-0059).
-    #[allow(dead_code)] // consumed by spec #545's later tickets; the module table test reads it today
+    #[allow(dead_code)] // the verdict's identity interface (ADR-0070); read by the module's tests
     pub(crate) fn turn_anchor(&self) -> Option<&TurnAnchor> {
         self.turn_anchor.as_ref()
     }
 
     /// The card's chain identity, when a card exists — the identity a Wake
     /// continuation loop's ownership guard compares (ADR-0059).
-    #[allow(dead_code)] // consumed by spec #545's later tickets; the module table test reads it today
+    #[allow(dead_code)] // the verdict's identity interface (ADR-0070); read by the module's tests
     pub(crate) fn chain_id(&self) -> Option<u64> {
         self.chain_id
     }
@@ -222,6 +247,22 @@ impl CardOwnership {
     /// never re-reads the waits state.
     pub(crate) fn reap_claim(&self) -> bool {
         self.claim() != Claim::None
+    }
+
+    /// The `/stop` disposition (#394): what the command's acknowledgement
+    /// reads. A render-owned card is stamped by its owner on the next tick and
+    /// needs no reply; a yielded card has no render loop left and only settles
+    /// at the quiet true end (ADR-0060), so it is acked; every other class —
+    /// no card, a terminal chain, the restart-stamped orphan — can never show
+    /// the stop, so the command says nothing ran. The claim half is
+    /// deliberately irrelevant: a guard beside the card does not change who
+    /// renders it.
+    pub(crate) fn stop_disposition(&self) -> StopDisposition {
+        match self.card_class() {
+            CardClass::RenderOwned => StopDisposition::OwnerStamps,
+            CardClass::Yielded { .. } => StopDisposition::QuietEndAck,
+            CardClass::Absent | CardClass::RestartStamped | CardClass::Ended => StopDisposition::Nothing,
+        }
     }
 
     /// The yielded-card write admission (ADR-0060, ADR-0066): whether the
@@ -433,23 +474,30 @@ mod tests {
         }
     }
 
-    /// Give the Session the card `state`, or no card at all.
+    /// Give the Session the card `state` — armed with the fixed Turn anchor
+    /// the table's `covers` row reads — or no card at all.
     async fn set_card(cards: &CardsHandle, state: Option<CardState>) {
         match state {
             None => Turn::drop_card(cards, SID).await,
             Some(state) => {
                 Turn::seed_card(cards, SID, Some("om_live")).await;
+                Turn::set_turn_anchor(cards, SID, &turn_anchor(1)).await;
                 Turn::set_card_state(cards, SID, state).await;
             }
         }
     }
 
-    /// The classification is the product of the two halves: every `CardState`
-    /// reads as its class under every claim, the claim is carried through
-    /// untouched (a guard beside a yielded card, a pending message beside a
-    /// render-owned one — ADR-0070), and the yielded write admission is the
-    /// class's own write-readiness — exactly the open yielded card, under
-    /// every claim (the claim half is deliberately irrelevant, ADR-0070).
+    /// The verdict's complete table (ADR-0070): every `CardState` × claim
+    /// combination, read through ONE `CardOwnership::read`, pins every named
+    /// rule — the class, the routing rule with its label, the yielded write
+    /// admission, the reap's claim, `covers` and the `/stop` disposition.
+    ///
+    /// The product is deliberate: the claim is carried through untouched (a
+    /// guard beside a yielded card, a pending message beside a render-owned
+    /// one), the claim-only rules read apart on purpose (the reap counts the
+    /// pending message; the routing key ignores it — the #428 strand), and the
+    /// card-only rules are constant under every claim. `covers` follows the
+    /// card's own armed anchor.
     #[tokio::test]
     async fn classification_covers_every_card_state_under_every_claim() {
         let _wd = test_work_dir();
@@ -459,36 +507,131 @@ mod tests {
         let cards = app.cards_handle();
         let waits = app.waits_handle();
 
-        // Every CardState the map can hold, with the class it must read as and
-        // whether it admits the yielded write (the named admission: only the
-        // open yielded card does). `None` is the map's absent key.
-        let states: &[(Option<CardState>, CardClass, bool)] = &[
-            (None, CardClass::Absent, false),
-            (Some(CardState::Loading), CardClass::RenderOwned, false),
-            (Some(CardState::Reasoning), CardClass::RenderOwned, false),
-            (Some(CardState::Streaming), CardClass::RenderOwned, false),
-            (Some(CardState::Continued), CardClass::RenderOwned, false),
-            (Some(CardState::Resuming), CardClass::RenderOwned, false),
+        // Every CardState the map can hold, with the card half of every named
+        // rule: its class, the routing label a NON-guard claim sees (a guard's
+        // own label is asserted in the loop), the yielded write admission and
+        // the `/stop` disposition. `None` is the map's absent key.
+        // (state, class, non-guard routing label, admission, /stop disposition)
+        type Row = (
+            Option<CardState>,
+            CardClass,
+            Option<&'static str>,
+            bool,
+            StopDisposition,
+        );
+        let rows: &[Row] = &[
+            (None, CardClass::Absent, None, false, StopDisposition::Nothing),
+            (
+                Some(CardState::Loading),
+                CardClass::RenderOwned,
+                Some("card-chain"),
+                false,
+                StopDisposition::OwnerStamps,
+            ),
+            (
+                Some(CardState::Reasoning),
+                CardClass::RenderOwned,
+                Some("card-chain"),
+                false,
+                StopDisposition::OwnerStamps,
+            ),
+            (
+                Some(CardState::Streaming),
+                CardClass::RenderOwned,
+                Some("card-chain"),
+                false,
+                StopDisposition::OwnerStamps,
+            ),
+            (
+                Some(CardState::Continued),
+                CardClass::RenderOwned,
+                Some("card-chain"),
+                false,
+                StopDisposition::OwnerStamps,
+            ),
+            (
+                Some(CardState::Resuming),
+                CardClass::RenderOwned,
+                Some("card-chain"),
+                false,
+                StopDisposition::OwnerStamps,
+            ),
             (
                 Some(CardState::Waiting),
                 CardClass::Yielded {
                     live: true,
                     handoff_owed: false,
                 },
+                None,
                 true,
+                StopDisposition::QuietEndAck,
             ),
-            (Some(CardState::Restarted), CardClass::RestartStamped, false),
-            (Some(CardState::Done), CardClass::Ended, false),
-            (Some(CardState::Error), CardClass::Ended, false),
-            (Some(CardState::Retried), CardClass::Ended, false),
-            (Some(CardState::Stopped), CardClass::Ended, false),
-            (Some(CardState::Unreceived), CardClass::Ended, false),
-            (Some(CardState::Superseded), CardClass::Ended, false),
-            (Some(CardState::SwitchedAway), CardClass::Ended, false),
-            (Some(CardState::TakenOver), CardClass::Ended, false),
+            (
+                Some(CardState::Restarted),
+                CardClass::RestartStamped,
+                None,
+                false,
+                StopDisposition::Nothing,
+            ),
+            (
+                Some(CardState::Done),
+                CardClass::Ended,
+                None,
+                false,
+                StopDisposition::Nothing,
+            ),
+            (
+                Some(CardState::Error),
+                CardClass::Ended,
+                None,
+                false,
+                StopDisposition::Nothing,
+            ),
+            (
+                Some(CardState::Retried),
+                CardClass::Ended,
+                None,
+                false,
+                StopDisposition::Nothing,
+            ),
+            (
+                Some(CardState::Stopped),
+                CardClass::Ended,
+                None,
+                false,
+                StopDisposition::Nothing,
+            ),
+            (
+                Some(CardState::Unreceived),
+                CardClass::Ended,
+                None,
+                false,
+                StopDisposition::Nothing,
+            ),
+            (
+                Some(CardState::Superseded),
+                CardClass::Ended,
+                None,
+                false,
+                StopDisposition::Nothing,
+            ),
+            (
+                Some(CardState::SwitchedAway),
+                CardClass::Ended,
+                None,
+                false,
+                StopDisposition::Nothing,
+            ),
+            (
+                Some(CardState::TakenOver),
+                CardClass::Ended,
+                None,
+                false,
+                StopDisposition::Nothing,
+            ),
         ];
 
-        for (state, expected_class, expected_admission) in states {
+        for (state, expected_class, expected_routing, expected_admission, expected_stop) in rows {
             for claim in [Claim::None, Claim::Inbound, Claim::Guard] {
                 set_claim(&app, claim).await;
                 set_card(&cards, state.clone()).await;
@@ -504,10 +647,41 @@ mod tests {
                     *expected_class,
                     "class of {state:?} under {claim:?}"
                 );
+                // A guard always owns the session, and its label wins when the
+                // card is render-owned too; otherwise the card chain decides.
+                let routing = if claim == Claim::Guard {
+                    Some("guard")
+                } else {
+                    *expected_routing
+                };
+                assert_eq!(
+                    ownership.routing_label(),
+                    routing,
+                    "routing of {state:?} under {claim:?}"
+                );
                 assert_eq!(
                     ownership.admits_ledger_refresh(),
                     *expected_admission,
                     "admission of {state:?} under {claim:?}"
+                );
+                // The reap counts the pending message too — it must not PATCH
+                // a card the message is about to reach (ADR-0063).
+                assert_eq!(
+                    ownership.reap_claim(),
+                    claim != Claim::None,
+                    "reap claim of {state:?} under {claim:?}"
+                );
+                // The card's own armed anchor is covered exactly while the
+                // card exists; a missing card is covered by nothing (ADR-0059).
+                assert_eq!(
+                    ownership.covers(&Ticket::TurnAnchor(turn_anchor(1))),
+                    state.is_some(),
+                    "covers of {state:?} under {claim:?}"
+                );
+                assert_eq!(
+                    ownership.stop_disposition(),
+                    *expected_stop,
+                    "/stop disposition of {state:?} under {claim:?}"
                 );
             }
         }
@@ -654,52 +828,6 @@ mod tests {
         assert!(CardOwnership::admit_ledger_write(&cards, SID).await.is_none());
     }
 
-    /// The routing rule (ADR-0062) and its label: a guard or a render-owned
-    /// card owns; every other combination — a pending-inbound claim alone
-    /// included (the #428 strand) — starts a new Turn. The guard's label wins
-    /// when both own, and `guard` / `card-chain` are the router's own words.
-    #[tokio::test]
-    async fn routing_label_is_guard_or_render_owned_with_its_label() {
-        let _wd = test_work_dir();
-        let dir = tempfile::tempdir().unwrap();
-        let cfg = test_config(&dir.path().join("sessions.json"));
-        let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
-        let cards = app.cards_handle();
-        let waits = app.waits_handle();
-
-        let rows: &[(Claim, Option<CardState>, Option<&str>)] = &[
-            (Claim::None, None, None),
-            // The pending claim alone owns no card chain: new Turn, never a
-            // Supplement.
-            (Claim::Inbound, None, None),
-            (Claim::Inbound, Some(CardState::Waiting), None),
-            (Claim::Inbound, Some(CardState::Done), None),
-            (Claim::Guard, None, Some("guard")),
-            (Claim::Guard, Some(CardState::Done), Some("guard")),
-            (Claim::None, Some(CardState::Streaming), Some("card-chain")),
-            // The product: a pending message beside a render-owned card still
-            // sees the card's ownership for routing.
-            (Claim::Inbound, Some(CardState::Streaming), Some("card-chain")),
-            // Both halves own: the guard's label wins.
-            (Claim::Guard, Some(CardState::Streaming), Some("guard")),
-            // A yielded or spent card is not render-owned.
-            (Claim::None, Some(CardState::Waiting), None),
-            (Claim::None, Some(CardState::Restarted), None),
-            (Claim::None, Some(CardState::Done), None),
-        ];
-
-        for (claim, state, expected) in rows {
-            set_claim(&app, *claim).await;
-            set_card(&cards, state.clone()).await;
-            let ownership = CardOwnership::read(&cards, &waits, SID).await;
-            assert_eq!(
-                ownership.routing_label(),
-                *expected,
-                "routing for {claim:?} on {state:?}"
-            );
-        }
-    }
-
     /// The read carries the identities the remaining rules compare: the card's
     /// message id, its Turn anchor and its chain identity — all absent when
     /// the Session has no card.
@@ -728,38 +856,6 @@ mod tests {
         assert_eq!(absent.card_message_id(), None);
         assert_eq!(absent.turn_anchor(), None);
         assert_eq!(absent.chain_id(), None);
-    }
-
-    /// The reap's claim (ADR-0063): a guard or a pending-inbound message
-    /// claims the Session — the message about to land included, unlike routing
-    /// (the #428 strand) — and the claim is independent of the card class.
-    #[tokio::test]
-    async fn reap_claim_is_guard_or_inbound() {
-        let _wd = test_work_dir();
-        let dir = tempfile::tempdir().unwrap();
-        let cfg = test_config(&dir.path().join("sessions.json"));
-        let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
-        let cards = app.cards_handle();
-        let waits = app.waits_handle();
-
-        let rows: &[(Claim, bool)] = &[(Claim::None, false), (Claim::Inbound, true), (Claim::Guard, true)];
-        for (claim, expected) in rows {
-            set_claim(&app, *claim).await;
-            set_card(&cards, None).await;
-            assert_eq!(
-                CardOwnership::read(&cards, &waits, SID).await.reap_claim(),
-                *expected,
-                "the reap claim for {claim:?} with no card"
-            );
-            // The claim half reads the same beside any card class: a yielded
-            // card this process no longer renders still claims the reap.
-            set_card(&cards, Some(CardState::Waiting)).await;
-            assert_eq!(
-                CardOwnership::read(&cards, &waits, SID).await.reap_claim(),
-                *expected,
-                "the reap claim for {claim:?} beside a yielded card"
-            );
-        }
     }
 
     /// A stale inbound claim reads as absent and its entry is dropped by the

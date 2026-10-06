@@ -340,9 +340,10 @@ impl CardSession {
     /// `Superseded`/`SwitchedAway`) stays in the cards handle's map until the
     /// next Turn replaces it, so the map's key alone does not mean a live card.
     /// A `Waiting` card reads as running here (it is not terminal) — it is
-    /// still the chain's newest card; Session Sync's Wake step asks
-    /// [`super::Turn::card_is_owned`] instead, which excludes the waiting yield
-    /// because the next Wake continues that chain (ADR-0059).
+    /// still the chain's newest card; Session Sync's Wake step asks the
+    /// ownership verdict's routing rule ([`super::CardOwnership::routing_label`])
+    /// instead, which excludes the waiting yield because the next Wake
+    /// continues that chain (ADR-0059).
     pub(super) fn is_running(&self) -> bool {
         !self.acc.card_state.is_terminal()
     }

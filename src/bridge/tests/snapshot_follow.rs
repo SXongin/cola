@@ -849,11 +849,12 @@ async fn busy_follow_question_block_resolves() {
 }
 
 /// ADR-0062's ownership routing on an EXTERNAL run: the snapshot follow owns
-/// the Session's live card chain (its external renderer does — `card_is_owned`,
-/// the same verdict the Wake step reads), so a cola prompt during the follow is
-/// a Supplement — it merges into the running work and the Card Chain splits
-/// below it, instead of starting a competing Turn that replaces the follow's
-/// accumulator. The external renderer keeps streaming into the continuation.
+/// the Session's live card chain (its external renderer does — the render-owned
+/// card class, the same routing rule the Wake step reads), so a cola prompt
+/// during the follow is a Supplement — it merges into the running work and the
+/// Card Chain splits below it, instead of starting a competing Turn that
+/// replaces the follow's accumulator. The external renderer keeps streaming
+/// into the continuation.
 #[tokio::test]
 async fn user_prompt_during_follow_merges_as_a_supplement() {
     let _wd = test_work_dir();
