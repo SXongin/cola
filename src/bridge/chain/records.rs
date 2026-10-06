@@ -8,8 +8,10 @@
 //!   directory and the per-process-life reconciliation marks. One entry owns
 //!   its lifecycle: [`ChainRecords::track`] creates the record when a card
 //!   becomes the Session's live card and re-points it when the chain
-//!   continues, and [`ChainRecords::release`] removes it once that card
-//!   reaches a terminal or is collected.
+//!   continues, [`ChainRecords::release`] removes it once that card reaches a
+//!   terminal or is collected, and [`release_spent`] carries the rule that
+//!   decides the terminal case — release only once the ending write is
+//!   confirmed (ADR-0063 amendment, ADR-0067).
 //! - **announcements** — the Wake Watermark (ADR-0061): the newest Wake whose
 //!   completion a card announced, advanced only after the carrying card write
 //!   lands. Monotonic per Session and never removed, so a restart cannot
@@ -32,6 +34,7 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::backend::{MessageId, TurnAnchor};
+use crate::bridge::handles::CardsHandle;
 use crate::bridge::sidecar;
 
 /// The keep rule the fresh-Turn takeover's collect applied to the card it
@@ -507,6 +510,34 @@ impl ChainRecords {
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
+}
+
+/// Drop `session_id`'s durable record once its terminal card's ending write
+/// is **confirmed** (ADR-0063 amendment; the pre-0067 rule dropped it before
+/// the PATCH). A terminal card whose newest write failed recoverably is
+/// still owed a Pending Card Update (ADR-0067), so its record stays: this
+/// life's drain, or the next restart's reap, repairs the card and the reap
+/// cleans the record once the write confirmed. A yielded `Waiting` card
+/// keeps it (the reap settles its true end later) and a live card keeps it
+/// (still owed). Called after every ending PATCH in the flush path and by the
+/// reap's same-card probe; the rule lives here, beside the record it releases.
+pub(crate) async fn release_spent(cards: &CardsHandle, session_id: &str) {
+    let card_message_id = {
+        let cards = cards.cards.lock().await;
+        let Some(card) = cards.get(session_id) else {
+            return;
+        };
+        if !card.is_terminal() {
+            return;
+        }
+        card.card_message_id().map(str::to_string)
+    };
+    if let Some(card_message_id) = card_message_id
+        && cards.feishu.has_pending_card_update(&card_message_id)
+    {
+        return;
+    }
+    cards.chains.release(session_id);
 }
 
 #[cfg(test)]

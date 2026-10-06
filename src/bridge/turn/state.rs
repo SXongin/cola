@@ -345,7 +345,21 @@ impl CardSession {
     /// instead, which excludes the waiting yield because the next Wake
     /// continues that chain (ADR-0059).
     pub(super) fn is_running(&self) -> bool {
-        !self.acc.card_state.is_terminal()
+        !self.is_terminal()
+    }
+
+    /// Whether this card has reached a terminal ending — the card-state rule
+    /// the Chain Record's release check reads off the locked card
+    /// ([`crate::bridge::chain::release_spent`]).
+    pub(crate) fn is_terminal(&self) -> bool {
+        self.acc.card_state.is_terminal()
+    }
+
+    /// This session's tracked card message id, once a card was sent — the card
+    /// the Chain Record names and the release check consults the delivery
+    /// outbox for.
+    pub(crate) fn card_message_id(&self) -> Option<&str> {
+        self.card_message_id.as_deref()
     }
 
     /// Re-point the live card identity at a new message (ADR-0028: a re-adopt
