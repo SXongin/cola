@@ -144,11 +144,32 @@ pub(super) struct SeedFrontier {
     pub(super) extent_pos: Option<(usize, usize)>,
 }
 
+/// A text/reasoning part's content, `""` for anything else.
+fn text_part_text(part: &crate::backend::Part) -> &str {
+    match part {
+        crate::backend::Part::Text(text) => text.text.as_str(),
+        crate::backend::Part::Reasoning(reasoning) => reasoning.text.as_str(),
+        _ => "",
+    }
+}
+
+/// A text/reasoning part's cursor kind, `None` for anything else.
+fn text_part_kind(part: &crate::backend::Part) -> Option<CursorPartKind> {
+    match part {
+        crate::backend::Part::Text(_) => Some(CursorPartKind::Text),
+        crate::backend::Part::Reasoning(_) => Some(CursorPartKind::Reasoning),
+        _ => None,
+    }
+}
+
 impl CursorSeed {
     /// Resolve `cursor` against `transcript` (spec #561): `None` when the
-    /// frontier names a message/part this read does not carry, or the part's
-    /// kind or server start time no longer matches — the read moved on, so
-    /// nothing may be skipped.
+    /// frontier names a message/part this read does not carry at all, or its
+    /// kind no longer matches — nothing may be skipped then. A text/reasoning
+    /// part that only changed identity (a start time or delivered prefix that
+    /// no longer matches) resolves as a CUT-AT-0 frontier instead: that part
+    /// renders in full while everything before it stays delivered, so a
+    /// rewrite cannot lose the tail (review #569).
     pub(crate) fn resolve(transcript: &SessionTranscript, cursor: &RenderedCursor) -> Option<Self> {
         let frontier = match &cursor.frontier {
             None => None,
@@ -158,75 +179,114 @@ impl CursorSeed {
                     .iter()
                     .position(|message| message.id == frontier.message_id)?;
                 let part = transcript.messages[message_pos].parts.get(frontier.part_index)?;
-                let (matches_kind, part_started_at, part_chars) = match part {
-                    crate::backend::Part::Text(text) => (
-                        frontier.kind == CursorPartKind::Text,
-                        text.started_at,
-                        text.text.chars().count(),
-                    ),
-                    crate::backend::Part::Reasoning(reasoning) => (
-                        frontier.kind == CursorPartKind::Reasoning,
-                        reasoning.started_at,
-                        reasoning.text.chars().count(),
-                    ),
-                    crate::backend::Part::Tool(call) => {
-                        (frontier.kind == CursorPartKind::Tool, call.started_at, 0)
+                let (matches_kind, part_started_at) = match part {
+                    crate::backend::Part::Text(text) => {
+                        (frontier.kind == CursorPartKind::Text, text.started_at)
                     }
-                    _ => (false, None, 0),
+                    crate::backend::Part::Reasoning(reasoning) => {
+                        (frontier.kind == CursorPartKind::Reasoning, reasoning.started_at)
+                    }
+                    crate::backend::Part::Tool(call) => {
+                        (frontier.kind == CursorPartKind::Tool, call.started_at)
+                    }
+                    _ => (false, None),
                 };
-                // The frontier's identity is the message, the ordinal, the
-                // kind AND the part's server start time (ADR-0071): a
-                // replacement part in the same slot is a different part, and
-                // skipping its prefix would omit content (review #569).
-                if !matches_kind || frontier.started_at != part_started_at {
+                // The frontier's identity is the message, the ordinal and the
+                // kind: a part that is not even the same kind in that slot
+                // cannot be placed at all, and the seed falls back. A
+                // text/reasoning part whose server start time or delivered
+                // prefix no longer matches, by contrast, is a rewrite or a
+                // replacement — not a reason to drop the seed: the frontier is
+                // CUT AT 0, so that part renders in full while everything
+                // before it stays delivered (review #569). A grown part keeps
+                // the matching prefix and still renders only its tail.
+                if !matches_kind {
                     return None;
                 }
+                let start_matches = frontier.started_at == part_started_at;
                 // A tool-kind frontier carries the newest text/reasoning part's
-                // delivered extent: resolve that part in THIS read and hold the
-                // guard against it (spec #561, review #569).
-                let (part_chars, extent_pos) = if frontier.kind == CursorPartKind::Tool {
+                // delivered extent: resolve that part in THIS read — the part
+                // the cut and the digest belong to.
+                let extent_target = if frontier.kind == CursorPartKind::Tool {
                     match transcript.newest_text_before(message_pos, frontier.part_index) {
-                        Some((extent_pos, chars)) => (chars, Some(extent_pos)),
+                        Some((extent_pos, _chars)) => Some(extent_pos),
                         // No text before the tool: no extent may ride along.
-                        None if frontier.delivered_chars == 0 => (0, None),
+                        None if frontier.delivered_chars == 0 => None,
                         None => return None,
                     }
                 } else {
-                    (part_chars, None)
+                    None
                 };
-                // A cursor delivered past this read's content means the read
-                // is not the one the cursor was taken from (compaction, a
-                // recreated part): skipping would hide content.
-                if frontier.delivered_chars > part_chars {
-                    return None;
-                }
-                // The identity cannot tell a same-slot replacement from growth
-                // when the part carries no server start time (V2 decodes text
-                // without `time.start`), so the delivered prefix's digest must
-                // match too (spec #561, review #569). A cursor carrying no
-                // digest — an older release — falls back rather than guess.
-                let expected_digest = frontier.prefix_digest?;
-                let extent_part = match extent_pos {
+                let extent_part = match extent_target {
                     Some((pos, index)) => transcript.messages[pos].parts.get(index)?,
                     None => part,
                 };
-                let prefix_text = match extent_part {
-                    crate::backend::Part::Text(text) => text.text.as_str(),
-                    crate::backend::Part::Reasoning(reasoning) => reasoning.text.as_str(),
-                    _ => "",
+                let extent_chars = text_part_text(extent_part).chars().count();
+                // A cursor delivered past the read's content is not the read
+                // the cursor came from (a rewrite, compaction, a recreated
+                // part): the prefix cannot be verified, so the frontier cuts at
+                // 0 and that part renders in full rather than skipping it.
+                let verified = frontier.delivered_chars <= extent_chars;
+                // A cursor carrying no digest — an older release — falls back
+                // rather than guess (the one-release migration seam).
+                let expected_digest = frontier.prefix_digest?;
+                let delivered_prefix: String = text_part_text(extent_part)
+                    .chars()
+                    .take(frontier.delivered_chars)
+                    .collect();
+                let digest_matches = verified
+                    && crate::bridge::chain::cursor_prefix_digest(&delivered_prefix) == expected_digest;
+                let keep_extent = start_matches && digest_matches;
+                let frontier = match frontier.kind {
+                    CursorPartKind::Tool => match extent_target {
+                        // The tool itself changed (or its text target was
+                        // rewritten): degrade to the target as the frontier,
+                        // so the tool and everything after it render normally
+                        // and the target renders from its verified cut.
+                        Some((target_pos, target_index)) if !keep_extent => {
+                            let kind = text_part_kind(extent_part)?;
+                            SeedFrontier {
+                                message_id: frontier.message_id.clone(),
+                                message_pos: target_pos,
+                                part_index: target_index,
+                                kind,
+                                delivered_chars: if digest_matches {
+                                    frontier.delivered_chars
+                                } else {
+                                    0
+                                },
+                                extent_pos: None,
+                            }
+                        }
+                        Some((target_pos, target_index)) => SeedFrontier {
+                            message_id: frontier.message_id.clone(),
+                            message_pos,
+                            part_index: frontier.part_index,
+                            kind: CursorPartKind::Tool,
+                            delivered_chars: frontier.delivered_chars,
+                            extent_pos: Some((target_pos, target_index)),
+                        },
+                        // No text target: nothing is skipped past the tool,
+                        // which is marked delivered.
+                        None => SeedFrontier {
+                            message_id: frontier.message_id.clone(),
+                            message_pos,
+                            part_index: frontier.part_index,
+                            kind: CursorPartKind::Tool,
+                            delivered_chars: 0,
+                            extent_pos: None,
+                        },
+                    },
+                    _ => SeedFrontier {
+                        message_id: frontier.message_id.clone(),
+                        message_pos,
+                        part_index: frontier.part_index,
+                        kind: frontier.kind,
+                        delivered_chars: if keep_extent { frontier.delivered_chars } else { 0 },
+                        extent_pos: None,
+                    },
                 };
-                let delivered_prefix: String = prefix_text.chars().take(frontier.delivered_chars).collect();
-                if crate::bridge::chain::cursor_prefix_digest(&delivered_prefix) != expected_digest {
-                    return None;
-                }
-                Some(SeedFrontier {
-                    message_id: frontier.message_id.clone(),
-                    message_pos,
-                    part_index: frontier.part_index,
-                    kind: frontier.kind,
-                    delivered_chars: frontier.delivered_chars,
-                    extent_pos,
-                })
+                Some(frontier)
             }
         };
         let resolved_live_calls = cursor

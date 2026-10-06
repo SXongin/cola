@@ -5379,6 +5379,9 @@ async fn a_turn_winning_the_create_window_keeps_the_chain_and_its_late_card_is_c
     app.turn_follow_read_timeout_ms
         .store(200, std::sync::atomic::Ordering::Relaxed);
     platform.given_card_view("om_frozen", orphan_running_card_view());
+    // The late card's own view carries the tail it was created with: the same
+    // tail the winning Turn's message-first seed re-rendered (review #569).
+    platform.given_card_view("om_late_adoption", late_successor_view(missed));
 
     // The projection arms its successor and parks inside the awaited create.
     // The scripted id is the late card's own identity — the mock's default
@@ -5397,8 +5400,9 @@ async fn a_turn_winning_the_create_window_keeps_the_chain_and_its_late_card_is_c
     wait_for_record_card(&app, "ses_test", "msg_reply").await;
 
     // Release the create: the projection resumes onto a session it no longer
-    // owns. Its late card is collected as taken over — its only write — and it
-    // never touches the Turn's session or the record.
+    // owns. Its late card is collected as taken over — its only write, with NO
+    // body: the winner re-rendered that tail, so the reader must never see it
+    // twice — and it never touches the Turn's session or the record.
     create_release.notify_one();
     wait_for_update(
         &platform,
@@ -5412,6 +5416,11 @@ async fn a_turn_winning_the_create_window_keeps_the_chain_and_its_late_card_is_c
         late.len(),
         1,
         "the late card gets its collect and nothing else: {late:?}"
+    );
+    let late_collect = late.last().expect("the collect");
+    assert!(
+        !card_text(late_collect).contains(missed),
+        "the late card is reduced to the taken-over marker, never the repeated tail: {late_collect:?}"
     );
 
     let record = app
@@ -5566,6 +5575,8 @@ async fn a_turn_winning_the_create_window_keeps_the_chain_when_the_run_ended_whi
     app.turn_follow_read_timeout_ms
         .store(200, std::sync::atomic::Ordering::Relaxed);
     platform.given_card_view("om_frozen", realistic_card_view());
+    // The late terminal card's own view carries the tail it was created with.
+    platform.given_card_view("om_late_adoption", late_successor_view(missed));
 
     // The projection arms its terminal successor and parks inside the awaited
     // create; the scripted id is the late card's own identity.
@@ -5581,8 +5592,9 @@ async fn a_turn_winning_the_create_window_keeps_the_chain_when_the_run_ended_whi
     wait_for_card_text(&platform, missed).await;
     wait_for_record_card(&app, "ses_test", "msg_reply").await;
 
-    // Release the create: the late terminal card is collected, never attached
-    // to the Turn's session nor re-pointed into the record.
+    // Release the create: the late terminal card is collected bodyless — the
+    // winner re-rendered that tail — never attached to the Turn's session nor
+    // re-pointed into the record.
     create_release.notify_one();
     wait_for_update(
         &platform,
@@ -5596,6 +5608,11 @@ async fn a_turn_winning_the_create_window_keeps_the_chain_when_the_run_ended_whi
         late.len(),
         1,
         "the late card gets its collect and nothing else: {late:?}"
+    );
+    let late_collect = late.last().expect("the collect");
+    assert!(
+        !card_text(late_collect).contains(missed),
+        "the late card is reduced to the taken-over marker, never the repeated tail: {late_collect:?}"
     );
     let record = app
         .cards_handle()
@@ -5860,6 +5877,12 @@ async fn an_ambiguous_create_after_a_lost_response_is_never_retried() {
 /// review #569): a V2 transcript truncated at its page cap leaves the call
 /// outside the successor's sight, so the old card keeps the frozen running
 /// marker instead of dropping a panel that would vanish from both.
+///
+/// Truncation is NOT detectable at this seam (review #569): the V2 transcript
+/// read stops at its page cap with a log line, and the generation-neutral
+/// `SessionTranscript` carries no truncation fact — so the projection cannot
+/// withhold itself on a truncated read. This frozen `⏳` is therefore the
+/// honest signal; a later complete read adopts normally (ADR-0071).
 #[tokio::test]
 async fn an_unobserved_running_tool_stays_on_the_old_card() {
     let _wd = test_work_dir();
@@ -6290,4 +6313,21 @@ async fn a_definite_http_refusal_retries_on_the_next_pass() {
         posts[0]
     );
     wait_for_record_gone(&app, "ses_test").await;
+}
+
+/// The late projection successor's card view (spec #561, review #569): the
+/// card as Feishu would return it just before its collect — a working header
+/// and the tail body the projection rendered.
+fn late_successor_view(tail: &str) -> serde_json::Value {
+    serde_json::json!({
+        "schema": "2.0",
+        "config": { "wide_screen_mode": true, "streaming_mode": true },
+        "header": {
+            "template": "blue",
+            "title": { "tag": "plain_text", "content": "✍️ 回复中" }
+        },
+        "body": { "elements": [
+            { "tag": "markdown", "content": tail }
+        ] }
+    })
 }

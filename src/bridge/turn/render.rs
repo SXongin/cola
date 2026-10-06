@@ -4886,11 +4886,12 @@ Index: /x/src/main.rs
     }
     /// ADR-0071's frontier identity includes the part's server start time
     /// (spec #561, review #569): a replacement part in the same message slot
-    /// with the same kind is a DIFFERENT part, and resolving the cursor
-    /// against it would skip its prefix and omit content. The seed refuses to
-    /// place it — the projection falls back rather than guess.
+    /// with the same kind is a DIFFERENT part. The seed does not fail on it —
+    /// the frontier is cut at 0, so the replacement renders in FULL while
+    /// everything before it stays delivered — because dropping the seed would
+    /// lose its tail entirely.
     #[test]
-    fn a_replaced_part_in_the_frontier_slot_never_resolves_the_cursor() {
+    fn a_replaced_part_in_the_frontier_slot_resolves_as_cut_zero() {
         let cursor = projection_cursor_at("msg_a_2000", 0, CursorPartKind::Text, Some(2_000), "答复", &[]);
         let replaced = SessionTranscript::new(vec![message(
             "msg_a_2000",
@@ -4899,14 +4900,28 @@ Index: /x/src/main.rs
             // the server start time differs.
             vec![text_at("另外的答复", 3_000)],
         )]);
-        assert!(
-            CursorSeed::resolve(&replaced, &cursor).is_none(),
-            "a part with a different server start time is not the cursor's part"
+        let seed = CursorSeed::resolve(&replaced, &cursor).expect("the slot resolves as cut zero");
+        assert_eq!(
+            seed.frontier.as_ref().map(|frontier| frontier.delivered_chars),
+            Some(0),
+            "a replaced part is cut at 0, never skipped"
         );
-        let same = SessionTranscript::new(vec![message("msg_a_2000", 2_000, vec![text_at("答复", 2_000)])]);
+        let mut acc = StreamAccumulator::new("proj");
+        acc.turn_anchor = Some(turn_anchor(1_000));
+        acc.seed_projection(&cursor, seed);
+        assert!(render_new_turn_parts(&mut acc, &replaced));
+        let text = card_text(&acc.build_card_with_info().card);
         assert!(
-            CursorSeed::resolve(&same, &cursor).is_some(),
-            "the recorded part still resolves"
+            text.contains("另外的答复"),
+            "the replacement renders in full: {text}"
+        );
+
+        let same = SessionTranscript::new(vec![message("msg_a_2000", 2_000, vec![text_at("答复", 2_000)])]);
+        let seed = CursorSeed::resolve(&same, &cursor).expect("the recorded part still resolves");
+        assert_eq!(
+            seed.frontier.as_ref().map(|frontier| frontier.delivered_chars),
+            Some(2),
+            "the recorded part keeps its delivered extent"
         );
     }
 
@@ -4995,23 +5010,28 @@ Index: /x/src/main.rs
         );
     }
 
-    /// A timestampless REPLACEMENT with different content does not resolve
-    /// (spec #561, review #569): the digest mismatches, so the projection falls
-    /// back rather than skip the replacement's prefix and omit content. The
-    /// same content in the same slot is growth, not a replacement.
+    /// A timestampless REPLACEMENT with different content resolves as CUT 0
+    /// (spec #561, review #569): the digest mismatches, so the slot is not the
+    /// recorded part — but failing the seed would lose its tail, so the
+    /// frontier renders it in full instead. The same content in the same slot
+    /// is growth, not a replacement, and keeps its delivered extent.
     #[test]
-    fn a_timestampless_replacement_never_resolves() {
+    fn a_timestampless_replacement_resolves_as_cut_zero() {
         let cursor = projection_cursor("msg_a_2000", 0, CursorPartKind::Text, "答复", &[]);
         let replaced =
             SessionTranscript::new(vec![message("msg_a_2000", 2_000, vec![text_part("另外的答复")])]);
-        assert!(
-            CursorSeed::resolve(&replaced, &cursor).is_none(),
-            "a replacement whose content differs from the delivered prefix is not the cursor's part"
+        let seed = CursorSeed::resolve(&replaced, &cursor).expect("the slot resolves as cut zero");
+        assert_eq!(
+            seed.frontier.as_ref().map(|frontier| frontier.delivered_chars),
+            Some(0),
+            "a digest mismatch cuts the part at 0 rather than skipping it"
         );
         let same = SessionTranscript::new(vec![message("msg_a_2000", 2_000, vec![text_part("答复")])]);
-        assert!(
-            CursorSeed::resolve(&same, &cursor).is_some(),
-            "the same content is the recorded part"
+        let seed = CursorSeed::resolve(&same, &cursor).expect("the same content resolves");
+        assert_eq!(
+            seed.frontier.as_ref().map(|frontier| frontier.delivered_chars),
+            Some(2),
+            "the recorded content keeps its delivered extent"
         );
     }
 
@@ -5027,6 +5047,47 @@ Index: /x/src/main.rs
         assert!(
             CursorSeed::resolve(&transcript, &cursor).is_none(),
             "no digest, no projection"
+        );
+    }
+
+    /// The message-first race's seed (spec #561, ticket #565, review #569): a
+    /// frontier whose recorded prefix digest no longer matches the read — the
+    /// orphan's part was rewritten in place — still delivers the rewritten
+    /// part IN FULL before the new Turn's content, instead of falling back to
+    /// the live set alone and losing the tail.
+    #[test]
+    fn a_message_first_seed_renders_a_rewritten_orphan_part_in_full() {
+        let new_anchor = 2_000_000;
+        let orphan = TurnAnchor {
+            message_id: MessageId::new("msg_cola_old"),
+            created_ms: new_anchor - 60_000,
+        };
+        let rewritten = "改写后的完整回答。";
+        let transcript = SessionTranscript::new(vec![
+            typed_message(
+                "msg_cola_new",
+                MessageRole::User,
+                Some(new_anchor),
+                vec![text_part("新的问题")],
+            ),
+            message_in_flight("a_orphan", new_anchor - 50_000, None, vec![text_part(rewritten)]),
+        ]);
+        // The cursor recorded a prefix that no longer exists in the read.
+        let cursor = projection_cursor_at("a_orphan", 0, CursorPartKind::Text, None, "改写前的前缀", &[]);
+        let seed = CursorSeed::for_orphan(&transcript, &cursor, &orphan);
+        assert!(
+            seed.frontier.is_some(),
+            "a digest mismatch resolves as cut zero, not a fallback"
+        );
+
+        let mut acc = StreamAccumulator::new("proj");
+        acc.cola_message_id = Some("msg_cola_new".into());
+        acc.seed_projection(&cursor, seed);
+        assert!(render_new_turn_parts(&mut acc, &transcript));
+        let text = card_text(&acc.build_card_with_split().0);
+        assert!(
+            text.contains(rewritten),
+            "the rewritten orphan answer renders in full: {text}"
         );
     }
 }
