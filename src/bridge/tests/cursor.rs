@@ -15,7 +15,7 @@ use super::drain::{
     assistant, ctx, scripted_app, settle_tool, spawn_turn, tool_assistant, user, wait_for_card_text,
 };
 use crate::backend::{MessageId, MessageRole, SessionTranscript, ToolStatus};
-use crate::bridge::chain::{CursorFrontier, CursorPartKind, RenderedCursor};
+use crate::bridge::chain::{CursorFrontier, CursorPartKind, RenderedCursor, cursor_prefix_digest};
 use crate::bridge::test_support::{
     MockBackend, PlatformCall, card_text, patches_to, test_work_dir, text_part, typed_message,
     wait_for_transcript_reads,
@@ -118,6 +118,7 @@ async fn a_live_turn_advances_the_record_cursor_to_the_delivered_body() {
             kind: CursorPartKind::Text,
             started_at: Some(2_000),
             delivered_chars: "第一段回答。".chars().count(),
+            prefix_digest: Some(cursor_prefix_digest("第一段回答。")),
         }),
         "the frontier is the delivered text part and its character extent"
     );
@@ -150,6 +151,7 @@ async fn a_live_turn_advances_the_record_cursor_to_the_delivered_body() {
             // The fixture's tool part carries no server clock.
             started_at: None,
             delivered_chars: "第一段回答。".chars().count(),
+            prefix_digest: Some(cursor_prefix_digest("第一段回答。")),
         }),
         "the settled panel is the frontier, carrying the text's delivered extent"
     );
@@ -410,6 +412,7 @@ async fn a_failed_card_write_stages_and_the_drain_advances_the_cursor_once() {
             kind: CursorPartKind::Text,
             started_at: Some(2_000),
             delivered_chars: "答复。".chars().count(),
+            prefix_digest: Some(cursor_prefix_digest("答复。")),
         }),
         "the cursor matches the delivered body's render point"
     );

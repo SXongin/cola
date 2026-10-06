@@ -86,6 +86,24 @@ impl BridgeError {
             _ => false,
         }
     }
+
+    /// Whether a failed **create** proves the platform created no message
+    /// (spec #561, review #569): a card-content rejection, or an explicit 4xx
+    /// refusal other than the ambiguous 408, was refused before any message
+    /// existed — a retry cannot duplicate it, so a projection's create stays
+    /// retryable. Transport errors, timeouts, 5xx and untyped API errors may
+    /// have landed, so they are treated as single-shot. This axis is
+    /// deliberately NOT [`Self::is_recoverable_card_write`] (ADR-0067's
+    /// vocabulary, reused for creates): a 4xx is permanent there but
+    /// definitely-not-delivered here, and a 5xx is recoverable there but
+    /// ambiguous here.
+    pub(crate) fn is_definite_non_delivery(&self) -> bool {
+        match self {
+            BridgeError::CardContentRejected { .. } => true,
+            BridgeError::FeishuHttp { status, .. } => (400..500).contains(status) && *status != 408,
+            _ => false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -129,5 +147,42 @@ mod tests {
         assert!(
             !BridgeError::Feishu("update error 230002: message not found".into()).is_recoverable_card_write()
         );
+    }
+
+    /// A create's definite non-delivery (spec #561, review #569): a content
+    /// rejection and an explicit 4xx refusal (except the ambiguous 408) prove
+    /// no message was created; transport errors, 5xx and untyped API errors
+    /// may have landed.
+    #[test]
+    fn create_non_delivery_classification_splits_retryable_from_ambiguous() {
+        assert!(
+            BridgeError::CardContentRejected {
+                code: 230099,
+                detail: String::new()
+            }
+            .is_definite_non_delivery()
+        );
+        for status in [400u16, 401, 403, 404, 422, 429] {
+            assert!(
+                BridgeError::FeishuHttp {
+                    status,
+                    detail: String::new()
+                }
+                .is_definite_non_delivery(),
+                "{status} proves no message was created"
+            );
+        }
+        for status in [408u16, 500, 502, 503] {
+            assert!(
+                !BridgeError::FeishuHttp {
+                    status,
+                    detail: String::new()
+                }
+                .is_definite_non_delivery(),
+                "{status} is ambiguous: the message may have landed"
+            );
+        }
+        assert!(!BridgeError::Io(std::io::Error::other("reset")).is_definite_non_delivery());
+        assert!(!BridgeError::Feishu("semantic refusal".into()).is_definite_non_delivery());
     }
 }

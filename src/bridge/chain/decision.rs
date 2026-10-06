@@ -491,7 +491,7 @@ pub(crate) fn fresh(reads: &FreshReads) -> FreshDisposition {
 mod tests {
     use super::*;
     use crate::backend::{MessageId, TranscriptMessage};
-    use crate::bridge::chain::{CursorFrontier, CursorPartKind, RenderedCursor};
+    use crate::bridge::chain::{CursorFrontier, CursorPartKind, RenderedCursor, cursor_prefix_digest};
     use crate::bridge::test_support::{background_shell, shell_wake};
     use crate::bridge::tests::drain::{assistant, user};
 
@@ -886,6 +886,7 @@ mod tests {
                 kind: CursorPartKind::Text,
                 started_at: Some(2_000),
                 delivered_chars: 2,
+                prefix_digest: Some(cursor_prefix_digest("答复")),
             }),
             live_calls: Default::default(),
         };
@@ -920,9 +921,10 @@ mod tests {
         );
 
         // A waiting ending projects as well, with the successor yielding.
+        // (The same answer text as the cursor's prefix: the digest must match.)
         let waiting = SessionTranscript::new(vec![
             user("msg_cola_anchor", 1_000, "问题"),
-            assistant(2_000, "跑着。"),
+            assistant(2_000, "答复。"),
         ])
         .with_background_tasks(vec![background_shell(1_500)]);
         assert_eq!(
@@ -967,6 +969,7 @@ mod tests {
                 kind: CursorPartKind::Text,
                 started_at: None,
                 delivered_chars: 1,
+                prefix_digest: Some(cursor_prefix_digest("答")),
             }),
             live_calls: Default::default(),
         };
@@ -1042,6 +1045,7 @@ mod tests {
                 kind: CursorPartKind::Text,
                 started_at: Some(2_000),
                 delivered_chars: 2,
+                prefix_digest: Some(cursor_prefix_digest("答复")),
             }),
             live_calls: Default::default(),
         };
@@ -1073,6 +1077,7 @@ mod tests {
                 kind: CursorPartKind::Text,
                 started_at: None,
                 delivered_chars: 1,
+                prefix_digest: Some(cursor_prefix_digest("答")),
             }),
             live_calls: Default::default(),
         };
@@ -1134,6 +1139,7 @@ mod tests {
                 kind: CursorPartKind::Text,
                 started_at: Some(2_000),
                 delivered_chars: 2,
+                prefix_digest: Some(cursor_prefix_digest("答复")),
             }),
             live_calls: Default::default(),
         };

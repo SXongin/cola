@@ -22,7 +22,9 @@ use crate::backend::{
     ContentBlock, MessageId, MessageRole, MessageTime, Part, SessionTranscript, TextPart, ToolCall,
     ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage,
 };
-use crate::bridge::chain::{ChainRecords, CursorFrontier, CursorPartKind, RenderedCursor};
+use crate::bridge::chain::{
+    ChainRecords, CursorFrontier, CursorPartKind, RenderedCursor, cursor_prefix_digest,
+};
 use crate::bridge::test_support::*;
 use crate::bridge::turn::Turn;
 use crate::config::{SessionEntry, ThreadKey};
@@ -2781,7 +2783,7 @@ async fn a_record_carrying_wake_goes_through_the_projection() {
         "msg_cola_anchor",
         Some(1_000),
         Some("/work"),
-        Some(text_frontier(delivered.chars().count())),
+        Some(text_frontier(delivered)),
         &[],
     );
     // The run continued past the confirmed frontier while cola was down —
@@ -2869,7 +2871,7 @@ async fn a_projection_announces_its_wake_across_a_second_restart() {
         "msg_cola_anchor",
         Some(1_000),
         Some("/work"),
-        Some(text_frontier(delivered.chars().count())),
+        Some(text_frontier(delivered)),
         &[],
     );
     let resumed = "CI 通过了。";
@@ -3657,13 +3659,14 @@ fn seed_cursor_record(
 
 /// The cursor frontier of the fixture: a text part at `msg_a_2000` delivered
 /// up to `delivered_chars`.
-fn text_frontier(delivered_chars: usize) -> CursorFrontier {
+fn text_frontier(delivered: &str) -> CursorFrontier {
     CursorFrontier {
         message_id: MessageId::new("msg_a_2000"),
         part_index: 0,
         kind: CursorPartKind::Text,
         started_at: Some(2_000),
-        delivered_chars,
+        delivered_chars: delivered.chars().count(),
+        prefix_digest: Some(cursor_prefix_digest(delivered)),
     }
 }
 
@@ -3707,7 +3710,7 @@ async fn a_restart_projects_the_missed_tail_of_an_ended_run() {
         "msg_cola_anchor",
         Some(1_000),
         Some("/work"),
-        Some(text_frontier(delivered.chars().count())),
+        Some(text_frontier(delivered)),
         &[],
     );
     let transcript = SessionTranscript::new(vec![
@@ -3790,7 +3793,7 @@ async fn a_projection_cut_inside_a_fence_renders_intact() {
         "msg_cola_anchor",
         Some(1_000),
         Some("/work"),
-        Some(text_frontier(delivered.chars().count())),
+        Some(text_frontier(delivered)),
         &[],
     );
     let transcript = SessionTranscript::new(vec![
@@ -3829,7 +3832,7 @@ async fn a_projection_settles_a_tool_that_finished_while_cola_was_down() {
         "msg_cola_anchor",
         Some(1_000),
         Some("/work"),
-        Some(text_frontier("第一段回答。".chars().count())),
+        Some(text_frontier("第一段回答。")),
         &["call_1"],
     );
     let transcript = SessionTranscript::new(vec![
@@ -3909,7 +3912,7 @@ async fn a_projection_confirm_advances_the_cursor_it_was_confirmed_on() {
         "msg_cola_anchor",
         Some(1_000),
         Some("/work"),
-        Some(text_frontier(delivered.chars().count())),
+        Some(text_frontier(delivered)),
         &[],
     );
     let transcript = SessionTranscript::new(vec![
@@ -3969,7 +3972,7 @@ async fn a_failed_projection_create_advances_nothing() {
         "msg_cola_anchor",
         Some(1_000),
         Some("/work"),
-        Some(text_frontier(delivered.chars().count())),
+        Some(text_frontier(delivered)),
         &[],
     );
     // The read carries a Wake the projection would announce: the failed write
@@ -4071,7 +4074,7 @@ async fn a_record_with_no_deliverable_target_projects_nothing() {
         "msg_cola_anchor",
         None,
         Some("/work"),
-        Some(text_frontier("已经写了一半。".chars().count())),
+        Some(text_frontier("已经写了一半。")),
         &[],
     );
     let transcript = SessionTranscript::new(vec![
@@ -4202,7 +4205,7 @@ async fn a_restart_mid_run_follows_the_live_run_onto_a_successor() {
         "msg_cola_anchor",
         Some(1_000),
         Some("/work"),
-        Some(text_frontier(delivered.chars().count())),
+        Some(text_frontier(delivered)),
         &[],
     );
     // The run is live and has produced nothing past the confirmed cursor yet.
@@ -4322,7 +4325,7 @@ async fn a_restart_mid_run_carries_a_running_tool_and_settles_it_once() {
         "msg_cola_anchor",
         Some(1_000),
         Some("/work"),
-        Some(text_frontier(delivered.chars().count())),
+        Some(text_frontier(delivered)),
         &["call_1"],
     );
     let running = SessionTranscript::new(vec![
@@ -4413,7 +4416,7 @@ async fn a_restart_mid_run_settles_a_tool_that_finished_while_cola_was_down() {
         "msg_cola_anchor",
         Some(1_000),
         Some("/work"),
-        Some(text_frontier(delivered.chars().count())),
+        Some(text_frontier(delivered)),
         &["call_1"],
     );
     let running = SessionTranscript::new(vec![
@@ -4466,7 +4469,7 @@ async fn a_live_adoption_announces_the_wake_its_successor_rendered() {
         "msg_cola_anchor",
         Some(1_000),
         Some("/work"),
-        Some(text_frontier(delivered.chars().count())),
+        Some(text_frontier(delivered)),
         &[],
     );
     // The run is still live and the Wake resumed it: the successor's first
@@ -4558,7 +4561,7 @@ async fn an_adoption_carries_a_pending_request_onto_the_successor() {
         "msg_cola_anchor",
         Some(1_000),
         Some("/work"),
-        Some(text_frontier(delivered.chars().count())),
+        Some(text_frontier(delivered)),
         &[],
     );
 
@@ -4693,7 +4696,7 @@ async fn a_run_that_dies_with_the_server_settles_by_transcript_truth() {
         "msg_cola_anchor",
         Some(1_000),
         Some("/work"),
-        Some(text_frontier(delivered.chars().count())),
+        Some(text_frontier(delivered)),
         &[],
     );
     let running = SessionTranscript::new(vec![
@@ -4768,7 +4771,7 @@ async fn a_live_adoption_keeps_following_through_failed_reads() {
         "msg_cola_anchor",
         Some(1_000),
         Some("/work"),
-        Some(text_frontier(delivered.chars().count())),
+        Some(text_frontier(delivered)),
         &[],
     );
     let running = SessionTranscript::new(vec![
@@ -4840,7 +4843,7 @@ async fn an_ambiguous_adoption_create_is_never_retried() {
         "msg_cola_anchor",
         Some(1_000),
         Some("/work"),
-        Some(text_frontier(delivered.chars().count())),
+        Some(text_frontier(delivered)),
         &[],
     );
     let running = SessionTranscript::new(vec![
@@ -4883,7 +4886,7 @@ async fn an_ambiguous_adoption_create_is_never_retried() {
     assert_eq!(
         record.cursor,
         Some(RenderedCursor {
-            frontier: Some(text_frontier(delivered.chars().count())),
+            frontier: Some(text_frontier(delivered)),
             live_calls: Default::default(),
         }),
         "a failed create advanced no cursor"
@@ -4945,6 +4948,7 @@ async fn a_cursor_carrying_live_orphan_is_never_stamped() {
             kind: CursorPartKind::Text,
             started_at: None,
             delivered_chars: 1,
+            prefix_digest: Some(cursor_prefix_digest("答")),
         }),
         &[],
     );
@@ -5002,7 +5006,7 @@ async fn a_live_adoption_is_generation_neutral() {
             "msg_cola_anchor",
             Some(1_000),
             Some("/work"),
-            Some(text_frontier(delivered.chars().count())),
+            Some(text_frontier(delivered)),
             &[],
         );
         // The mock's generation capabilities: V2 keeps the session selection
@@ -5165,6 +5169,7 @@ async fn a_message_before_the_adoption_shows_the_orphans_tail_once() {
             kind: CursorPartKind::Text,
             started_at: Some(orphan_anchor + 500),
             delivered_chars: delivered.chars().count(),
+            prefix_digest: Some(cursor_prefix_digest(delivered)),
         }),
         &["call_sleep"],
     );
@@ -5341,6 +5346,7 @@ async fn a_turn_winning_the_create_window_keeps_the_chain_and_its_late_card_is_c
             kind: CursorPartKind::Text,
             started_at: Some(orphan_anchor + 500),
             delivered_chars: delivered.chars().count(),
+            prefix_digest: Some(cursor_prefix_digest(delivered)),
         }),
         &["call_sleep"],
     );
@@ -5509,6 +5515,7 @@ async fn a_turn_winning_the_create_window_keeps_the_chain_when_the_run_ended_whi
             kind: CursorPartKind::Text,
             started_at: Some(orphan_anchor + 500),
             delivered_chars: delivered.chars().count(),
+            prefix_digest: Some(cursor_prefix_digest(delivered)),
         }),
         &[],
     );
@@ -5818,7 +5825,7 @@ async fn an_ambiguous_create_after_a_lost_response_is_never_retried() {
         "msg_cola_anchor",
         Some(1_000),
         Some("/work"),
-        Some(text_frontier(delivered.chars().count())),
+        Some(text_frontier(delivered)),
         &[],
     );
     let transcript = SessionTranscript::new(vec![
@@ -5865,7 +5872,7 @@ async fn an_unobserved_running_tool_stays_on_the_old_card() {
         "msg_cola_anchor",
         Some(1_000),
         Some("/work"),
-        Some(text_frontier(delivered.chars().count())),
+        Some(text_frontier(delivered)),
         // `call_gone` is NOT in the read: a truncated transcript left the
         // still-running call outside it.
         &["call_1", "call_gone"],
@@ -5920,7 +5927,7 @@ async fn an_oversized_missed_delta_lands_across_a_bounded_chain() {
         "msg_cola_anchor",
         Some(1_000),
         Some("/work"),
-        Some(text_frontier(delivered.chars().count())),
+        Some(text_frontier(delivered)),
         &[],
     );
     let transcript = SessionTranscript::new(vec![
@@ -6004,7 +6011,7 @@ async fn a_mid_chain_projection_failure_keeps_only_the_landed_slices() {
         "msg_cola_anchor",
         Some(1_000),
         Some("/work"),
-        Some(text_frontier(delivered.chars().count())),
+        Some(text_frontier(delivered)),
         &[],
     );
     let transcript = SessionTranscript::new(vec![
@@ -6016,8 +6023,8 @@ async fn a_mid_chain_projection_failure_keeps_only_the_landed_slices() {
         restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Idle)).await;
     platform.given_card_view("om_frozen", realistic_card_view());
     // The first create lands; the second fails ambiguously.
-    platform.given_reply_card_outcome(true);
-    platform.given_reply_card_outcome(false);
+    platform.given_reply_card_outcome(crate::bridge::test_support::ReplyOutcome::Lands);
+    platform.given_reply_card_outcome(crate::bridge::test_support::ReplyOutcome::Ambiguous);
 
     spawn_sync(&app);
     let cursor = wait_for_cursor(&app, |cursor| {
@@ -6117,7 +6124,7 @@ async fn an_oversized_live_delta_chains_and_the_follow_continues_it() {
         "msg_cola_anchor",
         Some(1_000),
         Some("/work"),
-        Some(text_frontier(delivered.chars().count())),
+        Some(text_frontier(delivered)),
         &[],
     );
     let running = SessionTranscript::new(vec![
@@ -6165,4 +6172,122 @@ async fn an_oversized_live_delta_chains_and_the_follow_continues_it() {
         !text.contains(delivered),
         "the delivered prefix is never repeated: {text}"
     );
+}
+
+/// A DEFINITE create failure is retryable (spec #561, review #569): a card
+/// content rejection proves Feishu created no message, so the projection
+/// re-renders the SAME slice through the flush's fenced fallback and the missed
+/// tail still lands. The old behavior marked the attempt single-shot and let
+/// the tail be state-repaired away.
+#[tokio::test]
+async fn a_definite_create_failure_recovers_with_the_fenced_fallback() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let delivered = "已经写了一半。";
+    let missed = "后半段是在停机期间写完的。";
+    let full = format!("{delivered}{missed}");
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
+        Some(text_frontier(delivered)),
+        &[],
+    );
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "问题"),
+        assistant(2_000, &full),
+    ])
+    .with_executions(vec![execution(2_500)]);
+    let (app, platform, _backend) =
+        restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Idle)).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+    // The first create is refused as card content: Feishu created no message.
+    platform.given_reply_card_outcome(crate::bridge::test_support::ReplyOutcome::Rejected);
+
+    spawn_sync(&app);
+    // The fenced retry lands the same slice.
+    wait_for_posted_text(&platform, missed).await;
+    let posts = platform.replied_cards().await;
+    assert_eq!(
+        posts.len(),
+        1,
+        "only the fenced retry landed: {:?}",
+        platform.calls.lock().await
+    );
+    let text = card_text(&posts[0]);
+    assert!(text.contains(missed), "the missed tail lands: {text}");
+    assert!(
+        text.contains("```"),
+        "the retry degraded the model markdown to the flush's fenced form: {text}"
+    );
+    assert!(
+        !text.contains(delivered),
+        "the delivered prefix is never repeated: {text}"
+    );
+    let collected = last_update_of(&platform, "om_frozen")
+        .await
+        .expect("the old card is collected as taken over");
+    assert!(
+        card_header(&collected).contains("已由新卡片接管"),
+        "the old card is collected: {collected}"
+    );
+    wait_for_record_gone(&app, "ses_test").await;
+}
+
+/// A definite HTTP refusal (a 4xx: the platform created no message) leaves the
+/// record retryable, so the NEXT reconcile pass re-attempts and the missed tail
+/// lands (spec #561, review #569). An ambiguous failure (transport, 5xx) stays
+/// single-shot, covered by the ambiguous tests.
+#[tokio::test]
+async fn a_definite_http_refusal_retries_on_the_next_pass() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let delivered = "已经写了一半。";
+    let missed = "后半段是在停机期间写完的。";
+    let full = format!("{delivered}{missed}");
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
+        Some(text_frontier(delivered)),
+        &[],
+    );
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "问题"),
+        assistant(2_000, &full),
+    ])
+    .with_executions(vec![execution(2_500)]);
+    let (app, platform, _backend) =
+        restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Idle)).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+    // The first create is refused with an explicit 4xx: no message was made.
+    platform.given_reply_card_outcome(crate::bridge::test_support::ReplyOutcome::Refused(400));
+
+    spawn_sync(&app);
+    wait_for_posted_text(&platform, missed).await;
+    let posts = platform.replied_cards().await;
+    assert_eq!(
+        posts.len(),
+        1,
+        "the refused attempt made no message; the retry landed: {:?}",
+        platform.calls.lock().await
+    );
+    let text = card_text(&posts[0]);
+    assert!(text.contains(missed), "the missed tail lands: {text}");
+    assert!(
+        !text.contains(delivered),
+        "the delivered prefix is never repeated: {text}"
+    );
+    assert!(
+        card_header(&posts[0]).contains("✅"),
+        "the retry carried the transcript's true ending: {:?}",
+        posts[0]
+    );
+    wait_for_record_gone(&app, "ses_test").await;
 }
