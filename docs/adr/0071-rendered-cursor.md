@@ -113,14 +113,23 @@ projects the chain's delta after it onto a successor card.**
   today's in-place settle and a live one is not adopted. Both collect the
   recorded card as taken over — dropping every
   running `⏳` marker the successor resolves (ADR-0068's rule, generalized) —
-  and neither re-points the record's card until the create landed. A
+  and neither re-points the record's card until the create landed. The
+  re-point and the create's cursor confirmation are ONE write, inside the same
+  takeover critical section (review #569, round 3): the record must never be
+  observable naming the successor card while still carrying the predecessor's
+  frontier, because a fresh Turn that snapshots it in that window seeds the
+  already-delivered tail onto its own card while the collected successor keeps
+  its body — the same text twice. The old card's collect PATCH and the Wake
+  Watermark drain follow that atomic transition, and no awaited call sits
+  between the transition and the confirmation. A
   projection that renders nothing new (the cursor covered the whole read)
   drops its armed successor and keeps today's in-place ending; a live
   adoption is still sent — the run may produce next, and the follow is what
   keeps it live. An oversized delta goes through the SAME splitter as every
   card body, as a bounded chain of creates (≤ the existing chain bound), one
-  slice per card, in order, each slice's cursor confirmed only after its own
-  create landed: a failed or bound-stopped chain leaves the record at the
+  slice per card, in order, each slice's cursor confirmed with the same
+  critical section that attaches its card, only after its own create landed: a
+  failed or bound-stopped chain leaves the record at the
   last confirmed slice, re-posts nothing in that life and lets the next
   life's projection resume from the cursor (review #569).
 

@@ -13,9 +13,10 @@ pub(crate) use state::CardSession;
 
 /// The Rendered Cursor's drain reconcile (spec #561): after the Platform's
 /// Pending Card Update drain, Session Sync advances every staged cursor whose
-/// owed payload has delivered — and the projection's successor create confirms
-/// its staged cursor through the same drain (ticket #563).
-pub(crate) use flush::{confirm_armed_cursor, drain_armed_watermark, reconcile_staged_cursors};
+/// owed payload has delivered — while a projection's successor create confirms
+/// its staged cursor inside its own atomic takeover, before any later await
+/// (ticket #563, review #569).
+pub(crate) use flush::{drain_armed_watermark, reconcile_staged_cursors};
 
 /// The drain reconcile's test seam (spec #561, review #569): the gate parks
 /// the pass between its delivery check and the confirmation.
@@ -3581,17 +3582,22 @@ impl Turn {
     /// takes it before the cards lock).
     ///
     /// `chain_id` is the armed session's [`state::CardSession::chain_id`].
-    /// [`ArmedTakeover::Lost`] means the session was replaced or attached
-    /// meanwhile: nothing was touched. Otherwise the successor id is attached,
-    /// the record re-pointed (the Rendered Cursor carried into the armed
-    /// accumulator exactly as [`Self::track_live_card`] does) and the
-    /// predecessor record handed back for the caller's deferred collect.
+    /// `cursor_stage` is the exact Rendered Cursor stage the create's body
+    /// carried: it is confirmed in the SAME critical section as the re-point
+    /// (review #569), so the record never names the successor with the
+    /// predecessor's frontier. [`ArmedTakeover::Lost`] means the session was
+    /// replaced or attached meanwhile: nothing was touched. Otherwise the
+    /// successor id is attached, the record re-pointed carrying the confirmed
+    /// cursor into the armed accumulator exactly as [`Self::track_live_card`]
+    /// does, and the predecessor record handed back for the caller's deferred
+    /// collect.
     pub(crate) async fn take_over_armed_card(
         cards: &CardsHandle,
         session_id: &str,
         chain_id: u64,
         card_message_id: &str,
         directory: Option<&str>,
+        cursor_stage: state::StagedCursorId,
     ) -> ArmedTakeover {
         match Self::attach_and_repoint(
             cards,
@@ -3601,6 +3607,7 @@ impl Turn {
             card_message_id,
             None,
             directory,
+            cursor_stage,
         )
         .await
         {
@@ -3612,11 +3619,13 @@ impl Turn {
     /// Attach a projection chain's just-created continuation (spec #561,
     /// review #569): verify the chain is still the armed one, attach the new
     /// card, mark whether it is the chain's LIVE card (the follow streams onto
-    /// it) and re-point the record — one cards-map critical section, exactly
-    /// like the armed takeover, so a fresh Turn that replaced the session is
-    /// never touched. The chain continues (no predecessor collect). Returns
-    /// `false` when a fresh Turn owns the session now: the caller collects the
-    /// late card and stops the chain.
+    /// it), confirm the create's staged Rendered Cursor and re-point the record
+    /// — one cards-map critical section, exactly like the armed takeover, so a
+    /// fresh Turn that replaced the session is never touched and the record
+    /// never names the new card with the previous slice's frontier. The chain
+    /// continues (no predecessor collect). Returns `false` when a fresh Turn
+    /// owns the session now: the caller collects the late card and stops the
+    /// chain.
     pub(crate) async fn track_projected_continuation(
         cards: &CardsHandle,
         session_id: &str,
@@ -3624,6 +3633,7 @@ impl Turn {
         card_message_id: &str,
         card_is_live: bool,
         directory: Option<&str>,
+        cursor_stage: state::StagedCursorId,
     ) -> bool {
         Self::attach_and_repoint(
             cards,
@@ -3633,6 +3643,7 @@ impl Turn {
             card_message_id,
             Some(card_is_live),
             directory,
+            cursor_stage,
         )
         .await
         .is_some()
@@ -3641,7 +3652,8 @@ impl Turn {
     /// The shared projection transition (spec #561, review #569): under ONE
     /// cards-map lock, check the session is `chain_id`'s (and, for the armed
     /// case, never attached), attach `card_message_id`, mark the live/finalized
-    /// state when the caller knows it and re-point the durable record. `None`
+    /// state when the caller knows it, take the just-confirmed body's staged
+    /// Rendered Cursor and re-point the durable record carrying it. `None`
     /// when the session is not ours; otherwise the predecessor record (handed
     /// back only for the armed case — a continuation's predecessor is the slice
     /// the chain just sent).
@@ -3654,6 +3666,7 @@ impl Turn {
         card_message_id: &str,
         card_is_live: Option<bool>,
         directory: Option<&str>,
+        cursor_stage: state::StagedCursorId,
     ) -> Option<Option<Box<ChainRecord>>> {
         let mut live = cards.cards.lock().await;
         let card = live.get_mut(session_id)?;
@@ -3674,6 +3687,14 @@ impl Turn {
             card.acc.directory.clone(),
         );
         card.card_message_id = Some(card_message_id.to_string());
+        // The create landed: take its exact staged Rendered Cursor NOW, inside
+        // this critical section (review #569). A confirmation after this lock —
+        // however soon after — would leave the record naming the successor card
+        // while it still carried the predecessor's frontier; a fresh Turn
+        // snapshotting the record in that window seeds the already-delivered
+        // tail onto its own card while the collected successor keeps its body:
+        // the same text twice.
+        let confirmed = card.acc.take_staged_cursor(card_message_id, cursor_stage);
         // A card with no Turn message to scope a settle decision with cannot
         // be reaped: attached, but no record — `track_live_card`'s own rule.
         let Some(message_id) = message_id else {
@@ -3683,13 +3704,29 @@ impl Turn {
             .map(str::to_string)
             .filter(|directory| !directory.is_empty())
             .or(context_directory);
-        let previous = cards.chains.track(
-            session_id,
-            card_message_id,
-            message_id,
-            created_ms,
-            directory.as_deref(),
-        );
+        let previous = match &confirmed {
+            // The confirmed body's cursor rides the re-point in ONE chains
+            // write, so the record is never observable as (successor card,
+            // predecessor cursor) — not even between two chains operations.
+            Some(cursor) => cards.chains.track_carrying_cursor(
+                session_id,
+                card_message_id,
+                message_id,
+                created_ms,
+                directory.as_deref(),
+                cursor,
+            ),
+            // No staged cursor matched the create's stage: nothing was
+            // confirmed, so the re-point carries the previous frontier exactly
+            // as a plain re-point does.
+            None => cards.chains.track(
+                session_id,
+                card_message_id,
+                message_id,
+                created_ms,
+                directory.as_deref(),
+            ),
+        };
         // A re-point within the chain carries the Rendered Cursor (spec #561):
         // seed the accumulator's empty base with the carried fact, so the
         // successor's first body does not clear the chain's frontier.
@@ -4260,7 +4297,19 @@ mod tests {
             let ready = ready_tx.clone();
             tokio::spawn(async move {
                 ready.send(()).expect("the test is receiving");
-                Turn::take_over_armed_card(&cards, "ses_test", chain_id, "om_late", Some("/work")).await
+                Turn::take_over_armed_card(
+                    &cards,
+                    "ses_test",
+                    chain_id,
+                    "om_late",
+                    Some("/work"),
+                    // Nothing was staged: the id no stage matches.
+                    state::StagedCursorId {
+                        id: 0,
+                        awaiting_seq: None,
+                    },
+                )
+                .await
             })
         };
         let replacement = {
@@ -4353,7 +4402,18 @@ mod tests {
 
         assert!(
             matches!(
-                Turn::take_over_armed_card(&cards, "ses_test", chain_id, "om_late", Some("/work")).await,
+                Turn::take_over_armed_card(
+                    &cards,
+                    "ses_test",
+                    chain_id,
+                    "om_late",
+                    Some("/work"),
+                    state::StagedCursorId {
+                        id: 0,
+                        awaiting_seq: None,
+                    },
+                )
+                .await,
                 ArmedTakeover::Lost
             ),
             "a replaced armed session is lost, never taken over"
