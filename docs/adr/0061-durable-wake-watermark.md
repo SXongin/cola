@@ -5,6 +5,12 @@
 > durable facts). Its semantics — advance only after a card write lands,
 > monotonic per Session — are unchanged.
 
+> **Amended by ADR-0071**: the render-frontier watermark rejected below is no
+> longer rejected — it is the **Rendered Cursor** on the Chain Record,
+> advanced only by a confirmed card write. The Wake Watermark's own decision
+> stands; only a chain with no durable record uses its announcement rule now.
+> See the amendment at the end.
+
 ## Context
 
 ADR-0059 decided that card state stays in memory and the Wake path is
@@ -70,7 +76,9 @@ same choke point.
   gain over the watermark: announcements advance in transcript order.
 - **A render-frontier content watermark.** Would also cover non-Wake content a
   restart might replay, but must be written on every card PATCH — the hot path
-  — for a case the Wake-scoped mark already covers.
+  — for a case the Wake-scoped mark already covers. (Reopened by ADR-0071,
+  which persists exactly this frontier as the **Rendered Cursor**; see the
+  amendment at the end.)
 - **An Execution-idled-before-process-start rule.** Cannot carry the decision
   (both cases look identical); useful only as a supporting signal.
 - **Re-read the transcript before sending instead of an inbound claim.**
@@ -99,3 +107,30 @@ same choke point.
 
 Related: #424, #426, #405, #403, ADR-0059, ADR-0060, ADR-0026, ADR-0043,
 ADR-0053.
+
+## Amendment (2026-10-06): the render-frontier watermark is reopened (ADR-0071)
+
+The option in *Considered options* was rejected as "must be written on every
+card PATCH — the hot path". ADR-0071 reopens it because the cost that
+rejection weighed is no longer there. The **Rendered Cursor** rides the
+**existing delivery choke point**: it is staged with the body about to be
+written and drained by the same confirmation — a PATCH `Ok`, a create `Ok`,
+or a Pending Card Update the drain later delivers — that already orders every
+card write, so no new write path and no extra per-tick write is added. The
+payload is a frontier position plus a set of call ids, **small** and
+content-free, and the local atomic write is negligible beside the network
+PATCH it follows, whose cadence is content-driven and bounded. The decisive
+change is the **mechanism count**: one cursor retires the #443 restart stamp
+for cursor-carrying records, ADR-0068's carry, and the Fresh gate's no-replay
+for recorded chains, collapsing the pairwise restart rules into one
+projection.
+
+The Wake Watermark's own decision is unchanged — including its rule that the
+mark advances only after the card write carrying the announcement lands, which
+the cursor's advance rule mirrors — and the Fresh path keeps its
+**recordless scope**: the watermark's announcement gate still decides a
+post-restart continuation for a chain with no durable record. What the
+reopening changes is which chains reach it: a **recorded** chain's Wake
+belongs to the projection (or, cursorless, to the reap's fallback), so the
+watermark's exactly-once meaning stands exactly as decided above, where it
+applies (ADR-0071's retirement of the recorded-chain Fresh arm).
