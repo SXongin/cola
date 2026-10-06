@@ -221,8 +221,8 @@ async fn gather_reads<'a>(
 }
 
 /// What THIS process knows about the session's card, as values. Why not
-/// [`Turn::chain_ownership`]? Routing and the Wake step need only "owned or
-/// not"; a reconcile needs the record's card id and the lifecycle
+/// [`crate::bridge::turn::CardOwnership`]? Routing and the Wake step need only
+/// "owned or not"; a reconcile needs the record's card id and the lifecycle
 /// distinctions below — keep a live or yielded record, drop a spent one,
 /// collect a lagged one and re-point. The two agree where it matters: the
 /// orphan branch runs only when this process holds no card identity for the

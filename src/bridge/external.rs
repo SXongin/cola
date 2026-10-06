@@ -5,7 +5,9 @@ use tracing::Instrument;
 
 use crate::backend::{MessageRole, Part, SessionTranscript, TurnAnchor};
 use crate::bridge::handles::{CardsHandle, FlowHandles, NoticeRules};
-use crate::bridge::turn::{ContinuationFacts, SettleTiming, Turn, WakeContinuation, YieldedUpdate};
+use crate::bridge::turn::{
+    CardOwnership, ContinuationFacts, SettleTiming, Turn, WakeContinuation, YieldedUpdate,
+};
 
 /// The external-message flow: watches for user messages that were NOT sent by
 /// cola (someone posted from OpenChamber or another client on the shared store)
@@ -830,8 +832,11 @@ impl ExternalFlow {
     ) {
         // A live Turn/follow/renderer owns the session: it renders (or will
         // render) whatever arrives — never double-render into a second card.
-        if Turn::chain_ownership(&handles.cards, &handles.waits, sid)
+        // The same ownership verdict's routing rule the prompt router reads
+        // (ADR-0062, ADR-0070).
+        if CardOwnership::read(&handles.cards, &handles.waits, sid)
             .await
+            .routing_label()
             .is_some()
         {
             return;

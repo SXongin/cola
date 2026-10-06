@@ -1,6 +1,7 @@
 mod disposition;
 mod flush;
 mod follow;
+mod ownership;
 mod render;
 mod settle;
 mod state;
@@ -9,6 +10,11 @@ mod state;
 /// identity chain stay private to the Turn module: every read/write goes
 /// through the interface above (spec #298, A3).
 pub(crate) use state::CardSession;
+
+/// The one card ownership verdict (ADR-0070, spec #545): computed by one read
+/// over the waits state and the card map; the prompt router and the Wake gate
+/// read its routing rule. Its module docs state the sources.
+pub(crate) use ownership::CardOwnership;
 
 /// The one ending vocabulary (spec #538): the table every path that ends a
 /// card reads — the in-Turn paths through `StreamAccumulator::apply_ending`,
@@ -28,7 +34,7 @@ use crate::backend::{MessageId, MessageRole, SessionTranscript, TurnAnchor, Turn
 use crate::bridge::chain::ChainRecord;
 use crate::bridge::handler::image_inputs;
 use crate::bridge::handles::{
-    CardsHandle, FlowHandles, NoticeRules, RequestsHandle, SessionsHandle, TurnHandles, WaitsHandle,
+    CardsHandle, FlowHandles, NoticeRules, RequestsHandle, SessionsHandle, TurnHandles,
 };
 use crate::bridge::span;
 use crate::bridge::turn::state::StreamAccumulator;
@@ -3003,30 +3009,6 @@ pub(crate) enum WakeContinuation {
     Fresh { anchor: TurnAnchor },
 }
 
-/// Who owns a Session's live card chain (ADR-0062) — the routing key that
-/// decides Supplement vs new Turn, and the Wake step's double-render guard.
-/// The variant is also the verdict's name in the routing log, so the label
-/// cannot drift from the predicate that produced it.
-#[derive(Clone, Copy)]
-pub(crate) enum ChainOwnership {
-    /// The inflight guard a Turn holds, or its out-of-turn follow inherited
-    /// for its whole window.
-    Guard,
-    /// A card chain a live renderer owns.
-    CardChain,
-}
-
-impl ChainOwnership {
-    /// The verdict's name in the prompt router's INFO line: the two owned
-    /// verdicts read apart, so an incident log names which one held.
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::Guard => "guard",
-            Self::CardChain => "card-chain",
-        }
-    }
-}
-
 /// The opening 承接 line of a Wake continuation card (ADR-0059): the timeline
 /// key the line takes — just before the work the continuation renders — and
 /// the Wake whose completion the line already announces, with its own server
@@ -3216,8 +3198,9 @@ impl Turn {
     /// renderer. A finalized card and a Waiting card are NOT owned: a Wake
     /// continues either chain (ADR-0059), and the Wake step must not be
     /// blocked by them nor split a card someone else is streaming into. The
-    /// card-chain half of [`Self::chain_ownership`]; call that for the full
-    /// ownership verdict (the guard included).
+    /// card-chain half of the ownership question; [`CardOwnership`] is the
+    /// full verdict (the guard and the pending claim included) — call it
+    /// where a fresh read is wanted.
     pub(crate) async fn card_is_owned(cards: &CardsHandle, session_id: &str) -> bool {
         cards
             .cards
@@ -3225,27 +3208,6 @@ impl Turn {
             .await
             .get(session_id)
             .is_some_and(|card| card.acc.card_state.is_render_owned())
-    }
-
-    /// Who owns `session_id`'s live card chain, if anyone (ADR-0062): the
-    /// inflight guard a Turn holds — inherited by its out-of-turn follow for
-    /// its whole window — or a card chain a live renderer owns (the busy-adopt
-    /// snapshot follow's external render, a Wake continuation). The ONE
-    /// predicate the prompt router and the Wake step both read, so the two can
-    /// never disagree about whether a session is already being rendered.
-    /// `None` — no owned chain — means a Supplement would have no card to
-    /// split (#428) and a new Turn is the only safe route.
-    pub(crate) async fn chain_ownership(
-        cards: &CardsHandle,
-        waits: &WaitsHandle,
-        session_id: &str,
-    ) -> Option<ChainOwnership> {
-        if waits.inflight.lock().await.contains(session_id) {
-            return Some(ChainOwnership::Guard);
-        }
-        Self::card_is_owned(cards, session_id)
-            .await
-            .then_some(ChainOwnership::CardChain)
     }
 
     /// Whether `session_id`'s card yielded to live Background Tasks
