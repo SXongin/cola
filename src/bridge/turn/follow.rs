@@ -128,19 +128,21 @@ async fn ownership(
 /// The follow's loop: the shared settle loop under the accumulator's anchor
 /// (or, before the submitted message lands, under the unreceived watch's
 /// chain identity — ADR-0062), then the ending disposition applied through the
-/// one shared application and the Turn announced. The notice is sent for every
-/// ending (its own classification declines one that is not a true end, so a
-/// waiting yield and an Unreceived card stay silent) and carries the copy of
-/// the disposition the loop applied (#394).
+/// one shared, ownership-checked application (`Ownership::apply_if_held`) and
+/// the Turn announced. The notice is sent for every ending (its own
+/// classification declines one that is not a true end, so a waiting yield and
+/// an Unreceived card stay silent) and carries the copy of the disposition the
+/// loop applied (#394).
 ///
 /// The loop owns the Session's guard for the whole run and hands it back as
 /// soon as the loop ends — BEFORE the ending is applied. A message arriving at
 /// the end boundary must be a normal new Turn (the waiting window is exactly
 /// that state), never a Supplement racing a card that is about to be
-/// finalized. By then the run is over, so nothing is lost: the loop stamps
-/// only a chain it still owns — a new Turn that slipped into the released
-/// moment replaced the accumulator, and stamping its live card with the old
-/// ending would be a lie.
+/// finalized. By then the run is over, so nothing is lost: the ownership
+/// re-check and the stamp share ONE cards lock, so the loop stamps only a
+/// chain it still owns — a new Turn that slipped into the released moment
+/// replaced the accumulator, and stamping its live card with the old ending
+/// would be a lie.
 async fn run(handles: TurnHandles, facts: FollowFacts, timing: SettleTiming) {
     let Some(owns) = ownership(&handles, &facts, timing).await else {
         // The card vanished between the hand-off and this loop (or never
@@ -163,10 +165,13 @@ async fn run(handles: TurnHandles, facts: FollowFacts, timing: SettleTiming) {
     let Some(disposition) = disposition else {
         return;
     };
-    if !owns.held(&flow.cards, &session_id).await {
+    // The ownership re-check and the stamp share ONE cards lock (#539): the
+    // guard is already released, so a new Turn may have replaced the card —
+    // and its live card must never inherit this loop's ending. False means the
+    // card is gone or replaced: stamp nothing and stay silent.
+    if !owns.apply_if_held(&flow.cards, &session_id, &disposition).await {
         return;
     }
-    super::Turn::apply_disposition(&flow.cards, &session_id, &disposition).await;
     super::send_completion_notice(
         &handles.cards,
         &handles.platform,

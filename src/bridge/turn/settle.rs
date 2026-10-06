@@ -21,9 +21,10 @@
 //!   from a new Turn's;
 //! - **what an ending means**: the follow announces the Turn's true end with a
 //!   Completion Notice, while a Wake continuation is itself the notification.
-//!   The loop therefore only decides a [`Disposition`] and applies it through
-//!   the one disposition application ([`Turn::apply_disposition`]) — its
-//!   callers add their own announcement.
+//!   The loop therefore only decides a [`Disposition`]; its callers apply it
+//!   through [`Ownership::apply_if_held`] — the shared ending application with
+//!   the ownership re-check and the stamp under ONE lock (#539) — and add
+//!   their own announcement.
 //!
 //! Everything else — the reads, the contact bookkeeping, the panel grace, the
 //! unreceived watch's waiting hint and the settle decision — lives here once,
@@ -33,7 +34,7 @@ use crate::backend::TurnAnchor;
 use crate::bridge::handles::{CardsHandle, FlowHandles};
 use crate::opencode::types::SessionStatus;
 
-use super::{SettleTiming, Turn, disposition::Disposition};
+use super::{SettleTiming, Turn, disposition::Disposition, state};
 
 /// What the loop watches to know it still owns the card. The variant is also
 /// the loop's identity: each carries its own label, so a caller cannot pair
@@ -62,20 +63,57 @@ pub(super) enum Ownership {
 }
 
 impl Ownership {
-    /// Whether the loop still owns the card. `pub(super)` for the follow's
-    /// exit: after it hands the guard back, it must not stamp a card a new
-    /// Turn has taken over in the released moment. The probe stays here (the
-    /// one place the ownership predicate is spelled) rather than being
-    /// duplicated in `follow.rs`.
-    pub(super) async fn held(&self, cards: &CardsHandle, session_id: &str) -> bool {
+    /// Whether the loop still owns the card: the lock + lookup wrapper around
+    /// [`Self::held_on`] — the one place the ownership predicate is spelled
+    /// (`follow.rs` and the Wake loop both apply through it rather than a
+    /// second copy). A missing card is not owned.
+    async fn held(&self, cards: &CardsHandle, session_id: &str) -> bool {
+        let live = cards.cards.lock().await;
+        live.get(session_id).is_some_and(|card| self.held_on(card))
+    }
+
+    /// The ownership predicate over an ALREADY-LOCKED card: the accumulator's
+    /// Turn anchor is unchanged (a new Turn, or an external renderer arming
+    /// over it, replaces the session's card), or — for the chain variants —
+    /// the card's chain identity is unchanged (see the module docs). Lock-free
+    /// so a check and the write it authorizes can share ONE `cards` lock
+    /// (#539), which is what [`Self::apply_if_held`] does.
+    fn held_on(&self, card: &state::CardSession) -> bool {
         match self {
-            Self::TurnAnchor(anchor) => {
-                Turn::armed_turn_anchor(cards, session_id).await.as_ref() == Some(anchor)
-            }
-            Self::Chain { chain, .. } | Self::Unlanded { chain, .. } => {
-                Turn::chain_id(cards, session_id).await == Some(*chain)
-            }
+            Self::TurnAnchor(anchor) => card.acc.turn_anchor.as_ref() == Some(anchor),
+            Self::Chain { chain, .. } | Self::Unlanded { chain, .. } => card.chain_id() == *chain,
         }
+    }
+
+    /// Apply the ending `disposition` to `session_id`'s card only while the
+    /// loop still owns it — the check and the stamp under ONE `cards` lock
+    /// (#539). The callers run after the Session's guard was released, so a
+    /// new Turn may replace the card at any moment; a separate re-check would
+    /// let the old ending land on the successor's live card in the gap.
+    /// Returns whether it applied (false: the card was replaced or vanished —
+    /// nothing is touched, and the caller must not announce an ending).
+    pub(super) async fn apply_if_held(
+        &self,
+        cards: &CardsHandle,
+        session_id: &str,
+        disposition: &Disposition,
+    ) -> bool {
+        let stamped = {
+            let mut live = cards.cards.lock().await;
+            match live.get_mut(session_id) {
+                Some(card) if self.held_on(card) => {
+                    card.acc.apply_ending(disposition);
+                    true
+                }
+                _ => false,
+            }
+        };
+        if !stamped {
+            return false;
+        }
+        Turn::refresh_work_context(cards, session_id).await;
+        Turn::flush_card(cards, session_id).await;
+        true
     }
 
     /// The Turn anchor the settle decision reads; `None` for the unreceived
@@ -146,9 +184,9 @@ async fn render_once(flow: &FlowHandles, session_id: &str, read_timeout_ms: u64,
 /// Run one out-of-turn settle loop until it no longer owns the card or reaches
 /// an ending. `None` means it stopped without an ending: its card was replaced,
 /// or the accumulator vanished. Otherwise the returned [`Disposition`] is the
-/// one ending the caller applies through [`Turn::apply_disposition`]. `owns`
-/// carries the loop's name (its variant), which labels the bounded calls and
-/// log lines.
+/// one ending the caller applies through [`Ownership::apply_if_held`], which
+/// re-checks ownership atomically with the stamp (#539). `owns` carries the
+/// loop's name (its variant), which labels the bounded calls and log lines.
 pub(super) async fn run(
     flow: &FlowHandles,
     session_id: &str,
@@ -317,5 +355,137 @@ pub(super) async fn run(
             // (ADR-0062) and the true end — ends the loop here.
             disposition => return finish(disposition, session_id, label),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bridge::test_support::{
+        MockBackend, build_app, realistic_parts, test_config, test_work_dir, turn_anchor,
+    };
+    use crate::feishu::card::CardState;
+
+    /// The card's recorded failure line, read under the cards lock.
+    async fn card_error(cards: &CardsHandle, session_id: &str) -> Option<String> {
+        cards
+            .cards
+            .lock()
+            .await
+            .get(session_id)
+            .and_then(|card| card.acc.error.clone())
+    }
+
+    /// Seed a recorded failure on the live card, so an ending that clears it
+    /// (Stopped) is visible as a change.
+    async fn set_card_error(cards: &CardsHandle, session_id: &str, error: &str) {
+        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
+            card.acc.error = Some(error.to_string());
+        }
+    }
+
+    /// #539: the ownership re-check and the ending stamp share ONE cards lock
+    /// ([`Ownership::apply_if_held`]), so the released moment between the
+    /// settle loop and the stamp cannot hand a successor's live card the old
+    /// ending. A stale anchor applies nothing (state and failure untouched,
+    /// false); the matching anchor applies (true).
+    #[tokio::test]
+    async fn apply_if_held_stamps_only_the_anchor_it_still_owns() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        let cards = app.cards_handle();
+
+        let live = turn_anchor(1);
+        let successor = turn_anchor(2);
+        let owns = Ownership::TurnAnchor(live.clone());
+
+        // The ending the loop decided is applied to the card it watched.
+        Turn::seed_card(&cards, "ses_test", Some("om_live")).await;
+        Turn::set_turn_anchor(&cards, "ses_test", &live).await;
+        assert!(
+            owns.apply_if_held(&cards, "ses_test", &Disposition::Failed("loop failure".into()))
+                .await,
+            "the matching anchor applies"
+        );
+        assert_eq!(Turn::card_state(&cards, "ses_test").await, Some(CardState::Error));
+        assert_eq!(
+            card_error(&cards, "ses_test").await.as_deref(),
+            Some("loop failure")
+        );
+
+        // A new Turn replaced the card — and armed its own anchor — while the
+        // released moment ran. The stale ending must not clear the successor's
+        // recorded failure (Stopped would) nor touch its state.
+        Turn::seed_card(&cards, "ses_test", Some("om_successor")).await;
+        Turn::set_turn_anchor(&cards, "ses_test", &successor).await;
+        Turn::set_card_state(&cards, "ses_test", CardState::Streaming).await;
+        set_card_error(&cards, "ses_test", "successor failure").await;
+        assert!(
+            !owns
+                .apply_if_held(&cards, "ses_test", &Disposition::Stopped)
+                .await,
+            "a stale anchor applies nothing"
+        );
+        assert_eq!(
+            Turn::card_state(&cards, "ses_test").await,
+            Some(CardState::Streaming),
+            "the successor's state is untouched"
+        );
+        assert_eq!(
+            card_error(&cards, "ses_test").await.as_deref(),
+            Some("successor failure"),
+            "the successor's recorded failure is untouched"
+        );
+    }
+
+    /// The chain-identity arm of the same predicate (ADR-0059): a Wake
+    /// continuation — and the unreceived watch sharing the variant — applies
+    /// its ending only while the card's chain id is unchanged. A replacement
+    /// session carries a NEW chain id, so the stale loop stamps nothing; a
+    /// vanished card is ownership lost too, and the matching chain applies.
+    #[tokio::test]
+    async fn apply_if_held_stamps_only_the_chain_it_still_owns() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        let cards = app.cards_handle();
+
+        Turn::seed_card(&cards, "ses_test", Some("om_live")).await;
+        let chain = Turn::chain_id(&cards, "ses_test").await.expect("seeded card");
+        let owns = Ownership::Chain {
+            chain,
+            anchor: turn_anchor(3),
+        };
+        assert!(
+            owns.apply_if_held(&cards, "ses_test", &Disposition::Done).await,
+            "the matching chain applies"
+        );
+        assert_eq!(Turn::card_state(&cards, "ses_test").await, Some(CardState::Done));
+
+        // A replacement card carries a fresh chain id: the stale loop's ending
+        // must not stamp it.
+        Turn::seed_card(&cards, "ses_test", Some("om_successor")).await;
+        Turn::set_card_state(&cards, "ses_test", CardState::Streaming).await;
+        assert!(
+            !owns
+                .apply_if_held(&cards, "ses_test", &Disposition::Stopped)
+                .await,
+            "a stale chain applies nothing"
+        );
+        assert_eq!(
+            Turn::card_state(&cards, "ses_test").await,
+            Some(CardState::Streaming),
+            "the replacement's state is untouched"
+        );
+
+        // The card vanishing is ownership lost as well.
+        Turn::drop_card(&cards, "ses_test").await;
+        assert!(
+            !owns.apply_if_held(&cards, "ses_test", &Disposition::Done).await,
+            "a vanished card applies nothing"
+        );
     }
 }
