@@ -3037,11 +3037,16 @@ impl Turn {
         acc.stage_cursor(None, built.cursor.clone());
         let mut session = state::CardSession::new(acc, None);
         session.fallback_chat = fallback_chat.map(str::to_string);
+        // The caller re-checks this identity after its awaited create: a fresh
+        // Turn that replaced the armed session meanwhile owns the chain (spec
+        // #561, review #569).
+        let chain_id = session.chain_id();
         live.insert(session_id.to_string(), session);
         Some(ProjectedCard {
             card: built.card,
             rendered,
             resolved_calls,
+            chain_id,
         })
     }
 
@@ -3147,6 +3152,11 @@ pub(crate) struct ProjectedCard {
     /// resolved it, so the collected old card drops the running `⏳` panels
     /// (ADR-0068's generalized collect).
     pub(crate) resolved_calls: bool,
+    /// The armed [`state::CardSession::chain_id`] — the identity the caller
+    /// re-checks after its awaited create: a fresh Turn that replaced the
+    /// armed session meanwhile owns the chain, so the projection must leave
+    /// the session and the record alone (spec #561, review #569).
+    pub(crate) chain_id: u64,
 }
 
 /// The destination and identity a Wake continuation card is armed with:
@@ -3471,6 +3481,21 @@ impl Turn {
         {
             live.remove(session_id);
         }
+    }
+
+    /// Whether the session's card is still the exact session an arm inserted
+    /// and nothing has attached a card to it since (spec #561, review #569).
+    /// A projection's create is awaited, and a fresh Turn can replace the
+    /// armed session in that window: the projection then owns nothing — it
+    /// must not attach its late card to the Turn's session, re-point the
+    /// record, or confirm a cursor there.
+    pub(crate) async fn still_armed(cards: &CardsHandle, session_id: &str, chain_id: u64) -> bool {
+        cards
+            .cards
+            .lock()
+            .await
+            .get(session_id)
+            .is_some_and(|card| card.chain_id() == chain_id && card.card_message_id.is_none())
     }
 }
 

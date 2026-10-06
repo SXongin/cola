@@ -5271,3 +5271,340 @@ async fn a_message_before_the_adoption_shows_the_orphans_tail_once() {
     );
     wait_for_record_gone(&app, "ses_test").await;
 }
+
+// ---------------------------------------------------------------------------
+// The in-flight-create window (spec #561, Codex review on PR #569): the create
+// itself is awaited, so a fresh Turn can win the race AFTER the projection
+// armed its successor. The projection must then leave the Turn's chain alone —
+// never attach its late card to that session, never re-point the record — and
+// collect the late card so it cannot look live.
+// ---------------------------------------------------------------------------
+
+/// A user message starting a fresh Turn while the projection's create is in
+/// flight: the Turn owns the card and the record when the create returns. The
+/// projection's late card is collected as taken over and gets nothing else;
+/// the Turn's card keeps the chain — the orphan's tail once, then the new
+/// answer — and the record still names the Turn's own message.
+#[tokio::test]
+async fn a_turn_winning_the_create_window_keeps_the_chain_and_its_late_card_is_collected() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let orphan_anchor = 1_000_000;
+    let new_anchor = 2_000_000;
+    let delivered = "已经写了一半。";
+    let missed = "停机前没送达的尾巴。";
+    let full = format!("{delivered}{missed}");
+    // The orphan record confirmed the frontier inside its in-flight answer,
+    // plus its still-running call (the Rendered Cursor, spec #561).
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(orphan_anchor),
+        Some("/work"),
+        Some(CursorFrontier {
+            message_id: MessageId::new("msg_a_orphan"),
+            part_index: 0,
+            kind: CursorPartKind::Text,
+            started_at: Some(orphan_anchor + 500),
+            delivered_chars: delivered.chars().count(),
+        }),
+        &["call_sleep"],
+    );
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_transcript(
+        "ses_test",
+        vec![race_transcript(
+            orphan_anchor,
+            &full,
+            ToolStatus::Running,
+            "",
+            new_anchor,
+            None,
+        )],
+    );
+    backend.with_session_status("ses_test", Some(SessionStatus::Busy));
+    // The new Turn's prompt is held: the takeover and its render window are
+    // observable before the new run answers.
+    let prompt_gate = backend.hold_prompts();
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(
+        App::new(test_config(&session_file), backend.clone(), platform.clone()).expect("the race app builds"),
+    );
+    seed_session(&app, "ses_test", "/work").await;
+    app.turn_render_poll_ms
+        .store(5, std::sync::atomic::Ordering::Relaxed);
+    app.turn_drain_timeout_ms
+        .store(60_000, std::sync::atomic::Ordering::Relaxed);
+    app.turn_follow_read_timeout_ms
+        .store(200, std::sync::atomic::Ordering::Relaxed);
+    platform.given_card_view("om_frozen", orphan_running_card_view());
+
+    // The projection arms its successor and parks inside the awaited create.
+    // The scripted id is the late card's own identity — the mock's default
+    // `msg_reply` is the Turn's card, and the two must be tellable apart.
+    let (create_entered, create_release) = platform.pause("reply", "msg_cola_anchor");
+    platform.given_reply_id("om_late_adoption");
+    spawn_sync_with_timeout(&app, 5_000);
+    create_entered.notified().await;
+
+    // The message wins the create window: the fresh Turn takes the chain over
+    // while the projection's create is still in flight.
+    let mut context = ctx("ses_test", "新问题");
+    context.cola_message_id = Some("msg_cola_new".into());
+    let turn = spawn_turn(&app, context);
+    wait_for_card_text(&platform, missed).await;
+    wait_for_record_card(&app, "ses_test", "msg_reply").await;
+
+    // Release the create: the projection resumes onto a session it no longer
+    // owns. Its late card is collected as taken over — its only write — and it
+    // never touches the Turn's session or the record.
+    create_release.notify_one();
+    wait_for_update(
+        &platform,
+        "om_late_adoption",
+        "the late adoption's collect",
+        |card| card_header(card).contains("已由新卡片接管"),
+    )
+    .await;
+    let late = patches_to(&platform, "om_late_adoption").await;
+    assert_eq!(
+        late.len(),
+        1,
+        "the late card gets its collect and nothing else: {late:?}"
+    );
+
+    let record = app
+        .cards_handle()
+        .chains
+        .get("ses_test")
+        .expect("the Turn's record survives the late projection");
+    assert_eq!(
+        record.card_message_id, "msg_reply",
+        "the late projection never re-points the chain at its own card"
+    );
+    assert_eq!(
+        record.message_id.as_str(),
+        "msg_cola_new",
+        "the record still names the Turn's own message"
+    );
+    let turn_patches = patches_to(&platform, "msg_reply").await;
+    assert!(
+        turn_patches.iter().any(|card| card_text(card).contains(missed)),
+        "the Turn's card still carries the chain's content: {turn_patches:?}"
+    );
+    assert!(
+        !turn_patches
+            .iter()
+            .any(|card| card_header(card).contains("已由新卡片接管")),
+        "the Turn's card is never collected by the late projection: {turn_patches:?}"
+    );
+    assert_eq!(
+        card_posts(&platform).await,
+        2,
+        "the Turn's card and the late adoption's card were created: {:?}",
+        platform.calls.lock().await
+    );
+
+    // The run ends: the Turn's card still shows the orphan's tail exactly once
+    // and then the new answer — nothing was eaten or duplicated.
+    backend
+        .given_transcript_after_build(
+            "ses_test",
+            vec![race_transcript(
+                orphan_anchor,
+                &full,
+                ToolStatus::Completed,
+                "slept",
+                new_anchor,
+                Some("新回答"),
+            )],
+        )
+        .await;
+    backend
+        .set_session_status("ses_test", Some(SessionStatus::Idle))
+        .await;
+    prompt_gate.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), turn)
+        .await
+        .expect("the turn must end")
+        .unwrap()
+        .unwrap();
+    wait_for_card_header(&platform, "✅").await;
+    let final_text = card_text(platform.updated_cards().await.last().unwrap());
+    assert_eq!(
+        final_text.matches(missed).count(),
+        1,
+        "the tail stays exactly once at settle: {final_text}"
+    );
+    assert!(
+        !final_text.contains(delivered),
+        "the delivered prefix stays out: {final_text}"
+    );
+    assert!(
+        final_text.contains("新回答"),
+        "the new Turn's own answer follows the tail: {final_text}"
+    );
+    wait_for_record_gone(&app, "ses_test").await;
+}
+
+/// The ended-while-down twin of the create window: the projection's successor
+/// already wears the transcript's true ending, and a fresh Turn starting while
+/// its create is in flight must still keep the chain — the late terminal card
+/// is collected like any other, never attached to the Turn's session and never
+/// re-pointed into the record.
+#[tokio::test]
+async fn a_turn_winning_the_create_window_keeps_the_chain_when_the_run_ended_while_down() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let orphan_anchor = 1_000_000;
+    let new_anchor = 2_000_000;
+    let delivered = "已经写了一半。";
+    let missed = "停机期间写完的尾巴。";
+    let full = format!("{delivered}{missed}");
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(orphan_anchor),
+        Some("/work"),
+        Some(CursorFrontier {
+            message_id: MessageId::new("msg_a_orphan"),
+            part_index: 0,
+            kind: CursorPartKind::Text,
+            started_at: Some(orphan_anchor + 500),
+            delivered_chars: delivered.chars().count(),
+        }),
+        &[],
+    );
+    // The run ENDED while cola was down: its answer is completed, the session
+    // idles — the ended projection's decision. `answer` appends the fresh
+    // Turn's own reply once its prompt is released.
+    let transcript = |answer: Option<&str>| {
+        let mut messages = vec![
+            user("msg_cola_anchor", orphan_anchor, "问题"),
+            TranscriptMessage {
+                id: MessageId::new("msg_a_orphan"),
+                role: MessageRole::Assistant,
+                time: Some(MessageTime {
+                    created: orphan_anchor + 500,
+                    completed: Some(orphan_anchor + 3_000),
+                }),
+                model: None,
+                tokens: None,
+                error: None,
+                parts: vec![Part::Text(TextPart {
+                    text: full.clone(),
+                    started_at: Some(orphan_anchor + 500),
+                })],
+            },
+            user("msg_cola_new", new_anchor, "新问题"),
+        ];
+        if let Some(answer) = answer {
+            messages.push(assistant(new_anchor + 1_000, answer));
+        }
+        SessionTranscript::new(messages).with_executions(vec![execution(orphan_anchor + 2_500)])
+    };
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_transcript("ses_test", vec![transcript(None)]);
+    backend.with_session_status("ses_test", Some(SessionStatus::Idle));
+    // The new Turn's prompt is held: its takeover is observable before the
+    // fresh run answers.
+    let prompt_gate = backend.hold_prompts();
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(
+        App::new(test_config(&session_file), backend.clone(), platform.clone()).expect("the race app builds"),
+    );
+    seed_session(&app, "ses_test", "/work").await;
+    app.turn_render_poll_ms
+        .store(5, std::sync::atomic::Ordering::Relaxed);
+    app.turn_drain_timeout_ms
+        .store(60_000, std::sync::atomic::Ordering::Relaxed);
+    app.turn_follow_read_timeout_ms
+        .store(200, std::sync::atomic::Ordering::Relaxed);
+    platform.given_card_view("om_frozen", realistic_card_view());
+
+    // The projection arms its terminal successor and parks inside the awaited
+    // create; the scripted id is the late card's own identity.
+    let (create_entered, create_release) = platform.pause("reply", "msg_cola_anchor");
+    platform.given_reply_id("om_late_adoption");
+    spawn_sync_with_timeout(&app, 5_000);
+    create_entered.notified().await;
+
+    // The message wins the create window.
+    let mut context = ctx("ses_test", "新问题");
+    context.cola_message_id = Some("msg_cola_new".into());
+    let turn = spawn_turn(&app, context);
+    wait_for_card_text(&platform, missed).await;
+    wait_for_record_card(&app, "ses_test", "msg_reply").await;
+
+    // Release the create: the late terminal card is collected, never attached
+    // to the Turn's session nor re-pointed into the record.
+    create_release.notify_one();
+    wait_for_update(
+        &platform,
+        "om_late_adoption",
+        "the late terminal successor's collect",
+        |card| card_header(card).contains("已由新卡片接管"),
+    )
+    .await;
+    let late = patches_to(&platform, "om_late_adoption").await;
+    assert_eq!(
+        late.len(),
+        1,
+        "the late card gets its collect and nothing else: {late:?}"
+    );
+    let record = app
+        .cards_handle()
+        .chains
+        .get("ses_test")
+        .expect("the Turn's record survives the late projection");
+    assert_eq!(
+        record.card_message_id, "msg_reply",
+        "the late projection never re-points the chain at its own card"
+    );
+    assert_eq!(
+        record.message_id.as_str(),
+        "msg_cola_new",
+        "the record still names the Turn's own message"
+    );
+    let turn_patches = patches_to(&platform, "msg_reply").await;
+    assert!(
+        !turn_patches
+            .iter()
+            .any(|card| card_header(card).contains("已由新卡片接管")),
+        "the Turn's card is never collected by the late projection: {turn_patches:?}"
+    );
+
+    // The fresh run answers and settles on its own card: the tail once, then
+    // the new answer — nothing was eaten or duplicated.
+    backend
+        .given_transcript_after_build("ses_test", vec![transcript(Some("新回答"))])
+        .await;
+    prompt_gate.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), turn)
+        .await
+        .expect("the turn must end")
+        .unwrap()
+        .unwrap();
+    wait_for_card_header(&platform, "✅").await;
+    let final_text = card_text(platform.updated_cards().await.last().unwrap());
+    assert_eq!(
+        final_text.matches(missed).count(),
+        1,
+        "the tail stays exactly once at settle: {final_text}"
+    );
+    assert!(
+        !final_text.contains(delivered),
+        "the delivered prefix stays out: {final_text}"
+    );
+    assert!(
+        final_text.contains("新回答"),
+        "the new Turn's own answer follows the tail: {final_text}"
+    );
+    wait_for_record_gone(&app, "ses_test").await;
+}

@@ -574,9 +574,14 @@ async fn project_card(
     };
     if !projected.rendered {
         // The cursor covered the whole read — nothing was missed. Drop the
-        // armed successor and take today's in-place ending.
-        Turn::drop_armed_card(&handles.cards, session_id, &anchor).await;
-        settle_card(handles, session_id, record, reads.route, settle, read_timeout_ms).await;
+        // armed successor and take today's in-place ending — unless a fresh
+        // Turn replaced the armed session meanwhile: it owns the record now,
+        // and this pass must neither settle its card nor drop its session
+        // (review #569).
+        if Turn::still_armed(&handles.cards, session_id, projected.chain_id).await {
+            Turn::drop_armed_card(&handles.cards, session_id, &anchor).await;
+            settle_card(handles, session_id, record, reads.route, settle, read_timeout_ms).await;
+        }
         return;
     }
     let delivered = match &target {
@@ -596,11 +601,27 @@ async fn project_card(
                 "live-card reap: session {session_id} could not project its missed tail onto a successor: {e}"
             );
             // The send reached no card; the record keeps the old cursor and
-            // the next pass retries.
-            Turn::drop_armed_card(&handles.cards, session_id, &anchor).await;
+            // the next pass retries. Only the armed session this pass inserted
+            // may be dropped: a chain that replaced it meanwhile owns itself
+            // (review #569).
+            if Turn::still_armed(&handles.cards, session_id, projected.chain_id).await {
+                Turn::drop_armed_card(&handles.cards, session_id, &anchor).await;
+            }
             return;
         }
     };
+    // A fresh Turn can start after the arm but before the awaited create
+    // returns (review #569): it replaced the armed session and re-pointed the
+    // record at its own card. The late card is collected so it cannot look
+    // live, and none of this pass's takeover writes (attach, re-point, cursor
+    // confirm, watermark drain, terminal release) may touch the Turn's chain.
+    if !Turn::still_armed(&handles.cards, session_id, projected.chain_id).await {
+        collect_orphan(&handles.cards, session_id, &new_card_id).await;
+        tracing::info!(
+            "live-card reap: session {session_id} lost the create window to a fresh Turn; its late card is collected"
+        );
+        return;
+    }
     // The successor takes the chain over: attach its identity FIRST, re-point
     // the record at it (carrying the cursor), then collect the recorded card
     // as taken over — dropping the running `⏳` panels the successor resolved
@@ -753,11 +774,29 @@ async fn project_live_card(
                 "live-card reap: session {session_id} could not adopt its live run onto a successor: {e}"
             );
             // The send reached no card; the record keeps the old cursor and
-            // the next pass retries.
-            Turn::drop_armed_card(&handles.cards, session_id, &anchor).await;
+            // the next pass retries. Only the armed session this pass inserted
+            // may be dropped: a chain that replaced it meanwhile owns itself
+            // (the anchor alone cannot tell a Wake continuation of the same
+            // Turn apart — review #569).
+            if Turn::still_armed(&handles.cards, session_id, projected.chain_id).await {
+                Turn::drop_armed_card(&handles.cards, session_id, &anchor).await;
+            }
             return None;
         }
     };
+    // A fresh Turn can start after the arm but before the awaited create
+    // returns (review #569): it replaced the armed session and re-pointed the
+    // record at its own card. The projection then owns nothing — it must not
+    // attach its late card to that Turn's session, re-point the record back,
+    // confirm a cursor or drain a watermark there. The late card is collected
+    // so it cannot look live, and no follow is spawned.
+    if !Turn::still_armed(&handles.cards, session_id, projected.chain_id).await {
+        collect_orphan(&handles.cards, session_id, &new_card_id).await;
+        tracing::info!(
+            "live-card reap: session {session_id} lost the create window to a fresh Turn; its late card is collected"
+        );
+        return None;
+    }
     // The successor takes the chain over: attach its identity FIRST, re-point
     // the record at it (carrying the cursor), then collect the recorded card
     // as taken over. Every call the cursor's live set names is resolved by the
