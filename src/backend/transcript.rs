@@ -163,11 +163,11 @@ impl SessionTranscript {
     }
 
     /// The tool call `call_id`, joined over the WHOLE read — not the Turn
-    /// window, because a caller that owns a call identity (a **Carried Tool
-    /// Panel**, ADR-0068) must still resolve its current status and output
-    /// once the message it came from has gone stale. `None` when the read
-    /// carries no such part; call ids are unique, so the first match is the
-    /// call. The one join the carry's per-read reconciliation reads.
+    /// window, because a caller that owns a call identity (the seed's live
+    /// set, spec #561) must still resolve its current status and output once
+    /// the message it came from has gone stale. `None` when the read carries
+    /// no such part; call ids are unique, so the first match is the call. The
+    /// one join the live set's per-read reconciliation reads.
     pub fn tool_call(&self, call_id: &str) -> Option<&ToolCall> {
         self.messages
             .iter()
@@ -376,11 +376,11 @@ impl SessionTranscript {
 /// being produced as the Turn began.
 ///
 /// The arms are [`TurnAnchor::may_still_belong`]'s; the wrapper adds the ONE
-/// input the two scopes read differently: a message with no server time at all
-/// cannot be placed, so it never BELONGS to the projection — while the bounded
-/// tail scan must keep going for it, because an unplaceable message is no
-/// evidence that an older one cannot belong. The `time.is_some()` guard is
-/// therefore the membership rule's alone, and it lives here, once.
+/// input the two readings take differently: a message with no server time
+/// cannot be placed, so it never BELONGS to a projection — while it is no
+/// evidence about older messages either, so `may_still_belong` answers `true`
+/// for it. The `time.is_some()` guard is therefore the membership rule's
+/// alone, and it lives here, once.
 fn belongs_to_turn(message: &TranscriptMessage, anchor: &TurnAnchor) -> bool {
     message.time.is_some() && anchor.may_still_belong(message)
 }
@@ -443,8 +443,8 @@ impl TranscriptMessage {
     /// The newest server activity this message reports: its creation time and
     /// the latest part start it carries. The neutral read carries no part end
     /// time, so a part contributes its start only; boundary kinds contribute
-    /// nothing. `pub` for the tail read's boundary test (ADR-0068), which must
-    /// read exactly the rule the membership check uses.
+    /// nothing. `pub` for the membership tests, which must read exactly the
+    /// rule [`TurnAnchor::may_still_belong`] applies.
     pub fn newest_activity_ms(&self, created: i64) -> i64 {
         self.parts
             .iter()
@@ -557,27 +557,22 @@ impl TurnAnchor {
     /// The oldest server activity an UNFINISHED message (no completion stamp)
     /// may carry and still belong to this Turn's projection (see
     /// [`TurnAnchor::may_still_belong`]): the anchor minus the in-flight
-    /// window. A completed message is measured against `created_ms` alone, so
-    /// the tail scan's unfinished arm reads this line while its completed arm
-    /// reads the anchor itself. One derivation, so the scan's stop rule and
-    /// the membership rule cannot drift.
+    /// window. A completed message is measured against `created_ms` alone.
     pub fn in_flight_boundary_ms(&self) -> i64 {
         self.created_ms.saturating_sub(IN_FLIGHT_STALE_AFTER_MS)
     }
 
-    /// Whether `message` may STILL belong to this Turn's projection, as the
-    /// bounded tail scan asks it of a page's oldest message: the membership
-    /// rule's arms and nothing else — a message created at/after the anchor
-    /// may always belong; a completed one may when it completed at/after the
-    /// anchor; an unfinished one may while its newest activity is inside the
-    /// in-flight window ([`Self::in_flight_boundary_ms`]). The scan stops only
-    /// when this answers `false`.
+    /// Whether `message` may STILL belong to this Turn's projection: the
+    /// membership rule's arms and nothing else — a message created at/after
+    /// the anchor may always belong; a completed one may when it completed
+    /// at/after the anchor; an unfinished one may while its newest activity is
+    /// inside the in-flight window ([`Self::in_flight_boundary_ms`]).
     ///
     /// Deliberately DISTINCT from [`belongs_to_turn`], which the projection
     /// uses, on the one input they read differently: a message with no server
-    /// time cannot be placed, so it never belongs — but it is no evidence of
-    /// an older Turn either, so the scan may not stop on it and this answers
-    /// `true`. [`belongs_to_turn`] owns the `time.is_some()` guard.
+    /// time cannot be placed, so it never belongs there — but it is no
+    /// evidence about older messages either, so this answers `true` for it.
+    /// [`belongs_to_turn`] owns the `time.is_some()` guard.
     pub fn may_still_belong(&self, message: &TranscriptMessage) -> bool {
         let Some(time) = message.time else { return true };
         if time.created >= self.created_ms {
@@ -588,22 +583,6 @@ impl TurnAnchor {
             None => message.newest_activity_ms(time.created) >= self.in_flight_boundary_ms(),
         }
     }
-}
-
-/// The newest end of one Session's transcript, as read by a bounded
-/// newest-first tail scan (ADR-0068): the messages from the newest end back to
-/// (and including) the page whose oldest message cannot belong to the read's
-/// [`TurnAnchor`].
-///
-/// `complete` reports whether the scan actually reached that page (or the
-/// session's start). `false` means a page cap stopped it early: the tail is a
-/// prefix of the history, NOT a complete view of the window, so a caller that
-/// needs the whole window — the restart carry — must treat it as carrying
-/// nothing rather than guessing from a partial read.
-#[derive(Debug, Clone, Default)]
-pub struct TranscriptTail {
-    pub transcript: SessionTranscript,
-    pub complete: bool,
 }
 
 /// One Turn as read from a transcript: the assistant messages that belong to

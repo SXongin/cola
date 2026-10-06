@@ -21,7 +21,7 @@ mod tests;
 
 use async_trait::async_trait;
 
-use crate::backend::{SessionTranscript, TaskRuntime, TranscriptTail, TurnAnchor};
+use crate::backend::{SessionTranscript, TaskRuntime};
 use crate::error::Result;
 
 use super::strategy::GenerationStrategy;
@@ -302,23 +302,6 @@ impl GenerationStrategy for V1Strategy {
             .error_for_status()?;
         let body: serde_json::Value = resp.json().await?;
         wire::decode_response(&body)
-    }
-
-    /// V1's message read has no wire pagination: one request decoding the whole
-    /// message array — the same read class its render polls perform every tick
-    /// — so the tail read is that read, reported complete, and the anchor is
-    /// ignored (the unpaginated read already covers every message there is).
-    /// The caller's own timeout bounds it (ADR-0068).
-    async fn transcript_tail(
-        &self,
-        http: &Transport,
-        session_id: &str,
-        _anchor: &TurnAnchor,
-    ) -> Result<TranscriptTail> {
-        Ok(TranscriptTail {
-            transcript: self.transcript(http, session_id).await?,
-            complete: true,
-        })
     }
 
     /// V1 has no session-scoped selection: `/model`, `/think` and `/agent`

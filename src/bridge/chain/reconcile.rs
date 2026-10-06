@@ -1109,8 +1109,8 @@ enum KeepBody {
     /// to): the view's live tail goes —
     /// the Background Task Ledger element always, because the successor's own
     /// reads rebuild the live list (ADR-0060), and the running `⏳` panels
-    /// when the restart carry actually moved them onto the successor. Every
-    /// other preserved element stays.
+    /// when the takeover's seed actually resolved them onto the successor.
+    /// Every other preserved element stays.
     WithoutLiveTail { strip_running_panels: bool },
 }
 
@@ -1500,13 +1500,13 @@ mod tests {
     /// ADR-0068: the takeover collect's preserved body drops the Background
     /// Task Ledger element always — the successor's own reads rebuild the live
     /// list — and a running `⏳` panel only when `strip_running_panels` says
-    /// the restart carry moved it onto the successor. The #444 probe
+    /// the takeover's seed resolved it onto the successor. The #444 probe
     /// ("the collected card keeps a stale running marker today") is inverted
-    /// here: with the carry's answer the marker goes, without it today's
+    /// here: with the seed's answer the marker goes, without it today's
     /// preserved body stays; the reap's endings and the #443 stamp
     /// ([`KeepBody::Everything`]) keep both.
     #[test]
-    fn the_collect_drops_the_ledger_and_only_a_carried_running_panel() {
+    fn the_collect_drops_the_ledger_and_only_a_seeded_running_panel() {
         use crate::bridge::test_support::card_text;
 
         let bare = ending_card(CardState::TakenOver, None, None);

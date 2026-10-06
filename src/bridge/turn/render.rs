@@ -525,16 +525,10 @@ pub(super) fn render_turn_parts(acc: &mut StreamAccumulator, transcript: &Sessio
     // settled one joining the timeline exactly once and a running one riding
     // the live tail display-only.
     let mut rendered_any = resolve_seeded_calls(acc, transcript);
-    let Some(anchor) = acc.turn_anchor.clone() else {
-        return rendered_any;
-    };
-    // A merged Wake's completion entry is written before its work renders, so
-    // the entry sorts above the parts it announces.
-    rendered_any |= render_wake_entries(acc, transcript, &anchor);
-    // The projection seed (spec #561): resolved against THIS read, so its
-    // at-or-before-the-frontier rule uses the read's own message order.
-    let seed = acc.seed.clone();
-    let message_positions: std::collections::HashMap<&str, usize> = if seed.is_some() {
+    // The seed (spec #561) resolves against THIS read: its at-or-before-the-
+    // frontier rule uses the read's own message order. The positions map serves
+    // both walks below — the seed's own scope and the accumulator's window.
+    let message_positions: std::collections::HashMap<&str, usize> = if acc.seed.is_some() {
         transcript
             .messages
             .iter()
@@ -544,7 +538,30 @@ pub(super) fn render_turn_parts(acc: &mut StreamAccumulator, transcript: &Sessio
     } else {
         std::collections::HashMap::new()
     };
+    // The seed's own Turn window (spec #561, ticket #565): a seed carried onto
+    // a card whose Turn is a DIFFERENT one — the message-first race — walks the
+    // orphaned Turn before the accumulator's own window, so the run's final
+    // undelivered tail renders as a continuation. It runs before the anchor
+    // gate below for the same reason the live set does: while the new message
+    // is queued behind the orphan run the anchor is unobserved for as long as
+    // that run lasts.
+    let mut seeded_messages: std::collections::HashSet<MessageId> = std::collections::HashSet::new();
+    if let Some(scope) = seed_scope(acc) {
+        rendered_any |= render_seed_scope(acc, transcript, &scope, &message_positions, &mut seeded_messages);
+    }
+    let Some(anchor) = acc.turn_anchor.clone() else {
+        return rendered_any;
+    };
+    // A merged Wake's completion entry is written before its work renders, so
+    // the entry sorts above the parts it announces.
+    rendered_any |= render_wake_entries(acc, transcript, &anchor);
+    let seed = acc.seed.clone();
     for message in transcript.turn_for_user(&anchor).messages {
+        // A message the seed's own scope already walked is done: walking it
+        // again would render its frontier part's suffix twice in one pass.
+        if seeded_messages.contains(&message.id) {
+            continue;
+        }
         // An error-card retry carries the failed attempt's baseline (#387):
         // its messages stay suppressed, so the rebuilt card streams only the
         // new attempt instead of replaying the old window. Every message this
@@ -605,6 +622,69 @@ pub(super) fn render_turn_parts(acc: &mut StreamAccumulator, transcript: &Sessio
         }
     }
     rendered_any
+}
+
+/// The seed's own Turn window, when it is not the accumulator's (spec #561,
+/// ticket #565): the message-first seed carries the orphaned Turn's anchor, so
+/// its walk runs in addition to — and before — the accumulator's own window.
+/// The projection's seed has no scope (its Turn IS the accumulator's).
+fn seed_scope(acc: &StreamAccumulator) -> Option<TurnAnchor> {
+    acc.seed
+        .as_ref()
+        .and_then(|seed| seed.scope.clone())
+        .filter(|scope| acc.turn_anchor.as_ref() != Some(scope))
+}
+
+/// Render the seed's own Turn window ([`seed_scope`]) through the cursor cut:
+/// the frontier part renders its undelivered suffix, everything after it
+/// renders normally, and everything at or before it is marked delivered. Every
+/// message walked is recorded in `walked`, so the accumulator's own window
+/// below skips it and one pass renders each part exactly once. A seed with no
+/// frontier walks nothing — its live set alone resolves by identity, the
+/// cursorless fallback. Returns whether content entered the card.
+fn render_seed_scope(
+    acc: &mut StreamAccumulator,
+    transcript: &SessionTranscript,
+    scope: &TurnAnchor,
+    message_positions: &std::collections::HashMap<&str, usize>,
+    walked: &mut std::collections::HashSet<MessageId>,
+) -> bool {
+    let Some(seed) = acc.seed.clone() else {
+        return false;
+    };
+    if seed.frontier.is_none() {
+        return false;
+    }
+    let mut rendered = false;
+    for message in transcript.turn_for_user(scope).messages {
+        walked.insert(message.id.clone());
+        let Some(pos) = message_positions.get(message.id.as_str()).copied() else {
+            continue;
+        };
+        for (index, part) in message.parts.iter().enumerate() {
+            match seed.cut(pos, index) {
+                crate::bridge::turn::state::SeedCut::Delivered => acc.mark_delivered_part(part),
+                crate::bridge::turn::state::SeedCut::Frontier(delivered) => {
+                    if render_seeded_part(acc, message.id.clone(), index, part, delivered) {
+                        rendered = true;
+                    }
+                }
+                crate::bridge::turn::state::SeedCut::Undelivered => {
+                    // A seeded call this walk renders is an ordinary live panel
+                    // again: it leaves the display-only seeded set, exactly as
+                    // in the accumulator's own window.
+                    if let Part::Tool(call) = part {
+                        acc.seeded_calls.remove(&call.identity.call_id);
+                    }
+                    let source = PartSource::at(message.id.clone(), index);
+                    if render_part(acc, Some(source), part) {
+                        rendered = true;
+                    }
+                }
+            }
+        }
+    }
+    rendered
 }
 
 /// Render the frontier part of a projection seed (spec #561, ticket #563):
@@ -1647,17 +1727,17 @@ Index: /x/src/main.rs
         ));
     }
 
-    // --- The restart carry (ADR-0068) ---------------------------------------
+    // --- The takeover seed's live set (spec #561; ADR-0068's successor) -----
     //
     // A tool that settled while cola was down is deliberately out of scope
     // here: the faithful no-duplicate/no-omission restore of missed content is
-    // #505's question, not a tail carry's (ADR-0068's scope decision).
+    // the cursor's projection (tickets #563/#564), not a live-set fallback's.
 
-    /// Regression for the restart carry (ADR-0068): a running call inside the
-    /// in-flight window already renders onto the successor through the ordinary
-    /// transcript render — no carry needed — and its completion settles it into
-    /// the timeline exactly once. The probe that pinned this behavior becomes
-    /// the regression the carry must not break.
+    /// Regression for the in-flight window: a running call inside it already
+    /// renders onto the successor through the ordinary transcript render — no
+    /// seed needed — and its completion settles it into the timeline exactly
+    /// once. The probe that pinned this behavior becomes the regression the
+    /// live set must not break.
     #[test]
     fn a_recent_inflight_tool_already_renders_on_the_successor() {
         let anchor = 2_000_000;
@@ -1714,13 +1794,14 @@ Index: /x/src/main.rs
         ));
     }
 
-    /// ADR-0068: a call older than the in-flight window is dropped by the
-    /// successor's own render, so the takeover carries the orphan Turn's
-    /// running call — the successor's live tail shows `⏳`, and its completion
-    /// renders exactly once, joining the timeline at its server start key. A
-    /// later transcript render of the same call does not duplicate it.
+    /// Spec #561's live-set fallback (ADR-0068's carry, retired into it): a
+    /// call older than the in-flight window is dropped by the successor's own
+    /// render, so the takeover seeds the orphan Turn's running call — the
+    /// successor's live tail shows `⏳`, and its completion renders exactly
+    /// once, joining the timeline at its server start key. A later transcript
+    /// render of the same call does not duplicate it.
     #[test]
-    fn a_stale_inflight_tool_is_carried_and_settles_once_into_the_timeline() {
+    fn a_stale_inflight_tool_is_seeded_and_settles_once_into_the_timeline() {
         let anchor = 2_000_000;
         let orphan = TurnAnchor {
             message_id: MessageId::new("msg_cola_old"),
@@ -1752,9 +1833,9 @@ Index: /x/src/main.rs
         acc.cola_message_id = Some("msg_cola_new".into());
         // The takeover seeds the orphan Turn's running calls before the prompt.
         assert_eq!(
-            acc.carry_tools(&transcript(ToolStatus::Running, None).turn_running_tools(&orphan)),
+            seed_live_calls(&mut acc, &transcript(ToolStatus::Running, None), &orphan),
             1,
-            "the orphan's running call is the carry set"
+            "the orphan's running call is the seed's live set"
         );
         render_new_turn_parts(&mut acc, &transcript(ToolStatus::Running, None));
         assert_eq!(acc.tools["call_sleep"].status(), &ToolStatus::Running);
@@ -1762,10 +1843,10 @@ Index: /x/src/main.rs
         assert!(!full, "a live card with only a tail panel must not split");
         assert!(
             card_text(&card).contains("⏳ shell"),
-            "the carried call rides the successor's live tail: {card}"
+            "the seeded call rides the successor's live tail: {card}"
         );
 
-        // The tool completes while its message stays stale: the carried
+        // The tool completes while its message stays stale: the seeded
         // identity reconciles it past the Turn window, so the panel leaves the
         // tail and joins the timeline at its server start key — exactly once.
         let settled = SessionTranscript::new(vec![
@@ -1800,12 +1881,12 @@ Index: /x/src/main.rs
         );
     }
 
-    /// ADR-0068's carry set is every LIVE call — `pending` as well as
+    /// Spec #561's live set is every LIVE call — `pending` as well as
     /// `running` (`ToolStatus::is_live`) — so a pending orphan is seeded into
     /// the successor's live tail exactly like a running one, and its
     /// settlement reconciles exactly once at its server start key.
     #[test]
-    fn a_pending_orphan_call_is_carried_and_settles_once() {
+    fn a_pending_orphan_call_is_seeded_and_settles_once() {
         let anchor = 2_000_000;
         let orphan = TurnAnchor {
             message_id: MessageId::new("msg_cola_old"),
@@ -1836,21 +1917,23 @@ Index: /x/src/main.rs
         let mut acc = StreamAccumulator::new("proj");
         acc.cola_message_id = Some("msg_cola_new".into());
         // The takeover seeds the orphan Turn's pending call: `pending` is live,
-        // so it is part of ADR-0068's carry set.
+        // so it is part of spec #561's live set.
         assert_eq!(
-            acc.carry_tools(&transcript(ToolStatus::Pending, None).turn_running_tools(&orphan)),
+            seed_live_calls(&mut acc, &transcript(ToolStatus::Pending, None), &orphan),
             1,
-            "a pending orphan call is carried like a running one"
+            "a pending orphan call is seeded like a running one"
         );
+        // The first render resolves the seeded identity into the live tail.
+        render_new_turn_parts(&mut acc, &transcript(ToolStatus::Pending, None));
         assert_eq!(acc.tools["call_sleep"].status(), &ToolStatus::Pending);
         let (card, full) = acc.build_card_with_split();
         assert!(!full, "a live card with only a tail panel must not split");
         assert!(
             card_text(&card).contains("⏳ shell"),
-            "the carried pending call rides the successor's live tail: {card}"
+            "the seeded pending call rides the successor's live tail: {card}"
         );
 
-        // The call completes while its message stays stale: the carried
+        // The call completes while its message stays stale: the seeded
         // identity reconciles it past the Turn window, exactly once.
         let settled = SessionTranscript::new(vec![
             typed_message(
@@ -1870,7 +1953,7 @@ Index: /x/src/main.rs
         assert!(!acc.tools["call_sleep"].is_live());
         assert!(
             acc.seeded_calls.is_empty(),
-            "a settled carried call leaves the display-only carry set"
+            "a settled seeded call leaves the display-only live set"
         );
         let text = card_text(&acc.build_card_with_split().0);
         assert_eq!(text.matches("slept").count(), 1, "settled once: {text}");
@@ -1883,10 +1966,11 @@ Index: /x/src/main.rs
         );
     }
 
-    /// The carry is scoped to the orphan Turn's projection: an older, unrelated
-    /// turn's stale `running` part is never resurrected on the successor.
+    /// The live set is scoped to the orphan Turn's projection: an older,
+    /// unrelated turn's stale `running` part is never resurrected on the
+    /// successor.
     #[test]
-    fn only_the_orphan_turns_running_calls_are_carried() {
+    fn only_the_orphan_turns_running_calls_enter_the_live_set() {
         let orphan = TurnAnchor {
             message_id: MessageId::new("msg_cola_old"),
             created_ms: 1_000_000,
@@ -1923,25 +2007,25 @@ Index: /x/src/main.rs
             ),
         ]);
 
-        let carried: Vec<String> = transcript
+        let seeded: Vec<String> = transcript
             .turn_running_tools(&orphan)
             .iter()
             .map(|call| call.identity.call_id.clone())
             .collect();
         assert_eq!(
-            carried,
+            seeded,
             ["call_sleep"],
-            "only the orphan Turn's running call belongs to the carry set"
+            "only the orphan Turn's running call enters the live set"
         );
     }
 
-    /// A killed run's carried call reconciles to the transcript's final status
+    /// A killed run's seeded call reconciles to the transcript's final status
     /// on every render read — beyond the Turn window — and never outlives the
     /// Turn: the panel invents no ending while the transcript says `running`,
     /// and the successor's own settle decision is untouched by it. When the
     /// transcript finally records a status, the panel takes it and settles.
     #[test]
-    fn a_carried_call_beyond_the_window_reconciles_on_every_render_read() {
+    fn a_seeded_call_beyond_the_window_reconciles_on_every_render_read() {
         let anchor = 2_000_000;
         let new_anchor = TurnAnchor {
             message_id: MessageId::new("msg_cola_new"),
@@ -1977,20 +2061,20 @@ Index: /x/src/main.rs
 
         let mut acc = StreamAccumulator::new("proj");
         acc.cola_message_id = Some("msg_cola_new".into());
-        acc.carry_tools(&transcript(ToolStatus::Running, None).turn_running_tools(&orphan));
-        // Repeated reads while the transcript says running: the carried panel
+        seed_live_calls(&mut acc, &transcript(ToolStatus::Running, None), &orphan);
+        // Repeated reads while the transcript says running: the seeded panel
         // stays truthfully live and never invents an ending.
         for _ in 0..3 {
             render_new_turn_parts(&mut acc, &transcript(ToolStatus::Running, None));
             assert!(
                 acc.tools["call_sleep"].is_live(),
-                "a killed run's carried call keeps the transcript's running status"
+                "a killed run's seeded call keeps the transcript's running status"
             );
         }
         assert_eq!(
             transcript(ToolStatus::Running, None).settle(Some(&new_anchor)),
             TurnSettle::Complete,
-            "the carried panel is display-only: the Turn's settle decision is unchanged"
+            "the seeded panel is display-only: the Turn's settle decision is unchanged"
         );
 
         // The transcript finally records the failed run: the panel reconciles.
@@ -2003,14 +2087,14 @@ Index: /x/src/main.rs
         assert_eq!(text.matches("killed").count(), 1, "reconciled once: {text}");
     }
 
-    /// The canonical restart window (ADR-0068): the fresh Turn's message is
+    /// The canonical restart window (spec #561): the fresh Turn's message is
     /// queued behind the still-running orphan run, so the transcript carries no
-    /// anchor for as long as that run lasts. A carried call is resolved by call
+    /// anchor for as long as that run lasts. A seeded call is resolved by call
     /// identity against the whole read, so its completion reconciles into the
     /// timeline anyway — while the anchor is unobserved — exactly once; the
     /// later anchor capture neither duplicates nor re-orders it.
     #[test]
-    fn a_carried_call_reconciles_before_the_turn_anchor_is_observed() {
+    fn a_seeded_call_reconciles_before_the_turn_anchor_is_observed() {
         let anchor = 2_000_000;
         let orphan = TurnAnchor {
             message_id: MessageId::new("msg_cola_old"),
@@ -2041,13 +2125,13 @@ Index: /x/src/main.rs
         let mut acc = StreamAccumulator::new("proj");
         acc.cola_message_id = Some("msg_cola_new".into());
         assert_eq!(
-            acc.carry_tools(&anchorless(ToolStatus::Running, None).turn_running_tools(&orphan)),
+            seed_live_calls(&mut acc, &anchorless(ToolStatus::Running, None), &orphan),
             1
         );
         assert_eq!(acc.turn_anchor, None);
 
         // The call completes while the fresh message is still absent: the
-        // carried identity reconciles anyway, joining the timeline at its
+        // seeded identity reconciles anyway, joining the timeline at its
         // server start key.
         assert!(render_new_turn_parts(
             &mut acc,
@@ -2100,12 +2184,12 @@ Index: /x/src/main.rs
         );
     }
 
-    /// A carried call the Turn's own window renders is the Turn's own live
-    /// panel again: it leaves the display-only carry set, so the ordinary
+    /// A seeded call the Turn's own window renders is the Turn's own live
+    /// panel again: it leaves the display-only live set, so the ordinary
     /// live-panel rules (#284's guard included) apply exactly as before the
-    /// carry existed (ADR-0068's in-window regression).
+    /// seed existed.
     #[test]
-    fn an_in_window_render_readopts_a_carried_call() {
+    fn an_in_window_render_readopts_a_seeded_call() {
         let anchor = 2_000_000;
         let orphan = TurnAnchor {
             message_id: MessageId::new("msg_cola_old"),
@@ -2138,7 +2222,7 @@ Index: /x/src/main.rs
         let mut acc = StreamAccumulator::new("proj");
         acc.cola_message_id = Some("msg_cola_new".into());
         assert_eq!(
-            acc.carry_tools(&transcript(ToolStatus::Running, None).turn_running_tools(&orphan)),
+            seed_live_calls(&mut acc, &transcript(ToolStatus::Running, None), &orphan),
             1
         );
         assert!(acc.seeded_calls.contains("call_sleep"));
@@ -2146,44 +2230,54 @@ Index: /x/src/main.rs
         render_new_turn_parts(&mut acc, &transcript(ToolStatus::Running, None));
         assert!(
             acc.seeded_calls.is_empty(),
-            "the Turn's own window render owns the call now, not the carry"
+            "the Turn's own window render owns the call now, not the seed"
         );
     }
 
     /// The successor's own reads rebuild the todo list, so a running
-    /// `todowrite` is never carried (ADR-0068's carry set: the todo list, the
-    /// ledger and the interaction blocks stay out).
+    /// `todowrite` never enters the seed's live set (spec #561's fallback: the
+    /// todo list, the ledger and the interaction blocks stay out).
     #[test]
-    fn a_running_todowrite_is_never_carried() {
-        let mut acc = StreamAccumulator::new("proj");
-        let call = ToolCall {
-            identity: ToolIdentity {
-                name: "todowrite".into(),
-                call_id: "call_todo".into(),
-            },
-            status: ToolStatus::Running,
-            started_at: Some(1_000),
-            input: Some(serde_json::json!({"todos": []})),
-            metadata: None,
-            output: ToolOutput::default(),
+    fn a_running_todowrite_never_enters_the_live_set() {
+        let orphan = TurnAnchor {
+            message_id: MessageId::new("msg_cola_old"),
+            created_ms: 1_000_000,
         };
+        let transcript = SessionTranscript::new(vec![message_in_flight(
+            "a_todo",
+            1_000_000 + 5_000,
+            None,
+            vec![Part::Tool(ToolCall {
+                identity: ToolIdentity {
+                    name: "todowrite".into(),
+                    call_id: "call_todo".into(),
+                },
+                status: ToolStatus::Running,
+                started_at: Some(1_000_000 + 5_000),
+                input: Some(serde_json::json!({"todos": []})),
+                metadata: None,
+                output: ToolOutput::default(),
+            })],
+        )]);
 
-        assert_eq!(
-            acc.carry_tools(&[call]),
-            0,
+        let seed = CursorSeed::live_calls_only(&transcript, &orphan);
+        assert!(
+            seed.live_calls.is_empty(),
             "the successor's own reads rebuild the todo list"
         );
+        let mut acc = StreamAccumulator::new("proj");
+        acc.seed_projection(&RenderedCursor::default(), seed);
         assert!(acc.tools.is_empty() && acc.seeded_calls.is_empty());
     }
 
-    /// A killed run's carried call does not outlive the Turn (ADR-0068): while
+    /// A killed run's seeded call does not outlive the Turn (spec #561): while
     /// a live renderer owns the card the panel rides the tail and reconciles,
     /// but once the card settles no renderer will ever update it again, so a
-    /// still-running carried panel is not built — no permanent `⏳` on the
-    /// final card. A carried call that settled before the end is a timeline
+    /// still-running seeded panel is not built — no permanent `⏳` on the
+    /// final card. A seeded call that settled before the end is a timeline
     /// entry and still renders exactly once.
     #[test]
-    fn a_still_running_carried_call_is_not_built_once_the_card_is_settled() {
+    fn a_still_running_seeded_call_is_not_built_once_the_card_is_settled() {
         let anchor = 2_000_000;
         let orphan = TurnAnchor {
             message_id: MessageId::new("msg_cola_old"),
@@ -2215,11 +2309,11 @@ Index: /x/src/main.rs
 
         let mut acc = StreamAccumulator::new("proj");
         acc.cola_message_id = Some("msg_cola_new".into());
-        acc.carry_tools(&transcript(ToolStatus::Running, None).turn_running_tools(&orphan));
+        seed_live_calls(&mut acc, &transcript(ToolStatus::Running, None), &orphan);
         render_new_turn_parts(&mut acc, &transcript(ToolStatus::Running, None));
         assert!(
             card_text(&acc.build_card_with_split().0).contains("⏳ shell"),
-            "a live renderer owns the card, so the carried panel rides the tail"
+            "a live renderer owns the card, so the seeded panel rides the tail"
         );
 
         // The Turn ends with the call still running (the killed-run case): the
@@ -2234,7 +2328,7 @@ Index: /x/src/main.rs
         acc.card_state = CardState::Waiting;
         assert!(
             !card_text(&acc.build_card_with_split().0).contains("⏳ shell"),
-            "a card no renderer owns never shows a still-running carried panel"
+            "a card no renderer owns never shows a still-running seeded panel"
         );
 
         // A completion that landed before the end is a timeline record and
@@ -2249,8 +2343,153 @@ Index: /x/src/main.rs
         assert_eq!(
             text.matches("slept").count(),
             1,
-            "a settled carried call still renders on the final card: {text}"
+            "a settled seeded call still renders on the final card: {text}"
         );
+    }
+
+    /// The cursorless record's fallback seed (spec #561, ticket #565): the
+    /// orphaned Turn's still-live calls enter the seed's live set and the
+    /// accumulator, exactly as ADR-0068's carry once did. Returns how many
+    /// calls were seeded.
+    fn seed_live_calls(
+        acc: &mut StreamAccumulator,
+        transcript: &SessionTranscript,
+        orphan: &TurnAnchor,
+    ) -> usize {
+        let seed = CursorSeed::live_calls_only(transcript, orphan);
+        let count = seed.live_calls.len();
+        acc.seed_projection(&RenderedCursor::default(), seed);
+        count
+    }
+
+    /// The message-first race (spec #561, ticket #565): the takeover seeds the
+    /// accumulator with the ORPHANED Turn's own anchor as the seed's scope, so
+    /// the render walks the orphan's window — its undelivered tail, cut at the
+    /// confirmed frontier — before the new Turn's content, even while the new
+    /// message is still queued and the accumulator has no anchor.
+    #[test]
+    fn a_message_first_seed_renders_the_orphans_tail_then_the_new_answer() {
+        let new_anchor = 2_000_000;
+        let orphan = TurnAnchor {
+            message_id: MessageId::new("msg_cola_old"),
+            created_ms: new_anchor - 31 * 60_000,
+        };
+        let prefix = "第一段回答。";
+        let tail = "没送达的尾巴。";
+        let full = format!("{prefix}{tail}");
+        // The canonical window: the new message is queued behind the orphan
+        // run, so the read carries no anchor for the new Turn.
+        let queued = |text: &str| {
+            SessionTranscript::new(vec![message_in_flight(
+                "a_orphan",
+                new_anchor - 30 * 60_000,
+                None,
+                vec![text_at(text, new_anchor - 30 * 60_000)],
+            )])
+        };
+        let answered = |text: &str| {
+            SessionTranscript::new(vec![
+                typed_message(
+                    "msg_cola_new",
+                    MessageRole::User,
+                    Some(new_anchor),
+                    vec![text_part("新的问题")],
+                ),
+                message_in_flight(
+                    "a_orphan",
+                    new_anchor - 30 * 60_000,
+                    None,
+                    vec![text_at(text, new_anchor - 30 * 60_000)],
+                ),
+                message("a_new", new_anchor + 1_000, vec![text_part("新回答")]),
+            ])
+        };
+
+        let mut acc = StreamAccumulator::new("proj");
+        acc.cola_message_id = Some("msg_cola_new".into());
+        // The takeover's seed: the frontier inside the orphan's answer, the
+        // orphan's own Turn as the scope, no live calls.
+        let cursor = projection_cursor("a_orphan", 0, CursorPartKind::Text, prefix.chars().count(), &[]);
+        let seed = CursorSeed::for_orphan(&queued(&full), &cursor, &orphan);
+        acc.seed_projection(&cursor, seed);
+
+        // Queued: the seed's own scope renders the tail with no anchor
+        // observed.
+        assert!(render_new_turn_parts(&mut acc, &queued(&full)));
+        assert_eq!(acc.turn_anchor, None, "the new message is still queued");
+        let text = card_text(&acc.build_card_with_split().0);
+        assert_eq!(
+            text.matches(tail).count(),
+            1,
+            "the orphan's tail renders exactly once: {text}"
+        );
+        assert!(
+            !text.contains(prefix),
+            "the delivered prefix is never repeated: {text}"
+        );
+
+        // The message lands and the new run answers: no duplication, and the
+        // orphan's continuation reads before the new Turn's content.
+        assert!(render_new_turn_parts(&mut acc, &answered(&full)));
+        let text = card_text(&acc.build_card_with_split().0);
+        assert_eq!(text.matches(tail).count(), 1, "the tail stays once: {text}");
+        assert!(text.contains("新回答"), "{text}");
+        assert!(
+            text.find(tail).unwrap() < text.find("新回答").unwrap(),
+            "the orphan's continuation reads before the new answer: {text}"
+        );
+        assert!(!render_new_turn_parts(&mut acc, &answered(&full)));
+    }
+
+    /// A frontier message inside the new Turn's in-flight window belongs to
+    /// BOTH the seed's scope and the accumulator's own window: the scope walk
+    /// renders its suffix and the window skips it, so one pass renders the tail
+    /// exactly once (spec #561, ticket #565).
+    #[test]
+    fn a_message_first_seed_never_double_renders_a_straddling_message() {
+        let new_anchor = 2_000_000;
+        let orphan = TurnAnchor {
+            message_id: MessageId::new("msg_cola_old"),
+            created_ms: new_anchor - 60_000,
+        };
+        let prefix = "第一段。";
+        let tail = "第二段。";
+        let full = format!("{prefix}{tail}");
+        // In flight, created before the new anchor but still recent: it
+        // belongs to the orphan's Turn AND the new Turn's in-flight window.
+        let transcript = SessionTranscript::new(vec![
+            typed_message(
+                "msg_cola_new",
+                MessageRole::User,
+                Some(new_anchor),
+                vec![text_part("新的问题")],
+            ),
+            message_in_flight(
+                "a_orphan",
+                new_anchor - 50_000,
+                None,
+                vec![text_at(&full, new_anchor - 50_000)],
+            ),
+        ]);
+
+        let mut acc = StreamAccumulator::new("proj");
+        acc.cola_message_id = Some("msg_cola_new".into());
+        let cursor = projection_cursor("a_orphan", 0, CursorPartKind::Text, prefix.chars().count(), &[]);
+        let seed = CursorSeed::for_orphan(&transcript, &cursor, &orphan);
+        acc.seed_projection(&cursor, seed);
+
+        assert!(render_new_turn_parts(&mut acc, &transcript));
+        let text = card_text(&acc.build_card_with_split().0);
+        assert_eq!(
+            text.matches(tail).count(),
+            1,
+            "the suffix renders exactly once across both windows: {text}"
+        );
+        assert!(
+            !text.contains(prefix),
+            "the delivered prefix is never repeated: {text}"
+        );
+        assert!(!render_new_turn_parts(&mut acc, &transcript));
     }
 
     /// The Rendered Cursor fixture of the projection tests (spec #561): a

@@ -6,7 +6,7 @@
 //! beside its strategy has the same shape.
 
 use super::*;
-use crate::bridge::test_support::{assert_line_level, capture_logs, level_count, tail_anchor};
+use crate::bridge::test_support::{assert_line_level, capture_logs, level_count};
 use crate::error::BridgeError;
 use crate::opencode::client::OpenCodeBackend;
 use crate::opencode::parsing::parse_model;
@@ -1193,35 +1193,6 @@ async fn transcript_surfaces_a_failed_message_read() {
     let client = v1_wire_client(&server, None);
 
     assert!(client.transcript("ses_gone").await.is_err());
-}
-
-/// V1's message read has no wire pagination, so the carry's tail read
-/// (ADR-0068) is the same one-request read, reported complete, and ignores the
-/// anchor: the generation that cannot surface running calls simply carries what
-/// it reports.
-#[tokio::test]
-async fn transcript_tail_is_the_one_request_read_reported_complete() {
-    let server = TestHttpServer::start().await;
-    server.route(
-        "GET",
-        "/session/ses_1/message",
-        200,
-        transcript_fixture().to_string(),
-    );
-    let client = v1_wire_client(&server, None);
-
-    let anchor = tail_anchor(0);
-    let tail = client.transcript_tail("ses_1", &anchor).await.unwrap();
-
-    assert!(tail.complete, "an unpaginated read is always complete");
-    assert_eq!(tail.transcript.messages.len(), 3);
-    assert_eq!(
-        server.requests().len(),
-        1,
-        "one request, like the generation's render polls"
-    );
-    let request = last_request(&server);
-    assert_eq!(request.path, "/session/ses_1/message");
 }
 
 /// V1 has no session-scoped selection: the read answers `None` and both

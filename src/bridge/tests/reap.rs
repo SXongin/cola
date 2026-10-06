@@ -20,7 +20,7 @@ use super::drain::{
 };
 use crate::backend::{
     ContentBlock, MessageId, MessageRole, MessageTime, Part, SessionTranscript, TextPart, ToolCall,
-    ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage, TranscriptTail,
+    ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage,
 };
 use crate::bridge::chain::{ChainRecords, CursorFrontier, CursorPartKind, RenderedCursor};
 use crate::bridge::test_support::*;
@@ -1168,14 +1168,16 @@ async fn a_successor_owning_the_session_recollects_after_the_stamp() {
     );
 }
 
-// --- The restart carry (ADR-0068) ------------------------------------------
+// --- The message takeover's seed (spec #561, ticket #565) -------------------
 //
-// A fresh Turn's takeover over an orphaned card hands the orphan Turn's
-// still-running tool calls to the successor: the bounded, newest-first tail
-// read is scoped by the durable record's anchor, the calls ride the
-// successor's live tail by identity, and a failed/timeout/cap-stopped read
-// carries nothing. A tool that settled while cola was down stays out of scope
-// (#505); the carry is display-only.
+// A fresh Turn's takeover over an orphaned card resolves the orphan record's
+// Rendered Cursor against the session's own read and seeds the successor: the
+// orphaned Turn's window cut at the confirmed frontier (its undelivered tail),
+// plus the live set resolved by identity. A record written by an older release
+// carries no cursor; its still-running calls keep ADR-0068's carry exactly —
+// the seed's live-set fallback, resolved by identity, replaying nothing. The
+// seed reads the FULL transcript (the read the render polls use), so the
+// cursor's positions stay valid as the run grows.
 
 /// An assistant message with no completion stamp whose only content is one
 /// `shell` call started at `started_at` — the orphaned Turn's still-running
@@ -1220,10 +1222,9 @@ fn in_flight_shell(
     }
 }
 
-/// The whole-card view of an orphaned live card carrying the live tail
-/// ADR-0068's takeover collect decides on: written content, a running tool
-/// panel (`⏳`), a settled backgrounded launch (`🌙`) and the Background Task
-/// Ledger.
+/// The whole-card view of an orphaned live card carrying the live tail the
+/// takeover collect decides on: written content, a running tool panel (`⏳`),
+/// a settled backgrounded launch (`🌙`) and the Background Task Ledger.
 fn live_tail_orphan_view() -> serde_json::Value {
     serde_json::json!({
         "schema": "2.0",
@@ -1248,30 +1249,29 @@ fn live_tail_orphan_view() -> serde_json::Value {
     })
 }
 
-/// The carry's ONE INFO decision line (spec #523, story 14) — `capture_logs`'s
+/// The seed's ONE INFO decision line (spec #523, story 14) — `capture_logs`'s
 /// output for the one test whose requirement is a log line. The behavioral
 /// tests assert the cards, never the logs. Panics when the count is not one.
-fn carry_info_line(logs: &str) -> &str {
+fn seed_info_line(logs: &str) -> &str {
     let matches: Vec<&str> = logs
         .lines()
-        .filter(|line| line_level(line) == "INFO" && line.contains("restart carry"))
+        .filter(|line| line_level(line) == "INFO" && line.contains("restart seed"))
         .collect();
     assert_eq!(
         matches.len(),
         1,
-        "exactly one INFO carry decision per takeover:\n{logs}"
+        "exactly one INFO seed decision per takeover:\n{logs}"
     );
     matches[0]
 }
 
 /// A restarted app over `session_file` whose session serves `transcript` and
-/// its bounded tail read `tail` (ADR-0068), with the tiny turn cadences the
-/// carry tests need. The returned gate holds every prompt until the test
-/// releases it — the live window in which the carry is observed.
-async fn carried_app(
+/// `status`, with the tiny turn cadences the seed tests need. The returned gate
+/// holds every prompt until the test releases it — the live window in which the
+/// takeover's seed is observed.
+async fn seeded_app(
     session_file: &Path,
     transcript: SessionTranscript,
-    tail: TranscriptTail,
     status: SessionStatus,
 ) -> (
     Arc<App>,
@@ -1281,13 +1281,12 @@ async fn carried_app(
 ) {
     let mut backend = MockBackend::new(realistic_parts());
     backend.given_transcript("ses_test", vec![transcript]);
-    backend.given_transcript_tail("ses_test", vec![tail]);
     backend.with_session_status("ses_test", Some(status));
     let gate = backend.hold_prompts();
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(
-        App::new(test_config(session_file), backend.clone(), platform.clone()).expect("the carry app builds"),
+        App::new(test_config(session_file), backend.clone(), platform.clone()).expect("the seed app builds"),
     );
     seed_session(&app, "ses_test", "/work").await;
     app.turn_render_poll_ms
@@ -1299,13 +1298,14 @@ async fn carried_app(
     (app, platform, backend, gate)
 }
 
-/// ADR-0068 acceptance: a user message that starts a fresh Turn over the
-/// orphaned card hands the orphan Turn's still-running call to the successor.
-/// The panel rides the successor's live tail, its completion renders exactly
-/// once after its message has gone stale, and the carry is display-only (the
-/// durable record names the new Turn's message; the card still settles ✅).
+/// ADR-0068's carry, retired into the seed: a user message that starts a fresh
+/// Turn over the orphaned card hands the orphan Turn's still-running call to
+/// the successor. The panel rides the successor's live tail, its completion
+/// renders exactly once after its message has gone stale, and the seed is
+/// display-only (the durable record names the new Turn's message; the card
+/// still settles ✅).
 #[tokio::test]
-async fn a_restart_takeover_carries_the_orphans_running_tool() {
+async fn a_restart_takeover_seeds_the_orphans_running_tool() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("sessions.json");
@@ -1313,7 +1313,7 @@ async fn a_restart_takeover_carries_the_orphans_running_tool() {
     seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(orphan_anchor));
     let new_anchor = 2_000_000;
     // The call started long before the new message: outside its in-flight
-    // window, so only the carry can reach the successor.
+    // window, so only the seed can reach the successor.
     let started_at = 1_300_000;
     let orphan = |status: ToolStatus, output: &str| {
         in_flight_shell(
@@ -1325,24 +1325,15 @@ async fn a_restart_takeover_carries_the_orphans_running_tool() {
             output,
         )
     };
-    // The tail the carry reads: the orphan Turn's own newest end.
-    let tail = TranscriptTail {
-        transcript: SessionTranscript::new(vec![
-            user("msg_cola_anchor", orphan_anchor, "跑个长命令"),
-            orphan(ToolStatus::Running, ""),
-        ]),
-        complete: true,
-    };
-    // The session's newest end: the stale running call, then the new message
-    // whose turn the held prompt keeps in flight.
     let live = SessionTranscript::new(vec![
         user("msg_cola_anchor", orphan_anchor, "跑个长命令"),
         orphan(ToolStatus::Running, ""),
         user("msg_cola_new", new_anchor, "新问题"),
     ]);
-    let (app, platform, backend, gate) = carried_app(&session_file, live, tail, SessionStatus::Busy).await;
-    // The orphaned card's rendered view: the carried running panel rides the
-    // successor, so the collect must drop it there (ADR-0068).
+    let (app, platform, backend, gate) = seeded_app(&session_file, live, SessionStatus::Busy).await;
+    // The orphaned card's rendered view: the seeded running panel rides the
+    // successor, so the collect must drop it there (ADR-0068's generalized
+    // strip).
     platform.given_card_view("om_frozen", live_tail_orphan_view());
 
     let mut context = ctx("ses_test", "新问题");
@@ -1352,11 +1343,6 @@ async fn a_restart_takeover_carries_the_orphans_running_tool() {
     // The successor's live card carries the orphan's panel while the new
     // prompt is still in flight.
     wait_for_card_text(&platform, "⏳ shell").await;
-    assert_eq!(
-        backend.transcript_tail_calls.lock().await.as_slice(),
-        &[("ses_test".to_string(), tail_anchor(orphan_anchor))],
-        "the carry read is scoped by the orphan record's anchor"
-    );
     // The takeover itself is today's: the old card is collected in place, once.
     let orphan_patches = patches_to(&platform, "om_frozen").await;
     assert_eq!(
@@ -1365,13 +1351,13 @@ async fn a_restart_takeover_carries_the_orphans_running_tool() {
         "the takeover collect is the orphan's only write: {orphan_patches:?}"
     );
     assert_eq!(card_header(&orphan_patches[0]), "⏳ 已由新卡片接管 · 已停止更新");
-    // ADR-0068: the carried panel is live on the successor, so the orphan's
-    // preserved body drops it — and the ledger always — while the written body
-    // and the settled launch stay.
+    // The seeded panel is live on the successor, so the orphan's preserved
+    // body drops it — and the ledger always — while the written body and the
+    // settled launch stay.
     let orphan_text = card_text(&orphan_patches[0]);
     assert!(
         !orphan_text.contains("⏳ shell"),
-        "the carried running panel leaves the collected card: {orphan_text}"
+        "the seeded running panel leaves the collected card: {orphan_text}"
     );
     assert!(
         !orphan_text.contains("⏳ 后台任务"),
@@ -1388,11 +1374,11 @@ async fn a_restart_takeover_carries_the_orphans_running_tool() {
     assert_eq!(
         record.message_id,
         MessageId::new("msg_cola_new"),
-        "the carry moves no record: the successor owns the Turn"
+        "the seed moves no record: the successor owns the Turn"
     );
 
     // The call settles while its message stays stale (beyond the Turn window);
-    // the new turn also ends. Every render read must reconcile the carried
+    // the new turn also ends. Every render read must resolve the seeded
     // identity past the window, exactly once.
     backend
         .given_transcript_after_build(
@@ -1422,10 +1408,10 @@ async fn a_restart_takeover_carries_the_orphans_running_tool() {
     assert_eq!(
         card_text(after.last().unwrap()).matches("slept").count(),
         1,
-        "a later transcript render does not duplicate the carried call"
+        "a later transcript render does not duplicate the seeded call"
     );
 
-    // Release the held prompt: the Turn settles ✅ as usual, with the carried
+    // Release the held prompt: the Turn settles ✅ as usual, with the seeded
     // panel settled into the successor's timeline.
     gate.add_permits(1);
     tokio::time::timeout(Duration::from_secs(5), turn)
@@ -1439,7 +1425,7 @@ async fn a_restart_takeover_carries_the_orphans_running_tool() {
     assert_eq!(
         final_text.matches("slept").count(),
         1,
-        "the settled carried result stays exactly once: {final_text}"
+        "the settled seeded result stays exactly once: {final_text}"
     );
     assert!(
         final_text.contains("新回答"),
@@ -1447,14 +1433,14 @@ async fn a_restart_takeover_carries_the_orphans_running_tool() {
     );
 }
 
-/// ADR-0068's canonical restart window: the fresh Turn's message is queued
-/// behind the still-running orphan run, so the server's transcript carries no
-/// anchor for as long as that run lasts. A carried call is resolved by call
-/// identity against the whole read, so its completion still reconciles onto
-/// the successor's card — while the anchor is unobserved — exactly once, and
+/// The canonical restart window: the fresh Turn's message is queued behind the
+/// still-running orphan run, so the server's transcript carries no anchor for
+/// as long as that run lasts. A seeded call is resolved by call identity
+/// against the whole read, so its completion still reconciles onto the
+/// successor's card — while the anchor is unobserved — exactly once, and
 /// nothing duplicates when the message finally lands.
 #[tokio::test]
-async fn a_carried_call_reconciles_while_the_fresh_turn_is_still_queued() {
+async fn a_seeded_call_reconciles_while_the_fresh_turn_is_still_queued() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("sessions.json");
@@ -1472,14 +1458,6 @@ async fn a_carried_call_reconciles_while_the_fresh_turn_is_still_queued() {
             output,
         )
     };
-    // The tail the carry reads: the orphan Turn's own newest end.
-    let tail = TranscriptTail {
-        transcript: SessionTranscript::new(vec![
-            user("msg_cola_anchor", orphan_anchor, "跑个长命令"),
-            orphan(ToolStatus::Running, ""),
-        ]),
-        complete: true,
-    };
     // The session's newest end while the orphan run still holds the queue: the
     // fresh Turn's message is NOT in the transcript yet — the canonical
     // restart window, with no anchor to observe.
@@ -1487,15 +1465,15 @@ async fn a_carried_call_reconciles_while_the_fresh_turn_is_still_queued() {
         user("msg_cola_anchor", orphan_anchor, "跑个长命令"),
         orphan(ToolStatus::Running, ""),
     ]);
-    let (app, platform, backend, gate) = carried_app(&session_file, queued, tail, SessionStatus::Busy).await;
+    let (app, platform, backend, gate) = seeded_app(&session_file, queued, SessionStatus::Busy).await;
     platform.given_card_view("om_frozen", live_tail_orphan_view());
 
     let mut context = ctx("ses_test", "新问题");
     context.cola_message_id = Some("msg_cola_new".into());
     let turn = spawn_turn(&app, context);
 
-    // The carry seeds the successor's live tail while the submitted prompt is
-    // held in flight.
+    // The seed hands the successor's live tail the orphan's running call while
+    // the submitted prompt is held in flight.
     wait_for_card_text(&platform, "⏳ shell").await;
     assert_eq!(
         Turn::armed_turn_anchor(&app.cards_handle(), "ses_test").await,
@@ -1504,7 +1482,7 @@ async fn a_carried_call_reconciles_while_the_fresh_turn_is_still_queued() {
     );
 
     // The call completes while its message stays stale AND the fresh message is
-    // still absent: the carried identity must reconcile anyway, joining the
+    // still absent: the seeded identity must reconcile anyway, joining the
     // successor's timeline at its server start key.
     script_transcript(
         &backend,
@@ -1548,7 +1526,7 @@ async fn a_carried_call_reconciles_while_the_fresh_turn_is_still_queued() {
     assert_eq!(
         final_text.matches("slept").count(),
         1,
-        "the carried completion stays exactly once: {final_text}"
+        "the seeded completion stays exactly once: {final_text}"
     );
     assert!(
         final_text.contains("新回答"),
@@ -1556,10 +1534,10 @@ async fn a_carried_call_reconciles_while_the_fresh_turn_is_still_queued() {
     );
 }
 
-/// ADR-0068: the takeover's collect always drops the Background Task Ledger —
-/// a ledger-only orphan (its launch settled 🌙 while the run is still live) is
+/// The takeover's collect always drops the Background Task Ledger — a
+/// ledger-only orphan (its launch settled 🌙 while the run is still live) is
 /// collected without the stale live list, and the successor's own reads
-/// rebuild it. Nothing is running to carry, so the settled launch and the
+/// rebuild it. Nothing is running to seed, so the settled launch and the
 /// written body stay untouched.
 #[tokio::test]
 async fn a_restart_takeover_drops_a_ledger_only_orphans_live_list() {
@@ -1570,7 +1548,7 @@ async fn a_restart_takeover_drops_a_ledger_only_orphans_live_list() {
     seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(orphan_anchor));
     let new_anchor = 2_000_000;
     // The orphan Turn's shell call settled into the background: nothing is
-    // still running to carry; only the ledger lists its run.
+    // still running to seed; only the ledger lists its run.
     let launch = typed_message(
         "msg_launch",
         MessageRole::Assistant,
@@ -1583,13 +1561,6 @@ async fn a_restart_takeover_drops_a_ledger_only_orphans_live_list() {
             "moved to background",
         )],
     );
-    let tail = TranscriptTail {
-        transcript: SessionTranscript::new(vec![
-            user("msg_cola_anchor", orphan_anchor, "跑个构建"),
-            launch.clone(),
-        ]),
-        complete: true,
-    };
     // The Session's newest end: the background run is still live, so the
     // successor's own reads rebuild the ledger.
     let live = SessionTranscript::new(vec![
@@ -1599,7 +1570,7 @@ async fn a_restart_takeover_drops_a_ledger_only_orphans_live_list() {
         assistant(new_anchor + 1_000, "新回答"),
     ])
     .with_background_tasks(vec![background_shell(orphan_anchor + 600)]);
-    let (app, platform, backend, gate) = carried_app(&session_file, live, tail, SessionStatus::Idle).await;
+    let (app, platform, _backend, gate) = seeded_app(&session_file, live, SessionStatus::Idle).await;
     platform.given_card_view("om_frozen", live_tail_orphan_view());
 
     let mut context = ctx("ses_test", "新问题");
@@ -1617,7 +1588,7 @@ async fn a_restart_takeover_drops_a_ledger_only_orphans_live_list() {
     .await;
 
     // The collect drops the orphan's stale live list; the settled 🌙 launch
-    // and the written body stay (nothing was carried).
+    // and the written body stay (nothing was seeded).
     let orphan_patches = patches_to(&platform, "om_frozen").await;
     assert_eq!(
         orphan_patches.len(),
@@ -1634,12 +1605,6 @@ async fn a_restart_takeover_drops_a_ledger_only_orphans_live_list() {
         orphan_text.contains("🌙 shell") && orphan_text.contains("**正文** 已经写完的部分"),
         "the settled launch and the body stay: {orphan_text}"
     );
-    // The carry read ran and found nothing running to hand over.
-    assert_eq!(
-        backend.transcript_tail_calls.lock().await.as_slice(),
-        &[("ses_test".to_string(), tail_anchor(orphan_anchor))],
-        "the carry read is scoped by the orphan record's anchor"
-    );
 
     gate.add_permits(1);
     tokio::time::timeout(Duration::from_secs(5), turn)
@@ -1649,12 +1614,11 @@ async fn a_restart_takeover_drops_a_ledger_only_orphans_live_list() {
         .unwrap();
 }
 
-/// ADR-0068 + the best-effort collect rule (ticket #526): a takeover collect
-/// whose PATCH fails only warns — the successor keeps ownership of the chain
-/// and its carried panel — and never blocks the Turn. The ticket's acceptance
-/// names exactly one warning for the failed collect, so that count is read
-/// directly; the ownership behavior stands on the cards and the record, not
-/// the log.
+/// The best-effort collect rule (ticket #526): a takeover collect whose PATCH
+/// fails only warns — the successor keeps ownership of the chain and its seeded
+/// panel — and never blocks the Turn. The ticket's acceptance names exactly one
+/// warning for the failed collect, so that count is read directly; the
+/// ownership behavior stands on the cards and the record, not the log.
 #[tokio::test]
 async fn a_failed_takeover_collect_warns_and_keeps_the_successor() {
     let _wd = test_work_dir();
@@ -1671,19 +1635,12 @@ async fn a_failed_takeover_collect_warns_and_keeps_the_successor() {
         1_300_000,
         "",
     );
-    let tail = TranscriptTail {
-        transcript: SessionTranscript::new(vec![
-            user("msg_cola_anchor", orphan_anchor, "跑个长命令"),
-            orphan.clone(),
-        ]),
-        complete: true,
-    };
     let live = SessionTranscript::new(vec![
         user("msg_cola_anchor", orphan_anchor, "跑个长命令"),
         orphan,
         user("msg_cola_new", new_anchor, "新问题"),
     ]);
-    let (app, platform, backend, gate) = carried_app(&session_file, live, tail, SessionStatus::Busy).await;
+    let (app, platform, backend, gate) = seeded_app(&session_file, live, SessionStatus::Busy).await;
     platform.given_card_view("om_frozen", live_tail_orphan_view());
     // Exactly the collect's PATCH fails: it is the first card write after the
     // new reply, and the failure must not touch anything else.
@@ -1695,7 +1652,7 @@ async fn a_failed_takeover_collect_warns_and_keeps_the_successor() {
     context.cola_message_id = Some("msg_cola_new".into());
     let ((), logs) = capture_logs(async {
         let turn = spawn_turn(&app, context);
-        // The carried panel is live on the successor: the collect (and its
+        // The seeded panel is live on the successor: the collect (and its
         // failure) already ran, and the successor still owns the chain.
         wait_for_card_text(&platform, "⏳ shell").await;
         wait_for_record_card(&app, "ses_test", "msg_reply").await;
@@ -1737,11 +1694,11 @@ async fn a_failed_takeover_collect_warns_and_keeps_the_successor() {
     assert_eq!(warnings, 1, "a failed collect warns exactly once:\n{logs}");
 }
 
-/// The carry read is scoped to the orphan Turn's projection: an older,
+/// The seed's live set is scoped to the orphan Turn's projection: an older,
 /// unrelated turn's stale `running` part is never resurrected on the
 /// successor.
 #[tokio::test]
-async fn a_restart_takeover_never_carries_an_older_turns_stale_call() {
+async fn a_restart_takeover_never_seeds_an_older_turns_stale_call() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("sessions.json");
@@ -1757,27 +1714,18 @@ async fn a_restart_takeover_never_carries_an_older_turns_stale_call() {
         1_000 - 29 * 60_000,
         "",
     );
-    let tail = TranscriptTail {
-        transcript: SessionTranscript::new(vec![ghost.clone()]),
-        complete: true,
-    };
     let live = SessionTranscript::new(vec![
         ghost,
         user("msg_cola_new", new_anchor, "新问题"),
         assistant(new_anchor + 1_000, "新回答"),
     ]);
-    let (app, platform, backend, gate) = carried_app(&session_file, live, tail, SessionStatus::Idle).await;
+    let (app, platform, _backend, gate) = seeded_app(&session_file, live, SessionStatus::Idle).await;
     gate.add_permits(1);
 
     let mut context = ctx("ses_test", "新问题");
     context.cola_message_id = Some("msg_cola_new".into());
     Turn::run(&app.turn_handles(), context).await.unwrap();
 
-    assert_eq!(
-        backend.transcript_tail_calls.lock().await.as_slice(),
-        &[("ses_test".to_string(), tail_anchor(1_000))],
-        "the tail read ran, scoped by the orphan record's anchor"
-    );
     wait_for_card_header(&platform, "✅").await;
     let cards = platform.updated_cards().await;
     let text = card_text(cards.last().unwrap());
@@ -1787,70 +1735,11 @@ async fn a_restart_takeover_never_carries_an_older_turns_stale_call() {
     );
 }
 
-/// A cap-stopped tail read carries nothing: the page cap is a successful read
-/// that never reached the boundary, and the carry must not guess from a
-/// partial scan.
+/// A failed seed read degrades to today's behavior: nothing is seeded, the
+/// takeover still collects the orphan under today's keep rule (the running
+/// marker stays), and the successor settles as usual.
 #[tokio::test]
-async fn a_capped_carry_read_carries_nothing() {
-    let _wd = test_work_dir();
-    let dir = tempfile::tempdir().unwrap();
-    let session_file = dir.path().join("sessions.json");
-    let orphan_anchor = 1_000_000;
-    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(orphan_anchor));
-    let new_anchor = 2_000_000;
-    let orphan = in_flight_shell(
-        "a_orphan",
-        orphan_anchor + 500,
-        "call_sleep",
-        ToolStatus::Running,
-        1_300_000,
-        "",
-    );
-    let tail = TranscriptTail {
-        transcript: SessionTranscript::new(vec![orphan.clone()]),
-        // The scan hit the page cap before the boundary.
-        complete: false,
-    };
-    let live = SessionTranscript::new(vec![
-        orphan,
-        user("msg_cola_new", new_anchor, "新问题"),
-        assistant(new_anchor + 1_000, "新回答"),
-    ]);
-    let (app, platform, backend, gate) = carried_app(&session_file, live, tail, SessionStatus::Idle).await;
-    platform.given_card_view("om_frozen", live_tail_orphan_view());
-    gate.add_permits(1);
-
-    let mut context = ctx("ses_test", "新问题");
-    context.cola_message_id = Some("msg_cola_new".into());
-    Turn::run(&app.turn_handles(), context).await.unwrap();
-
-    wait_for_card_header(&platform, "✅").await;
-    assert_eq!(
-        backend.transcript_tail_calls.lock().await.len(),
-        1,
-        "the read ran"
-    );
-    let cards = platform.updated_cards().await;
-    let text = card_text(cards.last().unwrap());
-    assert!(!text.contains("call_sleep"), "nothing was carried: {text}");
-    // A cap-stopped read carries nothing, so the orphan's running marker
-    // stays in its preserved body — the ledger leaves it either way.
-    let orphan_patches = patches_to(&platform, "om_frozen").await;
-    let orphan_text = card_text(&orphan_patches[0]);
-    assert!(
-        orphan_text.contains("⏳ shell"),
-        "a cap stop keeps the running marker: {orphan_text}"
-    );
-    assert!(
-        !orphan_text.contains("⏳ 后台任务"),
-        "the ledger leaves the collect: {orphan_text}"
-    );
-}
-
-/// A failed carry read degrades to today's behavior: nothing is carried, the
-/// takeover still collects the orphan, and the successor settles as usual.
-#[tokio::test]
-async fn a_failed_carry_read_carries_nothing() {
+async fn a_failed_seed_read_seeds_nothing() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("sessions.json");
@@ -1870,15 +1759,10 @@ async fn a_failed_carry_read_carries_nothing() {
         user("msg_cola_new", new_anchor, "新问题"),
         assistant(new_anchor + 1_000, "新回答"),
     ]);
-    let (app, platform, backend, gate) = carried_app(
-        &session_file,
-        live,
-        TranscriptTail::default(),
-        SessionStatus::Idle,
-    )
-    .await;
+    let (app, platform, backend, gate) = seeded_app(&session_file, live, SessionStatus::Idle).await;
     platform.given_card_view("om_frozen", live_tail_orphan_view());
-    backend.fail_transcript_tail_for("ses_test").await;
+    // Exactly the seed's read fails; every later read serves normally.
+    backend.fail_transcript_reads(1);
     gate.add_permits(1);
 
     let mut context = ctx("ses_test", "新问题");
@@ -1888,9 +1772,9 @@ async fn a_failed_carry_read_carries_nothing() {
     wait_for_card_header(&platform, "✅").await;
     let cards = platform.updated_cards().await;
     let text = card_text(cards.last().unwrap());
-    assert!(!text.contains("call_sleep"), "nothing was carried: {text}");
-    // A failed carry carries nothing, so the orphan's running marker stays in
-    // its preserved body — while the ledger leaves it either way (ADR-0068).
+    assert!(!text.contains("call_sleep"), "nothing was seeded: {text}");
+    // A failed read seeds nothing, so the orphan's running marker stays in its
+    // preserved body — while the ledger leaves it either way.
     let orphan_patches = patches_to(&platform, "om_frozen").await;
     assert_eq!(
         orphan_patches.len(),
@@ -1905,18 +1789,18 @@ async fn a_failed_carry_read_carries_nothing() {
     let orphan_text = card_text(&orphan_patches[0]);
     assert!(
         orphan_text.contains("⏳ shell"),
-        "a failed carry keeps the running marker: {orphan_text}"
+        "a failed seed read keeps the running marker: {orphan_text}"
     );
     assert!(
         !orphan_text.contains("⏳ 后台任务"),
-        "the ledger leaves the collect even when nothing was carried: {orphan_text}"
+        "the ledger leaves the collect even when nothing was seeded: {orphan_text}"
     );
 }
 
-/// A timed-out carry read carries nothing and leaves the takeover as today —
-/// the existing read timeout bounds the prompt's wait.
+/// A timed-out seed read seeds nothing and leaves the takeover as today — the
+/// existing read timeout bounds the prompt's wait.
 #[tokio::test]
-async fn a_timed_out_carry_read_carries_nothing() {
+async fn a_timed_out_seed_read_seeds_nothing() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("sessions.json");
@@ -1936,18 +1820,10 @@ async fn a_timed_out_carry_read_carries_nothing() {
         user("msg_cola_new", new_anchor, "新问题"),
         assistant(new_anchor + 1_000, "新回答"),
     ]);
-    let (app, platform, backend, gate) = carried_app(
-        &session_file,
-        live,
-        TranscriptTail::default(),
-        SessionStatus::Idle,
-    )
-    .await;
+    let (app, platform, backend, gate) = seeded_app(&session_file, live, SessionStatus::Idle).await;
     platform.given_card_view("om_frozen", live_tail_orphan_view());
-    // The tail read hangs; the 20 ms read timeout ends it.
-    backend
-        .hang_transcript_tail
-        .store(1, std::sync::atomic::Ordering::Relaxed);
+    // The seed's read hangs; the 20 ms read timeout ends it.
+    backend.hang_transcript_reads(1);
     gate.add_permits(1);
 
     let mut context = ctx("ses_test", "新问题");
@@ -1957,14 +1833,14 @@ async fn a_timed_out_carry_read_carries_nothing() {
     wait_for_card_header(&platform, "✅").await;
     let cards = platform.updated_cards().await;
     let text = card_text(cards.last().unwrap());
-    assert!(!text.contains("call_sleep"), "nothing was carried: {text}");
-    // A timed-out read carries nothing, so the orphan's running marker stays
-    // in its preserved body — the ledger leaves it either way.
+    assert!(!text.contains("call_sleep"), "nothing was seeded: {text}");
+    // A timed-out read seeds nothing, so the orphan's running marker stays in
+    // its preserved body — the ledger leaves it either way.
     let orphan_patches = patches_to(&platform, "om_frozen").await;
     let orphan_text = card_text(&orphan_patches[0]);
     assert!(
         orphan_text.contains("⏳ shell"),
-        "a timed-out carry keeps the running marker: {orphan_text}"
+        "a timed-out seed read keeps the running marker: {orphan_text}"
     );
     assert!(
         !orphan_text.contains("⏳ 后台任务"),
@@ -1974,13 +1850,13 @@ async fn a_timed_out_carry_read_carries_nothing() {
 
 /// The #443 stamp's PATCH passes its pre-PATCH ownership check, then a fresh
 /// Turn takes the orphan over while the stamp is in flight: the takeover's
-/// collect queues behind the stamp's delivery lock, and the stamp's
-/// post-PATCH repair lands last. The repair must reproduce the takeover
-/// collect's keep rule (ADR-0068) — not `Everything` — so the stamp's stale
-/// body never restores the tail the takeover removed. Carrying one running
-/// call, that means no running `⏳` panel and no ledger on the orphan.
+/// collect queues behind the stamp's delivery lock, and the stamp's post-PATCH
+/// repair lands last. The repair must reproduce the takeover collect's keep
+/// rule — not `Everything` — so the stamp's stale body never restores the tail
+/// the takeover removed. Seeding one running call, that means no running `⏳`
+/// panel and no ledger on the orphan.
 #[tokio::test]
-async fn a_stamp_over_a_carrying_takeover_repairs_without_the_carried_tail() {
+async fn a_stamp_over_a_seeding_takeover_repairs_without_the_seeded_tail() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("sessions.json");
@@ -1995,19 +1871,12 @@ async fn a_stamp_over_a_carrying_takeover_repairs_without_the_carried_tail() {
         1_300_000,
         "",
     );
-    let tail = TranscriptTail {
-        transcript: SessionTranscript::new(vec![
-            user("msg_cola_anchor", orphan_anchor, "跑个长命令"),
-            orphan.clone(),
-        ]),
-        complete: true,
-    };
     let live = SessionTranscript::new(vec![
         user("msg_cola_anchor", orphan_anchor, "跑个长命令"),
         orphan,
         user("msg_cola_new", new_anchor, "新问题"),
     ]);
-    let (app, platform, backend, gate) = carried_app(&session_file, live, tail, SessionStatus::Busy).await;
+    let (app, platform, backend, gate) = seeded_app(&session_file, live, SessionStatus::Busy).await;
     platform.given_card_view("om_frozen", live_tail_orphan_view());
     // Park the stamp PATCH after its pre-PATCH ownership check passed: it
     // holds the card's delivery lock, so the takeover's collect queues behind
@@ -2020,7 +1889,7 @@ async fn a_stamp_over_a_carrying_takeover_repairs_without_the_carried_tail() {
     let mut context = ctx("ses_test", "新问题");
     context.cola_message_id = Some("msg_cola_new".into());
     let turn = spawn_turn(&app, context);
-    // The recorded rule is the observed proof the takeover attached, carried
+    // The recorded rule is the observed proof the takeover attached, seeded
     // (at least one call) and reached its collect before the stamp is
     // released — so the post-PATCH repair can no longer miss the successor.
     wait_for_predecessor_keep(&app, "ses_test", "om_frozen", true).await;
@@ -2052,7 +1921,7 @@ async fn a_stamp_over_a_carrying_takeover_repairs_without_the_carried_tail() {
         let text = card_text(patch);
         assert!(
             !text.contains("⏳ shell"),
-            "a carried running marker never returns to the collected card: {text}"
+            "a seeded running marker never returns to the collected card: {text}"
         );
         assert!(
             !text.contains("⏳ 后台任务"),
@@ -2064,7 +1933,7 @@ async fn a_stamp_over_a_carrying_takeover_repairs_without_the_carried_tail() {
         );
     }
 
-    // End the turn as usual: the carried call settles and the session idles.
+    // End the turn as usual: the seeded call settles and the session idles.
     backend
         .given_transcript_after_build(
             "ses_test",
@@ -2094,10 +1963,11 @@ async fn a_stamp_over_a_carrying_takeover_repairs_without_the_carried_tail() {
         .unwrap();
 }
 
-/// The same stamp/takeover interleaving for a carry that moved nothing (a
-/// failed read): the repair reproduces the takeover's rule, so the running
-/// `⏳` marker stays — spec #523: "When nothing was carried … the running
-/// marker stays" — while the ledger still leaves the collected card.
+/// The same stamp/takeover interleaving for a takeover that seeded nothing (no
+/// live call in the orphan Turn's own window): the repair reproduces the
+/// takeover's rule, so the running `⏳` marker stays — spec #523: "When nothing
+/// was carried … the running marker stays" — while the ledger still leaves the
+/// collected card.
 #[tokio::test]
 async fn a_stamp_over_an_empty_takeover_repairs_without_the_ledger() {
     let _wd = test_work_dir();
@@ -2106,29 +1976,25 @@ async fn a_stamp_over_an_empty_takeover_repairs_without_the_ledger() {
     let orphan_anchor = 1_000_000;
     seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(orphan_anchor));
     let new_anchor = 2_000_000;
+    // The orphan Turn's call is already settled in this read: the seed's live
+    // set is empty, so nothing moves to the successor.
     let live = SessionTranscript::new(vec![
         user("msg_cola_anchor", orphan_anchor, "跑个长命令"),
         in_flight_shell(
             "a_orphan",
             orphan_anchor + 500,
             "call_sleep",
-            ToolStatus::Running,
+            ToolStatus::Completed,
             1_300_000,
-            "",
+            "slept",
         ),
         user("msg_cola_new", new_anchor, "新问题"),
     ]);
-    let (app, platform, backend, gate) = carried_app(
-        &session_file,
-        live,
-        TranscriptTail::default(),
-        SessionStatus::Busy,
-    )
-    .await;
+    let (app, platform, backend, gate) = seeded_app(&session_file, live, SessionStatus::Busy).await;
     platform.given_card_view("om_frozen", live_tail_orphan_view());
-    // The carry read fails: nothing moves to the successor, so the collect —
-    // and the repair behind it — keep the running panel and drop the ledger.
-    backend.fail_transcript_tail_for("ses_test").await;
+    // The seed resolves no live call: nothing moves to the successor, so the
+    // collect — and the repair behind it — keep the running panel and drop the
+    // ledger.
     let (entered, release) = platform.pause("update", "om_frozen");
 
     spawn_sync_with_timeout(&app, 5_000);
@@ -2161,7 +2027,7 @@ async fn a_stamp_over_an_empty_takeover_repairs_without_the_ledger() {
         let text = card_text(patch);
         assert!(
             text.contains("⏳ shell"),
-            "an uncarried running marker stays: {text}"
+            "an unseeded running marker stays: {text}"
         );
         assert!(
             !text.contains("⏳ 后台任务"),
@@ -2173,26 +2039,7 @@ async fn a_stamp_over_an_empty_takeover_repairs_without_the_ledger() {
         );
     }
 
-    // End the turn as usual: the never-carried call stays running in the
-    // scripted read, so settle it and idle the session before the prompt.
-    backend
-        .given_transcript_after_build(
-            "ses_test",
-            vec![SessionTranscript::new(vec![
-                user("msg_cola_anchor", orphan_anchor, "跑个长命令"),
-                in_flight_shell(
-                    "a_orphan",
-                    orphan_anchor + 500,
-                    "call_sleep",
-                    ToolStatus::Completed,
-                    1_300_000,
-                    "slept",
-                ),
-                user("msg_cola_new", new_anchor, "新问题"),
-                assistant(new_anchor + 1_000, "新回答"),
-            ])],
-        )
-        .await;
+    // End the turn as usual before the held prompt is released.
     backend
         .set_session_status("ses_test", Some(SessionStatus::Idle))
         .await;
@@ -2204,33 +2051,36 @@ async fn a_stamp_over_an_empty_takeover_repairs_without_the_ledger() {
         .unwrap();
 }
 
-/// An ordinary turn with no durable record never carries and never reads a
-/// tail: a takeover without an orphan behaves exactly as today.
+/// An ordinary turn with no durable record never seeds: a takeover without an
+/// orphan behaves exactly as today — one card, settled ✅.
 #[tokio::test]
-async fn a_takeover_with_no_orphan_record_reads_no_tail() {
+async fn a_takeover_with_no_orphan_record_seeds_nothing() {
     let _wd = test_work_dir();
     let new_anchor = 2_000_000;
     let transcript = SessionTranscript::new(vec![
         user("msg_cola_new", new_anchor, "新问题"),
         assistant(new_anchor + 1_000, "新回答"),
     ]);
-    let (_dir, app, backend, platform) = scripted_app(vec![transcript], Some(SessionStatus::Idle)).await;
+    let (_dir, app, _backend, platform) = scripted_app(vec![transcript], Some(SessionStatus::Idle)).await;
 
     let mut context = ctx("ses_test", "新问题");
     context.cola_message_id = Some("msg_cola_new".into());
     Turn::run(&app.turn_handles(), context).await.unwrap();
 
     wait_for_card_header(&platform, "✅").await;
-    assert!(
-        backend.transcript_tail_calls.lock().await.is_empty(),
-        "no orphan record, no carry read"
+    assert_eq!(
+        card_posts(&platform).await,
+        1,
+        "the turn's own card is the only send: {:?}",
+        platform.calls.lock().await
     );
 }
 
-/// A record with no captured anchor carries nothing — it cannot scope the
-/// orphan Turn's projection — and reads no tail.
+/// A record with no captured anchor seeds nothing — it cannot scope the
+/// orphan Turn's projection — and the takeover still collects the orphan under
+/// today's keep rule.
 #[tokio::test]
-async fn an_anchorless_record_reads_no_tail() {
+async fn an_anchorless_record_seeds_nothing() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("sessions.json");
@@ -2240,13 +2090,8 @@ async fn an_anchorless_record_reads_no_tail() {
         user("msg_cola_new", new_anchor, "新问题"),
         assistant(new_anchor + 1_000, "新回答"),
     ]);
-    let (app, platform, backend, gate) = carried_app(
-        &session_file,
-        transcript,
-        TranscriptTail::default(),
-        SessionStatus::Idle,
-    )
-    .await;
+    let (app, platform, _backend, gate) = seeded_app(&session_file, transcript, SessionStatus::Idle).await;
+    platform.given_card_view("om_frozen", live_tail_orphan_view());
     gate.add_permits(1);
 
     let mut context = ctx("ses_test", "新问题");
@@ -2254,35 +2099,38 @@ async fn an_anchorless_record_reads_no_tail() {
     Turn::run(&app.turn_handles(), context).await.unwrap();
 
     wait_for_card_header(&platform, "✅").await;
+    let orphan_patches = patches_to(&platform, "om_frozen").await;
+    assert_eq!(
+        orphan_patches.len(),
+        1,
+        "an anchorless record still collects its orphan: {orphan_patches:?}"
+    );
+    let text = card_text(&orphan_patches[0]);
     assert!(
-        backend.transcript_tail_calls.lock().await.is_empty(),
-        "an anchorless record cannot scope a carry read"
+        text.contains("⏳ shell"),
+        "an anchorless record cannot resolve the running marker away: {text}"
     );
 }
 
-/// The carry's operator-facing contract (spec #523, story 14): every takeover
+/// The seed's operator-facing contract (spec #523, story 14): every takeover
 /// logs exactly ONE INFO decision line — the session and a decision word,
 /// never chat content. The spec's testing rule keeps log text out of the
 /// behavioral tests; this is the one test that reads it, because the logging
 /// requirement is itself a log line. The fixture is the simplest decision: an
-/// orphan Turn with nothing running to carry.
+/// orphan Turn with nothing running to seed.
 #[tokio::test]
-async fn a_carry_decision_logs_one_info_line() {
+async fn a_seed_decision_logs_one_info_line() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("sessions.json");
     seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
     let new_anchor = 2_000_000;
-    let tail = TranscriptTail {
-        transcript: SessionTranscript::new(vec![user("msg_cola_anchor", 1_000, "问题")]),
-        complete: true,
-    };
     let live = SessionTranscript::new(vec![
         user("msg_cola_anchor", 1_000, "问题"),
         user("msg_cola_new", new_anchor, "新问题"),
         assistant(new_anchor + 1_000, "新回答"),
     ]);
-    let (app, platform, backend, gate) = carried_app(&session_file, live, tail, SessionStatus::Idle).await;
+    let (app, platform, _backend, gate) = seeded_app(&session_file, live, SessionStatus::Idle).await;
     gate.add_permits(1);
 
     let mut context = ctx("ses_test", "新问题");
@@ -2292,30 +2140,22 @@ async fn a_carry_decision_logs_one_info_line() {
     })
     .await;
 
-    // The user-visible outcome stands on its own: the takeover ran its one
-    // bounded read and the successor settled.
-    assert_eq!(
-        backend.transcript_tail_calls.lock().await.len(),
-        1,
-        "the carry read ran"
-    );
     wait_for_card_header(&platform, "✅").await;
-
-    let line = carry_info_line(&logs);
+    let line = seed_info_line(&logs);
     assert!(
-        line.contains("ses_test") && line.contains("carried 0"),
+        line.contains("ses_test") && line.contains("resolved false"),
         "the one INFO line names the session and its decision: {line}"
     );
 }
 
-/// A killed run's carried call does not outlive the Turn: the transcript never
+/// A killed run's seeded call does not outlive the Turn: the transcript never
 /// settles it, yet the follow still ends ✅ by the Turn's own settle decision
-/// (the carried panel is display-only), and the settled card omits the
+/// (the seeded panel is display-only), and the settled card omits the
 /// still-running panel — no permanent `⏳` survives the Turn. A genuinely
 /// running call keeps its panel while the successor is live; only the
 /// end-of-turn card drops it, because no renderer will ever update it again.
 #[tokio::test]
-async fn a_killed_runs_carried_call_does_not_outlive_the_turn() {
+async fn a_killed_runs_seeded_call_does_not_outlive_the_turn() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("sessions.json");
@@ -2330,13 +2170,6 @@ async fn a_killed_runs_carried_call_does_not_outlive_the_turn() {
         1_300_000,
         "",
     );
-    let tail = TranscriptTail {
-        transcript: SessionTranscript::new(vec![
-            user("msg_cola_anchor", orphan_anchor, "跑个长命令"),
-            orphan.clone(),
-        ]),
-        complete: true,
-    };
     // The call NEVER settles (a killed run leaves its part behind), while the
     // new turn's reply lands terminal.
     let live = SessionTranscript::new(vec![
@@ -2345,16 +2178,16 @@ async fn a_killed_runs_carried_call_does_not_outlive_the_turn() {
         user("msg_cola_new", new_anchor, "新问题"),
         assistant(new_anchor + 1_000, "新回答"),
     ]);
-    let (app, platform, backend, gate) = carried_app(&session_file, live, tail, SessionStatus::Busy).await;
+    let (app, platform, backend, gate) = seeded_app(&session_file, live, SessionStatus::Busy).await;
     // The drain bound hands the card to the follow, where the live-panel guard
-    // would otherwise keep waiting on the carried call.
+    // would otherwise keep waiting on the seeded call.
     app.turn_drain_timeout_ms
         .store(30, std::sync::atomic::Ordering::Relaxed);
 
     let mut context = ctx("ses_test", "新问题");
     context.cola_message_id = Some("msg_cola_new".into());
     let turn = spawn_turn(&app, context);
-    // The carried panel is live on the successor while the prompt is held.
+    // The seeded panel is live on the successor while the prompt is held.
     wait_for_card_text(&platform, "⏳ shell").await;
 
     gate.add_permits(1);
@@ -2363,7 +2196,7 @@ async fn a_killed_runs_carried_call_does_not_outlive_the_turn() {
         .expect("the turn must hand off at the drain bound")
         .unwrap()
         .unwrap();
-    // The follow observes an idle session; the carried call is display-only, so
+    // The follow observes an idle session; the seeded call is display-only, so
     // it neither extends the settle decision nor outlives the Turn.
     backend
         .set_session_status("ses_test", Some(SessionStatus::Idle))
@@ -2379,7 +2212,7 @@ async fn a_killed_runs_carried_call_does_not_outlive_the_turn() {
     let text = card_text(settled);
     assert!(
         !text.contains("⏳ shell"),
-        "a killed run's carried call must not leave a permanent running panel: {text}"
+        "a killed run's seeded call must not leave a permanent running panel: {text}"
     );
 }
 
@@ -2995,18 +2828,18 @@ async fn a_restart_continuation_collects_the_old_card() {
     );
 }
 
-/// The Wake continuation arm never carries (ADR-0061's no-replay scope): the
-/// restart's Session Sync posts its continuation with no tail read, so a stale
-/// running call from the lost chain is not replayed onto it.
+/// The Wake continuation arm never seeds (ADR-0061's no-replay scope): the
+/// restart's Session Sync posts its continuation without the takeover's seed,
+/// so a stale running call from the lost chain is not replayed onto it.
 #[tokio::test]
-async fn a_restart_wake_continuation_never_carries() {
+async fn a_restart_wake_continuation_never_seeds() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("sessions.json");
     seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000_000));
 
     // The lost chain: its running call sits beyond the Wake's own in-flight
-    // window, so only a carry could ever replay it.
+    // window, so only a seed could ever replay it.
     let transcript = SessionTranscript::new(vec![
         user("msg_cola_anchor", 1_000_000, "跑一下 CI"),
         in_flight_shell(
@@ -3032,9 +2865,10 @@ async fn a_restart_wake_continuation_never_carries() {
     )
     .await;
 
+    let reads = backend.transcript_calls.lock().await.len();
     assert!(
-        backend.transcript_tail_calls.lock().await.is_empty(),
-        "the Wake continuation arm never reads (or carries) the tail"
+        reads > 0,
+        "the reap ran its reads; it just never seeded the lost chain"
     );
     let cards = platform.updated_cards().await;
     assert!(

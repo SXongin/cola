@@ -37,9 +37,7 @@ mod tests;
 
 use async_trait::async_trait;
 
-use crate::backend::{
-    ChildRuntime, SessionTranscript, ShellRuntime, TaskRuntime, TranscriptTail, TurnAnchor,
-};
+use crate::backend::{ChildRuntime, SessionTranscript, ShellRuntime, TaskRuntime};
 use crate::error::Result;
 
 use super::strategy::GenerationStrategy;
@@ -101,13 +99,6 @@ const MAX_SESSION_PAGES: usize = 100;
 /// same reason: 100 pages of the endpoint's 200-row maximum is 20k messages,
 /// far past any real session.
 const MAX_MESSAGE_PAGES: usize = 100;
-
-/// Hard stop for the newest-first tail scan (ADR-0068's restart-carry read):
-/// the common case is ONE page — a page of 200 reaches the anchor's scope on
-/// any real session — and five are a generous bound for the rest.
-/// A scan this cap stops reports `complete: false`, and the carry then carries
-/// nothing rather than guessing.
-const MAX_TAIL_PAGES: usize = 5;
 
 /// The page size the transcript read asks for — the endpoint's documented
 /// maximum. The whole history is re-read every render poll, so the largest
@@ -447,79 +438,6 @@ impl GenerationStrategy for V2Strategy {
         let mut transcript = wire::decode_messages(&self.read_messages(http, session_id).await?);
         self.progress.apply(session_id, &mut transcript);
         Ok(transcript)
-    }
-
-    /// The bounded, newest-first tail read (ADR-0068): pages the projected-
-    /// message read in `order=desc`, following `cursor.next` for older pages,
-    /// and stops at the first page whose oldest message CANNOT belong to
-    /// `anchor`'s Turn — under either membership rule, exactly as
-    /// [`TurnAnchor::may_still_belong`] reads them: a message with no server
-    /// time cannot be placed, so the scan keeps going rather than stopping on
-    /// an unknown. A page with no unfinished message does NOT end the scan
-    /// (another client can queue messages above an unfinished call), and a
-    /// scan the page cap stops reports `complete: false`. The collected pages
-    /// are reversed into transcript order before decoding, so the returned
-    /// [`TranscriptTail`] reads exactly like the ascending full read.
-    async fn transcript_tail(
-        &self,
-        http: &Transport,
-        session_id: &str,
-        anchor: &TurnAnchor,
-    ) -> Result<TranscriptTail> {
-        self.progress.ensure_started(http);
-        let mut data: Vec<serde_json::Value> = Vec::new();
-        let mut cursor: Option<String> = None;
-        let mut complete = false;
-        for _ in 0..MAX_TAIL_PAGES {
-            let mut query: Vec<(&str, &str)> = Vec::new();
-            match &cursor {
-                Some(cursor) => query.push(("cursor", cursor)),
-                None => query.push(("order", "desc")),
-            }
-            query.push(("limit", MESSAGE_PAGE_LIMIT));
-            let page = self
-                .message_page(http, session_id, "transcript tail", &query)
-                .await?;
-            let empty = page.data.is_empty();
-            // The page's OLDEST message (server order; a desc page's last)
-            // ends the scan when it cannot belong to the anchor's Turn: it
-            // decides under the SAME membership rule the caller's projection
-            // applies, so a completed message whose completion is at/after the
-            // anchor cannot be cut short even when its newest activity (a part
-            // start) predates the in-flight boundary. A message with no time
-            // cannot be placed, so the scan continues rather than stopping on
-            // an unknown.
-            let cannot_belong = wire::decode_messages(&page.data)
-                .messages
-                .last()
-                .is_some_and(|oldest| !anchor.may_still_belong(oldest));
-            // Keep the whole crossing page: it holds every message at/after the
-            // boundary, and older ones are excluded by the scope's own
-            // membership rule.
-            data.extend(page.data);
-            if cannot_belong {
-                complete = true;
-                break;
-            }
-            match page.cursor.next {
-                Some(next) if !empty => cursor = Some(next),
-                // The session's start (an empty page) or its oldest page: the
-                // scan saw everything there is.
-                _ => {
-                    complete = true;
-                    break;
-                }
-            }
-        }
-        if !complete {
-            tracing::warn!(
-                "transcript tail {session_id}: page cap reached before the boundary; carrying nothing"
-            );
-        }
-        data.reverse();
-        let mut transcript = wire::decode_messages(&data);
-        self.progress.apply(session_id, &mut transcript);
-        Ok(TranscriptTail { transcript, complete })
     }
 
     /// The run state for ONE session (V2 `GET /api/session/active`), with the

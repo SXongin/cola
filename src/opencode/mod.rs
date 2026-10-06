@@ -33,9 +33,7 @@ mod wire;
 
 use std::sync::Arc;
 
-use crate::backend::{
-    Backend, BackendDirectory, DirectoryBackend, SessionTranscript, TaskRuntime, TranscriptTail, TurnAnchor,
-};
+use crate::backend::{Backend, BackendDirectory, DirectoryBackend, SessionTranscript, TaskRuntime};
 use crate::error::Result;
 use async_trait::async_trait;
 use client::OpenCodeBackend;
@@ -118,10 +116,6 @@ impl Backend for OpenCodeBackend {
 
     async fn transcript(&self, session_id: &str) -> Result<SessionTranscript> {
         OpenCodeBackend::transcript(self, session_id).await
-    }
-
-    async fn transcript_tail(&self, session_id: &str, anchor: &TurnAnchor) -> Result<TranscriptTail> {
-        OpenCodeBackend::transcript_tail(self, session_id, anchor).await
     }
 
     async fn session_selection(

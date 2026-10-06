@@ -10,7 +10,7 @@
 
 use std::sync::{Arc, RwLock};
 
-use crate::backend::{SessionTranscript, TaskRetirements, TaskRuntime, TurnAnchor};
+use crate::backend::{SessionTranscript, TaskRetirements, TaskRuntime};
 
 use super::parsing::parse_model;
 use super::strategy::{Generation, GenerationStrategy};
@@ -335,23 +335,6 @@ impl OpenCodeBackend {
         let mut transcript = self.strategy().transcript(&self.transport, session_id).await?;
         self.retirements.apply(session_id, &mut transcript);
         Ok(transcript)
-    }
-
-    /// The newest end of the session's transcript as a bounded, newest-first
-    /// tail scan (ADR-0068), scoped to `anchor`'s Turn, with this cola life's
-    /// runtime retirements applied like every other transcript read. See
-    /// [`crate::backend::Backend::transcript_tail`].
-    pub async fn transcript_tail(
-        &self,
-        session_id: &str,
-        anchor: &TurnAnchor,
-    ) -> crate::error::Result<crate::backend::TranscriptTail> {
-        let mut tail = self
-            .strategy()
-            .transcript_tail(&self.transport, session_id, anchor)
-            .await?;
-        self.retirements.apply(session_id, &mut tail.transcript);
-        Ok(tail)
     }
 
     /// Record the Background Tasks a runtime reconciliation retired (issue
