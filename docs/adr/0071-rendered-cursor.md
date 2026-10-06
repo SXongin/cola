@@ -92,10 +92,16 @@ projects the chain's delta after it onto a successor card.**
   confirmation. The outbox remembers the highest sequence each card delivered
   (not just its newest write's verdict), so a newer failed write that replaces
   the entry does not erase the delivery evidence a stage confirms by. A stage
-  older than the one the base already reflects is dropped unapplied: the
-  durable cursor only ever moves forward. The Wake Watermark's stages are
+  older than the one the base already reflects is dropped unapplied, and the
+  stage comparison and the durable record write happen in ONE cards critical
+  section (review #569, round 5): a concurrent confirmation can never
+  interleave between them, so an older confirmation arriving after a newer one
+  was applied is discarded and never overwrites the durable cursor — it only
+  ever moves forward. The Wake Watermark's stages are
   retained the same way — a delivered mark drains after a newer one is staged,
-  and `ChainRecords::advance` keeps the durable mark monotonic. A failure note
+  its take and durable write share the same critical section, and
+  `ChainRecords::advance` keeps the durable mark monotonic by `created_ms` as
+  the second guard (an older drain can never move it backwards). A failure note
   whose payload the drain delivered
   before the note looked up its sequence confirms the stage then and there
   (the settled delivery verdict), instead of discarding a write that reached

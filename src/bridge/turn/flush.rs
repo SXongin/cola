@@ -149,21 +149,55 @@ async fn confirm_staged_cursor(
     card_message_id: &str,
     chain_id: Option<u64>,
     expected: crate::bridge::turn::state::StagedCursorId,
+    gate: Option<&ConfirmGate>,
 ) {
-    let cursor = {
-        let mut live = cards.cards.lock().await;
-        let Some(card) = live.get_mut(session_id) else {
-            return;
-        };
-        if chain_id.is_some_and(|chain_id| card.chain_id() != chain_id) {
-            return;
-        }
-        let Some(cursor) = card.acc.take_staged_cursor(card_message_id, expected) else {
-            return;
-        };
-        cursor
+    // ONE critical section (spec #561, review #569): the stage comparison —
+    // `take_staged_cursor`'s last-applied guard — and the durable record write
+    // happen atomically, so a concurrent confirmation can never interleave
+    // between them. An older stage arriving after a newer one was applied is
+    // discarded by the guard, and the durable cursor only ever moves forward.
+    let mut live = cards.cards.lock().await;
+    let Some(card) = live.get_mut(session_id) else {
+        return;
     };
+    if chain_id.is_some_and(|chain_id| card.chain_id() != chain_id) {
+        return;
+    }
+    let Some(cursor) = card.acc.take_staged_cursor(card_message_id, expected) else {
+        return;
+    };
+    // The ordering test parks one confirmation here (spec #561, review #569):
+    // inside the critical section, so a newer confirmation waits for it.
+    if let Some(gate) = gate {
+        gate.entered.notify_one();
+        gate.release.notified().await;
+    }
     cards.chains.advance_cursor(session_id, card_message_id, &cursor);
+}
+
+/// A one-shot test gate inside one cursor confirmation (spec #561, review
+/// #569): awaited after the stage take and before the durable write — inside
+/// the confirmation's cards critical section — so the ordering test can
+/// interleave a newer confirmation there. Only tests construct one; production
+/// passes `None`.
+pub(crate) struct ConfirmGate {
+    /// Signalled when the confirmation parked at the gate.
+    pub(crate) entered: Arc<tokio::sync::Notify>,
+    /// The confirmation proceeds once this is signalled.
+    pub(crate) release: Arc<tokio::sync::Notify>,
+}
+
+/// The test seam's confirmation entry (spec #561, review #569): confirm one
+/// exact staged cursor, optionally parked at `gate`.
+#[cfg(test)]
+pub(crate) async fn confirm_staged_cursor_for_test(
+    cards: &CardsHandle,
+    session_id: &str,
+    card_message_id: &str,
+    expected: crate::bridge::turn::state::StagedCursorId,
+    gate: Option<&ConfirmGate>,
+) {
+    confirm_staged_cursor(cards, session_id, card_message_id, None, expected, gate).await;
 }
 
 /// Fold a failed card write into the staged Rendered Cursor (spec #561): a
@@ -200,7 +234,7 @@ async fn note_cursor_write_failure(
         if cards.feishu.settled_card_write_delivered(card_message_id) == Some(true) {
             // The drain delivered it first: the write landed, so confirm the
             // exact stage this body carried.
-            confirm_staged_cursor(cards, session_id, card_message_id, None, stage).await;
+            confirm_staged_cursor(cards, session_id, card_message_id, None, stage, None).await;
             return;
         }
     }
@@ -254,7 +288,7 @@ async fn reconcile_staged(cards: &CardsHandle, gate: Option<&ReconcileGate>) {
             // Only the stage whose delivery was just verified is confirmed: a
             // body staged since (a fresh flush whose PATCH is still pending) is
             // left for its own confirmation (review #569).
-            confirm_staged_cursor(cards, &session_id, &card_message_id, None, expected).await;
+            confirm_staged_cursor(cards, &session_id, &card_message_id, None, expected, None).await;
         } else if cards
             .feishu
             .settled_card_write_delivered(&card_message_id)
@@ -432,7 +466,7 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, spl
                     // The confirmed PATCH carries this body's Rendered Cursor
                     // (spec #561): advance the chain's record — only while the
                     // exact stage this write carried is still the staged one.
-                    confirm_staged_cursor(cards, session_id, &card_id, None, stage).await;
+                    confirm_staged_cursor(cards, session_id, &card_id, None, stage, None).await;
                     // The PATCH carried this slice's completion entries: the
                     // staged Wake Watermark is now user-visible (ADR-0061).
                     drain_wake_watermark(cards, session_id, watermark).await;
@@ -590,7 +624,7 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, spl
                 // (spec #561): advance the chain's record — only while the
                 // exact stage this write carried is still the staged one.
                 if let Some(stage) = stage {
-                    confirm_staged_cursor(cards, session_id, &card_id, None, stage).await;
+                    confirm_staged_cursor(cards, session_id, &card_id, None, stage, None).await;
                 }
                 // The finalized PATCH delivered this slice's entries; with no
                 // split queued the mark is fully user-visible, so it may drain
@@ -681,7 +715,7 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, spl
                 // (spec #561): advance the chain's record, now naming the new
                 // card — only while the exact stage this send carried is still
                 // the staged one.
-                confirm_staged_cursor(cards, session_id, &new_id, None, stage).await;
+                confirm_staged_cursor(cards, session_id, &new_id, None, stage, None).await;
                 // The send delivered the 承接 line (or the size-split slice):
                 // the staged Wake Watermark is user-visible now (ADR-0061).
                 drain_wake_watermark(cards, session_id, watermark).await;
@@ -805,28 +839,27 @@ async fn drain_staged_watermark(
     chain_id: Option<u64>,
     expected: Option<u64>,
 ) {
-    let staged = {
-        let mut live = cards.cards.lock().await;
-        let Some(card) = live.get_mut(session_id) else {
-            return;
-        };
-        if chain_id.is_some_and(|chain_id| card.chain_id() != chain_id) {
-            return;
-        }
-        if !card.pending_split.is_empty() {
-            return;
-        }
-        // The delivered write's own stage drains even when a newer mark has
-        // been staged since: a durable announcement is never lost to a later
-        // stage (review #569). `ChainRecords::advance` keeps the mark itself
-        // monotonic, so an older drain can never move it backwards.
-        expected.and_then(|expected| card.acc.take_staged_watermark(expected))
+    let mut live = cards.cards.lock().await;
+    let Some(card) = live.get_mut(session_id) else {
+        return;
     };
-    if let Some(staged) = staged {
-        cards
-            .chains
-            .advance(session_id, &staged.wake_id, staged.created_ms);
+    if chain_id.is_some_and(|chain_id| card.chain_id() != chain_id) {
+        return;
     }
+    if !card.pending_split.is_empty() {
+        return;
+    }
+    // The delivered write's own stage drains even when a newer mark has
+    // been staged since: a durable announcement is never lost to a later
+    // stage (review #569). The take and the durable write share ONE critical
+    // section, and `ChainRecords::advance` is monotonic by `created_ms`, so
+    // even a stale drain could never move the mark backwards.
+    let Some(staged) = expected.and_then(|expected| card.acc.take_staged_watermark(expected)) else {
+        return;
+    };
+    cards
+        .chains
+        .advance(session_id, &staged.wake_id, staged.created_ms);
 }
 
 #[cfg(test)]
