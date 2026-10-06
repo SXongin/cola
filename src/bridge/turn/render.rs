@@ -184,13 +184,15 @@ fn render_part(acc: &mut StreamAccumulator, source: Option<PartSource>, part: &P
     match part {
         Part::Text(text) => {
             acc.rendered_parts.insert(RenderedPart::Text(text.text.clone()));
-            acc.push_text_from(text.started_at, source, &text.text);
+            let (source, chunk) = source_chunk(acc, source, &text.text);
+            acc.push_text_from(text.started_at, source, &chunk);
             acc.card_state = crate::feishu::card::CardState::Streaming;
         }
         Part::Reasoning(reasoning) => {
             acc.rendered_parts
                 .insert(RenderedPart::Reasoning(reasoning.text.clone()));
-            acc.push_reasoning_from(reasoning.started_at, source, &reasoning.text);
+            let (source, chunk) = source_chunk(acc, source, &reasoning.text);
+            acc.push_reasoning_from(reasoning.started_at, source, &chunk);
             acc.card_state = crate::feishu::card::CardState::Reasoning;
         }
         Part::Tool(call) => {
@@ -218,6 +220,40 @@ fn render_part(acc: &mut StreamAccumulator, source: Option<PartSource>, part: &P
     // card_state / running-tool changes reset the header phase timer.
     acc.refresh_phase();
     true
+}
+
+/// The chunk an ordinary source-carrying text/reasoning render still owes the
+/// card (spec #561, Codex review on PR #569): the server re-sends a grown part
+/// WHOLE, so only the characters this accumulator has not delivered yet are
+/// pushed — appended to the part's existing entry, or as its next chunk. The
+/// returned source carries no offset: the timeline already holds everything
+/// before the chunk, so the part's entries stay disjoint and the Rendered
+/// Cursor's extent stays the part's own character count. A synthetic push
+/// (`source: None`) and a snapshot that is not an extension of the delivered
+/// content (a part's first render, or a part the server rewrote) push whole,
+/// exactly as the content-keyed dedup always did.
+fn source_chunk(
+    acc: &StreamAccumulator,
+    source: Option<PartSource>,
+    text: &str,
+) -> (Option<PartSource>, String) {
+    let Some(source) = source else {
+        return (None, text.to_string());
+    };
+    let Some(rendered) = acc.source_rendered(&source) else {
+        return (Some(source), text.to_string());
+    };
+    if rendered.is_empty() || !text.starts_with(&rendered) {
+        return (Some(source), text.to_string());
+    }
+    (
+        Some(PartSource {
+            message_id: source.message_id,
+            index: source.index,
+            delivered_before: 0,
+        }),
+        text[rendered.len()..].to_string(),
+    )
 }
 
 /// Render a batch of typed parts into the accumulator, skipping anything
@@ -711,9 +747,20 @@ fn render_seeded_part(
             return false;
         }
     };
-    let delivered = delivered.min(full.chars().count());
-    let prefix: String = full.chars().take(delivered).collect();
-    let suffix: String = full.chars().skip(delivered).collect();
+    let full_len = full.chars().count();
+    let delivered = delivered.min(full_len);
+    // The prefix the PREVIOUS card delivered is carried on this part's first
+    // entry alone; a part this accumulator already holds (the frontier growing
+    // under a later read) continues from what it delivered, never repeating
+    // the offset (spec #561, review #569).
+    let held = acc.source_extent(&PartSource::at(message_id.clone(), index));
+    let (cut, before) = if held == 0 {
+        (delivered, delivered)
+    } else {
+        (held, 0)
+    };
+    let prefix: String = full.chars().take(cut).collect();
+    let suffix: String = full.chars().skip(cut).collect();
     // Everything up to the part's current end is delivered now: a later read
     // grows the part and renders only the growth.
     acc.mark_delivered_part(part);
@@ -722,7 +769,7 @@ fn render_seeded_part(
         let source = PartSource {
             message_id,
             index,
-            delivered_before: delivered,
+            delivered_before: before,
         };
         if is_text {
             acc.push_text_lead(started_at, Some(source), &suffix, lead);
@@ -735,7 +782,7 @@ fn render_seeded_part(
     if let Some(seed) = acc.seed.as_mut()
         && let Some(frontier) = seed.frontier.as_mut()
     {
-        frontier.delivered_chars = full.chars().count();
+        frontier.delivered_chars = full_len;
     }
     !suffix.is_empty()
 }
@@ -2575,6 +2622,125 @@ Index: /x/src/main.rs
             1,
             "growth never duplicates the delivered suffix: {text}"
         );
+    }
+
+    /// The ordinary render's cursor arithmetic (spec #561, Codex review on PR
+    /// #569): the server grows an in-flight part by re-sending it whole, so
+    /// the render must push only the undelivered delta — the same part's
+    /// entries stay disjoint chunks and the frontier's extent is the part's
+    /// own length, never a sum over overlapping snapshots. Before the fix the
+    /// "AB" read re-pushed the whole snapshot ("AAB") and the frontier read 3.
+    #[test]
+    fn a_grown_part_renders_only_its_new_tail_and_counts_the_part_once() {
+        let transcript = |text: &str| {
+            SessionTranscript::new(vec![
+                typed_message(
+                    "msg_cola_anchor",
+                    MessageRole::User,
+                    Some(1_000),
+                    vec![text_part("问题")],
+                ),
+                message("msg_a_2000", 2_000, vec![text_at(text, 2_000)]),
+            ])
+        };
+        let mut acc = StreamAccumulator::new("t");
+        acc.turn_anchor = Some(turn_anchor(1_000));
+
+        assert!(render_new_turn_parts(&mut acc, &transcript("A")));
+        let built = acc.build_card_with_info();
+        let text = card_text(&built.card);
+        assert_eq!(
+            text.matches('A').count(),
+            1,
+            "the first snapshot renders once: {text}"
+        );
+        assert_eq!(
+            built.cursor.frontier.as_ref().map(|f| f.delivered_chars),
+            Some(1),
+            "the frontier counts the delivered part"
+        );
+
+        // The server grew the same part: only the new tail is appended.
+        assert!(render_new_turn_parts(&mut acc, &transcript("AB")));
+        let built = acc.build_card_with_info();
+        let text = card_text(&built.card);
+        assert!(
+            !text.contains("AAB") && text.matches('A').count() == 1,
+            "the grown snapshot never repeats the delivered prefix: {text}"
+        );
+        assert_eq!(
+            built.cursor.frontier.as_ref().map(|f| f.delivered_chars),
+            Some(2),
+            "the frontier is the part's character extent, not a sum over its snapshots"
+        );
+
+        // And again: the delta rule holds for every growth.
+        assert!(render_new_turn_parts(&mut acc, &transcript("ABC")));
+        let built = acc.build_card_with_info();
+        let text = card_text(&built.card);
+        assert!(
+            !text.contains("AAB") && text.matches('A').count() == 1,
+            "the further growth never repeats the prefix: {text}"
+        );
+        assert_eq!(
+            built.cursor.frontier.as_ref().map(|f| f.delivered_chars),
+            Some(3),
+            "the frontier keeps counting the whole part exactly once"
+        );
+        // An unchanged read renders nothing new.
+        assert!(!render_new_turn_parts(&mut acc, &transcript("ABC")));
+    }
+
+    /// The delta rule at the card-size boundary (spec #561, Codex review on PR
+    /// #569): a part whose chunk already fills its timeline entry grows into a
+    /// new entry, and the frontier still counts the part exactly once — the
+    /// growth must not re-push the chunk the earlier entry delivered.
+    #[test]
+    fn a_grown_split_part_keeps_the_cursor_extent_exact() {
+        let max = crate::feishu::card::MAX_CARD_TEXT_CHARS;
+        let first: String = "长".repeat(max);
+        let transcript = |text: &str| {
+            SessionTranscript::new(vec![
+                typed_message(
+                    "msg_cola_anchor",
+                    MessageRole::User,
+                    Some(1_000),
+                    vec![text_part("问题")],
+                ),
+                message("msg_a_2000", 2_000, vec![text_at(text, 2_000)]),
+            ])
+        };
+        let mut acc = StreamAccumulator::new("t");
+        acc.turn_anchor = Some(turn_anchor(1_000));
+
+        assert!(render_new_turn_parts(&mut acc, &transcript(&first)));
+        let delivered = acc.build_card_with_info();
+        assert!(!delivered.full, "the part exactly fills one card");
+        assert_eq!(
+            delivered.cursor.frontier.as_ref().map(|f| f.delivered_chars),
+            Some(max),
+            "the single chunk is delivered whole"
+        );
+
+        // The part grows past the entry's chunk: the tail opens a new entry.
+        let tail = "尾巴。";
+        let grown = format!("{first}{tail}");
+        assert!(render_new_turn_parts(&mut acc, &transcript(&grown)));
+        let finalized = acc.build_card_with_info();
+        assert!(finalized.full, "the over-budget part finalizes the first card");
+        assert_eq!(
+            finalized.cursor.frontier.as_ref().map(|f| f.delivered_chars),
+            Some(max),
+            "the finalized slice delivered the first chunk"
+        );
+        let continuation = acc.build_card_with_info();
+        assert_eq!(
+            continuation.cursor.frontier.as_ref().map(|f| f.delivered_chars),
+            Some(max + tail.chars().count()),
+            "the continuation counts the part once across both entries"
+        );
+        let text = card_text(&continuation.card);
+        assert_eq!(text.matches(tail).count(), 1, "the grown tail lands once: {text}");
     }
 
     /// A tail cut inside a code fence (spec #561, ticket #563): the seeded

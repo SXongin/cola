@@ -153,6 +153,99 @@ async fn grow_scripted_answer(backend: &Arc<MockBackend>, created: i64, text: &s
     ));
 }
 
+/// Replace the newest scripted assistant part's text — the server re-sending a
+/// GROWN snapshot of the SAME part, not a new message (the in-flight update
+/// shape the Rendered Cursor must count exactly once).
+async fn grow_scripted_part(backend: &Arc<MockBackend>, text: &str) {
+    let mut scripts = backend.transcript_scripts.lock().await;
+    let transcript = &mut scripts.get_mut("ses_test").unwrap()[0];
+    for message in transcript.messages.iter_mut() {
+        if message.id.as_str() != "msg_a_2000" {
+            continue;
+        }
+        for part in message.parts.iter_mut() {
+            if let crate::backend::Part::Text(part) = part {
+                part.text = text.to_string();
+                return;
+            }
+        }
+    }
+    panic!("the scripted transcript carries no msg_a_2000 text part to grow");
+}
+
+/// A part the server grows in place while the follow streams (spec #561, Codex
+/// review on PR #569): every read re-sends the whole snapshot, so the card must
+/// show the part exactly once and the record's frontier must be its character
+/// extent — never a sum over the snapshots. Before the fix the grown snapshot
+/// was appended whole, the card read "第一段回答。第一段回答。第二段回答。" and
+/// the frontier recorded one character per snapshot twice over, which no
+/// restart could resolve.
+#[tokio::test]
+async fn a_grown_part_advances_the_cursor_to_its_own_extent() {
+    let _wd = test_work_dir();
+    let first = "第一段回答。";
+    let full = format!("{first}第二段回答。");
+    let timeline = vec![
+        user("msg_cola_anchor", 1_000, "第一条消息"),
+        assistant(2_000, first),
+        tool_assistant(4_000, ToolStatus::Running, ""),
+    ];
+    let (_dir, app, backend, platform) =
+        scripted_app(vec![SessionTranscript::new(timeline)], Some(SessionStatus::Busy)).await;
+    app.turn_drain_timeout_ms.store(30, Ordering::Relaxed);
+
+    let turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
+    wait_for_card_text(&platform, first).await;
+    // The turn hands off at the tiny drain bound; the follow keeps the card
+    // (and the record) live.
+    let result = tokio::time::timeout(Duration::from_secs(5), turn)
+        .await
+        .expect("the turn must hand off at the drain bound")
+        .unwrap();
+    result.unwrap();
+    wait_for_cursor(&app, |cursor| {
+        cursor
+            .frontier
+            .as_ref()
+            .is_some_and(|frontier| frontier.delivered_chars == first.chars().count())
+    })
+    .await;
+
+    // The same part is re-sent, grown: the card takes only the tail and the
+    // frontier stays the part's own extent.
+    grow_scripted_part(&backend, &full).await;
+    let cursor = wait_for_cursor(&app, |cursor| {
+        cursor
+            .frontier
+            .as_ref()
+            .is_some_and(|frontier| frontier.delivered_chars == full.chars().count())
+    })
+    .await;
+    assert_eq!(
+        cursor.frontier.as_ref().map(|f| f.message_id.as_str()),
+        Some("msg_a_2000"),
+        "the grown part keeps its own message identity"
+    );
+    wait_for_card_text(&platform, "第二段回答。").await;
+    let card = platform
+        .updated_cards()
+        .await
+        .last()
+        .cloned()
+        .expect("the grown part reached the card");
+    let text = card_text(&card);
+    assert_eq!(
+        text.matches(first).count(),
+        1,
+        "the delivered prefix is never repeated by a grown snapshot: {text}"
+    );
+    assert_eq!(
+        text.matches("第二段回答。").count(),
+        1,
+        "the grown tail lands exactly once: {text}"
+    );
+}
+
 /// The write-cost acceptance (spec #561; reopening ADR-0061's rejected
 /// render-frontier watermark): on a live-turn scenario the Chain Record
 /// sidecar is persisted once per confirmed card write that moved the frontier
