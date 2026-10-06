@@ -990,10 +990,12 @@ mod tests {
 
     /// The live adoption (spec #561, ticket #564): a record carrying a Rendered
     /// Cursor whose run is still live projects AND follows — the successor is
-    /// seeded at the cursor. A cursor the read cannot place falls back to
-    /// today's stamp, and the one-time stamp marks hold for the fallback.
+    /// seeded at the cursor. A cursor-carrying record is never stamped (ticket
+    /// #566): an unplaceable cursor, a missing scope and a missing transcript
+    /// read all claim nothing and wait for a read that can project; the #443
+    /// stamp is the cursorless fallback's alone.
     #[test]
-    fn a_still_live_cursor_record_projects_and_follows() {
+    fn a_still_live_cursor_record_projects_and_is_never_stamped() {
         let transcript = SessionTranscript::new(vec![
             user("msg_cola_anchor", 1_000, "问题"),
             assistant(2_000, "答复。"),
@@ -1013,20 +1015,22 @@ mod tests {
             ..record()
         };
         let seed = CursorSeed::resolve(&transcript, &cursor).expect("the frontier resolves");
-        let live = |transcript: Option<SessionTranscript>| RecoveryReads {
+        let live = |cursor: bool, transcript: Option<SessionTranscript>| RecoveryReads {
             status: Some(StatusRead::Named(SessionStatus::Busy)),
             transcript: transcript.map(TranscriptRead::Read),
-            cursor: true,
+            cursor,
             ..orphan()
         };
         assert_eq!(
-            reconcile(&with_cursor, &live(Some(transcript.clone()))),
+            reconcile(&with_cursor, &live(true, Some(transcript.clone()))),
             ChainDisposition::ProjectLive { seed },
             "a live run with a placed cursor is adopted for following"
         );
 
-        // The cursor names a part this read does not carry: the read moved on,
-        // so nothing may be skipped — today's one-time stamp.
+        // The cursor names a part this read does not carry: nothing may be
+        // skipped, and the projection — not the #443 stamp — owns a
+        // cursor-carrying record, so the pass claims nothing and a later read
+        // decides.
         let dangling = RenderedCursor {
             frontier: Some(CursorFrontier {
                 message_id: MessageId::new("msg_gone"),
@@ -1042,13 +1046,14 @@ mod tests {
             ..record()
         };
         assert_eq!(
-            reconcile(&dangling_record, &live(Some(transcript.clone()))),
-            ChainDisposition::StampRestart
+            reconcile(&dangling_record, &live(true, Some(transcript.clone()))),
+            ChainDisposition::NoDecision,
+            "an unplaceable cursor is never stamped"
         );
 
         // A resolvable cursor whose submitted message never landed and whose
         // record captured no server time has no scope to arm a successor with:
-        // today's stamp, never an unscoped follow.
+        // claim nothing, never the stamp.
         let anchorless = ChainRecord::new("om_card", MessageId::new("msg_cola_anchor"), None)
             .with_directory(Some("/work".into()));
         let anchorless = ChainRecord {
@@ -1058,29 +1063,23 @@ mod tests {
         let other_turn =
             SessionTranscript::new(vec![user("msg_other", 500, "上一条"), assistant(2_000, "答复。")]);
         assert_eq!(
-            reconcile(&anchorless, &live(Some(other_turn))),
-            ChainDisposition::StampRestart
+            reconcile(&anchorless, &live(true, Some(other_turn))),
+            ChainDisposition::NoDecision,
+            "an anchorless cursor record is never stamped"
         );
 
-        // The fallback's one-time marks hold: an unplaceable cursor whose
-        // stamp already landed (or was permanently refused) is kept.
-        for marked in [
-            ChainRecord {
-                cursor: Some(dangling.clone()),
-                restarted_reaped: true,
-                ..record()
-            },
-            ChainRecord {
-                cursor: Some(dangling),
-                restart_stamp_rejected: true,
-                ..record()
-            },
-        ] {
-            assert_eq!(
-                reconcile(&marked, &live(Some(transcript.clone()))),
-                ChainDisposition::Keep
-            );
-        }
+        // The same facts on a cursorless record keep today's one-time stamp —
+        // its live fallback needs no scope and no cursor.
+        assert_eq!(
+            reconcile(&record(), &live(false, None)),
+            ChainDisposition::StampRestart,
+            "the cursorless fallback keeps today's stamp"
+        );
+        assert_eq!(
+            reconcile(&record(), &live(false, Some(transcript.clone()))),
+            ChainDisposition::StampRestart,
+            "a scope a cursorless record lacks is not its concern"
+        );
     }
 
     /// The boundary rule the plan promises: the status read is warranted only
