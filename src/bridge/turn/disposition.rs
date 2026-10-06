@@ -5,9 +5,10 @@
 //! ([`TurnSettle`]) or by a caller that knows a loop-only ending (the sticky
 //! `/stop` marker, the out-of-turn loop's two graces) — and every ending path
 //! with a live card applies it through one application
-//! ([`super::Turn::apply_disposition`] /
-//! [`super::state::StreamAccumulator::apply_ending`]): the card's state and
-//! failure line, its phase timer, then the work-context refresh and the flush.
+//! (`StreamAccumulator::apply_ending`, behind the out-of-turn loops'
+//! ownership-checked `Ownership::apply_if_held` and the external arm's anchor
+//! guard): the card's state and failure line, its phase timer, then the
+//! work-context refresh and the flush.
 //! The durable reap has no live accumulator to apply to: it reads the same
 //! table for its ending card's state and failure line and keeps its own
 //! body-preserving PATCH and record mechanics (ADR-0063).

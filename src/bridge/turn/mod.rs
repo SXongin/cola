@@ -11,11 +11,12 @@ mod state;
 pub(crate) use state::CardSession;
 
 /// The one ending vocabulary (spec #538): the table every path that ends a
-/// card reads — the in-Turn paths through [`Turn::apply_disposition`], the
-/// out-of-turn loop and the durable reap through its `From<TurnSettle>`
-/// mapping. Crate-visible so a path outside the Turn module (the reap's card
-/// translation in `chain::reconcile`) reads the same table instead of a second
-/// state/failure mapping.
+/// card reads — the in-Turn paths through `StreamAccumulator::apply_ending`,
+/// the out-of-turn loops through `Ownership::apply_if_held` (the ownership
+/// check and the stamp under one lock), and the durable reap through its
+/// `From<TurnSettle>` mapping. Crate-visible so a path outside the Turn module
+/// (the reap's card translation in `chain::reconcile`) reads the same table
+/// instead of a second state/failure mapping.
 pub(crate) use disposition::Disposition;
 
 use std::collections::{HashMap, HashSet};
@@ -2389,20 +2390,6 @@ impl Turn {
         state::refresh_work_context(cards, session_id).await;
     }
 
-    /// Apply an ending disposition to `session_id`'s card — the one
-    /// application every ending path shares (spec #538): the accumulator
-    /// stamps the ending (state, failure line, phase timer), then the work
-    /// context is refreshed and the card flushed, exactly the order the
-    /// per-ending helpers had. [`Disposition::Observe`] is not an ending and
-    /// the accumulator stamps nothing for it.
-    pub(crate) async fn apply_disposition(cards: &CardsHandle, session_id: &str, disposition: &Disposition) {
-        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
-            card.acc.apply_ending(disposition);
-        }
-        Self::refresh_work_context(cards, session_id).await;
-        Self::flush_card(cards, session_id).await;
-    }
-
     /// Apply an ending `disposition` only while the card's accumulator is
     /// still `anchor`'s — the check and the application share ONE lock, so a
     /// renderer whose bound fired after a successor replaced the accumulator
@@ -3356,7 +3343,8 @@ impl Turn {
     /// Run the Wake continuation's out-of-turn settle loop (ADR-0059) on the
     /// caller's own task: the shared out-of-turn loop under the
     /// continuation's chain identity, then its ending applied through the one
-    /// disposition application. Returns the ending disposition the loop
+    /// shared, ownership-checked application ([`settle::Ownership::apply_if_held`],
+    /// #539). Returns the ending disposition the loop
     /// reached and applied, or `None` when it stopped owning the card (its
     /// accumulator vanished or a successor took it over) and stamped nothing;
     /// the caller owns the announcement. A split continuation needs none — its
@@ -3376,7 +3364,13 @@ impl Turn {
             anchor: anchor.clone(),
         };
         let disposition = settle::run(flow, session_id, directory, timing, &owns).await?;
-        Self::apply_disposition(&flow.cards, session_id, &disposition).await;
+        // The same post-run gap as the follow's: the loop's last probe may be
+        // stale by now, so the ending is applied atomically with a fresh
+        // ownership check. Ownership lost is a loop that ended nothing — the
+        // same `None` `run` returns.
+        if !owns.apply_if_held(&flow.cards, session_id, &disposition).await {
+            return None;
+        }
         Some(disposition)
     }
 
