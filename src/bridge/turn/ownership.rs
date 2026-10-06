@@ -29,12 +29,20 @@
 //!   [`Ticket`]'s identity. [`Ticket::apply_ending_if_owned`] re-checks through
 //!   the same predicate under the cards lock before it stamps (#539), so the
 //!   loop's check and its atomic apply cannot disagree.
+//! - [`CardOwnership::admits_ledger_refresh`] — the yielded-card write
+//!   admission (ADR-0060, ADR-0066): a yielded card, still live, owing no
+//!   handoff. The in-place Wake resume, the Background Task Ledger refresh,
+//!   the runtime reconciliation's observation and the Wake step's
+//!   resume-in-place decision all read this one rule; the two ledger WRITE
+//!   sites re-check it under the session's card-write lock through
+//!   [`CardOwnership::admit_ledger_write`], so the admission and the write it
+//!   authorizes share one lock. The claim half is deliberately irrelevant: the
+//!   yield's carve-out is the card's own write-readiness, not the owner's.
 //!
 //! The classification carries the identities the remaining rules need — the
 //! card's message id, its Turn anchor and its chain identity — so those rules
 //! land as methods over one value, not as new reads. Later tickets of the spec
-//! consume the yielded-card write admission, the reap's claim and the `/stop`
-//! disposition (ADR-0070).
+//! consume the reap's claim and the `/stop` disposition (ADR-0070).
 //!
 //! Sources, exactly:
 //!
@@ -44,6 +52,8 @@
 //!   [`CardSession`]'s `acc.card_state`, its `card_is_live` + `pending_split`
 //!   (the yielded write-readiness), `acc.turn_anchor`, `card_message_id` and
 //!   `chain_id()`.
+
+use tokio::sync::{MappedMutexGuard, MutexGuard};
 
 use crate::backend::TurnAnchor;
 use crate::bridge::handles::{CardsHandle, WaitsHandle};
@@ -213,6 +223,44 @@ impl CardOwnership {
     pub(crate) fn reap_claim(&self) -> bool {
         self.claim() != Claim::None
     }
+
+    /// The yielded-card write admission (ADR-0060, ADR-0066): whether the
+    /// Session's card may receive its in-place yield carve-out right now — a
+    /// yielded card (Waiting), still live, owing no handoff. The ONE rule the
+    /// in-place Wake resume, the Background Task Ledger refresh, the runtime
+    /// reconciliation's observation and the Wake step's resume-in-place
+    /// decision all read; the claim half is deliberately irrelevant (a guard
+    /// can sit beside the yielded card, ADR-0070), and a render-owned,
+    /// restart-stamped or ended card never admits.
+    pub(crate) fn admits_ledger_refresh(&self) -> bool {
+        self.card_class.admits_ledger_refresh()
+    }
+
+    /// The lock-scoped re-check for the two ledger WRITE sites (the in-place
+    /// Wake resume and the yielded Ledger refresh): the caller holds the
+    /// session's card-write lock ([`CardsHandle::write_lock`]); this takes the
+    /// card map inside it, re-applies [`Self::admits_ledger_refresh`] to the
+    /// live card and hands that card back STILL LOCKED — so the admission and
+    /// the write it authorizes share one lock, and no collect, split or ending
+    /// can land in a re-lookup gap (#539's property). `None`: the Session has
+    /// no card, or its card no longer admits the write. The caller must
+    /// release the returned guard before a flush takes the card map again.
+    pub(crate) async fn admit_ledger_write<'a>(
+        cards: &'a CardsHandle,
+        session_id: &str,
+    ) -> Option<MappedMutexGuard<'a, CardSession>> {
+        let live = cards.cards.lock().await;
+        let card = MutexGuard::try_map(live, |map| map.get_mut(session_id)).ok()?;
+        admits_ledger_refresh(&card).then_some(card)
+    }
+}
+
+/// The yielded-card write admission over one card already in hand — the
+/// definition [`CardOwnership::admits_ledger_refresh`] and the lock-scoped
+/// write helper both read, and the read-time form for a gate that already
+/// holds the card map (the Wake step's resume-in-place decision).
+pub(super) fn admits_ledger_refresh(card: &CardSession) -> bool {
+    classify(card).admits_ledger_refresh()
 }
 
 /// The out-of-turn settle loop's ownership ticket (ADR-0059, ADR-0062): what
@@ -345,6 +393,22 @@ fn classify(card: &CardSession) -> CardClass {
     }
 }
 
+impl CardClass {
+    /// The yielded-card write admission's one definition (ADR-0060,
+    /// ADR-0066): exactly the OPEN yielded card — still live, owing no
+    /// handoff. Every other class refuses: a render-owned card belongs to its
+    /// renderer, and a restart-stamped or ended card has spent its chain.
+    fn admits_ledger_refresh(self) -> bool {
+        matches!(
+            self,
+            Self::Yielded {
+                live: true,
+                handoff_owed: false
+            }
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,9 +445,11 @@ mod tests {
     }
 
     /// The classification is the product of the two halves: every `CardState`
-    /// reads as its class under every claim, and the claim is carried through
+    /// reads as its class under every claim, the claim is carried through
     /// untouched (a guard beside a yielded card, a pending message beside a
-    /// render-owned one — ADR-0070).
+    /// render-owned one — ADR-0070), and the yielded write admission is the
+    /// class's own write-readiness — exactly the open yielded card, under
+    /// every claim (the claim half is deliberately irrelevant, ADR-0070).
     #[tokio::test]
     async fn classification_covers_every_card_state_under_every_claim() {
         let _wd = test_work_dir();
@@ -393,34 +459,36 @@ mod tests {
         let cards = app.cards_handle();
         let waits = app.waits_handle();
 
-        // Every CardState the map can hold, with the class it must read as.
-        // `None` is the map's absent key.
-        let states: &[(Option<CardState>, CardClass)] = &[
-            (None, CardClass::Absent),
-            (Some(CardState::Loading), CardClass::RenderOwned),
-            (Some(CardState::Reasoning), CardClass::RenderOwned),
-            (Some(CardState::Streaming), CardClass::RenderOwned),
-            (Some(CardState::Continued), CardClass::RenderOwned),
-            (Some(CardState::Resuming), CardClass::RenderOwned),
+        // Every CardState the map can hold, with the class it must read as and
+        // whether it admits the yielded write (the named admission: only the
+        // open yielded card does). `None` is the map's absent key.
+        let states: &[(Option<CardState>, CardClass, bool)] = &[
+            (None, CardClass::Absent, false),
+            (Some(CardState::Loading), CardClass::RenderOwned, false),
+            (Some(CardState::Reasoning), CardClass::RenderOwned, false),
+            (Some(CardState::Streaming), CardClass::RenderOwned, false),
+            (Some(CardState::Continued), CardClass::RenderOwned, false),
+            (Some(CardState::Resuming), CardClass::RenderOwned, false),
             (
                 Some(CardState::Waiting),
                 CardClass::Yielded {
                     live: true,
                     handoff_owed: false,
                 },
+                true,
             ),
-            (Some(CardState::Restarted), CardClass::RestartStamped),
-            (Some(CardState::Done), CardClass::Ended),
-            (Some(CardState::Error), CardClass::Ended),
-            (Some(CardState::Retried), CardClass::Ended),
-            (Some(CardState::Stopped), CardClass::Ended),
-            (Some(CardState::Unreceived), CardClass::Ended),
-            (Some(CardState::Superseded), CardClass::Ended),
-            (Some(CardState::SwitchedAway), CardClass::Ended),
-            (Some(CardState::TakenOver), CardClass::Ended),
+            (Some(CardState::Restarted), CardClass::RestartStamped, false),
+            (Some(CardState::Done), CardClass::Ended, false),
+            (Some(CardState::Error), CardClass::Ended, false),
+            (Some(CardState::Retried), CardClass::Ended, false),
+            (Some(CardState::Stopped), CardClass::Ended, false),
+            (Some(CardState::Unreceived), CardClass::Ended, false),
+            (Some(CardState::Superseded), CardClass::Ended, false),
+            (Some(CardState::SwitchedAway), CardClass::Ended, false),
+            (Some(CardState::TakenOver), CardClass::Ended, false),
         ];
 
-        for (state, expected_class) in states {
+        for (state, expected_class, expected_admission) in states {
             for claim in [Claim::None, Claim::Inbound, Claim::Guard] {
                 set_claim(&app, claim).await;
                 set_card(&cards, state.clone()).await;
@@ -436,13 +504,19 @@ mod tests {
                     *expected_class,
                     "class of {state:?} under {claim:?}"
                 );
+                assert_eq!(
+                    ownership.admits_ledger_refresh(),
+                    *expected_admission,
+                    "admission of {state:?} under {claim:?}"
+                );
             }
         }
     }
 
     /// The yielded class carries the card's LIVE write-readiness: still the
     /// growing card with no handoff owed is open; a queued split or a card no
-    /// longer live is not (ADR-0060, ADR-0066).
+    /// longer live is not (ADR-0060, ADR-0066). The admission follows the
+    /// class exactly.
     #[tokio::test]
     async fn yielded_classifies_its_write_readiness() {
         let _wd = test_work_dir();
@@ -462,6 +536,10 @@ mod tests {
                 handoff_owed: false
             },
             "a yielded card that is live and owes nothing is open"
+        );
+        assert!(
+            open.admits_ledger_refresh(),
+            "the open yielded card admits its in-place writes"
         );
 
         // A queued split the chain has not served: the handoff is owed.
@@ -483,6 +561,10 @@ mod tests {
             },
             "an owed handoff closes the card to in-place writes"
         );
+        assert!(
+            !owed.admits_ledger_refresh(),
+            "an owed handoff refuses the in-place writes"
+        );
 
         // A card a split already finalized is no longer the live one.
         cards.cards.lock().await.get_mut(SID).unwrap().card_is_live = false;
@@ -495,6 +577,81 @@ mod tests {
             },
             "a finalized card is not the live one"
         );
+        assert!(
+            !finalized.admits_ledger_refresh(),
+            "a finalized card refuses the in-place writes"
+        );
+    }
+
+    /// The lock-scoped write admission ([`CardOwnership::admit_ledger_write`],
+    /// the two ledger write sites' re-check) hands back exactly the open
+    /// yielded card and leaves it LOCKED from the card map — so the admission
+    /// and the write it authorizes share one lock (#539). A render-owned card,
+    /// a terminal card, a restart-stamped card, an owed handoff, a finalized
+    /// card and a missing card are all refused.
+    #[tokio::test]
+    async fn locked_write_admission_hands_back_only_the_open_yielded_card() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        let cards = app.cards_handle();
+
+        // No card at all: nothing to admit.
+        assert!(CardOwnership::admit_ledger_write(&cards, SID).await.is_none());
+
+        // The open yielded card: admitted and still locked, so the write
+        // through the returned guard cannot race the admission.
+        Turn::seed_card(&cards, SID, Some("om_live")).await;
+        Turn::set_card_state(&cards, SID, CardState::Waiting).await;
+        let mut card = CardOwnership::admit_ledger_write(&cards, SID)
+            .await
+            .expect("the open yielded card admits its in-place writes");
+        assert!(
+            cards.cards.try_lock().is_err(),
+            "the admitted card is handed back still under the card map's lock"
+        );
+        card.card_is_live = false;
+        drop(card);
+        assert!(
+            cards.cards.try_lock().is_ok(),
+            "releasing the admitted guard releases the card map"
+        );
+        assert!(
+            !cards.cards.lock().await.get(SID).unwrap().card_is_live,
+            "the write through the admitted card landed"
+        );
+
+        // A live card is render-owned: its own renderer owns the writes.
+        Turn::seed_card(&cards, SID, Some("om_live")).await;
+        Turn::set_card_state(&cards, SID, CardState::Streaming).await;
+        assert!(CardOwnership::admit_ledger_write(&cards, SID).await.is_none());
+
+        // A terminal card keeps the ending it recorded.
+        Turn::set_card_state(&cards, SID, CardState::Done).await;
+        assert!(CardOwnership::admit_ledger_write(&cards, SID).await.is_none());
+
+        // The restart-stamped orphan is spent too.
+        Turn::set_card_state(&cards, SID, CardState::Restarted).await;
+        assert!(CardOwnership::admit_ledger_write(&cards, SID).await.is_none());
+
+        // A queued split closes the yielded card: the handoff is owed.
+        Turn::seed_card(&cards, SID, Some("om_live")).await;
+        Turn::set_card_state(&cards, SID, CardState::Waiting).await;
+        cards.cards.lock().await.get_mut(SID).unwrap().pending_split.push(
+            crate::bridge::turn::state::PendingSplit {
+                reply_to: "om_user".into(),
+                kind: SplitKind::Supplement,
+                receipt_pushed: false,
+                line: None,
+                handover: false,
+            },
+        );
+        assert!(CardOwnership::admit_ledger_write(&cards, SID).await.is_none());
+
+        // A split already finalized the card: it is no longer the live one.
+        cards.cards.lock().await.get_mut(SID).unwrap().card_is_live = false;
+        assert!(CardOwnership::admit_ledger_write(&cards, SID).await.is_none());
     }
 
     /// The routing rule (ADR-0062) and its label: a guard or a render-owned
