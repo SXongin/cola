@@ -3114,8 +3114,9 @@ pub(crate) enum WakeContinuation {
     /// render (that work is already in the past at poll time, so a key at
     /// cola's "now" would sort the receipt after it — the live order bug).
     ContinueChain { line: ContinuationLine },
-    /// No chain (a cola restart): arm a fresh card, scoped at the newest
-    /// Wake's own anchor so the lost card's content is never replayed.
+    /// No chain in this process and no durable record (a cola restart that
+    /// left nothing behind): arm a fresh card, scoped at the newest Wake's own
+    /// anchor so the lost card's content is never replayed.
     Fresh { anchor: TurnAnchor },
 }
 
@@ -3192,10 +3193,13 @@ impl Turn {
     ///   completion the chain has not taken over yet resumes in place
     ///   ([`WakeContinuation::ResumeInPlace`], ADR-0066), and every other
     ///   continuation continues the chain by split.
-    /// - **No chain (a cola restart).** Nothing durable says what the lost
-    ///   card showed, so only the newest placeable Wake's own work may be
-    ///   rendered, scoped at the Wake's anchor — the whole Turn is never
-    ///   replayed. A Wake-less read owes nothing.
+    /// - **No chain in this process (a cola restart).** A durable Chain Record
+    ///   means the projection — or, cursorless, the reap's one-release
+    ///   fallback — owns the chain's Wake, so the Fresh path owes nothing
+    ///   (spec #561, ticket #566). Only a recordless post reaches the Fresh
+    ///   gate: the newest placeable Wake's own work may be rendered, scoped at
+    ///   the Wake's anchor — the whole Turn is never replayed. A Wake-less read
+    ///   owes nothing.
     pub(crate) async fn wake_continuation(
         cards: &CardsHandle,
         session_id: &str,
@@ -3275,10 +3279,11 @@ impl Turn {
         }
         // No chain in this process (a cola restart). The Fresh gate is the
         // Chain Record module's second decision entry (ADR-0069): it shares
-        // this store's Wake Watermark and the Keep / NoDecision vocabulary,
-        // and owns the rules the read facts are judged by. The corroboration
-        // the gate cannot decide — the in-process inbound claim and the
-        // anchor re-read — stays with `render_wake_continuation`'s caller.
+        // this store's durable facts — the Chain Record itself and the Wake
+        // Watermark — and the Keep / NoDecision vocabulary, and owns the rules
+        // the read facts are judged by. The corroboration the gate cannot
+        // decide — the in-process inbound claim and the anchor re-read — stays
+        // with `render_wake_continuation`'s caller.
         let wake = newest_wake.and_then(|wake| wake.anchor());
         // A Wake older than the newest user message is STALE: the conversation
         // has moved past it — a later cola life already saw or superseded it —
@@ -3297,6 +3302,10 @@ impl Turn {
         });
         let mut reads = crate::bridge::chain::FreshReads {
             announced: cards.chains.announced(session_id),
+            // A durable record owns this chain's Wake: the projection (or, for
+            // a cursorless record, the reap's fallback) supersedes the Fresh
+            // post (spec #561, ticket #566). Only a recordless post survives.
+            recorded: cards.chains.recorded(session_id),
             wake,
             stale,
             renders: false,
@@ -3335,9 +3344,10 @@ impl Turn {
             .and_then(|card| card.acc.cola_message_id.clone())
     }
 
-    /// Arm a FRESH Wake continuation card: the no-chain path (a cola restart
-    /// happened while the Wake was pending), so there is nothing to hand over.
-    /// The new accumulator renders only the Wake's own work — scoped at
+    /// Arm a FRESH Wake continuation card: the path with neither a chain in
+    /// this process nor a durable record (a cola restart that left nothing
+    /// behind), so there is nothing to hand over. The new accumulator renders
+    /// only the Wake's own work — scoped at
     /// `anchor` — opens with the 承接 line, carries the session's work context,
     /// answers to `facts.reply_to` and is marked a continuation (it offers no
     /// Retry). Returns the card to send; the caller attaches its id with

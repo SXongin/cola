@@ -7,7 +7,9 @@
 //! readable transcript's real ending settles the card in place (✅ / ❌ /
 //! ⏳ 等待后台任务), an idle Session whose Turn message never landed ends it
 //! 「⚠️ 这条消息未被接收」 — never ✅ — and a still-live Session keeps the
-//! record, its orphaned card stamped once with the restart status (#443). A
+//! record: its cursor-carrying chain is adopted and followed (below), while a
+//! cursorless one has its orphaned card stamped once with the restart status
+//! (#443, the one-release fallback). A
 //! card a successor took over is collected as 「⏳ 已由新卡片接管 · 已停止更新」
 //! at the takeover itself ([`collect_orphan`], called by the card paths that
 //! arm over an orphan), so two cards never both look live. Every ending PATCH
@@ -25,7 +27,9 @@
 //! caller spawns). A cursorless record, a projection that renders nothing
 //! new, and one with no deliverable target all keep the in-place behavior, so
 //! an upgrade restart and a no-delta reap read exactly as before.
-//! The still-live cursorless orphan's one-time stamp (#443) reads the
+//! The still-live CURSORLESS orphan's one-time stamp (#443, the fallback a
+//! record with no Rendered Cursor keeps for one release — a cursor-carrying
+//! record is never stamped, ticket #566) reads the
 //! same view the other way around: only the header changes, and a failed read
 //! or PATCH claims nothing — a bare stamp would wipe the body the stamp exists
 //! to keep — so the next pass retries it; a PATCH Feishu *permanently* refuses
@@ -92,12 +96,12 @@ use crate::feishu::card::{
 /// Collect the orphaned card `card_message_id` because a new card took the
 /// chain over (ADR-0063): one PATCH naming the successor, terminal and grey,
 /// keeping whatever the card already showed (#434 acceptance feedback). The
-/// spec's Trigger scopes ADR-0068's live-tail strip to the fresh-Turn message
-/// takeover alone, so this ordinary collect leaves the preserved body exactly
-/// as today — the Wake continuation's arm, the external arm, the reap's
-/// reconcile all come through here. The fresh Turn's own collect is
-/// [`collect_orphan_after_takeover`], and the #443 stamp's repair reproduces
-/// that collect's recorded rule where one exists (this plain collect
+/// seeded takeovers — the fresh-Turn message takeover and the reap's
+/// projections — strip the orphan's live tail through
+/// [`collect_orphan_after_takeover`]; this ordinary collect (the Wake
+/// continuation's arm, the external arm, the reap's successor collect) leaves
+/// the preserved body exactly as today. The #443 stamp's repair reproduces
+/// the takeover's recorded rule where one exists (this plain collect
 /// otherwise).
 ///
 /// A failed PATCH only warns; the record follows the successor either way, so
@@ -106,8 +110,9 @@ pub(crate) async fn collect_orphan(cards: &CardsHandle, session_id: &str, card_m
     collect_orphan_with(cards, session_id, card_message_id, KeepBody::Everything).await;
 }
 
-/// Collect the orphaned card `card_message_id` for the **fresh-Turn message
-/// takeover** (spec #561, ADR-0068's successor): the Background Task Ledger
+/// Collect the orphaned card `card_message_id` for a seeded takeover — the
+/// **fresh-Turn message takeover** and the reap's projections (spec #561,
+/// ADR-0068's successor): the Background Task Ledger
 /// element goes always (the successor's own reads rebuild the live list,
 /// ADR-0060's one-card handover) and the running `⏳` panels go only when the
 /// takeover's seed actually resolved at least one call onto the successor —
@@ -630,12 +635,13 @@ async fn project_card(
 /// so it can spawn the follow.
 ///
 /// The guards mirror [`project_card`]'s: a missing route or transcript claims
-/// nothing; no deliverable target or scope falls back to today's one-time
-/// stamp (the run is live, so there is no ending to settle); a cursor the
-/// record no longer carries (a confirmed write landed meanwhile) claims
-/// nothing and lets the next pass decide afresh. Unlike the ended projection,
-/// a successor that renders nothing new is still sent: the run is live and the
-/// follow streams whatever it produces next.
+/// nothing; a missing scope or no deliverable target claims nothing too — a
+/// cursor-carrying record is never stamped (spec #561, ticket #566), so an
+/// adoption the apply cannot arm waits for a later pass; a cursor the record
+/// no longer carries (a confirmed write landed meanwhile) claims nothing and
+/// lets the next pass decide afresh. Unlike the ended projection, a successor
+/// that renders nothing new is still sent: the run is live and the follow
+/// streams whatever it produces next.
 async fn project_live_card(
     handles: &FlowHandles,
     session_id: &str,
@@ -651,15 +657,13 @@ async fn project_live_card(
         return None;
     };
     // The projection's scope: the recorded Turn anchor, else the submitted
-    // message's own anchor re-derived from this read. Without a scope nothing
-    // can be armed — today's one-time stamp.
-    let scope = record
+    // message's own anchor re-derived from this read. The decision only adopts
+    // a record with a scope; a missing one here is a plan/decision mismatch
+    // that claims nothing — never the cursorless fallback's stamp (spec #561,
+    // ticket #566).
+    let anchor = record
         .anchor()
-        .or_else(|| transcript.anchor_of_user(record.message_id.as_str()));
-    let Some(anchor) = scope else {
-        stamp_restarted(handles, session_id, record, read_timeout_ms);
-        return None;
-    };
+        .or_else(|| transcript.anchor_of_user(record.message_id.as_str()))?;
     let recorded_anchor = record.anchor();
     let chat = handles
         .sessions
@@ -667,9 +671,8 @@ async fn project_live_card(
         .await
         .map(|entry| entry.thread_key.chat_id);
     let Some(target) = project_target(record, recorded_anchor.as_ref(), chat.as_deref()) else {
-        // No deliverable target at all: the stamp is today's live-run
-        // behavior, never an attempted projection.
-        stamp_restarted(handles, session_id, record, read_timeout_ms);
+        // No deliverable target at all: the adoption is not attempted — and a
+        // cursor-carrying record is never stamped, so the pass claims nothing.
         return None;
     };
     // The durable cursor, re-read at apply time: the record snapshot the reap
