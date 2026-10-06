@@ -34,7 +34,11 @@ whose delivery failed and has not since been superseded.
   evicts oldest-first with a WARN; entries leave on permanent refusal (card
   gone, content rejected, unrecoverable 4xx) and retry indefinitely
   otherwise — a time limit would strand the card permanently stale, which is
-  the defect being fixed.
+  the defect being fixed. Newest-wins governs the PAYLOAD; the delivered
+  evidence is a high-water mark, not newest-only (ADR-0071's amendment,
+  review #569): the entry remembers the highest sequence the card delivered,
+  so a newer failed write that replaces the entry never unsays an earlier
+  delivery a staged Rendered Cursor still confirms by.
 - Scope: every `update_message`, not message creation. `reply_card` /
   `send_card` are not retried: Feishu has no idempotency key, so retrying a
   create can double-post. The 230099 content-rejection path keeps its

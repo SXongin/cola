@@ -83,7 +83,20 @@ projects the chain's delta after it onto a successor card.**
   sequence whose delivery was verified — so a body staged since (a fresh
   flush whose PATCH is still pending) is left for its own confirmation and can
   never be advanced by an earlier write; the Wake Watermark's drain carries
-  the same stage identity. A failure note whose payload the drain delivered
+  the same stage identity. Stages are therefore RETAINED until their own write
+  resolves them, not kept in a single pending slot (review #569, round 2): a
+  delivered-but-unconfirmed stage stays confirmable after a newer body is
+  staged — the reconcile walks every retained stage and confirms each by its
+  own sequence, drops one whose entry settled without delivering it, and keeps
+  a still-owed one — so a later delivery can never lose an earlier write's
+  confirmation. The outbox remembers the highest sequence each card delivered
+  (not just its newest write's verdict), so a newer failed write that replaces
+  the entry does not erase the delivery evidence a stage confirms by. A stage
+  older than the one the base already reflects is dropped unapplied: the
+  durable cursor only ever moves forward. The Wake Watermark's stages are
+  retained the same way — a delivered mark drains after a newer one is staged,
+  and `ChainRecords::advance` keeps the durable mark monotonic. A failure note
+  whose payload the drain delivered
   before the note looked up its sequence confirms the stage then and there
   (the settled delivery verdict), instead of discarding a write that reached
   the card. The per-write cost rides the network PATCH it follows; this

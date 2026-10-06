@@ -193,7 +193,7 @@ async fn note_cursor_write_failure(
             // payload delivers.
             let mut live = cards.cards.lock().await;
             if let Some(session) = live.get_mut(session_id) {
-                session.acc.await_cursor_write(card_message_id, seq);
+                session.acc.await_cursor_write(stage, card_message_id, seq);
             }
             return;
         }
@@ -206,15 +206,18 @@ async fn note_cursor_write_failure(
     }
     let mut live = cards.cards.lock().await;
     if let Some(session) = live.get_mut(session_id) {
-        session.acc.discard_pending_cursor();
+        session.acc.discard_staged_cursor(stage);
     }
 }
 
 /// Advance every staged Rendered Cursor whose owed Pending Card Update has
 /// since delivered (spec #561). Runs after a drain: the failed payload a
 /// cursor was tied to landed out of band, so the confirmation comes from the
-/// delivery state rather than from a flush. A still-owed or refused payload
-/// advances nothing.
+/// delivery state rather than from a flush. Every retained stage is resolved
+/// by its OWN sequence (review #569) — a delivered one persists even while a
+/// newer stage holds the pending slot; one whose entry settled without
+/// delivering it (a refusal, or a superseded payload) is dropped; a still-owed
+/// one stays for its own confirmation.
 pub(crate) async fn reconcile_staged_cursors(cards: &CardsHandle) {
     reconcile_staged(cards, None).await;
 }
@@ -231,14 +234,14 @@ async fn reconcile_staged(cards: &CardsHandle, gate: Option<&ReconcileGate>) {
     let due: Vec<(String, String, u64, crate::bridge::turn::state::StagedCursorId)> = {
         let live = cards.cards.lock().await;
         live.iter()
-            .filter_map(|(session_id, session)| {
-                let staged = session.acc.pending_cursor.as_ref()?;
-                Some((
-                    session_id.clone(),
-                    staged.card_message_id.clone()?,
-                    staged.awaiting_seq?,
-                    session.acc.pending_cursor_id()?,
-                ))
+            .flat_map(|(session_id, session)| {
+                session
+                    .acc
+                    .staged_cursor_due()
+                    .into_iter()
+                    .map(|(card_message_id, seq, expected)| {
+                        (session_id.clone(), card_message_id, seq, expected)
+                    })
             })
             .collect()
     };
@@ -248,11 +251,34 @@ async fn reconcile_staged(cards: &CardsHandle, gate: Option<&ReconcileGate>) {
                 gate.entered.notify_one();
                 gate.release.notified().await;
             }
-            // Only the exact stage whose delivery was just verified may be
-            // confirmed: a body staged since (a fresh flush whose PATCH is
-            // still pending) is left for its own confirmation (review #569).
+            // Only the stage whose delivery was just verified is confirmed: a
+            // body staged since (a fresh flush whose PATCH is still pending) is
+            // left for its own confirmation (review #569).
             confirm_staged_cursor(cards, &session_id, &card_message_id, None, expected).await;
+        } else if cards
+            .feishu
+            .settled_card_write_delivered(&card_message_id)
+            .is_some()
+        {
+            // The card's newest write settled at this or a newer sequence
+            // without delivering this stage's payload (a permanent refusal, or
+            // a payload a newer write superseded): nothing may advance by it,
+            // and no later confirmation waits for it — drop the stage.
+            discard_staged_cursor(cards, &session_id, expected).await;
         }
+    }
+}
+
+/// Drop one staged cursor (spec #561, review #569) — the reconcile's own
+/// cleanup for a stage whose payload can no longer deliver.
+async fn discard_staged_cursor(
+    cards: &CardsHandle,
+    session_id: &str,
+    expected: crate::bridge::turn::state::StagedCursorId,
+) {
+    let mut live = cards.cards.lock().await;
+    if let Some(session) = live.get_mut(session_id) {
+        session.acc.discard_staged_cursor(expected);
     }
 }
 
@@ -770,10 +796,9 @@ pub(crate) async fn drain_armed_watermark(
     drain_staged_watermark(cards, session_id, Some(chain_id), expected).await;
 }
 
-/// The shared drain body: take the session's staged Wake Watermark and persist
-/// it — optionally only while the session is still `chain_id`'s, and only
-/// while the staged watermark is still the exact stage the delivered write
-/// carried.
+/// The shared drain body: take the exact staged Wake Watermark a delivered
+/// write carried and persist it — optionally only while the session is still
+/// `chain_id`'s (spec #561, review #569).
 async fn drain_staged_watermark(
     cards: &CardsHandle,
     session_id: &str,
@@ -791,10 +816,11 @@ async fn drain_staged_watermark(
         if !card.pending_split.is_empty() {
             return;
         }
-        if card.acc.pending_watermark_id() != expected {
-            return;
-        }
-        card.acc.pending_watermark.take()
+        // The delivered write's own stage drains even when a newer mark has
+        // been staged since: a durable announcement is never lost to a later
+        // stage (review #569). `ChainRecords::advance` keeps the mark itself
+        // monotonic, so an older drain can never move it backwards.
+        expected.and_then(|expected| card.acc.take_staged_watermark(expected))
     };
     if let Some(staged) = staged {
         cards
@@ -1120,6 +1146,49 @@ mod tests {
             cards.chains.announced("ses_test").map(|mark| mark.created_ms),
             Some(1_000),
             "a drained stage never advances twice"
+        );
+    }
+
+    /// A delivered stage still drains after a NEWER Wake Watermark is staged
+    /// (spec #561, review #569): the durable announcement must not be lost
+    /// when the mark advances while the delivered write's drain is in flight.
+    #[tokio::test]
+    async fn a_delivered_watermark_drains_though_a_newer_stage_replaced_it() {
+        let (app, _platform) = app_with_session().await;
+        let cards = app.cards_handle();
+        Turn::seed_card(&cards, "ses_test", Some("om_live")).await;
+
+        {
+            let mut live = cards.cards.lock().await;
+            let card = live.get_mut("ses_test").expect("the seeded card");
+            assert!(card.acc.announce_wake("wake_1", 1_000));
+        }
+        let delivered = staged_watermark_id(&cards, "ses_test")
+            .await
+            .expect("a staged watermark");
+        // A newer Wake stages while the delivered write's drain has not run.
+        {
+            let mut live = cards.cards.lock().await;
+            let card = live.get_mut("ses_test").expect("the seeded card");
+            assert!(card.acc.announce_wake("wake_2", 2_000));
+        }
+
+        // The delivered write's own stage drains: its mark is persisted even
+        // though the newer stage now rides the accumulator.
+        drain_wake_watermark(&cards, "ses_test", Some(delivered)).await;
+        assert_eq!(
+            cards.chains.announced("ses_test").map(|mark| mark.created_ms),
+            Some(1_000),
+            "the delivered stage persists despite the newer one"
+        );
+        let newer = staged_watermark_id(&cards, "ses_test")
+            .await
+            .expect("the newer stage stays staged for its own drain");
+        drain_wake_watermark(&cards, "ses_test", Some(newer)).await;
+        assert_eq!(
+            cards.chains.announced("ses_test").map(|mark| mark.created_ms),
+            Some(2_000),
+            "the newer stage then advances the mark"
         );
     }
 
