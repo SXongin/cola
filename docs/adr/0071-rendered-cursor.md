@@ -57,9 +57,14 @@ projects the chain's delta after it onto a successor card.**
   so a write that reached no card can never hide content from a later
   recovery. `advance_cursor` writes only the record naming the card the write
   landed on, so a stale flush cannot touch a successor that already took the
-  chain over. The per-write cost rides the network PATCH it follows; this
-  reopens ADR-0061's rejected render-frontier watermark, and the affordability
-  answer is recorded in that ADR's amendment.
+  chain over. Every confirmation also names the exact stage its write carried —
+  the stage generation in the accumulator, and for the drain the outbox
+  sequence whose delivery was verified — so a body staged since (a fresh
+  flush whose PATCH is still pending) is left for its own confirmation and can
+  never be advanced by an earlier write; the Wake Watermark's drain carries
+  the same stage identity. The per-write cost rides the network PATCH it
+  follows; this reopens ADR-0061's rejected render-frontier watermark, and the
+  affordability answer is recorded in that ADR's amendment.
 
 - **The cursor is chain-level and belongs to the record's lifetime.** A
   re-point within the chain — a split's continuation, a new Turn on the same

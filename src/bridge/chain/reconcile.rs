@@ -649,16 +649,30 @@ async fn project_card(
     }
     // The confirmed create carries the successor's body: advance the chain's
     // cursor exactly like a flush-confirmed write (spec #561) — scoped to the
-    // armed chain, so a fresh Turn that replaced the session in the meantime
-    // never has its own staged cursor taken (review #569).
-    crate::bridge::turn::confirm_armed_cursor(&handles.cards, session_id, projected.chain_id, &new_card_id)
-        .await;
+    // armed chain and to the exact staged body the create carried, so a fresh
+    // Turn that replaced the session meanwhile never has its own staged cursor
+    // taken, and a body staged since is never advanced by this create
+    // (review #569).
+    crate::bridge::turn::confirm_armed_cursor(
+        &handles.cards,
+        session_id,
+        projected.chain_id,
+        &new_card_id,
+        projected.cursor_stage,
+    )
+    .await;
     // The same write carried every Wake completion entry the seeded render
     // staged: the confirmed create is what makes the announcement durable
     // (ADR-0061, ticket #566), so a later recordless restart cannot
-    // re-announce the Wake through the Fresh gate. Chain-scoped like the
-    // cursor confirm.
-    crate::bridge::turn::drain_armed_watermark(&handles.cards, session_id, projected.chain_id).await;
+    // re-announce the Wake through the Fresh gate. Chain- and stage-scoped like
+    // the cursor confirm.
+    crate::bridge::turn::drain_armed_watermark(
+        &handles.cards,
+        session_id,
+        projected.chain_id,
+        projected.watermark_stage,
+    )
+    .await;
     if state.is_terminal() {
         // The successor reached a terminal: nothing is owed a reap, and the
         // cursor goes with the record.
@@ -832,16 +846,30 @@ async fn project_live_card(
     }
     // The confirmed create carries the successor's body: advance the chain's
     // cursor exactly like a flush-confirmed write (spec #561) — scoped to the
-    // armed chain, so a fresh Turn that replaced the session in the meantime
-    // never has its own staged cursor taken (review #569).
-    crate::bridge::turn::confirm_armed_cursor(&handles.cards, session_id, projected.chain_id, &new_card_id)
-        .await;
+    // armed chain and to the exact staged body the create carried, so a fresh
+    // Turn that replaced the session meanwhile never has its own staged cursor
+    // taken, and a body staged since is never advanced by this create
+    // (review #569).
+    crate::bridge::turn::confirm_armed_cursor(
+        &handles.cards,
+        session_id,
+        projected.chain_id,
+        &new_card_id,
+        projected.cursor_stage,
+    )
+    .await;
     // The same write carried every Wake completion entry the seeded render
     // staged: the confirmed create is what makes the announcement durable
     // (ADR-0061, ticket #566), so a later recordless restart cannot
-    // re-announce the Wake through the Fresh gate. Chain-scoped like the
-    // cursor confirm.
-    crate::bridge::turn::drain_armed_watermark(&handles.cards, session_id, projected.chain_id).await;
+    // re-announce the Wake through the Fresh gate. Chain- and stage-scoped like
+    // the cursor confirm.
+    crate::bridge::turn::drain_armed_watermark(
+        &handles.cards,
+        session_id,
+        projected.chain_id,
+        projected.watermark_stage,
+    )
+    .await;
     tracing::info!("live-card reap: session {session_id} adopted its still-live run onto a successor card");
     Some(AdoptedFollow {
         card_message_id: new_card_id,

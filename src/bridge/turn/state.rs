@@ -787,6 +787,11 @@ impl LedgerChange {
 /// confirmed write drains it into the Chain Record. In-memory only.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct StagedCursor {
+    /// The stage generation, assigned by [`StreamAccumulator::stage_cursor`]:
+    /// a confirmation names the generation it confirms, so a body staged later
+    /// can never be advanced by an earlier write's confirmation (spec #561,
+    /// review #569).
+    pub(super) id: u64,
     /// The card the body is written to; `None` for a create (the id is only
     /// known once the send lands, and creates are never outbox-retried).
     pub(super) card_message_id: Option<String>,
@@ -795,6 +800,27 @@ pub(super) struct StagedCursor {
     /// the drain reconcile confirms the cursor only once THAT payload
     /// delivers. `None` while no failure is owed.
     pub(super) awaiting_seq: Option<u64>,
+}
+
+/// The exact staged write a confirmation may advance (spec #561, review #569):
+/// its stage generation and, for a drain, the Pending Card Update sequence
+/// whose delivery was verified. Whatever the accumulator staged since is left
+/// untouched for its own confirmation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StagedCursorId {
+    pub(crate) id: u64,
+    pub(crate) awaiting_seq: Option<u64>,
+}
+
+/// The Wake Watermark staged for the card body about to be written (ADR-0061):
+/// the announce value the body carries, plus the stage generation a
+/// confirmation must match (spec #561, review #569) so a watermark staged
+/// after the write is never drained by it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct StagedWatermark {
+    pub(super) wake_id: String,
+    pub(super) created_ms: i64,
+    pub(super) id: u64,
 }
 
 /// Accumulates streaming state for one session.
@@ -1012,7 +1038,7 @@ pub(super) struct StreamAccumulator {
     /// (ADR-0061). In-memory `announced_wakes` is the exactly-once gate; this
     /// is the restart-surviving high-water mark, so it must never advance
     /// before the write that makes the announcement user-visible.
-    pub(super) pending_watermark: Option<(String, i64)>,
+    pub(super) pending_watermark: Option<StagedWatermark>,
     /// The chain's last confirmed Rendered Cursor (spec #561): the in-memory
     /// mirror of the record's fact. Every staged candidate derives from it,
     /// and a fresh accumulator taking over a chain is seeded from the record
@@ -1030,6 +1056,13 @@ pub(super) struct StreamAccumulator {
     /// drained into [`Self::cursor`] and the durable record once that write
     /// lands. A failed or still-owed write leaves it staged.
     pub(super) pending_cursor: Option<StagedCursor>,
+    /// The stage generation handed to the next [`StagedCursor`] (spec #561,
+    /// review #569): a confirmation names the generation it confirms, so a
+    /// body staged later is never advanced by an earlier write's confirmation.
+    cursor_stage_seq: u64,
+    /// The stage generation handed to the next [`StagedWatermark`] — the same
+    /// identity rule for the Wake Watermark's drain.
+    watermark_stage_seq: u64,
     /// The Turn's anchor, captured as one fact: the identity of the user
     /// message this turn answers together with that message's server time. An
     /// external render arms with the external message's anchor directly; a
@@ -1379,7 +1412,8 @@ impl StreamAccumulator {
     /// 承接 line or by the merged-path completion entry. Returns false when it
     /// already was: the exactly-once gate both paths honour (ADR-0059). A new
     /// mark also stages the durable Wake Watermark (ADR-0061), which only a
-    /// delivering card write drains.
+    /// delivering card write drains; the stage's generation is what a drain
+    /// must match (spec #561, review #569).
     pub(super) fn announce_wake(&mut self, wake_id: &str, created_ms: i64) -> bool {
         if !self.announced_wakes.insert(wake_id.to_string()) {
             return false;
@@ -1387,9 +1421,14 @@ impl StreamAccumulator {
         if self
             .pending_watermark
             .as_ref()
-            .is_none_or(|(_, staged_ms)| created_ms > *staged_ms)
+            .is_none_or(|staged| created_ms > staged.created_ms)
         {
-            self.pending_watermark = Some((wake_id.to_string(), created_ms));
+            self.watermark_stage_seq = self.watermark_stage_seq.wrapping_add(1);
+            self.pending_watermark = Some(StagedWatermark {
+                wake_id: wake_id.to_string(),
+                created_ms,
+                id: self.watermark_stage_seq,
+            });
         }
         true
     }
@@ -1398,13 +1437,32 @@ impl StreamAccumulator {
     /// `card_message_id` is `None` for a create, whose id is only known once
     /// the send lands. The staged value supersedes any earlier one — the
     /// newest body is the one a write can confirm — and only a confirmed
-    /// write drains it.
-    pub(super) fn stage_cursor(&mut self, card_message_id: Option<&str>, cursor: RenderedCursor) {
+    /// write drains it. Returns the stage generation a confirmation must name
+    /// (spec #561, review #569).
+    pub(super) fn stage_cursor(&mut self, card_message_id: Option<&str>, cursor: RenderedCursor) -> u64 {
+        self.cursor_stage_seq = self.cursor_stage_seq.wrapping_add(1);
         self.pending_cursor = Some(StagedCursor {
+            id: self.cursor_stage_seq,
             card_message_id: card_message_id.map(str::to_string),
             cursor,
             awaiting_seq: None,
         });
+        self.cursor_stage_seq
+    }
+
+    /// The identity of the staged Rendered Cursor, when one is staged: what a
+    /// confirmation must match before it may drain it.
+    pub(super) fn pending_cursor_id(&self) -> Option<StagedCursorId> {
+        self.pending_cursor.as_ref().map(|staged| StagedCursorId {
+            id: staged.id,
+            awaiting_seq: staged.awaiting_seq,
+        })
+    }
+
+    /// The stage generation of the staged Wake Watermark, when one is staged:
+    /// what a drain must match (spec #561, review #569).
+    pub(super) fn pending_watermark_id(&self) -> Option<u64> {
+        self.pending_watermark.as_ref().map(|staged| staged.id)
     }
 
     /// Tie the staged cursor to the Pending Card Update sequence a recoverably

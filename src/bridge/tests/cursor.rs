@@ -482,3 +482,94 @@ async fn a_permanently_rejected_write_advances_nothing() {
         .unwrap();
     result.unwrap();
 }
+
+/// The drain reconcile confirms only the exact write whose delivery it
+/// verified (spec #561, review #569): a fresh flush can stage a newer cursor
+/// between the delivery check and the confirmation; that newer stage — whose
+/// PATCH is still pending — must never be persisted, or a restart would skip
+/// its undelivered content. The interleaving is deterministic through the
+/// drain's test gate.
+#[tokio::test]
+async fn a_newer_staged_cursor_is_never_confirmed_by_an_older_delivery() {
+    let _wd = test_work_dir();
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "你好"),
+        assistant(2_000, "答复。"),
+    ]);
+    let (dir, app, _backend, platform) = scripted_app(vec![transcript], Some(SessionStatus::Idle)).await;
+    let session_file = dir.path().join("sessions.json");
+    // Every content write fails at the transport: the ending is owed, its
+    // cursor staged and tied to the Pending Card Update sequence.
+    platform.fail_update_transport_count.store(100, Ordering::SeqCst);
+    Turn::run(&app.turn_handles(), ctx("ses_test", "你好"))
+        .await
+        .unwrap();
+    let card_id = app
+        .cards_handle()
+        .chains
+        .get("ses_test")
+        .expect("the failed ending keeps the record")
+        .card_message_id
+        .clone();
+    assert_eq!(
+        app.cards_handle().chains.cursor("ses_test"),
+        None,
+        "a failed write advanced nothing"
+    );
+    let staged_a = Turn::staged_cursor(&app.cards_handle(), "ses_test")
+        .await
+        .expect("the failed write staged its cursor");
+
+    // Feishu returns: the owed payload delivers, so the reconcile now verifies
+    // cursor A's write as delivered.
+    platform.fail_update_transport_count.store(0, Ordering::SeqCst);
+    app.core.feishu.drain_pending_card_updates(true).await;
+
+    // Park the reconcile between that verification and its confirmation, and
+    // stage a NEWER cursor there — the fresh flush's body, its own PATCH still
+    // pending.
+    let gate = crate::bridge::turn::ReconcileGate {
+        entered: std::sync::Arc::new(tokio::sync::Notify::new()),
+        release: std::sync::Arc::new(tokio::sync::Notify::new()),
+    };
+    let reconcile = {
+        let cards = app.cards_handle();
+        let gate = crate::bridge::turn::ReconcileGate {
+            entered: gate.entered.clone(),
+            release: gate.release.clone(),
+        };
+        tokio::spawn(async move {
+            crate::bridge::turn::reconcile_staged_cursors_gated(&cards, &gate).await;
+        })
+    };
+    gate.entered.notified().await;
+    let mut staged_b = staged_a.clone();
+    staged_b.frontier = staged_a.frontier.clone().map(|mut frontier| {
+        frontier.delivered_chars += 1;
+        frontier
+    });
+    Turn::stage_cursor(&app.cards_handle(), "ses_test", Some(&card_id), &staged_b).await;
+    gate.release.notify_one();
+    reconcile.await.unwrap();
+
+    // The newer stage is left for its own confirmation, and the durable cursor
+    // stays at the last confirmed position — a restart from here re-renders
+    // B's undelivered content instead of skipping it.
+    assert_eq!(
+        app.cards_handle().chains.cursor("ses_test"),
+        None,
+        "an unconfirmed newer stage is never persisted as delivered"
+    );
+    assert_eq!(
+        Turn::staged_cursor(&app.cards_handle(), "ses_test").await,
+        Some(staged_b),
+        "the newer stage is left untouched for its own confirmation"
+    );
+    let persisted =
+        crate::bridge::chain::ChainRecords::load(session_file.with_file_name("chain_records.json"));
+    assert_eq!(
+        persisted.cursor("ses_test"),
+        None,
+        "the persisted record still holds the last confirmed cursor"
+    );
+}
