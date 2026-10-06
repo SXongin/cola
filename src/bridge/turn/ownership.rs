@@ -2,9 +2,11 @@
 //! chain right now, and may a caller touch its card.
 //!
 //! [`CardOwnership::read`] is the one read. It reads the **waits state**
-//! first — the in-flight guard set, then the pending-inbound claim (an entry
-//! past [`crate::bridge::handles`]' `INBOUND_CLAIM_TTL` reads as absent and is
-//! dropped, invisibly) — and then the **card map**, sequentially: each wait
+//! first — the in-flight guard set, then the pending-inbound claim, both
+//! unconditionally (an entry past [`crate::bridge::handles`]'
+//! `INBOUND_CLAIM_TTL` reads as absent and is dropped by the read, invisibly;
+//! a held guard never skips that sweep, so the TTL expiry is uniform across
+//! every verdict read) — and then the **card map**, sequentially: each wait
 //! lock is released before the next is taken, the card map is taken last, the
 //! two are never held together, and the verdict adds no lock of its own.
 //!
@@ -55,7 +57,7 @@
 //! Sources, exactly:
 //!
 //! - the claim: [`WaitsHandle`]'s `inflight` set, then `inbound_pending()`
-//!   (which owns the TTL expiry);
+//!   (which owns the TTL expiry, always read — guard or not);
 //! - the card class and the identities: [`CardsHandle`]'s card map — the
 //!   [`CardSession`]'s `acc.card_state`, its `card_is_live` + `pending_split`
 //!   (the yielded write-readiness), `acc.turn_anchor`, `card_message_id` and
@@ -145,17 +147,25 @@ pub(crate) struct CardOwnership {
 }
 
 impl CardOwnership {
-    /// The one read: the waits state (guard, then the pending-inbound claim),
-    /// then the card map — sequentially, never nested, no new lock.
+    /// The one read: the waits state (the guard, then the pending-inbound
+    /// claim), then the card map — sequentially, never nested, no new lock.
+    ///
+    /// Both waits sources are always read, whatever the guard says: the
+    /// pending-inbound read owns the TTL sweep, so a held guard must not skip
+    /// it — a caller that reports the guard must still leave the expiry
+    /// invisible rather than deferred (spec #545). The guard wins the claim's
+    /// VALUE, never the read.
     pub(crate) async fn read(cards: &CardsHandle, waits: &WaitsHandle, session_id: &str) -> Self {
-        // The guard first: a held guard is the strongest claim, and a
-        // message that is both admitted and still marked inbound reads as
-        // the guard (the Turn owns it now). `inbound_pending` owns the TTL
-        // rule — an expired claim reads as absent and is dropped, invisible
-        // to every caller.
-        let claim = if waits.inflight.lock().await.contains(session_id) {
+        // The guard is read first (it is the stronger claim) and the inbound
+        // read runs unconditionally after it, so its TTL sweep cannot depend
+        // on which caller happened to hold a guard. A message that is both
+        // admitted and still marked inbound reads as the guard — the Turn owns
+        // it now.
+        let guarded = waits.inflight.lock().await.contains(session_id);
+        let inbound = waits.inbound_pending(session_id).await;
+        let claim = if guarded {
             Claim::Guard
-        } else if waits.inbound_pending(session_id).await {
+        } else if inbound {
             Claim::Inbound
         } else {
             Claim::None
@@ -190,22 +200,16 @@ impl CardOwnership {
     }
 
     /// The card's message id, when a card exists — the identity the reap's
-    /// record matching and the settle ticket's `covers` compare.
-    #[allow(dead_code)] // the verdict's identity interface (ADR-0070); read by the module's tests
+    /// record matching and the settle ticket's `covers` compare. Read by the
+    /// reap's claim read (`gather_reads`), so the record match consumes the
+    /// same card-map pass the claim classified.
     pub(crate) fn card_message_id(&self) -> Option<&str> {
         self.card_message_id.as_deref()
     }
 
-    /// The card's Turn anchor, when one is armed — the identity the settle
-    /// ticket's anchor variant compares (ADR-0059).
-    #[allow(dead_code)] // the verdict's identity interface (ADR-0070); read by the module's tests
-    pub(crate) fn turn_anchor(&self) -> Option<&TurnAnchor> {
-        self.turn_anchor.as_ref()
-    }
-
-    /// The card's chain identity, when a card exists — the identity a Wake
-    /// continuation loop's ownership guard compares (ADR-0059).
-    #[allow(dead_code)] // the verdict's identity interface (ADR-0070); read by the module's tests
+    /// The card's chain identity, when a card exists — the identity the Wake
+    /// continuation loop's ownership guard compares (ADR-0059). Read by the
+    /// follow's watch, the three Wake arms' loop guard and the module's tests.
     pub(crate) fn chain_id(&self) -> Option<u64> {
         self.chain_id
     }
@@ -460,9 +464,35 @@ mod tests {
 
     const SID: &str = "ses_test";
 
+    /// The module's shared fixture: an isolated work dir (cwd — sessions are
+    /// created there, and the guard keeps it alive), a temp session store and
+    /// the mock platform backend, reduced to the two handles the verdict
+    /// reads. Every test here needs exactly this quartet; building it in one
+    /// place keeps the fixtures from drifting.
+    struct Fixture {
+        cards: CardsHandle,
+        waits: WaitsHandle,
+        _work_dir: tempfile::TempDir,
+        _store_dir: tempfile::TempDir,
+    }
+
+    /// Build one module fixture: the app over a fresh work dir and session
+    /// store, with the card and waits handles.
+    async fn fixture() -> Fixture {
+        let work_dir = test_work_dir();
+        let store_dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&store_dir.path().join("sessions.json"));
+        let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        Fixture {
+            cards: app.cards_handle(),
+            waits: app.waits_handle(),
+            _work_dir: work_dir,
+            _store_dir: store_dir,
+        }
+    }
+
     /// Set the waits state to exactly `claim` (clearing both sources first).
-    async fn set_claim(app: &std::sync::Arc<crate::bridge::handler::App>, claim: Claim) {
-        let waits = app.waits_handle();
+    async fn set_claim(waits: &WaitsHandle, claim: Claim) {
         waits.inflight.lock().await.remove(SID);
         waits.clear_inbound(SID).await;
         match claim {
@@ -500,12 +530,9 @@ mod tests {
     /// card's own armed anchor.
     #[tokio::test]
     async fn classification_covers_every_card_state_under_every_claim() {
-        let _wd = test_work_dir();
-        let dir = tempfile::tempdir().unwrap();
-        let cfg = test_config(&dir.path().join("sessions.json"));
-        let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
-        let cards = app.cards_handle();
-        let waits = app.waits_handle();
+        let fx = fixture().await;
+        let cards = &fx.cards;
+        let waits = &fx.waits;
 
         // Every CardState the map can hold, with the card half of every named
         // rule: its class, the routing label a NON-guard claim sees (a guard's
@@ -633,10 +660,10 @@ mod tests {
 
         for (state, expected_class, expected_routing, expected_admission, expected_stop) in rows {
             for claim in [Claim::None, Claim::Inbound, Claim::Guard] {
-                set_claim(&app, claim).await;
-                set_card(&cards, state.clone()).await;
+                set_claim(waits, claim).await;
+                set_card(cards, state.clone()).await;
 
-                let ownership = CardOwnership::read(&cards, &waits, SID).await;
+                let ownership = CardOwnership::read(cards, waits, SID).await;
                 assert_eq!(
                     ownership.claim(),
                     claim,
@@ -693,16 +720,13 @@ mod tests {
     /// class exactly.
     #[tokio::test]
     async fn yielded_classifies_its_write_readiness() {
-        let _wd = test_work_dir();
-        let dir = tempfile::tempdir().unwrap();
-        let cfg = test_config(&dir.path().join("sessions.json"));
-        let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
-        let cards = app.cards_handle();
-        let waits = app.waits_handle();
+        let fx = fixture().await;
+        let cards = &fx.cards;
+        let waits = &fx.waits;
 
-        Turn::seed_card(&cards, SID, Some("om_live")).await;
-        Turn::set_card_state(&cards, SID, CardState::Waiting).await;
-        let open = CardOwnership::read(&cards, &waits, SID).await;
+        Turn::seed_card(cards, SID, Some("om_live")).await;
+        Turn::set_card_state(cards, SID, CardState::Waiting).await;
+        let open = CardOwnership::read(cards, waits, SID).await;
         assert_eq!(
             open.card_class(),
             CardClass::Yielded {
@@ -726,7 +750,7 @@ mod tests {
                 handover: false,
             },
         );
-        let owed = CardOwnership::read(&cards, &waits, SID).await;
+        let owed = CardOwnership::read(cards, waits, SID).await;
         assert_eq!(
             owed.card_class(),
             CardClass::Yielded {
@@ -742,7 +766,7 @@ mod tests {
 
         // A card a split already finalized is no longer the live one.
         cards.cards.lock().await.get_mut(SID).unwrap().card_is_live = false;
-        let finalized = CardOwnership::read(&cards, &waits, SID).await;
+        let finalized = CardOwnership::read(cards, waits, SID).await;
         assert_eq!(
             finalized.card_class(),
             CardClass::Yielded {
@@ -765,20 +789,17 @@ mod tests {
     /// card and a missing card are all refused.
     #[tokio::test]
     async fn locked_write_admission_hands_back_only_the_open_yielded_card() {
-        let _wd = test_work_dir();
-        let dir = tempfile::tempdir().unwrap();
-        let cfg = test_config(&dir.path().join("sessions.json"));
-        let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
-        let cards = app.cards_handle();
+        let fx = fixture().await;
+        let cards = &fx.cards;
 
         // No card at all: nothing to admit.
-        assert!(CardOwnership::admit_ledger_write(&cards, SID).await.is_none());
+        assert!(CardOwnership::admit_ledger_write(cards, SID).await.is_none());
 
         // The open yielded card: admitted and still locked, so the write
         // through the returned guard cannot race the admission.
-        Turn::seed_card(&cards, SID, Some("om_live")).await;
-        Turn::set_card_state(&cards, SID, CardState::Waiting).await;
-        let mut card = CardOwnership::admit_ledger_write(&cards, SID)
+        Turn::seed_card(cards, SID, Some("om_live")).await;
+        Turn::set_card_state(cards, SID, CardState::Waiting).await;
+        let mut card = CardOwnership::admit_ledger_write(cards, SID)
             .await
             .expect("the open yielded card admits its in-place writes");
         assert!(
@@ -797,21 +818,21 @@ mod tests {
         );
 
         // A live card is render-owned: its own renderer owns the writes.
-        Turn::seed_card(&cards, SID, Some("om_live")).await;
-        Turn::set_card_state(&cards, SID, CardState::Streaming).await;
-        assert!(CardOwnership::admit_ledger_write(&cards, SID).await.is_none());
+        Turn::seed_card(cards, SID, Some("om_live")).await;
+        Turn::set_card_state(cards, SID, CardState::Streaming).await;
+        assert!(CardOwnership::admit_ledger_write(cards, SID).await.is_none());
 
         // A terminal card keeps the ending it recorded.
-        Turn::set_card_state(&cards, SID, CardState::Done).await;
-        assert!(CardOwnership::admit_ledger_write(&cards, SID).await.is_none());
+        Turn::set_card_state(cards, SID, CardState::Done).await;
+        assert!(CardOwnership::admit_ledger_write(cards, SID).await.is_none());
 
         // The restart-stamped orphan is spent too.
-        Turn::set_card_state(&cards, SID, CardState::Restarted).await;
-        assert!(CardOwnership::admit_ledger_write(&cards, SID).await.is_none());
+        Turn::set_card_state(cards, SID, CardState::Restarted).await;
+        assert!(CardOwnership::admit_ledger_write(cards, SID).await.is_none());
 
         // A queued split closes the yielded card: the handoff is owed.
-        Turn::seed_card(&cards, SID, Some("om_live")).await;
-        Turn::set_card_state(&cards, SID, CardState::Waiting).await;
+        Turn::seed_card(cards, SID, Some("om_live")).await;
+        Turn::set_card_state(cards, SID, CardState::Waiting).await;
         cards.cards.lock().await.get_mut(SID).unwrap().pending_split.push(
             crate::bridge::turn::state::PendingSplit {
                 reply_to: "om_user".into(),
@@ -821,11 +842,11 @@ mod tests {
                 handover: false,
             },
         );
-        assert!(CardOwnership::admit_ledger_write(&cards, SID).await.is_none());
+        assert!(CardOwnership::admit_ledger_write(cards, SID).await.is_none());
 
         // A split already finalized the card: it is no longer the live one.
         cards.cards.lock().await.get_mut(SID).unwrap().card_is_live = false;
-        assert!(CardOwnership::admit_ledger_write(&cards, SID).await.is_none());
+        assert!(CardOwnership::admit_ledger_write(cards, SID).await.is_none());
     }
 
     /// The read carries the identities the remaining rules compare: the card's
@@ -833,28 +854,27 @@ mod tests {
     /// the Session has no card.
     #[tokio::test]
     async fn read_carries_the_cards_identities() {
-        let _wd = test_work_dir();
-        let dir = tempfile::tempdir().unwrap();
-        let cfg = test_config(&dir.path().join("sessions.json"));
-        let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
-        let cards = app.cards_handle();
-        let waits = app.waits_handle();
+        let fx = fixture().await;
+        let cards = &fx.cards;
+        let waits = &fx.waits;
 
         let anchor = turn_anchor(7);
-        Turn::seed_card(&cards, SID, Some("om_live")).await;
-        Turn::set_card_state(&cards, SID, CardState::Streaming).await;
-        Turn::set_turn_anchor(&cards, SID, &anchor).await;
-        let chain = Turn::chain_id(&cards, SID).await.expect("seeded card");
+        Turn::seed_card(cards, SID, Some("om_live")).await;
+        Turn::set_card_state(cards, SID, CardState::Streaming).await;
+        Turn::set_turn_anchor(cards, SID, &anchor).await;
+        let chain = cards.cards.lock().await.get(SID).expect("seeded card").chain_id();
 
-        let ownership = CardOwnership::read(&cards, &waits, SID).await;
+        let ownership = CardOwnership::read(cards, waits, SID).await;
         assert_eq!(ownership.card_message_id(), Some("om_live"));
-        assert_eq!(ownership.turn_anchor(), Some(&anchor));
+        // The carried anchor has no accessor — the ticket's `covers` compares
+        // it inside the verdict — so the test reads the field directly.
+        assert_eq!(ownership.turn_anchor.as_ref(), Some(&anchor));
         assert_eq!(ownership.chain_id(), Some(chain));
 
-        Turn::drop_card(&cards, SID).await;
-        let absent = CardOwnership::read(&cards, &waits, SID).await;
+        Turn::drop_card(cards, SID).await;
+        let absent = CardOwnership::read(cards, waits, SID).await;
         assert_eq!(absent.card_message_id(), None);
-        assert_eq!(absent.turn_anchor(), None);
+        assert_eq!(absent.turn_anchor.as_ref(), None);
         assert_eq!(absent.chain_id(), None);
     }
 
@@ -863,23 +883,46 @@ mod tests {
     /// never an error), and uniform (every verdict read applies it).
     #[tokio::test]
     async fn an_expired_inbound_claim_reads_as_absent_and_is_dropped() {
-        let _wd = test_work_dir();
-        let dir = tempfile::tempdir().unwrap();
-        let cfg = test_config(&dir.path().join("sessions.json"));
-        let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
-        let cards = app.cards_handle();
-        let waits = app.waits_handle();
+        let fx = fixture().await;
+        let cards = &fx.cards;
+        let waits = &fx.waits;
 
         // The claim TTL is 120s (`INBOUND_CLAIM_TTL`); age this entry past it.
         waits.inbound.lock().await.insert(
             SID.to_string(),
             std::time::Instant::now() - std::time::Duration::from_secs(121),
         );
-        let ownership = CardOwnership::read(&cards, &waits, SID).await;
+        let ownership = CardOwnership::read(cards, waits, SID).await;
         assert_eq!(ownership.claim(), Claim::None);
         assert!(
             !waits.inbound.lock().await.contains_key(SID),
             "the expired entry is dropped by the read"
+        );
+    }
+
+    /// A held guard never skips the pending-inbound read: the TTL sweep runs
+    /// under it too — the guard only wins the claim VALUE — so an expired
+    /// entry cannot survive a verdict read that reported a guard (#545). The
+    /// expiry stays invisible (the claim never changes), but it stays uniform:
+    /// the reap's `reap_claim`, reading after a guard slipped in, must not
+    /// count a claim the TTL already spent.
+    #[tokio::test]
+    async fn a_held_guard_still_sweeps_an_expired_inbound_claim() {
+        let fx = fixture().await;
+        let cards = &fx.cards;
+        let waits = &fx.waits;
+
+        waits.inflight.lock().await.insert(SID.to_string());
+        waits.inbound.lock().await.insert(
+            SID.to_string(),
+            std::time::Instant::now() - std::time::Duration::from_secs(121),
+        );
+
+        let ownership = CardOwnership::read(cards, waits, SID).await;
+        assert_eq!(ownership.claim(), Claim::Guard, "the guard is the claim value");
+        assert!(
+            !waits.inbound.lock().await.contains_key(SID),
+            "the read sweeps the expired entry even while a guard is held"
         );
     }
 
@@ -891,24 +934,21 @@ mod tests {
     /// atomic apply cannot disagree.
     #[tokio::test]
     async fn covers_compares_each_ticket_variant_against_the_live_card() {
-        let _wd = test_work_dir();
-        let dir = tempfile::tempdir().unwrap();
-        let cfg = test_config(&dir.path().join("sessions.json"));
-        let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
-        let cards = app.cards_handle();
-        let waits = app.waits_handle();
+        let fx = fixture().await;
+        let cards = &fx.cards;
+        let waits = &fx.waits;
 
         let anchor = turn_anchor(1);
-        Turn::seed_card(&cards, SID, Some("om_live")).await;
-        Turn::set_turn_anchor(&cards, SID, &anchor).await;
-        let chain = Turn::chain_id(&cards, SID).await.expect("seeded card");
+        Turn::seed_card(cards, SID, Some("om_live")).await;
+        Turn::set_turn_anchor(cards, SID, &anchor).await;
+        let chain = cards.cards.lock().await.get(SID).expect("seeded card").chain_id();
         let unlanded = |chain| Ticket::Unlanded {
             chain,
             submitted: "om_user".into(),
             hint_at: std::time::Instant::now(),
         };
 
-        let ownership = CardOwnership::read(&cards, &waits, SID).await;
+        let ownership = CardOwnership::read(cards, waits, SID).await;
         assert!(
             ownership.covers(&Ticket::TurnAnchor(anchor.clone())),
             "the armed anchor is covered"
@@ -938,8 +978,8 @@ mod tests {
         assert!(!ownership.covers(&unlanded(chain + 1)), "another chain is not");
 
         // The card vanishes: nothing is covered any more.
-        Turn::drop_card(&cards, SID).await;
-        let gone = CardOwnership::read(&cards, &waits, SID).await;
+        Turn::drop_card(cards, SID).await;
+        let gone = CardOwnership::read(cards, waits, SID).await;
         assert!(
             !gone.covers(&Ticket::TurnAnchor(anchor)) && !gone.covers(&unlanded(chain)),
             "a missing card is covered by nothing"
@@ -971,47 +1011,44 @@ mod tests {
     /// false); the matching anchor applies (true).
     #[tokio::test]
     async fn apply_ending_if_owned_stamps_only_the_anchor_it_still_owns() {
-        let _wd = test_work_dir();
-        let dir = tempfile::tempdir().unwrap();
-        let cfg = test_config(&dir.path().join("sessions.json"));
-        let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
-        let cards = app.cards_handle();
+        let fx = fixture().await;
+        let cards = &fx.cards;
 
         let live = turn_anchor(1);
         let successor = turn_anchor(2);
         let owns = Ticket::TurnAnchor(live.clone());
 
         // The ending the loop decided is applied to the card it watched.
-        Turn::seed_card(&cards, SID, Some("om_live")).await;
-        Turn::set_turn_anchor(&cards, SID, &live).await;
+        Turn::seed_card(cards, SID, Some("om_live")).await;
+        Turn::set_turn_anchor(cards, SID, &live).await;
         assert!(
-            owns.apply_ending_if_owned(&cards, SID, &Disposition::Failed("loop failure".into()))
+            owns.apply_ending_if_owned(cards, SID, &Disposition::Failed("loop failure".into()))
                 .await,
             "the matching anchor applies"
         );
-        assert_eq!(Turn::card_state(&cards, SID).await, Some(CardState::Error));
-        assert_eq!(card_error(&cards, SID).await.as_deref(), Some("loop failure"));
+        assert_eq!(Turn::card_state(cards, SID).await, Some(CardState::Error));
+        assert_eq!(card_error(cards, SID).await.as_deref(), Some("loop failure"));
 
         // A new Turn replaced the card — and armed its own anchor — while the
         // released moment ran. The stale ending must not clear the successor's
         // recorded failure (Stopped would) nor touch its state.
-        Turn::seed_card(&cards, SID, Some("om_successor")).await;
-        Turn::set_turn_anchor(&cards, SID, &successor).await;
-        Turn::set_card_state(&cards, SID, CardState::Streaming).await;
-        set_card_error(&cards, SID, "successor failure").await;
+        Turn::seed_card(cards, SID, Some("om_successor")).await;
+        Turn::set_turn_anchor(cards, SID, &successor).await;
+        Turn::set_card_state(cards, SID, CardState::Streaming).await;
+        set_card_error(cards, SID, "successor failure").await;
         assert!(
             !owns
-                .apply_ending_if_owned(&cards, SID, &Disposition::Stopped)
+                .apply_ending_if_owned(cards, SID, &Disposition::Stopped)
                 .await,
             "a stale anchor applies nothing"
         );
         assert_eq!(
-            Turn::card_state(&cards, SID).await,
+            Turn::card_state(cards, SID).await,
             Some(CardState::Streaming),
             "the successor's state is untouched"
         );
         assert_eq!(
-            card_error(&cards, SID).await.as_deref(),
+            card_error(cards, SID).await.as_deref(),
             Some("successor failure"),
             "the successor's recorded failure is untouched"
         );
@@ -1024,44 +1061,41 @@ mod tests {
     /// vanished card is ownership lost too, and the matching chain applies.
     #[tokio::test]
     async fn apply_ending_if_owned_stamps_only_the_chain_it_still_owns() {
-        let _wd = test_work_dir();
-        let dir = tempfile::tempdir().unwrap();
-        let cfg = test_config(&dir.path().join("sessions.json"));
-        let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
-        let cards = app.cards_handle();
+        let fx = fixture().await;
+        let cards = &fx.cards;
 
-        Turn::seed_card(&cards, SID, Some("om_live")).await;
-        let chain = Turn::chain_id(&cards, SID).await.expect("seeded card");
+        Turn::seed_card(cards, SID, Some("om_live")).await;
+        let chain = cards.cards.lock().await.get(SID).expect("seeded card").chain_id();
         let owns = Ticket::Chain {
             chain,
             anchor: turn_anchor(3),
         };
         assert!(
-            owns.apply_ending_if_owned(&cards, SID, &Disposition::Done).await,
+            owns.apply_ending_if_owned(cards, SID, &Disposition::Done).await,
             "the matching chain applies"
         );
-        assert_eq!(Turn::card_state(&cards, SID).await, Some(CardState::Done));
+        assert_eq!(Turn::card_state(cards, SID).await, Some(CardState::Done));
 
         // A replacement card carries a fresh chain id: the stale loop's ending
         // must not stamp it.
-        Turn::seed_card(&cards, SID, Some("om_successor")).await;
-        Turn::set_card_state(&cards, SID, CardState::Streaming).await;
+        Turn::seed_card(cards, SID, Some("om_successor")).await;
+        Turn::set_card_state(cards, SID, CardState::Streaming).await;
         assert!(
             !owns
-                .apply_ending_if_owned(&cards, SID, &Disposition::Stopped)
+                .apply_ending_if_owned(cards, SID, &Disposition::Stopped)
                 .await,
             "a stale chain applies nothing"
         );
         assert_eq!(
-            Turn::card_state(&cards, SID).await,
+            Turn::card_state(cards, SID).await,
             Some(CardState::Streaming),
             "the replacement's state is untouched"
         );
 
         // The card vanishing is ownership lost as well.
-        Turn::drop_card(&cards, SID).await;
+        Turn::drop_card(cards, SID).await;
         assert!(
-            !owns.apply_ending_if_owned(&cards, SID, &Disposition::Done).await,
+            !owns.apply_ending_if_owned(cards, SID, &Disposition::Done).await,
             "a vanished card applies nothing"
         );
     }
