@@ -518,6 +518,105 @@ async fn a_permanently_rejected_write_advances_nothing() {
     result.unwrap();
 }
 
+/// Both writes confirmed, the older one's durable write attempted LAST (spec
+/// #561, review #569): the stage comparison and the record write are ONE
+/// critical section, so an older stage — already applied and removed — can
+/// never overwrite a newer cursor's durable position. Without the atomic
+/// confirmation the older write lands last and a restart replays content the
+/// newer card already delivered.
+#[tokio::test]
+async fn an_older_confirmation_never_overwrites_a_newer_durable_cursor() {
+    let _wd = test_work_dir();
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "你好"),
+        assistant(2_000, "答复。"),
+    ]);
+    let (dir, app, _backend, platform) = scripted_app(vec![transcript], Some(SessionStatus::Idle)).await;
+    let session_file = dir.path().join("sessions.json");
+    // Every content write fails at the transport: the ending is owed, cursor A
+    // staged and tied to its Pending Card Update sequence.
+    platform.fail_update_transport_count.store(100, Ordering::SeqCst);
+    Turn::run(&app.turn_handles(), ctx("ses_test", "你好"))
+        .await
+        .unwrap();
+    let card_id = app
+        .cards_handle()
+        .chains
+        .get("ses_test")
+        .expect("the failed ending keeps the record")
+        .card_message_id
+        .clone();
+    let staged_a = Turn::staged_cursor(&app.cards_handle(), "ses_test")
+        .await
+        .expect("A is staged");
+    let stage_a = Turn::staged_cursor_id(&app.cards_handle(), "ses_test")
+        .await
+        .expect("A's exact identity");
+    // A NEWER stage B is staged NOW — before A's confirmation takes the cards
+    // lock — so the test never contends for that lock itself.
+    let mut staged_b = staged_a.clone();
+    staged_b.frontier = staged_a.frontier.clone().map(|mut frontier| {
+        frontier.delivered_chars += 1;
+        frontier
+    });
+    let stage_b = Turn::stage_cursor(&app.cards_handle(), "ses_test", Some(&card_id), &staged_b).await;
+
+    // A's payload delivers: its confirmation takes the stage and parks before
+    // the durable write.
+    platform.fail_update_transport_count.store(0, Ordering::SeqCst);
+    app.core.feishu.drain_pending_card_updates(true).await;
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let first = {
+        let cards = app.cards_handle();
+        let card_id = card_id.clone();
+        let gate = crate::bridge::turn::ConfirmGate {
+            entered: entered.clone(),
+            release: release.clone(),
+        };
+        tokio::spawn(async move {
+            crate::bridge::turn::confirm_staged_cursor_for_test(
+                &cards,
+                "ses_test",
+                &card_id,
+                stage_a,
+                Some(&gate),
+            )
+            .await;
+        })
+    };
+    entered.notified().await;
+
+    let second = {
+        let cards = app.cards_handle();
+        let card_id = card_id.clone();
+        tokio::spawn(async move {
+            crate::bridge::turn::confirm_staged_cursor_for_test(&cards, "ses_test", &card_id, stage_b, None)
+                .await;
+        })
+    };
+    // B gets its chance: with the atomic confirmation it waits for A's
+    // critical section; without it, it persists B now — and A's late write
+    // would then overwrite it.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    release.notify_one();
+    first.await.unwrap();
+    second.await.unwrap();
+
+    assert_eq!(
+        app.cards_handle().chains.cursor("ses_test"),
+        Some(staged_b.clone()),
+        "the newer confirmation's cursor is the durable one"
+    );
+    let persisted =
+        crate::bridge::chain::ChainRecords::load(session_file.with_file_name("chain_records.json"));
+    assert_eq!(
+        persisted.cursor("ses_test"),
+        Some(staged_b),
+        "the persisted record keeps the newer cursor"
+    );
+}
+
 /// The drain reconcile confirms only the exact write whose delivery it
 /// verified, while a delivered-but-unconfirmed write keeps its confirmation
 /// even after a newer stage replaces the pending slot (spec #561, review

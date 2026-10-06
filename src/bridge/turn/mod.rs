@@ -23,6 +23,12 @@ pub(crate) use flush::{drain_armed_watermark, reconcile_staged_cursors};
 #[cfg(test)]
 pub(crate) use flush::{ReconcileGate, reconcile_staged_cursors_gated};
 
+/// The confirmation's test seams (spec #561, review #569): the gate parks one
+/// confirmation between its stage take and its durable write, and the wrapper
+/// confirms one exact stage through the same path the flush uses.
+#[cfg(test)]
+pub(crate) use flush::{ConfirmGate, confirm_staged_cursor_for_test};
+
 /// The projection's resolved render seed (spec #561, ticket #563): the chain's
 /// Rendered Cursor placed in one transcript read, which the Chain Record
 /// module's decision carries and this module's render consumes.
@@ -3997,6 +4003,24 @@ impl Turn {
         if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
             card.acc.card_state = state;
         }
+    }
+
+    /// The identity of the NEWEST staged cursor (spec #561, review #569): the
+    /// exact stage a confirmation must name, for the tests that drive the
+    /// confirmation seams directly.
+    pub(crate) async fn staged_cursor_id(
+        cards: &CardsHandle,
+        session_id: &str,
+    ) -> Option<state::StagedCursorId> {
+        cards.cards.lock().await.get(session_id).and_then(|card| {
+            card.acc
+                .staged_cursors
+                .last()
+                .map(|staged| state::StagedCursorId {
+                    id: staged.id,
+                    awaiting_seq: staged.awaiting_seq,
+                })
+        })
     }
 
     /// Clear the card's phase timer (a fixture that needs a frozen header: a
