@@ -56,10 +56,16 @@ projects the chain's delta after it onto a successor card.**
   is not dropped — that would lose its tail — but resolved as **cut 0**: that
   part renders in full while everything before it stays delivered, so a rewrite
   duplicates nothing (the old content is gone from the read) and a growth still
-  renders only its tail. A cursor written by an older release carries no digest
-  and therefore resolves nothing (a one-release migration seam, the cursorless
-  fallback by another name); the first confirmed write after the upgrade gives
-  it one.
+  renders only its tail. The same rewrite seen live, from the read that carries
+  it, replaces the part's timeline entries instead of accumulating the old
+  content under the new snapshot — the replacement is the part's whole content
+  now — and stamps its prefix digest at the new full length, so the persisted
+  cursor describes exactly what the card shows rather than the double-counted
+  sum, and a restart resolves the part instead of rejecting it as the digestless
+  legacy case (review #569, round 2). A cursor written by an older release
+  carries no digest and therefore resolves nothing (a one-release migration
+  seam, the cursorless fallback by another name); the first confirmed write
+  after the upgrade gives it one.
 
 - **Advance only on a confirmed write, through the existing delivery choke
   point.** The accumulator stages the cursor of the body it is about to write,
@@ -100,10 +106,12 @@ projects the chain's delta after it onto a successor card.**
   the cursor, its create is the restart notification, and the existing
   external-render arm streams the run's later content and settles it by
   transcript truth, never an invented interruption. Only the live case adds
-  the follow phase. Both reply to the original Turn anchor, falling back to
-  the recorded card and then the chain's top-level Chat; with no deliverable
-  target at all an ended run takes today's in-place settle and a live one is
-  not adopted. Both collect the recorded card as taken over — dropping every
+  the follow phase. Both reply to the original Turn anchor — recorded, or
+  re-derived from the same read when the previous life never captured its
+  server time — falling back to the recorded card and then the chain's
+  top-level Chat; with no deliverable target at all an ended run takes
+  today's in-place settle and a live one is not adopted. Both collect the
+  recorded card as taken over — dropping every
   running `⏳` marker the successor resolves (ADR-0068's rule, generalized) —
   and neither re-points the record's card until the create landed. A
   projection that renders nothing new (the cursor covered the whole read)

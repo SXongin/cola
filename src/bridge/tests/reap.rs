@@ -4057,51 +4057,52 @@ async fn a_cursorless_record_keeps_todays_in_place_settle() {
     assert!(app.cards_handle().chains.get("ses_test").is_none());
 }
 
-/// No deliverable target at all projects nothing (spec #561, ticket #563):
-/// with no recorded anchor, no card and no session mapping, the pass takes
-/// today's in-place settle and never creates a successor.
+/// A cursor-carrying record that recorded no card and no Chat mapping still
+/// delivers (spec #561's order, review #569): the submitted message's anchor,
+/// re-derived from this read, is the projection's reply target — the missed
+/// tail lands as a reply to the original Turn, instead of the old fallback's
+/// settle PATCH to an empty card id.
 #[tokio::test]
-async fn a_record_with_no_deliverable_target_projects_nothing() {
+async fn a_record_with_no_card_or_chat_projects_to_the_derived_anchor() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("sessions.json");
+    let delivered = "已经写了一半。";
+    let missed = "后半段。";
     // The previous life recorded no card and never captured an anchor; the
     // submitted message did land later, so the transcript alone decides the
-    // ending (Complete).
+    // ending (Complete) and re-derives the delivery anchor.
     seed_cursor_record(
         &session_file,
         "",
         "msg_cola_anchor",
         None,
         Some("/work"),
-        Some(text_frontier("已经写了一半。")),
+        Some(text_frontier(delivered)),
         &[],
     );
     let transcript = SessionTranscript::new(vec![
         user("msg_cola_anchor", 1_000, "问题"),
-        assistant(2_000, "已经写了一半。后半段。"),
+        assistant(2_000, &format!("{delivered}{missed}")),
     ])
     .with_executions(vec![execution(2_500)]);
-    // NO session mapping either: no reply anchor, no card, no Chat.
+    // NO session mapping either: no recorded card, no Chat — the anchor alone.
     let (app, platform, _backend) = restarted_app_unmapped(&session_file, transcript).await;
 
     spawn_sync(&app);
-    // Today's behavior still runs: the ending lands on the recorded card.
-    wait_for_card_update(&platform, "the in-place settle", CardUpdates::Any, |card| {
-        card_header(card).contains("✅")
-    })
-    .await;
-
-    assert_eq!(
-        card_posts(&platform).await,
-        0,
-        "an undeliverable projection is never attempted: {:?}",
-        platform.calls.lock().await
-    );
-    let settled = patches_to(&platform, "").await;
+    let (successor, successor_text) = wait_for_projection(&platform, "msg_cola_anchor").await;
     assert!(
-        settled.iter().any(|card| card_header(card).contains("✅")),
-        "the in-place settle still ends the record's card: {settled:?}"
+        successor_text.contains(missed),
+        "the missed tail replies to the original Turn anchor: {successor}"
+    );
+    assert!(
+        !successor_text.contains(delivered),
+        "the delivered prefix is never repeated: {successor}"
+    );
+    assert!(
+        patches_to(&platform, "").await.is_empty(),
+        "no settle ever PATCHes an empty card id: {:?}",
+        platform.calls.lock().await
     );
 }
 
@@ -6330,4 +6331,183 @@ fn late_successor_view(tail: &str) -> serde_json::Value {
             { "tag": "markdown", "content": tail }
         ] }
     })
+}
+
+/// Rewrite the newest scripted assistant part's text in place (spec #561,
+/// review #569): the server REPLACING a part's content instead of extending
+/// it.
+async fn rewrite_scripted_part(backend: &Arc<MockBackend>, text: &str) {
+    let mut scripts = backend.transcript_scripts.lock().await;
+    let transcript = &mut scripts.get_mut("ses_test").unwrap()[0];
+    for message in transcript.messages.iter_mut() {
+        if message.role != MessageRole::Assistant {
+            continue;
+        }
+        for part in message.parts.iter_mut() {
+            if let Part::Text(part) = part {
+                part.text = text.to_string();
+                return;
+            }
+        }
+    }
+    panic!("the scripted transcript carries no assistant text part to rewrite");
+}
+
+/// A rewritten part persists a RESOLVABLE cursor (spec #561, review #569):
+/// after the server replaces a text part's content, the record's frontier must
+/// carry the replacement's digest at the new full length, so a restart
+/// resolves it — an ended run projects its missed tail and a live run is
+/// adopted, instead of falling back to the legacy cursorless behavior.
+#[tokio::test]
+async fn a_rewritten_part_persists_a_resolvable_cursor_for_the_restart() {
+    let _wd = test_work_dir();
+    for live in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let session_file = dir.path().join("sessions.json");
+        let first = "ABC";
+        let rewritten = "XYZ";
+        let tail = "更多";
+        // Life 1: a live run renders "ABC", then the server rewrites the part
+        // to "XYZ"; the confirmed write must persist the new frontier.
+        let mut backend1 = MockBackend::new(realistic_parts());
+        backend1.given_transcript(
+            "ses_test",
+            vec![SessionTranscript::new(vec![
+                user("msg_cola_anchor", 1_000, "问题"),
+                assistant(2_000, first),
+            ])],
+        );
+        backend1.with_session_status("ses_test", Some(SessionStatus::Busy));
+        let backend1 = Arc::new(backend1);
+        let platform1 = Arc::new(RecordingPlatform::new());
+        let app1 = Arc::new(
+            App::new(test_config(&session_file), backend1.clone(), platform1.clone())
+                .expect("the first life builds"),
+        );
+        seed_session(&app1, "ses_test", "/work").await;
+        app1.turn_render_poll_ms
+            .store(5, std::sync::atomic::Ordering::Relaxed);
+        app1.turn_drain_timeout_ms
+            .store(30, std::sync::atomic::Ordering::Relaxed);
+        app1.turn_follow_read_timeout_ms
+            .store(50, std::sync::atomic::Ordering::Relaxed);
+        let turn = spawn_turn(&app1, ctx("ses_test", "问题"));
+        wait_for_card_text(&platform1, first).await;
+        let result = tokio::time::timeout(Duration::from_secs(5), turn)
+            .await
+            .expect("the turn must hand off at the drain bound")
+            .unwrap();
+        result.unwrap();
+        wait_for_cursor(&app1, |cursor| {
+            cursor
+                .frontier
+                .as_ref()
+                .is_some_and(|frontier| frontier.delivered_chars == first.chars().count())
+        })
+        .await;
+
+        rewrite_scripted_part(&backend1, rewritten).await;
+        wait_for_card_text(&platform1, rewritten).await;
+        // The rewrite's confirmed write persists the replacement's digest at
+        // its own full length — red before the fix, which accumulated the two
+        // snapshots and left the cursor digestless.
+        let cursor = wait_for_cursor(&app1, |cursor| {
+            cursor.frontier.as_ref().is_some_and(|frontier| {
+                frontier.delivered_chars == rewritten.chars().count()
+                    && frontier.prefix_digest == Some(cursor_prefix_digest(rewritten))
+            })
+        })
+        .await;
+        drop(cursor);
+        // Life 1 ends here; a fresh process takes the sidecar over.
+        drop(app1);
+
+        // Life 2: the run streams on past the rewrite (or ended while down):
+        // the persisted cursor resolves, so the tail is projected.
+        let full = format!("{rewritten}{tail}");
+        let mut backend2 = MockBackend::new(realistic_parts());
+        let mut transcript = SessionTranscript::new(vec![
+            user("msg_cola_anchor", 1_000, "问题"),
+            if live {
+                assistant_in_flight(2_000, &full)
+            } else {
+                assistant(2_000, &full)
+            },
+        ]);
+        if !live {
+            transcript = transcript.with_executions(vec![execution(2_500)]);
+        }
+        backend2.given_transcript("ses_test", vec![transcript]);
+        backend2.with_session_status(
+            "ses_test",
+            Some(if live {
+                SessionStatus::Busy
+            } else {
+                SessionStatus::Idle
+            }),
+        );
+        let backend2 = Arc::new(backend2);
+        let platform2 = Arc::new(RecordingPlatform::new());
+        let app2 = Arc::new(
+            App::new(test_config(&session_file), backend2.clone(), platform2.clone())
+                .expect("the restarted app builds"),
+        );
+        seed_session(&app2, "ses_test", "/work").await;
+        spawn_sync(&app2);
+        let (successor, successor_text) = wait_for_projection(&platform2, "msg_cola_anchor").await;
+        assert!(
+            successor_text.contains(tail),
+            "the missed tail follows the rewritten part (live={live}): {successor}"
+        );
+        assert!(
+            !successor_text.contains(rewritten),
+            "the rewritten-away prefix is never repeated (live={live}): {successor}"
+        );
+    }
+}
+
+/// A record whose `created_ms` was never captured still replies to the
+/// ORIGINAL Turn anchor (spec #561's delivery order: original Turn anchor →
+/// recorded card → chat), not to the recorded card: the transcript read
+/// derives the anchor from the submitted message (review #569).
+#[tokio::test]
+async fn a_successor_replies_to_the_original_anchor_derived_from_the_read() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let delivered = "已经写了一半。";
+    let missed = "后半段。";
+    let full = format!("{delivered}{missed}");
+    // The record has no `created_ms`: its anchor can only be re-derived from
+    // the read (the original user message is in the transcript).
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        None,
+        Some("/work"),
+        Some(text_frontier(delivered)),
+        &[],
+    );
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "问题"),
+        assistant(2_000, &full),
+    ])
+    .with_executions(vec![execution(2_500)]);
+    let (app, platform, _backend) =
+        restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Idle)).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+
+    spawn_sync(&app);
+    // The successor replies to the ORIGINAL user message, not the old card.
+    let (successor, successor_text) = wait_for_projection(&platform, "msg_cola_anchor").await;
+    assert!(successor_text.contains(missed), "{successor}");
+    assert!(
+        !platform.calls.lock().await.iter().any(|call| matches!(
+            call,
+            PlatformCall::ReplyCard { reply_to, .. } if reply_to == "om_frozen"
+        )),
+        "no reply lands on the recorded card: {:?}",
+        platform.calls.lock().await
+    );
 }

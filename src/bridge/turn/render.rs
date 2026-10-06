@@ -184,15 +184,32 @@ fn render_part(acc: &mut StreamAccumulator, source: Option<PartSource>, part: &P
     match part {
         Part::Text(text) => {
             acc.rendered_parts.insert(RenderedPart::Text(text.text.clone()));
-            let (source, chunk) = source_chunk(acc, source, &text.text);
-            acc.push_text_from(text.started_at, source, &chunk);
+            if let Some(rewritten) = source
+                .as_ref()
+                .filter(|source| acc.source_rewritten(source, &text.text))
+            {
+                // The server rewrote the part: replace its entry run (spec
+                // #561, review #569) — appending the new snapshot would
+                // double-count the part and leave the cursor digestless.
+                acc.replace_text_run(rewritten, &text.text, text.started_at);
+            } else {
+                let (source, chunk) = source_chunk(acc, source, &text.text);
+                acc.push_text_from(text.started_at, source, &chunk);
+            }
             acc.card_state = crate::feishu::card::CardState::Streaming;
         }
         Part::Reasoning(reasoning) => {
             acc.rendered_parts
                 .insert(RenderedPart::Reasoning(reasoning.text.clone()));
-            let (source, chunk) = source_chunk(acc, source, &reasoning.text);
-            acc.push_reasoning_from(reasoning.started_at, source, &chunk);
+            if let Some(rewritten) = source
+                .as_ref()
+                .filter(|source| acc.source_rewritten(source, &reasoning.text))
+            {
+                acc.replace_reasoning_run(rewritten, &reasoning.text, reasoning.started_at);
+            } else {
+                let (source, chunk) = source_chunk(acc, source, &reasoning.text);
+                acc.push_reasoning_from(reasoning.started_at, source, &chunk);
+            }
             acc.card_state = crate::feishu::card::CardState::Reasoning;
         }
         Part::Tool(call) => {
@@ -231,10 +248,12 @@ fn render_part(acc: &mut StreamAccumulator, source: Option<PartSource>, part: &P
 /// Cursor's extent stays the part's own character count) but it does carry the
 /// delivered prefix's digest (review #569: the same-slot replacement guard a
 /// part with no server start time needs). A synthetic push (`source: None`) and
-/// a snapshot that is not an extension of the delivered content (a part's first
-/// render, or a part the server rewrote) push whole, exactly as the
-/// content-keyed dedup always did — the rewrite keeps no digest, so resolution
-/// falls back rather than trust an ambiguous prefix.
+/// a part's first render push whole, exactly as the content-keyed dedup always
+/// did. A REWRITE never reaches this function: [`render_part`] replaces the
+/// part's entry run instead (the old content is gone from the read), and the
+/// offset-entry case — a seeded part this accumulator only holds the tail of —
+/// keeps no digest, so resolution falls back rather than trust an ambiguous
+/// prefix.
 fn source_chunk(
     acc: &StreamAccumulator,
     source: Option<PartSource>,
@@ -247,8 +266,9 @@ fn source_chunk(
     // The chunk to push and the delivered prefix's digest, when it is
     // unambiguous: a part's FIRST render pushes the whole snapshot, an append
     // pushes its tail, and both leave the new snapshot as the delivered prefix.
-    // A rewrite (the concatenation is not the snapshot) or a seeded offset
-    // entry keeps no digest — resolution then falls back rather than trust it.
+    // A seeded offset entry keeps no digest — resolution then falls back rather
+    // than trust an ambiguous prefix (a rewrite never reaches here: it replaced
+    // the part's run).
     let (chunk, digest) = match &rendered {
         None if !acc.has_source(&source) => (
             text.to_string(),
@@ -5088,6 +5108,69 @@ Index: /x/src/main.rs
         assert!(
             text.contains(rewritten),
             "the rewritten orphan answer renders in full: {text}"
+        );
+    }
+
+    /// Spec #561, review #569: a part the server REWRITES (a new snapshot that
+    /// does not extend the tracked content) replaces its timeline entry run
+    /// instead of accumulating the old one — the card shows the replacement
+    /// exactly once and the cursor records its digest at the new full length,
+    /// so a restart resolves it instead of falling back as the legacy case.
+    #[test]
+    fn a_rewritten_part_replaces_its_entry_run_and_stamps_the_cursor() {
+        let transcript = |text: &str| {
+            SessionTranscript::new(vec![
+                typed_message(
+                    "msg_cola_anchor",
+                    MessageRole::User,
+                    Some(1_000),
+                    vec![text_part("问题")],
+                ),
+                message("msg_a_2000", 2_000, vec![text_at(text, 2_000)]),
+            ])
+        };
+        let mut acc = StreamAccumulator::new("t");
+        acc.turn_anchor = Some(turn_anchor(1_000));
+        assert!(render_new_turn_parts(&mut acc, &transcript("ABC")));
+        // The server rewrote the part in place.
+        assert!(render_new_turn_parts(&mut acc, &transcript("XYZ")));
+
+        let built = acc.build_card_with_info();
+        let text = card_text(&built.card);
+        assert_eq!(
+            text.matches("XYZ").count(),
+            1,
+            "the replacement renders once: {text}"
+        );
+        assert!(
+            !text.contains("ABC"),
+            "the rewritten-away content is not accumulated: {text}"
+        );
+        assert_eq!(
+            built.cursor.frontier,
+            Some(CursorFrontier {
+                message_id: MessageId::new("msg_a_2000"),
+                part_index: 0,
+                kind: CursorPartKind::Text,
+                started_at: Some(2_000),
+                delivered_chars: 3,
+                prefix_digest: Some(cursor_prefix_digest("XYZ")),
+            }),
+            "the cursor records the replacement's full extent and digest"
+        );
+
+        // The persisted cursor resolves against the rewritten read (nothing
+        // undelivered) and against a grown one (only the tail).
+        let seed = CursorSeed::resolve(&transcript("XYZ"), &built.cursor).expect("the cursor resolves");
+        assert_eq!(
+            seed.frontier.as_ref().map(|frontier| frontier.delivered_chars),
+            Some(3)
+        );
+        let grown = CursorSeed::resolve(&transcript("XYZ更多"), &built.cursor).expect("the cursor resolves");
+        assert_eq!(
+            grown.frontier.as_ref().map(|frontier| frontier.delivered_chars),
+            Some(3),
+            "growth still renders only the tail"
         );
     }
 }
