@@ -833,3 +833,56 @@ async fn prompt_routing_logs_the_ownership_verdict_without_the_message() {
         "the message body must never be logged:\n{logs}"
     );
 }
+
+/// ADR-0062/ADR-0070: a pending-inbound claim alone is NOT ownership — the
+/// message it belongs to is still being routed and owns no card to split (the
+/// #428 strand) — so the router takes the new-Turn path with `ownership=none`,
+/// exactly as it does for a Session with no claim at all. The claim is read by
+/// the ownership verdict (and TTL-expires invisibly), never treated as an
+/// owned chain.
+#[tokio::test]
+async fn a_pending_inbound_claim_alone_still_routes_a_new_turn() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = MockBackend::new(realistic_parts());
+    backend.busy_then_idle_once();
+    let (app, _platform) = build_app(cfg, backend).await;
+    seed_session(&app, "ses_test", "/work").await;
+
+    // The message is still being routed: the claim is set and no card exists.
+    app.waits_handle().note_inbound("ses_test").await;
+
+    let text = "在途消息";
+    let ((), logs) = capture_logs(async {
+        app.handle_message(incoming(
+            "msg_inbound".into(),
+            "chat_1".into(),
+            "p2p".into(),
+            None,
+            text.into(),
+            None,
+        ))
+        .await;
+    })
+    .await;
+
+    let lines: Vec<&str> = logs
+        .lines()
+        .filter(|line| line.contains("prompt routing:"))
+        .collect();
+    assert_eq!(lines.len(), 1, "exactly one routing line: {lines:?}");
+    assert!(
+        lines[0].contains("ownership=none") && lines[0].contains("route=turn"),
+        "an inbound claim alone starts a new Turn, never a Supplement: {}",
+        lines[0]
+    );
+    assert!(
+        !logs.contains("route=supplement"),
+        "the claim must not route a Supplement:\n{logs}"
+    );
+    assert!(
+        !logs.contains(text),
+        "the message body must never be logged:\n{logs}"
+    );
+}

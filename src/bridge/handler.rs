@@ -80,7 +80,8 @@ async fn read_session_status(
     }
 }
 
-/// The prompt routing verdict (ADR-0062). cola's own live ownership is the
+/// The prompt route (ADR-0062). cola's own live ownership — the
+/// [`crate::bridge::turn::CardOwnership`] verdict's routing rule — is the
 /// routing key; the Backend's status read is advisory data that only picks the
 /// new card's opening line.
 enum PromptRoute {
@@ -520,15 +521,15 @@ impl App {
         })
     }
 
-    /// Route a prompt by cola's OWN live ownership (ADR-0062): the inflight
-    /// guard a Turn holds — inherited by its out-of-turn follow for its whole
-    /// window — or a card chain a live renderer owns (the busy-adopt snapshot
-    /// follow's external render, a Wake continuation): the same pair the Wake
-    /// step treats as "a live Turn/follow/renderer owns the session". Only an
-    /// owned chain takes the Supplement path — the split needs a live card,
-    /// and with no owned chain it would find nothing to continue (the #428
-    /// strand, where the read said live and the message was silently
-    /// absorbed).
+    /// Route a prompt by cola's OWN live ownership (ADR-0062, ADR-0070): the
+    /// one [`crate::bridge::turn::CardOwnership`] read over the waits state and
+    /// the card map, whose routing rule — a guard held, or a card chain a live
+    /// renderer owns — the Wake gate reads too, so the two can never disagree
+    /// about whether a session is already being rendered. Only an owned chain
+    /// takes the Supplement path — the split needs a live card, and with no
+    /// owned chain it would find nothing to continue (the #428 strand, where
+    /// the read said live and the message was silently absorbed). A
+    /// pending-inbound claim owns no chain and routes a new Turn.
     ///
     /// With no owned chain, the Backend's status read is ADVISORY: it no
     /// longer routes, it only tells the new Turn whether to open with the
@@ -541,14 +542,11 @@ impl App {
     /// ownership verdict and, when read, the advisory status — never chat
     /// content.
     async fn route_prompt(&self, session_id: &str) -> PromptRoute {
-        if let Some(ownership) =
-            crate::bridge::turn::Turn::chain_ownership(&self.cards_handle(), &self.waits_handle(), session_id)
-                .await
-        {
-            tracing::info!(
-                "prompt routing: session={session_id} ownership={} route=supplement",
-                ownership.label()
-            );
+        let ownership =
+            crate::bridge::turn::CardOwnership::read(&self.cards_handle(), &self.waits_handle(), session_id)
+                .await;
+        if let Some(label) = ownership.routing_label() {
+            tracing::info!("prompt routing: session={session_id} ownership={label} route=supplement");
             return PromptRoute::Supplement;
         }
         let directory = self.sessions.lock().await.directory_for_session(session_id);
