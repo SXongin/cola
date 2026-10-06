@@ -167,7 +167,11 @@ has already announced — its identity and server time — advanced only after t
 card write that carried the announcement succeeds. **Session Sync**'s
 post-restart continuation reads it: a Wake at or below the watermark is never
 re-announced, only a strictly newer one continues (with the content probe still
-required). Distinct from the **Sync Watermark**, which accounts user messages,
+required). It serves a chain with no durable **Chain Record** alone: a recorded
+chain's Wake belongs to the **Rendered Cursor**'s projection (or, cursorless,
+to the reap's fallback), and the projection's confirmed create drains the same
+watermark, so a Wake a successor rendered is never re-posted either (ADR-0071).
+Distinct from the **Sync Watermark**, which accounts user messages,
 lives in memory, and is never moved by a Wake (ADR-0061). One section of the
 **Chain Record** since ADR-0069.
 _Avoid_: Sync Watermark (the user-message-scoped one), announced set (the
@@ -177,8 +181,9 @@ in-memory per-chain predecessor)
 The one durable record a **Session** has about its **Card Chain**, owned by the
 Chain Record module and persisted as one sidecar (`chain_records.json`) with two
 sections of distinct lifetimes: the **live card record** (the live card's
-identity, its **Turn**'s anchor and the Session's directory, plus the per-process
-reconciliation marks) — written, or re-pointed to a successor, when a card
+identity, its **Turn**'s anchor and the Session's directory, the chain's
+**Rendered Cursor**, plus the per-process reconciliation marks) — written, or
+re-pointed to a successor, when a card
 becomes the Session's live card, and released only when its card reaches a
 terminal ending whose write is confirmed (delivered or permanently refused;
 ADR-0063's amendment, ADR-0067) or when a successor collect cannot carry the
@@ -187,10 +192,29 @@ record (the successor settled, or has no armed anchor) — and the
 file reads as empty; the file itself is kept even when both sections are empty,
 because its presence is the one-time migration marker from the pre-ADR-0069
 `live_cards.json` / `wake_watermarks.json` sidecars. **Session Sync**'s reap
-reconciles its records against the Session's own reads, so a card a cola restart
-orphaned stops looking live.
+reconciles its records against the Session's own reads: a card a cola restart
+orphaned stops looking live — settled in place, or projected onto a successor
+from its **Rendered Cursor** (ADR-0071).
 _Avoid_: Live Card record (the pre-module name for the records section alone),
 store, mapping (the Session Mapping is the Chat/Topic side)
+
+**Rendered Cursor**:
+The durable frontier of what a **Card Chain** has confirmed rendered: the
+newest delivered text/reasoning part (its message identity, part position,
+kind, server start and delivered character extent) plus the set of tool call
+ids whose newest delivered state was `running`. Position and identity only —
+never content. A field of the **Chain Record**'s records section, advanced
+only by a confirmed card write (a PATCH `Ok`, a create `Ok`, or a **Pending
+Card Update** the drain delivers later) and released with the record; a split's
+re-point carries it and a new **Turn** never clears it. `None` means
+cursorless — an older release's record, or a chain whose first confirmed write
+has not landed — and keeps the existing fallback behavior. **Session Sync**'s
+reap projects the delta after the cursor onto a successor: a still-live run is
+adopted and followed, a run that ended while cola was down shows its missed
+tail together with its true ending, and the message takeover seeds the same
+delta onto the fresh Turn's card (ADR-0071).
+_Avoid_: Render watermark (the name of the option ADR-0071 reopened), **Sync
+Watermark** (user messages), **Wake Watermark** (Wakes)
 
 **Session Sync** (会话同步):
 The Bridge flow that keeps a thread's **Active Session**'s card chain current without a user message: it notifies **External Messages**, renders **Wakes** as continuation cards, and catches content its card missed (ADR-0059). The successor of the external-message sync; still scoped to the thread's active Session (ADR-0017).
@@ -236,7 +260,7 @@ The one read-only card a Chat/Topic receives when it activates a Session it was 
 _Avoid_: Briefing, takeover summary, handoff card
 
 **Card**:
-A Feishu interactive message card. It evolves through live states (loading → reasoning → streaming, including a running-tool phase) and ends in one of five terminals — 「✅ 完成」, 「❌ 出错」, 「⏹ 已停止」 for a deliberate stop, 「↩️ 已重试」 once its retry was submitted, or 「⚠️ 这条消息未被接收」 when its Turn's message never reached the Session Transcript (ADR-0062) — or, while its Turn's **Background Tasks** are still live, yields with 「⏳ 等待后台任务」 (not a terminal: the next shell/subagent completion **Wake** resumes it in place as 「🔄 后台任务完成，继续处理中…」, ADR-0066); such a waiting card is later **collected** as a terminal of its own — 「⏳ 部分完成 · 已由新消息接管」 when a new Turn supersedes it, 「⏳ 已切换会话 · 后台任务仍在运行」 when its Session stops being the thread's Active Session — and a card a cola restart orphaned is **reaped** by Session Sync into its true ending (✅ / ❌ / 等待后台任务 / 未被接收) or collected as 「⏳ 已由新卡片接管 · 已停止更新」 when a continuation takes the chain over — while its Session still reads live, that orphan is stamped once per cola life with 「⏳ 已重启，等待运行结束」 until the same settle decides it (ADR-0063); a filled card hands over to its chain's continuation with a 「⏳ 部分完成，继续中…」 pause. A yielded card still accepts exactly two updates while it waits: its **Background Task Ledger**, and a quiet true-end settlement (ADR-0060); the resumption a completion Wake brings is the third, and only once the wait is over (ADR-0066). It uses collapsible panels for secondary content and shows progress in its header (phase timer, silence, reasoning length) so a slow turn is distinguishable from a dead one — including a "等待你的授权"/"等待你的回答" state that names whichever pending request blocks the turn (both at once reads "等待你的授权/回答").
+A Feishu interactive message card. It evolves through live states (loading → reasoning → streaming, including a running-tool phase) and ends in one of five terminals — 「✅ 完成」, 「❌ 出错」, 「⏹ 已停止」 for a deliberate stop, 「↩️ 已重试」 once its retry was submitted, or 「⚠️ 这条消息未被接收」 when its Turn's message never reached the Session Transcript (ADR-0062) — or, while its Turn's **Background Tasks** are still live, yields with 「⏳ 等待后台任务」 (not a terminal: the next shell/subagent completion **Wake** resumes it in place as 「🔄 后台任务完成，继续处理中…」, ADR-0066); such a waiting card is later **collected** as a terminal of its own — 「⏳ 部分完成 · 已由新消息接管」 when a new Turn supersedes it, 「⏳ 已切换会话 · 后台任务仍在运行」 when its Session stops being the thread's Active Session — and a card a cola restart orphaned is **reaped** by Session Sync into its true ending (✅ / ❌ / 等待后台任务 / 未被接收) or collected as 「⏳ 已由新卡片接管 · 已停止更新」 when a continuation takes the chain over — while its Session still reads live, that orphan is stamped once per cola life with 「⏳ 已重启，等待运行结束」 until the same settle decides it (ADR-0063; a chain carrying a **Rendered Cursor** is projected onto a successor instead — ADR-0071); a filled card hands over to its chain's continuation with a 「⏳ 部分完成，继续中…」 pause. A yielded card still accepts exactly two updates while it waits: its **Background Task Ledger**, and a quiet true-end settlement (ADR-0060); the resumption a completion Wake brings is the third, and only once the wait is over (ADR-0066). It uses collapsible panels for secondary content and shows progress in its header (phase timer, silence, reasoning length) so a slow turn is distinguishable from a dead one — including a "等待你的授权"/"等待你的回答" state that names whichever pending request blocks the turn (both at once reads "等待你的授权/回答").
 _Avoid_: Widget, component, bubble
 
 **Card Chain**:
@@ -282,7 +306,7 @@ The card element recording one tool call in a **Turn** — a folded collapsible 
 _Avoid_: tool card, call card, tool bubble
 
 **Carried Tool Panel**:
-The **Tool Panel** of a call that was still `running`/`pending` when the card showing it was orphaned by a cola restart, handed to the successor **Turn**'s card when the takeover happens, so a running tool's live signal is never split across two cards: only calls belonging to the orphaned **Turn** are carried, and they ride the successor's live tail by call identity — the collected old card's body is left without its stale running marker, and each settles once on the successor (ADR-0068). Like every live panel it is display-only — never an adoption of the old run. Only the fresh-Turn message takeover carries; a **Wake** continuation keeps its no-replay scope (ADR-0061).
+The **Tool Panel** of a call that was still `running`/`pending` when the card showing it was orphaned by a cola restart, handed to the successor **Turn**'s card when the takeover happens, so a running tool's live signal is never split across two cards: only calls belonging to the orphaned **Turn** are carried, and they ride the successor's live tail by call identity — the collected old card's body is left without its stale running marker, and each settles once on the successor (ADR-0068). Like every live panel it is display-only — never an adoption of the old run. Only the fresh-Turn message takeover carries; a **Wake** continuation keeps its no-replay scope (ADR-0061). Since ADR-0071 the carry is one case of the **Rendered Cursor**'s live set: a takeover seeds the successor with the calls whose newest delivered state was `running` (or, for a cursorless record, the orphaned Turn's still-live calls), resolved by identity on every read, and the message-first race seeds the orphaned Turn's undelivered text tail through the same seed.
 _Avoid_: Transferred panel, migrated panel, adopted panel
 
 **Built-in Tool**:
@@ -377,6 +401,7 @@ _Avoid_: Notification, message, signal
 - A **Session** contains many **Turns** and has one **Project** and one optional **Agent**; a **Turn** spans one or more **Executions**, and an **Execution** ends at the Backend's idle boundary, which a **Wake** may follow with another Execution (ADR-0059)
 - A **Session** is read through one **Session Transcript**, whose projections serve rendering, **Session Sync** and the **Session Snapshot**
 - A **Wake Watermark** persists which **Wake**s a card chain has already announced, so a cola restart never re-posts one; the **Sync Watermark** stays user-message-scoped (ADR-0061)
+- A **Card Chain**'s **Rendered Cursor** records how far its card has confirmed rendered; a restart's projection renders only the delta after it — a still-live run adopted and followed on a successor, an ended one's missed tail and true ending — while a cursorless record keeps the #443 stamp / in-place settle fallback (ADR-0071)
 - A **Turn** renders into a **Card Chain**; a pending **Permission**/**Question** rides its newest card as an **Interaction Block**, and resolving one leaves an **Interaction Receipt**
 - A **Session**'s card chain has one **Card Ownership** verdict at a time — the in-process claim (none / inbound / guard) × the current card's class (absent / render-owned / yielded with its write-readiness / restart-stamped / ended); its named rules decide **Supplement** vs new **Turn** (ADR-0062), the yielded-card write admission (ADR-0060, ADR-0066), the durable reap's claim (ADR-0063), the settle ticket and the `/stop` disposition (ADR-0070)
 - A **Supplement** splits its **Turn**'s **Card Chain** so the continuation card is the newest message; the render loop stays alive across a Supplement that starts a new **Turn**; a **Command** reply does not split the chain by itself — `/card` pulls the live card down on explicit request
