@@ -41,10 +41,11 @@ pub(super) struct TimelineItem {
     pub(super) key: i64,
     pub(super) shown_at: Option<i64>,
     /// Identity of this entry, assigned once at insertion and never reused.
-    /// It names the entry's panel on the card (`tool_{seq}` / `reason_{seq}`);
-    /// unlike the entry's position it survives timeline insertions and
-    /// merges, so the client's local panel state can't drift to another panel
-    /// when the card re-renders.
+    /// It names the entry's panel on the card (`reason_{seq}`; a tool panel
+    /// uses the call's own id, `tool_{call_id}`, so the takeover's per-call
+    /// strip can match it); unlike the entry's position it survives timeline
+    /// insertions and merges, so the client's local panel state can't drift to
+    /// another panel when the card re-renders.
     pub(super) seq: u64,
     pub(super) kind: TimelineKind,
     /// The typed transcript part this entry rendered from, for text/reasoning
@@ -399,9 +400,10 @@ impl CursorSeed {
     /// card must drop the running markers it left behind. A call outside the
     /// read (a truncated V2 transcript) cannot render on the successor: its
     /// panel stays on the old card as a frozen marker rather than vanishing
-    /// from both, so the strip happens only when every named call resolved.
-    pub(crate) fn resolves_live_calls(&self) -> bool {
-        !self.live_calls.is_empty() && self.resolved_live_calls.len() == self.live_calls.len()
+    /// from both. The per-call set the collect strips by (review #569); empty
+    /// when no named call resolved.
+    pub(crate) fn resolved_calls(&self) -> Vec<String> {
+        self.resolved_live_calls.iter().cloned().collect()
     }
 }
 
@@ -2737,7 +2739,7 @@ impl StreamAccumulator {
                         builder = builder.with_tool_at(
                             panel.clone(),
                             item.shown_at,
-                            Some(&format!("tool_{}", item.seq)),
+                            Some(&format!("tool_{call_id}")),
                         );
                     }
                 }
@@ -2798,11 +2800,8 @@ impl StreamAccumulator {
                     continue;
                 }
                 if let Some(panel) = self.tools.get(call_id) {
-                    builder = builder.with_tool_at(
-                        panel.clone(),
-                        live.shown_at,
-                        Some(&format!("tool_{}", live.seq)),
-                    );
+                    builder =
+                        builder.with_tool_at(panel.clone(), live.shown_at, Some(&format!("tool_{call_id}")));
                 }
             }
             // The card's tail: the live interaction blocks, in accumulated
@@ -2983,6 +2982,35 @@ impl StreamAccumulator {
         self.timeline
             .iter()
             .any(|item| item.source.as_ref().is_some_and(|s| s.same_part(source)))
+    }
+
+    /// Whether the read's part text still carries what this accumulator (and
+    /// the chain's cursor) delivered for `source` (spec #561, review #569): the
+    /// newest same-part entry's digest — recorded over the part's whole
+    /// delivered extent at its push — must hash the read's prefix of that
+    /// extent. `false` when the part has no entry here, that entry carries no
+    /// digest, the read is shorter than the extent, or the prefix no longer
+    /// hashes to it: the caller must then cut at zero, because appending the
+    /// read's `extent..` suffix would skip content the card never showed.
+    pub(super) fn source_prefix_holds(&self, source: &PartSource, text: &str, extent: usize) -> bool {
+        let prefix: String = text.chars().take(extent).collect();
+        if prefix.chars().count() < extent {
+            return false;
+        }
+        self.source_digest(source)
+            .is_some_and(|digest| digest == crate::bridge::chain::cursor_prefix_digest(&prefix))
+    }
+
+    /// The prefix digest of `source`'s newest timeline entry — the one whose
+    /// push last covered the part's whole delivered extent (spec #561, review
+    /// #569). `None` when the part has no entry here, or that entry carries
+    /// none: the caller then cannot tell a growth from a rewrite.
+    fn source_digest(&self, source: &PartSource) -> Option<u64> {
+        self.timeline
+            .iter()
+            .rev()
+            .find(|item| item.source.as_ref().is_some_and(|s| s.same_part(source)))
+            .and_then(|item| item.source.as_ref().and_then(|s| s.prefix_digest))
     }
 
     /// The part content this accumulator's timeline already shows for `source`
@@ -4504,7 +4532,9 @@ mod tests {
 
     /// #243 / ADR-0045: when the tool settles, its panel leaves the tail and
     /// joins the timeline — with the element identity it was born with, so the
-    /// reader's fold state survives the move.
+    /// reader's fold state survives the move. The id names the CALL
+    /// (`tool_{call_id}`, spec #561, review #569), so a takeover's collect can
+    /// also identify the marker of a call the successor resolved.
     #[test]
     fn a_settled_tool_panel_joins_the_timeline_keeping_its_identity() {
         let panel_ids = |card: &serde_json::Value| -> Vec<String> {
@@ -4543,6 +4573,11 @@ mod tests {
             panel_ids(&done_card),
             panel_ids(&running_card),
             "the settle move keeps the panel's element identity"
+        );
+        assert_eq!(
+            panel_ids(&done_card),
+            vec!["tool_call_bash".to_string()],
+            "the panel's id names its call"
         );
     }
 

@@ -788,7 +788,30 @@ fn render_seeded_part(
     // entry alone; a part this accumulator already holds (the frontier growing
     // under a later read) continues from what it delivered, never repeating
     // the offset (spec #561, review #569).
-    let held = acc.source_extent(&PartSource::at(message_id.clone(), index));
+    let source = PartSource::at(message_id.clone(), index);
+    let held = acc.source_extent(&source);
+    // The suffix-only cut is valid only while the read still carries what the
+    // chain delivered for the part. A live REWRITE — the read's prefix no
+    // longer hashing to the held extent — replaces the part's run with the new
+    // content in full: cutting at `held` would push a stray suffix and let the
+    // cursor claim the replacement delivered (spec #561, review #569, ADR-0071's
+    // rewrite rule).
+    if held > 0 && !acc.source_prefix_holds(&source, full, held) {
+        acc.mark_delivered_part(part);
+        if is_text {
+            acc.replace_text_run(&source, full, started_at);
+            acc.card_state = crate::feishu::card::CardState::Streaming;
+        } else {
+            acc.replace_reasoning_run(&source, full, started_at);
+            acc.card_state = crate::feishu::card::CardState::Reasoning;
+        }
+        if let Some(seed) = acc.seed.as_mut()
+            && let Some(frontier) = seed.frontier.as_mut()
+        {
+            frontier.delivered_chars = full_len;
+        }
+        return !full.is_empty();
+    }
     let (cut, before) = if held == 0 {
         (delivered, delivered)
     } else {
@@ -3541,10 +3564,12 @@ Index: /x/src/main.rs
     }
 
     /// Every collapsible panel carries a stable `element_id`, derived from the
-    /// timeline entry it renders — never from its position. The card is
-    /// re-rendered whole on every flush while the client holds each panel's
-    /// open/closed state locally; an id that moved would hand that state to a
-    /// different panel, which is how the todo panel used to lose its expansion.
+    /// thing it renders — a reasoning panel from its timeline item, a tool
+    /// panel from its call (`tool_{call_id}`) — never from its position. The
+    /// card is re-rendered whole on every flush while the client holds each
+    /// panel's open/closed state locally; an id that moved would hand that
+    /// state to a different panel, which is how the todo panel used to lose its
+    /// expansion.
     #[test]
     fn panel_element_ids_stay_with_their_timeline_item() {
         let panel_ids = |card: &serde_json::Value| -> Vec<String> {
@@ -3579,7 +3604,10 @@ Index: /x/src/main.rs
         let before = panel_ids(&acc.build_card());
         assert_eq!(before.len(), 3, "reasoning, tool, todo: {before:?}");
         assert!(before[0].starts_with("reason_"), "{before:?}");
-        assert!(before[1].starts_with("tool_"), "{before:?}");
+        assert!(
+            before[1].starts_with("tool_call_1("),
+            "a tool panel's id names its call: {before:?}"
+        );
         assert!(
             before[2].starts_with("todo("),
             "the tail panel is the todo: {before:?}"
@@ -4974,14 +5002,10 @@ Index: /x/src/main.rs
                 .collect(),
         };
         let seed = CursorSeed::resolve(&transcript, &cursor).expect("the cursor resolves");
-        assert!(
-            !seed.resolves_live_calls(),
-            "a named call outside the read is never handed over"
-        );
         assert_eq!(
-            seed.resolved_live_calls,
-            ["call_seen".to_string()].into_iter().collect(),
-            "only the read's own call resolves"
+            seed.resolved_calls(),
+            vec!["call_seen".to_string()],
+            "a named call outside the read is never handed over"
         );
 
         // Every named call present: the successor renders them, so the old
@@ -4991,7 +5015,11 @@ Index: /x/src/main.rs
             ..cursor.clone()
         };
         let seed = CursorSeed::resolve(&transcript, &all_present).expect("the cursor resolves");
-        assert!(seed.resolves_live_calls());
+        assert_eq!(
+            seed.resolved_calls(),
+            vec!["call_seen".to_string()],
+            "every named call present resolves"
+        );
     }
 
     /// Spec #561, review #569: V2 decodes text parts without `time.start`, so

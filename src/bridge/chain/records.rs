@@ -39,15 +39,16 @@ use crate::bridge::sidecar;
 
 /// The keep rule the fresh-Turn takeover's collect applied to the card it
 /// replaced (ADR-0068, spec #561), in memory only: which predecessor card the
-/// collect targeted and whether the takeover's seed resolved its running `⏳`
-/// panels onto the successor. The #443 restart stamp's post-PATCH repair reads
-/// it so a stamp landing over that takeover reproduces the collect's strip
-/// instead of restoring the tail it removed; every other takeover (the Wake
-/// and external arms) records none.
+/// collect targeted and which of the takeover seed's live-set calls it
+/// resolved onto the successor — the running `⏳` markers that left the card.
+/// The #443 restart stamp's post-PATCH repair reads it so a stamp landing over
+/// that takeover reproduces the collect's per-call strip instead of restoring
+/// the tail it removed; every other takeover (the Wake and external arms)
+/// records none.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PredecessorKeep {
     pub(crate) card_message_id: String,
-    pub(crate) strip_running_panels: bool,
+    pub(crate) resolved_calls: Vec<String>,
 }
 
 /// The transcript kind of the part a [`CursorFrontier`] names: the two kinds
@@ -576,36 +577,41 @@ impl ChainRecords {
     }
 
     /// Record the keep rule the fresh-Turn takeover's collect is about to
-    /// apply to `card_message_id` (ADR-0068), so the #443 stamp's post-PATCH
-    /// repair can reproduce it. Recorded before the collect's PATCH so a stamp
-    /// that lands after it finds the rule. In-memory only; a later handover
-    /// that rewrites the record drops it.
+    /// apply to `card_message_id` (ADR-0068): `resolved_calls` are the live-set
+    /// calls the seed resolved onto the successor, whose running panels the
+    /// collect strips. Recorded before the collect's PATCH so a stamp that
+    /// lands after it finds the rule. In-memory only; a later handover that
+    /// rewrites the record drops it.
     pub(crate) fn note_predecessor_keep(
         &self,
         session_id: &str,
         card_message_id: &str,
-        strip_running_panels: bool,
+        resolved_calls: &[String],
     ) {
         let mut state = self.lock();
         if let Some(card) = state.records.get_mut(session_id) {
             card.predecessor_keep = Some(PredecessorKeep {
                 card_message_id: card_message_id.to_string(),
-                strip_running_panels,
+                resolved_calls: resolved_calls.to_vec(),
             });
         }
     }
 
-    /// The live-tail strip the takeover collect recorded for the predecessor
-    /// card `card_message_id`, when this record still remembers it:
-    /// `Some(strip_running_panels)` after a fresh-Turn takeover's collect,
-    /// `None` for every other takeover (the #443 repair then keeps today's
-    /// body) and for a record that moved on.
-    pub(crate) fn predecessor_keep_strip(&self, session_id: &str, card_message_id: &str) -> Option<bool> {
+    /// The running panels the takeover collect stripped from the predecessor
+    /// card `card_message_id`, when this record still remembers them:
+    /// `Some(resolved_calls)` after a fresh-Turn takeover's collect, `None` for
+    /// every other takeover (the #443 repair then keeps today's body) and for a
+    /// record that moved on.
+    pub(crate) fn predecessor_keep_strip(
+        &self,
+        session_id: &str,
+        card_message_id: &str,
+    ) -> Option<Vec<String>> {
         self.lock().records.get(session_id).and_then(|card| {
             card.predecessor_keep
                 .as_ref()
                 .filter(|keep| keep.card_message_id == card_message_id)
-                .map(|keep| keep.strip_running_panels)
+                .map(|keep| keep.resolved_calls.clone())
         })
     }
 
@@ -1068,17 +1074,20 @@ mod tests {
         );
 
         assert_eq!(chains.predecessor_keep_strip("ses_a", "om_old"), None);
-        chains.note_predecessor_keep("ses_a", "om_old", true);
-        assert_eq!(chains.predecessor_keep_strip("ses_a", "om_old"), Some(true));
+        chains.note_predecessor_keep("ses_a", "om_old", &["call_1".to_string()]);
+        assert_eq!(
+            chains.predecessor_keep_strip("ses_a", "om_old"),
+            Some(vec!["call_1".to_string()])
+        );
         assert_eq!(
             chains.predecessor_keep_strip("ses_a", "om_other"),
             None,
             "the rule only answers for the card it was recorded for"
         );
-        chains.note_predecessor_keep("ses_a", "om_old", false);
+        chains.note_predecessor_keep("ses_a", "om_old", &[]);
         assert_eq!(
             chains.predecessor_keep_strip("ses_a", "om_old"),
-            Some(false),
+            Some(Vec::new()),
             "a second takeover collect replaces the recorded rule"
         );
 

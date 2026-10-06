@@ -507,7 +507,7 @@ impl Turn {
                 &handles.cards,
                 &session_id,
                 &orphan.card_message_id,
-                resolved,
+                &resolved,
             )
             .await;
         }
@@ -1679,9 +1679,10 @@ impl Turn {
     /// was. A record with no cursor keeps today's carry as the seed's
     /// live-set fallback: the orphaned Turn's still-live calls resolve by
     /// identity, no content replays. One INFO line records the decision
-    /// (session + outcome, never chat content). Returns whether the seed
-    /// resolved any live call — the takeover's collect reads it to decide
-    /// whether the orphan card's running `⏳` panels go with them.
+    /// (session + outcome, never chat content). Returns the live-set calls the
+    /// seed RESOLVED onto the successor — empty when nothing landed — which
+    /// the takeover's collect strips from the orphan card's running `⏳`
+    /// panels (spec #561, review #569).
     ///
     /// Only a fresh Turn's takeover calls this: a Wake continuation keeps
     /// ADR-0061's no-replay scope and the reap/external arms never seed.
@@ -1690,10 +1691,10 @@ impl Turn {
         session_id: &str,
         successor_card_id: &str,
         orphan: &ChainRecord,
-    ) -> bool {
+    ) -> Vec<String> {
         let Some(anchor) = orphan.anchor() else {
             tracing::info!("restart seed: session {session_id} none (no anchor)");
-            return false;
+            return Vec::new();
         };
         let read = crate::bridge::bounded_call(
             "restart seed transcript",
@@ -1706,18 +1707,18 @@ impl Turn {
             Some(Err(error)) => {
                 tracing::debug!("restart seed: session {session_id} read failed: {error}");
                 tracing::info!("restart seed: session {session_id} none (read failed)");
-                return false;
+                return Vec::new();
             }
             None => {
                 tracing::info!("restart seed: session {session_id} none (read timed out)");
-                return false;
+                return Vec::new();
             }
         };
         let seed = match &orphan.cursor {
             Some(cursor) => state::CursorSeed::for_orphan(&transcript, cursor, &anchor),
             None => state::CursorSeed::live_calls_only(&transcript, &anchor),
         };
-        let resolved = seed.resolves_live_calls();
+        let resolved = seed.resolved_calls();
         // The cursor the seed derives from: the orphan's confirmed one, or the
         // default a cursorless record starts from.
         let cursor = orphan.cursor.clone().unwrap_or_default();
@@ -1726,9 +1727,10 @@ impl Turn {
             Self::apply_orphan_seed(&mut live, session_id, successor_card_id, &cursor, seed)
         };
         tracing::info!(
-            "restart seed: session {session_id} resolved {resolved} live calls (applied {applied})"
+            "restart seed: session {session_id} resolved {} live calls (applied {applied})",
+            resolved.len()
         );
-        applied && resolved
+        if applied { resolved } else { Vec::new() }
     }
 
     /// Apply a resolved seed to `session_id`'s accumulator, but only while that
@@ -3013,17 +3015,7 @@ impl Turn {
         acc.wake_continuation = true;
         acc.apply_work_context(work_context);
         acc.seed_projection(cursor, seed.clone());
-        let carried_before: std::collections::HashSet<String> = acc.seeded_calls.iter().cloned().collect();
         let rendered = render::render_turn_parts(&mut acc, transcript);
-        // Every carried live call must resolve onto the successor — rendered by
-        // its own window or settled by the identity reconciliation — before the
-        // old card's running panels may go: a call this read does not carry
-        // (a truncated transcript) stays a frozen marker on the old card rather
-        // than vanishing from both (spec #561, review #569).
-        let resolved_calls = !carried_before.is_empty()
-            && carried_before
-                .iter()
-                .all(|call_id| !acc.seeded_calls.contains(call_id));
         render::apply_ledger_read(
             &mut acc,
             transcript,
@@ -3071,7 +3063,6 @@ impl Turn {
         Some(ProjectedCard {
             card: built.card,
             rendered,
-            resolved_calls,
             chain_id,
             cursor_stage,
             watermark_stage,
@@ -3177,13 +3168,6 @@ pub(crate) struct ProjectedCard {
     /// successor. The live adoption sends either way — the run is live and the
     /// follow streams what it produces next (ticket #564).
     pub(crate) rendered: bool,
-    /// Whether EVERY live-set call resolved onto the successor — rendered by
-    /// its own window, or settled by the identity reconciliation: only then
-    /// does the collected old card drop its running `⏳` panels (ADR-0068's
-    /// generalized collect). A call the read does not carry (a truncated
-    /// transcript) resolves nothing and keeps its frozen marker on the old
-    /// card (spec #561, review #569).
-    pub(crate) resolved_calls: bool,
     /// The armed [`state::CardSession::chain_id`] — the identity
     /// [`Turn::take_over_armed_card`] verifies inside its one cards-map
     /// critical section: a fresh Turn that replaced the armed session
