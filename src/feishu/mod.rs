@@ -145,6 +145,17 @@ pub trait Platform: Send + Sync {
     fn card_write_delivered(&self, _message_id: &str, _seq: u64) -> bool {
         false
     }
+
+    /// The settled delivery verdict of `message_id`'s newest card write once
+    /// it is no longer owed (spec #561, review #569): `Some(true)` when the
+    /// settled write delivered, `Some(false)` when it settled otherwise (a
+    /// permanent refusal). `None` while a payload is still owed, the card has
+    /// no entry, or the platform does not observe card writes. A failure note
+    /// whose payload a drain delivered in the meantime reads `Some(true)` and
+    /// may confirm its staged cursor immediately instead of discarding it.
+    fn settled_card_write_delivered(&self, _message_id: &str) -> Option<bool> {
+        None
+    }
 }
 
 #[async_trait]

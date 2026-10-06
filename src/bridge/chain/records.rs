@@ -65,13 +65,25 @@ pub(crate) enum CursorPartKind {
     Tool,
 }
 
+/// The digest a Rendered Cursor frontier stores for a part's delivered prefix
+/// (spec #561, review #569): a small, derived fingerprint of the prefix
+/// CONTENT — never the content itself, and never the payload journal #505
+/// rejected. It lets resolution tell a grown part (same prefix) from a
+/// replacement in the same slot when both parts carry no server start time
+/// (V2 decodes text parts without `time.start`), where identity alone cannot.
+pub(crate) fn cursor_prefix_digest(prefix: &str) -> u64 {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(prefix.as_bytes());
+    u64::from_be_bytes(hash[..8].try_into().expect("sha256 is 32 bytes"))
+}
+
 /// The transcript position of the newest delivered content a Card Chain has
 /// confirmed delivered (spec #561): the message identity, the part's position
 /// and — for a text/reasoning frontier — the delivered character extent of
 /// that part. A settled tool may be the frontier too (review #569), by
 /// position alone; the extent then belongs to the newest text/reasoning part
 /// at or before it, so that part still renders its growth. Position and
-/// identity only — never content.
+/// identity only, plus the prefix's derived digest — never content.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CursorFrontier {
     /// The assistant message that carried the part.
@@ -85,6 +97,13 @@ pub(crate) struct CursorFrontier {
     pub(crate) started_at: Option<i64>,
     /// Unicode characters of the part's text confirmed delivered.
     pub(crate) delivered_chars: usize,
+    /// The delivered prefix's [`cursor_prefix_digest`] (spec #561, review
+    /// #569): derived metadata, never content. `None` on a cursor written by
+    /// an older release — or by a body whose entries carried no digest —
+    /// resolution then falls back (no projection) rather than guess, the same
+    /// one-release seam a cursorless record uses.
+    #[serde(default)]
+    pub(crate) prefix_digest: Option<u64>,
 }
 
 /// The **Rendered Cursor** (spec #561): how far a Card Chain's card has
@@ -1240,6 +1259,7 @@ mod tests {
                 kind: CursorPartKind::Text,
                 started_at: Some(2_000),
                 delivered_chars: 42,
+                prefix_digest: Some(7),
             }),
             live_calls: ["call_1".to_string()].into_iter().collect(),
         };
@@ -1276,6 +1296,7 @@ mod tests {
                 kind: CursorPartKind::Reasoning,
                 started_at: None,
                 delivered_chars: 7,
+                prefix_digest: Some(7),
             }),
             live_calls: ["call_1".to_string()].into_iter().collect(),
         };

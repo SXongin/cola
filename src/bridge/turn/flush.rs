@@ -183,26 +183,42 @@ async fn confirm_staged_cursor(
 /// left owed — the drain reconcile confirms the cursor once that payload
 /// delivers — while anything else (a permanent refusal, a create that will
 /// never be retried) drops the stage, because no later write can carry it.
+///
+/// A recoverable failure whose payload the drain ALREADY delivered before this
+/// note ran (the sequence lookup finds the payload settled, not owed) is a
+/// confirmation, not a discard: the write reached the card, so the stage
+/// advances now — a crash before another confirmed flush must never leave the
+/// durable cursor behind content already on the card (spec #561, review #569).
 async fn note_cursor_write_failure(
     cards: &CardsHandle,
     session_id: &str,
     card_message_id: Option<&str>,
     card: &serde_json::Value,
     error: &crate::error::BridgeError,
+    stage: crate::bridge::turn::state::StagedCursorId,
 ) {
-    let awaiting = error
-        .is_recoverable_card_write()
-        .then(|| {
-            card_message_id.and_then(|card_message_id| cards.feishu.pending_card_write(card_message_id, card))
-        })
-        .flatten();
+    if error.is_recoverable_card_write()
+        && let Some(card_message_id) = card_message_id
+    {
+        if let Some(seq) = cards.feishu.pending_card_write(card_message_id, card) {
+            // Still owed: the drain reconcile confirms the cursor once that
+            // payload delivers.
+            let mut live = cards.cards.lock().await;
+            if let Some(session) = live.get_mut(session_id) {
+                session.acc.await_cursor_write(card_message_id, seq);
+            }
+            return;
+        }
+        if cards.feishu.settled_card_write_delivered(card_message_id) == Some(true) {
+            // The drain delivered it first: the write landed, so confirm the
+            // exact stage this body carried.
+            confirm_staged_cursor(cards, session_id, card_message_id, None, stage).await;
+            return;
+        }
+    }
     let mut live = cards.cards.lock().await;
-    let Some(session) = live.get_mut(session_id) else {
-        return;
-    };
-    match (awaiting, card_message_id) {
-        (Some(seq), Some(card_message_id)) => session.acc.await_cursor_write(card_message_id, seq),
-        _ => session.acc.discard_pending_cursor(),
+    if let Some(session) = live.get_mut(session_id) {
+        session.acc.discard_pending_cursor();
     }
 }
 
@@ -395,6 +411,7 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, spl
                                         Some(&card_id),
                                         &built.card,
                                         &e,
+                                        stage,
                                     )
                                     .await;
                                     release_spent(cards, session_id).await;
@@ -402,7 +419,8 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, spl
                                 }
                             }
                         }
-                        note_cursor_write_failure(cards, session_id, Some(&card_id), &built.card, &e).await;
+                        note_cursor_write_failure(cards, session_id, Some(&card_id), &built.card, &e, stage)
+                            .await;
                         false
                     }
                 };
@@ -503,6 +521,7 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, spl
                 None
             };
             let delivered = if should_patch {
+                let stage = stage.expect("a PATCHed slice stages its cursor");
                 match cards.feishu.update_message(&card_id, &finalized.card).await {
                     Ok(()) => true,
                     Err(e) => {
@@ -531,8 +550,15 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, spl
                             // A suspended ending can never deliver, so a terminal
                             // record is spent (never retried), and its staged
                             // cursor is dropped with it.
-                            note_cursor_write_failure(cards, session_id, Some(&card_id), &finalized.card, &e)
-                                .await;
+                            note_cursor_write_failure(
+                                cards,
+                                session_id,
+                                Some(&card_id),
+                                &finalized.card,
+                                &e,
+                                stage,
+                            )
+                            .await;
                             release_spent(cards, session_id).await;
                             cards
                                 .card_handles
@@ -541,8 +567,15 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, spl
                                 .record(&card_id, &finalized.card, Vec::new());
                             return;
                         }
-                        note_cursor_write_failure(cards, session_id, Some(&card_id), &finalized.card, &e)
-                            .await;
+                        note_cursor_write_failure(
+                            cards,
+                            session_id,
+                            Some(&card_id),
+                            &finalized.card,
+                            &e,
+                            stage,
+                        )
+                        .await;
                         false
                     }
                 }
@@ -667,7 +700,7 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, spl
                 tracing::warn!("Card continuation send failed: {}", e);
                 // The create reached no card and is never retried: its staged
                 // cursor is dropped (a fenced retry rebuilds and re-stages).
-                note_cursor_write_failure(cards, session_id, None, &built.card, &e).await;
+                note_cursor_write_failure(cards, session_id, None, &built.card, &e, stage).await;
                 let retry_fenced = is_card_content_rejected(&e)
                     && matches!(
                         advance_card_fallback(cards, session_id).await,
@@ -813,7 +846,7 @@ mod tests {
 
     use std::sync::Arc;
 
-    use super::{drain_wake_watermark, staged_watermark_id};
+    use super::{drain_wake_watermark, note_cursor_write_failure, staged_watermark_id};
     use crate::bridge::test_support::*;
     use crate::bridge::turn::Turn;
     use crate::bridge::turn::state::{CardFallback, CardSession, StreamAccumulator};
@@ -1118,6 +1151,73 @@ mod tests {
             cards.chains.announced("ses_test").map(|mark| mark.created_ms),
             Some(1_000),
             "a drained stage never advances twice"
+        );
+    }
+
+    /// A failure note whose payload the drain delivered before the note looked
+    /// up its sequence must CONFIRM the staged cursor, not discard it (spec
+    /// #561, review #569): the write reached the card, so the durable cursor
+    /// must cover it — a crash before another confirmed flush would otherwise
+    /// repeat content the card already shows.
+    #[tokio::test]
+    async fn a_failure_note_after_the_drain_delivered_confirms_the_stage() {
+        use crate::backend::MessageId;
+        use crate::bridge::chain::{CursorFrontier, CursorPartKind, RenderedCursor, cursor_prefix_digest};
+        let (app, platform) = app_with_live_card("回答。").await;
+        let cards = app.cards_handle();
+        cards.chains.track(
+            "ses_test",
+            "om_live",
+            MessageId::new("msg_cola_anchor"),
+            Some(1_000),
+            None,
+        );
+        let card = serde_json::json!({ "schema": "2.0" });
+        // The write fails recoverably: the payload is owed...
+        platform
+            .fail_update_transport_count
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        let error = cards
+            .feishu
+            .update_message("om_live", &card)
+            .await
+            .expect_err("the transport failure");
+        assert!(
+            cards.feishu.has_pending_card_update("om_live"),
+            "a recoverable failure leaves the payload owed"
+        );
+        // ...and the drain delivers it before the failure note runs.
+        cards.feishu.drain_pending_card_updates(true).await;
+        assert!(!cards.feishu.has_pending_card_update("om_live"));
+        assert_eq!(
+            cards.feishu.settled_card_write_delivered("om_live"),
+            Some(true),
+            "the settled write delivered"
+        );
+
+        let cursor = RenderedCursor {
+            frontier: Some(CursorFrontier {
+                message_id: MessageId::new("msg_a_2000"),
+                part_index: 0,
+                kind: CursorPartKind::Text,
+                started_at: Some(2_000),
+                delivered_chars: "回答".chars().count(),
+                prefix_digest: Some(cursor_prefix_digest("回答")),
+            }),
+            live_calls: Default::default(),
+        };
+        let stage = Turn::stage_cursor(&cards, "ses_test", Some("om_live"), &cursor).await;
+        note_cursor_write_failure(&cards, "ses_test", Some("om_live"), &card, &error, stage).await;
+
+        assert_eq!(
+            cards.chains.cursor("ses_test"),
+            Some(cursor),
+            "the drain-delivered write advances the staged cursor"
+        );
+        assert_eq!(
+            Turn::staged_cursor(&cards, "ses_test").await,
+            None,
+            "the stage was consumed exactly once"
         );
     }
 }

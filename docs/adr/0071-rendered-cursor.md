@@ -48,6 +48,13 @@ projects the chain's delta after it onto a successor card.**
   identity is the message, the ordinal, the kind AND the part's server start
   time: a read carrying a different part in that slot resolves nothing and the
   projection falls back rather than skip a replacement's prefix (review #569).
+  Because V2 decodes text parts without `time.start`, identity alone cannot
+  tell growth from a same-slot replacement there: the frontier also stores a
+  small **digest of the delivered prefix** — derived metadata, never content —
+  and resolution requires the read's prefix of that length to hash to it. A
+  cursor written by an older release carries no digest and therefore resolves
+  nothing (a one-release migration seam, the cursorless fallback by another
+  name); the first confirmed write after the upgrade gives it one.
 
 - **Advance only on a confirmed write, through the existing delivery choke
   point.** The accumulator stages the cursor of the body it is about to write,
@@ -65,8 +72,11 @@ projects the chain's delta after it onto a successor card.**
   sequence whose delivery was verified — so a body staged since (a fresh
   flush whose PATCH is still pending) is left for its own confirmation and can
   never be advanced by an earlier write; the Wake Watermark's drain carries
-  the same stage identity. The per-write cost rides the network PATCH it
-  follows; this reopens ADR-0061's rejected render-frontier watermark, and the
+  the same stage identity. A failure note whose payload the drain delivered
+  before the note looked up its sequence confirms the stage then and there
+  (the settled delivery verdict), instead of discarding a write that reached
+  the card. The per-write cost rides the network PATCH it follows; this
+  reopens ADR-0061's rejected render-frontier watermark, and the
   affordability answer is recorded in that ADR's amendment.
 
 - **The cursor is chain-level and belongs to the record's lifetime.** A
@@ -109,10 +119,16 @@ projects the chain's delta after it onto a successor card.**
   old card is state-repaired in place by transcript truth, and the ambiguous
   card is left as it fell. The trade: an ambiguous create can leave the
   successor unposted and the old card state-repaired, never duplicated. A
-  restart forgets the mark, exactly like every in-memory reconcile mark. A
-  chain that stopped mid-way (below) keeps its record instead: the tail past
-  the last confirmed slice is still owed, so a terminal card's usual record
-  discard is suppressed for it and the next life resumes from the cursor.
+  **definite** non-delivery is not single-shot: a card-content rejection or an
+  explicit 4xx refusal proves the platform created no message, so the record
+  stays retryable — the next pass re-attempts, and a content rejection is
+  re-rendered once through the flush's fenced fallback so the tail can still
+  land (a content rejection that survives the fenced retry is suspended:
+  single-shot, the payload can never land). A restart forgets the mark,
+  exactly like every in-memory reconcile mark. A chain that stopped mid-way
+  (below) keeps its record instead: the tail past the last confirmed slice is
+  still owed, so a terminal card's usual record discard is suppressed for it
+  and the next life resumes from the cursor.
 
 - **Render seeding.** The seed resolves the cursor against the read:
   everything at or before the frontier counts as delivered — marked, not

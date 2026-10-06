@@ -13,5 +13,6 @@ mod records;
 pub(crate) use decision::{FreshDisposition, FreshReads, fresh};
 pub(crate) use reconcile::{AdoptedFollow, collect_orphan, collect_orphan_after_takeover, reconcile};
 pub(crate) use records::{
-    ChainRecord, ChainRecords, CursorFrontier, CursorPartKind, RenderedCursor, release_spent,
+    ChainRecord, ChainRecords, CursorFrontier, CursorPartKind, RenderedCursor, cursor_prefix_digest,
+    release_spent,
 };

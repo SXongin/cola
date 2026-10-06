@@ -3734,6 +3734,47 @@ impl Turn {
             full: built.full,
         })
     }
+
+    /// Rebuild a projection's FIRST slice with the flush's fenced fallback
+    /// (spec #561, review #569): a definite card-content rejection means the
+    /// same payload can never land, so the same body is re-rendered with every
+    /// model-markdown element fenced — exactly the flush's `RetryFenced` path —
+    /// rewinding the arm's render boundary and staging the new body's cursor.
+    /// `None` when the fenced retry was already refused (`Suspended`: the
+    /// content can never land) or the chain is gone.
+    pub(crate) async fn fenced_projected_slice(
+        cards: &CardsHandle,
+        session_id: &str,
+        chain_id: u64,
+    ) -> Option<ProjectedSlice> {
+        use crate::bridge::turn::state::CardFallback;
+        let mut live = cards.cards.lock().await;
+        let card = live.get_mut(session_id)?;
+        if card.chain_id() != chain_id {
+            return None;
+        }
+        match card.acc.card_fallback {
+            CardFallback::None => card.acc.card_fallback = CardFallback::Fenced,
+            CardFallback::Fenced | CardFallback::Suspended => {
+                card.acc.card_fallback = CardFallback::Suspended;
+                return None;
+            }
+        }
+        // The arm built the first slice already: the fenced retry re-renders
+        // the SAME body, so its render boundary rewinds.
+        card.acc.render_from = 0;
+        let built = card.acc.build_card_with_info();
+        let cursor_stage = state::StagedCursorId {
+            id: card.acc.stage_cursor(None, built.cursor.clone()),
+            awaiting_seq: None,
+        };
+        Some(ProjectedSlice {
+            card: built.card,
+            cursor_stage,
+            watermark_stage: card.acc.pending_watermark_id(),
+            full: built.full,
+        })
+    }
 }
 
 /// Release a session's busy guard. A free function so the phases' error paths
@@ -3848,15 +3889,22 @@ impl Turn {
 
     /// Stage a Rendered Cursor directly (spec #561, review #569) — a test seam
     /// for the confirmation's identity requirement, standing in for the flush
-    /// that would stage it.
+    /// that would stage it. Returns the stage identity a confirmation names.
     pub(crate) async fn stage_cursor(
         cards: &CardsHandle,
         session_id: &str,
         card_message_id: Option<&str>,
         cursor: &RenderedCursor,
-    ) {
-        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
-            card.acc.stage_cursor(card_message_id, cursor.clone());
+    ) -> state::StagedCursorId {
+        match cards.cards.lock().await.get_mut(session_id) {
+            Some(card) => state::StagedCursorId {
+                id: card.acc.stage_cursor(card_message_id, cursor.clone()),
+                awaiting_seq: None,
+            },
+            None => state::StagedCursorId {
+                id: 0,
+                awaiting_seq: None,
+            },
         }
     }
 

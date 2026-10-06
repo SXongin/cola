@@ -75,16 +75,30 @@ pub(super) struct PartSource {
     /// the entry's own (model) characters; the markdown lead is not counted.
     /// `0` for every ordinary render.
     pub(super) delivered_before: usize,
+    /// The digest of the part's delivered prefix at the moment this entry was
+    /// pushed (spec #561, review #569): derived metadata, never content, kept
+    /// so the frontier can tell a grown part from a same-slot replacement even
+    /// when neither carries a server start time (V2). `None` for a source no
+    /// render stamped.
+    pub(super) prefix_digest: Option<u64>,
 }
 
 impl PartSource {
-    /// An ordinary render's source: nothing delivered before it.
+    /// An ordinary render's source: nothing delivered before it and no digest
+    /// yet — the push stamps the digest of what it renders.
     pub(super) fn at(message_id: MessageId, index: usize) -> Self {
         Self {
             message_id,
             index,
             delivered_before: 0,
+            prefix_digest: None,
         }
+    }
+
+    /// Whether `self` names the same transcript part as `other` (the position,
+    /// not the offset or digest).
+    pub(super) fn same_part(&self, other: &PartSource) -> bool {
+        self.message_id == other.message_id && self.index == other.index
     }
 }
 
@@ -184,6 +198,25 @@ impl CursorSeed {
                 // is not the one the cursor was taken from (compaction, a
                 // recreated part): skipping would hide content.
                 if frontier.delivered_chars > part_chars {
+                    return None;
+                }
+                // The identity cannot tell a same-slot replacement from growth
+                // when the part carries no server start time (V2 decodes text
+                // without `time.start`), so the delivered prefix's digest must
+                // match too (spec #561, review #569). A cursor carrying no
+                // digest — an older release — falls back rather than guess.
+                let expected_digest = frontier.prefix_digest?;
+                let extent_part = match extent_pos {
+                    Some((pos, index)) => transcript.messages[pos].parts.get(index)?,
+                    None => part,
+                };
+                let prefix_text = match extent_part {
+                    crate::backend::Part::Text(text) => text.text.as_str(),
+                    crate::backend::Part::Reasoning(reasoning) => reasoning.text.as_str(),
+                    _ => "",
+                };
+                let delivered_prefix: String = prefix_text.chars().take(frontier.delivered_chars).collect();
+                if crate::bridge::chain::cursor_prefix_digest(&delivered_prefix) != expected_digest {
                     return None;
                 }
                 Some(SeedFrontier {
@@ -1893,6 +1926,14 @@ impl StreamAccumulator {
                     if item_source.is_none() {
                         *item_source = source.clone();
                     }
+                    // A later push of the same part refreshes the entry's
+                    // prefix digest: it always covers the whole delivered
+                    // prefix at each push (spec #561, review #569).
+                    if let (Some(item_source), Some(pushed)) = (item_source.as_mut(), source.as_ref())
+                        && item_source.same_part(pushed)
+                    {
+                        item_source.prefix_digest = pushed.prefix_digest;
+                    }
                     if item_lead.is_none() {
                         *item_lead = lead.take();
                     }
@@ -1961,7 +2002,14 @@ impl StreamAccumulator {
             }) => {
                 last.push_str(chunk);
                 if item_source.is_none() {
-                    *item_source = source;
+                    *item_source = source.clone();
+                }
+                // A later push of the same part refreshes the entry's prefix
+                // digest (spec #561, review #569).
+                if let (Some(item_source), Some(pushed)) = (item_source.as_mut(), source.as_ref())
+                    && item_source.same_part(pushed)
+                {
+                    item_source.prefix_digest = pushed.prefix_digest;
                 }
                 if item_lead.is_none() {
                     *item_lead = lead;
@@ -2838,6 +2886,16 @@ impl StreamAccumulator {
         offset + chars
     }
 
+    /// Whether any timeline entry names the part `source` (spec #561, review
+    /// #569): the ordinary render reads this to tell a part's first push from
+    /// a later one when the entry carries a seed offset and yields no plain
+    /// rendered text.
+    pub(super) fn has_source(&self, source: &PartSource) -> bool {
+        self.timeline
+            .iter()
+            .any(|item| item.source.as_ref().is_some_and(|s| s.same_part(source)))
+    }
+
     /// The part content this accumulator's timeline already shows for `source`
     /// — the concatenation of its entries, in order — when that content is a
     /// plain prefix of the part (every entry offset-free). `None` when the
@@ -2899,22 +2957,24 @@ impl StreamAccumulator {
                     Some((idx, source, kind, item.shown_at))
                 })
         {
-            let delivered_chars = match kind {
+            let (delivered_chars, prefix_digest) = match kind {
                 // The settled tool has no extent of its own: the frontier
                 // carries the newest text/reasoning part's, so that part still
                 // renders its growth after a restart (review #569).
-                CursorPartKind::Tool => self.timeline[..idx]
-                    .iter()
-                    .rev()
-                    .find_map(|item| match &item.kind {
-                        TimelineKind::Text(_) | TimelineKind::Reasoning(_) => item
-                            .source
-                            .as_ref()
-                            .map(|source| self.source_extent_in(source, end)),
-                        _ => None,
-                    })
-                    .unwrap_or(0),
-                _ => self.source_extent_in(source, end),
+                CursorPartKind::Tool => {
+                    match self.timeline[..idx]
+                        .iter()
+                        .rev()
+                        .find_map(|item| match &item.kind {
+                            TimelineKind::Text(_) | TimelineKind::Reasoning(_) => item.source.as_ref(),
+                            _ => None,
+                        }) {
+                        Some(source) => (self.source_extent_in(source, end), source.prefix_digest),
+                        // No text part to fingerprint: the empty prefix.
+                        None => (0, Some(crate::bridge::chain::cursor_prefix_digest(""))),
+                    }
+                }
+                _ => (self.source_extent_in(source, end), source.prefix_digest),
             };
             cursor.frontier = Some(CursorFrontier {
                 message_id: source.message_id.clone(),
@@ -2922,6 +2982,7 @@ impl StreamAccumulator {
                 kind,
                 started_at,
                 delivered_chars,
+                prefix_digest,
             });
         }
         for item in &self.timeline[..end] {

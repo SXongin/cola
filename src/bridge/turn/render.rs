@@ -226,12 +226,15 @@ fn render_part(acc: &mut StreamAccumulator, source: Option<PartSource>, part: &P
 /// card (spec #561, Codex review on PR #569): the server re-sends a grown part
 /// WHOLE, so only the characters this accumulator has not delivered yet are
 /// pushed — appended to the part's existing entry, or as its next chunk. The
-/// returned source carries no offset: the timeline already holds everything
+/// returned source carries no offset (the timeline already holds everything
 /// before the chunk, so the part's entries stay disjoint and the Rendered
-/// Cursor's extent stays the part's own character count. A synthetic push
-/// (`source: None`) and a snapshot that is not an extension of the delivered
-/// content (a part's first render, or a part the server rewrote) push whole,
-/// exactly as the content-keyed dedup always did.
+/// Cursor's extent stays the part's own character count) but it does carry the
+/// delivered prefix's digest (review #569: the same-slot replacement guard a
+/// part with no server start time needs). A synthetic push (`source: None`) and
+/// a snapshot that is not an extension of the delivered content (a part's first
+/// render, or a part the server rewrote) push whole, exactly as the
+/// content-keyed dedup always did — the rewrite keeps no digest, so resolution
+/// falls back rather than trust an ambiguous prefix.
 fn source_chunk(
     acc: &StreamAccumulator,
     source: Option<PartSource>,
@@ -240,19 +243,31 @@ fn source_chunk(
     let Some(source) = source else {
         return (None, text.to_string());
     };
-    let Some(rendered) = acc.source_rendered(&source) else {
-        return (Some(source), text.to_string());
+    let rendered = acc.source_rendered(&source);
+    // The chunk to push and the delivered prefix's digest, when it is
+    // unambiguous: a part's FIRST render pushes the whole snapshot, an append
+    // pushes its tail, and both leave the new snapshot as the delivered prefix.
+    // A rewrite (the concatenation is not the snapshot) or a seeded offset
+    // entry keeps no digest — resolution then falls back rather than trust it.
+    let (chunk, digest) = match &rendered {
+        None if !acc.has_source(&source) => (
+            text.to_string(),
+            Some(crate::bridge::chain::cursor_prefix_digest(text)),
+        ),
+        Some(rendered) if !rendered.is_empty() && text.starts_with(rendered) => (
+            text[rendered.len()..].to_string(),
+            Some(crate::bridge::chain::cursor_prefix_digest(text)),
+        ),
+        _ => (text.to_string(), None),
     };
-    if rendered.is_empty() || !text.starts_with(&rendered) {
-        return (Some(source), text.to_string());
-    }
     (
         Some(PartSource {
             message_id: source.message_id,
             index: source.index,
             delivered_before: 0,
+            prefix_digest: digest,
         }),
-        text[rendered.len()..].to_string(),
+        chunk,
     )
 }
 
@@ -770,6 +785,10 @@ fn render_seeded_part(
             message_id,
             index,
             delivered_before: before,
+            // The delivered prefix after this push is the read's whole part:
+            // its digest lets a later resolution tell growth from a same-slot
+            // replacement even with no server start time (review #569).
+            prefix_digest: Some(crate::bridge::chain::cursor_prefix_digest(full)),
         };
         if is_text {
             acc.push_text_lead(started_at, Some(source), &suffix, lead);
@@ -1283,7 +1302,7 @@ mod tests {
         ToolIdentity, ToolOutput, TranscriptMessage, TurnAnchor, TurnSettle,
     };
     use crate::bridge::App;
-    use crate::bridge::chain::{CursorFrontier, CursorPartKind, RenderedCursor};
+    use crate::bridge::chain::{CursorFrontier, CursorPartKind, RenderedCursor, cursor_prefix_digest};
     use crate::bridge::test_support::{
         MockBackend, PlatformCall, RecordingPlatform, build_app, card_text, realistic_parts,
         seed_cover_title, seed_entry, test_config, test_work_dir, text_part, turn_anchor, typed_message,
@@ -2469,7 +2488,7 @@ Index: /x/src/main.rs
             0,
             CursorPartKind::Text,
             Some(new_anchor - 30 * 60_000),
-            prefix.chars().count(),
+            prefix,
             &[],
         );
         let seed = CursorSeed::for_orphan(&queued(&full), &cursor, &orphan);
@@ -2541,7 +2560,7 @@ Index: /x/src/main.rs
             0,
             CursorPartKind::Text,
             Some(new_anchor - 50_000),
-            prefix.chars().count(),
+            prefix,
             &[],
         );
         let seed = CursorSeed::for_orphan(&transcript, &cursor, &orphan);
@@ -2570,10 +2589,10 @@ Index: /x/src/main.rs
         message: &str,
         part_index: usize,
         kind: CursorPartKind,
-        delivered_chars: usize,
+        delivered: &str,
         live: &[&str],
     ) -> RenderedCursor {
-        projection_cursor_at(message, part_index, kind, None, delivered_chars, live)
+        projection_cursor_at(message, part_index, kind, None, delivered, live)
     }
 
     /// [`projection_cursor`] with the part's server start time (ADR-0071's
@@ -2583,7 +2602,7 @@ Index: /x/src/main.rs
         part_index: usize,
         kind: CursorPartKind,
         started_at: Option<i64>,
-        delivered_chars: usize,
+        delivered: &str,
         live: &[&str],
     ) -> RenderedCursor {
         RenderedCursor {
@@ -2592,7 +2611,8 @@ Index: /x/src/main.rs
                 part_index,
                 kind,
                 started_at,
-                delivered_chars,
+                delivered_chars: delivered.chars().count(),
+                prefix_digest: Some(cursor_prefix_digest(delivered)),
             }),
             live_calls: live.iter().map(|id| id.to_string()).collect(),
         }
@@ -2621,7 +2641,7 @@ Index: /x/src/main.rs
 
         let mut acc = StreamAccumulator::new("proj");
         acc.turn_anchor = Some(turn_anchor(1_000));
-        let cursor = projection_cursor("msg_a_2000", 0, CursorPartKind::Text, prefix.chars().count(), &[]);
+        let cursor = projection_cursor("msg_a_2000", 0, CursorPartKind::Text, prefix, &[]);
         let seed = CursorSeed::resolve(&transcript(&full), &cursor).expect("the frontier resolves");
         acc.seed_projection(&cursor, seed);
 
@@ -2643,6 +2663,7 @@ Index: /x/src/main.rs
                 // keeps the part's position either way.
                 started_at: None,
                 delivered_chars: full.chars().count(),
+                prefix_digest: Some(cursor_prefix_digest(&full)),
             }),
             "the body's cursor continues from the cut, not from zero"
         );
@@ -2799,7 +2820,7 @@ Index: /x/src/main.rs
 
         let mut acc = StreamAccumulator::new("proj");
         acc.turn_anchor = Some(turn_anchor(1_000));
-        let cursor = projection_cursor("msg_a_2000", 0, CursorPartKind::Text, prefix.chars().count(), &[]);
+        let cursor = projection_cursor("msg_a_2000", 0, CursorPartKind::Text, prefix, &[]);
         let seed = CursorSeed::resolve(&transcript, &cursor).expect("the frontier resolves");
         acc.seed_projection(&cursor, seed);
 
@@ -2842,7 +2863,7 @@ Index: /x/src/main.rs
             0,
             CursorPartKind::Reasoning,
             Some(2_000),
-            "先想第一步。".chars().count(),
+            "先想第一步。",
             &[],
         );
         let seed = CursorSeed::resolve(&transcript, &cursor).expect("the frontier resolves");
@@ -2883,7 +2904,7 @@ Index: /x/src/main.rs
 
         let mut acc = StreamAccumulator::new("proj");
         acc.turn_anchor = Some(turn_anchor(1_000));
-        let cursor = projection_cursor("msg_a_2000", 0, CursorPartKind::Text, prefix.chars().count(), &[]);
+        let cursor = projection_cursor("msg_a_2000", 0, CursorPartKind::Text, prefix, &[]);
         let seed = CursorSeed::resolve(&transcript, &cursor).expect("the frontier resolves");
         acc.seed_projection(&cursor, seed);
 
@@ -2932,13 +2953,7 @@ Index: /x/src/main.rs
         let running = timeline(ToolStatus::Running, None);
         let mut acc = StreamAccumulator::new("proj");
         acc.turn_anchor = Some(turn_anchor(1_000));
-        let cursor = projection_cursor(
-            "msg_a_2000",
-            0,
-            CursorPartKind::Text,
-            text.chars().count(),
-            &["call_1"],
-        );
+        let cursor = projection_cursor("msg_a_2000", 0, CursorPartKind::Text, text, &["call_1"]);
         let seed = CursorSeed::resolve(&running, &cursor).expect("the frontier resolves");
         acc.seed_projection(&cursor, seed);
 
@@ -3009,13 +3024,7 @@ Index: /x/src/main.rs
         let running = timeline(ToolStatus::Running, None);
         let mut acc = StreamAccumulator::new("proj");
         acc.turn_anchor = Some(turn_anchor(1_000));
-        let cursor = projection_cursor(
-            "msg_a_2000",
-            0,
-            CursorPartKind::Text,
-            text.chars().count(),
-            &["call_1"],
-        );
+        let cursor = projection_cursor("msg_a_2000", 0, CursorPartKind::Text, text, &["call_1"]);
         let seed = CursorSeed::resolve(&running, &cursor).expect("the frontier resolves");
         acc.seed_projection(&cursor, seed);
 
@@ -3067,7 +3076,7 @@ Index: /x/src/main.rs
 
         let mut acc = StreamAccumulator::new("proj");
         acc.turn_anchor = Some(turn_anchor(1_000));
-        let cursor = projection_cursor("msg_a_2000", 0, CursorPartKind::Text, prefix.chars().count(), &[]);
+        let cursor = projection_cursor("msg_a_2000", 0, CursorPartKind::Text, prefix, &[]);
         let seed = CursorSeed::resolve(&transcript, &cursor).expect("the frontier resolves");
         acc.seed_projection(&cursor, seed);
 
@@ -4648,6 +4657,7 @@ Index: /x/src/main.rs
                 kind: CursorPartKind::Text,
                 started_at: Some(100),
                 delivered_chars: text.chars().count(),
+                prefix_digest: Some(cursor_prefix_digest(text)),
             }),
             "the frontier names the newest delivered text part and its extent"
         );
@@ -4692,6 +4702,7 @@ Index: /x/src/main.rs
                 kind: CursorPartKind::Text,
                 started_at: Some(100),
                 delivered_chars: text.chars().count(),
+                prefix_digest: Some(cursor_prefix_digest(text)),
             }),
             "a running tool never becomes the frontier"
         );
@@ -4727,6 +4738,7 @@ Index: /x/src/main.rs
                 kind: CursorPartKind::Tool,
                 started_at: Some(150),
                 delivered_chars: text.chars().count(),
+                prefix_digest: Some(cursor_prefix_digest(text)),
             }),
             "the settled panel is the frontier, with the text extent carried"
         );
@@ -4879,14 +4891,7 @@ Index: /x/src/main.rs
     /// place it — the projection falls back rather than guess.
     #[test]
     fn a_replaced_part_in_the_frontier_slot_never_resolves_the_cursor() {
-        let cursor = projection_cursor_at(
-            "msg_a_2000",
-            0,
-            CursorPartKind::Text,
-            Some(2_000),
-            "答复".chars().count(),
-            &[],
-        );
+        let cursor = projection_cursor_at("msg_a_2000", 0, CursorPartKind::Text, Some(2_000), "答复", &[]);
         let replaced = SessionTranscript::new(vec![message(
             "msg_a_2000",
             2_000,
@@ -4952,5 +4957,76 @@ Index: /x/src/main.rs
         };
         let seed = CursorSeed::resolve(&transcript, &all_present).expect("the cursor resolves");
         assert!(seed.resolves_live_calls());
+    }
+
+    /// Spec #561, review #569: V2 decodes text parts without `time.start`, so
+    /// two parts in the same slot are indistinguishable by identity alone. The
+    /// frontier's prefix digest tells growth from replacement: a part grown in
+    /// place keeps its delivered prefix, so the seed resolves and renders only
+    /// the tail.
+    #[test]
+    fn a_timestampless_part_grown_in_place_still_resolves() {
+        let prefix = "第一段回答。";
+        let full = format!("{prefix}第二段回答。");
+        let transcript = SessionTranscript::new(vec![
+            typed_message(
+                "msg_cola_anchor",
+                MessageRole::User,
+                Some(1_000),
+                vec![text_part("问题")],
+            ),
+            message("msg_a_2000", 2_000, vec![text_part(&full)]),
+        ]);
+        let cursor = projection_cursor("msg_a_2000", 0, CursorPartKind::Text, prefix, &[]);
+        let seed = CursorSeed::resolve(&transcript, &cursor).expect("growth keeps the prefix");
+
+        let mut acc = StreamAccumulator::new("proj");
+        acc.turn_anchor = Some(turn_anchor(1_000));
+        acc.seed_projection(&cursor, seed);
+        assert!(render_new_turn_parts(&mut acc, &transcript));
+        let text = card_text(&acc.build_card_with_info().card);
+        assert!(
+            text.contains("第二段回答。"),
+            "the undelivered tail renders: {text}"
+        );
+        assert!(
+            !text.contains(prefix),
+            "the delivered prefix is not repeated: {text}"
+        );
+    }
+
+    /// A timestampless REPLACEMENT with different content does not resolve
+    /// (spec #561, review #569): the digest mismatches, so the projection falls
+    /// back rather than skip the replacement's prefix and omit content. The
+    /// same content in the same slot is growth, not a replacement.
+    #[test]
+    fn a_timestampless_replacement_never_resolves() {
+        let cursor = projection_cursor("msg_a_2000", 0, CursorPartKind::Text, "答复", &[]);
+        let replaced =
+            SessionTranscript::new(vec![message("msg_a_2000", 2_000, vec![text_part("另外的答复")])]);
+        assert!(
+            CursorSeed::resolve(&replaced, &cursor).is_none(),
+            "a replacement whose content differs from the delivered prefix is not the cursor's part"
+        );
+        let same = SessionTranscript::new(vec![message("msg_a_2000", 2_000, vec![text_part("答复")])]);
+        assert!(
+            CursorSeed::resolve(&same, &cursor).is_some(),
+            "the same content is the recorded part"
+        );
+    }
+
+    /// A cursor written by an older release carries no prefix digest: the seed
+    /// falls back (no projection) rather than guess — the one-release
+    /// migration seam (spec #561, review #569).
+    #[test]
+    fn a_cursor_without_a_prefix_digest_falls_back() {
+        let mut cursor = projection_cursor("msg_a_2000", 0, CursorPartKind::Text, "答复", &[]);
+        cursor.frontier.as_mut().expect("a frontier").prefix_digest = None;
+        let transcript =
+            SessionTranscript::new(vec![message("msg_a_2000", 2_000, vec![text_part("答复。")])]);
+        assert!(
+            CursorSeed::resolve(&transcript, &cursor).is_none(),
+            "no digest, no projection"
+        );
     }
 }

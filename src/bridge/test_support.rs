@@ -255,6 +255,20 @@ pub struct CallGate {
     pub release: Arc<tokio::sync::Notify>,
 }
 
+/// A scripted `reply_card` outcome (spec #561, review #569).
+#[derive(Clone, Copy, Debug)]
+pub enum ReplyOutcome {
+    /// The send lands (the next scripted id, or the mock's default).
+    Lands,
+    /// An ambiguous transport failure: the create may have landed.
+    Ambiguous,
+    /// A definite card-content rejection (`230099`): no message was created.
+    Rejected,
+    /// A definite HTTP refusal with this status (a 4xx): no message was
+    /// created.
+    Refused(u16),
+}
+
 /// Records every card cola would send, instead of posting to Feishu.
 pub struct RecordingPlatform {
     pub calls: Arc<tokio::sync::Mutex<Vec<PlatformCall>>>,
@@ -291,11 +305,10 @@ pub struct RecordingPlatform {
     /// response lost" shape a single-shot create must never repeat (spec #561,
     /// review #569).
     pub fail_reply_card_after_send_count: std::sync::atomic::AtomicUsize,
-    /// Scripted `reply_card` outcomes, popped in call order: `false` fails the
-    /// send with a transport error (ambiguous; nothing recorded), `true` lands
-    /// it. Empty means every send lands. Lets a test stop a projection's chain
-    /// at an exact slice (spec #561, review #569).
-    pub reply_card_outcomes: std::sync::Mutex<std::collections::VecDeque<bool>>,
+    /// Scripted `reply_card` outcomes, popped in call order; empty means every
+    /// send lands. Lets a test drive a projection create's exact failure class
+    /// (spec #561, review #569) or stop its chain at a known slice.
+    pub reply_card_outcomes: std::sync::Mutex<std::collections::VecDeque<ReplyOutcome>>,
     /// When set, `set_instant_reminder` fails after recording the attempt
     /// (tests the best-effort pin path: failures log and never affect a turn).
     /// Atomic so a test can flip it mid-lifecycle and watch a recovery.
@@ -359,10 +372,10 @@ impl RecordingPlatform {
         self.reply_ids.lock().unwrap().push_back(id.to_string());
     }
 
-    /// Queue the next `reply_card` call's outcome: `false` fails it with a
-    /// transport error without recording the send (ambiguous), `true` lands it.
-    pub fn given_reply_card_outcome(&self, lands: bool) {
-        self.reply_card_outcomes.lock().unwrap().push_back(lands);
+    /// Queue the next `reply_card` call's outcome; a failed send is not
+    /// recorded (it never reached Feishu).
+    pub fn given_reply_card_outcome(&self, outcome: ReplyOutcome) {
+        self.reply_card_outcomes.lock().unwrap().push_back(outcome);
     }
 
     /// Park the first `method` call targeting `target` until `release`, after
@@ -620,20 +633,28 @@ impl feishu::Platform for RecordingPlatform {
                 "simulated accepted-but-lost reply_card response",
             )));
         }
-        // A scripted outcome can stop a projection chain at an exact slice: a
-        // failed send is not recorded (it never reached Feishu) and returns
-        // the ambiguous transport error the single-shot rule expects.
-        if self
-            .reply_card_outcomes
-            .lock()
-            .unwrap()
-            .pop_front()
-            .is_some_and(|lands| !lands)
-        {
-            return Err(crate::error::BridgeError::Io(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "simulated reply_card failure",
-            )));
+        // A scripted outcome drives the create's failure class (or lands it):
+        // a failed send is not recorded — it never reached Feishu.
+        match self.reply_card_outcomes.lock().unwrap().pop_front() {
+            None | Some(ReplyOutcome::Lands) => {}
+            Some(ReplyOutcome::Ambiguous) => {
+                return Err(crate::error::BridgeError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "simulated reply_card failure",
+                )));
+            }
+            Some(ReplyOutcome::Rejected) => {
+                return Err(crate::error::BridgeError::CardContentRejected {
+                    code: 230099,
+                    detail: "simulated card content rejection".into(),
+                });
+            }
+            Some(ReplyOutcome::Refused(status)) => {
+                return Err(crate::error::BridgeError::FeishuHttp {
+                    status,
+                    detail: "simulated reply_card refusal".into(),
+                });
+            }
         }
         if let Some(gate) = self.take_gate("reply", reply_to) {
             wait_gate(gate).await;

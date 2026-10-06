@@ -86,7 +86,8 @@
 
 use super::decision::{self, CardProbe, ChainDisposition, RecoveryReads, Route, StatusRead, TranscriptRead};
 use super::records::ChainRecord;
-use crate::backend::{TurnAnchor, TurnSettle};
+use crate::backend::{SessionTranscript, TurnAnchor, TurnSettle};
+use crate::bridge::chain::RenderedCursor;
 use crate::bridge::handles::{CardsHandle, FlowHandles};
 use crate::bridge::turn::{ArmedTakeover, CardOwnership, Disposition, Turn};
 use crate::feishu::card::{
@@ -562,17 +563,247 @@ async fn send_projected_chain(
     ProjectedChain::Complete(last)
 }
 
-/// Project a run that ended while cola was down (spec #561, ticket #563):
-/// arm a successor card seeded from the chain's Rendered Cursor, render the
-/// read's missed tail plus the transcript's true ending once, send it as a
-/// create, take the chain over and collect the recorded card as taken over.
-/// The send is the restart notification (never outbox-retried).
+/// What a projection's shared transition produced (spec #561, review #569).
+enum Projection {
+    /// The armed successor rendered nothing and the session was still ours:
+    /// only the ended projection reaches this, and it takes today's in-place
+    /// settle.
+    NothingRendered,
+    /// The create failed DEFINITELY (the platform created no message): the
+    /// record stays retryable and the next reconcile pass re-attempts.
+    Retryable,
+    /// The chain stopped — an ambiguous failure, a suspended payload, a lost
+    /// create window, or a bounded/failed continuation chain — or the armed
+    /// session was no longer ours. The record is marked where it is ours and
+    /// the caller owes nothing more this life.
+    Stopped,
+    /// Every slice landed; the chain's last card id.
+    Landed(String),
+}
+
+/// The projection transition both dispositions share (spec #561, review
+/// #569): arm the successor from the chain's cursor, send its first create —
+/// with the definite-failure classification and the flush's fenced fallback —
+/// take the chain over in one cards-map critical section, collect the recorded
+/// card, confirm each slice's cursor and continue an oversized delta as a
+/// bounded chain. The callers keep only their genuine differences: `ending` is
+/// the ended projection's ending (a live adoption passes `None` and keeps its
+/// follow), and `None` means this pass claims nothing.
+#[allow(clippy::too_many_arguments)] // the projection's whole fixture
+async fn send_projected_successor(
+    handles: &FlowHandles,
+    session_id: &str,
+    record: &ChainRecord,
+    target: &ProjectTarget,
+    anchor: &TurnAnchor,
+    cursor: &RenderedCursor,
+    seed: &crate::bridge::turn::CursorSeed,
+    transcript: &SessionTranscript,
+    ending: Option<&Disposition>,
+    route_directory: &str,
+    read_timeout_ms: u64,
+) -> Option<Projection> {
+    let fallback_chat = match target {
+        ProjectTarget::Reply(_) => None,
+        ProjectTarget::TopLevel(chat) => Some(chat.clone()),
+    };
+    let title = crate::bridge::external::session_subtitle(
+        &handles.backend,
+        session_id,
+        route_directory,
+        read_timeout_ms,
+    )
+    .await;
+    let variant = handles
+        .sessions
+        .store
+        .lock()
+        .await
+        .entry_for_session(session_id)
+        .and_then(|entry| entry.variant.clone());
+    let projected = Turn::arm_projected_card(
+        &handles.cards,
+        session_id,
+        anchor,
+        cursor,
+        seed,
+        transcript,
+        ending,
+        &title,
+        route_directory,
+        fallback_chat.as_deref(),
+        variant,
+    )
+    .await?;
+    let chain_id = projected.chain_id;
+    if !projected.rendered && ending.is_some() {
+        // The cursor covered the whole read — nothing was missed: drop the
+        // armed successor and take today's in-place ending, but only while the
+        // session is still the one this pass armed (a fresh Turn that replaced
+        // it is never removed and never settled). A live adoption sends either
+        // way: the run may produce next.
+        return if Turn::drop_armed_session(&handles.cards, session_id, chain_id).await {
+            Some(Projection::NothingRendered)
+        } else {
+            Some(Projection::Stopped)
+        };
+    }
+    // The first slice to send — the armed body, or its fenced rebuild after a
+    // definite content rejection.
+    let mut slice = crate::bridge::turn::ProjectedSlice {
+        card: projected.card,
+        cursor_stage: projected.cursor_stage,
+        watermark_stage: projected.watermark_stage,
+        full: projected.full,
+    };
+    let new_card_id = loop {
+        let delivered = match target {
+            ProjectTarget::Reply(reply_to) => handles.cards.feishu.reply_card(reply_to, &slice.card).await,
+            ProjectTarget::TopLevel(chat) => {
+                handles.cards.feishu.send_card("chat_id", chat, &slice.card).await
+            }
+        };
+        match delivered {
+            Ok(card_id) => break card_id,
+            Err(e) => {
+                tracing::warn!(
+                    "live-card reap: session {session_id} could not project its missed tail onto a successor: {e}"
+                );
+                if matches!(e, crate::error::BridgeError::CardContentRejected { .. }) {
+                    // The same payload can never land: re-render THIS slice
+                    // through the flush's fenced fallback and retry once. No
+                    // duplicate is possible — the rejection proves the first
+                    // create made no message. `None` means the fenced retry
+                    // was refused too: the payload is suspended, permanently
+                    // unlandable.
+                    let Some(fenced) =
+                        Turn::fenced_projected_slice(&handles.cards, session_id, chain_id).await
+                    else {
+                        handles
+                            .cards
+                            .chains
+                            .mark_projection_attempted(session_id, &record.card_message_id);
+                        Turn::drop_armed_session(&handles.cards, session_id, chain_id).await;
+                        return Some(Projection::Stopped);
+                    };
+                    slice = fenced;
+                    continue;
+                }
+                if e.is_definite_non_delivery() {
+                    // The platform created no message: the record stays
+                    // retryable and the next pass re-attempts (spec #561,
+                    // review #569).
+                    Turn::drop_armed_session(&handles.cards, session_id, chain_id).await;
+                    return Some(Projection::Retryable);
+                }
+                // Ambiguous — the send may have landed: single-shot. The mark
+                // keeps every later pass from re-posting; the record stays for
+                // the reap's in-place state repair. The phantom session is
+                // dropped only while it is still this pass's armed one.
+                handles
+                    .cards
+                    .chains
+                    .mark_projection_attempted(session_id, &record.card_message_id);
+                Turn::drop_armed_session(&handles.cards, session_id, chain_id).await;
+                return Some(Projection::Stopped);
+            }
+        }
+    };
+    // The successor takes the chain over in ONE cards-map critical section
+    // (review #569): verify the armed session is still current, attach its
+    // identity and re-point the record, with no gap for a fresh Turn's own
+    // card insert to land in. Lost means the Turn owns the session and the
+    // record now: the late card is collected so it cannot look live, and none
+    // of this pass's takeover writes (attach, re-point, cursor confirm,
+    // watermark drain, terminal release) may touch the Turn's chain.
+    let ArmedTakeover::Took(orphan) = Turn::take_over_armed_card(
+        &handles.cards,
+        session_id,
+        chain_id,
+        &new_card_id,
+        Some(route_directory),
+    )
+    .await
+    else {
+        collect_orphan(&handles.cards, session_id, &new_card_id).await;
+        tracing::info!(
+            "live-card reap: session {session_id} lost the create window to a fresh Turn; its late card is collected"
+        );
+        return Some(Projection::Stopped);
+    };
+    if let Some(orphan) = orphan {
+        crate::bridge::chain::collect_orphan_after_takeover(
+            &handles.cards,
+            session_id,
+            &orphan.card_message_id,
+            seed.resolves_live_calls() || projected.resolved_calls,
+        )
+        .await;
+    }
+    // The confirmed create carries the successor's body: advance the chain's
+    // cursor exactly like a flush-confirmed write (spec #561) — scoped to the
+    // armed chain and to the exact staged body the create carried, so a fresh
+    // Turn that replaced the session meanwhile never has its own staged cursor
+    // taken, and a body staged since is never advanced by this create
+    // (review #569).
+    crate::bridge::turn::confirm_armed_cursor(
+        &handles.cards,
+        session_id,
+        chain_id,
+        &new_card_id,
+        slice.cursor_stage,
+    )
+    .await;
+    // The same write carried every Wake completion entry the seeded render
+    // staged: the confirmed create is what makes the announcement durable
+    // (ADR-0061, ticket #566), so a later recordless restart cannot
+    // re-announce the Wake through the Fresh gate. Chain- and stage-scoped like
+    // the cursor confirm.
+    crate::bridge::turn::drain_armed_watermark(&handles.cards, session_id, chain_id, slice.watermark_stage)
+        .await;
+    // An oversized delta continues on a bounded chain of cards (spec #561,
+    // review #569): every slice through the same splitter, each confirmed only
+    // after its own create lands. A stopped chain leaves the tail to the next
+    // life's recovery: the record (kept by the single-shot mark) holds the
+    // last confirmed slice's cursor, and this life re-posts nothing.
+    let final_card_id = if slice.full {
+        match send_projected_chain(
+            handles,
+            session_id,
+            target,
+            chain_id,
+            route_directory,
+            &new_card_id,
+            true,
+        )
+        .await
+        {
+            ProjectedChain::Complete(last) => last,
+            ProjectedChain::Stopped(last) => {
+                handles.cards.chains.mark_projection_attempted(session_id, &last);
+                return Some(Projection::Stopped);
+            }
+        }
+    } else {
+        new_card_id
+    };
+    Some(Projection::Landed(final_card_id))
+}
+
+/// Project a run that ended while cola was down (spec #561, ticket #563): arm
+/// a successor card seeded from the chain's Rendered Cursor, render the read's
+/// missed tail plus the transcript's true ending once, send it as a create,
+/// take the chain over and collect the recorded card as taken over. The send
+/// is the restart notification (never outbox-retried).
 ///
-/// The guards: a missing route or transcript and an ending with no card
-/// state claim nothing; no deliverable target falls back to today's in-place
-/// settle; a projection that renders nothing new (the cursor covered the
-/// whole read) drops its armed card and settles in place; a failed create
-/// drops the armed card and leaves the record for the next tick.
+/// The guards: a missing route or transcript and an ending with no card state
+/// claim nothing; no deliverable target falls back to today's in-place settle;
+/// a projection that renders nothing new (the cursor covered the whole read)
+/// drops its armed card and settles in place; a DEFINITE create failure leaves
+/// the record retryable for the next pass (the missed tail is never given up
+/// when the platform provably created nothing), while an ambiguous one is
+/// single-shot and leaves the record for the reap's state repair. The shared
+/// transition itself lives in [`send_projected_successor`].
 async fn project_card(
     handles: &FlowHandles,
     session_id: &str,
@@ -631,184 +862,41 @@ async fn project_card(
     if record.cursor.as_ref() != Some(&cursor) {
         return;
     }
-    let fallback_chat = match &target {
-        ProjectTarget::Reply(_) => None,
-        ProjectTarget::TopLevel(chat) => Some(chat.clone()),
-    };
-    let title = crate::bridge::external::session_subtitle(
-        &handles.backend,
+    match send_projected_successor(
+        handles,
         session_id,
-        route.directory,
-        read_timeout_ms,
-    )
-    .await;
-    let variant = handles
-        .sessions
-        .store
-        .lock()
-        .await
-        .entry_for_session(session_id)
-        .and_then(|entry| entry.variant.clone());
-    let Some(projected) = Turn::arm_projected_card(
-        &handles.cards,
-        session_id,
+        record,
+        &target,
         &anchor,
         &cursor,
         &seed,
         transcript,
         Some(&disposition),
-        &title,
         route.directory,
-        fallback_chat.as_deref(),
-        variant,
+        read_timeout_ms,
     )
     .await
-    else {
-        // A card appeared for the session meanwhile: this pass claims nothing.
-        return;
-    };
-    if !projected.rendered {
-        // The cursor covered the whole read — nothing was missed. The armed
-        // successor is dropped and today's in-place ending taken, but only
-        // while the session is still the one this pass armed: the verify and
-        // the drop are ONE cards-map critical section (review #569), so a
-        // fresh Turn that replaced the session is never removed and never
-        // settled.
-        if Turn::drop_armed_session(&handles.cards, session_id, projected.chain_id).await {
+    {
+        Some(Projection::NothingRendered) => {
             settle_card(handles, session_id, record, reads.route, settle, read_timeout_ms).await;
         }
-        return;
-    }
-    let delivered = match &target {
-        ProjectTarget::Reply(reply_to) => handles.cards.feishu.reply_card(reply_to, &projected.card).await,
-        ProjectTarget::TopLevel(chat) => {
-            handles
-                .cards
-                .feishu
-                .send_card("chat_id", chat, &projected.card)
-                .await
-        }
-    };
-    let new_card_id = match delivered {
-        Ok(card_id) => card_id,
-        Err(e) => {
-            tracing::warn!(
-                "live-card reap: session {session_id} could not project its missed tail onto a successor: {e}"
-            );
-            // Feishu has no idempotency key (ADR-0067): the create is
-            // single-shot per record per process life. This failure is
-            // ambiguous — the send may have landed — so it is never retried, or
-            // the user could get two successor cards (review #569). The mark
-            // keeps every later pass from re-posting; the record stays for the
-            // reap's in-place state repair. The phantom session is dropped only
-            // while it is still this pass's armed one: a chain that replaced it
-            // meanwhile owns itself.
-            handles
-                .cards
-                .chains
-                .mark_projection_attempted(session_id, &record.card_message_id);
-            Turn::drop_armed_session(&handles.cards, session_id, projected.chain_id).await;
-            return;
-        }
-    };
-    // The successor takes the chain over in ONE cards-map critical section
-    // (review #569): verify the armed session is still current, attach its
-    // identity and re-point the record, with no gap for a fresh Turn's own
-    // card insert to land in. Lost means the Turn owns the session and the
-    // record now: the late card is collected so it cannot look live, and none
-    // of this pass's takeover writes (attach, re-point, cursor confirm,
-    // watermark drain, terminal release) may touch the Turn's chain.
-    let ArmedTakeover::Took(orphan) = Turn::take_over_armed_card(
-        &handles.cards,
-        session_id,
-        projected.chain_id,
-        &new_card_id,
-        Some(route.directory),
-    )
-    .await
-    else {
-        collect_orphan(&handles.cards, session_id, &new_card_id).await;
-        tracing::info!(
-            "live-card reap: session {session_id} lost the create window to a fresh Turn; its late card is collected"
-        );
-        return;
-    };
-    if let Some(orphan) = orphan {
-        crate::bridge::chain::collect_orphan_after_takeover(
-            &handles.cards,
-            session_id,
-            &orphan.card_message_id,
-            projected.resolved_calls,
-        )
-        .await;
-    }
-    // The confirmed create carries the successor's body: advance the chain's
-    // cursor exactly like a flush-confirmed write (spec #561) — scoped to the
-    // armed chain and to the exact staged body the create carried, so a fresh
-    // Turn that replaced the session meanwhile never has its own staged cursor
-    // taken, and a body staged since is never advanced by this create
-    // (review #569).
-    crate::bridge::turn::confirm_armed_cursor(
-        &handles.cards,
-        session_id,
-        projected.chain_id,
-        &new_card_id,
-        projected.cursor_stage,
-    )
-    .await;
-    // The same write carried every Wake completion entry the seeded render
-    // staged: the confirmed create is what makes the announcement durable
-    // (ADR-0061, ticket #566), so a later recordless restart cannot
-    // re-announce the Wake through the Fresh gate. Chain- and stage-scoped like
-    // the cursor confirm.
-    crate::bridge::turn::drain_armed_watermark(
-        &handles.cards,
-        session_id,
-        projected.chain_id,
-        projected.watermark_stage,
-    )
-    .await;
-    // An oversized delta continues on a bounded chain of cards (spec #561,
-    // review #569): every slice through the same splitter, each confirmed only
-    // after its own create lands. A stopped chain leaves the tail to the next
-    // life's recovery: the record (kept by the single-shot mark) holds the
-    // last confirmed slice's cursor, and this life re-posts nothing.
-    let final_card_id = if projected.full {
-        match send_projected_chain(
-            handles,
-            session_id,
-            &target,
-            projected.chain_id,
-            route.directory,
-            &new_card_id,
-            true,
-        )
-        .await
-        {
-            ProjectedChain::Complete(last) => last,
-            ProjectedChain::Stopped(last) => {
-                handles.cards.chains.mark_projection_attempted(session_id, &last);
-                return;
+        Some(Projection::Landed(last)) => {
+            if state.is_terminal() {
+                // The successor reached a terminal: nothing is owed a reap,
+                // and the cursor goes with the record.
+                crate::bridge::chain::release_spent(&handles.cards, session_id).await;
+            } else if matches!(disposition, Disposition::Waiting) {
+                // Waiting: the successor yields, and its own yield is the one
+                // the record remembers, so a later pass does not project it
+                // again.
+                handles.cards.chains.mark_waiting_reaped(session_id, &last);
             }
+            tracing::info!(
+                "live-card reap: session {session_id} projected its missed tail onto a successor card"
+            );
         }
-    } else {
-        new_card_id
-    };
-    if state.is_terminal() {
-        // The successor reached a terminal: nothing is owed a reap, and the
-        // cursor goes with the record.
-        crate::bridge::chain::release_spent(&handles.cards, session_id).await;
-    } else {
-        // Waiting: the successor yields, and its own yield is the one the
-        // record remembers, so a later pass does not project it again.
-        if matches!(disposition, Disposition::Waiting) {
-            handles
-                .cards
-                .chains
-                .mark_waiting_reaped(session_id, &final_card_id);
-        }
+        Some(Projection::Retryable) | Some(Projection::Stopped) | None => {}
     }
-    tracing::info!("live-card reap: session {session_id} projected its missed tail onto a successor card");
 }
 
 /// Adopt a run that is still live (spec #561, ticket #564): arm a successor
@@ -825,7 +913,8 @@ async fn project_card(
 /// no longer carries (a confirmed write landed meanwhile) claims nothing and
 /// lets the next pass decide afresh. Unlike the ended projection, a successor
 /// that renders nothing new is still sent: the run is live and the follow
-/// streams whatever it produces next.
+/// streams whatever it produces next. The shared transition lives in
+/// [`send_projected_successor`].
 async fn project_live_card(
     handles: &FlowHandles,
     session_id: &str,
@@ -868,163 +957,32 @@ async fn project_live_card(
     if record.cursor.as_ref() != Some(&cursor) {
         return None;
     }
-    let fallback_chat = match &target {
-        ProjectTarget::Reply(_) => None,
-        ProjectTarget::TopLevel(chat) => Some(chat.clone()),
-    };
-    let title = crate::bridge::external::session_subtitle(
-        &handles.backend,
+    match send_projected_successor(
+        handles,
         session_id,
-        route.directory,
-        read_timeout_ms,
-    )
-    .await;
-    let variant = handles
-        .sessions
-        .store
-        .lock()
-        .await
-        .entry_for_session(session_id)
-        .and_then(|entry| entry.variant.clone());
-    let Some(projected) = Turn::arm_projected_card(
-        &handles.cards,
-        session_id,
+        record,
+        &target,
         &anchor,
         &cursor,
         &seed,
         transcript,
         None,
-        &title,
         route.directory,
-        fallback_chat.as_deref(),
-        variant,
+        read_timeout_ms,
     )
     .await
-    else {
-        // A card appeared for the session meanwhile: this pass claims nothing.
-        return None;
-    };
-    let delivered = match &target {
-        ProjectTarget::Reply(reply_to) => handles.cards.feishu.reply_card(reply_to, &projected.card).await,
-        ProjectTarget::TopLevel(chat) => {
-            handles
-                .cards
-                .feishu
-                .send_card("chat_id", chat, &projected.card)
-                .await
-        }
-    };
-    let new_card_id = match delivered {
-        Ok(card_id) => card_id,
-        Err(e) => {
-            tracing::warn!(
-                "live-card reap: session {session_id} could not adopt its live run onto a successor: {e}"
+    {
+        Some(Projection::Landed(last)) => {
+            tracing::info!(
+                "live-card reap: session {session_id} adopted its still-live run onto a successor card"
             );
-            // Feishu has no idempotency key (ADR-0067): the create is
-            // single-shot per record per process life. This failure is
-            // ambiguous — the send may have landed — so it is never retried, or
-            // the user could get two successor cards (review #569). The mark
-            // keeps every later pass from re-posting; the record keeps
-            // observing until the run ends and the ended pass state-repairs the
-            // old card in place. The phantom session is dropped only while it is
-            // still this pass's armed one: a chain that replaced it meanwhile
-            // owns itself.
-            handles
-                .cards
-                .chains
-                .mark_projection_attempted(session_id, &record.card_message_id);
-            Turn::drop_armed_session(&handles.cards, session_id, projected.chain_id).await;
-            return None;
+            Some(AdoptedFollow {
+                card_message_id: last,
+                anchor,
+            })
         }
-    };
-    // The successor takes the chain over in ONE cards-map critical section
-    // (review #569): verify the armed session is still current, attach its
-    // identity and re-point the record, with no gap for a fresh Turn's own
-    // card insert to land in. Lost means the Turn owns the session and the
-    // record now: the late card is collected so it cannot look live, and none
-    // of this pass's takeover writes (attach, re-point, cursor confirm,
-    // watermark drain) may touch the Turn's chain.
-    let ArmedTakeover::Took(orphan) = Turn::take_over_armed_card(
-        &handles.cards,
-        session_id,
-        projected.chain_id,
-        &new_card_id,
-        Some(route.directory),
-    )
-    .await
-    else {
-        collect_orphan(&handles.cards, session_id, &new_card_id).await;
-        tracing::info!(
-            "live-card reap: session {session_id} lost the create window to a fresh Turn; its late card is collected"
-        );
-        return None;
-    };
-    if let Some(orphan) = orphan {
-        crate::bridge::chain::collect_orphan_after_takeover(
-            &handles.cards,
-            session_id,
-            &orphan.card_message_id,
-            seed.resolves_live_calls() || projected.resolved_calls,
-        )
-        .await;
+        _ => None,
     }
-    // The confirmed create carries the successor's body: advance the chain's
-    // cursor exactly like a flush-confirmed write (spec #561) — scoped to the
-    // armed chain and to the exact staged body the create carried, so a fresh
-    // Turn that replaced the session meanwhile never has its own staged cursor
-    // taken, and a body staged since is never advanced by this create
-    // (review #569).
-    crate::bridge::turn::confirm_armed_cursor(
-        &handles.cards,
-        session_id,
-        projected.chain_id,
-        &new_card_id,
-        projected.cursor_stage,
-    )
-    .await;
-    // The same write carried every Wake completion entry the seeded render
-    // staged: the confirmed create is what makes the announcement durable
-    // (ADR-0061, ticket #566), so a later recordless restart cannot
-    // re-announce the Wake through the Fresh gate. Chain- and stage-scoped like
-    // the cursor confirm.
-    crate::bridge::turn::drain_armed_watermark(
-        &handles.cards,
-        session_id,
-        projected.chain_id,
-        projected.watermark_stage,
-    )
-    .await;
-    // An oversized delta continues on a bounded chain (spec #561, review
-    // #569): the follow starts on the chain's LAST card. A stopped chain
-    // spawns no follow — the record keeps the last confirmed slice for the
-    // next life's recovery, and the single-shot mark stops this life from
-    // re-posting anything.
-    let final_card_id = if projected.full {
-        match send_projected_chain(
-            handles,
-            session_id,
-            &target,
-            projected.chain_id,
-            route.directory,
-            &new_card_id,
-            true,
-        )
-        .await
-        {
-            ProjectedChain::Complete(last) => last,
-            ProjectedChain::Stopped(last) => {
-                handles.cards.chains.mark_projection_attempted(session_id, &last);
-                return None;
-            }
-        }
-    } else {
-        new_card_id
-    };
-    tracing::info!("live-card reap: session {session_id} adopted its still-live run onto a successor card");
-    Some(AdoptedFollow {
-        card_message_id: final_card_id,
-        anchor,
-    })
 }
 
 /// PATCH the transcript's ending onto the record's card — keeping the body

@@ -464,6 +464,12 @@ impl Platform for CardDelivery {
             .get(message_id)
             .is_some_and(|entry| entry.seq == seq && entry.card.is_none() && entry.delivered)
     }
+
+    fn settled_card_write_delivered(&self, message_id: &str) -> Option<bool> {
+        let state = self.state.lock().unwrap();
+        let entry = state.entries.get(message_id)?;
+        entry.card.is_none().then_some(entry.delivered)
+    }
 }
 
 #[cfg(test)]
