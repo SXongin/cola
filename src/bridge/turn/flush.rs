@@ -9,7 +9,7 @@
 use super::{MAX_CARD_CHAIN, PredecessorCollect, Turn};
 
 use crate::bridge::card_handles::RenderedBlock;
-use crate::bridge::chain::release_spent;
+use crate::bridge::chain::{RenderedCursor, release_spent};
 use crate::bridge::handles::CardsHandle;
 
 /// Whether `e` is Feishu's deterministic card-content rejection (`230099`).
@@ -88,6 +88,103 @@ async fn advance_card_fallback(cards: &CardsHandle, session_id: &str) -> Fallbac
         CardFallback::Fenced | CardFallback::Suspended => {
             card.acc.card_fallback = CardFallback::Suspended;
             FallbackAdvance::Stop
+        }
+    }
+}
+
+/// Stage the Rendered Cursor of the body about to be written (spec #561):
+/// `card_message_id` is `None` for a create, whose id is only known once the
+/// send lands. Only a confirmed write drains the staged value.
+async fn stage_rendered_cursor(
+    cards: &CardsHandle,
+    session_id: &str,
+    card_message_id: Option<&str>,
+    cursor: &RenderedCursor,
+) {
+    let mut live = cards.cards.lock().await;
+    if let Some(card) = live.get_mut(session_id) {
+        card.acc.stage_cursor(card_message_id, cursor.clone());
+    }
+}
+
+/// Confirm the staged Rendered Cursor once the write carrying it landed
+/// (spec #561): the staged value is taken exactly once, mirrored into the
+/// accumulator's confirmed base and advanced on the Chain Record, scoped to
+/// the card the flush wrote.
+async fn confirm_staged_cursor(cards: &CardsHandle, session_id: &str, card_message_id: &str) {
+    let cursor = {
+        let mut live = cards.cards.lock().await;
+        let Some(card) = live.get_mut(session_id) else {
+            return;
+        };
+        let matches = card.acc.pending_cursor.as_ref().is_some_and(|staged| {
+            staged
+                .card_message_id
+                .as_deref()
+                .is_none_or(|id| id == card_message_id)
+        });
+        if !matches {
+            return;
+        }
+        let Some(staged) = card.acc.pending_cursor.take() else {
+            return;
+        };
+        card.acc.cursor = staged.cursor.clone();
+        staged.cursor
+    };
+    cards.chains.advance_cursor(session_id, card_message_id, &cursor);
+}
+
+/// Fold a failed card write into the staged Rendered Cursor (spec #561): a
+/// recoverable failure ties the stage to the Pending Card Update payload it
+/// left owed — the drain reconcile confirms the cursor once that payload
+/// delivers — while anything else (a permanent refusal, a create that will
+/// never be retried) drops the stage, because no later write can carry it.
+async fn note_cursor_write_failure(
+    cards: &CardsHandle,
+    session_id: &str,
+    card_message_id: Option<&str>,
+    card: &serde_json::Value,
+    error: &crate::error::BridgeError,
+) {
+    let awaiting = error
+        .is_recoverable_card_write()
+        .then(|| {
+            card_message_id.and_then(|card_message_id| cards.feishu.pending_card_write(card_message_id, card))
+        })
+        .flatten();
+    let mut live = cards.cards.lock().await;
+    let Some(session) = live.get_mut(session_id) else {
+        return;
+    };
+    match (awaiting, card_message_id) {
+        (Some(seq), Some(card_message_id)) => session.acc.await_cursor_write(card_message_id, seq),
+        _ => session.acc.discard_pending_cursor(),
+    }
+}
+
+/// Advance every staged Rendered Cursor whose owed Pending Card Update has
+/// since delivered (spec #561). Runs after a drain: the failed payload a
+/// cursor was tied to landed out of band, so the confirmation comes from the
+/// delivery state rather than from a flush. A still-owed or refused payload
+/// advances nothing.
+pub(crate) async fn reconcile_staged_cursors(cards: &CardsHandle) {
+    let due: Vec<(String, String, u64)> = {
+        let live = cards.cards.lock().await;
+        live.iter()
+            .filter_map(|(session_id, session)| {
+                let staged = session.acc.pending_cursor.as_ref()?;
+                Some((
+                    session_id.clone(),
+                    staged.card_message_id.clone()?,
+                    staged.awaiting_seq?,
+                ))
+            })
+            .collect()
+    };
+    for (session_id, card_message_id, seq) in due {
+        if cards.feishu.card_write_delivered(&card_message_id, seq) {
+            confirm_staged_cursor(cards, &session_id, &card_message_id).await;
         }
     }
 }
@@ -185,7 +282,9 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, spl
         if card_is_live {
             let supplement_split_requested = !pending_split.is_empty();
             if !supplement_split_requested && !built.full {
-                // The live card still fits: a plain update.
+                // The live card still fits: a plain update. Stage this body's
+                // Rendered Cursor first; only a confirmed write drains it.
+                stage_rendered_cursor(cards, session_id, Some(&card_id), &built.cursor).await;
                 let delivered = match cards.feishu.update_message(&card_id, &built.card).await {
                     Ok(()) => true,
                     Err(e) => {
@@ -202,11 +301,22 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, spl
                                 FallbackAdvance::Stop => {
                                     // A suspended ending can never deliver, so a
                                     // terminal record is spent (never retried).
+                                    // The staged cursor is dropped with it: no
+                                    // later write can carry this body.
+                                    note_cursor_write_failure(
+                                        cards,
+                                        session_id,
+                                        Some(&card_id),
+                                        &built.card,
+                                        &e,
+                                    )
+                                    .await;
                                     release_spent(cards, session_id).await;
                                     return;
                                 }
                             }
                         }
+                        note_cursor_write_failure(cards, session_id, Some(&card_id), &built.card, &e).await;
                         false
                     }
                 };
@@ -220,6 +330,9 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, spl
                     .await
                     .record(&card_id, &built.card, rendered);
                 if delivered {
+                    // The confirmed PATCH carries this body's Rendered Cursor
+                    // (spec #561): advance the chain's record.
+                    confirm_staged_cursor(cards, session_id, &card_id).await;
                     // The PATCH carried this slice's completion entries: the
                     // staged Wake Watermark is now user-visible (ADR-0061).
                     drain_wake_watermark(cards, session_id).await;
@@ -259,9 +372,10 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, spl
                 // (the loading-card window's deferred split).
                 let terminal = continues_an_ended_card && card.acc.card_state.is_terminal();
                 let state = terminal.then(|| card.acc.card_state.clone());
-                (card.acc.build_finalized_handoff(state), !terminal || handover)
+                let finalized = card.acc.build_finalized_handoff(state);
+                (finalized, !terminal || handover)
             } else {
-                (built.card, true)
+                (built, true)
             };
             // Persist the finalization BEFORE the send: a failed or cancelled
             // send must not leave the next flush thinking this card still
@@ -288,7 +402,10 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, spl
                 push_queued_receipts(cards, session_id).await;
             }
             let delivered = if should_patch {
-                match cards.feishu.update_message(&card_id, &finalized).await {
+                // Stage the finalized body's Rendered Cursor before its PATCH;
+                // only the confirmed write drains it.
+                stage_rendered_cursor(cards, session_id, Some(&card_id), &finalized.cursor).await;
+                match cards.feishu.update_message(&card_id, &finalized.card).await {
                     Ok(()) => true,
                     Err(e) => {
                         tracing::warn!("Card update failed: {}", e);
@@ -314,15 +431,20 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, spl
                             // suspended, so stop the chain instead of building the
                             // next card out of content the platform may refuse too.
                             // A suspended ending can never deliver, so a terminal
-                            // record is spent (never retried).
+                            // record is spent (never retried), and its staged
+                            // cursor is dropped with it.
+                            note_cursor_write_failure(cards, session_id, Some(&card_id), &finalized.card, &e)
+                                .await;
                             release_spent(cards, session_id).await;
                             cards
                                 .card_handles
                                 .lock()
                                 .await
-                                .record(&card_id, &finalized, Vec::new());
+                                .record(&card_id, &finalized.card, Vec::new());
                             return;
                         }
+                        note_cursor_write_failure(cards, session_id, Some(&card_id), &finalized.card, &e)
+                            .await;
                         false
                     }
                 }
@@ -336,8 +458,11 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, spl
                 .card_handles
                 .lock()
                 .await
-                .record(&card_id, &finalized, Vec::new());
+                .record(&card_id, &finalized.card, Vec::new());
             if delivered {
+                // The confirmed PATCH carries this body's Rendered Cursor
+                // (spec #561): advance the chain's record.
+                confirm_staged_cursor(cards, session_id, &card_id).await;
                 // The finalized PATCH delivered this slice's entries; with no
                 // split queued the mark is fully user-visible, so it may drain
                 // (a queued split's 承接 line still owes the continuation send
@@ -372,10 +497,19 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, spl
                 ),
             }
         };
+        if reply_to.is_none() && fallback_chat.is_none() {
+            // Nothing can reach a card: no continuation is attempted, so no
+            // cursor is staged.
+            return;
+        }
+        // Stage this continuation body's Rendered Cursor before the create:
+        // creates are never outbox-retried, so only this send's own Ok drains
+        // it (the new card's id is attached after `track_live_card`).
+        stage_rendered_cursor(cards, session_id, None, &built.cursor).await;
         let sent = match (reply_to.as_deref(), fallback_chat.as_deref()) {
             (Some(reply_to), _) => cards.feishu.reply_card(reply_to, &built.card).await,
             (None, Some(chat)) => cards.feishu.send_card("chat_id", chat, &built.card).await,
-            (None, None) => return,
+            (None, None) => unreachable!("checked above"),
         };
         match sent {
             Ok(new_id) => {
@@ -412,6 +546,10 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, spl
                     .lock()
                     .await
                     .record(&new_id, &built.card, rendered);
+                // The confirmed create carries this body's Rendered Cursor
+                // (spec #561): advance the chain's record, now naming the new
+                // card.
+                confirm_staged_cursor(cards, session_id, &new_id).await;
                 // The send delivered the 承接 line (or the size-split slice):
                 // the staged Wake Watermark is user-visible now (ADR-0061).
                 drain_wake_watermark(cards, session_id).await;
@@ -423,6 +561,9 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, spl
             }
             Err(e) => {
                 tracing::warn!("Card continuation send failed: {}", e);
+                // The create reached no card and is never retried: its staged
+                // cursor is dropped (a fenced retry rebuilds and re-stages).
+                note_cursor_write_failure(cards, session_id, None, &built.card, &e).await;
                 let retry_fenced = is_card_content_rejected(&e)
                     && matches!(
                         advance_card_fallback(cards, session_id).await,

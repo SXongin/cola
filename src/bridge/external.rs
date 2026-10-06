@@ -193,6 +193,11 @@ impl ExternalFlow {
         // immediate drain on reconnect, since REST and WS reachability are
         // independent.
         handles.platform.drain_pending_card_updates(false).await;
+        // The drain may have delivered a failed card body whose staged Rendered
+        // Cursor (spec #561) was waiting on exactly that payload: confirm those
+        // now, so a late delivery advances the chain's record exactly once. A
+        // still-owed or refused payload advances nothing.
+        crate::bridge::turn::reconcile_staged_cursors(&handles.cards).await;
     }
 
     /// Reconcile the transcript's live Background Tasks against the server's
