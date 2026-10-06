@@ -50,6 +50,49 @@ pub(crate) struct PredecessorKeep {
     pub(crate) strip_running_panels: bool,
 }
 
+/// The transcript kind of the part a [`CursorFrontier`] names: the two kinds
+/// carrying renderable model content (spec #561).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CursorPartKind {
+    Text,
+    Reasoning,
+}
+
+/// The transcript position of the newest text/reasoning content a Card Chain
+/// has confirmed delivered (spec #561): the message identity, the part's
+/// position and the delivered character extent of that part. Position and
+/// identity only — never content.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CursorFrontier {
+    /// The assistant message that carried the part.
+    pub(crate) message_id: MessageId,
+    /// The part's index in its message's typed `parts` vec, so a later read
+    /// resolves the same part.
+    pub(crate) part_index: usize,
+    pub(crate) kind: CursorPartKind,
+    /// The part's server start time, when it reported one.
+    #[serde(default)]
+    pub(crate) started_at: Option<i64>,
+    /// Unicode characters of the part's text confirmed delivered.
+    pub(crate) delivered_chars: usize,
+}
+
+/// The **Rendered Cursor** (spec #561): how far a Card Chain's card has
+/// confirmed rendered. The frontier is the newest delivered text/reasoning
+/// position; `live_calls` is the set of tool call ids whose newest delivered
+/// state was `running`. Stored on the [Chain Record](ChainRecord) and
+/// advanced only by a confirmed card write; `None` on the record means
+/// cursorless — an older release, or a chain whose first write has not been
+/// confirmed — which reads as the existing fallback behavior.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RenderedCursor {
+    #[serde(default)]
+    pub(crate) frontier: Option<CursorFrontier>,
+    #[serde(default)]
+    pub(crate) live_calls: std::collections::BTreeSet<String>,
+}
+
 /// One Session's durable live-card facts. `card_message_id` is the Feishu
 /// message the reap PATCHes; `message_id` is the Turn's own message (the
 /// `msg_cola_` user message a cola Turn submitted, or the external message an
@@ -114,6 +157,12 @@ pub(crate) struct ChainRecord {
     /// starts `None`; it never persists.
     #[serde(skip)]
     pub(crate) predecessor_keep: Option<PredecessorKeep>,
+    /// The Rendered Cursor (spec #561): how far this chain's card has
+    /// confirmed rendered. `None` — cursorless — is an older release's record
+    /// or a chain whose first confirmed write has not landed; both read as the
+    /// existing fallback behavior.
+    #[serde(default)]
+    pub(crate) cursor: Option<RenderedCursor>,
 }
 
 impl ChainRecord {
@@ -132,6 +181,7 @@ impl ChainRecord {
             restart_stamping: false,
             restart_stamp_rejected: false,
             predecessor_keep: None,
+            cursor: None,
         }
     }
 
@@ -288,11 +338,17 @@ impl ChainRecords {
         directory: Option<&str>,
     ) -> Option<ChainRecord> {
         let mut state = self.lock();
-        let previous = state.records.insert(
-            session_id.to_string(),
-            ChainRecord::new(card_message_id, message_id, created_ms)
-                .with_directory(directory.map(str::to_string)),
-        );
+        // A re-point within the chain carries the Rendered Cursor (spec #561):
+        // a split continuation or a new Turn on the same chain must not clear
+        // the chain's frontier — only a genuinely new chain (no previous
+        // record) starts cursorless.
+        let previous = state.records.get(session_id).cloned();
+        let mut record = ChainRecord::new(card_message_id, message_id, created_ms)
+            .with_directory(directory.map(str::to_string));
+        if let Some(previous) = &previous {
+            record.cursor = previous.cursor.clone();
+        }
+        state.records.insert(session_id.to_string(), record);
         self.write(&state);
         previous
     }
@@ -345,6 +401,36 @@ impl ChainRecords {
         }
         card.message_id = anchor.message_id.clone();
         card.created_ms = Some(anchor.created_ms);
+        self.write(&state);
+    }
+
+    /// The session's Rendered Cursor, when its record carries one (spec #561).
+    /// `None` for a missing record or a cursorless one — a legacy record or a
+    /// chain whose first confirmed write has not landed. The upcoming
+    /// projection (#563) lifts the test gate.
+    #[cfg(test)]
+    pub(crate) fn cursor(&self, session_id: &str) -> Option<RenderedCursor> {
+        self.lock()
+            .records
+            .get(session_id)
+            .and_then(|record| record.cursor.clone())
+    }
+
+    /// Advance the Rendered Cursor of the record naming `card_message_id`
+    /// (spec #561): the card write carrying that body landed. A no-op when the
+    /// record names another card (the chain moved on, a successor owns the
+    /// session — the same stale-write guard [`Self::set_anchor`] uses) or the
+    /// cursor is already current, so repeated confirmations do not rewrite the
+    /// file. Best-effort and atomic, like every record write.
+    pub(crate) fn advance_cursor(&self, session_id: &str, card_message_id: &str, cursor: &RenderedCursor) {
+        let mut state = self.lock();
+        let Some(card) = state.records.get_mut(session_id) else {
+            return;
+        };
+        if card.card_message_id != card_message_id || card.cursor.as_ref() == Some(cursor) {
+            return;
+        }
+        card.cursor = Some(cursor.clone());
         self.write(&state);
     }
 
@@ -1018,6 +1104,116 @@ mod tests {
         std::fs::remove_file(&legacy).unwrap();
         let reloaded = ChainRecords::load(path);
         assert_eq!(reloaded.get("ses_a").unwrap().card_message_id, "om_card_1");
+    }
+
+    /// The Rendered Cursor (spec #561) round-trips on its record, advances
+    /// only for the card the record names, and leaves with the record.
+    #[test]
+    fn the_rendered_cursor_round_trips_and_advances_only_the_named_card() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE);
+        let chains = ChainRecords::load(path.clone());
+        chains.track(
+            "ses_a",
+            "om_card_1",
+            MessageId::new("msg_cola_1"),
+            Some(1_000),
+            None,
+        );
+        assert_eq!(chains.cursor("ses_a"), None, "a fresh record is cursorless");
+
+        let cursor = RenderedCursor {
+            frontier: Some(CursorFrontier {
+                message_id: MessageId::new("msg_a_1"),
+                part_index: 2,
+                kind: CursorPartKind::Text,
+                started_at: Some(2_000),
+                delivered_chars: 42,
+            }),
+            live_calls: ["call_1".to_string()].into_iter().collect(),
+        };
+        chains.advance_cursor("ses_a", "om_other", &cursor);
+        assert_eq!(chains.cursor("ses_a"), None, "a stale write advances nothing");
+
+        chains.advance_cursor("ses_a", "om_card_1", &cursor);
+        assert_eq!(
+            ChainRecords::load(path.clone()).cursor("ses_a"),
+            Some(cursor.clone()),
+            "the cursor persists across a reload"
+        );
+
+        chains.release("ses_a");
+        assert_eq!(
+            ChainRecords::load(path).cursor("ses_a"),
+            None,
+            "the cursor is released with the record"
+        );
+    }
+
+    /// A re-point within the chain (`track`) carries the cursor; a session
+    /// with no previous record starts cursorless, and so does a record an
+    /// older release wrote (no cursor field).
+    #[test]
+    fn track_carries_the_rendered_cursor_and_a_legacy_record_reads_cursorless() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE);
+        let chains = ChainRecords::load(path.clone());
+        let cursor = RenderedCursor {
+            frontier: Some(CursorFrontier {
+                message_id: MessageId::new("msg_a_1"),
+                part_index: 0,
+                kind: CursorPartKind::Reasoning,
+                started_at: None,
+                delivered_chars: 7,
+            }),
+            live_calls: ["call_1".to_string()].into_iter().collect(),
+        };
+        chains.track(
+            "ses_a",
+            "om_card_1",
+            MessageId::new("msg_cola_1"),
+            Some(1_000),
+            None,
+        );
+        chains.advance_cursor("ses_a", "om_card_1", &cursor);
+
+        let previous = chains
+            .track(
+                "ses_a",
+                "om_card_2",
+                MessageId::new("msg_cola_1"),
+                Some(1_000),
+                None,
+            )
+            .expect("the re-point returns the previous record");
+        assert_eq!(previous.cursor, Some(cursor.clone()));
+        assert_eq!(
+            chains.cursor("ses_a"),
+            Some(cursor.clone()),
+            "the split continuation's record inherits the chain's cursor"
+        );
+
+        chains.track("ses_b", "om_card_3", MessageId::new("msg_cola_2"), None, None);
+        assert_eq!(
+            chains.cursor("ses_b"),
+            None,
+            "a genuinely new chain starts cursorless"
+        );
+
+        // A record written without the cursor field (an older release) folds
+        // in cursorless and can still be advanced by this life.
+        std::fs::write(
+            dir.path().join("legacy.json"),
+            r#"{"records":{"ses_legacy":{"card_message_id":"om_card","message_id":"msg_cola_1"}},"announcements":{}}"#,
+        )
+        .unwrap();
+        let legacy = ChainRecords::load(dir.path().join("legacy.json"));
+        assert_eq!(legacy.cursor("ses_legacy"), None);
+        assert_eq!(
+            legacy.get("ses_legacy").unwrap().card_message_id,
+            "om_card",
+            "the legacy record still reads"
+        );
     }
 
     /// Once `chain_records.json` exists, it wins: the legacy files beside it
