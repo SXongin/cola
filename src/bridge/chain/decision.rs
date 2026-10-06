@@ -32,10 +32,11 @@ use crate::opencode::types::SessionStatus;
 /// ADR-0069). One variant per observable outcome: nothing is owed (`Keep`), a
 /// deciding read is missing (`NoDecision`), the record is spent
 /// (`DiscardRecord`), a successor owns the session (`CollectThenRepoint` /
-/// `CollectThenRelease`), the still-live orphan is owed its one-time stamp
-/// (`StampRestart`), the transcript decided the ending (`Settle` — PATCHed in
-/// place), or a cursor-carrying record's ended run is projected onto a
-/// successor (`Project`, spec #561 / ticket #563).
+/// `CollectThenRelease`), the still-live CURSORLESS orphan is owed its
+/// one-time stamp (`StampRestart`), the transcript decided the ending
+/// (`Settle` — PATCHed in place), or a cursor-carrying record's run is
+/// projected onto a successor (`Project` for an ended run — spec #561 / ticket
+/// #563 — and `ProjectLive` for a followed live one, ticket #564).
 ///
 /// `Keep` also carries the marked outcomes: an orphan whose stamp already
 /// landed or was permanently refused (#522), a yielded waiting card whose
@@ -63,7 +64,10 @@ pub(crate) enum ChainDisposition {
     /// A settled successor owns the session: collect the recorded orphan and
     /// drop the record — there is nothing left to track.
     CollectThenRelease,
-    /// The still-live orphan is owed its one-time restart stamp (#443).
+    /// The still-live CURSORLESS orphan is owed its one-time restart stamp
+    /// (#443) — the fallback for a record with no Rendered Cursor (spec #561,
+    /// ticket #566); a cursor-carrying record is projected instead, never
+    /// stamped.
     StampRestart,
     /// The transcript decided the card's ending. `TurnSettle::Running` never
     /// surfaces here — an undecided ending is `Keep`.
@@ -87,10 +91,13 @@ pub(crate) enum ChainDisposition {
     /// the run through the existing external-render arm (spec #561, ticket
     /// #564) — the content produced after the seed lands on the successor as
     /// it arrives, and the run settles by transcript truth. No user message is
-    /// sent: the successor's create is the restart notification. A cursorless
-    /// record, an anchorless one, a cursor this read cannot place, and a
-    /// missing transcript read all fall back ([`Self::StampRestart`] /
-    /// [`Self::NoDecision`]) — never a guessed replay.
+    /// sent: the successor's create is the restart notification.
+    ///
+    /// A cursor-carrying record is never stamped (ticket #566): a missing
+    /// transcript read, a record with no scope to arm against and a cursor
+    /// this read cannot place all claim nothing ([`Self::NoDecision`]) and
+    /// wait for a read the projection can seed — never a guessed replay, and
+    /// never the cursorless fallback's stamp.
     ProjectLive {
         /// The chain's cursor, resolved against this read: the render's seed.
         seed: CursorSeed,
@@ -295,15 +302,14 @@ pub(crate) fn reconcile(record: &ChainRecord, reads: &RecoveryReads<'_>) -> Chai
                 // died and nothing will move it until transcript truth ends
                 // it, or the projection follows it (spec #561, ticket #564).
                 Some(StatusRead::Named(status)) if status.is_live() => {
-                    // The projection's live case: a record carrying a cursor
-                    // and a scope follows the still-live run from its confirmed
-                    // frontier. It is tried before the one-time stamp marks —
-                    // a stamp that landed earlier this life is only the
-                    // fallback, never a reason to leave a resolvable run
-                    // unfollowed. A missing transcript read the plan warranted
-                    // claims nothing (a failed read must not burn the stamp
-                    // the projection could still make unnecessary); a cursor
-                    // this read cannot place falls back to today's stamp.
+                    // The projection's live case (spec #561, tickets #564/#566):
+                    // a record carrying a Rendered Cursor is NEVER stamped — the
+                    // projection supersedes the #443 fallback. A missing
+                    // transcript read, a record with no scope to arm against and
+                    // a cursor this read cannot place all claim nothing and wait
+                    // for a read the projection can seed; skipping content on an
+                    // unplaced frontier would guess, and stamping would freeze
+                    // the run the projection is supposed to follow.
                     if let Some(cursor) = record.cursor.as_ref() {
                         let Some(TranscriptRead::Read(transcript)) = reads.transcript.as_ref() else {
                             return ChainDisposition::NoDecision;
@@ -316,10 +322,12 @@ pub(crate) fn reconcile(record: &ChainRecord, reads: &RecoveryReads<'_>) -> Chai
                         {
                             return ChainDisposition::ProjectLive { seed };
                         }
+                        return ChainDisposition::NoDecision;
                     }
-                    // The one-time outcome: a stamp that landed, or was
-                    // permanently refused and given up for this process life
-                    // (#522), is never attempted again.
+                    // The cursorless fallback: today's one-time outcome — a
+                    // stamp that landed, or was permanently refused and given
+                    // up for this process life (#522), is never attempted
+                    // again.
                     if record.restarted_reaped || record.restart_stamp_rejected {
                         ChainDisposition::Keep
                     } else {
@@ -382,6 +390,11 @@ pub(crate) struct FreshReads {
     /// The durable Wake Watermark for the session (ADR-0061): the newest Wake
     /// a previous cola life already showed.
     pub(crate) announced: Option<WakeMark>,
+    /// The session has a durable Chain Record (spec #561, ticket #566): its
+    /// Wake belongs to the projection — or, cursorless, to the reap's
+    /// fallback — so the Fresh path owes nothing. Only a recordless post uses
+    /// the Wake Watermark's announcement rule.
+    pub(crate) recorded: bool,
     /// The newest placeable Wake's anchor — the newest Wake whose server time
     /// the read carried. `None` when the read has no Wake to decide on.
     pub(crate) wake: Option<TurnAnchor>,
@@ -429,21 +442,26 @@ impl FreshReads {
     }
 
     /// Whether the content-diff probe is warranted: a placeable Wake the
-    /// watermark does not already cover and the conversation has not moved
-    /// past. An already-announced or stale Wake owes nothing whatever its
-    /// work renders, so the caller skips the probe (a full transcript scan) —
-    /// a probe never run leaves `renders` false, which the gate maps to
-    /// `Keep` anyway.
+    /// watermark does not already cover, the conversation has not moved past,
+    /// and no durable record claims the chain. An already-announced, stale or
+    /// recorded Wake owes nothing whatever its work renders, so the caller
+    /// skips the probe (a full transcript scan) — a probe never run leaves
+    /// `renders` false, which the gate maps to `Keep` anyway.
     pub(crate) fn needs_render_probe(&self) -> bool {
-        self.wake.is_some() && !self.covered() && !self.stale
+        !self.recorded && self.wake.is_some() && !self.covered() && !self.stale
     }
 }
 
 /// The Fresh gate (ADR-0069): whether a restart owes a Fresh Wake
-/// continuation. Pure over the read's facts — the durable watermark, the
-/// newest placeable Wake, whether the conversation moved past it, and whether
-/// its own work renders.
+/// continuation. Pure over the read's facts — the durable record, the durable
+/// watermark, the newest placeable Wake, whether the conversation moved past
+/// it, and whether its own work renders. A recorded chain is never a Fresh
+/// post (spec #561, ticket #566): the projection (or the cursorless fallback)
+/// owns it.
 pub(crate) fn fresh(reads: &FreshReads) -> FreshDisposition {
+    if reads.recorded {
+        return FreshDisposition::Keep;
+    }
     let Some(wake) = reads.wake.clone() else {
         return FreshDisposition::NoDecision;
     };
@@ -961,9 +979,10 @@ mod tests {
         );
     }
 
-    /// The #564 fallback (ticket #563): a live record the projection cannot
-    /// take — no cursor, or a cursor whose warranted transcript read is
-    /// missing — keeps today's one-time restart stamp.
+    /// The #564 fallback (ticket #563): a CURSORLESS live record keeps today's
+    /// one-time restart stamp, while a cursor-carrying one whose warranted
+    /// transcript read is missing claims nothing (ticket #566) — a transient
+    /// failure never stamps a record the projection supersedes.
     #[test]
     fn a_live_record_without_a_projection_keeps_todays_stamp() {
         let with_cursor = ChainRecord {
@@ -1078,7 +1097,7 @@ mod tests {
         assert_eq!(
             reconcile(&record(), &live(false, Some(transcript.clone()))),
             ChainDisposition::StampRestart,
-            "a scope a cursorless record lacks is not its concern"
+            "a readable transcript changes nothing without a cursor"
         );
     }
 
@@ -1134,7 +1153,9 @@ mod tests {
 
     /// The Fresh gate: no Wake decides nothing; an announced, stale or
     /// unrendering Wake owes nothing; a strictly newer rendering one is
-    /// announced at its anchor.
+    /// announced at its anchor; and a durable chain record always owes nothing
+    /// (spec #561, ticket #566) — the projection, or the cursorless fallback,
+    /// owns a recorded chain's Wake.
     #[test]
     fn the_fresh_gate_announces_only_newer_rendering_wakes() {
         let anchor = TurnAnchor {
@@ -1146,6 +1167,7 @@ mod tests {
                 wake_id: "msg_wake".into(),
                 created_ms,
             }),
+            recorded: false,
             wake: Some(TurnAnchor {
                 message_id: MessageId::new("msg_wake"),
                 created_ms: 2_000,
@@ -1199,6 +1221,40 @@ mod tests {
                 ..reads(None, false, false)
             }
             .needs_render_probe()
+        );
+    }
+
+    /// The Fresh gate narrows to recordless posts (spec #561, ticket #566): a
+    /// session with a durable Chain Record hands its Wake to the projection —
+    /// or, cursorless, to the reap's fallback — so the gate owes nothing and
+    /// skips the content probe, while the same read without a record still
+    /// announces.
+    #[test]
+    fn the_fresh_gate_yields_to_a_chain_record() {
+        let anchor = TurnAnchor {
+            message_id: MessageId::new("msg_wake"),
+            created_ms: 2_000,
+        };
+        let reads = |recorded: bool| FreshReads {
+            announced: None,
+            recorded,
+            wake: Some(anchor.clone()),
+            stale: false,
+            renders: true,
+        };
+        assert_eq!(
+            fresh(&reads(true)),
+            FreshDisposition::Keep,
+            "a recorded chain's Wake is the projection's, never a Fresh post"
+        );
+        assert!(
+            !reads(true).needs_render_probe(),
+            "a recorded post skips the content probe"
+        );
+        assert_eq!(
+            fresh(&reads(false)),
+            FreshDisposition::Announce(anchor),
+            "a recordless post keeps the Watermark gate"
         );
     }
 }

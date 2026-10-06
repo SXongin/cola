@@ -416,6 +416,14 @@ impl ChainRecords {
             .and_then(|record| record.cursor.clone())
     }
 
+    /// Whether the session has a durable Chain Record at all — the Fresh
+    /// gate's one read (spec #561, ticket #566). A recorded chain's Wake
+    /// belongs to the projection (or, cursorless, to the reap's fallback),
+    /// so only a recordless post uses the Wake Watermark's announcement rule.
+    pub(crate) fn recorded(&self, session_id: &str) -> bool {
+        self.lock().records.contains_key(session_id)
+    }
+
     /// Advance the Rendered Cursor of the record naming `card_message_id`
     /// (spec #561): the card write carrying that body landed. A no-op when the
     /// record names another card (the chain moved on, a successor owns the
