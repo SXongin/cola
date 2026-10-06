@@ -494,7 +494,7 @@ impl Turn {
         // own reads rebuild the live list).
         if let Some(orphan) = orphan {
             let carried = Self::carry_orphan_tools(handles, &session_id, &new_card_id, &orphan).await;
-            crate::bridge::chain::collect_orphan_after_carry(
+            crate::bridge::chain::collect_orphan_after_takeover(
                 &handles.cards,
                 &session_id,
                 &orphan.card_message_id,
@@ -2357,16 +2357,17 @@ impl Turn {
     /// Turn owns — a call whose status is `running` or `pending` (both render
     /// `⏳`). The drain follow's Done decision waits for these to settle (#284):
     /// the card must never read `✅ 完成` over a `⏳` panel. A still-running
-    /// **Carried Tool Panel** (ADR-0068) is deliberately not one of the Turn's
-    /// own: it is display-only, so it must not extend the settle decision — a
-    /// carried call the Turn's window never renders stops being counted the
-    /// moment it was seeded, and the settled card omits it instead of waiting
-    /// on it. A carried call the window DID render has already left the carry
-    /// set, so today's guard applies to it as before.
+    /// **seeded** call (spec #561's live set, ADR-0068's successor) is
+    /// deliberately not one of the Turn's own: it is display-only, so it must
+    /// not extend the settle decision — a seeded call the Turn's window never
+    /// renders stops being counted the moment it was seeded, and the settled
+    /// card omits it instead of waiting on it. A seeded call the window DID
+    /// render has already left the seeded set, so today's guard applies to it
+    /// as before.
     pub(crate) async fn has_live_tools(cards: &CardsHandle, session_id: &str) -> bool {
         cards.cards.lock().await.get(session_id).is_some_and(|c| {
             c.acc.tools.iter().any(|(call_id, panel)| {
-                !c.acc.carried_calls.contains(call_id)
+                !c.acc.seeded_calls.contains(call_id)
                     && crate::feishu::card::tool_render::ToolPanel::is_live(panel)
             }) || c
                 .acc
@@ -2989,11 +2990,11 @@ impl Turn {
         acc.wake_continuation = true;
         acc.apply_work_context(work_context);
         acc.seed_projection(cursor, seed.clone());
-        let carried_before: std::collections::HashSet<String> = acc.carried_calls.iter().cloned().collect();
+        let carried_before: std::collections::HashSet<String> = acc.seeded_calls.iter().cloned().collect();
         let rendered = render::render_turn_parts(&mut acc, transcript);
         let resolved_calls = carried_before
             .iter()
-            .any(|call_id| !acc.carried_calls.contains(call_id));
+            .any(|call_id| !acc.seeded_calls.contains(call_id));
         render::apply_ledger_read(
             &mut acc,
             transcript,
@@ -3840,7 +3841,7 @@ mod tests {
             1,
             "the read's own successor is seeded"
         );
-        assert!(live["ses_test"].acc.carried_calls.contains("call_sleep"));
+        assert!(live["ses_test"].acc.seeded_calls.contains("call_sleep"));
 
         // Another Turn replaced the card session during the read: nothing is
         // seeded into the newer accumulator.
@@ -3856,7 +3857,7 @@ mod tests {
             0,
             "a replaced successor carries nothing"
         );
-        assert!(live["ses_test"].acc.carried_calls.is_empty());
+        assert!(live["ses_test"].acc.seeded_calls.is_empty());
         assert!(live["ses_test"].acc.tools.is_empty());
     }
 

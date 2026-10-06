@@ -180,9 +180,10 @@ impl SessionTranscript {
 
     /// The `running`/`pending` tool calls of the Turn anchored at `anchor` —
     /// the orphaned Turn's projection, membership rule included: only calls
-    /// whose message [`belongs_to_turn`] may be handed to a successor as
-    /// **Carried Tool Panels** (ADR-0068), so an older card's stale `running`
-    /// part is never resurrected. In transcript order.
+    /// whose message [`belongs_to_turn`] may enter a successor's seed as its
+    /// live-set fallback (spec #561; ADR-0068's carry retires into it for a
+    /// cursorless record), so an older card's stale `running` part is never
+    /// resurrected. In transcript order.
     pub fn turn_running_tools(&self, anchor: &TurnAnchor) -> Vec<ToolCall> {
         self.turn_for_user(anchor)
             .messages
