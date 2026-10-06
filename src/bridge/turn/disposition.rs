@@ -6,7 +6,7 @@
 //! `/stop` marker, the out-of-turn loop's two graces) — and every ending path
 //! with a live card applies it through one application
 //! (`StreamAccumulator::apply_ending`, behind the out-of-turn loops'
-//! ownership-checked `Ownership::apply_if_held` and the external arm's anchor
+//! ownership-checked `Ticket::apply_ending_if_owned` and the external arm's anchor
 //! guard): the card's state and failure line, its phase timer, then the
 //! work-context refresh and the flush.
 //! The durable reap has no live accumulator to apply to: it reads the same

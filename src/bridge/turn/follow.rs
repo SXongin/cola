@@ -29,7 +29,7 @@ use crate::bridge::handles::TurnHandles;
 use crate::bridge::span;
 use crate::config::ThreadKey;
 
-use super::{SettleTiming, settle};
+use super::{SettleTiming, ownership::Ticket, settle};
 
 /// The fixture a follow inherits from the Turn it continues: whose card it
 /// watches, where its reads route, and when the run started (the long-task
@@ -104,13 +104,9 @@ pub(super) async fn spawn(handles: &TurnHandles, facts: FollowFacts) {
 /// plus the follow grace); the loop reads all three through the variant.
 /// `None` — the card is gone, or carries no submitted message — means there is
 /// nothing to watch; [`run`] then hands the guard back and stops.
-async fn ownership(
-    handles: &TurnHandles,
-    facts: &FollowFacts,
-    timing: SettleTiming,
-) -> Option<settle::Ownership> {
+async fn ownership(handles: &TurnHandles, facts: &FollowFacts, timing: SettleTiming) -> Option<Ticket> {
     if let Some(anchor) = &facts.anchor {
-        return Some(settle::Ownership::TurnAnchor(anchor.clone()));
+        return Some(Ticket::TurnAnchor(anchor.clone()));
     }
     // The unreceived watch: the card's chain identity and the accumulator's
     // submitted id, both read through the Turn accessors so the watch and
@@ -118,7 +114,7 @@ async fn ownership(
     // sentinel chain or an empty id could never match what the loop watches.
     let chain = super::Turn::chain_id(&handles.cards, &facts.session_id).await?;
     let submitted = super::Turn::submitted_message_id(&handles.cards, &facts.session_id).await?;
-    Some(settle::Ownership::Unlanded {
+    Some(Ticket::Unlanded {
         chain,
         submitted,
         hint_at: facts.started_at + std::time::Duration::from_millis(timing.grace_ms),
@@ -128,8 +124,8 @@ async fn ownership(
 /// The follow's loop: the shared settle loop under the accumulator's anchor
 /// (or, before the submitted message lands, under the unreceived watch's
 /// chain identity — ADR-0062), then the ending disposition applied through the
-/// one shared, ownership-checked application (`Ownership::apply_if_held`) and
-/// the Turn announced. The notice is sent for every ending (its own
+/// one shared, ownership-checked application (`Ticket::apply_ending_if_owned`)
+/// and the Turn announced. The notice is sent for every ending (its own
 /// classification declines one that is not a true end, so a waiting yield and
 /// an Unreceived card stay silent) and carries the copy of the disposition the
 /// loop applied (#394).
@@ -144,7 +140,7 @@ async fn ownership(
 /// replaced the accumulator, and stamping its live card with the old ending
 /// would be a lie.
 async fn run(handles: TurnHandles, facts: FollowFacts, timing: SettleTiming) {
-    let Some(owns) = ownership(&handles, &facts, timing).await else {
+    let Some(ticket) = ownership(&handles, &facts, timing).await else {
         // The card vanished between the hand-off and this loop (or never
         // carried a submitted message): there is nothing to watch. The spawn
         // inherited the guard, so hand it back — a stale hold would leave the
@@ -160,7 +156,7 @@ async fn run(handles: TurnHandles, facts: FollowFacts, timing: SettleTiming) {
         anchor: _,
     } = facts;
     let flow = handles.flow();
-    let disposition = settle::run(&flow, &session_id, &directory, timing, &owns).await;
+    let disposition = settle::run(&flow, &session_id, &directory, timing, &ticket).await;
     super::release_inflight(&handles, &session_id).await;
     let Some(disposition) = disposition else {
         return;
@@ -169,7 +165,10 @@ async fn run(handles: TurnHandles, facts: FollowFacts, timing: SettleTiming) {
     // guard is already released, so a new Turn may have replaced the card —
     // and its live card must never inherit this loop's ending. False means the
     // card is gone or replaced: stamp nothing and stay silent.
-    if !owns.apply_if_held(&flow.cards, &session_id, &disposition).await {
+    if !ticket
+        .apply_ending_if_owned(&flow.cards, &session_id, &disposition)
+        .await
+    {
         return;
     }
     super::send_completion_notice(
