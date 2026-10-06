@@ -2646,6 +2646,68 @@ impl StreamAccumulator {
         (builder.build(), spans, cursor)
     }
 
+    /// The part characters this accumulator's timeline delivers for `source`
+    /// (spec #561, review #569): the un-rendered prefix a first entry's
+    /// `delivered_before` carries, plus every same-source entry's own model
+    /// characters. The push semantics keep the entries disjoint — only a
+    /// part's FIRST entry may carry a nonzero offset, every later entry (a
+    /// server-grown snapshot, a split past the size budget) carries none — so
+    /// the offset is counted once, never once per entry.
+    pub(super) fn source_extent(&self, source: &PartSource) -> usize {
+        self.source_extent_in(source, self.timeline.len())
+    }
+
+    /// [`Self::source_extent`] over the timeline prefix `..end`: one body's
+    /// Rendered Cursor reads only what that body delivers.
+    fn source_extent_in(&self, source: &PartSource, end: usize) -> usize {
+        let mut chars = 0usize;
+        let mut offset = 0usize;
+        for item in &self.timeline[..end] {
+            if !item
+                .source
+                .as_ref()
+                .is_some_and(|s| s.message_id == source.message_id && s.index == source.index)
+            {
+                continue;
+            }
+            if let TimelineKind::Text(text) | TimelineKind::Reasoning(text) = &item.kind {
+                offset = offset.max(item.source.as_ref().map_or(0, |s| s.delivered_before));
+                chars += text.chars().count();
+            }
+        }
+        offset + chars
+    }
+
+    /// The part content this accumulator's timeline already shows for `source`
+    /// — the concatenation of its entries, in order — when that content is a
+    /// plain prefix of the part (every entry offset-free). `None` when the
+    /// part has no entry here, or a seeded entry carries a prefix the card
+    /// does not hold: the caller can then tell neither a growth nor its
+    /// remainder. The delta test the ordinary render reads (review #569).
+    pub(super) fn source_rendered(&self, source: &PartSource) -> Option<String> {
+        let mut rendered = String::new();
+        let mut found = false;
+        for item in &self.timeline {
+            let Some(item_source) = item.source.as_ref() else {
+                continue;
+            };
+            if item_source.message_id != source.message_id || item_source.index != source.index {
+                continue;
+            }
+            if item_source.delivered_before != 0 {
+                return None;
+            }
+            match &item.kind {
+                TimelineKind::Text(text) | TimelineKind::Reasoning(text) => {
+                    found = true;
+                    rendered.push_str(text);
+                }
+                _ => return None,
+            }
+        }
+        found.then_some(rendered)
+    }
+
     /// The Rendered Cursor of the card body [`Self::build_card_inner`] is
     /// about to render for `timeline[..end]` (spec #561): the chain's
     /// confirmed cursor plus what this body adds. The frontier names the
@@ -2666,21 +2728,7 @@ impl StreamAccumulator {
             };
             Some((source, kind, item.shown_at))
         }) {
-            let delivered_chars = self.timeline[..end]
-                .iter()
-                .filter(|item| item.source.as_ref() == Some(source))
-                .filter_map(|item| match &item.kind {
-                    TimelineKind::Text(text) | TimelineKind::Reasoning(text) => {
-                        // The projection's seeded entry continues the part
-                        // mid-way: its counted extent is the delivered prefix
-                        // plus the entry's own model characters (the markdown
-                        // lead is rendered, never counted).
-                        let before = item.source.as_ref().map_or(0, |source| source.delivered_before);
-                        Some(before + text.chars().count())
-                    }
-                    _ => None,
-                })
-                .sum();
+            let delivered_chars = self.source_extent_in(source, end);
             cursor.frontier = Some(CursorFrontier {
                 message_id: source.message_id.clone(),
                 part_index: source.index,
