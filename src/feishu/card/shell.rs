@@ -476,9 +476,12 @@ pub(super) fn panel_time_suffix(at_ms: Option<i64>) -> String {
 /// `element_id` names the panel for the duration of the card: the streaming
 /// card re-renders its whole JSON on every flush, and the client holds each
 /// panel's open/closed state locally. A panel whose id is derived from the
-/// timeline item it renders (`tool_{seq}` / `reason_{seq}`) keeps that id as
+/// thing it renders — a tool panel from its call (`tool_{call_id}`), a
+/// reasoning panel from its timeline item (`reason_{seq}`) — keeps that id as
 /// the timeline grows or reorders, so the fold state follows the panel instead
-/// of whichever panel happens to sit at its old position.
+/// of whichever panel happens to sit at its old position. A tool panel's
+/// call-named id also lets a takeover's collect identify the running marker of
+/// a call the successor resolved (spec #561, review #569).
 pub(crate) fn collapsible_panel_chunks(
     title: &str,
     chunks: &[String],

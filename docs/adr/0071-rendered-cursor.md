@@ -111,8 +111,10 @@ projects the chain's delta after it onto a successor card.**
   server time — falling back to the recorded card and then the chain's
   top-level Chat; with no deliverable target at all an ended run takes
   today's in-place settle and a live one is not adopted. Both collect the
-  recorded card as taken over — dropping every
-  running `⏳` marker the successor resolves (ADR-0068's rule, generalized) —
+  recorded card as taken over — dropping the Background Task Ledger and,
+  per call, each running `⏳` marker the successor actually resolved (ADR-0068's
+  rule, generalized; a marker whose call the read did not carry stays as a
+  frozen witness, review #569) —
   and neither re-points the record's card until the create landed. The
   re-point and the create's cursor confirmation are ONE write, inside the same
   takeover critical section (review #569, round 3): the record must never be
@@ -161,15 +163,25 @@ projects the chain's delta after it onto a successor card.**
   rendered, so the content-keyed dedup and the Wake step's content diff can
   never replay it — and the frontier part renders only its undelivered
   suffix, with a markdown lead (a reopened fence, a repeated table
-  header/delimiter) when the cut lands inside a construct. The live set
-  resolves by call identity against the whole read on every render read: a
+  header/delimiter) when the cut lands inside a construct. That suffix-only
+  cut holds only while the read still carries what the successor delivered:
+  the accumulated run's newest prefix digest must hash the read's prefix of
+  the delivered extent, and a live REWRITE — a read whose prefix no longer
+  does — replaces the part's run with the rewritten content in full, exactly
+  like the ordinary render's rewrite rule (review #569, round 3). Cutting a
+  rewritten part at the old extent would push a stray suffix and let the
+  cursor claim the replacement delivered. The live set resolves by call
+  identity against the whole read on every render read: a
   still-running call rides the successor's live tail display-only and a call
   that settled while cola was down joins its timeline exactly once, at the
   server start key it was born with. Only calls the read actually carries
-  resolve: a V2 transcript truncated at its page cap leaves a running call
-  outside it, and that call's panel then stays on the collected old card as a
-  frozen witness rather than being stripped from a card the successor cannot
-  repair (review #569). Truncation is not reportable at this seam — the read
+  resolve, and the collect strips per call: exactly the running `⏳` panels
+  whose call the seed resolved leave the old card (identified through the
+  panel's call-named element id, `tool_{call_id}`), while a call outside the
+  read — a V2 transcript truncated at its page cap — keeps its panel on the
+  collected old card as a frozen witness rather than being stripped from a
+  card the successor cannot repair (review #569). Truncation is not reportable
+  at this seam — the read
   stops at its page cap with a log, and the generation-neutral
   `SessionTranscript` carries no truncation fact — so the projection cannot
   withhold itself on a truncated read, and the frozen marker is the honest

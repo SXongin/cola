@@ -115,11 +115,13 @@ pub(crate) async fn collect_orphan(cards: &CardsHandle, session_id: &str, card_m
 /// **fresh-Turn message takeover** and the reap's projections (spec #561,
 /// ADR-0068's successor): the Background Task Ledger
 /// element goes always (the successor's own reads rebuild the live list,
-/// ADR-0060's one-card handover) and the running `⏳` panels go only when the
-/// takeover's seed actually resolved at least one call onto the successor —
-/// `resolved_running_panels` is the seed's own result, so a failed, empty or
-/// fallback seed keeps today's body for them. A failed PATCH only warns, like
-/// every collect.
+/// ADR-0060's one-card handover) and each running `⏳` panel goes exactly when
+/// its call is in `resolved_calls` — the live-set calls the takeover's seed
+/// actually resolved onto the successor (spec #561, review #569). A call the
+/// read did not carry keeps its frozen marker: the successor cannot repair
+/// what it never saw, so an unresolved panel must not vanish from both cards.
+/// A failed, empty or fallback seed resolves nothing and keeps today's body.
+/// A failed PATCH only warns, like every collect.
 ///
 /// The rule is recorded on the successor's record **before** the collect's
 /// PATCH: a #443 stamp admitted while the takeover ran may land after this
@@ -129,13 +131,13 @@ pub(crate) async fn collect_orphan_after_takeover(
     cards: &CardsHandle,
     session_id: &str,
     card_message_id: &str,
-    resolved_running_panels: bool,
+    resolved_calls: &[String],
 ) {
     cards
         .chains
-        .note_predecessor_keep(session_id, card_message_id, resolved_running_panels);
+        .note_predecessor_keep(session_id, card_message_id, resolved_calls);
     let keep = KeepBody::WithoutLiveTail {
-        strip_running_panels: resolved_running_panels,
+        resolved_calls: resolved_calls.to_vec(),
     };
     collect_orphan_with(cards, session_id, card_message_id, keep).await;
 }
@@ -754,7 +756,7 @@ async fn send_projected_successor(
             &handles.cards,
             session_id,
             &orphan.card_message_id,
-            seed.resolves_live_calls() || projected.resolved_calls,
+            &seed.resolved_calls(),
         )
         .await;
     }
@@ -1235,14 +1237,14 @@ async fn stamp_restart_attempt(
     // only repairs the reversed order.
     //
     // The repair reproduces the takeover's own keep rule (ADR-0068), never
-    // the plain one: a fresh Turn's collect recorded whether its carry moved
-    // the running `⏳` panels ([`collect_orphan_after_takeover`]), and the stamp's
-    // stale body must not restore the tail that collect removed. A takeover
+    // the plain one: a fresh Turn's collect recorded which of the carry's calls
+    // it resolved onto the successor, so the stamp's stale body must not
+    // restore the running markers that collect removed. A takeover
     // that recorded no rule — the Wake continuation's arm, the external arm —
     // keeps today's preserved body ([`KeepBody::Everything`]).
     if Turn::card_message_id(cards, session_id).await.is_some() {
         let keep = match cards.chains.predecessor_keep_strip(session_id, card_message_id) {
-            Some(strip_running_panels) => KeepBody::WithoutLiveTail { strip_running_panels },
+            Some(resolved_calls) => KeepBody::WithoutLiveTail { resolved_calls },
             None => KeepBody::Everything,
         };
         collect_orphan_with(cards, session_id, card_message_id, keep).await;
@@ -1316,7 +1318,7 @@ async fn patch_ending_keeping_body(
 
 /// The view-element rule a preserved card's merge applies (#434 acceptance
 /// feedback, ADR-0068).
-#[derive(Clone, Copy)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum KeepBody {
     /// Every ordinary collect, every ending and the #443 restart stamp —
     /// plus the stamp's repair when no takeover recorded a rule: the card's
@@ -1326,10 +1328,12 @@ enum KeepBody {
     /// of it (ADR-0068, the one collect the spec's Trigger scopes the strip
     /// to): the view's live tail goes —
     /// the Background Task Ledger element always, because the successor's own
-    /// reads rebuild the live list (ADR-0060), and the running `⏳` panels
-    /// when the takeover's seed actually resolved them onto the successor.
-    /// Every other preserved element stays.
-    WithoutLiveTail { strip_running_panels: bool },
+    /// reads rebuild the live list (ADR-0060), and each running `⏳` panel
+    /// whose call is in `resolved_calls` (spec #561, review #569) — the
+    /// panels the successor actually carries. Every other element stays,
+    /// including a running marker whose call the read did not carry: the
+    /// successor cannot repair what it never saw.
+    WithoutLiveTail { resolved_calls: Vec<String> },
     /// The late projection successor's collect (spec #561, review #569): the
     /// card is reduced to the bare taken-over marker, NO element kept. The
     /// winner (a fresh Turn whose message-first seed re-rendered the same
@@ -1342,18 +1346,31 @@ enum KeepBody {
 impl KeepBody {
     /// Whether the preserved body keeps `element` (before the interactive
     /// strip).
-    fn keeps(self, element: &serde_json::Value) -> bool {
+    fn keeps(&self, element: &serde_json::Value) -> bool {
         match self {
             Self::Everything => true,
-            Self::WithoutLiveTail { strip_running_panels } => {
+            Self::WithoutLiveTail { resolved_calls } => {
                 if is_task_ledger_element(element) {
                     return false;
                 }
-                !strip_running_panels || !is_running_panel_element(element)
+                !is_running_panel_element(element) || !names_resolved_call(element, resolved_calls)
             }
             Self::Nothing => false,
         }
     }
+}
+
+/// Whether the running panel `element` names a call the seed resolved (spec
+/// #561, review #569): a tool panel's element id IS its call
+/// (`tool_{call_id}`), so exactly the markers the successor carries leave the
+/// collected card. A panel with no id — or one rendered before the id named
+/// its call — is kept: an unidentifiable marker is never dropped.
+fn names_resolved_call(element: &serde_json::Value, resolved_calls: &[String]) -> bool {
+    element
+        .get("element_id")
+        .and_then(|id| id.as_str())
+        .and_then(|id| id.strip_prefix("tool_"))
+        .is_some_and(|call_id| resolved_calls.iter().any(|resolved| resolved == call_id))
 }
 
 /// Whether `element` is the Background Task Ledger's panel (ADR-0060): the
@@ -1725,8 +1742,9 @@ mod tests {
 
     /// ADR-0068: the takeover collect's preserved body drops the Background
     /// Task Ledger element always — the successor's own reads rebuild the live
-    /// list — and a running `⏳` panel only when `strip_running_panels` says
-    /// the takeover's seed resolved it onto the successor. The #444 probe
+    /// list — and exactly the running `⏳` panels whose call the takeover's
+    /// seed resolved onto the successor (`resolved_calls`, matched through the
+    /// panel's call-named element id; spec #561, review #569). The #444 probe
     /// ("the collected card keeps a stale running marker today") is inverted
     /// here: with the seed's answer the marker goes, without it today's
     /// preserved body stays; the reap's endings and the #443 stamp
@@ -1743,7 +1761,7 @@ mod tests {
             "config": { "wide_screen_mode": true },
             "body": { "elements": [
                 { "tag": "markdown", "content": "**正文** 已经写完的部分" },
-                { "tag": "collapsible_panel", "expanded": false, "element_id": "tool_1",
+                { "tag": "collapsible_panel", "expanded": false, "element_id": "tool_call_1",
                   "header": { "title": { "tag": "plain_text", "content": "⏳ shell · 12:00" } },
                   "elements": [ { "tag": "markdown", "content": "**Input**\n`sleep 600`" } ] },
                 { "tag": "collapsible_panel", "expanded": false, "element_id": "tool_2",
@@ -1762,7 +1780,7 @@ mod tests {
             &bare,
             &view,
             KeepBody::WithoutLiveTail {
-                strip_running_panels: true,
+                resolved_calls: vec!["call_1".to_string()],
             },
         );
         let text = card_text(&carried);
@@ -1797,7 +1815,7 @@ mod tests {
             &bare,
             &view,
             KeepBody::WithoutLiveTail {
-                strip_running_panels: false,
+                resolved_calls: Vec::new(),
             },
         );
         let text = card_text(&kept);

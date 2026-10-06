@@ -271,8 +271,9 @@ async fn wait_for_predecessor_keep(
     app: &Arc<App>,
     session_id: &str,
     card_message_id: &str,
-    strip_running_panels: bool,
+    resolved_calls: &[&str],
 ) {
+    let expected: Vec<String> = resolved_calls.iter().map(|call| call.to_string()).collect();
     let probe = async {
         loop {
             let recorded = app
@@ -280,8 +281,8 @@ async fn wait_for_predecessor_keep(
                 .chains
                 .get(session_id)
                 .and_then(|record| record.predecessor_keep)
-                .map(|keep| (keep.card_message_id, keep.strip_running_panels));
-            if recorded == Some((card_message_id.to_string(), strip_running_panels)) {
+                .map(|keep| (keep.card_message_id, keep.resolved_calls));
+            if recorded == Some((card_message_id.to_string(), expected.clone())) {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -1243,7 +1244,7 @@ fn live_tail_orphan_view() -> serde_json::Value {
         },
         "body": { "elements": [
             { "tag": "markdown", "content": "**正文** 已经写完的部分" },
-            { "tag": "collapsible_panel", "expanded": false, "element_id": "tool_1",
+            { "tag": "collapsible_panel", "expanded": false, "element_id": "tool_call_sleep",
               "header": { "title": { "tag": "plain_text", "content": "⏳ shell · 12:00" } },
               "elements": [ { "tag": "markdown", "content": "**Input**\n`sleep 3600`" } ] },
             { "tag": "collapsible_panel", "expanded": false, "element_id": "tool_2",
@@ -1900,7 +1901,7 @@ async fn a_stamp_over_a_seeding_takeover_repairs_without_the_seeded_tail() {
     // The recorded rule is the observed proof the takeover attached, seeded
     // (at least one call) and reached its collect before the stamp is
     // released — so the post-PATCH repair can no longer miss the successor.
-    wait_for_predecessor_keep(&app, "ses_test", "om_frozen", true).await;
+    wait_for_predecessor_keep(&app, "ses_test", "om_frozen", &["call_sleep"]).await;
     release.notify_one();
     // The repair is the orphan's third write: the parked stamp, the
     // takeover's queued collect, then the stamp's repair. Waiting for it pins
@@ -2011,7 +2012,7 @@ async fn a_stamp_over_an_empty_takeover_repairs_without_the_ledger() {
     let mut context = ctx("ses_test", "新问题");
     context.cola_message_id = Some("msg_cola_new".into());
     let turn = spawn_turn(&app, context);
-    wait_for_predecessor_keep(&app, "ses_test", "om_frozen", false).await;
+    wait_for_predecessor_keep(&app, "ses_test", "om_frozen", &[]).await;
     release.notify_one();
     wait_for_patches(&platform, "om_frozen", 3).await;
 
@@ -2151,7 +2152,7 @@ async fn a_seed_decision_logs_one_info_line() {
     wait_for_card_header(&platform, "✅").await;
     let line = seed_info_line(&logs);
     assert!(
-        line.contains("ses_test") && line.contains("resolved false"),
+        line.contains("ses_test") && line.contains("resolved 0 live calls"),
         "the one INFO line names the session and its decision: {line}"
     );
 }
@@ -3859,7 +3860,7 @@ async fn a_projection_settles_a_tool_that_finished_while_cola_was_down() {
                         "title": { "tag": "plain_text", "content": "✍️ 回复中" } },
             "body": { "elements": [
                 { "tag": "markdown", "content": "**正文** 第一段" },
-                { "tag": "collapsible_panel", "expanded": false,
+                { "tag": "collapsible_panel", "expanded": false, "element_id": "tool_call_1",
                   "header": { "title": { "tag": "plain_text", "content": "⏳ bash" } },
                   "elements": [ { "tag": "markdown", "content": "还在跑" } ] }
             ] }
@@ -4306,25 +4307,6 @@ async fn a_restart_mid_run_follows_the_live_run_onto_a_successor() {
     wait_for_record_gone(&app, "ses_test").await;
 }
 
-/// The old card's running `⏳` panel for the tool-carry tests: a card that was
-/// showing a live `bash` panel when the process died.
-fn running_panel_card_view() -> serde_json::Value {
-    serde_json::json!({
-        "schema": "2.0",
-        "config": { "wide_screen_mode": true, "streaming_mode": true },
-        "header": {
-            "template": "blue",
-            "title": { "tag": "plain_text", "content": "✍️ 回复中" }
-        },
-        "body": { "elements": [
-            { "tag": "markdown", "content": "**正文** 已经写了一半。" },
-            { "tag": "collapsible_panel", "expanded": false,
-              "header": { "title": { "tag": "plain_text", "content": "⏳ bash" } },
-              "elements": [ { "tag": "markdown", "content": "还在跑" } ] }
-        ] }
-    })
-}
-
 /// A tool still running across the restart rides the successor as a live carry
 /// and joins its timeline exactly once at settle; the collected old card keeps
 /// no frozen running marker (spec #561, ticket #564).
@@ -4350,7 +4332,7 @@ async fn a_restart_mid_run_carries_a_running_tool_and_settles_it_once() {
     ]);
     let (app, platform, backend) =
         restarted_app_with_backend(&session_file, running, Some(SessionStatus::Busy)).await;
-    platform.given_card_view("om_frozen", running_panel_card_view());
+    platform.given_card_view("om_frozen", running_panel_card_view("call_1"));
 
     spawn_sync(&app);
     let (successor, successor_text) = wait_for_projection(&platform, "msg_cola_anchor").await;
@@ -4441,7 +4423,7 @@ async fn a_restart_mid_run_settles_a_tool_that_finished_while_cola_was_down() {
     ]);
     let (app, platform, _backend) =
         restarted_app_with_backend(&session_file, running, Some(SessionStatus::Busy)).await;
-    platform.given_card_view("om_frozen", running_panel_card_view());
+    platform.given_card_view("om_frozen", running_panel_card_view("call_1"));
 
     spawn_sync(&app);
     let (successor, successor_text) = wait_for_projection(&platform, "msg_cola_anchor").await;
@@ -4598,7 +4580,7 @@ async fn an_adoption_carries_a_pending_request_onto_the_successor() {
             .expect("the restarted app builds"),
     );
     seed_session(&app, "ses_test", "/work").await;
-    platform.given_card_view("om_frozen", running_panel_card_view());
+    platform.given_card_view("om_frozen", running_panel_card_view("call_1"));
 
     spawn_sync(&app);
     let (_successor, successor_text) = wait_for_projection(&platform, "msg_cola_anchor").await;
@@ -5137,7 +5119,8 @@ fn race_transcript(
 }
 
 /// The orphaned card's view when the message landed: a written body and a
-/// running `shell` panel riding its live tail.
+/// running `shell` panel riding its live tail (its element id names the call,
+/// `tool_{call_id}`, as every real card's does).
 fn orphan_running_card_view() -> serde_json::Value {
     serde_json::json!({
         "schema": "2.0",
@@ -5148,9 +5131,53 @@ fn orphan_running_card_view() -> serde_json::Value {
         },
         "body": { "elements": [
             { "tag": "markdown", "content": "**正文** 已经写了一半。" },
-            { "tag": "collapsible_panel", "expanded": false,
+            { "tag": "collapsible_panel", "expanded": false, "element_id": "tool_call_sleep",
               "header": { "title": { "tag": "plain_text", "content": "⏳ shell" } },
               "elements": [ { "tag": "markdown", "content": "还在跑" } ] }
+        ] }
+    })
+}
+
+/// A `⏳` running panel as a whole-card read returns it, named for the call it
+/// renders (`tool_{call_id}`): the identity the takeover's per-call strip
+/// matches against the resolved set (spec #561, review #569).
+fn running_panel_card_view(call_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "schema": "2.0",
+        "config": { "wide_screen_mode": true, "streaming_mode": true },
+        "header": {
+            "template": "blue",
+            "title": { "tag": "plain_text", "content": "✍️ 回复中" }
+        },
+        "body": { "elements": [
+            { "tag": "markdown", "content": "**正文** 已经写了一半。" },
+            { "tag": "collapsible_panel", "expanded": false,
+              "element_id": format!("tool_{call_id}"),
+              "header": { "title": { "tag": "plain_text", "content": "⏳ bash" } },
+              "elements": [ { "tag": "markdown", "content": "还在跑" } ] }
+        ] }
+    })
+}
+
+/// The whole-card view of an old card carrying TWO running panels — one for a
+/// call this read carries, one it does not (spec #561, review #569): the
+/// takeover's strip must drop exactly the resolved one.
+fn two_running_panels_card_view() -> serde_json::Value {
+    serde_json::json!({
+        "schema": "2.0",
+        "config": { "wide_screen_mode": true, "streaming_mode": true },
+        "header": {
+            "template": "blue",
+            "title": { "tag": "plain_text", "content": "✍️ 回复中" }
+        },
+        "body": { "elements": [
+            { "tag": "markdown", "content": "**正文** 已经写了一半。" },
+            { "tag": "collapsible_panel", "expanded": false, "element_id": "tool_call_1",
+              "header": { "title": { "tag": "plain_text", "content": "⏳ bash · 12:00" } },
+              "elements": [ { "tag": "markdown", "content": "被带到新卡片的还在跑" } ] },
+            { "tag": "collapsible_panel", "expanded": false, "element_id": "tool_call_gone",
+              "header": { "title": { "tag": "plain_text", "content": "⏳ 没读到的工具" } },
+              "elements": [ { "tag": "markdown", "content": "冻结的标记" } ] }
         ] }
     })
 }
@@ -5922,7 +5949,7 @@ async fn an_unobserved_running_tool_stays_on_the_old_card() {
     ]);
     let (app, platform, _backend) =
         restarted_app_with_backend(&session_file, running, Some(SessionStatus::Busy)).await;
-    platform.given_card_view("om_frozen", running_panel_card_view());
+    platform.given_card_view("om_frozen", running_panel_card_view("call_gone"));
 
     spawn_sync(&app);
     let (successor, successor_text) = wait_for_projection(&platform, "msg_cola_anchor").await;
@@ -5941,6 +5968,60 @@ async fn an_unobserved_running_tool_stays_on_the_old_card() {
     assert!(
         collect_text.contains("⏳ bash") && collect_text.contains("还在跑"),
         "a call the successor cannot render keeps its marker on the old card: {collect}"
+    );
+}
+
+/// The strip is per resolved call (spec #561, review #569): when the read
+/// carries one live-set call but not the other, only the RESOLVED call's
+/// running marker leaves the collected old card — the unread call's stays a
+/// frozen witness. The all-present case and the all-unresolved case keep their
+/// own tests.
+#[tokio::test]
+async fn the_collect_strips_only_the_running_panels_the_seed_resolved() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let delivered = "已经写了一半。";
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
+        Some(text_frontier(delivered)),
+        // The read carries `call_1` (a running `bash`); `call_gone` is NOT in
+        // it — a truncated transcript left the still-running call outside.
+        &["call_1", "call_gone"],
+    );
+    let running = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "问题"),
+        assistant_in_flight(2_000, delivered),
+        tool_assistant(3_000, ToolStatus::Running, ""),
+    ]);
+    let (app, platform, _backend) =
+        restarted_app_with_backend(&session_file, running, Some(SessionStatus::Busy)).await;
+    platform.given_card_view("om_frozen", two_running_panels_card_view());
+
+    spawn_sync(&app);
+    let (successor, successor_text) = wait_for_projection(&platform, "msg_cola_anchor").await;
+    assert!(
+        successor_text.contains("⏳ bash"),
+        "the read's own still-running call is carried live onto the successor: {successor}"
+    );
+
+    // The collect drops the resolved call's marker and keeps the unread
+    // call's frozen one.
+    let collect = last_update_of(&platform, "om_frozen")
+        .await
+        .expect("the old card is collected as taken over");
+    let collect_text = card_text(&collect);
+    assert!(
+        !collect_text.contains("被带到新卡片的还在跑"),
+        "the resolved call's running marker leaves the old card: {collect}"
+    );
+    assert!(
+        collect_text.contains("没读到的工具") && collect_text.contains("冻结的标记"),
+        "the unread call's frozen marker stays: {collect}"
     );
 }
 
@@ -6676,4 +6757,105 @@ async fn a_turn_winning_the_collect_window_never_re_renders_the_delivered_tail()
         turn_patches.iter().all(|card| !card_text(card).contains(missed)),
         "the fresh Turn never re-renders the delivered tail: {turn_patches:?}"
     );
+}
+
+/// A live run REWRITES its frontier part under the seeded follow (spec #561,
+/// review #569): the read no longer carries the prefix the successor already
+/// delivered, so the follow must REPLACE the part's run with the rewritten
+/// content — never cut the new text at the old extent, which would push a
+/// stray suffix and claim the replacement delivered. On a match, the
+/// suffix-only growth stays (the existing growth tests prove that half).
+#[tokio::test]
+async fn a_live_rewrite_of_the_frontier_part_replaces_the_successors_run() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let delivered = "已经写了一半。";
+    let streamed = "尾巴一。";
+    let adopted = format!("{delivered}{streamed}");
+    let rewritten = "换了一段全新的答案内容补充。";
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
+        Some(CursorFrontier {
+            message_id: MessageId::new("msg_a_2000"),
+            part_index: 0,
+            kind: CursorPartKind::Text,
+            started_at: Some(2_000),
+            delivered_chars: delivered.chars().count(),
+            prefix_digest: Some(cursor_prefix_digest(delivered)),
+        }),
+        &[],
+    );
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_transcript(
+        "ses_test",
+        vec![SessionTranscript::new(vec![
+            user("msg_cola_anchor", 1_000, "问题"),
+            assistant_in_flight(2_000, &adopted),
+        ])],
+    );
+    backend.with_session_status("ses_test", Some(SessionStatus::Busy));
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(
+        App::new(test_config(&session_file), backend.clone(), platform.clone()).expect("the app builds"),
+    );
+    seed_session(&app, "ses_test", "/work").await;
+    app.turn_render_poll_ms
+        .store(5, std::sync::atomic::Ordering::Relaxed);
+    app.turn_follow_read_timeout_ms
+        .store(200, std::sync::atomic::Ordering::Relaxed);
+    platform.given_reply_id("om_successor");
+
+    spawn_sync(&app);
+    let (successor, successor_text) = wait_for_projection(&platform, "msg_cola_anchor").await;
+    assert_eq!(
+        successor_text.matches(streamed).count(),
+        1,
+        "the adoption shows the streamed tail once: {successor}"
+    );
+    wait_for_cursor(&app, |cursor| {
+        cursor
+            .frontier
+            .as_ref()
+            .is_some_and(|frontier| frontier.delivered_chars == adopted.chars().count())
+    })
+    .await;
+
+    // The run rewrites the frontier part in place under the live follow.
+    backend
+        .given_transcript_after_build(
+            "ses_test",
+            vec![SessionTranscript::new(vec![
+                user("msg_cola_anchor", 1_000, "问题"),
+                assistant_in_flight(2_000, rewritten),
+            ])],
+        )
+        .await;
+    // The follow processed the rewrite: its last two characters appear in both
+    // worlds (the buggy cut keeps them as a stray suffix).
+    wait_for_card_text(&platform, "补充。").await;
+    let updates = patches_to(&platform, "om_successor").await;
+    let update = updates.last().expect("the successor was patched");
+    let text = card_text(update);
+    assert!(
+        text.contains(rewritten),
+        "the rewritten part replaces the successor's run in full: {update}"
+    );
+    assert!(
+        !text.contains(streamed),
+        "the rewritten-away run leaves the successor's card: {update}"
+    );
+    // The cursor reflects the rewritten part.
+    wait_for_cursor(&app, |cursor| {
+        cursor.frontier.as_ref().is_some_and(|frontier| {
+            frontier.delivered_chars == rewritten.chars().count()
+                && frontier.prefix_digest == Some(cursor_prefix_digest(rewritten))
+        })
+    })
+    .await;
 }
