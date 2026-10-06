@@ -10,7 +10,7 @@ pub(crate) use crate::opencode;
 use crate::backend::{
     BackgroundTask, ContentBlock, Execution, ExecutionOutcome, FinishReason, MessageId, MessageRole,
     MessageTime, Part, ReasoningPart, SessionTranscript, StepFinish, StepStart, TextPart, ToolCall,
-    ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage, TranscriptTail, TurnAnchor, Wake, WakeSource,
+    ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage, TurnAnchor, Wake, WakeSource,
 };
 
 /// One typed transcript message for view-shaped fixtures (spec #332): identity,
@@ -44,17 +44,6 @@ pub(crate) fn text_part(text: &str) -> Part {
         text: text.to_string(),
         started_at: None,
     })
-}
-
-/// The Turn anchor the carry's tail-read fixtures scope on: the orphan record's
-/// `msg_cola_anchor` message id together with the given server time. Shared by
-/// the V2 strategy tests and the bridge's carry tests, so the two fixtures
-/// cannot drift.
-pub(crate) fn tail_anchor(created_ms: i64) -> TurnAnchor {
-    TurnAnchor {
-        message_id: MessageId::new("msg_cola_anchor"),
-        created_ms,
-    }
 }
 
 /// One typed tool part — name, correlation id, status, raw input and a single
@@ -953,23 +942,10 @@ pub struct MockBackend {
     /// read in a render's liveness gather, #457). The caller's own bound must
     /// abandon it. Reversible via [`MockBackend::release_transcript_for`].
     pub hang_transcripts: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
-    /// Session id → scripted [`TranscriptTail`]s served by `transcript_tail`,
-    /// consumed one per call (the last repeating) — the restart carry's
-    /// bounded tail read (ADR-0068). A session absent from the map serves an
-    /// empty, complete tail.
-    pub transcript_tail_scripts:
-        Arc<tokio::sync::Mutex<std::collections::HashMap<String, Vec<TranscriptTail>>>>,
-    /// Records every `transcript_tail` call as `(session id, anchor)` — the
-    /// carry read's Turn scope, so a test can pin the orphan record's anchor
-    /// the takeover asked for and that exactly one tail read happened.
-    pub transcript_tail_calls: Arc<tokio::sync::Mutex<Vec<(String, TurnAnchor)>>>,
-    /// Number of initial `transcript_tail` calls to hang forever (then it
-    /// serves normally) — the timed-out carry read (ADR-0068's degrade arm).
-    pub hang_transcript_tail: Arc<std::sync::atomic::AtomicUsize>,
-    /// Session ids whose `transcript_tail` read fails with a 500 — the failed
-    /// carry read (ADR-0068's other degrade arm). Armable mid-life via
-    /// [`MockBackend::fail_transcript_tail_for`].
-    pub fail_transcript_tails: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Number of initial `transcript` calls to fail with a 500 (then the read
+    /// serves normally) — a wedged or failed read on one arm of a caller that
+    /// must degrade without failing the whole turn. Armable through `&self`.
+    pub fail_transcript_reads: Arc<std::sync::atomic::AtomicUsize>,
     /// Pending questions served by `list_questions`.
     pub questions: Vec<opencode::types::QuestionRequest>,
     /// Records `reply_question` calls: (request_id, answers). The answers are
@@ -1203,10 +1179,7 @@ impl MockBackend {
             transcript_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             fail_transcripts: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             hang_transcripts: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
-            transcript_tail_scripts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-            transcript_tail_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
-            hang_transcript_tail: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            fail_transcript_tails: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+            fail_transcript_reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             questions: Vec::new(),
             reply_question_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             reply_question_keyed_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
@@ -1506,29 +1479,13 @@ impl MockBackend {
         self.hang_transcripts.lock().await.remove(session_id);
     }
 
-    /// Scenario: `transcript_tail` serves `tails` for `session_id`, one per
-    /// call (the last repeating) — the restart carry's bounded, newest-first
-    /// tail read (ADR-0068). Sessions without a script serve an empty,
-    /// complete tail.
-    pub(crate) fn given_transcript_tail(
-        &mut self,
-        session_id: &str,
-        tails: Vec<TranscriptTail>,
-    ) -> &mut Self {
-        self.transcript_tail_scripts
-            .try_lock()
-            .expect("given_transcript_tail before the app is built")
-            .insert(session_id.to_string(), tails);
+    /// Scenario: the next `count` `transcript` reads fail with a 500 (later
+    /// reads serve normally) — one arm of a caller that must degrade without
+    /// failing the whole turn.
+    pub(crate) fn fail_transcript_reads(&self, count: usize) -> &Self {
+        self.fail_transcript_reads
+            .store(count, std::sync::atomic::Ordering::SeqCst);
         self
-    }
-
-    /// Scenario: `transcript_tail` for `session_id` fails with a 500 — the
-    /// failed carry read (ADR-0068), which must carry nothing.
-    pub(crate) async fn fail_transcript_tail_for(&self, session_id: &str) {
-        self.fail_transcript_tails
-            .lock()
-            .await
-            .insert(session_id.to_string());
     }
 
     /// Scenario: hold every `prompt` until the returned semaphore is released
@@ -2072,6 +2029,21 @@ impl crate::backend::Backend for MockBackend {
             let _permit = gate.acquire().await;
         }
         hang_if_scripted(&self.hang_transcript).await;
+        // A one-shot failure: exactly `count` initial reads serve a 500, the
+        // later ones normally — one caller's read arm degrades without
+        // failing the whole turn.
+        if self
+            .fail_transcript_reads
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0
+        {
+            self.fail_transcript_reads
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            self.transcript_calls.lock().await.push(session_id.to_string());
+            return Err(crate::error::BridgeError::OpenCode(format!(
+                "transcript {session_id} failed: 500 Internal Server Error"
+            )));
+        }
         // A per-session hang (#457): the read never resolves — the caller's own
         // bound must abandon it. The guard is dropped before parking, so a
         // release can still clear the set.
@@ -2108,39 +2080,6 @@ impl crate::backend::Backend for MockBackend {
         self.retirements.apply(session_id, &mut transcript);
         self.transcript_calls.lock().await.push(session_id.to_string());
         Ok(transcript)
-    }
-
-    /// The restart carry's bounded tail read (ADR-0068): a scripted tail wins,
-    /// recorded with the anchor the takeover asked for; a session the test
-    /// marked failing or hanging answers like the real read's error/timeout
-    /// arms. The default is an empty, complete tail.
-    async fn transcript_tail(
-        &self,
-        session_id: &str,
-        anchor: &TurnAnchor,
-    ) -> crate::error::Result<TranscriptTail> {
-        hang_if_scripted(&self.hang_transcript_tail).await;
-        self.transcript_tail_calls
-            .lock()
-            .await
-            .push((session_id.to_string(), anchor.clone()));
-        if self.fail_transcript_tails.lock().await.contains(session_id) {
-            return Err(crate::error::BridgeError::OpenCode(format!(
-                "transcript tail {session_id} failed: 500 Internal Server Error"
-            )));
-        }
-        let scripted = {
-            let mut scripts = self.transcript_tail_scripts.lock().await;
-            match scripts.get_mut(session_id) {
-                Some(script) if !script.is_empty() => Some(if script.len() == 1 {
-                    script[0].clone()
-                } else {
-                    script.remove(0)
-                }),
-                _ => None,
-            }
-        };
-        Ok(scripted.unwrap_or_default())
     }
 
     async fn list_permissions(

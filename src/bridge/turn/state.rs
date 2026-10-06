@@ -8,7 +8,7 @@
 //! accumulator's own tests are the module's internal seam.
 
 use super::disposition::Disposition;
-use crate::backend::{MessageId, Part, SessionTranscript, ToolCall, ToolStatus, TurnAnchor};
+use crate::backend::{MessageId, Part, SessionTranscript, TurnAnchor};
 use crate::bridge::chain::{CursorFrontier, CursorPartKind, RenderedCursor};
 use crate::bridge::handles::CardsHandle;
 use crate::feishu::card::first_n_chars_bytes;
@@ -100,6 +100,12 @@ pub(crate) struct CursorSeed {
     /// #561's live set): resolved by identity against the whole read — still
     /// running renders display-only, settled joins the timeline once.
     pub(super) live_calls: std::collections::BTreeSet<String>,
+    /// The Turn window the seed renders beyond the accumulator's own (spec
+    /// #561, ticket #565): the orphaned Turn's anchor carried onto a card
+    /// whose own Turn is a different one (the message-first race). `None` when
+    /// the seed's Turn IS the accumulator's (the projection), so one seed
+    /// shape serves both and `render_turn_parts` walks the scope itself.
+    pub(super) scope: Option<TurnAnchor>,
 }
 
 /// The frontier's resolved place in one read: the message's index in the
@@ -157,7 +163,51 @@ impl CursorSeed {
         Some(Self {
             frontier,
             live_calls: cursor.live_calls.clone(),
+            scope: None,
         })
+    }
+
+    /// The seed a fresh Turn's takeover resolves from the orphan record's
+    /// Rendered Cursor (spec #561, ticket #565): the cursor against this read
+    /// plus the orphaned Turn's own window as the seed's scope, so the
+    /// successor's render continues the orphan's content past its own Turn.
+    /// A cursor this read cannot place falls back to the live set alone —
+    /// nothing replays, but the calls the old card showed running still
+    /// resolve by identity.
+    pub(crate) fn for_orphan(
+        transcript: &SessionTranscript,
+        cursor: &RenderedCursor,
+        scope: &TurnAnchor,
+    ) -> Self {
+        match Self::resolve(transcript, cursor) {
+            Some(seed) => Self {
+                scope: Some(scope.clone()),
+                ..seed
+            },
+            None => Self {
+                frontier: None,
+                live_calls: cursor.live_calls.clone(),
+                scope: None,
+            },
+        }
+    }
+
+    /// The cursorless record's fallback seed (spec #561, ticket #565): no
+    /// frontier — nothing replays — but the orphaned Turn's still-live calls
+    /// enter the live set exactly as ADR-0068's carry did. A `todowrite` is
+    /// excluded: the successor's own reads rebuild the todo list.
+    pub(crate) fn live_calls_only(transcript: &SessionTranscript, scope: &TurnAnchor) -> Self {
+        let live_calls = transcript
+            .turn_running_tools(scope)
+            .iter()
+            .filter(|call| call.identity.name != "todowrite")
+            .map(|call| call.identity.call_id.clone())
+            .collect();
+        Self {
+            frontier: None,
+            live_calls,
+            scope: None,
+        }
     }
 
     /// Where the part at `(message_pos, part_index)` sits relative to the
@@ -1863,43 +1913,14 @@ impl StreamAccumulator {
         self.refresh_phase();
     }
 
-    /// Seed the orphaned Turn's still-running calls into this successor
-    /// (ADR-0068): each call enters the live tail by call identity exactly as
-    /// a rendered running panel would ([`Self::push_tool_at`]), and its id is
-    /// remembered so every later render read reconciles it past the Turn
-    /// window. Returns how many calls were carried; an already-settled call is
-    /// never carried — the carry set is the orphan's live tool signals only —
-    /// and neither is a `todowrite`: the successor's own reads rebuild the todo
-    /// list (ADR-0068's carry set).
-    pub(super) fn carry_tools(&mut self, calls: &[ToolCall]) -> usize {
-        let mut carried = 0;
-        for call in calls
-            .iter()
-            .filter(|call| call.status.is_live() && call.identity.name != "todowrite")
-        {
-            self.seeded_calls.insert(call.identity.call_id.clone());
-            self.push_tool_at(
-                call.started_at,
-                &call.identity.call_id,
-                ToolPanel::new(call.clone()),
-            );
-            // Mirror the render's running-tool arm: a carried running call is
-            // live content, so the card reads Streaming (ADR-0014) and its
-            // first flush cannot leave the header at Loading.
-            if call.status == ToolStatus::Running {
-                self.card_state = crate::feishu::card::CardState::Streaming;
-            }
-            carried += 1;
-        }
-        carried
-    }
-
-    /// Seed a projection's render from the chain's Rendered Cursor (spec #561,
-    /// tickets #563/#564): the resolved seed makes everything at or before its
-    /// frontier count as delivered, and the live set enters the identity
-    /// carry — whose reconciliation already renders a settled call once into
-    /// the timeline and keeps a still-running one display-only. The base
-    /// cursor is the confirmed fact every later candidate derives from.
+    /// Seed a render from the chain's Rendered Cursor (spec #561, tickets
+    /// #563/#564/#565): the resolved seed makes everything at or before its
+    /// frontier count as delivered, its live set enters the identity
+    /// reconciliation — which renders a settled call once into the timeline and
+    /// keeps a still-running one display-only — and its scope (when the seed's
+    /// Turn is not this accumulator's: the message-first race) marks the window
+    /// the render walks past its own. The base cursor is the confirmed fact
+    /// every later candidate derives from.
     pub(super) fn seed_projection(&mut self, cursor: &RenderedCursor, seed: CursorSeed) {
         self.cursor = cursor.clone();
         self.seed = Some(seed.clone());
@@ -2277,7 +2298,7 @@ impl StreamAccumulator {
             // card's budget: the todo list, the Background Task Ledger, then
             // every running tool's panel (ADR-0045). When they don't fit, the
             // card finalizes without the tail and the continuation carries it.
-            // A still-running Carried Tool Panel is excluded on a card no live
+            // A still-running seeded panel is excluded on a card no live
             // renderer owns, exactly as `build_card_inner` omits it
             // ([`Self::omitted_live_seeded`]): the reserve must not charge for
             // what the build will not render.
@@ -2470,9 +2491,9 @@ impl StreamAccumulator {
             // finalizes the card without them; they continue on the newest
             // card and join the timeline once they settle (ADR-0045).
             //
-            // A still-running Carried Tool Panel (ADR-0068) is omitted when no
-            // live renderer owns the card ([`Self::omitted_live_seeded`],
-            // under this build's effective `state`); a carried call that
+            // A still-running seeded panel (spec #561's live set) is omitted
+            // when no live renderer owns the card ([`Self::omitted_live_seeded`],
+            // under this build's effective `state`); a seeded call that
             // settled before the end is a timeline entry and still renders
             // below/above like any other.
             for (call_id, live) in &self.live_tools {

@@ -476,8 +476,8 @@ impl Turn {
         // and persist the durable record (ADR-0063) — the anchor follows on the
         // first read that carries the submitted message. A previously recorded
         // orphan this Turn's card replaces is handed back uncollected, so the
-        // restart carry below can tell the collect whether it moved the
-        // orphan's running tail (ADR-0068).
+        // takeover seed below can tell the collect whether it resolved the
+        // orphan's running tail onto the successor (spec #561).
         let orphan = Self::take_over_card_deferring_collect(
             &handles.cards,
             &session_id,
@@ -485,20 +485,23 @@ impl Turn {
             Some(&session_dir),
         )
         .await;
-        // The restart carry (ADR-0068): hand the orphaned Turn's still-running
-        // tool calls to this fresh card's live tail — a display-only seed, no
-        // anchor/record/settle input moves — before the prompt is submitted.
-        // The collect follows the carry: the orphan card's running `⏳` panels
-        // may leave its preserved body only when the carry actually moved them
-        // here; the Background Task Ledger leaves it either way (this card's
-        // own reads rebuild the live list).
+        // The takeover seed (spec #561, ticket #565): resolve the orphaned
+        // chain's Rendered Cursor against the session's own read and hand the
+        // fresh card the orphan Turn's undelivered delta — its window, cut at
+        // the confirmed frontier, plus the live-set calls resolved by identity
+        // — before the prompt is submitted. A message that wins the race
+        // against the adoption shows the run's final undelivered tail exactly
+        // once, as a continuation; the collect follows the seed, so the orphan
+        // card's running `⏳` panels leave its preserved body only when the seed
+        // actually resolved them here (the Background Task Ledger leaves either
+        // way: this card's own reads rebuild the live list).
         if let Some(orphan) = orphan {
-            let carried = Self::carry_orphan_tools(handles, &session_id, &new_card_id, &orphan).await;
+            let resolved = Self::seed_orphan_delta(handles, &session_id, &new_card_id, &orphan).await;
             crate::bridge::chain::collect_orphan_after_takeover(
                 &handles.cards,
                 &session_id,
                 &orphan.card_message_id,
-                carried > 0,
+                resolved,
             )
             .await;
         }
@@ -1465,10 +1468,10 @@ pub(crate) enum PredecessorCollect {
     /// Wake continuation armed after a restart (the fresh Turn uses
     /// [`Turn::take_over_card_deferring_collect`] instead).
     Now,
-    /// Hand the predecessor back **uncollected**: the fresh Turn's restart
-    /// carry (ADR-0068) reads the orphan first, and only its result can tell
-    /// the collect whether the orphan card's running `⏳` panels moved onto
-    /// the successor — so the collect happens after the carry. The record and
+    /// Hand the predecessor back **uncollected**: the fresh Turn's seed (spec
+    /// #561, ticket #565) reads the orphan first, and only its result can tell
+    /// the collect whether the orphan card's running `⏳` panels resolved onto
+    /// the successor — so the collect happens after the seed. The record and
     /// the in-memory card id are already the successor's when this returns,
     /// so nothing else owns the orphan in between.
     Deferred,
@@ -1509,7 +1512,7 @@ impl Turn {
     /// [`PredecessorCollect::Now`] collects it as taken over where this send
     /// opens a new chain over an orphan (a Wake continuation armed after a
     /// restart, an external arm), [`PredecessorCollect::Deferred`] hands it
-    /// back uncollected (the fresh Turn's restart carry, ADR-0068, decides the
+    /// back uncollected (the fresh Turn's takeover seed, spec #561, decides the
     /// collect only after its read), and [`PredecessorCollect::Never`] is for
     /// a send that continues the same chain (a split's continuation, a
     /// re-adopt), whose predecessor the split — or the static snapshot it
@@ -1517,8 +1520,8 @@ impl Turn {
     /// [`Self::take_over_card`] (or its deferred sibling), which owns the
     /// attach-then-collect order. Returns the predecessor record this send
     /// took over — `Some` exactly when a DIFFERENT recorded card was handed
-    /// over — so the caller can read the orphan's anchor (the fresh-Turn
-    /// carry, ADR-0068).
+    /// over — so the caller can read the orphan's anchor and cursor (the
+    /// fresh-Turn seed, ticket #565).
     ///
     /// `directory` is the Session's directory when the caller knows it (a
     /// Turn's mapping, an external arm); `None` falls back to the card's own
@@ -1619,15 +1622,16 @@ impl Turn {
     }
 
     /// [`Self::take_over_card`] with the predecessor's collect **deferred** to
-    /// the caller (ADR-0068): the fresh Turn takes the chain over first, then
-    /// runs the restart carry, and only the carry's result can tell the collect
-    /// whether the orphan card's running `⏳` panels moved onto the successor —
-    /// so the carry reads the orphan before the collect strips anything. The
-    /// record and the in-memory card id are already the successor's when this
-    /// returns, so nothing else can own the orphan in between. Returns the
-    /// predecessor to carry from — `None` when no different card was taken
-    /// over — and the caller must collect it with
-    /// [`crate::bridge::chain::collect_orphan`] once the carry has run.
+    /// the caller (spec #561, ticket #565): the fresh Turn takes the chain over
+    /// first, then resolves the takeover seed, and only the seed's result can
+    /// tell the collect whether the orphan card's running `⏳` panels resolved
+    /// onto the successor — so the seed reads the orphan before the collect
+    /// strips anything. The record and the in-memory card id are already the
+    /// successor's when this returns, so nothing else can own the orphan in
+    /// between. Returns the predecessor to seed from — `None` when no different
+    /// card was taken over — and the caller must collect it with
+    /// [`crate::bridge::chain::collect_orphan_after_takeover`] once the seed
+    /// has run.
     pub(crate) async fn take_over_card_deferring_collect(
         cards: &CardsHandle,
         session_id: &str,
@@ -1653,80 +1657,93 @@ impl Turn {
         }
     }
 
-    /// Carry the orphaned Turn's still-running tool calls onto this fresh
-    /// card's live tail (ADR-0068): a bounded, newest-first Session Transcript
-    /// tail read scoped by the orphan's anchor, its `running`/`pending` calls
-    /// seeded by call identity into the successor `successor_card_id` — and
-    /// only while that successor is still the session's card: the read runs
-    /// unlocked, and a card another Turn put there meanwhile must never
-    /// receive the orphan's tools. Display-only. A record with no anchor
-    /// carries nothing; a failed, timed-out or page-cap-stopped read carries
-    /// nothing and leaves today's takeover exactly as it was. One INFO line
-    /// records the decision (session + outcome, never chat content). Returns
-    /// how many calls actually moved (0 for every "carried nothing" arm) — the
-    /// takeover's collect reads it to decide whether the orphan card's running
-    /// `⏳` panels go with them.
+    /// Seed the fresh Turn's card from the orphaned chain's Rendered Cursor
+    /// (spec #561, ticket #565): one bounded Session Transcript read, resolved
+    /// into the projection seed the reap's adoption also uses — the orphaned
+    /// Turn's window cut at the confirmed frontier, plus its live set resolved
+    /// by identity — so a message that wins the race against the adoption
+    /// still shows the run's final undelivered tail exactly once, as a
+    /// continuation before the new Turn's content.
+    ///
+    /// The seed lands only while `successor_card_id` is still the session's
+    /// card: the read runs unlocked, and a card another Turn put there
+    /// meanwhile must never receive the orphan's content — it belongs to no
+    /// successor of it. A record with no anchor seeds nothing; a failed or
+    /// timed-out read seeds nothing and leaves today's takeover exactly as it
+    /// was. A record with no cursor keeps today's carry as the seed's
+    /// live-set fallback: the orphaned Turn's still-live calls resolve by
+    /// identity, no content replays. One INFO line records the decision
+    /// (session + outcome, never chat content). Returns whether the seed
+    /// resolved any live call — the takeover's collect reads it to decide
+    /// whether the orphan card's running `⏳` panels go with them.
     ///
     /// Only a fresh Turn's takeover calls this: a Wake continuation keeps
-    /// ADR-0061's no-replay scope and the reap/external arms never carry.
-    async fn carry_orphan_tools(
+    /// ADR-0061's no-replay scope and the reap/external arms never seed.
+    async fn seed_orphan_delta(
         handles: &TurnHandles,
         session_id: &str,
         successor_card_id: &str,
         orphan: &ChainRecord,
-    ) -> usize {
+    ) -> bool {
         let Some(anchor) = orphan.anchor() else {
-            tracing::info!("restart carry: session {session_id} none (no anchor)");
-            return 0;
+            tracing::info!("restart seed: session {session_id} none (no anchor)");
+            return false;
         };
         let read = crate::bridge::bounded_call(
-            "restart carry transcript tail",
+            "restart seed transcript",
             handles.config.follow_read_timeout_ms(),
-            handles.backend.transcript_tail(session_id, &anchor),
+            handles.backend.transcript(session_id),
         )
         .await;
-        let tail = match read {
-            Some(Ok(tail)) => tail,
+        let transcript = match read {
+            Some(Ok(transcript)) => transcript,
             Some(Err(error)) => {
-                tracing::debug!("restart carry: session {session_id} tail read failed: {error}");
-                tracing::info!("restart carry: session {session_id} none (read failed)");
-                return 0;
+                tracing::debug!("restart seed: session {session_id} read failed: {error}");
+                tracing::info!("restart seed: session {session_id} none (read failed)");
+                return false;
             }
             None => {
-                tracing::info!("restart carry: session {session_id} none (read timed out)");
-                return 0;
+                tracing::info!("restart seed: session {session_id} none (read timed out)");
+                return false;
             }
         };
-        if !tail.complete {
-            tracing::info!("restart carry: session {session_id} none (page cap)");
-            return 0;
-        }
-        let calls = tail.transcript.turn_running_tools(&anchor);
-        let carried = {
-            let mut live = handles.cards.cards.lock().await;
-            Self::seed_carried_tools(&mut live, session_id, successor_card_id, &calls)
+        let seed = match &orphan.cursor {
+            Some(cursor) => state::CursorSeed::for_orphan(&transcript, cursor, &anchor),
+            None => state::CursorSeed::live_calls_only(&transcript, &anchor),
         };
-        tracing::info!("restart carry: session {session_id} carried {carried}");
-        carried
+        let resolved = seed.resolves_live_calls();
+        // The cursor the seed derives from: the orphan's confirmed one, or the
+        // default a cursorless record starts from.
+        let cursor = orphan.cursor.clone().unwrap_or_default();
+        let applied = {
+            let mut live = handles.cards.cards.lock().await;
+            Self::apply_orphan_seed(&mut live, session_id, successor_card_id, &cursor, seed)
+        };
+        tracing::info!(
+            "restart seed: session {session_id} resolved {resolved} live calls (applied {applied})"
+        );
+        applied && resolved
     }
 
-    /// Seed the orphan's carried `calls` into `session_id`'s accumulator, but
-    /// only while that card session is still `successor_card_id`'s (ADR-0068):
-    /// the carry's tail read runs unlocked, and a card another Turn replaced
-    /// meanwhile must never receive the orphan's tools — they belong to no
-    /// successor of it. Returns how many calls were seeded.
-    fn seed_carried_tools(
+    /// Apply a resolved seed to `session_id`'s accumulator, but only while that
+    /// card session is still `successor_card_id`'s: the caller's transcript
+    /// read runs unlocked, and a card another Turn replaced meanwhile must
+    /// never receive the orphan's content — it belongs to no successor of it.
+    /// Returns whether the seed landed.
+    fn apply_orphan_seed(
         live: &mut std::collections::HashMap<String, state::CardSession>,
         session_id: &str,
         successor_card_id: &str,
-        calls: &[crate::backend::ToolCall],
-    ) -> usize {
+        cursor: &RenderedCursor,
+        seed: state::CursorSeed,
+    ) -> bool {
         match live.get_mut(session_id) {
             Some(card) if card.card_message_id.as_deref() == Some(successor_card_id) => {
-                card.acc.carry_tools(calls)
+                card.acc.seed_projection(cursor, seed);
+                true
             }
             // The successor was replaced during the read: nothing to seed.
-            _ => 0,
+            _ => false,
         }
     }
 
@@ -3808,23 +3825,20 @@ mod tests {
         }
     }
 
-    /// ADR-0068: the carry seeds its calls only into the successor it was read
-    /// for. The read runs unlocked, so a card session another Turn replaced
-    /// meanwhile must never receive the orphan's tools.
+    /// A takeover's seed lands only in the successor it was read for (spec
+    /// #561, ticket #565): the transcript read runs unlocked, so a card
+    /// session another Turn replaced meanwhile must never receive the
+    /// orphan's content.
     #[test]
-    fn carried_tools_never_seed_a_replaced_successor() {
-        use crate::backend::{ToolCall, ToolIdentity, ToolOutput, ToolStatus};
-
-        let call = ToolCall {
-            identity: ToolIdentity {
-                name: "shell".into(),
-                call_id: "call_sleep".into(),
-            },
-            status: ToolStatus::Running,
-            started_at: Some(1_000),
-            input: None,
-            metadata: None,
-            output: ToolOutput::default(),
+    fn the_orphan_seed_never_lands_on_a_replaced_successor() {
+        let cursor = RenderedCursor {
+            frontier: None,
+            live_calls: ["call_sleep".to_string()].into_iter().collect(),
+        };
+        let seed = state::CursorSeed {
+            frontier: None,
+            live_calls: cursor.live_calls.clone(),
+            scope: None,
         };
         let mut live = std::collections::HashMap::new();
         live.insert(
@@ -3835,10 +3849,9 @@ mod tests {
             ),
         );
 
-        // The successor this carry was read for: the call seeds its tail.
-        assert_eq!(
-            Turn::seed_carried_tools(&mut live, "ses_test", "om_successor", std::slice::from_ref(&call)),
-            1,
+        // The successor this seed was read for: it lands.
+        assert!(
+            Turn::apply_orphan_seed(&mut live, "ses_test", "om_successor", &cursor, seed.clone()),
             "the read's own successor is seeded"
         );
         assert!(live["ses_test"].acc.seeded_calls.contains("call_sleep"));
@@ -3852,10 +3865,9 @@ mod tests {
                 Some("om_newer".to_string()),
             ),
         );
-        assert_eq!(
-            Turn::seed_carried_tools(&mut live, "ses_test", "om_successor", std::slice::from_ref(&call)),
-            0,
-            "a replaced successor carries nothing"
+        assert!(
+            !Turn::apply_orphan_seed(&mut live, "ses_test", "om_successor", &cursor, seed),
+            "a replaced successor receives nothing"
         );
         assert!(live["ses_test"].acc.seeded_calls.is_empty());
         assert!(live["ses_test"].acc.tools.is_empty());
