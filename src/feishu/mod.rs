@@ -128,6 +128,23 @@ pub trait Platform: Send + Sync {
     fn has_pending_card_update(&self, _message_id: &str) -> bool {
         false
     }
+
+    /// The sequence of `message_id`'s newest card write when it is still owed
+    /// as a Pending Card Update carrying exactly `card` — the Rendered
+    /// Cursor's tie to the payload a drain will retry (spec #561). `None` when
+    /// nothing is owed, the newest owed payload is a different one, or the
+    /// platform does not observe card writes.
+    fn pending_card_write(&self, _message_id: &str, _card: &Value) -> Option<u64> {
+        None
+    }
+
+    /// Whether `message_id`'s card write `seq` settled **delivered** — the
+    /// confirmation the drain reconcile advances the Rendered Cursor on
+    /// (spec #561). `false` while the write is still owed, was permanently
+    /// refused, was superseded or evicted, or is not observed.
+    fn card_write_delivered(&self, _message_id: &str, _seq: u64) -> bool {
+        false
+    }
 }
 
 #[async_trait]

@@ -59,6 +59,11 @@ struct PendingEntry {
     seq: u64,
     /// The undelivered newest card JSON; `None` for a settled tombstone.
     card: Option<Value>,
+    /// Whether the settled write actually reached Feishu. Meaningless while
+    /// `card` is `Some` (the payload is still owed); a settled tombstone
+    /// carries it so the Rendered Cursor's drain reconcile can tell a
+    /// delivery from a permanent refusal (spec #561).
+    delivered: bool,
     /// Failed retry attempts so far — the backoff exponent.
     attempts: u32,
     /// The earliest instant the next retry may go out (unless forced).
@@ -167,6 +172,7 @@ impl CardDelivery {
             PendingEntry {
                 seq,
                 card: Some(card.clone()),
+                delivered: false,
                 attempts: 0,
                 next_attempt: tokio::time::Instant::now() + self.backoff_base,
                 lock: state.locks.entry(message_id.to_string()).or_default().clone(),
@@ -174,10 +180,13 @@ impl CardDelivery {
         } else {
             // Delivered, or a permanent refusal (a rejected card, a gone
             // message, a non-recoverable 4xx): the payload can never usefully
-            // be retried, so only the sequence is remembered.
+            // be retried, so only the sequence is remembered — together with
+            // whether it actually landed, which the Rendered Cursor's drain
+            // reconcile reads (spec #561).
             PendingEntry {
                 seq,
                 card: None,
+                delivered: result.is_ok(),
                 attempts: 0,
                 next_attempt: tokio::time::Instant::now(),
                 lock: state.locks.entry(message_id.to_string()).or_default().clone(),
@@ -399,9 +408,11 @@ impl Platform for CardDelivery {
                 Ok(()) => {
                     // Keep the sequence as a settled tombstone: an outcome that
                     // is not newer than the stored one must not re-register
-                    // behind it.
+                    // behind it. `delivered` is what the Rendered Cursor's
+                    // drain reconcile confirms against (spec #561).
                     if let Some(current) = state.entries.get_mut(&message_id) {
                         current.card = None;
+                        current.delivered = true;
                     }
                     if entry.attempts > 0 {
                         tracing::info!(
@@ -419,9 +430,11 @@ impl Platform for CardDelivery {
                 }
                 Err(e) => {
                     // A permanent refusal is settled too: the tombstone keeps
-                    // an older slow failure from re-registering.
+                    // an older slow failure from re-registering, and records
+                    // that nothing was delivered (spec #561).
                     if let Some(current) = state.entries.get_mut(&message_id) {
                         current.card = None;
+                        current.delivered = false;
                     }
                     tracing::warn!("pending card update for {message_id} dropped: {e}");
                 }
@@ -432,6 +445,24 @@ impl Platform for CardDelivery {
 
     fn has_pending_card_update(&self, message_id: &str) -> bool {
         self.pending(message_id)
+    }
+
+    fn pending_card_write(&self, message_id: &str, card: &Value) -> Option<u64> {
+        self.state
+            .lock()
+            .unwrap()
+            .entries
+            .get(message_id)
+            .and_then(|entry| (entry.card.as_ref() == Some(card)).then_some(entry.seq))
+    }
+
+    fn card_write_delivered(&self, message_id: &str, seq: u64) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .entries
+            .get(message_id)
+            .is_some_and(|entry| entry.seq == seq && entry.card.is_none() && entry.delivered)
     }
 }
 
@@ -619,6 +650,51 @@ mod tests {
             "the newest payload went out"
         );
         assert!(!delivery.pending("om_1"), "a delivered retry clears the entry");
+    }
+
+    /// Spec #561: the Rendered Cursor's tie to the outbox. Only the owed
+    /// payload's exact write reports a pending sequence, and only that
+    /// sequence's delivered outcome confirms it — a refusal or a different
+    /// payload/sequence never does.
+    #[tokio::test]
+    async fn the_pending_write_tie_reports_only_this_payloads_delivery() {
+        let inner = Arc::new(FakePlatform::new());
+        let delivery = CardDelivery::new(inner.clone());
+        let card = serde_json::json!({ "body": "owed" });
+        let other = serde_json::json!({ "body": "other" });
+
+        inner.fail_next(Fail::Transport);
+        let _ = delivery.update_message("om_1", &card).await;
+        let seq = delivery
+            .pending_card_write("om_1", &card)
+            .expect("the owed payload is tied to its sequence");
+        assert_eq!(
+            delivery.pending_card_write("om_1", &other),
+            None,
+            "a different payload has no tie"
+        );
+        assert!(
+            !delivery.card_write_delivered("om_1", seq),
+            "a still-owed write is not a delivery"
+        );
+
+        delivery.drain_pending_card_updates(true).await;
+        assert!(
+            delivery.card_write_delivered("om_1", seq),
+            "the drain's delivery confirms exactly that sequence"
+        );
+        assert!(
+            !delivery.card_write_delivered("om_1", seq + 1),
+            "another sequence is never confirmed"
+        );
+
+        // A permanent refusal settles without a delivery.
+        inner.fail_next(Fail::ContentRejected);
+        let _ = delivery.update_message("om_1", &other).await;
+        assert!(
+            !delivery.card_write_delivered("om_1", seq + 1),
+            "a refused write is never a delivery"
+        );
     }
 
     /// The newest failed payload wins: an older failure never overwrites it,

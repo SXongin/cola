@@ -49,7 +49,7 @@ pub(crate) fn assistant(created: i64, text: &str) -> TranscriptMessage {
 /// An assistant message whose only content is one `bash` tool call in the
 /// given state — the #284 fixture: a panel still `running` when the drain
 /// bound lands, whose later `completed` update must still reach the card.
-fn tool_assistant(created: i64, status: ToolStatus, output: &str) -> TranscriptMessage {
+pub(crate) fn tool_assistant(created: i64, status: ToolStatus, output: &str) -> TranscriptMessage {
     typed_message(
         &format!("msg_tool_{created}"),
         MessageRole::Assistant,
@@ -189,7 +189,7 @@ async fn run_to_handoff(app: &Arc<App>, platform: &RecordingPlatform) {
 
 /// Settle the scenario's `bash` panel in the scripted transcript the follow
 /// reads (`status`/`output` — the server's own part update).
-async fn settle_tool(backend: &Arc<MockBackend>, status: ToolStatus, output: &str) {
+pub(crate) async fn settle_tool(backend: &Arc<MockBackend>, status: ToolStatus, output: &str) {
     let mut scripts = backend.transcript_scripts.lock().await;
     let transcript = &mut scripts.get_mut("ses_test").unwrap()[0];
     let message = transcript.messages.last_mut().unwrap();

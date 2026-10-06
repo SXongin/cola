@@ -11,6 +11,11 @@ mod state;
 /// through the interface above (spec #298, A3).
 pub(crate) use state::CardSession;
 
+/// The Rendered Cursor's drain reconcile (spec #561): after the Platform's
+/// Pending Card Update drain, Session Sync advances every staged cursor whose
+/// owed payload has delivered.
+pub(crate) use flush::reconcile_staged_cursors;
+
 /// The one card ownership verdict (ADR-0070, spec #545): computed by one read
 /// over the waits state and the card map; the prompt router, the Wake gate,
 /// the reap and the `/stop` acknowledgement read its named rules. Its module
@@ -32,7 +37,7 @@ use std::sync::Arc;
 use tracing::Instrument;
 
 use crate::backend::{MessageId, MessageRole, SessionTranscript, TurnAnchor, TurnSettle, WakeSource};
-use crate::bridge::chain::ChainRecord;
+use crate::bridge::chain::{ChainRecord, RenderedCursor};
 use crate::bridge::handler::image_inputs;
 use crate::bridge::handles::{
     CardsHandle, FlowHandles, NoticeRules, RequestsHandle, SessionsHandle, TurnHandles,
@@ -1550,6 +1555,19 @@ impl Turn {
             created_ms,
             directory.as_deref(),
         );
+        // A re-point within the chain carries the Rendered Cursor (spec #561).
+        // Seed a fresh accumulator's empty base with the carried fact — a new
+        // Turn's or a takeover's card must not clear the chain's frontier —
+        // while a split continuation's accumulator already carries the same
+        // value and keeps its own.
+        if let Some(cursor) = previous.as_ref().and_then(|record| record.cursor.clone()) {
+            let mut live = cards.cards.lock().await;
+            if let Some(card) = live.get_mut(session_id)
+                && card.acc.cursor == RenderedCursor::default()
+            {
+                card.acc.cursor = cursor;
+            }
+        }
         if collect == PredecessorCollect::Never {
             return None;
         }
