@@ -184,6 +184,18 @@ impl CardOwnership {
             None
         }
     }
+
+    /// The durable reap's claim (ADR-0063): the Session's card is not orphaned
+    /// while this process holds a guard — a Turn, or the out-of-turn follow
+    /// that inherited it — or a message is still being routed to it. The
+    /// pending claim COUNTS here, unlike the routing key: a message about to
+    /// land owns no card yet (the #428 strand), but the reap must wait for it
+    /// or its PATCH races the message's admission. The reap pairs this claim
+    /// with its own record-relative facts (the Chain Record module's probe) and
+    /// never re-reads the waits state.
+    pub(crate) fn reap_claim(&self) -> bool {
+        self.claim() != Claim::None
+    }
 }
 
 /// The card class from one [`CardSession`]: the display state first, then the
@@ -430,6 +442,38 @@ mod tests {
         assert_eq!(absent.card_message_id(), None);
         assert_eq!(absent.turn_anchor(), None);
         assert_eq!(absent.chain_id(), None);
+    }
+
+    /// The reap's claim (ADR-0063): a guard or a pending-inbound message
+    /// claims the Session — the message about to land included, unlike routing
+    /// (the #428 strand) — and the claim is independent of the card class.
+    #[tokio::test]
+    async fn reap_claim_is_guard_or_inbound() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        let cards = app.cards_handle();
+        let waits = app.waits_handle();
+
+        let rows: &[(Claim, bool)] = &[(Claim::None, false), (Claim::Inbound, true), (Claim::Guard, true)];
+        for (claim, expected) in rows {
+            set_claim(&app, *claim).await;
+            set_card(&cards, None).await;
+            assert_eq!(
+                CardOwnership::read(&cards, &waits, SID).await.reap_claim(),
+                *expected,
+                "the reap claim for {claim:?} with no card"
+            );
+            // The claim half reads the same beside any card class: a yielded
+            // card this process no longer renders still claims the reap.
+            set_card(&cards, Some(CardState::Waiting)).await;
+            assert_eq!(
+                CardOwnership::read(&cards, &waits, SID).await.reap_claim(),
+                *expected,
+                "the reap claim for {claim:?} beside a yielded card"
+            );
+        }
     }
 
     /// A stale inbound claim reads as absent and its entry is dropped by the
