@@ -30,10 +30,9 @@ onto a card a renderer owns, or a reap PATCHing a card this process still
 holds. Answering "may I touch this card" means reading four modules together.
 
 The architecture review (2026-10-05, candidate 3) named the deepening; the
-design round settled the shape. This ADR records it. This step of the refactor
-is behavior-preserving: it lands the verdict whole and moves the routing rule
-onto it; the remaining rules are consumed by the follow-up tickets of spec
-#545.
+design round settled the shape, and spec #545 landed it. This ADR records the
+finished module. The refactor is behavior-preserving: the verdict landed whole,
+and every named rule is consumed at the site that used to re-derive it.
 
 ## Decision
 
@@ -92,24 +91,26 @@ in the Turn layer, answers the ownership question for every site.**
   genuinely a product — a guard can sit beside a yielded card, a pending
   message beside a render-owned one — and collapsing it would force a priority
   into the classification that the sites disagree about on purpose.
-- **Move the card map's raw state behind the verdict.** Rejected for this
-  step: card addressing (continuation replies), Turn-anchor arming/capture and
-  the stalled-poll comparison are not ownership questions; they keep their
+- **Move the card map's raw state behind the verdict.** Rejected: card
+  addressing (continuation replies), Turn-anchor arming/capture and the
+  stalled-poll comparison are not ownership questions; they keep their
   accessors (spec #545's migration scope). The ownership-domain accessors
-  (`card_is_owned`, `card_is_waiting`, the reap's claim) migrate as their
-  tickets land.
+  (`card_is_owned`, `card_is_waiting`, the reap's own claim) migrated onto the
+  verdict as the rules landed.
 
 ## Consequences
 
 - The routing verdict type (`ChainOwnership`) and `Turn::chain_ownership`
-  retire; the prompt router and the Wake gate read the one verdict's routing
+  retired; the prompt router and the Wake gate read the one verdict's routing
   rule. Behavior and the `ownership=guard|card-chain` INFO line are unchanged.
-- The classification lands whole in this step; only the routing rule is
-  consumed here. The remaining rules (admission, reap claim, `covers`, `/stop`
-  disposition) land as methods in the follow-up tickets, each consuming the
-  same verdict instead of re-deriving it.
-- The reap's divergence essay retires when the reap's claim migrates; until
-  then it points at this verdict as the intended home.
+- Every named rule is consumed at its site, each reading the same verdict
+  instead of re-deriving it: the yielded-card admission by the in-place Wake
+  resume, the Ledger refresh and the runtime observation; the reap claim by
+  `gather_reads`; `covers` by the settle loop's read-time check; the `/stop`
+  disposition by the acknowledgement.
+- The reap's divergence essay retired with the claim's migration: the reap
+  consumes the verdict's claim and keeps its record-relative probe in the
+  Chain Record module.
 - GLOSSARY gains **Card Ownership**, disambiguated from ADR-0007's owner (the
   Chat/Topic a Session is mapped to) and from the Backend's Execution.
 - The verdict seam gains a module table test: every `CardState` × claim
