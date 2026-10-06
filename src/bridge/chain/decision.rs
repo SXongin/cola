@@ -13,6 +13,14 @@
 //! continuation asks the same question of a chain with no live card in this
 //! process, sharing the [`ChainRecords`](super::ChainRecords) facts (the Wake
 //! Watermark) and the `Keep` / `NoDecision` vocabulary.
+//!
+//! The ladder's claim — a live Turn or its follow owns the session, or an
+//! inbound message is about to — comes from the one card ownership verdict
+//! (ADR-0070), never from a second read here. The converse is a declaration the
+//! ladder's tests pin: when this process holds the Session's card, the ladder
+//! never PATCHes or collects it. A `Recorded` probe — the record names this
+//! process's own card — yields `Keep` / `DiscardRecord` only; a `Successor`
+//! probe's collect arms target the recorded orphan, never the held successor.
 
 use super::records::{ChainRecord, WakeMark};
 use crate::backend::{SessionTranscript, TurnAnchor, TurnSettle};
@@ -136,8 +144,9 @@ pub(crate) struct Route<'a> {
 /// degrades to "nothing claimed", never to a wrong claim.
 #[derive(Debug)]
 pub(crate) struct RecoveryReads<'a> {
-    /// A live Turn (or the follow that inherited its guard) owns the session,
-    /// or an inbound message is about to: either way the card is not orphaned.
+    /// The ownership verdict's claim (ADR-0070) as the reap reads it: a live
+    /// Turn (or the follow that inherited its guard) owns the session, or an
+    /// inbound message is about to — either way the card is not orphaned.
     pub(crate) claimed: bool,
     /// A restart-stamp attempt is in flight for this record (#443): its write
     /// is never cancelled and may still land, ordered by the card's delivery
@@ -191,8 +200,9 @@ impl RecoveryReads<'_> {
 /// successor probe, after its collect and anchor re-read
 /// ([`RecoveryReads::needs_successor_collect`]).
 pub(crate) fn reconcile(record: &ChainRecord, reads: &RecoveryReads<'_>) -> ChainDisposition {
-    // A live Turn (or the follow that inherited its guard) owns the session,
-    // and an inbound message is about to: either way the card is not orphaned.
+    // The ownership verdict's claim (ADR-0070) owns the session: a live Turn
+    // (or the follow that inherited its guard), or an inbound message about to
+    // land — either way the card is not orphaned.
     if reads.claimed {
         return ChainDisposition::Keep;
     }
@@ -456,6 +466,106 @@ mod tests {
             ChainDisposition::Keep,
             "a terminal card whose ending is still owed keeps its record"
         );
+    }
+
+    /// The divergence essay's assertion, declared (ADR-0070, spec #545): when
+    /// this process holds the Session's card, the ladder never PATCHes or
+    /// collects it.
+    ///
+    /// The probe names the held card, and every writing disposition targets
+    /// `record.card_message_id` — the settle and the restart stamp as an
+    /// orphan's ending, both collect arms as the recorded predecessor's
+    /// takeover — so the table decides which cards are protected:
+    ///
+    /// - `Recorded`: the record's card IS this process's card (whether it has
+    ///   always named it or a takeover re-pointed it at the successor this
+    ///   process's own lifecycle owns). Every writing arm would target the
+    ///   held card, so only `Keep` / `DiscardRecord` may follow.
+    /// - `Successor`: the card this process's own lifecycle owns is the
+    ///   successor, while the record names the predecessor it no longer holds.
+    ///   The ladder's only card writes are the collect arms, and they target
+    ///   the RECORDED card — never the held successor.
+    #[test]
+    fn a_card_this_process_holds_is_never_patched_or_collected() {
+        /// The card a disposition PATCHes, when it writes one at all.
+        fn written_card<'r>(record: &'r ChainRecord, disposition: &ChainDisposition) -> Option<&'r str> {
+            match disposition {
+                ChainDisposition::Settle(_)
+                | ChainDisposition::StampRestart
+                | ChainDisposition::CollectThenRepoint { .. }
+                | ChainDisposition::CollectThenRelease => Some(record.card_message_id.as_str()),
+                ChainDisposition::Keep | ChainDisposition::NoDecision | ChainDisposition::DiscardRecord => {
+                    None
+                }
+            }
+        }
+
+        let record = record();
+        let anchor = TurnAnchor {
+            message_id: MessageId::new("msg_cola_next"),
+            created_ms: 2_000,
+        };
+
+        // The record's card is this process's card: none of the PATCHing or
+        // collecting dispositions may follow.
+        for terminal in [true, false] {
+            for update_pending in [true, false] {
+                let reads = RecoveryReads {
+                    card: CardProbe::Recorded {
+                        terminal,
+                        update_pending,
+                    },
+                    ..orphan()
+                };
+                let disposition = reconcile(&record, &reads);
+                assert!(
+                    matches!(
+                        disposition,
+                        ChainDisposition::Keep | ChainDisposition::DiscardRecord
+                    ),
+                    "the ladder must not PATCH or collect the record's own card \
+                     (terminal={terminal}, update_pending={update_pending}): {disposition:?}"
+                );
+                assert_eq!(
+                    written_card(&record, &disposition),
+                    None,
+                    "no card write may follow for the record's own card: {disposition:?}"
+                );
+            }
+        }
+
+        // A successor this process's own lifecycle owns: the ladder collects
+        // only the recorded orphan, never the held successor.
+        for (running, anchor) in [
+            (true, Some(anchor.clone())),
+            (true, None),
+            (false, Some(anchor)),
+            (false, None),
+        ] {
+            let reads = RecoveryReads {
+                card: CardProbe::Successor {
+                    card_message_id: "om_new".into(),
+                    running,
+                    anchor,
+                },
+                ..orphan()
+            };
+            let disposition = reconcile(&record, &reads);
+            assert!(
+                matches!(
+                    disposition,
+                    ChainDisposition::CollectThenRepoint { .. } | ChainDisposition::CollectThenRelease
+                ),
+                "a successor probe may only collect the recorded orphan \
+                 (running={running}): {disposition:?}"
+            );
+            assert_ne!(
+                written_card(&record, &disposition),
+                Some("om_new"),
+                "the ladder must never PATCH or collect the successor this process holds \
+                 (running={running}): {disposition:?}"
+            );
+        }
     }
 
     /// A successor: a live anchored card re-points the record at it; a

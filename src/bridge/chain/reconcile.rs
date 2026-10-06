@@ -29,6 +29,13 @@
 //! in the transcript: content the card never showed is never rebuilt, and the
 //! reap never replays a turn onto a stale card.
 //!
+//! The pass's claim — a live Turn (or the follow that inherited its guard)
+//! owns the session, or an inbound message is about to — comes from the one
+//! **card ownership verdict** ([`CardOwnership::reap_claim`], ADR-0070), never
+//! from a second read of the waits state. Everything else the ladder decides on
+//! is the record-relative probe ([`decision`]): what the record names, its
+//! terminality, the pending ending write, the successor's armed anchor.
+//!
 //! The pass is a pure decision plus a thin apply (ADR-0069's delivery cuts):
 //! [`decision::reconcile`] mirrors every outcome as one [`ChainDisposition`]
 //! over the evidence [`RecoveryReads`] carries — no I/O, failures are values —
@@ -65,7 +72,7 @@ use super::decision::{self, CardProbe, ChainDisposition, RecoveryReads, Route, S
 use super::records::ChainRecord;
 use crate::backend::TurnSettle;
 use crate::bridge::handles::{CardsHandle, FlowHandles};
-use crate::bridge::turn::{Disposition, Turn};
+use crate::bridge::turn::{CardOwnership, Disposition, Turn};
 use crate::feishu::card::{
     CardState, error_line, ledger::TASK_LEDGER_ELEMENT_ID, move_line, shell::CardBuilder,
 };
@@ -195,10 +202,12 @@ async fn gather_reads<'a>(
     directory: Option<&'a str>,
     tracked_directory: Option<&'a str>,
 ) -> RecoveryReads<'a> {
-    // A live Turn (or the follow that inherited its guard) owns the session,
-    // and an inbound message is about to: either way the card is not orphaned.
-    let claimed = handles.waits.inflight.lock().await.contains(session_id)
-        || handles.waits.inbound_pending(session_id).await;
+    // The claim comes from the one ownership verdict (ADR-0070): a live Turn
+    // (or the follow that inherited its guard) owns the session, and an
+    // inbound message is about to — either way the card is not orphaned.
+    let claimed = CardOwnership::read(&handles.cards, &handles.waits, session_id)
+        .await
+        .reap_claim();
     // The directory the card was TRACKED under: the record's own when it has
     // one, else the caller's pre-follow value. The followed route can never
     // prove a move — it already names the new location (#433).
@@ -220,19 +229,16 @@ async fn gather_reads<'a>(
     }
 }
 
-/// What THIS process knows about the session's card, as values. Why not
-/// [`crate::bridge::turn::CardOwnership`]? Routing and the Wake step need only
-/// "owned or not"; a reconcile needs the record's card id and the lifecycle
-/// distinctions below — keep a live or yielded record, drop a spent one,
-/// collect a lagged one and re-point. The two agree where it matters: the
-/// orphan branch runs only when this process holds no card identity for the
-/// session (and the record can never name a card this process is mid-admitting:
-/// `take_over_card` attaches the id before tracking), while a card this
-/// process still holds is never PATCHed by the ladder — a Waiting card
-/// included, which routing reads as unowned but whose true end this process's
-/// ledger watch still owes. A future ownership rule must be mirrored here, or
-/// the reap restructured to consume the verdict, rather than assumed to reach
-/// it.
+/// What THIS process knows about the session's card, relative to the record:
+/// whether the record names the process's current card — and if so, whether
+/// that card is terminal and whether the delivery outbox still owes it a write
+/// — or the successor in the map instead, with its id, liveness and armed Turn
+/// anchor. These record-relative distinctions are the ladder's own; whether a
+/// live Turn (or the follow that inherited its guard) owns the session, or a
+/// message is being routed to it, is the one ownership verdict's claim
+/// ([`CardOwnership::reap_claim`], ADR-0070) — read once by [`gather_reads`],
+/// never re-derived here. The ladder never PATCHes or collects a card this
+/// process holds, which [`decision`]'s declaration test pins.
 async fn probe_card(handles: &FlowHandles, session_id: &str, record: &ChainRecord) -> CardProbe {
     let Some(current_id) = Turn::card_message_id(&handles.cards, session_id).await else {
         return CardProbe::None;
