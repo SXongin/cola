@@ -2415,7 +2415,10 @@ impl Turn {
     /// renderer's "partial reply" probe before it finalizes on timeout.
     pub(crate) async fn has_rendered_content(cards: &CardsHandle, session_id: &str) -> bool {
         cards.cards.lock().await.get(session_id).is_some_and(|c| {
-            !c.acc.rendered_parts.is_empty() || !c.acc.tools.is_empty() || c.acc.todo_panel.is_some()
+            !c.acc.rendered_parts.is_empty()
+                || !c.acc.seeded_delivered.is_empty()
+                || !c.acc.tools.is_empty()
+                || c.acc.todo_panel.is_some()
         })
     }
 

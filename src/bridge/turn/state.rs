@@ -143,6 +143,13 @@ pub(super) struct SeedFrontier {
     /// `None` when the frontier IS the text/reasoning part, or a tool frontier
     /// has no text before it.
     pub(super) extent_pos: Option<(usize, usize)>,
+    /// Whether the part at the frontier is a REPLACEMENT this read carries in
+    /// the recorded slot — a tool whose start time no longer matches (spec
+    /// #561, review #569). The tool itself must render: nothing may be skipped
+    /// past a part this read replaced, so [`CursorSeed::cut`] leaves it
+    /// undelivered. Text/reasoning parts express the same rule with
+    /// `delivered_chars = 0`.
+    pub(super) replacement: bool,
 }
 
 /// A text/reasoning part's content, `""` for anything else.
@@ -257,6 +264,7 @@ impl CursorSeed {
                                     0
                                 },
                                 extent_pos: None,
+                                replacement: false,
                             }
                         }
                         Some((target_pos, target_index)) => SeedFrontier {
@@ -266,9 +274,14 @@ impl CursorSeed {
                             kind: CursorPartKind::Tool,
                             delivered_chars: frontier.delivered_chars,
                             extent_pos: Some((target_pos, target_index)),
+                            replacement: false,
                         },
-                        // No text target: nothing is skipped past the tool,
-                        // which is marked delivered.
+                        // No text target: nothing is skipped past the tool. A
+                        // tool whose start time no longer matches is a
+                        // REPLACEMENT — like a rewritten text part, it is the
+                        // frontier itself and renders (cut 0), so everything
+                        // before it stays delivered and its result is never
+                        // omitted (spec #561, review #569).
                         None => SeedFrontier {
                             message_id: frontier.message_id.clone(),
                             message_pos,
@@ -276,6 +289,7 @@ impl CursorSeed {
                             kind: CursorPartKind::Tool,
                             delivered_chars: 0,
                             extent_pos: None,
+                            replacement: !start_matches,
                         },
                     },
                     _ => SeedFrontier {
@@ -285,6 +299,7 @@ impl CursorSeed {
                         kind: frontier.kind,
                         delivered_chars: if keep_extent { frontier.delivered_chars } else { 0 },
                         extent_pos: None,
+                        replacement: false,
                     },
                 };
                 Some(frontier)
@@ -367,7 +382,10 @@ impl CursorSeed {
             };
         }
         if frontier.kind == CursorPartKind::Tool {
-            return if pos <= frontier_pos {
+            // A REPLACEMENT tool at the frontier renders (cut 0): nothing may
+            // be skipped past a part this read replaced, or its result would be
+            // omitted (spec #561, review #569).
+            return if pos < frontier_pos || (pos == frontier_pos && !frontier.replacement) {
                 SeedCut::Delivered
             } else {
                 SeedCut::Undelivered
@@ -1153,6 +1171,13 @@ pub(super) struct StreamAccumulator {
     /// re-render happens exactly when the typed call's visible content changed
     /// (including a `todowrite` list rewritten with same-length items).
     pub(super) rendered_parts: std::collections::HashSet<RenderedPart>,
+    /// Text/reasoning content a SEEDED earlier card already delivered, keyed by
+    /// the message it appeared in (spec #561, review #569): the seed's
+    /// at/before-frontier parts and the frontier part itself, marked by
+    /// [`Self::mark_delivered_part`]. Message-scoped on purpose — the content
+    /// in `rendered_parts` would swallow a NEW Turn's own part that happens to
+    /// have identical text, and the race must render the new answer.
+    pub(super) seeded_delivered: std::collections::HashSet<(crate::backend::MessageId, RenderedPart)>,
     /// Monotonic count of observable progress this accumulator has produced
     /// (#457): bumped by every render stage that changes content, a tool
     /// panel revision, a live fragment, ledger rows, or context tokens —
@@ -2316,18 +2341,24 @@ impl StreamAccumulator {
     }
 
     /// Mark one transcript part as delivered without rendering it (spec #561's
-    /// projection seed): the content-keyed dedup and the content-diff probe
-    /// then see it exactly as if the earlier body had rendered it — nothing at
-    /// or before the frontier renders again, and no Wake continuation replays
-    /// it.
-    pub(super) fn mark_delivered_part(&mut self, part: &Part) {
+    /// projection seed): the seed's own walk and the Wake step's content-diff
+    /// probe then see it exactly as delivered — nothing at or before the
+    /// frontier renders again, and no Wake continuation replays it. The
+    /// text/reasoning mark is scoped to the part's OWN message (review #569):
+    /// the same text in the NEW Turn's window is the new turn's content and
+    /// must still render. Tool panels are keyed by their call, which is unique
+    /// per call, so their current-panel dedup cannot cross turns.
+    pub(super) fn mark_delivered_part(&mut self, message_id: &crate::backend::MessageId, part: &Part) {
         match part {
             Part::Text(text) => {
-                self.rendered_parts.insert(RenderedPart::Text(text.text.clone()));
+                self.seeded_delivered
+                    .insert((message_id.clone(), RenderedPart::Text(text.text.clone())));
             }
             Part::Reasoning(reasoning) => {
-                self.rendered_parts
-                    .insert(RenderedPart::Reasoning(reasoning.text.clone()));
+                self.seeded_delivered.insert((
+                    message_id.clone(),
+                    RenderedPart::Reasoning(reasoning.text.clone()),
+                ));
             }
             Part::Tool(call) => {
                 if call.identity.name == "todowrite" {
@@ -2339,6 +2370,23 @@ impl StreamAccumulator {
                 }
             }
             Part::StepStart(_) | Part::StepFinish(_) | Part::Patch(_) | Part::Other(_) => {}
+        }
+    }
+
+    /// Whether the seed already delivered `part` in `message_id` (spec #561,
+    /// review #569): what the Wake step's content diff reads, message-scoped so
+    /// an identical part the seed never saw still counts as renderable.
+    pub(super) fn part_seeded_delivered(&self, message_id: &crate::backend::MessageId, part: &Part) -> bool {
+        match part {
+            Part::Text(text) => self
+                .seeded_delivered
+                .contains(&(message_id.clone(), RenderedPart::Text(text.text.clone()))),
+            Part::Reasoning(reasoning) => self.seeded_delivered.contains(&(
+                message_id.clone(),
+                RenderedPart::Reasoning(reasoning.text.clone()),
+            )),
+            // Tool panels dedupe by their rendered revision, never by content.
+            _ => false,
         }
     }
 
