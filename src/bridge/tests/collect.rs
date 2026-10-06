@@ -19,7 +19,7 @@ use std::time::Duration;
 use super::drain::{assistant, ctx, noticed, script_transcript, scripted_app, spawn_sync, user};
 use crate::backend::SessionTranscript;
 use crate::bridge::test_support::*;
-use crate::bridge::turn::Turn;
+use crate::bridge::turn::{CardOwnership, Turn};
 use crate::config::{ConversationKind, ThreadKey};
 use crate::feishu::card::CardState;
 use crate::opencode::types::SessionStatus;
@@ -173,7 +173,9 @@ async fn a_new_turn_collects_the_waiting_card() {
         Turn::card_state(&app.cards_handle(), "ses_test").await,
         Some(CardState::Waiting)
     );
-    let waiting_chain = Turn::chain_id(&app.cards_handle(), "ses_test").await;
+    let waiting_chain = CardOwnership::read(&app.cards_handle(), &app.waits_handle(), "ses_test")
+        .await
+        .chain_id();
     assert!(!noticed(&platform).await, "the waiting yield sends no notice");
     // The harness serves one id for every sent card; name the waiting card so
     // its PATCHes can be told apart from the new Turn's card below.
@@ -211,7 +213,9 @@ async fn a_new_turn_collects_the_waiting_card() {
         patches[0]
     );
     assert_ne!(
-        Turn::chain_id(&app.cards_handle(), "ses_test").await,
+        CardOwnership::read(&app.cards_handle(), &app.waits_handle(), "ses_test")
+            .await
+            .chain_id(),
         waiting_chain,
         "the new Turn renders on a new chain"
     );
