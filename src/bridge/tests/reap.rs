@@ -7059,3 +7059,134 @@ async fn a_failed_seed_read_keeps_a_cursor_bearing_tail_pending() {
     );
     drop(turn);
 }
+
+/// Wait until ANY card — a projection/create or an in-place update — carries
+/// `needle`, or panic after 5 s. A stopped live chain's follow may post
+/// continuations instead of PATCHing the last slice.
+async fn wait_for_any_card_text(platform: &RecordingPlatform, needle: &str) {
+    let probe = async {
+        loop {
+            let posted = platform
+                .replied_cards()
+                .await
+                .iter()
+                .any(|card| card_text(card).contains(needle));
+            let updated = platform
+                .updated_cards()
+                .await
+                .iter()
+                .any(|card| card_text(card).contains(needle));
+            if posted || updated {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), probe)
+        .await
+        .unwrap_or_else(|_| panic!("no card ever carried {needle:?}"));
+}
+
+/// A live projection whose CONTINUATION create failed still gets followed
+/// (spec #561, review #569): the last landed slice's card is handed to the
+/// follow, whose normal flush/continuation machinery carries the remaining
+/// delta and the run's future output — instead of the run freezing until the
+/// next cola restart.
+#[tokio::test]
+async fn a_stopped_live_chain_after_a_failed_continuation_is_still_followed() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let delivered = "已经写了一半。";
+    let marker = |i: usize| format!("【S{i:02}】");
+    let tail: String = (0..40)
+        .map(|i| format!("{}{}", marker(i), "长".repeat(400)))
+        .collect();
+    let full = format!("{delivered}{tail}");
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
+        Some(text_frontier(delivered)),
+        &[],
+    );
+    let running = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "问题"),
+        assistant_in_flight(2_000, &full),
+    ]);
+    let (app, platform, backend) =
+        restarted_app_with_backend(&session_file, running, Some(SessionStatus::Busy)).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+    // The first create lands; the second (a continuation slice) fails.
+    platform.given_reply_card_outcome(crate::bridge::test_support::ReplyOutcome::Lands);
+    platform.given_reply_card_outcome(crate::bridge::test_support::ReplyOutcome::Ambiguous);
+
+    spawn_sync(&app);
+    // The follow carries the slices the stopped projection never posted.
+    wait_for_posted_text(&platform, &marker(39)).await;
+
+    // The run streams on: its future output reaches the same chain.
+    let grown = format!("{full}重启之后的尾巴。");
+    backend
+        .given_transcript_after_build(
+            "ses_test",
+            vec![SessionTranscript::new(vec![
+                user("msg_cola_anchor", 1_000, "问题"),
+                assistant_in_flight(2_000, &grown),
+            ])],
+        )
+        .await;
+    wait_for_any_card_text(&platform, "重启之后的尾巴。").await;
+}
+
+/// A live projection that stops at the CHAIN BOUND is still followed (spec
+/// #561, review #569): the last landed slice's card carries the follow, so the
+/// remaining delta and the run's future output land instead of freezing until
+/// the next cola restart.
+#[tokio::test]
+async fn a_chain_bound_stop_of_a_live_projection_is_still_followed() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let delivered = "已经写了一半。";
+    let marker = |i: usize| format!("【S{i:03}】");
+    let tail: String = (0..160)
+        .map(|i| format!("{}{}", marker(i), "长".repeat(500)))
+        .collect();
+    let full = format!("{delivered}{tail}");
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
+        Some(text_frontier(delivered)),
+        &[],
+    );
+    let running = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "问题"),
+        assistant_in_flight(2_000, &full),
+    ]);
+    let (app, platform, backend) =
+        restarted_app_with_backend(&session_file, running, Some(SessionStatus::Busy)).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+
+    spawn_sync(&app);
+    // The projection stops at the chain bound; the follow carries the rest.
+    wait_for_posted_text(&platform, &marker(159)).await;
+
+    // The run streams on: its future output reaches the same chain.
+    let grown = format!("{full}重启之后的尾巴。");
+    backend
+        .given_transcript_after_build(
+            "ses_test",
+            vec![SessionTranscript::new(vec![
+                user("msg_cola_anchor", 1_000, "问题"),
+                assistant_in_flight(2_000, &grown),
+            ])],
+        )
+        .await;
+    wait_for_any_card_text(&platform, "重启之后的尾巴。").await;
+}
