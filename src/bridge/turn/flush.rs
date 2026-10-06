@@ -638,8 +638,11 @@ async fn push_queued_receipts(cards: &CardsHandle, session_id: &str) {
 /// delivered it. A queued split keeps the mark staged: its 承接 line still
 /// owes its own send, and until that lands the covered Wake is not
 /// user-visible, so a crash here must leave it unannounced for the next
-/// restart. The staged value is cleared only on a successful drain.
-pub(super) async fn drain_wake_watermark(cards: &CardsHandle, session_id: &str) {
+/// restart. The staged value is cleared only on a successful drain. The
+/// projections' confirmed creates drain through this same choke point (spec
+/// #561, ticket #566), so a Wake their successor rendered cannot be
+/// re-announced by a later recordless Fresh post.
+pub(crate) async fn drain_wake_watermark(cards: &CardsHandle, session_id: &str) {
     let staged = {
         let mut live = cards.cards.lock().await;
         let Some(card) = live.get_mut(session_id) else {

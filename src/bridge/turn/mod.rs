@@ -15,7 +15,7 @@ pub(crate) use state::CardSession;
 /// Pending Card Update drain, Session Sync advances every staged cursor whose
 /// owed payload has delivered — and the projection's successor create confirms
 /// its staged cursor through the same drain (ticket #563).
-pub(crate) use flush::{confirm_card_cursor, reconcile_staged_cursors};
+pub(crate) use flush::{confirm_card_cursor, drain_wake_watermark, reconcile_staged_cursors};
 
 /// The projection's resolved render seed (spec #561, ticket #563): the chain's
 /// Rendered Cursor placed in one transcript read, which the Chain Record
