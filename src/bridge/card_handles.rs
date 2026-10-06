@@ -178,6 +178,19 @@ impl CardHandles {
         self.mirror(message_id);
     }
 
+    /// Release a card's cached JSON while keeping its live blocks registered: a
+    /// path outside the registry repainted the card (the takeover collect), so
+    /// the cache no longer matches what Feishu shows. The block entries stay
+    /// until a successor's own `record` moves them, so a still-pending request
+    /// can still re-host — but an edit from the stale cache (the re-host's
+    /// old-card strip) can no longer resurrect the pre-collect presentation
+    /// (spec #561's adoption × re-host interleaving).
+    pub fn release_cache(&mut self, message_id: &str) {
+        if self.cards.remove(message_id).is_some() {
+            self.mirror(message_id);
+        }
+    }
+
     /// The card currently showing `request_id`'s live block.
     pub fn message_of(&self, request_id: &str) -> Option<&str> {
         self.blocks.get(request_id).map(|h| h.message_id.as_str())

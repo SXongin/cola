@@ -4497,6 +4497,184 @@ async fn a_live_adoption_announces_the_wake_its_successor_rendered() {
     wait_for_announced(&app, "ses_test", 2_900).await;
 }
 
+/// The persisted interactive-surface record's raw JSON, or `None` when the
+/// file is gone (the surfaces test's own read).
+fn persisted_surfaces(session_file: &Path) -> Option<String> {
+    std::fs::read_to_string(session_file.with_file_name("interactive_surfaces.json")).ok()
+}
+
+/// The adoption and the pending-request migration are one sequence (spec #561,
+/// ticket #564 + the Interaction Receipts boundary): a restart with a
+/// cursor-carrying record and a still-pending permission whose surface a
+/// previous life persisted adopts the live run onto a successor, and the
+/// existing re-adoption/re-host sweep lands the permission's controls on that
+/// successor within its ≤2-sweep bound — while the collected old card keeps
+/// the takeover presentation, never a stale rehost repaint that would
+/// resurrect the pre-collect card.
+#[tokio::test]
+async fn an_adoption_carries_a_pending_request_onto_the_successor() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let delivered = "已经写了一半。";
+
+    // Life 1: the permission inlined on the live card, the surface persisted
+    // beside the session store.
+    {
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.ask_permission(perm_request("per_1", "ses_test", "ls -la"));
+        let backend = Arc::new(backend);
+        let platform = Arc::new(RecordingPlatform::new());
+        let app = Arc::new(
+            App::new(test_config(&session_file), backend.clone(), platform.clone()).expect("life 1 builds"),
+        );
+        seed_session(&app, "ses_test", "/work").await;
+        let cards = app.cards_handle();
+        Turn::seed_card(&cards, "ses_test", Some("om_frozen")).await;
+        Turn::set_card_state(&cards, "ses_test", CardState::Streaming).await;
+        Turn::push_text(&cards, "ses_test", delivered).await;
+        Turn::set_reply_target(&cards, "ses_test", "msg_1").await;
+
+        let mut seen = std::collections::HashSet::new();
+        app.permission.sweep(&app.flow_handles(), &mut seen).await;
+        assert_eq!(
+            app.card_handles.lock().await.message_of("per_1"),
+            Some("om_frozen"),
+            "precondition: life 1 inlined the permission on the live card"
+        );
+        let raw = persisted_surfaces(&session_file).expect("the surface is persisted");
+        assert!(
+            raw.contains("per_1") && raw.contains("om_frozen"),
+            "the block and its card are in the record: {raw}"
+        );
+    }
+
+    // The chain record the previous life's confirmed write left behind: its
+    // cursor names the same card and the delivered prefix.
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
+        Some(text_frontier(delivered.chars().count())),
+        &[],
+    );
+
+    // Life 2: the same record and surface, the run still live.
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.ask_permission(perm_request("per_1", "ses_test", "ls -la"));
+    backend.given_transcript(
+        "ses_test",
+        vec![SessionTranscript::new(vec![
+            user("msg_cola_anchor", 1_000, "问题"),
+            assistant_in_flight(2_000, delivered),
+        ])],
+    );
+    backend.with_session_status("ses_test", Some(SessionStatus::Busy));
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(
+        App::new(test_config(&session_file), backend.clone(), platform.clone())
+            .expect("the restarted app builds"),
+    );
+    seed_session(&app, "ses_test", "/work").await;
+    platform.given_card_view("om_frozen", running_panel_card_view());
+
+    spawn_sync(&app);
+    let (_successor, successor_text) = wait_for_projection(&platform, "msg_cola_anchor").await;
+    assert!(
+        !successor_text.contains(delivered),
+        "the adoption seeds past the delivered prefix: {successor_text}"
+    );
+    // The collect lands before the sweeps, so their own writes are the only
+    // thing between the old card and the assertions.
+    wait_for_update(&platform, "om_frozen", "the takeover collect", |card| {
+        card_header(card).contains("已由新卡片接管")
+    })
+    .await;
+    // ...and its cache release lands with it: the old card's cached JSON is
+    // dropped so no later edit may repaint the pre-collect presentation.
+    let released = async {
+        loop {
+            if app.card_handles.lock().await.cached_card("om_frozen").is_none() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), released)
+        .await
+        .expect("the collect released the old card's stale handle cache");
+
+    // The migration sequence within the sweep bound: at most two permission
+    // sweeps from the adopted successor (the first re-adopts or inlines, the
+    // second re-hosts).
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+
+    assert_eq!(
+        app.card_handles.lock().await.message_of("per_1"),
+        Some("msg_reply"),
+        "the block's handle follows the successor within the bound"
+    );
+    let successor = patches_to(&platform, "msg_reply")
+        .await
+        .iter()
+        .rev()
+        .find(|card| card_text(card).contains("🔐 **权限请求**"))
+        .cloned()
+        .expect("the successor carries the permission's controls");
+    assert!(
+        card_text(&successor).contains("允许一次"),
+        "the controls are live on the successor: {successor}"
+    );
+
+    // The old card's last word is the takeover collect: the controls left it,
+    // and the collected presentation stays — a later rehost strip must never
+    // rewrite the pre-collect card from the stale handle cache (spec #561:
+    // no collected card looks live).
+    let collect = last_update_of(&platform, "om_frozen")
+        .await
+        .expect("the old card was collected");
+    assert!(
+        card_header(&collect).contains("已由新卡片接管"),
+        "the old card's last write stays the takeover collect: {collect}"
+    );
+    assert!(
+        !card_text(&collect).contains("🔐 **权限请求**"),
+        "the controls left the collected card: {collect}"
+    );
+    assert!(
+        card_text(&collect).contains("**正文** 已经写了一半。"),
+        "the collect keeps the body the old card already showed: {collect}"
+    );
+
+    // Answerable on the successor: the click resolves the request and leaves
+    // its receipt there.
+    let result = app
+        .host_action(serde_json::json!({
+            "action": "perm",
+            "reply": "once",
+            "session_id": "ses_test",
+            "directory": "/work",
+            "request_id": "per_1",
+            "open_message_id": "msg_reply",
+            "perm_label": "✅ 已允许一次",
+            "perm_color": "green",
+            "perm_body": "bash",
+        }))
+        .await
+        .expect("a card-action result");
+    let ack = card_text(result.card.as_ref().expect("the ack carries the card"));
+    assert!(
+        ack.contains("✅ 已允许一次"),
+        "the request resolves from the successor: {ack}"
+    );
+    assert_eq!(backend.reply_permission_calls.lock().await.len(), 1);
+}
+
 /// A run that dies with the server settles by transcript truth (spec #561,
 /// ticket #564): the follow needs no status read, so the transcript's own
 /// ending still lands — with no invented interruption anywhere.

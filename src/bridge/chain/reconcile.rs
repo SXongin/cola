@@ -150,10 +150,21 @@ async fn collect_orphan_with(cards: &CardsHandle, session_id: &str, card_message
     match patch_ending_keeping_body(cards.feishu.as_ref(), card_message_id, &card, keep).await {
         // The one reap vocabulary: the INFO line's ending word comes from the
         // state itself, exactly like every `ApplyPass::settle` line.
-        Ok(()) => tracing::info!(
-            "live-card reap: session {session_id} {}",
-            CardState::TakenOver.reap_word()
-        ),
+        Ok(()) => {
+            // The collect repainted the card outside the handle registry, so
+            // its cached JSON is now older than what Feishu shows (this PATCH
+            // stripped every control). Release it: the card's live blocks stay
+            // registered — a still-pending request's re-host still moves them
+            // to the successor — but the re-host's old-card strip can no
+            // longer rewrite this collected presentation from the stale cache
+            // (spec #561's adoption × re-host interleaving: a collected card
+            // must not be resurrected as a live one).
+            cards.card_handles.lock().await.release_cache(card_message_id);
+            tracing::info!(
+                "live-card reap: session {session_id} {}",
+                CardState::TakenOver.reap_word()
+            );
+        }
         Err(e) => tracing::warn!(
             "live-card reap: session {session_id} could not collect card {card_message_id}: {e}"
         ),
