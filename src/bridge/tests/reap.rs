@@ -7216,3 +7216,72 @@ async fn a_chain_bound_stop_of_a_live_projection_is_still_followed() {
         .await;
     wait_for_any_card_text(&platform, "重启之后的尾巴。").await;
 }
+
+/// The message-first race with an identical answer (spec #561, review #569):
+/// the orphan's delivered text never replays, but the NEW Turn's own part with
+/// the same content still renders — the seeded delivery must not suppress the
+/// new answer.
+#[tokio::test]
+async fn an_identical_new_answer_renders_after_the_seeded_takeover() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let orphan_anchor = 1_000_000;
+    let new_anchor = 2_000_000;
+    let answer = "同一个答案。";
+    // The orphan record's cursor covers its whole answer: nothing is left to
+    // seed, but the content was delivered.
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(orphan_anchor),
+        Some("/work"),
+        Some(CursorFrontier {
+            message_id: MessageId::new("msg_a_orphan"),
+            part_index: 0,
+            kind: CursorPartKind::Text,
+            started_at: Some(orphan_anchor + 500),
+            delivered_chars: answer.chars().count(),
+            prefix_digest: Some(cursor_prefix_digest(answer)),
+        }),
+        &[],
+    );
+    let live = SessionTranscript::new(vec![
+        user("msg_cola_anchor", orphan_anchor, "跑个长命令"),
+        TranscriptMessage {
+            id: MessageId::new("msg_a_orphan"),
+            role: MessageRole::Assistant,
+            time: Some(MessageTime {
+                created: orphan_anchor + 500,
+                completed: Some(orphan_anchor + 900),
+            }),
+            model: None,
+            tokens: None,
+            error: None,
+            parts: vec![Part::Text(TextPart {
+                text: answer.to_string(),
+                started_at: Some(orphan_anchor + 500),
+            })],
+        },
+        user("msg_cola_new", new_anchor, "新问题"),
+        // The NEW Turn's own answer: the same text.
+        assistant(new_anchor + 1_000, answer),
+    ]);
+    let (app, platform, _backend, gate) = seeded_app(&session_file, live, SessionStatus::Idle).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+    gate.add_permits(1);
+
+    let mut context = ctx("ses_test", "新问题");
+    context.cola_message_id = Some("msg_cola_new".into());
+    Turn::run(&app.turn_handles(), context).await.unwrap();
+
+    wait_for_card_header(&platform, "✅").await;
+    let cards = platform.updated_cards().await;
+    let text = card_text(cards.last().expect("the new Turn's card"));
+    assert_eq!(
+        text.matches(answer).count(),
+        1,
+        "the new Turn's identical answer renders exactly once: {text}"
+    );
+}

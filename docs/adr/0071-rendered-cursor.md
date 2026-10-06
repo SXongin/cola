@@ -180,9 +180,12 @@ projects the chain's delta after it onto a successor card.**
   and the next life resumes from the cursor.
 
 - **Render seeding.** The seed resolves the cursor against the read:
-  everything at or before the frontier counts as delivered — marked, not
-  rendered, so the content-keyed dedup and the Wake step's content diff can
-  never replay it — and the frontier part renders only its undelivered
+  everything at or before the frontier counts as delivered — marked per
+  MESSAGE, not by content alone, so the seeded suppression and the Wake step's
+  content diff can never replay the orphan's own parts while a NEW Turn's part
+  with identical text still renders (review #569, round 4; a content-global
+  mark swallowed the new answer in the message-first race) — and the frontier
+  part renders only its undelivered
   suffix, with a markdown lead (a reopened fence, a repeated table
   header/delimiter) when the cut lands inside a construct. That suffix-only
   cut holds only while the read still carries what the successor delivered:
@@ -191,7 +194,11 @@ projects the chain's delta after it onto a successor card.**
   does — replaces the part's run with the rewritten content in full, exactly
   like the ordinary render's rewrite rule (review #569, round 3). Cutting a
   rewritten part at the old extent would push a stray suffix and let the
-  cursor claim the replacement delivered. The live set resolves by call
+  cursor claim the replacement delivered. The frontier's identity rule covers
+  tools too: a settled-tool frontier whose recorded start time no longer
+  matches the slot — with or without a text extent before it — is a
+  REPLACEMENT, and it renders (cut 0) rather than being skipped, so its result
+  is never omitted (review #569, round 4). The live set resolves by call
   identity against the whole read on every render read: a
   still-running call rides the successor's live tail display-only and a call
   that settled while cola was down joins its timeline exactly once, at the

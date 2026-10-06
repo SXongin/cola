@@ -173,12 +173,21 @@ fn renders_part(acc: &StreamAccumulator, part: &Part) -> bool {
 /// Render one typed part into the accumulator, applying the dedup rules
 /// ([`renders_part`]): text and reasoning are tracked by their content
 /// (OpenCode part payloads carry NO `id`, AGENTS.md #9), and a tool call
-/// re-renders exactly when its typed panel revision changed. `source` is the
-/// part's own position in the transcript, recorded on text/reasoning timeline
+/// re-renders exactly when its typed panel revision changed. A part the SEED
+/// already delivered in this very message is skipped whatever the read's
+/// positions say (spec #561, review #569): the resolved positions can shift
+/// under a later read, and the same content in ANOTHER message — the new
+/// Turn's own answer — still renders. `source` is the part's own position in
+/// the transcript, recorded on text/reasoning timeline
 /// entries for the Rendered Cursor frontier (spec #561); callers without one
 /// (synthetic batches, the seeded live-set join) pass `None`. Returns true when
 /// the part rendered (not skipped as duplicate/empty).
 fn render_part(acc: &mut StreamAccumulator, source: Option<PartSource>, part: &Part) -> bool {
+    if let Some(source) = source.as_ref()
+        && acc.part_seeded_delivered(&source.message_id, part)
+    {
+        return false;
+    }
     if !renders_part(acc, part) {
         return false;
     }
@@ -671,7 +680,7 @@ pub(super) fn render_turn_parts(acc: &mut StreamAccumulator, transcript: &Sessio
                 // tool here stays in the display-only seeded set when it is
                 // still running (its identity reconciliation keeps it current)
                 // — only a position the window actually renders retires it.
-                crate::bridge::turn::state::SeedCut::Delivered => acc.mark_delivered_part(part),
+                crate::bridge::turn::state::SeedCut::Delivered => acc.mark_delivered_part(&message.id, part),
                 crate::bridge::turn::state::SeedCut::Frontier(delivered) => {
                     if render_seeded_part(acc, message.id.clone(), index, part, delivered) {
                         rendered_any = true;
@@ -762,7 +771,7 @@ fn render_seed_scope(
         };
         for (index, part) in message.parts.iter().enumerate() {
             match seed.cut(pos, index) {
-                crate::bridge::turn::state::SeedCut::Delivered => acc.mark_delivered_part(part),
+                crate::bridge::turn::state::SeedCut::Delivered => acc.mark_delivered_part(&message.id, part),
                 crate::bridge::turn::state::SeedCut::Frontier(delivered) => {
                     if render_seeded_part(acc, message.id.clone(), index, part, delivered) {
                         rendered = true;
@@ -806,7 +815,7 @@ fn render_seeded_part(
         // means the read changed under the cursor — mark it delivered rather
         // than guess a suffix.
         _ => {
-            acc.mark_delivered_part(part);
+            acc.mark_delivered_part(&message_id, part);
             return false;
         }
     };
@@ -825,7 +834,7 @@ fn render_seeded_part(
     // cursor claim the replacement delivered (spec #561, review #569, ADR-0071's
     // rewrite rule).
     if held > 0 && !acc.source_prefix_holds(&source, full, held) {
-        acc.mark_delivered_part(part);
+        acc.mark_delivered_part(&message_id, part);
         if is_text {
             acc.replace_text_run(&source, full, started_at);
             acc.card_state = crate::feishu::card::CardState::Streaming;
@@ -849,7 +858,7 @@ fn render_seeded_part(
     let suffix: String = full.chars().skip(cut).collect();
     // Everything up to the part's current end is delivered now: a later read
     // grows the part and renders only the growth.
-    acc.mark_delivered_part(part);
+    acc.mark_delivered_part(&message_id, part);
     if !suffix.is_empty() {
         let lead = crate::feishu::card::sanitize::neutralize_tail(&prefix, &suffix);
         let source = PartSource {
@@ -972,7 +981,10 @@ pub(super) fn renders_new_content(
 ) -> bool {
     transcript.turn_for_user(anchor).messages.iter().any(|message| {
         !acc.baseline.suppressed.contains(message.id.as_str())
-            && message.parts.iter().any(|part| renders_part(acc, part))
+            && message
+                .parts
+                .iter()
+                .any(|part| renders_part(acc, part) && !acc.part_seeded_delivered(&message.id, part))
     })
 }
 
@@ -2594,6 +2606,65 @@ Index: /x/src/main.rs
         assert!(!render_new_turn_parts(&mut acc, &answered(&full)));
     }
 
+    /// A NEW Turn's answer identical to the orphan's delivered text still
+    /// renders (spec #561, review #569): the seeded delivery suppresses the
+    /// ORPHAN's own parts, never the new Turn's — the race requires the
+    /// orphan's tail to read before the new content, and the new content must
+    /// never be swallowed by the orphan's delivery.
+    #[test]
+    fn an_identical_new_answer_is_not_swallowed_by_the_seeds_delivery() {
+        let new_anchor = 2_000_000;
+        let orphan = TurnAnchor {
+            message_id: MessageId::new("msg_cola_old"),
+            created_ms: new_anchor - 60_000,
+        };
+        let answer = "同一个答案。";
+        let transcript = SessionTranscript::new(vec![
+            typed_message(
+                "msg_cola_new",
+                MessageRole::User,
+                Some(new_anchor),
+                vec![text_part("新的问题")],
+            ),
+            // The orphan's answer, delivered in full by the cursor.
+            message_in_flight(
+                "a_orphan",
+                new_anchor - 50_000,
+                None,
+                vec![text_at(answer, new_anchor - 50_000)],
+            ),
+            // The NEW Turn's own answer: the same text.
+            message(
+                "a_new",
+                new_anchor + 1_000,
+                vec![text_at(answer, new_anchor + 1_000)],
+            ),
+        ]);
+
+        let mut acc = StreamAccumulator::new("proj");
+        acc.cola_message_id = Some("msg_cola_new".into());
+        let cursor = projection_cursor_at(
+            "a_orphan",
+            0,
+            CursorPartKind::Text,
+            Some(new_anchor - 50_000),
+            answer,
+            &[],
+        );
+        let seed =
+            CursorSeed::for_orphan_resolving(&transcript, &cursor, &orphan).expect("the cursor resolves");
+        acc.seed_projection(&cursor, seed);
+
+        let rendered = render_new_turn_parts(&mut acc, &transcript);
+        let text = card_text(&acc.build_card_with_split().0);
+        assert_eq!(
+            text.matches(answer).count(),
+            1,
+            "the new Turn's identical answer renders exactly once for the new turn: {text}"
+        );
+        assert!(rendered, "the new Turn's own answer is a render");
+    }
+
     /// A frontier message inside the new Turn's in-flight window belongs to
     /// BOTH the seed's scope and the accumulator's own window: the scope walk
     /// renders its suffix and the window skips it, so one pass renders the tail
@@ -3116,6 +3187,49 @@ Index: /x/src/main.rs
         assert!(!render_new_turn_parts(&mut acc, &settled));
         let text = card_text(&acc.build_card_with_info().card);
         assert_eq!(text.matches("done").count(), 1, "no duplication: {text}");
+    }
+
+    /// A tool frontier whose recorded start time no longer matches the read is
+    /// a REPLACEMENT (spec #561, review #569): with no text before it, nothing
+    /// may be skipped past it — the new tool renders its result instead of
+    /// being marked delivered.
+    #[test]
+    fn a_replaced_settled_tool_frontier_renders_its_result() {
+        let transcript = SessionTranscript::new(vec![message(
+            "msg_a_1",
+            100,
+            vec![tool(
+                "bash",
+                "call_new",
+                ToolStatus::Completed,
+                Some(200),
+                Some(serde_json::json!({ "command": "echo new" })),
+                Some("new-result"),
+            )],
+        )]);
+        let mut acc = StreamAccumulator::new("t");
+        acc.turn_anchor = Some(turn_anchor(50));
+        // The cursor named a settled tool in this slot, with no text before it.
+        let cursor = RenderedCursor {
+            frontier: Some(CursorFrontier {
+                message_id: MessageId::new("msg_a_1"),
+                part_index: 0,
+                kind: CursorPartKind::Tool,
+                started_at: Some(150),
+                delivered_chars: 0,
+                prefix_digest: Some(cursor_prefix_digest("")),
+            }),
+            live_calls: Default::default(),
+        };
+        let seed = CursorSeed::resolve(&transcript, &cursor).expect("the slot resolves");
+        acc.seed_projection(&cursor, seed);
+
+        render_new_turn_parts(&mut acc, &transcript);
+        let text = card_text(&acc.build_card_with_info().card);
+        assert!(
+            text.contains("new-result"),
+            "the replacement tool's result renders: {text}"
+        );
     }
 
     /// Everything at or before the frontier is delivered — including a tool
