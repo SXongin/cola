@@ -2852,6 +2852,69 @@ async fn a_record_carrying_wake_goes_through_the_projection() {
     wait_for_record_gone(&app, "ses_test").await;
 }
 
+/// A Wake whose work a projection rendered is announced exactly once (spec
+/// #561, ticket #566; ADR-0061, #424): the successor's confirmed create drains
+/// the staged Wake Watermark like any delivering card write, so a SECOND
+/// restart — recordless by then, the terminal successor having spent the
+/// record — finds the Wake covered and the Fresh gate posts nothing.
+#[tokio::test]
+async fn a_projection_announces_its_wake_across_a_second_restart() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let delivered = "已经交给后台了。";
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
+        Some(text_frontier(delivered.chars().count())),
+        &[],
+    );
+    let resumed = "CI 通过了。";
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, delivered),
+        assistant(2_500, "停机期间续写的一段。"),
+        assistant(3_100, resumed),
+    ])
+    .with_executions(vec![execution(2_600), execution(4_000)])
+    .with_wakes(vec![shell_wake(2_900)]);
+    let (app, platform, _backend) =
+        restarted_app_with_backend(&session_file, transcript.clone(), Some(SessionStatus::Idle)).await;
+    platform.given_card_view("om_frozen", live_tail_orphan_view());
+
+    // Life 1: the projection renders the Wake's resumed work and settles the
+    // successor — the confirmed create is the write that announces the Wake.
+    spawn_sync(&app);
+    let (_successor, successor_text) = wait_for_projection(&platform, "msg_cola_anchor").await;
+    assert!(successor_text.contains(resumed), "{successor_text}");
+    wait_for_record_gone(&app, "ses_test").await;
+    wait_for_announced(&app, "ses_test", 2_900).await;
+    drop(app); // life 1 ends
+
+    // Life 2: the record is spent, so the chain is recordless and only the
+    // durable Watermark can stop a re-announcement. The Fresh gate must Keep.
+    let (restarted, platform2, backend2) =
+        restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Idle)).await;
+    assert!(
+        restarted.cards_handle().chains.get("ses_test").is_none(),
+        "the terminal successor spent life 1's record"
+    );
+    spawn_sync(&restarted);
+    // The pass ran (its per-session transcript read) before the negative
+    // assertion.
+    wait_for_transcript_reads(&backend2, "ses_test", 2).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        card_posts(&platform2).await,
+        0,
+        "an announced Wake is not re-posted after a second restart: {:?}",
+        platform2.calls.lock().await
+    );
+}
+
 /// The Fresh gate narrows to recordless posts (spec #561, ticket #566): a
 /// durable record — cursorless here, so the projection has nothing to seed —
 /// hands its Wake to the reap's fallback, which settles the recorded card in
@@ -3887,9 +3950,10 @@ async fn a_projection_confirm_advances_the_cursor_it_was_confirmed_on() {
     );
 }
 
-/// A create that fails advances nothing (spec #561, ticket #563): the record
-/// keeps the old card and its cursor, the old card is never collected, and
-/// the next pass may retry.
+/// A create that fails advances nothing (spec #561, tickets #563/#566): the
+/// record keeps the old card and its cursor, the staged Wake Watermark stays
+/// unannounced — only a confirmed write advances it — the old card is never
+/// collected, and the next pass may retry.
 #[tokio::test]
 async fn a_failed_projection_create_advances_nothing() {
     let _wd = test_work_dir();
@@ -3907,11 +3971,14 @@ async fn a_failed_projection_create_advances_nothing() {
         Some(text_frontier(delivered.chars().count())),
         &[],
     );
+    // The read carries a Wake the projection would announce: the failed write
+    // must not.
     let transcript = SessionTranscript::new(vec![
         user("msg_cola_anchor", 1_000, "问题"),
         assistant(2_000, &full),
     ])
-    .with_executions(vec![execution(2_500)]);
+    .with_executions(vec![execution(2_500), execution(4_000)])
+    .with_wakes(vec![shell_wake(2_900)]);
     let (app, platform, backend) =
         restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Idle)).await;
     // Every successor create fails at the platform.
@@ -3944,6 +4011,11 @@ async fn a_failed_projection_create_advances_nothing() {
         patches_to(&platform, "om_frozen").await.len(),
         0,
         "a failed projection never collects the old card"
+    );
+    assert_eq!(
+        app.cards_handle().chains.announced("ses_test"),
+        None,
+        "a failed create announces nothing: only a confirmed write advances the Watermark"
     );
 }
 
@@ -4087,6 +4159,27 @@ async fn wait_for_record_gone(app: &Arc<App>, session_id: &str) {
     tokio::time::timeout(Duration::from_secs(5), probe)
         .await
         .unwrap_or_else(|_| panic!("the record was never released"));
+}
+
+/// Wait until the session's durable Wake Watermark covers `created_ms`, or
+/// panic after 5 s.
+async fn wait_for_announced(app: &Arc<App>, session_id: &str, created_ms: i64) {
+    let probe = async {
+        loop {
+            if app
+                .cards_handle()
+                .chains
+                .announced(session_id)
+                .is_some_and(|mark| mark.created_ms >= created_ms)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), probe)
+        .await
+        .unwrap_or_else(|_| panic!("the Wake Watermark never reached {created_ms}"));
 }
 
 /// The headline acceptance (spec #561, ticket #564): a restart while the run
@@ -4354,6 +4447,54 @@ async fn a_restart_mid_run_settles_a_tool_that_finished_while_cola_was_down() {
         !card_text(&collect).contains("⏳ bash"),
         "the resolved running panel leaves the collected card: {collect}"
     );
+}
+
+/// A Wake whose work a live adoption's successor rendered is announced by that
+/// successor's confirmed create too (spec #561, ticket #566; ADR-0061): the
+/// Watermark advances with the same staged drain the flush uses, so the
+/// announcement is durable even before the follow's first own write.
+#[tokio::test]
+async fn a_live_adoption_announces_the_wake_its_successor_rendered() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let delivered = "已经交给后台了。";
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
+        Some(text_frontier(delivered.chars().count())),
+        &[],
+    );
+    // The run is still live and the Wake resumed it: the successor's first
+    // send renders the Wake's completion entry and its resumed work.
+    let running = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant_in_flight(2_000, delivered),
+        assistant(3_100, "CI 通过了。"),
+    ])
+    .with_executions(vec![execution(2_500), execution(4_000)])
+    .with_wakes(vec![shell_wake(2_900)]);
+    let (app, platform, _backend) =
+        restarted_app_with_backend(&session_file, running, Some(SessionStatus::Busy)).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+    // No PATCH can confirm: every update fails at the transport, so the
+    // adoption's own create is the only write that can carry the announcement
+    // to the record.
+    platform
+        .fail_update_transport_count
+        .store(100, std::sync::atomic::Ordering::SeqCst);
+
+    spawn_sync(&app);
+    let (successor, successor_text) = wait_for_projection(&platform, "msg_cola_anchor").await;
+    assert!(
+        card_header(&successor).contains("回复中"),
+        "the adoption follows the live run: {successor}"
+    );
+    assert!(successor_text.contains("CI 通过了。"), "{successor}");
+    wait_for_announced(&app, "ses_test", 2_900).await;
 }
 
 /// A run that dies with the server settles by transcript truth (spec #561,
