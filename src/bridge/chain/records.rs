@@ -370,6 +370,25 @@ impl ChainRecords {
         }
     }
 
+    /// Drop `session_id`'s record only while it still names
+    /// `card_message_id` (spec #561, review #569): the ending that just landed
+    /// belongs to that card, and a chain that moved on meanwhile — a fresh Turn
+    /// taking the session over — keeps its own record. Returns whether a
+    /// record was released.
+    pub(crate) fn release_if_card(&self, session_id: &str, card_message_id: &str) -> bool {
+        let mut state = self.lock();
+        if state
+            .records
+            .get(session_id)
+            .is_none_or(|record| record.card_message_id != card_message_id)
+        {
+            return false;
+        }
+        state.records.remove(session_id);
+        self.write(&state);
+        true
+    }
+
     /// Re-key a record when the session it names is recreated under a fresh id
     /// (the 404 recreate): the card is still live, only its session id moved.
     /// The Session's announcement moves with it — the recreated id names the
@@ -746,6 +765,43 @@ mod tests {
             ChainRecords::load(path).get("ses_a"),
             None,
             "the removal persists across a reload"
+        );
+    }
+
+    /// [`ChainRecords::release_if_card`] releases only the record that still
+    /// names the card: a chain that moved on — a fresh Turn taking the session
+    /// over, review #569 — keeps its record.
+    #[test]
+    fn release_if_card_drops_only_the_record_naming_that_card() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE);
+        let chains = ChainRecords::load(path.clone());
+        chains.track(
+            "ses_a",
+            "om_card_1",
+            MessageId::new("msg_cola_1"),
+            Some(1_000),
+            None,
+        );
+
+        assert!(
+            !chains.release_if_card("ses_a", "om_stale"),
+            "another card's record is never released"
+        );
+        assert_eq!(
+            chains.get("ses_a").expect("the record survives").card_message_id,
+            "om_card_1"
+        );
+
+        assert!(
+            chains.release_if_card("ses_a", "om_card_1"),
+            "the record naming the settled card is released"
+        );
+        assert_eq!(chains.get("ses_a"), None);
+        assert_eq!(
+            ChainRecords::load(path).get("ses_a"),
+            None,
+            "the guarded removal persists across a reload"
         );
     }
 

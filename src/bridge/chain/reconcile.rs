@@ -88,7 +88,7 @@ use super::decision::{self, CardProbe, ChainDisposition, RecoveryReads, Route, S
 use super::records::ChainRecord;
 use crate::backend::{TurnAnchor, TurnSettle};
 use crate::bridge::handles::{CardsHandle, FlowHandles};
-use crate::bridge::turn::{CardOwnership, Disposition, Turn};
+use crate::bridge::turn::{ArmedTakeover, CardOwnership, Disposition, Turn};
 use crate::feishu::card::{
     CardState, error_line, ledger::TASK_LEDGER_ELEMENT_ID, move_line, shell::CardBuilder,
 };
@@ -573,13 +573,13 @@ async fn project_card(
         return;
     };
     if !projected.rendered {
-        // The cursor covered the whole read — nothing was missed. Drop the
-        // armed successor and take today's in-place ending — unless a fresh
-        // Turn replaced the armed session meanwhile: it owns the record now,
-        // and this pass must neither settle its card nor drop its session
-        // (review #569).
-        if Turn::still_armed(&handles.cards, session_id, projected.chain_id).await {
-            Turn::drop_armed_card(&handles.cards, session_id, &anchor).await;
+        // The cursor covered the whole read — nothing was missed. The armed
+        // successor is dropped and today's in-place ending taken, but only
+        // while the session is still the one this pass armed: the verify and
+        // the drop are ONE cards-map critical section (review #569), so a
+        // fresh Turn that replaced the session is never removed and never
+        // settled.
+        if Turn::drop_armed_session(&handles.cards, session_id, projected.chain_id).await {
             settle_card(handles, session_id, record, reads.route, settle, read_timeout_ms).await;
         }
         return;
@@ -601,38 +601,35 @@ async fn project_card(
                 "live-card reap: session {session_id} could not project its missed tail onto a successor: {e}"
             );
             // The send reached no card; the record keeps the old cursor and
-            // the next pass retries. Only the armed session this pass inserted
-            // may be dropped: a chain that replaced it meanwhile owns itself
-            // (review #569).
-            if Turn::still_armed(&handles.cards, session_id, projected.chain_id).await {
-                Turn::drop_armed_card(&handles.cards, session_id, &anchor).await;
-            }
+            // the next pass retries. The phantom session is dropped only while
+            // it is still this pass's armed one (review #569): a chain that
+            // replaced it meanwhile owns itself.
+            Turn::drop_armed_session(&handles.cards, session_id, projected.chain_id).await;
             return;
         }
     };
-    // A fresh Turn can start after the arm but before the awaited create
-    // returns (review #569): it replaced the armed session and re-pointed the
-    // record at its own card. The late card is collected so it cannot look
-    // live, and none of this pass's takeover writes (attach, re-point, cursor
-    // confirm, watermark drain, terminal release) may touch the Turn's chain.
-    if !Turn::still_armed(&handles.cards, session_id, projected.chain_id).await {
+    // The successor takes the chain over in ONE cards-map critical section
+    // (review #569): verify the armed session is still current, attach its
+    // identity and re-point the record, with no gap for a fresh Turn's own
+    // card insert to land in. Lost means the Turn owns the session and the
+    // record now: the late card is collected so it cannot look live, and none
+    // of this pass's takeover writes (attach, re-point, cursor confirm,
+    // watermark drain, terminal release) may touch the Turn's chain.
+    let ArmedTakeover::Took(orphan) = Turn::take_over_armed_card(
+        &handles.cards,
+        session_id,
+        projected.chain_id,
+        &new_card_id,
+        Some(route.directory),
+    )
+    .await
+    else {
         collect_orphan(&handles.cards, session_id, &new_card_id).await;
         tracing::info!(
             "live-card reap: session {session_id} lost the create window to a fresh Turn; its late card is collected"
         );
         return;
-    }
-    // The successor takes the chain over: attach its identity FIRST, re-point
-    // the record at it (carrying the cursor), then collect the recorded card
-    // as taken over — dropping the running `⏳` panels the successor resolved
-    // (ADR-0068's generalized collect).
-    let orphan = Turn::take_over_card_deferring_collect(
-        &handles.cards,
-        session_id,
-        &new_card_id,
-        Some(route.directory),
-    )
-    .await;
+    };
     if let Some(orphan) = orphan {
         crate::bridge::chain::collect_orphan_after_takeover(
             &handles.cards,
@@ -643,13 +640,17 @@ async fn project_card(
         .await;
     }
     // The confirmed create carries the successor's body: advance the chain's
-    // cursor exactly like a flush-confirmed write (spec #561).
-    crate::bridge::turn::confirm_card_cursor(&handles.cards, session_id, &new_card_id).await;
+    // cursor exactly like a flush-confirmed write (spec #561) — scoped to the
+    // armed chain, so a fresh Turn that replaced the session in the meantime
+    // never has its own staged cursor taken (review #569).
+    crate::bridge::turn::confirm_armed_cursor(&handles.cards, session_id, projected.chain_id, &new_card_id)
+        .await;
     // The same write carried every Wake completion entry the seeded render
     // staged: the confirmed create is what makes the announcement durable
     // (ADR-0061, ticket #566), so a later recordless restart cannot
-    // re-announce the Wake through the Fresh gate.
-    crate::bridge::turn::drain_wake_watermark(&handles.cards, session_id).await;
+    // re-announce the Wake through the Fresh gate. Chain-scoped like the
+    // cursor confirm.
+    crate::bridge::turn::drain_armed_watermark(&handles.cards, session_id, projected.chain_id).await;
     if state.is_terminal() {
         // The successor reached a terminal: nothing is owed a reap, and the
         // cursor goes with the record.
@@ -774,42 +775,35 @@ async fn project_live_card(
                 "live-card reap: session {session_id} could not adopt its live run onto a successor: {e}"
             );
             // The send reached no card; the record keeps the old cursor and
-            // the next pass retries. Only the armed session this pass inserted
-            // may be dropped: a chain that replaced it meanwhile owns itself
-            // (the anchor alone cannot tell a Wake continuation of the same
-            // Turn apart — review #569).
-            if Turn::still_armed(&handles.cards, session_id, projected.chain_id).await {
-                Turn::drop_armed_card(&handles.cards, session_id, &anchor).await;
-            }
+            // the next pass retries. The phantom session is dropped only while
+            // it is still this pass's armed one (review #569): a chain that
+            // replaced it meanwhile owns itself.
+            Turn::drop_armed_session(&handles.cards, session_id, projected.chain_id).await;
             return None;
         }
     };
-    // A fresh Turn can start after the arm but before the awaited create
-    // returns (review #569): it replaced the armed session and re-pointed the
-    // record at its own card. The projection then owns nothing — it must not
-    // attach its late card to that Turn's session, re-point the record back,
-    // confirm a cursor or drain a watermark there. The late card is collected
-    // so it cannot look live, and no follow is spawned.
-    if !Turn::still_armed(&handles.cards, session_id, projected.chain_id).await {
+    // The successor takes the chain over in ONE cards-map critical section
+    // (review #569): verify the armed session is still current, attach its
+    // identity and re-point the record, with no gap for a fresh Turn's own
+    // card insert to land in. Lost means the Turn owns the session and the
+    // record now: the late card is collected so it cannot look live, and none
+    // of this pass's takeover writes (attach, re-point, cursor confirm,
+    // watermark drain) may touch the Turn's chain.
+    let ArmedTakeover::Took(orphan) = Turn::take_over_armed_card(
+        &handles.cards,
+        session_id,
+        projected.chain_id,
+        &new_card_id,
+        Some(route.directory),
+    )
+    .await
+    else {
         collect_orphan(&handles.cards, session_id, &new_card_id).await;
         tracing::info!(
             "live-card reap: session {session_id} lost the create window to a fresh Turn; its late card is collected"
         );
         return None;
-    }
-    // The successor takes the chain over: attach its identity FIRST, re-point
-    // the record at it (carrying the cursor), then collect the recorded card
-    // as taken over. Every call the cursor's live set names is resolved by the
-    // successor — a still-running one carried display-only, a settled one
-    // joined to its timeline — so the collected card drops the running `⏳`
-    // panels (ADR-0068's generalized collect, ticket #564).
-    let orphan = Turn::take_over_card_deferring_collect(
-        &handles.cards,
-        session_id,
-        &new_card_id,
-        Some(route.directory),
-    )
-    .await;
+    };
     if let Some(orphan) = orphan {
         crate::bridge::chain::collect_orphan_after_takeover(
             &handles.cards,
@@ -820,13 +814,17 @@ async fn project_live_card(
         .await;
     }
     // The confirmed create carries the successor's body: advance the chain's
-    // cursor exactly like a flush-confirmed write (spec #561).
-    crate::bridge::turn::confirm_card_cursor(&handles.cards, session_id, &new_card_id).await;
+    // cursor exactly like a flush-confirmed write (spec #561) — scoped to the
+    // armed chain, so a fresh Turn that replaced the session in the meantime
+    // never has its own staged cursor taken (review #569).
+    crate::bridge::turn::confirm_armed_cursor(&handles.cards, session_id, projected.chain_id, &new_card_id)
+        .await;
     // The same write carried every Wake completion entry the seeded render
     // staged: the confirmed create is what makes the announcement durable
     // (ADR-0061, ticket #566), so a later recordless restart cannot
-    // re-announce the Wake through the Fresh gate.
-    crate::bridge::turn::drain_wake_watermark(&handles.cards, session_id).await;
+    // re-announce the Wake through the Fresh gate. Chain-scoped like the
+    // cursor confirm.
+    crate::bridge::turn::drain_armed_watermark(&handles.cards, session_id, projected.chain_id).await;
     tracing::info!("live-card reap: session {session_id} adopted its still-live run onto a successor card");
     Some(AdoptedFollow {
         card_message_id: new_card_id,
@@ -931,7 +929,13 @@ impl ApplyPass<'_> {
             state.reap_word()
         );
         if terminal {
-            self.handles.cards.chains.release(self.session_id);
+            // Release only the record this ending belongs to (review #569):
+            // between the PATCH and here a fresh Turn can take the session over
+            // and re-point the chain; that chain keeps its own record.
+            self.handles
+                .cards
+                .chains
+                .release_if_card(self.session_id, &self.record.card_message_id);
         }
         true
     }
