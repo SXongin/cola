@@ -5,10 +5,11 @@
 //!
 //! - **records** — the live card record (ADR-0063): which card a Session is
 //!   currently streaming into and the Turn it answers, plus the Session's
-//!   directory and the per-process-life reconciliation marks. Written when a
-//!   card becomes the Session's live card, re-pointed when the chain
-//!   continues, and removed when that card reaches a terminal or is
-//!   collected.
+//!   directory and the per-process-life reconciliation marks. One entry owns
+//!   its lifecycle: [`ChainRecords::track`] creates the record when a card
+//!   becomes the Session's live card and re-points it when the chain
+//!   continues, and [`ChainRecords::release`] removes it once that card
+//!   reaches a terminal or is collected.
 //! - **announcements** — the Wake Watermark (ADR-0061): the newest Wake whose
 //!   completion a card announced, advanced only after the carrying card write
 //!   lands. Monotonic per Session and never removed, so a restart cannot
@@ -251,7 +252,7 @@ impl ChainRecords {
 
     /// The session's record, when its card is (believed to be) live. The test
     /// seam: production reads the whole record through [`Self::entries`] (the
-    /// reap's pass) or the previous value [`Self::replace`] returns.
+    /// reap's pass) or the previous value [`Self::track`] returns.
     #[cfg(test)]
     pub(crate) fn get(&self, session_id: &str) -> Option<ChainRecord> {
         self.lock().records.get(session_id).cloned()
@@ -267,22 +268,36 @@ impl ChainRecords {
             .collect()
     }
 
-    /// Make `card` the session's record, returning the previous one — the
-    /// one-shot write every "a card became the session's live card" path uses.
-    /// Best-effort: a failed write leaves the in-memory record correct (the
-    /// next write retries the file), which at worst means this card is not
-    /// reaped by the next restart.
-    pub(crate) fn replace(&self, session_id: &str, card: ChainRecord) -> Option<ChainRecord> {
+    /// The one creation/re-point entry: make the record naming
+    /// `card_message_id` the session's record from the current Turn facts and
+    /// the Session's directory, whether that card opens a chain, continues it
+    /// or takes it over from a predecessor — so the same facts can never build
+    /// two different records. Returns the previous record, the predecessor a
+    /// takeover acts on. Best-effort: a failed write leaves the in-memory
+    /// record correct (the next write retries the file), which at worst means
+    /// this card is not reaped by the next restart.
+    pub(crate) fn track(
+        &self,
+        session_id: &str,
+        card_message_id: impl Into<String>,
+        message_id: MessageId,
+        created_ms: Option<i64>,
+        directory: Option<&str>,
+    ) -> Option<ChainRecord> {
         let mut state = self.lock();
-        let previous = state.records.insert(session_id.to_string(), card);
+        let previous = state.records.insert(
+            session_id.to_string(),
+            ChainRecord::new(card_message_id, message_id, created_ms)
+                .with_directory(directory.map(str::to_string)),
+        );
         self.write(&state);
         previous
     }
 
-    /// Drop the session's record — the card reached a terminal or was
-    /// collected, so nothing is owed a reap. Its announcement, if any, stays:
-    /// the watermark outlives the record it was announced on.
-    pub(crate) fn remove(&self, session_id: &str) {
+    /// The one removal: drop the session's record — the card reached a
+    /// terminal or was collected, so nothing is owed a reap. Its announcement,
+    /// if any, stays: the watermark outlives the record it was announced on.
+    pub(crate) fn release(&self, session_id: &str) {
         let mut state = self.lock();
         if state.records.remove(session_id).is_some() {
             self.write(&state);
@@ -501,22 +516,22 @@ mod tests {
     const FILE: &str = "chain_records.json";
 
     #[test]
-    fn replace_persists_and_reloads_the_record() {
+    fn track_persists_and_reloads_the_record() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(FILE);
         let chains = ChainRecords::load(path.clone());
 
         assert_eq!(
-            chains.replace(
+            chains.track(
                 "ses_a",
-                ChainRecord::new("om_card_1", MessageId::new("msg_cola_1"), Some(1_000))
+                "om_card_1",
+                MessageId::new("msg_cola_1"),
+                Some(1_000),
+                None
             ),
             None
         );
-        chains.replace(
-            "ses_b",
-            ChainRecord::new("om_card_2", MessageId::new("msg_cola_2"), None),
-        );
+        chains.track("ses_b", "om_card_2", MessageId::new("msg_cola_2"), None, None);
 
         let reloaded = ChainRecords::load(path.clone());
         assert_eq!(
@@ -533,10 +548,13 @@ mod tests {
         );
         assert_eq!(reloaded.get("ses_c"), None);
 
-        // Replacing returns the previous record and keeps one per session.
-        let previous = chains.replace(
+        // Re-tracking returns the previous record and keeps one per session.
+        let previous = chains.track(
             "ses_a",
-            ChainRecord::new("om_card_3", MessageId::new("msg_cola_1"), Some(1_000)),
+            "om_card_3",
+            MessageId::new("msg_cola_1"),
+            Some(1_000),
+            None,
         );
         assert_eq!(
             previous,
@@ -555,13 +573,39 @@ mod tests {
             ))
         );
 
-        // Removing the last record keeps the file (the migration marker) but
+        // Releasing the last record keeps the file (the migration marker) but
         // drops the records themselves.
-        chains.remove("ses_a");
-        chains.remove("ses_b");
+        chains.release("ses_a");
+        chains.release("ses_b");
         assert!(path.exists(), "the Chain Record file is kept when empty");
         assert_eq!(chains.entries().len(), 0);
         assert_eq!(ChainRecords::load(path).entries().len(), 0);
+    }
+
+    /// The release entry is the one removal: the record is gone from memory and
+    /// stays gone across a reload (a later load cannot resurrect it from the
+    /// file).
+    #[test]
+    fn release_removes_the_record_and_persists_across_a_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE);
+        let chains = ChainRecords::load(path.clone());
+        chains.track(
+            "ses_a",
+            "om_card_1",
+            MessageId::new("msg_cola_1"),
+            Some(1_000),
+            None,
+        );
+
+        chains.release("ses_a");
+        chains.release("ses_missing");
+        assert_eq!(chains.get("ses_a"), None);
+        assert_eq!(
+            ChainRecords::load(path).get("ses_a"),
+            None,
+            "the removal persists across a reload"
+        );
     }
 
     #[test]
@@ -569,9 +613,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(FILE);
         let chains = ChainRecords::load(path.clone());
-        chains.replace(
+        chains.track(
             "ses_old",
-            ChainRecord::new("om_card_1", MessageId::new("msg_cola_1"), Some(1_000)),
+            "om_card_1",
+            MessageId::new("msg_cola_1"),
+            Some(1_000),
+            None,
         );
 
         chains.rename("ses_old", "ses_fresh");
@@ -594,9 +641,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(FILE);
         let chains = ChainRecords::load(path.clone());
-        chains.replace(
+        chains.track(
             "ses_old",
-            ChainRecord::new("om_card_1", MessageId::new("msg_cola_1"), Some(1_000)),
+            "om_card_1",
+            MessageId::new("msg_cola_1"),
+            Some(1_000),
+            None,
         );
         chains.advance("ses_old", "msg_wake_1", 1_000);
 
@@ -622,9 +672,12 @@ mod tests {
         let chains = ChainRecords::load(path.clone());
         assert_eq!(chains.get("ses_a"), None, "a corrupt file reads as empty");
         // The next write replaces the corrupt file with a valid one.
-        chains.replace(
+        chains.track(
             "ses_a",
-            ChainRecord::new("om_card_1", MessageId::new("msg_cola_1"), Some(1_000)),
+            "om_card_1",
+            MessageId::new("msg_cola_1"),
+            Some(1_000),
+            None,
         );
         assert_eq!(
             ChainRecords::load(path).get("ses_a"),
@@ -643,9 +696,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(FILE);
         let chains = ChainRecords::load(path.clone());
-        chains.replace(
+        chains.track(
             "ses_a",
-            ChainRecord::new("om_card_1", MessageId::new("msg_cola_1"), Some(1_000)),
+            "om_card_1",
+            MessageId::new("msg_cola_1"),
+            Some(1_000),
+            None,
         );
 
         assert!(!chains.mark_waiting_reaped("ses_a", "om_other"));
@@ -660,9 +716,12 @@ mod tests {
                 .unwrap()
                 .waiting_reaped
         );
-        chains.replace(
+        chains.track(
             "ses_a",
-            ChainRecord::new("om_card_2", MessageId::new("msg_cola_1"), Some(1_000)),
+            "om_card_2",
+            MessageId::new("msg_cola_1"),
+            Some(1_000),
+            None,
         );
         assert!(!chains.get("ses_a").unwrap().waiting_reaped);
     }
@@ -676,9 +735,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(FILE);
         let chains = ChainRecords::load(path.clone());
-        chains.replace(
+        chains.track(
             "ses_a",
-            ChainRecord::new("om_card_1", MessageId::new("msg_cola_1"), Some(1_000)),
+            "om_card_1",
+            MessageId::new("msg_cola_1"),
+            Some(1_000),
+            None,
         );
 
         // A released claim (the transient-failure path) may be retried.
@@ -703,9 +765,12 @@ mod tests {
                 .unwrap()
                 .restart_stamp_rejected
         );
-        chains.replace(
+        chains.track(
             "ses_a",
-            ChainRecord::new("om_card_2", MessageId::new("msg_cola_1"), Some(1_000)),
+            "om_card_2",
+            MessageId::new("msg_cola_1"),
+            Some(1_000),
+            None,
         );
         assert!(!chains.get("ses_a").unwrap().restart_stamp_rejected);
     }
@@ -719,9 +784,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(FILE);
         let chains = ChainRecords::load(path.clone());
-        chains.replace(
+        chains.track(
             "ses_a",
-            ChainRecord::new("om_successor", MessageId::new("msg_cola_1"), Some(1_000)),
+            "om_successor",
+            MessageId::new("msg_cola_1"),
+            Some(1_000),
+            None,
         );
 
         assert_eq!(chains.predecessor_keep_strip("ses_a", "om_old"), None);
@@ -744,9 +812,12 @@ mod tests {
             ChainRecords::load(path.clone()).predecessor_keep_strip("ses_a", "om_old"),
             None
         );
-        chains.replace(
+        chains.track(
             "ses_a",
-            ChainRecord::new("om_next", MessageId::new("msg_cola_1"), Some(1_000)),
+            "om_next",
+            MessageId::new("msg_cola_1"),
+            Some(1_000),
+            None,
         );
         assert_eq!(chains.predecessor_keep_strip("ses_a", "om_old"), None);
     }
@@ -758,16 +829,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(FILE);
         let chains = ChainRecords::load(path.clone());
-        chains.replace(
+        chains.track(
             "ses_a",
-            ChainRecord::new("om_card_1", MessageId::new("msg_cola_1"), Some(1_000))
-                .with_directory(Some("/work".into())),
+            "om_card_1",
+            MessageId::new("msg_cola_1"),
+            Some(1_000),
+            Some("/work"),
         );
-        chains.replace(
-            "ses_b",
-            ChainRecord::new("om_card_2", MessageId::new("msg_cola_2"), None)
-                .with_directory(Some(String::new())),
-        );
+        chains.track("ses_b", "om_card_2", MessageId::new("msg_cola_2"), None, Some(""));
 
         let reloaded = ChainRecords::load(path);
         assert_eq!(reloaded.get("ses_a").unwrap().directory.as_deref(), Some("/work"));
@@ -825,13 +894,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(FILE);
         let chains = ChainRecords::load(path.clone());
-        chains.replace(
+        chains.track(
             "ses_a",
-            ChainRecord::new("om_card_1", MessageId::new("msg_cola_1"), Some(1_000)),
+            "om_card_1",
+            MessageId::new("msg_cola_1"),
+            Some(1_000),
+            None,
         );
         chains.advance("ses_a", "msg_wake_1", 1_000);
 
-        chains.remove("ses_a");
+        chains.release("ses_a");
         let reloaded = ChainRecords::load(path);
         assert_eq!(reloaded.get("ses_a"), None);
         assert_eq!(
@@ -886,7 +958,7 @@ mod tests {
 
         // Clearing the folded record persists the new file; the stale legacy
         // record must not come back on the next load.
-        chains.remove("ses_a");
+        chains.release("ses_a");
         assert!(path.exists());
         let reloaded = ChainRecords::load(path);
         assert_eq!(reloaded.get("ses_a"), None);
@@ -924,10 +996,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(FILE);
         let chains = ChainRecords::load(path.clone());
-        chains.replace(
-            "ses_new",
-            ChainRecord::new("om_new", MessageId::new("msg_cola_new"), None),
-        );
+        chains.track("ses_new", "om_new", MessageId::new("msg_cola_new"), None, None);
         std::fs::write(
             dir.path().join("live_cards.json"),
             r#"{"sessions":{"ses_old":{"card_message_id":"om_old","message_id":"msg_cola_old"}}}"#,

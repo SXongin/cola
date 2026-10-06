@@ -1543,10 +1543,12 @@ impl Turn {
             .map(str::to_string)
             .filter(|directory| !directory.is_empty())
             .or(context_directory);
-        let previous = cards.chains.replace(
+        let previous = cards.chains.track(
             session_id,
-            crate::bridge::chain::ChainRecord::new(card_message_id, message_id, created_ms)
-                .with_directory(directory),
+            card_message_id,
+            message_id,
+            created_ms,
+            directory.as_deref(),
         );
         if collect == PredecessorCollect::Never {
             return None;
@@ -1730,7 +1732,7 @@ impl Turn {
         {
             return;
         }
-        cards.chains.remove(session_id);
+        cards.chains.release(session_id);
     }
 
     /// Split `session_id`'s Card Chain at a user message (ADR-0043): append the

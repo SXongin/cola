@@ -22,7 +22,7 @@ use crate::backend::{
     ContentBlock, MessageId, MessageRole, MessageTime, Part, SessionTranscript, ToolCall, ToolIdentity,
     ToolOutput, ToolStatus, TranscriptMessage, TranscriptTail,
 };
-use crate::bridge::chain::{ChainRecord, ChainRecords};
+use crate::bridge::chain::ChainRecords;
 use crate::bridge::test_support::*;
 use crate::bridge::turn::Turn;
 use crate::config::{SessionEntry, ThreadKey};
@@ -35,18 +35,28 @@ fn sidecar(session_file: &Path) -> PathBuf {
 }
 
 /// Seed the record a previous cola life left behind — the card that was live
-/// when the process died — directly into the sidecar, so the next app loads it
-/// at construction exactly like a real restart.
+/// when the process died — directly into the sidecar through the store's own
+/// track entry, so the next app loads it at construction exactly like a real
+/// restart.
 fn seed_record(session_file: &Path, card_message_id: &str, message_id: &str, created_ms: Option<i64>) {
-    seed_chain_record(
-        session_file,
-        ChainRecord::new(card_message_id, MessageId::new(message_id), created_ms),
-    );
+    seed_chain_record(session_file, card_message_id, message_id, created_ms, None);
 }
 
-/// [`seed_record`] with the record built by the caller (a stored directory).
-fn seed_chain_record(session_file: &Path, card: ChainRecord) {
-    ChainRecords::load(sidecar(session_file)).replace("ses_test", card);
+/// [`seed_record`] carrying the Session's stored directory (the reap's route).
+fn seed_chain_record(
+    session_file: &Path,
+    card_message_id: &str,
+    message_id: &str,
+    created_ms: Option<i64>,
+    directory: Option<&str>,
+) {
+    ChainRecords::load(sidecar(session_file)).track(
+        "ses_test",
+        card_message_id,
+        MessageId::new(message_id),
+        created_ms,
+        directory,
+    );
 }
 
 /// Seed the durable Wake Watermark a previous cola life left behind — the
@@ -430,8 +440,10 @@ async fn a_reap_of_a_moved_session_names_the_move() {
     let session_file = dir.path().join("sessions.json");
     seed_chain_record(
         &session_file,
-        ChainRecord::new("om_frozen", MessageId::new("msg_cola_anchor"), Some(1_000))
-            .with_directory(Some("/work".into())),
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
     );
 
     let mut interrupted = assistant(2_000, "被打断了。");
@@ -490,11 +502,7 @@ async fn a_moved_never_promoted_card_names_the_move_too() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("sessions.json");
-    seed_chain_record(
-        &session_file,
-        ChainRecord::new("om_frozen", MessageId::new("msg_cola_anchor"), None)
-            .with_directory(Some("/work".into())),
-    );
+    seed_chain_record(&session_file, "om_frozen", "msg_cola_anchor", None, Some("/work"));
 
     // The submitted message never landed; the store reports the new directory.
     let transcript = SessionTranscript::new(vec![
@@ -547,8 +555,10 @@ async fn a_reap_of_an_unmoved_session_carries_no_move_line() {
     let session_file = dir.path().join("sessions.json");
     seed_chain_record(
         &session_file,
-        ChainRecord::new("om_frozen", MessageId::new("msg_cola_anchor"), Some(1_000))
-            .with_directory(Some("/work".into())),
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
     );
 
     // The store reports the same directory the record was tracked under.
@@ -587,8 +597,10 @@ async fn an_unknown_current_directory_claims_no_move() {
     let session_file = dir.path().join("sessions.json");
     seed_chain_record(
         &session_file,
-        ChainRecord::new("om_frozen", MessageId::new("msg_cola_anchor"), Some(1_000))
-            .with_directory(Some("/work".into())),
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
     );
 
     let (app, platform, _backend) =
@@ -661,8 +673,10 @@ async fn a_waiting_yield_carries_no_move_line() {
     let session_file = dir.path().join("sessions.json");
     seed_chain_record(
         &session_file,
-        ChainRecord::new("om_frozen", MessageId::new("msg_cola_anchor"), Some(1_000))
-            .with_directory(Some("/work".into())),
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
     );
 
     let transcript = SessionTranscript::new(vec![
@@ -1017,10 +1031,12 @@ async fn a_takeover_during_the_stamp_read_wins_over_the_stamp() {
     seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
     // A second live orphan the reap keeps reading: the pass clock proving
     // ticks ran after the parked stamp was released.
-    ChainRecords::load(sidecar(&session_file)).replace(
+    ChainRecords::load(sidecar(&session_file)).track(
         "ses_other",
-        ChainRecord::new("om_other", MessageId::new("msg_cola_other"), Some(2_000))
-            .with_directory(Some("/work".into())),
+        "om_other",
+        MessageId::new("msg_cola_other"),
+        Some(2_000),
+        Some("/work"),
     );
 
     let transcript = SessionTranscript::new(vec![user("msg_cola_anchor", 1_000, "问题")]);
@@ -1077,10 +1093,12 @@ async fn a_successor_owning_the_session_recollects_after_the_stamp() {
     let session_file = dir.path().join("sessions.json");
     seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
     // A second live orphan: the pass clock.
-    ChainRecords::load(sidecar(&session_file)).replace(
+    ChainRecords::load(sidecar(&session_file)).track(
         "ses_other",
-        ChainRecord::new("om_other", MessageId::new("msg_cola_other"), Some(2_000))
-            .with_directory(Some("/work".into())),
+        "om_other",
+        MessageId::new("msg_cola_other"),
+        Some(2_000),
+        Some("/work"),
     );
 
     let transcript = SessionTranscript::new(vec![user("msg_cola_anchor", 1_000, "问题")]);
@@ -2375,8 +2393,10 @@ async fn a_card_this_process_still_holds_is_never_stamped() {
     let session_file = dir.path().join("sessions.json");
     seed_chain_record(
         &session_file,
-        ChainRecord::new("om_live", MessageId::new("msg_cola_anchor"), Some(1_000))
-            .with_directory(Some("/work".into())),
+        "om_live",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
     );
 
     let (app, platform, backend) =
@@ -2412,10 +2432,12 @@ async fn a_pending_inbound_claim_is_never_stamped_over() {
     seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
     // A second live orphan the reap keeps reading: the pass clock proving
     // ticks ran while the claim held.
-    ChainRecords::load(sidecar(&session_file)).replace(
+    ChainRecords::load(sidecar(&session_file)).track(
         "ses_other",
-        ChainRecord::new("om_other", MessageId::new("msg_cola_other"), Some(2_000))
-            .with_directory(Some("/work".into())),
+        "om_other",
+        MessageId::new("msg_cola_other"),
+        Some(2_000),
+        Some("/work"),
     );
 
     let transcript = SessionTranscript::new(vec![user("msg_cola_anchor", 1_000, "问题")]);
@@ -2597,10 +2619,12 @@ async fn a_hung_stamp_patch_never_wedges_the_pass() {
     seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
     // A second live orphan whose reads prove the pass kept ticking while the
     // first record's stamp hung.
-    ChainRecords::load(sidecar(&session_file)).replace(
+    ChainRecords::load(sidecar(&session_file)).track(
         "ses_other",
-        ChainRecord::new("om_other", MessageId::new("msg_cola_other"), Some(2_000))
-            .with_directory(Some("/work".into())),
+        "om_other",
+        MessageId::new("msg_cola_other"),
+        Some(2_000),
+        Some("/work"),
     );
 
     let transcript = SessionTranscript::new(vec![user("msg_cola_anchor", 1_000, "问题")]);
@@ -2663,10 +2687,12 @@ async fn a_terminal_waits_for_an_in_flight_stamp() {
     seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
     // The pass clock: this record's reads keep ticking — the claimed record
     // returns before its own status read.
-    ChainRecords::load(sidecar(&session_file)).replace(
+    ChainRecords::load(sidecar(&session_file)).track(
         "ses_other",
-        ChainRecord::new("om_other", MessageId::new("msg_cola_other"), Some(2_000))
-            .with_directory(Some("/work".into())),
+        "om_other",
+        MessageId::new("msg_cola_other"),
+        Some(2_000),
+        Some("/work"),
     );
 
     let (app, platform, backend) =
@@ -2831,8 +2857,10 @@ async fn a_stored_directory_routes_the_reap_without_the_mapping() {
     let session_file = dir.path().join("sessions.json");
     seed_chain_record(
         &session_file,
-        ChainRecord::new("om_frozen", MessageId::new("msg_cola_anchor"), Some(1_000))
-            .with_directory(Some("/gone".into())),
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/gone"),
     );
 
     // No mapping at all: only the record says where the session lives.
@@ -3026,8 +3054,10 @@ async fn a_record_that_lagged_a_handover_collects_the_orphan_and_repoints() {
     let session_file = dir.path().join("sessions.json");
     seed_chain_record(
         &session_file,
-        ChainRecord::new("om_old", MessageId::new("msg_cola_anchor"), Some(1_000))
-            .with_directory(Some("/work".into())),
+        "om_old",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
     );
 
     let (app, platform) = restarted_app(&session_file, completed(1_000), None).await;
@@ -3067,8 +3097,10 @@ async fn an_anchor_armed_during_the_collect_still_repoints_the_record() {
     let session_file = dir.path().join("sessions.json");
     seed_chain_record(
         &session_file,
-        ChainRecord::new("om_old", MessageId::new("msg_cola_anchor"), Some(1_000))
-            .with_directory(Some("/work".into())),
+        "om_old",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
     );
 
     let (app, platform) = restarted_app(&session_file, completed(1_000), None).await;
@@ -3100,8 +3132,10 @@ async fn a_collected_orphan_keeps_its_body_without_the_controls() {
     let session_file = dir.path().join("sessions.json");
     seed_chain_record(
         &session_file,
-        ChainRecord::new("om_old", MessageId::new("msg_cola_anchor"), Some(1_000))
-            .with_directory(Some("/work".into())),
+        "om_old",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
     );
 
     let (app, platform) = restarted_app(&session_file, completed(1_000), None).await;
@@ -3172,8 +3206,10 @@ async fn a_reaped_error_card_keeps_its_body_after_the_detail_and_move_line() {
     let session_file = dir.path().join("sessions.json");
     seed_chain_record(
         &session_file,
-        ChainRecord::new("om_frozen", MessageId::new("msg_cola_anchor"), Some(1_000))
-            .with_directory(Some("/work".into())),
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
     );
 
     let mut failed = assistant(2_000, "没成功。");
