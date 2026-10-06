@@ -29,15 +29,22 @@ design round (2026-10-06) settled the shape, and spec #561 landed it (tickets
 position whose content is confirmed delivered — and one reconcile pass
 projects the chain's delta after it onto a successor card.**
 
-- **The fact: a frontier plus a live set, never content.** The cursor is the
-  newest delivered text/reasoning part — its message identity, its ordinal in
-  the message's typed parts, its kind, its server start time and the Unicode
-  character extent confirmed delivered — plus the set of tool call ids whose
-  newest delivered state was `running`. It stores position and identity only:
-  #505's rejected payload journal (persisting built card JSON) stays rejected —
-  the content lives on the server, and a boundary is all the recovery needs.
-  `None` on a record is valid — cursorless — and means an older release's
-  record or a chain whose first confirmed write has not landed.
+- **The fact: a frontier plus a live set, never content.** The frontier names
+  the newest delivered-final item of any content kind: a text/reasoning part —
+  its message identity, its ordinal in the message's typed parts, its kind, its
+  server start time and the Unicode character extent confirmed delivered — or a
+  settled tool panel, by position, with the extent then still belonging to the
+  newest text/reasoning part at or before it (so that part's growth stays
+  renderable). A still-`running` tool is never the frontier: it rides the live
+  set — the tool call ids whose newest delivered state was `running` — for the
+  display-only carry and settle-once resolution. The cursor stores position and
+  identity only: #505's rejected payload journal (persisting built card JSON)
+  stays rejected — the content lives on the server, and a boundary is all the
+  recovery needs. `None` on a record is valid — cursorless — and means an older
+  release's record or a chain whose first confirmed write has not landed. A
+  cursor written by an older release (text/reasoning kinds only) still loads:
+  a settled tool that followed its frontier re-renders once on the first
+  restart after the upgrade, then the new shape covers it.
 
 - **Advance only on a confirmed write, through the existing delivery choke
   point.** The accumulator stages the cursor of the body it is about to write,
@@ -80,6 +87,16 @@ projects the chain's delta after it onto a successor card.**
   drops its armed successor and keeps today's in-place ending; a live
   adoption is still sent — the run may produce next, and the follow is what
   keeps it live.
+
+- **A projection's create is single-shot per record per process life.** Feishu
+  offers no idempotency key, so a create whose outcome is not a definite
+  non-landing — any transport or API error — may have landed; retrying it would
+  post a duplicate successor. The attempt is marked in memory, like the other
+  reconcile marks, and no later pass this life re-posts: the record stays, the
+  old card is state-repaired in place by transcript truth, and the ambiguous
+  card is left as it fell. The trade: an ambiguous create can leave the
+  successor unposted and the old card state-repaired, never duplicated. A
+  restart forgets the mark, exactly like every in-memory reconcile mark.
 
 - **Render seeding.** The seed resolves the cursor against the read:
   everything at or before the frontier counts as delivered — marked, not
@@ -146,6 +163,10 @@ projects the chain's delta after it onto a successor card.**
 - **Stamp a cursor-carrying record when its cursor cannot be placed.**
   Rejected: the stamp freezes the run the projection is supposed to follow;
   claiming nothing leaves the record for a later read that can seed.
+- **Retry a create whose response was lost.** Rejected: Feishu has no
+  idempotency key (ADR-0067), so a retry can post a second successor card; the
+  single-shot mark prefers an unposted successor with an in-place state repair
+  over a duplicate.
 - **Hold a lock across the projection.** Rejected: the projection uses the
   existing per-card delivery lock for ordering, like every other card writer
   (the review's candidate 5 is not a prerequisite).
@@ -176,9 +197,13 @@ projects the chain's delta after it onto a successor card.**
   character-level (no duplication, no omission) for the ended and live cases,
   the message-first race, the cursorless fallback, the cursorless stamp's
   untouched suites, and the confirmed-write advance (a transport failure, a
-  content rejection, and the drain's late delivery). The store seam pins the
-  cursor's round-trip, `track`'s carry, `release`'s drop and the legacy
-  cursorless read.
+  content rejection, and the drain's late delivery). A settled tool behind the
+  newest text is part of the frontier: a restart over that cursor re-renders
+  neither the panel nor the delivered text, and later growth still renders only
+  its tail. A create whose response was lost is never retried: later passes
+  post nothing further and state-repair the old card in place. The store seam
+  pins the cursor's round-trip, `track`'s carry, `release`'s drop and the
+  legacy cursorless read.
 
 Related: #505, #528, #529, #443, #444, #522, #527, ADR-0038, ADR-0061,
 ADR-0063, ADR-0068, ADR-0069.

@@ -3951,9 +3951,10 @@ async fn a_projection_confirm_advances_the_cursor_it_was_confirmed_on() {
 }
 
 /// A create that fails advances nothing (spec #561, tickets #563/#566): the
-/// record keeps the old card and its cursor, the staged Wake Watermark stays
-/// unannounced — only a confirmed write advances it — the old card is never
-/// collected, and the next pass may retry.
+/// staged Wake Watermark stays unannounced — only a confirmed write advances
+/// it — and the old card is never collected. The attempt is single-shot
+/// (review #569): later passes never re-post; the reap settles the old card in
+/// place by transcript truth instead.
 #[tokio::test]
 async fn a_failed_projection_create_advances_nothing() {
     let _wd = test_work_dir();
@@ -3979,7 +3980,7 @@ async fn a_failed_projection_create_advances_nothing() {
     ])
     .with_executions(vec![execution(2_500), execution(4_000)])
     .with_wakes(vec![shell_wake(2_900)]);
-    let (app, platform, backend) =
+    let (app, platform, _backend) =
         restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Idle)).await;
     // Every successor create fails at the platform.
     platform
@@ -3987,36 +3988,31 @@ async fn a_failed_projection_create_advances_nothing() {
         .store(100, std::sync::atomic::Ordering::SeqCst);
 
     spawn_sync(&app);
-    wait_for_status_reads(&backend, "ses_test", 3).await;
-
-    let record = app
-        .cards_handle()
-        .chains
-        .get("ses_test")
-        .expect("a failed projection keeps the record");
-    assert_eq!(
-        record.card_message_id, "om_frozen",
-        "the record still names the old card"
-    );
-    assert_eq!(
-        record
-            .cursor
-            .as_ref()
-            .and_then(|cursor| cursor.frontier.as_ref())
-            .map(|frontier| frontier.delivered_chars),
-        Some(delivered.chars().count()),
-        "a failed create advanced nothing"
-    );
-    assert_eq!(
-        patches_to(&platform, "om_frozen").await.len(),
-        0,
-        "a failed projection never collects the old card"
-    );
+    // The next pass never re-posts: it settles the old card in place by
+    // transcript truth.
+    wait_for_update(&platform, "om_frozen", "the in-place ending", |card| {
+        card_header(card).contains("✅")
+    })
+    .await;
     assert_eq!(
         app.cards_handle().chains.announced("ses_test"),
         None,
         "a failed create announces nothing: only a confirmed write advances the Watermark"
     );
+    assert_eq!(
+        card_posts(&platform).await,
+        0,
+        "the failed projection never posts a successor: {:?}",
+        platform.calls.lock().await
+    );
+    let patches = patches_to(&platform, "om_frozen").await;
+    assert!(
+        patches
+            .iter()
+            .all(|card| !card_header(card).contains("已由新卡片接管")),
+        "the old card is settled in place, never collected: {patches:?}"
+    );
+    wait_for_record_gone(&app, "ses_test").await;
 }
 
 /// A cursorless record follows today's settle path (spec #561, ticket #563):
@@ -4822,11 +4818,13 @@ async fn a_live_adoption_keeps_following_through_failed_reads() {
     wait_for_record_gone(&app, "ses_test").await;
 }
 
-/// A create that fails leaves the record for the next pass — never a stamp,
-/// never a collect — and the retry adopts once Feishu returns (spec #561,
-/// ticket #564).
+/// A create this process life already attempted is single-shot (spec #561,
+/// review #569): Feishu has no idempotency key (ADR-0067), so the ambiguous
+/// failure is never retried — a retry could post a duplicate successor. The
+/// record stays (a live run keeps observing), the old card is never stamped or
+/// collected, and when the run ends the reap state-repairs it in place.
 #[tokio::test]
-async fn a_failed_adoption_create_retries_and_never_stamps() {
+async fn an_ambiguous_adoption_create_is_never_retried() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("sessions.json");
@@ -4847,13 +4845,26 @@ async fn a_failed_adoption_create_retries_and_never_stamps() {
     let (app, platform, backend) =
         restarted_app_with_backend(&session_file, running, Some(SessionStatus::Busy)).await;
     platform.given_card_view("om_frozen", realistic_card_view());
-    // Every successor create fails at the platform.
+    // The first successor create fails; a retry would succeed — exactly the
+    // duplicate a single-shot attempt must never post.
     platform
         .fail_reply_card_count
-        .store(100, std::sync::atomic::Ordering::SeqCst);
+        .store(1, std::sync::atomic::Ordering::SeqCst);
 
     spawn_sync(&app);
-    wait_for_status_reads(&backend, "ses_test", 3).await;
+    // One pass ran (the attempt happened): the record keeps the old card.
+    let reads = backend.session_status_reads.lock().await.len();
+    wait_for_status_reads(&backend, "ses_test", reads + 1).await;
+
+    // Later passes must not re-post: a window of ticks proves the attempt is
+    // single-shot (a retry would land on the very next one).
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        card_posts(&platform).await,
+        0,
+        "an ambiguous create is never repeated: {:?}",
+        platform.calls.lock().await
+    );
 
     let record = app
         .cards_handle()
@@ -4878,17 +4889,33 @@ async fn a_failed_adoption_create_retries_and_never_stamps() {
         "a failed adoption never stamps or collects the old card"
     );
 
-    // Feishu returns: the next pass adopts.
-    platform
-        .fail_reply_card_count
-        .store(0, std::sync::atomic::Ordering::SeqCst);
-    let (successor, successor_text) = wait_for_projection(&platform, "msg_cola_anchor").await;
-    assert!(
-        card_header(&successor).contains("回复中"),
-        "the retry adopts onto a live successor: {successor}"
+    // The run ends: the reap settles the old card in place, still no successor.
+    backend
+        .given_transcript_after_build(
+            "ses_test",
+            vec![
+                SessionTranscript::new(vec![
+                    user("msg_cola_anchor", 1_000, "问题"),
+                    assistant(2_000, delivered),
+                ])
+                .with_executions(vec![execution(2_500)]),
+            ],
+        )
+        .await;
+    backend
+        .set_session_status("ses_test", Some(SessionStatus::Idle))
+        .await;
+    wait_for_update(&platform, "om_frozen", "the in-place ending", |card| {
+        card_header(card).contains("✅")
+    })
+    .await;
+    assert_eq!(
+        card_posts(&platform).await,
+        0,
+        "no successor is ever posted after the ambiguous create: {:?}",
+        platform.calls.lock().await
     );
-    assert!(!successor_text.contains(delivered), "{successor}");
-    wait_for_record_card(&app, "ses_test", "msg_reply").await;
+    wait_for_record_gone(&app, "ses_test").await;
 }
 
 /// A record carrying a Rendered Cursor is never stamped (spec #561, ticket
@@ -5605,6 +5632,214 @@ async fn a_turn_winning_the_create_window_keeps_the_chain_when_the_run_ended_whi
     assert!(
         final_text.contains("新回答"),
         "the new Turn's own answer follows the tail: {final_text}"
+    );
+    wait_for_record_gone(&app, "ses_test").await;
+}
+
+// ---------------------------------------------------------------------------
+// A settled tool at the cursor (spec #561, review #569): the frontier names
+// the newest delivered-final item of ANY content kind, so a restart does not
+// re-render a panel the old card already showed.
+// ---------------------------------------------------------------------------
+
+/// Wait until the session's durable cursor satisfies `ready`, or panic after
+/// 5 s.
+async fn wait_for_cursor(app: &Arc<App>, mut ready: impl FnMut(&RenderedCursor) -> bool) -> RenderedCursor {
+    let probe = async {
+        loop {
+            if let Some(cursor) = app.cards_handle().chains.cursor("ses_test")
+                && ready(&cursor)
+            {
+                return cursor;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), probe)
+        .await
+        .expect("the record's cursor must reach the awaited shape")
+}
+
+/// The restart's read: an in-flight answer plus the `shell` call it made,
+/// whose status the caller scripts. Both parts carry their server start times,
+/// so the timeline orders them like the server's own read.
+fn text_and_tool(text: &str, status: ToolStatus, output: &str) -> SessionTranscript {
+    SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑个长命令"),
+        TranscriptMessage {
+            id: MessageId::new("msg_a_2000"),
+            role: MessageRole::Assistant,
+            time: Some(MessageTime {
+                created: 2_000,
+                completed: None,
+            }),
+            model: None,
+            tokens: None,
+            error: None,
+            parts: vec![Part::Text(TextPart {
+                text: text.to_string(),
+                started_at: Some(2_000),
+            })],
+        },
+        in_flight_shell("msg_tool_3000", 3_000, "call_sleep", status, 3_100, output),
+    ])
+}
+
+/// A tool that settles while the run streams is part of the confirmed
+/// frontier (spec #561, review #569): a restart over that cursor must NOT
+/// re-render the panel the old card already showed, and text the run produces
+/// after the restart still renders only its tail.
+#[tokio::test]
+async fn a_restart_does_not_re_render_a_settled_tool_delivered_after_the_text() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let delivered = "已经写了一半。";
+
+    // Life 1: a live turn streams the text, then the tool settles. The
+    // confirmed write that settles it advances the persisted cursor.
+    let mut backend1 = MockBackend::new(realistic_parts());
+    backend1.given_transcript(
+        "ses_test",
+        vec![text_and_tool(delivered, ToolStatus::Running, "")],
+    );
+    backend1.with_session_status("ses_test", Some(SessionStatus::Busy));
+    let backend1 = Arc::new(backend1);
+    let platform1 = Arc::new(RecordingPlatform::new());
+    let app1 = Arc::new(
+        App::new(test_config(&session_file), backend1.clone(), platform1.clone())
+            .expect("the first life builds"),
+    );
+    seed_session(&app1, "ses_test", "/work").await;
+    app1.turn_render_poll_ms
+        .store(5, std::sync::atomic::Ordering::Relaxed);
+    app1.turn_drain_timeout_ms
+        .store(30, std::sync::atomic::Ordering::Relaxed);
+    app1.turn_follow_read_timeout_ms
+        .store(50, std::sync::atomic::Ordering::Relaxed);
+    let turn = spawn_turn(&app1, ctx("ses_test", "跑个长命令"));
+    wait_for_card_text(&platform1, delivered).await;
+    let result = tokio::time::timeout(Duration::from_secs(5), turn)
+        .await
+        .expect("the turn must hand off at the drain bound")
+        .unwrap();
+    result.unwrap();
+    wait_for_cursor(&app1, |cursor| cursor.live_calls.contains("call_sleep")).await;
+
+    // The server settles the call: the next confirmed write's frontier must
+    // name it (the live set empties and the extent stays the text's).
+    settle_tool(&backend1, ToolStatus::Completed, "done").await;
+    wait_for_cursor(&app1, |cursor| {
+        cursor.live_calls.is_empty()
+            && cursor
+                .frontier
+                .as_ref()
+                .is_some_and(|frontier| frontier.delivered_chars == delivered.chars().count())
+    })
+    .await;
+    // Life 1 ends here; a fresh process takes the sidecar over.
+    drop(app1);
+
+    // Life 2: the restart finds the settled panel delivered, so neither it nor
+    // the text is repeated on the successor.
+    let mut backend2 = MockBackend::new(realistic_parts());
+    backend2.given_transcript(
+        "ses_test",
+        vec![text_and_tool(delivered, ToolStatus::Completed, "done")],
+    );
+    backend2.with_session_status("ses_test", Some(SessionStatus::Busy));
+    let backend2 = Arc::new(backend2);
+    let platform2 = Arc::new(RecordingPlatform::new());
+    let app2 = Arc::new(
+        App::new(test_config(&session_file), backend2.clone(), platform2.clone())
+            .expect("the restarted app builds"),
+    );
+    seed_session(&app2, "ses_test", "/work").await;
+    spawn_sync(&app2);
+    let (successor, successor_text) = wait_for_projection(&platform2, "msg_cola_anchor").await;
+    assert!(
+        !successor_text.contains("done") && !successor_text.contains("sleep 3600"),
+        "a settled panel the old card already showed is never re-rendered: {successor}"
+    );
+    assert!(
+        !successor_text.contains(delivered),
+        "the delivered text prefix is never repeated: {successor}"
+    );
+
+    // The run streams on: the text grows, and only the new tail renders.
+    let tail = "重启之后又写了一部分。";
+    let grown = format!("{delivered}{tail}");
+    backend2
+        .given_transcript_after_build(
+            "ses_test",
+            vec![text_and_tool(&grown, ToolStatus::Completed, "done")],
+        )
+        .await;
+    wait_for_card_text(&platform2, tail).await;
+    let update = platform2
+        .updated_cards()
+        .await
+        .into_iter()
+        .find(|card| card_text(card).contains(tail))
+        .expect("the tail reached a card");
+    let text = card_text(&update);
+    assert_eq!(
+        text.matches(tail).count(),
+        1,
+        "the grown tail lands exactly once: {text}"
+    );
+    assert!(
+        !text.contains("done"),
+        "the settled panel stays out of the continuation: {text}"
+    );
+}
+
+/// The exact lost-response shape (spec #561, review #569): Feishu accepted
+/// the successor create but the response never arrived. Feishu has no
+/// idempotency key (ADR-0067), so the attempt is single-shot — later passes
+/// post nothing further and the reap state-repairs the old card in place —
+/// and the user never gets two successor cards.
+#[tokio::test]
+async fn an_ambiguous_create_after_a_lost_response_is_never_retried() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let delivered = "已经写了一半。";
+    let missed = "停机期间写完的尾巴。";
+    let full = format!("{delivered}{missed}");
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
+        Some(text_frontier(delivered.chars().count())),
+        &[],
+    );
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "问题"),
+        assistant(2_000, &full),
+    ])
+    .with_executions(vec![execution(2_500)]);
+    let (app, platform, _backend) =
+        restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Idle)).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+    // The successor create is accepted remotely, but its response is lost.
+    platform
+        .fail_reply_card_after_send_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+
+    spawn_sync(&app);
+    // The reap settles the old card in place — never a second successor.
+    wait_for_update(&platform, "om_frozen", "the in-place ending", |card| {
+        card_header(card).contains("✅")
+    })
+    .await;
+    assert_eq!(
+        platform.replied_cards().await.len(),
+        1,
+        "the ambiguous create is never repeated: {:?}",
+        platform.calls.lock().await
     );
     wait_for_record_gone(&app, "ses_test").await;
 }

@@ -117,6 +117,12 @@ pub(super) struct SeedFrontier {
     pub(super) part_index: usize,
     pub(super) kind: CursorPartKind,
     pub(super) delivered_chars: usize,
+    /// The newest text/reasoning part at or before the frontier, when the
+    /// frontier itself is a settled tool (spec #561, review #569): the part
+    /// [`Self::delivered_chars`] belongs to, which still renders its growth.
+    /// `None` when the frontier IS the text/reasoning part, or a tool frontier
+    /// has no text before it.
+    pub(super) extent_pos: Option<(usize, usize)>,
 }
 
 impl CursorSeed {
@@ -140,11 +146,25 @@ impl CursorSeed {
                         frontier.kind == CursorPartKind::Reasoning,
                         reasoning.text.chars().count(),
                     ),
+                    crate::backend::Part::Tool(_) => (frontier.kind == CursorPartKind::Tool, 0),
                     _ => (false, 0),
                 };
                 if !matches_kind {
                     return None;
                 }
+                // A tool-kind frontier carries the newest text/reasoning part's
+                // delivered extent: resolve that part in THIS read and hold the
+                // guard against it (spec #561, review #569).
+                let (part_chars, extent_pos) = if frontier.kind == CursorPartKind::Tool {
+                    match transcript.newest_text_before(message_pos, frontier.part_index) {
+                        Some((extent_pos, chars)) => (chars, Some(extent_pos)),
+                        // No text before the tool: no extent may ride along.
+                        None if frontier.delivered_chars == 0 => (0, None),
+                        None => return None,
+                    }
+                } else {
+                    (part_chars, None)
+                };
                 // A cursor delivered past this read's content means the read
                 // is not the one the cursor was taken from (compaction, a
                 // recreated part): skipping would hide content.
@@ -157,6 +177,7 @@ impl CursorSeed {
                     part_index: frontier.part_index,
                     kind: frontier.kind,
                     delivered_chars: frontier.delivered_chars,
+                    extent_pos,
                 })
             }
         };
@@ -212,12 +233,37 @@ impl CursorSeed {
 
     /// Where the part at `(message_pos, part_index)` sits relative to the
     /// cut: delivered (skip), the frontier itself (render the suffix), or
-    /// undelivered (render normally).
+    /// undelivered (render normally). A tool-kind frontier covers everything
+    /// up to and including itself, while the delivered extent still belongs to
+    /// the newest text/reasoning part at or before it — that part renders its
+    /// growth (spec #561, review #569).
     pub(super) fn cut(&self, message_pos: usize, part_index: usize) -> SeedCut {
         let Some(frontier) = &self.frontier else {
             return SeedCut::Undelivered;
         };
-        match (message_pos, part_index).cmp(&(frontier.message_pos, frontier.part_index)) {
+        let pos = (message_pos, part_index);
+        let frontier_pos = (frontier.message_pos, frontier.part_index);
+        if let Some(extent_pos) = frontier.extent_pos {
+            if pos < extent_pos {
+                return SeedCut::Delivered;
+            }
+            if pos == extent_pos {
+                return SeedCut::Frontier(frontier.delivered_chars);
+            }
+            return if pos <= frontier_pos {
+                SeedCut::Delivered
+            } else {
+                SeedCut::Undelivered
+            };
+        }
+        if frontier.kind == CursorPartKind::Tool {
+            return if pos <= frontier_pos {
+                SeedCut::Delivered
+            } else {
+                SeedCut::Undelivered
+            };
+        }
+        match pos.cmp(&frontier_pos) {
             std::cmp::Ordering::Less => SeedCut::Delivered,
             std::cmp::Ordering::Equal => SeedCut::Frontier(frontier.delivered_chars),
             std::cmp::Ordering::Greater => SeedCut::Undelivered,
@@ -248,12 +294,15 @@ pub(super) enum SeedCut {
 /// Bookkeeping for a Tool Panel that is still live (ADR-0045): the timeline
 /// key and element identity allocated when its call first appeared, so the
 /// settle move into the timeline lands in the call's original order and keeps
-/// the reader's fold state.
+/// the reader's fold state. The typed part position it rendered from travels
+/// along (spec #561, review #569), so its settled entry can become the
+/// Rendered Cursor frontier.
 #[derive(Debug, Clone)]
 struct LiveTool {
     key: i64,
     shown_at: Option<i64>,
     seq: u64,
+    source: Option<PartSource>,
 }
 
 /// What a timeline entry renders.
@@ -1853,7 +1902,21 @@ impl StreamAccumulator {
     /// nothing is placed yet — while a panel already in the timeline keeps its
     /// key and only gains the clock. A call with no server time keeps showing
     /// no clock.
+    #[cfg(test)]
     pub(super) fn push_tool_at(&mut self, at_ms: Option<i64>, call_id: &str, panel: ToolPanel) {
+        self.push_tool_from(at_ms, call_id, panel, None);
+    }
+
+    /// [`Self::push_tool_at`] carrying the typed transcript part the call
+    /// rendered from (spec #561, review #569): a settled panel's timeline entry
+    /// keeps it, so it can become the Rendered Cursor frontier.
+    pub(super) fn push_tool_from(
+        &mut self,
+        at_ms: Option<i64>,
+        call_id: &str,
+        panel: ToolPanel,
+        source: Option<PartSource>,
+    ) {
         let live = panel.is_live();
         let is_new = !self.tools.contains_key(call_id);
         self.tools.insert(call_id.to_string(), panel);
@@ -1870,10 +1933,11 @@ impl StreamAccumulator {
                         key,
                         shown_at: at_ms,
                         seq: self.item_seq,
+                        source,
                     },
                 );
             } else {
-                self.insert_kind(key, at_ms, TimelineKind::Tool(call_id.to_string()));
+                self.insert_kind_src(key, at_ms, source, TimelineKind::Tool(call_id.to_string()));
             }
         } else if self.live_tools.contains_key(call_id) {
             // A later sighting may carry the server start time the first one
@@ -1885,6 +1949,12 @@ impl StreamAccumulator {
                 entry.shown_at = entry.shown_at.or(at_ms);
                 entry.key = at;
             }
+            if let Some(source) = source
+                && let Some(entry) = self.live_tools.get_mut(call_id)
+                && entry.source.is_none()
+            {
+                entry.source = Some(source);
+            }
             if !live {
                 // Settled: the panel joins the timeline at the key it was born
                 // with — clamped to the top of the live slice when that key is
@@ -1894,7 +1964,7 @@ impl StreamAccumulator {
                 self.insert_item(
                     entry.key,
                     entry.shown_at,
-                    None,
+                    entry.source,
                     entry.seq,
                     TimelineKind::Tool(call_id.to_string()),
                     None,
@@ -2711,24 +2781,51 @@ impl StreamAccumulator {
     /// The Rendered Cursor of the card body [`Self::build_card_inner`] is
     /// about to render for `timeline[..end]` (spec #561): the chain's
     /// confirmed cursor plus what this body adds. The frontier names the
-    /// newest text/reasoning part included, with its cumulative delivered
-    /// character extent — a body with none of its own keeps the base frontier
+    /// newest delivered-final item included — text/reasoning with its
+    /// cumulative delivered character extent, or a settled tool by position,
+    /// the extent then carried from the newest text/reasoning part before it
+    /// (review #569) — a body with none of its own keeps the base frontier
     /// (it must never regress). The live set adds the running calls this
     /// body's tail delivers and removes the calls it delivers settled into the
     /// timeline; a call the body omits (a finalized slice has no tail, a
     /// settled card omits a carried `⏳`) keeps its last delivered state.
     fn cursor_for_slice(&self, end: usize, include_tail: bool, state: &CardState) -> RenderedCursor {
         let mut cursor = self.cursor.clone();
-        if let Some((source, kind, started_at)) = self.timeline[..end].iter().rev().find_map(|item| {
-            let source = item.source.as_ref()?;
-            let kind = match &item.kind {
-                TimelineKind::Text(_) => CursorPartKind::Text,
-                TimelineKind::Reasoning(_) => CursorPartKind::Reasoning,
-                _ => return None,
+        if let Some((idx, source, kind, started_at)) =
+            self.timeline[..end]
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(idx, item)| {
+                    let source = item.source.as_ref()?;
+                    let kind = match &item.kind {
+                        TimelineKind::Text(_) => CursorPartKind::Text,
+                        TimelineKind::Reasoning(_) => CursorPartKind::Reasoning,
+                        // A timeline tool entry is settled by construction: a
+                        // running panel lives in the tail, not the timeline.
+                        TimelineKind::Tool(_) => CursorPartKind::Tool,
+                        _ => return None,
+                    };
+                    Some((idx, source, kind, item.shown_at))
+                })
+        {
+            let delivered_chars = match kind {
+                // The settled tool has no extent of its own: the frontier
+                // carries the newest text/reasoning part's, so that part still
+                // renders its growth after a restart (review #569).
+                CursorPartKind::Tool => self.timeline[..idx]
+                    .iter()
+                    .rev()
+                    .find_map(|item| match &item.kind {
+                        TimelineKind::Text(_) | TimelineKind::Reasoning(_) => item
+                            .source
+                            .as_ref()
+                            .map(|source| self.source_extent_in(source, end)),
+                        _ => None,
+                    })
+                    .unwrap_or(0),
+                _ => self.source_extent_in(source, end),
             };
-            Some((source, kind, item.shown_at))
-        }) {
-            let delivered_chars = self.source_extent_in(source, end);
             cursor.frontier = Some(CursorFrontier {
                 message_id: source.message_id.clone(),
                 part_index: source.index,

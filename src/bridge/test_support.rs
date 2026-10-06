@@ -286,6 +286,11 @@ pub struct RecordingPlatform {
     /// The next N `reply_card` calls fail with the same typed rejection, for
     /// the continuation-send recovery path.
     pub fail_reply_card_content_count: std::sync::atomic::AtomicUsize,
+    /// The next N `reply_card` calls record the send — as if Feishu accepted
+    /// it — and then return a transport-class error: the "accepted remotely,
+    /// response lost" shape a single-shot create must never repeat (spec #561,
+    /// review #569).
+    pub fail_reply_card_after_send_count: std::sync::atomic::AtomicUsize,
     /// When set, `set_instant_reminder` fails after recording the attempt
     /// (tests the best-effort pin path: failures log and never affect a turn).
     /// Atomic so a test can flip it mid-lifecycle and watch a recovery.
@@ -331,6 +336,7 @@ impl RecordingPlatform {
             fail_update_count: std::sync::atomic::AtomicUsize::new(0),
             fail_update_transport_count: std::sync::atomic::AtomicUsize::new(0),
             fail_reply_card_content_count: std::sync::atomic::AtomicUsize::new(0),
+            fail_reply_card_after_send_count: std::sync::atomic::AtomicUsize::new(0),
             fail_instant_reminder: std::sync::atomic::AtomicBool::new(false),
             fail_pin: std::sync::atomic::AtomicBool::new(false),
             reply_in_thread_thread_id: Some("omt_created_topic".into()),
@@ -584,6 +590,24 @@ impl feishu::Platform for RecordingPlatform {
             .unwrap()
             .pop_front()
             .unwrap_or_else(|| "msg_reply".into());
+        // The "accepted remotely, response lost" shape: the send is recorded,
+        // then a transport error is returned (spec #561, review #569).
+        if self
+            .fail_reply_card_after_send_count
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0
+        {
+            self.fail_reply_card_after_send_count
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            self.calls.lock().await.push(PlatformCall::ReplyCard {
+                reply_to: reply_to.into(),
+                card: card.clone(),
+            });
+            return Err(crate::error::BridgeError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "simulated accepted-but-lost reply_card response",
+            )));
+        }
         if let Some(gate) = self.take_gate("reply", reply_to) {
             wait_gate(gate).await;
         }

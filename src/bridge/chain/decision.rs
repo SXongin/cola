@@ -311,6 +311,15 @@ pub(crate) fn reconcile(record: &ChainRecord, reads: &RecoveryReads<'_>) -> Chai
                     // unplaced frontier would guess, and stamping would freeze
                     // the run the projection is supposed to follow.
                     if let Some(cursor) = record.cursor.as_ref() {
+                        // A create this process life already attempted is never
+                        // retried (review #569): Feishu has no idempotency key
+                        // (ADR-0067), so a retry could post a duplicate
+                        // successor. The record keeps observing until the run
+                        // ends, when the ended pass state-repairs the old card
+                        // in place.
+                        if record.projection_attempted {
+                            return ChainDisposition::Keep;
+                        }
                         let Some(TranscriptRead::Read(transcript)) = reads.transcript.as_ref() else {
                             return ChainDisposition::NoDecision;
                         };
@@ -366,8 +375,12 @@ pub(crate) fn reconcile(record: &ChainRecord, reads: &RecoveryReads<'_>) -> Chai
                         // Unreceived ending is no content to continue, and a
                         // still-live run keeps today's stamp (the adoption/
                         // follow is ticket #564's disposition, not this one).
+                        // A create this life already attempted blocks the
+                        // projection too (review #569): it is never retried, and
+                        // the reap state-repairs the old card in place instead.
                         settle => {
                             if !matches!(settle, TurnSettle::Unreceived)
+                                && !record.projection_attempted
                                 && let Some(cursor) = record.cursor.as_ref()
                                 && let Some(seed) = CursorSeed::resolve(transcript, cursor)
                             {
@@ -1098,6 +1111,50 @@ mod tests {
             reconcile(&record(), &live(false, Some(transcript.clone()))),
             ChainDisposition::StampRestart,
             "a readable transcript changes nothing without a cursor"
+        );
+    }
+
+    /// A create this process life already attempted is single-shot (spec #561,
+    /// review #569): Feishu has no idempotency key (ADR-0067), so the live case
+    /// keeps observing (the ended pass later state-repairs the old card in
+    /// place) and the ended case settles in place — neither re-posts.
+    #[test]
+    fn an_attempted_projection_is_never_retried() {
+        let transcript = SessionTranscript::new(vec![
+            user("msg_cola_anchor", 1_000, "问题"),
+            assistant(2_000, "答复。"),
+        ]);
+        let cursor = RenderedCursor {
+            frontier: Some(CursorFrontier {
+                message_id: MessageId::new("msg_a_2000"),
+                part_index: 0,
+                kind: CursorPartKind::Text,
+                started_at: Some(2_000),
+                delivered_chars: 2,
+            }),
+            live_calls: Default::default(),
+        };
+        let attempted = ChainRecord {
+            cursor: Some(cursor),
+            projection_attempted: true,
+            ..record()
+        };
+
+        let live = RecoveryReads {
+            status: Some(StatusRead::Named(SessionStatus::Busy)),
+            transcript: Some(TranscriptRead::Read(transcript.clone())),
+            cursor: true,
+            ..orphan()
+        };
+        assert_eq!(
+            reconcile(&attempted, &live),
+            ChainDisposition::Keep,
+            "an attempted live adoption is never re-posted"
+        );
+        assert_eq!(
+            reconcile(&attempted, &idle_transcript(transcript)),
+            ChainDisposition::Settle(TurnSettle::Complete),
+            "an attempted ended projection state-repairs the old card in place"
         );
     }
 
