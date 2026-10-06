@@ -29,7 +29,11 @@ use crate::bridge::handles::TurnHandles;
 use crate::bridge::span;
 use crate::config::ThreadKey;
 
-use super::{SettleTiming, ownership::Ticket, settle};
+use super::{
+    SettleTiming,
+    ownership::{CardOwnership, Ticket},
+    settle,
+};
 
 /// The fixture a follow inherits from the Turn it continues: whose card it
 /// watches, where its reads route, and when the run started (the long-task
@@ -99,20 +103,27 @@ pub(super) async fn spawn(handles: &TurnHandles, facts: FollowFacts) {
 /// anchor when the submitted message has landed — the renderer identity a new
 /// Turn or an external arming replaces — or, when the message has not landed
 /// yet (the unreceived watch), the card's chain identity, which survives a
-/// Supplement split and dies with a new Turn. The watch carries the submitted
-/// id the anchor capture looks for and the hint's deadline (the turn's start
-/// plus the follow grace); the loop reads all three through the variant.
-/// `None` — the card is gone, or carries no submitted message — means there is
-/// nothing to watch; [`run`] then hands the guard back and stops.
+/// Supplement split and dies with a new Turn. The chain identity comes from
+/// the one ownership verdict (ADR-0070), so the watch cannot disagree with the
+/// Wake loop's guard; the submitted id is the watch's own correlation fact —
+/// the anchor capture's datum, not one of the verdict's three identities — so
+/// it stays on the Turn. The watch carries the submitted id the anchor capture
+/// looks for and the hint's deadline (the turn's start plus the follow grace);
+/// the loop reads all three through the variant. `None` — the card is gone, or
+/// carries no submitted message — means there is nothing to watch; [`run`]
+/// then hands the guard back and stops.
 async fn ownership(handles: &TurnHandles, facts: &FollowFacts, timing: SettleTiming) -> Option<Ticket> {
     if let Some(anchor) = &facts.anchor {
         return Some(Ticket::TurnAnchor(anchor.clone()));
     }
-    // The unreceived watch: the card's chain identity and the accumulator's
-    // submitted id, both read through the Turn accessors so the watch and
-    // `capture_turn_anchor` look at the same facts. Absence is explicit — a
-    // sentinel chain or an empty id could never match what the loop watches.
-    let chain = super::Turn::chain_id(&handles.cards, &facts.session_id).await?;
+    // The unreceived watch: the card's chain identity through the verdict, and
+    // the accumulator's submitted id through the Turn (the anchor capture
+    // matches on it, so the watch and `capture_turn_anchor` look at the same
+    // fact). Absence is explicit — a sentinel chain or an empty id could never
+    // match what the loop watches.
+    let chain = CardOwnership::read(&handles.cards, &handles.waits, &facts.session_id)
+        .await
+        .chain_id()?;
     let submitted = super::Turn::submitted_message_id(&handles.cards, &facts.session_id).await?;
     Some(Ticket::Unlanded {
         chain,

@@ -202,12 +202,12 @@ async fn gather_reads<'a>(
     directory: Option<&'a str>,
     tracked_directory: Option<&'a str>,
 ) -> RecoveryReads<'a> {
-    // The claim comes from the one ownership verdict (ADR-0070): a live Turn
-    // (or the follow that inherited its guard) owns the session, and an
-    // inbound message is about to — either way the card is not orphaned.
-    let claimed = CardOwnership::read(&handles.cards, &handles.waits, session_id)
-        .await
-        .reap_claim();
+    // The claim — and the current card's message id the record match reads —
+    // come from the one ownership verdict (ADR-0070): a live Turn (or the
+    // follow that inherited its guard) owns the session, and an inbound
+    // message is about to — either way the card is not orphaned.
+    let ownership = CardOwnership::read(&handles.cards, &handles.waits, session_id).await;
+    let claimed = ownership.reap_claim();
     // The directory the card was TRACKED under: the record's own when it has
     // one, else the caller's pre-follow value. The followed route can never
     // prove a move — it already names the new location (#433).
@@ -222,7 +222,7 @@ async fn gather_reads<'a>(
     RecoveryReads {
         claimed,
         stamping: record.restart_stamping,
-        card: probe_card(handles, session_id, record).await,
+        card: probe_card(handles, session_id, record, ownership.card_message_id()).await,
         route,
         status: None,
         transcript: None,
@@ -237,24 +237,32 @@ async fn gather_reads<'a>(
 /// live Turn (or the follow that inherited its guard) owns the session, or a
 /// message is being routed to it, is the one ownership verdict's claim
 /// ([`CardOwnership::reap_claim`], ADR-0070) — read once by [`gather_reads`],
-/// never re-derived here. The ladder never PATCHes or collects a card this
-/// process holds, which [`decision`]'s declaration test pins.
-async fn probe_card(handles: &FlowHandles, session_id: &str, record: &ChainRecord) -> CardProbe {
-    let Some(current_id) = Turn::card_message_id(&handles.cards, session_id).await else {
+/// never re-derived here. The current card's id is that same read's
+/// [`CardOwnership::card_message_id`], so the record match cannot classify a
+/// different card than the claim did; the liveness and the successor's armed
+/// anchor stay this process's own reads. The ladder never PATCHes or collects a
+/// card this process holds, which [`decision`]'s declaration test pins.
+async fn probe_card(
+    handles: &FlowHandles,
+    session_id: &str,
+    record: &ChainRecord,
+    current_id: Option<&str>,
+) -> CardProbe {
+    let Some(current_id) = current_id else {
         return CardProbe::None;
     };
     // A live or yielded card is still running; a terminal one is not.
     let running = Turn::is_running(&handles.cards, session_id).await;
-    if current_id == record.card_message_id {
+    if current_id == record.card_message_id.as_str() {
         return CardProbe::Recorded {
             terminal: !running,
             // Only a terminal card consults the outbox: a live card is kept by
             // its own lifecycle either way.
-            update_pending: !running && handles.cards.feishu.has_pending_card_update(&current_id),
+            update_pending: !running && handles.cards.feishu.has_pending_card_update(current_id),
         };
     }
     CardProbe::Successor {
-        card_message_id: current_id,
+        card_message_id: current_id.to_string(),
         running,
         anchor: Turn::armed_turn_anchor(&handles.cards, session_id).await,
     }

@@ -3196,19 +3196,6 @@ impl Turn {
         }
     }
 
-    /// `session_id`'s chain identity, when it has a card session — the Wake
-    /// continuation loop's ownership guard. A Wake continues the SAME Turn, so
-    /// its accumulator's anchor cannot tell its loop apart from a new Turn's;
-    /// the chain identity can (a replacement session gets a new one).
-    pub(crate) async fn chain_id(cards: &CardsHandle, session_id: &str) -> Option<u64> {
-        cards
-            .cards
-            .lock()
-            .await
-            .get(session_id)
-            .map(|card| card.chain_id())
-    }
-
     /// The submitted user message's cola id on `session_id`'s card (ADR-0026),
     /// when the card carries one — the id the unreceived watch's anchor
     /// capture matches on (`capture_turn_anchor`). `None` when the session has

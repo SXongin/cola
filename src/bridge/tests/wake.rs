@@ -1948,7 +1948,9 @@ async fn a_wake_on_a_non_active_session_is_not_rendered() {
         platform.calls.lock().await
     );
     assert_eq!(
-        Turn::chain_id(&app.cards_handle(), "ses_hist").await,
+        CardOwnership::read(&app.cards_handle(), &app.waits_handle(), "ses_hist")
+            .await
+            .chain_id(),
         None,
         "no card chain may be armed for the historical session"
     );
@@ -1970,7 +1972,9 @@ async fn a_live_card_is_never_split_by_a_wake() {
     Turn::seed_card(&app.cards_handle(), "ses_test", Some("om_live")).await;
     Turn::set_card_state(&app.cards_handle(), "ses_test", CardState::Streaming).await;
     Turn::set_reply_target(&app.cards_handle(), "ses_test", "msg_1").await;
-    let chain = Turn::chain_id(&app.cards_handle(), "ses_test").await;
+    let chain = CardOwnership::read(&app.cards_handle(), &app.waits_handle(), "ses_test")
+        .await
+        .chain_id();
 
     spawn_sync(&app);
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -1981,7 +1985,9 @@ async fn a_live_card_is_never_split_by_a_wake() {
         platform.calls.lock().await
     );
     assert_eq!(
-        Turn::chain_id(&app.cards_handle(), "ses_test").await,
+        CardOwnership::read(&app.cards_handle(), &app.waits_handle(), "ses_test")
+            .await
+            .chain_id(),
         chain,
         "the live chain must be left untouched"
     );

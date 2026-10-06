@@ -859,10 +859,19 @@ impl ExternalFlow {
                 if !Turn::resume_yielded_card(&handles.cards, sid, &wake_id, transcript, now_ms).await {
                     return;
                 }
-                let (Some(anchor), Some(chain)) = (
-                    Turn::armed_turn_anchor(&handles.cards, sid).await,
-                    Turn::chain_id(&handles.cards, sid).await,
-                ) else {
+                // Both facts are read AFTER the resume: its flush may split an
+                // overgrown card onto a new chain (`SplitPolicy::Allow`), so
+                // they describe the chain the resumed run actually continues
+                // on. The chain identity is the ownership verdict's (ADR-0070);
+                // the anchor stays on the Turn (arming/capture is not an
+                // ownership question).
+                let Some(anchor) = Turn::armed_turn_anchor(&handles.cards, sid).await else {
+                    return;
+                };
+                let Some(chain) = CardOwnership::read(&handles.cards, &handles.waits, sid)
+                    .await
+                    .chain_id()
+                else {
                     return;
                 };
                 tracing::info!(
@@ -892,9 +901,7 @@ impl ExternalFlow {
                 // which a split cannot do.
                 let reply_target = self.wake_reply_target(handles, sid, thread_key).await;
                 // The split carries the continuation: its flush re-stamps the
-                // previous card, sends the new card and tracks it. The loop's
-                // guard facts are read AFTER the split, so they describe the
-                // chain the continuation actually lives on.
+                // previous card, sends the new card and tracks it.
                 let Some(reply_to) = reply_target else {
                     tracing::warn!(
                         "wake continuation: session {} has a chain but no reachable reply target",
@@ -913,10 +920,18 @@ impl ExternalFlow {
                 {
                     return;
                 }
-                let (Some(anchor), Some(chain)) = (
-                    Turn::armed_turn_anchor(&handles.cards, sid).await,
-                    Turn::chain_id(&handles.cards, sid).await,
-                ) else {
+                // The loop's guard facts are read AFTER the split, so they
+                // describe the chain the continuation actually lives on. The
+                // chain identity is the ownership verdict's (ADR-0070); the
+                // anchor stays on the Turn (arming/capture is not an ownership
+                // question).
+                let Some(anchor) = Turn::armed_turn_anchor(&handles.cards, sid).await else {
+                    return;
+                };
+                let Some(chain) = CardOwnership::read(&handles.cards, &handles.waits, sid)
+                    .await
+                    .chain_id()
+                else {
                     return;
                 };
                 tracing::info!("wake continuation: session {} continues its card chain", sid);
@@ -1015,7 +1030,10 @@ impl ExternalFlow {
                                 "wake continuation: session {sid} posted while an inbound message was being admitted"
                             );
                         }
-                        let Some(chain) = Turn::chain_id(&handles.cards, sid).await else {
+                        let Some(chain) = CardOwnership::read(&handles.cards, &handles.waits, sid)
+                            .await
+                            .chain_id()
+                        else {
                             return;
                         };
                         tracing::info!("wake continuation: session {} continues after a restart", sid);
