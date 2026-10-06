@@ -2763,83 +2763,109 @@ async fn a_record_without_a_directory_is_never_decided() {
     );
 }
 
-/// A Wake continuation posted by the restart's Session Sync takes the chain
-/// over: the old card is collected as 「已由新卡片接管」 and the record follows
-/// the successor, so two cards never both look live.
+/// A record-carrying chain's Wake goes through the projection (spec #561,
+/// ticket #566): the durable record hands the Wake to the projection, which
+/// renders everything after the confirmed cursor — the content produced while
+/// cola was down, the resumed work included — and settles by transcript truth.
+/// The Fresh Wake path never arms a card over a recorded chain, and the old
+/// card is collected as taken over.
 #[tokio::test]
-async fn a_restart_continuation_collects_the_old_card() {
+async fn a_record_carrying_wake_goes_through_the_projection() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("sessions.json");
-    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
-
+    let delivered = "已经交给后台了。";
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
+        Some(text_frontier(delivered.chars().count())),
+        &[],
+    );
+    // The run continued past the confirmed frontier while cola was down —
+    // content produced BEFORE the Wake included — then the Wake's completion
+    // resumed it and the true end arrived.
+    let mid = "停机期间续写的一段。";
+    let resumed = "CI 通过了。";
     let transcript = SessionTranscript::new(vec![
         user("msg_cola_anchor", 1_000, "跑一下 CI"),
-        assistant(2_000, "已经交给后台了。"),
-        assistant(3_100, "CI 通过了。"),
+        assistant(2_000, delivered),
+        assistant(2_500, mid),
+        assistant(3_100, resumed),
     ])
-    .with_executions(vec![execution(2_500), execution(4_000)])
+    .with_executions(vec![execution(2_600), execution(4_000)])
     .with_wakes(vec![shell_wake(2_900)]);
-    let (app, platform) = restarted_app(&session_file, transcript, None).await;
-    // The orphaned card's view: the Wake arm's collect is NOT the fresh-Turn
-    // takeover, so ADR-0068's strip must leave this body untouched.
+    let (app, platform, _backend) =
+        restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Idle)).await;
+    // The projection's collect is not the fresh-Turn takeover: ADR-0068's
+    // strip leaves this body untouched.
     platform.given_card_view("om_frozen", live_tail_orphan_view());
 
     spawn_sync(&app);
-    // The continuation posts, streams the resumed work and ends ✅.
-    wait_for_card_update(
-        &platform,
-        "the restart continuation's done card",
-        CardUpdates::Latest,
-        |card| card_header(card).contains("✅") && card_text(card).contains("CI 通过了。"),
-    )
-    .await;
+    let (successor, successor_text) = wait_for_projection(&platform, "msg_cola_anchor").await;
+
+    assert_eq!(
+        card_header(&successor),
+        "✅ 完成",
+        "the projection settles the transcript's true end"
+    );
+    assert_eq!(
+        successor_text.matches(mid).count(),
+        1,
+        "the pre-Wake tail lands exactly once: {successor}"
+    );
+    assert_eq!(
+        successor_text.matches(resumed).count(),
+        1,
+        "the resumed work lands exactly once: {successor}"
+    );
+    assert!(
+        !successor_text.contains(delivered),
+        "the delivered prefix is never repeated: {successor}"
+    );
+    assert_eq!(
+        card_posts(&platform).await,
+        1,
+        "one card, the projection's successor — never a Fresh Wake card: {:?}",
+        platform.calls.lock().await
+    );
+
     // The orphan is collected in place, never left looking live.
-    wait_for_card_update(
-        &platform,
-        "the orphan's taken-over note",
-        CardUpdates::Any,
-        |card| card_header(card).contains("已由新卡片接管"),
-    )
-    .await;
     let collected = last_update_of(&platform, "om_frozen")
         .await
         .expect("the orphaned card is collected in place");
     assert_eq!(card_header(&collected), "⏳ 已由新卡片接管 · 已停止更新");
-    // The Wake continuation's collect keeps the preserved body as today (the
-    // spec's Trigger scopes the ADR-0068 strip to the fresh-Turn takeover):
-    // the running panel and the ledger both stay.
+    // The projection's collect keeps the running panel it did not resolve;
+    // the ledger element always leaves a takeover collect (ADR-0060: the
+    // successor's own reads rebuild the live list).
     let collected_text = card_text(&collected);
     assert!(
-        collected_text.contains("⏳ shell") && collected_text.contains("⏳ 后台任务"),
-        "the Wake arm's collect is untouched by ADR-0068: {collected_text}"
+        collected_text.contains("⏳ shell"),
+        "an unresolved running panel stays on the collected card: {collected_text}"
     );
-
-    // The record followed the successor: after the continuation's own settle
-    // (it ended ✅ in the same read) the record is spent, but the send that
-    // took over re-pointed it first — proven by the successor's own send
-    // having tracked a card id that is not the orphan's.
-    let record = app.cards_handle().chains.get("ses_test");
     assert!(
-        record
-            .as_ref()
-            .is_none_or(|record| record.card_message_id != "om_frozen"),
-        "the record never keeps naming the collected orphan: {record:?}"
+        !collected_text.contains("⏳ 后台任务"),
+        "the ledger leaves the projection's collect: {collected_text}"
     );
+    wait_for_record_gone(&app, "ses_test").await;
 }
 
-/// The Wake continuation arm never seeds (ADR-0061's no-replay scope): the
-/// restart's Session Sync posts its continuation without the takeover's seed,
-/// so a stale running call from the lost chain is not replayed onto it.
+/// The Fresh gate narrows to recordless posts (spec #561, ticket #566): a
+/// durable record — cursorless here, so the projection has nothing to seed —
+/// hands its Wake to the reap's fallback, which settles the recorded card in
+/// place. The Fresh path never arms a card over a recorded chain, so the lost
+/// chain's stale running call is never replayed onto a new card.
 #[tokio::test]
-async fn a_restart_wake_continuation_never_seeds() {
+async fn a_record_carrying_wake_is_never_re_posted_by_the_fresh_path() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("sessions.json");
     seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000_000));
 
     // The lost chain: its running call sits beyond the Wake's own in-flight
-    // window, so only a seed could ever replay it.
+    // window, so only a Fresh card could ever replay it.
     let transcript = SessionTranscript::new(vec![
         user("msg_cola_anchor", 1_000_000, "跑一下 CI"),
         in_flight_shell(
@@ -2854,26 +2880,33 @@ async fn a_restart_wake_continuation_never_seeds() {
     ])
     .with_executions(vec![execution(1_400_000), execution(2_200_000)])
     .with_wakes(vec![shell_wake(2_000_000)]);
-    let (app, platform, backend) = restarted_app_with_backend(&session_file, transcript, None).await;
+    let (app, platform, _backend) =
+        restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Idle)).await;
 
     spawn_sync(&app);
+    // The fallback still runs: the recorded card settles in place by
+    // transcript truth.
     wait_for_card_update(
         &platform,
-        "the restart continuation's done card",
-        CardUpdates::Latest,
-        |card| card_header(card).contains("✅") && card_text(card).contains("CI 通过了。"),
+        "the reap's in-place settle",
+        CardUpdates::Any,
+        |card| card_header(card).contains("✅"),
     )
     .await;
 
-    let reads = backend.transcript_calls.lock().await.len();
-    assert!(
-        reads > 0,
-        "the reap ran its reads; it just never seeded the lost chain"
+    assert_eq!(
+        card_posts(&platform).await,
+        0,
+        "a record-carrying Wake never arms a Fresh continuation: {:?}",
+        platform.calls.lock().await
     );
-    let cards = platform.updated_cards().await;
+    let settled = last_update_of(&platform, "om_frozen")
+        .await
+        .expect("the recorded card settles in place");
+    assert_eq!(card_header(&settled), "✅ 完成");
     assert!(
-        !card_text(cards.last().unwrap()).contains("call_sleep"),
-        "the lost chain's stale running call is never replayed: {cards:?}"
+        !card_text(&settled).contains("call_sleep"),
+        "the lost chain's stale running call is never replayed: {settled}"
     );
 }
 
@@ -4537,6 +4570,66 @@ async fn a_failed_adoption_create_retries_and_never_stamps() {
     );
     assert!(!successor_text.contains(delivered), "{successor}");
     wait_for_record_card(&app, "ses_test", "msg_reply").await;
+}
+
+/// A record carrying a Rendered Cursor is never stamped (spec #561, ticket
+/// #566): a still-live run whose cursor this read cannot place waits for a read
+/// the projection can seed — the #443 stamp is the cursorless fallback's alone,
+/// so the old card is left exactly as it was and the record is kept.
+#[tokio::test]
+async fn a_cursor_carrying_live_orphan_is_never_stamped() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    // The frontier names a message this read does not carry: unplaceable.
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
+        Some(CursorFrontier {
+            message_id: MessageId::new("msg_gone"),
+            part_index: 0,
+            kind: CursorPartKind::Text,
+            started_at: None,
+            delivered_chars: 1,
+        }),
+        &[],
+    );
+    let running = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "问题"),
+        assistant_in_flight(2_000, "还在写。"),
+    ]);
+    let (app, platform, backend) =
+        restarted_app_with_backend(&session_file, running, Some(SessionStatus::Busy)).await;
+    // A stamp PATCH would succeed if one were made.
+    platform.given_card_view("om_frozen", realistic_card_view());
+
+    spawn_sync(&app);
+    wait_for_status_reads(&backend, "ses_test", 3).await;
+
+    assert!(
+        patches_to(&platform, "om_frozen").await.is_empty(),
+        "a cursor-carrying live orphan is never stamped: {:?}",
+        platform.calls.lock().await
+    );
+    assert_eq!(
+        card_posts(&platform).await,
+        0,
+        "an unplaceable cursor projects nothing either: {:?}",
+        platform.calls.lock().await
+    );
+    let record = app
+        .cards_handle()
+        .chains
+        .get("ses_test")
+        .expect("the record waits for a read the projection can place");
+    assert_eq!(record.card_message_id, "om_frozen");
+    assert!(
+        record.cursor.is_some(),
+        "a no-decision pass leaves the cursor untouched"
+    );
 }
 
 /// V1 and V2 share one rule (spec #561, ticket #564): the projection's reads
