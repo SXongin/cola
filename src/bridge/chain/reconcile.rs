@@ -844,18 +844,18 @@ async fn project_card(
     // The projection's scope: the recorded Turn anchor, else the submitted
     // message's own anchor re-derived from this read (a settle beyond
     // `Unreceived` implies one exists — the decision settled on it). The
-    // DELIVERY target reads the recorded anchor alone: an anchor the previous
-    // life never persisted falls back to the recorded card, then the Chat.
+    // DELIVERY target follows the same order (spec #561): the original Turn
+    // anchor — recorded, or re-derived here when the previous life never
+    // persisted its server time — then the recorded card, then the Chat.
     let scope = record
         .anchor()
         .or_else(|| transcript.anchor_of_user(record.message_id.as_str()));
-    let recorded_anchor = record.anchor();
     let chat = handles
         .sessions
         .entry_for_session(session_id)
         .await
         .map(|entry| entry.thread_key.chat_id);
-    let Some(target) = project_target(record, recorded_anchor.as_ref(), chat.as_deref()) else {
+    let Some(target) = project_target(record, scope.as_ref(), chat.as_deref()) else {
         // No deliverable target at all: today's behavior, never a projection.
         settle_card(handles, session_id, record, reads.route, settle, read_timeout_ms).await;
         return;
@@ -948,17 +948,18 @@ async fn project_live_card(
     // message's own anchor re-derived from this read. The decision only adopts
     // a record with a scope; a missing one here is a plan/decision mismatch
     // that claims nothing — never the cursorless fallback's stamp (spec #561,
-    // ticket #566).
+    // ticket #566). The DELIVERY target follows the same order: the original
+    // Turn anchor — recorded, or re-derived here — then the recorded card,
+    // then the Chat.
     let anchor = record
         .anchor()
         .or_else(|| transcript.anchor_of_user(record.message_id.as_str()))?;
-    let recorded_anchor = record.anchor();
     let chat = handles
         .sessions
         .entry_for_session(session_id)
         .await
         .map(|entry| entry.thread_key.chat_id);
-    let Some(target) = project_target(record, recorded_anchor.as_ref(), chat.as_deref()) else {
+    let Some(target) = project_target(record, Some(&anchor), chat.as_deref()) else {
         // No deliverable target at all: the adoption is not attempted — and a
         // cursor-carrying record is never stamped, so the pass claims nothing.
         return None;

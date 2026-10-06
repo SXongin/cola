@@ -2986,6 +2986,60 @@ impl StreamAccumulator {
         found.then_some(rendered)
     }
 
+    /// Whether `text` is a REWRITE of the part `source` (spec #561, review
+    /// #569): the timeline holds content for the part and the new snapshot
+    /// does not extend it. The render must then REPLACE the part's entries —
+    /// the old content is gone from the read — instead of accumulating the
+    /// new snapshot on top, which would double-count the part and leave the
+    /// Rendered Cursor digestless.
+    pub(super) fn source_rewritten(&self, source: &PartSource, text: &str) -> bool {
+        self.source_rendered(source)
+            .is_some_and(|rendered| !rendered.is_empty() && !text.starts_with(&rendered))
+    }
+
+    /// Replace `source`'s timeline entries with a fresh run of `text` (spec
+    /// #561, review #569) — the server rewrote the part, so the replacement is
+    /// its whole content now. The new run lands where the old one began
+    /// (chunked like any push, keyed at the part's start time), its source
+    /// carrying the new content's prefix digest and no offset: the cursor
+    /// records the part's new full extent, and a restart resolves it.
+    pub(super) fn replace_text_run(&mut self, source: &PartSource, text: &str, at_ms: Option<i64>) {
+        self.drop_source_run(source);
+        self.push_text_lead(at_ms, Some(self.rewrite_source(source, text)), text, None);
+    }
+
+    /// [`Self::replace_text_run`] for a rewritten reasoning part.
+    pub(super) fn replace_reasoning_run(&mut self, source: &PartSource, text: &str, at_ms: Option<i64>) {
+        self.drop_source_run(source);
+        self.push_reasoning_lead(at_ms, Some(self.rewrite_source(source, text)), text, None);
+    }
+
+    /// The source a rewritten part's fresh run carries: its position with the
+    /// new content's prefix digest and no offset.
+    fn rewrite_source(&self, source: &PartSource, text: &str) -> PartSource {
+        PartSource {
+            message_id: source.message_id.clone(),
+            index: source.index,
+            delivered_before: 0,
+            prefix_digest: Some(crate::bridge::chain::cursor_prefix_digest(text)),
+        }
+    }
+
+    /// Drop every timeline entry of `source` (spec #561, review #569), keeping
+    /// `render_from` on the same logical position: entries before the
+    /// finalized boundary belong to sent cards, and a rewritten part's entries
+    /// after it are the live render's own.
+    fn drop_source_run(&mut self, source: &PartSource) {
+        let boundary = self.render_from.min(self.timeline.len());
+        let removed_before = self.timeline[..boundary]
+            .iter()
+            .filter(|item| item.source.as_ref().is_some_and(|s| s.same_part(source)))
+            .count();
+        self.timeline
+            .retain(|item| !item.source.as_ref().is_some_and(|s| s.same_part(source)));
+        self.render_from = self.render_from.saturating_sub(removed_before);
+    }
+
     /// The Rendered Cursor of the card body [`Self::build_card_inner`] is
     /// about to render for `timeline[..end]` (spec #561): the chain's
     /// confirmed cursor plus what this body adds. The frontier names the
