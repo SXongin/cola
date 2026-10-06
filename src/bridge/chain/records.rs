@@ -398,6 +398,34 @@ impl ChainRecords {
         previous
     }
 
+    /// Re-point the session's record AND set its Rendered Cursor in ONE chains
+    /// critical section (spec #561, review #569): a projection's atomic
+    /// takeover. A separate [`Self::track`] + [`Self::advance_cursor`] would
+    /// leave the record naming the successor card with the PREDECESSOR's
+    /// frontier in between, and a fresh Turn that snapshots the record in that
+    /// window would seed from the stale cursor and re-render the successor's
+    /// already-delivered tail onto its own card — while the collected successor
+    /// keeps its body: the same text twice. Returns the previous record,
+    /// exactly like [`Self::track`].
+    pub(crate) fn track_carrying_cursor(
+        &self,
+        session_id: &str,
+        card_message_id: impl Into<String>,
+        message_id: MessageId,
+        created_ms: Option<i64>,
+        directory: Option<&str>,
+        cursor: &RenderedCursor,
+    ) -> Option<ChainRecord> {
+        let mut state = self.lock();
+        let previous = state.records.get(session_id).cloned();
+        let mut record = ChainRecord::new(card_message_id, message_id, created_ms)
+            .with_directory(directory.map(str::to_string));
+        record.cursor = Some(cursor.clone());
+        state.records.insert(session_id.to_string(), record);
+        self.write(&state);
+        previous
+    }
+
     /// The one removal: drop the session's record — the card reached a
     /// terminal or was collected, so nothing is owed a reap. Its announcement,
     /// if any, stays: the watermark outlives the record it was announced on.

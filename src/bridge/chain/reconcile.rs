@@ -543,6 +543,7 @@ async fn send_projected_chain(
             &new_card_id,
             !slice.full,
             Some(directory),
+            slice.cursor_stage,
         )
         .await
         {
@@ -553,14 +554,6 @@ async fn send_projected_chain(
             collect_late_projection(&handles.cards, session_id, &new_card_id).await;
             return ProjectedChain::Stopped(last);
         }
-        crate::bridge::turn::confirm_armed_cursor(
-            &handles.cards,
-            session_id,
-            chain_id,
-            &new_card_id,
-            slice.cursor_stage,
-        )
-        .await;
         crate::bridge::turn::drain_armed_watermark(
             &handles.cards,
             session_id,
@@ -596,11 +589,12 @@ enum Projection {
 /// The projection transition both dispositions share (spec #561, review
 /// #569): arm the successor from the chain's cursor, send its first create —
 /// with the definite-failure classification and the flush's fenced fallback —
-/// take the chain over in one cards-map critical section, collect the recorded
-/// card, confirm each slice's cursor and continue an oversized delta as a
-/// bounded chain. The callers keep only their genuine differences: `ending` is
-/// the ended projection's ending (a live adoption passes `None` and keeps its
-/// follow), and `None` means this pass claims nothing.
+/// take the chain over in one cards-map critical section that confirms the
+/// create's cursor with the re-point, collect the recorded card and continue
+/// an oversized delta as a bounded chain. The callers keep only their genuine
+/// differences: `ending` is the ended projection's ending (a live adoption
+/// passes `None` and keeps its follow), and `None` means this pass claims
+/// nothing.
 #[allow(clippy::too_many_arguments)] // the projection's whole fixture
 async fn send_projected_successor(
     handles: &FlowHandles,
@@ -723,17 +717,18 @@ async fn send_projected_successor(
     };
     // The successor takes the chain over in ONE cards-map critical section
     // (review #569): verify the armed session is still current, attach its
-    // identity and re-point the record, with no gap for a fresh Turn's own
-    // card insert to land in. Lost means the Turn owns the session and the
-    // record now: the late card is collected so it cannot look live, and none
-    // of this pass's takeover writes (attach, re-point, cursor confirm,
-    // watermark drain, terminal release) may touch the Turn's chain.
+    // identity, re-point the record and confirm the create's staged Rendered
+    // Cursor — with no gap for a fresh Turn's own card insert to land in. Lost
+    // means the Turn owns the session and the record now: the late card is
+    // collected so it cannot look live, and none of this pass's takeover
+    // writes (the cursor confirm included) may touch the Turn's chain.
     let ArmedTakeover::Took(orphan) = Turn::take_over_armed_card(
         &handles.cards,
         session_id,
         chain_id,
         &new_card_id,
         Some(route_directory),
+        slice.cursor_stage,
     )
     .await
     else {
@@ -746,6 +741,14 @@ async fn send_projected_successor(
         );
         return Some(Projection::Stopped);
     };
+    // The same write carried every Wake completion entry the seeded render
+    // staged: the confirmed create is what makes the announcement durable
+    // (ADR-0061, ticket #566), so a later recordless restart cannot
+    // re-announce the Wake through the Fresh gate. Drained before the old
+    // card's collect, so no awaited network call sits between the takeover's
+    // cursor confirmation and the record that carries it (review #569).
+    crate::bridge::turn::drain_armed_watermark(&handles.cards, session_id, chain_id, slice.watermark_stage)
+        .await;
     if let Some(orphan) = orphan {
         crate::bridge::chain::collect_orphan_after_takeover(
             &handles.cards,
@@ -755,27 +758,6 @@ async fn send_projected_successor(
         )
         .await;
     }
-    // The confirmed create carries the successor's body: advance the chain's
-    // cursor exactly like a flush-confirmed write (spec #561) — scoped to the
-    // armed chain and to the exact staged body the create carried, so a fresh
-    // Turn that replaced the session meanwhile never has its own staged cursor
-    // taken, and a body staged since is never advanced by this create
-    // (review #569).
-    crate::bridge::turn::confirm_armed_cursor(
-        &handles.cards,
-        session_id,
-        chain_id,
-        &new_card_id,
-        slice.cursor_stage,
-    )
-    .await;
-    // The same write carried every Wake completion entry the seeded render
-    // staged: the confirmed create is what makes the announcement durable
-    // (ADR-0061, ticket #566), so a later recordless restart cannot
-    // re-announce the Wake through the Fresh gate. Chain- and stage-scoped like
-    // the cursor confirm.
-    crate::bridge::turn::drain_armed_watermark(&handles.cards, session_id, chain_id, slice.watermark_stage)
-        .await;
     // An oversized delta continues on a bounded chain of cards (spec #561,
     // review #569): every slice through the same splitter, each confirmed only
     // after its own create lands. A stopped chain leaves the tail to the next

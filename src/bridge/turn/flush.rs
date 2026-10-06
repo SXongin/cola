@@ -136,13 +136,13 @@ async fn stage_rendered_cursor(
 /// (spec #561): the staged value is taken exactly once, mirrored into the
 /// accumulator's confirmed base and advanced on the Chain Record, scoped to
 /// the card the flush wrote. `chain_id` narrows the call to one chain when the
-/// caller knows it (a projection's armed successor, review #569): a fresh Turn
-/// that replaced the session meanwhile owns its staged cursor itself, so its
-/// accumulator is never read, mutated or advanced by a foreign confirmation.
-/// `expected` is the exact stage the caller's write carried (its generation,
-/// plus the outbox sequence a drain verified): a body staged SINCE that write
-/// — for example a fresh flush whose PATCH is still pending — never matches
-/// and is left untouched for its own confirmation (review #569).
+/// caller knows it (review #569): a fresh Turn that replaced the session
+/// meanwhile owns its staged cursor itself, so its accumulator is never read,
+/// mutated or advanced by a foreign confirmation. `expected` is the exact
+/// stage the caller's write carried (its generation, plus the outbox sequence
+/// a drain verified): a body staged SINCE that write — for example a fresh
+/// flush whose PATCH is still pending — never matches and is left untouched
+/// for its own confirmation (review #569).
 async fn confirm_staged_cursor(
     cards: &CardsHandle,
     session_id: &str,
@@ -158,22 +158,10 @@ async fn confirm_staged_cursor(
         if chain_id.is_some_and(|chain_id| card.chain_id() != chain_id) {
             return;
         }
-        let matches = card.acc.pending_cursor.as_ref().is_some_and(|staged| {
-            staged.id == expected.id
-                && staged.awaiting_seq == expected.awaiting_seq
-                && staged
-                    .card_message_id
-                    .as_deref()
-                    .is_none_or(|id| id == card_message_id)
-        });
-        if !matches {
-            return;
-        }
-        let Some(staged) = card.acc.pending_cursor.take() else {
+        let Some(cursor) = card.acc.take_staged_cursor(card_message_id, expected) else {
             return;
         };
-        card.acc.cursor = staged.cursor.clone();
-        staged.cursor
+        cursor
     };
     cards.chains.advance_cursor(session_id, card_message_id, &cursor);
 }
@@ -220,25 +208,6 @@ async fn note_cursor_write_failure(
     if let Some(session) = live.get_mut(session_id) {
         session.acc.discard_pending_cursor();
     }
-}
-
-/// Confirm the Rendered Cursor a projection's successor create carried, scoped
-/// to the armed successor's chain identity (spec #561, ticket #563, review
-/// #569): the body's cursor was staged by
-/// [`Turn::arm_projected_card`](super::Turn::arm_projected_card) and the
-/// create landed, so the chain's record advances exactly as a flush-confirmed
-/// write does. A no-op when nothing is staged for that card — and when a fresh
-/// Turn replaced the session meanwhile, whose staged cursor is its own and is
-/// never taken or advanced by the projection's late create. `expected` is the
-/// stage the armed body carried; anything staged since is left untouched.
-pub(crate) async fn confirm_armed_cursor(
-    cards: &CardsHandle,
-    session_id: &str,
-    chain_id: u64,
-    card_message_id: &str,
-    expected: crate::bridge::turn::state::StagedCursorId,
-) {
-    confirm_staged_cursor(cards, session_id, card_message_id, Some(chain_id), expected).await;
 }
 
 /// Advance every staged Rendered Cursor whose owed Pending Card Update has

@@ -1584,6 +1584,35 @@ impl StreamAccumulator {
         })
     }
 
+    /// Take the staged Rendered Cursor a just-confirmed write carried (spec
+    /// #561, review #569): mirror it into the confirmed base and hand it back
+    /// for the Chain Record. Only the EXACT stage matches — a body staged
+    /// since is left for its own confirmation — and the stage's card scope
+    /// must accept `card_message_id` (a create's stage carries none). The
+    /// projection's atomic takeover calls this inside its cards-map critical
+    /// section, so the record can carry the successor's frontier from the
+    /// first moment it names the successor card.
+    pub(super) fn take_staged_cursor(
+        &mut self,
+        card_message_id: &str,
+        expected: StagedCursorId,
+    ) -> Option<RenderedCursor> {
+        let matches = self.pending_cursor.as_ref().is_some_and(|staged| {
+            staged.id == expected.id
+                && staged.awaiting_seq == expected.awaiting_seq
+                && staged
+                    .card_message_id
+                    .as_deref()
+                    .is_none_or(|id| id == card_message_id)
+        });
+        if !matches {
+            return None;
+        }
+        let staged = self.pending_cursor.take()?;
+        self.cursor = staged.cursor.clone();
+        Some(staged.cursor)
+    }
+
     /// The stage generation of the staged Wake Watermark, when one is staged:
     /// what a drain must match (spec #561, review #569).
     pub(super) fn pending_watermark_id(&self) -> Option<u64> {
