@@ -64,6 +64,11 @@ struct PendingEntry {
     /// carries it so the Rendered Cursor's drain reconcile can tell a
     /// delivery from a permanent refusal (spec #561).
     delivered: bool,
+    /// The highest sequence this card is known to have DELIVERED (spec #561,
+    /// review #569), carried across entry replacements: a newer write — even a
+    /// failed one that now owes a payload — never unsays a delivery a staged
+    /// cursor still needs to confirm. It goes with the entry on eviction.
+    delivered_through: u64,
     /// Failed retry attempts so far — the backoff exponent.
     attempts: u32,
     /// The earliest instant the next retry may go out (unless forced).
@@ -168,11 +173,20 @@ impl CardDelivery {
         if !newest {
             return;
         }
+        // A delivery is never unsaid (spec #561, review #569): the evidence a
+        // staged cursor confirms by survives the newer write that replaces
+        // this entry — even a newer failed one that now owes its own payload.
+        let delivered_through = state
+            .entries
+            .get(message_id)
+            .map_or(0, |entry| entry.delivered_through)
+            .max(if result.is_ok() { seq } else { 0 });
         let entry = if matches!(result, Err(e) if e.is_recoverable_card_write()) {
             PendingEntry {
                 seq,
                 card: Some(card.clone()),
                 delivered: false,
+                delivered_through,
                 attempts: 0,
                 next_attempt: tokio::time::Instant::now() + self.backoff_base,
                 lock: state.locks.entry(message_id.to_string()).or_default().clone(),
@@ -187,6 +201,7 @@ impl CardDelivery {
                 seq,
                 card: None,
                 delivered: result.is_ok(),
+                delivered_through,
                 attempts: 0,
                 next_attempt: tokio::time::Instant::now(),
                 lock: state.locks.entry(message_id.to_string()).or_default().clone(),
@@ -409,10 +424,13 @@ impl Platform for CardDelivery {
                     // Keep the sequence as a settled tombstone: an outcome that
                     // is not newer than the stored one must not re-register
                     // behind it. `delivered` is what the Rendered Cursor's
-                    // drain reconcile confirms against (spec #561).
+                    // drain reconcile confirms against (spec #561), and
+                    // `delivered_through` keeps that evidence after a newer
+                    // write replaces this entry (review #569).
                     if let Some(current) = state.entries.get_mut(&message_id) {
                         current.card = None;
                         current.delivered = true;
+                        current.delivered_through = current.delivered_through.max(entry.seq);
                     }
                     if entry.attempts > 0 {
                         tracing::info!(
@@ -457,12 +475,15 @@ impl Platform for CardDelivery {
     }
 
     fn card_write_delivered(&self, message_id: &str, seq: u64) -> bool {
+        // The delivered watermark, not just the newest entry's own verdict
+        // (spec #561, review #569): a staged cursor confirms by the sequence
+        // its write carried, which a newer write must not erase.
         self.state
             .lock()
             .unwrap()
             .entries
             .get(message_id)
-            .is_some_and(|entry| entry.seq == seq && entry.card.is_none() && entry.delivered)
+            .is_some_and(|entry| entry.delivered_through >= seq)
     }
 
     fn settled_card_write_delivered(&self, message_id: &str) -> Option<bool> {
@@ -700,6 +721,43 @@ mod tests {
         assert!(
             !delivery.card_write_delivered("om_1", seq + 1),
             "a refused write is never a delivery"
+        );
+    }
+
+    /// A delivered write stays confirmable after a NEWER failure replaces the
+    /// entry (spec #561, review #569): the outbox owes the newer payload, but
+    /// the delivered sequence is still what the Rendered Cursor's staged write
+    /// needs — the durable cursor must not lose a delivery to a later
+    /// supersede.
+    #[tokio::test]
+    async fn a_delivered_write_stays_confirmable_after_a_newer_failure() {
+        let inner = Arc::new(FakePlatform::new());
+        let delivery = CardDelivery::new(inner.clone());
+        let first = serde_json::json!({ "body": "first" });
+        let second = serde_json::json!({ "body": "second" });
+
+        inner.fail_next(Fail::Transport);
+        let _ = delivery.update_message("om_1", &first).await;
+        let seq = delivery
+            .pending_card_write("om_1", &first)
+            .expect("the owed payload is tied to its sequence");
+        delivery.drain_pending_card_updates(true).await;
+        assert!(
+            delivery.card_write_delivered("om_1", seq),
+            "the drained write delivered"
+        );
+
+        // A newer write fails: the newest entry now owes another payload, but
+        // the delivered sequence stays verified for the stage it belongs to.
+        inner.fail_next(Fail::Transport);
+        let _ = delivery.update_message("om_1", &second).await;
+        assert!(
+            delivery.card_write_delivered("om_1", seq),
+            "a delivered write is still a delivery after a newer failure"
+        );
+        assert!(
+            !delivery.card_write_delivered("om_1", seq + 1),
+            "the owed newer write is not a delivery"
         );
     }
 

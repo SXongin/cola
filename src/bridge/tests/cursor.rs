@@ -12,16 +12,48 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use super::drain::{
-    assistant, ctx, scripted_app, settle_tool, spawn_turn, tool_assistant, user, wait_for_card_text,
+    assistant, ctx, scripted_app, settle_tool, spawn_sync, spawn_turn, tool_assistant, user,
+    wait_for_card_text,
 };
-use crate::backend::{MessageId, MessageRole, SessionTranscript, ToolStatus};
+use crate::backend::{
+    MessageId, MessageRole, MessageTime, Part, SessionTranscript, TextPart, ToolStatus, TranscriptMessage,
+};
 use crate::bridge::chain::{CursorFrontier, CursorPartKind, RenderedCursor, cursor_prefix_digest};
 use crate::bridge::test_support::{
-    MockBackend, PlatformCall, card_text, patches_to, test_work_dir, text_part, typed_message,
-    wait_for_transcript_reads,
+    MockBackend, PlatformCall, card_text, patches_to, realistic_parts, seed_session, test_config,
+    test_work_dir, text_part, typed_message, wait_for_transcript_reads,
 };
 use crate::bridge::turn::Turn;
 use crate::opencode::types::SessionStatus;
+
+/// Wait until a reply to `reply_to` carries `needle`, or panic after 5 s: the
+/// restart's projection successor (spec #561's adoption).
+async fn wait_for_reply_text(
+    platform: &Arc<crate::bridge::test_support::RecordingPlatform>,
+    reply_to: &str,
+    needle: &str,
+) -> String {
+    let probe = async {
+        loop {
+            {
+                let calls = platform.calls.lock().await;
+                if let Some(card) = calls.iter().find_map(|call| match call {
+                    PlatformCall::ReplyCard { reply_to: to, card } if to == reply_to => Some(card.clone()),
+                    _ => None,
+                }) {
+                    let text = card_text(&card);
+                    if text.contains(needle) {
+                        return text;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), probe)
+        .await
+        .unwrap_or_else(|_| panic!("the projection never showed {needle}"))
+}
 
 /// Wait until the durable record's Rendered Cursor satisfies `ready`, or
 /// panic after 5 s.
@@ -487,13 +519,13 @@ async fn a_permanently_rejected_write_advances_nothing() {
 }
 
 /// The drain reconcile confirms only the exact write whose delivery it
-/// verified (spec #561, review #569): a fresh flush can stage a newer cursor
-/// between the delivery check and the confirmation; that newer stage — whose
-/// PATCH is still pending — must never be persisted, or a restart would skip
-/// its undelivered content. The interleaving is deterministic through the
-/// drain's test gate.
+/// verified, while a delivered-but-unconfirmed write keeps its confirmation
+/// even after a newer stage replaces the pending slot (spec #561, review
+/// #569). The interleaving is deterministic through the drain's test gate, and
+/// a restart from the persisted cursor re-renders only what the delivered
+/// write did not cover.
 #[tokio::test]
-async fn a_newer_staged_cursor_is_never_confirmed_by_an_older_delivery() {
+async fn a_delivered_cursor_survives_a_newer_stage_that_replaces_it() {
     let _wd = test_work_dir();
     let transcript = SessionTranscript::new(vec![
         user("msg_cola_anchor", 1_000, "你好"),
@@ -555,24 +587,65 @@ async fn a_newer_staged_cursor_is_never_confirmed_by_an_older_delivery() {
     gate.release.notify_one();
     reconcile.await.unwrap();
 
-    // The newer stage is left for its own confirmation, and the durable cursor
-    // stays at the last confirmed position — a restart from here re-renders
-    // B's undelivered content instead of skipping it.
+    // The delivered write A is persisted even though B now holds the pending
+    // slot; B itself is left for its own confirmation — a restart from here
+    // re-renders B's undelivered content instead of skipping it.
     assert_eq!(
         app.cards_handle().chains.cursor("ses_test"),
-        None,
-        "an unconfirmed newer stage is never persisted as delivered"
+        Some(staged_a.clone()),
+        "the delivered write's cursor is persisted despite the newer stage"
     );
     assert_eq!(
         Turn::staged_cursor(&app.cards_handle(), "ses_test").await,
-        Some(staged_b),
+        Some(staged_b.clone()),
         "the newer stage is left untouched for its own confirmation"
     );
     let persisted =
         crate::bridge::chain::ChainRecords::load(session_file.with_file_name("chain_records.json"));
     assert_eq!(
         persisted.cursor("ses_test"),
-        None,
-        "the persisted record still holds the last confirmed cursor"
+        Some(staged_a.clone()),
+        "the persisted record carries the delivered write's cursor"
+    );
+
+    // A restart over that cursor re-renders only the growth past it: the
+    // delivered content is never repeated (review #569).
+    drop(app);
+    let grown = "答复。补充。";
+    let mut backend2 = MockBackend::new(realistic_parts());
+    backend2.given_transcript(
+        "ses_test",
+        vec![SessionTranscript::new(vec![
+            user("msg_cola_anchor", 1_000, "你好"),
+            TranscriptMessage {
+                id: MessageId::new("msg_a_2000"),
+                role: MessageRole::Assistant,
+                time: Some(MessageTime {
+                    created: 2_000,
+                    completed: None,
+                }),
+                model: None,
+                tokens: None,
+                error: None,
+                parts: vec![Part::Text(TextPart {
+                    text: grown.to_string(),
+                    started_at: Some(2_000),
+                })],
+            },
+        ])],
+    );
+    backend2.with_session_status("ses_test", Some(SessionStatus::Busy));
+    let backend2 = Arc::new(backend2);
+    let platform2 = Arc::new(crate::bridge::test_support::RecordingPlatform::new());
+    let app2 = Arc::new(
+        crate::bridge::App::new(test_config(&session_file), backend2.clone(), platform2.clone())
+            .expect("the restarted app builds"),
+    );
+    seed_session(&app2, "ses_test", "/work").await;
+    spawn_sync(&app2);
+    let successor_text = wait_for_reply_text(&platform2, "msg_cola_anchor", "补充。").await;
+    assert!(
+        !successor_text.contains("答复。"),
+        "the delivered content is never repeated on the restart: {successor_text}"
     );
 }

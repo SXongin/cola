@@ -3956,12 +3956,12 @@ impl Turn {
     /// The session's staged Rendered Cursor (spec #561, review #569): the body
     /// most recently built and not yet confirmed.
     pub(crate) async fn staged_cursor(cards: &CardsHandle, session_id: &str) -> Option<RenderedCursor> {
-        cards.cards.lock().await.get(session_id).and_then(|card| {
-            card.acc
-                .pending_cursor
-                .as_ref()
-                .map(|staged| staged.cursor.clone())
-        })
+        cards
+            .cards
+            .lock()
+            .await
+            .get(session_id)
+            .and_then(|card| card.acc.staged_cursors.last().map(|staged| staged.cursor.clone()))
     }
 
     /// Stage a Rendered Cursor directly (spec #561, review #569) — a test seam
