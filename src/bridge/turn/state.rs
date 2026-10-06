@@ -716,19 +716,21 @@ pub(super) struct StreamAccumulator {
     /// strand it on a closed card; it joins `timeline` — with the identity it
     /// was born with — only when the tool settles (ADR-0045).
     live_tools: IndexMap<String, LiveTool>,
-    /// The **Carried Tool Panels**' call ids (ADR-0068): the orphaned Turn's
-    /// still-running calls a restart takeover seeded into this successor, while
-    /// they remain live. The set is the reconciliation scope — every render
-    /// read resolves each id against the WHOLE transcript, past the Turn window
-    /// whose membership would drop a long-running call's message — so the panel
-    /// keeps the transcript's current status and output and joins the timeline
-    /// at its server start key once it settles (the id then leaves the set).
-    /// Carried panels are display-only: they render only while a live renderer
-    /// owns the card (a settled/end-of-turn card omits a still-running one, so
-    /// no `⏳` outlives the Turn) and never count as the Turn's own unfinished
-    /// tools for the settle guard. In-memory only, never durable; empty for
-    /// every card that did not take over an orphan.
-    pub(super) carried_calls: std::collections::HashSet<String>,
+    /// The seed's live set (spec #561): the tool call ids a takeover's
+    /// projection seed handed this successor — the calls whose newest
+    /// DELIVERED state was `running`, or, for a cursorless record's fallback,
+    /// the orphaned Turn's still-live calls. The set is the reconciliation
+    /// scope — every render read resolves each id against the WHOLE transcript,
+    /// past the Turn window whose membership would drop a long-running call's
+    /// message — so the panel keeps the transcript's current status and output
+    /// and joins the timeline at its server start key once it settles (or once
+    /// the Turn's own window renders it, which retires the id). A seeded call
+    /// is display-only: it renders only while a live renderer owns the card (a
+    /// settled/end-of-turn card omits a still-running one, so no `⏳` outlives
+    /// the Turn) and never counts as the Turn's own unfinished tools for the
+    /// settle guard. In-memory only, never durable; empty for every card that
+    /// did not take over an orphan.
+    pub(super) seeded_calls: std::collections::HashSet<String>,
     /// The latest `todowrite` panel of this turn, rendered as a card-TAIL
     /// status section instead of a timeline row. A timeline row would freeze on
     /// whichever card the call landed on: once that card finalizes (a long
@@ -1875,7 +1877,7 @@ impl StreamAccumulator {
             .iter()
             .filter(|call| call.status.is_live() && call.identity.name != "todowrite")
         {
-            self.carried_calls.insert(call.identity.call_id.clone());
+            self.seeded_calls.insert(call.identity.call_id.clone());
             self.push_tool_at(
                 call.started_at,
                 &call.identity.call_id,
@@ -1901,7 +1903,7 @@ impl StreamAccumulator {
     pub(super) fn seed_projection(&mut self, cursor: &RenderedCursor, seed: CursorSeed) {
         self.cursor = cursor.clone();
         self.seed = Some(seed.clone());
-        self.carried_calls = seed.live_calls.into_iter().collect();
+        self.seeded_calls = seed.live_calls.into_iter().collect();
     }
 
     /// Mark one transcript part as delivered without rendering it (spec #561's
@@ -2232,19 +2234,19 @@ impl StreamAccumulator {
             .collect()
     }
 
-    /// Whether a still-running Carried Tool Panel (ADR-0068) is omitted from
-    /// the card being built under `state`: it rides the tail only while a live
-    /// renderer owns the card — once the card is settled (or yielded), no
+    /// Whether a still-running seeded call (spec #561's live set) is omitted
+    /// from the card being built under `state`: it rides the tail only while a
+    /// live renderer owns the card — once the card is settled (or yielded), no
     /// renderer will ever update the panel again, so it must not keep showing
     /// a `⏳` that can never move; it never outlives the Turn. `state` is the
     /// caller's EFFECTIVE state (the builder's `state_override` included), so
     /// the split estimator's tail reserve and the card builder's tail decide
     /// on the same state their card is built with and cannot drift; the
     /// estimator passes `self.card_state`. The reserve therefore never charges
-    /// for what the build will not render. A carried call that settled before
+    /// for what the build will not render. A seeded call that settled before
     /// the end is a timeline entry and is not covered by this rule.
-    fn omitted_live_carried(&self, state: &CardState, call_id: &str) -> bool {
-        !state.is_render_owned() && self.carried_calls.contains(call_id)
+    fn omitted_live_seeded(&self, state: &CardState, call_id: &str) -> bool {
+        !state.is_render_owned() && self.seeded_calls.contains(call_id)
     }
 
     /// First timeline index whose items would push the estimated component
@@ -2277,7 +2279,7 @@ impl StreamAccumulator {
             // card finalizes without the tail and the continuation carries it.
             // A still-running Carried Tool Panel is excluded on a card no live
             // renderer owns, exactly as `build_card_inner` omits it
-            // ([`Self::omitted_live_carried`]): the reserve must not charge for
+            // ([`Self::omitted_live_seeded`]): the reserve must not charge for
             // what the build will not render.
             if let Some(panel) = &self.todo_panel {
                 comps += 1;
@@ -2288,7 +2290,7 @@ impl StreamAccumulator {
                 size += crate::feishu::card::ledger::task_ledger_estimate(&self.ledger);
             }
             for call_id in self.live_tools.keys() {
-                if self.omitted_live_carried(&self.card_state, call_id) {
+                if self.omitted_live_seeded(&self.card_state, call_id) {
                     continue;
                 }
                 if let Some(panel) = self.tools.get(call_id) {
@@ -2359,7 +2361,7 @@ impl StreamAccumulator {
         // panel for it (a split continuation after `sleep 30` started): pass
         // the accumulator's global selection as the builder's override. The
         // state is cloned for the builder so the tail below can keep reading
-        // the EFFECTIVE state through `omitted_live_carried` after the move.
+        // the EFFECTIVE state through `omitted_live_seeded` after the move.
         let mut builder = CardBuilder::new()
             .with_state(state.clone())
             .with_progress(self.header_progress())
@@ -2469,12 +2471,12 @@ impl StreamAccumulator {
             // card and join the timeline once they settle (ADR-0045).
             //
             // A still-running Carried Tool Panel (ADR-0068) is omitted when no
-            // live renderer owns the card ([`Self::omitted_live_carried`],
+            // live renderer owns the card ([`Self::omitted_live_seeded`],
             // under this build's effective `state`); a carried call that
             // settled before the end is a timeline entry and still renders
             // below/above like any other.
             for (call_id, live) in &self.live_tools {
-                if self.omitted_live_carried(&state, call_id) {
+                if self.omitted_live_seeded(&state, call_id) {
                     continue;
                 }
                 if let Some(panel) = self.tools.get(call_id) {
@@ -2673,7 +2675,7 @@ impl StreamAccumulator {
         }
         if include_tail {
             for call_id in self.live_tools.keys() {
-                if !self.omitted_live_carried(state, call_id) {
+                if !self.omitted_live_seeded(state, call_id) {
                     cursor.live_calls.insert(call_id.clone());
                 }
             }

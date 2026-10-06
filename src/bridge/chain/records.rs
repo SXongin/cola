@@ -38,12 +38,12 @@ use crate::bridge::handles::CardsHandle;
 use crate::bridge::sidecar;
 
 /// The keep rule the fresh-Turn takeover's collect applied to the card it
-/// replaced (ADR-0068), in memory only: which predecessor card the collect
-/// targeted and whether the restart carry moved its running `⏳` panels onto
-/// the successor. The #443 restart stamp's post-PATCH repair reads it so a
-/// stamp landing over that takeover reproduces the collect's strip instead of
-/// restoring the tail it removed; every other takeover (the Wake and external
-/// arms) records none.
+/// replaced (ADR-0068, spec #561), in memory only: which predecessor card the
+/// collect targeted and whether the takeover's seed resolved its running `⏳`
+/// panels onto the successor. The #443 restart stamp's post-PATCH repair reads
+/// it so a stamp landing over that takeover reproduces the collect's strip
+/// instead of restoring the tail it removed; every other takeover (the Wake
+/// and external arms) records none.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PredecessorKeep {
     pub(crate) card_message_id: String,

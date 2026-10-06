@@ -96,7 +96,7 @@ use crate::feishu::card::{
 /// takeover alone, so this ordinary collect leaves the preserved body exactly
 /// as today — the Wake continuation's arm, the external arm, the reap's
 /// reconcile all come through here. The fresh Turn's own collect is
-/// [`collect_orphan_after_carry`], and the #443 stamp's repair reproduces
+/// [`collect_orphan_after_takeover`], and the #443 stamp's repair reproduces
 /// that collect's recorded rule where one exists (this plain collect
 /// otherwise).
 ///
@@ -107,35 +107,35 @@ pub(crate) async fn collect_orphan(cards: &CardsHandle, session_id: &str, card_m
 }
 
 /// Collect the orphaned card `card_message_id` for the **fresh-Turn message
-/// takeover** (ADR-0068, the only collect the strip is scoped to): the
-/// Background Task Ledger element goes always (the successor's own reads
-/// rebuild the live list, ADR-0060's one-card handover) and the running `⏳`
-/// panels go only when the restart carry actually moved at least one call
-/// onto the successor — `carried_running_panels` is the carry's own result, so
-/// a failed, timed-out, cap-stopped or empty carry keeps today's body for
-/// them. A failed PATCH only warns, like every collect.
+/// takeover** (spec #561, ADR-0068's successor): the Background Task Ledger
+/// element goes always (the successor's own reads rebuild the live list,
+/// ADR-0060's one-card handover) and the running `⏳` panels go only when the
+/// takeover's seed actually resolved at least one call onto the successor —
+/// `resolved_running_panels` is the seed's own result, so a failed, empty or
+/// fallback seed keeps today's body for them. A failed PATCH only warns, like
+/// every collect.
 ///
 /// The rule is recorded on the successor's record **before** the collect's
 /// PATCH: a #443 stamp admitted while the takeover ran may land after this
 /// collect, and its post-PATCH repair reads the rule to reproduce this strip
 /// instead of restoring the tail it removed ([`stamp_restart_attempt`]).
-pub(crate) async fn collect_orphan_after_carry(
+pub(crate) async fn collect_orphan_after_takeover(
     cards: &CardsHandle,
     session_id: &str,
     card_message_id: &str,
-    carried_running_panels: bool,
+    resolved_running_panels: bool,
 ) {
     cards
         .chains
-        .note_predecessor_keep(session_id, card_message_id, carried_running_panels);
+        .note_predecessor_keep(session_id, card_message_id, resolved_running_panels);
     let keep = KeepBody::WithoutLiveTail {
-        strip_running_panels: carried_running_panels,
+        strip_running_panels: resolved_running_panels,
     };
     collect_orphan_with(cards, session_id, card_message_id, keep).await;
 }
 
 /// The shared takeover collect behind [`collect_orphan`] and
-/// [`collect_orphan_after_carry`]: one PATCH naming the successor, terminal
+/// [`collect_orphan_after_takeover`]: one PATCH naming the successor, terminal
 /// and grey, its preserved body under `keep`.
 async fn collect_orphan_with(cards: &CardsHandle, session_id: &str, card_message_id: &str, keep: KeepBody) {
     if card_message_id.is_empty() {
@@ -597,7 +597,7 @@ async fn project_card(
     )
     .await;
     if let Some(orphan) = orphan {
-        crate::bridge::chain::collect_orphan_after_carry(
+        crate::bridge::chain::collect_orphan_after_takeover(
             &handles.cards,
             session_id,
             &orphan.card_message_id,
@@ -753,7 +753,7 @@ async fn project_live_card(
     )
     .await;
     if let Some(orphan) = orphan {
-        crate::bridge::chain::collect_orphan_after_carry(
+        crate::bridge::chain::collect_orphan_after_takeover(
             &handles.cards,
             session_id,
             &orphan.card_message_id,
@@ -1018,7 +1018,7 @@ async fn stamp_restart_attempt(
     //
     // The repair reproduces the takeover's own keep rule (ADR-0068), never
     // the plain one: a fresh Turn's collect recorded whether its carry moved
-    // the running `⏳` panels ([`collect_orphan_after_carry`]), and the stamp's
+    // the running `⏳` panels ([`collect_orphan_after_takeover`]), and the stamp's
     // stale body must not restore the tail that collect removed. A takeover
     // that recorded no rule — the Wake continuation's arm, the external arm —
     // keeps today's preserved body ([`KeepBody::Everything`]).
