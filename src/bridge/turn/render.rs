@@ -647,8 +647,10 @@ fn render_seeded_part(
         };
         if is_text {
             acc.push_text_lead(started_at, Some(source), &suffix, lead);
+            acc.card_state = crate::feishu::card::CardState::Streaming;
         } else {
             acc.push_reasoning_lead(started_at, Some(source), &suffix, lead);
+            acc.card_state = crate::feishu::card::CardState::Reasoning;
         }
     }
     if let Some(seed) = acc.seed.as_mut()

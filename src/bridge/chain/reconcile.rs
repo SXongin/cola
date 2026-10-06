@@ -15,14 +15,17 @@
 //! feedback): the reap reads the card's own view, strips the controls a
 //! whole-card read cannot preserve and restamps the header over the kept
 //! elements; a failed read degrades to the bare ending. The exception is the
-//! **ended-while-down projection** (spec #561, ticket #563): a record carrying
-//! a Rendered Cursor whose run ended while cola was down renders the content
-//! after the confirmed frontier — the missed tail plus the transcript's true
-//! ending — onto a successor card and collects the recorded card as taken
-//! over (see [`project_card`]). A cursorless record, a projection that renders
-//! nothing new, and one with no deliverable target all keep the in-place
-//! behavior, so an upgrade restart and a no-delta reap read exactly as before.
-//! The still-live orphan's one-time stamp (#443) reads the
+//! **projection** (spec #561): a record carrying a Rendered Cursor projects
+//! the content after the confirmed frontier onto a successor card and
+//! collects the recorded card as taken over. A run that ended while cola was
+//! down renders its missed tail plus the transcript's true ending and settles
+//! (ticket #563, [`project_card`]); a run that is STILL LIVE is adopted and
+//! followed — the successor streams what the run produces next and settles by
+//! transcript truth (ticket #564, [`project_live_card`], whose follow the
+//! caller spawns). A cursorless record, a projection that renders nothing
+//! new, and one with no deliverable target all keep the in-place behavior, so
+//! an upgrade restart and a no-delta reap read exactly as before.
+//! The still-live cursorless orphan's one-time stamp (#443) reads the
 //! same view the other way around: only the header changes, and a failed read
 //! or PATCH claims nothing — a bare stamp would wipe the body the stamp exists
 //! to keep — so the next pass retries it; a PATCH Feishu *permanently* refuses
@@ -33,7 +36,7 @@
 //! card-delivery lock can order a successor's later collect after it. A
 //! per-record in-flight claim holds every other reap decision until the
 //! attempt resolves. Content the chain never showed is published by the
-//! ended-while-down projection above (bounded by its confirmed cursor), by the
+//! projections above (bounded by their confirmed cursor), by the
 //! existing continuation machinery (a Wake's continuation card), or left in
 //! the transcript — the reap never replays a turn onto a stale card, and never
 //! re-renders anything at or before a confirmed frontier.
@@ -152,6 +155,20 @@ async fn collect_orphan_with(cards: &CardsHandle, session_id: &str, card_message
     }
 }
 
+/// What one reconcile pass armed and left for its caller to drive (spec #561,
+/// ticket #564): a live adoption's follow runs on the External Flow's own
+/// cadences and its render loop lives in that module, so the reap returns the
+/// fact and the flow spawns the loop. The ended projection spawns nothing —
+/// the successor is already terminal — so it never produces one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AdoptedFollow {
+    /// The successor card the adoption created.
+    pub(crate) card_message_id: String,
+    /// The chain's Turn anchor — the successor's scope, and the identity the
+    /// follow loop's guards compare.
+    pub(crate) anchor: TurnAnchor,
+}
+
 /// Reconcile one record against the Session's own reads (ADR-0063). `directory`
 /// is the Session's mapped directory, when it still has one — the fallback
 /// route when the record itself carries none. `tracked_directory` is the
@@ -166,7 +183,8 @@ async fn collect_orphan_with(cards: &CardsHandle, session_id: &str, card_message
 /// The pass: gather the evidence the decision's plan warrants, decide
 /// ([`decision::reconcile`]), apply. The card writes are the apply's, and a
 /// read that failed or timed out is a value the decision maps to "nothing
-/// claimed".
+/// claimed". Returns the live adoption's follow when the pass armed one (see
+/// [`AdoptedFollow`]) — the caller spawns it.
 pub(crate) async fn reconcile(
     handles: &FlowHandles,
     session_id: &str,
@@ -174,7 +192,7 @@ pub(crate) async fn reconcile(
     tracked_directory: Option<&str>,
     record: &ChainRecord,
     read_timeout_ms: u64,
-) {
+) -> Option<AdoptedFollow> {
     let mut reads = gather_reads(handles, session_id, record, directory, tracked_directory).await;
     // The successor branch's collect runs before the decision: its awaited
     // orphan PATCH is exactly where a takeover can arm the successor's anchor,
@@ -198,7 +216,7 @@ pub(crate) async fn reconcile(
         reads.transcript = Some(read_transcript(handles, session_id, read_timeout_ms).await);
     }
     let disposition = decision::reconcile(record, &reads);
-    apply(handles, session_id, record, &reads, disposition, read_timeout_ms).await;
+    apply(handles, session_id, record, &reads, disposition, read_timeout_ms).await
 }
 
 /// The evidence no server read is needed for: the claims, the in-process card
@@ -235,6 +253,7 @@ async fn gather_reads<'a>(
         route,
         status: None,
         transcript: None,
+        cursor: record.cursor.is_some(),
     }
 }
 
@@ -329,9 +348,10 @@ async fn read_transcript(handles: &FlowHandles, session_id: &str, read_timeout_m
 /// `NoDecision` logs the one diagnosis the reads did not (a missing route);
 /// the collect arms only move the record — the successor's [`collect_orphan`]
 /// already ran before the decision (see [`reconcile`]); the stamp hands off to
-/// the detached attempt; the settle PATCHes the ending in place; the
+/// the detached attempt; the settle PATCHes the ending in place; the ended
 /// projection arms, creates, tracks and collects its successor
-/// ([`project_card`]).
+/// ([`project_card`]); the live adoption does the same and returns the follow
+/// its caller must spawn ([`project_live_card`], [`AdoptedFollow`]).
 async fn apply(
     handles: &FlowHandles,
     session_id: &str,
@@ -339,7 +359,7 @@ async fn apply(
     reads: &RecoveryReads<'_>,
     disposition: ChainDisposition,
     read_timeout_ms: u64,
-) {
+) -> Option<AdoptedFollow> {
     match disposition {
         ChainDisposition::Keep => {}
         ChainDisposition::NoDecision => {
@@ -364,7 +384,7 @@ async fn apply(
             // repoints a successor probe; a mismatch (the impossible case)
             // claims nothing.
             let CardProbe::Successor { card_message_id, .. } = &reads.card else {
-                return;
+                return None;
             };
             handles.cards.chains.track(
                 session_id,
@@ -390,13 +410,18 @@ async fn apply(
         ChainDisposition::Project { settle, seed } => {
             project_card(handles, session_id, record, reads, settle, seed, read_timeout_ms).await;
         }
+        ChainDisposition::ProjectLive { seed } => {
+            return project_live_card(handles, session_id, record, reads, seed, read_timeout_ms).await;
+        }
     }
+    None
 }
 
-/// Where a projection's successor card is delivered (spec #561, ticket #563):
-/// a reply to the original Turn anchor, else to the recorded card, else a
-/// top-level send into the chain's Chat. No deliverable target at all means
-/// no projection — today's in-place behavior.
+/// Where a projection's successor card is delivered (spec #561): a reply to
+/// the original Turn anchor, else to the recorded card, else a top-level send
+/// into the chain's Chat. No deliverable target at all means no projection —
+/// today's in-place behavior (the ending settle for an ended run, the
+/// one-time stamp for a live one).
 enum ProjectTarget {
     /// Reply to this Feishu message (the Turn anchor, or the recorded card).
     Reply(String),
@@ -404,10 +429,10 @@ enum ProjectTarget {
     TopLevel(String),
 }
 
-/// The projection's successor delivery target (spec #561, ticket #563), in
-/// the spec's fallback order: the original Turn anchor, then the recorded
-/// card, then the chain's top-level Chat. `None` when nothing can reach a
-/// card — the caller keeps today's behavior.
+/// The projection's successor delivery target (spec #561), in the spec's
+/// fallback order: the original Turn anchor, then the recorded card, then the
+/// chain's top-level Chat. `None` when nothing can reach a card — the caller
+/// keeps today's behavior.
 fn project_target(
     record: &ChainRecord,
     anchor: Option<&TurnAnchor>,
@@ -520,7 +545,7 @@ async fn project_card(
         &cursor,
         &seed,
         transcript,
-        &disposition,
+        Some(&disposition),
         &title,
         route.directory,
         fallback_chat.as_deref(),
@@ -595,6 +620,155 @@ async fn project_card(
         }
     }
     tracing::info!("live-card reap: session {session_id} projected its missed tail onto a successor card");
+}
+
+/// Adopt a run that is still live (spec #561, ticket #564): arm a successor
+/// card seeded from the chain's Rendered Cursor, render the delta the run has
+/// produced so far, send it as a create — the restart notification — take the
+/// chain over, collect the recorded card as taken over (dropping the running
+/// panels the successor resolved) and hand the caller the successor's identity
+/// so it can spawn the follow.
+///
+/// The guards mirror [`project_card`]'s: a missing route or transcript claims
+/// nothing; no deliverable target or scope falls back to today's one-time
+/// stamp (the run is live, so there is no ending to settle); a cursor the
+/// record no longer carries (a confirmed write landed meanwhile) claims
+/// nothing and lets the next pass decide afresh. Unlike the ended projection,
+/// a successor that renders nothing new is still sent: the run is live and the
+/// follow streams whatever it produces next.
+async fn project_live_card(
+    handles: &FlowHandles,
+    session_id: &str,
+    record: &ChainRecord,
+    reads: &RecoveryReads<'_>,
+    seed: crate::bridge::turn::CursorSeed,
+    read_timeout_ms: u64,
+) -> Option<AdoptedFollow> {
+    // The decision only adopts an orphan with a route and a readable
+    // transcript; a missing one here is a plan/decision mismatch.
+    let route = reads.route?;
+    let Some(TranscriptRead::Read(transcript)) = reads.transcript.as_ref() else {
+        return None;
+    };
+    // The projection's scope: the recorded Turn anchor, else the submitted
+    // message's own anchor re-derived from this read. Without a scope nothing
+    // can be armed — today's one-time stamp.
+    let scope = record
+        .anchor()
+        .or_else(|| transcript.anchor_of_user(record.message_id.as_str()));
+    let Some(anchor) = scope else {
+        stamp_restarted(handles, session_id, record, read_timeout_ms);
+        return None;
+    };
+    let recorded_anchor = record.anchor();
+    let chat = handles
+        .sessions
+        .entry_for_session(session_id)
+        .await
+        .map(|entry| entry.thread_key.chat_id);
+    let Some(target) = project_target(record, recorded_anchor.as_ref(), chat.as_deref()) else {
+        // No deliverable target at all: the stamp is today's live-run
+        // behavior, never an attempted projection.
+        stamp_restarted(handles, session_id, record, read_timeout_ms);
+        return None;
+    };
+    // The durable cursor, re-read at apply time: the record snapshot the reap
+    // took before its server reads can be older than a confirmed write that
+    // advanced the chain meanwhile. A moved cursor means this pass's decision
+    // is stale — claim nothing and let the next pass decide afresh, never
+    // re-render content a newer body already delivered.
+    let cursor = handles.cards.chains.cursor(session_id)?;
+    if record.cursor.as_ref() != Some(&cursor) {
+        return None;
+    }
+    let fallback_chat = match &target {
+        ProjectTarget::Reply(_) => None,
+        ProjectTarget::TopLevel(chat) => Some(chat.clone()),
+    };
+    let title = crate::bridge::external::session_subtitle(
+        &handles.backend,
+        session_id,
+        route.directory,
+        read_timeout_ms,
+    )
+    .await;
+    let variant = handles
+        .sessions
+        .store
+        .lock()
+        .await
+        .entry_for_session(session_id)
+        .and_then(|entry| entry.variant.clone());
+    let Some(projected) = Turn::arm_projected_card(
+        &handles.cards,
+        session_id,
+        &anchor,
+        &cursor,
+        &seed,
+        transcript,
+        None,
+        &title,
+        route.directory,
+        fallback_chat.as_deref(),
+        variant,
+    )
+    .await
+    else {
+        // A card appeared for the session meanwhile: this pass claims nothing.
+        return None;
+    };
+    let delivered = match &target {
+        ProjectTarget::Reply(reply_to) => handles.cards.feishu.reply_card(reply_to, &projected.card).await,
+        ProjectTarget::TopLevel(chat) => {
+            handles
+                .cards
+                .feishu
+                .send_card("chat_id", chat, &projected.card)
+                .await
+        }
+    };
+    let new_card_id = match delivered {
+        Ok(card_id) => card_id,
+        Err(e) => {
+            tracing::warn!(
+                "live-card reap: session {session_id} could not adopt its live run onto a successor: {e}"
+            );
+            // The send reached no card; the record keeps the old cursor and
+            // the next pass retries.
+            Turn::drop_armed_card(&handles.cards, session_id, &anchor).await;
+            return None;
+        }
+    };
+    // The successor takes the chain over: attach its identity FIRST, re-point
+    // the record at it (carrying the cursor), then collect the recorded card
+    // as taken over. Every call the cursor's live set names is resolved by the
+    // successor — a still-running one carried display-only, a settled one
+    // joined to its timeline — so the collected card drops the running `⏳`
+    // panels (ADR-0068's generalized collect, ticket #564).
+    let orphan = Turn::take_over_card_deferring_collect(
+        &handles.cards,
+        session_id,
+        &new_card_id,
+        Some(route.directory),
+    )
+    .await;
+    if let Some(orphan) = orphan {
+        crate::bridge::chain::collect_orphan_after_carry(
+            &handles.cards,
+            session_id,
+            &orphan.card_message_id,
+            seed.resolves_live_calls() || projected.resolved_calls,
+        )
+        .await;
+    }
+    // The confirmed create carries the successor's body: advance the chain's
+    // cursor exactly like a flush-confirmed write (spec #561).
+    crate::bridge::turn::confirm_card_cursor(&handles.cards, session_id, &new_card_id).await;
+    tracing::info!("live-card reap: session {session_id} adopted its still-live run onto a successor card");
+    Some(AdoptedFollow {
+        card_message_id: new_card_id,
+        anchor,
+    })
 }
 
 /// PATCH the transcript's ending onto the record's card — keeping the body

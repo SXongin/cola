@@ -176,7 +176,7 @@ impl ExternalFlow {
             // this pass followed the session (#433), else the reap falls back
             // to the route itself.
             let baseline = moved_from.get(&sid).map(String::as_str);
-            crate::bridge::chain::reconcile(
+            let follow = crate::bridge::chain::reconcile(
                 handles,
                 &sid,
                 mapping.map(|(_, directory)| directory.as_str()),
@@ -186,6 +186,12 @@ impl ExternalFlow {
             )
             .instrument(span)
             .await;
+            // The live adoption (spec #561, ticket #564): the reap armed and
+            // created the successor; the render loop that keeps it streaming
+            // runs here, on this flow's own cadences.
+            if let Some(follow) = follow {
+                self.start_adopted_follow(handles, &sid, &follow).await;
+            }
         }
         // Pending Card Updates (ADR-0067): every pass retries the card writes
         // Feishu refused since the last one — the reap's own endings included.
@@ -608,6 +614,42 @@ impl ExternalFlow {
         // explicitly with this Session's `external` span (ADR-0048) — rooted, so
         // its lines do not repeat the ambient chain of whoever armed it.
         let span = crate::bridge::span::external(session_id, session_thread_key.as_ref());
+        tokio::spawn(
+            async move {
+                external_render_loop(&handles, sid, anchor, poll_ms, read_timeout_ms, idle_timeout_ms).await;
+            }
+            .instrument(span),
+        );
+    }
+
+    /// Follow a still-live run a restart adoption just took over (spec #561,
+    /// ticket #564): spawn the existing external render loop on the successor
+    /// card the reap armed and created. The loop streams whatever the run
+    /// produces into the successor and settles it by transcript truth, under
+    /// the same guards and graces every external follow runs — the
+    /// accumulator the reap inserted already carries the Turn anchor and the
+    /// resolved seed, so the loop needs no other fact. The arm is the create
+    /// the reap just confirmed: this spawn only keeps it moving.
+    pub(crate) async fn start_adopted_follow(
+        &self,
+        handles: &FlowHandles,
+        session_id: &str,
+        follow: &crate::bridge::chain::AdoptedFollow,
+    ) {
+        let session_thread_key = handles.sessions.thread_for_session(session_id).await;
+        let span = crate::bridge::span::external(session_id, session_thread_key.as_ref());
+        tracing::info!(
+            "adopted follow armed for session {session_id} on card {}",
+            follow.card_message_id
+        );
+        let handles = handles.clone();
+        let sid = session_id.to_string();
+        let anchor = follow.anchor.clone();
+        let poll_ms = self.render_poll_ms.load(std::sync::atomic::Ordering::Relaxed);
+        let read_timeout_ms = self.request_timeout_ms.load(std::sync::atomic::Ordering::Relaxed);
+        let idle_timeout_ms = self
+            .render_idle_timeout_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
         tokio::spawn(
             async move {
                 external_render_loop(&handles, sid, anchor, poll_ms, read_timeout_ms, idle_timeout_ms).await;
