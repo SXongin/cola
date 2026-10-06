@@ -17,6 +17,11 @@ pub(crate) use state::CardSession;
 /// its staged cursor through the same drain (ticket #563).
 pub(crate) use flush::{confirm_armed_cursor, drain_armed_watermark, reconcile_staged_cursors};
 
+/// The drain reconcile's test seam (spec #561, review #569): the gate parks
+/// the pass between its delivery check and the confirmation.
+#[cfg(test)]
+pub(crate) use flush::{ReconcileGate, reconcile_staged_cursors_gated};
+
 /// The projection's resolved render seed (spec #561, ticket #563): the chain's
 /// Rendered Cursor placed in one transcript read, which the Chain Record
 /// module's decision carries and this module's render consumes.
@@ -3033,8 +3038,14 @@ impl Turn {
         }
         let built = acc.build_card_unsplit();
         // Stage the body's cursor exactly like a flush does: only the
-        // confirmed create drains it into the Chain Record.
-        acc.stage_cursor(None, built.cursor.clone());
+        // confirmed create drains it into the Chain Record. The stage
+        // identities travel on the [`ProjectedCard`], so the confirmation can
+        // name the exact body the create carried (spec #561, review #569).
+        let cursor_stage = state::StagedCursorId {
+            id: acc.stage_cursor(None, built.cursor.clone()),
+            awaiting_seq: None,
+        };
+        let watermark_stage = acc.pending_watermark_id();
         let mut session = state::CardSession::new(acc, None);
         session.fallback_chat = fallback_chat.map(str::to_string);
         // The caller re-checks this identity after its awaited create: a fresh
@@ -3047,6 +3058,8 @@ impl Turn {
             rendered,
             resolved_calls,
             chain_id,
+            cursor_stage,
+            watermark_stage,
         })
     }
 
@@ -3158,6 +3171,15 @@ pub(crate) struct ProjectedCard {
     /// meanwhile owns the chain, so the projection must leave the session and
     /// the record alone (spec #561, review #569).
     pub(crate) chain_id: u64,
+    /// The exact staged Rendered Cursor the armed body carries (spec #561,
+    /// review #569): the confirmation after the create names this stage, so a
+    /// body staged since — or a replaced session — is never advanced by the
+    /// projection's late create.
+    pub(crate) cursor_stage: state::StagedCursorId,
+    /// The stage generation of the Wake Watermark the armed body carries, if
+    /// any: the create's drain names it, so a watermark staged since is left
+    /// untouched.
+    pub(crate) watermark_stage: Option<u64>,
 }
 
 /// The outcome of [`Turn::take_over_armed_card`] (spec #561, review #569): the
@@ -3689,6 +3711,31 @@ impl Turn {
                 card_message_id.map(str::to_string),
             ),
         );
+    }
+
+    /// The session's staged Rendered Cursor (spec #561, review #569): the body
+    /// most recently built and not yet confirmed.
+    pub(crate) async fn staged_cursor(cards: &CardsHandle, session_id: &str) -> Option<RenderedCursor> {
+        cards.cards.lock().await.get(session_id).and_then(|card| {
+            card.acc
+                .pending_cursor
+                .as_ref()
+                .map(|staged| staged.cursor.clone())
+        })
+    }
+
+    /// Stage a Rendered Cursor directly (spec #561, review #569) — a test seam
+    /// for the confirmation's identity requirement, standing in for the flush
+    /// that would stage it.
+    pub(crate) async fn stage_cursor(
+        cards: &CardsHandle,
+        session_id: &str,
+        card_message_id: Option<&str>,
+        cursor: &RenderedCursor,
+    ) {
+        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
+            card.acc.stage_cursor(card_message_id, cursor.clone());
+        }
     }
 
     /// Set the card's display state.
