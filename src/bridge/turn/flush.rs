@@ -9,6 +9,7 @@
 use super::{MAX_CARD_CHAIN, PredecessorCollect, Turn};
 
 use crate::bridge::card_handles::RenderedBlock;
+use crate::bridge::chain::release_spent;
 use crate::bridge::handles::CardsHandle;
 
 /// Whether `e` is Feishu's deterministic card-content rejection (`230099`).
@@ -100,9 +101,9 @@ async fn advance_card_fallback(cards: &CardsHandle, session_id: &str) -> Fallbac
 /// and continue on a new one ([`SplitPolicy`]).
 pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, split_policy: SplitPolicy) {
     // A terminal card's durable record is dropped only once its ending write
-    // is confirmed (ADR-0063 amendment): each ending PATCH below re-checks the
-    // pending outbox before discarding, so a failed final write keeps the
-    // record the reap needs.
+    // is confirmed (ADR-0063 amendment): each ending PATCH below goes through
+    // `chain::release_spent`, which re-checks the pending outbox before
+    // releasing, so a failed final write keeps the record the reap needs.
     // The card-chain state a flush resumes from: a pending Supplement split
     // (ADR-0043) and whether the tracked card is still the live (growing) one.
     // Both survive the flush — a chain that exhausted the size bound, or died
@@ -201,7 +202,7 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, spl
                                 FallbackAdvance::Stop => {
                                     // A suspended ending can never deliver, so a
                                     // terminal record is spent (never retried).
-                                    Turn::discard_spent_record(cards, session_id).await;
+                                    release_spent(cards, session_id).await;
                                     return;
                                 }
                             }
@@ -211,7 +212,7 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, spl
                 };
                 // The ending write is settled — delivered, or permanently
                 // refused: a terminal record may go once nothing is pending.
-                Turn::discard_spent_record(cards, session_id).await;
+                release_spent(cards, session_id).await;
                 // Record what this card now renders: the live blocks.
                 cards
                     .card_handles
@@ -314,7 +315,7 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, spl
                             // next card out of content the platform may refuse too.
                             // A suspended ending can never deliver, so a terminal
                             // record is spent (never retried).
-                            Turn::discard_spent_record(cards, session_id).await;
+                            release_spent(cards, session_id).await;
                             cards
                                 .card_handles
                                 .lock()
@@ -330,7 +331,7 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, spl
             };
             // The ending write is settled — delivered, or permanently refused:
             // a terminal record may go once nothing is pending.
-            Turn::discard_spent_record(cards, session_id).await;
+            release_spent(cards, session_id).await;
             cards
                 .card_handles
                 .lock()
@@ -700,6 +701,47 @@ mod tests {
         assert_eq!(
             app.cards.lock().await.get("ses_test").unwrap().acc.card_fallback,
             CardFallback::Fenced
+        );
+    }
+
+    /// A terminal card whose ending Feishu permanently refuses — rejected
+    /// plain, then rejected fenced — can never deliver, so its durable record
+    /// is spent there and then: nothing is owed a reap, and the suspended card
+    /// is never PATCHed again. This is the suspended-ending half of ADR-0067's
+    /// release rule (the recoverable-failure half keeps the record until the
+    /// outbox drains).
+    #[tokio::test]
+    async fn a_suspended_terminal_ending_spends_the_record() {
+        let (app, platform) = app_with_live_card("回答 <number_tag> 里。").await;
+        {
+            let mut cards = app.cards.lock().await;
+            cards.get_mut("ses_test").unwrap().acc.card_state = CardState::Done;
+        }
+        app.cards_handle().chains.track(
+            "ses_test",
+            "om_live",
+            crate::backend::MessageId::new("msg_1"),
+            Some(1_000),
+            Some("/work"),
+        );
+        platform
+            .fail_update_card_content_count
+            .store(2, std::sync::atomic::Ordering::SeqCst);
+
+        Turn::flush_card(&app.cards_handle(), "ses_test").await;
+
+        assert_eq!(
+            patches_to(&platform, "om_live").await.len(),
+            2,
+            "the plain attempt and the fenced one only"
+        );
+        assert_eq!(
+            app.cards.lock().await.get("ses_test").unwrap().acc.card_fallback,
+            CardFallback::Suspended
+        );
+        assert!(
+            app.cards_handle().chains.get("ses_test").is_none(),
+            "a permanently refused ending spends the record"
         );
     }
 

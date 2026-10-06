@@ -345,7 +345,7 @@ async fn apply(
             // state and the outbox from a snapshot, and a card that moved on
             // in between must not lose a record it still owes (an ending write
             // that raced this pass).
-            Turn::discard_spent_record(&handles.cards, session_id).await;
+            super::release_spent(&handles.cards, session_id).await;
         }
         ChainDisposition::CollectThenRepoint { anchor } => {
             // The successor's collect already ran (before the decision, in

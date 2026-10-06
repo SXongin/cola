@@ -1706,35 +1706,6 @@ impl Turn {
         }
     }
 
-    /// Drop `session_id`'s durable record once its terminal card's ending write
-    /// is **confirmed** (ADR-0063 amendment; the pre-0067 rule dropped it before
-    /// the PATCH). A terminal card whose newest write failed recoverably is
-    /// still owed a Pending Card Update (ADR-0067), so its record stays: this
-    /// life's drain, or the next restart's reap, repairs the card and the reap
-    /// cleans the record once the write confirmed. A yielded `Waiting` card
-    /// keeps it (the reap settles its true end later) and a live card keeps it
-    /// (still owed). Called after every ending PATCH in
-    /// [`flush::flush_card_locked`](flush::flush_card_locked) and by the reap's
-    /// same-card probe.
-    pub(crate) async fn discard_spent_record(cards: &CardsHandle, session_id: &str) {
-        let card_message_id = {
-            let cards = cards.cards.lock().await;
-            let Some(card) = cards.get(session_id) else {
-                return;
-            };
-            if !card.acc.card_state.is_terminal() {
-                return;
-            }
-            card.card_message_id.clone()
-        };
-        if let Some(card_message_id) = card_message_id
-            && cards.feishu.has_pending_card_update(&card_message_id)
-        {
-            return;
-        }
-        cards.chains.release(session_id);
-    }
-
     /// Split `session_id`'s Card Chain at a user message (ADR-0043): append the
     /// split to the chain's split queue and flush. The flush finalizes the live
     /// card with the standard split header (keeping everything before the split)
