@@ -580,10 +580,18 @@ enum Projection {
     /// record stays retryable and the next reconcile pass re-attempts.
     Retryable,
     /// The chain stopped — an ambiguous failure, a suspended payload, a lost
-    /// create window, or a bounded/failed continuation chain — or the armed
-    /// session was no longer ours. The record is marked where it is ours and
-    /// the caller owes nothing more this life.
+    /// create window, or the armed session was no longer ours — with NO card
+    /// the pass could follow. The record is marked where it is ours and the
+    /// caller owes nothing more this life.
     Stopped,
+    /// The successor chain stopped after at least one slice LANDED — a
+    /// continuation create failed or the chain bound was reached — carrying
+    /// the LAST landed card's id (spec #561, review #569). A live adoption
+    /// still follows it: the follow's own flush/continuation machinery carries
+    /// the remaining delta and the run's future output on that card, because
+    /// the single-shot mark blocks further projections, never a follow. The
+    /// ended projection treats it as [`Self::Stopped`].
+    ChainStopped(String),
     /// Every slice landed; the chain's last card id.
     Landed(String),
 }
@@ -780,7 +788,13 @@ async fn send_projected_successor(
             ProjectedChain::Complete(last) => last,
             ProjectedChain::Stopped(last) => {
                 handles.cards.chains.mark_projection_attempted(session_id, &last);
-                return Some(Projection::Stopped);
+                // The chain stopped, but `last` is a card the slices landed on:
+                // a live adoption still gets followed there (review #569) —
+                // the follow carries the remaining delta and the run's future
+                // output, while the single-shot mark keeps later reap passes
+                // from re-posting the chain. The ended projection treats it as
+                // `Stopped` (nothing more to drive).
+                return Some(Projection::ChainStopped(last));
             }
         }
     } else {
@@ -894,7 +908,10 @@ async fn project_card(
                 "live-card reap: session {session_id} projected its missed tail onto a successor card"
             );
         }
-        Some(Projection::Retryable) | Some(Projection::Stopped) | None => {}
+        Some(Projection::Retryable)
+        | Some(Projection::Stopped)
+        | Some(Projection::ChainStopped(_))
+        | None => {}
     }
 }
 
@@ -975,6 +992,20 @@ async fn project_live_card(
         Some(Projection::Landed(last)) => {
             tracing::info!(
                 "live-card reap: session {session_id} adopted its still-live run onto a successor card"
+            );
+            Some(AdoptedFollow {
+                card_message_id: last,
+                anchor,
+            })
+        }
+        // The chain stopped after landing slices, but the run is still live
+        // (spec #561, review #569): the last landed card is handed to the
+        // follow, whose own flush/continuation machinery carries the remaining
+        // delta and everything the run produces next. The single-shot mark
+        // blocks further projections, never a follow.
+        Some(Projection::ChainStopped(last)) => {
+            tracing::info!(
+                "live-card reap: session {session_id} adopted its still-live run onto a successor card whose chain stopped early"
             );
             Some(AdoptedFollow {
                 card_message_id: last,

@@ -146,7 +146,15 @@ projects the chain's delta after it onto a successor card.**
   critical section that attaches its card, only after its own create landed: a
   failed or bound-stopped chain leaves the record at the
   last confirmed slice, re-posts nothing in that life and lets the next
-  life's projection resume from the cursor (review #569).
+  life's projection resume from the cursor (review #569). For a LIVE adoption
+  that stop is not the end of the run (review #569, round 2): the last landed
+  slice's card is still handed to the follow, whose own flush/continuation
+  machinery carries the remaining delta and everything the run produces next —
+  the single-shot mark blocks further projections, never a follow. An ended
+  projection's stopped chain keeps today's semantics (the successor already
+  carries the transcript's ending, and the next life resumes from the cursor);
+  a stop with NO landed card (an ambiguous first create, a lost window) follows
+  nothing for either case.
 
 - **A projection's create is single-shot per record per process life.** Feishu
   offers no idempotency key, so a create whose outcome is not a definite
