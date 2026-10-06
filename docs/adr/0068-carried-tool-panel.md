@@ -6,6 +6,13 @@
 > stop-rule prose below is superseded on that point (and "reaching the
 > boundary" now means reaching that page); see the amendment at the end.
 
+> **Amended by ADR-0071**: the bounded tail read and the carry mechanism
+> retire into the **Rendered Cursor**'s seed — a takeover resolves the
+> orphaned Turn's calls from the chain's cursor (or, cursorless, from the
+> read's still-live calls), and the message-first race seeds its text tail
+> too. The panel semantics below (display-only, settles exactly once, the
+> collect's strip) stand. See the amendment at the end.
+
 ## Context
 
 ADR-0045 made an unfinished **Tool Panel** card-tail live content: it rides
@@ -186,3 +193,35 @@ page whose oldest message completed before the anchor ends it (complete, one
 request, page kept whole); the descending-scan, unknown-time, empty-end-page
 and cap-stop tests were re-fixtured to real anchors, and the mock backend
 records the anchor itself rather than a derived boundary.
+
+## Amendment (2026-10-06): the carry is generalized into the projection seed (ADR-0071)
+
+The Carried Tool Panel's semantics are unchanged, but its mechanism is: the
+bounded newest-first tail read, its page cap and the carry path retired with
+ADR-0071, replaced by the **Rendered Cursor**'s live set. A takeover seeds the
+successor from the record's cursor — the tool call ids whose newest delivered
+state was `running`, resolved by call identity against the whole Session
+Transcript on every render read: display-only while the call still runs, and
+joining the successor's timeline exactly once at settle, at the server start
+key the call was born with. A cursorless record keeps the carry's fallback
+semantics — the orphaned Turn's still-live calls, nothing replayed — and the
+message-first race additionally seeds the orphaned Turn's text tail (only the
+undelivered suffix after the confirmed frontier), so a message that wins
+against the adoption shows the run's ending once instead of losing it.
+
+The read the carry needed for its keyhole view — newest-first and cap-bounded
+only to stay off the full history — left with it. The seed resolves against
+the transcript read the render polls already perform, and the durable cursor
+supplies the boundary the read alone could not carry.
+
+The takeover collect's rule is now stated on the seed's own result
+(`collect_orphan_after_takeover`): it drops every running `⏳` panel the
+successor resolved, whether the call was carried still-running or settled
+while cola was down and joined once — no frozen marker remains on a collected
+card.
+
+The Decision's "Only the fresh-Turn takeover carries" stands: a **Wake**
+continuation keeps ADR-0061's no-replay scope, and the reap's live adoption is
+ADR-0071's projection rule, not a Wake arm. "No new durable state" is
+narrowed the same way ADR-0061 and ADR-0063 are: the durable fact is the
+Rendered Cursor on the Chain Record, not state about a carry.
