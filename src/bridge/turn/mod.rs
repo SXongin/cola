@@ -3014,9 +3014,15 @@ impl Turn {
         acc.seed_projection(cursor, seed.clone());
         let carried_before: std::collections::HashSet<String> = acc.seeded_calls.iter().cloned().collect();
         let rendered = render::render_turn_parts(&mut acc, transcript);
-        let resolved_calls = carried_before
-            .iter()
-            .any(|call_id| !acc.seeded_calls.contains(call_id));
+        // Every carried live call must resolve onto the successor — rendered by
+        // its own window or settled by the identity reconciliation — before the
+        // old card's running panels may go: a call this read does not carry
+        // (a truncated transcript) stays a frozen marker on the old card rather
+        // than vanishing from both (spec #561, review #569).
+        let resolved_calls = !carried_before.is_empty()
+            && carried_before
+                .iter()
+                .all(|call_id| !acc.seeded_calls.contains(call_id));
         render::apply_ledger_read(
             &mut acc,
             transcript,
@@ -3036,7 +3042,12 @@ impl Turn {
                 }
             }
         }
-        let built = acc.build_card_unsplit();
+        // The successor's body goes through the SAME splitter the flush uses
+        // (spec #561, review #569): an oversized missed delta must become a
+        // bounded chain of cards, never one over-limit create that fails and
+        // loses the tail. A finalized slice wears 「部分完成」 even when the
+        // ending is terminal; the final slice wears the ending.
+        let built = acc.build_card_with_info();
         // Stage the body's cursor exactly like a flush does: only the
         // confirmed create drains it into the Chain Record. The stage
         // identities travel on the [`ProjectedCard`], so the confirmation can
@@ -3047,6 +3058,9 @@ impl Turn {
         };
         let watermark_stage = acc.pending_watermark_id();
         let mut session = state::CardSession::new(acc, None);
+        // A finalized first slice is not the chain's live card: the caller
+        // continues the chain on a new card.
+        session.card_is_live = !built.full;
         session.fallback_chat = fallback_chat.map(str::to_string);
         // The caller re-checks this identity after its awaited create: a fresh
         // Turn that replaced the armed session meanwhile owns the chain (spec
@@ -3060,6 +3074,7 @@ impl Turn {
             chain_id,
             cursor_stage,
             watermark_stage,
+            full: built.full,
         })
     }
 
@@ -3161,9 +3176,12 @@ pub(crate) struct ProjectedCard {
     /// successor. The live adoption sends either way — the run is live and the
     /// follow streams what it produces next (ticket #564).
     pub(crate) rendered: bool,
-    /// Whether a live-set call settled while cola was down: the successor
-    /// resolved it, so the collected old card drops the running `⏳` panels
-    /// (ADR-0068's generalized collect).
+    /// Whether EVERY live-set call resolved onto the successor — rendered by
+    /// its own window, or settled by the identity reconciliation: only then
+    /// does the collected old card drop its running `⏳` panels (ADR-0068's
+    /// generalized collect). A call the read does not carry (a truncated
+    /// transcript) resolves nothing and keeps its frozen marker on the old
+    /// card (spec #561, review #569).
     pub(crate) resolved_calls: bool,
     /// The armed [`state::CardSession::chain_id`] — the identity
     /// [`Turn::take_over_armed_card`] verifies inside its one cards-map
@@ -3180,6 +3198,21 @@ pub(crate) struct ProjectedCard {
     /// any: the create's drain names it, so a watermark staged since is left
     /// untouched.
     pub(crate) watermark_stage: Option<u64>,
+    /// Whether MORE content remains after this body (spec #561, review #569):
+    /// the delta overflowed one card, so the caller continues the chain with
+    /// [`Turn::next_projected_slice`] until a slice fits.
+    pub(crate) full: bool,
+}
+
+/// One continuation slice of a projection's successor chain (spec #561, review
+/// #569): a bounded card built by the normal splitter, with the stage
+/// identities its create must confirm.
+pub(crate) struct ProjectedSlice {
+    pub(crate) card: serde_json::Value,
+    pub(crate) cursor_stage: state::StagedCursorId,
+    pub(crate) watermark_stage: Option<u64>,
+    /// More content remains after this slice.
+    pub(crate) full: bool,
 }
 
 /// The outcome of [`Turn::take_over_armed_card`] (spec #561, review #569): the
@@ -3560,12 +3593,75 @@ impl Turn {
         card_message_id: &str,
         directory: Option<&str>,
     ) -> ArmedTakeover {
+        match Self::attach_and_repoint(
+            cards,
+            session_id,
+            chain_id,
+            true,
+            card_message_id,
+            None,
+            directory,
+        )
+        .await
+        {
+            Some(previous) => ArmedTakeover::Took(previous),
+            None => ArmedTakeover::Lost,
+        }
+    }
+
+    /// Attach a projection chain's just-created continuation (spec #561,
+    /// review #569): verify the chain is still the armed one, attach the new
+    /// card, mark whether it is the chain's LIVE card (the follow streams onto
+    /// it) and re-point the record — one cards-map critical section, exactly
+    /// like the armed takeover, so a fresh Turn that replaced the session is
+    /// never touched. The chain continues (no predecessor collect). Returns
+    /// `false` when a fresh Turn owns the session now: the caller collects the
+    /// late card and stops the chain.
+    pub(crate) async fn track_projected_continuation(
+        cards: &CardsHandle,
+        session_id: &str,
+        chain_id: u64,
+        card_message_id: &str,
+        card_is_live: bool,
+        directory: Option<&str>,
+    ) -> bool {
+        Self::attach_and_repoint(
+            cards,
+            session_id,
+            chain_id,
+            false,
+            card_message_id,
+            Some(card_is_live),
+            directory,
+        )
+        .await
+        .is_some()
+    }
+
+    /// The shared projection transition (spec #561, review #569): under ONE
+    /// cards-map lock, check the session is `chain_id`'s (and, for the armed
+    /// case, never attached), attach `card_message_id`, mark the live/finalized
+    /// state when the caller knows it and re-point the durable record. `None`
+    /// when the session is not ours; otherwise the predecessor record (handed
+    /// back only for the armed case — a continuation's predecessor is the slice
+    /// the chain just sent).
+    #[allow(clippy::too_many_arguments)] // the projection transition's whole fixture
+    async fn attach_and_repoint(
+        cards: &CardsHandle,
+        session_id: &str,
+        chain_id: u64,
+        require_unattached: bool,
+        card_message_id: &str,
+        card_is_live: Option<bool>,
+        directory: Option<&str>,
+    ) -> Option<Option<Box<ChainRecord>>> {
         let mut live = cards.cards.lock().await;
-        let Some(card) = live.get_mut(session_id) else {
-            return ArmedTakeover::Lost;
-        };
-        if card.chain_id() != chain_id || card.card_message_id.is_some() {
-            return ArmedTakeover::Lost;
+        let card = live.get_mut(session_id)?;
+        if card.chain_id() != chain_id || (require_unattached && card.card_message_id.is_some()) {
+            return None;
+        }
+        if let Some(card_is_live) = card_is_live {
+            card.card_is_live = card_is_live;
         }
         let (message_id, created_ms, context_directory) = (
             card.acc.cola_message_id.clone().map(MessageId::new).or_else(|| {
@@ -3581,7 +3677,7 @@ impl Turn {
         // A card with no Turn message to scope a settle decision with cannot
         // be reaped: attached, but no record — `track_live_card`'s own rule.
         let Some(message_id) = message_id else {
-            return ArmedTakeover::Took(None);
+            return Some(None);
         };
         let directory = directory
             .map(str::to_string)
@@ -3595,22 +3691,48 @@ impl Turn {
             directory.as_deref(),
         );
         // A re-point within the chain carries the Rendered Cursor (spec #561):
-        // seed the armed accumulator's empty base with the carried fact, so
-        // the successor's first body does not clear the chain's frontier.
+        // seed the accumulator's empty base with the carried fact, so the
+        // successor's first body does not clear the chain's frontier.
         if let Some(cursor) = previous.as_ref().and_then(|record| record.cursor.clone()) {
             let card = live
                 .get_mut(session_id)
-                .expect("the cards map still holds the armed session");
+                .expect("the cards map still holds the session");
             if card.acc.cursor == RenderedCursor::default() {
                 card.acc.cursor = cursor;
             }
         }
         match previous {
-            Some(previous) if previous.card_message_id != card_message_id => {
-                ArmedTakeover::Took(Some(Box::new(previous)))
-            }
-            _ => ArmedTakeover::Took(None),
+            Some(previous) if previous.card_message_id != card_message_id => Some(Some(Box::new(previous))),
+            _ => Some(None),
         }
+    }
+
+    /// Build a projection successor chain's next slice (spec #561, review
+    /// #569): the remaining content from `render_from`, bounded by the SAME
+    /// splitter the flush uses, with its Rendered Cursor staged for the
+    /// create's confirmation. `None` when the session no longer carries the
+    /// projection's chain (a fresh Turn owns it) — the caller stops.
+    pub(crate) async fn next_projected_slice(
+        cards: &CardsHandle,
+        session_id: &str,
+        chain_id: u64,
+    ) -> Option<ProjectedSlice> {
+        let mut live = cards.cards.lock().await;
+        let card = live.get_mut(session_id)?;
+        if card.chain_id() != chain_id {
+            return None;
+        }
+        let built = card.acc.build_card_with_info();
+        let cursor_stage = state::StagedCursorId {
+            id: card.acc.stage_cursor(None, built.cursor.clone()),
+            awaiting_seq: None,
+        };
+        Some(ProjectedSlice {
+            card: built.card,
+            cursor_stage,
+            watermark_stage: card.acc.pending_watermark_id(),
+            full: built.full,
+        })
     }
 }
 
@@ -4013,6 +4135,7 @@ mod tests {
         let seed = state::CursorSeed {
             frontier: None,
             live_calls: cursor.live_calls.clone(),
+            resolved_live_calls: cursor.live_calls.clone(),
             scope: None,
         };
         let mut live = std::collections::HashMap::new();

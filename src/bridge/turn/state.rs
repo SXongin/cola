@@ -100,6 +100,11 @@ pub(crate) struct CursorSeed {
     /// #561's live set): resolved by identity against the whole read — still
     /// running renders display-only, settled joins the timeline once.
     pub(super) live_calls: std::collections::BTreeSet<String>,
+    /// The live-set ids the resolving read actually carried (spec #561, review
+    /// #569): a V2 read can be truncated at its page cap, so a call outside it
+    /// cannot render on the successor — only a call the read carries may drop
+    /// the old card's running panel.
+    pub(super) resolved_live_calls: std::collections::BTreeSet<String>,
     /// The Turn window the seed renders beyond the accumulator's own (spec
     /// #561, ticket #565): the orphaned Turn's anchor carried onto a card
     /// whose own Turn is a different one (the message-first race). `None` when
@@ -128,7 +133,8 @@ pub(super) struct SeedFrontier {
 impl CursorSeed {
     /// Resolve `cursor` against `transcript` (spec #561): `None` when the
     /// frontier names a message/part this read does not carry, or the part's
-    /// kind no longer matches — the read moved on, so nothing may be skipped.
+    /// kind or server start time no longer matches — the read moved on, so
+    /// nothing may be skipped.
     pub(crate) fn resolve(transcript: &SessionTranscript, cursor: &RenderedCursor) -> Option<Self> {
         let frontier = match &cursor.frontier {
             None => None,
@@ -138,18 +144,27 @@ impl CursorSeed {
                     .iter()
                     .position(|message| message.id == frontier.message_id)?;
                 let part = transcript.messages[message_pos].parts.get(frontier.part_index)?;
-                let (matches_kind, part_chars) = match part {
-                    crate::backend::Part::Text(text) => {
-                        (frontier.kind == CursorPartKind::Text, text.text.chars().count())
-                    }
+                let (matches_kind, part_started_at, part_chars) = match part {
+                    crate::backend::Part::Text(text) => (
+                        frontier.kind == CursorPartKind::Text,
+                        text.started_at,
+                        text.text.chars().count(),
+                    ),
                     crate::backend::Part::Reasoning(reasoning) => (
                         frontier.kind == CursorPartKind::Reasoning,
+                        reasoning.started_at,
                         reasoning.text.chars().count(),
                     ),
-                    crate::backend::Part::Tool(_) => (frontier.kind == CursorPartKind::Tool, 0),
-                    _ => (false, 0),
+                    crate::backend::Part::Tool(call) => {
+                        (frontier.kind == CursorPartKind::Tool, call.started_at, 0)
+                    }
+                    _ => (false, None, 0),
                 };
-                if !matches_kind {
+                // The frontier's identity is the message, the ordinal, the
+                // kind AND the part's server start time (ADR-0071): a
+                // replacement part in the same slot is a different part, and
+                // skipping its prefix would omit content (review #569).
+                if !matches_kind || frontier.started_at != part_started_at {
                     return None;
                 }
                 // A tool-kind frontier carries the newest text/reasoning part's
@@ -181,9 +196,16 @@ impl CursorSeed {
                 })
             }
         };
+        let resolved_live_calls = cursor
+            .live_calls
+            .iter()
+            .filter(|call_id| transcript.tool_call(call_id).is_some())
+            .cloned()
+            .collect();
         Some(Self {
             frontier,
             live_calls: cursor.live_calls.clone(),
+            resolved_live_calls,
             scope: None,
         })
     }
@@ -208,6 +230,12 @@ impl CursorSeed {
             None => Self {
                 frontier: None,
                 live_calls: cursor.live_calls.clone(),
+                resolved_live_calls: cursor
+                    .live_calls
+                    .iter()
+                    .filter(|call_id| transcript.tool_call(call_id).is_some())
+                    .cloned()
+                    .collect(),
                 scope: None,
             },
         }
@@ -218,7 +246,7 @@ impl CursorSeed {
     /// enter the live set exactly as ADR-0068's carry did. A `todowrite` is
     /// excluded: the successor's own reads rebuild the todo list.
     pub(crate) fn live_calls_only(transcript: &SessionTranscript, scope: &TurnAnchor) -> Self {
-        let live_calls = transcript
+        let live_calls: std::collections::BTreeSet<String> = transcript
             .turn_running_tools(scope)
             .iter()
             .filter(|call| call.identity.name != "todowrite")
@@ -226,6 +254,7 @@ impl CursorSeed {
             .collect();
         Self {
             frontier: None,
+            resolved_live_calls: live_calls.clone(),
             live_calls,
             scope: None,
         }
@@ -270,13 +299,16 @@ impl CursorSeed {
         }
     }
 
-    /// Whether the cursor's live set named any call (spec #561, ticket #564):
-    /// the successor resolves each one by identity — a still-running call
-    /// renders display-only there, a settled one joins its timeline exactly
-    /// once — so the collected old card must drop the running markers it left
-    /// behind.
+    /// Whether the cursor's live set named calls the resolving read ACTUALLY
+    /// carried (spec #561, ticket #564, review #569): the successor resolves
+    /// each one by identity — a still-running call renders display-only there,
+    /// a settled one joins its timeline exactly once — so the collected old
+    /// card must drop the running markers it left behind. A call outside the
+    /// read (a truncated V2 transcript) cannot render on the successor: its
+    /// panel stays on the old card as a frozen marker rather than vanishing
+    /// from both, so the strip happens only when every named call resolved.
     pub(crate) fn resolves_live_calls(&self) -> bool {
-        !self.live_calls.is_empty()
+        !self.live_calls.is_empty() && self.resolved_live_calls.len() == self.live_calls.len()
     }
 }
 

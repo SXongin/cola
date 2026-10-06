@@ -44,7 +44,10 @@ projects the chain's delta after it onto a successor card.**
   release's record or a chain whose first confirmed write has not landed. A
   cursor written by an older release (text/reasoning kinds only) still loads:
   a settled tool that followed its frontier re-renders once on the first
-  restart after the upgrade, then the new shape covers it.
+  restart after the upgrade, then the new shape covers it. The frontier's
+  identity is the message, the ordinal, the kind AND the part's server start
+  time: a read carrying a different part in that slot resolves nothing and the
+  projection falls back rather than skip a replacement's prefix (review #569).
 
 - **Advance only on a confirmed write, through the existing delivery choke
   point.** The accumulator stages the cursor of the body it is about to write,
@@ -91,7 +94,12 @@ projects the chain's delta after it onto a successor card.**
   projection that renders nothing new (the cursor covered the whole read)
   drops its armed successor and keeps today's in-place ending; a live
   adoption is still sent — the run may produce next, and the follow is what
-  keeps it live.
+  keeps it live. An oversized delta goes through the SAME splitter as every
+  card body, as a bounded chain of creates (≤ the existing chain bound), one
+  slice per card, in order, each slice's cursor confirmed only after its own
+  create landed: a failed or bound-stopped chain leaves the record at the
+  last confirmed slice, re-posts nothing in that life and lets the next
+  life's projection resume from the cursor (review #569).
 
 - **A projection's create is single-shot per record per process life.** Feishu
   offers no idempotency key, so a create whose outcome is not a definite
@@ -101,7 +109,10 @@ projects the chain's delta after it onto a successor card.**
   old card is state-repaired in place by transcript truth, and the ambiguous
   card is left as it fell. The trade: an ambiguous create can leave the
   successor unposted and the old card state-repaired, never duplicated. A
-  restart forgets the mark, exactly like every in-memory reconcile mark.
+  restart forgets the mark, exactly like every in-memory reconcile mark. A
+  chain that stopped mid-way (below) keeps its record instead: the tail past
+  the last confirmed slice is still owed, so a terminal card's usual record
+  discard is suppressed for it and the next life resumes from the cursor.
 
 - **Render seeding.** The seed resolves the cursor against the read:
   everything at or before the frontier counts as delivered — marked, not
@@ -112,7 +123,11 @@ projects the chain's delta after it onto a successor card.**
   resolves by call identity against the whole read on every render read: a
   still-running call rides the successor's live tail display-only and a call
   that settled while cola was down joins its timeline exactly once, at the
-  server start key it was born with.
+  server start key it was born with. Only calls the read actually carries
+  resolve: a V2 transcript truncated at its page cap leaves a running call
+  outside it, and that call's panel then stays on the collected old card as a
+  frozen witness rather than being stripped from a card the successor cannot
+  repair (review #569).
 
 - **The message-first race uses the same primitive.** When a user message wins
   the race against the adoption, the fresh Turn's takeover seeds its card from

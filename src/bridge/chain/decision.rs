@@ -266,12 +266,15 @@ pub(crate) fn reconcile(record: &ChainRecord, reads: &RecoveryReads<'_>) -> Chai
         // The recorded card IS this process's card: its own lifecycle owns it.
         // A terminal card's record is spent once its ending write is confirmed
         // (ADR-0063 amendment — a write still pending in the outbox keeps the
-        // record); a live or yielded card keeps it.
+        // record); a live or yielded card keeps it. A record whose projection
+        // stopped mid-chain (spec #561, review #569) keeps it too: the tail
+        // past the last confirmed slice is still owed, and the next life's
+        // projection resumes from the cursor.
         CardProbe::Recorded {
             terminal,
             update_pending,
         } => {
-            if *terminal && !*update_pending {
+            if *terminal && !*update_pending && !record.projection_attempted {
                 ChainDisposition::DiscardRecord
             } else {
                 ChainDisposition::Keep
@@ -1155,6 +1158,35 @@ mod tests {
             reconcile(&attempted, &idle_transcript(transcript)),
             ChainDisposition::Settle(TurnSettle::Complete),
             "an attempted ended projection state-repairs the old card in place"
+        );
+    }
+
+    /// A record whose projection stopped mid-chain keeps its card (spec #561,
+    /// review #569): the tail past the last confirmed slice is still owed, and
+    /// the next life's projection resumes from the cursor — the terminal card
+    /// alone must not discard the record that still owes content.
+    #[test]
+    fn an_attempted_projection_keeps_a_terminal_records_card() {
+        let reads = RecoveryReads {
+            card: CardProbe::Recorded {
+                terminal: true,
+                update_pending: false,
+            },
+            ..orphan()
+        };
+        assert_eq!(
+            reconcile(&record(), &reads),
+            ChainDisposition::DiscardRecord,
+            "an ordinary terminal card spends its record"
+        );
+        let attempted = ChainRecord {
+            projection_attempted: true,
+            ..record()
+        };
+        assert_eq!(
+            reconcile(&attempted, &reads),
+            ChainDisposition::Keep,
+            "a stopped projection keeps the record for the next life"
         );
     }
 
