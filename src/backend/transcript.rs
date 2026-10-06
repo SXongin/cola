@@ -178,6 +178,56 @@ impl SessionTranscript {
             })
     }
 
+    /// The typed position of the part carrying the tool call `call_id` — its
+    /// message identity and the part's ordinal in it — joined over the WHOLE
+    /// read, like [`Self::tool_call`]. The seed's live-set entries carry it as
+    /// their Rendered Cursor source (spec #561, review #569), so a call that
+    /// settles after the restart can become the frontier instead of being
+    /// re-rendered by a later restart. `None` when the read carries no such
+    /// part.
+    pub fn tool_call_position(&self, call_id: &str) -> Option<(MessageId, usize)> {
+        self.messages.iter().find_map(|message| {
+            message
+                .parts
+                .iter()
+                .position(|part| matches!(part, Part::Tool(call) if call.identity.call_id == call_id))
+                .map(|index| (message.id.clone(), index))
+        })
+    }
+
+    /// The newest assistant text/reasoning part strictly before
+    /// `(message_pos, part_index)` in this read — its `(message index, part
+    /// ordinal)` and its character count. The part a tool-kind Rendered Cursor
+    /// frontier's delivered extent belongs to (spec #561, review #569). User
+    /// messages carry no renderable content and are skipped.
+    pub fn newest_text_before(
+        &self,
+        message_pos: usize,
+        part_index: usize,
+    ) -> Option<((usize, usize), usize)> {
+        for pos in (0..=message_pos).rev() {
+            let message = &self.messages[pos];
+            if message.role != MessageRole::Assistant {
+                continue;
+            }
+            let limit = if pos == message_pos {
+                part_index
+            } else {
+                message.parts.len()
+            };
+            for index in (0..limit).rev() {
+                match &message.parts[index] {
+                    Part::Text(text) => return Some(((pos, index), text.text.chars().count())),
+                    Part::Reasoning(reasoning) => {
+                        return Some(((pos, index), reasoning.text.chars().count()));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        None
+    }
+
     /// The `running`/`pending` tool calls of the Turn anchored at `anchor` —
     /// the orphaned Turn's projection, membership rule included: only calls
     /// whose message [`belongs_to_turn`] may enter a successor's seed as its

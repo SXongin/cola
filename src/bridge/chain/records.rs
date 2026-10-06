@@ -51,17 +51,26 @@ pub(crate) struct PredecessorKeep {
 }
 
 /// The transcript kind of the part a [`CursorFrontier`] names: the two kinds
-/// carrying renderable model content (spec #561).
+/// carrying renderable model content and a settled tool panel (spec #561,
+/// review #569).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum CursorPartKind {
     Text,
     Reasoning,
+    /// A settled tool panel (spec #561, review #569): the frontier names its
+    /// position so a restart never re-renders a panel the old card already
+    /// showed. `CursorFrontier::delivered_chars` then belongs to the newest
+    /// text/reasoning part at or before it — a tool has no extent of its own.
+    Tool,
 }
 
-/// The transcript position of the newest text/reasoning content a Card Chain
-/// has confirmed delivered (spec #561): the message identity, the part's
-/// position and the delivered character extent of that part. Position and
+/// The transcript position of the newest delivered content a Card Chain has
+/// confirmed delivered (spec #561): the message identity, the part's position
+/// and — for a text/reasoning frontier — the delivered character extent of
+/// that part. A settled tool may be the frontier too (review #569), by
+/// position alone; the extent then belongs to the newest text/reasoning part
+/// at or before it, so that part still renders its growth. Position and
 /// identity only — never content.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CursorFrontier {
@@ -157,6 +166,15 @@ pub(crate) struct ChainRecord {
     /// starts `None`; it never persists.
     #[serde(skip)]
     pub(crate) predecessor_keep: Option<PredecessorKeep>,
+    /// In-memory only: this chain's projection already attempted its successor
+    /// create in this process life (spec #561, review #569). Feishu has no
+    /// idempotency key (ADR-0067), so a create whose outcome is not a definite
+    /// non-landing is never retried — it may have landed, and a retry would
+    /// post a duplicate successor. The record stays for the reap's in-place
+    /// state repair instead. A record rewritten for a new card starts
+    /// unmarked, and the mark never survives a restart.
+    #[serde(skip)]
+    pub(crate) projection_attempted: bool,
     /// The Rendered Cursor (spec #561): how far this chain's card has
     /// confirmed rendered. `None` — cursorless — is an older release's record
     /// or a chain whose first confirmed write has not landed; both read as the
@@ -181,6 +199,7 @@ impl ChainRecord {
             restart_stamping: false,
             restart_stamp_rejected: false,
             predecessor_keep: None,
+            projection_attempted: false,
             cursor: None,
         }
     }
@@ -494,6 +513,18 @@ impl ChainRecords {
     pub(crate) fn mark_restart_stamp_rejected(&self, session_id: &str, card_message_id: &str) -> bool {
         self.set_reap_flag(session_id, card_message_id, |card| {
             card.restart_stamp_rejected = true
+        })
+    }
+
+    /// Mark that `card_message_id`'s projection already attempted its successor
+    /// create in this process life (spec #561, review #569): Feishu has no
+    /// idempotency key (ADR-0067), so the create is single-shot — a later pass
+    /// must state-repair the old card instead of re-posting a successor that
+    /// may already have landed. In-memory only; a record rewritten for a new
+    /// card starts unmarked. Returns whether the record still names that card.
+    pub(crate) fn mark_projection_attempted(&self, session_id: &str, card_message_id: &str) -> bool {
+        self.set_reap_flag(session_id, card_message_id, |card| {
+            card.projection_attempted = true
         })
     }
 

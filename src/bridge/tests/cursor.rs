@@ -128,14 +128,30 @@ async fn a_live_turn_advances_the_record_cursor_to_the_delivered_body() {
     );
 
     // The tool settles: the next delivered body renders it as a timeline
-    // panel, so the live set drops it. The frontier stays the text part.
+    // panel, so the live set drops it. The frontier then moves to the settled
+    // panel — it WAS delivered, so a restart must not re-render it — while
+    // still carrying the text part's delivered extent (review #569).
     settle_tool(&backend, ToolStatus::Completed, "done").await;
     wait_for_card_text(&platform, "done").await;
-    let cursor = wait_for_cursor(&app, |cursor| cursor.live_calls.is_empty()).await;
+    let cursor = wait_for_cursor(&app, |cursor| {
+        cursor.live_calls.is_empty()
+            && cursor
+                .frontier
+                .as_ref()
+                .is_some_and(|frontier| frontier.kind == CursorPartKind::Tool)
+    })
+    .await;
     assert_eq!(
-        cursor.frontier.as_ref().map(|f| f.message_id.as_str()),
-        Some("msg_a_2000"),
-        "a settled tool does not move the text frontier"
+        cursor.frontier,
+        Some(CursorFrontier {
+            message_id: MessageId::new("msg_tool_4000"),
+            part_index: 0,
+            kind: CursorPartKind::Tool,
+            // The fixture's tool part carries no server clock.
+            started_at: None,
+            delivered_chars: "第一段回答。".chars().count(),
+        }),
+        "the settled panel is the frontier, carrying the text's delivered extent"
     );
 }
 

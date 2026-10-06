@@ -600,10 +600,18 @@ async fn project_card(
             tracing::warn!(
                 "live-card reap: session {session_id} could not project its missed tail onto a successor: {e}"
             );
-            // The send reached no card; the record keeps the old cursor and
-            // the next pass retries. The phantom session is dropped only while
-            // it is still this pass's armed one (review #569): a chain that
-            // replaced it meanwhile owns itself.
+            // Feishu has no idempotency key (ADR-0067): the create is
+            // single-shot per record per process life. This failure is
+            // ambiguous — the send may have landed — so it is never retried, or
+            // the user could get two successor cards (review #569). The mark
+            // keeps every later pass from re-posting; the record stays for the
+            // reap's in-place state repair. The phantom session is dropped only
+            // while it is still this pass's armed one: a chain that replaced it
+            // meanwhile owns itself.
+            handles
+                .cards
+                .chains
+                .mark_projection_attempted(session_id, &record.card_message_id);
             Turn::drop_armed_session(&handles.cards, session_id, projected.chain_id).await;
             return;
         }
@@ -774,10 +782,19 @@ async fn project_live_card(
             tracing::warn!(
                 "live-card reap: session {session_id} could not adopt its live run onto a successor: {e}"
             );
-            // The send reached no card; the record keeps the old cursor and
-            // the next pass retries. The phantom session is dropped only while
-            // it is still this pass's armed one (review #569): a chain that
-            // replaced it meanwhile owns itself.
+            // Feishu has no idempotency key (ADR-0067): the create is
+            // single-shot per record per process life. This failure is
+            // ambiguous — the send may have landed — so it is never retried, or
+            // the user could get two successor cards (review #569). The mark
+            // keeps every later pass from re-posting; the record keeps
+            // observing until the run ends and the ended pass state-repairs the
+            // old card in place. The phantom session is dropped only while it is
+            // still this pass's armed one: a chain that replaced it meanwhile
+            // owns itself.
+            handles
+                .cards
+                .chains
+                .mark_projection_attempted(session_id, &record.card_message_id);
             Turn::drop_armed_session(&handles.cards, session_id, projected.chain_id).await;
             return None;
         }

@@ -209,7 +209,7 @@ fn render_part(acc: &mut StreamAccumulator, source: Option<PartSource>, part: &P
                 acc.todo_panel = Some(panel);
                 acc.todo_shown_at = call.started_at;
             } else {
-                acc.push_tool_at(call.started_at, &call.identity.call_id, panel);
+                acc.push_tool_from(call.started_at, &call.identity.call_id, panel, source);
             }
             if call.status == ToolStatus::Running {
                 acc.card_state = crate::feishu::card::CardState::Streaming;
@@ -810,8 +810,16 @@ fn resolve_seeded_calls(acc: &mut StreamAccumulator, transcript: &SessionTranscr
     let mut rendered = false;
     let seeded: Vec<String> = acc.seeded_calls.iter().cloned().collect();
     for call_id in seeded {
+        // The call's typed position — the seeded panel keeps it, so once it
+        // settles its timeline entry can become the Rendered Cursor frontier
+        // (spec #561, review #569).
         if let Some(call) = transcript.tool_call(&call_id)
-            && render_part(acc, None, &Part::Tool(call.clone()))
+            && let Some((message_id, index)) = transcript.tool_call_position(&call_id)
+            && render_part(
+                acc,
+                Some(PartSource::at(message_id, index)),
+                &Part::Tool(call.clone()),
+            )
         {
             rendered = true;
         }
@@ -4612,6 +4620,85 @@ Index: /x/src/main.rs
                 delivered_chars: text.chars().count(),
             }),
             "the frontier names the newest delivered text part and its extent"
+        );
+        assert!(built.cursor.live_calls.is_empty());
+    }
+
+    /// Spec #561, review #569: a settled tool delivered after the newest text
+    /// part becomes the frontier itself — by position, with the text part's
+    /// delivered extent carried along — so a restart never re-renders the
+    /// panel. A still-running tool stays in the live set and never becomes the
+    /// frontier.
+    #[test]
+    fn a_settled_tool_after_text_becomes_the_frontier() {
+        let text = "回答";
+        let running = SessionTranscript::new(vec![message(
+            "msg_a_1",
+            100,
+            vec![
+                text_at(text, 100),
+                tool(
+                    "bash",
+                    "call_1",
+                    ToolStatus::Running,
+                    Some(150),
+                    Some(serde_json::json!({ "command": "sleep 30" })),
+                    None,
+                ),
+            ],
+        )]);
+        let mut acc = StreamAccumulator::new("test");
+        acc.turn_anchor = Some(turn_anchor(0));
+        assert!(render_new_turn_parts(&mut acc, &running));
+
+        // The running call stays display-only: the frontier is the text, the
+        // call is in the live set.
+        let built = acc.build_card_with_info();
+        assert_eq!(
+            built.cursor.frontier,
+            Some(CursorFrontier {
+                message_id: MessageId::new("msg_a_1"),
+                part_index: 0,
+                kind: CursorPartKind::Text,
+                started_at: Some(100),
+                delivered_chars: text.chars().count(),
+            }),
+            "a running tool never becomes the frontier"
+        );
+        assert_eq!(
+            built.cursor.live_calls,
+            ["call_1".to_string()].into_iter().collect()
+        );
+
+        // The call settles: the delivered panel is the newest item, so the
+        // frontier names it — and still carries the text's delivered extent.
+        let settled = SessionTranscript::new(vec![message(
+            "msg_a_1",
+            100,
+            vec![
+                text_at(text, 100),
+                tool(
+                    "bash",
+                    "call_1",
+                    ToolStatus::Completed,
+                    Some(150),
+                    Some(serde_json::json!({ "command": "sleep 30" })),
+                    Some("done"),
+                ),
+            ],
+        )]);
+        assert!(render_new_turn_parts(&mut acc, &settled));
+        let built = acc.build_card_with_info();
+        assert_eq!(
+            built.cursor.frontier,
+            Some(CursorFrontier {
+                message_id: MessageId::new("msg_a_1"),
+                part_index: 1,
+                kind: CursorPartKind::Tool,
+                started_at: Some(150),
+                delivered_chars: text.chars().count(),
+            }),
+            "the settled panel is the frontier, with the text extent carried"
         );
         assert!(built.cursor.live_calls.is_empty());
     }
