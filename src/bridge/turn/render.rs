@@ -16,7 +16,7 @@ use crate::backend::{
 use crate::bridge::core::SESSION_INFO_TIMEOUT;
 use crate::bridge::handles::{CardsHandle, RequestsHandle, SessionsHandle, TurnHandles};
 use crate::bridge::span;
-use crate::bridge::turn::state::{LedgerCadence, RenderedPart, StreamAccumulator};
+use crate::bridge::turn::state::{LedgerCadence, PartSource, RenderedPart, StreamAccumulator};
 use crate::config::ThreadKey;
 use crate::feishu::card::ledger::{TaskCompletionEntry, TaskEnding, TaskKind};
 use crate::feishu::card::tool_render::{ChildActivity, TaskLiveness};
@@ -172,22 +172,25 @@ fn renders_part(acc: &StreamAccumulator, part: &Part) -> bool {
 /// Render one typed part into the accumulator, applying the dedup rules
 /// ([`renders_part`]): text and reasoning are tracked by their content
 /// (OpenCode part payloads carry NO `id`, AGENTS.md #9), and a tool call
-/// re-renders exactly when its typed panel revision changed. Returns true when
+/// re-renders exactly when its typed panel revision changed. `source` is the
+/// part's own position in the transcript, recorded on text/reasoning timeline
+/// entries for the Rendered Cursor frontier (spec #561); callers without one
+/// (synthetic batches, the carried-call join) pass `None`. Returns true when
 /// the part rendered (not skipped as duplicate/empty).
-fn render_part(acc: &mut StreamAccumulator, part: &Part) -> bool {
+fn render_part(acc: &mut StreamAccumulator, source: Option<PartSource>, part: &Part) -> bool {
     if !renders_part(acc, part) {
         return false;
     }
     match part {
         Part::Text(text) => {
             acc.rendered_parts.insert(RenderedPart::Text(text.text.clone()));
-            acc.push_text_at(text.started_at, &text.text);
+            acc.push_text_from(text.started_at, source, &text.text);
             acc.card_state = crate::feishu::card::CardState::Streaming;
         }
         Part::Reasoning(reasoning) => {
             acc.rendered_parts
                 .insert(RenderedPart::Reasoning(reasoning.text.clone()));
-            acc.push_reasoning_at(reasoning.started_at, &reasoning.text);
+            acc.push_reasoning_from(reasoning.started_at, source, &reasoning.text);
             acc.card_state = crate::feishu::card::CardState::Reasoning;
         }
         Part::Tool(call) => {
@@ -225,7 +228,7 @@ fn render_part(acc: &mut StreamAccumulator, part: &Part) -> bool {
 pub(super) fn render_parts(acc: &mut StreamAccumulator, parts: &[Part]) -> bool {
     let mut rendered_any = false;
     for part in parts {
-        if render_part(acc, part) {
+        if render_part(acc, None, part) {
             rendered_any = true;
         }
     }
@@ -545,7 +548,7 @@ fn render_turn_parts(acc: &mut StreamAccumulator, transcript: &SessionTranscript
                 acc.context_tokens = used;
             }
         }
-        for part in &message.parts {
+        for (index, part) in message.parts.iter().enumerate() {
             // A carried call the Turn's own window now renders is the Turn's own
             // live panel again: it leaves the display-only carry set, so the
             // ordinary rules (the #284 live-panel guard included) apply to it
@@ -553,7 +556,14 @@ fn render_turn_parts(acc: &mut StreamAccumulator, transcript: &SessionTranscript
             if let Part::Tool(call) = part {
                 acc.carried_calls.remove(&call.identity.call_id);
             }
-            if render_part(acc, part) {
+            // The part's own position identifies it for the Rendered Cursor
+            // frontier (spec #561): parts carry no id (AGENTS.md #9), so the
+            // message identity plus the ordinal is the whole position.
+            let source = PartSource {
+                message_id: message.id.clone(),
+                index,
+            };
+            if render_part(acc, Some(source), part) {
                 rendered_any = true;
             }
         }
@@ -583,7 +593,7 @@ fn reconcile_carried_calls(acc: &mut StreamAccumulator, transcript: &SessionTran
     let carried: Vec<String> = acc.carried_calls.iter().cloned().collect();
     for call_id in carried {
         if let Some(call) = transcript.tool_call(&call_id)
-            && render_part(acc, &Part::Tool(call.clone()))
+            && render_part(acc, None, &Part::Tool(call.clone()))
         {
             rendered = true;
         }
@@ -1047,6 +1057,7 @@ mod tests {
         ToolIdentity, ToolOutput, TranscriptMessage, TurnAnchor, TurnSettle,
     };
     use crate::bridge::App;
+    use crate::bridge::chain::{CursorFrontier, CursorPartKind, RenderedCursor};
     use crate::bridge::test_support::{
         MockBackend, PlatformCall, RecordingPlatform, build_app, card_text, realistic_parts,
         seed_cover_title, seed_entry, test_config, test_work_dir, text_part, turn_anchor, typed_message,
@@ -3681,6 +3692,187 @@ Index: /x/src/main.rs
             done["header"]["subtitle"]["content"].as_str().unwrap(),
             "proj · 09-16",
             "the header must carry the turn's date, not the parts'"
+        );
+    }
+
+    /// A text part with its server start time — the timeline key the cursor
+    /// frontier records.
+    fn text_at(text: &str, started_at: i64) -> Part {
+        Part::Text(crate::backend::TextPart {
+            text: text.to_string(),
+            started_at: Some(started_at),
+        })
+    }
+
+    /// Spec #561: building a card captures the Rendered Cursor frontier of the
+    /// body-about-to-be-written — the newest text/reasoning part included,
+    /// with its message identity, part position, kind, start time and
+    /// delivered character extent. Staging it (and persisting on a confirmed
+    /// write) is the flush's; this seam pins the capture.
+    #[test]
+    fn the_built_card_carries_the_delivered_frontier() {
+        let mut acc = StreamAccumulator::new("test");
+        acc.turn_anchor = Some(turn_anchor(0));
+        let text = "第一段回答。";
+        let transcript = SessionTranscript::new(vec![message(
+            "msg_a_1",
+            100,
+            vec![reasoning_at("先想一下", 90), text_at(text, 100)],
+        )]);
+        assert!(render_new_turn_parts(&mut acc, &transcript));
+
+        let built = acc.build_card_with_info();
+        assert_eq!(
+            built.cursor.frontier,
+            Some(CursorFrontier {
+                message_id: MessageId::new("msg_a_1"),
+                part_index: 1,
+                kind: CursorPartKind::Text,
+                started_at: Some(100),
+                delivered_chars: text.chars().count(),
+            }),
+            "the frontier names the newest delivered text part and its extent"
+        );
+        assert!(built.cursor.live_calls.is_empty());
+    }
+
+    /// Spec #561: a part that spans more than one card records the delivered
+    /// prefix on the finalized body and the cumulative extent on the
+    /// continuation — the character position a later recovery resumes from.
+    #[test]
+    fn a_split_part_records_its_delivered_prefix_then_the_full_extent() {
+        let mut acc = StreamAccumulator::new("test");
+        acc.turn_anchor = Some(turn_anchor(0));
+        let max = crate::feishu::card::MAX_CARD_TEXT_CHARS;
+        let text: String = "长".repeat(max + 500);
+        let transcript = SessionTranscript::new(vec![message("msg_a_1", 100, vec![text_at(&text, 100)])]);
+        assert!(render_new_turn_parts(&mut acc, &transcript));
+
+        let first = acc.build_card_with_info();
+        assert!(first.full, "the part overflows one card");
+        assert_eq!(
+            first.cursor.frontier.as_ref().map(|f| f.delivered_chars),
+            Some(max),
+            "the finalized body delivered only the first chunk"
+        );
+        let second = acc.build_card_with_info();
+        assert!(!second.full);
+        assert_eq!(
+            second.cursor.frontier.as_ref().map(|f| f.delivered_chars),
+            Some(text.chars().count()),
+            "the continuation delivers the rest, cumulatively"
+        );
+        assert_eq!(
+            second.cursor.frontier.as_ref().map(|f| f.part_index),
+            Some(0),
+            "both bodies name the same part"
+        );
+    }
+
+    /// Spec #561: the live set follows the delivered body — a running call is
+    /// in it, and a call settled into the timeline leaves it on the next
+    /// delivered body.
+    #[test]
+    fn the_built_card_carries_running_tool_ids_and_drops_settled_ones() {
+        let mut acc = StreamAccumulator::new("test");
+        acc.turn_anchor = Some(turn_anchor(0));
+        let running = SessionTranscript::new(vec![message(
+            "msg_a_1",
+            100,
+            vec![
+                text_at("回答", 100),
+                tool(
+                    "bash",
+                    "call_1",
+                    ToolStatus::Running,
+                    Some(150),
+                    Some(serde_json::json!({ "command": "sleep 30" })),
+                    None,
+                ),
+            ],
+        )]);
+        assert!(render_new_turn_parts(&mut acc, &running));
+
+        let built = acc.build_card_with_info();
+        assert_eq!(
+            built.cursor.live_calls,
+            ["call_1".to_string()].into_iter().collect(),
+            "a running panel is in the delivered live set"
+        );
+        assert_eq!(
+            built.cursor.frontier.as_ref().map(|f| f.message_id.as_str()),
+            Some("msg_a_1"),
+            "the text frontier is captured alongside"
+        );
+
+        // The call settles: the next body renders it as a timeline panel, so
+        // the delivered live set drops it.
+        let settled = SessionTranscript::new(vec![message(
+            "msg_a_1",
+            100,
+            vec![
+                text_at("回答", 100),
+                tool(
+                    "bash",
+                    "call_1",
+                    ToolStatus::Completed,
+                    Some(150),
+                    Some(serde_json::json!({ "command": "sleep 30" })),
+                    Some("done"),
+                ),
+            ],
+        )]);
+        assert!(render_new_turn_parts(&mut acc, &settled));
+
+        let built = acc.build_card_with_info();
+        assert!(
+            built.cursor.live_calls.is_empty(),
+            "a settled call leaves the live set: {:?}",
+            built.cursor.live_calls
+        );
+    }
+
+    /// Spec #561: a body with no text/reasoning of its own keeps the chain's
+    /// confirmed frontier — it must never regress to "nothing delivered".
+    #[test]
+    fn a_body_without_content_keeps_the_chains_frontier() {
+        let mut acc = StreamAccumulator::new("test");
+        acc.turn_anchor = Some(turn_anchor(0));
+        let transcript =
+            SessionTranscript::new(vec![message("msg_a_1", 100, vec![text_at("第一段。", 100)])]);
+        assert!(render_new_turn_parts(&mut acc, &transcript));
+        let built = acc.build_card_with_info();
+        let frontier = built.cursor.frontier.expect("the text frontier");
+
+        // The flush confirmed this frontier: mirror it into the base (a
+        // confirmed write) and deliver a tool-only body afterwards.
+        acc.cursor = RenderedCursor {
+            frontier: Some(frontier.clone()),
+            live_calls: Default::default(),
+        };
+        let tool_only = SessionTranscript::new(vec![message(
+            "msg_a_2",
+            200,
+            vec![tool(
+                "bash",
+                "call_2",
+                ToolStatus::Running,
+                Some(250),
+                Some(serde_json::json!({ "command": "sleep 30" })),
+                None,
+            )],
+        )]);
+        assert!(render_new_turn_parts(&mut acc, &tool_only));
+
+        let built = acc.build_card_with_info();
+        assert_eq!(
+            built.cursor.frontier,
+            Some(frontier),
+            "the frontier does not regress on a text-free body"
+        );
+        assert_eq!(
+            built.cursor.live_calls,
+            ["call_2".to_string()].into_iter().collect()
         );
     }
 }
