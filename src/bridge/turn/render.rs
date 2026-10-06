@@ -2464,7 +2464,14 @@ Index: /x/src/main.rs
         acc.cola_message_id = Some("msg_cola_new".into());
         // The takeover's seed: the frontier inside the orphan's answer, the
         // orphan's own Turn as the scope, no live calls.
-        let cursor = projection_cursor("a_orphan", 0, CursorPartKind::Text, prefix.chars().count(), &[]);
+        let cursor = projection_cursor_at(
+            "a_orphan",
+            0,
+            CursorPartKind::Text,
+            Some(new_anchor - 30 * 60_000),
+            prefix.chars().count(),
+            &[],
+        );
         let seed = CursorSeed::for_orphan(&queued(&full), &cursor, &orphan);
         acc.seed_projection(&cursor, seed);
 
@@ -2529,7 +2536,14 @@ Index: /x/src/main.rs
 
         let mut acc = StreamAccumulator::new("proj");
         acc.cola_message_id = Some("msg_cola_new".into());
-        let cursor = projection_cursor("a_orphan", 0, CursorPartKind::Text, prefix.chars().count(), &[]);
+        let cursor = projection_cursor_at(
+            "a_orphan",
+            0,
+            CursorPartKind::Text,
+            Some(new_anchor - 50_000),
+            prefix.chars().count(),
+            &[],
+        );
         let seed = CursorSeed::for_orphan(&transcript, &cursor, &orphan);
         acc.seed_projection(&cursor, seed);
 
@@ -2549,11 +2563,26 @@ Index: /x/src/main.rs
 
     /// The Rendered Cursor fixture of the projection tests (spec #561): a
     /// text/reasoning frontier at `(message, part)` with `delivered_chars`
-    /// confirmed and the given live calls.
+    /// confirmed and the given live calls. The part carries no server clock,
+    /// like the `text_part` fixtures — a cursor whose frontier names a part
+    /// WITH a clock uses [`projection_cursor_at`].
     fn projection_cursor(
         message: &str,
         part_index: usize,
         kind: CursorPartKind,
+        delivered_chars: usize,
+        live: &[&str],
+    ) -> RenderedCursor {
+        projection_cursor_at(message, part_index, kind, None, delivered_chars, live)
+    }
+
+    /// [`projection_cursor`] with the part's server start time (ADR-0071's
+    /// frontier identity, review #569).
+    fn projection_cursor_at(
+        message: &str,
+        part_index: usize,
+        kind: CursorPartKind,
+        started_at: Option<i64>,
         delivered_chars: usize,
         live: &[&str],
     ) -> RenderedCursor {
@@ -2562,7 +2591,7 @@ Index: /x/src/main.rs
                 message_id: MessageId::new(message),
                 part_index,
                 kind,
-                started_at: Some(2_000),
+                started_at,
                 delivered_chars,
             }),
             live_calls: live.iter().map(|id| id.to_string()).collect(),
@@ -2808,10 +2837,11 @@ Index: /x/src/main.rs
         let mut acc = StreamAccumulator::new("proj");
         acc.turn_anchor = Some(turn_anchor(1_000));
         // The reasoning part delivered up to its first sentence.
-        let cursor = projection_cursor(
+        let cursor = projection_cursor_at(
             "msg_a_2000",
             0,
             CursorPartKind::Reasoning,
+            Some(2_000),
             "先想第一步。".chars().count(),
             &[],
         );
@@ -4841,5 +4871,86 @@ Index: /x/src/main.rs
             built.cursor.live_calls,
             ["call_2".to_string()].into_iter().collect()
         );
+    }
+    /// ADR-0071's frontier identity includes the part's server start time
+    /// (spec #561, review #569): a replacement part in the same message slot
+    /// with the same kind is a DIFFERENT part, and resolving the cursor
+    /// against it would skip its prefix and omit content. The seed refuses to
+    /// place it — the projection falls back rather than guess.
+    #[test]
+    fn a_replaced_part_in_the_frontier_slot_never_resolves_the_cursor() {
+        let cursor = projection_cursor_at(
+            "msg_a_2000",
+            0,
+            CursorPartKind::Text,
+            Some(2_000),
+            "答复".chars().count(),
+            &[],
+        );
+        let replaced = SessionTranscript::new(vec![message(
+            "msg_a_2000",
+            2_000,
+            // Same slot, same kind, longer than the delivered extent — only
+            // the server start time differs.
+            vec![text_at("另外的答复", 3_000)],
+        )]);
+        assert!(
+            CursorSeed::resolve(&replaced, &cursor).is_none(),
+            "a part with a different server start time is not the cursor's part"
+        );
+        let same = SessionTranscript::new(vec![message("msg_a_2000", 2_000, vec![text_at("答复", 2_000)])]);
+        assert!(
+            CursorSeed::resolve(&same, &cursor).is_some(),
+            "the recorded part still resolves"
+        );
+    }
+
+    /// Only a live-set call the resolving read carries can be handed over
+    /// (spec #561, review #569): a V2 read truncated at its page cap leaves a
+    /// still-running call outside it, and the successor cannot render a panel
+    /// it cannot see — the old card must keep that marker rather than strip
+    /// it into nothing.
+    #[test]
+    fn a_live_set_call_outside_the_read_is_never_handed_over() {
+        let transcript = SessionTranscript::new(vec![message(
+            "msg_a_1",
+            100,
+            vec![
+                text_at("回答", 100),
+                tool(
+                    "bash",
+                    "call_seen",
+                    ToolStatus::Running,
+                    Some(150),
+                    Some(serde_json::json!({ "command": "sleep 30" })),
+                    None,
+                ),
+            ],
+        )]);
+        let cursor = RenderedCursor {
+            frontier: None,
+            live_calls: ["call_seen".to_string(), "call_gone".to_string()]
+                .into_iter()
+                .collect(),
+        };
+        let seed = CursorSeed::resolve(&transcript, &cursor).expect("the cursor resolves");
+        assert!(
+            !seed.resolves_live_calls(),
+            "a named call outside the read is never handed over"
+        );
+        assert_eq!(
+            seed.resolved_live_calls,
+            ["call_seen".to_string()].into_iter().collect(),
+            "only the read's own call resolves"
+        );
+
+        // Every named call present: the successor renders them, so the old
+        // card's running markers may go.
+        let all_present = RenderedCursor {
+            live_calls: ["call_seen".to_string()].into_iter().collect(),
+            ..cursor.clone()
+        };
+        let seed = CursorSeed::resolve(&transcript, &all_present).expect("the cursor resolves");
+        assert!(seed.resolves_live_calls());
     }
 }

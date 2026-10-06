@@ -291,6 +291,11 @@ pub struct RecordingPlatform {
     /// response lost" shape a single-shot create must never repeat (spec #561,
     /// review #569).
     pub fail_reply_card_after_send_count: std::sync::atomic::AtomicUsize,
+    /// Scripted `reply_card` outcomes, popped in call order: `false` fails the
+    /// send with a transport error (ambiguous; nothing recorded), `true` lands
+    /// it. Empty means every send lands. Lets a test stop a projection's chain
+    /// at an exact slice (spec #561, review #569).
+    pub reply_card_outcomes: std::sync::Mutex<std::collections::VecDeque<bool>>,
     /// When set, `set_instant_reminder` fails after recording the attempt
     /// (tests the best-effort pin path: failures log and never affect a turn).
     /// Atomic so a test can flip it mid-lifecycle and watch a recovery.
@@ -337,6 +342,7 @@ impl RecordingPlatform {
             fail_update_transport_count: std::sync::atomic::AtomicUsize::new(0),
             fail_reply_card_content_count: std::sync::atomic::AtomicUsize::new(0),
             fail_reply_card_after_send_count: std::sync::atomic::AtomicUsize::new(0),
+            reply_card_outcomes: std::sync::Mutex::new(std::collections::VecDeque::new()),
             fail_instant_reminder: std::sync::atomic::AtomicBool::new(false),
             fail_pin: std::sync::atomic::AtomicBool::new(false),
             reply_in_thread_thread_id: Some("omt_created_topic".into()),
@@ -351,6 +357,12 @@ impl RecordingPlatform {
     /// with none queued keeps the mock's default `msg_reply`.
     pub fn given_reply_id(&self, id: &str) {
         self.reply_ids.lock().unwrap().push_back(id.to_string());
+    }
+
+    /// Queue the next `reply_card` call's outcome: `false` fails it with a
+    /// transport error without recording the send (ambiguous), `true` lands it.
+    pub fn given_reply_card_outcome(&self, lands: bool) {
+        self.reply_card_outcomes.lock().unwrap().push_back(lands);
     }
 
     /// Park the first `method` call targeting `target` until `release`, after
@@ -606,6 +618,21 @@ impl feishu::Platform for RecordingPlatform {
             return Err(crate::error::BridgeError::Io(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "simulated accepted-but-lost reply_card response",
+            )));
+        }
+        // A scripted outcome can stop a projection chain at an exact slice: a
+        // failed send is not recorded (it never reached Feishu) and returns
+        // the ambiguous transport error the single-shot rule expects.
+        if self
+            .reply_card_outcomes
+            .lock()
+            .unwrap()
+            .pop_front()
+            .is_some_and(|lands| !lands)
+        {
+            return Err(crate::error::BridgeError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "simulated reply_card failure",
             )));
         }
         if let Some(gate) = self.take_gate("reply", reply_to) {

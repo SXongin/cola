@@ -467,6 +467,101 @@ fn project_target(
         .map(|chat| ProjectTarget::TopLevel(chat.to_string()))
 }
 
+/// The outcome of a projection's continuation chain (spec #561, review #569).
+enum ProjectedChain {
+    /// Every slice landed; the chain's last card id.
+    Complete(String),
+    /// The chain stopped with content left — a create failed, the card bound
+    /// was hit, or a fresh Turn took the session over. The record keeps the
+    /// last confirmed slice's cursor and the next life's projection resumes
+    /// from it. The last landed card is the record's current card.
+    Stopped(String),
+}
+
+/// Send the remaining slices of an oversized projection delta (spec #561,
+/// review #569): one bounded create per slice through the same splitter the
+/// flush uses, in order, each slice's Rendered Cursor confirmed only after its
+/// own create landed — so a stop leaves the cursor exactly over the slices that
+/// did land (no omission of earlier content, no duplication later). The
+/// existing chain bound caps one projection's cards; the rest waits for the
+/// next life's recovery. The single-shot rule stays the caller's: it marks the
+/// record `projection_attempted` when the chain stops, so this life never
+/// re-posts a slice that may have landed.
+async fn send_projected_chain(
+    handles: &FlowHandles,
+    session_id: &str,
+    target: &ProjectTarget,
+    chain_id: u64,
+    directory: &str,
+    first_card_id: &str,
+    mut full: bool,
+) -> ProjectedChain {
+    let mut last = first_card_id.to_string();
+    let mut slices = 1usize;
+    while full {
+        if slices >= crate::bridge::turn::MAX_CARD_CHAIN {
+            tracing::info!(
+                "live-card reap: session {session_id} stopped its successor chain at the card bound with content left"
+            );
+            return ProjectedChain::Stopped(last);
+        }
+        let Some(slice) = Turn::next_projected_slice(&handles.cards, session_id, chain_id).await else {
+            // The chain is gone (a fresh Turn owns the session): the content
+            // left is no longer ours to render.
+            return ProjectedChain::Stopped(last);
+        };
+        let delivered = match target {
+            ProjectTarget::Reply(reply_to) => handles.cards.feishu.reply_card(reply_to, &slice.card).await,
+            ProjectTarget::TopLevel(chat) => {
+                handles.cards.feishu.send_card("chat_id", chat, &slice.card).await
+            }
+        };
+        let new_card_id = match delivered {
+            Ok(card_id) => card_id,
+            Err(e) => {
+                tracing::warn!(
+                    "live-card reap: session {session_id} could not continue its successor chain: {e}"
+                );
+                return ProjectedChain::Stopped(last);
+            }
+        };
+        if !Turn::track_projected_continuation(
+            &handles.cards,
+            session_id,
+            chain_id,
+            &new_card_id,
+            !slice.full,
+            Some(directory),
+        )
+        .await
+        {
+            // A fresh Turn owns the session: the late card is collected so it
+            // cannot look live, and the chain stops.
+            collect_orphan(&handles.cards, session_id, &new_card_id).await;
+            return ProjectedChain::Stopped(last);
+        }
+        crate::bridge::turn::confirm_armed_cursor(
+            &handles.cards,
+            session_id,
+            chain_id,
+            &new_card_id,
+            slice.cursor_stage,
+        )
+        .await;
+        crate::bridge::turn::drain_armed_watermark(
+            &handles.cards,
+            session_id,
+            chain_id,
+            slice.watermark_stage,
+        )
+        .await;
+        last = new_card_id;
+        full = slice.full;
+        slices += 1;
+    }
+    ProjectedChain::Complete(last)
+}
+
 /// Project a run that ended while cola was down (spec #561, ticket #563):
 /// arm a successor card seeded from the chain's Rendered Cursor, render the
 /// read's missed tail plus the transcript's true ending once, send it as a
@@ -673,6 +768,32 @@ async fn project_card(
         projected.watermark_stage,
     )
     .await;
+    // An oversized delta continues on a bounded chain of cards (spec #561,
+    // review #569): every slice through the same splitter, each confirmed only
+    // after its own create lands. A stopped chain leaves the tail to the next
+    // life's recovery: the record (kept by the single-shot mark) holds the
+    // last confirmed slice's cursor, and this life re-posts nothing.
+    let final_card_id = if projected.full {
+        match send_projected_chain(
+            handles,
+            session_id,
+            &target,
+            projected.chain_id,
+            route.directory,
+            &new_card_id,
+            true,
+        )
+        .await
+        {
+            ProjectedChain::Complete(last) => last,
+            ProjectedChain::Stopped(last) => {
+                handles.cards.chains.mark_projection_attempted(session_id, &last);
+                return;
+            }
+        }
+    } else {
+        new_card_id
+    };
     if state.is_terminal() {
         // The successor reached a terminal: nothing is owed a reap, and the
         // cursor goes with the record.
@@ -681,7 +802,10 @@ async fn project_card(
         // Waiting: the successor yields, and its own yield is the one the
         // record remembers, so a later pass does not project it again.
         if matches!(disposition, Disposition::Waiting) {
-            handles.cards.chains.mark_waiting_reaped(session_id, &new_card_id);
+            handles
+                .cards
+                .chains
+                .mark_waiting_reaped(session_id, &final_card_id);
         }
     }
     tracing::info!("live-card reap: session {session_id} projected its missed tail onto a successor card");
@@ -870,9 +994,35 @@ async fn project_live_card(
         projected.watermark_stage,
     )
     .await;
+    // An oversized delta continues on a bounded chain (spec #561, review
+    // #569): the follow starts on the chain's LAST card. A stopped chain
+    // spawns no follow — the record keeps the last confirmed slice for the
+    // next life's recovery, and the single-shot mark stops this life from
+    // re-posting anything.
+    let final_card_id = if projected.full {
+        match send_projected_chain(
+            handles,
+            session_id,
+            &target,
+            projected.chain_id,
+            route.directory,
+            &new_card_id,
+            true,
+        )
+        .await
+        {
+            ProjectedChain::Complete(last) => last,
+            ProjectedChain::Stopped(last) => {
+                handles.cards.chains.mark_projection_attempted(session_id, &last);
+                return None;
+            }
+        }
+    } else {
+        new_card_id
+    };
     tracing::info!("live-card reap: session {session_id} adopted its still-live run onto a successor card");
     Some(AdoptedFollow {
-        card_message_id: new_card_id,
+        card_message_id: final_card_id,
         anchor,
     })
 }

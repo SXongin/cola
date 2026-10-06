@@ -4109,13 +4109,18 @@ async fn a_record_with_no_deliverable_target_projects_nothing() {
 // ---------------------------------------------------------------------------
 
 /// An assistant message still in flight: content without a terminal
-/// `step-finish`, so its Turn reads as running.
+/// `step-finish`, so its Turn reads as running. The part carries the message's
+/// server time, like the server's own reads (and the `text_frontier`
+/// fixtures): the Rendered Cursor frontier's identity includes it.
 fn assistant_in_flight(created: i64, text: &str) -> TranscriptMessage {
     typed_message(
         &format!("msg_a_{created}"),
         MessageRole::Assistant,
         Some(created),
-        vec![text_part(text)],
+        vec![Part::Text(TextPart {
+            text: text.to_string(),
+            started_at: Some(created),
+        })],
     )
 }
 
@@ -5842,4 +5847,322 @@ async fn an_ambiguous_create_after_a_lost_response_is_never_retried() {
         platform.calls.lock().await
     );
     wait_for_record_gone(&app, "ses_test").await;
+}
+
+/// A live-set call the read does not carry is never handed over (spec #561,
+/// review #569): a V2 transcript truncated at its page cap leaves the call
+/// outside the successor's sight, so the old card keeps the frozen running
+/// marker instead of dropping a panel that would vanish from both.
+#[tokio::test]
+async fn an_unobserved_running_tool_stays_on_the_old_card() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let delivered = "已经写了一半。";
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
+        Some(text_frontier(delivered.chars().count())),
+        // `call_gone` is NOT in the read: a truncated transcript left the
+        // still-running call outside it.
+        &["call_1", "call_gone"],
+    );
+    let running = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "问题"),
+        assistant_in_flight(2_000, delivered),
+        tool_assistant(3_000, ToolStatus::Running, ""),
+    ]);
+    let (app, platform, _backend) =
+        restarted_app_with_backend(&session_file, running, Some(SessionStatus::Busy)).await;
+    platform.given_card_view("om_frozen", running_panel_card_view());
+
+    spawn_sync(&app);
+    let (successor, successor_text) = wait_for_projection(&platform, "msg_cola_anchor").await;
+    assert!(
+        successor_text.contains("⏳ bash"),
+        "the read's own still-running call is carried live onto the successor: {successor}"
+    );
+
+    // The old card's collect withholds the strip: the successor cannot render
+    // `call_gone`, so its marker stays as a frozen witness rather than
+    // vanishing from both cards.
+    let collect = last_update_of(&platform, "om_frozen")
+        .await
+        .expect("the old card is collected as taken over");
+    let collect_text = card_text(&collect);
+    assert!(
+        collect_text.contains("⏳ bash") && collect_text.contains("还在跑"),
+        "a call the successor cannot render keeps its marker on the old card: {collect}"
+    );
+}
+
+/// The oversized missed delta (spec #561, review #569): a restart whose
+/// undelivered tail exceeds Feishu's card limits projects through the normal
+/// splitter as a bounded chain — every slice in order, each confirmed only
+/// after its own create, no content lost or duplicated.
+#[tokio::test]
+async fn an_oversized_missed_delta_lands_across_a_bounded_chain() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let delivered = "已经写了一半。";
+    let marker = |i: usize| format!("【S{i:02}】");
+    let tail: String = (0..40)
+        .map(|i| format!("{}{}", marker(i), "长".repeat(400)))
+        .collect();
+    let full = format!("{delivered}{tail}");
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
+        Some(text_frontier(delivered.chars().count())),
+        &[],
+    );
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "问题"),
+        assistant(2_000, &full),
+    ])
+    .with_executions(vec![execution(2_500)]);
+    let (app, platform, _backend) =
+        restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Idle)).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+
+    spawn_sync(&app);
+    // The last marker proves the whole tail landed across the created chain.
+    wait_for_posted_text(&platform, &marker(39)).await;
+    let posts = platform.replied_cards().await;
+    assert!(
+        posts.len() >= 2,
+        "an oversized delta is a chain, not one card: {:?}",
+        platform.calls.lock().await
+    );
+    let texts: Vec<String> = posts.iter().map(card_text).collect();
+    let combined = texts.join("\n");
+    let mut last_pos = 0usize;
+    for i in 0..40 {
+        let m = marker(i);
+        assert_eq!(
+            combined.matches(&m).count(),
+            1,
+            "{m} lands exactly once across the chain: {combined}"
+        );
+        let pos = combined.find(&m).expect("found");
+        assert!(pos >= last_pos, "{m} lands in order: {combined}");
+        last_pos = pos;
+    }
+    assert!(
+        !combined.contains(delivered),
+        "the delivered prefix is never repeated: {combined}"
+    );
+    for text in &texts {
+        assert!(
+            text.chars().count() <= crate::feishu::card::MAX_CARD_TEXT_CHARS + 2_000,
+            "each slice is bounded ({} chars): {text}",
+            text.chars().count()
+        );
+    }
+    // The chain ends with the true ending on its last card, the old card is
+    // collected, and the record is spent.
+    assert!(
+        card_header(posts.last().expect("the chain posted")).contains("✅"),
+        "the chain's last card wears the transcript's true ending: {:?}",
+        posts.last().unwrap()
+    );
+    let collected = last_update_of(&platform, "om_frozen")
+        .await
+        .expect("the old card is collected as taken over");
+    assert!(
+        card_header(&collected).contains("已由新卡片接管"),
+        "the old card is collected: {collected}"
+    );
+    wait_for_record_gone(&app, "ses_test").await;
+}
+
+/// A mid-chain create failure (spec #561, review #569): the cursor advances
+/// only through the slices that landed, the possibly-landed slice is never
+/// re-posted in this life, and the record — kept by the single-shot mark —
+/// hands the rest to the next life's recovery.
+#[tokio::test]
+async fn a_mid_chain_projection_failure_keeps_only_the_landed_slices() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let delivered = "已经写了一半。";
+    let marker = |i: usize| format!("【S{i:02}】");
+    let tail: String = (0..40)
+        .map(|i| format!("{}{}", marker(i), "长".repeat(400)))
+        .collect();
+    let full = format!("{delivered}{tail}");
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
+        Some(text_frontier(delivered.chars().count())),
+        &[],
+    );
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "问题"),
+        assistant(2_000, &full),
+    ])
+    .with_executions(vec![execution(2_500)]);
+    let (app, platform, backend) =
+        restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Idle)).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+    // The first create lands; the second fails ambiguously.
+    platform.given_reply_card_outcome(true);
+    platform.given_reply_card_outcome(false);
+
+    spawn_sync(&app);
+    let cursor = wait_for_cursor(&app, |cursor| {
+        cursor
+            .frontier
+            .as_ref()
+            .is_some_and(|frontier| frontier.delivered_chars > delivered.chars().count())
+    })
+    .await;
+    let landed = cursor
+        .frontier
+        .as_ref()
+        .map(|frontier| frontier.delivered_chars)
+        .expect("the frontier is confirmed");
+    assert!(
+        landed < full.chars().count(),
+        "only the landed slices are confirmed: {cursor:?}"
+    );
+    // Exactly one successor card: the failed slice is never re-posted.
+    assert_eq!(
+        platform.replied_cards().await.len(),
+        1,
+        "the failed slice is not re-posted: {:?}",
+        platform.calls.lock().await
+    );
+    let _ = &backend;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        platform.replied_cards().await.len(),
+        1,
+        "later passes never re-post the stopped chain: {:?}",
+        platform.calls.lock().await
+    );
+    assert!(
+        app.cards_handle().chains.get("ses_test").is_some(),
+        "the record stays for the next life's recovery"
+    );
+    let persisted =
+        crate::bridge::chain::ChainRecords::load(session_file.with_file_name("chain_records.json"));
+    assert_eq!(
+        persisted
+            .cursor("ses_test")
+            .and_then(|cursor| cursor.frontier.map(|frontier| frontier.delivered_chars)),
+        Some(landed),
+        "the persisted cursor covers exactly the landed slices"
+    );
+    let first = platform
+        .replied_cards()
+        .await
+        .into_iter()
+        .next()
+        .expect("the landed slice");
+    let first_text = card_text(&first);
+    assert!(first_text.contains(&marker(0)), "{first_text}");
+    assert!(!first_text.contains(&marker(39)), "{first_text}");
+}
+
+/// Wait until a successfully POSTED (created) card carries `needle`, or panic
+/// after 5 s — a projection's chain slices are creates, not PATCHes, so
+/// [`wait_for_card_text`] (which reads updates) never sees them.
+async fn wait_for_posted_text(platform: &RecordingPlatform, needle: &str) {
+    let probe = async {
+        loop {
+            if platform
+                .replied_cards()
+                .await
+                .iter()
+                .any(|card| card_text(card).contains(needle))
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), probe)
+        .await
+        .unwrap_or_else(|_| panic!("no posted card ever carried {needle:?}"));
+}
+
+/// An oversized LIVE delta (spec #561, review #569): the chain's last card is
+/// the live card the follow continues on, so content the run produces after
+/// the restart still streams onto the chain.
+#[tokio::test]
+async fn an_oversized_live_delta_chains_and_the_follow_continues_it() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let delivered = "已经写了一半。";
+    let marker = |i: usize| format!("【S{i:02}】");
+    let tail: String = (0..40)
+        .map(|i| format!("{}{}", marker(i), "长".repeat(400)))
+        .collect();
+    let full = format!("{delivered}{tail}");
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
+        Some(text_frontier(delivered.chars().count())),
+        &[],
+    );
+    let running = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "问题"),
+        assistant_in_flight(2_000, &full),
+    ]);
+    let (app, platform, backend) =
+        restarted_app_with_backend(&session_file, running, Some(SessionStatus::Busy)).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+
+    spawn_sync(&app);
+    wait_for_posted_text(&platform, &marker(39)).await;
+    let posts = platform.replied_cards().await;
+    assert!(
+        posts.len() >= 2,
+        "the oversized live delta is a chain: {:?}",
+        platform.calls.lock().await
+    );
+
+    // The run streams on: the grown tail PATCHes the chain's live card.
+    let grown = format!("{full}重启之后的尾巴。");
+    backend
+        .given_transcript_after_build(
+            "ses_test",
+            vec![SessionTranscript::new(vec![
+                user("msg_cola_anchor", 1_000, "问题"),
+                assistant_in_flight(2_000, &grown),
+            ])],
+        )
+        .await;
+    wait_for_card_text(&platform, "重启之后的尾巴。").await;
+    let update = platform
+        .updated_cards()
+        .await
+        .into_iter()
+        .find(|card| card_text(card).contains("重启之后的尾巴。"))
+        .expect("the follow's tail reached the card");
+    let text = card_text(&update);
+    assert_eq!(
+        text.matches("重启之后的尾巴。").count(),
+        1,
+        "the follow's tail lands exactly once: {text}"
+    );
+    assert!(
+        !text.contains(delivered),
+        "the delivered prefix is never repeated: {text}"
+    );
 }
