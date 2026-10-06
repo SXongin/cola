@@ -566,13 +566,6 @@ pub(super) fn render_turn_parts(acc: &mut StreamAccumulator, transcript: &Sessio
         }
         let message_pos = message_positions.get(message.id.as_str()).copied();
         for (index, part) in message.parts.iter().enumerate() {
-            // A carried call the Turn's own window now renders is the Turn's own
-            // live panel again: it leaves the display-only carry set, so the
-            // ordinary rules (the #284 live-panel guard included) apply to it
-            // exactly as they did before the carry existed.
-            if let Part::Tool(call) = part {
-                acc.carried_calls.remove(&call.identity.call_id);
-            }
             let cut = match (seed.as_ref(), message_pos) {
                 (Some(seed), Some(pos)) => seed.cut(pos, index),
                 _ => crate::bridge::turn::state::SeedCut::Undelivered,
@@ -580,7 +573,11 @@ pub(super) fn render_turn_parts(acc: &mut StreamAccumulator, transcript: &Sessio
             match cut {
                 // At or before the frontier: already delivered. It is marked
                 // delivered (not rendered), so the content-keyed dedup and the
-                // content-diff probe both see the earlier body's delivery.
+                // content-diff probe both see the earlier body's delivery. A
+                // tool here stays in the display-only carry when it is still
+                // running (its identity reconciliation keeps it current) —
+                // only a position the window actually renders retires the
+                // carry.
                 crate::bridge::turn::state::SeedCut::Delivered => acc.mark_delivered_part(part),
                 crate::bridge::turn::state::SeedCut::Frontier(delivered) => {
                     if render_seeded_part(acc, message.id.clone(), index, part, delivered) {
@@ -588,6 +585,14 @@ pub(super) fn render_turn_parts(acc: &mut StreamAccumulator, transcript: &Sessio
                     }
                 }
                 crate::bridge::turn::state::SeedCut::Undelivered => {
+                    // A carried call the Turn's own window now renders is the
+                    // Turn's own live panel again: it leaves the display-only
+                    // carry set, so the ordinary rules (the #284 live-panel
+                    // guard included) apply to it exactly as they did before
+                    // the carry existed.
+                    if let Part::Tool(call) = part {
+                        acc.carried_calls.remove(&call.identity.call_id);
+                    }
                     // The part's own position identifies it for the Rendered
                     // Cursor frontier (spec #561): parts carry no id (AGENTS.md
                     // #9), so the message identity plus the ordinal is the
@@ -2524,6 +2529,65 @@ Index: /x/src/main.rs
             1,
             "no duplication: {text_after}"
         );
+    }
+
+    /// A live-set call delivered running at or before the frontier stays in
+    /// the identity carry after the seeded render, so its later settlement
+    /// still joins the timeline exactly once (spec #561, ticket #563).
+    #[test]
+    fn a_seeded_live_set_call_before_the_frontier_still_settles_once() {
+        let text = "第一段回答。";
+        let timeline = |status: ToolStatus, output: Option<&str>| {
+            SessionTranscript::new(vec![
+                typed_message(
+                    "msg_cola_anchor",
+                    MessageRole::User,
+                    Some(1_000),
+                    vec![text_part("问题")],
+                ),
+                message(
+                    "msg_tool_1500",
+                    1_500,
+                    vec![tool(
+                        "bash",
+                        "call_1",
+                        status,
+                        Some(1_500),
+                        Some(serde_json::json!({ "command": "sleep 300" })),
+                        output,
+                    )],
+                ),
+                message("msg_a_2000", 2_000, vec![text_part(text)]),
+            ])
+        };
+        let running = timeline(ToolStatus::Running, None);
+        let mut acc = StreamAccumulator::new("proj");
+        acc.turn_anchor = Some(turn_anchor(1_000));
+        let cursor = projection_cursor(
+            "msg_a_2000",
+            0,
+            CursorPartKind::Text,
+            text.chars().count(),
+            &["call_1"],
+        );
+        let seed = CursorSeed::resolve(&running, &cursor).expect("the frontier resolves");
+        acc.seed_projection(&cursor, seed);
+
+        assert!(render_new_turn_parts(&mut acc, &running));
+        assert!(
+            acc.carried_calls.contains("call_1"),
+            "the delivered running call stays in the identity carry even before the frontier"
+        );
+
+        // The call settles: the carry still resolves it, exactly once.
+        let settled = timeline(ToolStatus::Completed, Some("done"));
+        assert!(render_new_turn_parts(&mut acc, &settled));
+        assert!(acc.carried_calls.is_empty(), "the settled call leaves the carry");
+        let text = card_text(&acc.build_card_with_info().card);
+        assert_eq!(text.matches("done").count(), 1, "settled once: {text}");
+        assert!(!render_new_turn_parts(&mut acc, &settled));
+        let text = card_text(&acc.build_card_with_info().card);
+        assert_eq!(text.matches("done").count(), 1, "no duplication: {text}");
     }
 
     /// Everything at or before the frontier is delivered — including a tool
