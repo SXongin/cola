@@ -355,22 +355,20 @@ async fn apply(
             let CardProbe::Successor { card_message_id, .. } = &reads.card else {
                 return;
             };
-            handles.cards.chains.replace(
+            handles.cards.chains.track(
                 session_id,
-                ChainRecord::new(
-                    card_message_id.clone(),
-                    anchor.message_id.clone(),
-                    Some(anchor.created_ms),
-                )
+                card_message_id.clone(),
+                anchor.message_id.clone(),
+                Some(anchor.created_ms),
                 // The route belongs to the session, not the card: keep it
                 // across the re-point.
-                .with_directory(record.directory.clone()),
+                record.directory.as_deref(),
             );
         }
         ChainDisposition::CollectThenRelease => {
             // The collect already ran; the successor cannot carry a record —
             // it settled, or it still has no anchor to scope a reap with.
-            handles.cards.chains.remove(session_id);
+            handles.cards.chains.release(session_id);
         }
         ChainDisposition::StampRestart => {
             stamp_restarted(handles, session_id, record, read_timeout_ms);
@@ -478,7 +476,7 @@ impl ApplyPass<'_> {
             state.reap_word()
         );
         if terminal {
-            self.handles.cards.chains.remove(self.session_id);
+            self.handles.cards.chains.release(self.session_id);
         }
         true
     }
