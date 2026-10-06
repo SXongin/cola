@@ -3699,6 +3699,19 @@ async fn wait_for_projection(platform: &RecordingPlatform, reply_to: &str) -> (s
         .unwrap_or_else(|_| panic!("the projection never posted a successor for {reply_to}"))
 }
 
+/// The successor's header as issue #561 requires it: the same session (the
+/// subtitle names the thread, `{title} · {id-tail}`) and the chain's date
+/// anchor (`MM-DD`). The reply-target and content assertions alone would still
+/// pass if either disappeared.
+fn assert_successor_header(card: &serde_json::Value, session_title: &str, anchor_ms: i64) {
+    let date = crate::feishu::card::fmt_local_date(anchor_ms).expect("the anchor formats a date");
+    assert_eq!(
+        card["header"]["subtitle"]["content"].as_str().unwrap_or_default(),
+        format!("{session_title} · test · {date}"),
+        "the successor names its session and carries the turn's header date: {card}"
+    );
+}
+
 /// The headline acceptance (spec #561, ticket #563): a restart with a
 /// delivered prefix and a longer transcript projects exactly the delta plus
 /// the true ending onto a successor — character-level no-dup, no omission —
@@ -3728,6 +3741,13 @@ async fn a_restart_projects_the_missed_tail_of_an_ended_run() {
     let (app, platform, backend) =
         restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Idle)).await;
     platform.given_card_view("om_frozen", realistic_card_view());
+    // The successor's session subtitle reads the server's title (issue #561):
+    // a projection that skipped the read would land a bare id tail instead.
+    backend
+        .session_titles
+        .lock()
+        .unwrap()
+        .insert("ses_test".to_string(), "项目甲".to_string());
 
     spawn_sync(&app);
     let (successor, successor_text) = wait_for_projection(&platform, "msg_cola_anchor").await;
@@ -3737,6 +3757,7 @@ async fn a_restart_projects_the_missed_tail_of_an_ended_run() {
         "✅ 完成",
         "the successor carries the transcript's true ending"
     );
+    assert_successor_header(&successor, "项目甲", 1_000);
     assert_eq!(
         successor_text.matches(missed).count(),
         1,
@@ -5021,6 +5042,10 @@ async fn a_live_adoption_is_generation_neutral() {
             ])],
         );
         backend.with_session_status("ses_test", Some(SessionStatus::Busy));
+        // The successor's header reads the session's title and the chain's
+        // date anchor (issue #561): pin both here so a projection that dropped
+        // either cannot pass on its reply target and content alone.
+        backend.with_session_title("ses_test", "项目乙");
         let backend = Arc::new(backend);
         let platform = Arc::new(RecordingPlatform::new());
         let app = Arc::new(
@@ -5035,6 +5060,7 @@ async fn a_live_adoption_is_generation_neutral() {
             card_header(&successor).contains("回复中"),
             "a working successor on the {generation} mock: {successor}"
         );
+        assert_successor_header(&successor, "项目乙", 1_000);
         assert!(
             !successor_text.contains(delivered),
             "the delivered prefix is never repeated on the {generation} mock: {successor}"
