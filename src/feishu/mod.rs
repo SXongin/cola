@@ -11,6 +11,7 @@ use crate::error::Result;
 use async_trait::async_trait;
 use client::Client;
 use serde_json::Value;
+use std::time::Duration;
 
 /// The Feishu platform, abstracted so the bridge core can be tested with a
 /// recording adapter (captures every card cola would send) or, in the live
@@ -73,6 +74,18 @@ pub trait Platform: Send + Sync {
         _intent: delivery::CardWriteIntent,
     ) -> bool {
         false
+    }
+
+    /// How long a writer awaits an issued keyed submission's completion ticket
+    /// before proceeding without a verdict (spec #571 review): an issued keyed
+    /// write is **never cancelled** — a cancelled PATCH could still commit at
+    /// Feishu and land over a newer generation — so a slow or hung one can
+    /// outlive its caller. The writer bounds its own wait instead and then
+    /// proceeds, leaving the write owned by the queue, which may still land it.
+    /// The delivery decorator forwards this to the platform it wraps, so a
+    /// test fake may shorten it; production uses the delivery layer's bound.
+    fn keyed_ticket_await(&self) -> Duration {
+        delivery::KEYED_TICKET_AWAIT
     }
 
     async fn reply_text(&self, message_id: &str, text: &str) -> Result<String>;

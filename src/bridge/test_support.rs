@@ -367,6 +367,10 @@ pub struct RecordingPlatform {
     /// racing creates apart (the Turn's card vs. a projection's late one) names
     /// each reply itself.
     pub reply_ids: std::sync::Mutex<std::collections::VecDeque<String>>,
+    /// How long a writer awaits an issued keyed submission's ticket (spec #571
+    /// review): production's delivery bound by default, shortened by a test
+    /// that parks a keyed write and must watch a caller give up on it.
+    pub keyed_ticket_await: std::sync::Mutex<std::time::Duration>,
 }
 
 impl RecordingPlatform {
@@ -392,7 +396,15 @@ impl RecordingPlatform {
             card_view_reads: std::sync::Mutex::new(Vec::new()),
             pause_call: std::sync::Mutex::new(None),
             reply_ids: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            keyed_ticket_await: std::sync::Mutex::new(crate::feishu::delivery::KEYED_TICKET_AWAIT),
         }
+    }
+
+    /// Shorten the bound a writer awaits an issued keyed submission's ticket
+    /// (spec #571 review), so a test can park a keyed write and watch its
+    /// caller proceed without a verdict.
+    pub fn given_keyed_ticket_await(&self, bound: std::time::Duration) {
+        *self.keyed_ticket_await.lock().unwrap() = bound;
     }
 
     /// Queue the id the next `reply_card` call returns (call order); a call
@@ -600,6 +612,10 @@ fn collect_button_values(value: &serde_json::Value, out: &mut Vec<serde_json::Va
 impl feishu::Platform for RecordingPlatform {
     async fn get_ws_endpoint(&self) -> crate::error::Result<String> {
         Ok("wss://example.test".into())
+    }
+
+    fn keyed_ticket_await(&self) -> std::time::Duration {
+        *self.keyed_ticket_await.lock().unwrap()
     }
 
     async fn reply_card(&self, reply_to: &str, card: &serde_json::Value) -> crate::error::Result<String> {

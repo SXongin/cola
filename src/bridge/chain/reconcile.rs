@@ -171,9 +171,9 @@ pub(crate) async fn collect_late_projection(cards: &CardsHandle, session_id: &st
 /// fallback (spec #571 review): a platform that refuses the preserved shape as
 /// card content degrades to it inside the queue, under the same key and lock,
 /// so the degradation can never land over a newer generation. The collect
-/// awaits its completion ticket — the cache release follows a delivery and the
-/// warning a failure, exactly the timing the PATCH's own await had — while the
-/// queue owns the write.
+/// awaits its completion ticket with a bound — the reap's pass must never wait
+/// on Feishu unboundedly — and the queue owns the write past it: an issued
+/// keyed write is never cancelled and may still land.
 async fn collect_orphan_with(cards: &CardsHandle, session_id: &str, card_message_id: &str, keep: KeepBody) {
     if card_message_id.is_empty() {
         return;
@@ -181,6 +181,7 @@ async fn collect_orphan_with(cards: &CardsHandle, session_id: &str, card_message
     let bare = ending_card(CardState::TakenOver, None, None);
     let card = preserved_ending(cards.feishu.as_ref(), card_message_id, &bare, keep).await;
     let generation = cards.chains.generation(session_id);
+    let bound = cards.feishu.keyed_ticket_await();
     let outcome = cards
         .feishu
         .submit_ordered(KeyedSubmission {
@@ -191,10 +192,10 @@ async fn collect_orphan_with(cards: &CardsHandle, session_id: &str, card_message
             fallback: Some(&bare),
         })
         .await
-        .settled()
+        .settled_within(bound)
         .await;
     match outcome {
-        WriteOutcome::Delivered => {
+        Some(WriteOutcome::Delivered) => {
             // The collect repainted the card outside the handle registry, so
             // its cached JSON is now older than what Feishu shows (this PATCH
             // stripped every control). Release it: the card's live blocks stay
@@ -209,14 +210,27 @@ async fn collect_orphan_with(cards: &CardsHandle, session_id: &str, card_message
                 CardState::TakenOver.reap_word()
             );
         }
-        WriteOutcome::Failed(e) => tracing::warn!(
+        Some(WriteOutcome::Failed(e)) => tracing::warn!(
             "live-card reap: session {session_id} could not collect card {card_message_id}: {e}"
         ),
-        WriteOutcome::Superseded => {
+        Some(WriteOutcome::Superseded) => {
             // A newer chain state owns the card (or its key already settled):
             // nothing was written for this collect, so there is no repaint to
             // release the cache for and no failure to warn about — the write
             // that does own the card decides its own presentation.
+        }
+        None => {
+            // Indeterminate: the ticket outlived the await bound. The write is
+            // issued and owned by the queue — never cancelled — and may still
+            // land, so release the cache anyway: the release exists so a re-host
+            // cannot resurrect the collected presentation from the stale cache,
+            // and a collect that lands later would do exactly that. The write
+            // itself stays the queue's business.
+            cards.card_handles.lock().await.release_cache(card_message_id);
+            tracing::info!(
+                "live-card reap: session {session_id} {} (write still in flight)",
+                CardState::TakenOver.reap_word()
+            );
         }
     }
 }
@@ -1232,18 +1246,22 @@ impl ApplyPass<'_> {
     /// submission's fallback (spec #571 review): a platform that refuses the
     /// preserved shape as card content degrades to it inside the queue, under
     /// the same key and the same held card lock, so the degradation can never
-    /// land over a newer generation. Then await its ticket.
+    /// land over a newer generation. Then await its ticket, bounded: the pass
+    /// must never wait on Feishu unboundedly (an issued keyed write is never
+    /// cancelled and the queue may still land it).
     ///
     /// Returns whether the write landed: `Delivered` — this attempt's write (or
     /// its delivered fallback), or the same key already on the card (its retry
     /// landed through the drain) — takes the caller's success path; a failure
-    /// warns and keeps the record; a superseded submission (a takeover bumped
-    /// the chain first, or the queue already handled the key) does nothing — no
-    /// cache release, no warn.
+    /// or an indeterminate ticket warns/keeps and keeps the record (the release
+    /// gate sees the keyed ending the queue still owes); a superseded
+    /// submission (a takeover bumped the chain first, or the queue already
+    /// handled the key) does nothing — no cache release, no warn.
     async fn submit_ending(&self, card: &serde_json::Value, intent: CardWriteIntent) -> bool {
         let platform = self.handles.cards.feishu.as_ref();
         let card_message_id = self.record.card_message_id.as_str();
         let preserved = preserved_ending(platform, card_message_id, card, KeepBody::Everything).await;
+        let bound = platform.keyed_ticket_await();
         match platform
             .submit_ordered(KeyedSubmission {
                 message_id: card_message_id,
@@ -1253,20 +1271,33 @@ impl ApplyPass<'_> {
                 fallback: Some(card),
             })
             .await
-            .settled()
+            .settled_within(bound)
             .await
         {
-            WriteOutcome::Delivered => true,
-            WriteOutcome::Failed(e) => {
+            Some(WriteOutcome::Delivered) => true,
+            Some(WriteOutcome::Failed(e)) => {
                 tracing::warn!(
                     "live-card reap: session {} could not settle card {card_message_id}: {e}",
                     self.session_id
                 );
                 false
             }
-            WriteOutcome::Superseded => {
+            Some(WriteOutcome::Superseded) => {
                 tracing::debug!(
                     "live-card reap: session {} settle for card {card_message_id} superseded by a newer chain state",
+                    self.session_id
+                );
+                false
+            }
+            None => {
+                // Indeterminate: the ticket outlived the await bound. The
+                // ending is issued and owned by the queue — never cancelled —
+                // and may still land, so keep the record: the release gate
+                // counts the keyed ending the queue still owes (spec #571's
+                // amendment), and a later pass settles the card truthfully if
+                // the write never lands.
+                tracing::info!(
+                    "live-card reap: session {} ending for card {card_message_id} still in flight",
                     self.session_id
                 );
                 false
@@ -1376,6 +1407,7 @@ async fn stamp_restart_attempt(
         None => return,
     };
     let card = restamped_keeping_body(&ending_card(CardState::Restarted, None, None), &view);
+    let bound = platform.keyed_ticket_await();
     match platform
         .submit_ordered(KeyedSubmission {
             message_id: card_message_id,
@@ -1385,24 +1417,33 @@ async fn stamp_restart_attempt(
             fallback: None,
         })
         .await
-        .settled()
+        .settled_within(bound)
         .await
     {
-        WriteOutcome::Delivered => tracing::info!(
+        Some(WriteOutcome::Delivered) => tracing::info!(
             "live-card reap: session {session_id} {}",
             CardState::Restarted.reap_word()
         ),
-        WriteOutcome::Failed(e) => {
+        Some(WriteOutcome::Failed(e)) => {
             tracing::warn!(
                 "live-card reap: session {session_id} could not stamp card {card_message_id}: {e}"
             );
         }
-        WriteOutcome::Superseded => {
+        Some(WriteOutcome::Superseded) => {
             // A newer chain state owns the card: the takeover's collect was
             // submitted first (or a newer stamp did), so this stamp is not
             // owed and never reached Feishu.
             tracing::debug!(
                 "live-card reap: session {session_id} stamp for card {card_message_id} superseded by a newer chain state"
+            );
+        }
+        None => {
+            // Indeterminate: the ticket outlived the await bound. The stamp is
+            // issued and owned by the queue — never cancelled — and may still
+            // land; nothing is logged as landed, and the next tick's decision
+            // reads the queue's own state.
+            tracing::debug!(
+                "live-card reap: session {session_id} stamp for card {card_message_id} still in flight"
             );
         }
     }

@@ -4149,6 +4149,69 @@ async fn an_owed_settle_converges_through_the_pass_drain() {
     assert_eq!(card_header(patches.last().unwrap()), "✅ 完成");
 }
 
+/// A hung keyed write never holds Session Sync (spec #571 review): the platform
+/// never answers the settle's keyed ✅, so the write stays in flight — never
+/// cancelled — while the writer's bounded ticket await gives up and the pass
+/// keeps ticking. The queue still owns the write, so the ending stays owed (the
+/// record is not confirmed) and the card is never re-PATCHed behind it.
+#[tokio::test]
+async fn a_hung_keyed_write_does_not_block_the_pass() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
+
+    let (app, platform, backend) =
+        restarted_app_with_backend(&session_file, completed(1_000), Some(SessionStatus::Idle)).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+    // The writer's ticket await is tiny: the pass must never wait on Feishu —
+    // the write itself is never cancelled and stays in flight.
+    platform.given_keyed_ticket_await(Duration::from_millis(50));
+    // Park the settle's keyed ✅: the write is issued and unanswered.
+    let (entered, release) = platform.pause("update", "om_frozen");
+
+    spawn_sync_with_timeout(&app, 5_000);
+    entered.notified().await;
+
+    // The pass keeps reading the session while the write hangs: its own bound,
+    // never the platform's, is what it waits on.
+    wait_for_status_reads(&backend, "ses_test", 3).await;
+
+    // The write is still in flight and owned by the queue: the ending stays
+    // owed — the record waits for it — and no re-decision PATCHes behind it.
+    assert!(
+        app.cards_handle().feishu.keyed_write_covered(
+            "om_frozen",
+            0,
+            crate::feishu::delivery::CardWriteIntent::Settle
+        ),
+        "the hung write still owns its key"
+    );
+    assert!(
+        app.core.feishu.has_pending_card_update("om_frozen"),
+        "the hung ending is still owed"
+    );
+    assert!(
+        app.cards_handle().chains.get("ses_test").is_some(),
+        "the record waits for its ending"
+    );
+    assert!(
+        patches_to(&platform, "om_frozen").await.is_empty(),
+        "no retry PATCHes the card while the issued write is unanswered"
+    );
+
+    // Feishu finally answers: the hung write commits as the card's only PATCH.
+    release.notify_one();
+    wait_for_patches(&platform, "om_frozen", 1).await;
+    let patches = patches_to(&platform, "om_frozen").await;
+    assert_eq!(
+        patches.len(),
+        1,
+        "one issued write, never a retry behind it: {patches:?}"
+    );
+    assert_eq!(card_header(&patches[0]), "✅ 完成");
+}
+
 /// A Turn tracks its card the moment it becomes live — card id, message id,
 /// the captured anchor and the session's directory — and a terminal drops the
 /// record; a Waiting yield keeps it for the later true end.
