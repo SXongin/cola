@@ -468,6 +468,32 @@ impl PendingEntry {
         self.in_flight.as_ref().is_some_and(settle) || self.waiting.as_ref().is_some_and(settle)
     }
 
+    /// Whether a waiting write may still be **promoted** (spec #571 review):
+    /// the waiter must still pass the admission rules the current state
+    /// establishes — a `Stamp` shadowed by an accepted ending, or a key that
+    /// already settled (delivered or refused), may not be written. A strictly
+    /// newer generation also makes it stale (a newer state arrived while it
+    /// waited), which is the floor's effect here: the floor itself is
+    /// deliberately NOT compared, because a waiter may legitimately have
+    /// raised it — accepting a `Settle` closes its OWN generation, and that
+    /// settle must still land after the write it waited behind. A stale waiter
+    /// is dropped, never written after a newer state. (The caller has already
+    /// taken the waiter out of the slot.)
+    fn promotable(&self, write: &QueuedWrite) -> bool {
+        if write.generation < self.generation {
+            return false;
+        }
+        if write.intent == CardWriteIntent::Stamp
+            && self.ending_gen.is_some_and(|ending| write.generation <= ending)
+        {
+            return false;
+        }
+        if write.generation == self.generation && self.keys.contains_key(&write.intent) {
+            return false;
+        }
+        true
+    }
+
     /// Whether this entry still carries order state a stale writer may need
     /// (spec #571's reviews): a **raised generation floor** — an accepted keyed
     /// submission at generation ≥ 1, which drops every older-generation writer
@@ -778,10 +804,22 @@ impl CardDelivery {
             .or_insert_with(|| PendingEntry::new(lock));
         // A newer generation forgets the older generation's settled keys:
         // every older submission is dropped by the rules below, and only the
-        // newest generation's states are remembered.
+        // newest generation's states are remembered. The advance also
+        // invalidates every older WAIT (spec #571 review): a waiting write
+        // below the new generation is settled `Superseded` here rather than
+        // kept for a promotion that must refuse it, so a stale payload can
+        // never be written after a newer state.
         if submission.generation > entry.generation {
             entry.generation = submission.generation;
             entry.keys.clear();
+            if entry
+                .waiting
+                .as_ref()
+                .is_some_and(|waiting| waiting.generation < entry.generation)
+            {
+                let stale = entry.waiting.take().expect("checked above");
+                Self::settle_ticket(entry, stale.token, WriteOutcome::Superseded);
+            }
         }
         // (d) A settled key never writes again: a delivered key is already on
         // the card (so per-tick re-decisions are free, and their callers learn
@@ -1061,9 +1099,18 @@ impl CardDelivery {
                 }
             }
             // Promote the waiting submission, if one waits: it is the newer
-            // decision, and its own driver continues the queue.
+            // decision, and its own driver continues the queue. The promotion
+            // re-validates it against the entry's CURRENT admission state
+            // (spec #571 review) — a stale waiter (below the floor, shadowed by
+            // an accepted ending, or a settled key) is dropped here, never
+            // written after a newer generation.
             match entry.waiting.take() {
                 Some(next) => {
+                    if !entry.promotable(&next) {
+                        Self::settle_ticket(entry, next.token, WriteOutcome::Superseded);
+                        entry.driver = None;
+                        return;
+                    }
                     token = next.token;
                     entry.driver = Some(token);
                     entry.in_flight = Some(next);
@@ -3366,6 +3413,61 @@ mod tests {
             inner.attempts(),
             vec![("om_1".to_string(), stamp), ("om_1".to_string(), collect)],
             "the slow write committed first; the newer collect owns the last word"
+        );
+    }
+
+    /// A stale waiting generation is never promoted (spec #571 review): a lock
+    /// wait that times out leaves an older generation waiting, and a newer
+    /// generation that then takes the in-flight slot and writes must not be
+    /// followed by that stale payload — the generation rule drops it, never
+    /// PATCHes it.
+    #[tokio::test(start_paused = true)]
+    async fn a_stale_waiting_generation_is_never_promoted() {
+        let inner = Arc::new(FakePlatform::new());
+        let delivery = Arc::new(
+            CardDelivery::with_limits(inner.clone(), MAX_PENDING, BACKOFF_BASE, BACKOFF_MAX)
+                .with_lock_wait(Duration::from_secs(5)),
+        );
+        let keyless = serde_json::json!({ "body": "keyless" });
+        let first = serde_json::json!({ "body": "generation one" });
+        let second = serde_json::json!({ "body": "generation two" });
+        let third = serde_json::json!({ "body": "generation three" });
+
+        // The card's lock is held by a parked keyless write for the whole play.
+        let (entered, release) = inner.park_next();
+        let holding = tokio::spawn({
+            let delivery = Arc::clone(&delivery);
+            let keyless = keyless.clone();
+            async move { delivery.update_message("om_1", &keyless).await }
+        });
+        entered.notified().await;
+
+        // Generation 1's driver waits on the lock; generation 2 joins the
+        // single waiting slot behind it.
+        let gen1 = submit(&delivery, "om_1", 1, CardWriteIntent::Collect, &first).await;
+        let gen2 = submit(&delivery, "om_1", 2, CardWriteIntent::Collect, &second).await;
+
+        // The lock wait expires: generation 1 is left owed, generation 2 waits.
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert!(matches!(gen1.settled().await, WriteOutcome::Failed(_)));
+
+        // Generation 3 replaces the in-flight slot: generation 2 is below it
+        // now and must never be written.
+        let gen3 = submit(&delivery, "om_1", 3, CardWriteIntent::Collect, &third).await;
+
+        // The lock frees: generation 3 writes, and the stale waiter is dropped.
+        release.notify_one();
+        holding.await.unwrap().unwrap();
+        assert!(matches!(gen3.settled().await, WriteOutcome::Delivered));
+        assert!(
+            matches!(gen2.settled().await, WriteOutcome::Superseded),
+            "the stale waiting generation is dropped, not written"
+        );
+        assert_eq!(
+            inner.attempts(),
+            vec![("om_1".to_string(), keyless), ("om_1".to_string(), third)],
+            "the stale generation 2 never reached Feishu"
         );
     }
 
