@@ -846,7 +846,7 @@ mod tests {
         );
         let repaint_seq = delivery
             .pending_card_write("om_1", &second)
-            .map_or(failed_seq + 1, |seq| seq);
+            .unwrap_or(failed_seq + 1);
         assert!(delivery.card_write_delivered("om_1", repaint_seq));
         assert_eq!(
             delivery.failed_card_write("om_1", &first),
