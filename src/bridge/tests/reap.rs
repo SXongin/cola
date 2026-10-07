@@ -1197,6 +1197,136 @@ async fn a_successor_owning_the_session_collects_after_the_stamp() {
     );
 }
 
+/// The amendment's window (spec #571): a settle decided while the stamp's
+/// card-view read is still outstanding closes its generation, so the stamp the
+/// parked read releases afterwards is dropped — 「已重启，等待运行结束」 never
+/// lands over the ✅. The record is released only after the keyed ending write
+/// is confirmed.
+#[tokio::test]
+async fn a_settle_during_the_stamp_read_closes_the_generation() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
+    // A second live orphan the reap keeps reading: the pass clock proving
+    // ticks ran after the parked stamp was released.
+    ChainRecords::load(sidecar(&session_file)).track(
+        "ses_other",
+        "om_other",
+        MessageId::new("msg_cola_other"),
+        Some(2_000),
+        Some("/work"),
+    );
+
+    let (app, platform, backend) =
+        restarted_app_with_backend(&session_file, completed(1_000), Some(SessionStatus::Busy)).await;
+    backend
+        .set_session_status("ses_other", Some(SessionStatus::Busy))
+        .await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+    // Park the stamp's view read: its submission is not made yet.
+    let (entered, release) = platform.pause("card_view", "om_frozen");
+
+    spawn_sync_with_timeout(&app, 5_000);
+    entered.notified().await;
+
+    // The run ends while the stamp's read hangs: the next pass decides the
+    // settle, its own read (a later call, not gated) composes the ending, and
+    // the keyed ✅ closes the generation.
+    backend
+        .set_session_status("ses_test", Some(SessionStatus::Idle))
+        .await;
+    wait_for_card_update(&platform, "the ✅ ending", CardUpdates::Any, |card| {
+        card_header(card).contains("✅")
+    })
+    .await;
+    // The ending is confirmed before the record goes (ADR-0063's amendment).
+    wait_for_record_gone(&app, "ses_test").await;
+
+    // Now the stamp's read returns: it composes and submits at the record's
+    // generation, which the settle closed.
+    release.notify_one();
+    let before = backend
+        .session_status_reads
+        .lock()
+        .await
+        .iter()
+        .filter(|sid| sid.as_str() == "ses_other")
+        .count();
+    wait_for_status_reads(&backend, "ses_other", before + 3).await;
+
+    let patches = patches_to(&platform, "om_frozen").await;
+    assert_eq!(
+        patches.len(),
+        1,
+        "the ✅ is the orphan's only write, never a late stamp: {patches:?}"
+    );
+    assert_eq!(card_header(&patches[0]), "✅ 完成");
+    assert!(
+        !patches.iter().any(|card| card_header(card).contains("已重启")),
+        "「已重启」 never appears: {patches:?}"
+    );
+}
+
+/// The mirror window: a settle the takeover outran is dropped like any stale
+/// submission (spec #571's amendment) — it never lands over the collect that
+/// bumped the chain.
+#[tokio::test]
+async fn a_takeover_during_the_settle_read_wins_over_the_settle() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
+    // A second live orphan the reap keeps reading: the pass clock.
+    ChainRecords::load(sidecar(&session_file)).track(
+        "ses_other",
+        "om_other",
+        MessageId::new("msg_cola_other"),
+        Some(2_000),
+        Some("/work"),
+    );
+
+    let (app, platform, backend) =
+        restarted_app_with_backend(&session_file, completed(1_000), Some(SessionStatus::Idle)).await;
+    backend
+        .set_session_status("ses_other", Some(SessionStatus::Busy))
+        .await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+    // Park the settle's preserved-ending read: the pass decided, nothing was
+    // submitted.
+    let (entered, release) = platform.pause("card_view", "om_frozen");
+
+    spawn_sync_with_timeout(&app, 5_000);
+    entered.notified().await;
+
+    // A successor takes the orphan over while the settle's read is parked:
+    // the chain bumps to the new card's generation and its collect lands.
+    Turn::seed_card(&app.cards_handle(), "ses_test", None).await;
+    Turn::set_turn_anchor(&app.cards_handle(), "ses_test", &turn_anchor(1_000)).await;
+    Turn::take_over_card(&app.cards_handle(), "ses_test", "om_new", Some("/work")).await;
+    wait_for_patches(&platform, "om_frozen", 1).await;
+
+    let before = backend
+        .session_status_reads
+        .lock()
+        .await
+        .iter()
+        .filter(|sid| sid.as_str() == "ses_other")
+        .count();
+    release.notify_one();
+    // Three more observed passes: the released settle had every chance to
+    // (wrongly) land over the collect before these.
+    wait_for_status_reads(&backend, "ses_other", before + 3).await;
+
+    let patches = patches_to(&platform, "om_frozen").await;
+    assert_eq!(
+        patches.len(),
+        1,
+        "the takeover collect is the orphan's only write, never a stale settle: {patches:?}"
+    );
+    assert_eq!(card_header(&patches[0]), "⏳ 已由新卡片接管 · 已停止更新");
+}
+
 // --- The message takeover's seed (spec #561, ticket #565) -------------------
 //
 // A fresh Turn's takeover over an orphaned card resolves the orphan record's
@@ -2616,11 +2746,11 @@ async fn a_hung_stamp_patch_never_wedges_the_pass() {
 }
 
 /// A run that ends while the stamp's write is in flight is settled only after
-/// that write lands (spec #571, ticket #575): the claim that used to gate the
-/// decision is retired, so the next pass decides the settle freely — its
-/// keyless PATCH waits on the card's delivery lock the in-flight stamp holds,
-/// and the ✅ is the card's last word. No later tick can resurrect the stamp
-/// over it.
+/// that write lands (spec #571's amendment): the retired claim no longer gates
+/// the decision — the next pass decides the ending freely, its keyed
+/// submission queues behind the stamp's in-flight write and lands after it,
+/// closing the generation — and the ✅ is the card's last word. No later tick
+/// can resurrect the stamp over it.
 #[tokio::test]
 async fn a_terminal_waits_for_an_in_flight_stamp() {
     let _wd = test_work_dir();
@@ -2648,7 +2778,8 @@ async fn a_terminal_waits_for_an_in_flight_stamp() {
     entered.notified().await;
     // The run ends while the stamp write hangs: the next pass decides the
     // settle, and its preserved-ending read (the stamp's own was the first
-    // card-view read) is the observed point that decision reached the card.
+    // card-view read) is the observed point that decision reached the card —
+    // the keyed submission queues behind the in-flight stamp.
     backend
         .set_session_status("ses_test", Some(SessionStatus::Idle))
         .await;
@@ -3594,14 +3725,13 @@ async fn a_rejected_preserved_ending_retries_the_bare_one() {
     );
 }
 
-/// A PATCH failure that is NOT a definite card-content rejection — here a
-/// transport-class failure, the shape a timeout or dropped connection surfaces
-/// as — is never retried bare: the preserved attempt may already have landed,
-/// and the bare ending would then wipe the body this path exists to keep. The
-/// record stays, so the next tick tries the settle again (#434 acceptance
-/// feedback).
+/// A transport failure on the keyed ending is never retried bare, and a later
+/// tick does not re-PATCH it either: accepting the ending closed its
+/// generation, so the reap's re-decisions are dropped and the queue's own
+/// retry (the drain) owns the write. The record stays — the release gate sees
+/// the owed ending (spec #571's amendment).
 #[tokio::test]
-async fn a_transport_failed_preserved_ending_does_not_retry_bare() {
+async fn a_transport_failed_settle_stays_owed_for_the_drain() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("sessions.json");
@@ -3609,31 +3739,82 @@ async fn a_transport_failed_preserved_ending_does_not_retry_bare() {
 
     let (app, platform, backend) = restarted_app_with_backend(&session_file, completed(1_000), None).await;
     platform.given_card_view("om_frozen", realistic_card_view());
-    // A transport failure on every attempt, so each observed tick records
-    // what it sent before failing.
+    // A transport failure on every attempt, so each observed tick records what
+    // it sent before failing.
     platform
         .fail_update_transport_count
-        .store(10, std::sync::atomic::Ordering::SeqCst);
+        .store(100, std::sync::atomic::Ordering::SeqCst);
 
     spawn_sync(&app);
-    // Three observed status reads: at least two passes reached their PATCH.
+    // Three observed status reads: at least two later passes re-decided the
+    // ending and dropped it on the closed generation.
     wait_for_status_reads(&backend, "ses_test", 3).await;
 
     let patches = patches_to(&platform, "om_frozen").await;
-    assert!(
-        patches.len() >= 2,
-        "the observed ticks retried the settle: {patches:?}"
+    assert_eq!(
+        patches.len(),
+        1,
+        "one keyed attempt; the closed generation drops every re-decision: {patches:?}"
     );
     assert!(
-        patches
-            .iter()
-            .all(|card| card_text(card).contains("**正文** 第一段")),
+        card_text(&patches[0]).contains("**正文** 第一段"),
         "no transport failure falls back to the bare ending: {patches:?}"
     );
     assert!(
         app.cards_handle().chains.get("ses_test").is_some(),
-        "a failed settle keeps the record for the next tick"
+        "a failed settle keeps the record for the queue's retry"
     );
+    assert!(
+        app.cards_handle().feishu.has_pending_card_update("om_frozen"),
+        "the ending is still owed"
+    );
+}
+
+/// The queue's own retry converges an owed ending: once its backoff is due the
+/// pass drain delivers the keyed write, and the reap — whose re-decision now
+/// reads the settled key — confirms the ending and releases the record. No
+/// restart and no forced drain; the paused clock elapses the backoff virtually
+/// (spec #571's amendment).
+#[tokio::test(start_paused = true)]
+async fn an_owed_settle_converges_through_the_pass_drain() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
+
+    let (app, platform, _backend) =
+        restarted_app_with_backend(&session_file, completed(1_000), Some(SessionStatus::Idle)).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+    // The first keyed attempt fails at the transport; the queue keeps the
+    // ending owed with its backoff.
+    platform
+        .fail_update_transport_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+
+    spawn_sync(&app);
+    // The pass drain retries once the 5s backoff elapses; the reap then
+    // confirms the ending and releases the record — both observed here, or the
+    // test times out.
+    tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            if app.cards_handle().chains.get("ses_test").is_none()
+                && !app.cards_handle().feishu.has_pending_card_update("om_frozen")
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the pass drain converges the ending and the reap releases the record");
+
+    let patches = patches_to(&platform, "om_frozen").await;
+    assert_eq!(
+        patches.len(),
+        2,
+        "the failed attempt and the drain's retry: {patches:?}"
+    );
+    assert_eq!(card_header(patches.last().unwrap()), "✅ 完成");
 }
 
 /// A Turn tracks its card the moment it becomes live — card id, message id,
