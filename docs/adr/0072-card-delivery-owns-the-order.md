@@ -104,8 +104,11 @@ drops stale intents, collapses duplicates and retries failures.
   still under the same key; only a refusal of the fallback (or a write with
   none) settles the key refused (spec #571 review). A recoverable failure
   instead stays owed with its key and its backoff, retried by the existing
-  drain; a newer submission supersedes the owed one, so convergence stays
-  newest-wins under retry too.
+  drain. That schedule belongs to the **logical key, not the payload**: a
+  re-submission of the same `(generation, intent)` inherits the owed write's
+  attempt count and next retry time, so re-deciding a failed key does not
+  retry it early, while a submission of a **newer key** supersedes the owed one
+  at once — convergence stays newest-wins under retry too (spec #571 review).
   This is the outbox's one permanent-refusal outcome and #522's give-up in one
   place, not a mark on any record.
 

@@ -940,7 +940,7 @@ impl CardDelivery {
         } else if (entry.floor, entry.ending_gen) != state_before {
             entry.order_state_since = Some(now);
         }
-        let write = QueuedWrite::new(token, submission, now);
+        let mut write = QueuedWrite::new(token, submission, now);
         // The ticket lives with the queue until the submission settles: a
         // displaced or dropped slot still answers its caller.
         entry.tickets.insert(token, ticket);
@@ -954,9 +954,28 @@ impl CardDelivery {
         }
         // No driver owns the card: this submission takes the in-flight slot —
         // a newer payload supersedes an owed write (a recoverable failure's
-        // payload the newest decision replaces) — and starts its driver.
+        // payload the newest decision replaces) — and starts its driver. A
+        // re-submission of the SAME key inherits the owed write's retry
+        // schedule (spec #571 review): the backoff belongs to the logical key,
+        // not to the payload, so re-deciding a failed write must not retry it
+        // before its scheduled time. A newer key supersedes the owed write at
+        // once, schedule or not.
+        if let Some(owed) = entry.in_flight.as_ref()
+            && owed.generation == write.generation
+            && owed.intent == write.intent
+        {
+            write.attempts = owed.attempts;
+            write.next_attempt = owed.next_attempt;
+        }
+        // An inherited schedule still in the future leaves the write owed: no
+        // driver starts, so nothing re-attempts it before the backoff — the
+        // drain retries it when due (or at once, forced).
+        let scheduled = write.next_attempt > now;
         if let Some(displaced) = entry.in_flight.replace(write) {
             Self::settle_ticket(entry, displaced.token, WriteOutcome::Superseded);
+        }
+        if scheduled {
+            return None;
         }
         entry.driver = Some(token);
         Some(token)
@@ -3669,6 +3688,61 @@ mod tests {
         delivery.drain_pending_card_updates(false).await;
         wait_for_attempts(&inner, 5).await;
         assert_eq!(inner.attempts().len(), 5, "due at the doubled backoff");
+    }
+
+    /// A same-key re-submission inherits the owed write's retry schedule (spec
+    /// #571 review): re-deciding a failed key — the reap re-deciding a failed
+    /// `Settle` next tick — must not retry it before its scheduled backoff,
+    /// because the schedule belongs to the logical key, not to the payload. A
+    /// different key still supersedes the owed write immediately.
+    #[tokio::test(start_paused = true)]
+    async fn a_same_key_resubmission_waits_for_the_owed_backoff() {
+        let inner = Arc::new(FakePlatform::new());
+        inner.fail_next(Fail::Transport);
+        let delivery = CardDelivery::with_limits(
+            inner.clone(),
+            MAX_PENDING,
+            Duration::from_secs(5),
+            Duration::from_secs(20),
+        );
+        let stamp = serde_json::json!({ "body": "stamp" });
+        let stamp_again = serde_json::json!({ "body": "stamp again" });
+
+        // The first attempt fails recoverably: the key is owed with a 5 s
+        // backoff.
+        let ticket = submit(&delivery, "om_1", 1, CardWriteIntent::Stamp, &stamp).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Failed(_)));
+        assert_eq!(inner.attempts().len(), 1);
+
+        // The same-key re-submission must not attempt before that backoff.
+        let again = submit(&delivery, "om_1", 1, CardWriteIntent::Stamp, &stamp_again).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(
+            inner.attempts().len(),
+            1,
+            "the same-key re-decision waited for the owed backoff"
+        );
+
+        // Due at the schedule: the drain lands the newest payload of the key.
+        tokio::time::advance(Duration::from_secs(4)).await;
+        delivery.drain_pending_card_updates(false).await;
+        wait_for_attempts(&inner, 2).await;
+        assert_eq!(inner.attempts().last(), Some(&("om_1".to_string(), stamp_again)));
+        assert!(matches!(again.settled().await, WriteOutcome::Delivered));
+
+        // A different key is superseded immediately, schedule or not.
+        let inner2 = Arc::new(FakePlatform::new());
+        inner2.fail_next(Fail::Transport);
+        let delivery2 = CardDelivery::new(inner2.clone());
+        let first = submit(&delivery2, "om_2", 1, CardWriteIntent::Stamp, &stamp).await;
+        assert!(matches!(first.settled().await, WriteOutcome::Failed(_)));
+        let second = submit(&delivery2, "om_2", 1, CardWriteIntent::Collect, &stamp).await;
+        assert!(matches!(second.settled().await, WriteOutcome::Delivered));
+        assert_eq!(
+            inner2.attempts().len(),
+            2,
+            "a different key supersedes the owed write at once"
+        );
     }
 
     /// A newer submission supersedes an owed keyed write: the newest decision
