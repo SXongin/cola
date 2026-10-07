@@ -492,3 +492,47 @@ no deliverable rung claims nothing — never a settle PATCH to an empty card id,
 and never a write aimed at an OpenCode id.
 
 Related: #580, #561, ADR-0063, ADR-0069.
+
+## Amendment (2026-10-08): a restart gives a waiting chain its successor even with nothing missed (issue #583)
+
+The Decision's "A projection that renders nothing new (the cursor covered the
+whole read) drops its armed successor and keeps today's in-place ending" put a
+chain waiting on Background Tasks in the same arm as an ended one. But the two
+are not alike: a `Waiting` settle means the chain HAS a future — the retiring
+task's Wake continues it, the surest of the three cases — and the live case
+already sends its successor regardless of delta ("the run may produce next"),
+while the waiting case is the surer one. Observed live 2026-10-08 (session
+`ses_ee92bdb57ffeAAXEFmHoekPDyX`): `/restart` settled the waiting orphan
+「⏳ 等待后台任务」 in place and no live card existed until the task completed and
+the run went live — the chain sat without a card for the whole wait.
+
+The empty-delta rule now reads: **the chain's future decides whether a restart
+creates a successor; content decides only whether an ENDED chain projects.** A
+`Waiting` settle on a cursor-carrying record with a deliverable target sends
+its armed successor even when the delta is empty — a waiting card carrying the
+Background Task Ledger, nothing replayed — and collects the recorded card as
+taken over like any projection; its create is the restart notification. The
+completion Wake's `ResumeInPlace` decision (ADR-0066) then finds the chain in
+this process and resumes that successor in place, so one card carries the chain
+from the restart through the resumed run to its true end (splits on overflow
+only). The ended cases are unchanged: a terminal settle with an empty delta
+still drops the successor and settles in place, and a terminal settle with a
+missed tail still projects — content delivery, not future. The cursorless
+fallback is unchanged: an older release's record keeps today's stamp /
+in-place settle (one-release migration seam).
+
+Consequences:
+
+- Each restart during the same wait sends one successor — the same per-restart
+  card the live adoption already costs — and collects the previous one; no
+  durable "already projected" mark is added for it.
+- A stranded task (#454, no completion Wake) now leaves the empty waiting
+  successor as the newest card with the content card collected; the pinned
+  ledger on the successor is where #454's cleanup surfaces. Noted there.
+- Tests pin: a `Waiting` settle with an empty delta over a cursor record sends
+  a successor (standard ⏳ header + ledger, no transcript replay, old card
+  collected, record re-pointed, waiting mark); the completion Wake resumes
+  that successor in place; a terminal empty delta still settles in place; the
+  cursorless fallback is untouched.
+
+Related: #583, #454, #561, ADR-0059, ADR-0063, ADR-0066, ADR-0069, ADR-0072.
