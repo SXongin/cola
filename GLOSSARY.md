@@ -198,6 +198,19 @@ from its **Rendered Cursor** (ADR-0071).
 _Avoid_: Live Card record (the pre-module name for the records section alone),
 store, mapping (the Session Mapping is the Chat/Topic side)
 
+**Chain Generation**:
+The in-memory monotonic version of a **Session**'s tracked card identity,
+bumped whenever its **Chain Record** is re-pointed onto a different card (a
+track onto a new card, a **Turn**'s takeover, a projection's re-point) and
+carried across a re-track of the same card. A reconcile decision captures it
+together with the record read it decided from, and a **Keyed Submission**
+carries it as the first half of its ordering key; a fresh process life (and so
+a record loaded from disk) starts at zero. Never persisted — a process-local
+ordering fact needs no durable format (ADR-0072).
+_Avoid_: cursor (that is the **Rendered Cursor**, the render frontier),
+chain id (the card session's process-local id), **Generation** (the
+OpenCode protocol era, ADR-0055)
+
 **Rendered Cursor**:
 The durable frontier of what a **Card Chain** has confirmed rendered: the
 newest delivered text/reasoning part (its message identity, part position,
@@ -274,6 +287,24 @@ _Avoid_: owner (ADR-0007's Chat/Topic sense), busy session (the Backend's **Exec
 **Pending Card Update**:
 A **Card** state cola has produced but not yet delivered to the platform. At most one per card — the newest; an older pending update is always superseded, never replayed ("newest wins"). cola retries it until it lands, is replaced by a newer state, or is refused permanently: a recoverable failure never abandons it. A pending update does not survive a cola restart — a card orphaned that way is reconciled by **Session Sync**'s reap instead.
 _Avoid_: Dirty (this glossary's Dirty is a git working tree), outbox (implies replaying queued states in order), retry queue
+
+**Keyed Submission**:
+An already-composed **Card** payload a writer hands to the card-delivery
+decorator with an explicit ordering key — `(Chain Generation, intent)` —
+instead of writing it directly (ADR-0072). The decorator's per-card queue
+drops a submission below the card's floor (a newer generation owns the card,
+or a terminal `Settle` closed the generation), lands same-generation
+submissions in submission order (one in flight, one waiting, the newer
+replacing the waiting one), collapses a `(generation, intent)` pair to its
+newest payload — and to nothing once the key settled — and retries a
+recoverable failure under its key. The intent vocabulary is `Stamp` (the #443
+restart stamp), `Collect` (a takeover's old-card collect), `Settle` (the
+terminal ending) and `Yield` (the waiting ending, which shadows a later
+`Stamp` without closing the generation). Distinct from a keyless
+`update_message`, which serializes on the same per-card delivery lock but is
+never dropped for staleness (ADR-0067).
+_Avoid_: Pending Card Update (the keyless newest-payload rule), outbox entry,
+message queue
 
 **Waiting on Background Work** (等待后台任务):
 The state a **Card** takes when its **Execution** ended but the **Turn**'s **Background Tasks** are still live: the card stops updating while it waits (its **Background Task Ledger** and a quiet true end are the only updates it accepts, ADR-0060), is neither a terminal nor ✅, and the next shell/subagent completion **Wake** resumes it in place as 「🔄 后台任务完成，继续处理中…」 — back to waiting while tasks remain live, or to the true end — while a restart/interrupt Wake, a late tail or a card already at an ending still continues the chain on a new card (ADR-0059, ADR-0066). Distinct from the live 「等待你的授权/回答」 state: the turn is not blocked on the user, and it resumes without one. A waiting card that is superseded collects as 「⏳ 部分完成 · 已由新消息接管」; one whose Session stops being the Active Session collects as 「⏳ 已切换会话 · 后台任务仍在运行」. A waiting card whose last Background Task retires — by its **Wake**, or by the runtime reconciliation that finds the task ended or gone while no Wake will ever come (#454, ADR-0065) — with no continuation to render settles in place as ✅, the true end, with the **Completion Notice** per its existing rules, instead of staying frozen (ADR-0060).
@@ -402,6 +433,7 @@ _Avoid_: Notification, message, signal
 - A **Session** is read through one **Session Transcript**, whose projections serve rendering, **Session Sync** and the **Session Snapshot**
 - A **Wake Watermark** persists which **Wake**s a card chain has already announced, so a cola restart never re-posts one; the **Sync Watermark** stays user-message-scoped (ADR-0061)
 - A **Card Chain**'s **Rendered Cursor** records how far its card has confirmed rendered; a restart's projection renders only the delta after it — a still-live run adopted and followed on a successor, an ended one's missed tail and true ending — while a cursorless record keeps the #443 stamp / in-place settle fallback (ADR-0071)
+- A **Keyed Submission** carries the **Chain Generation** its writer decided under; the card-delivery queue drops a submission below the card's floor, lands same-generation submissions in submission order and collapses a `(generation, intent)` pair to its newest payload, so "a takeover's collect lands after a restart stamp" is a property of the queue (ADR-0072)
 - A **Turn** renders into a **Card Chain**; a pending **Permission**/**Question** rides its newest card as an **Interaction Block**, and resolving one leaves an **Interaction Receipt**
 - A **Session**'s card chain has one **Card Ownership** verdict at a time — the in-process claim (none / inbound / guard) × the current card's class (absent / render-owned / yielded with its write-readiness / restart-stamped / ended); its named rules decide **Supplement** vs new **Turn** (ADR-0062), the yielded-card write admission (ADR-0060, ADR-0066), the durable reap's claim (ADR-0063), the settle ticket and the `/stop` disposition (ADR-0070)
 - A **Supplement** splits its **Turn**'s **Card Chain** so the continuation card is the newest message; the render loop stays alive across a Supplement that starts a new **Turn**; a **Command** reply does not split the chain by itself — `/card` pulls the live card down on explicit request
