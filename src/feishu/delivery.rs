@@ -769,10 +769,16 @@ impl CardDelivery {
     /// chosen while another victim exists (spec #571's reviews); once **every**
     /// entry carries order state, one past its protection window leaves as the
     /// last resort, oldest state first (spec #571 review) — its stale writer
-    /// can no longer be composing. Above the **hard ceiling** the oldest entry
-    /// leaves regardless of protection (spec #571 review): the map can never
-    /// exceed it, even under a flood of fresh order states, at the cost of the
-    /// same narrow stale-writer window expiry accepts — forced early. `protect`
+    /// can no longer be composing. Above the **hard ceiling** protection yields
+    /// (spec #571 review): state-only entries leave first, oldest first, then
+    /// entries with owed payloads (their writes drop with the warning below) —
+    /// so the map can never exceed the ceiling, even under a flood of fresh
+    /// order states, at the cost of the same narrow stale-writer window expiry
+    /// accepts — forced early. An entry with a **driver-active** write is never
+    /// a victim anywhere: its write is issued and can never be cancelled, and
+    /// evicting it would lose the card's floor while that write is still in
+    /// flight — the permit pool caps how many such entries exist, well below
+    /// the ceiling, so the hard bound stays enforceable. `protect`
     /// is the entry the caller just admitted: dropping the very write being
     /// recorded is never the cap's answer to its own growth. Between the cap
     /// and the ceiling, the map may sit above the cap until an order state ages
@@ -781,13 +787,23 @@ impl CardDelivery {
         while state.entries.len() > self.max_pending {
             let now = tokio::time::Instant::now();
             let over_ceiling = state.entries.len() > self.max_entries;
-            let evictable = |message_id: &String| protect != Some(message_id.as_str());
+            // A **driver-active** entry — its write is issued and, per spec
+            // #571, can never be cancelled — is never a victim (spec #571
+            // review): evicting it would lose the card's order state (its
+            // generation floor) while the write is still in flight, letting a
+            // stale submission admit into a fresh entry and land later over the
+            // newer state. The driver permit pool caps how many such entries
+            // exist (the cap in production), far below the ceiling, so the hard
+            // bound stays enforceable.
+            let evictable = |message_id: &String, entry: &PendingEntry| {
+                entry.driver.is_none() && protect != Some(message_id.as_str())
+            };
             // A settled, unneeded tombstone is the preferred victim; then any
             // entry without order state, oldest first.
             let ordinary = state
                 .entries
                 .iter()
-                .filter(|(message_id, entry)| !entry.keeps_order_state() && evictable(message_id))
+                .filter(|(message_id, entry)| !entry.keeps_order_state() && evictable(message_id, entry))
                 .min_by_key(|(_, entry)| {
                     let settled =
                         entry.card.is_none() && entry.in_flight.is_none() && entry.waiting.is_none();
@@ -802,28 +818,33 @@ impl CardDelivery {
                 .iter()
                 .filter(|(message_id, entry)| {
                     entry.order_state_expired(self.limits.order_state_protection, now)
-                        && evictable(message_id)
+                        && evictable(message_id, entry)
                 })
                 .min_by_key(|(_, entry)| entry.order_state_since)
                 .map(|(message_id, _)| message_id.clone());
-            // Above the ceiling, protection yields: the oldest entry leaves.
-            let victim = ordinary.or(expired).or_else(|| {
-                if !over_ceiling {
-                    return None;
-                }
+            // Above the ceiling protection yields — state-only entries first
+            // (oldest), then entries with owed payloads (the write is dropped
+            // with the warning below), never a driver-active entry.
+            let ceiling_victim = over_ceiling.then(|| {
                 state
                     .entries
                     .iter()
-                    .filter(|(message_id, _)| evictable(message_id))
-                    .min_by_key(|(_, entry)| entry.age)
+                    .filter(|(message_id, entry)| evictable(message_id, entry))
+                    .min_by_key(|(_, entry)| {
+                        let state_only =
+                            entry.card.is_none() && entry.in_flight.is_none() && entry.waiting.is_none();
+                        (!state_only, entry.age)
+                    })
                     .map(|(message_id, _)| message_id.clone())
             });
+            let victim = ordinary.or(expired).or(ceiling_victim.flatten());
             let Some(victim) = victim else {
                 // Every remaining entry carries order state inside its
-                // protection window (or is the admission itself), and the map
-                // is still below the hard ceiling: dropping one would reopen
-                // the window its floor or shadow exists to close. It ages into
-                // evictability, and the ceiling above bounds the growth.
+                // protection window (or is the admission itself, or has a
+                // driver-active write), and the map is still below the hard
+                // ceiling: dropping one would reopen the window its floor or
+                // shadow exists to close. It ages into evictability, and the
+                // ceiling above bounds the growth.
                 return;
             };
             let evicted = state.entries.remove(&victim);
@@ -3214,6 +3235,63 @@ mod tests {
             state.entries.contains_key("om_19"),
             "the newest admission stays: {:?}",
             state.entries.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// The hard ceiling never evicts a card whose write is driver-active (spec
+    /// #571 review): losing an active collect's generation floor would let a
+    /// stale stamp admit into a fresh entry, wait out the collect's card lock
+    /// and land over it on a later drain. The ceiling's victims are the
+    /// state-only entries first, then owed payloads, never the active one.
+    #[tokio::test(start_paused = true)]
+    async fn the_hard_ceiling_never_evicts_an_active_cards_floor() {
+        let inner = Arc::new(FakePlatform::new());
+        let delivery =
+            CardDelivery::with_limits(inner.clone(), 2, BACKOFF_BASE, BACKOFF_MAX).with_max_entries(4);
+        let card = serde_json::json!({ "body": "collect" });
+        let stale = serde_json::json!({ "body": "stale stamp" });
+
+        // An ACTIVE collect on om_x: its driver is parked holding the card lock.
+        let (entered, release) = inner.park_next();
+        let collect = submit(&delivery, "om_x", 1, CardWriteIntent::Collect, &card).await;
+        entered.notified().await;
+
+        // Ceiling pressure from other cards: every admission lands, and the
+        // ceiling keeps the map bounded.
+        for n in 0..6 {
+            let ticket = submit(&delivery, &format!("om_{n}"), 1, CardWriteIntent::Settle, &card).await;
+            assert!(matches!(ticket.settled().await, WriteOutcome::Delivered));
+            let len = delivery.state.lock().unwrap().entries.len();
+            assert!(
+                len <= 4,
+                "the map never exceeds the hard ceiling at om_{n}: {len}"
+            );
+        }
+        assert!(
+            delivery.state.lock().unwrap().entries.contains_key("om_x"),
+            "the active card's entry — and its floor — survives the ceiling"
+        );
+
+        // The stale stamp (below the active collect's floor) is dropped and
+        // never left owed for a later drain.
+        let ticket = submit(&delivery, "om_x", 0, CardWriteIntent::Stamp, &stale).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Superseded));
+        assert!(
+            delivery.keyed_write_covered("om_x", 0, CardWriteIntent::Stamp),
+            "the surviving floor covers the stale stamp: nothing can write it"
+        );
+
+        // The active collect completes: the stale stamp never lands over it.
+        release.notify_one();
+        assert!(matches!(collect.settled().await, WriteOutcome::Delivered));
+        delivery.drain_pending_card_updates(true).await;
+        assert!(
+            inner
+                .attempts()
+                .iter()
+                .all(|(message_id, payload)| message_id != "om_x" || payload != &stale),
+            "the stale stamp never reached Feishu: {:?}",
+            inner.attempts()
         );
     }
 

@@ -160,9 +160,14 @@ drops stale intents, collapses duplicates and retries failures.
   than a generous protection window, past every bounded card-view read — the
   oldest such state is the cap's last-resort victim). Above a **hard ceiling**
   — a small documented multiple of the cap
-  (`MAX_PENDING × MAX_ENTRIES_FACTOR`) — the oldest entry leaves regardless of
-  protection (spec #571 review), so a flood of fresh order states can never
-  grow the map without bound: the trade is the same narrow stale-writer window
+  (`MAX_PENDING × MAX_ENTRIES_FACTOR`) — protection yields (spec #571 review):
+  state-only entries leave first, oldest first, then entries with owed payloads,
+  and **never an entry whose write is driver-active** — that issued write can
+  never be cancelled, and evicting its entry would lose the card's generation
+  floor while the write is still in flight, letting a stale submission admit
+  into a fresh entry and land over the newer state later (the permit pool caps
+  how many such entries exist, well below the ceiling, so the hard bound stays
+  enforceable). The trade is the same narrow stale-writer window
   expiry accepts, forced early. The **live driver tasks** are bounded by a
   global permit pool on the decorator (spec #571 review): a driver retains its
   payload while it awaits Feishu, so a spawn takes a permit for the driver's
