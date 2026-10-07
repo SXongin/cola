@@ -21,7 +21,10 @@
 //! submission** queue (spec #571): a writer that needs its write ordered against
 //! the card's other writers submits a composed payload with `(generation,
 //! intent)` — the **chain generation** its decision read and the intent naming
-//! the logical write. The same per-card state machine then:
+//! the logical write. Every driver task it spawns holds a permit from a global
+//! pool for its whole life (spec #571 review), so the live writes — and the
+//! payloads they retain while awaiting Feishu — are bounded alongside the
+//! entries map. The same per-card state machine then:
 //!
 //! - drops a submission below the card's floor: the highest generation seen,
 //!   raised past a generation an accepted `Settle` closed (spec #571's
@@ -573,6 +576,13 @@ pub(crate) struct CardDelivery {
     /// of order-state protection, so a flood of protected admissions can never
     /// grow memory without bound (spec #571 review).
     max_entries: usize,
+    /// The keyed driver tasks' global permit pool (spec #571 review): a driver
+    /// retains its payload while it awaits the platform, so the live drivers —
+    /// and the payloads they hold — must be bounded even when the entries map
+    /// is capped. A spawn takes a permit for the driver's whole life; without
+    /// one the submission stays owed in its entry (no driver) and the next
+    /// drain resumes it once a permit frees.
+    drivers: Arc<tokio::sync::Semaphore>,
     limits: Limits,
 }
 
@@ -595,6 +605,7 @@ impl CardDelivery {
             drain_lock: tokio::sync::Mutex::new(()),
             max_pending,
             max_entries: max_pending.saturating_mul(MAX_ENTRIES_FACTOR),
+            drivers: Arc::new(tokio::sync::Semaphore::new(max_pending)),
             limits: Limits {
                 backoff_base,
                 backoff_max,
@@ -609,6 +620,14 @@ impl CardDelivery {
     #[cfg(test)]
     fn with_max_entries(mut self, max_entries: usize) -> Self {
         self.max_entries = max_entries;
+        self
+    }
+
+    /// [`Self::with_limits`] with a smaller driver permit pool, so a test can
+    /// exhaust it with a couple of hung writes (spec #571 review).
+    #[cfg(test)]
+    fn with_max_drivers(mut self, max_drivers: usize) -> Self {
+        self.drivers = Arc::new(tokio::sync::Semaphore::new(max_drivers));
         self
     }
 
@@ -1338,14 +1357,21 @@ impl CardDelivery {
             entry.driver = Some(due.0);
             due.0
         };
-        tokio::spawn(Self::drive_keyed(
-            self.inner.clone(),
-            self.state.clone(),
-            message_id.to_string(),
-            token,
-            LockMode::Try,
-            self.limits,
-        ));
+        // The re-armed driver needs one of the global permits too (spec #571
+        // review): with every permit held by a hung write, this owed
+        // submission stays owed for the next drain, when a permit frees.
+        let Ok(permit) = Arc::clone(&self.drivers).try_acquire_owned() else {
+            Self::release_driver(&self.state, message_id, token);
+            return;
+        };
+        let inner = self.inner.clone();
+        let state = self.state.clone();
+        let limits = self.limits;
+        let message_id = message_id.to_string();
+        tokio::spawn(async move {
+            let _driver = permit;
+            Self::drive_keyed(inner, state, message_id, token, LockMode::Try, limits).await;
+        });
     }
 }
 
@@ -1505,15 +1531,23 @@ impl Platform for CardDelivery {
         if let Some(token) = drive {
             // The write is owned by the queue, not the caller: a driver task
             // outlives a cancelled submitter, so an admitted submission always
-            // settles. The ticket just observes its outcome.
-            tokio::spawn(Self::drive_keyed(
-                self.inner.clone(),
-                self.state.clone(),
-                message_id,
-                token,
-                LockMode::Await,
-                self.limits,
-            ));
+            // settles. The ticket just observes its outcome. A driver holds one
+            // of the global pool's permits for its whole life (spec #571
+            // review): with every permit taken by a hung write, no driver
+            // starts and the submission stays owed in its entry — the next
+            // drain resumes it once a permit frees.
+            let inner = self.inner.clone();
+            let state = self.state.clone();
+            let limits = self.limits;
+            match Arc::clone(&self.drivers).try_acquire_owned() {
+                Ok(permit) => {
+                    tokio::spawn(async move {
+                        let _driver = permit;
+                        Self::drive_keyed(inner, state, message_id, token, LockMode::Await, limits).await;
+                    });
+                }
+                Err(_) => Self::release_driver(&self.state, &message_id, token),
+            }
         }
         CardWriteTicket::pending(ticket_rx)
     }
@@ -3577,6 +3611,77 @@ mod tests {
             inner.attempts(),
             vec![("om_1".to_string(), keyless), ("om_1".to_string(), third)],
             "the stale generation 2 never reached Feishu"
+        );
+    }
+
+    /// Live keyed drivers — and the payloads they retain while awaiting the
+    /// platform — are bounded by a global permit pool (spec #571 review): with
+    /// every permit held by a hung write, further submissions spawn no driver
+    /// at all; they stay owed in their entries and the drain resumes them once
+    /// a permit frees.
+    #[tokio::test(start_paused = true)]
+    async fn hung_drivers_are_bounded_by_the_permit_pool() {
+        let inner = Arc::new(FakePlatform::new());
+        let delivery = Arc::new(
+            CardDelivery::with_limits(inner.clone(), MAX_PENDING, BACKOFF_BASE, BACKOFF_MAX)
+                .with_max_drivers(2)
+                .with_max_entries(4),
+        );
+        let card = serde_json::json!({ "body": "collect" });
+
+        // Two hung writers on distinct cards hold both permits.
+        let (entered1, release1) = inner.park_next();
+        let first = submit(&delivery, "om_1", 1, CardWriteIntent::Collect, &card).await;
+        entered1.notified().await;
+        let (entered2, release2) = inner.park_next();
+        let second = submit(&delivery, "om_2", 1, CardWriteIntent::Collect, &card).await;
+        entered2.notified().await;
+        assert_eq!(delivery.drivers.available_permits(), 0, "both permits are held");
+
+        // A third and fourth card spawn nothing: their payloads stay owed and
+        // nothing reaches Feishu.
+        let third = submit(&delivery, "om_3", 1, CardWriteIntent::Collect, &card).await;
+        let fourth = submit(&delivery, "om_4", 1, CardWriteIntent::Collect, &card).await;
+        assert_eq!(
+            delivery.drivers.available_permits(),
+            0,
+            "no further permit is taken: the pool is never exceeded"
+        );
+        assert_eq!(
+            inner.attempts().len(),
+            2,
+            "only the two hung drivers have attempted"
+        );
+        // Even the drain's re-arm path cannot exceed the pool.
+        delivery.drain_pending_card_updates(true).await;
+        assert_eq!(
+            delivery.drivers.available_permits(),
+            0,
+            "the drain's re-arm respects the pool"
+        );
+        assert_eq!(
+            inner.attempts().len(),
+            2,
+            "no owed write started without a permit"
+        );
+
+        // A hung write completes: its permit frees and the drain resumes one
+        // owed submission; the other waits for the next free permit.
+        release1.notify_one();
+        assert!(matches!(first.settled().await, WriteOutcome::Delivered));
+        delivery.drain_pending_card_updates(true).await;
+        wait_for_attempts(&inner, 3).await;
+
+        release2.notify_one();
+        assert!(matches!(second.settled().await, WriteOutcome::Delivered));
+        delivery.drain_pending_card_updates(true).await;
+        wait_for_attempts(&inner, 4).await;
+        assert!(matches!(third.settled().await, WriteOutcome::Delivered));
+        assert!(matches!(fourth.settled().await, WriteOutcome::Delivered));
+        assert_eq!(
+            delivery.drivers.available_permits(),
+            2,
+            "every permit is released: nothing leaks"
         );
     }
 
