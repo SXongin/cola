@@ -38,6 +38,30 @@ pub(crate) fn typed_message(
     }
 }
 
+/// One assistant message carrying TWO text parts at the SAME server time
+/// (spec #561, review #569): the shape whose merge used to lose the second
+/// part's identity, and whose card must still show each part exactly once.
+pub(crate) fn two_parts_at_one_time(first: &str, second: &str) -> crate::backend::TranscriptMessage {
+    typed_message(
+        "msg_a_2000",
+        crate::backend::MessageRole::Assistant,
+        Some(2_000),
+        vec![
+            Part::Text(crate::backend::TextPart {
+                text: first.to_string(),
+                started_at: Some(2_000),
+            }),
+            Part::Text(crate::backend::TextPart {
+                text: second.to_string(),
+                started_at: Some(2_000),
+            }),
+            Part::StepFinish(crate::backend::StepFinish {
+                reason: crate::backend::FinishReason::Stop,
+            }),
+        ],
+    )
+}
+
 /// One typed text part — the common content of the view-shaped fixtures.
 pub(crate) fn text_part(text: &str) -> Part {
     Part::Text(TextPart {

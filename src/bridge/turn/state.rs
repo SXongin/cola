@@ -2021,9 +2021,9 @@ impl StreamAccumulator {
         source: Option<PartSource>,
         kind: TimelineKind,
         lead: Option<String>,
-    ) {
+    ) -> usize {
         self.item_seq += 1;
-        self.insert_item(key, shown_at, source, self.item_seq, kind, lead);
+        self.insert_item(key, shown_at, source, self.item_seq, kind, lead)
     }
 
     /// [`Self::insert_kind`] with a pre-allocated identity: a live Tool Panel
@@ -2038,7 +2038,7 @@ impl StreamAccumulator {
         seq: u64,
         kind: TimelineKind,
         lead: Option<String>,
-    ) {
+    ) -> usize {
         let idx = self.timeline.partition_point(|item| item.key <= key);
         let (idx, key) = if idx < self.render_from {
             (
@@ -2061,6 +2061,78 @@ impl StreamAccumulator {
             },
         );
         self.last_key = self.last_key.max(key);
+        idx
+    }
+
+    /// The timeline index of the LAST entry keyed `key` that renders `kind`
+    /// and belongs to the SAME transcript part as `source` (spec #561, review
+    /// #569): the entry a push may merge into. Entries from different parts
+    /// never merge — two parts of one message may share a server time — so the
+    /// search walks this key's own run for the part's entry instead of taking
+    /// the run's last one. A `None` on either side demands an exact `None`
+    /// match, so a synthetic push never absorbs a part's entry.
+    fn source_entry(
+        &self,
+        key: i64,
+        source: Option<&PartSource>,
+        accepts: impl Fn(&TimelineKind) -> bool,
+    ) -> Option<usize> {
+        let end = self.timeline.partition_point(|item| item.key <= key);
+        self.timeline[..end]
+            .iter()
+            .enumerate()
+            .rev()
+            .take_while(|(_, item)| item.key == key)
+            .find_map(|(idx, item)| {
+                if !accepts(&item.kind) {
+                    return None;
+                }
+                let same = match (item.source.as_ref(), source) {
+                    (None, None) => true,
+                    (Some(item_source), Some(source)) => item_source.same_part(source),
+                    _ => false,
+                };
+                same.then_some(idx)
+            })
+    }
+
+    /// Insert `kind` directly AFTER timeline index `after` (spec #561, review
+    /// #569): a chunk continuing a part whose equal-key run another part's
+    /// entry follows must stay beside its own entries, never jump past them.
+    /// Mirrors [`Self::insert_item`]'s render-boundary clamp; returns the
+    /// inserted index.
+    fn insert_kind_after(
+        &mut self,
+        after: usize,
+        key: i64,
+        shown_at: Option<i64>,
+        source: Option<PartSource>,
+        kind: TimelineKind,
+        lead: Option<String>,
+    ) -> usize {
+        self.item_seq += 1;
+        let seq = self.item_seq;
+        let (idx, key) = if after + 1 < self.render_from {
+            (
+                self.render_from,
+                self.timeline.get(self.render_from).map_or(key, |item| item.key),
+            )
+        } else {
+            (after + 1, key)
+        };
+        self.timeline.insert(
+            idx,
+            TimelineItem {
+                key,
+                shown_at,
+                seq,
+                kind,
+                source,
+                lead,
+            },
+        );
+        self.last_key = self.last_key.max(key);
+        idx
     }
 
     /// Key for a push with no server part time (tests, synthetic content), and
@@ -2075,13 +2147,6 @@ impl StreamAccumulator {
             .max(self.last_key.saturating_add(1))
             .max(chrono::Utc::now().timestamp_millis());
         self.order_seq
-    }
-
-    /// The timeline index of the entry keyed `key`, if one exists (equal keys
-    /// are contiguous, so the predecessor of the insertion point is it).
-    fn item_with_key(&self, key: i64) -> Option<usize> {
-        let idx = self.timeline.partition_point(|item| item.key <= key);
-        (idx > 0 && self.timeline.get(idx - 1).is_some_and(|i| i.key == key)).then(|| idx - 1)
     }
 
     /// Append a text chunk, keeping it in the chronological timeline (merging
@@ -2128,8 +2193,14 @@ impl StreamAccumulator {
         let max = crate::feishu::card::MAX_CARD_TEXT_CHARS;
         let mut remaining = chunk;
         let mut lead = lead;
+        // The entry THIS part merges into (spec #561, review #569): another
+        // part's entry at the same server time is never a merge target, so
+        // each part keeps its own source and extent. `None` until this part
+        // has an entry under this key.
+        let mut target =
+            self.source_entry(key, source.as_ref(), |kind| matches!(kind, TimelineKind::Text(_)));
         while !remaining.is_empty() {
-            let space = match self.item_with_key(key).and_then(|i| self.timeline.get(i)) {
+            let space = match target.and_then(|idx| self.timeline.get(idx)) {
                 Some(TimelineItem {
                     kind: TimelineKind::Text(last),
                     ..
@@ -2138,18 +2209,31 @@ impl StreamAccumulator {
             };
             if space == 0 {
                 let take: String = remaining.chars().take(max).collect();
-                self.insert_kind_lead(
-                    key,
-                    at_ms,
-                    source.clone(),
-                    TimelineKind::Text(take.clone()),
-                    lead.take(),
-                );
+                let pushed = source.clone();
+                target = Some(match target {
+                    // Beside its own run: another part's equal-key entry may
+                    // already follow it.
+                    Some(idx) => self.insert_kind_after(
+                        idx,
+                        key,
+                        at_ms,
+                        pushed,
+                        TimelineKind::Text(take.clone()),
+                        lead.take(),
+                    ),
+                    None => self.insert_kind_lead(
+                        key,
+                        at_ms,
+                        pushed,
+                        TimelineKind::Text(take.clone()),
+                        lead.take(),
+                    ),
+                });
                 remaining = &remaining[take.len()..];
                 continue;
             }
             let take: String = remaining.chars().take(space).collect();
-            let idx = self.item_with_key(key).expect("space came from it");
+            let idx = target.expect("space came from it");
             match self.timeline.get_mut(idx) {
                 Some(TimelineItem {
                     kind: TimelineKind::Text(last),
@@ -2173,13 +2257,16 @@ impl StreamAccumulator {
                         *item_lead = lead.take();
                     }
                 }
-                _ => self.insert_kind_lead(
-                    key,
-                    at_ms,
-                    source.clone(),
-                    TimelineKind::Text(take.clone()),
-                    lead.take(),
-                ),
+                _ => {
+                    target = Some(self.insert_kind_after(
+                        idx,
+                        key,
+                        at_ms,
+                        source.clone(),
+                        TimelineKind::Text(take.clone()),
+                        lead.take(),
+                    ));
+                }
             }
             remaining = &remaining[take.len()..];
         }
@@ -2227,7 +2314,11 @@ impl StreamAccumulator {
     ) {
         let key = at_ms.unwrap_or_else(|| self.next_order());
         self.reasoning.push_str(chunk);
-        let idx = self.item_with_key(key);
+        // The entry THIS part merges into, never another part's at the same
+        // server time (spec #561, review #569).
+        let idx = self.source_entry(key, source.as_ref(), |kind| {
+            matches!(kind, TimelineKind::Reasoning(_))
+        });
         match idx.and_then(|i| self.timeline.get_mut(i)) {
             Some(TimelineItem {
                 kind: TimelineKind::Reasoning(last),
@@ -2250,13 +2341,15 @@ impl StreamAccumulator {
                     *item_lead = lead;
                 }
             }
-            _ => self.insert_kind_lead(
-                key,
-                at_ms,
-                source,
-                TimelineKind::Reasoning(chunk.to_string()),
-                lead,
-            ),
+            _ => {
+                self.insert_kind_lead(
+                    key,
+                    at_ms,
+                    source,
+                    TimelineKind::Reasoning(chunk.to_string()),
+                    lead,
+                );
+            }
         }
     }
 
@@ -5036,5 +5129,77 @@ mod tests {
         let card = acc.build_card();
         assert_eq!(first_content(&card), "earlier content");
         assert_eq!(card["body"]["elements"][1]["content"], "📨 receipt");
+    }
+
+    /// Two text parts of ONE message sharing a server time keep their own
+    /// timeline entries — and their own sources (spec #561, review #569):
+    /// merging them would record the combined character count under the FIRST
+    /// part's digest, so the frontier could not resolve on a restart and both
+    /// parts would render again. The card's content and order are unchanged.
+    #[test]
+    fn two_text_parts_at_one_server_time_keep_their_own_entries() {
+        let message = MessageId::new("msg_a_2000");
+        let first = "第一段回答。";
+        let second = "第二段回答。";
+        let source = |index: usize, text: &str| PartSource {
+            message_id: message.clone(),
+            index,
+            delivered_before: 0,
+            prefix_digest: Some(crate::bridge::chain::cursor_prefix_digest(text)),
+        };
+        let mut acc = StreamAccumulator::new("test");
+        acc.push_text_lead(Some(2_000), Some(source(0, first)), first, None);
+        acc.push_text_lead(Some(2_000), Some(source(1, second)), second, None);
+
+        assert_eq!(
+            acc.timeline
+                .iter()
+                .map(|item| item.source.as_ref().map(|source| source.index))
+                .collect::<Vec<_>>(),
+            vec![Some(0), Some(1)],
+            "each part keeps its own entry and source: {:?}",
+            acc.timeline
+        );
+        let built = acc.build_card_with_info();
+        assert_eq!(
+            built.cursor.frontier,
+            Some(CursorFrontier {
+                message_id: message.clone(),
+                part_index: 1,
+                kind: CursorPartKind::Text,
+                started_at: Some(2_000),
+                delivered_chars: second.chars().count(),
+                prefix_digest: Some(crate::bridge::chain::cursor_prefix_digest(second)),
+            }),
+            "the frontier names the second part with its OWN extent"
+        );
+
+        // The frontier resolves against the read: part one stays delivered and
+        // the second part renders only past its own cut.
+        let transcript = SessionTranscript::new(vec![crate::backend::TranscriptMessage {
+            id: message.clone(),
+            role: crate::backend::MessageRole::Assistant,
+            time: Some(crate::backend::MessageTime {
+                created: 2_000,
+                completed: None,
+            }),
+            model: None,
+            tokens: None,
+            error: None,
+            parts: vec![
+                crate::backend::Part::Text(crate::backend::TextPart {
+                    text: first.to_string(),
+                    started_at: Some(2_000),
+                }),
+                crate::backend::Part::Text(crate::backend::TextPart {
+                    text: second.to_string(),
+                    started_at: Some(2_000),
+                }),
+            ],
+        }]);
+        let seed = CursorSeed::resolve(&transcript, &built.cursor).expect("the frontier resolves");
+        let frontier = seed.frontier.as_ref().expect("a frontier");
+        assert_eq!(frontier.part_index, 1);
+        assert_eq!(frontier.delivered_chars, second.chars().count());
     }
 }

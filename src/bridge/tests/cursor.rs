@@ -21,7 +21,7 @@ use crate::backend::{
 use crate::bridge::chain::{CursorFrontier, CursorPartKind, RenderedCursor, cursor_prefix_digest};
 use crate::bridge::test_support::{
     MockBackend, PlatformCall, card_text, patches_to, realistic_parts, seed_session, test_config,
-    test_work_dir, text_part, typed_message, wait_for_transcript_reads,
+    test_work_dir, text_part, two_parts_at_one_time, typed_message, wait_for_transcript_reads,
 };
 use crate::bridge::turn::Turn;
 use crate::opencode::types::SessionStatus;
@@ -186,6 +186,68 @@ async fn a_live_turn_advances_the_record_cursor_to_the_delivered_body() {
             prefix_digest: Some(cursor_prefix_digest("第一段回答。")),
         }),
         "the settled panel is the frontier, carrying the text's delivered extent"
+    );
+}
+
+/// Two text parts of one assistant message sharing a server time (spec #561,
+/// review #569): the render keeps them as separate entries, each with its own
+/// source, so the confirmed frontier names the SECOND part with its OWN
+/// character extent and digest. Merged into one entry it would carry the first
+/// part's digest over the combined text, resolve to a cut at 0, and re-render
+/// both parts after a restart.
+#[tokio::test]
+async fn two_text_parts_at_one_server_time_confirm_their_own_frontier() {
+    let _wd = test_work_dir();
+    let first = "第一段回答。";
+    let second = "第二段回答。";
+    let timeline = vec![
+        user("msg_cola_anchor", 1_000, "第一条消息"),
+        two_parts_at_one_time(first, second),
+        // A running tool keeps the card (and its durable record) live without
+        // adding a timeline entry of its own.
+        tool_assistant(4_000, ToolStatus::Running, ""),
+    ];
+    let (_dir, app, _backend, platform) =
+        scripted_app(vec![SessionTranscript::new(timeline)], Some(SessionStatus::Busy)).await;
+    app.turn_drain_timeout_ms.store(30, Ordering::Relaxed);
+
+    let turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
+    wait_for_card_text(&platform, second).await;
+    let result = tokio::time::timeout(Duration::from_secs(5), turn)
+        .await
+        .expect("the turn must hand off at the drain bound")
+        .unwrap();
+    result.unwrap();
+
+    let cursor = wait_for_cursor(&app, |cursor| cursor.frontier.is_some()).await;
+    assert_eq!(
+        cursor.frontier,
+        Some(CursorFrontier {
+            message_id: MessageId::new("msg_a_2000"),
+            part_index: 1,
+            kind: CursorPartKind::Text,
+            started_at: Some(2_000),
+            delivered_chars: second.chars().count(),
+            prefix_digest: Some(cursor_prefix_digest(second)),
+        }),
+        "the second part is its own frontier, with its own extent and digest"
+    );
+    let card = platform
+        .updated_cards()
+        .await
+        .last()
+        .cloned()
+        .expect("the parts reached the card");
+    let text = card_text(&card);
+    assert_eq!(
+        text.matches(first).count(),
+        1,
+        "the first part renders exactly once: {text}"
+    );
+    assert_eq!(
+        text.matches(second).count(),
+        1,
+        "the second part renders exactly once: {text}"
     );
 }
 

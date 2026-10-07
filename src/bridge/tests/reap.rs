@@ -8033,3 +8033,75 @@ async fn a_split_gap_resumes_from_its_confirmed_head_after_a_restart() {
         "the resumed chain ends on the transcript's true ending"
     );
 }
+
+/// Two text parts of one message sharing a server time (spec #561, review
+/// #569): the render keeps each part's own source, so the confirmed cursor
+/// resolves on the next life and NOTHING re-renders — the card the old life
+/// showed already carries both parts. Merged into one entry under the first
+/// part's digest, the second life's projection re-renders both onto a
+/// successor card.
+#[tokio::test]
+async fn a_restart_re_renders_nothing_for_two_parts_at_one_server_time() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let first = "第一段回答。";
+    let second = "第二段回答。";
+    let transcript = || {
+        SessionTranscript::new(vec![
+            user("msg_cola_anchor", 1_000, "第一条消息"),
+            two_parts_at_one_time(first, second),
+        ])
+    };
+    // Life 1: a live turn renders both parts and confirms its cursor.
+    let (app, platform, _backend, gate) = seeded_app(&session_file, transcript(), SessionStatus::Busy).await;
+    platform.given_card_view("msg_reply", realistic_card_view());
+    gate.add_permits(1);
+    let mut context = ctx("ses_test", "第一条消息");
+    context.cola_message_id = Some("msg_cola_anchor".into());
+    let turn = spawn_turn(&app, context);
+    wait_for_card_text(&platform, second).await;
+    let cursor = wait_for_cursor(&app, |cursor| cursor.frontier.is_some()).await;
+    assert_eq!(
+        cursor.frontier.as_ref().map(|frontier| frontier.part_index),
+        Some(1),
+        "the second part is its own frontier"
+    );
+    turn.abort();
+    drop(app);
+
+    // Life 2: the restart settles the card in place — no successor re-renders
+    // what the old card already showed.
+    let (app2, platform2, _backend2) =
+        restarted_app_with_backend(&session_file, transcript(), Some(SessionStatus::Idle)).await;
+    platform2.given_card_view("msg_reply", realistic_card_view());
+    spawn_sync(&app2);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        assert!(
+            platform2.replied_cards().await.is_empty(),
+            "a restart re-renders nothing the old card showed: {:?}",
+            platform2.calls.lock().await
+        );
+        let settled = patches_to(&platform2, "msg_reply")
+            .await
+            .iter()
+            .any(|card| card_header(card).contains("✅"));
+        if settled {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the recorded card never settles in place"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let settled = last_update_of(&platform2, "msg_reply")
+        .await
+        .expect("the in-place settle");
+    let text = card_text(&settled);
+    assert!(
+        !text.contains(first) && !text.contains(second),
+        "the delivered parts are never re-rendered: {text}"
+    );
+}
