@@ -392,7 +392,8 @@ struct PendingEntry {
     /// so the true end's terminal settle still lands after a yield. Lives with
     /// the entry, like [`Self::floor`].
     ending_gen: Option<u64>,
-    /// When this entry's order state (a raised floor, or an ending shadow) was
+    /// When this entry's order state (a raised floor, an ending shadow, or a
+    /// settled key state) was
     /// (re)established; `None` while it carries none. Only a state that is
     /// *established* starts the clock — a same-generation write that raises
     /// nothing keeps the running window. The cap may evict such an entry as a
@@ -405,7 +406,10 @@ struct PendingEntry {
     /// the newest submission (whose keyed-only entry has no keyless sequence
     /// to rank by).
     age: u64,
-    /// The newest generation's settled key states (rule (d)).
+    /// The newest generation's settled key states (rule (d)): the coverage
+    /// answers that stop per-tick re-decisions — and, for a refused key, the
+    /// give-up (#522). Order state, protected from the cap within its window
+    /// like a raised floor (spec #571 review).
     keys: KeyStates,
     /// The keyed submission this card's driver is writing, or the one left
     /// owed by a recoverable failure — at most one per card.
@@ -513,13 +517,16 @@ impl PendingEntry {
     /// Whether this entry still carries order state a stale writer may need
     /// (spec #571's reviews): a **raised generation floor** — an accepted keyed
     /// submission at generation ≥ 1, which drops every older-generation writer
-    /// (the ordinary collect's floor, a settle's closed generation) — or an
+    /// (the ordinary collect's floor, a settle's closed generation) — an
     /// ending shadow sitting at the card's floor (a yield landed and nothing
-    /// newer has pushed the floor past it). Such an entry holds no payload. It
-    /// outranks the cap while a stale writer could still be composing (see
+    /// newer has pushed the floor past it), or a **settled key state**: the
+    /// newest generation's delivered/refused answers are the coverage that
+    /// stops per-tick re-reads and re-refusals (#522), so they must survive
+    /// cap pressure too. Such an entry holds no payload. It outranks the cap
+    /// while a stale writer could still be composing (see
     /// [`Self::order_state_expired`]).
     fn keeps_order_state(&self) -> bool {
-        self.floor > 0 || self.ending_gen == Some(self.floor)
+        self.floor > 0 || self.ending_gen == Some(self.floor) || !self.keys.is_empty()
     }
 
     /// Whether this entry's order state has outlived the window in which a
@@ -754,7 +761,8 @@ impl CardDelivery {
     /// settled tombstone leaves before an undelivered payload (the cap bounds
     /// undelivered payloads; a tombstone only guards against a still-in-flight
     /// older write), oldest first by entry age. An entry that still carries
-    /// order state — a raised generation floor, an ending shadow — is never
+    /// order state — a raised generation floor, an ending shadow, a settled
+    /// key state — is never
     /// chosen while another victim exists (spec #571's reviews); once **every**
     /// entry carries order state, one past its protection window leaves as the
     /// last resort, oldest state first (spec #571 review) — its stale writer
@@ -1120,7 +1128,13 @@ impl CardDelivery {
             match attempt.result {
                 Ok(()) => {
                     if write.generation == entry.generation {
-                        entry.keys.insert(write.intent, KeyState::Delivered);
+                        if entry.keys.insert(write.intent, KeyState::Delivered).is_none() {
+                            // A freshly settled key is established order state:
+                            // its coverage answer must survive cap pressure,
+                            // and its protection window starts here (spec #571
+                            // review).
+                            entry.order_state_since = Some(now);
+                        }
                         // A waiter carrying the SAME key is a duplicate of the
                         // write that just landed: it collapses into it — one
                         // key, one PATCH — and settles `Superseded`, exactly
@@ -1160,7 +1174,14 @@ impl CardDelivery {
                 }
                 Err(e) => {
                     if write.generation == entry.generation {
-                        entry.keys.insert(write.intent, KeyState::Refused);
+                        if entry.keys.insert(write.intent, KeyState::Refused).is_none() {
+                            // A freshly refused key is established order state
+                            // too (spec #571 review): its coverage answer is
+                            // what stops every later tick's re-read and
+                            // re-refusal (#522), so it must survive cap pressure
+                            // for its window.
+                            entry.order_state_since = Some(now);
+                        }
                         // A newer payload of the SAME key already waiting is a
                         // re-submission of the refused key: drop it too, so an
                         // unrenderable card is never written again (#522).
@@ -3172,30 +3193,66 @@ mod tests {
         );
     }
 
-    /// The cap bounds KEYED-ONLY traffic too (spec #571's first review):
-    /// writes that raise no floor — a collect on a chain still at generation 0
-    /// — leave ordinary entries, and every admission runs the same cap check
-    /// the keyless observe runs, so a life that only ever collects cannot
-    /// retain one payload-less entry per card forever. A raised floor is order
-    /// state and protected within its window instead (the windowed tests
-    /// below).
+    /// A settled key state is order state (spec #571 review): the coverage
+    /// answer that stops a refused write's re-read and re-refusal must survive
+    /// cap pressure like a floor or a shadow — a fresh chain's generation-0
+    /// stamp has neither to protect it.
+    #[tokio::test]
+    async fn the_cap_keeps_a_settled_key_state_while_another_victim_exists() {
+        let inner = Arc::new(FakePlatform::new());
+        inner.fail_next(Fail::ContentRejected);
+        let delivery = CardDelivery::with_limits(inner.clone(), 1, BACKOFF_BASE, BACKOFF_MAX);
+        let card = serde_json::json!({ "body": "stamp" });
+
+        // A fresh chain's stamp at generation 0 is permanently refused: the key
+        // settles refused with no floor or shadow to protect the entry.
+        let ticket = submit(&delivery, "om_refused", 0, CardWriteIntent::Stamp, &card).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Failed(_)));
+        assert!(delivery.keyed_write_covered("om_refused", 0, CardWriteIntent::Stamp));
+
+        // Another card's admission pushes the map over the cap: the settled key
+        // must not be the victim.
+        let ticket = submit(&delivery, "om_other", 0, CardWriteIntent::Collect, &card).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Delivered));
+        assert!(
+            delivery.keyed_write_covered("om_refused", 0, CardWriteIntent::Stamp),
+            "the refused key survived the cap"
+        );
+
+        // The re-decision stays free: no second refusal reaches Feishu.
+        let ticket = submit(&delivery, "om_refused", 0, CardWriteIntent::Stamp, &card).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Superseded));
+        assert_eq!(
+            inner.attempts().len(),
+            2,
+            "one refusal and one collect, never a repeated refusal"
+        );
+    }
+
+    /// The cap bounds KEYED-ONLY traffic that carries no order state — writes
+    /// whose recoverable failures leave them owed (no settled key, raised
+    /// floor or ending shadow) — because every admission runs the same cap
+    /// check the keyless observe runs, so a life that only ever collects
+    /// cannot retain one payload-less entry per card forever. Order state
+    /// (a raised floor, a shadow, a settled key) is protected within its
+    /// window and bounded by the hard ceiling instead (the key-state, windowed
+    /// and flood tests here).
     #[tokio::test]
     async fn the_cap_bounds_keyed_only_cards() {
         let inner = Arc::new(FakePlatform::new());
         let delivery = CardDelivery::with_limits(inner.clone(), 2, BACKOFF_BASE, BACKOFF_MAX);
 
         for n in 0..5 {
+            inner.fail_next(Fail::Transport);
             let card = serde_json::json!({ "body": n });
             let ticket = submit(&delivery, &format!("om_{n}"), 0, CardWriteIntent::Collect, &card).await;
-            assert!(matches!(ticket.settled().await, WriteOutcome::Delivered));
+            assert!(matches!(ticket.settled().await, WriteOutcome::Failed(_)));
+            assert!(
+                delivery.state.lock().unwrap().entries.len() <= 2,
+                "keyed-only admission is bounded by the cap: {:?}",
+                delivery.state.lock().unwrap().entries.keys().collect::<Vec<_>>()
+            );
         }
-
-        let state = delivery.state.lock().unwrap();
-        assert!(
-            state.entries.len() <= 2,
-            "keyed-only admission is bounded by the cap: {:?}",
-            state.entries.keys().collect::<Vec<_>>()
-        );
     }
 
     /// Order state is protected only while a stale writer could still be

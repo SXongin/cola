@@ -72,7 +72,10 @@ drops stale intents, collapses duplicates and retries failures.
   same-key submission already waiting behind the key's in-flight write is
   dropped (`Superseded`) the moment that write lands — one key, one PATCH
   (spec #571 review). The newest generation's delivered/refused key states are
-  remembered per card; a newer
+  remembered per card — **order state**, protected from the cap within their
+  window exactly like a raised floor or an ending shadow (spec #571 review), so
+  the coverage answer that stops a refused write's re-read and re-refusal
+  survives cap pressure; a newer
   generation forgets the older generation's — every older submission is
   dropped by the floor anyway. The queue also answers a read-only coverage
   query (`keyed_write_covered`): a writer that re-decides every tick asks
@@ -135,8 +138,9 @@ drops stale intents, collapses duplicates and retries failures.
   most one submission in flight plus one waiting plus the newest generation's
   key states per card, and the outbox's entry cap bounds the map (a
   payload-less entry that still carries order state — a raised generation
-  floor, an ending shadow — is never evicted while any other victim exists, and
-  the entry a write is being admitted into is never evicted by its own
+  floor, an ending shadow, a settled key state — is never evicted while any
+  other victim exists, and the entry a write is being admitted into is never
+  evicted by its own
   admission; once no stale writer can still be composing — an order state older
   than a generous protection window, past every bounded card-view read — the
   oldest such state is the cap's last-resort victim). Above a **hard ceiling**
@@ -214,9 +218,11 @@ for it was rejected.
 
 **Accepted residual: the hard ceiling evicts young order state.** Under a flood
 of more protected admissions than `MAX_PENDING × MAX_ENTRIES_FACTOR`, the
-ceiling's oldest-first eviction may drop a raised floor or ending shadow while
-its protection window is still open — a stale writer from an older generation
-could then land over the newer state. This is deliberately the *same* narrow
+ceiling's oldest-first eviction may drop a raised floor, an ending shadow or a
+settled key state while its protection window is still open — a stale writer
+from an older generation could then land over the newer state, and a refused
+key's card would be read and refused once more (the state a fresh process
+starts from). This is deliberately the *same* narrow
 window the protection window already accepts at its expiry, forced early to
 keep the map hard-bounded (issue #571: "an outage or a flood of writers cannot
 grow memory without bound"); the window's own reasoning (a bounded card-view
