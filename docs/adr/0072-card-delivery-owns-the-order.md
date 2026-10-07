@@ -39,10 +39,17 @@ drops stale intents, collapses duplicates and retries failures.
   it together with the record read it decided from; a fresh process life (and
   so a record loaded from disk) starts at zero, and no durable format changes.
   The reap's stamp and endings submit the generation of the record snapshot
-  their decision used, while the collects read the chain's **current** version
+  their decision used, and the collects read the chain's **current** version
   at submission (`ChainRecords::generation`), so a takeover that landed since
   the caller's own snapshot outranks that snapshot's older intent instead of
-  being refused by it. The second half is the intent vocabulary: `Stamp` (the
+  being refused by it. The one exception is the reap's **lagging handover**
+  (spec #571 review): its successor collect carries the handover's own
+  generation — the lagging record's + 1, exactly the generation the re-point
+  assigns — decided at hand-off, because the record may still name the orphan
+  (or be released instead of re-pointed) when the detached task runs, and a
+  read at submission would then name the lagging generation, or none at all
+  once released: the old chain's late stamp at that generation could be
+  admitted beside the collect and land after the takeover notice. The second half is the intent vocabulary: `Stamp` (the
   #443 restart stamp), the three collect variants — `Collect` (the ordinary
   collect: the reap's successor collect, the Wake continuation's arm, the
   external arm, keeping the whole preserved body), `TakeoverCollect` (the
