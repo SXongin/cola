@@ -14,6 +14,33 @@
 //! eviction with a WARN) and retried with per-entry exponential backoff by
 //! [`CardDelivery::drain_pending_card_updates`] — called by the Session Sync
 //! pass each tick, and with `force` immediately after a Feishu WS reconnect.
+//!
+//! Besides the keyless `update_message`, the decorator owns a **keyed
+//! submission** queue (spec #571): a writer that needs its write ordered against
+//! the card's other writers submits a composed payload with `(generation,
+//! intent)` — the **chain generation** its decision read and the intent naming
+//! the logical write. The same per-card state machine then:
+//!
+//! - drops a submission below the highest generation seen for the card;
+//! - lands same-generation submissions in submission order — one in-flight
+//!   submission at a time, with a single waiting slot a newer submission
+//!   replaces (older generations are forgotten as the key bumps);
+//! - collapses a settled `(generation, intent)` pair: a delivered key never
+//!   writes again (per-tick re-decisions are free) and a **permanently refused**
+//!   key stays refused, so its re-submissions are dropped without a Feishu
+//!   call (#522);
+//! - keeps a recoverable failure owed with its key and its backoff, to be
+//!   retried by the drain;
+//! - serializes keyless and keyed writes on the same per-card delivery lock —
+//!   a keyless write is never dropped for staleness.
+//!
+//! Each keyed submission returns a [`CardWriteTicket`] settling on that
+//! submission's own attempt, so a caller that needs the write's timing (a
+//! collect releasing its cached card on delivery, warning on failure) awaits
+//! it while Session Sync's submission stays fire-and-forget. The write itself
+//! is owned by the queue — a spawned driver task takes the card's delivery
+//! lock and settles the state — not by the submitting task, so cancelling a
+//! submitter cannot strand the payload it already submitted.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -22,8 +49,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::Value;
+use tokio::sync::oneshot;
 
-use crate::error::Result;
+use crate::error::{BridgeError, Result};
 use crate::feishu::Platform;
 use crate::feishu::client::{ChatMessage, FeishuMessage, ImageAttachment};
 
@@ -48,6 +76,151 @@ const MAX_DELIVERED_SEQS: usize = 16;
 /// cancelled update may have landed, and re-sending one is idempotent.
 const DRAIN_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Which logical write a keyed submission is (spec #571). The intent is the
+/// second half of the ordering key: `(generation, intent)` names one logical
+/// write, so a writer's per-tick re-decision collapses to its newest payload
+/// — or, once the key settled, is dropped — instead of writing again.
+// The ordered queue lands ahead of its writers (spec #571): no bridge writer
+// submits a keyed write yet — ticket #574 wires them — so the keyed seam is
+// unreachable from the binary until then. The `dead_code` allows in this
+// module cover exactly that wiring gap, not a stale path.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum CardWriteIntent {
+    /// The restart stamp (#443, ADR-0063): mark a card a cola restart
+    /// orphaned while its session still reads live.
+    Stamp,
+    /// A collect: the fresh-Turn takeover, a late projection, and the reap's
+    /// successor collect — bring an orphaned card to its taken-over state.
+    Collect,
+}
+
+/// One **keyed submission**: an already-composed card payload with the ordering
+/// key its writer decided under (spec #571) — the **chain generation** the
+/// decision read, and the intent naming the logical write.
+#[allow(dead_code)]
+pub(crate) struct KeyedSubmission<'a> {
+    /// The card this write targets.
+    pub message_id: &'a str,
+    /// The chain generation the writer's decision read (ticket #572).
+    pub generation: u64,
+    /// Which logical write this is.
+    pub intent: CardWriteIntent,
+    /// The composed payload.
+    pub card: &'a Value,
+}
+
+/// What became of one keyed submission — its [`CardWriteTicket`]'s verdict.
+pub(crate) enum WriteOutcome {
+    /// The card holds this logical write: this submission's own payload
+    /// reached Feishu, or the same key had already delivered.
+    Delivered,
+    /// This submission's own attempt failed. A recoverable failure stays owed
+    /// in the queue and is retried with backoff; a permanent refusal settles
+    /// the key, so later same-key submissions are dropped without a call.
+    Failed(BridgeError),
+    /// Nothing was written for this submission: a newer submission owns the
+    /// card, its generation was stale, or its key was permanently refused.
+    Superseded,
+}
+
+impl std::fmt::Debug for WriteOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Delivered => write!(f, "Delivered"),
+            Self::Failed(error) => write!(f, "Failed({error})"),
+            Self::Superseded => write!(f, "Superseded"),
+        }
+    }
+}
+
+/// The completion ticket of one keyed submission (spec #571, decision 7):
+/// callers that need the write's own timing await [`Self::settled`]; a
+/// fire-and-forget caller may drop it — the queue owns the write either way.
+#[allow(dead_code)]
+pub(crate) struct CardWriteTicket {
+    rx: oneshot::Receiver<WriteOutcome>,
+}
+
+#[allow(dead_code)]
+impl CardWriteTicket {
+    fn pending(rx: oneshot::Receiver<WriteOutcome>) -> Self {
+        Self { rx }
+    }
+
+    /// A ticket already settled — the unordered fallback's ticket.
+    pub(crate) fn settled_now(outcome: WriteOutcome) -> Self {
+        let (ticket, rx) = oneshot::channel();
+        let _ = ticket.send(outcome);
+        Self { rx }
+    }
+
+    /// Await this submission's own outcome. A ticket whose queue state was
+    /// forgotten (the entry evicted under the cap) reports
+    /// [`WriteOutcome::Superseded`]: nothing will be written for it.
+    pub(crate) async fn settled(self) -> WriteOutcome {
+        self.rx.await.unwrap_or(WriteOutcome::Superseded)
+    }
+}
+
+/// The newest generation's settled key state (spec #571, rule (d)): once a
+/// `(generation, intent)` pair settled it never writes again — a delivered key
+/// is already on the card, a refused one is final — so a re-decision of the
+/// same key is dropped without a Feishu call. A pending key is a slot below,
+/// not an entry here.
+#[derive(Clone, Copy)]
+enum KeyState {
+    Delivered,
+    Refused,
+}
+
+/// The newest generation's key states, keyed by intent: bounded by the intent
+/// vocabulary, and forgotten when a newer generation arrives.
+type KeyStates = HashMap<CardWriteIntent, KeyState>;
+
+/// One admitted keyed submission: the in-flight slot's occupant, or the single
+/// submission waiting behind it.
+struct QueuedWrite {
+    /// Identifies this occupancy: a driver's outcome is ignored once the slot
+    /// was superseded or the entry was evicted.
+    token: u64,
+    /// The generation the submission was admitted under.
+    generation: u64,
+    /// The logical write this submission is.
+    intent: CardWriteIntent,
+    /// The composed payload.
+    card: Value,
+    /// This submission's own failed attempts so far: each further failure
+    /// doubles the delay before the next retry.
+    attempts: u32,
+    /// The earliest instant a retry may go out (unless forced).
+    next_attempt: tokio::time::Instant,
+}
+
+#[allow(dead_code)]
+impl QueuedWrite {
+    fn new(token: u64, submission: KeyedSubmission<'_>, now: tokio::time::Instant) -> Self {
+        Self {
+            token,
+            generation: submission.generation,
+            intent: submission.intent,
+            card: submission.card.clone(),
+            attempts: 0,
+            next_attempt: now,
+        }
+    }
+}
+
+/// The queue's retry bounds: each failed attempt waits the base delay doubled
+/// per further failure (capped), and one attempt is bounded by the retry
+/// timeout, so a hung PATCH cannot hold a card's delivery lock forever.
+#[derive(Clone, Copy)]
+struct Limits {
+    backoff_base: Duration,
+    backoff_max: Duration,
+    retry_timeout: Duration,
+}
+
 /// One card's newest write state.
 ///
 /// `card` is `Some` while that write's payload is undelivered — the Pending
@@ -57,7 +230,6 @@ const DRAIN_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
 /// must not re-register its older payload (ADR-0067: a slow failure may never
 /// resurrect a superseded payload over a newer delivered one). Tombstones age
 /// out under the same cap as pending payloads.
-#[derive(Clone)]
 struct PendingEntry {
     /// The monotonic write sequence this state belongs to. A retry may clear
     /// the payload only while the entry still names this sequence.
@@ -76,10 +248,52 @@ struct PendingEntry {
     /// The earliest instant the next retry may go out (unless forced).
     next_attempt: tokio::time::Instant,
     /// The card's delivery lock (shared with [`State::locks`]): every write to
-    /// this message — a normal `update_message` and a drain retry alike —
-    /// holds it across the Feishu call, so an older retry can never land after
-    /// a newer write (ADR-0038's ordering, for the outbox writer).
+    /// this message — a normal `update_message`, a keyed submission's driver
+    /// and a drain retry alike — holds it across the Feishu call, so an older
+    /// retry can never land after a newer write (ADR-0038's ordering, for the
+    /// outbox writer).
     lock: Arc<tokio::sync::Mutex<()>>,
+    /// The highest **chain generation** seen for this card (spec #571): a
+    /// submission below it is dropped, and a newer one forgets the older
+    /// generation's settled keys — every older submission is dropped by the
+    /// generation rule anyway.
+    generation: u64,
+    /// The newest generation's settled key states (rule (d)).
+    keys: KeyStates,
+    /// The keyed submission this card's driver is writing, or the one left
+    /// owed by a recoverable failure — at most one per card.
+    in_flight: Option<QueuedWrite>,
+    /// The one submission waiting behind the in-flight one. A newer
+    /// submission replaces it, so the queue stays bounded at 1 + 1.
+    waiting: Option<QueuedWrite>,
+    /// The token of the driver that owns this card's keyed queue right now;
+    /// `None` when no write is reserved. A submission that finds a driver
+    /// parks in `waiting`; one that finds none takes the in-flight slot and
+    /// starts a driver.
+    driver: Option<u64>,
+    /// The completion tickets of the queued submissions, by token: a slot's
+    /// ticket leaves with its outcome, so a dropped or superseded submission
+    /// still settles its caller.
+    tickets: HashMap<u64, oneshot::Sender<WriteOutcome>>,
+}
+
+impl PendingEntry {
+    fn new(lock: Arc<tokio::sync::Mutex<()>>) -> Self {
+        Self {
+            seq: 0,
+            card: None,
+            delivered: VecDeque::new(),
+            attempts: 0,
+            next_attempt: tokio::time::Instant::now(),
+            lock,
+            generation: 0,
+            keys: KeyStates::new(),
+            in_flight: None,
+            waiting: None,
+            driver: None,
+            tickets: HashMap::new(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -97,20 +311,22 @@ struct State {
     /// (see [`CardDelivery::prune_locks`]), so it stays bounded.
     locks: HashMap<String, Arc<tokio::sync::Mutex<()>>>,
     seq: u64,
+    /// Allocates the tokens that identify one keyed slot occupancy.
+    #[allow(dead_code)]
+    tokens: u64,
 }
 
 /// A [`Platform`] decorator that turns a failed `update_message` into a
 /// Pending Card Update and drains them on demand.
 pub(crate) struct CardDelivery {
     inner: Arc<dyn Platform>,
-    state: Mutex<State>,
+    state: Arc<Mutex<State>>,
     /// One drain at a time: a Session Sync pass and a WS reconnect must not
     /// both walk the set (a superseded retry is harmless, but a shared walk
     /// keeps the bookkeeping single-writer).
     drain_lock: tokio::sync::Mutex<()>,
     max_pending: usize,
-    backoff_base: Duration,
-    backoff_max: Duration,
+    limits: Limits,
 }
 
 impl CardDelivery {
@@ -128,11 +344,14 @@ impl CardDelivery {
     ) -> Self {
         Self {
             inner,
-            state: Mutex::new(State::default()),
+            state: Arc::new(Mutex::new(State::default())),
             drain_lock: tokio::sync::Mutex::new(()),
             max_pending,
-            backoff_base,
-            backoff_max,
+            limits: Limits {
+                backoff_base,
+                backoff_max,
+                retry_timeout: DRAIN_RETRY_TIMEOUT,
+            },
         }
     }
 
@@ -171,24 +390,16 @@ impl CardDelivery {
     /// Card Update; a delivery (or a permanent refusal) leaves a settled
     /// tombstone at that sequence instead, so an outcome that is not newer
     /// than the stored one cannot re-register a superseded payload.
+    ///
+    /// The keyed queue lives in the same entry and is left untouched: the
+    /// sequence governs the keyless payload alone.
     fn observe(&self, message_id: &str, seq: u64, card: &Value, result: &Result<()>) {
         let mut state = self.state.lock().unwrap();
-        let newest = match state.entries.get(message_id) {
-            Some(entry) => entry.seq < seq,
-            None => true,
-        };
+        let newest = state.entries.get(message_id).is_none_or(|entry| entry.seq < seq);
         if !newest {
             return;
         }
         let recoverable = matches!(result, Err(e) if e.is_recoverable_card_write());
-        // The delivered sequences outlive the entry (spec #561, review #569):
-        // a newer write's outcome replaces the owed payload, and the older
-        // delivery must still answer for its own sequence.
-        let mut delivered = state
-            .entries
-            .get(message_id)
-            .map(|entry| entry.delivered.clone())
-            .unwrap_or_default();
         if recoverable {
             // Remember the exact write a failure note will ask about (spec
             // #561, review #569): a newer write may replace the entry before
@@ -196,18 +407,22 @@ impl CardDelivery {
             // THIS payload's sequence delivered.
             state.failed.insert(message_id.to_string(), (seq, card.clone()));
         }
+        let lock = state.locks.entry(message_id.to_string()).or_default().clone();
+        let entry = state
+            .entries
+            .entry(message_id.to_string())
+            .or_insert_with(|| PendingEntry::new(lock));
+        // The delivered sequences outlive the entry (spec #561, review #569):
+        // a newer write's outcome replaces the owed payload, and the older
+        // delivery must still answer for its own sequence.
+        entry.seq = seq;
+        entry.attempts = 0;
         if result.is_ok() {
-            Self::remember_delivered(&mut delivered, seq);
+            Self::remember_delivered(&mut entry.delivered, seq);
         }
-        let entry = if recoverable {
-            PendingEntry {
-                seq,
-                card: Some(card.clone()),
-                delivered,
-                attempts: 0,
-                next_attempt: tokio::time::Instant::now() + self.backoff_base,
-                lock: state.locks.entry(message_id.to_string()).or_default().clone(),
-            }
+        if recoverable {
+            entry.card = Some(card.clone());
+            entry.next_attempt = tokio::time::Instant::now() + self.limits.backoff_base;
         } else {
             // Delivered, or a permanent refusal (a rejected card, a gone
             // message, a non-recoverable 4xx): the payload can never usefully
@@ -215,16 +430,9 @@ impl CardDelivery {
             // set the Rendered Cursor's drain reconcile reads, and the
             // tombstone that keeps an older slow outcome from re-registering
             // (spec #561).
-            PendingEntry {
-                seq,
-                card: None,
-                delivered,
-                attempts: 0,
-                next_attempt: tokio::time::Instant::now(),
-                lock: state.locks.entry(message_id.to_string()).or_default().clone(),
-            }
-        };
-        state.entries.insert(message_id.to_string(), entry);
+            entry.card = None;
+            entry.next_attempt = tokio::time::Instant::now();
+        }
         self.evict_over_cap(&mut state);
         Self::prune_locks(&mut state);
     }
@@ -250,7 +458,9 @@ impl CardDelivery {
             let victim = state
                 .entries
                 .iter()
-                .filter(|(_, entry)| entry.card.is_none())
+                .filter(|(_, entry)| {
+                    entry.card.is_none() && entry.in_flight.is_none() && entry.waiting.is_none()
+                })
                 .min_by_key(|(_, entry)| entry.seq)
                 .or_else(|| state.entries.iter().min_by_key(|(_, entry)| entry.seq))
                 .map(|(message_id, _)| message_id.clone());
@@ -261,21 +471,435 @@ impl CardDelivery {
             // The failure memory leaves with its card's entry: the note it
             // serves names the same payload, and the entry is gone.
             state.failed.remove(&victim);
-            if evicted.is_some_and(|entry| entry.card.is_some()) {
-                tracing::warn!(
-                    "pending card update for {victim} evicted: {} card writes reached",
-                    self.max_pending
-                );
+            if let Some(mut entry) = evicted {
+                // A keyed submission whose slot leaves with the entry is
+                // dropped: nothing will be written for it, so its ticket says
+                // so instead of waiting forever.
+                for (_, ticket) in entry.tickets.drain() {
+                    let _ = ticket.send(WriteOutcome::Superseded);
+                }
+                if entry.card.is_some() {
+                    tracing::warn!(
+                        "pending card update for {victim} evicted: {} card writes reached",
+                        self.max_pending
+                    );
+                }
             }
         }
     }
 
     /// The delay before the next retry after `attempts` failed ones.
     fn backoff(&self, attempts: u32) -> Duration {
-        self.backoff_base
-            .saturating_mul(1u32 << attempts.min(16))
-            .min(self.backoff_max)
+        backoff_delay(self.limits.backoff_base, self.limits.backoff_max, attempts)
     }
+
+    /// Admit one keyed submission into `message_id`'s queue. Returns the token
+    /// of the driver to start when the submission took the in-flight slot;
+    /// `None` when it was dropped or parked behind the running write's driver.
+    #[allow(dead_code)]
+    fn admit(
+        state: &mut State,
+        submission: KeyedSubmission<'_>,
+        ticket: oneshot::Sender<WriteOutcome>,
+    ) -> Option<u64> {
+        let now = tokio::time::Instant::now();
+        let lock = state
+            .locks
+            .entry(submission.message_id.to_string())
+            .or_default()
+            .clone();
+        state.tokens += 1;
+        let token = state.tokens;
+        let entry = state
+            .entries
+            .entry(submission.message_id.to_string())
+            .or_insert_with(|| PendingEntry::new(lock));
+        // (a) Below the highest generation seen: the decision is stale, so a
+        // newer generation already owns the card. The submission never
+        // reaches Feishu.
+        if submission.generation < entry.generation {
+            let _ = ticket.send(WriteOutcome::Superseded);
+            return None;
+        }
+        // A newer generation forgets the older one's settled keys: every older
+        // submission is dropped by (a), and only the newest generation's
+        // states are remembered.
+        if submission.generation > entry.generation {
+            entry.generation = submission.generation;
+            entry.keys.clear();
+        }
+        // (d) A settled key never writes again: a delivered key is already on
+        // the card (so per-tick re-decisions are free), and a permanent
+        // refusal is final for this generation (#522). Both are dropped
+        // without a Feishu call.
+        match entry.keys.get(&submission.intent) {
+            Some(KeyState::Delivered) => {
+                let _ = ticket.send(WriteOutcome::Delivered);
+                return None;
+            }
+            Some(KeyState::Refused) => {
+                let _ = ticket.send(WriteOutcome::Superseded);
+                return None;
+            }
+            None => {}
+        }
+        let write = QueuedWrite::new(token, submission, now);
+        // The ticket lives with the queue until the submission settles: a
+        // displaced or dropped slot still answers its caller.
+        entry.tickets.insert(token, ticket);
+        // A driver owns the card right now: the newest submission takes the
+        // single waiting slot, replacing whatever waited there.
+        if entry.driver.is_some() {
+            if let Some(displaced) = entry.waiting.replace(write) {
+                Self::settle_ticket(entry, displaced.token, WriteOutcome::Superseded);
+            }
+            return None;
+        }
+        // No driver owns the card: this submission takes the in-flight slot —
+        // a newer payload supersedes an owed write (a recoverable failure's
+        // payload the newest decision replaces) — and starts its driver.
+        if let Some(displaced) = entry.in_flight.replace(write) {
+            Self::settle_ticket(entry, displaced.token, WriteOutcome::Superseded);
+        }
+        entry.driver = Some(token);
+        Some(token)
+    }
+
+    /// Settle one queued submission's ticket, if its caller still waits.
+    fn settle_ticket(entry: &mut PendingEntry, token: u64, outcome: WriteOutcome) {
+        if let Some(ticket) = entry.tickets.remove(&token) {
+            let _ = ticket.send(outcome);
+        }
+    }
+
+    /// Drive `message_id`'s keyed queue: attempt its reserved in-flight
+    /// submission, settle it, promote the waiting slot and write that too, so
+    /// a submission admitted behind a running write lands as soon as the write
+    /// settles.
+    ///
+    /// A recoverable failure keeps the submission owed with its backoff (the
+    /// drain retries it) unless a newer submission waits behind it — that one
+    /// supersedes it and is written now. A permanent refusal settles the key,
+    /// so later same-key submissions are dropped without a call.
+    async fn drive_keyed(
+        inner: Arc<dyn Platform>,
+        state: Arc<Mutex<State>>,
+        message_id: String,
+        mut token: u64,
+        mode: LockMode,
+        limits: Limits,
+    ) {
+        loop {
+            // Confirm this driver still owns the queue and snapshot the
+            // payload to write. The state lock is never held across an await.
+            let payload = {
+                let mut state = state.lock().unwrap();
+                let Some(entry) = state.entries.get_mut(&message_id) else {
+                    return;
+                };
+                if entry.driver != Some(token) {
+                    return;
+                }
+                match entry.in_flight.as_ref() {
+                    Some(write) => write.card.clone(),
+                    None => {
+                        entry.driver = None;
+                        return;
+                    }
+                }
+            };
+            // Serialize with every other writer of this card: the keyless
+            // `update_message`, the outbox's retry, another driver. A
+            // submission's driver waits for the lock (its write must land
+            // promptly); the drain's retry skips a card a writer already holds
+            // (the Session Sync pass never blocks on one).
+            let lock = card_lock(&state, &message_id);
+            let guard = match mode {
+                LockMode::Await => Some(lock.lock().await),
+                LockMode::Try => lock.try_lock().ok(),
+            };
+            let Some(_delivery) = guard else {
+                // The card is being written right now: leave the submission
+                // owed and release the reservation, so the active writer's own
+                // settlement — or the next drain — picks it up.
+                Self::release_driver(&state, &message_id, token);
+                return;
+            };
+            // Under the lock, re-check the reservation: the entry may have
+            // been evicted under the cap while this driver waited.
+            {
+                let state = state.lock().unwrap();
+                if state
+                    .entries
+                    .get(&message_id)
+                    .is_none_or(|entry| entry.driver != Some(token))
+                {
+                    return;
+                }
+            }
+            // Bounded like the outbox's retry: a hung PATCH must not hold the
+            // card's delivery lock — and so its queue — forever.
+            let result =
+                match tokio::time::timeout(limits.retry_timeout, inner.update_message(&message_id, &payload))
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(BridgeError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "card update timed out",
+                    ))),
+                };
+            let now = tokio::time::Instant::now();
+            let mut state = state.lock().unwrap();
+            let Some(entry) = state.entries.get_mut(&message_id) else {
+                return;
+            };
+            if entry.driver != Some(token) {
+                return;
+            }
+            let Some(mut write) = entry.in_flight.take() else {
+                entry.driver = None;
+                return;
+            };
+            match result {
+                Ok(()) => {
+                    // Only when no newer payload of the same key waits behind
+                    // this write: that one is the key's newest payload and will
+                    // settle it.
+                    if write.generation == entry.generation
+                        && entry.waiting.as_ref().is_none_or(|w| w.intent != write.intent)
+                    {
+                        entry.keys.insert(write.intent, KeyState::Delivered);
+                    }
+                    Self::settle_ticket(entry, write.token, WriteOutcome::Delivered);
+                }
+                Err(e) if e.is_recoverable_card_write() => {
+                    if entry.waiting.is_some() {
+                        // A newer submission supersedes the failed one (newest
+                        // wins): the newest payload lands instead.
+                        Self::settle_ticket(entry, write.token, WriteOutcome::Failed(e));
+                    } else {
+                        // Stay owed with the backoff: the drain retries it, and
+                        // a newer submission replaces it if one arrives. The
+                        // first failure waits the base delay, each further one
+                        // doubles it — the outbox's own cadence.
+                        write.next_attempt =
+                            now + backoff_delay(limits.backoff_base, limits.backoff_max, write.attempts);
+                        write.attempts += 1;
+                        Self::settle_ticket(entry, write.token, WriteOutcome::Failed(e));
+                        entry.in_flight = Some(write);
+                        entry.driver = None;
+                        return;
+                    }
+                }
+                Err(e) => {
+                    if write.generation == entry.generation {
+                        entry.keys.insert(write.intent, KeyState::Refused);
+                        // A newer payload of the SAME key already waiting is a
+                        // re-submission of the refused key: drop it too, so an
+                        // unrenderable card is never written again (#522).
+                        // Another key's waiting payload is a different logical
+                        // write and still lands.
+                        if entry
+                            .waiting
+                            .as_ref()
+                            .is_some_and(|w| w.generation == write.generation && w.intent == write.intent)
+                        {
+                            let waiting = entry.waiting.take().expect("checked above");
+                            Self::settle_ticket(entry, waiting.token, WriteOutcome::Superseded);
+                        }
+                    }
+                    Self::settle_ticket(entry, write.token, WriteOutcome::Failed(e));
+                }
+            }
+            // Promote the waiting submission, if one waits: it is the newer
+            // decision, and its own driver continues the queue.
+            match entry.waiting.take() {
+                Some(next) => {
+                    token = next.token;
+                    entry.driver = Some(token);
+                    entry.in_flight = Some(next);
+                }
+                None => {
+                    entry.driver = None;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Release a driver's reservation, if it still holds it.
+    fn release_driver(state: &Mutex<State>, message_id: &str, token: u64) {
+        if let Some(entry) = state.lock().unwrap().entries.get_mut(message_id)
+            && entry.driver == Some(token)
+        {
+            entry.driver = None;
+        }
+    }
+
+    /// Retry one card's owed keyless payload — the Pending Card Update proper —
+    /// as the drain found it due.
+    async fn retry_pending_card_update(&self, retry: KeylessRetry) {
+        let KeylessRetry {
+            message_id,
+            card,
+            lock,
+            seq,
+            attempts,
+        } = retry;
+        // Serialize with the card's other writers: the retry must land at
+        // Feishu before any newer write, or an older payload would be the
+        // last state on the card (ADR-0067's newest-wins at the wire).
+        // A live writer already mid-flight makes the retry unnecessary —
+        // it is about to deliver a newer state — so skip and let the next
+        // pass retry anything its outcome left owed.
+        let Ok(_delivery) = lock.try_lock() else {
+            return;
+        };
+        // Re-check under the lock: a write that settled (or replaced) the
+        // entry while this drain was waiting must not be overwritten by
+        // the payload we snapshotted.
+        {
+            let state = self.state.lock().unwrap();
+            if !state
+                .entries
+                .get(&message_id)
+                .is_some_and(|current| current.seq == seq && current.card.is_some())
+            {
+                return;
+            }
+        }
+        // Bounded: a hung PATCH must not hold the card's delivery lock —
+        // and so the Session Sync pass — forever. On expiry the payload
+        // stays pending and is retried later.
+        let result =
+            match tokio::time::timeout(DRAIN_RETRY_TIMEOUT, self.inner.update_message(&message_id, &card))
+                .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(BridgeError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "card update retry timed out",
+                ))),
+            };
+        let mut state = self.state.lock().unwrap();
+        // The entry could still have left the set under cap eviction while
+        // the retry was in flight; its outcome belongs to the payload it
+        // carried, not to a newer state.
+        let still_current = state
+            .entries
+            .get(&message_id)
+            .is_some_and(|current| current.seq == seq && current.card.is_some());
+        if !still_current {
+            Self::prune_locks(&mut state);
+            return;
+        }
+        match result {
+            Ok(()) => {
+                // Keep the sequence as a settled tombstone: an outcome that
+                // is not newer than the stored one must not re-register
+                // behind it — and remember THIS payload's own sequence as
+                // delivered, which is what the Rendered Cursor's drain
+                // reconcile confirms against, even after a newer write
+                // replaces the entry (spec #561, review #569).
+                if let Some(current) = state.entries.get_mut(&message_id) {
+                    current.card = None;
+                    Self::remember_delivered(&mut current.delivered, seq);
+                }
+                if attempts > 0 {
+                    tracing::info!("pending card update for {message_id} delivered after {attempts} retries");
+                }
+            }
+            Err(e) if e.is_recoverable_card_write() => {
+                if let Some(current) = state.entries.get_mut(&message_id) {
+                    current.attempts += 1;
+                    current.next_attempt = tokio::time::Instant::now() + self.backoff(current.attempts);
+                }
+                tracing::debug!("pending card update for {message_id} still failing: {e}");
+            }
+            Err(e) => {
+                // A permanent refusal is settled too: the tombstone keeps
+                // an older slow failure from re-registering, and records
+                // that nothing was delivered (spec #561).
+                if let Some(current) = state.entries.get_mut(&message_id) {
+                    current.card = None;
+                }
+                tracing::warn!("pending card update for {message_id} dropped: {e}");
+            }
+        }
+        Self::prune_locks(&mut state);
+    }
+
+    /// Retry a card's owed keyed write when it is due: reserve it and drive it
+    /// inline with the drain's lock mode, so a card another writer holds is
+    /// skipped rather than awaited.
+    async fn drive_owed_keyed(&self, message_id: &str, force: bool, now: tokio::time::Instant) {
+        let token = {
+            let mut state = self.state.lock().unwrap();
+            let Some(entry) = state.entries.get_mut(message_id) else {
+                return;
+            };
+            if entry.driver.is_some() {
+                return;
+            }
+            let Some(due) = entry
+                .in_flight
+                .as_ref()
+                .map(|write| (write.token, force || write.next_attempt <= now))
+                .filter(|(_, due)| *due)
+            else {
+                return;
+            };
+            entry.driver = Some(due.0);
+            due.0
+        };
+        Self::drive_keyed(
+            self.inner.clone(),
+            self.state.clone(),
+            message_id.to_string(),
+            token,
+            LockMode::Try,
+            self.limits,
+        )
+        .await;
+    }
+}
+
+/// One card's owed keyless payload, snapshotted by the drain so the state lock
+/// is never held across an await.
+struct KeylessRetry {
+    message_id: String,
+    card: Value,
+    lock: Arc<tokio::sync::Mutex<()>>,
+    seq: u64,
+    attempts: u32,
+}
+
+/// How a driver takes the card's delivery lock: a submission's driver waits
+/// for it (the write must land promptly), the drain's retry only tries it (a
+/// card a writer already holds is skipped, never awaited).
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+enum LockMode {
+    Await,
+    Try,
+}
+
+/// The delay before the next retry after `attempts` failed ones.
+fn backoff_delay(base: Duration, max: Duration, attempts: u32) -> Duration {
+    base.saturating_mul(1u32 << attempts.min(16)).min(max)
+}
+
+/// The card's delivery lock, created on first use. Stable while an entry names
+/// the card or any call holds the lock.
+fn card_lock(state: &Mutex<State>, message_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    state
+        .lock()
+        .unwrap()
+        .locks
+        .entry(message_id.to_string())
+        .or_default()
+        .clone()
 }
 
 #[async_trait]
@@ -306,6 +930,29 @@ impl Platform for CardDelivery {
         let result = self.inner.update_message(message_id, card).await;
         self.observe(message_id, seq, card, &result);
         result
+    }
+
+    async fn submit_ordered(&self, submission: KeyedSubmission<'_>) -> CardWriteTicket {
+        let (ticket, ticket_rx) = oneshot::channel();
+        let message_id = submission.message_id.to_string();
+        let drive = {
+            let mut state = self.state.lock().unwrap();
+            Self::admit(&mut state, submission, ticket)
+        };
+        if let Some(token) = drive {
+            // The write is owned by the queue, not the caller: a driver task
+            // outlives a cancelled submitter, so an admitted submission always
+            // settles. The ticket just observes its outcome.
+            tokio::spawn(Self::drive_keyed(
+                self.inner.clone(),
+                self.state.clone(),
+                message_id,
+                token,
+                LockMode::Await,
+                self.limits,
+            ));
+        }
+        CardWriteTicket::pending(ticket_rx)
     }
 
     async fn reply_text(&self, message_id: &str, text: &str) -> Result<String> {
@@ -389,105 +1036,45 @@ impl Platform for CardDelivery {
             Err(_) => return,
         };
         let now = tokio::time::Instant::now();
-        let due: Vec<(String, PendingEntry)> = {
+        // Snapshot what the retries need; the state lock is never held across
+        // an await.
+        let keyless: Vec<KeylessRetry> = {
             let state = self.state.lock().unwrap();
             state
                 .entries
                 .iter()
                 .filter(|(_, entry)| entry.card.is_some() && (force || entry.next_attempt <= now))
-                .map(|(message_id, entry)| (message_id.clone(), entry.clone()))
+                .map(|(message_id, entry)| KeylessRetry {
+                    message_id: message_id.clone(),
+                    card: entry.card.clone().expect("filtered to a pending payload"),
+                    lock: entry.lock.clone(),
+                    seq: entry.seq,
+                    attempts: entry.attempts,
+                })
                 .collect()
         };
-        for (message_id, entry) in due {
-            // Only a pending entry is due (the filter above); the clone keeps
-            // the payload for the retry.
-            let Some(card) = entry.card.clone() else { continue };
-            // Serialize with the card's other writers: the retry must land at
-            // Feishu before any newer write, or an older payload would be the
-            // last state on the card (ADR-0067's newest-wins at the wire).
-            // A live writer already mid-flight makes the retry unnecessary —
-            // it is about to deliver a newer state — so skip and let the next
-            // pass retry anything its outcome left owed.
-            let Ok(_delivery) = entry.lock.try_lock() else {
-                continue;
-            };
-            // Re-check under the lock: a write that settled (or replaced) the
-            // entry while this drain was waiting must not be overwritten by
-            // the payload we snapshotted.
-            {
-                let state = self.state.lock().unwrap();
-                if !state
-                    .entries
-                    .get(&message_id)
-                    .is_some_and(|current| current.seq == entry.seq && current.card.is_some())
-                {
-                    continue;
-                }
-            }
-            // Bounded: a hung PATCH must not hold the card's delivery lock —
-            // and so the Session Sync pass — forever. On expiry the payload
-            // stays pending and is retried later.
-            let result = match tokio::time::timeout(
-                DRAIN_RETRY_TIMEOUT,
-                self.inner.update_message(&message_id, &card),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => Err(crate::error::BridgeError::Io(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "card update retry timed out",
-                ))),
-            };
-            let mut state = self.state.lock().unwrap();
-            // The entry could still have left the set under cap eviction while
-            // the retry was in flight; its outcome belongs to the payload it
-            // carried, not to a newer state.
-            let still_current = state
+        // The keyed queue's owed write: a submission whose recoverable failure
+        // released its driver, due for another attempt.
+        let keyed: Vec<String> = {
+            let state = self.state.lock().unwrap();
+            state
                 .entries
-                .get(&message_id)
-                .is_some_and(|current| current.seq == entry.seq && current.card.is_some());
-            if !still_current {
-                Self::prune_locks(&mut state);
-                continue;
-            }
-            match result {
-                Ok(()) => {
-                    // Keep the sequence as a settled tombstone: an outcome that
-                    // is not newer than the stored one must not re-register
-                    // behind it — and remember THIS payload's own sequence as
-                    // delivered, which is what the Rendered Cursor's drain
-                    // reconcile confirms against, even after a newer write
-                    // replaces the entry (spec #561, review #569).
-                    if let Some(current) = state.entries.get_mut(&message_id) {
-                        current.card = None;
-                        Self::remember_delivered(&mut current.delivered, entry.seq);
-                    }
-                    if entry.attempts > 0 {
-                        tracing::info!(
-                            "pending card update for {message_id} delivered after {} retries",
-                            entry.attempts
-                        );
-                    }
-                }
-                Err(e) if e.is_recoverable_card_write() => {
-                    if let Some(current) = state.entries.get_mut(&message_id) {
-                        current.attempts += 1;
-                        current.next_attempt = tokio::time::Instant::now() + self.backoff(current.attempts);
-                    }
-                    tracing::debug!("pending card update for {message_id} still failing: {e}");
-                }
-                Err(e) => {
-                    // A permanent refusal is settled too: the tombstone keeps
-                    // an older slow failure from re-registering, and records
-                    // that nothing was delivered (spec #561).
-                    if let Some(current) = state.entries.get_mut(&message_id) {
-                        current.card = None;
-                    }
-                    tracing::warn!("pending card update for {message_id} dropped: {e}");
-                }
-            }
-            Self::prune_locks(&mut state);
+                .iter()
+                .filter(|(_, entry)| {
+                    entry.driver.is_none()
+                        && entry
+                            .in_flight
+                            .as_ref()
+                            .is_some_and(|write| force || write.next_attempt <= now)
+                })
+                .map(|(message_id, _)| message_id.clone())
+                .collect()
+        };
+        for retry in keyless {
+            self.retry_pending_card_update(retry).await;
+        }
+        for message_id in keyed {
+            self.drive_owed_keyed(&message_id, force, now).await;
         }
     }
 
@@ -698,6 +1285,24 @@ mod tests {
         async fn unpin_message(&self, _message_id: &str) -> Result<()> {
             unimplemented!("not used")
         }
+    }
+
+    /// Submit one keyed write and hand back its completion ticket.
+    async fn submit(
+        delivery: &CardDelivery,
+        message_id: &str,
+        generation: u64,
+        intent: CardWriteIntent,
+        card: &Value,
+    ) -> CardWriteTicket {
+        delivery
+            .submit_ordered(KeyedSubmission {
+                message_id,
+                generation,
+                intent,
+                card,
+            })
+            .await
     }
 
     #[tokio::test]
@@ -1178,5 +1783,453 @@ mod tests {
             "the reconnect drain retried immediately"
         );
         assert!(!delivery.pending("om_1"));
+    }
+
+    // ---- The ordered queue (spec #571): keyed submissions ----
+
+    /// A keyed submission reaches Feishu with its composed payload, and its
+    /// ticket reports this submission's own delivery.
+    #[tokio::test]
+    async fn a_keyed_submission_reaches_the_wire_and_settles_delivered() {
+        let inner = Arc::new(FakePlatform::new());
+        let delivery = CardDelivery::new(inner.clone());
+        let card = serde_json::json!({ "body": "collected" });
+
+        let ticket = submit(&delivery, "om_1", 1, CardWriteIntent::Collect, &card).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Delivered));
+        assert_eq!(inner.attempts(), vec![("om_1".to_string(), card)]);
+    }
+
+    /// A submission below the highest generation seen for the card never
+    /// reaches Feishu: the newer decision owns the card (rule (a)).
+    #[tokio::test]
+    async fn a_stale_generation_is_dropped_without_a_call() {
+        let inner = Arc::new(FakePlatform::new());
+        let delivery = CardDelivery::new(inner.clone());
+        let newer = serde_json::json!({ "body": "newer" });
+        let stale = serde_json::json!({ "body": "stale" });
+
+        let ticket = submit(&delivery, "om_1", 2, CardWriteIntent::Collect, &newer).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Delivered));
+
+        let ticket = submit(&delivery, "om_1", 1, CardWriteIntent::Stamp, &stale).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Superseded));
+        assert_eq!(
+            inner.attempts().len(),
+            1,
+            "the stale submission never reached Feishu"
+        );
+    }
+
+    /// Same-generation submissions land in submission order: while a write is
+    /// in flight the newer submission waits, and the newer decision is the
+    /// card's last write (rule (b)).
+    #[tokio::test]
+    async fn an_in_flight_submission_lands_before_the_newer_one() {
+        let inner = Arc::new(FakePlatform::new());
+        let delivery = Arc::new(CardDelivery::new(inner.clone()));
+        let stamp = serde_json::json!({ "body": "stamped" });
+        let collect = serde_json::json!({ "body": "collected" });
+
+        let (entered, release) = inner.park_next();
+        let first = submit(&delivery, "om_1", 1, CardWriteIntent::Stamp, &stamp).await;
+        entered.notified().await;
+
+        let second = submit(&delivery, "om_1", 1, CardWriteIntent::Collect, &collect).await;
+        // The newer submission must not overtake the write in flight.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            inner.attempts().len(),
+            1,
+            "the newer submission waits for the in-flight one"
+        );
+
+        release.notify_one();
+        assert!(matches!(first.settled().await, WriteOutcome::Delivered));
+        assert!(matches!(second.settled().await, WriteOutcome::Delivered));
+        assert_eq!(
+            inner.attempts(),
+            vec![("om_1".to_string(), stamp), ("om_1".to_string(), collect)],
+            "the newer submission landed after the in-flight one"
+        );
+    }
+
+    /// The waiting slot is a single slot: a newer submission replaces the one
+    /// waiting there, whose ticket settles superseded — it never reaches the
+    /// wire. The newest payload of a key is what lands (rule (c)).
+    #[tokio::test]
+    async fn the_newest_submission_replaces_the_waiting_slot() {
+        let inner = Arc::new(FakePlatform::new());
+        let delivery = Arc::new(CardDelivery::new(inner.clone()));
+        let collect = serde_json::json!({ "body": "collected" });
+        let replanned = serde_json::json!({ "body": "replanned" });
+        let newest = serde_json::json!({ "body": "newest" });
+
+        let (entered, release) = inner.park_next();
+        let in_flight = submit(&delivery, "om_1", 1, CardWriteIntent::Collect, &collect).await;
+        entered.notified().await;
+
+        // Both are the same logical write (Stamp at generation 1): the newest
+        // payload is the one that lands.
+        let displaced = submit(&delivery, "om_1", 1, CardWriteIntent::Stamp, &replanned).await;
+        let waiting = submit(&delivery, "om_1", 1, CardWriteIntent::Stamp, &newest).await;
+
+        release.notify_one();
+        assert!(matches!(displaced.settled().await, WriteOutcome::Superseded));
+        assert!(matches!(waiting.settled().await, WriteOutcome::Delivered));
+        assert!(matches!(in_flight.settled().await, WriteOutcome::Delivered));
+        assert_eq!(
+            inner.attempts(),
+            vec![("om_1".to_string(), collect), ("om_1".to_string(), newest)],
+            "the displaced payload never reached Feishu"
+        );
+    }
+
+    /// A key that already delivered never writes again: a writer's per-tick
+    /// re-decision of the same generation and intent is free (rule (d)).
+    #[tokio::test]
+    async fn a_settled_key_is_never_written_again() {
+        let inner = Arc::new(FakePlatform::new());
+        let delivery = CardDelivery::new(inner.clone());
+        let first = serde_json::json!({ "body": "stamped once" });
+        let again = serde_json::json!({ "body": "stamped twice" });
+
+        let ticket = submit(&delivery, "om_1", 1, CardWriteIntent::Stamp, &first).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Delivered));
+
+        let ticket = submit(&delivery, "om_1", 1, CardWriteIntent::Stamp, &again).await;
+        assert!(
+            matches!(ticket.settled().await, WriteOutcome::Delivered),
+            "the card already holds this logical write"
+        );
+        assert_eq!(inner.attempts().len(), 1, "the re-decision never reached Feishu");
+    }
+
+    /// A newer generation forgets the older one's settled keys: the same intent
+    /// at a newer generation is a newer chain state and writes.
+    #[tokio::test]
+    async fn a_newer_generation_forgets_the_older_keys() {
+        let inner = Arc::new(FakePlatform::new());
+        let delivery = CardDelivery::new(inner.clone());
+        let old = serde_json::json!({ "body": "old chain" });
+        let new = serde_json::json!({ "body": "new chain" });
+
+        let ticket = submit(&delivery, "om_1", 1, CardWriteIntent::Collect, &old).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Delivered));
+        let ticket = submit(&delivery, "om_1", 2, CardWriteIntent::Collect, &new).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Delivered));
+        assert_eq!(
+            inner.attempts(),
+            vec![("om_1".to_string(), old), ("om_1".to_string(), new)],
+            "the newer generation's collect wrote again"
+        );
+    }
+
+    /// A permanent refusal settles the key, and later same-key submissions are
+    /// dropped without a Feishu call (#522, rule (d)).
+    #[tokio::test]
+    async fn a_permanent_refusal_settles_the_key_and_drops_resubmissions() {
+        let inner = Arc::new(FakePlatform::new());
+        inner.fail_next(Fail::ContentRejected);
+        let delivery = CardDelivery::new(inner.clone());
+        let refused = serde_json::json!({ "body": "refused" });
+        let again = serde_json::json!({ "body": "refused again" });
+
+        let ticket = submit(&delivery, "om_1", 1, CardWriteIntent::Collect, &refused).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Failed(_)));
+
+        let ticket = submit(&delivery, "om_1", 1, CardWriteIntent::Collect, &again).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Superseded));
+        assert_eq!(inner.attempts().len(), 1, "the refused key never wrote again");
+    }
+
+    /// A permanent refusal also drops a newer payload of the same key that was
+    /// already waiting: the key is refused, so nothing of it is written again
+    /// — one call, not a retry loop behind an unrenderable card (#522).
+    #[tokio::test]
+    async fn a_permanent_refusal_drops_a_waiting_payload_of_the_same_key() {
+        let inner = Arc::new(FakePlatform::new());
+        inner.fail_next(Fail::ContentRejected);
+        let (entered, release) = inner.park_next();
+        let delivery = Arc::new(CardDelivery::new(inner.clone()));
+        let refused = serde_json::json!({ "body": "refused" });
+        let newer = serde_json::json!({ "body": "refused too" });
+
+        let first = submit(&delivery, "om_1", 1, CardWriteIntent::Collect, &refused).await;
+        entered.notified().await;
+        let second = submit(&delivery, "om_1", 1, CardWriteIntent::Collect, &newer).await;
+        release.notify_one();
+
+        assert!(matches!(first.settled().await, WriteOutcome::Failed(_)));
+        assert!(matches!(second.settled().await, WriteOutcome::Superseded));
+        assert_eq!(inner.attempts().len(), 1, "the refused key never wrote again");
+    }
+
+    /// Another key's waiting payload is a different logical write: a refusal
+    /// settles only its own key.
+    #[tokio::test]
+    async fn a_refusal_settles_only_its_own_key() {
+        let inner = Arc::new(FakePlatform::new());
+        inner.fail_next(Fail::ContentRejected);
+        let (entered, release) = inner.park_next();
+        let delivery = Arc::new(CardDelivery::new(inner.clone()));
+        let refused = serde_json::json!({ "body": "refused" });
+        let stamp = serde_json::json!({ "body": "stamp" });
+
+        let first = submit(&delivery, "om_1", 1, CardWriteIntent::Collect, &refused).await;
+        entered.notified().await;
+        let second = submit(&delivery, "om_1", 1, CardWriteIntent::Stamp, &stamp).await;
+        release.notify_one();
+
+        assert!(matches!(first.settled().await, WriteOutcome::Failed(_)));
+        assert!(matches!(second.settled().await, WriteOutcome::Delivered));
+        assert_eq!(
+            inner.attempts(),
+            vec![("om_1".to_string(), refused), ("om_1".to_string(), stamp)],
+            "the other key's payload still landed"
+        );
+    }
+
+    /// Keyless writes keep today's semantics: they are never dropped for
+    /// staleness and serialize on the same per-card lock as the queue.
+    #[tokio::test]
+    async fn a_keyless_write_is_never_dropped_and_serializes_with_the_queue() {
+        let inner = Arc::new(FakePlatform::new());
+        let delivery = Arc::new(CardDelivery::new(inner.clone()));
+        let keyed = serde_json::json!({ "body": "keyed" });
+        let keyless = serde_json::json!({ "body": "keyless" });
+
+        let (entered, release) = inner.park_next();
+        let ticket = submit(&delivery, "om_1", 5, CardWriteIntent::Collect, &keyed).await;
+        entered.notified().await;
+
+        let writing = tokio::spawn({
+            let delivery = Arc::clone(&delivery);
+            let keyless = keyless.clone();
+            async move { delivery.update_message("om_1", &keyless).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            inner.attempts().len(),
+            1,
+            "the keyless write waits for the card's write in flight"
+        );
+
+        release.notify_one();
+        assert!(matches!(ticket.settled().await, WriteOutcome::Delivered));
+        writing.await.unwrap().unwrap();
+        assert_eq!(
+            inner.attempts(),
+            vec![("om_1".to_string(), keyed), ("om_1".to_string(), keyless)],
+            "the keyless write landed, never dropped for the keyed write's generation"
+        );
+    }
+
+    /// A platform with no delivery decorator keeps compiling and writes
+    /// through the unordered fallback: the default `submit_ordered` delegates
+    /// to its own `update_message`.
+    #[tokio::test]
+    async fn the_unordered_fallback_writes_through_update_message() {
+        let inner = Arc::new(FakePlatform::new());
+        let card = serde_json::json!({ "body": "fallback" });
+
+        let ticket = inner
+            .submit_ordered(KeyedSubmission {
+                message_id: "om_1",
+                generation: 3,
+                intent: CardWriteIntent::Collect,
+                card: &card,
+            })
+            .await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Delivered));
+        assert_eq!(inner.attempts(), vec![("om_1".to_string(), card.clone())]);
+
+        inner.fail_next(Fail::ContentRejected);
+        let ticket = inner
+            .submit_ordered(KeyedSubmission {
+                message_id: "om_2",
+                generation: 3,
+                intent: CardWriteIntent::Stamp,
+                card: &card,
+            })
+            .await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Failed(_)));
+        assert_eq!(inner.attempts().len(), 2, "the fallback writes straight through");
+    }
+
+    /// A recoverable failure stays owed with its key: the caller sees its own
+    /// attempt's failure, and the drain retries the same payload.
+    #[tokio::test]
+    async fn a_recoverable_failure_stays_owed_for_the_drain() {
+        let inner = Arc::new(FakePlatform::new());
+        inner.fail_next(Fail::Transport);
+        let delivery = CardDelivery::new(inner.clone());
+        let card = serde_json::json!({ "body": "collect" });
+
+        let ticket = submit(&delivery, "om_1", 1, CardWriteIntent::Collect, &card).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Failed(_)));
+
+        delivery.drain_pending_card_updates(true).await;
+        assert_eq!(
+            inner.attempts(),
+            vec![("om_1".to_string(), card.clone()), ("om_1".to_string(), card)],
+            "the owed keyed write was retried with its own payload"
+        );
+    }
+
+    /// The pass drain waits for the keyed write's backoff — doubled on each
+    /// failure like the outbox's — and a forced drain ignores it.
+    #[tokio::test(start_paused = true)]
+    async fn the_keyed_retry_waits_for_the_backoff_unless_forced() {
+        let inner = Arc::new(FakePlatform::new());
+        inner.fail_next(Fail::Transport);
+        let delivery = CardDelivery::with_limits(
+            inner.clone(),
+            MAX_PENDING,
+            Duration::from_secs(5),
+            Duration::from_secs(20),
+        );
+        let card = serde_json::json!({ "body": "collect" });
+        let ticket = submit(&delivery, "om_1", 1, CardWriteIntent::Collect, &card).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Failed(_)));
+
+        delivery.drain_pending_card_updates(false).await;
+        assert_eq!(inner.attempts().len(), 1, "not due yet");
+
+        tokio::time::advance(Duration::from_secs(5)).await;
+        delivery.drain_pending_card_updates(false).await;
+        assert_eq!(inner.attempts().len(), 2, "due after the base backoff");
+
+        // A failed retry doubles the delay: 10s after it, not due; at 10s, due.
+        inner.fail_next(Fail::Transport);
+        let ticket = submit(&delivery, "om_1", 2, CardWriteIntent::Collect, &card).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Failed(_)));
+        inner.fail_next(Fail::Transport); // the forced retry fails too
+        delivery.drain_pending_card_updates(true).await; // forced: retries at once
+        assert_eq!(inner.attempts().len(), 4);
+        delivery.drain_pending_card_updates(false).await;
+        assert_eq!(inner.attempts().len(), 4, "not due at the doubled backoff yet");
+        tokio::time::advance(Duration::from_secs(10)).await;
+        delivery.drain_pending_card_updates(false).await;
+        assert_eq!(inner.attempts().len(), 5, "due at the doubled backoff");
+    }
+
+    /// A newer submission supersedes an owed keyed write: the newest decision
+    /// writes promptly instead of waiting for the older one's retry backoff.
+    #[tokio::test]
+    async fn a_newer_submission_supersedes_an_owed_write() {
+        let inner = Arc::new(FakePlatform::new());
+        inner.fail_next(Fail::Transport);
+        let delivery = CardDelivery::new(inner.clone());
+        let stamp = serde_json::json!({ "body": "stamp" });
+        let collect = serde_json::json!({ "body": "collect" });
+
+        let ticket = submit(&delivery, "om_1", 2, CardWriteIntent::Stamp, &stamp).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Failed(_)));
+
+        let ticket = submit(&delivery, "om_1", 3, CardWriteIntent::Collect, &collect).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Delivered));
+        assert_eq!(
+            inner.attempts(),
+            vec![("om_1".to_string(), stamp), ("om_1".to_string(), collect)],
+            "the newest decision wrote without waiting for the older backoff"
+        );
+    }
+
+    /// A recoverable failure with a newer submission waiting is superseded by
+    /// it (newest wins): the newest payload lands instead of the retry.
+    #[tokio::test]
+    async fn a_failed_write_is_superseded_by_the_waiting_one() {
+        let inner = Arc::new(FakePlatform::new());
+        inner.fail_next(Fail::Transport);
+        let (entered, release) = inner.park_next();
+        let delivery = Arc::new(CardDelivery::new(inner.clone()));
+        let stamp = serde_json::json!({ "body": "stamp" });
+        let collect = serde_json::json!({ "body": "collect" });
+
+        let first = submit(&delivery, "om_1", 1, CardWriteIntent::Stamp, &stamp).await;
+        entered.notified().await;
+        let second = submit(&delivery, "om_1", 1, CardWriteIntent::Collect, &collect).await;
+        release.notify_one();
+
+        assert!(matches!(first.settled().await, WriteOutcome::Failed(_)));
+        assert!(matches!(second.settled().await, WriteOutcome::Delivered));
+        assert_eq!(
+            inner.attempts(),
+            vec![("om_1".to_string(), stamp), ("om_1".to_string(), collect)],
+            "the waiting newer payload landed, not the failed retry"
+        );
+    }
+
+    /// The keyless outbox and the keyed queue share one entry without
+    /// disturbing each other: a failed keyless payload stays owed and is still
+    /// delivered — keyless writes are never dropped — while a keyed write
+    /// lands on its own.
+    #[tokio::test]
+    async fn a_keyless_failure_and_a_keyed_write_share_the_card() {
+        let inner = Arc::new(FakePlatform::new());
+        inner.fail_next(Fail::Transport);
+        let delivery = CardDelivery::new(inner.clone());
+        let owed = serde_json::json!({ "body": "keyless owed" });
+        let keyed = serde_json::json!({ "body": "keyed" });
+
+        let _ = delivery.update_message("om_1", &owed).await;
+        assert!(delivery.pending("om_1"), "the keyless failure is owed");
+
+        let ticket = submit(&delivery, "om_1", 1, CardWriteIntent::Collect, &keyed).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Delivered));
+        assert!(
+            delivery.pending("om_1"),
+            "the keyed delivery never settles the keyless outbox entry"
+        );
+
+        delivery.drain_pending_card_updates(true).await;
+        assert_eq!(
+            inner.attempts().last(),
+            Some(&("om_1".to_string(), owed)),
+            "the owed keyless payload was still delivered"
+        );
+        assert!(!delivery.pending("om_1"));
+    }
+
+    /// The drain's keyed retry never blocks on a card another writer holds:
+    /// the pass skips it and a later drain converges.
+    #[tokio::test]
+    async fn the_drain_skips_a_card_another_writer_holds() {
+        let inner = Arc::new(FakePlatform::new());
+        inner.fail_next(Fail::Transport);
+        let delivery = Arc::new(CardDelivery::new(inner.clone()));
+        let card = serde_json::json!({ "body": "stamp" });
+
+        let ticket = submit(&delivery, "om_1", 1, CardWriteIntent::Stamp, &card).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Failed(_)));
+
+        // A keyless writer holds the card's delivery lock mid-flight.
+        let (entered, release) = inner.park_next();
+        let writing = tokio::spawn({
+            let delivery = Arc::clone(&delivery);
+            async move {
+                delivery
+                    .update_message("om_1", &serde_json::json!({ "body": "keyless" }))
+                    .await
+            }
+        });
+        entered.notified().await;
+
+        delivery.drain_pending_card_updates(true).await;
+        assert_eq!(
+            inner.attempts().len(),
+            2,
+            "the keyed retry was skipped, not awaited behind the live writer"
+        );
+
+        release.notify_one();
+        writing.await.unwrap().unwrap();
+        delivery.drain_pending_card_updates(true).await;
+        assert_eq!(
+            inner.attempts().len(),
+            3,
+            "the keyed write converged on the next drain"
+        );
     }
 }
