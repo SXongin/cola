@@ -136,7 +136,14 @@ drops stale intents, collapses duplicates and retries failures.
   unchanged: serialized on the same per-card delivery lock, never dropped for
   staleness. The per-card state machine, the entry cap, the delivered-sequence
   set and the backoff are the outbox's (ADR-0067); the keyed slots are added
-  beside them. The key and intent types live at the delivery seam, so the
+  beside them. Across the classes, **a keyed state write supersedes an owed
+  keyless payload** (spec #571 review): an accepted keyed submission (a collect,
+  an ending) tombstones the card's pending payload — keeping the delivered
+  sequences and the failure memory — so the drain can never resurrect a
+  pre-collect payload over the newer keyed state and make a collected card look
+  live again; a keyless write that fails *after* the keyed state is the newer
+  writer and stays owed as today (newest wins within the keyless class). The
+  key and intent types live at the delivery seam, so the
   Feishu layer keeps no dependency on the bridge. `Platform` gains
   `submit_ordered` with a default implementation that delegates to
   `update_message` — the unordered fallback for an unwrapped platform (tests,

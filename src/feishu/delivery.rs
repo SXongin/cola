@@ -47,7 +47,10 @@
 //!   review), so a degradation — a preserved ending's bare retry, a collect's
 //!   bare marker — can never land over a newer generation;
 //! - serializes keyless and keyed writes on the same per-card delivery lock —
-//!   a keyless write is never dropped for staleness.
+//!   a keyless write is never dropped for staleness — while an **accepted keyed
+//!   state write supersedes an owed keyless payload** (spec #571 review): the
+//!   payload is tombstoned, so the drain can never resurrect it over the newer
+//!   keyed state (a collected card must not look live again).
 //!
 //! The queue also answers whether a card's **ending** is still owed
 //! ([`CardDelivery::pending`] counts a keyed `Settle` the queue holds, not only
@@ -967,6 +970,15 @@ impl CardDelivery {
         } else if (entry.floor, entry.ending_gen) != state_before {
             entry.order_state_since = Some(now);
         }
+        // An accepted keyed state write supersedes an owed keyless payload
+        // (spec #571 review): the payload predates the keyed state (a collect,
+        // an ending), so the drain must never resurrect it over it — a
+        // collected card must not start looking live again. The tombstone keeps
+        // the existing bookkeeping (the delivered sequences the cursor
+        // reconcile reads, the failure memory); only the payload goes. A
+        // keyless failure AFTER the keyed state is the newer writer and stays
+        // owed as today.
+        entry.card = None;
         let mut write = QueuedWrite::new(token, submission, now);
         // The ticket lives with the queue until the submission settles: a
         // displaced or dropped slot still answers its caller.
@@ -4042,17 +4054,20 @@ mod tests {
         assert!(matches!(duplicate.settled().await, WriteOutcome::Delivered));
     }
 
-    /// The keyless outbox and the keyed queue share one entry without
-    /// disturbing each other: a failed keyless payload stays owed and is still
-    /// delivered — keyless writes are never dropped — while a keyed write
-    /// lands on its own.
+    /// A keyed state write supersedes an owed keyless payload (spec #571
+    /// review): the payload predates the keyed state, so the drain must never
+    /// resurrect it over it — a collected card must not look live again. Its
+    /// tombstone keeps the bookkeeping. A keyless failure AFTER the keyed state
+    /// is the newer writer and stays owed as today (newest wins within the
+    /// keyless class).
     #[tokio::test]
-    async fn a_keyless_failure_and_a_keyed_write_share_the_card() {
+    async fn a_keyed_write_supersedes_an_owed_keyless_payload() {
         let inner = Arc::new(FakePlatform::new());
         inner.fail_next(Fail::Transport);
         let delivery = CardDelivery::new(inner.clone());
         let owed = serde_json::json!({ "body": "keyless owed" });
-        let keyed = serde_json::json!({ "body": "keyed" });
+        let keyed = serde_json::json!({ "body": "collected" });
+        let late = serde_json::json!({ "body": "keyless later" });
 
         let _ = delivery.update_message("om_1", &owed).await;
         assert!(delivery.pending("om_1"), "the keyless failure is owed");
@@ -4060,15 +4075,28 @@ mod tests {
         let ticket = submit(&delivery, "om_1", 1, CardWriteIntent::Collect, &keyed).await;
         assert!(matches!(ticket.settled().await, WriteOutcome::Delivered));
         assert!(
-            delivery.pending("om_1"),
-            "the keyed delivery never settles the keyless outbox entry"
+            !delivery.pending("om_1"),
+            "the keyed state superseded the owed keyless payload"
         );
 
+        // The drain never re-writes the superseded payload.
+        delivery.drain_pending_card_updates(true).await;
+        assert_eq!(
+            inner.attempts(),
+            vec![("om_1".to_string(), owed), ("om_1".to_string(), keyed)],
+            "the superseded keyless payload is never retried"
+        );
+
+        // A keyless failure after the keyed state is the newer writer: it
+        // stays owed and the drain delivers it.
+        inner.fail_next(Fail::Transport);
+        let _ = delivery.update_message("om_1", &late).await;
+        assert!(delivery.pending("om_1"), "the later keyless failure is owed");
         delivery.drain_pending_card_updates(true).await;
         assert_eq!(
             inner.attempts().last(),
-            Some(&("om_1".to_string(), owed)),
-            "the owed keyless payload was still delivered"
+            Some(&("om_1".to_string(), late)),
+            "the newer keyless writer still lands"
         );
         assert!(!delivery.pending("om_1"));
     }

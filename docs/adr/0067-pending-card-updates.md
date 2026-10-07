@@ -104,6 +104,12 @@ The Decision's sequence rule — the monotonic per-card sequence, newest payload
 wins, a slow failed retry never resurrects a superseded payload — governs the
 keyless `update_message` class alone; a keyless write is never dropped for
 staleness and serializes on the same per-card delivery lock as a keyed write.
+Across the classes, an **accepted keyed state write supersedes an owed keyless
+payload**: the payload is tombstoned (its delivered sequences and failure
+memory kept), so the drain can never resurrect a pre-collect payload over the
+newer keyed state and make a collected card look live again (spec #571 review).
+A keyless write that fails *after* the keyed state is the newer writer and
+stays owed as before.
 
 Two rules read under the amendment:
 
