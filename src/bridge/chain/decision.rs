@@ -231,13 +231,15 @@ impl RecoveryReads<'_> {
     }
 
     /// Whether the successor branch's collect is owed: no claim owns the
-    /// record, and a successor card owns the session. The collect precedes the
-    /// decision because it is an awaited card write and the successor's armed
-    /// anchor cannot be trusted before it returns — a takeover can arm the
-    /// anchor while the write is in flight. The caller collects and then
-    /// re-reads the anchor ([`CardProbe::Successor`]), so the decision sees the
-    /// post-collect fact; the id and `running` stay the pre-collect ones,
-    /// exactly the facts the pass read before the split.
+    /// record, and a successor card owns the session. The collect is handed
+    /// off before the decision — detached since spec #571's reviews, so the
+    /// pass never awaits it — carrying the **handover's** generation (the
+    /// lagging record's + 1). The successor's armed anchor cannot be trusted
+    /// before that hand-off — a takeover can arm the anchor around the collect
+    /// — so the caller re-reads the anchor ([`CardProbe::Successor`]) right
+    /// after it and the decision sees the post-hand-off fact; the id and
+    /// `running` stay the pre-collect ones, exactly the facts the pass read
+    /// before the split.
     pub(crate) fn needs_successor_collect(&self) -> bool {
         !self.claimed && matches!(self.card, CardProbe::Successor { .. })
     }

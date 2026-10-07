@@ -3721,6 +3721,136 @@ async fn a_record_that_lagged_a_handover_collects_the_orphan_and_repoints() {
     );
 }
 
+/// The lagged handover the reap **releases** — the successor is attached but
+/// still anchorless, so the recorded orphan is collected and the record is
+/// spent — must collect at the HANDOVER's generation, not at whatever a read
+/// inside the detached task finds (spec #571 review). Read after the release
+/// that is no record at all — generation zero — and the old chain's late
+/// stamp, its pre-submission read outliving the handover, would be admitted at
+/// the same generation and repaint 「已重启」 over the takeover notice. The
+/// stamp's own key, submitted through the queue's public seam, must be dropped
+/// below the collect's generation.
+#[tokio::test]
+async fn a_released_lagged_handover_collects_at_the_handover_generation() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
+
+    let (app, platform) = restarted_app(&session_file, completed(1_000), None).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+    // The process's live successor — attached, still anchorless: the reap
+    // collects the recorded orphan and releases the record.
+    Turn::seed_card(&app.cards_handle(), "ses_test", Some("om_live")).await;
+    let lagging = app.cards_handle().chains.generation("ses_test");
+
+    spawn_sync(&app);
+    wait_for_patches(&platform, "om_frozen", 1).await;
+    assert!(
+        app.cards_handle().chains.get("ses_test").is_none(),
+        "the anchorless successor cannot carry the record: it is released"
+    );
+    assert_eq!(
+        card_header(&patches_to(&platform, "om_frozen").await[0]),
+        "⏳ 已由新卡片接管 · 已停止更新"
+    );
+
+    // The old chain's stamp, decided under the lagging record's generation:
+    // the handover's collect owns that generation's card now, so the stamp is
+    // dropped without a Feishu call — never painted over the notice.
+    let stale = crate::feishu::card::shell::CardBuilder::new()
+        .with_state(CardState::Restarted)
+        .build();
+    let outcome = app
+        .cards_handle()
+        .feishu
+        .submit_ordered(crate::feishu::delivery::KeyedSubmission {
+            message_id: "om_frozen",
+            generation: lagging,
+            intent: crate::feishu::delivery::CardWriteIntent::Stamp,
+            card: &stale,
+            fallback: None,
+        })
+        .await
+        .settled()
+        .await;
+    assert!(
+        matches!(outcome, crate::feishu::delivery::WriteOutcome::Superseded),
+        "a stamp at the lagging generation is dropped below the handover's collect"
+    );
+    assert_eq!(
+        patches_to(&platform, "om_frozen").await.len(),
+        1,
+        "no write followed the collect"
+    );
+}
+
+/// The lagged handover the reap **re-points** — a running successor with an
+/// armed anchor — collects the orphan at the HANDOVER's generation too (spec
+/// #571 review), so it outranks every write the old chain decided under the
+/// lagging record's generation even while a prior stamp's read is still
+/// outstanding. The record ends following the successor with the successor's
+/// anchor, and the late stamp's key is dropped below the collect.
+#[tokio::test]
+async fn a_repointed_lagged_handover_collects_at_the_handover_generation() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_chain_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
+    );
+
+    let (app, platform) = restarted_app(&session_file, completed(1_000), None).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+    // The process's live card: a handover the record missed, its anchor armed.
+    Turn::seed_card(&app.cards_handle(), "ses_test", Some("om_new")).await;
+    Turn::set_turn_anchor(&app.cards_handle(), "ses_test", &turn_anchor(1_000)).await;
+    let lagging = app.cards_handle().chains.generation("ses_test");
+
+    spawn_sync(&app);
+    wait_for_patches(&platform, "om_frozen", 1).await;
+    // The record follows the successor with the successor's anchor.
+    wait_for_record_card(&app, "ses_test", "om_new").await;
+    let record = app.cards_handle().chains.get("ses_test").unwrap();
+    assert_eq!(
+        record.message_id,
+        MessageId::new("msg_anchor_1000"),
+        "the successor's anchor scopes the reaped chain"
+    );
+
+    // The old chain's stamp, decided under the lagging record's generation:
+    // the handover's collect outranks it.
+    let stale = crate::feishu::card::shell::CardBuilder::new()
+        .with_state(CardState::Restarted)
+        .build();
+    let outcome = app
+        .cards_handle()
+        .feishu
+        .submit_ordered(crate::feishu::delivery::KeyedSubmission {
+            message_id: "om_frozen",
+            generation: lagging,
+            intent: crate::feishu::delivery::CardWriteIntent::Stamp,
+            card: &stale,
+            fallback: None,
+        })
+        .await
+        .settled()
+        .await;
+    assert!(
+        matches!(outcome, crate::feishu::delivery::WriteOutcome::Superseded),
+        "a stamp at the lagging generation is dropped below the handover's collect"
+    );
+    assert_eq!(
+        patches_to(&platform, "om_frozen").await.len(),
+        1,
+        "no write followed the collect"
+    );
+}
+
 /// A successor can be attached before its Turn anchor is armed. The pass reads
 /// the armed anchor itself (the card probe) and re-reads it right after the
 /// collect is handed off, so an anchor that lands around the collect must still

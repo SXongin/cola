@@ -134,6 +134,7 @@ pub(crate) async fn collect_orphan(cards: &CardsHandle, session_id: &str, card_m
         card_message_id,
         KeepBody::Everything,
         CardWriteIntent::Collect,
+        CollectGeneration::AtSubmission,
     )
     .await;
 }
@@ -170,6 +171,7 @@ pub(crate) async fn collect_orphan_after_takeover(
         card_message_id,
         keep,
         CardWriteIntent::TakeoverCollect,
+        CollectGeneration::AtSubmission,
     )
     .await;
 }
@@ -188,13 +190,28 @@ fn takeover_keep(resolved_calls: &[String]) -> KeepBody {
 /// submission and the completion handling — runs on a detached task, so the
 /// reap pass returns immediately after deciding and never awaits a Feishu call
 /// (GET or PATCH).
-pub(crate) fn collect_orphan_detached(cards: &CardsHandle, session_id: &str, card_message_id: &str) {
+///
+/// `handover_generation` is the ordering generation the write carries: the
+/// reap's successor collect belongs to the HANDOVER — the generation the
+/// re-point assigns the lagging record, one past it — never to whatever a read
+/// inside the detached task would find (spec #571 review). The record may
+/// still name the orphan when the task runs (and the pass may release it
+/// instead of re-pointing it), so that read would name the lagging generation
+/// — or, once released, none at all — and the old chain's late stamp at the
+/// lagging generation could land after the takeover notice.
+pub(crate) fn collect_orphan_detached(
+    cards: &CardsHandle,
+    session_id: &str,
+    card_message_id: &str,
+    handover_generation: u64,
+) {
     spawn_collect(
         cards,
         session_id,
         card_message_id,
         KeepBody::Everything,
         CardWriteIntent::Collect,
+        CollectGeneration::Handover(handover_generation),
     );
 }
 
@@ -212,6 +229,7 @@ pub(crate) fn collect_orphan_after_takeover_detached(
         card_message_id,
         takeover_keep(resolved_calls),
         CardWriteIntent::TakeoverCollect,
+        CollectGeneration::AtSubmission,
     );
 }
 
@@ -232,7 +250,23 @@ pub(crate) fn collect_late_projection_detached(cards: &CardsHandle, session_id: 
         card_message_id,
         KeepBody::Nothing,
         CardWriteIntent::LateProjectionCollect,
+        CollectGeneration::AtSubmission,
     );
+}
+
+/// Where one collect's ordering generation comes from (spec #571 review).
+#[derive(Clone, Copy)]
+enum CollectGeneration {
+    /// Read from the chain **at submission**, after the composition read — the
+    /// default (spec #571's amendment): a takeover that re-points the chain
+    /// during that read bumps the generation, and the collect is then the NEW
+    /// chain state's write, never a snapshot's stale one the queue would drop.
+    AtSubmission,
+    /// The **handover's own generation**, decided by the caller before the
+    /// detached task exists (spec #571 review): the lagging handover's collect
+    /// must outrank the old chain's writes even though the record may still
+    /// name the orphan when the task runs.
+    Handover(u64),
 }
 
 /// Spawn one collect's whole pipeline on a detached task (spec #571 review),
@@ -243,22 +277,26 @@ fn spawn_collect(
     card_message_id: &str,
     keep: KeepBody,
     intent: CardWriteIntent,
+    ordering: CollectGeneration,
 ) {
     let cards = cards.clone();
     let session_id = session_id.to_string();
     let card_message_id = card_message_id.to_string();
     tokio::spawn(async move {
-        collect_pipeline(&cards, &session_id, &card_message_id, keep, intent).await;
+        collect_pipeline(&cards, &session_id, &card_message_id, keep, intent, ordering).await;
     });
 }
 
 /// The shared collect pipeline behind every `collect_orphan*` form: one keyed
 /// submission naming the successor, terminal and grey, its preserved body
-/// under `keep`, carrying the **chain generation the write belongs to** — read
-/// from the chain immediately before the submission, after the composition
-/// read above (spec #571 review): a takeover that re-points the chain during
-/// that read bumps the generation, and this collect is then the NEW chain
-/// state's write, never a snapshot's stale one the queue would drop. The bare
+/// under `keep`, carrying the **chain generation the write belongs to** — by
+/// [`CollectGeneration::AtSubmission`], read from the chain immediately before
+/// the submission, after the composition read above (spec #571 review): a
+/// takeover that re-points the chain during that read bumps the generation,
+/// and this collect is then the NEW chain state's write, never a snapshot's
+/// stale one the queue would drop. The reap's lagging handover passes its own
+/// [`CollectGeneration::Handover`] instead (spec #571 review): its write
+/// belongs to the handover, not to the record the task may still see. The bare
 /// ending rides as the submission's fallback (spec #571 review): a platform
 /// that refuses the preserved shape as card content degrades to it inside the
 /// queue, under the same key and lock, so the degradation can never land over
@@ -277,6 +315,7 @@ async fn collect_pipeline(
     card_message_id: &str,
     keep: KeepBody,
     intent: CardWriteIntent,
+    ordering: CollectGeneration,
 ) {
     if card_message_id.is_empty() {
         return;
@@ -291,7 +330,10 @@ async fn collect_pipeline(
         view_timeout_ms,
     )
     .await;
-    let generation = cards.chains.generation(session_id);
+    let generation = match ordering {
+        CollectGeneration::AtSubmission => cards.chains.generation(session_id),
+        CollectGeneration::Handover(generation) => generation,
+    };
     let bound = cards.feishu.keyed_ticket_await();
     let ticket = cards
         .feishu
@@ -412,7 +454,18 @@ pub(crate) async fn reconcile(
     // missed. Only the anchor is re-read — the id and running stay the
     // pre-collect facts the pre-split pass entered the branch with.
     if reads.needs_successor_collect() {
-        collect_orphan_detached(&handles.cards, session_id, &record.card_message_id);
+        // The collect carries the HANDOVER's generation — the lagging record's
+        // + 1, exactly what the re-point below assigns — never a generation
+        // read inside the detached task (spec #571 review): the record may
+        // still name the orphan when that task runs, and the pass may release
+        // it instead of re-pointing it, so the old chain's late stamp at the
+        // lagging generation could land after the takeover notice.
+        collect_orphan_detached(
+            &handles.cards,
+            session_id,
+            &record.card_message_id,
+            record.generation.saturating_add(1),
+        );
         let anchor = Turn::armed_turn_anchor(&handles.cards, session_id).await;
         if let CardProbe::Successor { anchor: slot, .. } = &mut reads.card {
             *slot = anchor;
