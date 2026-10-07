@@ -162,6 +162,16 @@ pub(crate) struct RenderedCursor {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ChainRecord {
     pub(crate) card_message_id: String,
+    /// In-memory only: this chain's **Chain Generation** (spec #571, ticket
+    /// #572) — a monotonic version of the tracked card identity, bumped
+    /// whenever a track, a re-point or a takeover rewrites the record onto a
+    /// DIFFERENT card. A decision captures it together with the snapshot it
+    /// decided from, so a card write can submit with the state version it
+    /// read. Never persisted: a fresh process life (and so a record loaded
+    /// from disk) starts at zero, and the generation dies with the record it
+    /// belongs to.
+    #[serde(skip)]
+    pub(crate) generation: u64,
     pub(crate) message_id: MessageId,
     #[serde(default)]
     pub(crate) created_ms: Option<i64>,
@@ -254,6 +264,7 @@ impl ChainRecord {
     ) -> Self {
         Self {
             card_message_id: card_message_id.into(),
+            generation: 0,
             message_id,
             created_ms,
             directory: None,
@@ -285,6 +296,18 @@ impl ChainRecord {
             message_id: self.message_id.clone(),
             created_ms: self.created_ms?,
         })
+    }
+}
+
+/// The in-memory **Chain Generation** a record write leaves behind (spec #571,
+/// ticket #572): a record replacing one that named the same card carries its
+/// generation (a re-track is not an identity change), a record re-pointed onto
+/// a different card bumps it by one, and a genuinely new chain starts at zero.
+fn chain_generation(previous: Option<&ChainRecord>, card_message_id: &str) -> u64 {
+    match previous {
+        Some(previous) if previous.card_message_id == card_message_id => previous.generation,
+        Some(previous) => previous.generation.saturating_add(1),
+        None => 0,
     }
 }
 
@@ -436,6 +459,7 @@ impl ChainRecords {
         let previous = state.records.get(session_id).cloned();
         let mut record = ChainRecord::new(card_message_id, message_id, created_ms)
             .with_directory(directory.map(str::to_string));
+        record.generation = chain_generation(previous.as_ref(), &record.card_message_id);
         if let Some(previous) = &previous {
             record.cursor = previous.cursor.clone();
             // The owed orphan gap is chain-level too (spec #561, review #569):
@@ -479,6 +503,7 @@ impl ChainRecords {
         let previous = state.records.get(session_id).cloned();
         let mut record = ChainRecord::new(card_message_id, message_id.clone(), created_ms)
             .with_directory(directory.map(str::to_string));
+        record.generation = chain_generation(previous.as_ref(), &record.card_message_id);
         if let Some(previous) = &previous {
             record.cursor = previous.cursor.clone();
             record.pending_gap = previous.pending_gap.clone().or_else(|| {
@@ -538,6 +563,7 @@ impl ChainRecords {
         let previous = state.records.get(session_id).cloned();
         let mut record = ChainRecord::new(card_message_id, message_id, created_ms)
             .with_directory(directory.map(str::to_string));
+        record.generation = chain_generation(previous.as_ref(), &record.card_message_id);
         record.cursor = Some(cursor.clone());
         // The gap rides the re-point exactly as it does through [`Self::track`]
         // (spec #561, review #569), and the confirmed body's coverage settles
@@ -1833,5 +1859,190 @@ mod tests {
         let reloaded = ChainRecords::load(path);
         assert_eq!(reloaded.get("ses_new").unwrap().card_message_id, "om_new");
         assert_eq!(reloaded.get("ses_old"), None);
+    }
+
+    /// The Chain Generation (spec #571, ticket #572): one in-memory monotonic
+    /// version per chain, minted when the tracked card identity changes. A
+    /// fresh chain starts at zero; a plain re-point onto a new card bumps by
+    /// one.
+    #[test]
+    fn a_track_re_point_bumps_the_chain_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE);
+        let chains = ChainRecords::load(path.clone());
+
+        chains.track(
+            "ses_a",
+            "om_first",
+            MessageId::new("msg_cola_1"),
+            Some(1_000),
+            None,
+        );
+        assert_eq!(
+            chains.get("ses_a").expect("the record").generation,
+            0,
+            "a fresh chain starts at zero"
+        );
+
+        chains.track(
+            "ses_a",
+            "om_second",
+            MessageId::new("msg_cola_2"),
+            Some(2_000),
+            None,
+        );
+        assert_eq!(
+            chains.get("ses_a").expect("the re-pointed record").generation,
+            1,
+            "a re-point onto a new card bumps the generation"
+        );
+
+        // A re-track of the SAME card is not an identity change: the record
+        // keeps its generation (and a monotonic version can never drop back).
+        chains.track(
+            "ses_a",
+            "om_second",
+            MessageId::new("msg_cola_2"),
+            Some(2_000),
+            None,
+        );
+        assert_eq!(
+            chains.get("ses_a").expect("the re-tracked record").generation,
+            1,
+            "re-tracking the same card carries the generation"
+        );
+    }
+
+    /// The two takeover entries mint the same way: a fresh Turn's takeover and
+    /// the projection's atomic re-point bump the generation when they rewrite
+    /// the record onto a different card.
+    #[test]
+    fn a_takeover_and_a_projection_re_point_bump_the_chain_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE);
+        let chains = ChainRecords::load(path.clone());
+
+        chains.track("ses_a", "om_old", MessageId::new("msg_cola_1"), Some(1_000), None);
+        chains.track_takeover("ses_a", "om_new", MessageId::new("msg_cola_2"), Some(2_000), None);
+        assert_eq!(
+            chains.get("ses_a").expect("the successor").generation,
+            1,
+            "a fresh Turn's takeover bumps the generation"
+        );
+
+        chains.track_carrying_cursor(
+            "ses_a",
+            "om_projected",
+            MessageId::new("msg_cola_3"),
+            Some(3_000),
+            None,
+            &RenderedCursor::default(),
+            None,
+        );
+        assert_eq!(
+            chains
+                .get("ses_a")
+                .expect("the projection's successor")
+                .generation,
+            2,
+            "the projection's carrying re-point bumps again"
+        );
+    }
+
+    /// The unrelated record writes — the anchor fill-in and the cursor
+    /// advance — mutate the record in place, so the version the last identity
+    /// change minted survives them untouched.
+    #[test]
+    fn anchor_and_cursor_writes_never_bump_the_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE);
+        let chains = ChainRecords::load(path.clone());
+        chains.track("ses_a", "om_first", MessageId::new("msg_cola_1"), None, None);
+        chains.track("ses_a", "om_second", MessageId::new("msg_cola_2"), None, None);
+        let minted = chains.get("ses_a").expect("the record").generation;
+        assert_eq!(minted, 1, "the re-point minted a version");
+
+        chains.set_anchor(
+            "ses_a",
+            "om_second",
+            &TurnAnchor {
+                message_id: MessageId::new("msg_cola_2"),
+                created_ms: 2_000,
+            },
+        );
+        assert_eq!(
+            chains.get("ses_a").expect("the anchored record").generation,
+            minted,
+            "the anchor fill-in never bumps the generation"
+        );
+
+        chains.advance_cursor("ses_a", "om_second", &RenderedCursor::default());
+        assert_eq!(
+            chains.get("ses_a").expect("the advanced record").generation,
+            minted,
+            "the cursor advance never bumps the generation"
+        );
+    }
+
+    /// The record snapshot decisions read carries the version it was read at:
+    /// every entry [`ChainRecords::entries`] hands out, and the predecessor a
+    /// re-point returns, name their own generation — not the newest one.
+    #[test]
+    fn the_record_snapshot_carries_the_generation_it_was_read_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE);
+        let chains = ChainRecords::load(path.clone());
+        chains.track("ses_a", "om_first", MessageId::new("msg_cola_1"), None, None);
+        let previous = chains
+            .track("ses_a", "om_second", MessageId::new("msg_cola_2"), None, None)
+            .expect("the re-point returns the predecessor");
+        assert_eq!(
+            previous.generation, 0,
+            "the predecessor carries the version its decision read"
+        );
+
+        let entries: HashMap<String, ChainRecord> = chains.entries().into_iter().collect();
+        assert_eq!(
+            entries["ses_a"].generation, 1,
+            "the snapshot carries the record's current version"
+        );
+    }
+
+    /// The generation is process-local: releasing the record drops it (a chain
+    /// re-tracked after a release starts at zero again), and so does a fresh
+    /// load — no durable field carries the version across lives.
+    #[test]
+    fn the_generation_dies_with_the_record_and_a_fresh_load_starts_at_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE);
+        let chains = ChainRecords::load(path.clone());
+        chains.track("ses_a", "om_first", MessageId::new("msg_cola_1"), None, None);
+        chains.track("ses_a", "om_second", MessageId::new("msg_cola_2"), None, None);
+        assert_eq!(chains.get("ses_a").expect("the record").generation, 1);
+
+        let persisted = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !persisted.contains("\"generation\""),
+            "the generation never reaches the durable file: {persisted}"
+        );
+        assert_eq!(
+            ChainRecords::load(path.clone())
+                .get("ses_a")
+                .expect("the reloaded record")
+                .generation,
+            0,
+            "a fresh load starts at zero"
+        );
+
+        chains.release("ses_a");
+        chains.track("ses_a", "om_third", MessageId::new("msg_cola_3"), None, None);
+        assert_eq!(
+            chains
+                .get("ses_a")
+                .expect("the chain after the release")
+                .generation,
+            0,
+            "the released version never leaks into the next chain"
+        );
     }
 }
