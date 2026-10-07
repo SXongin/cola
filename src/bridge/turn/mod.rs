@@ -1560,7 +1560,7 @@ impl Turn {
         collect: PredecessorCollect,
         directory: Option<&str>,
     ) -> Option<ChainRecord> {
-        let (message_id, created_ms, context_directory) = {
+        let (message_id, created_ms, context_directory, reply_to) = {
             let live = cards.cards.lock().await;
             match live.get(session_id) {
                 Some(card) => (
@@ -1572,8 +1572,12 @@ impl Turn {
                     }),
                     card.acc.turn_anchor.as_ref().map(|anchor| anchor.created_ms),
                     card.acc.directory.clone(),
+                    // The chain's durable reply target (issue #580): the Feishu
+                    // message the card replies under — an OpenCode message id
+                    // is never a deliverable target.
+                    card.acc.reply_to_message_id.clone(),
                 ),
-                None => (None, None, None),
+                None => (None, None, None, None),
             }
         };
         // A card with no Turn message to scope a settle decision with cannot be
@@ -1595,6 +1599,7 @@ impl Turn {
                 message_id,
                 created_ms,
                 directory.as_deref(),
+                reply_to.as_deref(),
             ),
             _ => cards.chains.track_takeover(
                 session_id,
@@ -1602,6 +1607,7 @@ impl Turn {
                 message_id,
                 created_ms,
                 directory.as_deref(),
+                reply_to.as_deref(),
             ),
         };
         // A re-point within the chain carries the Rendered Cursor (spec #561).
@@ -1646,7 +1652,7 @@ impl Turn {
         card_message_id: &str,
         expected: state::StagedCursorId,
     ) {
-        let (message_id, created_ms, context_directory, confirmed) = {
+        let (message_id, created_ms, context_directory, reply_to, confirmed) = {
             let mut live = cards.cards.lock().await;
             let Some(card) = live.get_mut(session_id) else {
                 return;
@@ -1661,6 +1667,9 @@ impl Turn {
                 }),
                 card.acc.turn_anchor.as_ref().map(|anchor| anchor.created_ms),
                 card.acc.directory.clone(),
+                // The chain's durable reply target (issue #580): a split whose
+                // supplement moved the anchor carries the newest one.
+                card.acc.reply_to_message_id.clone(),
                 (confirmed),
             )
         };
@@ -1677,6 +1686,7 @@ impl Turn {
                 message_id,
                 created_ms,
                 context_directory.as_deref(),
+                reply_to.as_deref(),
                 &cursor,
                 gap.as_ref()
                     .map(|coverage| (&coverage.frontier, coverage.complete)),
@@ -1687,6 +1697,7 @@ impl Turn {
                 message_id,
                 created_ms,
                 context_directory.as_deref(),
+                reply_to.as_deref(),
             ),
         };
         // A re-point within the chain carries the Rendered Cursor (spec #561):
@@ -3230,9 +3241,11 @@ impl Turn {
         Self::seed_wake_floor(cards, session_id, &mut acc);
         acc.turn_anchor = Some(anchor.clone());
         acc.session_id = Some(session_id.to_string());
-        // The chain's reply target: the original Turn's user message, so the
-        // successor and any later split continue from where the chain began.
-        acc.reply_to_message_id = Some(anchor.message_id.to_string());
+        // The chain's reply target (issue #580) is the target the successor's
+        // create actually lands on — the durable reply target, or the recorded
+        // card a refused target falls back to. `take_over_armed_card` sets it
+        // under the takeover's own critical section; an OpenCode message id is
+        // never a deliverable Feishu target, so the anchor is not one.
         acc.variant = variant;
         // The successor continues a chain: it carries no question to re-ask,
         // so an Error ending never offers Retry (ADR-0059).
@@ -3814,6 +3827,7 @@ impl Turn {
         session_id: &str,
         chain_id: u64,
         card_message_id: &str,
+        reply_to: Option<&str>,
         directory: Option<&str>,
         cursor_stage: state::StagedCursorId,
     ) -> ArmedTakeover {
@@ -3824,6 +3838,7 @@ impl Turn {
             true,
             card_message_id,
             None,
+            reply_to,
             directory,
             cursor_stage,
         )
@@ -3860,6 +3875,9 @@ impl Turn {
             false,
             card_message_id,
             Some(card_is_live),
+            // The armed takeover already set the chain's reply target; a
+            // continuation keeps it (issue #580).
+            None,
             directory,
             cursor_stage,
         )
@@ -3883,6 +3901,7 @@ impl Turn {
         require_unattached: bool,
         card_message_id: &str,
         card_is_live: Option<bool>,
+        reply_to: Option<&str>,
         directory: Option<&str>,
         cursor_stage: state::StagedCursorId,
     ) -> Option<Option<Box<ChainRecord>>> {
@@ -3894,7 +3913,14 @@ impl Turn {
         if let Some(card_is_live) = card_is_live {
             card.card_is_live = card_is_live;
         }
-        let (message_id, created_ms, context_directory) = (
+        // The armed successor's landing reply target (issue #580): the target
+        // its create actually reached — the durable reply target, or the
+        // recorded card a refused target fell back to. Set before the record
+        // facts are read so the re-point and the accumulator never disagree.
+        if let Some(reply_to) = reply_to {
+            card.acc.reply_to_message_id = Some(reply_to.to_string());
+        }
+        let (message_id, created_ms, context_directory, reply_to) = (
             card.acc.cola_message_id.clone().map(MessageId::new).or_else(|| {
                 card.acc
                     .turn_anchor
@@ -3903,6 +3929,7 @@ impl Turn {
             }),
             card.acc.turn_anchor.as_ref().map(|anchor| anchor.created_ms),
             card.acc.directory.clone(),
+            card.acc.reply_to_message_id.clone(),
         );
         card.card_message_id = Some(card_message_id.to_string());
         // The create landed: take its exact staged Rendered Cursor NOW, inside
@@ -3942,6 +3969,7 @@ impl Turn {
                 message_id,
                 created_ms,
                 directory.as_deref(),
+                reply_to.as_deref(),
                 cursor,
                 gap.as_ref()
                     .map(|coverage| (&coverage.frontier, coverage.complete)),
@@ -3955,6 +3983,7 @@ impl Turn {
                 message_id,
                 created_ms,
                 directory.as_deref(),
+                reply_to.as_deref(),
             ),
         };
         // The projection's take-over CONSUMES the write-ahead intent (spec
@@ -4561,6 +4590,7 @@ mod tests {
                     "ses_test",
                     chain_id,
                     "om_late",
+                    None,
                     Some("/work"),
                     // Nothing was staged: the id no stage matches.
                     state::StagedCursorId {
@@ -4650,6 +4680,7 @@ mod tests {
             MessageId::new("msg_cola_new"),
             Some(2_000),
             Some("/work"),
+            None,
         );
 
         // A fresh Turn replaced the armed session — its own insert, exactly as
@@ -4666,6 +4697,7 @@ mod tests {
                     "ses_test",
                     chain_id,
                     "om_late",
+                    None,
                     Some("/work"),
                     state::StagedCursorId {
                         id: 0,

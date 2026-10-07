@@ -467,3 +467,28 @@ deliberately still adds no interlock, because the queue is the order and the
 lock is only the wire serializer. #443's stamp — the cursorless fallback
 narrowed above — is a keyed submission too (ADR-0063's amendment), so its order
 against every projection collect is the same mechanism.
+
+## Amendment (2026-10-07): the successor replies to the chain's durable reply target (issue #580)
+
+The Decision's delivery order — "reply to the original Turn anchor (fallback:
+the old card, then top-level)" — named a target the record never held: the Turn
+anchor's `message_id` is an OpenCode message id (`msg_cola_*`), not a Feishu
+`om_*`. The first live restart (2026-10-07, session
+`ses_ee92bdb57ffeAAXEFmHoekPDyX`) proved it: the successor's create went to
+`/im/v1/messages/msg_cola_…/reply`, Feishu answered 400 `99992354` ("not a
+valid open_message_id"), and the definite-failure handling retried the same id
+on every Session Sync tick — 47 attempts, forever; the old card stayed yielded
+and the missed tail never rendered.
+
+The delivery target is now a durable fact on the **Chain Record**: `reply_to`,
+the Feishu message the chain's cards reply under (the accumulator's reply
+target at track time), carried across re-points like the cursor and defaulted
+absent for an older release's record. The projection's ladder is `reply_to` →
+the recorded card → the Chat, and a DEFINITE non-delivery advances to the next
+rung instead of retrying the same target; when every rung refuses, the record
+stays retryable for the next pass. The successor's accumulator adopts the rung
+its create actually landed on, so later splits thread there too. A record with
+no deliverable rung claims nothing — never a settle PATCH to an empty card id,
+and never a write aimed at an OpenCode id.
+
+Related: #580, #561, ADR-0063, ADR-0069.

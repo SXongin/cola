@@ -804,7 +804,7 @@ async fn a_delivered_cursor_survives_a_newer_stage_that_replaces_it() {
     );
     seed_session(&app2, "ses_test", "/work").await;
     spawn_sync(&app2);
-    let successor_text = wait_for_reply_text(&platform2, "msg_cola_anchor", "补充。").await;
+    let successor_text = wait_for_reply_text(&platform2, "msg_1", "补充。").await;
     assert!(
         !successor_text.contains("答复。"),
         "the delivered content is never repeated on the restart: {successor_text}"

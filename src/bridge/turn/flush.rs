@@ -1116,6 +1116,7 @@ mod tests {
             crate::backend::MessageId::new("msg_1"),
             Some(1_000),
             Some("/work"),
+            None,
         );
         platform
             .fail_update_card_content_count
@@ -1276,6 +1277,7 @@ mod tests {
             MessageId::new("msg_cola_anchor"),
             Some(1_000),
             None,
+            None,
         );
         let card = serde_json::json!({ "schema": "2.0" });
         // The write fails recoverably: the payload is owed...
@@ -1338,6 +1340,7 @@ mod tests {
             "om_live",
             MessageId::new("msg_cola_anchor"),
             Some(1_000),
+            None,
             None,
         );
         let card = serde_json::json!({ "schema": "2.0" });

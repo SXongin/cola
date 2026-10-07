@@ -657,6 +657,9 @@ async fn apply(
                 // The route belongs to the session, not the card: keep it
                 // across the re-point.
                 record.directory.as_deref(),
+                // The reply target (issue #580) belongs to the chain too: an
+                // unprompted re-point learns no new one.
+                None,
             );
         }
         ChainDisposition::CollectThenRelease => {
@@ -699,38 +702,69 @@ async fn apply(
     None
 }
 
-/// Where a projection's successor card is delivered (spec #561): a reply to
-/// the original Turn anchor, else to the recorded card, else a top-level send
-/// into the chain's Chat. No deliverable target at all means no projection —
-/// today's in-place behavior (the ending settle for an ended run, the
-/// one-time stamp for a live one).
+/// Where a projection's successor card is delivered (spec #561, issue #580):
+/// a reply to the chain's durable reply target, else to the recorded card,
+/// else a top-level send into the chain's Chat. No deliverable target at all
+/// means no projection — today's in-place behavior (the ending settle for an
+/// ended run, the one-time stamp for a live one).
 enum ProjectTarget {
-    /// Reply to this Feishu message (the Turn anchor, or the recorded card).
+    /// Reply to this Feishu message (the durable reply target, or the
+    /// recorded card).
     Reply(String),
     /// Send at the chain's top level into this Chat.
     TopLevel(String),
 }
 
-/// The projection's successor delivery target (spec #561), in the spec's
-/// fallback order: the original Turn anchor, then the recorded card, then the
-/// chain's top-level Chat. `None` when nothing can reach a card — the caller
-/// keeps today's behavior.
-fn project_target(
-    record: &ChainRecord,
-    anchor: Option<&TurnAnchor>,
-    chat: Option<&str>,
-) -> Option<ProjectTarget> {
-    if let Some(message_id) = anchor
-        .map(|anchor| anchor.message_id.as_str())
-        .filter(|message_id| !message_id.is_empty())
+/// The projection's successor delivery targets (issue #580), in the spec's
+/// fallback order: the chain's durable reply target — the Feishu user message
+/// the chain answers, never an OpenCode message id (`record.message_id`,
+/// `msg_*`, is not a deliverable Feishu target) — then the recorded card, then
+/// the chain's top-level Chat. Deduped; empty when nothing can reach a card —
+/// the caller keeps today's behavior.
+fn project_targets(record: &ChainRecord, chat: Option<&str>) -> Vec<ProjectTarget> {
+    let mut targets: Vec<ProjectTarget> = Vec::new();
+    push_reply_target(&mut targets, record.reply_to.as_deref());
+    push_reply_target(&mut targets, Some(record.card_message_id.as_str()));
+    if let Some(chat) = chat.filter(|chat| !chat.is_empty()) {
+        targets.push(ProjectTarget::TopLevel(chat.to_string()));
+    }
+    targets
+}
+
+/// Push one non-empty, not-already-listed reply target (issue #580).
+fn push_reply_target(targets: &mut Vec<ProjectTarget>, id: Option<&str>) {
+    let Some(id) = id.filter(|id| !id.is_empty()) else {
+        return;
+    };
+    if targets
+        .iter()
+        .any(|target| matches!(target, ProjectTarget::Reply(existing) if existing == id))
     {
-        return Some(ProjectTarget::Reply(message_id.to_string()));
+        return;
     }
-    if !record.card_message_id.is_empty() {
-        return Some(ProjectTarget::Reply(record.card_message_id.clone()));
+    targets.push(ProjectTarget::Reply(id.to_string()));
+}
+
+/// The rung's own label for the ladder's logs (issue #580).
+fn target_label(target: &ProjectTarget) -> &str {
+    match target {
+        ProjectTarget::Reply(id) => id,
+        ProjectTarget::TopLevel(chat) => chat,
     }
-    chat.filter(|chat| !chat.is_empty())
-        .map(|chat| ProjectTarget::TopLevel(chat.to_string()))
+}
+
+/// Deliver one composed projection card to `target` (issue #580): the first
+/// create and every chain slice share this one call, so the ladder's rungs
+/// cannot drift between them.
+async fn deliver_card(
+    handles: &FlowHandles,
+    target: &ProjectTarget,
+    card: &serde_json::Value,
+) -> crate::error::Result<String> {
+    match target {
+        ProjectTarget::Reply(reply_to) => handles.cards.feishu.reply_card(reply_to, card).await,
+        ProjectTarget::TopLevel(chat) => handles.cards.feishu.send_card("chat_id", chat, card).await,
+    }
 }
 
 /// The outcome of a projection's continuation chain (spec #561, review #569).
@@ -745,18 +779,23 @@ enum ProjectedChain {
 }
 
 /// Send the remaining slices of an oversized projection delta (spec #561,
-/// review #569): one bounded create per slice through the same splitter the
-/// flush uses, in order, each slice's Rendered Cursor confirmed only after its
-/// own create landed — so a stop leaves the cursor exactly over the slices that
-/// did land (no omission of earlier content, no duplication later). The
-/// existing chain bound caps one projection's cards; the rest waits for the
-/// next life's recovery. The single-shot rule stays the caller's: it marks the
-/// record `projection_attempted` when the chain stops, so this life never
-/// re-posts a slice that may have landed.
+/// review #569; issue #580): one bounded create per slice through the same
+/// splitter the flush uses, in order, each slice's Rendered Cursor confirmed
+/// only after its own create landed, and each slice delivered through the same
+/// target ladder the first create used — a definite refusal of the rung a
+/// slice writes to advances to the next one, and when every remaining rung
+/// refuses the chain stops for a later pass to resume. `start` is the rung the
+/// first create landed on: earlier rungs were just refused and are not
+/// retried. The existing chain bound caps one projection's cards; the rest
+/// waits for the next life's recovery. The single-shot rule stays the caller's:
+/// it marks the record `projection_attempted` when the chain stops, so this
+/// life never re-posts a slice that may have landed.
+#[allow(clippy::too_many_arguments)] // the projection chain's whole fixture
 async fn send_projected_chain(
     handles: &FlowHandles,
     session_id: &str,
-    target: &ProjectTarget,
+    targets: &[ProjectTarget],
+    start: usize,
     chain_id: u64,
     directory: &str,
     first_card_id: &str,
@@ -764,6 +803,7 @@ async fn send_projected_chain(
 ) -> ProjectedChain {
     let mut last = first_card_id.to_string();
     let mut slices = 1usize;
+    let mut rung = start;
     while full {
         if slices >= crate::bridge::turn::MAX_CARD_CHAIN {
             tracing::info!(
@@ -782,26 +822,39 @@ async fn send_projected_chain(
         // single-shot fact behind. The re-point consumes it; a definite
         // non-delivery clears it below so a later life may resume the chain.
         handles.cards.chains.note_projection_intent(session_id, &last);
-        let delivered = match target {
-            ProjectTarget::Reply(reply_to) => handles.cards.feishu.reply_card(reply_to, &slice.card).await,
-            ProjectTarget::TopLevel(chat) => {
-                handles.cards.feishu.send_card("chat_id", chat, &slice.card).await
-            }
-        };
-        let new_card_id = match delivered {
-            Ok(card_id) => card_id,
-            Err(e) => {
-                tracing::warn!(
-                    "live-card reap: session {session_id} could not continue its successor chain: {e}"
-                );
-                if e.is_definite_non_delivery() {
-                    // No message was created: the intent is cleared, so a later
-                    // life can resume the chain from the last tracked slice.
-                    handles.cards.chains.clear_projection_intent(session_id, &last);
+        let mut landed: Option<(String, usize)> = None;
+        for (index, target) in targets.iter().enumerate().skip(rung) {
+            match deliver_card(handles, target, &slice.card).await {
+                Ok(card_id) => {
+                    landed = Some((card_id, index));
+                    break;
                 }
-                return ProjectedChain::Stopped(last);
+                Err(e) => {
+                    tracing::warn!(
+                        "live-card reap: session {session_id} could not continue its successor chain: {e}"
+                    );
+                    if e.is_definite_non_delivery() {
+                        // This rung created no message: try the next one.
+                        tracing::info!(
+                            "live-card reap: session {session_id} successor target {} refused; trying the next target",
+                            target_label(target)
+                        );
+                        continue;
+                    }
+                    // Ambiguous — the send may have landed: the intent stays,
+                    // so a later life never re-posts this slice.
+                    return ProjectedChain::Stopped(last);
+                }
             }
+        }
+        let Some((new_card_id, landed_rung)) = landed else {
+            // Every remaining rung provably created no message: the intent is
+            // cleared, so a later pass or life can resume the chain from the
+            // last tracked slice.
+            handles.cards.chains.clear_projection_intent(session_id, &last);
+            return ProjectedChain::Stopped(last);
         };
+        rung = landed_rung;
         if !Turn::track_projected_continuation(
             &handles.cards,
             session_id,
@@ -819,6 +872,11 @@ async fn send_projected_chain(
             // chain stops.
             collect_late_projection_detached(&handles.cards, session_id, &new_card_id);
             return ProjectedChain::Stopped(last);
+        }
+        if matches!(targets[rung], ProjectTarget::TopLevel(_)) {
+            // A top-level slice has no reply anchor: clear the durable target
+            // so a later projection does not retry the rung just refused.
+            handles.cards.chains.clear_reply_to(session_id, &new_card_id);
         }
         crate::bridge::turn::drain_armed_watermark(
             &handles.cards,
@@ -874,7 +932,7 @@ async fn send_projected_successor(
     handles: &FlowHandles,
     session_id: &str,
     record: &ChainRecord,
-    target: &ProjectTarget,
+    targets: &[ProjectTarget],
     anchor: &TurnAnchor,
     cursor: &RenderedCursor,
     seed: &crate::bridge::turn::CursorSeed,
@@ -883,10 +941,12 @@ async fn send_projected_successor(
     route_directory: &str,
     read_timeout_ms: u64,
 ) -> Option<Projection> {
-    let fallback_chat = match target {
-        ProjectTarget::Reply(_) => None,
+    // The armed successor's own fallback: the Chat when the ladder has one, so
+    // its later splits keep a place to land (issue #580).
+    let fallback_chat = targets.iter().find_map(|target| match target {
         ProjectTarget::TopLevel(chat) => Some(chat.clone()),
-    };
+        ProjectTarget::Reply(_) => None,
+    });
     let title = crate::bridge::external::session_subtitle(
         &handles.backend,
         session_id,
@@ -948,72 +1008,94 @@ async fn send_projected_successor(
         .cards
         .chains
         .note_projection_intent(session_id, &record.card_message_id);
-    let new_card_id = loop {
-        let delivered = match target {
-            ProjectTarget::Reply(reply_to) => handles.cards.feishu.reply_card(reply_to, &slice.card).await,
-            ProjectTarget::TopLevel(chat) => {
-                handles.cards.feishu.send_card("chat_id", chat, &slice.card).await
-            }
-        };
-        match delivered {
-            Ok(card_id) => break card_id,
-            Err(e) => {
-                tracing::warn!(
-                    "live-card reap: session {session_id} could not project its missed tail onto a successor: {e}"
-                );
-                if matches!(e, crate::error::BridgeError::CardContentRejected { .. }) {
-                    // The same payload can never land: re-render THIS slice
-                    // through the flush's fenced fallback and retry once. No
-                    // duplicate is possible — the rejection proves the first
-                    // create made no message. `None` means the fenced retry
-                    // was refused too: the payload is suspended, permanently
-                    // unlandable.
-                    let Some(fenced) =
-                        Turn::fenced_projected_slice(&handles.cards, session_id, chain_id).await
-                    else {
-                        handles
-                            .cards
-                            .chains
-                            .mark_projection_attempted(session_id, &record.card_message_id);
-                        // The rejection proves the platform created no message,
-                        // so a later life may retry (and re-refuse) rather than
-                        // being blocked by a stale intent.
-                        handles
-                            .cards
-                            .chains
-                            .clear_projection_intent(session_id, &record.card_message_id);
-                        Turn::drop_armed_session(&handles.cards, session_id, chain_id).await;
-                        return Some(Projection::Stopped);
-                    };
-                    slice = fenced;
-                    continue;
+    // The target the create lands on (issue #580): the first target the
+    // platform accepts. A DEFINITE refusal on a target (an id the platform can
+    // never accept — a withdrawn message, a foreign id shape) advances to the
+    // next one instead of pinning the projection to it forever; an ambiguous
+    // failure stays single-shot on the target that produced it (the create may
+    // have landed, and no retry may duplicate it).
+    let mut landed: Option<(String, usize)> = None;
+    'targets: for (index, target) in targets.iter().enumerate() {
+        loop {
+            let delivered = deliver_card(handles, target, &slice.card).await;
+            match delivered {
+                Ok(card_id) => {
+                    landed = Some((card_id, index));
+                    break 'targets;
                 }
-                if e.is_definite_non_delivery() {
-                    // The platform created no message: the record stays
-                    // retryable and the next pass re-attempts (spec #561,
-                    // review #569) — and the write-ahead intent is cleared, so
-                    // a restart may retry too.
+                Err(e) => {
+                    tracing::warn!(
+                        "live-card reap: session {session_id} could not project its missed tail onto a successor: {e}"
+                    );
+                    if matches!(e, crate::error::BridgeError::CardContentRejected { .. }) {
+                        // The same payload can never land: re-render THIS slice
+                        // through the flush's fenced fallback and retry once. No
+                        // duplicate is possible — the rejection proves the first
+                        // create made no message. `None` means the fenced retry
+                        // was refused too: the payload is suspended, permanently
+                        // unlandable.
+                        let Some(fenced) =
+                            Turn::fenced_projected_slice(&handles.cards, session_id, chain_id).await
+                        else {
+                            handles
+                                .cards
+                                .chains
+                                .mark_projection_attempted(session_id, &record.card_message_id);
+                            // The rejection proves the platform created no message,
+                            // so a later life may retry (and re-refuse) rather than
+                            // being blocked by a stale intent.
+                            handles
+                                .cards
+                                .chains
+                                .clear_projection_intent(session_id, &record.card_message_id);
+                            Turn::drop_armed_session(&handles.cards, session_id, chain_id).await;
+                            return Some(Projection::Stopped);
+                        };
+                        slice = fenced;
+                        continue;
+                    }
+                    if e.is_definite_non_delivery() {
+                        // The platform created no message on this target: fall
+                        // to the next one — the recorded card, then the Chat
+                        // (issue #580). When every target refuses, the record
+                        // stays retryable and the next pass re-attempts it.
+                        tracing::info!(
+                            "live-card reap: session {session_id} successor target {} refused; trying the next target",
+                            target_label(target)
+                        );
+                        continue 'targets;
+                    }
+                    // Ambiguous — the send may have landed: single-shot. The mark
+                    // keeps every later pass from re-posting, the durable intent
+                    // keeps every later LIFE from re-posting (review #569), and the
+                    // record stays for the reap's in-place state repair. The phantom
+                    // session is
+                    // dropped only while it is still this pass's armed one.
                     handles
                         .cards
                         .chains
-                        .clear_projection_intent(session_id, &record.card_message_id);
+                        .mark_projection_attempted(session_id, &record.card_message_id);
                     Turn::drop_armed_session(&handles.cards, session_id, chain_id).await;
-                    return Some(Projection::Retryable);
+                    return Some(Projection::Stopped);
                 }
-                // Ambiguous — the send may have landed: single-shot. The mark
-                // keeps every later pass from re-posting, the durable intent
-                // keeps every later LIFE from re-posting (review #569), and the
-                // record stays for the reap's in-place state repair. The phantom
-                // session is
-                // dropped only while it is still this pass's armed one.
-                handles
-                    .cards
-                    .chains
-                    .mark_projection_attempted(session_id, &record.card_message_id);
-                Turn::drop_armed_session(&handles.cards, session_id, chain_id).await;
-                return Some(Projection::Stopped);
             }
         }
+    }
+    let Some((new_card_id, landing_index)) = landed else {
+        // Every target provably created no message: the record stays retryable
+        // and the next pass re-attempts (spec #561, review #569) — and the
+        // write-ahead intent is cleared, so a restart may retry too.
+        handles
+            .cards
+            .chains
+            .clear_projection_intent(session_id, &record.card_message_id);
+        Turn::drop_armed_session(&handles.cards, session_id, chain_id).await;
+        return Some(Projection::Retryable);
+    };
+    let landing_target = &targets[landing_index];
+    let landing_reply_to = match landing_target {
+        ProjectTarget::Reply(id) => Some(id.as_str()),
+        ProjectTarget::TopLevel(_) => None,
     };
     // The successor takes the chain over in ONE cards-map critical section
     // (review #569): verify the armed session is still current, attach its
@@ -1027,6 +1109,7 @@ async fn send_projected_successor(
         session_id,
         chain_id,
         &new_card_id,
+        landing_reply_to,
         Some(route_directory),
         slice.cursor_stage,
     )
@@ -1048,6 +1131,11 @@ async fn send_projected_successor(
         );
         return Some(Projection::Stopped);
     };
+    if matches!(landing_target, ProjectTarget::TopLevel(_)) {
+        // A top-level successor has no reply anchor: clear the durable target
+        // so a later projection does not retry the rung just refused.
+        handles.cards.chains.clear_reply_to(session_id, &new_card_id);
+    }
     // The same write carried every Wake completion entry the seeded render
     // staged: the confirmed create is what makes the announcement durable
     // (ADR-0061, ticket #566), so a later recordless restart cannot
@@ -1073,7 +1161,8 @@ async fn send_projected_successor(
         match send_projected_chain(
             handles,
             session_id,
-            target,
+            targets,
+            landing_index,
             chain_id,
             route_directory,
             &new_card_id,
@@ -1106,13 +1195,16 @@ async fn send_projected_successor(
 /// is the restart notification (never outbox-retried).
 ///
 /// The guards: a missing route or transcript and an ending with no card state
-/// claim nothing; no deliverable target falls back to today's in-place settle;
+/// claim nothing; no deliverable reply target falls back to the recorded card,
+/// the Chat, or — with none of those — to claiming nothing at all (never a
+/// write to an empty card id);
 /// a projection that renders nothing new (the cursor covered the whole read)
-/// drops its armed card and settles in place; a DEFINITE create failure leaves
-/// the record retryable for the next pass (the missed tail is never given up
-/// when the platform provably created nothing), while an ambiguous one is
-/// single-shot and leaves the record for the reap's state repair. The shared
-/// transition itself lives in [`send_projected_successor`].
+/// drops its armed card and settles in place; a DEFINITE create failure falls
+/// to the next target and, when every target provably created no message,
+/// leaves the record retryable for the next pass (the missed tail is never
+/// given up), while an ambiguous one is single-shot and leaves the record for
+/// the reap's state repair. The shared transition itself lives in
+/// [`send_projected_successor`].
 async fn project_card(
     handles: &FlowHandles,
     session_id: &str,
@@ -1149,11 +1241,15 @@ async fn project_card(
         .entry_for_session(session_id)
         .await
         .map(|entry| entry.thread_key.chat_id);
-    let Some(target) = project_target(record, scope.as_ref(), chat.as_deref()) else {
-        // No deliverable target at all: today's behavior, never a projection.
-        settle_card(handles, session_id, record, reads.route, settle, read_timeout_ms).await;
+    let targets = project_targets(record, chat.as_deref());
+    if targets.is_empty() {
+        // No deliverable target at all (issue #580): the record names no card
+        // and no reply target resolves, so there is nothing to project AND
+        // nothing to settle — claim nothing rather than write an empty card
+        // id. The OpenCode message id is not a deliverable Feishu target, so
+        // it can never stand in for one.
         return;
-    };
+    }
     let Some(anchor) = scope else {
         // Defensive: a projectable ending carries an anchor, but nothing may
         // be armed without one (the record could not be re-pointed).
@@ -1175,7 +1271,7 @@ async fn project_card(
         handles,
         session_id,
         record,
-        &target,
+        &targets,
         &anchor,
         &cursor,
         &seed,
@@ -1256,11 +1352,12 @@ async fn project_live_card(
         .entry_for_session(session_id)
         .await
         .map(|entry| entry.thread_key.chat_id);
-    let Some(target) = project_target(record, Some(&anchor), chat.as_deref()) else {
+    let targets = project_targets(record, chat.as_deref());
+    if targets.is_empty() {
         // No deliverable target at all: the adoption is not attempted — and a
         // cursor-carrying record is never stamped, so the pass claims nothing.
         return None;
-    };
+    }
     // The durable cursor, re-read at apply time: the record snapshot the reap
     // took before its server reads can be older than a confirmed write that
     // advanced the chain meanwhile. A moved cursor means this pass's decision
@@ -1274,7 +1371,7 @@ async fn project_live_card(
         handles,
         session_id,
         record,
-        &target,
+        &targets,
         &anchor,
         &cursor,
         &seed,
