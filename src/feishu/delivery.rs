@@ -1154,18 +1154,30 @@ impl CardDelivery {
                     Self::settle_ticket(entry, write.token, WriteOutcome::Delivered);
                 }
                 Err(e) if e.is_recoverable_card_write() => {
+                    // The failed attempt's own schedule: the logical key's
+                    // backoff, doubled per further failure (the outbox's
+                    // cadence).
+                    write.next_attempt =
+                        now + backoff_delay(limits.backoff_base, limits.backoff_max, write.attempts);
+                    write.attempts += 1;
                     if entry.waiting.is_some() {
                         // A newer submission supersedes the failed one (newest
-                        // wins): the newest payload lands instead.
+                        // wins): the newest payload lands instead — unless the
+                        // waiter carries the SAME key, a duplicate of the
+                        // failed write, which inherits its schedule so the key
+                        // is still retried after its backoff, not at once
+                        // (spec #571 review).
+                        if let Some(next) = entry.waiting.as_mut()
+                            && next.generation == write.generation
+                            && next.intent == write.intent
+                        {
+                            next.attempts = write.attempts;
+                            next.next_attempt = write.next_attempt;
+                        }
                         Self::settle_ticket(entry, write.token, WriteOutcome::Failed(e));
                     } else {
                         // Stay owed with the backoff: the drain retries it, and
-                        // a newer submission replaces it if one arrives. The
-                        // first failure waits the base delay, each further one
-                        // doubles it — the outbox's own cadence.
-                        write.next_attempt =
-                            now + backoff_delay(limits.backoff_base, limits.backoff_max, write.attempts);
-                        write.attempts += 1;
+                        // a newer submission replaces it if one arrives.
                         Self::settle_ticket(entry, write.token, WriteOutcome::Failed(e));
                         entry.in_flight = Some(write);
                         entry.driver = None;
@@ -1209,6 +1221,15 @@ impl CardDelivery {
                 Some(next) => {
                     if !entry.promotable(&next) {
                         Self::settle_ticket(entry, next.token, WriteOutcome::Superseded);
+                        entry.driver = None;
+                        return;
+                    }
+                    if next.next_attempt > now {
+                        // The promoted write carries a still-running schedule —
+                        // a duplicate of the failed key inherited it (spec #571
+                        // review): leave it owed with no driver; the drain
+                        // retries it when due (or at once, forced).
+                        entry.in_flight = Some(next);
                         entry.driver = None;
                         return;
                     }
@@ -3971,6 +3992,54 @@ mod tests {
             vec![("om_1".to_string(), stamp), ("om_1".to_string(), collect)],
             "the waiting newer payload landed, not the failed retry"
         );
+    }
+
+    /// A waiter carrying the SAME key as a failing in-flight write inherits the
+    /// failure's schedule (spec #571 review): the duplicate of the failed key
+    /// must not retry at once — the schedule belongs to the logical key — while
+    /// a different-key waiter still supersedes immediately (newest wins, the
+    /// test above).
+    #[tokio::test(start_paused = true)]
+    async fn a_same_key_waiter_inherits_the_failed_attempts_schedule() {
+        let inner = Arc::new(FakePlatform::new());
+        inner.fail_next(Fail::Transport);
+        let (entered, release) = inner.park_next();
+        let delivery = Arc::new(CardDelivery::with_limits(
+            inner.clone(),
+            MAX_PENDING,
+            Duration::from_secs(5),
+            Duration::from_secs(20),
+        ));
+        let stamp = serde_json::json!({ "body": "stamp" });
+        let stamp_again = serde_json::json!({ "body": "stamp again" });
+
+        // The first attempt fails recoverably while a duplicate of its key
+        // waits behind it.
+        let first = submit(&delivery, "om_1", 1, CardWriteIntent::Stamp, &stamp).await;
+        entered.notified().await;
+        let duplicate = submit(&delivery, "om_1", 1, CardWriteIntent::Stamp, &stamp_again).await;
+        release.notify_one();
+        assert!(matches!(first.settled().await, WriteOutcome::Failed(_)));
+        assert_eq!(inner.attempts().len(), 1);
+
+        // The duplicate inherited the 5 s schedule: no attempt before it.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(
+            inner.attempts().len(),
+            1,
+            "the same-key duplicate waited for the failed attempt's backoff"
+        );
+
+        // Due at the schedule: the drain lands the duplicate's payload.
+        tokio::time::advance(Duration::from_secs(4)).await;
+        delivery.drain_pending_card_updates(false).await;
+        wait_for_attempts(&inner, 2).await;
+        assert_eq!(
+            inner.attempts().last(),
+            Some(&("om_1".to_string(), stamp_again)),
+            "the duplicate is the key's newest payload"
+        );
+        assert!(matches!(duplicate.settled().await, WriteOutcome::Delivered));
     }
 
     /// The keyless outbox and the keyed queue share one entry without
