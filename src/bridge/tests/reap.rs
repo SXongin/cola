@@ -8632,3 +8632,238 @@ async fn a_truncated_takeover_keeps_the_gap_until_a_complete_read() {
         "the delivered visible tail never repeats: {all}"
     );
 }
+
+/// The takeover records the owed orphan gap in the SAME write that re-points
+/// the record (spec #561, review #569): the facts are known at takeover time,
+/// so a crash while the takeover's transcript read is still pending must leave
+/// the gap already durable. Before the fix the record named the new,
+/// not-yet-submitted message with the old cursor and NO gap, and the Unreceived
+/// path settled and released the record — losing the orphan's tail.
+#[tokio::test]
+async fn a_takeover_records_the_gap_before_its_read_completes() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let orphan_anchor = 1_000_000;
+    let delivered = "已经写了一半。";
+    let tail = "停机前没送达的尾巴。";
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(orphan_anchor),
+        Some("/work"),
+        Some(CursorFrontier {
+            message_id: MessageId::new(format!("msg_a_{}", orphan_anchor + 500)),
+            part_index: 0,
+            kind: CursorPartKind::Text,
+            started_at: Some(orphan_anchor + 500),
+            delivered_chars: delivered.chars().count(),
+            prefix_digest: Some(cursor_prefix_digest(delivered)),
+        }),
+        &[],
+    );
+    let transcript = || {
+        SessionTranscript::new(vec![
+            user("msg_cola_anchor", orphan_anchor, "跑个长命令"),
+            TranscriptMessage {
+                id: MessageId::new(format!("msg_a_{}", orphan_anchor + 500)),
+                role: MessageRole::Assistant,
+                time: Some(MessageTime {
+                    created: orphan_anchor + 500,
+                    completed: None,
+                }),
+                model: None,
+                tokens: None,
+                error: None,
+                parts: vec![Part::Text(TextPart {
+                    text: format!("{delivered}{tail}"),
+                    started_at: Some(orphan_anchor + 500),
+                })],
+            },
+        ])
+    };
+
+    // Life 1: the fresh Turn takes over, but its seed read never returns — the
+    // crash lands while it is pending.
+    let (app, _platform, backend, _gate) = seeded_app(&session_file, transcript(), SessionStatus::Busy).await;
+    backend.hold_transcripts();
+    let mut context = ctx("ses_test", "新问题");
+    context.cola_message_id = Some("msg_cola_new".into());
+    let turn = spawn_turn(&app, context);
+    // The takeover re-pointed the record (its write is before the gated read).
+    wait_for_record_card(&app, "ses_test", "msg_reply").await;
+    let record = app.cards_handle().chains.get("ses_test").unwrap();
+    assert!(
+        record.pending_gap.is_some(),
+        "the takeover itself owes the gap, before any read: {record:?}"
+    );
+    turn.abort();
+    drop(app);
+
+    // Life 2: a restart whose read never carries the new Turn's message — the
+    // Unreceived ending — must keep the record (the gap is still owed).
+    let (app2, platform2, backend2) =
+        restarted_app_with_backend(&session_file, transcript(), Some(SessionStatus::Idle)).await;
+    platform2.given_card_view("msg_reply", realistic_card_view());
+    spawn_sync(&app2);
+    // The reap runs: the record must survive every pass.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let kept = app2.cards_handle().chains.get("ses_test");
+        assert!(
+            kept.as_ref().is_some_and(|record| record.pending_gap.is_some()),
+            "an Unreceived ending never releases an owed gap: {kept:?}"
+        );
+        let reads = backend2
+            .session_status_reads
+            .lock()
+            .await
+            .iter()
+            .filter(|sid| sid.as_str() == "ses_test")
+            .count();
+        if reads >= 2 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the reap never observed the kept record"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    drop(app2);
+
+    // Life 3: the next user Turn takes the chain over and lands the tail
+    // exactly once.
+    let (app3, platform3, _backend3, gate3) =
+        seeded_app(&session_file, transcript(), SessionStatus::Busy).await;
+    // The new Turn's loading card takes a DIFFERENT id than the record names,
+    // so the fresh Turn really takes the chain over.
+    platform3.given_reply_id("om_third");
+    platform3.given_card_view("msg_reply", realistic_card_view());
+    gate3.add_permits(1);
+    let mut context = ctx("ses_test", "又一条消息");
+    context.cola_message_id = Some("msg_cola_third".into());
+    let turn3 = spawn_turn(&app3, context);
+    wait_for_card_text(&platform3, tail).await;
+    let text = card_text(platform3.updated_cards().await.last().expect("the takeover card"));
+    assert_eq!(
+        text.matches(tail).count(),
+        1,
+        "the orphaned tail lands exactly once: {text}"
+    );
+    assert!(
+        !text.contains(delivered),
+        "the delivered prefix is never repeated: {text}"
+    );
+    drop(turn3);
+}
+
+/// A fresh Turn's takeover never erases an unresolved projection intent
+/// (spec #561, review #569): a projection create may be in flight (its card
+/// landed, its takeover lost the race), and the winning chain must keep the
+/// single-shot fact — or a restart projects the late card's tail again.
+#[tokio::test]
+async fn a_takeover_keeps_an_unresolved_projection_intent() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let orphan_anchor = 1_000_000;
+    let new_anchor = 2_000_000;
+    let delivered = "已经写了一半。";
+    let tail = "停机前没送达的尾巴。";
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(orphan_anchor),
+        Some("/work"),
+        Some(CursorFrontier {
+            message_id: MessageId::new(format!("msg_a_{}", orphan_anchor + 500)),
+            part_index: 0,
+            kind: CursorPartKind::Text,
+            started_at: Some(orphan_anchor + 500),
+            delivered_chars: delivered.chars().count(),
+            prefix_digest: Some(cursor_prefix_digest(delivered)),
+        }),
+        &[],
+    );
+    // The previous life died mid-create: the write-ahead intent is durable.
+    assert!(ChainRecords::load(sidecar(&session_file)).note_projection_intent("ses_test", "om_frozen"));
+    let transcript = || {
+        SessionTranscript::new(vec![
+            user("msg_cola_anchor", orphan_anchor, "跑个长命令"),
+            TranscriptMessage {
+                id: MessageId::new(format!("msg_a_{}", orphan_anchor + 500)),
+                role: MessageRole::Assistant,
+                time: Some(MessageTime {
+                    created: orphan_anchor + 500,
+                    completed: None,
+                }),
+                model: None,
+                tokens: None,
+                error: None,
+                parts: vec![Part::Text(TextPart {
+                    text: format!("{delivered}{tail}"),
+                    started_at: Some(orphan_anchor + 500),
+                })],
+            },
+            user("msg_cola_new", new_anchor, "新问题"),
+            assistant(new_anchor + 1_000, "新回答。"),
+        ])
+    };
+    // Life 1: a fresh Turn takes over; the ambiguous create's intent survives.
+    let (app, platform, _backend, gate) = seeded_app(&session_file, transcript(), SessionStatus::Busy).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+    gate.add_permits(1);
+    let mut context = ctx("ses_test", "新问题");
+    context.cola_message_id = Some("msg_cola_new".into());
+    let turn = spawn_turn(&app, context);
+    wait_for_record_card(&app, "ses_test", "msg_reply").await;
+    let record = app.cards_handle().chains.get("ses_test").unwrap();
+    assert!(
+        record.projection_intent,
+        "a takeover never erases an unresolved intent: {record:?}"
+    );
+    turn.abort();
+    drop(app);
+
+    // Life 2: the restart must never project again — the single-shot intent
+    // blocks it, and the old card takes the in-place repair instead.
+    let (app2, platform2, _backend2) =
+        restarted_app_with_backend(&session_file, transcript(), Some(SessionStatus::Idle)).await;
+    platform2.given_card_view("msg_reply", realistic_card_view());
+    spawn_sync(&app2);
+    // Either the old card is repaired in place (the fix) or a successor is
+    // posted again (the bug this test forbids).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        assert_eq!(
+            card_posts(&platform2).await,
+            0,
+            "the ambiguous intent blocks a second projection: {:?}",
+            platform2.calls.lock().await
+        );
+        let repaired = patches_to(&platform2, "msg_reply")
+            .await
+            .iter()
+            .any(|card| card_header(card).contains("✅"));
+        if repaired {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the record never repairs the old card in place"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        !card_text(
+            &last_update_of(&platform2, "msg_reply")
+                .await
+                .expect("the repaired card")
+        )
+        .contains(tail),
+        "the late card's tail is never projected again"
+    );
+}
