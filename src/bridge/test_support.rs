@@ -355,6 +355,10 @@ pub struct RecordingPlatform {
     /// missing permission), which is what every reap test that expects the
     /// bare ending relies on.
     pub card_views: std::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>,
+    /// Every `get_card_view` call's target, in call order, recorded on entry
+    /// (a parked read still counts). The reap's stamp tests count the reads a
+    /// settled key must never repeat (spec #571, ticket #575).
+    pub card_view_reads: std::sync::Mutex<Vec<String>>,
     /// One-shot mid-send pause installed by a concurrency test (absent in
     /// every other test). Taken by the first matching call.
     pub pause_call: std::sync::Mutex<Option<CallGate>>,
@@ -385,6 +389,7 @@ impl RecordingPlatform {
             reply_in_thread_thread_id: Some("omt_created_topic".into()),
             quoted_messages: std::sync::Mutex::new(std::collections::HashMap::new()),
             card_views: std::sync::Mutex::new(std::collections::HashMap::new()),
+            card_view_reads: std::sync::Mutex::new(Vec::new()),
             pause_call: std::sync::Mutex::new(None),
             reply_ids: std::sync::Mutex::new(std::collections::VecDeque::new()),
         }
@@ -911,6 +916,7 @@ impl feishu::Platform for RecordingPlatform {
     }
 
     async fn get_card_view(&self, message_id: &str) -> crate::error::Result<serde_json::Value> {
+        self.card_view_reads.lock().unwrap().push(message_id.to_string());
         if let Some(gate) = self.take_gate("card_view", message_id) {
             wait_gate(gate).await;
         }

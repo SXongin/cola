@@ -38,10 +38,9 @@ use crate::opencode::types::SessionStatus;
 /// projected onto a successor (`Project` for an ended run — spec #561 / ticket
 /// #563 — and `ProjectLive` for a followed live one, ticket #564).
 ///
-/// `Keep` also carries the marked outcomes: an orphan whose stamp already
-/// landed or was permanently refused (#522), a yielded waiting card whose
-/// yield already landed, and an ending the read left undecided
-/// ([`TurnSettle::Running`]).
+/// `Keep` also carries the already-marked outcomes: a yielded waiting card
+/// whose yield already landed, an attempted projection, and an ending the
+/// read left undecided ([`TurnSettle::Running`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ChainDisposition {
     /// Nothing is owed this pass: a claim owns the record, the card is this
@@ -67,7 +66,8 @@ pub(crate) enum ChainDisposition {
     /// The still-live CURSORLESS orphan is owed its one-time restart stamp
     /// (#443) — the fallback for a record with no Rendered Cursor (spec #561,
     /// ticket #566); a cursor-carrying record is projected instead, never
-    /// stamped.
+    /// stamped. Re-decided on every tick until the delivery queue's settled
+    /// key answers for it (spec #571, ticket #575).
     StampRestart,
     /// The transcript decided the card's ending. `TurnSettle::Running` never
     /// surfaces here — an undecided ending is `Keep`.
@@ -185,10 +185,6 @@ pub(crate) struct RecoveryReads<'a> {
     /// Turn (or the follow that inherited its guard) owns the session, or an
     /// inbound message is about to — either way the card is not orphaned.
     pub(crate) claimed: bool,
-    /// A restart-stamp attempt is in flight for this record (#443): its write
-    /// is never cancelled and may still land, ordered by the card's delivery
-    /// lock, so every other decision waits for it to resolve.
-    pub(crate) stamping: bool,
     /// This process's card, or none.
     pub(crate) card: CardProbe,
     /// The route for the Session's reads, when one exists.
@@ -213,7 +209,7 @@ impl RecoveryReads<'_> {
     /// worse than leaving a record for a later life (growth is bounded by the
     /// live-card sessions).
     pub(crate) fn needs_status(&self) -> bool {
-        !self.claimed && !self.stamping && matches!(self.card, CardProbe::None) && self.route.is_some()
+        !self.claimed && matches!(self.card, CardProbe::None) && self.route.is_some()
     }
 
     /// Whether the transcript read is warranted: the status read ran and its
@@ -241,7 +237,7 @@ impl RecoveryReads<'_> {
     /// post-collect fact; the id and `running` stay the pre-collect ones,
     /// exactly the facts the pass read before the split.
     pub(crate) fn needs_successor_collect(&self) -> bool {
-        !self.claimed && !self.stamping && matches!(self.card, CardProbe::Successor { .. })
+        !self.claimed && matches!(self.card, CardProbe::Successor { .. })
     }
 }
 
@@ -254,12 +250,6 @@ pub(crate) fn reconcile(record: &ChainRecord, reads: &RecoveryReads<'_>) -> Chai
     // (or the follow that inherited its guard), or an inbound message about to
     // land — either way the card is not orphaned.
     if reads.claimed {
-        return ChainDisposition::Keep;
-    }
-    // A restart-stamp attempt is in flight (#443): its never-cancelled write
-    // may still land, ordered by the card's delivery lock, so any decision
-    // here — a settle, a collect after a takeover — could be overtaken by it.
-    if reads.stamping {
         return ChainDisposition::Keep;
     }
     match &reads.card {
@@ -345,15 +335,12 @@ pub(crate) fn reconcile(record: &ChainRecord, reads: &RecoveryReads<'_>) -> Chai
                         }
                         return ChainDisposition::NoDecision;
                     }
-                    // The cursorless fallback: today's one-time outcome — a
-                    // stamp that landed, or was permanently refused and given
-                    // up for this process life (#522), is never attempted
-                    // again.
-                    if record.restarted_reaped || record.restart_stamp_rejected {
-                        ChainDisposition::Keep
-                    } else {
-                        ChainDisposition::StampRestart
-                    }
+                    // The cursorless fallback: today's one-time outcome. The
+                    // stamp is submitted every tick — the queue's settled key
+                    // (spec #571, ticket #575) is what makes a landed (#443) or
+                    // permanently refused (#522) one a no-op, so no per-record
+                    // mark and no ordering claim survives on the record.
+                    ChainDisposition::StampRestart
                 }
                 // A definite non-live status: only the transcript decides the
                 // ending.
@@ -576,7 +563,6 @@ mod tests {
     fn orphan() -> RecoveryReads<'static> {
         RecoveryReads {
             claimed: false,
-            stamping: false,
             card: CardProbe::None,
             route: Some(route()),
             status: None,
@@ -598,26 +584,18 @@ mod tests {
     #[test]
     fn a_claim_keeps_the_record_before_anything_else() {
         let record = record();
-        for reads in [
-            RecoveryReads {
-                claimed: true,
-                card: CardProbe::Recorded {
-                    terminal: true,
-                    update_pending: false,
-                },
-                route: None,
-                status: Some(StatusRead::Named(SessionStatus::Idle)),
-                transcript: None,
-                stamping: false,
-                cursor: false,
+        let reads = RecoveryReads {
+            claimed: true,
+            card: CardProbe::Recorded {
+                terminal: true,
+                update_pending: false,
             },
-            RecoveryReads {
-                stamping: true,
-                ..orphan()
-            },
-        ] {
-            assert_eq!(reconcile(&record, &reads), ChainDisposition::Keep);
-        }
+            route: None,
+            status: Some(StatusRead::Named(SessionStatus::Idle)),
+            transcript: None,
+            cursor: false,
+        };
+        assert_eq!(reconcile(&record, &reads), ChainDisposition::Keep);
     }
 
     /// The record's own card: a terminal card with a confirmed ending is
@@ -824,19 +802,6 @@ mod tests {
             ..orphan()
         };
         assert_eq!(reconcile(&record, &live), ChainDisposition::StampRestart);
-
-        // The one-time marks hold: a stamped orphan, and (#522) one whose
-        // stamp was permanently refused, are both kept, never retried.
-        let stamped = ChainRecord {
-            restarted_reaped: true,
-            ..record.clone()
-        };
-        assert_eq!(reconcile(&stamped, &live), ChainDisposition::Keep);
-        let rejected = ChainRecord {
-            restart_stamp_rejected: true,
-            ..record.clone()
-        };
-        assert_eq!(reconcile(&rejected, &live), ChainDisposition::Keep);
     }
 
     /// The transcript decides the ending at a definite non-live status: each
@@ -1452,10 +1417,6 @@ mod tests {
         for blocked in [
             RecoveryReads {
                 claimed: true,
-                ..orphan()
-            },
-            RecoveryReads {
-                stamping: true,
                 ..orphan()
             },
             RecoveryReads {

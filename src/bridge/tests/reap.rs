@@ -226,8 +226,8 @@ async fn wait_for_record_card(app: &Arc<App>, session_id: &str, card_message_id:
 }
 
 /// Wait until `message_id` has at least `n` recorded in-place PATCHes, or
-/// panic after 5 s — the observation a stamp test needs before it asserts on
-/// the writes a parked stamp PATCH let queue up behind it.
+/// panic after 5 s — the observation a takeover test needs before it asserts
+/// on the writes a parked stamp let queue up behind it.
 async fn wait_for_patches(platform: &RecordingPlatform, message_id: &str, n: usize) {
     let probe = async {
         loop {
@@ -242,49 +242,27 @@ async fn wait_for_patches(platform: &RecordingPlatform, message_id: &str, n: usi
         .unwrap_or_else(|_| panic!("{message_id} never reached {n} PATCHes"));
 }
 
-/// Wait until the record's restart stamp is marked permanently refused by
-/// Feishu (#522), or panic after 5 s — proof the rejected attempt resolved
-/// before the passes that must not retry it are asserted on.
-async fn wait_for_rejected_stamp(app: &Arc<App>, session_id: &str) {
-    let probe = async {
-        loop {
-            if app
-                .cards_handle()
-                .chains
-                .get(session_id)
-                .is_some_and(|record| record.restart_stamp_rejected)
-            {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    };
-    tokio::time::timeout(Duration::from_secs(5), probe)
-        .await
-        .unwrap_or_else(|_| panic!("the stamp was never marked permanently refused"));
+/// How many `get_card_view` reads the platform served for `message_id` — the
+/// count the settled-key churn test pins (spec #571, ticket #575): a stamp that
+/// already settled must never make the reap read the card again.
+fn card_views_to(platform: &RecordingPlatform, message_id: &str) -> usize {
+    platform
+        .card_view_reads
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|mid| mid.as_str() == message_id)
+        .count()
 }
 
-/// Wait until the fresh-Turn takeover's collect recorded its keep rule for
-/// `card_message_id` (ADR-0068), or panic after 5 s. The recorded rule is the
-/// observed point the takeover's collect reached its decision — before it
-/// queues behind a parked stamp PATCH — so the stamp's post-PATCH ownership
-/// check can no longer miss the successor.
-async fn wait_for_predecessor_keep(
-    app: &Arc<App>,
-    session_id: &str,
-    card_message_id: &str,
-    resolved_calls: &[&str],
-) {
-    let expected: Vec<String> = resolved_calls.iter().map(|call| call.to_string()).collect();
+/// Wait until the platform served at least `n` card-view reads for
+/// `message_id`, or panic after 5 s — the observation the stamp-ordering tests
+/// need before they release a parked write, so the interleaving they create is
+/// proven rather than raced (spec #571, ticket #575).
+async fn wait_for_card_views(platform: &RecordingPlatform, message_id: &str, n: usize) {
     let probe = async {
         loop {
-            let recorded = app
-                .cards_handle()
-                .chains
-                .get(session_id)
-                .and_then(|record| record.predecessor_keep)
-                .map(|keep| (keep.card_message_id, keep.resolved_calls));
-            if recorded == Some((card_message_id.to_string(), expected.clone())) {
+            if card_views_to(platform, message_id) >= n {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -292,7 +270,32 @@ async fn wait_for_predecessor_keep(
     };
     tokio::time::timeout(Duration::from_secs(5), probe)
         .await
-        .unwrap_or_else(|_| panic!("the takeover never recorded its collect rule for {card_message_id}"));
+        .unwrap_or_else(|_| panic!("{message_id} never reached {n} card-view reads"));
+}
+
+/// Wait until `message_id`'s stamp key is covered in the card-delivery queue —
+/// settled (delivered, or permanently refused by Feishu, #522) — or panic
+/// after 5 s. The observation a "#522 is given up" test needs before it asserts
+/// on the ticks that must not touch the card again.
+async fn wait_for_covered_stamp(app: &Arc<App>, session_id: &str, card_message_id: &str) {
+    let probe = async {
+        loop {
+            let covered = app.cards_handle().chains.get(session_id).is_some_and(|record| {
+                app.cards_handle().feishu.keyed_write_covered(
+                    card_message_id,
+                    record.generation,
+                    crate::feishu::delivery::CardWriteIntent::Stamp,
+                )
+            });
+            if covered {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), probe)
+        .await
+        .unwrap_or_else(|_| panic!("the stamp key for {card_message_id} was never covered"));
 }
 
 /// The transcript that has finished while cola was down: the submitted
@@ -989,6 +992,11 @@ async fn a_landed_message_settles_done_even_when_the_anchor_never_persisted() {
 /// once (#443): the run may still answer it, so a restart must not invent an
 /// ending — but the card froze when the previous process died, and the stamp
 /// tells the user why. The card keeps its own body under the new header.
+///
+/// The retired per-record mark is gone (spec #571, ticket #575), so the stamp
+/// is re-decided on every Session Sync tick; the delivery queue's settled key
+/// is what keeps the later ticks free — no further PATCH, and no further
+/// card-view GET behind a key that already landed.
 #[tokio::test]
 async fn a_still_live_session_stamps_its_persisted_card_once() {
     let _wd = test_work_dir();
@@ -1006,9 +1014,9 @@ async fn a_still_live_session_stamps_its_persisted_card_once() {
         card_header(card).contains("已重启，等待运行结束")
     })
     .await;
-    // Several more observed passes, each reading the live status: the stamp
-    // is one per process life, so no further PATCH may follow.
-    wait_for_status_reads(&backend, "ses_test", 3).await;
+    // Several more observed passes, each reading the live status and
+    // re-deciding the stamp: the settled key drops it without a Feishu call.
+    wait_for_status_reads(&backend, "ses_test", 5).await;
 
     let patches = patches_to(&platform, "om_frozen").await;
     assert_eq!(
@@ -1018,6 +1026,12 @@ async fn a_still_live_session_stamps_its_persisted_card_once() {
     );
     assert_eq!(card_header(&patches[0]), "⏳ 已重启，等待运行结束");
     assert_preserved_body(&patches[0]);
+    assert_eq!(
+        card_views_to(&platform, "om_frozen"),
+        1,
+        "a settled key never re-reads the card: {:?}",
+        platform.calls.lock().await
+    );
     assert_eq!(
         card_posts(&platform).await,
         0,
@@ -1030,76 +1044,16 @@ async fn a_still_live_session_stamps_its_persisted_card_once() {
     );
 }
 
-/// A successor that arms while the stamp's view read is in flight collects
-/// the orphan before the read returns; the stamp re-checks ownership before
-/// its PATCH and yields to that later terminal — an interim status never
-/// overwrites a takeover (#443).
+/// A takeover during the stamp's card-view read wins over the stamp (spec
+/// #571, tickets #574/#575): the stamp was decided under the orphan record's
+/// generation, while the takeover tracked its own card first and submitted its
+/// collect under the NEW generation — so the stamp the parked read releases
+/// afterwards is dropped by the queue's generation rule, and the collect is
+/// the orphan's only write. The pre-check that used to catch this race, and
+/// the test-only card-id drop that used to get past it, are both retired
+/// (ticket #575): the ordering key is the whole mechanism now.
 #[tokio::test]
 async fn a_takeover_during_the_stamp_read_wins_over_the_stamp() {
-    let _wd = test_work_dir();
-    let dir = tempfile::tempdir().unwrap();
-    let session_file = dir.path().join("sessions.json");
-    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
-    // A second live orphan the reap keeps reading: the pass clock proving
-    // ticks ran after the parked stamp was released.
-    ChainRecords::load(sidecar(&session_file)).track(
-        "ses_other",
-        "om_other",
-        MessageId::new("msg_cola_other"),
-        Some(2_000),
-        Some("/work"),
-    );
-
-    let transcript = SessionTranscript::new(vec![user("msg_cola_anchor", 1_000, "问题")]);
-    let (app, platform, backend) =
-        restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Busy)).await;
-    backend
-        .set_session_status("ses_other", Some(SessionStatus::Busy))
-        .await;
-    platform.given_card_view("om_frozen", realistic_card_view());
-    // Park the stamp's view read. A generous bound: the takeover below runs
-    // while the read is parked, and this test must not race the bound.
-    let (entered, release) = platform.pause("card_view", "om_frozen");
-
-    spawn_sync_with_timeout(&app, 5_000);
-    entered.notified().await;
-
-    // A successor arms over the orphan while the stamp's read is parked:
-    // attach first, then collect — the order `take_over_card` owns.
-    Turn::seed_card(&app.cards_handle(), "ses_test", None).await;
-    Turn::set_turn_anchor(&app.cards_handle(), "ses_test", &turn_anchor(1_000)).await;
-    Turn::take_over_card(&app.cards_handle(), "ses_test", "om_new", Some("/work")).await;
-
-    let before = backend
-        .session_status_reads
-        .lock()
-        .await
-        .iter()
-        .filter(|sid| sid.as_str() == "ses_other")
-        .count();
-    release.notify_one();
-    // Three more observed passes, the takeover already landed: the released
-    // stamp had every chance to (wrongly) land before these.
-    wait_for_status_reads(&backend, "ses_other", before + 3).await;
-
-    let patches = patches_to(&platform, "om_frozen").await;
-    assert_eq!(
-        patches.len(),
-        1,
-        "the takeover collect is the orphan's only write, never a stale stamp: {patches:?}"
-    );
-    assert_eq!(card_header(&patches[0]), "⏳ 已由新卡片接管 · 已停止更新");
-}
-
-/// A stamp decided under generation G and submitted after a takeover bumped
-/// the chain to G+1 never PATCHes the card (spec #571, ticket #574): the
-/// takeover's collect owns the latest chain state, and the queue drops the
-/// stale stamp by generation. The parked attempt's pre-check cannot mask the
-/// rule in this test — the takeover's in-memory card is gone by the time the
-/// read resumes, the cardless state every restart starts from — so only the
-/// ordering key stands between the stamp and the collected card.
-#[tokio::test]
-async fn a_stamp_submitted_after_a_takeover_bumped_the_chain_never_patches() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("sessions.json");
@@ -1127,16 +1081,12 @@ async fn a_stamp_submitted_after_a_takeover_bumped_the_chain_never_patches() {
     spawn_sync_with_timeout(&app, 5_000);
     entered.notified().await;
 
-    // A successor takes the orphan over while the stamp's read is parked: the
-    // chain bumps to the new card's generation and its collect lands first.
+    // A successor arms over the orphan while the read is parked: attach first,
+    // then collect — the order `take_over_card` owns — and the chain bumps to
+    // the new card's generation.
     Turn::seed_card(&app.cards_handle(), "ses_test", None).await;
     Turn::set_turn_anchor(&app.cards_handle(), "ses_test", &turn_anchor(1_000)).await;
     Turn::take_over_card(&app.cards_handle(), "ses_test", "om_new", Some("/work")).await;
-    wait_for_patches(&platform, "om_frozen", 1).await;
-    // The takeover's card is gone before the stamp resumes (the process no
-    // longer holds one), so the attempt's pre-check finds nothing to yield to
-    // and the stale stamp reaches the queue.
-    Turn::drop_card(&app.cards_handle(), "ses_test").await;
 
     let before = backend
         .session_status_reads
@@ -1160,12 +1110,11 @@ async fn a_stamp_submitted_after_a_takeover_bumped_the_chain_never_patches() {
 }
 
 /// An in-flight stamp followed by a collect leaves the collect as the card's
-/// last write (spec #571, ticket #574): the takeover's collect is submitted at
-/// the NEW chain generation while the stamp's PATCH is parked, so the queue
-/// writes it after the stamp — and the stamp's legacy post-PATCH repair, a
-/// duplicate collect under the stamp's OLD generation, is dropped without a
-/// call. The branch stays in the code for the legacy window where a takeover
-/// has tracked but not yet submitted its collect.
+/// last write (spec #571, tickets #574/#575): the takeover's collect is
+/// submitted at the NEW chain generation while the stamp's PATCH is parked, so
+/// the queue writes it after the stamp. The stamp's legacy post-PATCH repair
+/// is retired with the rest of the guard cluster (ticket #575), so the two
+/// writes are the whole story — no third PATCH repairs anything.
 #[tokio::test]
 async fn a_successor_owning_the_session_collects_after_the_stamp() {
     let _wd = test_work_dir();
@@ -1992,15 +1941,14 @@ async fn a_timed_out_seed_read_seeds_nothing() {
     );
 }
 
-/// The #443 stamp's PATCH passes its pre-PATCH ownership check, then a fresh
-/// Turn takes the orphan over while the stamp is in flight: the takeover's
-/// collect is submitted at the NEW chain generation, so it takes the queue's
-/// waiting slot behind the stamp and lands after it — the collect is the
-/// orphan's last write, and the stamp's duplicate repair under the old
-/// generation is dropped. The collect reproduces the takeover's keep rule —
-/// not `Everything` — so the stamp's stale body never restores the tail the
-/// takeover removed. Seeding one running call, that means no running `⏳`
-/// panel and no ledger on the orphan.
+/// A fresh Turn takes the orphan over while the #443 stamp's PATCH is in
+/// flight: the takeover's collect is submitted at the NEW chain generation, so
+/// it takes the queue's waiting slot behind the stamp and lands after it — the
+/// collect is the orphan's last write, and the retired repair (spec #571,
+/// ticket #575) never adds a third. The collect composes the takeover's own
+/// strip rule — not `Everything` — so the stamp's stale body never restores
+/// the tail the takeover removed. Seeding one running call, that means no
+/// running `⏳` panel and no ledger on the orphan.
 #[tokio::test]
 async fn a_stamp_over_a_seeding_takeover_collects_without_the_seeded_tail() {
     let _wd = test_work_dir();
@@ -2035,10 +1983,10 @@ async fn a_stamp_over_a_seeding_takeover_collects_without_the_seeded_tail() {
     let mut context = ctx("ses_test", "新问题");
     context.cola_message_id = Some("msg_cola_new".into());
     let turn = spawn_turn(&app, context);
-    // The recorded rule is the observed proof the takeover attached, seeded
-    // (at least one call) and reached its collect before the stamp is
-    // released — so the collect, never a repair, carries the strip.
-    wait_for_predecessor_keep(&app, "ses_test", "om_frozen", &["call_sleep"]).await;
+    // The takeover's collect read the orphan's view (the stamp's own read was
+    // the first): the observed proof it reached its composition — its PATCH
+    // queues behind the parked stamp, which lands first.
+    wait_for_card_views(&platform, "om_frozen", 2).await;
     release.notify_one();
     // The collect is the orphan's second write: the parked stamp, then the
     // takeover's queued collect. Waiting for it pins the interleaving this
@@ -2110,10 +2058,10 @@ async fn a_stamp_over_a_seeding_takeover_collects_without_the_seeded_tail() {
 
 /// The same stamp/takeover interleaving for a takeover that seeded nothing (no
 /// live call in the orphan Turn's own window): the takeover's collect — the
-/// orphan's second and last write, submitting at the new generation — carries
-/// the takeover's rule, so the running `⏳` marker stays — spec #523: "When
-/// nothing was carried … the running marker stays" — while the ledger still
-/// leaves the collected card.
+/// orphan's second and last write, submitting at the new generation and
+/// composing its own strip rule — keeps the running `⏳` marker — spec #523:
+/// "When nothing was carried … the running marker stays" — while the ledger
+/// still leaves the collected card.
 #[tokio::test]
 async fn a_stamp_over_an_empty_takeover_collects_without_the_ledger() {
     let _wd = test_work_dir();
@@ -2148,7 +2096,9 @@ async fn a_stamp_over_an_empty_takeover_collects_without_the_ledger() {
     let mut context = ctx("ses_test", "新问题");
     context.cola_message_id = Some("msg_cola_new".into());
     let turn = spawn_turn(&app, context);
-    wait_for_predecessor_keep(&app, "ses_test", "om_frozen", &[]).await;
+    // The takeover's collect read the orphan's view (the stamp's own read was
+    // the first): the observed proof it reached its composition.
+    wait_for_card_views(&platform, "om_frozen", 2).await;
     release.notify_one();
     wait_for_patches(&platform, "om_frozen", 2).await;
 
@@ -2482,8 +2432,11 @@ async fn a_failed_stamp_read_leaves_the_card_untouched_until_readable() {
     assert_preserved_body(&patches[0]);
 }
 
-/// A stamp PATCH that fails recoverably is not marked: the next pass retries
-/// it until one lands, and the mark then holds (#443).
+/// A stamp PATCH that fails recoverably is not given up: the queue keeps the
+/// write owed with its key, and the next tick's re-decision (the key is not
+/// settled, so the card is read again) replaces the owed payload and lands it.
+/// Once a write lands the settled key holds — no further attempt (#443,
+/// spec #571's ticket #575).
 #[tokio::test]
 async fn a_failed_stamp_patch_retries_until_it_lands() {
     let _wd = test_work_dir();
@@ -2496,7 +2449,7 @@ async fn a_failed_stamp_patch_retries_until_it_lands() {
         restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Busy)).await;
     platform.given_card_view("om_frozen", realistic_card_view());
     // The first stamp PATCH fails recoverably (transport class): the write may
-    // not have landed, so the record stays unmarked and the next pass retries.
+    // not have landed, so the queue keeps it owed and the next tick retries.
     platform
         .fail_update_transport_count
         .store(1, std::sync::atomic::Ordering::SeqCst);
@@ -2506,7 +2459,7 @@ async fn a_failed_stamp_patch_retries_until_it_lands() {
         card_header(card).contains("已重启，等待运行结束")
     })
     .await;
-    // Further observed passes: the mark holds — no third PATCH.
+    // Further observed passes: the settled key holds — no third PATCH.
     wait_for_status_reads(&backend, "ses_test", 5).await;
 
     let patches = patches_to(&platform, "om_frozen").await;
@@ -2528,11 +2481,13 @@ async fn a_failed_stamp_patch_retries_until_it_lands() {
     );
 }
 
-/// #522: a stamp PATCH Feishu permanently refuses — a typed
-/// `CardContentRejected`, deterministic by ADR-0067's own treatment — is
-/// attempted once and given up for this process life: no later Session Sync
-/// tick retries the identical payload. The record stays (the pre-#443
-/// behavior for that rare card), and the real ending still supersedes it.
+/// #522 folds into the queue's one permanent-refusal outcome (spec #571,
+/// ticket #575): a stamp PATCH Feishu *permanently* refuses — a typed
+/// `CardContentRejected`, deterministic by ADR-0067's own treatment — settles
+/// its `(generation, Stamp)` key. Every later Session Sync tick then drops the
+/// re-decided stamp without a Feishu call, and the settled-key query also
+/// spares the card-view read. The record stays (the pre-#443 behavior for that
+/// rare card), and the real ending still supersedes the missing stamp.
 #[tokio::test]
 async fn a_rejected_stamp_is_attempted_once_and_given_up() {
     let _wd = test_work_dir();
@@ -2544,21 +2499,28 @@ async fn a_rejected_stamp_is_attempted_once_and_given_up() {
         restarted_app_with_backend(&session_file, completed(1_000), Some(SessionStatus::Busy)).await;
     platform.given_card_view("om_frozen", realistic_card_view());
     // The one stamp attempt is refused as card content (230099): every later
-    // pass would send the identical payload, so none may be made.
+    // tick would send the identical payload, so none may be made.
     platform
         .fail_update_card_content_count
         .store(1, std::sync::atomic::Ordering::SeqCst);
 
     spawn_sync(&app);
-    wait_for_rejected_stamp(&app, "ses_test").await;
-    // Several observed passes after the rejection: the mark holds.
-    wait_for_status_reads(&backend, "ses_test", 4).await;
+    // The refusal settles the queue's key — the fact every later tick reads
+    // before it does anything.
+    wait_for_covered_stamp(&app, "ses_test", "om_frozen").await;
+    // Several observed passes after the rejection: the key holds.
+    wait_for_status_reads(&backend, "ses_test", 6).await;
 
     let patches = patches_to(&platform, "om_frozen").await;
     assert_eq!(
         patches.len(),
         1,
         "the refused stamp is attempted once, never retried: {patches:?}"
+    );
+    assert_eq!(
+        card_views_to(&platform, "om_frozen"),
+        1,
+        "a refused key is settled too: no later tick re-reads the card"
     );
     assert!(
         app.cards_handle().chains.get("ses_test").is_some(),
@@ -2584,10 +2546,10 @@ async fn a_rejected_stamp_is_attempted_once_and_given_up() {
     );
 }
 
-/// A stamp PATCH that hangs never wedges the pass: the attempt is detached
-/// and the pass keeps reconciling other records while the write waits. The
-/// write is never cancelled — when Feishu finally answers, the stamp lands
-/// exactly once (#443).
+/// A stamp PATCH that hangs never wedges the pass: the view read and the
+/// composition run off the pass's critical path, and the write is owned by the
+/// delivery queue — the pass keeps reconciling other records while the write
+/// waits. When Feishu finally answers, the stamp lands exactly once (#443).
 #[tokio::test]
 async fn a_hung_stamp_patch_never_wedges_the_pass() {
     let _wd = test_work_dir();
@@ -2631,7 +2593,8 @@ async fn a_hung_stamp_patch_never_wedges_the_pass() {
         platform.calls.lock().await
     );
 
-    // Feishu answers: the never-cancelled write lands and is marked once.
+    // Feishu answers: the queue's own write lands, once, and the settled key
+    // keeps every later tick from writing it again.
     release.notify_one();
     wait_for_card_update(&platform, "the stamp after the hang", CardUpdates::Any, |card| {
         card_header(card).contains("已重启，等待运行结束")
@@ -2652,18 +2615,19 @@ async fn a_hung_stamp_patch_never_wedges_the_pass() {
     );
 }
 
-/// A run that ends while the stamp's write hangs is settled only after the
-/// attempt resolves: the terminal must not race the never-cancelled write
-/// (which could then land over it), so nothing is written while the stamp is
-/// in flight, and the ✅ follows the stamp as the card's last word (#443).
+/// A run that ends while the stamp's write is in flight is settled only after
+/// that write lands (spec #571, ticket #575): the claim that used to gate the
+/// decision is retired, so the next pass decides the settle freely — its
+/// keyless PATCH waits on the card's delivery lock the in-flight stamp holds,
+/// and the ✅ is the card's last word. No later tick can resurrect the stamp
+/// over it.
 #[tokio::test]
 async fn a_terminal_waits_for_an_in_flight_stamp() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("sessions.json");
     seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
-    // The pass clock: this record's reads keep ticking — the claimed record
-    // returns before its own status read.
+    // The pass clock: this record's reads keep ticking after the settle.
     ChainRecords::load(sidecar(&session_file)).track(
         "ses_other",
         "om_other",
@@ -2682,22 +2646,16 @@ async fn a_terminal_waits_for_an_in_flight_stamp() {
 
     spawn_sync(&app);
     entered.notified().await;
-    // The run ends while the stamp write hangs: the settle must wait for the
-    // attempt, never race it.
+    // The run ends while the stamp write hangs: the next pass decides the
+    // settle, and its preserved-ending read (the stamp's own was the first
+    // card-view read) is the observed point that decision reached the card.
     backend
         .set_session_status("ses_test", Some(SessionStatus::Idle))
         .await;
-    let before = backend
-        .session_status_reads
-        .lock()
-        .await
-        .iter()
-        .filter(|sid| sid.as_str() == "ses_other")
-        .count();
-    wait_for_status_reads(&backend, "ses_other", before + 3).await;
+    wait_for_card_views(&platform, "om_frozen", 2).await;
     assert!(
         patches_to(&platform, "om_frozen").await.is_empty(),
-        "no settle while the stamp is in flight: {:?}",
+        "no settle lands while the stamp write is in flight: {:?}",
         platform.calls.lock().await
     );
 
@@ -2707,6 +2665,15 @@ async fn a_terminal_waits_for_an_in_flight_stamp() {
         card_header(card).contains("✅")
     })
     .await;
+    // Further observed passes: nothing resurrects the stamp over the ✅.
+    let before = backend
+        .session_status_reads
+        .lock()
+        .await
+        .iter()
+        .filter(|sid| sid.as_str() == "ses_other")
+        .count();
+    wait_for_status_reads(&backend, "ses_other", before + 3).await;
 
     let patches = patches_to(&platform, "om_frozen").await;
     assert_eq!(patches.len(), 2, "the stamp then its terminal: {patches:?}");

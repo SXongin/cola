@@ -31,16 +31,17 @@
 //! record with no Rendered Cursor keeps for one release — a cursor-carrying
 //! record is never stamped, ticket #566) reads the
 //! same view the other way around: only the header changes, and a failed read
-//! or PATCH claims nothing — a bare stamp would wipe the body the stamp exists
-//! to keep — so the next pass retries it; a PATCH Feishu *permanently* refuses
-//! as card content is given up for the process life instead (#522). The attempt
-//! is handed to a detached
-//! task: the pass must not await a stuck Feishu call, while the issued write is
-//! submitted as a **keyed write** (spec #571) that the card-delivery queue owns
-//! — it runs to its own result, and a successor's later collect, carrying the
-//! newer chain generation, is ordered after it or drops it by generation. A
-//! per-record in-flight claim holds every other reap decision until the
-//! attempt resolves. Content the chain never showed is published by the
+//! claims nothing — a bare stamp would wipe the body the stamp exists to
+//! keep — so the next tick re-decides it. The view read and the composition run
+//! on a small pre-submission task: the pass must not await a stuck Feishu call,
+//! while the issued write is submitted as a **keyed write** (spec #571) that the
+//! card-delivery queue owns — it runs to its own result, and a successor's later
+//! collect, carrying the newer chain generation, is ordered after it or drops it
+//! by generation. The queue's own memory replaces the retired per-record marks
+//! (ticket #575): a key it already settled — delivered, so it is on the card, or
+//! permanently refused as card content (#522) — or is still writing makes the
+//! next tick's re-decision a no-op, so an already-stamped orphan costs no card
+//! read and no Feishu call. Content the chain never showed is published by the
 //! projections above (bounded by their confirmed cursor), by the
 //! existing continuation machinery (a Wake's continuation card), or left in
 //! the transcript — the reap never replays a turn onto a stale card, and never
@@ -58,8 +59,8 @@
 //! over the evidence [`RecoveryReads`] carries — no I/O, failures are values —
 //! while this module gathers the reads the decision's own plan warrants,
 //! performs the card writes, and keeps the card mechanics (the preserved
-//! body, the detached stamp attempt). The plan lives beside the decision, so
-//! the reads are exactly the ones the decision consumes and a read the pass
+//! body, the stamp's pre-submission task). The plan lives beside the decision,
+//! so the reads are exactly the ones the decision consumes and a read the pass
 //! could not make degrades to "nothing claimed" instead of a wrong claim.
 //!
 //! A Session that relocated while the run was in flight (#428: `session_move`
@@ -103,9 +104,7 @@ use crate::feishu::delivery::{CardWriteIntent, KeyedSubmission, WriteOutcome};
 /// projections — strip the orphan's live tail through
 /// [`collect_orphan_after_takeover`]; this ordinary collect (the Wake
 /// continuation's arm, the external arm, the reap's successor collect) leaves
-/// the preserved body exactly as today. The #443 stamp's repair reproduces
-/// the takeover's recorded rule where one exists (this plain collect
-/// otherwise).
+/// the preserved body exactly as today.
 ///
 /// A failed PATCH only warns; the record follows the successor either way, so
 /// the freeze it leaves behind is the pre-#438 behavior, never a crash.
@@ -133,19 +132,16 @@ pub(crate) async fn collect_orphan(cards: &CardsHandle, session_id: &str, card_m
 /// A failed, empty or fallback seed resolves nothing and keeps today's body.
 /// A failed PATCH only warns, like every collect.
 ///
-/// The rule is recorded on the successor's record **before** the collect's
-/// submission: the collect itself now outranks any stamp the ordering let
-/// through, and the record is what the legacy repair reads when one does
-/// ([`stamp_restart_attempt`]).
+/// The strip rule is the collect's own composition (`keep` below) and lives
+/// nowhere else: the retired repair that used to re-read it from the successor's
+/// record is gone (spec #571, ticket #575), and the queue's generation order is
+/// what keeps this collect after any older stamp.
 pub(crate) async fn collect_orphan_after_takeover(
     cards: &CardsHandle,
     session_id: &str,
     card_message_id: &str,
     resolved_calls: &[String],
 ) {
-    cards
-        .chains
-        .note_predecessor_keep(session_id, card_message_id, resolved_calls);
     let keep = KeepBody::WithoutLiveTail {
         resolved_calls: resolved_calls.to_vec(),
     };
@@ -171,12 +167,10 @@ pub(crate) async fn collect_late_projection(cards: &CardsHandle, session_id: &st
 /// [`collect_orphan_after_takeover`]: one keyed submission naming the
 /// successor, terminal and grey, its preserved body under `keep`, carrying the
 /// **chain generation the write belongs to** — the successor's current
-/// generation for every live collect (spec #571, ticket #574), and the stamp's
-/// older read generation for the legacy repair, whose duplicate submission a
-/// takeover's newer collect then drops. The collect awaits its completion
-/// ticket — the cache release follows a delivery and the warning a failure,
-/// exactly the timing the PATCH's own await had — while the queue owns the
-/// write.
+/// generation, read at submission (spec #571, ticket #574). The collect awaits
+/// its completion ticket — the cache release follows a delivery and the warning
+/// a failure, exactly the timing the PATCH's own await had — while the queue
+/// owns the write.
 async fn collect_orphan_with(
     cards: &CardsHandle,
     session_id: &str,
@@ -334,7 +328,6 @@ async fn gather_reads<'a>(
     });
     RecoveryReads {
         claimed,
-        stamping: record.restart_stamping,
         card: probe_card(handles, session_id, record, ownership.card_message_id()).await,
         route,
         status: None,
@@ -434,7 +427,7 @@ async fn read_transcript(handles: &FlowHandles, session_id: &str, read_timeout_m
 /// `NoDecision` logs the one diagnosis the reads did not (a missing route);
 /// the collect arms only move the record — the successor's [`collect_orphan`]
 /// already ran before the decision (see [`reconcile`]); the stamp hands off to
-/// the detached attempt; the settle PATCHes the ending in place; the ended
+/// the pre-submission task; the settle PATCHes the ending in place; the ended
 /// projection arms, creates, tracks and collects its successor
 /// ([`project_card`]); the live adoption does the same and returns the follow
 /// its caller must spawn ([`project_live_card`], [`AdoptedFollow`]).
@@ -488,7 +481,18 @@ async fn apply(
             handles.cards.chains.release(session_id);
         }
         ChainDisposition::StampRestart => {
-            stamp_restarted(handles, session_id, record, read_timeout_ms);
+            // The queue's own settled/owed knowledge replaces the retired
+            // per-record marks (spec #571, ticket #575): a stamp the queue
+            // already settled — delivered, or permanently refused (#522) —
+            // owes nothing, and one it is still writing needs no second
+            // submission. Either way the card must not be read again.
+            if !handles.cards.feishu.keyed_write_covered(
+                &record.card_message_id,
+                record.generation,
+                CardWriteIntent::Stamp,
+            ) {
+                stamp_restarted(handles, session_id, record, read_timeout_ms);
+            }
         }
         ChainDisposition::Settle(settle) => {
             settle_card(handles, session_id, record, reads.route, settle, read_timeout_ms).await;
@@ -1270,54 +1274,38 @@ impl ApplyPass<'_> {
     }
 }
 
-/// Claim the one in-flight stamp attempt for this record and hand it to a
-/// detached task (#443): the pass must never await the write, and the write
-/// must never be cancelled. Both properties matter — a stuck Feishu call
-/// cannot freeze Session Sync if nobody awaits it, and the card's delivery
-/// queue owns the issued write, so it runs to its own result and any
-/// successor's later collect is ordered after it (spec #571, ticket #574).
-/// The task submits the stamp under the generation its decision read, marks
-/// the record when the write lands, repairs a takeover admitted while it was
-/// in flight, and releases the claim (resolved either way) so the next pass
-/// may retry. A submission a newer generation superseded marks nothing: the
-/// takeover's own collect is the card's last word.
+/// Hand the still-live orphan's one-time restart stamp (#443) to the card's
+/// delivery queue (spec #571): the view read and the composition run on a small
+/// task so the Session Sync pass never awaits Feishu — and cancelling that task
+/// before the submission is safe, because the write belongs to the queue, not
+/// to the task. The attempt submits the stamp under the generation its decision
+/// read, so a takeover that bumps the chain meanwhile outranks (and drops) it;
+/// the queue's settled key then makes every later tick's re-decision free.
 fn stamp_restarted(handles: &FlowHandles, session_id: &str, record: &ChainRecord, read_timeout_ms: u64) {
     let card_message_id = record.card_message_id.clone();
     // The generation the decision read rides the record snapshot: submitted
     // with the write, so a takeover that bumps the chain meanwhile outranks
     // (and drops) this stamp (spec #571, ticket #574).
     let generation = record.generation;
-    if !handles
-        .cards
-        .chains
-        .begin_restart_stamp(session_id, &card_message_id)
-    {
-        return;
-    }
     let cards = handles.cards.clone();
     let session_id = session_id.to_string();
     tokio::spawn(async move {
         stamp_restart_attempt(&cards, &session_id, &card_message_id, generation, read_timeout_ms).await;
-        cards.chains.finish_restart_stamp(&session_id, &card_message_id);
     });
 }
-/// One restart-stamp attempt (#443), detached from the Session Sync pass: the
-/// still-live orphan's card view is read back (bounded — nothing has been sent
-/// yet, so abandoning a timed-out read is safe) and only the header changes —
-/// body kept, controls stripped, exactly like a preserved ending. The PATCH
-/// itself is submitted as a **keyed write** under the generation the decision
-/// read (spec #571, ticket #574): the queue owns it, and the attempt awaits
-/// its own ticket, so the landing line, the marks and the legacy repair keep
-/// the exact timing the awaited PATCH had. A failed read claims nothing — no
-/// bare fallback: the stamp's whole value is the body it preserves — and the
-/// caller releases the attempt's claim so the next pass retries; a write
-/// permanently refused as card content (#522) is marked given up instead. A
-/// submission superseded by a newer generation is the ordering working: the
-/// takeover's collect owns the card and this stamp is never owed. On success
-/// the in-memory mark is set, and a takeover admitted while the write was in
-/// flight is repaired by the post-PATCH re-collect — under the fresh-Turn
-/// takeover's own keep rule when it recorded one (ADR-0068), never restoring
-/// the tail that collect removed.
+
+/// One restart-stamp attempt (#443): the still-live orphan's card view is read
+/// back (bounded — nothing has been sent yet, so abandoning a timed-out read is
+/// safe) and only the header changes — body kept, controls stripped, exactly
+/// like a preserved ending. The PATCH itself is submitted as a **keyed write**
+/// under the generation the decision read (spec #571): the queue owns it, so
+/// the ordering against every collect is the queue's, not this task's. A failed
+/// read claims nothing — no bare fallback: the stamp's whole value is the body
+/// it preserves — and the queue remembers nothing, so the next tick retries. A
+/// write permanently refused as card content (#522) settles the queue's key;
+/// later ticks then read the settled key and never touch Feishu again. A
+/// submission a newer generation superseded is the ordering working: the
+/// takeover's collect owns the card and this stamp is never owed.
 async fn stamp_restart_attempt(
     cards: &CardsHandle,
     session_id: &str,
@@ -1342,19 +1330,8 @@ async fn stamp_restart_attempt(
         }
         None => return,
     };
-    // The pass's ownership check is stale by now: a Turn may have started —
-    // or a successor armed — while the view read was in flight. A takeover
-    // attaches the successor id BEFORE it collects this card
-    // (`take_over_card`'s attach-then-collect order), so any admitted
-    // successor is visible here, and its collect is the later terminal: the
-    // stamp yields to it rather than overwriting it with an interim status.
-    // The generation rule behind this check catches the same race in the
-    // queue when the successor's card is no longer visible (spec #571).
-    if Turn::card_message_id(cards, session_id).await.is_some() {
-        return;
-    }
     let card = restamped_keeping_body(&ending_card(CardState::Restarted, None, None), &view);
-    let outcome = platform
+    match platform
         .submit_ordered(KeyedSubmission {
             message_id: card_message_id,
             generation,
@@ -1363,65 +1340,25 @@ async fn stamp_restart_attempt(
         })
         .await
         .settled()
-        .await;
-    match outcome {
-        WriteOutcome::Delivered => {}
+        .await
+    {
+        WriteOutcome::Delivered => tracing::info!(
+            "live-card reap: session {session_id} {}",
+            CardState::Restarted.reap_word()
+        ),
         WriteOutcome::Failed(e) => {
             tracing::warn!(
                 "live-card reap: session {session_id} could not stamp card {card_message_id}: {e}"
             );
-            // #522: a definite content rejection is deterministic — the same
-            // preserved payload can never land — so this process life gives the
-            // stamp up instead of retrying it every Session Sync tick. Transient
-            // failures change nothing: the caller releases the claim either way;
-            // the queue keeps a recoverable failure owed with its key, and the
-            // next pass's re-submission delivers or replaces it.
-            if matches!(e, crate::error::BridgeError::CardContentRejected { .. }) {
-                cards
-                    .chains
-                    .mark_restart_stamp_rejected(session_id, card_message_id);
-            }
-            return;
         }
         WriteOutcome::Superseded => {
             // A newer chain state owns the card: the takeover's collect was
             // submitted first (or a newer stamp did), so this stamp is not
-            // owed and never reached Feishu. Nothing to mark and nothing to
-            // repair — the record keeps its place for that owner's decisions.
+            // owed and never reached Feishu.
             tracing::debug!(
                 "live-card reap: session {session_id} stamp for card {card_message_id} superseded by a newer chain state"
             );
-            return;
         }
-    }
-    tracing::info!(
-        "live-card reap: session {session_id} {}",
-        CardState::Restarted.reap_word()
-    );
-    cards.chains.mark_restarted_reaped(session_id, card_message_id);
-    // A takeover that started while the PATCH was in flight may have seen its
-    // older collect overwritten by this stamp (the delivery lock serializes
-    // the two writes, not their order of intent): if a successor owns the
-    // session now, collect the orphan again so the takeover has the card's
-    // last word. A collect that lands after this PATCH wins on its own; this
-    // only repairs the reversed order. Under the keyed ordering the takeover's
-    // collect was submitted at the NEW generation, so this repair's submission
-    // under the stamp's older generation is dropped without a call — the
-    // branch stays for the legacy window in which a takeover has tracked but
-    // not yet submitted its collect.
-    //
-    // The repair reproduces the takeover's own keep rule (ADR-0068), never
-    // the plain one: a fresh Turn's collect recorded which of the carry's calls
-    // it resolved onto the successor, so the stamp's stale body must not
-    // restore the running markers that collect removed. A takeover
-    // that recorded no rule — the Wake continuation's arm, the external arm —
-    // keeps today's preserved body ([`KeepBody::Everything`]).
-    if Turn::card_message_id(cards, session_id).await.is_some() {
-        let keep = match cards.chains.predecessor_keep_strip(session_id, card_message_id) {
-            Some(resolved_calls) => KeepBody::WithoutLiveTail { resolved_calls },
-            None => KeepBody::Everything,
-        };
-        collect_orphan_with(cards, session_id, card_message_id, keep, generation).await;
     }
 }
 
@@ -1453,7 +1390,7 @@ fn ending_card(state: CardState, detail: Option<&str>, move_note: Option<&str>) 
 /// ending over it, PATCH the merge. `keep` is the merge's view-element rule —
 /// [`KeepBody::Everything`] for every ordinary ending and the #443 stamp,
 /// [`KeepBody::WithoutLiveTail`] for the fresh-Turn takeover's collect
-/// and the #443 stamp's repair of it (ADR-0068). A failed
+/// (ADR-0068). A failed
 /// read PATCHes `bare` directly — today's behavior — because the ending must
 /// never depend on the read.
 ///
@@ -1504,12 +1441,11 @@ async fn preserved_ending(
 /// feedback, ADR-0068).
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum KeepBody {
-    /// Every ordinary collect, every ending and the #443 restart stamp —
-    /// plus the stamp's repair when no takeover recorded a rule: the card's
-    /// own view stays as it was, its controls stripped.
+    /// Every ordinary collect, every ending and the #443 restart stamp: the
+    /// card's own view stays as it was, its controls stripped.
     Everything,
-    /// The fresh-Turn message takeover's collect and the #443 stamp's repair
-    /// of it (ADR-0068, the one collect the spec's Trigger scopes the strip
+    /// The fresh-Turn message takeover's collect (ADR-0068, the one collect
+    /// the spec's Trigger scopes the strip
     /// to): the view's live tail goes —
     /// the Background Task Ledger element always, because the successor's own
     /// reads rebuild the live list (ADR-0060), and each running `⏳` panel
