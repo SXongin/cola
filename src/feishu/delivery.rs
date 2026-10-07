@@ -34,6 +34,12 @@
 //! - serializes keyless and keyed writes on the same per-card delivery lock —
 //!   a keyless write is never dropped for staleness.
 //!
+//! Readers can ask the queue what it already covers — [`Platform::keyed_write_covered`]
+//! (spec #571, ticket #575): a settled key or one already being written needs
+//! no re-decision, so a writer that re-decides every tick (the reap's stamp)
+//! reads and submits nothing for it. The query only reports; it never orders,
+//! claims or drops anything.
+//!
 //! Each keyed submission returns a [`CardWriteTicket`] settling on that
 //! submission's own attempt, so a caller that needs the write's timing (a
 //! collect releasing its cached card on delivery, warning on failure) awaits
@@ -288,6 +294,26 @@ impl PendingEntry {
             driver: None,
             tickets: HashMap::new(),
         }
+    }
+
+    /// Whether this card's queue already owns `(generation, intent)` (spec
+    /// #571, ticket #575): the key settled, or a write of that exact key is in
+    /// flight (its driver running) or waiting. An owed write with no driver is
+    /// not covered — a later re-decision may still replace it — and neither is
+    /// an older generation, whose keys were forgotten and whose submissions
+    /// are dropped by the generation rule anyway.
+    fn covers(&self, generation: u64, intent: CardWriteIntent) -> bool {
+        if self.generation != generation {
+            return false;
+        }
+        if self.keys.contains_key(&intent) {
+            return true;
+        }
+        let same_key = |write: &QueuedWrite| write.generation == generation && write.intent == intent;
+        self.in_flight
+            .as_ref()
+            .is_some_and(|write| self.driver == Some(write.token) && same_key(write))
+            || self.waiting.as_ref().is_some_and(same_key)
     }
 }
 
@@ -1107,6 +1133,15 @@ impl Platform for CardDelivery {
             .failed
             .get(message_id)
             .and_then(|(seq, payload)| (payload == card).then_some(*seq))
+    }
+
+    fn keyed_write_covered(&self, message_id: &str, generation: u64, intent: CardWriteIntent) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .entries
+            .get(message_id)
+            .is_some_and(|entry| entry.covers(generation, intent))
     }
 
     fn settled_card_write_delivered(&self, message_id: &str) -> Option<bool> {
@@ -1985,6 +2020,75 @@ mod tests {
         );
     }
 
+    /// The read-only covered-key query a writer's per-tick re-decision
+    /// consults before doing any work (spec #571, ticket #575): a settled key
+    /// (delivered or permanently refused) and an in-flight or waiting write of
+    /// the exact key are covered; an owed recoverable failure is not, and a
+    /// newer generation forgets the older generation's keys.
+    #[tokio::test]
+    async fn the_covered_key_query_reports_settled_and_in_flight_keys() {
+        let inner = Arc::new(FakePlatform::new());
+        let delivery = CardDelivery::new(inner.clone());
+        let stamp = serde_json::json!({ "body": "stamp" });
+        let collect = serde_json::json!({ "body": "collect" });
+
+        assert!(
+            !delivery.keyed_write_covered("om_1", 1, CardWriteIntent::Stamp),
+            "a card the queue never saw reports nothing covered"
+        );
+
+        // An in-flight write covers its own key (the writer's re-decision
+        // would only queue the same payload behind it) while a different key
+        // is not covered.
+        let (entered, release) = inner.park_next();
+        let in_flight = submit(&delivery, "om_1", 1, CardWriteIntent::Collect, &collect).await;
+        entered.notified().await;
+        assert!(
+            delivery.keyed_write_covered("om_1", 1, CardWriteIntent::Collect),
+            "a write in flight covers its key"
+        );
+        assert!(
+            !delivery.keyed_write_covered("om_1", 1, CardWriteIntent::Stamp),
+            "another key's in-flight write covers nothing of this key"
+        );
+        release.notify_one();
+        assert!(matches!(in_flight.settled().await, WriteOutcome::Delivered));
+        assert!(
+            delivery.keyed_write_covered("om_1", 1, CardWriteIntent::Collect),
+            "a delivered key is covered"
+        );
+        assert!(
+            !delivery.keyed_write_covered("om_1", 2, CardWriteIntent::Collect),
+            "another generation's key is not this key"
+        );
+
+        // A recoverable failure leaves the key owed with no driver: a later
+        // re-decision may still replace it, so it is not covered.
+        let (entered, release) = inner.park_next();
+        inner.fail_next(Fail::Transport);
+        let failed = submit(&delivery, "om_2", 3, CardWriteIntent::Stamp, &stamp).await;
+        entered.notified().await;
+        release.notify_one();
+        assert!(matches!(failed.settled().await, WriteOutcome::Failed(_)));
+        assert!(
+            !delivery.keyed_write_covered("om_2", 3, CardWriteIntent::Stamp),
+            "an owed recoverable failure is not covered"
+        );
+
+        // A permanent refusal is covered, like a delivery (#522).
+        inner.fail_next(Fail::ContentRejected);
+        let ticket = submit(&delivery, "om_1", 2, CardWriteIntent::Stamp, &stamp).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Failed(_)));
+        assert!(
+            delivery.keyed_write_covered("om_1", 2, CardWriteIntent::Stamp),
+            "a permanently refused key is covered"
+        );
+        assert!(
+            !delivery.keyed_write_covered("om_1", 1, CardWriteIntent::Collect),
+            "a newer generation forgets the older generation's keys"
+        );
+    }
+
     /// A keyed submission's entry never answers for a keyless write that has
     /// not happened: the Rendered Cursor's views stay unobserved, not settled,
     /// until a keyless `update_message` is written for the card.
@@ -2074,6 +2178,10 @@ mod tests {
             .await;
         assert!(matches!(ticket.settled().await, WriteOutcome::Failed(_)));
         assert_eq!(inner.attempts().len(), 2, "the fallback writes straight through");
+        assert!(
+            !inner.keyed_write_covered("om_2", 3, CardWriteIntent::Stamp),
+            "an unwrapped platform remembers no covered key"
+        );
     }
 
     /// A recoverable failure stays owed with its key: the caller sees its own
