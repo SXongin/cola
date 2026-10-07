@@ -1158,6 +1158,7 @@ async fn a_collect_submits_the_live_generation_after_its_card_view_read() {
             generation: 1,
             intent: crate::feishu::delivery::CardWriteIntent::Stamp,
             card: &stamp,
+            fallback: None,
         })
         .await
         .settled()
@@ -1195,6 +1196,7 @@ async fn a_collect_submits_the_live_generation_after_its_card_view_read() {
             generation: 0,
             intent: crate::feishu::delivery::CardWriteIntent::Stamp,
             card: &stale,
+            fallback: None,
         })
         .await
         .settled()
@@ -3955,6 +3957,103 @@ async fn a_rejected_preserved_ending_retries_the_bare_one() {
         patches[1]["body"]["elements"].as_array().unwrap().is_empty(),
         "the retry is the bare ending: {}",
         patches[1]
+    );
+}
+
+/// The collect path's degradation goes through the queue's fallback too (spec
+/// #571 review): a preserved collect the platform refuses as card content still
+/// lands its bare taken-over marker, under the collect's own
+/// `(generation, Collect)` key — never a keyless write the generation order
+/// cannot see.
+#[tokio::test]
+async fn a_rejected_preserved_collect_lands_the_bare_marker() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
+
+    let (app, platform) = restarted_app(&session_file, completed(1_000), None).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+    // The preserved collect is refused as card content (230099): its bare
+    // marker must still land.
+    platform
+        .fail_update_card_content_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+
+    // A successor takes the orphan over: the collect PATCHes the orphan card.
+    Turn::seed_card(&app.cards_handle(), "ses_test", None).await;
+    Turn::set_turn_anchor(&app.cards_handle(), "ses_test", &turn_anchor(1_000)).await;
+    Turn::take_over_card(&app.cards_handle(), "ses_test", "om_new", Some("/work")).await;
+
+    let patches = patches_to(&platform, "om_frozen").await;
+    assert_eq!(
+        patches.len(),
+        2,
+        "the preserved collect and its bare fallback: {patches:?}"
+    );
+    assert!(
+        card_text(&patches[0]).contains("**正文** 第一段"),
+        "the first attempt kept the body: {}",
+        patches[0]
+    );
+    assert_eq!(card_header(&patches[1]), "⏳ 已由新卡片接管 · 已停止更新");
+    assert!(
+        patches[1]["body"]["elements"].as_array().unwrap().is_empty(),
+        "the fallback is the bare taken-over marker: {}",
+        patches[1]
+    );
+}
+
+/// The bare-ending fallback stays inside the queue's ordering (spec #571
+/// review): a preserved ending the platform refuses as card content
+/// degrades to the bare ending, but under the SAME key and the same held card
+/// lock — a newer-generation collect queued behind the ending owns the card's
+/// last word. The pre-review keyless retry could acquire the card lock after
+/// the collect and repaint a stale ✅ over the taken-over card.
+#[tokio::test]
+async fn a_refused_preserved_ending_never_lands_over_a_newer_collect() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
+
+    let (app, platform, _backend) =
+        restarted_app_with_backend(&session_file, completed(1_000), Some(SessionStatus::Idle)).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+    // The preserved ✅ ending is refused as card content (230099): its bare
+    // fallback must still land — ordered under the ending's own key.
+    platform
+        .fail_update_card_content_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    // Park the preserved ending's PATCH: the refusal and the fallback are both
+    // still outstanding when the takeover queues behind them.
+    let (entered, release) = platform.pause("update", "om_frozen");
+
+    spawn_sync_with_timeout(&app, 5_000);
+    entered.notified().await;
+
+    // A successor takes the orphan over while the ending is parked: its collect
+    // queues at the new chain generation and must be the card's last write.
+    let takeover = {
+        let app = app.clone();
+        tokio::spawn(async move {
+            Turn::seed_card(&app.cards_handle(), "ses_test", None).await;
+            Turn::set_turn_anchor(&app.cards_handle(), "ses_test", &turn_anchor(1_000)).await;
+            Turn::take_over_card(&app.cards_handle(), "ses_test", "om_new", Some("/work")).await;
+        })
+    };
+    wait_for_record_card(&app, "ses_test", "om_new").await;
+
+    release.notify_one();
+    takeover.await.unwrap();
+    // The preserved attempt, the bare fallback and the collect — nothing more.
+    wait_for_patches(&platform, "om_frozen", 3).await;
+
+    let patches = patches_to(&platform, "om_frozen").await;
+    assert_eq!(
+        card_header(patches.last().expect("the writes")),
+        "⏳ 已由新卡片接管 · 已停止更新",
+        "the newer collect owns the card's last word, never the stale ending: {patches:?}"
     );
 }
 

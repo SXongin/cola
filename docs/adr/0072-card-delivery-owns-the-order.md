@@ -77,16 +77,23 @@ drops stale intents, collapses duplicates and retries failures.
   stays open, so the true end's `Settle` at the same generation still lands
   after it and owns the card's last word. The shadow state is kept while a
   stale stamp could still arrive. Both endings remain the writers' composed
-  payloads — a settle keeps the card's body best-effort and a rejected
-  preserved ending still retries bare, exactly as before (ADR-0063).
+  payloads — a settle keeps the card's body best-effort — and a preserved
+  ending a platform refuses as card content still degrades to the bare ending
+  (ADR-0063), but as the submission's **fallback payload**: the driver tries it
+  under the same held card lock and the same `(generation, intent)` key, so the
+  degradation is one ordered write and can never land over a newer generation
+  (spec #571 review).
 
 - **The permanent-refusal outcome (#522's home).** A write the platform
   permanently refuses (a typed card-content rejection) settles its
   `(generation, intent)` key as refused: later same-key submissions are
   dropped without a Feishu call, so a card that cannot render the payload is
-  never retried forever. A recoverable failure instead stays owed with its key
-  and its backoff, retried by the existing drain; a newer submission
-  supersedes the owed one, so convergence stays newest-wins under retry too.
+  never retried forever. A write carrying a fallback payload tries that first,
+  still under the same key; only a refusal of the fallback (or a write with
+  none) settles the key refused (spec #571 review). A recoverable failure
+  instead stays owed with its key and its backoff, retried by the existing
+  drain; a newer submission supersedes the owed one, so convergence stays
+  newest-wins under retry too.
   This is the outbox's one permanent-refusal outcome and #522's give-up in one
   place, not a mark on any record.
 

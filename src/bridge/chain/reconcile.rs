@@ -167,9 +167,13 @@ pub(crate) async fn collect_late_projection(cards: &CardsHandle, session_id: &st
 /// before the submission, after the composition read above (spec #571 review):
 /// a takeover that re-points the chain during that read bumps the generation,
 /// and this collect is then the NEW chain state's write, never a snapshot's
-/// stale one the queue would drop. The collect awaits its completion ticket —
-/// the cache release follows a delivery and the warning a failure, exactly the
-/// timing the PATCH's own await had — while the queue owns the write.
+/// stale one the queue would drop. The bare ending rides as the submission's
+/// fallback (spec #571 review): a platform that refuses the preserved shape as
+/// card content degrades to it inside the queue, under the same key and lock,
+/// so the degradation can never land over a newer generation. The collect
+/// awaits its completion ticket — the cache release follows a delivery and the
+/// warning a failure, exactly the timing the PATCH's own await had — while the
+/// queue owns the write.
 async fn collect_orphan_with(cards: &CardsHandle, session_id: &str, card_message_id: &str, keep: KeepBody) {
     if card_message_id.is_empty() {
         return;
@@ -184,6 +188,7 @@ async fn collect_orphan_with(cards: &CardsHandle, session_id: &str, card_message
             generation,
             intent: CardWriteIntent::Collect,
             card: &card,
+            fallback: Some(&bare),
         })
         .await
         .settled()
@@ -203,19 +208,6 @@ async fn collect_orphan_with(cards: &CardsHandle, session_id: &str, card_message
                 "live-card reap: session {session_id} {}",
                 CardState::TakenOver.reap_word()
             );
-        }
-        WriteOutcome::Failed(e @ crate::error::BridgeError::CardContentRejected { .. }) => {
-            // The preserved payload can never land — the queue settled its key
-            // refused — so retry the bare ending keyless, exactly like every
-            // preserved ending: the card never stays looking live.
-            tracing::warn!(
-                "live-card reap: card {card_message_id} refused the preserved ending ({e}); retrying bare"
-            );
-            if let Err(e) = cards.feishu.update_message(card_message_id, &bare).await {
-                tracing::warn!(
-                    "live-card reap: session {session_id} could not collect card {card_message_id}: {e}"
-                );
-            }
         }
         WriteOutcome::Failed(e) => tracing::warn!(
             "live-card reap: session {session_id} could not collect card {card_message_id}: {e}"
@@ -1236,13 +1228,18 @@ impl ApplyPass<'_> {
     /// read with `intent` — `Settle` for the terminal ending (accepting it
     /// closes the generation, so a stamp whose read outlived the ending is
     /// dropped) or `Yield` for the waiting ending (accepting it only shadows a
-    /// later stamp at ≤ its generation). Then await its ticket.
+    /// later stamp at ≤ its generation). The bare ending rides as the
+    /// submission's fallback (spec #571 review): a platform that refuses the
+    /// preserved shape as card content degrades to it inside the queue, under
+    /// the same key and the same held card lock, so the degradation can never
+    /// land over a newer generation. Then await its ticket.
     ///
-    /// Returns whether the write landed: `Delivered` — this attempt's write, or
-    /// the same key already on the card (its retry landed through the drain) —
-    /// takes the caller's success path; a failure warns and keeps the record; a
-    /// superseded submission (a takeover bumped the chain first, or the queue
-    /// already handled the key) does nothing — no cache release, no warn.
+    /// Returns whether the write landed: `Delivered` — this attempt's write (or
+    /// its delivered fallback), or the same key already on the card (its retry
+    /// landed through the drain) — takes the caller's success path; a failure
+    /// warns and keeps the record; a superseded submission (a takeover bumped
+    /// the chain first, or the queue already handled the key) does nothing — no
+    /// cache release, no warn.
     async fn submit_ending(&self, card: &serde_json::Value, intent: CardWriteIntent) -> bool {
         let platform = self.handles.cards.feishu.as_ref();
         let card_message_id = self.record.card_message_id.as_str();
@@ -1253,34 +1250,13 @@ impl ApplyPass<'_> {
                 generation: self.record.generation,
                 intent,
                 card: &preserved,
+                fallback: Some(card),
             })
             .await
             .settled()
             .await
         {
             WriteOutcome::Delivered => true,
-            // A PATCH the platform *definitely* refuses as card content (the
-            // typed `CardContentRejected`, e.g. `230099`) retries once bare:
-            // the refusal is deterministic, so the bare ending lands and the
-            // card never stays looking live. Any other failure — transport,
-            // timeout, auth, server — keeps the record instead: the preserved
-            // PATCH may already have landed, and retrying bare would then wipe
-            // the very body this path exists to keep.
-            WriteOutcome::Failed(e @ crate::error::BridgeError::CardContentRejected { .. }) => {
-                tracing::warn!(
-                    "live-card reap: card {card_message_id} refused the preserved ending ({e}); retrying bare"
-                );
-                match platform.update_message(card_message_id, card).await {
-                    Ok(()) => true,
-                    Err(e) => {
-                        tracing::warn!(
-                            "live-card reap: session {} could not settle card {card_message_id}: {e}",
-                            self.session_id
-                        );
-                        false
-                    }
-                }
-            }
             WriteOutcome::Failed(e) => {
                 tracing::warn!(
                     "live-card reap: session {} could not settle card {card_message_id}: {e}",
@@ -1406,6 +1382,7 @@ async fn stamp_restart_attempt(
             generation,
             intent: CardWriteIntent::Stamp,
             card: &card,
+            fallback: None,
         })
         .await
         .settled()
