@@ -60,11 +60,13 @@ drops stale intents, collapses duplicates and retries failures.
   waiting write below the new generation is dropped (`Superseded`) the moment
   the newer generation is admitted, mirroring the forgotten keys, and every
   promotion of the waiting slot re-validates the waiter against the current
-  state — a newer generation since, an accepted ending's shadow over a
-  `Stamp`, or a settled key drops it — so a stale waiter can never be written
-  after a newer state. (The floor itself is not the promotion test: a waiter
-  may legitimately have raised it, since accepting a `Settle` closes its OWN
-  generation and that settle must still land.) A
+  state — a newer generation since, a **generation the floor has closed** (an
+  accepted `Settle` at G raises the floor to G+1, so a waiting non-settle write
+  of G may never land after the true ending; a `Settle` waiter of G stays
+  promotable, because accepting it closed its OWN generation), an accepted
+  ending's shadow over a `Stamp`, or a settled key drops it — so a stale waiter
+  can never be written after a newer state. Accepting a `Settle` also drops
+  such a stale waiter right away, belt-and-braces. A
   duplicate `(generation, intent)` collapses to one write: a
   **delivered** key answers every later re-submission `Delivered` without a
   second write (per-tick re-decisions are free), a **permanently refused**
