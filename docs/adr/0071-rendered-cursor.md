@@ -1,5 +1,11 @@
 # The Rendered Cursor: a restart projects only the delta after the confirmed render frontier
 
+> **Amended by ADR-0072**: card write order now has an owner — the keyed
+> per-card submission queue (chain generation + intent) — so the projection's
+> ordering assumption below (the per-card delivery lock alone, and candidate 5
+> "not a prerequisite") reads under that amendment. See the amendment at the
+> end.
+
 ## Context
 
 A cola restart mid-answer had no single rule for what the user sees, so every
@@ -438,3 +444,26 @@ projects the chain's delta after it onto a successor card.**
 
 Related: #505, #528, #529, #443, #444, #522, #527, ADR-0038, ADR-0061,
 ADR-0063, ADR-0068, ADR-0069.
+
+## Amendment (2026-10-07): keyed ordering owns the projection's interleavings (ADR-0072)
+
+The Decision's "No interlock is introduced: the projection relies on the
+existing per-card delivery lock for ordering (#527's no-hold property)" is
+narrowed: the delivery lock still serializes the writes themselves, while their
+ORDER now comes from the keyed per-card queue (ADR-0072). The projection's
+card writes run through it — the recorded card's collect, the message-first
+race's late-card collect and the settle all submit under the chain generation
+they read — and the projection's re-point bumps that generation, so an older
+writer's submission (the #443 stamp's, a stale collect) is dropped by
+generation instead of racing the lock. The successor's create stays what it is,
+a create with no idempotency key (ADR-0067). The no-hold property itself
+stands: no lock is held across a read, the queue is async and bounded, and the
+projection still acquires no lock of its own.
+
+The Considered option "Hold a lock across the projection ... (the review's
+candidate 5 is not a prerequisite)" is answered by candidate 5 landing as
+ADR-0072: ordering no longer rests on the delivery lock alone — and the design
+deliberately still adds no interlock, because the queue is the order and the
+lock is only the wire serializer. #443's stamp — the cursorless fallback
+narrowed above — is a keyed submission too (ADR-0063's amendment), so its order
+against every projection collect is the same mechanism.
