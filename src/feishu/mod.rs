@@ -88,6 +88,22 @@ pub trait Platform: Send + Sync {
         delivery::KEYED_TICKET_AWAIT
     }
 
+    /// Whether `(generation, intent)` already **settled** on `message_id`'s
+    /// keyed queue (spec #571 review): `Some(true)` delivered — the card holds
+    /// the logical write — `Some(false)` permanently refused, so it will never
+    /// write again (#522), and `None` unsettled (or no remembered queue state;
+    /// an unwrapped platform remembers nothing by default). A writer that
+    /// re-decides every tick consults this before its card-view read, so a
+    /// settled key costs no read and no submission. The query only reports.
+    fn keyed_write_settled(
+        &self,
+        _message_id: &str,
+        _generation: u64,
+        _intent: delivery::CardWriteIntent,
+    ) -> Option<bool> {
+        None
+    }
+
     async fn reply_text(&self, message_id: &str, text: &str) -> Result<String>;
 
     /// Reply to a message in thread form (`reply_in_thread: true`) with an

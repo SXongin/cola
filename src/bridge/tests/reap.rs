@@ -3964,6 +3964,111 @@ async fn a_rejected_preserved_ending_retries_the_bare_one() {
     );
 }
 
+/// A permanently refused ending — the preserved shape AND its bare fallback —
+/// is a confirmed non-delivery: the terminal record is spent (ADR-0067:
+/// delivery *or* permanent refusal releases) instead of surviving every pass,
+/// and no card-view GET repeats (spec #571 review).
+#[tokio::test]
+async fn a_permanently_refused_ending_releases_the_record() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
+    // A second live orphan the reap keeps reading: the pass clock.
+    ChainRecords::load(sidecar(&session_file)).track(
+        "ses_other",
+        "om_other",
+        MessageId::new("msg_cola_other"),
+        Some(2_000),
+        Some("/work"),
+    );
+
+    let (app, platform, backend) =
+        restarted_app_with_backend(&session_file, completed(1_000), Some(SessionStatus::Idle)).await;
+    backend
+        .set_session_status("ses_other", Some(SessionStatus::Busy))
+        .await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+    // Both the preserved ending and its bare fallback are refused as card
+    // content (230099): nothing can ever land for this key.
+    platform
+        .fail_update_card_content_count
+        .store(2, std::sync::atomic::Ordering::SeqCst);
+
+    spawn_sync_with_timeout(&app, 5_000);
+    // The refusal spends the record: no later pass may bring the ending back.
+    wait_for_record_gone(&app, "ses_test").await;
+    // Several more observed passes: the settled key is never re-read.
+    wait_for_status_reads(&backend, "ses_other", 3).await;
+
+    assert_eq!(
+        card_views_to(&platform, "om_frozen"),
+        1,
+        "a refused ending is never re-read: {:?}",
+        platform.calls.lock().await
+    );
+    let patches = patches_to(&platform, "om_frozen").await;
+    assert_eq!(
+        patches.len(),
+        2,
+        "the preserved attempt and its bare fallback, nothing more: {patches:?}"
+    );
+}
+
+/// A refused waiting yield keeps its record (only the true end spends it), but
+/// its settled key short-circuits the re-read: the reap must not GET the card
+/// again every tick (spec #571 review).
+#[tokio::test]
+async fn a_refused_waiting_yield_is_never_re_read() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
+    ChainRecords::load(sidecar(&session_file)).track(
+        "ses_other",
+        "om_other",
+        MessageId::new("msg_cola_other"),
+        Some(2_000),
+        Some("/work"),
+    );
+
+    let waiting = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_background_tasks(vec![background_shell(2_100)]);
+    let (app, platform, backend) =
+        restarted_app_with_backend(&session_file, waiting, Some(SessionStatus::Idle)).await;
+    backend
+        .set_session_status("ses_other", Some(SessionStatus::Busy))
+        .await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+    platform
+        .fail_update_card_content_count
+        .store(2, std::sync::atomic::Ordering::SeqCst);
+
+    spawn_sync_with_timeout(&app, 5_000);
+    wait_for_status_reads(&backend, "ses_other", 4).await;
+
+    assert!(
+        app.cards_handle().chains.get("ses_test").is_some(),
+        "a waiting orphan keeps its record"
+    );
+    assert_eq!(
+        card_views_to(&platform, "om_frozen"),
+        1,
+        "the refused yield is never re-read: {:?}",
+        platform.calls.lock().await
+    );
+    let patches = patches_to(&platform, "om_frozen").await;
+    assert_eq!(
+        patches.len(),
+        2,
+        "the refused attempt set, nothing more: {patches:?}"
+    );
+}
+
 /// The collect path's degradation goes through the queue's fallback too (spec
 /// #571 review): a preserved collect the platform refuses as card content still
 /// lands its bare taken-over marker, under the collect's own

@@ -110,8 +110,16 @@ Two rules read under the amendment:
 - "a terminal card's record is removed only once its ending write is
   confirmed": the gate (`has_pending_card_update`) now answers yes for a keyed
   `Settle` in flight, waiting, or left owed by a recoverable failure, not only
-  for a pending keyless payload.
+  for a pending keyless payload. A **permanently refused** keyed ending is the
+  other half of the same rule: it is a confirmed non-delivery (the queue will
+  never write it again), so the gate answers no and the reap spends the
+  terminal record on that refusal — delivery *or* refusal releases, exactly as
+  the keyless outbox's permanent refusal always did (spec #571 review).
 - "Permanent failures cannot loop": a permanently refused keyed
   `(generation, intent)` is the same one-outcome rule — the key settles as
   refused, and later same-key submissions are dropped without a Feishu call
-  (#522's give-up, ADR-0072).
+  (#522's give-up, ADR-0072). A settled key also needs no card-view read: the
+  reap asks the queue whether `(generation, intent)` settled — delivered, so
+  the card holds it, or refused — before its preserved-ending GET, so a
+  refused ending costs one attempt set and never re-reads the card (spec #571
+  review).

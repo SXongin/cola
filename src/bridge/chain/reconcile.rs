@@ -1196,6 +1196,23 @@ struct ApplyPass<'a> {
     read_timeout_ms: u64,
 }
 
+/// What one keyed ending submission settled to (spec #571 review).
+enum EndingOutcome {
+    /// The card holds the ending: this attempt's write (or its delivered
+    /// fallback) landed, or the key had already delivered.
+    Landed,
+    /// The key settled **permanently refused**: a confirmed non-delivery the
+    /// queue will never retry (#522). For a terminal state the record is spent
+    /// anyway (ADR-0067: delivery *or* permanent refusal releases); the card
+    /// keeps whatever it showed.
+    Refused,
+    /// The write is issued but unconfirmed — in flight, superseded by a newer
+    /// chain state, or past the caller's await bound — or the ending is a
+    /// Waiting yield (whose record always waits for the true end). The record
+    /// stays for a later pass.
+    Owed,
+}
+
 impl ApplyPass<'_> {
     /// PATCH the record's card into `state`, keeping the card's existing body
     /// best-effort (#434 acceptance feedback), as the card's keyed **ending**
@@ -1204,13 +1221,15 @@ impl ApplyPass<'_> {
     /// a stamp whose read outlived the ending is dropped — and a Waiting state
     /// is the `Yield`, which only shadows a later stamp at ≤ its generation
     /// (the true end supersedes it at the same generation). When the state is
-    /// terminal, the record is dropped once the ending is confirmed: nothing is
-    /// owed a reap any more. A terminal ending whose Session's current directory
-    /// differs from the pass's baseline directory gains one extra line naming
-    /// the move (#439), on top of `detail` (the failure's message when there is
-    /// one); a Waiting yield carries none. Returns whether the write landed — a
-    /// failed or superseded ending keeps the record for the queue's retry (the
-    /// release gate sees the keyed write it still owes). One INFO line per
+    /// terminal, the record is dropped once the ending is confirmed — delivered
+    /// **or permanently refused** (a refused ending can never land; ADR-0067's
+    /// delivery-or-refusal rule, #522). A terminal ending whose Session's
+    /// current directory differs from the pass's baseline directory gains one
+    /// extra line naming the move (#439), on top of `detail` (the failure's
+    /// message when there is one); a Waiting yield carries none. Returns
+    /// whether the ending is spent (landed, already delivered, or permanently
+    /// refused) — an unconfirmed ending keeps the record for the queue's retry
+    /// (the release gate sees the keyed write it still owes). One INFO line per
     /// action, naming the session and the decision — never chat content; a
     /// settle that named a move says so.
     async fn settle(&self, state: CardState, detail: Option<&str>) -> bool {
@@ -1222,9 +1241,30 @@ impl ApplyPass<'_> {
         } else {
             CardWriteIntent::Yield
         };
-        let landed = self.submit_ending(&card, intent).await;
-        if !landed {
-            return false;
+        match self.submit_ending(&card, intent).await {
+            EndingOutcome::Landed => {}
+            EndingOutcome::Refused => {
+                // A confirmed non-delivery: nothing will ever be written for
+                // this card again, so the record must not survive every pass
+                // (ADR-0067: a terminal record is removed after delivery OR
+                // permanent refusal — which is also the outbox's pre-batch
+                // behavior). A Waiting yield keeps its record: only the true
+                // end spends it.
+                tracing::info!(
+                    "live-card reap: session {} ending for card {} permanently refused; record spent",
+                    self.session_id,
+                    self.record.card_message_id
+                );
+                if terminal {
+                    self.handles
+                        .cards
+                        .chains
+                        .release_if_card(self.session_id, &self.record.card_message_id);
+                    return true;
+                }
+                return false;
+            }
+            EndingOutcome::Owed => return false,
         }
         let moved = if move_note.is_some() {
             " on a session that moved"
@@ -1257,20 +1297,23 @@ impl ApplyPass<'_> {
     /// submission's fallback (spec #571 review): a platform that refuses the
     /// preserved shape as card content degrades to it inside the queue, under
     /// the same key and the same held card lock, so the degradation can never
-    /// land over a newer generation. Then await its ticket, bounded: the pass
+    /// land over a newer generation. The key is consulted first: an already
+    /// **settled** ending — delivered, so the card holds it, or permanently
+    /// refused, so it can never land (#522) — costs no card-view read and no
+    /// submission (spec #571 review). Then await the ticket, bounded: the pass
     /// must never wait on Feishu unboundedly (an issued keyed write is never
     /// cancelled and the queue may still land it).
-    ///
-    /// Returns whether the write landed: `Delivered` — this attempt's write (or
-    /// its delivered fallback), or the same key already on the card (its retry
-    /// landed through the drain) — takes the caller's success path; a failure
-    /// or an indeterminate ticket warns/keeps and keeps the record (the release
-    /// gate sees the keyed ending the queue still owes); a superseded
-    /// submission (a takeover bumped the chain first, or the queue already
-    /// handled the key) does nothing — no cache release, no warn.
-    async fn submit_ending(&self, card: &serde_json::Value, intent: CardWriteIntent) -> bool {
+    async fn submit_ending(&self, card: &serde_json::Value, intent: CardWriteIntent) -> EndingOutcome {
         let platform = self.handles.cards.feishu.as_ref();
         let card_message_id = self.record.card_message_id.as_str();
+        let generation = self.record.generation;
+        if let Some(delivered) = platform.keyed_write_settled(card_message_id, generation, intent) {
+            return if delivered {
+                EndingOutcome::Landed
+            } else {
+                EndingOutcome::Refused
+            };
+        }
         let view_timeout_ms = self.handles.cards.preserved_view_timeout_ms();
         let preserved = preserved_ending(
             platform,
@@ -1284,7 +1327,7 @@ impl ApplyPass<'_> {
         match platform
             .submit_ordered(KeyedSubmission {
                 message_id: card_message_id,
-                generation: self.record.generation,
+                generation,
                 intent,
                 card: &preserved,
                 fallback: Some(card),
@@ -1293,20 +1336,28 @@ impl ApplyPass<'_> {
             .settled_within(bound)
             .await
         {
-            Some(WriteOutcome::Delivered) => true,
+            Some(WriteOutcome::Delivered) => EndingOutcome::Landed,
             Some(WriteOutcome::Failed(e)) => {
                 tracing::warn!(
                     "live-card reap: session {} could not settle card {card_message_id}: {e}",
                     self.session_id
                 );
-                false
+                // A permanently refused ending is a CONFIRMED non-delivery:
+                // the queue settled the key refused, so no payload is ever
+                // retried for it (#522) and the record is spent. A recoverable
+                // failure keeps the record (the queue retries).
+                if e.is_recoverable_card_write() {
+                    EndingOutcome::Owed
+                } else {
+                    EndingOutcome::Refused
+                }
             }
             Some(WriteOutcome::Superseded) => {
                 tracing::debug!(
                     "live-card reap: session {} settle for card {card_message_id} superseded by a newer chain state",
                     self.session_id
                 );
-                false
+                EndingOutcome::Owed
             }
             None => {
                 // Indeterminate: the ticket outlived the await bound. The
@@ -1319,7 +1370,7 @@ impl ApplyPass<'_> {
                     "live-card reap: session {} ending for card {card_message_id} still in flight",
                     self.session_id
                 );
-                false
+                EndingOutcome::Owed
             }
         }
     }
