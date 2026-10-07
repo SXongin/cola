@@ -124,6 +124,9 @@ pub(crate) enum WriteOutcome {
     Superseded,
 }
 
+// Hand-written rather than derived: it reads the failure the variant carries —
+// the error a caller logs once ticket #574 wires the keyed writers — which the
+// derived impl would leave as an unread field.
 impl std::fmt::Debug for WriteOutcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
