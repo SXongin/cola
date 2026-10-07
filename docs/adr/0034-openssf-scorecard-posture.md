@@ -273,3 +273,34 @@ and rejected: the action's drop-sudo safety strategy removes passwordless sudo,
 so a second invocation in the job cannot start. Revisit the pin when the
 wrapper fix (#151) ships; the salvage stays useful against stream drops
 regardless (#530).
+
+## Amendment (2026-10-07): the review prompt carries its linked issues, and the check mirrors the verdict (#555)
+
+The gate's spec discovery was body-only and silent: the prompt fetched the PR
+body's *first* `(Closes|Fixes|Resolves|Refs|Part of) #N` reference, and a body
+that had lost its keyword produced an issue-less prompt with no marker that
+anything was missing. PR #554's first review then had to infer the spec's
+number from an ADR and failed with "spec review incomplete" — a FAIL about the
+handoff, not about the code.
+
+The workflow now collects references from the PR body **and** the commits'
+`Refs:` trailers (`git log <base>..<head>`), deduplicated, body references
+first, capped at `CODEX_MAX_LINKED_ISSUES` (8; overflow is listed by number
+without its body), and fetches each one before the Codex step runs. Zero
+references, or a reference that cannot be fetched, fails the workflow with an
+`::error::` annotation: the sandboxed reviewer has no network and no token, so
+what the prompt does not carry does not exist — and a review that never saw a
+spec must not look complete. `edited` joins the trigger types so a body
+correction that adds the missing reference re-runs the gate by itself. The
+collector is written from the workflow into `$RUNNER_TEMP` like the verdict
+parser, and `cargo test -p xtask codex_gate` extracts and exercises both.
+Giving the sandbox the token back (the OpenCode gate's posture, where the
+reviewer ran `gh issue view` itself) was rejected: it re-opens the
+prompt-injection surface the Codex migration closed; the prefetch is the seam.
+
+The approve step now fails when the readback verdict is not `PASS` (the
+head-moved case still exits clean): `gh pr checks`'s green/red mirrors the
+verdict instead of always reading green, while the no-`request-changes`
+contract is untouched — a FAIL is still a comment without an approval, and the
+approval remains the merge gate (`review` is not a required check; the
+approval is).

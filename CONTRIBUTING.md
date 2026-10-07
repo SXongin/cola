@@ -156,7 +156,10 @@ newly published RUSTSEC advisories surface even when nothing is pushed.
    number; archive specs live under `.scratch/<feature>/`). To auto-close
    issues on merge, give **every** number its own keyword — `Closes #10,
    closes #11, closes #12`; GitHub closes only the first issue of a bare
-   comma list after a single keyword (`Closes #10, #11`).
+   comma list after a single keyword (`Closes #10, #11`). The Codex gate
+   collects references from the body and from `Refs: #N` commit trailers
+   alike; a PR that carries no reference in either place fails the review
+   workflow before the model runs.
 4. Record architectural decisions as ADRs in `docs/adr/` when the change is
    hard to reverse.
 5. Do not merge until CI (fmt, clippy, test, release build, dependency audit) is
@@ -255,18 +258,25 @@ silently overriding it.
 
 Every non-draft in-repo PR gets a Codex review, except the skips noted below
 (`.github/workflows/codex-review.yml`, ADR-0034). It runs on `opened`,
-`synchronize`, `reopened` and `ready_for_review` with the OpenCode Go
+`synchronize`, `reopened`, `ready_for_review` and `edited` with the OpenCode Go
 subscription's Responses-compatible endpoint
 (`https://opencode.ai/inference/openai/v1/responses`), reviews the diff
 read-only on
 the two axes above plus an adversarial correctness/test-adequacy pass
 (`.github/codex/prompts/review.md`, model `gpt-6-luna`), and — when it finds
-nothing blocking — `github-actions[bot]` approves. The approval is
+nothing blocking — `github-actions[bot]` approves. The prompt embeds every
+issue the PR references — body keywords and `Refs:` commit trailers,
+deduplicated and capped — fetched before the model runs; a PR with no
+reference, or an unfetchable one, fails the workflow instead of reviewing
+without a spec (#555). `edited` is what lets a body correction that adds the
+missing reference re-run the gate by itself. The approval is
 deterministic: the workflow posts the review as a comment, records that
 comment's ID, and the approve step reads back exactly that comment and approves
 only when its final line is `CODEX_REVIEW_VERDICT: PASS`, pinned to the
 reviewed commit. A `FAIL`, a missing marker, or prose after the marker never
-approves. That approval is what satisfies the `main: review` ruleset's required
+approves, and it fails the check, so `gh pr checks`'s green/red mirrors the
+verdict (red means no approval; the check is advisory, the approval is what
+gates). That approval is what satisfies the `main: review` ruleset's required
 review for solo work. A blocking review is a comment with a `FAIL` verdict and
 no approval, not a `request-changes`: Actions bots cannot dismiss their own
 review and would lock the PR. Fork PRs are skipped (no secrets) and Dependabot
