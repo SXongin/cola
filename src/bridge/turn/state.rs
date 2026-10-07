@@ -1263,6 +1263,11 @@ pub(super) struct StreamAccumulator {
     /// includes it clears the durable fact, so a crash before that write keeps
     /// the gap recoverable.
     pub(super) gap_rendered: bool,
+    /// Whether the gap's last render came from a TRUNCATED read (spec #561,
+    /// review #569): the read is a prefix, so the gap's end may be beyond the
+    /// page cap — its coverage can never be complete, and the gap stays owed
+    /// until a complete read shows its end.
+    pub(super) gap_truncated: bool,
     /// The chain's durable Wake Watermark as a floor (spec #561, review #569):
     /// every Wake at or below this `created_ms` was announced by an earlier
     /// card, so this accumulator's render neither re-inserts its completion
@@ -3279,6 +3284,18 @@ impl StreamAccumulator {
             .is_some_and(|digest| digest == crate::bridge::chain::cursor_prefix_digest(&prefix))
     }
 
+    /// The prefix offset the part's entries carry (spec #561's seeded cut): the
+    /// characters a PREVIOUS card delivered before them. `0` for the ordinary,
+    /// offset-free render.
+    pub(super) fn source_delivered_before(&self, source: &PartSource) -> usize {
+        self.timeline
+            .iter()
+            .filter(|item| item.source.as_ref().is_some_and(|s| s.same_part(source)))
+            .filter_map(|item| item.source.as_ref().map(|s| s.delivered_before))
+            .max()
+            .unwrap_or(0)
+    }
+
     /// The prefix digest of `source`'s newest timeline entry — the one whose
     /// push last covered the part's whole delivered extent (spec #561, review
     /// #569). `None` when the part has no entry here, or that entry carries
@@ -3452,15 +3469,16 @@ impl StreamAccumulator {
     /// advances the gap and the remaining tail stays owed.
     fn gap_coverage(&self, end: usize) -> Option<GapCoverage> {
         let frontier = self.frontier_for(end, |source| self.gap_messages.contains(&source.message_id))?;
-        let complete = self
-            .timeline
-            .iter()
-            .rposition(|item| {
-                item.source
-                    .as_ref()
-                    .is_some_and(|source| self.gap_messages.contains(&source.message_id))
-            })
-            .is_some_and(|last| last < end.min(self.timeline.len()));
+        let complete = !self.gap_truncated
+            && self
+                .timeline
+                .iter()
+                .rposition(|item| {
+                    item.source
+                        .as_ref()
+                        .is_some_and(|source| self.gap_messages.contains(&source.message_id))
+                })
+                .is_some_and(|last| last < end.min(self.timeline.len()));
         Some(GapCoverage { frontier, complete })
     }
 

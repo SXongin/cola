@@ -8448,3 +8448,187 @@ async fn a_restart_renders_a_long_reasoning_parts_undisclosed_suffix() {
     );
     assert!(!all.contains(shown), "the displayed prefix never repeats: {all}");
 }
+
+/// A split continuation's record re-point and its confirmed cursor settle in
+/// ONE chains write (spec #561, review #569): two writes leave a window where
+/// the record names the continuation card with the predecessor's frontier, and
+/// a crash right after Feishu accepted the create makes the next recovery
+/// project content the continuation already shows.
+#[tokio::test]
+async fn a_split_continuation_persists_its_repoint_and_cursor_once() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "问题"),
+        assistant(2_000, "答复。"),
+    ]);
+    let (app, _platform, _backend) =
+        restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Idle)).await;
+    // The live card that splits: its accumulator is in the map with the Turn
+    // facts the continuation's re-point reads.
+    Turn::seed_card(&app.cards_handle(), "ses_test", Some("om_old")).await;
+    Turn::set_turn_anchor(&app.cards_handle(), "ses_test", &turn_anchor(1_000)).await;
+    let delivered = "答复。";
+    let cursor = RenderedCursor {
+        frontier: Some(CursorFrontier {
+            message_id: MessageId::new("msg_a_2000"),
+            part_index: 0,
+            kind: CursorPartKind::Text,
+            started_at: Some(2_000),
+            delivered_chars: delivered.chars().count(),
+            prefix_digest: Some(cursor_prefix_digest(delivered)),
+        }),
+        live_calls: Default::default(),
+    };
+    // The create's stage: a create's id is unknown until it lands, so the
+    // stage carries none and the confirmation names the new card.
+    let stage = Turn::stage_cursor(&app.cards_handle(), "ses_test", None, &cursor).await;
+    let chains = app.cards_handle().chains.clone();
+    let writes0 = chains.writes();
+
+    Turn::track_continuation_card(&app.cards_handle(), "ses_test", "om_next", stage).await;
+
+    assert_eq!(
+        chains.writes() - writes0,
+        1,
+        "the re-point and the confirmed cursor persist in one record write"
+    );
+    let record = app
+        .cards_handle()
+        .chains
+        .get("ses_test")
+        .expect("the continuation's record");
+    assert_eq!(record.card_message_id, "om_next");
+    assert_eq!(record.cursor, Some(cursor), "the same write confirms the cursor");
+}
+
+/// A truncated message-first takeover must not consume the orphan gap (spec
+/// #561, review #569): the read is the oldest prefix, so the successor's Turn
+/// message — the gap's window bound — may sit beyond the page cap. Resolving
+/// the seed against that prefix let the gap walk treat what it saw as the
+/// whole gap, and the first confirmed write cleared the durable fact, losing
+/// the messages beyond the cap. The gap stays owed (the visible prefix still
+/// renders) and the full tail lands once a complete read arrives.
+#[tokio::test]
+async fn a_truncated_takeover_keeps_the_gap_until_a_complete_read() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let orphan_anchor = 1_000_000;
+    let new_anchor = 2_000_000;
+    let delivered = "已经写了一半。";
+    let visible = "【可见的尾巴】";
+    let hidden = "【没看见的尾巴】";
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(orphan_anchor),
+        Some("/work"),
+        Some(CursorFrontier {
+            message_id: MessageId::new(format!("msg_a_{}", orphan_anchor + 500)),
+            part_index: 0,
+            kind: CursorPartKind::Text,
+            started_at: Some(orphan_anchor + 500),
+            delivered_chars: delivered.chars().count(),
+            prefix_digest: Some(cursor_prefix_digest(delivered)),
+        }),
+        &[],
+    );
+    let orphan_text = |tail: &str| TranscriptMessage {
+        id: MessageId::new(format!("msg_a_{}", orphan_anchor + 500)),
+        role: MessageRole::Assistant,
+        time: Some(MessageTime {
+            created: orphan_anchor + 500,
+            completed: None,
+        }),
+        model: None,
+        tokens: None,
+        error: None,
+        parts: vec![Part::Text(TextPart {
+            text: format!("{delivered}{tail}"),
+            started_at: Some(orphan_anchor + 500),
+        })],
+    };
+    // The truncated read: it stops at the first orphaned message, so the later
+    // one — and the successor's Turn message that bounds the gap — are beyond
+    // the page cap.
+    let phase_a = || {
+        SessionTranscript::new(vec![
+            user("msg_cola_anchor", orphan_anchor, "跑个长命令"),
+            orphan_text(visible),
+        ])
+        .with_truncated()
+    };
+    // The complete read: both orphaned messages and the new Turn.
+    let phase_b = || {
+        SessionTranscript::new(vec![
+            user("msg_cola_anchor", orphan_anchor, "跑个长命令"),
+            orphan_text(visible),
+            TranscriptMessage {
+                id: MessageId::new(format!("msg_a_{}", orphan_anchor + 900)),
+                role: MessageRole::Assistant,
+                time: Some(MessageTime {
+                    created: orphan_anchor + 900,
+                    completed: None,
+                }),
+                model: None,
+                tokens: None,
+                error: None,
+                parts: vec![Part::Text(TextPart {
+                    text: hidden.to_string(),
+                    started_at: Some(orphan_anchor + 900),
+                })],
+            },
+            user("msg_cola_new", new_anchor, "新问题"),
+            assistant(new_anchor + 1_000, "新回答。"),
+        ])
+    };
+    // Life 1: the takeover reads the truncated prefix. The visible tail
+    // renders, and the durable gap must stay owed — nothing may mark it
+    // complete off a prefix.
+    let (app, platform, _backend, gate) = seeded_app(&session_file, phase_a(), SessionStatus::Busy).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+    gate.add_permits(1);
+    let mut context = ctx("ses_test", "新问题");
+    context.cola_message_id = Some("msg_cola_new".into());
+    let turn = spawn_turn(&app, context);
+    wait_for_card_text(&platform, visible).await;
+    let record = app
+        .cards_handle()
+        .chains
+        .get("ses_test")
+        .expect("the fresh Turn's record");
+    assert!(
+        record.pending_gap.is_some(),
+        "a truncated read never consumes the gap: {record:?}"
+    );
+    turn.abort();
+    drop(app);
+
+    // Life 2: the complete read shows the gap's end, so the recovery lands the
+    // unseen tail — content no read of the NEW Turn's window can reach.
+    let (app2, platform2, _backend2) =
+        restarted_app_with_backend(&session_file, phase_b(), Some(SessionStatus::Idle)).await;
+    platform2.given_card_view("msg_reply", realistic_card_view());
+    spawn_sync(&app2);
+    wait_for_posted_text(&platform2, hidden).await;
+    let all: String = platform2
+        .replied_cards()
+        .await
+        .iter()
+        .map(card_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        all.matches(hidden).count(),
+        1,
+        "the unseen tail lands exactly once: {all}"
+    );
+    assert!(
+        !all.contains(visible),
+        "the delivered visible tail never repeats: {all}"
+    );
+}
