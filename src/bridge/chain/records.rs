@@ -37,6 +37,28 @@ use crate::backend::{MessageId, TurnAnchor};
 use crate::bridge::handles::CardsHandle;
 use crate::bridge::sidecar;
 
+/// The orphan gap a restart must still deliver (spec #561, review #569): the
+/// message-first takeover's undelivered tail, recorded durably because the
+/// chain's Rendered Cursor has already advanced past the delivered content that
+/// follows it — one frontier cannot express "gap undelivered, later content
+/// delivered".
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PendingGap {
+    /// The orphaned chain's confirmed cursor: where the gap starts, inside the
+    /// orphaned Turn's window.
+    pub(crate) cursor: RenderedCursor,
+    /// The orphaned Turn's anchor: the window the gap lives in.
+    pub(crate) anchor: TurnAnchor,
+    /// The user message that ENDS the gap's window — the Turn the chain moved
+    /// to when the gap was recorded. Content from there on belongs to a later
+    /// card the durable cursor already covers, while [`TurnAnchor`] membership
+    /// has no upper end; the walk stops before this message. `None` when the
+    /// successor's Turn message could not be named: a read-derived bound (the
+    /// next user message after the gap's anchor) stands in.
+    #[serde(default)]
+    pub(crate) bound: Option<MessageId>,
+}
+
 /// The keep rule the fresh-Turn takeover's collect applied to the card it
 /// replaced (ADR-0068, spec #561), in memory only: which predecessor card the
 /// collect targeted and which of the takeover seed's live-set calls it
@@ -206,6 +228,15 @@ pub(crate) struct ChainRecord {
     /// retry stays safe. Scoped to the record's generation by its own lifetime.
     #[serde(default)]
     pub(crate) projection_intent: bool,
+    /// Durable (spec #561, review #569): the orphan gap this chain still owes —
+    /// the message-first takeover's undelivered tail, whose start the Rendered
+    /// Cursor can no longer express once the delivered content after it
+    /// advanced the frontier. Rendered once by the projection that finds it (or
+    /// by the fresh Turn that carries it), then consumed: a projection's
+    /// re-point rewrites the record (while an unrendered gap is carried onto
+    /// the new one), and a rendered gap's first confirmed write clears it.
+    #[serde(default)]
+    pub(crate) pending_gap: Option<PendingGap>,
     /// The Rendered Cursor (spec #561): how far this chain's card has
     /// confirmed rendered. `None` — cursorless — is an older release's record
     /// or a chain whose first confirmed write has not landed; both read as the
@@ -232,6 +263,7 @@ impl ChainRecord {
             predecessor_keep: None,
             projection_attempted: false,
             projection_intent: false,
+            pending_gap: None,
             cursor: None,
         }
     }
@@ -624,6 +656,41 @@ impl ChainRecords {
         }
     }
 
+    /// Persist the orphan gap a takeover owes (spec #561, review #569), scoped
+    /// to the record naming `card_message_id`: the fresh Turn's failed seed and
+    /// a carried predecessor's gap both record it here, so a restart renders
+    /// exactly the gap and nothing the old cards already showed.
+    pub(crate) fn note_pending_gap(&self, session_id: &str, card_message_id: &str, gap: &PendingGap) -> bool {
+        let mut state = self.lock();
+        match state.records.get_mut(session_id) {
+            Some(card) if card.card_message_id == card_message_id => {
+                if card.pending_gap.as_ref() != Some(gap) {
+                    card.pending_gap = Some(gap.clone());
+                    self.write(&state);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Drop the orphan gap once its content is on a card (spec #561, review
+    /// #569), scoped like [`Self::note_pending_gap`]: a successful projection's
+    /// re-point rewrites the record anyway; this is the fresh Turn's
+    /// confirmed-write clearance.
+    pub(crate) fn clear_pending_gap(&self, session_id: &str, card_message_id: &str) -> bool {
+        let mut state = self.lock();
+        match state.records.get_mut(session_id) {
+            Some(card) if card.card_message_id == card_message_id => {
+                if card.pending_gap.take().is_some() {
+                    self.write(&state);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Record the keep rule the fresh-Turn takeover's collect is about to
     /// apply to `card_message_id` (ADR-0068): `resolved_calls` are the live-set
     /// calls the seed resolved onto the successor, whose running panels the
@@ -780,9 +847,10 @@ impl ChainRecords {
 /// life's drain, or the next restart's reap, repairs the card and the reap
 /// cleans the record once the write confirmed. A yielded `Waiting` card
 /// keeps it (the reap settles its true end later) and a live card keeps it
-/// (still owed). A card whose accumulator still holds a PENDING orphan seed
-/// keeps it too (spec #561, review #569): the cursor it pins is the only record
-/// of the gap the tail will land in, so releasing it would strand that tail.
+/// (still owed). A card whose accumulator still holds an UNRENDERED orphan gap
+/// keeps it too (spec #561, review #569): the durable fact on the record is the
+/// only record of the tail that will land in it, so releasing it would strand
+/// that tail.
 /// Called after every ending PATCH in the flush path and by the
 /// reap's same-card probe; the rule lives here, beside the record it releases.
 pub(crate) async fn release_spent(cards: &CardsHandle, session_id: &str) {
@@ -791,7 +859,7 @@ pub(crate) async fn release_spent(cards: &CardsHandle, session_id: &str) {
         let Some(card) = cards.get(session_id) else {
             return;
         };
-        if !card.is_terminal() || card.owes_pending_seed() {
+        if !card.is_terminal() || card.owes_pending_gap() {
             return;
         }
         card.card_message_id().map(str::to_string)

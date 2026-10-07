@@ -509,6 +509,24 @@ impl Turn {
         // actually resolved them here (the Background Task Ledger leaves either
         // way: this card's own reads rebuild the live list).
         if let Some(orphan) = orphan {
+            // A predecessor's pending orphan gap survives the takeover (spec
+            // #561, review #569): the re-point rewrote the record, so the
+            // durable fact is re-homed onto this card's record — and onto the
+            // accumulator — and the first render read that can place it lands
+            // it here. The seed below never invents a gap over it (its own
+            // failure path defers to a carried one).
+            if let Some(gap) = orphan.pending_gap.clone() {
+                handles
+                    .cards
+                    .chains
+                    .note_pending_gap(&session_id, &new_card_id, &gap);
+                let mut live = handles.cards.cards.lock().await;
+                if let Some(card) = live.get_mut(&session_id)
+                    && card.card_message_id.as_deref() == Some(new_card_id.as_str())
+                {
+                    card.acc.pending_gap = Some(gap);
+                }
+            }
             let resolved = Self::seed_orphan_delta(handles, &session_id, &new_card_id, &orphan).await;
             crate::bridge::chain::collect_orphan_after_takeover(
                 &handles.cards,
@@ -1717,14 +1735,14 @@ impl Turn {
             Some(Err(error)) => {
                 tracing::debug!("restart seed: session {session_id} read failed: {error}");
                 tracing::info!("restart seed: session {session_id} none (read failed)");
-                // A cursor-bearing orphan's tail must not be lost: keep its
-                // seed pending for a later read (spec #561, review #569).
-                Self::note_pending_orphan_seed(handles, session_id, successor_card_id, orphan).await;
+                // A cursor-bearing orphan's tail must not be lost: record it
+                // as the durable gap (spec #561, review #569).
+                Self::note_pending_gap(handles, session_id, successor_card_id, orphan).await;
                 return Vec::new();
             }
             None => {
                 tracing::info!("restart seed: session {session_id} none (read timed out)");
-                Self::note_pending_orphan_seed(handles, session_id, successor_card_id, orphan).await;
+                Self::note_pending_gap(handles, session_id, successor_card_id, orphan).await;
                 return Vec::new();
             }
         };
@@ -1733,14 +1751,19 @@ impl Turn {
         // pending while today's live-set fallback still resolves the running
         // calls — nothing replays, and the tail lands once a later read places
         // the cursor (spec #561, review #569).
+        // The Turn the chain has moved to ends the gap's window (spec #561,
+        // review #569): the successor card's own Turn message, exactly as the
+        // takeover persisted it.
+        let bound = Self::current_turn_message(handles, session_id).await;
         let (seed, pending) = match &orphan.cursor {
             Some(cursor) => match state::CursorSeed::for_orphan_resolving(&transcript, cursor, &anchor) {
                 Some(seed) => (seed, None),
                 None => (
                     state::CursorSeed::live_calls_only(&transcript, &anchor),
-                    Some(state::PendingOrphanSeed {
+                    Some(crate::bridge::chain::PendingGap {
                         cursor: cursor.clone(),
                         anchor: anchor.clone(),
+                        bound,
                     }),
                 ),
             },
@@ -1754,11 +1777,14 @@ impl Turn {
             let mut live = handles.cards.cards.lock().await;
             let landed = Self::apply_orphan_seed(&mut live, session_id, successor_card_id, &cursor, seed);
             if landed
-                && let Some(pending) = pending
+                && let Some(gap) = pending
+                // A gap the takeover already carried is the more accurate
+                // fact: the record's own cursor may have moved past it.
+                && orphan.pending_gap.is_none()
                 && let Some(card) = live.get_mut(session_id)
             {
                 // The same session/card check `apply_orphan_seed` just made.
-                card.acc.pending_orphan_seed = Some(pending);
+                card.acc.pending_gap = Some(gap);
             }
             landed
         };
@@ -1769,30 +1795,60 @@ impl Turn {
         if applied { resolved } else { Vec::new() }
     }
 
-    /// Keep a cursor-bearing orphan's seed pending on its successor's
-    /// accumulator (spec #561, review #569): the takeover's read failed or
-    /// timed out, so the undelivered tail the cursor guards cannot be resolved
-    /// now — a later render read applies the seed
-    /// ([`crate::bridge::turn::render`]'s pending-seed retry), and until then
-    /// the chain's cursor stays pinned at the gap's frontier. A cursorless
-    /// orphan has no frontier to lose and keeps today's behavior.
-    async fn note_pending_orphan_seed(
+    /// The Turn message the chain has moved to (spec #561, review #569): the
+    /// live card's own cola message, which bounds an orphan gap's window. `None`
+    /// when the card cannot name one — the gap then falls back to the read.
+    async fn current_turn_message(handles: &TurnHandles, session_id: &str) -> Option<MessageId> {
+        let live = handles.cards.cards.lock().await;
+        live.get(session_id)
+            .and_then(|card| card.acc.cola_message_id.clone())
+            .map(MessageId::new)
+    }
+
+    /// Record a cursor-bearing orphan's undelivered tail as the durable gap on
+    /// its successor's record (spec #561, review #569): the takeover's read
+    /// failed, timed out, or could not place the cursor, so the tail the cursor
+    /// guards cannot be resolved now. The gap is persisted — the chain's
+    /// Rendered Cursor keeps advancing with the content that follows it — and
+    /// the successor's accumulator renders it once a read places it; the first
+    /// confirmed write of a body that includes the content clears the fact. A
+    /// cursorless orphan has no frontier to lose and keeps today's behavior.
+    async fn note_pending_gap(
         handles: &TurnHandles,
         session_id: &str,
         successor_card_id: &str,
         orphan: &ChainRecord,
     ) {
+        // A predecessor gap the takeover already carried stays as it is: the
+        // record's own cursor may have advanced past it, and it is the only
+        // fact that still points at the tail.
+        if orphan.pending_gap.is_some() {
+            return;
+        }
         let Some(cursor) = orphan.cursor.clone() else {
             return;
         };
         let Some(anchor) = orphan.anchor() else {
             return;
         };
+        // The Turn the chain has moved to ends the gap's window (spec #561,
+        // review #569): the successor card's own Turn message, exactly as the
+        // takeover persisted it.
+        let bound = Self::current_turn_message(handles, session_id).await;
+        let gap = crate::bridge::chain::PendingGap {
+            cursor,
+            anchor,
+            bound,
+        };
+        handles
+            .cards
+            .chains
+            .note_pending_gap(session_id, successor_card_id, &gap);
         let mut live = handles.cards.cards.lock().await;
         if let Some(card) = live.get_mut(session_id)
             && card.card_message_id.as_deref() == Some(successor_card_id)
         {
-            card.acc.pending_orphan_seed = Some(state::PendingOrphanSeed { cursor, anchor });
+            card.acc.pending_gap = Some(gap);
         }
     }
 
@@ -3061,12 +3117,14 @@ impl Turn {
     /// drops the running panels the successor resolved, ADR-0068's
     /// generalized collect).
     #[allow(clippy::too_many_arguments)] // the successor's whole arming fixture
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn arm_projected_card(
         cards: &CardsHandle,
         session_id: &str,
         anchor: &TurnAnchor,
         cursor: &RenderedCursor,
         seed: &state::CursorSeed,
+        gap: Option<&crate::bridge::chain::PendingGap>,
         transcript: &SessionTranscript,
         ending: Option<&Disposition>,
         title: &str,
@@ -3092,6 +3150,14 @@ impl Turn {
         acc.wake_continuation = true;
         acc.apply_work_context(work_context);
         acc.seed_projection(cursor, seed.clone());
+        // A pending orphan gap renders first (spec #561, review #569): its
+        // content was never on a card, while the chain's cursor has already
+        // advanced past the delivered content that follows it. The seed then
+        // governs the successor's own window — the delivered content is never
+        // re-rendered.
+        if let Some(gap) = gap {
+            acc.pending_gap = Some(gap.clone());
+        }
         let rendered = render::render_turn_parts(&mut acc, transcript);
         render::apply_ledger_read(
             &mut acc,
@@ -3122,8 +3188,9 @@ impl Turn {
         // confirmed create drains it into the Chain Record. The stage
         // identities travel on the [`ProjectedCard`], so the confirmation can
         // name the exact body the create carried (spec #561, review #569).
+        let covers_gap = acc.gap_rendered;
         let cursor_stage = state::StagedCursorId {
-            id: acc.stage_cursor(None, built.cursor.clone()),
+            id: acc.stage_cursor(None, built.cursor.clone(), covers_gap),
             awaiting_seq: None,
         };
         let watermark_stage = acc.pending_watermark_id();
@@ -3758,6 +3825,15 @@ impl Turn {
         // tail onto its own card while the collected successor keeps its body:
         // the same text twice.
         let confirmed = card.acc.take_staged_cursor(card_message_id, cursor_stage);
+        // The orphan gap this projection rendered is consumed with the
+        // re-point; one it could NOT place stays owed and rides onto the new
+        // record (spec #561, review #569), so a later read can still deliver
+        // it.
+        let carried_gap = if matches!(&confirmed, Some((_, false))) {
+            card.acc.pending_gap.clone()
+        } else {
+            None
+        };
         // A card with no Turn message to scope a settle decision with cannot
         // be reaped: attached, but no record — `track_live_card`'s own rule.
         let Some(message_id) = message_id else {
@@ -3771,7 +3847,7 @@ impl Turn {
             // The confirmed body's cursor rides the re-point in ONE chains
             // write, so the record is never observable as (successor card,
             // predecessor cursor) — not even between two chains operations.
-            Some(cursor) => cards.chains.track_carrying_cursor(
+            Some((cursor, _)) => cards.chains.track_carrying_cursor(
                 session_id,
                 card_message_id,
                 message_id,
@@ -3790,6 +3866,9 @@ impl Turn {
                 directory.as_deref(),
             ),
         };
+        if let Some(gap) = &carried_gap {
+            cards.chains.note_pending_gap(session_id, card_message_id, gap);
+        }
         // A re-point within the chain carries the Rendered Cursor (spec #561):
         // seed the accumulator's empty base with the carried fact, so the
         // successor's first body does not clear the chain's frontier.
@@ -3823,8 +3902,9 @@ impl Turn {
             return None;
         }
         let built = card.acc.build_card_with_info();
+        let covers_gap = card.acc.gap_rendered;
         let cursor_stage = state::StagedCursorId {
-            id: card.acc.stage_cursor(None, built.cursor.clone()),
+            id: card.acc.stage_cursor(None, built.cursor.clone(), covers_gap),
             awaiting_seq: None,
         };
         Some(ProjectedSlice {
@@ -3864,8 +3944,9 @@ impl Turn {
         // the SAME body, so its render boundary rewinds.
         card.acc.render_from = 0;
         let built = card.acc.build_card_with_info();
+        let covers_gap = card.acc.gap_rendered;
         let cursor_stage = state::StagedCursorId {
-            id: card.acc.stage_cursor(None, built.cursor.clone()),
+            id: card.acc.stage_cursor(None, built.cursor.clone(), covers_gap),
             awaiting_seq: None,
         };
         Some(ProjectedSlice {
@@ -3997,10 +4078,13 @@ impl Turn {
         cursor: &RenderedCursor,
     ) -> state::StagedCursorId {
         match cards.cards.lock().await.get_mut(session_id) {
-            Some(card) => state::StagedCursorId {
-                id: card.acc.stage_cursor(card_message_id, cursor.clone()),
-                awaiting_seq: None,
-            },
+            Some(card) => {
+                let covers_gap = card.acc.gap_rendered;
+                state::StagedCursorId {
+                    id: card.acc.stage_cursor(card_message_id, cursor.clone(), covers_gap),
+                    awaiting_seq: None,
+                }
+            }
             None => state::StagedCursorId {
                 id: 0,
                 awaiting_seq: None,

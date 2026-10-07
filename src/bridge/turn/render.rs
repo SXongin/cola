@@ -601,12 +601,12 @@ pub(super) fn render_new_turn_parts(acc: &mut StreamAccumulator, transcript: &Se
 /// turn began — while one that finished before the anchor stays the previous
 /// turn's and never bleeds in (#190).
 pub(super) fn render_turn_parts(acc: &mut StreamAccumulator, transcript: &SessionTranscript) -> bool {
-    // A seed a failed takeover read left pending (spec #561, review #569)
-    // retries against every read: the first that places the cursor applies it,
-    // so the orphan's undelivered tail renders on this card exactly once. Until
-    // then the accumulator's cursor stays pinned ([`Self::cursor_for_slice`]).
-    resolve_pending_orphan_seed(acc, transcript);
     capture_turn_anchor(acc, transcript);
+    // The orphan gap this accumulator owes (spec #561, review #569) renders
+    // first, on the first read that can place its cursor: the content was never
+    // on a card, while the chain's Rendered Cursor has already advanced past
+    // the delivered content that follows it — one frontier cannot express both.
+    let gap_rendered = render_pending_gap_once(acc, transcript);
     // The seed's live set (spec #561) reconciles on EVERY render read, before
     // the anchor gate below: a seeded call is resolved by call identity against
     // the whole read, so it needs no Turn anchor. In the canonical restart
@@ -617,7 +617,10 @@ pub(super) fn render_turn_parts(acc: &mut StreamAccumulator, transcript: &Sessio
     // seed enter the same set: its live-set calls resolve by identity here, a
     // settled one joining the timeline exactly once and a running one riding
     // the live tail display-only.
+    // The live set reconciles on every read — `||` would skip it whenever the
+    // gap rendered (spec #561, review #569).
     let mut rendered_any = resolve_seeded_calls(acc, transcript);
+    rendered_any |= gap_rendered;
     // The seed (spec #561) resolves against THIS read: its at-or-before-the-
     // frontier rule uses the read's own message order. The positions map serves
     // both walks below — the seed's own scope and the accumulator's window.
@@ -717,26 +720,154 @@ pub(super) fn render_turn_parts(acc: &mut StreamAccumulator, transcript: &Sessio
     rendered_any
 }
 
-/// Retry the orphan seed a failed takeover read left pending (spec #561,
-/// review #569): the fresh Turn's later reads resolve the same cursor, whose
-/// scope then walks the orphaned Turn ([`render_seed_scope`]) and renders the
-/// undelivered tail on this card exactly once. A read that still cannot place
-/// the cursor leaves the seed pending — and the chain's cursor pinned — for the
-/// next one. One INFO line records the landing (never content).
-fn resolve_pending_orphan_seed(acc: &mut StreamAccumulator, transcript: &SessionTranscript) {
-    let Some(pending) = acc.pending_orphan_seed.clone() else {
-        return;
+/// Render the orphan gap this accumulator owes, once (spec #561, review #569):
+/// the first read whose cursor the gap's own Turn window can place renders the
+/// tail, clears the in-memory pending value, and marks
+/// [`StreamAccumulator::gap_rendered`] — the first confirmed write of a body
+/// that includes the content clears the durable fact. A read that cannot place
+/// it yet leaves the gap pending for the next one. One INFO line records the
+/// landing (never content).
+fn render_pending_gap_once(acc: &mut StreamAccumulator, transcript: &SessionTranscript) -> bool {
+    let Some(gap) = acc.pending_gap.clone() else {
+        return false;
     };
-    let Some(seed) = state::CursorSeed::for_orphan_resolving(transcript, &pending.cursor, &pending.anchor)
-    else {
-        return;
-    };
-    acc.seed_projection(&pending.cursor, seed);
-    acc.pending_orphan_seed = None;
+    if !render_pending_gap(acc, transcript, &gap) {
+        return false;
+    }
+    acc.pending_gap = None;
+    acc.gap_rendered = true;
     tracing::info!(
-        "orphan seed: session {} landed its pending tail on a later read",
+        "orphan gap: session {} rendered its pending tail",
         acc.session_id.as_deref().unwrap_or("")
     );
+    true
+}
+
+/// The gap walk itself: the orphaned Turn's window, cut at the gap's cursor —
+/// the same shape the message-first seed's scope uses, but with NO source on
+/// the pushed entries. The chain's Rendered Cursor already covers everything
+/// that follows the gap, so a successor built from them can never offer a
+/// frontier older than it (spec #561, review #569).
+fn render_pending_gap(
+    acc: &mut StreamAccumulator,
+    transcript: &SessionTranscript,
+    gap: &crate::bridge::chain::PendingGap,
+) -> bool {
+    let cursor = &gap.cursor;
+    let anchor = &gap.anchor;
+    let Some(seed) = state::CursorSeed::for_orphan_resolving(transcript, cursor, anchor) else {
+        return false;
+    };
+    if seed.frontier.is_none() {
+        return false;
+    }
+    let message_positions: std::collections::HashMap<&str, usize> = transcript
+        .messages
+        .iter()
+        .enumerate()
+        .map(|(pos, message)| (message.id.as_str(), pos))
+        .collect();
+    // The gap's window ends where the NEXT Turn begins (spec #561, review
+    // #569): `turn_for_user` has no upper end, so without a bound the walk
+    // would swallow every later Turn — content a later card already showed,
+    // which the durable cursor advanced past, and which must never be
+    // re-rendered as part of the gap. The gap carries the Turn the chain moved
+    // to when it was recorded; a gap that names no bound falls back to the
+    // read's next user message after the gap's anchor.
+    let bound_pos = gap
+        .bound
+        .as_ref()
+        .and_then(|bound| message_positions.get(bound.as_str()).copied())
+        .or_else(|| next_user_position(transcript, &message_positions, anchor));
+    let mut rendered = false;
+    for message in transcript.turn_for_user(anchor).messages {
+        let Some(pos) = message_positions.get(message.id.as_str()).copied() else {
+            continue;
+        };
+        if let Some(bound_pos) = bound_pos
+            && pos >= bound_pos
+        {
+            continue;
+        }
+        for (index, part) in message.parts.iter().enumerate() {
+            match seed.cut(pos, index) {
+                crate::bridge::turn::state::SeedCut::Delivered => {
+                    acc.mark_delivered_part(&message.id, part);
+                }
+                crate::bridge::turn::state::SeedCut::Frontier(delivered) => {
+                    if render_gap_part(acc, message.id.clone(), index, part, delivered) {
+                        rendered = true;
+                    }
+                }
+                crate::bridge::turn::state::SeedCut::Undelivered => {
+                    if render_part(acc, None, part) {
+                        rendered = true;
+                    }
+                }
+            }
+        }
+    }
+    rendered
+}
+
+/// The read position of the user message that ends a gap's window when the gap
+/// names none: the first user message after the gap's anchor (spec #561, review
+/// #569), in the read's own order. `None` when the read carries no later user
+/// message — the gap's Turn is then the last one and nothing follows to bound.
+fn next_user_position(
+    transcript: &SessionTranscript,
+    message_positions: &std::collections::HashMap<&str, usize>,
+    anchor: &TurnAnchor,
+) -> Option<usize> {
+    transcript
+        .messages
+        .iter()
+        .filter(|message| message.role == crate::backend::MessageRole::User)
+        .filter_map(|message| message_positions.get(message.id.as_str()).copied())
+        .filter(|pos| {
+            transcript.messages[*pos]
+                .time
+                .as_ref()
+                .is_some_and(|time| time.created > anchor.created_ms)
+        })
+        .min()
+}
+
+/// One gap part whose cut is its frontier: the undelivered suffix (with its
+/// markdown lead), pushed WITHOUT a source — the durable frontier names the
+/// delivered content that follows the gap, so the body must never regress it.
+fn render_gap_part(
+    acc: &mut StreamAccumulator,
+    message_id: MessageId,
+    index: usize,
+    part: &Part,
+    delivered: usize,
+) -> bool {
+    let (full, started_at, is_text) = match part {
+        Part::Text(text) => (text.text.as_str(), text.started_at, true),
+        Part::Reasoning(reasoning) => (reasoning.text.as_str(), reasoning.started_at, false),
+        // The gap's cut resolved to a tool: render it whole — the ordinary
+        // render's own dedup decides.
+        _ => return render_part(acc, None, part),
+    };
+    let full_len = full.chars().count();
+    let held = acc.source_extent(&PartSource::at(message_id.clone(), index));
+    let cut = held.max(delivered).min(full_len);
+    let prefix: String = full.chars().take(cut).collect();
+    let suffix: String = full.chars().skip(cut).collect();
+    acc.mark_delivered_part(&message_id, part);
+    if suffix.is_empty() {
+        return false;
+    }
+    let lead = crate::feishu::card::sanitize::neutralize_tail(&prefix, &suffix);
+    if is_text {
+        acc.push_text_lead(started_at, None, &suffix, lead);
+        acc.card_state = crate::feishu::card::CardState::Streaming;
+    } else {
+        acc.push_reasoning_lead(started_at, None, &suffix, lead);
+        acc.card_state = crate::feishu::card::CardState::Reasoning;
+    }
+    true
 }
 
 /// The seed's own Turn window, when it is not the accumulator's (spec #561,

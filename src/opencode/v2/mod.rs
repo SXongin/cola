@@ -435,7 +435,9 @@ impl GenerationStrategy for V2Strategy {
         // RUNNING tool parts' ephemeral progress (issue #470). Start the reader
         // lazily: the first transcript read is where the live transport exists.
         self.progress.ensure_started(http);
-        let mut transcript = wire::decode_messages(&self.read_messages(http, session_id).await?);
+        let (data, truncated) = self.read_messages(http, session_id).await?;
+        let mut transcript = wire::decode_messages(&data);
+        transcript.truncated = truncated;
         self.progress.apply(session_id, &mut transcript);
         Ok(transcript)
     }
@@ -922,7 +924,11 @@ impl V2Strategy {
     /// Read the session's projected messages, decoded-ready: the raw `data`
     /// arrays a `GET /api/session/{id}/message` read carries, in server order.
     /// The transcript decode's raw input.
-    async fn read_messages(&self, http: &Transport, session_id: &str) -> Result<Vec<serde_json::Value>> {
+    async fn read_messages(
+        &self,
+        http: &Transport,
+        session_id: &str,
+    ) -> Result<(Vec<serde_json::Value>, bool)> {
         let mut data: Vec<serde_json::Value> = Vec::new();
         let mut cursor: Option<String> = None;
         let url = http.url(&format!("{SESSION}/{session_id}{SESSION_MESSAGES_SUFFIX}"));
@@ -956,7 +962,8 @@ impl V2Strategy {
             data.extend(page.data);
             match page.cursor.next {
                 Some(next) if !empty => cursor = Some(next),
-                _ => return Ok(data),
+                // The read reached a page with no successor: a COMPLETE read.
+                _ => return Ok((data, false)),
             }
         }
         tracing::warn!(
@@ -964,7 +971,10 @@ impl V2Strategy {
              returning the {} messages fetched so far",
             data.len()
         );
-        Ok(data)
+        // The page cap stopped the read with content behind it (spec #561,
+        // review #569): the neutral transcript must say so, or an ended
+        // projection would settle on a prefix and lose the tail.
+        Ok((data, true))
     }
 
     /// Fetch ONE page of a session's projected messages with `query` pairs —

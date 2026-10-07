@@ -52,6 +52,13 @@ pub struct SessionTranscript {
     /// settle rule is deliberately unchanged (only a Wake or a positive
     /// terminal verdict retires a task).
     pub unconfirmed_tasks: std::collections::HashSet<String>,
+    /// Whether the backend's read stopped at its own page cap with more
+    /// content behind it (spec #561, review #569): the V2 projected-message
+    /// read pages to `MAX_MESSAGE_PAGES` and returns what it has, so the
+    /// neutral view must say the read is a PREFIX — a cursor inside it cannot
+    /// prove the tail beyond the cap absent, and an ended projection must not
+    /// settle on it. V1 reads are unbounded and always `false`.
+    pub truncated: bool,
 }
 
 impl SessionTranscript {
@@ -63,6 +70,7 @@ impl SessionTranscript {
             background_tasks: Vec::new(),
             runtime_retired: Vec::new(),
             unconfirmed_tasks: std::collections::HashSet::new(),
+            truncated: false,
         }
     }
 
@@ -71,6 +79,15 @@ impl SessionTranscript {
     /// directly (the transcript is the one seam every flow consumes).
     pub fn with_executions(mut self, executions: Vec<Execution>) -> Self {
         self.executions = executions;
+        self
+    }
+
+    /// Mark the read as a prefix the backend stopped at its page cap (spec
+    /// #561, review #569): the ended projection's truncation rule reads this.
+    /// The V2 adapter sets the field directly; this builder is for fixtures.
+    #[cfg(test)]
+    pub fn with_truncated(mut self) -> Self {
+        self.truncated = true;
         self
     }
 
@@ -597,7 +614,7 @@ impl TokenUsage {
 /// A Turn's anchor: the identity of the user message it answers together with
 /// that message's server time. The two travel as one fact, so no caller can
 /// reassemble the anchor from backend fields.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnAnchor {
     pub message_id: MessageId,
     pub created_ms: i64,

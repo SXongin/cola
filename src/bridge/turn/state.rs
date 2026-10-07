@@ -412,22 +412,6 @@ impl CursorSeed {
     }
 }
 
-/// A seed a failed takeover read could not resolve (spec #561, review #569):
-/// the fresh Turn keeps the orphan's cursor and Turn anchor so a later render
-/// read can place the cursor and render the orphan's undelivered tail onto its
-/// card exactly once. Until it lands, the chain's cursor stays pinned at
-/// [`PendingOrphanSeed::cursor`]'s base, so a confirmed write never skips the
-/// gap.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PendingOrphanSeed {
-    /// The orphaned chain's confirmed cursor: the frontier the tail starts
-    /// after, and the base the chain's pinned cursor keeps.
-    pub(super) cursor: RenderedCursor,
-    /// The orphaned Turn's anchor: the window the seed's walk covers (spec
-    /// #561, ticket #565).
-    pub(super) anchor: TurnAnchor,
-}
-
 /// What a seeded render owes one transcript part.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SeedCut {
@@ -733,11 +717,12 @@ impl CardSession {
         self.chain_id
     }
 
-    /// Whether the accumulator still owes a pending orphan seed (spec #561,
-    /// review #569): the chain's cursor is pinned at that gap, so the record
-    /// must not be released while it does.
-    pub(crate) fn owes_pending_seed(&self) -> bool {
-        self.acc.pending_orphan_seed.is_some()
+    /// Whether the accumulator still owes an unrendered orphan gap (spec #561,
+    /// review #569): the durable fact on the Chain Record is the only record of
+    /// that tail until a read places it and a confirmed write carries it, so
+    /// the record must not be released while it waits.
+    pub(crate) fn owes_pending_gap(&self) -> bool {
+        self.acc.pending_gap.is_some() && !self.acc.gap_rendered
     }
 
     /// True while this card belongs to a Turn that has not finished: the pull
@@ -967,6 +952,10 @@ pub(super) struct StagedCursor {
     /// the drain reconcile confirms the cursor only once THAT payload
     /// delivers. `None` while no failure is owed.
     pub(super) awaiting_seq: Option<u64>,
+    /// Whether the body carried a rendered orphan gap (spec #561, review
+    /// #569): the confirmation then clears the durable gap, because this very
+    /// body put its content on a card.
+    pub(super) covers_gap: bool,
 }
 
 impl StagedCursor {
@@ -1240,13 +1229,17 @@ pub(super) struct StreamAccumulator {
     /// undelivered suffix — while the live set resolves by identity against
     /// the whole read. `None` on every ordinary accumulator.
     pub(super) seed: Option<CursorSeed>,
-    /// An orphan seed a failed takeover read left pending (spec #561, review
-    /// #569): the fresh Turn retries it on every render read — the orphan's
-    /// undelivered tail then renders on its card exactly once — and until one
-    /// places the cursor, [`Self::cursor_for_slice`] pins the chain's cursor
-    /// at the base the seed continues from, so no confirmed write advances the
-    /// record past the gap.
-    pub(super) pending_orphan_seed: Option<PendingOrphanSeed>,
+    /// The orphan gap this accumulator owes (spec #561, review #569): the
+    /// durable gap, rendered once by the first render read that can place it.
+    /// The chain's Rendered Cursor keeps advancing past the delivered content
+    /// that follows the gap — one frontier cannot express both — so the gap's
+    /// recovery lives on the record instead.
+    pub(super) pending_gap: Option<crate::bridge::chain::PendingGap>,
+    /// Whether this accumulator's timeline holds the pending gap's content
+    /// (spec #561, review #569): the first confirmed write of a body that
+    /// includes it clears the durable fact, so a crash before that write keeps
+    /// the gap recoverable.
+    pub(super) gap_rendered: bool,
     /// The chain's durable Wake Watermark as a floor (spec #561, review #569):
     /// every Wake at or below this `created_ms` was announced by an earlier
     /// card, so this accumulator's render neither re-inserts its completion
@@ -1653,13 +1646,19 @@ impl StreamAccumulator {
     /// resolves it — a newer body staged since never loses an older stage's
     /// delivered confirmation (review #569). Returns the stage generation a
     /// confirmation must name (spec #561, review #569).
-    pub(super) fn stage_cursor(&mut self, card_message_id: Option<&str>, cursor: RenderedCursor) -> u64 {
+    pub(super) fn stage_cursor(
+        &mut self,
+        card_message_id: Option<&str>,
+        cursor: RenderedCursor,
+        covers_gap: bool,
+    ) -> u64 {
         self.cursor_stage_seq = self.cursor_stage_seq.wrapping_add(1);
         self.staged_cursors.push(StagedCursor {
             id: self.cursor_stage_seq,
             card_message_id: card_message_id.map(str::to_string),
             cursor,
             awaiting_seq: None,
+            covers_gap,
         });
         if self.staged_cursors.len() > MAX_STAGED_CURSORS {
             let excess = self.staged_cursors.len() - MAX_STAGED_CURSORS;
@@ -1700,7 +1699,7 @@ impl StreamAccumulator {
         &mut self,
         card_message_id: &str,
         expected: StagedCursorId,
-    ) -> Option<RenderedCursor> {
+    ) -> Option<(RenderedCursor, bool)> {
         let idx = self.staged_cursors.iter().position(|staged| {
             staged.id == expected.id
                 && staged.awaiting_seq == expected.awaiting_seq
@@ -1715,7 +1714,7 @@ impl StreamAccumulator {
         }
         self.confirmed_cursor_stage = staged.id;
         self.cursor = staged.cursor.clone();
-        Some(staged.cursor)
+        Some((staged.cursor, staged.covers_gap))
     }
 
     /// The stage generation of the NEWEST staged Wake Watermark, when one is
@@ -3254,13 +3253,6 @@ impl StreamAccumulator {
     /// timeline; a call the body omits (a finalized slice has no tail, a
     /// settled card omits a carried `⏳`) keeps its last delivered state.
     fn cursor_for_slice(&self, end: usize, include_tail: bool, state: &CardState) -> RenderedCursor {
-        // While an orphan seed is pending (spec #561, review #569), the chain's
-        // cursor stays pinned at the base the seed will continue from: a
-        // confirmed write must never advance the record past the undelivered
-        // gap the pending seed still owes.
-        if self.pending_orphan_seed.is_some() {
-            return self.cursor.clone();
-        }
         let mut cursor = self.cursor.clone();
         if let Some((idx, source, kind, started_at)) =
             self.timeline[..end]

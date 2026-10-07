@@ -400,6 +400,14 @@ pub(crate) fn reconcile(record: &ChainRecord, reads: &RecoveryReads<'_>) -> Chai
                             let Some(cursor) = record.cursor.as_ref() else {
                                 return ChainDisposition::Settle(settle);
                             };
+                            // A TRUNCATED read is a prefix (spec #561, review
+                            // #569): content beyond the backend's page cap is
+                            // unseen, so the ending and the delta cannot be
+                            // trusted — claim nothing and wait for a complete
+                            // read, exactly like an unplaceable cursor.
+                            if transcript.truncated {
+                                return ChainDisposition::Keep;
+                            }
                             // A create this life already attempted — or one an
                             // earlier life left in flight, marked by the durable
                             // write-ahead intent (review #569) — blocks the
@@ -408,6 +416,17 @@ pub(crate) fn reconcile(record: &ChainRecord, reads: &RecoveryReads<'_>) -> Chai
                             // instead.
                             if record.projection_attempted || record.projection_intent {
                                 return ChainDisposition::Settle(settle);
+                            }
+                            // An orphan gap this read cannot place keeps the
+                            // record (spec #561, review #569): the durable fact
+                            // is the only record of that tail, so settling
+                            // would drop it forever, while a later read may
+                            // place the gap's own cursor and deliver it.
+                            if let Some(gap) = record.pending_gap.as_ref()
+                                && CursorSeed::for_orphan_resolving(transcript, &gap.cursor, &gap.anchor)
+                                    .is_none()
+                            {
+                                return ChainDisposition::Keep;
                             }
                             match CursorSeed::resolve(transcript, cursor) {
                                 Some(seed) => ChainDisposition::Project { settle, seed },
@@ -516,9 +535,11 @@ pub(crate) fn fresh(reads: &FreshReads) -> FreshDisposition {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{MessageId, TranscriptMessage};
-    use crate::bridge::chain::{CursorFrontier, CursorPartKind, RenderedCursor, cursor_prefix_digest};
-    use crate::bridge::test_support::{background_shell, shell_wake};
+    use crate::backend::{MessageId, TranscriptMessage, TurnAnchor};
+    use crate::bridge::chain::{
+        CursorFrontier, CursorPartKind, PendingGap, RenderedCursor, cursor_prefix_digest,
+    };
+    use crate::bridge::test_support::{background_shell, execution, shell_wake};
     use crate::bridge::tests::drain::{assistant, user};
 
     fn record() -> ChainRecord {
@@ -968,6 +989,92 @@ mod tests {
         assert_eq!(
             reconcile(&yielded, &idle_transcript(waiting)),
             ChainDisposition::Keep
+        );
+    }
+
+    /// A record owing an orphan gap this read cannot place claims nothing
+    /// (spec #561, review #569): settling would drop the durable fact forever,
+    /// while a later read may place the gap's own cursor.
+    #[test]
+    fn an_unplaceable_gap_keeps_an_ended_record() {
+        let transcript = SessionTranscript::new(vec![
+            user("msg_cola_anchor", 1_000, "问题"),
+            assistant(2_000, "答复。"),
+        ]);
+        let cursor = RenderedCursor {
+            frontier: Some(CursorFrontier {
+                message_id: MessageId::new("msg_a_2000"),
+                part_index: 0,
+                kind: CursorPartKind::Text,
+                started_at: Some(2_000),
+                delivered_chars: 2,
+                prefix_digest: Some(cursor_prefix_digest("答复")),
+            }),
+            live_calls: Default::default(),
+        };
+        let with_gap = ChainRecord {
+            cursor: Some(cursor),
+            pending_gap: Some(PendingGap {
+                cursor: RenderedCursor {
+                    frontier: Some(CursorFrontier {
+                        message_id: MessageId::new("msg_a_missing"),
+                        part_index: 0,
+                        kind: CursorPartKind::Text,
+                        started_at: Some(500),
+                        delivered_chars: 2,
+                        prefix_digest: Some(cursor_prefix_digest("答复")),
+                    }),
+                    live_calls: Default::default(),
+                },
+                anchor: TurnAnchor {
+                    message_id: MessageId::new("msg_cola_gone"),
+                    created_ms: 400,
+                },
+                bound: Some(MessageId::new("msg_cola_anchor")),
+            }),
+            ..record()
+        };
+        assert_eq!(
+            reconcile(&with_gap, &idle_transcript(transcript)),
+            ChainDisposition::Keep,
+            "an unplaceable gap is never settled away"
+        );
+    }
+
+    /// A TRUNCATED read never settles a cursor-carrying record (spec #561,
+    /// review #569): the newer content beyond the backend's page cap is unseen,
+    /// so the ending cannot be trusted — claim nothing and wait for a complete
+    /// read.
+    #[test]
+    fn a_truncated_read_never_settles_the_ending() {
+        let transcript = SessionTranscript::new(vec![
+            user("msg_cola_anchor", 1_000, "问题"),
+            assistant(2_000, "答复。"),
+        ])
+        .with_executions(vec![execution(2_500)]);
+        let cursor = RenderedCursor {
+            frontier: Some(CursorFrontier {
+                message_id: MessageId::new("msg_a_2000"),
+                part_index: 0,
+                kind: CursorPartKind::Text,
+                started_at: Some(2_000),
+                delivered_chars: 2,
+                prefix_digest: Some(cursor_prefix_digest("答复")),
+            }),
+            live_calls: Default::default(),
+        };
+        let with_cursor = ChainRecord {
+            cursor: Some(cursor),
+            ..record()
+        };
+        assert!(matches!(
+            reconcile(&with_cursor, &idle_transcript(transcript.clone())),
+            ChainDisposition::Project { .. }
+        ));
+        assert_eq!(
+            reconcile(&with_cursor, &idle_transcript(transcript.with_truncated())),
+            ChainDisposition::Keep,
+            "a truncated read cannot prove the tail beyond its cap absent"
         );
     }
 
