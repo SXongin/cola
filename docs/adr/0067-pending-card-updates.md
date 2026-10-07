@@ -1,5 +1,10 @@
 # Failed card writes retry as Pending Card Updates — newest wins, bounded, in memory
 
+> **Amended by ADR-0072**: the decorator also owns a keyed submission queue
+> (chain generation + intent); the sequence rule below governs the keyless
+> class alone, and the record-release gate also counts a keyed ending the queue
+> still owes. See the amendment at the end.
+
 ## Context
 
 Card writes are fire-and-forget: a failed `update_message` is logged and
@@ -85,3 +90,28 @@ confirmed — the reap doubles as the record's cleaner.
   restart re-settled by the reap.
 
 Related: #195, #443, #505, ADR-0061, ADR-0063, ADR-0065.
+
+## Amendment (2026-10-07): keyed submissions add an ordered second write class (ADR-0072)
+
+ADR-0072 gives the same decorator and the same per-card state a second,
+ordered write class. A **keyed submission** carries `(chain generation,
+intent)` and the queue drops a submission below the card's floor, lands
+same-generation submissions in submission order (one in flight, one waiting,
+the newer replacing the waiting one), collapses a `(generation, intent)` pair
+to its newest payload, remembers a delivered or permanently refused key, and
+retries a recoverable failure under its key with the same per-entry backoff.
+The Decision's sequence rule — the monotonic per-card sequence, newest payload
+wins, a slow failed retry never resurrects a superseded payload — governs the
+keyless `update_message` class alone; a keyless write is never dropped for
+staleness and serializes on the same per-card delivery lock as a keyed write.
+
+Two rules read under the amendment:
+
+- "a terminal card's record is removed only once its ending write is
+  confirmed": the gate (`has_pending_card_update`) now answers yes for a keyed
+  `Settle` in flight, waiting, or left owed by a recoverable failure, not only
+  for a pending keyless payload.
+- "Permanent failures cannot loop": a permanently refused keyed
+  `(generation, intent)` is the same one-outcome rule — the key settles as
+  refused, and later same-key submissions are dropped without a Feishu call
+  (#522's give-up, ADR-0072).

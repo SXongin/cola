@@ -6,6 +6,11 @@
 > `track` carries it across a re-point, `release` drops it, and a record
 > without it reads cursorless. See the amendment at the end.
 
+> **Amended by ADR-0072**: #522's permanently refused carve-out is no longer a
+> mark on the record — it is the keyed queue's permanent-refusal outcome — and
+> the mark's `Keep` mapping retired with the restart stamp's guard cluster.
+> See the amendment at the end.
+
 ## Context
 
 A cola restart has, over ADR-0058–0068, grown one durable fact per symptom:
@@ -155,3 +160,16 @@ write.
 Nothing else about the module moves: the sections' lifetimes, the fail-open
 load, the atomic write, the one-time legacy fold and the interface's claim on
 the chain's reconciliation are as decided above.
+
+## Amendment (2026-10-07): #522's carve-out leaves the record (ADR-0072)
+
+The Decision's "the restart-stamp attempt's permanently refused carve-out
+(#522) is a mark on the record that the ladder maps to `Keep`" retired with the
+restart stamp's guard cluster (spec #571, ticket #575): the refusal is now
+remembered by the card-delivery queue as the settled `(chain generation,
+Stamp)` key, and the reap's per-tick re-decision is a read-only queue query
+(`keyed_write_covered`) instead of a record mark. The record carries no #522
+state: a still-live cursorless orphan's ladder returns its ordinary
+`StampRestart`, and the apply's coverage query is what suppresses the
+submission once the key is refused — or delivered, or already being written.
+The mark's unit test went with it; the queue's own tests pin the refusal.
