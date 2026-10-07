@@ -168,9 +168,23 @@ pub(crate) enum CardWriteIntent {
     /// The restart stamp (#443, ADR-0063): mark a card a cola restart
     /// orphaned while its session still reads live.
     Stamp,
-    /// A collect: the fresh-Turn takeover, a late projection, and the reap's
-    /// successor collect — bring an orphaned card to its taken-over state.
+    /// The **ordinary collect** — the reap's successor collect, the Wake
+    /// continuation's arm, the external arm: bring an orphaned card to its
+    /// taken-over state keeping its whole preserved body
+    /// (`KeepBody::Everything`).
     Collect,
+    /// The **fresh-Turn message takeover's collect** (ADR-0068): the same
+    /// taken-over card, but the orphan's live tail — the Background Task
+    /// Ledger and the running panels the successor carried — leaves with the
+    /// successor (`KeepBody::WithoutLiveTail`). A different logical write from
+    /// [`Self::Collect`] (spec #571 review): the two may share a generation
+    /// and must both land, the strip collect last.
+    TakeoverCollect,
+    /// The **late projection's collect** (spec #561, review #569): the late
+    /// card is reduced to the bare taken-over marker (`KeepBody::Nothing`)
+    /// because the winning Turn already re-rendered its tail. A different
+    /// logical write again (spec #571 review).
+    LateProjectionCollect,
     /// The ending settle (spec #571's amendment): the terminal card's ending
     /// write. Accepting one at generation G **closes** G — the card's floor
     /// rises to G+1 — so a stamp whose pre-submission read outlived the
@@ -2746,6 +2760,47 @@ mod tests {
             "the card already holds this logical write"
         );
         assert_eq!(inner.attempts().len(), 1, "the re-decision never reached Feishu");
+    }
+
+    /// Different collect variants are different logical writes (spec #571
+    /// review): the ordinary collect and the fresh-Turn takeover's strip
+    /// collect share a generation but carry different payload rules
+    /// (`KeepBody`), so the strip one must not collapse into the ordinary one
+    /// as a duplicate — it lands after it and owns the card's last word.
+    #[tokio::test]
+    async fn a_takeover_collect_is_not_a_duplicate_of_an_ordinary_collect() {
+        let inner = Arc::new(FakePlatform::new());
+        let (entered, release) = inner.park_next();
+        let delivery = Arc::new(CardDelivery::new(inner.clone()));
+        let ordinary = serde_json::json!({ "body": "collected, body kept" });
+        let stripped = serde_json::json!({ "body": "collected, tail stripped" });
+
+        // The ordinary collect is in flight at generation 1; the takeover's
+        // strip collect waits at the same generation behind it.
+        let first = submit(&delivery, "om_1", 1, CardWriteIntent::Collect, &ordinary).await;
+        entered.notified().await;
+        let second = submit(&delivery, "om_1", 1, CardWriteIntent::TakeoverCollect, &stripped).await;
+        release.notify_one();
+
+        assert!(matches!(first.settled().await, WriteOutcome::Delivered));
+        assert!(matches!(second.settled().await, WriteOutcome::Delivered));
+        assert_eq!(
+            inner.attempts(),
+            vec![
+                ("om_1".to_string(), ordinary),
+                ("om_1".to_string(), stripped.clone())
+            ],
+            "the strip collect lands after the ordinary one, never dropped as its duplicate"
+        );
+
+        // The same variant's later re-decision still collapses (rule (d)).
+        let ticket = submit(&delivery, "om_1", 1, CardWriteIntent::TakeoverCollect, &stripped).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Delivered));
+        assert_eq!(
+            inner.attempts().len(),
+            2,
+            "the same variant's duplicate still collapses"
+        );
     }
 
     /// A newer generation forgets the older one's settled keys: the same intent
