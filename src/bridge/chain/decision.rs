@@ -70,7 +70,9 @@ pub(crate) enum ChainDisposition {
     /// key answers for it (spec #571, ticket #575).
     StampRestart,
     /// The transcript decided the card's ending. `TurnSettle::Running` never
-    /// surfaces here — an undecided ending is `Keep`.
+    /// surfaces here — an undecided ending is `Keep`. The ending is a keyed
+    /// write (spec #571's amendment): accepting it closes the record's
+    /// generation, so a stamp whose read outlived it is dropped.
     Settle(TurnSettle),
     /// A record carrying a Rendered Cursor whose run ended while cola was down
     /// (or is gone): project the missed tail — and the transcript's true
