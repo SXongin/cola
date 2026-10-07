@@ -297,7 +297,11 @@ or a terminal `Settle` closed the generation), lands same-generation
 submissions in submission order (one in flight, one waiting, the newer
 replacing the waiting one), collapses a `(generation, intent)` pair to its
 newest payload — and to nothing once the key settled — and retries a
-recoverable failure under its key. The intent vocabulary is `Stamp` (the #443
+recoverable failure under its key. A submission may carry a **fallback**
+payload (spec #571 review): a typed card-content rejection of the primary
+tries it under the same held card lock and the same key, so a preserved
+ending's degradation to its bare shape stays one ordered write. The intent
+vocabulary is `Stamp` (the #443
 restart stamp), `Collect` (a takeover's old-card collect), `Settle` (the
 terminal ending) and `Yield` (the waiting ending, which shadows a later
 `Stamp` without closing the generation). Distinct from a keyless

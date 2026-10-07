@@ -36,6 +36,11 @@
 //!   call (#522);
 //! - keeps a recoverable failure owed with its key and its backoff, to be
 //!   retried by the drain;
+//! - tries a write's optional **fallback** payload when the primary is refused
+//!   as card content (a typed rejection): the fallback runs under the same held
+//!   card lock and settles the same `(generation, intent)` key (spec #571
+//!   review), so a degradation — a preserved ending's bare retry, a collect's
+//!   bare marker — can never land over a newer generation;
 //! - serializes keyless and keyed writes on the same per-card delivery lock —
 //!   a keyless write is never dropped for staleness.
 //!
@@ -138,6 +143,13 @@ pub(crate) struct KeyedSubmission<'a> {
     pub intent: CardWriteIntent,
     /// The composed payload.
     pub card: &'a Value,
+    /// The composed **fallback** payload, tried by the driver when the primary
+    /// is refused as card content (a typed `CardContentRejected`, e.g.
+    /// `230099`) — under the same held card lock and the same
+    /// `(generation, intent)` key (spec #571 review), so a degradation can
+    /// never jump the queue's ordering. `None` for a write with no degradation
+    /// (the stamp, a collect whose bare ending is only the read fallback).
+    pub fallback: Option<&'a Value>,
 }
 
 /// What became of one keyed submission — its [`CardWriteTicket`]'s verdict.
@@ -221,6 +233,10 @@ struct QueuedWrite {
     intent: CardWriteIntent,
     /// The composed payload.
     card: Value,
+    /// The write's fallback payload (see [`KeyedSubmission::fallback`]), tried
+    /// under the same lock and key on a typed content rejection. Cleared once
+    /// the fallback itself is the payload the write converged on.
+    fallback: Option<Value>,
     /// This submission's own failed attempts so far: each further failure
     /// doubles the delay before the next retry.
     attempts: u32,
@@ -236,6 +252,7 @@ impl QueuedWrite {
             generation: submission.generation,
             intent: submission.intent,
             card: submission.card.clone(),
+            fallback: submission.fallback.cloned(),
             attempts: 0,
             next_attempt: now,
         }
@@ -816,8 +833,9 @@ impl CardDelivery {
     ) {
         loop {
             // Confirm this driver still owns the queue and snapshot the
-            // payload to write. The state lock is never held across an await.
-            let payload = {
+            // payloads to write (the primary and its fallback). The state lock
+            // is never held across an await.
+            let (payload, fallback) = {
                 let mut state = state.lock().unwrap();
                 let Some(entry) = state.entries.get_mut(&message_id) else {
                     return;
@@ -826,7 +844,7 @@ impl CardDelivery {
                     return;
                 }
                 match entry.in_flight.as_ref() {
-                    Some(write) => write.card.clone(),
+                    Some(write) => (write.card.clone(), write.fallback.clone()),
                     None => {
                         entry.driver = None;
                         return;
@@ -863,8 +881,19 @@ impl CardDelivery {
                 }
             }
             // Bounded like the outbox's retry: a hung PATCH must not hold the
-            // card's delivery lock — and so its queue — forever.
-            let result = bounded_update(&inner, &message_id, &payload, limits.retry_timeout).await;
+            // card's delivery lock — and so its queue — forever. A typed
+            // content rejection of the primary switches to the write's fallback
+            // payload, under the SAME held lock (spec #571 review): the
+            // degradation stays inside the write's own key, never a keyless
+            // bypass of the generation order.
+            let attempt = attempt_queued_write(
+                &inner,
+                &message_id,
+                &payload,
+                fallback.as_ref(),
+                limits.retry_timeout,
+            )
+            .await;
             let now = tokio::time::Instant::now();
             let mut state = state.lock().unwrap();
             let Some(entry) = state.entries.get_mut(&message_id) else {
@@ -877,7 +906,15 @@ impl CardDelivery {
                 entry.driver = None;
                 return;
             };
-            match result {
+            // The payload the attempt actually carried — the fallback, when a
+            // typed rejection switched to it — is what stays owed on a
+            // recoverable failure, and once the fallback is the payload the
+            // primary never returns.
+            write.card = attempt.payload;
+            if attempt.used_fallback {
+                write.fallback = None;
+            }
+            match attempt.result {
                 Ok(()) => {
                     // Only when no newer payload of the same key waits behind
                     // this write: that one is the key's newest payload and will
@@ -1126,6 +1163,53 @@ async fn bounded_update(
             std::io::ErrorKind::TimedOut,
             "card update timed out",
         ))),
+    }
+}
+
+/// Whether the failure is the typed card-content rejection (e.g. `230099`)
+/// whose deterministic shape a write's fallback payload exists for.
+pub(crate) fn is_card_content_rejection(error: &BridgeError) -> bool {
+    matches!(error, BridgeError::CardContentRejected { .. })
+}
+
+/// One queued write's attempt: the payload it carried — the write's fallback
+/// when a typed content rejection of the primary switched to it — and the
+/// attempt's own outcome.
+struct QueuedAttempt {
+    /// The payload the attempt carried.
+    payload: Value,
+    /// Whether `payload` is the write's fallback.
+    used_fallback: bool,
+    /// The attempt's outcome.
+    result: Result<()>,
+}
+
+/// Attempt one queued keyed write: the primary payload, and — on a typed
+/// `CardContentRejected` of it — the write's fallback payload. Both attempts
+/// run under the caller's SAME held card lock and settle the same
+/// `(generation, intent)` key (spec #571 review): the preserved→bare
+/// degradation is part of one ordered write, never a keyless write that could
+/// land over a newer generation. A write with no fallback answers with its
+/// primary's failure, exactly as before.
+async fn attempt_queued_write(
+    platform: &Arc<dyn Platform>,
+    message_id: &str,
+    payload: &Value,
+    fallback: Option<&Value>,
+    timeout: Duration,
+) -> QueuedAttempt {
+    let result = bounded_update(platform, message_id, payload, timeout).await;
+    match (&result, fallback) {
+        (Err(e), Some(fallback)) if is_card_content_rejection(e) => QueuedAttempt {
+            payload: fallback.clone(),
+            used_fallback: true,
+            result: bounded_update(platform, message_id, fallback, timeout).await,
+        },
+        _ => QueuedAttempt {
+            payload: payload.clone(),
+            used_fallback: false,
+            result,
+        },
     }
 }
 
@@ -1547,6 +1631,27 @@ mod tests {
                 generation,
                 intent,
                 card,
+                fallback: None,
+            })
+            .await
+    }
+
+    /// [`submit`] with a fallback payload (spec #571 review).
+    async fn submit_with_fallback(
+        delivery: &CardDelivery,
+        message_id: &str,
+        generation: u64,
+        intent: CardWriteIntent,
+        card: &Value,
+        fallback: &Value,
+    ) -> CardWriteTicket {
+        delivery
+            .submit_ordered(KeyedSubmission {
+                message_id,
+                generation,
+                intent,
+                card,
+                fallback: Some(fallback),
             })
             .await
     }
@@ -2236,6 +2341,122 @@ mod tests {
         );
     }
 
+    /// A write's fallback is delivered under the SAME key and held lock (spec
+    /// #571 review): the primary's typed content rejection switches the attempt
+    /// to the fallback, which lands as this submission's own delivery — the key
+    /// settles delivered, so later re-decisions are free.
+    #[tokio::test]
+    async fn a_typed_refusal_delivers_the_writes_fallback_under_the_same_key() {
+        let inner = Arc::new(FakePlatform::new());
+        inner.fail_next(Fail::ContentRejected);
+        let delivery = CardDelivery::new(inner.clone());
+        let preserved = serde_json::json!({ "body": "preserved" });
+        let bare = serde_json::json!({ "body": "bare" });
+
+        let ticket =
+            submit_with_fallback(&delivery, "om_1", 1, CardWriteIntent::Collect, &preserved, &bare).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Delivered));
+        assert_eq!(
+            inner.attempts(),
+            vec![
+                ("om_1".to_string(), preserved.clone()),
+                ("om_1".to_string(), bare.clone())
+            ],
+            "the refused primary then its fallback"
+        );
+
+        let ticket =
+            submit_with_fallback(&delivery, "om_1", 1, CardWriteIntent::Collect, &preserved, &bare).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Delivered));
+        assert_eq!(inner.attempts().len(), 2, "the settled key never writes again");
+    }
+
+    /// The fallback stays inside the write's ordering (spec #571 review): the
+    /// degradation runs under the same held lock, so a newer-generation collect
+    /// queued behind the refused ending is the card's LAST write — the fallback
+    /// can never land after it.
+    #[tokio::test]
+    async fn a_typed_refusal_keeps_the_fallback_ordered_under_the_key() {
+        let inner = Arc::new(FakePlatform::new());
+        inner.fail_next(Fail::ContentRejected);
+        let (entered, release) = inner.park_next();
+        let delivery = Arc::new(CardDelivery::new(inner.clone()));
+        let preserved = serde_json::json!({ "body": "preserved" });
+        let bare = serde_json::json!({ "body": "bare" });
+        let collect = serde_json::json!({ "body": "collected" });
+
+        let ending =
+            submit_with_fallback(&delivery, "om_1", 1, CardWriteIntent::Settle, &preserved, &bare).await;
+        entered.notified().await;
+
+        // The newer chain state's collect queues behind the parked ending.
+        let newer = submit(&delivery, "om_1", 2, CardWriteIntent::Collect, &collect).await;
+
+        release.notify_one();
+        assert!(matches!(ending.settled().await, WriteOutcome::Delivered));
+        assert!(matches!(newer.settled().await, WriteOutcome::Delivered));
+        assert_eq!(
+            inner.attempts(),
+            vec![
+                ("om_1".to_string(), preserved),
+                ("om_1".to_string(), bare),
+                ("om_1".to_string(), collect),
+            ],
+            "the fallback runs under the ending's lock; the newer collect has the last word"
+        );
+    }
+
+    /// A typed refusal of the fallback too settles the key permanently: the
+    /// card can never render this write, so a later same-key submission is
+    /// dropped without a call (#522), and the submission reports its failure.
+    #[tokio::test]
+    async fn a_refused_fallback_settles_the_key_refused() {
+        let inner = Arc::new(FakePlatform::new());
+        inner.fail_next(Fail::ContentRejected);
+        inner.fail_next(Fail::ContentRejected);
+        let delivery = CardDelivery::new(inner.clone());
+        let preserved = serde_json::json!({ "body": "preserved" });
+        let bare = serde_json::json!({ "body": "bare" });
+
+        let ticket =
+            submit_with_fallback(&delivery, "om_1", 1, CardWriteIntent::Settle, &preserved, &bare).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Failed(_)));
+        assert_eq!(inner.attempts().len(), 2, "the primary and the fallback, no more");
+
+        let ticket =
+            submit_with_fallback(&delivery, "om_1", 1, CardWriteIntent::Settle, &preserved, &bare).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Superseded));
+        assert_eq!(inner.attempts().len(), 2, "the refused key never writes again");
+    }
+
+    /// A recoverable failure of the fallback keeps the write owed with the
+    /// fallback as its payload (spec #571 review): the drain retries the bare
+    /// payload, never the refused primary again.
+    #[tokio::test]
+    async fn a_recoverable_fallback_failure_stays_owed_with_the_fallback() {
+        let inner = Arc::new(FakePlatform::new());
+        inner.fail_next(Fail::ContentRejected); // the primary
+        inner.fail_next(Fail::Transport); // the fallback
+        let delivery = CardDelivery::new(inner.clone());
+        let preserved = serde_json::json!({ "body": "preserved" });
+        let bare = serde_json::json!({ "body": "bare" });
+
+        let ticket =
+            submit_with_fallback(&delivery, "om_1", 1, CardWriteIntent::Collect, &preserved, &bare).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Failed(_)));
+
+        delivery.drain_pending_card_updates(true).await;
+        assert_eq!(
+            inner.attempts(),
+            vec![
+                ("om_1".to_string(), preserved),
+                ("om_1".to_string(), bare.clone()),
+                ("om_1".to_string(), bare),
+            ],
+            "the drain retried the fallback payload"
+        );
+    }
+
     /// The read-only covered-key query a writer's per-tick re-decision
     /// consults before doing any work (spec #571, tickets #575): a settled key
     /// (delivered or permanently refused), an in-flight or waiting write of
@@ -2691,6 +2912,7 @@ mod tests {
                 generation: 3,
                 intent: CardWriteIntent::Collect,
                 card: &card,
+                fallback: None,
             })
             .await;
         assert!(matches!(ticket.settled().await, WriteOutcome::Delivered));
@@ -2703,6 +2925,7 @@ mod tests {
                 generation: 3,
                 intent: CardWriteIntent::Stamp,
                 card: &card,
+                fallback: None,
             })
             .await;
         assert!(matches!(ticket.settled().await, WriteOutcome::Failed(_)));
@@ -2710,6 +2933,27 @@ mod tests {
         assert!(
             !inner.keyed_write_covered("om_2", 3, CardWriteIntent::Stamp),
             "an unwrapped platform remembers no covered key"
+        );
+
+        // A typed content rejection degrades to the submission's fallback in
+        // the unordered path too (spec #571 review): one key, primary then
+        // fallback.
+        inner.fail_next(Fail::ContentRejected);
+        let bare = serde_json::json!({ "body": "bare" });
+        let ticket = inner
+            .submit_ordered(KeyedSubmission {
+                message_id: "om_3",
+                generation: 3,
+                intent: CardWriteIntent::Collect,
+                card: &card,
+                fallback: Some(&bare),
+            })
+            .await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Delivered));
+        assert_eq!(
+            inner.attempts().last(),
+            Some(&("om_3".to_string(), bare)),
+            "the fallback landed after the refused primary"
         );
     }
 

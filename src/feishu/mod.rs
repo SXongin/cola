@@ -27,15 +27,26 @@ pub trait Platform: Send + Sync {
 
     /// Submit a **keyed submission** for ordered delivery (spec #571): an
     /// already-composed payload carrying the **chain generation** its writer
-    /// decided under and the intent naming the logical write. The delivery
+    /// decided under and the intent naming the logical write, with an optional
+    /// **fallback** payload for a platform that refuses the primary as card
+    /// content (spec #571 review). The delivery
     /// decorator serializes it against the card's other writers — dropping a
     /// stale generation, collapsing a settled `(generation, intent)`, keeping a
-    /// recoverable failure owed — and returns the submission's completion
-    /// ticket. The default implementation is the unordered fallback: a platform
-    /// with no delivery decorator (a test fake, an unwrapped adapter) writes
-    /// the payload straight through [`Self::update_message`].
+    /// recoverable failure owed, trying the fallback inside the same key — and
+    /// returns the submission's completion ticket. The default implementation
+    /// is the unordered fallback: a platform with no delivery decorator (a test
+    /// fake, an unwrapped adapter) writes the payload straight through
+    /// [`Self::update_message`], degrading to the fallback on a typed content
+    /// rejection exactly as the queue's driver does.
     async fn submit_ordered(&self, submission: delivery::KeyedSubmission<'_>) -> delivery::CardWriteTicket {
         let outcome = match self.update_message(submission.message_id, submission.card).await {
+            Err(e) if delivery::is_card_content_rejection(&e) => match submission.fallback {
+                Some(fallback) => match self.update_message(submission.message_id, fallback).await {
+                    Ok(()) => delivery::WriteOutcome::Delivered,
+                    Err(e) => delivery::WriteOutcome::Failed(e),
+                },
+                None => delivery::WriteOutcome::Failed(e),
+            },
             Ok(()) => delivery::WriteOutcome::Delivered,
             Err(e) => delivery::WriteOutcome::Failed(e),
         };
