@@ -1120,7 +1120,10 @@ impl Platform for CardDelivery {
     fn settled_card_write_delivered(&self, message_id: &str) -> Option<bool> {
         let state = self.state.lock().unwrap();
         let entry = state.entries.get(message_id)?;
-        entry.card.is_none().then(|| entry.delivered.contains(&entry.seq))
+        // A keyed submission can create the entry before any keyless write is
+        // observed: sequence 0 is "no keyless write yet", never a settled one,
+        // so the card's keyed queue cannot answer for the Rendered Cursor.
+        (entry.seq > 0 && entry.card.is_none()).then(|| entry.delivered.contains(&entry.seq))
     }
 }
 
@@ -1988,6 +1991,30 @@ mod tests {
             vec![("om_1".to_string(), refused), ("om_1".to_string(), stamp)],
             "the other key's payload still landed"
         );
+    }
+
+    /// A keyed submission's entry never answers for a keyless write that has
+    /// not happened: the Rendered Cursor's views stay unobserved, not settled,
+    /// until a keyless `update_message` is written for the card.
+    #[tokio::test]
+    async fn a_keyed_only_entry_never_reports_a_settled_keyless_write() {
+        let inner = Arc::new(FakePlatform::new());
+        let delivery = CardDelivery::new(inner.clone());
+        let card = serde_json::json!({ "body": "keyed" });
+
+        let ticket = submit(&delivery, "om_1", 1, CardWriteIntent::Collect, &card).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Delivered));
+        assert_eq!(
+            delivery.settled_card_write_delivered("om_1"),
+            None,
+            "the keyed queue is not a keyless write's settled verdict"
+        );
+        assert_eq!(
+            delivery.pending_card_write("om_1", &card),
+            None,
+            "a keyed payload is never a Pending Card Update"
+        );
+        assert!(!delivery.pending("om_1"), "and owes nothing to the record gate");
     }
 
     /// Keyless writes keep today's semantics: they are never dropped for
