@@ -60,6 +60,7 @@ fn seed_chain_record(
         MessageId::new(message_id),
         created_ms,
         directory,
+        None,
     );
 }
 
@@ -1090,6 +1091,7 @@ async fn a_takeover_during_the_stamp_read_wins_over_the_stamp() {
         MessageId::new("msg_cola_other"),
         Some(2_000),
         Some("/work"),
+        None,
     );
 
     let transcript = SessionTranscript::new(vec![user("msg_cola_anchor", 1_000, "问题")]);
@@ -1169,6 +1171,7 @@ async fn a_collect_submits_the_live_generation_after_its_card_view_read() {
         MessageId::new("msg_cola_new"),
         Some(2_000),
         Some("/work"),
+        None,
     );
     // The new chain state writes the orphan first, at the NEW generation: the
     // card's queue now holds that generation and has delivered its stamp.
@@ -1255,6 +1258,7 @@ async fn a_successor_owning_the_session_collects_after_the_stamp() {
         MessageId::new("msg_cola_other"),
         Some(2_000),
         Some("/work"),
+        None,
     );
 
     let transcript = SessionTranscript::new(vec![user("msg_cola_anchor", 1_000, "问题")]);
@@ -1343,6 +1347,7 @@ async fn a_settle_during_the_stamp_read_closes_the_generation() {
         MessageId::new("msg_cola_other"),
         Some(2_000),
         Some("/work"),
+        None,
     );
 
     let (app, platform, backend) =
@@ -1543,6 +1548,7 @@ async fn a_takeover_during_the_settle_read_wins_over_the_settle() {
         MessageId::new("msg_cola_other"),
         Some(2_000),
         Some("/work"),
+        None,
     );
 
     let (app, platform, backend) =
@@ -2813,6 +2819,7 @@ async fn a_pending_inbound_claim_is_never_stamped_over() {
         MessageId::new("msg_cola_other"),
         Some(2_000),
         Some("/work"),
+        None,
     );
 
     let transcript = SessionTranscript::new(vec![user("msg_cola_anchor", 1_000, "问题")]);
@@ -3016,6 +3023,7 @@ async fn a_hung_stamp_patch_never_wedges_the_pass() {
         MessageId::new("msg_cola_other"),
         Some(2_000),
         Some("/work"),
+        None,
     );
 
     let transcript = SessionTranscript::new(vec![user("msg_cola_anchor", 1_000, "问题")]);
@@ -3086,6 +3094,7 @@ async fn a_terminal_waits_for_an_in_flight_stamp() {
         MessageId::new("msg_cola_other"),
         Some(2_000),
         Some("/work"),
+        None,
     );
 
     let (app, platform, backend) =
@@ -3396,7 +3405,7 @@ async fn a_projection_never_re_announces_a_wake_the_watermark_covers() {
     platform.given_card_view("om_frozen", live_tail_orphan_view());
 
     spawn_sync(&app);
-    let (successor, successor_text) = wait_for_projection(&platform, "msg_cola_anchor").await;
+    let (successor, successor_text) = wait_for_projection(&platform, "om_frozen").await;
 
     assert!(
         successor_text.contains(resumed),
@@ -3456,7 +3465,7 @@ async fn a_projection_announces_a_wake_newer_than_the_watermark() {
     platform.given_card_view("om_frozen", live_tail_orphan_view());
 
     spawn_sync(&app);
-    let (successor, successor_text) = wait_for_projection(&platform, "msg_cola_anchor").await;
+    let (successor, successor_text) = wait_for_projection(&platform, "om_frozen").await;
 
     assert_eq!(
         wake_entry_count(&successor),
@@ -3511,7 +3520,7 @@ async fn a_record_carrying_wake_goes_through_the_projection() {
     platform.given_card_view("om_frozen", live_tail_orphan_view());
 
     spawn_sync(&app);
-    let (successor, successor_text) = wait_for_projection(&platform, "msg_cola_anchor").await;
+    let (successor, successor_text) = wait_for_projection(&platform, "om_frozen").await;
 
     assert_eq!(
         card_header(&successor),
@@ -3595,7 +3604,7 @@ async fn a_projection_announces_its_wake_across_a_second_restart() {
     // Life 1: the projection renders the Wake's resumed work and settles the
     // successor — the confirmed create is the write that announces the Wake.
     spawn_sync(&app);
-    let (_successor, successor_text) = wait_for_projection(&platform, "msg_cola_anchor").await;
+    let (_successor, successor_text) = wait_for_projection(&platform, "om_frozen").await;
     assert!(successor_text.contains(resumed), "{successor_text}");
     wait_for_record_gone(&app, "ses_test").await;
     wait_for_announced(&app, "ses_test", 2_900).await;
@@ -4223,6 +4232,7 @@ async fn a_permanently_refused_ending_releases_the_record() {
         MessageId::new("msg_cola_other"),
         Some(2_000),
         Some("/work"),
+        None,
     );
 
     let (app, platform, backend) =
@@ -4272,6 +4282,7 @@ async fn a_refused_waiting_yield_is_never_re_read() {
         MessageId::new("msg_cola_other"),
         Some(2_000),
         Some("/work"),
+        None,
     );
 
     let waiting = SessionTranscript::new(vec![
@@ -4646,6 +4657,7 @@ async fn a_hung_ending_write_does_not_block_the_pass() {
         MessageId::new("msg_cola_other"),
         Some(2_000),
         Some("/work"),
+        None,
     );
 
     let (app, platform, backend) =
@@ -4764,6 +4776,7 @@ async fn a_hung_collect_card_view_does_not_block_the_pass() {
         MessageId::new("msg_cola_other"),
         Some(2_000),
         Some("/work"),
+        None,
     );
 
     let (app, platform, backend) =
@@ -4809,6 +4822,7 @@ async fn a_hung_settle_card_view_does_not_block_the_pass() {
         MessageId::new("msg_cola_other"),
         Some(2_000),
         Some("/work"),
+        None,
     );
 
     let (app, platform, backend) =
@@ -5114,6 +5128,42 @@ fn seed_cursor_record(
     ChainRecords::load(sidecar(session_file)).advance_cursor("ses_test", card_message_id, &cursor);
 }
 
+/// [`seed_cursor_record`] carrying the chain's durable reply target (issue
+/// #580): the Feishu user message the chain answers. The projection replies
+/// there first, then falls to the recorded card.
+#[allow(clippy::too_many_arguments)] // the seed's whole fixture
+fn seed_cursor_record_reply_to(
+    session_file: &Path,
+    card_message_id: &str,
+    message_id: &str,
+    created_ms: Option<i64>,
+    directory: Option<&str>,
+    reply_to: &str,
+    frontier: Option<CursorFrontier>,
+    live_calls: &[&str],
+) {
+    seed_cursor_record(
+        session_file,
+        card_message_id,
+        message_id,
+        created_ms,
+        directory,
+        frontier,
+        live_calls,
+    );
+    // Re-track the same facts with the reply target: the store carries the
+    // confirmed cursor across the re-point (spec #561), exactly as a live
+    // chain's later track does.
+    ChainRecords::load(sidecar(session_file)).track(
+        "ses_test",
+        card_message_id,
+        MessageId::new(message_id),
+        created_ms,
+        directory,
+        Some(reply_to),
+    );
+}
+
 /// The cursor frontier of the fixture: a text part at `msg_a_2000` delivered
 /// up to `delivered_chars`.
 fn text_frontier(delivered: &str) -> CursorFrontier {
@@ -5200,7 +5250,7 @@ async fn a_restart_projects_the_missed_tail_of_an_ended_run() {
         .insert("ses_test".to_string(), "项目甲".to_string());
 
     spawn_sync(&app);
-    let (successor, successor_text) = wait_for_projection(&platform, "msg_cola_anchor").await;
+    let (successor, successor_text) = wait_for_projection(&platform, "om_frozen").await;
 
     assert_eq!(
         card_header(&successor),
@@ -5254,6 +5304,166 @@ async fn a_restart_projects_the_missed_tail_of_an_ended_run() {
     );
 }
 
+/// Issue #580: the projection's successor replies to the chain's durable
+/// reply target — the Feishu user message the chain answers — never the
+/// OpenCode message id the record scopes its settle decision with. Live,
+/// Feishu answered 400 (`not a valid open_message_id`) for the `msg_cola_*`
+/// anchor and the projection retried the same id forever.
+#[tokio::test]
+async fn a_projection_replies_to_the_chains_durable_reply_target() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let delivered = "已经写了一半。";
+    let missed = "停机期间写完的。";
+    let full = format!("{delivered}{missed}");
+    seed_cursor_record_reply_to(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
+        "om_user_msg",
+        Some(text_frontier(delivered)),
+        &[],
+    );
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "问题"),
+        assistant(2_000, &full),
+    ])
+    .with_executions(vec![execution(2_500)]);
+    let (app, platform, _backend) =
+        restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Idle)).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+
+    spawn_sync(&app);
+    let (successor, successor_text) = wait_for_projection(&platform, "om_user_msg").await;
+
+    assert_eq!(card_header(&successor), "✅ 完成");
+    assert!(successor_text.contains(missed), "{successor_text}");
+    let anchored = platform.calls.lock().await.iter().any(|call| {
+        matches!(
+            call,
+            PlatformCall::ReplyCard { reply_to, .. } if reply_to == "msg_cola_anchor"
+        )
+    });
+    assert!(
+        !anchored,
+        "the OpenCode message id is never used as a Feishu reply target: {:?}",
+        platform.calls.lock().await
+    );
+}
+
+/// Issue #580: a target the platform refuses DEFINITIVELY (a 4xx — a
+/// withdrawn message id, say) falls through to the next target — the
+/// recorded card — instead of pinning the projection to it forever. The
+/// successor still lands, exactly once.
+#[tokio::test]
+async fn a_projection_falls_back_past_a_refused_reply_target() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let delivered = "已经写了一半。";
+    let missed = "停机期间写完的。";
+    let full = format!("{delivered}{missed}");
+    seed_cursor_record_reply_to(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
+        "om_withdrawn",
+        Some(text_frontier(delivered)),
+        &[],
+    );
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "问题"),
+        assistant(2_000, &full),
+    ])
+    .with_executions(vec![execution(2_500)]);
+    let (app, platform, _backend) =
+        restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Idle)).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+    // The durable target is gone: Feishu answers a definite 400 for it.
+    platform.given_reply_card_outcome(ReplyOutcome::Refused(400));
+
+    spawn_sync(&app);
+    let (successor, successor_text) = wait_for_projection(&platform, "om_frozen").await;
+
+    assert_eq!(card_header(&successor), "✅ 完成");
+    assert!(successor_text.contains(missed), "{successor_text}");
+    assert_eq!(
+        platform
+            .calls
+            .lock()
+            .await
+            .iter()
+            .filter(|call| matches!(
+                call,
+                PlatformCall::ReplyCard { reply_to, .. } if reply_to == "om_frozen"
+            ))
+            .count(),
+        1,
+        "one fallback successor, never a duplicate: {:?}",
+        platform.calls.lock().await
+    );
+}
+
+/// Issue #580: when every reply target is refused definitively, the Chat is
+/// the ladder's last rung — the successor lands as a top-level message
+/// instead of the projection giving up.
+#[tokio::test]
+async fn a_projection_falls_back_to_the_chat_when_every_reply_target_is_refused() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let delivered = "已经写了一半。";
+    let missed = "停机期间写完的。";
+    let full = format!("{delivered}{missed}");
+    seed_cursor_record_reply_to(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
+        "om_withdrawn",
+        Some(text_frontier(delivered)),
+        &[],
+    );
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "问题"),
+        assistant(2_000, &full),
+    ])
+    .with_executions(vec![execution(2_500)]);
+    let (app, platform, _backend) =
+        restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Idle)).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+    // Both reply targets are gone: definite 400s for each.
+    platform.given_reply_card_outcome(ReplyOutcome::Refused(400));
+    platform.given_reply_card_outcome(ReplyOutcome::Refused(400));
+
+    spawn_sync(&app);
+    // The successor lands at the Chat's top level.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let successor = loop {
+        if let Some(card) = platform
+            .sent_cards()
+            .await
+            .iter()
+            .find(|card| card_text(card).contains(missed))
+        {
+            break card.clone();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no top-level fallback successor: {:?}",
+            platform.calls.lock().await
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    assert_eq!(card_header(&successor), "✅ 完成");
+}
+
 /// A tail cut inside a code fence (spec #561, ticket #563): the successor's
 /// markdown reopens the fence, so the missed code stays code and the text
 /// after the original closer is not swallowed.
@@ -5283,7 +5493,7 @@ async fn a_projection_cut_inside_a_fence_renders_intact() {
         restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Idle)).await;
 
     spawn_sync(&app);
-    let (_successor, successor_text) = wait_for_projection(&platform, "msg_cola_anchor").await;
+    let (_successor, successor_text) = wait_for_projection(&platform, "om_frozen").await;
 
     assert!(
         successor_text.contains("```\nprint(2)\n```\n后的文字"),
@@ -5339,7 +5549,7 @@ async fn a_projection_settles_a_tool_that_finished_while_cola_was_down() {
     );
 
     spawn_sync(&app);
-    let (successor, successor_text) = wait_for_projection(&platform, "msg_cola_anchor").await;
+    let (successor, successor_text) = wait_for_projection(&platform, "om_frozen").await;
 
     assert_eq!(card_header(&successor), "✅ 完成");
     assert_eq!(
@@ -5403,7 +5613,7 @@ async fn a_projection_confirm_advances_the_cursor_it_was_confirmed_on() {
         restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Idle)).await;
 
     spawn_sync(&app);
-    let (successor, successor_text) = wait_for_projection(&platform, "msg_cola_anchor").await;
+    let (successor, successor_text) = wait_for_projection(&platform, "om_frozen").await;
 
     assert_eq!(card_header(&successor), "⏳ 等待后台任务");
     assert!(successor_text.contains(missed), "{successor}");
@@ -5584,13 +5794,12 @@ async fn a_cursorless_record_keeps_todays_in_place_settle() {
     wait_for_posted_text(&platform2, tail).await;
 }
 
-/// A cursor-carrying record that recorded no card and no Chat mapping still
-/// delivers (spec #561's order, review #569): the submitted message's anchor,
-/// re-derived from this read, is the projection's reply target — the missed
-/// tail lands as a reply to the original Turn, instead of the old fallback's
-/// settle PATCH to an empty card id.
+/// A cursor-carrying record that names no card and has no Chat mapping has no
+/// deliverable target at all (issue #580): the OpenCode message id is not a
+/// Feishu target, so nothing is projected and nothing is settled — the record
+/// claims nothing rather than PATCHing an empty card id.
 #[tokio::test]
-async fn a_record_with_no_card_or_chat_projects_to_the_derived_anchor() {
+async fn a_record_with_no_deliverable_target_claims_nothing() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("sessions.json");
@@ -5598,7 +5807,7 @@ async fn a_record_with_no_card_or_chat_projects_to_the_derived_anchor() {
     let missed = "后半段。";
     // The previous life recorded no card and never captured an anchor; the
     // submitted message did land later, so the transcript alone decides the
-    // ending (Complete) and re-derives the delivery anchor.
+    // ending (Complete).
     seed_cursor_record(
         &session_file,
         "",
@@ -5613,22 +5822,32 @@ async fn a_record_with_no_card_or_chat_projects_to_the_derived_anchor() {
         assistant(2_000, &format!("{delivered}{missed}")),
     ])
     .with_executions(vec![execution(2_500)]);
-    // NO session mapping either: no recorded card, no Chat — the anchor alone.
-    let (app, platform, _backend) = restarted_app_unmapped(&session_file, transcript).await;
+    // NO session mapping either: no recorded card, no Chat — and an OpenCode
+    // message id is never a deliverable Feishu target.
+    let (app, platform, backend) = restarted_app_unmapped(&session_file, transcript).await;
 
     spawn_sync(&app);
-    let (successor, successor_text) = wait_for_projection(&platform, "msg_cola_anchor").await;
-    assert!(
-        successor_text.contains(missed),
-        "the missed tail replies to the original Turn anchor: {successor}"
-    );
-    assert!(
-        !successor_text.contains(delivered),
-        "the delivered prefix is never repeated: {successor}"
-    );
+    // Let several passes run: the record claims nothing, forever — no
+    // projection create, no empty-id settle PATCH.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        assert!(
+            platform.replied_cards().await.is_empty(),
+            "no projection without a deliverable target: {:?}",
+            platform.calls.lock().await
+        );
+        if backend.transcript_calls.lock().await.len() >= 3 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the reap never observed the targetless record"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     assert!(
         patches_to(&platform, "").await.is_empty(),
-        "no settle ever PATCHes an empty card id: {:?}",
+        "nothing ever PATCHes an empty card id: {:?}",
         platform.calls.lock().await
     );
 }
@@ -5746,7 +5965,7 @@ async fn a_restart_mid_run_follows_the_live_run_onto_a_successor() {
     platform.given_card_view("om_frozen", realistic_card_view());
 
     spawn_sync(&app);
-    let (successor, successor_text) = wait_for_projection(&platform, "msg_cola_anchor").await;
+    let (successor, successor_text) = wait_for_projection(&platform, "om_frozen").await;
 
     // The successor is a live continuation — a working card, not a stamped
     // orphan — and the delivered prefix is never repeated.
@@ -5847,7 +6066,7 @@ async fn a_restart_mid_run_carries_a_running_tool_and_settles_it_once() {
     platform.given_card_view("om_frozen", running_panel_card_view("call_1"));
 
     spawn_sync(&app);
-    let (successor, successor_text) = wait_for_projection(&platform, "msg_cola_anchor").await;
+    let (successor, successor_text) = wait_for_projection(&platform, "om_frozen").await;
 
     assert!(
         successor_text.contains("⏳ bash"),
@@ -5938,7 +6157,7 @@ async fn a_restart_mid_run_settles_a_tool_that_finished_while_cola_was_down() {
     platform.given_card_view("om_frozen", running_panel_card_view("call_1"));
 
     spawn_sync(&app);
-    let (successor, successor_text) = wait_for_projection(&platform, "msg_cola_anchor").await;
+    let (successor, successor_text) = wait_for_projection(&platform, "om_frozen").await;
 
     assert_eq!(
         successor_text.matches("done").count(),
@@ -6001,7 +6220,7 @@ async fn a_live_adoption_announces_the_wake_its_successor_rendered() {
         .store(100, std::sync::atomic::Ordering::SeqCst);
 
     spawn_sync(&app);
-    let (successor, successor_text) = wait_for_projection(&platform, "msg_cola_anchor").await;
+    let (successor, successor_text) = wait_for_projection(&platform, "om_frozen").await;
     assert!(
         card_header(&successor).contains("回复中"),
         "the adoption follows the live run: {successor}"
@@ -6095,7 +6314,7 @@ async fn an_adoption_carries_a_pending_request_onto_the_successor() {
     platform.given_card_view("om_frozen", running_panel_card_view("call_1"));
 
     spawn_sync(&app);
-    let (_successor, successor_text) = wait_for_projection(&platform, "msg_cola_anchor").await;
+    let (_successor, successor_text) = wait_for_projection(&platform, "om_frozen").await;
     assert!(
         !successor_text.contains(delivered),
         "the adoption seeds past the delivered prefix: {successor_text}"
@@ -6217,7 +6436,7 @@ async fn a_run_that_dies_with_the_server_settles_by_transcript_truth() {
     platform.given_card_view("om_frozen", realistic_card_view());
 
     spawn_sync(&app);
-    wait_for_projection(&platform, "msg_cola_anchor").await;
+    wait_for_projection(&platform, "om_frozen").await;
 
     // The server goes away: its status reads fail from here on, while the
     // transcript (the follow's one read) carries the run's true end.
@@ -6292,7 +6511,7 @@ async fn a_live_adoption_keeps_following_through_failed_reads() {
     platform.given_card_view("om_frozen", realistic_card_view());
 
     spawn_sync(&app);
-    wait_for_projection(&platform, "msg_cola_anchor").await;
+    wait_for_projection(&platform, "om_frozen").await;
     let collects = patches_to(&platform, "om_frozen").await.len();
 
     // The transcript read starts failing: the follow keeps polling without
@@ -6558,7 +6777,7 @@ async fn a_live_adoption_is_generation_neutral() {
         seed_session(&app, "ses_test", "/work").await;
 
         spawn_sync(&app);
-        let (successor, successor_text) = wait_for_projection(&platform, "msg_cola_anchor").await;
+        let (successor, successor_text) = wait_for_projection(&platform, "om_frozen").await;
         assert!(
             card_header(&successor).contains("回复中"),
             "a working successor on the {generation} mock: {successor}"
@@ -6957,7 +7176,7 @@ async fn a_turn_winning_the_create_window_keeps_the_chain_and_its_late_card_is_c
     // The projection arms its successor and parks inside the awaited create.
     // The scripted id is the late card's own identity — the mock's default
     // `msg_reply` is the Turn's card, and the two must be tellable apart.
-    let (create_entered, create_release) = platform.pause("reply", "msg_cola_anchor");
+    let (create_entered, create_release) = platform.pause("reply", "om_frozen");
     platform.given_reply_id("om_late_adoption");
     spawn_sync_with_timeout(&app, 5_000);
     create_entered.notified().await;
@@ -7151,7 +7370,7 @@ async fn a_turn_winning_the_create_window_keeps_the_chain_when_the_run_ended_whi
 
     // The projection arms its terminal successor and parks inside the awaited
     // create; the scripted id is the late card's own identity.
-    let (create_entered, create_release) = platform.pause("reply", "msg_cola_anchor");
+    let (create_entered, create_release) = platform.pause("reply", "om_frozen");
     platform.given_reply_id("om_late_adoption");
     spawn_sync_with_timeout(&app, 5_000);
     create_entered.notified().await;
@@ -7356,7 +7575,7 @@ async fn a_restart_does_not_re_render_a_settled_tool_delivered_after_the_text() 
     );
     seed_session(&app2, "ses_test", "/work").await;
     spawn_sync(&app2);
-    let (successor, successor_text) = wait_for_projection(&platform2, "msg_cola_anchor").await;
+    let (successor, successor_text) = wait_for_projection(&platform2, "msg_1").await;
     assert!(
         !successor_text.contains("done") && !successor_text.contains("sleep 3600"),
         "a settled panel the old card already showed is never re-rendered: {successor}"
@@ -7481,7 +7700,7 @@ async fn an_unobserved_running_tool_stays_on_the_old_card() {
     platform.given_card_view("om_frozen", running_panel_card_view("call_gone"));
 
     spawn_sync(&app);
-    let (successor, successor_text) = wait_for_projection(&platform, "msg_cola_anchor").await;
+    let (successor, successor_text) = wait_for_projection(&platform, "om_frozen").await;
     assert!(
         successor_text.contains("⏳ bash"),
         "the read's own still-running call is carried live onto the successor: {successor}"
@@ -7532,7 +7751,7 @@ async fn the_collect_strips_only_the_running_panels_the_seed_resolved() {
     platform.given_card_view("om_frozen", two_running_panels_card_view());
 
     spawn_sync(&app);
-    let (successor, successor_text) = wait_for_projection(&platform, "msg_cola_anchor").await;
+    let (successor, successor_text) = wait_for_projection(&platform, "om_frozen").await;
     assert!(
         successor_text.contains("⏳ bash"),
         "the read's own still-running call is carried live onto the successor: {successor}"
@@ -7901,12 +8120,14 @@ async fn a_definite_create_failure_recovers_with_the_fenced_fallback() {
     wait_for_record_gone(&app, "ses_test").await;
 }
 
-/// A definite HTTP refusal (a 4xx: the platform created no message) leaves the
-/// record retryable, so the NEXT reconcile pass re-attempts and the missed tail
-/// lands (spec #561, review #569). An ambiguous failure (transport, 5xx) stays
-/// single-shot, covered by the ambiguous tests.
+/// A definite HTTP refusal (a 4xx: the platform created no message) falls to
+/// the next delivery target (issue #580); with no fallback left — no session
+/// mapping, the recorded card is the only target — the record stays retryable,
+/// so the NEXT reconcile pass re-attempts and the missed tail lands (spec
+/// #561, review #569). An ambiguous failure (transport, 5xx) stays single-shot,
+/// covered by the ambiguous tests.
 #[tokio::test]
-async fn a_definite_http_refusal_retries_on_the_next_pass() {
+async fn a_definite_http_refusal_without_a_fallback_retries_on_the_next_pass() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("sessions.json");
@@ -7927,8 +8148,10 @@ async fn a_definite_http_refusal_retries_on_the_next_pass() {
         assistant(2_000, &full),
     ])
     .with_executions(vec![execution(2_500)]);
-    let (app, platform, _backend) =
-        restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Idle)).await;
+    // No session mapping: the recorded card is the ONLY deliverable target,
+    // so the refusal leaves the projection with nowhere to fall — it must
+    // stay retryable for the next pass.
+    let (app, platform, _backend) = restarted_app_unmapped(&session_file, transcript).await;
     platform.given_card_view("om_frozen", realistic_card_view());
     // The first create is refused with an explicit 4xx: no message was made.
     platform.given_reply_card_outcome(crate::bridge::test_support::ReplyOutcome::Refused(400));
@@ -8094,7 +8317,7 @@ async fn a_rewritten_part_persists_a_resolvable_cursor_for_the_restart() {
         );
         seed_session(&app2, "ses_test", "/work").await;
         spawn_sync(&app2);
-        let (successor, successor_text) = wait_for_projection(&platform2, "msg_cola_anchor").await;
+        let (successor, successor_text) = wait_for_projection(&platform2, "msg_1").await;
         assert!(
             successor_text.contains(tail),
             "the missed tail follows the rewritten part (live={live}): {successor}"
@@ -8106,12 +8329,13 @@ async fn a_rewritten_part_persists_a_resolvable_cursor_for_the_restart() {
     }
 }
 
-/// A record whose `created_ms` was never captured still replies to the
-/// ORIGINAL Turn anchor (spec #561's delivery order: original Turn anchor →
-/// recorded card → chat), not to the recorded card: the transcript read
-/// derives the anchor from the submitted message (review #569).
+/// A record whose `created_ms` was never captured and which carries no durable
+/// reply target still delivers (issue #580's order: reply target → recorded
+/// card → chat): the successor replies to the recorded card, and the anchor
+/// re-derived from the read is NEVER a Feishu target (it is an OpenCode
+/// message id).
 #[tokio::test]
-async fn a_successor_replies_to_the_original_anchor_derived_from_the_read() {
+async fn a_successor_replies_to_the_recorded_card_without_a_durable_reply_target() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("sessions.json");
@@ -8139,15 +8363,16 @@ async fn a_successor_replies_to_the_original_anchor_derived_from_the_read() {
     platform.given_card_view("om_frozen", realistic_card_view());
 
     spawn_sync(&app);
-    // The successor replies to the ORIGINAL user message, not the old card.
-    let (successor, successor_text) = wait_for_projection(&platform, "msg_cola_anchor").await;
+    // The successor replies to the recorded card; the re-derived anchor is an
+    // OpenCode id and is never used as a reply target.
+    let (successor, successor_text) = wait_for_projection(&platform, "om_frozen").await;
     assert!(successor_text.contains(missed), "{successor}");
     assert!(
         !platform.calls.lock().await.iter().any(|call| matches!(
             call,
-            PlatformCall::ReplyCard { reply_to, .. } if reply_to == "om_frozen"
+            PlatformCall::ReplyCard { reply_to, .. } if reply_to == "msg_cola_anchor"
         )),
-        "no reply lands on the recorded card: {:?}",
+        "the OpenCode anchor is never used as a Feishu reply target: {:?}",
         platform.calls.lock().await
     );
 }
@@ -8357,7 +8582,7 @@ async fn a_live_rewrite_of_the_frontier_part_replaces_the_successors_run() {
     platform.given_reply_id("om_successor");
 
     spawn_sync(&app);
-    let (successor, successor_text) = wait_for_projection(&platform, "msg_cola_anchor").await;
+    let (successor, successor_text) = wait_for_projection(&platform, "om_frozen").await;
     assert_eq!(
         successor_text.matches(streamed).count(),
         1,
@@ -8897,9 +9122,10 @@ async fn a_crash_after_the_successor_create_never_re_posts_on_restart() {
     wait_for_record_gone(&app, "ses_test").await;
 }
 
-/// A DEFINITE create failure leaves no durable intent (spec #561, review #569):
-/// the platform proved it created no message, so a restart may retry and the
-/// missed tail still lands exactly once.
+/// A DEFINITE create failure with no fallback target left (no Chat mapping,
+/// review #569 + issue #580) leaves no durable intent: the platform proved it
+/// created no message anywhere, so a restart may retry and the missed tail
+/// still lands exactly once.
 #[tokio::test]
 async fn a_definite_refusal_leaves_no_durable_intent_across_a_restart() {
     let _wd = test_work_dir();
@@ -8922,11 +9148,11 @@ async fn a_definite_refusal_leaves_no_durable_intent_across_a_restart() {
         assistant(2_000, &full),
     ])
     .with_executions(vec![execution(2_500)]);
-    // Life 1: the create is refused with an explicit 4xx (no message made) and
-    // the process dies before the retry lands.
+    // Life 1: the create is refused with an explicit 4xx (no message made)
+    // and the process dies before the retry lands. No session mapping, so the
+    // recorded card is the only target and nothing falls through to a Chat.
     {
-        let (app, platform, _backend) =
-            restarted_app_with_backend(&session_file, transcript.clone(), Some(SessionStatus::Idle)).await;
+        let (app, platform, _backend) = restarted_app_unmapped(&session_file, transcript.clone()).await;
         platform.given_card_view("om_frozen", realistic_card_view());
         platform.given_reply_card_outcome(crate::bridge::test_support::ReplyOutcome::Refused(400));
         spawn_sync_with_timeout(&app, 300);
@@ -9115,7 +9341,7 @@ async fn a_restart_while_the_gap_is_pending_renders_only_the_gap() {
     platform2.given_card_view("msg_reply", realistic_card_view());
 
     spawn_sync(&app2);
-    let (successor, successor_text) = wait_for_projection(&platform2, "msg_cola_new").await;
+    let (successor, successor_text) = wait_for_projection(&platform2, "msg_1").await;
     assert_eq!(
         successor_text.matches(gap_tail).count(),
         1,
@@ -9329,9 +9555,9 @@ async fn a_split_gap_resumes_from_its_confirmed_head_after_a_restart() {
     };
 
     // Life 1: the first slice lands, every later create fails DEFINITELY (no
-    // card), so the rest of the gap stays owed.
-    let (app, platform, _backend) =
-        restarted_app_with_backend(&session_file, transcript(), Some(SessionStatus::Idle)).await;
+    // card) — with no session mapping the reply target is the only rung, so
+    // the rest of the gap stays owed.
+    let (app, platform, _backend) = restarted_app_unmapped(&session_file, transcript()).await;
     platform.given_card_view("om_frozen", realistic_card_view());
     platform.given_reply_card_outcome(crate::bridge::test_support::ReplyOutcome::Lands);
     for _ in 0..200 {
@@ -9372,9 +9598,8 @@ async fn a_split_gap_resumes_from_its_confirmed_head_after_a_restart() {
     drop(app);
 
     // Life 2: a restart resumes from the advanced gap and lands the remainder —
-    // exactly once.
-    let (app2, platform2, _backend2) =
-        restarted_app_with_backend(&session_file, transcript(), Some(SessionStatus::Idle)).await;
+    // exactly once (still unmapped: the reply ladder is the recorded card).
+    let (app2, platform2, _backend2) = restarted_app_unmapped(&session_file, transcript()).await;
     // Every create takes the mock's default id: the record names "msg_reply".
     platform2.given_card_view("msg_reply", realistic_card_view());
     spawn_sync(&app2);

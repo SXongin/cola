@@ -181,9 +181,10 @@ in-memory per-chain predecessor)
 The one durable record a **Session** has about its **Card Chain**, owned by the
 Chain Record module and persisted as one sidecar (`chain_records.json`) with two
 sections of distinct lifetimes: the **live card record** (the live card's
-identity, its **Turn**'s anchor and the Session's directory, the chain's
-**Rendered Cursor**, plus the per-process reconciliation marks) — written, or
-re-pointed to a successor, when a card
+identity, its **Turn**'s anchor, the Session's directory, the chain's durable
+reply target — the Feishu message its cards reply under, never an OpenCode
+message id — the chain's **Rendered Cursor**, plus the per-process
+reconciliation marks) — written, or re-pointed to a successor, when a card
 becomes the Session's live card, and released only when its card reaches a
 terminal ending whose write is confirmed (delivered or permanently refused;
 ADR-0063's amendment, ADR-0067) or when a successor collect cannot carry the

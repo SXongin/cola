@@ -163,6 +163,16 @@ pub(crate) struct ChainRecord {
     pub(crate) created_ms: Option<i64>,
     #[serde(default)]
     pub(crate) directory: Option<String>,
+    /// The Feishu message this chain's cards reply under (issue #580): the
+    /// user message the Turn answered, as the accumulator's
+    /// `reply_to_message_id` carried when the card was tracked. The
+    /// projection's successor replies here first, then falls to
+    /// `card_message_id`, then the Chat — an OpenCode message id (`msg_*`)
+    /// is never a deliverable Feishu target. `None` on a record written by
+    /// an older release, or one whose chain never knew a target: the
+    /// projection falls back to the recorded card.
+    #[serde(default)]
+    pub(crate) reply_to: Option<String>,
     /// In-memory only: the reap already PATCHed this card into its waiting
     /// ending. A record that is rewritten (a new card becomes live) starts
     /// unmarked; the flag only suppresses PATCHing the same waiting card on
@@ -218,6 +228,7 @@ impl ChainRecord {
             message_id,
             created_ms,
             directory: None,
+            reply_to: None,
             waiting_reaped: false,
             projection_attempted: false,
             projection_intent: false,
@@ -274,6 +285,15 @@ struct ChainRecordFile {
     records: HashMap<String, ChainRecord>,
     #[serde(default)]
     announcements: HashMap<String, WakeMark>,
+}
+
+/// The durable reply target a track leaves on the new record (issue #580):
+/// the caller's new value when it knows one, else the previous record's — one
+/// rule for all three re-point entries.
+fn carried_reply_to(previous: Option<&ChainRecord>, reply_to: Option<&str>) -> Option<String> {
+    reply_to
+        .map(str::to_string)
+        .or_else(|| previous.and_then(|previous| previous.reply_to.clone()))
 }
 
 /// The pre-ADR-0069 shape, read once when `chain_records.json` is absent and
@@ -402,6 +422,10 @@ impl ChainRecords {
     /// takeover acts on. Best-effort: a failed write leaves the in-memory
     /// record correct (the next write retries the file), which at worst means
     /// this card is not reaped by the next restart.
+    ///
+    /// `reply_to` is the chain's new durable reply target (issue #580), when
+    /// the caller knows one; `None` carries the previous record's — a re-point
+    /// that learns no new target never loses the one it had.
     pub(crate) fn track(
         &self,
         session_id: &str,
@@ -409,6 +433,7 @@ impl ChainRecords {
         message_id: MessageId,
         created_ms: Option<i64>,
         directory: Option<&str>,
+        reply_to: Option<&str>,
     ) -> Option<ChainRecord> {
         let mut state = self.lock();
         // A re-point within the chain carries the Rendered Cursor (spec #561):
@@ -419,6 +444,7 @@ impl ChainRecords {
         let mut record = ChainRecord::new(card_message_id, message_id, created_ms)
             .with_directory(directory.map(str::to_string));
         record.generation = chain_generation(previous.as_ref(), &record.card_message_id);
+        record.reply_to = carried_reply_to(previous.as_ref(), reply_to);
         if let Some(previous) = &previous {
             record.cursor = previous.cursor.clone();
             // The owed orphan gap is chain-level too (spec #561, review #569):
@@ -450,6 +476,8 @@ impl ChainRecords {
     /// orphan's undelivered tail. The previous cursor carries, the previous
     /// gap wins when there is one (its cursor may have advanced past the
     /// derived frontier), and an unresolved write-ahead intent carries too.
+    /// `reply_to` follows [`Self::track`]'s rule: the new Turn's own target
+    /// when it has one, else the previous record's.
     pub(crate) fn track_takeover(
         &self,
         session_id: &str,
@@ -457,12 +485,14 @@ impl ChainRecords {
         message_id: MessageId,
         created_ms: Option<i64>,
         directory: Option<&str>,
+        reply_to: Option<&str>,
     ) -> Option<ChainRecord> {
         let mut state = self.lock();
         let previous = state.records.get(session_id).cloned();
         let mut record = ChainRecord::new(card_message_id, message_id.clone(), created_ms)
             .with_directory(directory.map(str::to_string));
         record.generation = chain_generation(previous.as_ref(), &record.card_message_id);
+        record.reply_to = carried_reply_to(previous.as_ref(), reply_to);
         if let Some(previous) = &previous {
             record.cursor = previous.cursor.clone();
             record.pending_gap = previous.pending_gap.clone().or_else(|| {
@@ -498,6 +528,26 @@ impl ChainRecords {
         true
     }
 
+    /// Clear `session_id`'s durable reply target while the record still names
+    /// `card_message_id` (issue #580): a successor create that landed at the
+    /// Chat's top level has no reply anchor, and a later projection must not
+    /// retry the target the platform just refused. A crash between the
+    /// re-point and this write leaves the stale target on the record, which
+    /// the ladder falls through on its first attempt — bounded, never stuck.
+    /// Returns whether a target was cleared.
+    pub(crate) fn clear_reply_to(&self, session_id: &str, card_message_id: &str) -> bool {
+        let mut state = self.lock();
+        let Some(record) = state.records.get_mut(session_id) else {
+            return false;
+        };
+        if record.card_message_id != card_message_id || record.reply_to.is_none() {
+            return false;
+        }
+        record.reply_to = None;
+        self.write(&state);
+        true
+    }
+
     /// Re-point the session's record AND set its Rendered Cursor in ONE chains
     /// critical section (spec #561, review #569): a projection's atomic
     /// takeover. A separate [`Self::track`] + [`Self::advance_cursor`] would
@@ -515,6 +565,7 @@ impl ChainRecords {
         message_id: MessageId,
         created_ms: Option<i64>,
         directory: Option<&str>,
+        reply_to: Option<&str>,
         cursor: &RenderedCursor,
         gap: Option<(&CursorFrontier, bool)>,
     ) -> Option<ChainRecord> {
@@ -523,6 +574,7 @@ impl ChainRecords {
         let mut record = ChainRecord::new(card_message_id, message_id, created_ms)
             .with_directory(directory.map(str::to_string));
         record.generation = chain_generation(previous.as_ref(), &record.card_message_id);
+        record.reply_to = carried_reply_to(previous.as_ref(), reply_to);
         record.cursor = Some(cursor.clone());
         // The gap rides the re-point exactly as it does through [`Self::track`]
         // (spec #561, review #569), and the confirmed body's coverage settles
@@ -915,6 +967,77 @@ mod tests {
 
     const FILE: &str = "chain_records.json";
 
+    /// The durable reply target (issue #580): a track sets it, a re-point
+    /// without a new one carries it, and a new one wins — the fact the
+    /// projection replies to after a restart.
+    #[test]
+    fn a_repoint_carries_or_overrides_the_reply_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let chains = ChainRecords::load(dir.path().join(FILE));
+        chains.track(
+            "ses_a",
+            "om_1",
+            MessageId::new("msg_cola_1"),
+            Some(1_000),
+            None,
+            Some("om_user_1"),
+        );
+        assert_eq!(
+            chains.get("ses_a").expect("the record").reply_to.as_deref(),
+            Some("om_user_1")
+        );
+
+        chains.track("ses_a", "om_2", MessageId::new("msg_cola_1"), None, None, None);
+        assert_eq!(
+            chains.get("ses_a").expect("the record").reply_to.as_deref(),
+            Some("om_user_1"),
+            "a re-point that learns no new target keeps the one it had"
+        );
+
+        chains.track(
+            "ses_a",
+            "om_3",
+            MessageId::new("msg_cola_2"),
+            None,
+            None,
+            Some("om_user_2"),
+        );
+        assert_eq!(
+            chains.get("ses_a").expect("the record").reply_to.as_deref(),
+            Some("om_user_2"),
+            "a new target wins"
+        );
+    }
+
+    /// Clearing the durable reply target (issue #580): only the record still
+    /// naming the given card loses it, and only once.
+    #[test]
+    fn clear_reply_to_drops_the_target_of_the_named_card_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let chains = ChainRecords::load(dir.path().join(FILE));
+        chains.track(
+            "ses_a",
+            "om_1",
+            MessageId::new("msg_cola_1"),
+            Some(1_000),
+            None,
+            Some("om_user_1"),
+        );
+
+        assert!(!chains.clear_reply_to("ses_a", "om_other"));
+        assert_eq!(
+            chains.get("ses_a").expect("the record").reply_to.as_deref(),
+            Some("om_user_1"),
+            "a card mismatch clears nothing"
+        );
+        assert!(chains.clear_reply_to("ses_a", "om_1"));
+        assert_eq!(chains.get("ses_a").expect("the record").reply_to, None);
+        assert!(
+            !chains.clear_reply_to("ses_a", "om_1"),
+            "nothing is cleared twice"
+        );
+    }
+
     /// The orphan gap is chain-level (spec #561, review #569): a re-point —
     /// a split continuation, a Wake continuation, a fresh Turn's takeover —
     /// carries the owed tail, a confirmed partial body advances it, and only a
@@ -924,7 +1047,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(FILE);
         let chains = ChainRecords::load(path.clone());
-        chains.track("ses_a", "om_old", MessageId::new("msg_cola_1"), Some(1_000), None);
+        chains.track(
+            "ses_a",
+            "om_old",
+            MessageId::new("msg_cola_1"),
+            Some(1_000),
+            None,
+            None,
+        );
         let gap = PendingGap {
             cursor: RenderedCursor::default(),
             anchor: TurnAnchor {
@@ -948,6 +1078,7 @@ mod tests {
             "om_new",
             MessageId::new("msg_cola_2"),
             Some(2_000),
+            None,
             None,
             &RenderedCursor::default(),
             None,
@@ -985,6 +1116,7 @@ mod tests {
             MessageId::new("msg_cola_3"),
             Some(3_000),
             None,
+            None,
         );
         assert_eq!(
             chains.get("ses_a").expect("the record").pending_gap,
@@ -1013,6 +1145,7 @@ mod tests {
             MessageId::new("msg_cola_4"),
             Some(4_000),
             None,
+            None,
         );
         assert!(
             chains.get("ses_a").expect("the record").pending_gap.is_none(),
@@ -1029,7 +1162,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(FILE);
         let chains = ChainRecords::load(path.clone());
-        chains.track("ses_a", "om_old", MessageId::new("msg_cola_1"), Some(1_000), None);
+        chains.track(
+            "ses_a",
+            "om_old",
+            MessageId::new("msg_cola_1"),
+            Some(1_000),
+            None,
+            None,
+        );
 
         assert!(chains.note_projection_intent("ses_a", "om_old"));
         assert!(
@@ -1061,7 +1201,14 @@ mod tests {
         // the create it marked may have landed, and a takeover that erased the
         // mark would let a later restart post that tail again.
         assert!(chains.note_projection_intent("ses_a", "om_old"));
-        chains.track("ses_a", "om_new", MessageId::new("msg_cola_1"), Some(1_000), None);
+        chains.track(
+            "ses_a",
+            "om_new",
+            MessageId::new("msg_cola_1"),
+            Some(1_000),
+            None,
+            None,
+        );
         assert!(
             ChainRecords::load(path.clone())
                 .get("ses_a")
@@ -1097,11 +1244,19 @@ mod tests {
                 "om_card_1",
                 MessageId::new("msg_cola_1"),
                 Some(1_000),
+                None,
                 None
             ),
             None
         );
-        chains.track("ses_b", "om_card_2", MessageId::new("msg_cola_2"), None, None);
+        chains.track(
+            "ses_b",
+            "om_card_2",
+            MessageId::new("msg_cola_2"),
+            None,
+            None,
+            None,
+        );
 
         let reloaded = ChainRecords::load(path.clone());
         assert_eq!(
@@ -1124,6 +1279,7 @@ mod tests {
             "om_card_3",
             MessageId::new("msg_cola_1"),
             Some(1_000),
+            None,
             None,
         );
         assert_eq!(
@@ -1166,6 +1322,7 @@ mod tests {
             MessageId::new("msg_cola_1"),
             Some(1_000),
             None,
+            None,
         );
 
         chains.release("ses_a");
@@ -1191,6 +1348,7 @@ mod tests {
             "om_card_1",
             MessageId::new("msg_cola_1"),
             Some(1_000),
+            None,
             None,
         );
 
@@ -1226,6 +1384,7 @@ mod tests {
             MessageId::new("msg_cola_1"),
             Some(1_000),
             None,
+            None,
         );
 
         chains.rename("ses_old", "ses_fresh");
@@ -1253,6 +1412,7 @@ mod tests {
             "om_card_1",
             MessageId::new("msg_cola_1"),
             Some(1_000),
+            None,
             None,
         );
         chains.advance("ses_old", "msg_wake_1", 1_000);
@@ -1285,6 +1445,7 @@ mod tests {
             MessageId::new("msg_cola_1"),
             Some(1_000),
             None,
+            None,
         );
         assert_eq!(
             ChainRecords::load(path).get("ses_a"),
@@ -1309,6 +1470,7 @@ mod tests {
             MessageId::new("msg_cola_1"),
             Some(1_000),
             None,
+            None,
         );
 
         assert!(!chains.mark_waiting_reaped("ses_a", "om_other"));
@@ -1329,6 +1491,7 @@ mod tests {
             MessageId::new("msg_cola_1"),
             Some(1_000),
             None,
+            None,
         );
         assert!(!chains.get("ses_a").unwrap().waiting_reaped);
     }
@@ -1346,8 +1509,16 @@ mod tests {
             MessageId::new("msg_cola_1"),
             Some(1_000),
             Some("/work"),
+            None,
         );
-        chains.track("ses_b", "om_card_2", MessageId::new("msg_cola_2"), None, Some(""));
+        chains.track(
+            "ses_b",
+            "om_card_2",
+            MessageId::new("msg_cola_2"),
+            None,
+            Some(""),
+            None,
+        );
 
         let reloaded = ChainRecords::load(path);
         assert_eq!(reloaded.get("ses_a").unwrap().directory.as_deref(), Some("/work"));
@@ -1410,6 +1581,7 @@ mod tests {
             "om_card_1",
             MessageId::new("msg_cola_1"),
             Some(1_000),
+            None,
             None,
         );
         chains.advance("ses_a", "msg_wake_1", 1_000);
@@ -1513,6 +1685,7 @@ mod tests {
             MessageId::new("msg_cola_1"),
             Some(1_000),
             None,
+            None,
         );
         assert_eq!(chains.cursor("ses_a"), None, "a fresh record is cursorless");
 
@@ -1570,6 +1743,7 @@ mod tests {
             MessageId::new("msg_cola_1"),
             Some(1_000),
             None,
+            None,
         );
         chains.advance_cursor("ses_a", "om_card_1", &cursor);
 
@@ -1580,6 +1754,7 @@ mod tests {
                 MessageId::new("msg_cola_1"),
                 Some(1_000),
                 None,
+                None,
             )
             .expect("the re-point returns the previous record");
         assert_eq!(previous.cursor, Some(cursor.clone()));
@@ -1589,7 +1764,14 @@ mod tests {
             "the split continuation's record inherits the chain's cursor"
         );
 
-        chains.track("ses_b", "om_card_3", MessageId::new("msg_cola_2"), None, None);
+        chains.track(
+            "ses_b",
+            "om_card_3",
+            MessageId::new("msg_cola_2"),
+            None,
+            None,
+            None,
+        );
         assert_eq!(
             chains.cursor("ses_b"),
             None,
@@ -1619,7 +1801,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(FILE);
         let chains = ChainRecords::load(path.clone());
-        chains.track("ses_new", "om_new", MessageId::new("msg_cola_new"), None, None);
+        chains.track(
+            "ses_new",
+            "om_new",
+            MessageId::new("msg_cola_new"),
+            None,
+            None,
+            None,
+        );
         std::fs::write(
             dir.path().join("live_cards.json"),
             r#"{"sessions":{"ses_old":{"card_message_id":"om_old","message_id":"msg_cola_old"}}}"#,
@@ -1647,6 +1836,7 @@ mod tests {
             MessageId::new("msg_cola_1"),
             Some(1_000),
             None,
+            None,
         );
         assert_eq!(
             chains.get("ses_a").expect("the record").generation,
@@ -1659,6 +1849,7 @@ mod tests {
             "om_second",
             MessageId::new("msg_cola_2"),
             Some(2_000),
+            None,
             None,
         );
         assert_eq!(
@@ -1674,6 +1865,7 @@ mod tests {
             "om_second",
             MessageId::new("msg_cola_2"),
             Some(2_000),
+            None,
             None,
         );
         assert_eq!(
@@ -1692,8 +1884,22 @@ mod tests {
         let path = dir.path().join(FILE);
         let chains = ChainRecords::load(path.clone());
 
-        chains.track("ses_a", "om_old", MessageId::new("msg_cola_1"), Some(1_000), None);
-        chains.track_takeover("ses_a", "om_new", MessageId::new("msg_cola_2"), Some(2_000), None);
+        chains.track(
+            "ses_a",
+            "om_old",
+            MessageId::new("msg_cola_1"),
+            Some(1_000),
+            None,
+            None,
+        );
+        chains.track_takeover(
+            "ses_a",
+            "om_new",
+            MessageId::new("msg_cola_2"),
+            Some(2_000),
+            None,
+            None,
+        );
         assert_eq!(
             chains.get("ses_a").expect("the successor").generation,
             1,
@@ -1705,6 +1911,7 @@ mod tests {
             "om_projected",
             MessageId::new("msg_cola_3"),
             Some(3_000),
+            None,
             None,
             &RenderedCursor::default(),
             None,
@@ -1727,8 +1934,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(FILE);
         let chains = ChainRecords::load(path.clone());
-        chains.track("ses_a", "om_first", MessageId::new("msg_cola_1"), None, None);
-        chains.track("ses_a", "om_second", MessageId::new("msg_cola_2"), None, None);
+        chains.track(
+            "ses_a",
+            "om_first",
+            MessageId::new("msg_cola_1"),
+            None,
+            None,
+            None,
+        );
+        chains.track(
+            "ses_a",
+            "om_second",
+            MessageId::new("msg_cola_2"),
+            None,
+            None,
+            None,
+        );
         let minted = chains.get("ses_a").expect("the record").generation;
         assert_eq!(minted, 1, "the re-point minted a version");
 
@@ -1762,9 +1983,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(FILE);
         let chains = ChainRecords::load(path.clone());
-        chains.track("ses_a", "om_first", MessageId::new("msg_cola_1"), None, None);
+        chains.track(
+            "ses_a",
+            "om_first",
+            MessageId::new("msg_cola_1"),
+            None,
+            None,
+            None,
+        );
         let previous = chains
-            .track("ses_a", "om_second", MessageId::new("msg_cola_2"), None, None)
+            .track(
+                "ses_a",
+                "om_second",
+                MessageId::new("msg_cola_2"),
+                None,
+                None,
+                None,
+            )
             .expect("the re-point returns the predecessor");
         assert_eq!(
             previous.generation, 0,
@@ -1796,8 +2031,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(FILE);
         let chains = ChainRecords::load(path.clone());
-        chains.track("ses_a", "om_first", MessageId::new("msg_cola_1"), None, None);
-        chains.track("ses_a", "om_second", MessageId::new("msg_cola_2"), None, None);
+        chains.track(
+            "ses_a",
+            "om_first",
+            MessageId::new("msg_cola_1"),
+            None,
+            None,
+            None,
+        );
+        chains.track(
+            "ses_a",
+            "om_second",
+            MessageId::new("msg_cola_2"),
+            None,
+            None,
+            None,
+        );
         assert_eq!(chains.get("ses_a").expect("the record").generation, 1);
 
         let persisted = std::fs::read_to_string(&path).unwrap();
@@ -1815,7 +2064,14 @@ mod tests {
         );
 
         chains.release("ses_a");
-        chains.track("ses_a", "om_third", MessageId::new("msg_cola_3"), None, None);
+        chains.track(
+            "ses_a",
+            "om_third",
+            MessageId::new("msg_cola_3"),
+            None,
+            None,
+            None,
+        );
         assert_eq!(
             chains
                 .get("ses_a")
