@@ -1109,6 +1109,107 @@ async fn a_takeover_during_the_stamp_read_wins_over_the_stamp() {
     assert_eq!(card_header(&patches[0]), "⏳ 已由新卡片接管 · 已停止更新");
 }
 
+/// A collect reads the chain's **live generation at submission** (spec #571
+/// review): the generation is read after the collect's card-view read, not
+/// captured by its caller before it. A takeover that re-points the chain
+/// during the read bumps the generation; the collect is then a write of the
+/// NEW chain state and still lands, while a writer that decided under the
+/// outrun generation is the one the queue drops.
+#[tokio::test]
+async fn a_collect_submits_the_live_generation_after_its_card_view_read() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
+
+    let (app, platform) = restarted_app(&session_file, completed(1_000), None).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+    // Park the collect's view read: its composition, and so its submission,
+    // are still outstanding.
+    let (entered, release) = platform.pause("card_view", "om_frozen");
+
+    let cards = app.cards_handle();
+    let collect = {
+        let cards = cards.clone();
+        tokio::spawn(async move {
+            crate::bridge::chain::collect_orphan_after_takeover(&cards, "ses_test", "om_frozen", &[]).await
+        })
+    };
+    entered.notified().await;
+
+    // A takeover re-points the chain onto its own card while the read hangs:
+    // the chain's generation bumps past the one the parked collect saw.
+    cards.chains.track(
+        "ses_test",
+        "om_new",
+        MessageId::new("msg_cola_new"),
+        Some(2_000),
+        Some("/work"),
+    );
+    // The new chain state writes the orphan first, at the NEW generation: the
+    // card's queue now holds that generation and has delivered its stamp.
+    let stamp = crate::feishu::card::shell::CardBuilder::new()
+        .with_state(CardState::Restarted)
+        .build();
+    let outcome = cards
+        .feishu
+        .submit_ordered(crate::feishu::delivery::KeyedSubmission {
+            message_id: "om_frozen",
+            generation: 1,
+            intent: crate::feishu::delivery::CardWriteIntent::Stamp,
+            card: &stamp,
+        })
+        .await
+        .settled()
+        .await;
+    assert!(matches!(
+        outcome,
+        crate::feishu::delivery::WriteOutcome::Delivered
+    ));
+
+    release.notify_one();
+    collect.await.unwrap();
+
+    let patches = patches_to(&platform, "om_frozen").await;
+    assert_eq!(
+        patches.len(),
+        2,
+        "the new chain state's stamp and the collect, never a dropped collect: {patches:?}"
+    );
+    assert_eq!(card_header(&patches[0]), "⏳ 已重启，等待运行结束");
+    assert_eq!(
+        card_header(patches.last().expect("the collect")),
+        "⏳ 已由新卡片接管 · 已停止更新",
+        "the collect landed under the live generation: {patches:?}"
+    );
+
+    // The outrun generation is stale now: a writer that decided under the
+    // orphan record's generation is dropped without a Feishu call.
+    let stale = crate::feishu::card::shell::CardBuilder::new()
+        .with_state(CardState::Restarted)
+        .build();
+    let outcome = cards
+        .feishu
+        .submit_ordered(crate::feishu::delivery::KeyedSubmission {
+            message_id: "om_frozen",
+            generation: 0,
+            intent: crate::feishu::delivery::CardWriteIntent::Stamp,
+            card: &stale,
+        })
+        .await
+        .settled()
+        .await;
+    assert!(
+        matches!(outcome, crate::feishu::delivery::WriteOutcome::Superseded),
+        "a submission below the collect's generation is dropped"
+    );
+    assert_eq!(
+        patches_to(&platform, "om_frozen").await.len(),
+        2,
+        "no write followed the collect"
+    );
+}
+
 /// An in-flight stamp followed by a collect leaves the collect as the card's
 /// last write (spec #571, tickets #574/#575): the takeover's collect is
 /// submitted at the NEW chain generation while the stamp's PATCH is parked, so

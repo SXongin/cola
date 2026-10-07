@@ -119,15 +119,7 @@ use crate::feishu::delivery::{CardWriteIntent, KeyedSubmission, WriteOutcome};
 /// A failed PATCH only warns; the record follows the successor either way, so
 /// the freeze it leaves behind is the pre-#438 behavior, never a crash.
 pub(crate) async fn collect_orphan(cards: &CardsHandle, session_id: &str, card_message_id: &str) {
-    let generation = cards.chains.generation(session_id);
-    collect_orphan_with(
-        cards,
-        session_id,
-        card_message_id,
-        KeepBody::Everything,
-        generation,
-    )
-    .await;
+    collect_orphan_with(cards, session_id, card_message_id, KeepBody::Everything).await;
 }
 
 /// Collect the orphaned card `card_message_id` for a seeded takeover — the
@@ -155,11 +147,7 @@ pub(crate) async fn collect_orphan_after_takeover(
     let keep = KeepBody::WithoutLiveTail {
         resolved_calls: resolved_calls.to_vec(),
     };
-    // The takeover has tracked the successor by now, so this reads the NEW
-    // chain state's generation: the collect outranks the orphan-record
-    // generation a stamp decided under (spec #571, ticket #574).
-    let generation = cards.chains.generation(session_id);
-    collect_orphan_with(cards, session_id, card_message_id, keep, generation).await;
+    collect_orphan_with(cards, session_id, card_message_id, keep).await;
 }
 
 /// Collect a projection's LATE successor — the create that landed after a
@@ -169,30 +157,26 @@ pub(crate) async fn collect_orphan_after_takeover(
 /// reader the same text twice. The late card is reduced to the bare
 /// taken-over marker; every other collect keeps its body (ADR-0063).
 pub(crate) async fn collect_late_projection(cards: &CardsHandle, session_id: &str, card_message_id: &str) {
-    let generation = cards.chains.generation(session_id);
-    collect_orphan_with(cards, session_id, card_message_id, KeepBody::Nothing, generation).await;
+    collect_orphan_with(cards, session_id, card_message_id, KeepBody::Nothing).await;
 }
 
 /// The shared takeover collect behind [`collect_orphan`] and
 /// [`collect_orphan_after_takeover`]: one keyed submission naming the
 /// successor, terminal and grey, its preserved body under `keep`, carrying the
-/// **chain generation the write belongs to** — the successor's current
-/// generation, read at submission (spec #571, ticket #574). The collect awaits
-/// its completion ticket — the cache release follows a delivery and the warning
-/// a failure, exactly the timing the PATCH's own await had — while the queue
-/// owns the write.
-async fn collect_orphan_with(
-    cards: &CardsHandle,
-    session_id: &str,
-    card_message_id: &str,
-    keep: KeepBody,
-    generation: u64,
-) {
+/// **chain generation the write belongs to** — read from the chain immediately
+/// before the submission, after the composition read above (spec #571 review):
+/// a takeover that re-points the chain during that read bumps the generation,
+/// and this collect is then the NEW chain state's write, never a snapshot's
+/// stale one the queue would drop. The collect awaits its completion ticket —
+/// the cache release follows a delivery and the warning a failure, exactly the
+/// timing the PATCH's own await had — while the queue owns the write.
+async fn collect_orphan_with(cards: &CardsHandle, session_id: &str, card_message_id: &str, keep: KeepBody) {
     if card_message_id.is_empty() {
         return;
     }
     let bare = ending_card(CardState::TakenOver, None, None);
     let card = preserved_ending(cards.feishu.as_ref(), card_message_id, &bare, keep).await;
+    let generation = cards.chains.generation(session_id);
     let outcome = cards
         .feishu
         .submit_ordered(KeyedSubmission {
