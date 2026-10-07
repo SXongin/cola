@@ -201,8 +201,10 @@ drops stale intents, collapses duplicates and retries failures.
   fails degrades to the bare ending — the ending never depends on the read,
   and the pass never waits on Feishu unboundedly (the #443 stamp's own view
   read takes the pass's configured read bound the same way). A collect that
-  gives up on an indeterminate ticket releases its cache anyway: the release
-  exists so a re-host cannot resurrect the collected presentation, and a
+  gives up on an indeterminate ticket releases its cache anyway — and so does a
+  collect whose write failed, because the queue's retry may land later without
+  the caller ever seeing it (spec #571 review): the release exists so a re-host
+  cannot resurrect the collected presentation, and a
   collect that lands later would do exactly that. The keyless Pending Card
   Update retry keeps its own pre-existing bound (`DRAIN_RETRY_TIMEOUT`),
   outside this contract.

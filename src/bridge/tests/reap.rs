@@ -2152,6 +2152,79 @@ async fn a_takeover_collect_releases_the_cache_only_when_its_write_lands() {
     );
 }
 
+/// A collect that fails recoverably and is later delivered by the drain still
+/// releases the old card's cache (spec #571 review): the queue retries the
+/// write without this caller ever seeing the delivery, so the release happens
+/// conservatively at the failure — the same choice the bounded-await timeout
+/// makes, and the release is idempotent — and a re-host can never repaint the
+/// collected presentation from the stale cache.
+#[tokio::test]
+async fn a_recoverably_failed_collect_releases_the_cache() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
+
+    let transcript = SessionTranscript::new(vec![user("msg_cola_anchor", 1_000, "问题")]);
+    let (app, platform, _backend) =
+        restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Busy)).await;
+    // The registry still holds the orphan's last-rendered JSON.
+    app.cards_handle().card_handles.lock().await.record(
+        "om_frozen",
+        &realistic_card_view(),
+        vec![RenderedBlock {
+            request_id: "req_perm".into(),
+            start: 0,
+            end: 1,
+            kind: ClaimKind::Permission,
+            session_id: "ses_test".into(),
+            directory: "/work".into(),
+            target: "om_frozen".into(),
+        }],
+    );
+    // The collect's first attempt fails recoverably: the queue keeps it owed
+    // and retries it.
+    platform
+        .fail_update_transport_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+
+    Turn::seed_card(&app.cards_handle(), "ses_test", None).await;
+    Turn::set_turn_anchor(&app.cards_handle(), "ses_test", &turn_anchor(1_000)).await;
+    Turn::take_over_card(&app.cards_handle(), "ses_test", "om_new", Some("/work")).await;
+
+    // The write is owed — its delivery comes later, without this caller — so
+    // the cache is released now.
+    assert!(
+        app.cards_handle()
+            .card_handles
+            .lock()
+            .await
+            .cached_card("om_frozen")
+            .is_none(),
+        "an owed collect releases the cached presentation"
+    );
+
+    // The drain delivers the owed collect: the card is collected, and the
+    // stale cache stays gone.
+    app.core.feishu.drain_pending_card_updates(true).await;
+    wait_for_patches(&platform, "om_frozen", 2).await;
+    let patches = patches_to(&platform, "om_frozen").await;
+    assert_eq!(
+        card_header(patches.last().unwrap()),
+        "⏳ 已由新卡片接管 · 已停止更新",
+        "the owed collect landed on the drain: {patches:?}"
+    );
+    assert!(
+        app.cards_handle()
+            .card_handles
+            .lock()
+            .await
+            .cached_card("om_frozen")
+            .is_none(),
+        "the delivered retry still leaves no stale cache"
+    );
+}
+
 /// The seed's live set is scoped to the orphan Turn's projection: an older,
 /// unrelated turn's stale `running` part is never resurrected on the
 /// successor.

@@ -221,9 +221,18 @@ async fn collect_orphan_with(cards: &CardsHandle, session_id: &str, card_message
                 CardState::TakenOver.reap_word()
             );
         }
-        Some(WriteOutcome::Failed(e)) => tracing::warn!(
-            "live-card reap: session {session_id} could not collect card {card_message_id}: {e}"
-        ),
+        Some(WriteOutcome::Failed(e)) => {
+            // The write is owed (a recoverable failure the queue keeps
+            // retrying) or permanently refused: either way it may land later
+            // without this caller seeing the delivery, so release the cache
+            // now — the same conservative, idempotent choice the indeterminate
+            // branch makes — and a re-host can never resurrect the collected
+            // presentation from the stale cache (spec #571 review).
+            cards.card_handles.lock().await.release_cache(card_message_id);
+            tracing::warn!(
+                "live-card reap: session {session_id} could not collect card {card_message_id}: {e}"
+            );
+        }
         Some(WriteOutcome::Superseded) => {
             // A newer chain state owns the card (or its key already settled):
             // nothing was written for this collect, so there is no repaint to
