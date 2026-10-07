@@ -144,7 +144,12 @@ drops stale intents, collapses duplicates and retries failures.
   (`MAX_PENDING × MAX_ENTRIES_FACTOR`) — the oldest entry leaves regardless of
   protection (spec #571 review), so a flood of fresh order states can never
   grow the map without bound: the trade is the same narrow stale-writer window
-  expiry accepts, forced early. Its own
+  expiry accepts, forced early. The **live driver tasks** are bounded by a
+  global permit pool on the decorator (spec #571 review): a driver retains its
+  payload while it awaits Feishu, so a spawn takes a permit for the driver's
+  whole life and, with none free, the submission stays owed in its entry (no
+  driver) for the next drain — repeated hung writes cannot grow tasks or
+  retained payloads without bound either. Its own
   state lock is taken only to admit, snapshot or settle — never held across an
   await — and the card's delivery lock is held only across the Feishu write
   itself. A submission's write is owned by a spawned driver task, not by the
