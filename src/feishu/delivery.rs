@@ -21,7 +21,9 @@
 //! intent)` — the **chain generation** its decision read and the intent naming
 //! the logical write. The same per-card state machine then:
 //!
-//! - drops a submission below the highest generation seen for the card;
+//! - drops a submission below the card's floor: the highest generation seen,
+//!   raised past a generation an accepted `Settle` closed (spec #571's
+//!   amendment), so the ending beats a stamp whose read outlived it;
 //! - lands same-generation submissions in submission order — one in-flight
 //!   submission at a time, with a single waiting slot a newer submission
 //!   replaces (older generations are forgotten as the key bumps);
@@ -33,6 +35,11 @@
 //!   retried by the drain;
 //! - serializes keyless and keyed writes on the same per-card delivery lock —
 //!   a keyless write is never dropped for staleness.
+//!
+//! The queue also answers whether a card's **ending** is still owed
+//! ([`CardDelivery::pending`] counts a keyed `Settle` the queue holds, not only
+//! the keyless payload): the Live Card record is released only once the ending
+//! write is confirmed (ADR-0063's amendment, spec #571's amendment).
 //!
 //! Readers can ask the queue what it already covers — [`Platform::keyed_write_covered`]
 //! (spec #571, ticket #575): a settled key or one already being written needs
@@ -94,6 +101,11 @@ pub(crate) enum CardWriteIntent {
     /// A collect: the fresh-Turn takeover, a late projection, and the reap's
     /// successor collect — bring an orphaned card to its taken-over state.
     Collect,
+    /// The ending settle (spec #571's amendment): the terminal card's ending
+    /// write. Accepting one at generation G **closes** G — the card's floor
+    /// rises to G+1 — so a stamp whose pre-submission read outlived the
+    /// ending is dropped instead of painting 「已重启」 over the ✅.
+    Settle,
 }
 
 /// One **keyed submission**: an already-composed card payload with the ordering
@@ -259,6 +271,13 @@ struct PendingEntry {
     /// generation's settled keys — every older submission is dropped by the
     /// generation rule anyway.
     generation: u64,
+    /// The lowest generation this card still accepts (spec #571's amendment).
+    /// A plain submission raises it to its own generation; an accepted
+    /// `Settle` at generation G closes G, so it rises to G+1 and a later
+    /// submission at ≤ G — the stamp whose read outlived the ending — is
+    /// dropped. It lives as long as the entry (and its tombstone) does: an
+    /// evicted floor would reopen the window it exists to close.
+    floor: u64,
     /// The newest generation's settled key states (rule (d)).
     keys: KeyStates,
     /// The keyed submission this card's driver is writing, or the one left
@@ -288,6 +307,7 @@ impl PendingEntry {
             next_attempt: tokio::time::Instant::now(),
             lock,
             generation: 0,
+            floor: 0,
             keys: KeyStates::new(),
             in_flight: None,
             waiting: None,
@@ -297,12 +317,16 @@ impl PendingEntry {
     }
 
     /// Whether this card's queue already owns `(generation, intent)` (spec
-    /// #571, ticket #575): the key settled, or a write of that exact key is in
-    /// flight (its driver running) or waiting. An owed write with no driver is
-    /// not covered — a later re-decision may still replace it — and neither is
-    /// an older generation, whose keys were forgotten and whose submissions
-    /// are dropped by the generation rule anyway.
+    /// #571, tickets #575): the generation is closed (a settle ended it, so
+    /// no submission of it will ever write), the key settled, or a write of
+    /// that exact key is in flight (its driver running) or waiting. An owed
+    /// write with no driver is not covered — a later re-decision may still
+    /// replace it — and neither is an older generation, whose keys were
+    /// forgotten and whose submissions are dropped by the generation rule.
     fn covers(&self, generation: u64, intent: CardWriteIntent) -> bool {
+        if generation < self.floor {
+            return true;
+        }
         if self.generation != generation {
             return false;
         }
@@ -314,6 +338,23 @@ impl PendingEntry {
             .as_ref()
             .is_some_and(|write| self.driver == Some(write.token) && same_key(write))
             || self.waiting.as_ref().is_some_and(same_key)
+    }
+
+    /// Whether this card's keyed ending write is still owed: a `Settle` in
+    /// flight, waiting, or left owed by a recoverable failure. The card is not
+    /// confirmed until it settles — the record-release gate consults this
+    /// (spec #571's amendment).
+    fn settling_owed(&self) -> bool {
+        let settle = |write: &QueuedWrite| write.intent == CardWriteIntent::Settle;
+        self.in_flight.as_ref().is_some_and(settle) || self.waiting.as_ref().is_some_and(settle)
+    }
+
+    /// Whether this entry's newest generation is closed by an accepted settle:
+    /// the floor sits above it, so nothing at or below it will write again.
+    /// Such an entry holds no payload, and it is kept out of the cap's
+    /// eviction for as long as the floor matters.
+    fn closed(&self) -> bool {
+        self.floor > self.generation
     }
 }
 
@@ -375,16 +416,18 @@ impl CardDelivery {
         }
     }
 
-    /// Whether `message_id` has an undelivered newest payload — the gate the
-    /// Live Card record's removal consults (ADR-0063 amendment): a terminal
-    /// card's record stays until its ending write is confirmed.
+    /// Whether `message_id` has an undelivered write — the gate the Live Card
+    /// record's removal consults (ADR-0063 amendment): a terminal card's
+    /// record stays until its ending write is confirmed. Both classes count
+    /// (spec #571's amendment): the keyless Pending Card Update, and a keyed
+    /// ending write the queue still owes.
     pub(crate) fn pending(&self, message_id: &str) -> bool {
         self.state
             .lock()
             .unwrap()
             .entries
             .get(message_id)
-            .is_some_and(|entry| entry.card.is_some())
+            .is_some_and(|entry| entry.card.is_some() || entry.settling_owed())
     }
 
     /// The card's delivery lock, created on first use. Stable while an entry
@@ -471,20 +514,30 @@ impl CardDelivery {
 
     /// Keep the state under the cap. Settled tombstones leave first — the cap
     /// bounds undelivered payloads, and a tombstone only guards against a
-    /// still-in-flight older write. A pending payload evicted (only when more
-    /// than the cap are owed) warns; a tombstone leaves quietly.
+    /// still-in-flight older write. A closed generation's tombstone is never
+    /// evicted while another victim exists (spec #571's amendment): its floor
+    /// is what drops a stale writer whose read outlived the settle, and a
+    /// closed entry holds no payload, so leaving the map above the cap is the
+    /// smaller cost. A pending payload evicted (only when more than the cap are
+    /// owed) warns; a tombstone leaves quietly.
     fn evict_over_cap(&self, state: &mut State) {
         while state.entries.len() > self.max_pending {
+            // A settled, non-closed tombstone is the preferred victim; then
+            // any non-closed entry; a closed generation is never chosen while
+            // anything else can be.
             let victim = state
                 .entries
                 .iter()
-                .filter(|(_, entry)| {
-                    entry.card.is_none() && entry.in_flight.is_none() && entry.waiting.is_none()
+                .filter(|(_, entry)| !entry.closed())
+                .min_by_key(|(_, entry)| {
+                    let settled =
+                        entry.card.is_none() && entry.in_flight.is_none() && entry.waiting.is_none();
+                    (!settled, entry.seq)
                 })
-                .min_by_key(|(_, entry)| entry.seq)
-                .or_else(|| state.entries.iter().min_by_key(|(_, entry)| entry.seq))
                 .map(|(message_id, _)| message_id.clone());
             let Some(victim) = victim else {
+                // Every entry is a closed generation (a payload-less tombstone):
+                // dropping one would reopen the window its floor closes.
                 return;
             };
             let evicted = state.entries.remove(&victim);
@@ -533,34 +586,45 @@ impl CardDelivery {
             .entries
             .entry(submission.message_id.to_string())
             .or_insert_with(|| PendingEntry::new(lock));
-        // (a) Below the highest generation seen: the decision is stale, so a
-        // newer generation already owns the card. The submission never
-        // reaches Feishu.
-        if submission.generation < entry.generation {
-            let _ = ticket.send(WriteOutcome::Superseded);
-            return None;
-        }
-        // A newer generation forgets the older one's settled keys: every older
-        // submission is dropped by (a), and only the newest generation's
-        // states are remembered.
+        // A newer generation forgets the older generation's settled keys:
+        // every older submission is dropped by the rules below, and only the
+        // newest generation's states are remembered.
         if submission.generation > entry.generation {
             entry.generation = submission.generation;
             entry.keys.clear();
         }
         // (d) A settled key never writes again: a delivered key is already on
-        // the card (so per-tick re-decisions are free), and a permanent
-        // refusal is final for this generation (#522). Both are dropped
-        // without a Feishu call.
-        match entry.keys.get(&submission.intent) {
-            Some(KeyState::Delivered) => {
-                let _ = ticket.send(WriteOutcome::Delivered);
-                return None;
+        // the card (so per-tick re-decisions are free, and their callers learn
+        // the key landed), and a permanent refusal is final for this
+        // generation (#522). Both are dropped without a Feishu call.
+        if submission.generation == entry.generation {
+            match entry.keys.get(&submission.intent) {
+                Some(KeyState::Delivered) => {
+                    let _ = ticket.send(WriteOutcome::Delivered);
+                    return None;
+                }
+                Some(KeyState::Refused) => {
+                    let _ = ticket.send(WriteOutcome::Superseded);
+                    return None;
+                }
+                None => {}
             }
-            Some(KeyState::Refused) => {
-                let _ = ticket.send(WriteOutcome::Superseded);
-                return None;
-            }
-            None => {}
+        }
+        // (a) Below the card's floor: a newer generation already owns the
+        // card, or a settle closed this generation — its ending landed, so
+        // nothing submitted at or below it (the late stamp whose read
+        // outlived the ending) may write. The submission never reaches Feishu.
+        if submission.generation < entry.floor {
+            let _ = ticket.send(WriteOutcome::Superseded);
+            return None;
+        }
+        entry.floor = entry.floor.max(submission.generation);
+        // An accepted `Settle` closes its own generation (spec #571's
+        // amendment): the floor rises to G+1, so any LATER submission at ≤ G
+        // is dropped. The settle itself is admitted below, so its key settles
+        // the card's ending under rule (d).
+        if submission.intent == CardWriteIntent::Settle {
+            entry.floor = entry.floor.max(submission.generation.saturating_add(1));
         }
         let write = QueuedWrite::new(token, submission, now);
         // The ticket lives with the queue until the submission settles: a
@@ -2021,10 +2085,10 @@ mod tests {
     }
 
     /// The read-only covered-key query a writer's per-tick re-decision
-    /// consults before doing any work (spec #571, ticket #575): a settled key
-    /// (delivered or permanently refused) and an in-flight or waiting write of
-    /// the exact key are covered; an owed recoverable failure is not, and a
-    /// newer generation forgets the older generation's keys.
+    /// consults before doing any work (spec #571, tickets #575): a settled key
+    /// (delivered or permanently refused), an in-flight or waiting write of
+    /// the exact key, and any generation at or below the card's floor are
+    /// covered; an owed recoverable failure is not.
     #[tokio::test]
     async fn the_covered_key_query_reports_settled_and_in_flight_keys() {
         let inner = Arc::new(FakePlatform::new());
@@ -2083,9 +2147,150 @@ mod tests {
             delivery.keyed_write_covered("om_1", 2, CardWriteIntent::Stamp),
             "a permanently refused key is covered"
         );
+        // A newer generation forgets the older generation's keys — and the
+        // query reports the older generation covered all the same: nothing
+        // submitted at or below the card's floor can ever write.
         assert!(
-            !delivery.keyed_write_covered("om_1", 1, CardWriteIntent::Collect),
-            "a newer generation forgets the older generation's keys"
+            delivery.keyed_write_covered("om_1", 1, CardWriteIntent::Collect),
+            "a generation below the floor is covered"
+        );
+        let ticket = submit(&delivery, "om_1", 1, CardWriteIntent::Collect, &collect).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Superseded));
+    }
+
+    /// The ending settle joins the keyed vocabulary (spec #571's amendment): a
+    /// settle accepted at generation G closes G — the card's floor rises to
+    /// G+1 — so a late stamp whose read outlived the ending never reaches
+    /// Feishu, while a newer generation (a new chain state) still writes.
+    #[tokio::test]
+    async fn an_accepted_settle_closes_its_generation() {
+        let inner = Arc::new(FakePlatform::new());
+        let delivery = CardDelivery::new(inner.clone());
+        let stamp = serde_json::json!({ "body": "late stamp" });
+        let settle = serde_json::json!({ "body": "ending" });
+
+        let ticket = submit(&delivery, "om_1", 1, CardWriteIntent::Settle, &settle).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Delivered));
+        assert_eq!(inner.attempts().len(), 1);
+
+        // The late stamp — decided under the closed generation — is dropped.
+        let ticket = submit(&delivery, "om_1", 1, CardWriteIntent::Stamp, &stamp).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Superseded));
+        assert_eq!(inner.attempts().len(), 1, "the late stamp never reached Feishu");
+        assert!(
+            delivery.keyed_write_covered("om_1", 1, CardWriteIntent::Stamp),
+            "a closed generation is covered: nothing of it can ever write"
+        );
+
+        // A newer generation is a newer chain state: it may write.
+        let ticket = submit(&delivery, "om_1", 2, CardWriteIntent::Collect, &stamp).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Delivered));
+        assert_eq!(
+            inner.attempts(),
+            vec![("om_1".to_string(), settle), ("om_1".to_string(), stamp)],
+            "the newer generation wrote"
+        );
+    }
+
+    /// A settle that is itself stale relative to a newer generation is dropped
+    /// like any stale submission (spec #571's amendment): a takeover's collect
+    /// is never overwritten by a settle the takeover outran before it
+    /// submitted.
+    #[tokio::test]
+    async fn a_stale_settle_never_lands_over_a_collect() {
+        let inner = Arc::new(FakePlatform::new());
+        let delivery = CardDelivery::new(inner.clone());
+        let collect = serde_json::json!({ "body": "collected" });
+        let settle = serde_json::json!({ "body": "ending" });
+
+        let ticket = submit(&delivery, "om_1", 2, CardWriteIntent::Collect, &collect).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Delivered));
+
+        let ticket = submit(&delivery, "om_1", 1, CardWriteIntent::Settle, &settle).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Superseded));
+        assert_eq!(inner.attempts().len(), 1, "the stale settle never reached Feishu");
+        assert_eq!(
+            inner.attempts()[0].1,
+            collect,
+            "the collect is the card's last write"
+        );
+    }
+
+    /// The record-release gate (ADR-0063's amendment) sees the keyed ending
+    /// write's owed state: a settle in flight or left owed by a recoverable
+    /// failure keeps the card pending, and only a settled key — delivered or
+    /// permanently refused — reports it confirmed. Keyless pending is
+    /// untouched.
+    #[tokio::test]
+    async fn a_pending_settle_keeps_the_release_gate_closed_until_it_settles() {
+        let inner = Arc::new(FakePlatform::new());
+        let delivery = Arc::new(CardDelivery::new(inner.clone()));
+        let settle = serde_json::json!({ "body": "ending" });
+        let keyless = serde_json::json!({ "body": "keyless" });
+        assert!(!delivery.pending("om_1"));
+
+        // In flight: the ending write is owed, so the card is not confirmed.
+        let (entered, release) = inner.park_next();
+        let ticket = submit(&delivery, "om_1", 1, CardWriteIntent::Settle, &settle).await;
+        entered.notified().await;
+        assert!(
+            delivery.pending("om_1"),
+            "an in-flight ending keeps the card pending"
+        );
+        release.notify_one();
+        assert!(matches!(ticket.settled().await, WriteOutcome::Delivered));
+        assert!(!delivery.pending("om_1"), "a delivered ending is confirmed");
+
+        // A recoverable failure stays owed: still pending until the drain lands.
+        let (entered, release) = inner.park_next();
+        inner.fail_next(Fail::Transport);
+        let ticket = submit(&delivery, "om_2", 1, CardWriteIntent::Settle, &settle).await;
+        entered.notified().await;
+        release.notify_one();
+        assert!(matches!(ticket.settled().await, WriteOutcome::Failed(_)));
+        assert!(delivery.pending("om_2"), "an owed ending keeps the card pending");
+        delivery.drain_pending_card_updates(true).await;
+        assert!(!delivery.pending("om_2"), "the drain confirmed the ending");
+
+        // A permanent refusal is settled too — the ending can never land, and
+        // the keyless gate has always released a refused write.
+        inner.fail_next(Fail::ContentRejected);
+        let ticket = submit(&delivery, "om_3", 1, CardWriteIntent::Settle, &settle).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Failed(_)));
+        assert!(!delivery.pending("om_3"), "a refused ending is settled, not owed");
+
+        // The keyless half is untouched: only a keyless payload reports a
+        // keyless pending card.
+        inner.fail_next(Fail::Transport);
+        let _ = delivery.update_message("om_4", &keyless).await;
+        assert!(delivery.pending("om_4"));
+    }
+
+    /// The cap never evicts a closed generation while another victim exists
+    /// (spec #571's amendment): forgetting the floor would reopen the window
+    /// for a stale writer whose read outlived the settle.
+    #[tokio::test]
+    async fn the_cap_does_not_evict_a_closed_generation_while_another_victim_exists() {
+        let inner = Arc::new(FakePlatform::new());
+        let delivery = CardDelivery::with_limits(inner.clone(), 2, BACKOFF_BASE, BACKOFF_MAX);
+        let stamp = serde_json::json!({ "body": "late stamp" });
+        let settle = serde_json::json!({ "body": "ending" });
+
+        // om_closed: a settle accepted (and delivered) at generation 1 closes
+        // the generation.
+        let ticket = submit(&delivery, "om_closed", 1, CardWriteIntent::Settle, &settle).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Delivered));
+        // Two keyless writes push the map over the cap; the closed entry must
+        // not be chosen while a non-closed victim exists.
+        delivery.update_message("om_a", &stamp).await.unwrap();
+        delivery.update_message("om_b", &stamp).await.unwrap();
+
+        let ticket = submit(&delivery, "om_closed", 1, CardWriteIntent::Stamp, &stamp).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Superseded));
+        assert_eq!(
+            inner.attempts().len(),
+            3,
+            "the floor survived the cap eviction: the late stamp never reached Feishu"
         );
     }
 
