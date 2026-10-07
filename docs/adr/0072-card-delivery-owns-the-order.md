@@ -113,7 +113,12 @@ drops stale intents, collapses duplicates and retries failures.
   most one submission in flight plus one waiting plus the newest generation's
   key states per card, and the outbox's entry cap bounds the map (a
   payload-less entry that still carries order state — a closed generation, an
-  ending shadow — is never evicted while any other victim exists). Its own
+  ending shadow — is never evicted while any other victim exists, and the
+  entry a write is being admitted into is never evicted by its own admission;
+  once no stale writer can still be composing — an order state older than a
+  generous protection window, past every bounded card-view read — the oldest
+  such state is the cap's last-resort victim, so keyed-only traffic cannot
+  grow the map without bound). Its own
   state lock is taken only to admit, snapshot or settle — never held across an
   await — and the card's delivery lock is held only across the Feishu write
   itself. A submission's write is owned by a spawned driver task, not by the
