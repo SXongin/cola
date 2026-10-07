@@ -1750,6 +1750,25 @@ impl Platform for CardDelivery {
         self.inner.keyed_ticket_await()
     }
 
+    fn keyed_write_settled(
+        &self,
+        message_id: &str,
+        generation: u64,
+        intent: CardWriteIntent,
+    ) -> Option<bool> {
+        let state = self.state.lock().unwrap();
+        let entry = state.entries.get(message_id)?;
+        // Only the newest generation's key states are remembered; an older
+        // generation's keys were forgotten with its submissions.
+        if entry.generation != generation {
+            return None;
+        }
+        entry
+            .keys
+            .get(&intent)
+            .map(|key| matches!(key, KeyState::Delivered))
+    }
+
     fn settled_card_write_delivered(&self, message_id: &str) -> Option<bool> {
         let state = self.state.lock().unwrap();
         let entry = state.entries.get(message_id)?;

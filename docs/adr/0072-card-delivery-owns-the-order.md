@@ -120,8 +120,16 @@ drops stale intents, collapses duplicates and retries failures.
   The gate (`has_pending_card_update`, via `release_spent`) now counts a keyed
   `Settle` the queue still owes or is writing, not only the keyless Pending
   Card Update; the reap's own settle releases the record it wrote for as soon
-  as its ticket reports delivery. A failed ending keeps the record and the
-  queue's owed key for a later retry (or a later transcript-truth settle).
+  as its ticket reports delivery. A **recoverable** failure keeps the record and
+  the queue's owed key for a later retry (or a later transcript-truth settle),
+  while a **permanently refused** ending is a confirmed non-delivery: the reap
+  spends the record on it — delivery *or* refusal releases, exactly as the
+  keyless outbox's permanent refusal always did (spec #571 review). The ending
+  path also asks the queue whether its `(generation, intent)` already settled
+  (`keyed_write_settled`: delivered, so the card holds it, or refused, so it can
+  never land) *before* its preserved-ending card-view read, so a settled ending
+  costs no read and no submission — the same discipline the stamp's covered-key
+  query applies (spec #571 review).
 
 - **One queue, two write classes.** Keyless writes (`update_message` — the
   flush, interaction repaints, command cards, the drain's retries) pass through
