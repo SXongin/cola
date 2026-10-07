@@ -441,6 +441,13 @@ fn render_wake_entries(
         if created_ms < anchor.created_ms {
             continue;
         }
+        // A Wake at or below the durable Watermark's floor was already
+        // announced by an earlier card (spec #561, review #569; ADR-0061): its
+        // completion entry is never re-inserted, and no new announcement is
+        // staged for it. A strictly newer Wake renders and announces normally.
+        if acc.wake_floor.is_some_and(|floor| created_ms <= floor) {
+            continue;
+        }
         let Some(entry) = wake_completion_entry(wake, transcript, created_ms) else {
             continue;
         };

@@ -254,7 +254,14 @@ projects the chain's delta after it onto a successor card.**
   confirmed create drains the staged Wake Watermark through the same choke
   point the flush uses, so a Wake completion entry the successor rendered is
   durable and a later, by then recordless Fresh post cannot re-announce it
-  (#424).
+  (#424). The mark also flows the other way at arm time (review #569): every
+  accumulator that starts rendering a session — the fresh Turn, the projection
+  and external arms, the Wake continuation — seeds a **Wake floor** from the
+  chain's durable mark, and the wake-entry render skips any Wake at or below
+  it: its completion entry was already announced by an earlier card, so it is
+  neither re-inserted nor staged for a new advance. The floor is time-based,
+  not an id set, so older Wakes below the newest announced id are covered too,
+  and a Wake strictly newer than the mark still renders and announces.
 
 - **The cursorless fallback is today's behavior.** A record carrying no cursor
   keeps the existing arm unchanged: the #443 one-time restart stamp for a
