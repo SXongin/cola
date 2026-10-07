@@ -175,16 +175,17 @@ async fn confirm_staged_cursor(
         gate.entered.notify_one();
         gate.release.notified().await;
     }
-    cards.chains.advance_cursor(session_id, card_message_id, &cursor);
-    if let Some(gap) = gap {
-        // This very body carried the chain's orphan gap this far (spec #561,
-        // review #569): a PARTIAL body only advances the durable gap, so a
-        // restart (or the next slice) resumes after what a card showed, while
-        // a body that reached the gap's end consumes the fact.
-        cards
-            .chains
-            .advance_pending_gap(session_id, card_message_id, &gap.frontier, gap.complete);
-    }
+    // ONE record write (spec #561, review #569): this very body carried the
+    // chain's orphan gap this far — a PARTIAL body only advances the durable
+    // gap, so a restart (or the next slice) resumes after what a card showed,
+    // while a body that reached the gap's end consumes the fact — and the
+    // cursor and the gap must never be observable apart.
+    cards.chains.advance_cursor_and_gap(
+        session_id,
+        card_message_id,
+        &cursor,
+        gap.as_ref().map(|gap| (&gap.frontier, gap.complete)),
+    );
 }
 
 /// A one-shot test gate inside one cursor confirmation (spec #561, review

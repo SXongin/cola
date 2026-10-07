@@ -328,6 +328,13 @@ pub(crate) fn reconcile(record: &ChainRecord, reads: &RecoveryReads<'_>) -> Chai
                         let Some(TranscriptRead::Read(transcript)) = reads.transcript.as_ref() else {
                             return ChainDisposition::NoDecision;
                         };
+                        // A TRUNCATED read is the OLDEST prefix (review #569):
+                        // the follow would re-read that same prefix forever and
+                        // never see newer output, so a live record claims
+                        // nothing and a later complete read adopts.
+                        if transcript.truncated {
+                            return ChainDisposition::Keep;
+                        }
                         let scope = record
                             .anchor()
                             .or_else(|| transcript.anchor_of_user(record.message_id.as_str()));
@@ -989,6 +996,51 @@ mod tests {
         assert_eq!(
             reconcile(&yielded, &idle_transcript(waiting)),
             ChainDisposition::Keep
+        );
+    }
+
+    /// A TRUNCATED read never adopts a live record (spec #561, review #569):
+    /// the read is the oldest prefix, so the follow would re-read that same
+    /// prefix forever and never see newer output — claim nothing and let a
+    /// complete read adopt.
+    #[test]
+    fn a_truncated_read_never_adopts_a_live_record() {
+        let transcript = SessionTranscript::new(vec![
+            user("msg_cola_anchor", 1_000, "问题"),
+            assistant(2_000, "答复。"),
+        ]);
+        let cursor = RenderedCursor {
+            frontier: Some(CursorFrontier {
+                message_id: MessageId::new("msg_a_2000"),
+                part_index: 0,
+                kind: CursorPartKind::Text,
+                started_at: Some(2_000),
+                delivered_chars: 2,
+                prefix_digest: Some(cursor_prefix_digest("答复")),
+            }),
+            live_calls: Default::default(),
+        };
+        let with_cursor = ChainRecord {
+            cursor: Some(cursor),
+            ..record()
+        };
+        let live = RecoveryReads {
+            status: Some(StatusRead::Named(SessionStatus::Busy)),
+            transcript: Some(TranscriptRead::Read(transcript.clone())),
+            ..orphan()
+        };
+        assert!(matches!(
+            reconcile(&with_cursor, &live),
+            ChainDisposition::ProjectLive { .. }
+        ));
+        let truncated = RecoveryReads {
+            transcript: Some(TranscriptRead::Read(transcript.with_truncated())),
+            ..live
+        };
+        assert_eq!(
+            reconcile(&with_cursor, &truncated),
+            ChainDisposition::Keep,
+            "a truncated read cannot follow a live run"
         );
     }
 
