@@ -190,10 +190,12 @@ drops stale intents, collapses duplicates and retries failures.
   submitting task, so cancelling a submitter cannot strand an admitted
   payload. The stamp's view read and composition still run on a small
   pre-submission task that the Session Sync pass never awaits — and so do the
-  collects and the endings (spec #571 review): the pass submits them and a
-  **detached continuation** awaits the ticket (bounded) to perform the cache
-  release, the INFO line, the terminal record release and the warning, so no
-  Session Sync pass ever waits on a Feishu write at all.
+  collects and the endings (spec #571 review): the pass hands the *whole
+  pipeline* — the bounded preserved-card GET, the composition, the submission
+  and the completion handling (the cache release, the INFO line, the terminal
+  record release, the waiting mark, the warning) — to a detached task, so no
+  Session Sync pass ever awaits a Feishu call at all, GET or PATCH. Only the
+  queue's settled-key query stays inline (it issues no call).
   **An issued keyed write is never cancelled** (spec #571 review): a timed-out
   PATCH could still commit at Feishu and land over a newer generation, the very
   hazard the ordering exists to remove (ADR-0063's rule), so the driver awaits

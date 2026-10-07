@@ -109,6 +109,7 @@ use crate::feishu::card::{
     CardState, error_line, ledger::TASK_LEDGER_ELEMENT_ID, move_line, shell::CardBuilder,
 };
 use crate::feishu::delivery::{CardWriteIntent, CardWriteTicket, KeyedSubmission, WriteOutcome};
+use std::sync::Arc;
 
 /// Collect the orphaned card `card_message_id` because a new card took the
 /// chain over (ADR-0063): one PATCH naming the successor, terminal and grey,
@@ -121,8 +122,13 @@ use crate::feishu::delivery::{CardWriteIntent, CardWriteTicket, KeyedSubmission,
 ///
 /// A failed PATCH only warns; the record follows the successor either way, so
 /// the freeze it leaves behind is the pre-#438 behavior, never a crash.
+///
+/// This is the **awaiting form** for a caller that legitimately joins the
+/// collect (the turn-facing arms). A pass-internal caller uses
+/// [`collect_orphan_detached`] instead: the Session Sync pass must never await
+/// a Feishu call (spec #571 review).
 pub(crate) async fn collect_orphan(cards: &CardsHandle, session_id: &str, card_message_id: &str) {
-    collect_orphan_with(
+    collect_pipeline(
         cards,
         session_id,
         card_message_id,
@@ -148,16 +154,17 @@ pub(crate) async fn collect_orphan(cards: &CardsHandle, session_id: &str, card_m
 /// nowhere else: the retired repair that used to re-read it from the successor's
 /// record is gone (spec #571, ticket #575), and the queue's generation order is
 /// what keeps this collect after any older stamp.
+///
+/// The **awaiting form** (the fresh-Turn path); the reap's own projections use
+/// [`collect_orphan_after_takeover_detached`] (spec #571 review).
 pub(crate) async fn collect_orphan_after_takeover(
     cards: &CardsHandle,
     session_id: &str,
     card_message_id: &str,
     resolved_calls: &[String],
 ) {
-    let keep = KeepBody::WithoutLiveTail {
-        resolved_calls: resolved_calls.to_vec(),
-    };
-    collect_orphan_with(
+    let keep = takeover_keep(resolved_calls);
+    collect_pipeline(
         cards,
         session_id,
         card_message_id,
@@ -167,42 +174,104 @@ pub(crate) async fn collect_orphan_after_takeover(
     .await;
 }
 
+/// The takeover collect's own merge rule: the ledger always goes, and each
+/// running panel exactly when the seed resolved its call (ADR-0068, spec #561
+/// review #569).
+fn takeover_keep(resolved_calls: &[String]) -> KeepBody {
+    KeepBody::WithoutLiveTail {
+        resolved_calls: resolved_calls.to_vec(),
+    }
+}
+
+/// The **pass-internal** ordinary collect (spec #571 review): the whole
+/// pipeline — the bounded preserved-card GET, the composition, the keyed
+/// submission and the completion handling — runs on a detached task, so the
+/// reap pass returns immediately after deciding and never awaits a Feishu call
+/// (GET or PATCH).
+pub(crate) fn collect_orphan_detached(cards: &CardsHandle, session_id: &str, card_message_id: &str) {
+    spawn_collect(
+        cards,
+        session_id,
+        card_message_id,
+        KeepBody::Everything,
+        CardWriteIntent::Collect,
+    );
+}
+
+/// The pass-internal takeover collect (the reap's projections, spec #571
+/// review): spawned like [`collect_orphan_detached`].
+pub(crate) fn collect_orphan_after_takeover_detached(
+    cards: &CardsHandle,
+    session_id: &str,
+    card_message_id: &str,
+    resolved_calls: &[String],
+) {
+    spawn_collect(
+        cards,
+        session_id,
+        card_message_id,
+        takeover_keep(resolved_calls),
+        CardWriteIntent::TakeoverCollect,
+    );
+}
+
 /// Collect a projection's LATE successor — the create that landed after a
 /// fresh Turn had already won the chain — **without keeping its body** (spec
 /// #561, review #569): the winning Turn's card re-rendered the same tail
 /// through the message-first seed, so preserving this body would show the
 /// reader the same text twice. The late card is reduced to the bare
 /// taken-over marker; every other collect keeps its body (ADR-0063).
-pub(crate) async fn collect_late_projection(cards: &CardsHandle, session_id: &str, card_message_id: &str) {
-    collect_orphan_with(
+///
+/// Only the reap's projections call it, so it is spawned like
+/// [`collect_orphan_detached`]: the pass never awaits a Feishu call (spec #571
+/// review).
+pub(crate) fn collect_late_projection_detached(cards: &CardsHandle, session_id: &str, card_message_id: &str) {
+    spawn_collect(
         cards,
         session_id,
         card_message_id,
         KeepBody::Nothing,
         CardWriteIntent::LateProjectionCollect,
-    )
-    .await;
+    );
 }
 
-/// The shared takeover collect behind [`collect_orphan`] and
-/// [`collect_orphan_after_takeover`]: one keyed submission naming the
-/// successor, terminal and grey, its preserved body under `keep`, carrying the
-/// **chain generation the write belongs to** — read from the chain immediately
-/// before the submission, after the composition read above (spec #571 review):
-/// a takeover that re-points the chain during that read bumps the generation,
-/// and this collect is then the NEW chain state's write, never a snapshot's
-/// stale one the queue would drop. The bare ending rides as the submission's
-/// fallback (spec #571 review): a platform that refuses the preserved shape as
-/// card content degrades to it inside the queue, under the same key and lock,
-/// so the degradation can never land over a newer generation.
+/// Spawn one collect's whole pipeline on a detached task (spec #571 review),
+/// with owned handles so the task outlives the caller.
+fn spawn_collect(
+    cards: &CardsHandle,
+    session_id: &str,
+    card_message_id: &str,
+    keep: KeepBody,
+    intent: CardWriteIntent,
+) {
+    let cards = cards.clone();
+    let session_id = session_id.to_string();
+    let card_message_id = card_message_id.to_string();
+    tokio::spawn(async move {
+        collect_pipeline(&cards, &session_id, &card_message_id, keep, intent).await;
+    });
+}
+
+/// The shared collect pipeline behind every `collect_orphan*` form: one keyed
+/// submission naming the successor, terminal and grey, its preserved body
+/// under `keep`, carrying the **chain generation the write belongs to** — read
+/// from the chain immediately before the submission, after the composition
+/// read above (spec #571 review): a takeover that re-points the chain during
+/// that read bumps the generation, and this collect is then the NEW chain
+/// state's write, never a snapshot's stale one the queue would drop. The bare
+/// ending rides as the submission's fallback (spec #571 review): a platform
+/// that refuses the preserved shape as card content degrades to it inside the
+/// queue, under the same key and lock, so the degradation can never land over
+/// a newer generation.
 ///
-/// The submission is **detached** (spec #571 review): the caller — the reap
-/// pass above all — must never await a Feishu write, so a small continuation
-/// awaits the completion ticket (bounded) and performs the cache release, the
-/// INFO line and the warning exactly as this function once did. The queue owns
-/// the write either way: an issued keyed write is never cancelled and may
-/// still land.
-async fn collect_orphan_with(
+/// The whole pipeline — the bounded preserved-card GET, the composition, the
+/// submission and the completion handling (the cache release, the INFO line
+/// and the warning) — runs wherever its caller puts it: a pass-internal caller
+/// spawns it ([`spawn_collect`]), so the reap pass never awaits a Feishu call
+/// (GET or PATCH — spec #571 review); a turn-facing caller awaits it. The
+/// queue owns the write either way: an issued keyed write is never cancelled
+/// and may still land.
+async fn collect_pipeline(
     cards: &CardsHandle,
     session_id: &str,
     card_message_id: &str,
@@ -234,24 +303,13 @@ async fn collect_orphan_with(
             fallback: Some(&bare),
         })
         .await;
-    // Hand the waiting to a detached continuation: the pass proceeds now.
-    let cards = cards.clone();
-    let session_id = session_id.to_string();
-    let card_message_id = card_message_id.to_string();
-    tokio::spawn(async move {
-        collect_orphan_outcome(
-            &cards,
-            &session_id,
-            &card_message_id,
-            ticket.settled_within(bound).await,
-        )
-        .await;
-    });
+    let outcome = ticket.settled_within(bound).await;
+    collect_orphan_outcome(cards, session_id, card_message_id, outcome).await;
 }
 
 /// One collect submission's outcome handling — the cache release, the INFO
-/// line and the warning — run by the detached continuation so no caller ever
-/// waits on Feishu (spec #571 review).
+/// line and the warning — the tail of [`collect_pipeline`], run wherever the
+/// caller put that pipeline (detached for the pass, inline for a turn).
 async fn collect_orphan_outcome(
     cards: &CardsHandle,
     session_id: &str,
@@ -349,12 +407,12 @@ pub(crate) async fn reconcile(
     let mut reads = gather_reads(handles, session_id, record, directory, tracked_directory).await;
     // The successor branch's collect runs before the decision: its composition
     // read is where a takeover can arm the successor's anchor, and the anchor
-    // is re-read right after the (detached, spec #571 review) submission so an
-    // anchor landing in that window re-points the record instead of being
+    // is re-read right after the (detached, spec #571 review) hand-off, so an
+    // anchor landing around the collect re-points the record instead of being
     // missed. Only the anchor is re-read — the id and running stay the
     // pre-collect facts the pre-split pass entered the branch with.
     if reads.needs_successor_collect() {
-        collect_orphan(&handles.cards, session_id, &record.card_message_id).await;
+        collect_orphan_detached(&handles.cards, session_id, &record.card_message_id);
         let anchor = Turn::armed_turn_anchor(&handles.cards, session_id).await;
         if let CardProbe::Successor { anchor: slot, .. } = &mut reads.card {
             *slot = anchor;
@@ -706,7 +764,7 @@ async fn send_projected_chain(
             // bodyless — the winner re-rendered the same slice — so it cannot
             // look live and the reader never sees the text twice, and the
             // chain stops.
-            collect_late_projection(&handles.cards, session_id, &new_card_id).await;
+            collect_late_projection_detached(&handles.cards, session_id, &new_card_id);
             return ProjectedChain::Stopped(last);
         }
         crate::bridge::turn::drain_armed_watermark(
@@ -924,7 +982,7 @@ async fn send_projected_successor(
         // The late card is collected WITHOUT its body: the winning Turn's
         // message-first seed already re-rendered the same tail, so preserving
         // it would show the reader the text twice (review #569).
-        collect_late_projection(&handles.cards, session_id, &new_card_id).await;
+        collect_late_projection_detached(&handles.cards, session_id, &new_card_id);
         // The create this pass marked has landed, and its card is collected
         // here: the write-ahead intent is CONSUMED (spec #561, review #569).
         // The winning Turn's chain carried the unresolved mark through its own
@@ -946,13 +1004,12 @@ async fn send_projected_successor(
     crate::bridge::turn::drain_armed_watermark(&handles.cards, session_id, chain_id, slice.watermark_stage)
         .await;
     if let Some(orphan) = orphan {
-        crate::bridge::chain::collect_orphan_after_takeover(
+        crate::bridge::chain::collect_orphan_after_takeover_detached(
             &handles.cards,
             session_id,
             &orphan.card_message_id,
             &seed.resolved_calls(),
-        )
-        .await;
+        );
     }
     // An oversized delta continues on a bounded chain of cards (spec #561,
     // review #569): every slice through the same splitter, each confirmed only
@@ -1271,14 +1328,6 @@ enum EndingOutcome {
     Owed,
 }
 
-/// One ending submission as the pass leaves it (spec #571 review): the queue's
-/// settled-key answer already resolved it, or the write is issued with the
-/// ticket its detached continuation observes.
-enum EndingSubmission {
-    Settled(EndingOutcome),
-    Issued(CardWriteTicket, std::time::Duration),
-}
-
 /// The owned context one ending's detached continuation needs (spec #571
 /// review): the card store, the session, the record's card, the decision's
 /// labels, and whether the waiting mark belongs to a landing.
@@ -1342,6 +1391,51 @@ impl EndingContinuation {
     }
 }
 
+/// One ending's whole pipeline (spec #571 review): the bounded preserved-card
+/// GET, the composition, the keyed submission and the ticket await — run on a
+/// detached task by [`ApplyPass::settle`], so the reap pass never awaits a
+/// Feishu call (GET or PATCH). The bare ending rides as the submission's
+/// fallback: a platform that refuses the preserved shape as card content
+/// degrades to it inside the queue, under the same key and the same held card
+/// lock (spec #571 review).
+#[allow(clippy::too_many_arguments)]
+async fn ending_pipeline(
+    platform: Arc<dyn crate::feishu::Platform>,
+    bare: serde_json::Value,
+    intent: CardWriteIntent,
+    generation: u64,
+    card_message_id: String,
+    view_timeout_ms: u64,
+    bound: std::time::Duration,
+    continuation: EndingContinuation,
+) {
+    let preserved = preserved_ending(
+        platform.as_ref(),
+        &card_message_id,
+        &bare,
+        KeepBody::Everything,
+        view_timeout_ms,
+    )
+    .await;
+    let ticket = platform
+        .submit_ordered(KeyedSubmission {
+            message_id: &card_message_id,
+            generation,
+            intent,
+            card: &preserved,
+            fallback: Some(&bare),
+        })
+        .await;
+    let outcome = await_ending(
+        ticket,
+        bound,
+        &continuation.session_id,
+        &continuation.card_message_id,
+    )
+    .await;
+    continuation.apply(outcome);
+}
+
 /// Resolve one issued ending's ticket, bounded (spec #571 review): the mapping
 /// the pass once did inline, now run by the detached continuation so no pass
 /// waits on Feishu. An indeterminate ticket keeps the record — the write may
@@ -1398,14 +1492,16 @@ impl ApplyPass<'_> {
     /// extra line naming the move (#439), on top of `detail` (the failure's
     /// message when there is one); a Waiting yield carries none.
     ///
-    /// The submission itself is made here; its outcome handling (the INFO line,
-    /// the terminal record release, the waiting mark, the warning) runs in a
-    /// **detached continuation** (spec #571 review) — the same pattern the
-    /// stamp's pre-submission task uses — so the pass never awaits a Feishu
-    /// write. An unconfirmed ending keeps the record for the queue's retry
-    /// (the release gate sees the keyed write it still owes). One INFO line per
-    /// action, naming the session and the decision — never chat content; a
-    /// settle that named a move says so.
+    /// The whole ending pipeline — the bounded preserved-card GET, the
+    /// composition, the submission and the outcome handling (the INFO line,
+    /// the terminal record release, the waiting mark, the warning) — runs on a
+    /// **detached task** (spec #571 review), the same pattern the stamp's
+    /// pre-submission task uses, so the Session Sync pass never awaits a Feishu
+    /// call at all (GET or PATCH). The settled-key answer needs no Feishu call
+    /// and resolves inline. An unconfirmed ending keeps the record for the
+    /// queue's retry (the release gate sees the keyed write it still owes). One
+    /// INFO line per action, naming the session and the decision — never chat
+    /// content; a settle that named a move says so.
     async fn settle(&self, state: CardState, detail: Option<&str>, waiting: bool) {
         let terminal = state.is_terminal();
         let move_note = if terminal { self.move_note().await } else { None };
@@ -1415,73 +1511,41 @@ impl ApplyPass<'_> {
         } else {
             CardWriteIntent::Yield
         };
+        let platform = self.handles.cards.feishu.clone();
+        let card_message_id = self.record.card_message_id.clone();
+        let generation = self.record.generation;
         let continuation = EndingContinuation {
             cards: self.handles.cards.clone(),
             session_id: self.session_id.to_string(),
-            card_message_id: self.record.card_message_id.clone(),
+            card_message_id: card_message_id.clone(),
             terminal,
             waiting,
             moved: move_note.is_some(),
             word: state.reap_word(),
         };
-        match self.submit_ending(&card, intent).await {
-            EndingSubmission::Settled(outcome) => continuation.apply(outcome),
-            EndingSubmission::Issued(ticket, bound) => {
-                let session_id = continuation.session_id.clone();
-                let card_message_id = continuation.card_message_id.clone();
-                tokio::spawn(async move {
-                    let outcome = await_ending(ticket, bound, &session_id, &card_message_id).await;
-                    continuation.apply(outcome);
-                });
-            }
-        }
-    }
-
-    /// Submit the record's keyed **ending** write (spec #571's amendments):
-    /// compose the preserved card and submit it at the generation this decision
-    /// read with `intent` — `Settle` for the terminal ending (accepting it
-    /// closes the generation, so a stamp whose read outlived the ending is
-    /// dropped) or `Yield` for the waiting ending (accepting it only shadows a
-    /// later stamp at ≤ its generation). The bare ending rides as the
-    /// submission's fallback (spec #571 review): a platform that refuses the
-    /// preserved shape as card content degrades to it inside the queue, under
-    /// the same key and the same held card lock, so the degradation can never
-    /// land over a newer generation. The key is consulted first: an already
-    /// **settled** ending — delivered, so the card holds it, or permanently
-    /// refused, so it can never land (#522) — resolves inline with no card-view
-    /// read and no submission (spec #571 review). An issued write hands its
-    /// ticket and await bound back to the caller's detached continuation.
-    async fn submit_ending(&self, card: &serde_json::Value, intent: CardWriteIntent) -> EndingSubmission {
-        let platform = self.handles.cards.feishu.as_ref();
-        let card_message_id = self.record.card_message_id.as_str();
-        let generation = self.record.generation;
-        if let Some(delivered) = platform.keyed_write_settled(card_message_id, generation, intent) {
-            return EndingSubmission::Settled(if delivered {
+        // The queue's settled-key answer is a read-only query, not a Feishu
+        // call: an already-settled ending resolves inline with no read and no
+        // submission.
+        if let Some(delivered) = platform.keyed_write_settled(&card_message_id, generation, intent) {
+            continuation.apply(if delivered {
                 EndingOutcome::Landed
             } else {
                 EndingOutcome::Refused
             });
+            return;
         }
         let view_timeout_ms = self.handles.cards.preserved_view_timeout_ms();
-        let preserved = preserved_ending(
-            platform,
-            card_message_id,
-            card,
-            KeepBody::Everything,
-            view_timeout_ms,
-        )
-        .await;
         let bound = platform.keyed_ticket_await();
-        let ticket = platform
-            .submit_ordered(KeyedSubmission {
-                message_id: card_message_id,
-                generation,
-                intent,
-                card: &preserved,
-                fallback: Some(card),
-            })
-            .await;
-        EndingSubmission::Issued(ticket, bound)
+        tokio::spawn(ending_pipeline(
+            platform,
+            card,
+            intent,
+            generation,
+            card_message_id,
+            view_timeout_ms,
+            bound,
+            continuation,
+        ));
     }
 
     /// The one line a settling card carries when the Session's location changed
