@@ -496,14 +496,20 @@ impl PendingEntry {
     /// establishes — a `Stamp` shadowed by an accepted ending, or a key that
     /// already settled (delivered or refused), may not be written. A strictly
     /// newer generation also makes it stale (a newer state arrived while it
-    /// waited), which is the floor's effect here: the floor itself is
-    /// deliberately NOT compared, because a waiter may legitimately have
-    /// raised it — accepting a `Settle` closes its OWN generation, and that
-    /// settle must still land after the write it waited behind. A stale waiter
-    /// is dropped, never written after a newer state. (The caller has already
-    /// taken the waiter out of the slot.)
+    /// waited). So does a **generation the entry's floor has closed**: an
+    /// accepted `Settle` at G raises the floor to G+1, and a waiting non-settle
+    /// write of G (a `Yield`, a `Collect`) is then stale — it may never land
+    /// after the true ending (spec #571 review). A `Settle` waiter at that
+    /// generation stays promotable: accepting it closed its OWN generation and
+    /// raised the floor, so it must still land after the write it waited
+    /// behind (the terminal-waits-for-a-stamp case). A stale waiter is dropped,
+    /// never written after a newer state. (The caller has already taken the
+    /// waiter out of the slot.)
     fn promotable(&self, write: &QueuedWrite) -> bool {
         if write.generation < self.generation {
+            return false;
+        }
+        if write.intent != CardWriteIntent::Settle && write.generation < self.floor {
             return false;
         }
         if write.intent == CardWriteIntent::Stamp
@@ -960,9 +966,20 @@ impl CardDelivery {
         // An accepted `Settle` closes its own generation (spec #571's
         // amendment): the floor rises to G+1, so any LATER submission at ≤ G
         // is dropped. The settle itself is admitted below, so its key settles
-        // the card's ending under rule (d).
+        // the card's ending under rule (d). A non-settle waiter of the closed
+        // generation is stale now — it could otherwise be promoted after the
+        // true ending (spec #571 review) — and is dropped here belt-and-braces:
+        // the promotion's own validation refuses it too.
         if submission.intent == CardWriteIntent::Settle {
             entry.floor = entry.floor.max(submission.generation.saturating_add(1));
+            if entry
+                .waiting
+                .as_ref()
+                .is_some_and(|waiting| waiting.intent != CardWriteIntent::Settle)
+            {
+                let stale = entry.waiting.take().expect("checked above");
+                Self::settle_ticket(entry, stale.token, WriteOutcome::Superseded);
+            }
         }
         // An accepted ending — the `Settle` or the waiting `Yield` (spec
         // #571's amendment 2) — shadows later `Stamp`s at ≤ its generation:
@@ -3798,6 +3815,57 @@ mod tests {
             inner.attempts(),
             vec![("om_1".to_string(), keyless), ("om_1".to_string(), third)],
             "the stale generation 2 never reached Feishu"
+        );
+    }
+
+    /// A same-generation `Settle` stales a waiting non-settle write that its
+    /// floor has closed (spec #571 review): a keyless write holds the card
+    /// lock, the in-flight `Collect`'s lock wait times out, the `Settle` takes
+    /// the free in-flight slot and lands — the waiting `Yield` must be dropped,
+    /// never PATCHed after the true ending.
+    #[tokio::test(start_paused = true)]
+    async fn a_settle_stales_a_same_generation_waiter() {
+        let inner = Arc::new(FakePlatform::new());
+        let delivery = Arc::new(
+            CardDelivery::with_limits(inner.clone(), MAX_PENDING, BACKOFF_BASE, BACKOFF_MAX)
+                .with_lock_wait(Duration::from_secs(5)),
+        );
+        let keyless = serde_json::json!({ "body": "keyless" });
+        let collect = serde_json::json!({ "body": "collected" });
+        let waiting = serde_json::json!({ "body": "waiting" });
+        let settle = serde_json::json!({ "body": "ending" });
+
+        // A keyless write parks holding the card's lock.
+        let (entered, release) = inner.park_next();
+        let holding = tokio::spawn({
+            let delivery = Arc::clone(&delivery);
+            let keyless = keyless.clone();
+            async move { delivery.update_message("om_1", &keyless).await }
+        });
+        entered.notified().await;
+
+        // The collect's driver waits on the lock; the yield joins the waiting
+        // slot; the lock wait then expires, leaving both slots in place.
+        let collect_ticket = submit(&delivery, "om_1", 1, CardWriteIntent::Collect, &collect).await;
+        let yield_ticket = submit(&delivery, "om_1", 1, CardWriteIntent::Yield, &waiting).await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert!(matches!(collect_ticket.settled().await, WriteOutcome::Failed(_)));
+
+        // The settle takes the now-free in-flight slot and lands once the lock
+        // frees: the stale yield must never follow it.
+        let settle_ticket = submit(&delivery, "om_1", 1, CardWriteIntent::Settle, &settle).await;
+        release.notify_one();
+        holding.await.unwrap().unwrap();
+        assert!(matches!(settle_ticket.settled().await, WriteOutcome::Delivered));
+        assert!(
+            matches!(yield_ticket.settled().await, WriteOutcome::Superseded),
+            "the settle closed the generation, so the waiting yield is stale"
+        );
+        assert_eq!(
+            inner.attempts(),
+            vec![("om_1".to_string(), keyless), ("om_1".to_string(), settle)],
+            "the stale yield never reached Feishu: the ✅ is the card's last word"
         );
     }
 
