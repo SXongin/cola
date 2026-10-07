@@ -80,11 +80,6 @@ const DRAIN_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
 /// second half of the ordering key: `(generation, intent)` names one logical
 /// write, so a writer's per-tick re-decision collapses to its newest payload
 /// — or, once the key settled, is dropped — instead of writing again.
-// The ordered queue lands ahead of its writers (spec #571): no bridge writer
-// submits a keyed write yet — ticket #574 wires them — so the keyed seam is
-// unreachable from the binary until then. The `dead_code` allows in this
-// module cover exactly that wiring gap, not a stale path.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum CardWriteIntent {
     /// The restart stamp (#443, ADR-0063): mark a card a cola restart
@@ -98,7 +93,6 @@ pub(crate) enum CardWriteIntent {
 /// One **keyed submission**: an already-composed card payload with the ordering
 /// key its writer decided under (spec #571) — the **chain generation** the
 /// decision read, and the intent naming the logical write.
-#[allow(dead_code)]
 pub(crate) struct KeyedSubmission<'a> {
     /// The card this write targets.
     pub message_id: &'a str,
@@ -124,9 +118,9 @@ pub(crate) enum WriteOutcome {
     Superseded,
 }
 
-// Hand-written rather than derived: it reads the failure the variant carries —
-// the error a caller logs once ticket #574 wires the keyed writers — which the
-// derived impl would leave as an unread field.
+// Still hand-written rather than derived: it reads the failure the variant
+// carries, which the derived impl would leave as an unread field — and the
+// writers now log that failure (the stamp's and the collect's own WARN lines).
 impl std::fmt::Debug for WriteOutcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -140,12 +134,10 @@ impl std::fmt::Debug for WriteOutcome {
 /// The completion ticket of one keyed submission (spec #571, decision 7):
 /// callers that need the write's own timing await [`Self::settled`]; a
 /// fire-and-forget caller may drop it — the queue owns the write either way.
-#[allow(dead_code)]
 pub(crate) struct CardWriteTicket {
     rx: oneshot::Receiver<WriteOutcome>,
 }
 
-#[allow(dead_code)]
 impl CardWriteTicket {
     fn pending(rx: oneshot::Receiver<WriteOutcome>) -> Self {
         Self { rx }
@@ -315,7 +307,6 @@ struct State {
     locks: HashMap<String, Arc<tokio::sync::Mutex<()>>>,
     seq: u64,
     /// Allocates the tokens that identify one keyed slot occupancy.
-    #[allow(dead_code)]
     tokens: u64,
 }
 
@@ -499,7 +490,6 @@ impl CardDelivery {
     /// Admit one keyed submission into `message_id`'s queue. Returns the token
     /// of the driver to start when the submission took the in-flight slot;
     /// `None` when it was dropped or parked behind the running write's driver.
-    #[allow(dead_code)]
     fn admit(
         state: &mut State,
         submission: KeyedSubmission<'_>,
@@ -881,7 +871,6 @@ struct KeylessRetry {
 /// How a driver takes the card's delivery lock: a submission's driver waits
 /// for it (the write must land promptly), the drain's retry only tries it (a
 /// card a writer already holds is skipped, never awaited).
-#[allow(dead_code)]
 #[derive(Clone, Copy)]
 enum LockMode {
     Await,

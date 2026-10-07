@@ -34,9 +34,6 @@ pub trait Platform: Send + Sync {
     /// ticket. The default implementation is the unordered fallback: a platform
     /// with no delivery decorator (a test fake, an unwrapped adapter) writes
     /// the payload straight through [`Self::update_message`].
-    // The keyed writers land in ticket #574; the seam itself lands here, so it
-    // is unreachable from the binary until then.
-    #[allow(dead_code)]
     async fn submit_ordered(&self, submission: delivery::KeyedSubmission<'_>) -> delivery::CardWriteTicket {
         let outcome = match self.update_message(submission.message_id, submission.card).await {
             Ok(()) => delivery::WriteOutcome::Delivered,
