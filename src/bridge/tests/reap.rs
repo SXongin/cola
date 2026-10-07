@@ -1268,6 +1268,138 @@ async fn a_settle_during_the_stamp_read_closes_the_generation() {
     );
 }
 
+/// The waiting yield shadows a late stamp (spec #571's amendment 2): park the
+/// stamp's card-view read, let the run yield to its background tasks — the
+/// keyed yield lands 「⏳ 等待后台任务」 — then release the read. The stamp it
+/// releases is dropped by the ending shadow, so 「已重启」 never appears; a
+/// later live read is covered by the shadow too and never re-reads the card.
+#[tokio::test]
+async fn a_waiting_yield_shadows_a_late_stamp() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
+
+    let waiting = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_background_tasks(vec![background_shell(2_100)]);
+    let (app, platform, backend) =
+        restarted_app_with_backend(&session_file, waiting, Some(SessionStatus::Busy)).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+    // Park the stamp's view read: its submission is not made yet.
+    let (entered, release) = platform.pause("card_view", "om_frozen");
+
+    spawn_sync_with_timeout(&app, 5_000);
+    entered.notified().await;
+
+    // The run yields to its background tasks while the stamp's read hangs: the
+    // keyed yield lands ⏳.
+    backend
+        .set_session_status("ses_test", Some(SessionStatus::Idle))
+        .await;
+    wait_for_card_update(&platform, "the ⏳ waiting yield", CardUpdates::Any, |card| {
+        card_header(card).contains("等待后台任务")
+    })
+    .await;
+
+    // The stamp's read returns: it composes and submits at the record's
+    // generation, which the yield shadowed.
+    release.notify_one();
+    wait_for_status_reads(&backend, "ses_test", 5).await;
+
+    let patches = patches_to(&platform, "om_frozen").await;
+    assert_eq!(
+        patches.len(),
+        1,
+        "the ⏳ is the orphan's only write, never a late stamp: {patches:?}"
+    );
+    assert_eq!(card_header(&patches[0]), "⏳ 等待后台任务");
+    assert!(
+        !patches.iter().any(|card| card_header(card).contains("已重启")),
+        "「已重启」 never appears: {patches:?}"
+    );
+    assert!(
+        app.cards_handle().chains.get("ses_test").is_some(),
+        "a waiting orphan keeps its record"
+    );
+
+    // The run is live again: the shadow covers the stamp's re-decision, so the
+    // card is never read for it again.
+    backend
+        .set_session_status("ses_test", Some(SessionStatus::Busy))
+        .await;
+    wait_for_status_reads(&backend, "ses_test", 9).await;
+    assert_eq!(
+        card_views_to(&platform, "om_frozen"),
+        2,
+        "the shadow covers the stamp's re-decision: no further card-view read"
+    );
+    assert_eq!(
+        patches_to(&platform, "om_frozen").await.len(),
+        1,
+        "and no further write"
+    );
+}
+
+/// A typed refusal of the *yield's* preserved shape still ends the wait: the
+/// bare ⏳ lands keyless — today's degradation — and the waiting record is kept
+/// (spec #571's amendment 2 maps the yield's outcomes exactly like the
+/// settle's, minus the generation close).
+#[tokio::test]
+async fn a_rejected_preserved_yield_retries_the_bare_one() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
+
+    let waiting = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_background_tasks(vec![background_shell(2_100)]);
+    let (app, platform, _backend) = restarted_app_with_backend(&session_file, waiting, None).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+    // The preserved attempt is refused as card content (230099): the bare ⏳
+    // must still land.
+    platform
+        .fail_update_card_content_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+
+    spawn_sync(&app);
+    wait_for_card_update(&platform, "the bare ⏳", CardUpdates::Latest, |card| {
+        card_header(card).contains("等待后台任务")
+            && card["body"]["elements"]
+                .as_array()
+                .is_some_and(|elements| elements.is_empty())
+    })
+    .await;
+
+    let patches = patches_to(&platform, "om_frozen").await;
+    assert_eq!(
+        patches.len(),
+        2,
+        "the preserved attempt and its bare retry: {patches:?}"
+    );
+    assert!(
+        card_text(&patches[0]).contains("**正文** 第一段"),
+        "the first attempt kept the body: {}",
+        patches[0]
+    );
+    assert!(
+        patches[1]["body"]["elements"].as_array().unwrap().is_empty(),
+        "the retry is the bare ending: {}",
+        patches[1]
+    );
+    assert!(
+        app.cards_handle().chains.get("ses_test").is_some(),
+        "a waiting yield keeps its record"
+    );
+}
+
 /// The mirror window: a settle the takeover outran is dropped like any stale
 /// submission (spec #571's amendment) — it never lands over the collect that
 /// bumped the chain.
