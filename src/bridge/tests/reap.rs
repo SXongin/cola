@@ -4212,6 +4212,76 @@ async fn a_hung_keyed_write_does_not_block_the_pass() {
     assert_eq!(card_header(&patches[0]), "✅ 完成");
 }
 
+/// A hung card-view read never freezes Session Sync (spec #571 review): a
+/// collect's preserved-ending read is bounded like the #443 stamp's own view
+/// read, so a GET that never returns degrades to the bare collect — the
+/// existing read-failure fallback — and the pass proceeds. (The bounded ticket
+/// await only starts afterwards; this is the read before it.)
+#[tokio::test]
+async fn a_hung_card_view_does_not_block_a_collect() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
+
+    let (app, platform, _backend) =
+        restarted_app_with_backend(&session_file, completed(1_000), Some(SessionStatus::Busy)).await;
+    // The view read's own bound, tiny so the pass cannot hide behind it.
+    app.cards_handle()
+        .preserved_view_timeout_ms
+        .store(50, std::sync::atomic::Ordering::Relaxed);
+    // A successor card owns the session in-process: the pass collects the
+    // recorded orphan before its decision.
+    Turn::seed_card(&app.cards_handle(), "ses_test", Some("om_new")).await;
+    Turn::set_turn_anchor(&app.cards_handle(), "ses_test", &turn_anchor(1_000)).await;
+    // Park the orphan's view read: the collect's composition never returns.
+    let (_entered, _release) = platform.pause("card_view", "om_frozen");
+
+    spawn_sync_with_timeout(&app, 5_000);
+    // The pass proceeds and lands the bare collect within the read bound.
+    wait_for_patches(&platform, "om_frozen", 1).await;
+    let patches = patches_to(&platform, "om_frozen").await;
+    assert_eq!(card_header(&patches[0]), "⏳ 已由新卡片接管 · 已停止更新");
+    assert!(
+        patches[0]["body"]["elements"].as_array().unwrap().is_empty(),
+        "a timed-out view read settles the bare ending: {}",
+        patches[0]
+    );
+}
+
+/// The settle path's view read is bounded too (spec #571 review): a GET that
+/// never returns degrades to the bare ✅ — the existing read-failure fallback —
+/// and the record is spent, instead of freezing the pass.
+#[tokio::test]
+async fn a_hung_card_view_does_not_block_a_settle() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
+
+    let (app, platform, _backend) =
+        restarted_app_with_backend(&session_file, completed(1_000), Some(SessionStatus::Idle)).await;
+    app.cards_handle()
+        .preserved_view_timeout_ms
+        .store(50, std::sync::atomic::Ordering::Relaxed);
+    // Park the ending's view read: the preserved composition never returns.
+    let (_entered, _release) = platform.pause("card_view", "om_frozen");
+
+    spawn_sync_with_timeout(&app, 5_000);
+    wait_for_patches(&platform, "om_frozen", 1).await;
+    let patches = patches_to(&platform, "om_frozen").await;
+    assert_eq!(card_header(&patches[0]), "✅ 完成");
+    assert!(
+        patches[0]["body"]["elements"].as_array().unwrap().is_empty(),
+        "a timed-out view read settles the bare ending: {}",
+        patches[0]
+    );
+    assert!(
+        app.cards_handle().chains.get("ses_test").is_none(),
+        "the bare terminal spends the record"
+    );
+}
+
 /// A Turn tracks its card the moment it becomes live — card id, message id,
 /// the captured anchor and the session's directory — and a terminal drops the
 /// record; a Waiting yield keeps it for the later true end.

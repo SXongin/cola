@@ -830,6 +830,12 @@ pub(crate) struct CardsHandle {
     /// session_id → the lock serializing that session's card writes. Private:
     /// [`CardsHandle::write_lock`] is the accessor.
     write_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    /// How long a **preserved-ending card-view read** is awaited before the
+    /// ending degrades to the bare card (ms, spec #571 review): the read a
+    /// collect or a settle makes to keep the card's body, which the reap pass
+    /// must never await unboundedly. The Session Sync pass's own request bound
+    /// by default; a test may shorten it through the handle.
+    pub(crate) preserved_view_timeout_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl CardsHandle {
@@ -840,6 +846,7 @@ impl CardsHandle {
         feishu: Arc<dyn feishu::Platform>,
         chains: Arc<crate::bridge::chain::ChainRecords>,
         write_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+        preserved_view_timeout_ms: Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
         Self {
             cards,
@@ -848,7 +855,14 @@ impl CardsHandle {
             feishu,
             chains,
             write_locks,
+            preserved_view_timeout_ms,
         }
+    }
+
+    /// The preserved-ending card-view read's bound (ms, spec #571 review).
+    pub(crate) fn preserved_view_timeout_ms(&self) -> u64 {
+        self.preserved_view_timeout_ms
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The lock serializing card writes for `session_id`. Every path that reads

@@ -14,9 +14,12 @@
 //! at the takeover itself ([`collect_orphan`], called by the card paths that
 //! arm over an orphan), so two cards never both look live. Every ending PATCH
 //! keeps the card's already-rendered body best-effort (#434 acceptance
-//! feedback): the reap reads the card's own view, strips the controls a
+//! feedback): the reap reads the card's own view — bounded by the preserved
+//! view's own timeout, so a GET that never returns degrades instead of
+//! freezing the pass (spec #571 review) — strips the controls a
 //! whole-card read cannot preserve and restamps the header over the kept
-//! elements; a failed read degrades to the bare ending. The exception is the
+//! elements; a failed or timed-out read degrades to the bare ending. The
+//! exception is the
 //! **projection** (spec #561): a record carrying a Rendered Cursor projects
 //! the content after the confirmed frontier onto a successor card and
 //! collects the recorded card as taken over. A run that ended while cola was
@@ -179,7 +182,15 @@ async fn collect_orphan_with(cards: &CardsHandle, session_id: &str, card_message
         return;
     }
     let bare = ending_card(CardState::TakenOver, None, None);
-    let card = preserved_ending(cards.feishu.as_ref(), card_message_id, &bare, keep).await;
+    let view_timeout_ms = cards.preserved_view_timeout_ms();
+    let card = preserved_ending(
+        cards.feishu.as_ref(),
+        card_message_id,
+        &bare,
+        keep,
+        view_timeout_ms,
+    )
+    .await;
     let generation = cards.chains.generation(session_id);
     let bound = cards.feishu.keyed_ticket_await();
     let outcome = cards
@@ -1260,7 +1271,15 @@ impl ApplyPass<'_> {
     async fn submit_ending(&self, card: &serde_json::Value, intent: CardWriteIntent) -> bool {
         let platform = self.handles.cards.feishu.as_ref();
         let card_message_id = self.record.card_message_id.as_str();
-        let preserved = preserved_ending(platform, card_message_id, card, KeepBody::Everything).await;
+        let view_timeout_ms = self.handles.cards.preserved_view_timeout_ms();
+        let preserved = preserved_ending(
+            platform,
+            card_message_id,
+            card,
+            KeepBody::Everything,
+            view_timeout_ms,
+        )
+        .await;
         let bound = platform.keyed_ticket_await();
         match platform
             .submit_ordered(KeyedSubmission {
@@ -1473,23 +1492,33 @@ fn ending_card(state: CardState, detail: Option<&str>, move_note: Option<&str>) 
 }
 
 /// The card one preserved ending write PATCHes: `bare` merged under `keep`
-/// over the card's own view, or `bare` alone when the read fails — the ending
-/// must never depend on the read. `keep` is the merge's view-element rule —
-/// [`KeepBody::Everything`] for every ordinary ending and the #443 stamp,
-/// [`KeepBody::WithoutLiveTail`] for the fresh-Turn takeover's collect
-/// (ADR-0068), [`KeepBody::Nothing`] for the late projection's.
+/// over the card's own view, or `bare` alone when the read fails **or outlives
+/// `read_timeout_ms`** — the ending must never depend on the read, and the reap
+/// pass must never await Feishu unboundedly (spec #571 review): a GET that
+/// never returns would otherwise freeze reconciliation. `keep` is the merge's
+/// view-element rule — [`KeepBody::Everything`] for every ordinary ending and
+/// the #443 stamp, [`KeepBody::WithoutLiveTail`] for the fresh-Turn takeover's
+/// collect (ADR-0068), [`KeepBody::Nothing`] for the late projection's.
 async fn preserved_ending(
     platform: &dyn crate::feishu::Platform,
     card_message_id: &str,
     bare: &serde_json::Value,
     keep: KeepBody,
+    read_timeout_ms: u64,
 ) -> serde_json::Value {
-    match platform.get_card_view(card_message_id).await {
-        Ok(view) => restamped_keeping_body_with(bare, &view, keep),
-        Err(e) => {
+    match crate::bridge::bounded_call(
+        "live-card reap card view",
+        read_timeout_ms,
+        platform.get_card_view(card_message_id),
+    )
+    .await
+    {
+        Some(Ok(view)) => restamped_keeping_body_with(bare, &view, keep),
+        Some(Err(e)) => {
             tracing::debug!("live-card reap: card {card_message_id} view unreadable ({e}); settling bare");
             bare.clone()
         }
+        None => bare.clone(),
     }
 }
 
