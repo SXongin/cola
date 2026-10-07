@@ -92,6 +92,15 @@ const MAX_DELIVERED_SEQS: usize = 16;
 /// cancelled update may have landed, and re-sending one is idempotent.
 const DRAIN_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long an entry's order state (a closed generation's floor, an ending
+/// shadow) outranks the cap (spec #571 review). The state only guards
+/// against a **stale stamp submission**: one whose card-view read outlived its
+/// decision. That read is bounded at 30 s and the reap ticks every 8 s, so
+/// nothing can still be composing after this window — generously, an order of
+/// magnitude past the bound — and only then may the cap evict such an entry as
+/// a last resort rather than letting the map grow without bound.
+const ORDER_STATE_PROTECTION: Duration = Duration::from_secs(300);
+
 /// Which logical write a keyed submission is (spec #571). The intent is the
 /// second half of the ordering key: `(generation, intent)` names one logical
 /// write, so a writer's per-tick re-decision collapses to its newest payload
@@ -241,6 +250,9 @@ struct Limits {
     backoff_base: Duration,
     backoff_max: Duration,
     retry_timeout: Duration,
+    /// How long entry order state outranks the cap (spec #571 review);
+    /// injectable so tests can watch the window pass.
+    order_state_protection: Duration,
 }
 
 /// One card's newest write state.
@@ -294,6 +306,17 @@ struct PendingEntry {
     /// so the true end's terminal settle still lands after a yield. Lives with
     /// the entry, like [`Self::floor`].
     ending_gen: Option<u64>,
+    /// When this entry's order state (a floor above the newest generation, or
+    /// an ending shadow) was (re)established; `None` while it carries none.
+    /// The cap may evict such an entry as a last resort once this is older
+    /// than the protection window (spec #571 review): past it, no stale
+    /// submission it guards against can still be composing.
+    order_state_since: Option<tokio::time::Instant>,
+    /// This entry's age, a monotonic stamp from [`State::age`], refreshed by
+    /// every accepted write. The cap evicts the oldest ordinary entry, never
+    /// the newest submission (whose keyed-only entry has no keyless sequence
+    /// to rank by).
+    age: u64,
     /// The newest generation's settled key states (rule (d)).
     keys: KeyStates,
     /// The keyed submission this card's driver is writing, or the one left
@@ -325,6 +348,8 @@ impl PendingEntry {
             generation: 0,
             floor: 0,
             ending_gen: None,
+            order_state_since: None,
+            age: 0,
             keys: KeyStates::new(),
             in_flight: None,
             waiting: None,
@@ -372,14 +397,27 @@ impl PendingEntry {
     }
 
     /// Whether this entry still carries order state a stale writer may need
-    /// (spec #571's amendments), so the cap must not evict it: a closed
-    /// generation (`floor` above the newest seen — a settle ended it), or an
-    /// ending shadow still sitting at the card's floor (a yield landed and
-    /// nothing newer has pushed the floor past it; above that the floor's own
-    /// drop covers every stamp the shadow would). Such an entry holds no
-    /// payload.
+    /// (spec #571's amendments): a closed generation (`floor` above the newest
+    /// seen — a settle ended it), or an ending shadow still sitting at the
+    /// card's floor (a yield landed and nothing newer has pushed the floor
+    /// past it; above that the floor's own drop covers every stamp the shadow
+    /// would). Such an entry holds no payload. It outranks the cap while a
+    /// stale writer could still be composing (see [`Self::order_state_expired`]).
     fn keeps_order_state(&self) -> bool {
         self.floor > self.generation || self.ending_gen == Some(self.floor)
+    }
+
+    /// Whether this entry's order state has outlived the window in which a
+    /// stale writer could still arrive (spec #571 review): the state
+    /// only guards against a submission — a stamp whose card-view read
+    /// outlived its decision — that is composing, and that read is bounded;
+    /// past the window the cap may evict the entry as a last resort instead of
+    /// letting the map grow without bound.
+    fn order_state_expired(&self, protection: Duration, now: tokio::time::Instant) -> bool {
+        self.keeps_order_state()
+            && self
+                .order_state_since
+                .is_some_and(|since| now.saturating_duration_since(since) >= protection)
     }
 }
 
@@ -400,6 +438,10 @@ struct State {
     seq: u64,
     /// Allocates the tokens that identify one keyed slot occupancy.
     tokens: u64,
+    /// The monotonic age stamped onto an entry by every accepted write
+    /// (keyless or keyed): the cap's oldest-first victim order, meaningful for
+    /// keyed-only entries too (which carry no keyless sequence).
+    age: u64,
 }
 
 /// A [`Platform`] decorator that turns a failed `update_message` into a
@@ -437,8 +479,17 @@ impl CardDelivery {
                 backoff_base,
                 backoff_max,
                 retry_timeout: DRAIN_RETRY_TIMEOUT,
+                order_state_protection: ORDER_STATE_PROTECTION,
             },
         }
+    }
+
+    /// [`Self::with_limits`] with a shorter order-state protection window, so
+    /// a test can watch an entry age out of it (spec #571 review).
+    #[cfg(test)]
+    fn with_order_state_protection(mut self, protection: Duration) -> Self {
+        self.limits.order_state_protection = protection;
+        self
     }
 
     /// Whether `message_id` has an undelivered write — the gate the Live Card
@@ -488,6 +539,10 @@ impl CardDelivery {
             return;
         }
         let recoverable = matches!(result, Err(e) if e.is_recoverable_card_write());
+        let age = {
+            state.age += 1;
+            state.age
+        };
         if recoverable {
             // Remember the exact write a failure note will ask about (spec
             // #561, review #569): a newer write may replace the entry before
@@ -505,6 +560,7 @@ impl CardDelivery {
         // delivery must still answer for its own sequence.
         entry.seq = seq;
         entry.attempts = 0;
+        entry.age = age;
         if result.is_ok() {
             Self::remember_delivered(&mut entry.delivered, seq);
         }
@@ -521,7 +577,9 @@ impl CardDelivery {
             entry.card = None;
             entry.next_attempt = tokio::time::Instant::now();
         }
-        self.evict_over_cap(&mut state);
+        // The write just recorded is never this admission's own victim: the
+        // cap evicts another entry, or waits for one to age out.
+        self.evict_over_cap(&mut state, Some(message_id));
         Self::prune_locks(&mut state);
     }
 
@@ -537,33 +595,55 @@ impl CardDelivery {
         }
     }
 
-    /// Keep the state under the cap. Settled tombstones leave first — the cap
-    /// bounds undelivered payloads, and a tombstone only guards against a
-    /// still-in-flight older write. An entry that still carries order state
-    /// (a closed generation, or an ending shadow a stale writer may need) is
-    /// never evicted while another victim exists (spec #571's amendments): it
-    /// holds no payload, so leaving the map above the cap is the smaller cost.
-    /// A pending payload evicted (only when more than the cap are owed) warns;
-    /// a tombstone leaves quietly.
-    fn evict_over_cap(&self, state: &mut State) {
+    /// Keep the state under the cap. A settled tombstone leaves before an
+    /// undelivered payload (the cap bounds undelivered payloads; a tombstone
+    /// only guards against a still-in-flight older write), oldest first by
+    /// entry age. An entry that still carries order state is never chosen
+    /// while another victim exists (spec #571's amendments); once **every**
+    /// entry carries order state, one past its protection window leaves as
+    /// the last resort, oldest state first (spec #571 review) — its
+    /// stale writer can no longer be composing, so the map stays bounded
+    /// under keyed-only traffic too. `protect` is the entry the caller just
+    /// admitted: dropping the very write being recorded is never the cap's
+    /// answer to its own growth. If every other entry is fresh order state
+    /// the map may sit above the cap until one ages out. A pending payload
+    /// evicted (only when more than the cap are owed) warns; a tombstone
+    /// leaves quietly.
+    fn evict_over_cap(&self, state: &mut State, protect: Option<&str>) {
         while state.entries.len() > self.max_pending {
+            let now = tokio::time::Instant::now();
+            let evictable = |message_id: &String| protect != Some(message_id.as_str());
             // A settled, unneeded tombstone is the preferred victim; then any
-            // entry without order state; a closed generation or ending shadow
-            // is never chosen while anything else can be.
-            let victim = state
+            // entry without order state, oldest first.
+            let ordinary = state
                 .entries
                 .iter()
-                .filter(|(_, entry)| !entry.keeps_order_state())
+                .filter(|(message_id, entry)| !entry.keeps_order_state() && evictable(message_id))
                 .min_by_key(|(_, entry)| {
                     let settled =
                         entry.card.is_none() && entry.in_flight.is_none() && entry.waiting.is_none();
-                    (!settled, entry.seq)
+                    (!settled, entry.age)
                 })
                 .map(|(message_id, _)| message_id.clone());
+            // Nothing ordinary is left: an order state past its window is the
+            // last-resort victim, the oldest first. A fresh one stays — the
+            // window it protects is still open.
+            let victim = ordinary.or_else(|| {
+                state
+                    .entries
+                    .iter()
+                    .filter(|(message_id, entry)| {
+                        entry.order_state_expired(self.limits.order_state_protection, now)
+                            && evictable(message_id)
+                    })
+                    .min_by_key(|(_, entry)| entry.order_state_since)
+                    .map(|(message_id, _)| message_id.clone())
+            });
             let Some(victim) = victim else {
-                // Every entry still carries order state (a payload-less
-                // tombstone): dropping one would reopen the window its floor
-                // or shadow exists to close.
+                // Every remaining entry carries order state inside its
+                // protection window (or is the admission itself): dropping one
+                // would reopen the window its floor or shadow exists to close.
+                // It ages into evictability.
                 return;
             };
             let evicted = state.entries.remove(&victim);
@@ -608,6 +688,8 @@ impl CardDelivery {
             .clone();
         state.tokens += 1;
         let token = state.tokens;
+        state.age += 1;
+        let age = state.age;
         let entry = state
             .entries
             .entry(submission.message_id.to_string())
@@ -678,6 +760,14 @@ impl CardDelivery {
                     .map_or(submission.generation, |ending| ending.max(submission.generation)),
             );
         }
+        // An accepted submission refreshes the entry's age — the cap never
+        // picks the newest submission first — and (re)stamps the order
+        // state's clock. Only established state starts the protection window
+        // (spec #571 review): a later submission the state DROPS never
+        // reaches here, so a stream of dropped stamps cannot keep an old
+        // floor alive past its window.
+        entry.age = age;
+        entry.order_state_since = entry.keeps_order_state().then_some(now);
         let write = QueuedWrite::new(token, submission, now);
         // The ticket lives with the queue until the submission settles: a
         // displaced or dropped slot still answers its caller.
@@ -1071,7 +1161,14 @@ impl Platform for CardDelivery {
         let message_id = submission.message_id.to_string();
         let drive = {
             let mut state = self.state.lock().unwrap();
-            Self::admit(&mut state, submission, ticket)
+            let drive = Self::admit(&mut state, submission, ticket);
+            // Keyed-only traffic bounds the map like the keyless observe does
+            // (spec #571 review): every admission runs the cap check, so
+            // a life that only ever settles or collects cards cannot retain
+            // one payload-less entry per card forever.
+            self.evict_over_cap(&mut state, Some(&message_id));
+            Self::prune_locks(&mut state);
+            drive
         };
         if let Some(token) = drive {
             // The write is owned by the queue, not the caller: a driver task
@@ -2417,6 +2514,104 @@ mod tests {
             inner.attempts().len(),
             3,
             "the shadow survived the cap eviction: the late stamp never reached Feishu"
+        );
+    }
+
+    /// The cap bounds KEYED-ONLY traffic too (spec #571 review): a
+    /// process life that only ever admits keyed writes — a collect or an
+    /// ending per card — must not retain one payload-less entry per card
+    /// forever. Every admission runs the same cap check the keyless observe
+    /// runs, so the map stays at the injected cap.
+    #[tokio::test]
+    async fn the_cap_bounds_keyed_only_cards() {
+        let inner = Arc::new(FakePlatform::new());
+        let delivery = CardDelivery::with_limits(inner.clone(), 2, BACKOFF_BASE, BACKOFF_MAX);
+
+        for n in 0..5 {
+            let card = serde_json::json!({ "body": n });
+            let ticket = submit(&delivery, &format!("om_{n}"), 1, CardWriteIntent::Collect, &card).await;
+            assert!(matches!(ticket.settled().await, WriteOutcome::Delivered));
+        }
+
+        let state = delivery.state.lock().unwrap();
+        assert!(
+            state.entries.len() <= 2,
+            "keyed-only admission is bounded by the cap: {:?}",
+            state.entries.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// Order state is protected only while a stale writer could still be
+    /// composing (spec #571 review): inside the protection window
+    /// another victim is preferred, past it the oldest order state is the
+    /// last-resort victim — so the cap keeps the map bounded without ever
+    /// dropping a floor a live late stamp still needs.
+    #[tokio::test(start_paused = true)]
+    async fn the_cap_protects_order_state_only_inside_its_protection_window() {
+        let stamp = serde_json::json!({ "body": "late stamp" });
+        let settle = serde_json::json!({ "body": "ending" });
+
+        // Inside the window: a non-order entry leaves first, so the floor
+        // survives and the late stamp it closes is still dropped.
+        let inner = Arc::new(FakePlatform::new());
+        let delivery = CardDelivery::with_limits(inner.clone(), 2, BACKOFF_BASE, BACKOFF_MAX);
+        let ticket = submit(&delivery, "om_closed", 1, CardWriteIntent::Settle, &settle).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Delivered));
+        let ticket = submit(&delivery, "om_a", 1, CardWriteIntent::Collect, &stamp).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Delivered));
+        let ticket = submit(&delivery, "om_b", 1, CardWriteIntent::Collect, &stamp).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Delivered));
+        assert!(
+            delivery.state.lock().unwrap().entries.contains_key("om_closed"),
+            "a fresh closed generation is never chosen while another victim exists"
+        );
+        let ticket = submit(&delivery, "om_closed", 1, CardWriteIntent::Stamp, &stamp).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Superseded));
+        assert_eq!(
+            inner.attempts().len(),
+            3,
+            "the surviving floor dropped the late stamp: never a Feishu call"
+        );
+
+        // Past the window: with nothing but order-state entries left, the
+        // oldest expired one is the last-resort victim; a fresh one survives.
+        let inner = Arc::new(FakePlatform::new());
+        let delivery = CardDelivery::with_limits(inner.clone(), 2, BACKOFF_BASE, BACKOFF_MAX)
+            .with_order_state_protection(Duration::from_secs(30));
+        let ticket = submit(&delivery, "om_closed_1", 1, CardWriteIntent::Settle, &settle).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Delivered));
+        tokio::time::advance(Duration::from_secs(10)).await;
+        let ticket = submit(&delivery, "om_closed_2", 1, CardWriteIntent::Settle, &settle).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Delivered));
+        tokio::time::advance(Duration::from_secs(25)).await;
+        let ticket = submit(&delivery, "om_closed_3", 1, CardWriteIntent::Settle, &settle).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Delivered));
+
+        {
+            let state = delivery.state.lock().unwrap();
+            assert!(
+                !state.entries.contains_key("om_closed_1"),
+                "the oldest expired order state is evicted: {:?}",
+                state.entries.keys().collect::<Vec<_>>()
+            );
+            assert!(
+                state.entries.contains_key("om_closed_2") && state.entries.contains_key("om_closed_3"),
+                "the fresh floors survive: {:?}",
+                state.entries.keys().collect::<Vec<_>>()
+            );
+        }
+
+        // The evicted floor is forgotten — the late stamp it was protecting
+        // against can no longer be composing (its read is bounded) — while the
+        // fresh floor still drops its own late stamp.
+        let ticket = submit(&delivery, "om_closed_1", 1, CardWriteIntent::Stamp, &stamp).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Delivered));
+        let ticket = submit(&delivery, "om_closed_2", 1, CardWriteIntent::Stamp, &stamp).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Superseded));
+        assert_eq!(
+            inner.attempts().len(),
+            4,
+            "one settle per card and the evicted floor's late stamp: never the protected one"
         );
     }
 
