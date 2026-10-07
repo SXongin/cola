@@ -11,7 +11,10 @@ mod reconcile;
 mod records;
 
 pub(crate) use decision::{FreshDisposition, FreshReads, fresh};
-pub(crate) use reconcile::{AdoptedFollow, collect_orphan, collect_orphan_after_takeover, reconcile};
+pub(crate) use reconcile::{
+    AdoptedFollow, collect_orphan, collect_orphan_after_takeover, collect_orphan_after_takeover_detached,
+    reconcile,
+};
 pub(crate) use records::{
     ChainRecord, ChainRecords, CursorFrontier, CursorPartKind, PendingGap, RenderedCursor,
     cursor_prefix_digest, release_spent,

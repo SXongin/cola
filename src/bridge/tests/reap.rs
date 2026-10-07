@@ -3721,14 +3721,16 @@ async fn a_record_that_lagged_a_handover_collects_the_orphan_and_repoints() {
     );
 }
 
-/// A successor can be attached before its Turn anchor is armed, and the
-/// collect's awaited PATCH is the window where the anchor lands. The pre-split
-/// pass re-read the armed anchor AFTER the collect, so an anchor that appears
-/// while the collect is parked must still re-point the record at the
-/// successor — never be read as absent and release it, which would leave the
-/// live card unreaped after a later restart.
+/// A successor can be attached before its Turn anchor is armed. The pass reads
+/// the armed anchor itself (the card probe) and re-reads it right after the
+/// collect is handed off, so an anchor that lands around the collect must still
+/// re-point the record at the successor — never be read as absent and release
+/// it, which would leave the live card unreaped after a later restart. (The
+/// collect's own pipeline is detached since spec #571's review, so the anchor
+/// is armed before the pass runs rather than while a collect is parked on the
+/// platform.)
 #[tokio::test]
-async fn an_anchor_armed_during_the_collect_still_repoints_the_record() {
+async fn an_anchor_armed_around_the_collect_still_repoints_the_record() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("sessions.json");
@@ -3741,18 +3743,13 @@ async fn an_anchor_armed_during_the_collect_still_repoints_the_record() {
     );
 
     let (app, platform) = restarted_app(&session_file, completed(1_000), None).await;
+    platform.given_card_view("om_old", realistic_card_view());
     // The process's live card: a handover the record missed — attached, but
-    // its anchor is armed only while the collect is in flight.
+    // its Turn anchor is armed only now, after the record was written.
     Turn::seed_card(&app.cards_handle(), "ses_test", Some("om_live")).await;
-    // Park the collect's composition read: the submission (and the anchor
-    // re-read that follows it) are still outstanding.
-    let (entered, release) = platform.pause("card_view", "om_old");
+    Turn::set_turn_anchor(&app.cards_handle(), "ses_test", &turn_anchor(1_000)).await;
 
     spawn_sync_with_timeout(&app, 5_000);
-    entered.notified().await;
-    // The takeover arms its anchor while the collect composes.
-    Turn::set_turn_anchor(&app.cards_handle(), "ses_test", &turn_anchor(1_000)).await;
-    release.notify_one();
 
     // The record follows the successor with its freshly armed anchor — never
     // released as an anchorless one.
@@ -4612,6 +4609,106 @@ async fn a_hung_card_view_does_not_block_a_settle() {
         app.cards_handle().chains.get("ses_test").is_none(),
         "the bare terminal spends the record"
     );
+}
+
+/// The reap pass never awaits the collect's card-view GET either (spec #571
+/// review): with the preserved-card read PARKED (the production bound, never
+/// released while the pass runs), the pass still processes its other records;
+/// once the read returns, the collect lands exactly once.
+#[tokio::test]
+async fn a_hung_collect_card_view_does_not_block_the_pass() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_chain_record(
+        &session_file,
+        "om_old",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
+    );
+    // A second live orphan the reap keeps reading: the pass clock.
+    ChainRecords::load(sidecar(&session_file)).track(
+        "ses_other",
+        "om_other",
+        MessageId::new("msg_cola_other"),
+        Some(2_000),
+        Some("/work"),
+    );
+
+    let (app, platform, backend) =
+        restarted_app_with_backend(&session_file, completed(1_000), Some(SessionStatus::Idle)).await;
+    backend
+        .set_session_status("ses_other", Some(SessionStatus::Busy))
+        .await;
+    // The process's live card: a handover the record missed, so the pass
+    // collects the recorded orphan before its decision.
+    Turn::seed_card(&app.cards_handle(), "ses_test", Some("om_live")).await;
+    platform.given_card_view("om_old", realistic_card_view());
+    // Park the collect's card-view read: the composition is outstanding.
+    let (entered, release) = platform.pause("card_view", "om_old");
+
+    spawn_sync_with_timeout(&app, 5_000);
+    entered.notified().await;
+
+    // The pass proceeds with its other records while the GET is parked — the
+    // 5 s read clock cannot cover a 30 s inline await.
+    wait_for_status_reads(&backend, "ses_other", 3).await;
+
+    // The read returns: the collect lands once, and never a second PATCH.
+    release.notify_one();
+    wait_for_patches(&platform, "om_old", 1).await;
+    let patches = patches_to(&platform, "om_old").await;
+    assert_eq!(patches.len(), 1, "the collect lands exactly once: {patches:?}");
+    assert_eq!(card_header(&patches[0]), "⏳ 已由新卡片接管 · 已停止更新");
+}
+
+/// The settle path's card-view GET is off the pass too (spec #571 review):
+/// with the preserved-card read parked, the pass keeps processing its other
+/// records; once the read returns, the preserved ✅ lands and the record is
+/// spent.
+#[tokio::test]
+async fn a_hung_settle_card_view_does_not_block_the_pass() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
+    ChainRecords::load(sidecar(&session_file)).track(
+        "ses_other",
+        "om_other",
+        MessageId::new("msg_cola_other"),
+        Some(2_000),
+        Some("/work"),
+    );
+
+    let (app, platform, backend) =
+        restarted_app_with_backend(&session_file, completed(1_000), Some(SessionStatus::Idle)).await;
+    backend
+        .set_session_status("ses_other", Some(SessionStatus::Busy))
+        .await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+    // Park the ending's card-view read: the preserved composition is
+    // outstanding.
+    let (entered, release) = platform.pause("card_view", "om_frozen");
+
+    spawn_sync_with_timeout(&app, 5_000);
+    entered.notified().await;
+
+    // The pass proceeds with its other records while the GET is parked.
+    wait_for_status_reads(&backend, "ses_other", 3).await;
+
+    // The read returns: the preserved ✅ lands once and spends the record.
+    release.notify_one();
+    wait_for_patches(&platform, "om_frozen", 1).await;
+    let patches = patches_to(&platform, "om_frozen").await;
+    assert_eq!(patches.len(), 1, "the ending lands exactly once: {patches:?}");
+    assert_eq!(card_header(&patches[0]), "✅ 完成");
+    assert!(
+        card_text(&patches[0]).contains("**正文** 第一段"),
+        "the preserved body lands after the parked read: {}",
+        patches[0]
+    );
+    wait_for_record_gone(&app, "ses_test").await;
 }
 
 /// A Turn tracks its card the moment it becomes live — card id, message id,
