@@ -43,16 +43,18 @@ pub trait Platform: Send + Sync {
     }
 
     /// Whether the keyed queue already **covers** `(generation, intent)` for
-    /// `message_id` (spec #571): the key settled — delivered, so it is on the
-    /// card, or permanently refused, so it is final (#522) — or a write of the
-    /// exact key is already in flight or waiting in the queue. Either way a
-    /// writer's re-decision owes no work, and the card must not be read again
-    /// for it. A recoverable failure's payload is left **owed** with no driver:
-    /// a later re-decision may still replace it (and the drain retries it), so
-    /// that reports `false`. The query only remembers; it never orders or
-    /// claims anything, so consulting it before a read cannot resurrect the
-    /// retired in-flight claim. Default `false` — a platform with no delivery
-    /// decorator remembers nothing.
+    /// `message_id` (spec #571): the generation is closed (a settle ended it),
+    /// a `Stamp` at or below an accepted ending's generation is shadowed (the
+    /// waiting yield / the settle is the card's state), the key settled —
+    /// delivered, so it is on the card, or permanently refused, so it is final
+    /// (#522) — or a write of the exact key is already in flight or waiting in
+    /// the queue. Either way a writer's re-decision owes no work, and the card
+    /// must not be read again for it. A recoverable failure's payload is left
+    /// **owed** with no driver: a later re-decision may still replace it (and
+    /// the drain retries it), so that reports `false`. The query only
+    /// remembers; it never orders or claims anything, so consulting it before
+    /// a read cannot resurrect the retired in-flight claim. Default `false` —
+    /// a platform with no delivery decorator remembers nothing.
     fn keyed_write_covered(
         &self,
         _message_id: &str,
