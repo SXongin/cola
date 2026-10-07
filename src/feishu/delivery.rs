@@ -864,16 +864,7 @@ impl CardDelivery {
             }
             // Bounded like the outbox's retry: a hung PATCH must not hold the
             // card's delivery lock — and so its queue — forever.
-            let result =
-                match tokio::time::timeout(limits.retry_timeout, inner.update_message(&message_id, &payload))
-                    .await
-                {
-                    Ok(result) => result,
-                    Err(_) => Err(BridgeError::Io(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "card update timed out",
-                    ))),
-                };
+            let result = bounded_update(&inner, &message_id, &payload, limits.retry_timeout).await;
             let now = tokio::time::Instant::now();
             let mut state = state.lock().unwrap();
             let Some(entry) = state.entries.get_mut(&message_id) else {
@@ -997,16 +988,7 @@ impl CardDelivery {
         // Bounded: a hung PATCH must not hold the card's delivery lock —
         // and so the Session Sync pass — forever. On expiry the payload
         // stays pending and is retried later.
-        let result =
-            match tokio::time::timeout(DRAIN_RETRY_TIMEOUT, self.inner.update_message(&message_id, &card))
-                .await
-            {
-                Ok(result) => result,
-                Err(_) => Err(BridgeError::Io(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "card update retry timed out",
-                ))),
-            };
+        let result = bounded_update(&self.inner, &message_id, &card, DRAIN_RETRY_TIMEOUT).await;
         let mut state = self.state.lock().unwrap();
         // The entry could still have left the set under cap eviction while
         // the retry was in flight; its outcome belongs to the payload it
@@ -1124,6 +1106,27 @@ fn card_lock(state: &Mutex<State>, message_id: &str) -> Arc<tokio::sync::Mutex<(
         .entry(message_id.to_string())
         .or_default()
         .clone()
+}
+
+/// One retry's card PATCH, bounded: the client has no default timeout, and a
+/// hung PATCH must not hold the card's delivery lock — and so the card's queue
+/// and the Session Sync pass — forever. On expiry the write reports the one
+/// recoverable transport failure ([`BridgeError::Io`] / `TimedOut`) both retry
+/// paths answer with: the payload stays pending and is retried later — a
+/// cancelled update may have landed, and re-sending one is idempotent.
+async fn bounded_update(
+    platform: &Arc<dyn Platform>,
+    message_id: &str,
+    card: &Value,
+    timeout: Duration,
+) -> Result<()> {
+    match tokio::time::timeout(timeout, platform.update_message(message_id, card)).await {
+        Ok(result) => result,
+        Err(_) => Err(BridgeError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "card update timed out",
+        ))),
+    }
 }
 
 #[async_trait]
@@ -2707,6 +2710,37 @@ mod tests {
         assert!(
             !inner.keyed_write_covered("om_2", 3, CardWriteIntent::Stamp),
             "an unwrapped platform remembers no covered key"
+        );
+    }
+
+    /// A hung keyed write gives up at the same bound the keyless retry uses
+    /// (spec #571 review's shared helper): the submission reports the
+    /// recoverable timeout instead of hanging its caller, the payload stays
+    /// owed, and the next drain lands it.
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_keyed_write_times_out_and_stays_owed() {
+        let inner = Arc::new(FakePlatform::new());
+        let delivery = CardDelivery::new(inner.clone());
+        let card = serde_json::json!({ "body": "collect" });
+
+        let (entered, _never_released) = inner.park_next();
+        let ticket = submit(&delivery, "om_1", 1, CardWriteIntent::Collect, &card).await;
+        entered.notified().await;
+
+        // The paused clock elapses the retry bound; the driver must settle the
+        // ticket with the recoverable timeout, not hang.
+        let outcome = tokio::time::timeout(Duration::from_secs(120), ticket.settled())
+            .await
+            .expect("the hung keyed write must time out, not hang its caller");
+        assert!(matches!(outcome, WriteOutcome::Failed(_)));
+
+        // The payload is still owed: a forced drain retries it, and the
+        // second attempt lands.
+        delivery.drain_pending_card_updates(true).await;
+        assert_eq!(
+            inner.attempts(),
+            vec![("om_1".to_string(), card.clone()), ("om_1".to_string(), card)],
+            "the owed keyed write was retried with its own payload"
         );
     }
 
