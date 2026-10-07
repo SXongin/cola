@@ -393,6 +393,7 @@ impl Turn {
         // on a missing id, and the first flush after the id lands serves it.
         let started_at = std::time::Instant::now();
         let mut acc = StreamAccumulator::new(&subtitle);
+        Self::seed_wake_floor(&handles.cards, &session_id, &mut acc);
         // The advisory-live opening line (ADR-0062): pushed BEFORE any part can
         // render, so it heads the card's timeline and every later flush keeps
         // it — the card that owns this message says the message merged into a
@@ -2403,6 +2404,16 @@ impl Turn {
             .and_then(|c| c.acc.reply_to_message_id.clone())
     }
 
+    /// Seed `acc`'s Wake floor from the chain's durable Wake Watermark (spec
+    /// #561, review #569; ADR-0061): every Wake at or below the mark was
+    /// announced by an earlier card — the mark outlives the record it was
+    /// announced on — so this card's render neither re-inserts its completion
+    /// entry nor stages a watermark advance for it. A strictly newer Wake still
+    /// renders and announces.
+    fn seed_wake_floor(cards: &CardsHandle, session_id: &str, acc: &mut state::StreamAccumulator) {
+        acc.wake_floor = cards.chains.announced(session_id).map(|mark| mark.created_ms);
+    }
+
     /// The turn anchor of the session's armed renderer, if one is armed: the
     /// renderer identity both external arming paths compare their own turn's
     /// anchor against. The full anchor is the identity — message id together
@@ -3069,6 +3080,7 @@ impl Turn {
             return None;
         }
         let mut acc = StreamAccumulator::new(title);
+        Self::seed_wake_floor(cards, session_id, &mut acc);
         acc.turn_anchor = Some(anchor.clone());
         acc.session_id = Some(session_id.to_string());
         // The chain's reply target: the original Turn's user message, so the
@@ -3154,6 +3166,7 @@ impl Turn {
         anchor_text: Option<&str>,
     ) {
         let mut acc = state::StreamAccumulator::new(subtitle);
+        Self::seed_wake_floor(cards, session_id, &mut acc);
         // The external message's anchor — identity plus server time — is the
         // turn's anchor: header date, turn filter and renderer replacement
         // guard all read it, and cola's clock is never part of the card
@@ -3496,6 +3509,7 @@ impl Turn {
             return None;
         }
         let mut acc = StreamAccumulator::new(facts.subtitle);
+        Self::seed_wake_floor(cards, session_id, &mut acc);
         acc.turn_anchor = Some(anchor.clone());
         acc.session_id = Some(session_id.to_string());
         acc.reply_to_message_id = facts.reply_to.map(str::to_string);

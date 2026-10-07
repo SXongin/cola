@@ -1247,6 +1247,14 @@ pub(super) struct StreamAccumulator {
     /// at the base the seed continues from, so no confirmed write advances the
     /// record past the gap.
     pub(super) pending_orphan_seed: Option<PendingOrphanSeed>,
+    /// The chain's durable Wake Watermark as a floor (spec #561, review #569):
+    /// every Wake at or below this `created_ms` was announced by an earlier
+    /// card, so this accumulator's render neither re-inserts its completion
+    /// entry nor stages a watermark advance for it. Seeded when a card starts
+    /// rendering a session (`Turn`'s start, the projection/external arms, the
+    /// Wake continuation); a strictly newer Wake still announces. `None` when
+    /// the session announced no Wake.
+    pub(super) wake_floor: Option<i64>,
     /// The Rendered Cursors of the card bodies built and not yet confirmed,
     /// newest last (spec #561, review #569): the flush stages one before each
     /// write and a confirmed write drains its exact stage — while a stage whose

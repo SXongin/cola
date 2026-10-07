@@ -2772,6 +2772,149 @@ async fn a_record_without_a_directory_is_never_decided() {
     );
 }
 
+/// The Wake completion entries a card carries: ledger panels whose title
+/// opens with the entry's 🔔 marker, counted for exactly-once assertions.
+fn wake_entry_count(card: &serde_json::Value) -> usize {
+    fn walk(value: &serde_json::Value, count: &mut usize) {
+        match value {
+            serde_json::Value::Object(map) => {
+                let is_entry = map.get("tag").and_then(|tag| tag.as_str()) == Some("collapsible_panel")
+                    && map
+                        .get("header")
+                        .and_then(|header| header.get("title"))
+                        .and_then(|title| title.get("content"))
+                        .and_then(|content| content.as_str())
+                        .is_some_and(|title| title.starts_with('🔔'));
+                if is_entry {
+                    *count += 1;
+                }
+                for nested in map.values() {
+                    walk(nested, count);
+                }
+            }
+            serde_json::Value::Array(items) => items.iter().for_each(|nested| walk(nested, count)),
+            _ => {}
+        }
+    }
+    let mut count = 0;
+    walk(card, &mut count);
+    count
+}
+
+/// A Wake the durable Watermark already covers is never re-announced by a
+/// projection (spec #561, review #569; ADR-0061): the restart's fresh
+/// accumulator seeds the Wake floor from the mark, so the successor re-renders
+/// the resumed work but inserts no duplicate completion entry.
+#[tokio::test]
+async fn a_projection_never_re_announces_a_wake_the_watermark_covers() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let delivered = "已经交给后台了。";
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
+        Some(text_frontier(delivered)),
+        &[],
+    );
+    let mid = "停机期间续写的一段。";
+    let resumed = "CI 通过了。";
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, delivered),
+        assistant(2_500, mid),
+        assistant(3_100, resumed),
+    ])
+    .with_executions(vec![execution(2_600), execution(4_000)])
+    .with_wakes(vec![shell_wake(2_900)]);
+    // An earlier card already announced this Wake: the durable mark covers it.
+    crate::bridge::chain::ChainRecords::load(session_file.with_file_name("chain_records.json")).advance(
+        "ses_test",
+        "msg_wake_2900",
+        2_900,
+    );
+    let (app, platform, _backend) =
+        restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Idle)).await;
+    platform.given_card_view("om_frozen", live_tail_orphan_view());
+
+    spawn_sync(&app);
+    let (successor, successor_text) = wait_for_projection(&platform, "msg_cola_anchor").await;
+
+    assert!(
+        successor_text.contains(resumed),
+        "the resumed work still renders: {successor}"
+    );
+    assert_eq!(
+        wake_entry_count(&successor),
+        0,
+        "a Wake the durable Watermark covers is never re-announced: {successor}"
+    );
+    assert_eq!(
+        app.cards_handle()
+            .chains
+            .announced("ses_test")
+            .map(|mark| mark.created_ms),
+        Some(2_900),
+        "no new announcement is staged for a covered Wake"
+    );
+}
+
+/// A Wake strictly NEWER than the durable Watermark still announces (spec
+/// #561, review #569; ADR-0061): the floor covers only what an earlier card
+/// already showed, and the older Wake below it is suppressed.
+#[tokio::test]
+async fn a_projection_announces_a_wake_newer_than_the_watermark() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let delivered = "已经交给后台了。";
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
+        Some(text_frontier(delivered)),
+        &[],
+    );
+    let mid = "停机期间续写的一段。";
+    let resumed = "CI 通过了。";
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, delivered),
+        assistant(2_500, mid),
+        assistant(3_100, resumed),
+    ])
+    .with_executions(vec![execution(2_600), execution(3_400), execution(4_200)])
+    .with_wakes(vec![shell_wake(2_900), shell_wake(3_600)]);
+    // The durable mark already announced the older Wake.
+    crate::bridge::chain::ChainRecords::load(session_file.with_file_name("chain_records.json")).advance(
+        "ses_test",
+        "msg_wake_2900",
+        2_900,
+    );
+    let (app, platform, _backend) =
+        restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Idle)).await;
+    platform.given_card_view("om_frozen", live_tail_orphan_view());
+
+    spawn_sync(&app);
+    let (successor, successor_text) = wait_for_projection(&platform, "msg_cola_anchor").await;
+
+    assert_eq!(
+        wake_entry_count(&successor),
+        1,
+        "only the strictly newer Wake announces: {successor}"
+    );
+    assert!(
+        successor_text.contains(resumed),
+        "the resumed work lands: {successor}"
+    );
+    wait_for_announced(&app, "ses_test", 3_600).await;
+}
+
 /// A record-carrying chain's Wake goes through the projection (spec #561,
 /// ticket #566): the durable record hands the Wake to the projection, which
 /// renders everything after the confirmed cursor — the content produced while
