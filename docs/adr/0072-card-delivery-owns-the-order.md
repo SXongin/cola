@@ -56,11 +56,14 @@ drops stale intents, collapses duplicates and retries failures.
   submission order, one in flight and one waiting; a newer submission replaces
   the waiting slot, so the queue holds at most two and a submission displaced
   before its write settles its caller as `Superseded` instead of hanging. A
-  duplicate `(generation, intent)` collapses to the newest payload: a
+  duplicate `(generation, intent)` collapses to one write: a
   **delivered** key answers every later re-submission `Delivered` without a
-  second write (per-tick re-decisions are free), and a **permanently refused**
-  key answers every later re-submission `Superseded` without a call. The newest
-  generation's delivered/refused key states are remembered per card; a newer
+  second write (per-tick re-decisions are free), a **permanently refused**
+  key answers every later re-submission `Superseded` without a call, and a
+  same-key submission already waiting behind the key's in-flight write is
+  dropped (`Superseded`) the moment that write lands — one key, one PATCH
+  (spec #571 review). The newest generation's delivered/refused key states are
+  remembered per card; a newer
   generation forgets the older generation's — every older submission is
   dropped by the floor anyway. The queue also answers a read-only coverage
   query (`keyed_write_covered`): a writer that re-decides every tick asks
@@ -168,9 +171,10 @@ claim had indirectly gated:
 card-view read is invisible to the coverage query, so during a hung read each
 tick may spawn another attempt — up to ~4 concurrent card-view GETs before the
 first submission. The PATCH count stays one (the first submission takes the
-key and the rest are dropped), and the churn is bounded and one-shot;
-resurrecting attempt-lifecycle state (the retired claim's fragment) for it was
-rejected.
+key, and every same-key attempt that arrives meanwhile collapses into it
+without a Feishu call — spec #571 review), and the churn is bounded and
+one-shot; resurrecting attempt-lifecycle state (the retired claim's fragment)
+for it was rejected.
 
 ## Considered options
 
