@@ -195,7 +195,10 @@ projects the chain's delta after it onto a successor card.**
   process that dies between the create landing and the takeover's re-point
   leaves it behind; the next life treats the create as ambiguous and never
   re-posts, and the old card takes the state-repair path. The intent is
-  consumed by the takeover's re-point (a fresh record carries none) and cleared
+  consumed by the takeover's re-point (a fresh record carries none; a fresh
+  Turn's takeover CARRIES it, like the cursor and the gap, and the projection's
+  lost-race late-card collect clears it on the winning chain, so an unresolved
+  mark is never erased — and never outlives the create it covered) and cleared
   on a definite non-delivery, so a retry stays safe and a later life may resume
   a chain stopped by a definite slice failure from the last tracked slice. A
   **definite** non-delivery is not single-shot: a card-content rejection or an
@@ -275,11 +278,16 @@ projects the chain's delta after it onto a successor card.**
   Turn's own confirmed writes. One frontier cannot express "gap undelivered,
   later content delivered", so the gap is a fact of its own rather than a pin
   at the gap's frontier (review #569). A takeover that seeds from a cursor
-  records the gap durably whether or not its read can place the cursor (review
-  #569, round 24): the old card is collected right there, so a crash before the
+  records the gap durably whether or not its read can place the cursor — in the
+  SAME write that re-points the record, before that read even starts (review
+  #569, round 27): the old card is collected right there, so a crash before the
   new Turn's first confirmed write would leave the record with the old cursor
   and the new Turn's anchor — a recovery that cannot see the orphaned Turn's
-  window and would omit its tail. The in-process render (the resolved seed's
+  window and would omit its tail (and, with the new message never submitted,
+  would settle Unreceived and release the record instead). An Unreceived
+  ending on a record that still owes a gap therefore claims nothing either
+  (review #569, round 27): only a later Turn's takeover, which carries the
+  gap, lands the tail. The in-process render (the resolved seed's
   scope walk, which tags its entries as gap content and marks the accumulator)
   never clears it: only a confirmed write covering the gap's END does, so an
   unconfirmed render is simply re-rendered by recovery. Rendering it is a walk

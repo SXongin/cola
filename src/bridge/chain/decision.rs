@@ -401,8 +401,18 @@ pub(crate) fn reconcile(record: &ChainRecord, reads: &RecoveryReads<'_>) -> Chai
                             // Unreceived is its own terminal (ADR-0062): the
                             // submitted message never landed, so no anchor
                             // exists to continue onto.
+                            // An Unreceived ending whose record still OWES an
+                            // orphan gap claims nothing (spec #561, review
+                            // #569): the gap's tail is the only record of the
+                            // run that never landed, and settling would
+                            // release it — a later Turn's takeover still owes
+                            // it.
                             if matches!(settle, TurnSettle::Unreceived) {
-                                return ChainDisposition::Settle(settle);
+                                return if record.pending_gap.is_some() {
+                                    ChainDisposition::Keep
+                                } else {
+                                    ChainDisposition::Settle(settle)
+                                };
                             }
                             let Some(cursor) = record.cursor.as_ref() else {
                                 return ChainDisposition::Settle(settle);
@@ -996,6 +1006,38 @@ mod tests {
         assert_eq!(
             reconcile(&yielded, &idle_transcript(waiting)),
             ChainDisposition::Keep
+        );
+    }
+
+    /// An Unreceived ending on a record that still owes an orphan gap claims
+    /// nothing (spec #561, review #569): settling would release the only
+    /// record of the tail a later Turn's takeover still lands. Without a gap
+    /// it stays its own terminal.
+    #[test]
+    fn an_unreceived_ending_keeps_a_record_that_owes_a_gap() {
+        // The read never carries the submitted message.
+        let transcript = SessionTranscript::new(vec![user("msg_cola_prev", 500, "上一条")]);
+        let anchorless = ChainRecord::new("om_card", MessageId::new("msg_cola_anchor"), None)
+            .with_directory(Some("/work".into()));
+        assert_eq!(
+            reconcile(&anchorless, &idle_transcript(transcript.clone())),
+            ChainDisposition::Settle(TurnSettle::Unreceived)
+        );
+        let owing = ChainRecord {
+            pending_gap: Some(PendingGap {
+                cursor: RenderedCursor::default(),
+                anchor: TurnAnchor {
+                    message_id: MessageId::new("msg_cola_prev"),
+                    created_ms: 500,
+                },
+                bound: Some(MessageId::new("msg_cola_anchor")),
+            }),
+            ..anchorless
+        };
+        assert_eq!(
+            reconcile(&owing, &idle_transcript(transcript)),
+            ChainDisposition::Keep,
+            "an owed gap is never released by an Unreceived ending"
         );
     }
 

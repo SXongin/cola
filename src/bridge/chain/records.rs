@@ -444,10 +444,74 @@ impl ChainRecords {
             // projection's own re-point confirms its coverage separately —
             // consuming the fact when the body reached the gap's end.
             record.pending_gap = previous.pending_gap.clone();
+            // So is the projection's write-ahead intent (spec #561, review
+            // #569): a create it marked may have landed with its takeover lost
+            // to this re-point, and a chain that drops the mark would let a
+            // later restart post that tail a second time. The projection's own
+            // take-over consumes it (a fresh record without the mark, or an
+            // explicit clear on the loser's late-card collect).
+            record.projection_intent = previous.projection_intent;
         }
         state.records.insert(session_id.to_string(), record);
         self.write(&state);
         previous
+    }
+
+    /// A fresh Turn's TAKEOVER (spec #561, review #569): re-point the record
+    /// onto the new card AND record the owed orphan gap in ONE write — the
+    /// facts are known here, before any transcript read: the previous record's
+    /// cursor and anchor are the orphaned Turn's frontier and window, and the
+    /// new Turn's message is the window's bound. Nothing may depend on the
+    /// later read to become owed: a crash while that read is pending would
+    /// otherwise leave a record that settles Unreceived and releases the
+    /// orphan's undelivered tail. The previous cursor carries, the previous
+    /// gap wins when there is one (its cursor may have advanced past the
+    /// derived frontier), and an unresolved write-ahead intent carries too.
+    pub(crate) fn track_takeover(
+        &self,
+        session_id: &str,
+        card_message_id: impl Into<String>,
+        message_id: MessageId,
+        created_ms: Option<i64>,
+        directory: Option<&str>,
+    ) -> Option<ChainRecord> {
+        let mut state = self.lock();
+        let previous = state.records.get(session_id).cloned();
+        let mut record = ChainRecord::new(card_message_id, message_id.clone(), created_ms)
+            .with_directory(directory.map(str::to_string));
+        if let Some(previous) = &previous {
+            record.cursor = previous.cursor.clone();
+            record.pending_gap = previous.pending_gap.clone().or_else(|| {
+                Some(PendingGap {
+                    cursor: previous.cursor.clone()?,
+                    anchor: previous.anchor()?,
+                    bound: Some(message_id.clone()),
+                })
+            });
+            record.projection_intent = previous.projection_intent;
+        }
+        state.records.insert(session_id.to_string(), record);
+        self.write(&state);
+        previous
+    }
+
+    /// Consume the write-ahead intent whatever card the session's record now
+    /// names (spec #561, review #569): a projection that LOST its create
+    /// window to a fresh Turn collects its late card here, and the winning
+    /// chain — which carried the unresolved intent through its own takeover —
+    /// must not keep it, or a later restart could project the late card's tail
+    /// again.
+    pub(crate) fn clear_projection_intent_any(&self, session_id: &str) -> bool {
+        let mut state = self.lock();
+        let Some(card) = state.records.get_mut(session_id) else {
+            return false;
+        };
+        if !card.projection_intent {
+            return false;
+        }
+        card.projection_intent = false;
+        self.write(&state);
+        true
     }
 
     /// Re-point the session's record AND set its Rendered Cursor in ONE chains
@@ -1098,15 +1162,31 @@ mod tests {
             "the clear persists"
         );
 
-        // A re-point rewrites the record: no stale intent rides along.
+        // A re-point CARRIES the unresolved intent (spec #561, review #569):
+        // the create it marked may have landed, and a takeover that erased the
+        // mark would let a later restart post that tail again.
         assert!(chains.note_projection_intent("ses_a", "om_old"));
         chains.track("ses_a", "om_new", MessageId::new("msg_cola_1"), Some(1_000), None);
         assert!(
-            !ChainRecords::load(path)
+            ChainRecords::load(path.clone())
                 .get("ses_a")
                 .expect("the re-pointed record")
                 .projection_intent,
-            "a re-pointed record carries no stale intent"
+            "a re-point carries the unresolved intent"
+        );
+        // The landed create's late-card collect consumes it on the winning
+        // chain, whatever card that chain now names.
+        assert!(chains.clear_projection_intent_any("ses_a"));
+        assert!(
+            !ChainRecords::load(path)
+                .get("ses_a")
+                .expect("the record")
+                .projection_intent,
+            "the consumed intent stays consumed"
+        );
+        assert!(
+            !chains.clear_projection_intent_any("ses_a"),
+            "consuming an absent intent writes nothing"
         );
     }
 

@@ -1583,13 +1583,27 @@ impl Turn {
             .map(str::to_string)
             .filter(|directory| !directory.is_empty())
             .or(context_directory);
-        let previous = cards.chains.track(
-            session_id,
-            card_message_id,
-            message_id,
-            created_ms,
-            directory.as_deref(),
-        );
+        // A TAKEOVER (a different recorded predecessor is being replaced)
+        // records the owed orphan gap in the same write that re-points the
+        // record (spec #561, review #569): a crash before the takeover's read
+        // returns must not lose the orphaned tail. A continuation tracks
+        // plainly — its chain is the same one, still rendering.
+        let previous = match collect {
+            PredecessorCollect::Never => cards.chains.track(
+                session_id,
+                card_message_id,
+                message_id,
+                created_ms,
+                directory.as_deref(),
+            ),
+            _ => cards.chains.track_takeover(
+                session_id,
+                card_message_id,
+                message_id,
+                created_ms,
+                directory.as_deref(),
+            ),
+        };
         // A re-point within the chain carries the Rendered Cursor (spec #561).
         // Seed a fresh accumulator's empty base with the carried fact — a new
         // Turn's or a takeover's card must not clear the chain's frontier —
@@ -3943,6 +3957,13 @@ impl Turn {
                 directory.as_deref(),
             ),
         };
+        // The projection's take-over CONSUMES the write-ahead intent (spec
+        // #561, review #569): the create the mark covered has landed — this
+        // re-point is its confirmation — so no later life may treat it as
+        // ambiguous. `track_carrying_cursor` builds a fresh record without the
+        // mark (a no-op clear); the plain re-point branch must clear it, and
+        // the clear is skipped when there is nothing to clear.
+        cards.chains.clear_projection_intent(session_id, card_message_id);
         // A re-point within the chain carries the Rendered Cursor (spec #561):
         // seed the accumulator's empty base with the carried fact, so the
         // successor's first body does not clear the chain's frontier.

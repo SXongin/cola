@@ -783,6 +783,13 @@ async fn send_projected_successor(
         // message-first seed already re-rendered the same tail, so preserving
         // it would show the reader the text twice (review #569).
         collect_late_projection(&handles.cards, session_id, &new_card_id).await;
+        // The create this pass marked has landed, and its card is collected
+        // here: the write-ahead intent is CONSUMED (spec #561, review #569).
+        // The winning Turn's chain carried the unresolved mark through its own
+        // takeover; leaving it would only be safe, but a later restart must
+        // never treat this landed create as ambiguous and project again — nor
+        // need it to.
+        handles.cards.chains.clear_projection_intent_any(session_id);
         tracing::info!(
             "live-card reap: session {session_id} lost the create window to a fresh Turn; its late card is collected"
         );
