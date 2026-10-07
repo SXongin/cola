@@ -2814,12 +2814,16 @@ async fn a_failed_stamp_patch_retries_until_it_lands() {
         restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Busy)).await;
     platform.given_card_view("om_frozen", realistic_card_view());
     // The first stamp PATCH fails recoverably (transport class): the write may
-    // not have landed, so the queue keeps it owed and the next tick retries.
+    // not have landed, so the queue keeps it owed with its backoff. The reap's
+    // per-tick re-decisions inherit that schedule (spec #571 review), so the
+    // retry is the drain's — forced here, as the WS reconnect path does.
     platform
         .fail_update_transport_count
         .store(1, std::sync::atomic::Ordering::SeqCst);
 
     spawn_sync(&app);
+    wait_for_update_attempts(&platform, "om_frozen", 1).await;
+    app.core.feishu.drain_pending_card_updates(true).await;
     wait_for_card_update(&platform, "the retried restart stamp", CardUpdates::Any, |card| {
         card_header(card).contains("已重启，等待运行结束")
     })
