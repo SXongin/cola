@@ -25,6 +25,26 @@ pub trait Platform: Send + Sync {
 
     async fn update_message(&self, message_id: &str, card: &Value) -> Result<()>;
 
+    /// Submit a **keyed submission** for ordered delivery (spec #571): an
+    /// already-composed payload carrying the **chain generation** its writer
+    /// decided under and the intent naming the logical write. The delivery
+    /// decorator serializes it against the card's other writers — dropping a
+    /// stale generation, collapsing a settled `(generation, intent)`, keeping a
+    /// recoverable failure owed — and returns the submission's completion
+    /// ticket. The default implementation is the unordered fallback: a platform
+    /// with no delivery decorator (a test fake, an unwrapped adapter) writes
+    /// the payload straight through [`Self::update_message`].
+    // The keyed writers land in ticket #574; the seam itself lands here, so it
+    // is unreachable from the binary until then.
+    #[allow(dead_code)]
+    async fn submit_ordered(&self, submission: delivery::KeyedSubmission<'_>) -> delivery::CardWriteTicket {
+        let outcome = match self.update_message(submission.message_id, submission.card).await {
+            Ok(()) => delivery::WriteOutcome::Delivered,
+            Err(e) => delivery::WriteOutcome::Failed(e),
+        };
+        delivery::CardWriteTicket::settled_now(outcome)
+    }
+
     async fn reply_text(&self, message_id: &str, text: &str) -> Result<String>;
 
     /// Reply to a message in thread form (`reply_in_thread: true`) with an
