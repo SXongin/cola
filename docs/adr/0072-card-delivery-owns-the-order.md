@@ -134,18 +134,26 @@ drops stale intents, collapses duplicates and retries failures.
   itself. A submission's write is owned by a spawned driver task, not by the
   submitting task, so cancelling a submitter cannot strand an admitted
   payload. The stamp's view read and composition still run on a small
-  pre-submission task that the Session Sync pass never awaits; the drain
-  retries a card another writer holds with a try-lock (skipped, never
-  awaited), and a queued attempt is bounded by the retry timeout, so a hung
-  Feishu call leaves the payload owed for a later retry instead of freezing
-  convergence. The driver's own wait for the card lock is bounded by the same
-  timeout (spec #571 review): a lock another writer holds past it reports the
-  recoverable timeout, settles the submission's ticket so an awaiting caller
-  unblocks, and leaves the submission owed — the drain's try-lock retries it
-  once the lock frees. Callers that need the write's own timing (a collect
-  releasing its cached card on delivery, warning on failure; the ending's
-  confirmation) await the submission's completion ticket, exactly the timing
-  the PATCH's own await had.
+  pre-submission task that the Session Sync pass never awaits.
+  **An issued keyed write is never cancelled** (spec #571 review): a timed-out
+  PATCH could still commit at Feishu and land over a newer generation, the very
+  hazard the ordering exists to remove (ADR-0063's rule), so the driver awaits
+  the platform call to completion and a hung write holds its card's delivery
+  lock until it resolves. The drain re-arms a driver with a try-lock (a card
+  another writer holds is skipped, never awaited) and **spawns** it instead of
+  awaiting it, so the Session Sync pass never waits on a keyed write. What is
+  bounded is the **waiting**, not the write: the driver's acquisition of the
+  card lock issues no request, so its expiry reports the recoverable timeout,
+  settles the submission's ticket and leaves the payload owed for the drain's
+  next try; and every caller that needs the write's own timing — the collect
+  releasing its cached card on delivery and warning on failure, the ending's
+  confirmation, the stamp's pre-submission task — awaits the completion ticket
+  with `KEYED_TICKET_AWAIT`, after which it proceeds without a verdict (the
+  queue still owns the write, which may yet land). A collect that gives up on
+  an indeterminate ticket releases its cache anyway: the release exists so a
+  re-host cannot resurrect the collected presentation, and a collect that lands
+  later would do exactly that. The keyless Pending Card Update retry keeps its
+  own pre-existing bound (`DRAIN_RETRY_TIMEOUT`), outside this contract.
 
 **The two amendments (2026-10-07).** The vocabulary gained the endings while
 ticket #575 retired the claim, because each retirement exposed a window the

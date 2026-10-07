@@ -61,11 +61,21 @@
 //! it while Session Sync's submission stays fire-and-forget. The write itself
 //! is owned by the queue — a spawned driver task takes the card's delivery
 //! lock and settles the state — not by the submitting task, so cancelling a
-//! submitter cannot strand the payload it already submitted. Every wait a
-//! driver makes is bounded: the card-lock wait and the Feishu call both expire
-//! into the same recoverable outcome, so a ticket always settles and no caller
-//! — the reap's collect included — inherits another writer's hang (spec #571
-//! review).
+//! submitter cannot strand the payload it already submitted.
+//!
+//! An **issued keyed write is never cancelled** (spec #571 review): a timed-out
+//! PATCH could still commit at Feishu and land over a newer generation, the
+//! very hazard the ordering exists to remove (ADR-0063's rule). A hung write
+//! therefore holds its card's delivery lock until it resolves, and the drain
+//! **spawns** the driver it re-arms rather than awaiting it, so neither the
+//! card's queue nor the Session Sync pass ever waits on it. What is bounded is
+//! the **waiting**: the driver's acquisition of the card lock (a wait that
+//! issues no request — [`LOCK_WAIT`]) and every caller's ticket await
+//! ([`KEYED_TICKET_AWAIT`], via [`CardWriteTicket::settled_within`]), after
+//! which the caller proceeds without a verdict while the queue still owns the
+//! write and may land it. The keyless Pending Card Update retry keeps its own
+//! pre-existing bound ([`DRAIN_RETRY_TIMEOUT`]), outside the keyed ordering
+//! contract.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -94,12 +104,32 @@ const BACKOFF_MAX: Duration = Duration::from_secs(300);
 /// cursor confirmation — a handful — while the memory stays bounded.
 const MAX_DELIVERED_SEQS: usize = 16;
 
-/// One retry's own bound. The client has no default timeout, and the drain is
-/// a background convergence path: a hung PATCH must not hold the card's
-/// delivery lock (blocking new writes), the Session Sync pass, or all future
-/// drains. On expiry the payload stays pending and is retried later — a
-/// cancelled update may have landed, and re-sending one is idempotent.
+/// One keyless retry's own bound. The client has no default timeout, and the
+/// drain is a background convergence path: a hung PATCH must not hold the
+/// card's delivery lock (blocking new writes), the Session Sync pass, or all
+/// future drains. On expiry the payload stays pending and is retried later — a
+/// cancelled update may have landed, and re-sending one is idempotent. This
+/// bound belongs to the **keyless** Pending Card Update retry alone, pre-
+/// existing behavior outside the keyed ordering contract (spec #571 review):
+/// an issued **keyed** write is never cancelled.
 const DRAIN_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a submission's driver waits for the card's delivery lock before
+/// reporting the recoverable timeout and leaving the payload owed (spec #571
+/// review). No request is issued during this wait, so nothing is cancelled;
+/// the drain re-arms a driver once the lock is free. The keyed write itself is
+/// never bounded.
+const LOCK_WAIT: Duration = Duration::from_secs(30);
+
+/// How long a writer awaits an issued keyed submission's completion ticket
+/// before proceeding without a verdict (spec #571 review). An issued keyed
+/// write is never cancelled — a cancelled PATCH could still commit at Feishu
+/// and land over a newer generation — so a slow or hung one can outlive its
+/// caller; the caller bounds its own wait and then proceeds, leaving the write
+/// owned by the queue, which may still land it. The Session Sync pass's own
+/// request bound is the same 30 s, so a pass never awaits Feishu longer than
+/// any of its reads.
+pub(crate) const KEYED_TICKET_AWAIT: Duration = Duration::from_secs(30);
 
 /// How long an entry's order state (a raised generation floor, an ending
 /// shadow) outranks the cap (spec #571 review). The state only guards
@@ -208,6 +238,16 @@ impl CardWriteTicket {
     pub(crate) async fn settled(self) -> WriteOutcome {
         self.rx.await.unwrap_or(WriteOutcome::Superseded)
     }
+
+    /// Await this submission's own outcome for at most `bound` (spec #571
+    /// review): `None` when the bound elapses first. An issued keyed write is
+    /// never cancelled, so a slow one can outlive its caller — the caller must
+    /// then proceed without a verdict and treat `None` as indeterminate: the
+    /// write stays owned by the queue and may still land. Dropping the ticket
+    /// does not cancel the write either; the driver task owns it.
+    pub(crate) async fn settled_within(self, bound: Duration) -> Option<WriteOutcome> {
+        tokio::time::timeout(bound, self.settled()).await.ok()
+    }
 }
 
 /// The newest generation's settled key state (spec #571, rule (d)): once a
@@ -263,14 +303,21 @@ impl QueuedWrite {
     }
 }
 
-/// The queue's retry bounds: each failed attempt waits the base delay doubled
-/// per further failure (capped), and one attempt is bounded by the retry
-/// timeout, so a hung PATCH cannot hold a card's delivery lock forever.
+/// The queue's bounds: each failed attempt waits the base delay doubled per
+/// further failure (capped), a driver's wait for the card lock is bounded —
+/// that wait issues no request — and an entry's order state outranks the cap
+/// for a protection window. An issued keyed write itself is never bounded: it
+/// is never cancelled (spec #571 review).
 #[derive(Clone, Copy)]
 struct Limits {
     backoff_base: Duration,
     backoff_max: Duration,
-    retry_timeout: Duration,
+    /// How long a submission's driver waits for the card's delivery lock
+    /// before reporting the recoverable timeout and leaving the payload owed
+    /// (spec #571 review). No request was issued during this wait, so nothing
+    /// is cancelled; the drain re-arms a driver once the lock is free. The
+    /// keyed write itself is never bounded.
+    lock_wait: Duration,
     /// How long entry order state outranks the cap (spec #571 review);
     /// injectable so tests can watch the window pass.
     order_state_protection: Duration,
@@ -504,7 +551,7 @@ impl CardDelivery {
             limits: Limits {
                 backoff_base,
                 backoff_max,
-                retry_timeout: DRAIN_RETRY_TIMEOUT,
+                lock_wait: LOCK_WAIT,
                 order_state_protection: ORDER_STATE_PROTECTION,
             },
         }
@@ -518,13 +565,11 @@ impl CardDelivery {
         self
     }
 
-    /// [`Self::with_limits`] with a shorter per-attempt bound — both the
-    /// write's own timeout and the driver's wait for the card lock — so a test
-    /// can watch a hung write or a held lock time out without a paused 30 s
-    /// (spec #571 review).
+    /// [`Self::with_limits`] with a shorter card-lock wait, so a test can
+    /// watch a held lock time out without a paused 30 s (spec #571 review).
     #[cfg(test)]
-    fn with_retry_timeout(mut self, timeout: Duration) -> Self {
-        self.limits.retry_timeout = timeout;
+    fn with_lock_wait(mut self, lock_wait: Duration) -> Self {
+        self.limits.lock_wait = lock_wait;
         self
     }
 
@@ -892,7 +937,7 @@ impl CardDelivery {
             // never blocks on one).
             let lock = card_lock(&state, &message_id);
             let guard = match mode {
-                LockMode::Await => match tokio::time::timeout(limits.retry_timeout, lock.lock()).await {
+                LockMode::Await => match tokio::time::timeout(limits.lock_wait, lock.lock()).await {
                     Ok(guard) => Some(guard),
                     Err(_) => {
                         // The wait expired: answer the owed submission's ticket
@@ -924,20 +969,16 @@ impl CardDelivery {
                     return;
                 }
             }
-            // Bounded like the outbox's retry: a hung PATCH must not hold the
-            // card's delivery lock — and so its queue — forever. A typed
-            // content rejection of the primary switches to the write's fallback
-            // payload, under the SAME held lock (spec #571 review): the
+            // The write itself is NOT bounded: an issued keyed write is never
+            // cancelled (spec #571 review) — a cancelled PATCH could still
+            // commit at Feishu and land over a newer generation. It is awaited
+            // to completion under the card's lock, like every normal card
+            // write. A typed content rejection of the primary switches to the
+            // write's fallback payload, under the SAME held lock: the
             // degradation stays inside the write's own key, never a keyless
-            // bypass of the generation order.
-            let attempt = attempt_queued_write(
-                &inner,
-                &message_id,
-                &payload,
-                fallback.as_ref(),
-                limits.retry_timeout,
-            )
-            .await;
+            // bypass of the generation order. What is bounded is the WAITING:
+            // the lock acquisition above, and every caller's ticket await.
+            let attempt = attempt_queued_write(&inner, &message_id, &payload, fallback.as_ref()).await;
             let now = tokio::time::Instant::now();
             let mut state = state.lock().unwrap();
             let Some(entry) = state.entries.get_mut(&message_id) else {
@@ -1164,10 +1205,12 @@ impl CardDelivery {
         Self::prune_locks(&mut state);
     }
 
-    /// Retry a card's owed keyed write when it is due: reserve it and drive it
-    /// inline with the drain's lock mode, so a card another writer holds is
-    /// skipped rather than awaited.
-    async fn drive_owed_keyed(&self, message_id: &str, force: bool, now: tokio::time::Instant) {
+    /// Re-arm a card's owed keyed write when it is due (spec #571 review): the
+    /// driver owns the write, so the drain **spawns** it and returns — a hung
+    /// Feishu call must never hold the Session Sync pass, and the issued write
+    /// must never be cancelled by the drain giving up on it. The reservation is
+    /// taken before the spawn, so the next drain sees it and skips the card.
+    fn drive_owed_keyed(&self, message_id: &str, force: bool, now: tokio::time::Instant) {
         let token = {
             let mut state = self.state.lock().unwrap();
             let Some(entry) = state.entries.get_mut(message_id) else {
@@ -1187,15 +1230,14 @@ impl CardDelivery {
             entry.driver = Some(due.0);
             due.0
         };
-        Self::drive_keyed(
+        tokio::spawn(Self::drive_keyed(
             self.inner.clone(),
             self.state.clone(),
             message_id.to_string(),
             token,
             LockMode::Try,
             self.limits,
-        )
-        .await;
+        ));
     }
 }
 
@@ -1235,12 +1277,15 @@ fn card_lock(state: &Mutex<State>, message_id: &str) -> Arc<tokio::sync::Mutex<(
         .clone()
 }
 
-/// One retry's card PATCH, bounded: the client has no default timeout, and a
-/// hung PATCH must not hold the card's delivery lock — and so the card's queue
-/// and the Session Sync pass — forever. On expiry the write reports the one
-/// recoverable transport failure ([`BridgeError::Io`] / `TimedOut`) both retry
-/// paths answer with: the payload stays pending and is retried later — a
-/// cancelled update may have landed, and re-sending one is idempotent.
+/// One **keyless** retry's card PATCH, bounded by [`DRAIN_RETRY_TIMEOUT`]: the
+/// client has no default timeout, and the drain is a background convergence
+/// path where a hung PATCH must not hold the card's delivery lock — and so the
+/// card's queue and the Session Sync pass — forever. On expiry the write
+/// reports the recoverable transport failure ([`BridgeError::Io`] /
+/// `TimedOut`): the payload stays pending and is retried later — a cancelled
+/// update may have landed, and re-sending one is idempotent. (This is the
+/// pre-existing keyless behavior; an issued **keyed** write is never cancelled
+/// — see [`attempt_queued_write`].)
 async fn bounded_update(
     platform: &Arc<dyn Platform>,
     message_id: &str,
@@ -1277,23 +1322,25 @@ struct QueuedAttempt {
 /// Attempt one queued keyed write: the primary payload, and — on a typed
 /// `CardContentRejected` of it — the write's fallback payload. Both attempts
 /// run under the caller's SAME held card lock and settle the same
-/// `(generation, intent)` key (spec #571 review): the preserved→bare
-/// degradation is part of one ordered write, never a keyless write that could
-/// land over a newer generation. A write with no fallback answers with its
-/// primary's failure, exactly as before.
+/// `(generation, intent)` key (spec #571 review). The platform call is awaited
+/// to **completion**: an issued keyed write is never cancelled (spec #571
+/// review) — a cancelled PATCH could still commit at Feishu and land over a
+/// newer generation, which is the hazard the ordering exists to remove. A hung
+/// write therefore holds its card's delivery lock until it resolves, exactly
+/// like every normal card write; the callers that await this write's ticket
+/// bound their own wait instead ([`CardWriteTicket::settled_within`]).
 async fn attempt_queued_write(
     platform: &Arc<dyn Platform>,
     message_id: &str,
     payload: &Value,
     fallback: Option<&Value>,
-    timeout: Duration,
 ) -> QueuedAttempt {
-    let result = bounded_update(platform, message_id, payload, timeout).await;
+    let result = platform.update_message(message_id, payload).await;
     match (&result, fallback) {
         (Err(e), Some(fallback)) if is_card_content_rejection(e) => QueuedAttempt {
             payload: fallback.clone(),
             used_fallback: true,
-            result: bounded_update(platform, message_id, fallback, timeout).await,
+            result: platform.update_message(message_id, fallback).await,
         },
         _ => QueuedAttempt {
             payload: payload.clone(),
@@ -1482,7 +1529,7 @@ impl Platform for CardDelivery {
             self.retry_pending_card_update(retry).await;
         }
         for message_id in keyed {
-            self.drive_owed_keyed(&message_id, force, now).await;
+            self.drive_owed_keyed(&message_id, force, now);
         }
     }
 
@@ -1534,6 +1581,12 @@ impl Platform for CardDelivery {
             .is_some_and(|entry| entry.covers(generation, intent))
     }
 
+    fn keyed_ticket_await(&self) -> Duration {
+        // The transport decides: production's client keeps the delivery
+        // layer's bound, a test fake may shorten it (spec #571 review).
+        self.inner.keyed_ticket_await()
+    }
+
     fn settled_card_write_delivered(&self, message_id: &str) -> Option<bool> {
         let state = self.state.lock().unwrap();
         let entry = state.entries.get(message_id)?;
@@ -1572,6 +1625,12 @@ mod tests {
         attempts: Mutex<Vec<(String, Value)>>,
         script: Mutex<VecDeque<Fail>>,
         gate: Mutex<Option<Gate>>,
+        /// How many calls ran to COMPLETION (past their gate): the
+        /// never-cancelled observation (spec #571 review). A cancelled future
+        /// never reaches the far side of its park, so this stays put — while a
+        /// released request that "commits remotely" does count, whatever its
+        /// scripted response.
+        completions: Mutex<usize>,
     }
 
     impl FakePlatform {
@@ -1580,6 +1639,7 @@ mod tests {
                 attempts: Mutex::new(Vec::new()),
                 script: Mutex::new(VecDeque::new()),
                 gate: Mutex::new(None),
+                completions: Mutex::new(0),
             }
         }
 
@@ -1601,6 +1661,10 @@ mod tests {
         fn attempts(&self) -> Vec<(String, Value)> {
             self.attempts.lock().unwrap().clone()
         }
+
+        fn completions(&self) -> usize {
+            *self.completions.lock().unwrap()
+        }
     }
 
     #[async_trait]
@@ -1615,6 +1679,9 @@ mod tests {
                 gate.entered.notify_one();
                 gate.release.notified().await;
             }
+            // The request reached the platform and would commit here, whatever
+            // the scripted response: a cancelled call never gets this far.
+            *self.completions.lock().unwrap() += 1;
             match self.script.lock().unwrap().pop_front() {
                 None => Ok(()),
                 Some(Fail::Transport) => Err(BridgeError::Io(std::io::Error::other("transport down"))),
@@ -1744,6 +1811,52 @@ mod tests {
                 fallback: Some(fallback),
             })
             .await
+    }
+
+    /// Wait until the platform recorded at least `n` attempts, or panic after
+    /// 5 s — the drain re-arms a driver and never awaits it (spec #571 review),
+    /// so a retry lands after `drain_pending_card_updates` returns.
+    async fn wait_for_attempts(inner: &FakePlatform, n: usize) {
+        let probe = async {
+            while inner.attempts().len() < n {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), probe)
+            .await
+            .unwrap_or_else(|_| panic!("the platform never reached {n} attempts"));
+    }
+
+    /// Wait until the card's keyed driver reservation is free — the re-armed
+    /// drain driver ran (and skipped or settled) — or panic after 5 s.
+    async fn wait_for_no_driver(delivery: &CardDelivery, message_id: &str) {
+        let probe = async {
+            while delivery
+                .state
+                .lock()
+                .unwrap()
+                .entries
+                .get(message_id)
+                .is_some_and(|entry| entry.driver.is_some())
+            {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), probe)
+            .await
+            .unwrap_or_else(|_| panic!("{message_id}'s driver never released the card"));
+    }
+
+    /// Wait until the card reports no owed keyed ending, or panic after 5 s.
+    async fn wait_for_not_pending(delivery: &CardDelivery, message_id: &str) {
+        let probe = async {
+            while delivery.pending(message_id) {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), probe)
+            .await
+            .unwrap_or_else(|_| panic!("{message_id} stayed pending"));
     }
 
     #[tokio::test]
@@ -2572,6 +2685,7 @@ mod tests {
         assert!(matches!(ticket.settled().await, WriteOutcome::Failed(_)));
 
         delivery.drain_pending_card_updates(true).await;
+        wait_for_attempts(&inner, 3).await;
         assert_eq!(
             inner.attempts(),
             vec![
@@ -2749,6 +2863,7 @@ mod tests {
         assert!(matches!(ticket.settled().await, WriteOutcome::Failed(_)));
         assert!(delivery.pending("om_2"), "an owed ending keeps the card pending");
         delivery.drain_pending_card_updates(true).await;
+        wait_for_not_pending(&delivery, "om_2").await;
         assert!(!delivery.pending("om_2"), "the drain confirmed the ending");
 
         // A permanent refusal is settled too — the ending can never land, and
@@ -3165,34 +3280,92 @@ mod tests {
         );
     }
 
-    /// A hung keyed write gives up at the same bound the keyless retry uses
-    /// (spec #571 review's shared helper): the submission reports the
-    /// recoverable timeout instead of hanging its caller, the payload stays
-    /// owed, and the next drain lands it.
+    /// A keyed write the platform never answers is never cancelled (spec #571
+    /// review): the driver keeps waiting — no timeout cancels the issued
+    /// request — and when the request finally commits remotely (long past the
+    /// old retry bound), its completion IS observed and the ticket settles
+    /// Delivered. The old bounded retry cancelled the future here, letting a
+    /// later write pass a PATCH that could still commit.
     #[tokio::test(start_paused = true)]
-    async fn a_hung_keyed_write_times_out_and_stays_owed() {
+    async fn a_slow_keyed_write_commits_and_settles_delivered() {
         let inner = Arc::new(FakePlatform::new());
-        let delivery = CardDelivery::new(inner.clone());
+        let delivery = Arc::new(CardDelivery::new(inner.clone()));
         let card = serde_json::json!({ "body": "collect" });
 
-        let (entered, _never_released) = inner.park_next();
+        let (entered, release) = inner.park_next();
         let ticket = submit(&delivery, "om_1", 1, CardWriteIntent::Collect, &card).await;
         entered.notified().await;
 
-        // The paused clock elapses the retry bound; the driver must settle the
-        // ticket with the recoverable timeout, not hang.
-        let outcome = tokio::time::timeout(Duration::from_secs(120), ticket.settled())
-            .await
-            .expect("the hung keyed write must time out, not hang its caller");
-        assert!(matches!(outcome, WriteOutcome::Failed(_)));
+        // Far past the old retry bound the request is still in flight: nothing
+        // completed, and the queue still owns the write's key. The sleep parks
+        // the runtime so a due timer (the old bounded retry's) would fire here.
+        tokio::time::advance(Duration::from_secs(600)).await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(
+            inner.completions(),
+            0,
+            "no cancellation may complete the parked request"
+        );
+        assert!(
+            delivery.keyed_write_covered("om_1", 1, CardWriteIntent::Collect),
+            "the issued write still owns its key"
+        );
 
-        // The payload is still owed: a forced drain retries it, and the
-        // second attempt lands.
-        delivery.drain_pending_card_updates(true).await;
+        // The platform finally answers: the request commits and the ticket
+        // settles Delivered.
+        release.notify_one();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), ticket.settled())
+            .await
+            .expect("the released write settles");
+        assert!(matches!(outcome, WriteOutcome::Delivered));
+        assert_eq!(inner.completions(), 1, "the released request ran to completion");
+    }
+
+    /// A slow keyed write is never cancelled, so the ordering holds under a
+    /// slow platform too (spec #571 review): a newer-generation collect queued
+    /// behind it waits for the write to commit — the write's future runs to
+    /// completion rather than being cancelled and re-issued behind the collect,
+    /// and the collect still owns the card's last word.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_keyed_write_is_never_cancelled_and_a_newer_submission_lands_after_it() {
+        let inner = Arc::new(FakePlatform::new());
+        let (entered, release) = inner.park_next();
+        let delivery = Arc::new(CardDelivery::new(inner.clone()));
+        let stamp = serde_json::json!({ "body": "stamp" });
+        let collect = serde_json::json!({ "body": "collected" });
+
+        let slow = submit(&delivery, "om_1", 1, CardWriteIntent::Stamp, &stamp).await;
+        entered.notified().await;
+        // The newer chain state queues behind the in-flight write.
+        let newer = submit(&delivery, "om_1", 2, CardWriteIntent::Collect, &collect).await;
+
+        // Far past the old retry bound: the request has not completed and was
+        // not re-issued; the newer collect has not overtaken it. The sleep
+        // parks the runtime so a due timer (the old bounded retry's) would
+        // fire here.
+        tokio::time::advance(Duration::from_secs(600)).await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(inner.completions(), 0, "the parked request has not completed");
+        assert_eq!(
+            inner.attempts().len(),
+            1,
+            "the write was issued once, never re-issued"
+        );
+
+        release.notify_one();
+        let slow_outcome = tokio::time::timeout(Duration::from_secs(5), slow.settled())
+            .await
+            .expect("the slow write settles once released");
+        let newer_outcome = tokio::time::timeout(Duration::from_secs(5), newer.settled())
+            .await
+            .expect("the newer collect settles");
+        assert!(matches!(slow_outcome, WriteOutcome::Delivered));
+        assert!(matches!(newer_outcome, WriteOutcome::Delivered));
+        assert_eq!(inner.completions(), 2, "both requests ran to completion");
         assert_eq!(
             inner.attempts(),
-            vec![("om_1".to_string(), card.clone()), ("om_1".to_string(), card)],
-            "the owed keyed write was retried with its own payload"
+            vec![("om_1".to_string(), stamp), ("om_1".to_string(), collect)],
+            "the slow write committed first; the newer collect owns the last word"
         );
     }
 
@@ -3206,7 +3379,7 @@ mod tests {
         let inner = Arc::new(FakePlatform::new());
         let delivery = Arc::new(
             CardDelivery::with_limits(inner.clone(), MAX_PENDING, BACKOFF_BASE, BACKOFF_MAX)
-                .with_retry_timeout(Duration::from_secs(5)),
+                .with_lock_wait(Duration::from_secs(5)),
         );
         let keyless = serde_json::json!({ "body": "keyless" });
         let keyed = serde_json::json!({ "body": "keyed" });
@@ -3237,6 +3410,7 @@ mod tests {
         release.notify_one();
         writing.await.unwrap().unwrap();
         delivery.drain_pending_card_updates(true).await;
+        wait_for_attempts(&inner, 2).await;
         assert_eq!(
             inner.attempts(),
             vec![("om_1".to_string(), keyless), ("om_1".to_string(), keyed)],
@@ -3257,6 +3431,7 @@ mod tests {
         assert!(matches!(ticket.settled().await, WriteOutcome::Failed(_)));
 
         delivery.drain_pending_card_updates(true).await;
+        wait_for_attempts(&inner, 2).await;
         assert_eq!(
             inner.attempts(),
             vec![("om_1".to_string(), card.clone()), ("om_1".to_string(), card)],
@@ -3285,6 +3460,7 @@ mod tests {
 
         tokio::time::advance(Duration::from_secs(5)).await;
         delivery.drain_pending_card_updates(false).await;
+        wait_for_attempts(&inner, 2).await;
         assert_eq!(inner.attempts().len(), 2, "due after the base backoff");
 
         // A failed retry doubles the delay: 10s after it, not due; at 10s, due.
@@ -3293,11 +3469,13 @@ mod tests {
         assert!(matches!(ticket.settled().await, WriteOutcome::Failed(_)));
         inner.fail_next(Fail::Transport); // the forced retry fails too
         delivery.drain_pending_card_updates(true).await; // forced: retries at once
+        wait_for_attempts(&inner, 4).await;
         assert_eq!(inner.attempts().len(), 4);
         delivery.drain_pending_card_updates(false).await;
         assert_eq!(inner.attempts().len(), 4, "not due at the doubled backoff yet");
         tokio::time::advance(Duration::from_secs(10)).await;
         delivery.drain_pending_card_updates(false).await;
+        wait_for_attempts(&inner, 5).await;
         assert_eq!(inner.attempts().len(), 5, "due at the doubled backoff");
     }
 
@@ -3404,6 +3582,8 @@ mod tests {
         entered.notified().await;
 
         delivery.drain_pending_card_updates(true).await;
+        // The re-armed driver runs and skips the held card, never awaiting it.
+        wait_for_no_driver(&delivery, "om_1").await;
         assert_eq!(
             inner.attempts().len(),
             2,
@@ -3413,6 +3593,7 @@ mod tests {
         release.notify_one();
         writing.await.unwrap().unwrap();
         delivery.drain_pending_card_updates(true).await;
+        wait_for_attempts(&inner, 3).await;
         assert_eq!(
             inner.attempts().len(),
             3,
