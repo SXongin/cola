@@ -41,12 +41,15 @@
 //! (ticket #575): a key it already settled — delivered, so it is on the card, or
 //! permanently refused as card content (#522) — or is still writing makes the
 //! next tick's re-decision a no-op, so an already-stamped orphan costs no card
-//! read and no Feishu call. The ending itself is the card's keyed **settle**
-//! (spec #571's amendment): accepting one at the decision's generation closes
-//! that generation, so a stamp whose read outlived the ending is dropped
-//! instead of painting 「已重启」 over the ✅; a settle a takeover outran is
-//! dropped in turn, and the record is released only once the ending is
-//! confirmed (the release gate sees the keyed write the queue still owes).
+//! read and no Feishu call. The ending itself is the card's keyed write (spec
+//! #571's amendments): a terminal **settle** accepted at the decision's
+//! generation closes that generation, so a stamp whose read outlived the
+//! ending is dropped instead of painting 「已重启」 over the ✅; a waiting
+//! **yield** accepted at G only shadows a later stamp at ≤ G — it closes
+//! nothing, so the true end's settle still lands after it and owns the last
+//! word. A settle a takeover outran is dropped in turn, and the record is
+//! released only once the terminal ending is confirmed (the release gate sees
+//! the keyed write the queue still owes).
 //! Content the chain never showed is published by the
 //! projections above (bounded by their confirmed cursor), by the
 //! existing continuation machinery (a Wake's continuation card), or left in
@@ -490,9 +493,17 @@ async fn apply(
         ChainDisposition::StampRestart => {
             // The queue's own settled/owed knowledge replaces the retired
             // per-record marks (spec #571, ticket #575): a stamp the queue
-            // already settled — delivered, or permanently refused (#522) —
-            // owes nothing, and one it is still writing needs no second
-            // submission. Either way the card must not be read again.
+            // already settled — delivered, or permanently refused (#522) — owes
+            // nothing, and one it is still writing needs no second submission.
+            // Neither does one an accepted ending shadows (amendment 2). Either
+            // way the card must not be read again.
+            //
+            // Accepted residual (spec #571's amendment 2): an attempt still in
+            // its card-view read is invisible to this query, so a hung read
+            // (bounded at 30 s; Session Sync ticks every 8 s) lets each tick
+            // spawn another attempt — up to ~4 concurrent card-view GETs before
+            // the first submission. The PATCH count stays one: the first
+            // submission takes the queue's key and the rest are dropped.
             if !handles.cards.feishu.keyed_write_covered(
                 &record.card_message_id,
                 record.generation,
@@ -1186,19 +1197,18 @@ struct ApplyPass<'a> {
 
 impl ApplyPass<'_> {
     /// PATCH the record's card into `state`, keeping the card's existing body
-    /// best-effort (#434 acceptance feedback). A **terminal** state is the
-    /// card's ending: it is submitted as a keyed write at the generation this
-    /// decision read (spec #571's amendment), so accepting it closes that
-    /// generation and a stamp whose pre-submission read outlived the ending is
-    /// dropped instead of painting 「已重启」 over it. A **Waiting** yield is
-    /// not the ending — the true end supersedes it at the same generation — so
-    /// it keeps today's keyless write. When the state is terminal, the record
-    /// is dropped once the ending is confirmed: nothing is owed a reap any
-    /// more. A terminal ending whose Session's current directory differs from
-    /// the pass's baseline directory gains one extra line naming the move
-    /// (#439), on top of `detail` (the failure's message when there is one); a
-    /// Waiting yield carries none. Returns whether the write landed — a failed
-    /// or superseded ending keeps the record for the queue's retry (the
+    /// best-effort (#434 acceptance feedback), as the card's keyed **ending**
+    /// write at the generation this decision read (spec #571's amendments): a
+    /// terminal state is the `Settle` — accepting it closes the generation, so
+    /// a stamp whose read outlived the ending is dropped — and a Waiting state
+    /// is the `Yield`, which only shadows a later stamp at ≤ its generation
+    /// (the true end supersedes it at the same generation). When the state is
+    /// terminal, the record is dropped once the ending is confirmed: nothing is
+    /// owed a reap any more. A terminal ending whose Session's current directory
+    /// differs from the pass's baseline directory gains one extra line naming
+    /// the move (#439), on top of `detail` (the failure's message when there is
+    /// one); a Waiting yield carries none. Returns whether the write landed — a
+    /// failed or superseded ending keeps the record for the queue's retry (the
     /// release gate sees the keyed write it still owes). One INFO line per
     /// action, naming the session and the decision — never chat content; a
     /// settle that named a move says so.
@@ -1206,18 +1216,12 @@ impl ApplyPass<'_> {
         let terminal = state.is_terminal();
         let move_note = if terminal { self.move_note().await } else { None };
         let card = ending_card(state.clone(), detail, move_note.as_deref());
-        let landed = if terminal {
-            self.settle_ending(&card).await
+        let intent = if terminal {
+            CardWriteIntent::Settle
         } else {
-            patch_ending_keeping_body(
-                self.handles.cards.feishu.as_ref(),
-                &self.record.card_message_id,
-                &card,
-                KeepBody::Everything,
-            )
-            .await
-            .is_ok()
+            CardWriteIntent::Yield
         };
+        let landed = self.submit_ending(&card, intent).await;
         if !landed {
             return false;
         }
@@ -1243,17 +1247,19 @@ impl ApplyPass<'_> {
         true
     }
 
-    /// The terminal ending's write (spec #571's amendment): compose the
-    /// preserved card and submit it as a **keyed write** at the generation this
-    /// decision read, then await its ticket. Accepting the submission closes
-    /// that generation in the queue, so a stamp whose pre-submission read
-    /// outlived the ending is dropped. Returns whether the ending landed:
-    /// `Delivered` — this attempt's write, or the same key already on the card
-    /// (its retry landed through the drain) — takes the caller's success path;
-    /// a failure warns and keeps the record; a superseded submission (a
-    /// takeover bumped the chain first, or the queue already handled the key)
-    /// does nothing — no cache release, no warn.
-    async fn settle_ending(&self, card: &serde_json::Value) -> bool {
+    /// Submit the record's keyed **ending** write (spec #571's amendments):
+    /// compose the preserved card and submit it at the generation this decision
+    /// read with `intent` — `Settle` for the terminal ending (accepting it
+    /// closes the generation, so a stamp whose read outlived the ending is
+    /// dropped) or `Yield` for the waiting ending (accepting it only shadows a
+    /// later stamp at ≤ its generation). Then await its ticket.
+    ///
+    /// Returns whether the write landed: `Delivered` — this attempt's write, or
+    /// the same key already on the card (its retry landed through the drain) —
+    /// takes the caller's success path; a failure warns and keeps the record; a
+    /// superseded submission (a takeover bumped the chain first, or the queue
+    /// already handled the key) does nothing — no cache release, no warn.
+    async fn submit_ending(&self, card: &serde_json::Value, intent: CardWriteIntent) -> bool {
         let platform = self.handles.cards.feishu.as_ref();
         let card_message_id = self.record.card_message_id.as_str();
         let preserved = preserved_ending(platform, card_message_id, card, KeepBody::Everything).await;
@@ -1261,7 +1267,7 @@ impl ApplyPass<'_> {
             .submit_ordered(KeyedSubmission {
                 message_id: card_message_id,
                 generation: self.record.generation,
-                intent: CardWriteIntent::Settle,
+                intent,
                 card: &preserved,
             })
             .await
@@ -1464,42 +1470,9 @@ fn ending_card(state: CardState, detail: Option<&str>, move_note: Option<&str>) 
     builder.build()
 }
 
-/// PATCH `bare` onto `card_message_id`, keeping the card's existing body
-/// best-effort (#434 acceptance feedback): read the card's own view, merge the
-/// ending over it, PATCH the merge. The **Waiting yield's** path — it is not
-/// the ending, so it stays keyless and outside the generation-closing rule
-/// (spec #571's amendment). A failed
-/// read PATCHes `bare` directly — today's behavior — because the ending must
-/// never depend on the read.
-///
-/// A PATCH the platform *definitely* refuses as card content (the typed
-/// `CardContentRejected`, e.g. `230099`) is retried once bare: the refusal is
-/// deterministic, so the bare ending lands and the card never stays looking
-/// live. Any other failure — transport, timeout, auth, server — is returned
-/// as-is: the preserved PATCH may already have landed, and retrying bare would
-/// then wipe the very body this path exists to keep.
-async fn patch_ending_keeping_body(
-    platform: &dyn crate::feishu::Platform,
-    card_message_id: &str,
-    bare: &serde_json::Value,
-    keep: KeepBody,
-) -> crate::error::Result<()> {
-    let card = preserved_ending(platform, card_message_id, bare, keep).await;
-    match platform.update_message(card_message_id, &card).await {
-        Ok(()) => Ok(()),
-        Err(e @ crate::error::BridgeError::CardContentRejected { .. }) => {
-            tracing::warn!(
-                "live-card reap: card {card_message_id} refused the preserved ending ({e}); retrying bare"
-            );
-            platform.update_message(card_message_id, bare).await
-        }
-        Err(e) => Err(e),
-    }
-}
-
-/// The card one preserved write PATCHes: `bare` merged under `keep` over the
-/// card's own view, or `bare` alone when the read fails — the ending must
-/// never depend on the read. `keep` is the merge's view-element rule —
+/// The card one preserved ending write PATCHes: `bare` merged under `keep`
+/// over the card's own view, or `bare` alone when the read fails — the ending
+/// must never depend on the read. `keep` is the merge's view-element rule —
 /// [`KeepBody::Everything`] for every ordinary ending and the #443 stamp,
 /// [`KeepBody::WithoutLiveTail`] for the fresh-Turn takeover's collect
 /// (ADR-0068), [`KeepBody::Nothing`] for the late projection's.
