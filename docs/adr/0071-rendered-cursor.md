@@ -257,10 +257,20 @@ projects the chain's delta after it onto a successor card.**
   lands exactly once and is then consumed: a projection takes it with the
   re-point that rewrites the record (a gap the read could not place rides onto
   the new record), a fresh Turn's takeover that finds one re-homes it onto the
-  new record and renders it on its own card, and the first confirmed write of
-  a body that includes the gap's content clears the durable fact — the stage
-  carries the coverage, so a write built before the gap rendered can never
-  clear it early. An ended record whose gap this read cannot place claims
+  new record and renders it on its own card, and every confirmation advances
+  or consumes the durable fact exactly as far as ITS body reached: the stage
+  carries the body's **gap coverage** — the gap's cursor at the newest gap
+  content that body includes, and whether it reached the gap's last entry — so
+  a partial body (a gap split across cards) only advances the gap's cursor,
+  and a restart, or the next slice, resumes after what a card already showed
+  instead of repeating it; the fact clears only when the body carrying the
+  gap's END is confirmed. A write built before the gap rendered carries no
+  coverage and can neither clear nor advance it. The re-point carries the gap
+  like the cursor — a continuation or a fresh Turn cannot drop an owed tail —
+  and the chain cursor never takes a gap entry as its frontier: the gap's
+  content sits EARLIER in the read than the confirmed frontier, so the
+  accumulator tags the messages its gap walk rendered and the frontier skips
+  them. An ended record whose gap this read cannot place claims
   nothing (`Keep`: a settle would drop the fact forever), and the record is
   not released while an unrendered gap is owed. No interlock is
   introduced: the projection relies on the

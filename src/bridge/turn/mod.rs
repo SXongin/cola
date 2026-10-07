@@ -510,16 +510,11 @@ impl Turn {
         // way: this card's own reads rebuild the live list).
         if let Some(orphan) = orphan {
             // A predecessor's pending orphan gap survives the takeover (spec
-            // #561, review #569): the re-point rewrote the record, so the
-            // durable fact is re-homed onto this card's record — and onto the
-            // accumulator — and the first render read that can place it lands
-            // it here. The seed below never invents a gap over it (its own
-            // failure path defers to a carried one).
+            // #561, review #569): the re-point carried it onto this card's
+            // record, and the accumulator mirrors it so the first render read
+            // that can place it lands it here. The seed below never invents a
+            // gap over it (its own failure path defers to a carried one).
             if let Some(gap) = orphan.pending_gap.clone() {
-                handles
-                    .cards
-                    .chains
-                    .note_pending_gap(&session_id, &new_card_id, &gap);
                 let mut live = handles.cards.cards.lock().await;
                 if let Some(card) = live.get_mut(&session_id)
                     && card.card_message_id.as_deref() == Some(new_card_id.as_str())
@@ -3188,9 +3183,8 @@ impl Turn {
         // confirmed create drains it into the Chain Record. The stage
         // identities travel on the [`ProjectedCard`], so the confirmation can
         // name the exact body the create carried (spec #561, review #569).
-        let covers_gap = acc.gap_rendered;
         let cursor_stage = state::StagedCursorId {
-            id: acc.stage_cursor(None, built.cursor.clone(), covers_gap),
+            id: acc.stage_cursor(None, built.cursor.clone(), built.gap.clone()),
             awaiting_seq: None,
         };
         let watermark_stage = acc.pending_watermark_id();
@@ -3829,11 +3823,12 @@ impl Turn {
         // re-point; one it could NOT place stays owed and rides onto the new
         // record (spec #561, review #569), so a later read can still deliver
         // it.
-        let carried_gap = if matches!(&confirmed, Some((_, false))) {
-            card.acc.pending_gap.clone()
-        } else {
-            None
-        };
+        // The gap this projection's create carried (spec #561, review #569):
+        // the re-point already carried it onto the new record, and its coverage
+        // now consumes the fact (a body that reached the gap's end) or advances
+        // it past what the successor card shows — so neither the continuation
+        // nor a restart repeats delivered gap content. No coverage at all
+        // leaves the durable fact untouched.
         // A card with no Turn message to scope a settle decision with cannot
         // be reaped: attached, but no record — `track_live_card`'s own rule.
         let Some(message_id) = message_id else {
@@ -3866,8 +3861,13 @@ impl Turn {
                 directory.as_deref(),
             ),
         };
-        if let Some(gap) = &carried_gap {
-            cards.chains.note_pending_gap(session_id, card_message_id, gap);
+        if let Some(coverage) = confirmed.as_ref().and_then(|(_, gap)| gap.clone()) {
+            cards.chains.advance_pending_gap(
+                session_id,
+                card_message_id,
+                &coverage.frontier,
+                coverage.complete,
+            );
         }
         // A re-point within the chain carries the Rendered Cursor (spec #561):
         // seed the accumulator's empty base with the carried fact, so the
@@ -3902,9 +3902,10 @@ impl Turn {
             return None;
         }
         let built = card.acc.build_card_with_info();
-        let covers_gap = card.acc.gap_rendered;
         let cursor_stage = state::StagedCursorId {
-            id: card.acc.stage_cursor(None, built.cursor.clone(), covers_gap),
+            id: card
+                .acc
+                .stage_cursor(None, built.cursor.clone(), built.gap.clone()),
             awaiting_seq: None,
         };
         Some(ProjectedSlice {
@@ -3944,9 +3945,10 @@ impl Turn {
         // the SAME body, so its render boundary rewinds.
         card.acc.render_from = 0;
         let built = card.acc.build_card_with_info();
-        let covers_gap = card.acc.gap_rendered;
         let cursor_stage = state::StagedCursorId {
-            id: card.acc.stage_cursor(None, built.cursor.clone(), covers_gap),
+            id: card
+                .acc
+                .stage_cursor(None, built.cursor.clone(), built.gap.clone()),
             awaiting_seq: None,
         };
         Some(ProjectedSlice {
@@ -4078,13 +4080,10 @@ impl Turn {
         cursor: &RenderedCursor,
     ) -> state::StagedCursorId {
         match cards.cards.lock().await.get_mut(session_id) {
-            Some(card) => {
-                let covers_gap = card.acc.gap_rendered;
-                state::StagedCursorId {
-                    id: card.acc.stage_cursor(card_message_id, cursor.clone(), covers_gap),
-                    awaiting_seq: None,
-                }
-            }
+            Some(card) => state::StagedCursorId {
+                id: card.acc.stage_cursor(card_message_id, cursor.clone(), None),
+                awaiting_seq: None,
+            },
             None => state::StagedCursorId {
                 id: 0,
                 awaiting_seq: None,

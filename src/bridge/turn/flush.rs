@@ -115,12 +115,14 @@ async fn stage_rendered_cursor(
     session_id: &str,
     card_message_id: Option<&str>,
     cursor: &RenderedCursor,
+    gap: Option<&crate::bridge::turn::state::GapCoverage>,
 ) -> crate::bridge::turn::state::StagedCursorId {
     let mut live = cards.cards.lock().await;
     match live.get_mut(session_id) {
         Some(card) => {
-            let covers_gap = card.acc.gap_rendered;
-            let id = card.acc.stage_cursor(card_message_id, cursor.clone(), covers_gap);
+            let id = card
+                .acc
+                .stage_cursor(card_message_id, cursor.clone(), gap.cloned());
             crate::bridge::turn::state::StagedCursorId {
                 id,
                 awaiting_seq: None,
@@ -164,7 +166,7 @@ async fn confirm_staged_cursor(
     if chain_id.is_some_and(|chain_id| card.chain_id() != chain_id) {
         return;
     }
-    let Some((cursor, covers_gap)) = card.acc.take_staged_cursor(card_message_id, expected) else {
+    let Some((cursor, gap)) = card.acc.take_staged_cursor(card_message_id, expected) else {
         return;
     };
     // The ordering test parks one confirmation here (spec #561, review #569):
@@ -174,10 +176,14 @@ async fn confirm_staged_cursor(
         gate.release.notified().await;
     }
     cards.chains.advance_cursor(session_id, card_message_id, &cursor);
-    if covers_gap {
-        // This very body put the chain's orphan gap on a card (spec #561,
-        // review #569): the durable fact has served its purpose.
-        cards.chains.clear_pending_gap(session_id, card_message_id);
+    if let Some(gap) = gap {
+        // This very body carried the chain's orphan gap this far (spec #561,
+        // review #569): a PARTIAL body only advances the durable gap, so a
+        // restart (or the next slice) resumes after what a card showed, while
+        // a body that reached the gap's end consumes the fact.
+        cards
+            .chains
+            .advance_pending_gap(session_id, card_message_id, &gap.frontier, gap.complete);
     }
 }
 
@@ -427,7 +433,14 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, spl
                 // stage identity (and the watermark it can carry) is captured
                 // before the write, so a body staged meanwhile is never
                 // confirmed by this one (review #569).
-                let stage = stage_rendered_cursor(cards, session_id, Some(&card_id), &built.cursor).await;
+                let stage = stage_rendered_cursor(
+                    cards,
+                    session_id,
+                    Some(&card_id),
+                    &built.cursor,
+                    built.gap.as_ref(),
+                )
+                .await;
                 let watermark = staged_watermark_id(cards, session_id).await;
                 let delivered = match cards.feishu.update_message(&card_id, &built.card).await {
                     Ok(()) => true,
@@ -553,7 +566,16 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, spl
             // still the staged one (review #569). A slice that is not PATCHed
             // stages nothing.
             let stage = if should_patch {
-                Some(stage_rendered_cursor(cards, session_id, Some(&card_id), &finalized.cursor).await)
+                Some(
+                    stage_rendered_cursor(
+                        cards,
+                        session_id,
+                        Some(&card_id),
+                        &finalized.cursor,
+                        finalized.gap.as_ref(),
+                    )
+                    .await,
+                )
             } else {
                 None
             };
@@ -682,7 +704,7 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, spl
         // creates are never outbox-retried, so only this send's own Ok drains
         // it (the new card's id is attached after `track_live_card`) — and only
         // while this exact stage is still the staged one (review #569).
-        let stage = stage_rendered_cursor(cards, session_id, None, &built.cursor).await;
+        let stage = stage_rendered_cursor(cards, session_id, None, &built.cursor, built.gap.as_ref()).await;
         let watermark = staged_watermark_id(cards, session_id).await;
         let sent = match (reply_to.as_deref(), fallback_chat.as_deref()) {
             (Some(reply_to), _) => cards.feishu.reply_card(reply_to, &built.card).await,
