@@ -44,8 +44,9 @@ use crate::bridge::sidecar;
 /// delivered".
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PendingGap {
-    /// The orphaned chain's confirmed cursor: where the gap starts, inside the
-    /// orphaned Turn's window.
+    /// The gap's own cursor: where the undelivered tail starts, inside the
+    /// orphaned Turn's window — and, once a body covering part of the gap is
+    /// confirmed, where the DELIVERED part ends, so a restart resumes after it.
     pub(crate) cursor: RenderedCursor,
     /// The orphaned Turn's anchor: the window the gap lives in.
     pub(crate) anchor: TurnAnchor,
@@ -437,6 +438,12 @@ impl ChainRecords {
             .with_directory(directory.map(str::to_string));
         if let Some(previous) = &previous {
             record.cursor = previous.cursor.clone();
+            // The owed orphan gap is chain-level too (spec #561, review #569):
+            // a split continuation, a Wake continuation or a fresh Turn's
+            // takeover must not drop the tail a later read still owes. The
+            // projection's own re-point confirms its coverage separately —
+            // consuming the fact when the body reached the gap's end.
+            record.pending_gap = previous.pending_gap.clone();
         }
         state.records.insert(session_id.to_string(), record);
         self.write(&state);
@@ -466,6 +473,12 @@ impl ChainRecords {
         let mut record = ChainRecord::new(card_message_id, message_id, created_ms)
             .with_directory(directory.map(str::to_string));
         record.cursor = Some(cursor.clone());
+        // The gap rides the re-point exactly as it does through [`Self::track`]
+        // (spec #561, review #569): the caller's coverage confirmation then
+        // consumes or advances it in this same critical section.
+        record.pending_gap = previous
+            .as_ref()
+            .and_then(|previous| previous.pending_gap.clone());
         state.records.insert(session_id.to_string(), record);
         self.write(&state);
         previous
@@ -674,17 +687,31 @@ impl ChainRecords {
         }
     }
 
-    /// Drop the orphan gap once its content is on a card (spec #561, review
-    /// #569), scoped like [`Self::note_pending_gap`]: a successful projection's
-    /// re-point rewrites the record anyway; this is the fresh Turn's
-    /// confirmed-write clearance.
-    pub(crate) fn clear_pending_gap(&self, session_id: &str, card_message_id: &str) -> bool {
+    /// Record how far a confirmed write carried the chain's pending orphan gap
+    /// (spec #561, review #569), scoped like [`Self::note_pending_gap`]: a body
+    /// that stopped mid-gap ADVANCES the gap's cursor — so a restart (or the
+    /// next slice) resumes after the content a card already showed instead of
+    /// re-rendering it — while a body that reached the gap's end consumes the
+    /// durable fact.
+    pub(crate) fn advance_pending_gap(
+        &self,
+        session_id: &str,
+        card_message_id: &str,
+        frontier: &CursorFrontier,
+        complete: bool,
+    ) -> bool {
         let mut state = self.lock();
         match state.records.get_mut(session_id) {
             Some(card) if card.card_message_id == card_message_id => {
-                if card.pending_gap.take().is_some() {
-                    self.write(&state);
+                let Some(gap) = card.pending_gap.as_mut() else {
+                    return false;
+                };
+                if complete {
+                    card.pending_gap = None;
+                } else {
+                    gap.cursor.frontier = Some(frontier.clone());
                 }
+                self.write(&state);
                 true
             }
             _ => false,
@@ -877,6 +904,110 @@ mod tests {
     use super::*;
 
     const FILE: &str = "chain_records.json";
+
+    /// The orphan gap is chain-level (spec #561, review #569): a re-point —
+    /// a split continuation, a Wake continuation, a fresh Turn's takeover —
+    /// carries the owed tail, a confirmed partial body advances it, and only a
+    /// body that reached the gap's end consumes it.
+    #[test]
+    fn the_pending_gap_persists_advances_and_is_consumed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE);
+        let chains = ChainRecords::load(path.clone());
+        chains.track("ses_a", "om_old", MessageId::new("msg_cola_1"), Some(1_000), None);
+        let gap = PendingGap {
+            cursor: RenderedCursor::default(),
+            anchor: TurnAnchor {
+                message_id: MessageId::new("msg_cola_1"),
+                created_ms: 1_000,
+            },
+            bound: Some(MessageId::new("msg_cola_2")),
+        };
+        assert!(chains.note_pending_gap("ses_a", "om_old", &gap));
+        assert_eq!(
+            ChainRecords::load(path.clone())
+                .get("ses_a")
+                .expect("the reloaded record")
+                .pending_gap,
+            Some(gap.clone()),
+            "the gap survives a restart"
+        );
+
+        chains.track_carrying_cursor(
+            "ses_a",
+            "om_new",
+            MessageId::new("msg_cola_2"),
+            Some(2_000),
+            None,
+            &RenderedCursor::default(),
+        );
+        assert_eq!(
+            chains.get("ses_a").expect("the record").pending_gap,
+            Some(gap.clone()),
+            "a projection's re-point carries the gap"
+        );
+
+        let frontier = CursorFrontier {
+            message_id: MessageId::new("msg_a_1000"),
+            part_index: 0,
+            kind: CursorPartKind::Text,
+            started_at: Some(1_500),
+            delivered_chars: 5,
+            prefix_digest: Some(cursor_prefix_digest("尾巴")),
+        };
+        assert!(chains.advance_pending_gap("ses_a", "om_new", &frontier, false));
+        assert_eq!(
+            chains
+                .get("ses_a")
+                .expect("the record")
+                .pending_gap
+                .expect("the gap stays owed")
+                .cursor
+                .frontier,
+            Some(frontier.clone()),
+            "a partial body advances the gap's cursor"
+        );
+
+        chains.track(
+            "ses_a",
+            "om_third",
+            MessageId::new("msg_cola_3"),
+            Some(3_000),
+            None,
+        );
+        assert_eq!(
+            chains.get("ses_a").expect("the record").pending_gap,
+            Some(PendingGap {
+                cursor: RenderedCursor {
+                    frontier: Some(frontier.clone()),
+                    ..RenderedCursor::default()
+                },
+                ..gap.clone()
+            }),
+            "an ordinary re-point carries the advanced gap"
+        );
+
+        assert!(chains.advance_pending_gap("ses_a", "om_third", &frontier, true));
+        assert!(
+            ChainRecords::load(path.clone())
+                .get("ses_a")
+                .expect("the reloaded record")
+                .pending_gap
+                .is_none(),
+            "the body that reached the gap's end consumes it"
+        );
+        chains.track(
+            "ses_a",
+            "om_fourth",
+            MessageId::new("msg_cola_4"),
+            Some(4_000),
+            None,
+        );
+        assert!(
+            chains.get("ses_a").expect("the record").pending_gap.is_none(),
+            "a consumed gap does not come back on a re-point"
+        );
+    }
 
     /// The projection's write-ahead intent (spec #561, review #569) persists
     /// across a restart, clears on demand, and is scoped to the record's card:

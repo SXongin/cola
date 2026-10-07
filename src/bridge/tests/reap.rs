@@ -7876,3 +7876,160 @@ async fn a_fresh_turn_carries_a_pending_gap() {
     }
     drop(turn);
 }
+
+/// A gap large enough to split across cards keeps its remaining tail owed
+/// (spec #561, review #569): the first slice's confirmation only ADVANCES the
+/// durable gap — it never clears it — so a restart before later slices land
+/// re-renders the remainder exactly once, repeating nothing a card showed.
+#[tokio::test]
+async fn a_split_gap_resumes_from_its_confirmed_head_after_a_restart() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let orphan_anchor = 1_000_000;
+    let prev_anchor = 2_000_000;
+    let delivered = "已经写了一半。";
+    let marker = |i: usize| format!("【S{i:02}】");
+    let answer = "旧回答。";
+    // The record names the previous Turn's card: its cursor covers that Turn's
+    // delivered answer while the orphan's undelivered tail is owed as a gap.
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_prev",
+        Some(prev_anchor),
+        Some("/work"),
+        Some(CursorFrontier {
+            message_id: MessageId::new(format!("msg_a_{}", prev_anchor + 500)),
+            part_index: 0,
+            kind: CursorPartKind::Text,
+            started_at: Some(prev_anchor + 500),
+            delivered_chars: answer.chars().count(),
+            prefix_digest: Some(cursor_prefix_digest(answer)),
+        }),
+        &[],
+    );
+    ChainRecords::load(sidecar(&session_file)).note_pending_gap(
+        "ses_test",
+        "om_frozen",
+        &PendingGap {
+            cursor: RenderedCursor {
+                frontier: Some(CursorFrontier {
+                    message_id: MessageId::new(format!("msg_a_{}", orphan_anchor + 500)),
+                    part_index: 0,
+                    kind: CursorPartKind::Text,
+                    started_at: Some(orphan_anchor + 500),
+                    delivered_chars: delivered.chars().count(),
+                    prefix_digest: Some(cursor_prefix_digest(delivered)),
+                }),
+                live_calls: Default::default(),
+            },
+            anchor: crate::backend::TurnAnchor {
+                message_id: MessageId::new("msg_cola_anchor"),
+                created_ms: orphan_anchor,
+            },
+            bound: Some(MessageId::new("msg_cola_prev")),
+        },
+    );
+    // The orphan's tail is MANY parts, each its own timeline entry: the gap
+    // then spans more than one card slice, which is the case under test.
+    let transcript = || {
+        let mut parts = vec![Part::Text(TextPart {
+            text: delivered.to_string(),
+            started_at: Some(orphan_anchor + 500),
+        })];
+        for i in 0..40usize {
+            parts.push(Part::Text(TextPart {
+                text: format!("{}{}", marker(i), "长".repeat(400)),
+                started_at: Some(orphan_anchor + 501 + i as i64),
+            }));
+        }
+        SessionTranscript::new(vec![
+            user("msg_cola_anchor", orphan_anchor, "跑个长命令"),
+            TranscriptMessage {
+                id: MessageId::new(format!("msg_a_{}", orphan_anchor + 500)),
+                role: MessageRole::Assistant,
+                time: Some(MessageTime {
+                    created: orphan_anchor + 500,
+                    completed: None,
+                }),
+                model: None,
+                tokens: None,
+                error: None,
+                parts,
+            },
+            user("msg_cola_prev", prev_anchor, "旧问题"),
+            assistant(prev_anchor + 500, answer),
+        ])
+        .with_executions(vec![execution(orphan_anchor + 2_500)])
+    };
+
+    // Life 1: the first slice lands, every later create fails DEFINITELY (no
+    // card), so the rest of the gap stays owed.
+    let (app, platform, _backend) =
+        restarted_app_with_backend(&session_file, transcript(), Some(SessionStatus::Idle)).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+    platform.given_reply_card_outcome(crate::bridge::test_support::ReplyOutcome::Lands);
+    for _ in 0..200 {
+        platform.given_reply_card_outcome(crate::bridge::test_support::ReplyOutcome::Refused(400));
+    }
+    spawn_sync(&app);
+    wait_for_posted_text(&platform, &marker(0)).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let posted = platform.replied_cards().await;
+    assert_eq!(
+        posted.len(),
+        1,
+        "only the first slice lands: {:?}",
+        platform.calls.lock().await
+    );
+    assert!(
+        !card_text(&posted[0]).contains(&marker(39)),
+        "the landed slice is a prefix"
+    );
+    // The part a card already showed must never be owed again, and the rest of
+    // the tail must still be owed: the durable gap carries the confirmed head.
+    let record = app
+        .cards_handle()
+        .chains
+        .get("ses_test")
+        .expect("the stopped chain stays for the next life");
+    let gap = record
+        .pending_gap
+        .clone()
+        .expect("a split gap stays owed until its end lands");
+    assert!(
+        gap.cursor
+            .frontier
+            .as_ref()
+            .is_some_and(|frontier| frontier.delivered_chars > delivered.chars().count()),
+        "the confirmed slice advanced the gap: {gap:?}"
+    );
+    drop(app);
+
+    // Life 2: a restart resumes from the advanced gap and lands the remainder —
+    // exactly once.
+    let (app2, platform2, _backend2) =
+        restarted_app_with_backend(&session_file, transcript(), Some(SessionStatus::Idle)).await;
+    // Every create takes the mock's default id: the record names "msg_reply".
+    platform2.given_card_view("msg_reply", realistic_card_view());
+    spawn_sync(&app2);
+    wait_for_posted_text(&platform2, &marker(39)).await;
+    wait_for_record_gone(&app2, "ses_test").await;
+    let resumed = platform2.replied_cards().await;
+    let all: String = resumed.iter().map(card_text).collect::<Vec<_>>().join("\n");
+    assert_eq!(
+        all.matches(&marker(0)).count(),
+        0,
+        "nothing already delivered repeats: {all}"
+    );
+    assert_eq!(
+        all.matches(&marker(39)).count(),
+        1,
+        "the remaining gap tail lands exactly once: {all}"
+    );
+    assert!(
+        card_header(resumed.last().expect("the resumed chain posted")).contains("✅"),
+        "the resumed chain ends on the transcript's true ending"
+    );
+}

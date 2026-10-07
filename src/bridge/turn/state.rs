@@ -469,6 +469,24 @@ pub(super) struct BuiltCard {
     /// state it shows. The flush stages it before the write and drains it into
     /// the Chain Record once that write is confirmed.
     pub(super) cursor: RenderedCursor,
+    /// How far this body carries the chain's pending orphan gap (spec #561,
+    /// review #569), when one is owed and the body rendered any of it.
+    pub(super) gap: Option<GapCoverage>,
+}
+
+/// How far ONE built card body carries the chain's pending orphan gap (spec
+/// #561, review #569): captured per body, so a gap split across cards is not
+/// mistaken for a delivered one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct GapCoverage {
+    /// The gap's cursor advanced to the newest gap content the body covers.
+    /// A confirmed write persists it, so a restart — or the next slice's
+    /// build — resumes after the delivered part instead of re-rendering it.
+    pub(super) frontier: CursorFrontier,
+    /// Whether the body reached the gap's END (its last rendered entry). Only
+    /// then may a confirmation clear the durable gap; a body that stops
+    /// mid-gap leaves the remaining tail owed.
+    pub(super) complete: bool,
 }
 
 /// Estimated serialized size (bytes) of one collapsible tool panel, mirroring
@@ -952,10 +970,10 @@ pub(super) struct StagedCursor {
     /// the drain reconcile confirms the cursor only once THAT payload
     /// delivers. `None` while no failure is owed.
     pub(super) awaiting_seq: Option<u64>,
-    /// Whether the body carried a rendered orphan gap (spec #561, review
-    /// #569): the confirmation then clears the durable gap, because this very
-    /// body put its content on a card.
-    pub(super) covers_gap: bool,
+    /// How far the body carried the chain's pending orphan gap (spec #561,
+    /// review #569), captured per built body: the confirmation persists the
+    /// advance, and clears the durable gap only when the body reached its end.
+    pub(super) gap: Option<GapCoverage>,
 }
 
 impl StagedCursor {
@@ -1235,6 +1253,11 @@ pub(super) struct StreamAccumulator {
     /// that follows the gap — one frontier cannot express both — so the gap's
     /// recovery lives on the record instead.
     pub(super) pending_gap: Option<crate::bridge::chain::PendingGap>,
+    /// The messages whose parts the pending gap's own walk rendered (spec #561,
+    /// review #569). Their content sits EARLIER in the read than the chain's
+    /// confirmed frontier, so the chain cursor must never be built from their
+    /// entries — while they are exactly what the gap's progress reads.
+    pub(super) gap_messages: std::collections::HashSet<MessageId>,
     /// Whether this accumulator's timeline holds the pending gap's content
     /// (spec #561, review #569): the first confirmed write of a body that
     /// includes it clears the durable fact, so a crash before that write keeps
@@ -1650,7 +1673,7 @@ impl StreamAccumulator {
         &mut self,
         card_message_id: Option<&str>,
         cursor: RenderedCursor,
-        covers_gap: bool,
+        gap: Option<GapCoverage>,
     ) -> u64 {
         self.cursor_stage_seq = self.cursor_stage_seq.wrapping_add(1);
         self.staged_cursors.push(StagedCursor {
@@ -1658,7 +1681,7 @@ impl StreamAccumulator {
             card_message_id: card_message_id.map(str::to_string),
             cursor,
             awaiting_seq: None,
-            covers_gap,
+            gap,
         });
         if self.staged_cursors.len() > MAX_STAGED_CURSORS {
             let excess = self.staged_cursors.len() - MAX_STAGED_CURSORS;
@@ -1699,7 +1722,7 @@ impl StreamAccumulator {
         &mut self,
         card_message_id: &str,
         expected: StagedCursorId,
-    ) -> Option<(RenderedCursor, bool)> {
+    ) -> Option<(RenderedCursor, Option<GapCoverage>)> {
         let idx = self.staged_cursors.iter().position(|staged| {
             staged.id == expected.id
                 && staged.awaiting_seq == expected.awaiting_seq
@@ -1714,7 +1737,7 @@ impl StreamAccumulator {
         }
         self.confirmed_cursor_stage = staged.id;
         self.cursor = staged.cursor.clone();
-        Some((staged.cursor, staged.covers_gap))
+        Some((staged.cursor, staged.gap))
     }
 
     /// The stage generation of the NEWEST staged Wake Watermark, when one is
@@ -2619,7 +2642,7 @@ impl StreamAccumulator {
             }
         }
         let state = if full { Some(CardState::Continued) } else { None };
-        let (card, spans, cursor) = self.build_card_inner(self.render_from, split, !full, state);
+        let (card, spans, cursor, gap) = self.build_card_inner(self.render_from, split, !full, state);
         // Advance `render_from` ONLY on an actual split: while the card still
         // fits, subsequent flushes must re-render from the SAME start so the
         // content accumulates instead of only showing the latest delta.
@@ -2631,6 +2654,7 @@ impl StreamAccumulator {
             full,
             spans,
             cursor,
+            gap,
         }
     }
 
@@ -2651,12 +2675,14 @@ impl StreamAccumulator {
     /// stays under Feishu's hard cap even when its estimate crosses the split
     /// budget.
     pub(super) fn build_card_unsplit(&self) -> BuiltCard {
-        let (card, spans, cursor) = self.build_card_inner(self.render_from, self.timeline.len(), true, None);
+        let (card, spans, cursor, gap) =
+            self.build_card_inner(self.render_from, self.timeline.len(), true, None);
         BuiltCard {
             card,
             full: false,
             spans,
             cursor,
+            gap,
         }
     }
 
@@ -2684,6 +2710,7 @@ impl StreamAccumulator {
             full: false,
             spans: built.1,
             cursor: built.2,
+            gap: built.3,
         }
     }
 
@@ -2816,11 +2843,16 @@ impl StreamAccumulator {
         serde_json::Value,
         Vec<crate::bridge::card_handles::BlockSpan>,
         RenderedCursor,
+        Option<GapCoverage>,
     ) {
         let state = state_override.unwrap_or_else(|| self.card_state.clone());
         // The body's Rendered Cursor, captured before the builder consumes
         // nothing but `&self`: position and identity only (spec #561).
         let cursor = self.cursor_for_slice(end, include_tail, &state);
+        // How far THIS body carries the chain's orphan gap (spec #561, review
+        // #569): per body, never per accumulator — a gap split across cards
+        // must not read as delivered.
+        let gap = self.gap_coverage(end);
         // The header shows the Turn's running tool even when THIS slice has no
         // panel for it (a split continuation after `sleep 30` started): pass
         // the accumulator's global selection as the builder's override. The
@@ -3083,7 +3115,7 @@ impl StreamAccumulator {
             builder = builder.with_footer(&footer_parts.join(" · "));
         }
 
-        (builder.build(), spans, cursor)
+        (builder.build(), spans, cursor, gap)
     }
 
     /// The part characters this accumulator's timeline delivers for `source`
@@ -3252,15 +3284,23 @@ impl StreamAccumulator {
     /// body's tail delivers and removes the calls it delivers settled into the
     /// timeline; a call the body omits (a finalized slice has no tail, a
     /// settled card omits a carried `⏳`) keeps its last delivered state.
-    fn cursor_for_slice(&self, end: usize, include_tail: bool, state: &CardState) -> RenderedCursor {
-        let mut cursor = self.cursor.clone();
-        if let Some((idx, source, kind, started_at)) =
+    /// The newest entry before `end` whose source `wanted` accepts, as a
+    /// [`CursorFrontier`] (spec #561): the chain cursor's own frontier on an
+    /// ordinary body, and the gap's progress on a body that carries gap
+    /// content (the `wanted` predicate tells the two sets apart). `None` when
+    /// the body carries no such entry — the cursor keeps its base.
+    fn frontier_for(&self, end: usize, wanted: impl Fn(&PartSource) -> bool) -> Option<CursorFrontier> {
+        let end = end.min(self.timeline.len());
+        let (idx, source, kind, started_at) =
             self.timeline[..end]
                 .iter()
                 .enumerate()
                 .rev()
                 .find_map(|(idx, item)| {
                     let source = item.source.as_ref()?;
+                    if !wanted(source) {
+                        return None;
+                    }
                     let kind = match &item.kind {
                         TimelineKind::Text(_) => CursorPartKind::Text,
                         TimelineKind::Reasoning(_) => CursorPartKind::Reasoning,
@@ -3270,35 +3310,68 @@ impl StreamAccumulator {
                         _ => return None,
                     };
                     Some((idx, source, kind, item.shown_at))
-                })
-        {
-            let (delivered_chars, prefix_digest) = match kind {
-                // The settled tool has no extent of its own: the frontier
-                // carries the newest text/reasoning part's, so that part still
-                // renders its growth after a restart (review #569).
-                CursorPartKind::Tool => {
-                    match self.timeline[..idx]
-                        .iter()
-                        .rev()
-                        .find_map(|item| match &item.kind {
-                            TimelineKind::Text(_) | TimelineKind::Reasoning(_) => item.source.as_ref(),
-                            _ => None,
-                        }) {
-                        Some(source) => (self.source_extent_in(source, end), source.prefix_digest),
-                        // No text part to fingerprint: the empty prefix.
-                        None => (0, Some(crate::bridge::chain::cursor_prefix_digest(""))),
-                    }
+                })?;
+        let (delivered_chars, prefix_digest) = match kind {
+            // The settled tool has no extent of its own: the frontier
+            // carries the newest text/reasoning part's, so that part still
+            // renders its growth after a restart (review #569).
+            CursorPartKind::Tool => {
+                match self.timeline[..idx]
+                    .iter()
+                    .rev()
+                    .find_map(|item| match &item.kind {
+                        TimelineKind::Text(_) | TimelineKind::Reasoning(_) => item.source.as_ref(),
+                        _ => None,
+                    })
+                    .filter(|source| wanted(source))
+                {
+                    Some(source) => (self.source_extent_in(source, end), source.prefix_digest),
+                    // No text part to fingerprint: the empty prefix.
+                    None => (0, Some(crate::bridge::chain::cursor_prefix_digest(""))),
                 }
-                _ => (self.source_extent_in(source, end), source.prefix_digest),
-            };
-            cursor.frontier = Some(CursorFrontier {
-                message_id: source.message_id.clone(),
-                part_index: source.index,
-                kind,
-                started_at,
-                delivered_chars,
-                prefix_digest,
-            });
+            }
+            _ => (self.source_extent_in(source, end), source.prefix_digest),
+        };
+        Some(CursorFrontier {
+            message_id: source.message_id.clone(),
+            part_index: source.index,
+            kind,
+            started_at,
+            delivered_chars,
+            prefix_digest,
+        })
+    }
+
+    /// How far the body ending at timeline index `end` carries the chain's
+    /// pending orphan gap (spec #561, review #569): the newest gap entry it
+    /// includes, and whether that already reaches the gap's last entry — only
+    /// then is the whole gap on a card and the durable fact consumable. A body
+    /// that stops mid-gap reports `complete: false`, so its confirmation only
+    /// advances the gap and the remaining tail stays owed.
+    fn gap_coverage(&self, end: usize) -> Option<GapCoverage> {
+        let frontier = self.frontier_for(end, |source| self.gap_messages.contains(&source.message_id))?;
+        let complete = self
+            .timeline
+            .iter()
+            .rposition(|item| {
+                item.source
+                    .as_ref()
+                    .is_some_and(|source| self.gap_messages.contains(&source.message_id))
+            })
+            .is_some_and(|last| last < end.min(self.timeline.len()));
+        Some(GapCoverage { frontier, complete })
+    }
+
+    fn cursor_for_slice(&self, end: usize, include_tail: bool, state: &CardState) -> RenderedCursor {
+        let mut cursor = self.cursor.clone();
+        // The chain cursor never names a gap entry (spec #561, review #569):
+        // the gap's content sits EARLIER in the read than the confirmed
+        // frontier, so taking it would lower the cursor below content a later
+        // card already showed.
+        if let Some(frontier) =
+            self.frontier_for(end, |source| !self.gap_messages.contains(&source.message_id))
+        {
+            cursor.frontier = Some(frontier);
         }
         for item in &self.timeline[..end] {
             if let TimelineKind::Tool(call_id) = &item.kind {

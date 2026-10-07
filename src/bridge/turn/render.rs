@@ -728,13 +728,19 @@ pub(super) fn render_turn_parts(acc: &mut StreamAccumulator, transcript: &Sessio
 /// it yet leaves the gap pending for the next one. One INFO line records the
 /// landing (never content).
 fn render_pending_gap_once(acc: &mut StreamAccumulator, transcript: &SessionTranscript) -> bool {
+    // The accumulator keeps the durable gap (its cursor advances only through
+    // confirmed writes): `gap_rendered` is the one-shot render gate, so a
+    // partial render still leaves the fact — and its remaining tail — visible
+    // to the re-point that carries it on.
+    if acc.gap_rendered {
+        return false;
+    }
     let Some(gap) = acc.pending_gap.clone() else {
         return false;
     };
     if !render_pending_gap(acc, transcript, &gap) {
         return false;
     }
-    acc.pending_gap = None;
     acc.gap_rendered = true;
     tracing::info!(
         "orphan gap: session {} rendered its pending tail",
@@ -795,12 +801,25 @@ fn render_pending_gap(
                     acc.mark_delivered_part(&message.id, part);
                 }
                 crate::bridge::turn::state::SeedCut::Frontier(delivered) => {
+                    // A part the walk renders registers its message as gap
+                    // content (spec #561, review #569): the chain cursor must
+                    // never be built from these entries, while the gap's own
+                    // progress is read from them.
+                    acc.gap_messages.insert(message.id.clone());
                     if render_gap_part(acc, message.id.clone(), index, part, delivered) {
                         rendered = true;
                     }
                 }
                 crate::bridge::turn::state::SeedCut::Undelivered => {
-                    if render_part(acc, None, part) {
+                    acc.gap_messages.insert(message.id.clone());
+                    // A seeded call the gap renders is an ordinary settled
+                    // panel again: it leaves the display-only seeded set,
+                    // exactly as in the accumulator's own window.
+                    if let Part::Tool(call) = part {
+                        acc.seeded_calls.remove(&call.identity.call_id);
+                    }
+                    let source = PartSource::at(message.id.clone(), index);
+                    if render_part(acc, Some(source), part) {
                         rendered = true;
                     }
                 }
@@ -834,8 +853,10 @@ fn next_user_position(
 }
 
 /// One gap part whose cut is its frontier: the undelivered suffix (with its
-/// markdown lead), pushed WITHOUT a source — the durable frontier names the
-/// delivered content that follows the gap, so the body must never regress it.
+/// markdown lead), pushed with its source so the gap's own progress can be read
+/// back from the body — the chain cursor skips it by message
+/// ([`StreamAccumulator::gap_messages`]), so it can still never lower the
+/// chain's frontier.
 fn render_gap_part(
     acc: &mut StreamAccumulator,
     message_id: MessageId,
@@ -848,7 +869,10 @@ fn render_gap_part(
         Part::Reasoning(reasoning) => (reasoning.text.as_str(), reasoning.started_at, false),
         // The gap's cut resolved to a tool: render it whole — the ordinary
         // render's own dedup decides.
-        _ => return render_part(acc, None, part),
+        _ => {
+            let source = PartSource::at(message_id, index);
+            return render_part(acc, Some(source), part);
+        }
     };
     let full_len = full.chars().count();
     let held = acc.source_extent(&PartSource::at(message_id.clone(), index));
@@ -860,11 +884,17 @@ fn render_gap_part(
         return false;
     }
     let lead = crate::feishu::card::sanitize::neutralize_tail(&prefix, &suffix);
+    let source = PartSource {
+        message_id,
+        index,
+        delivered_before: cut,
+        prefix_digest: Some(crate::bridge::chain::cursor_prefix_digest(full)),
+    };
     if is_text {
-        acc.push_text_lead(started_at, None, &suffix, lead);
+        acc.push_text_lead(started_at, Some(source), &suffix, lead);
         acc.card_state = crate::feishu::card::CardState::Streaming;
     } else {
-        acc.push_reasoning_lead(started_at, None, &suffix, lead);
+        acc.push_reasoning_lead(started_at, Some(source), &suffix, lead);
         acc.card_state = crate::feishu::card::CardState::Reasoning;
     }
     true
