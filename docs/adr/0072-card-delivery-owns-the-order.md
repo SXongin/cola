@@ -135,10 +135,14 @@ drops stale intents, collapses duplicates and retries failures.
   retries a card another writer holds with a try-lock (skipped, never
   awaited), and a queued attempt is bounded by the retry timeout, so a hung
   Feishu call leaves the payload owed for a later retry instead of freezing
-  convergence. Callers that need the write's own timing (a collect releasing
-  its cached card on delivery, warning on failure; the ending's confirmation)
-  await the submission's completion ticket, exactly the timing the PATCH's own
-  await had.
+  convergence. The driver's own wait for the card lock is bounded by the same
+  timeout (spec #571 review): a lock another writer holds past it reports the
+  recoverable timeout, settles the submission's ticket so an awaiting caller
+  unblocks, and leaves the submission owed — the drain's try-lock retries it
+  once the lock frees. Callers that need the write's own timing (a collect
+  releasing its cached card on delivery, warning on failure; the ending's
+  confirmation) await the submission's completion ticket, exactly the timing
+  the PATCH's own await had.
 
 **The two amendments (2026-10-07).** The vocabulary gained the endings while
 ticket #575 retired the claim, because each retirement exposed a window the
