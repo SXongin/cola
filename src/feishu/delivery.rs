@@ -61,7 +61,11 @@
 //! it while Session Sync's submission stays fire-and-forget. The write itself
 //! is owned by the queue — a spawned driver task takes the card's delivery
 //! lock and settles the state — not by the submitting task, so cancelling a
-//! submitter cannot strand the payload it already submitted.
+//! submitter cannot strand the payload it already submitted. Every wait a
+//! driver makes is bounded: the card-lock wait and the Feishu call both expire
+//! into the same recoverable outcome, so a ticket always settles and no caller
+//! — the reap's collect included — inherits another writer's hang (spec #571
+//! review).
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -509,6 +513,16 @@ impl CardDelivery {
         self
     }
 
+    /// [`Self::with_limits`] with a shorter per-attempt bound — both the
+    /// write's own timeout and the driver's wait for the card lock — so a test
+    /// can watch a hung write or a held lock time out without a paused 30 s
+    /// (spec #571 review).
+    #[cfg(test)]
+    fn with_retry_timeout(mut self, timeout: Duration) -> Self {
+        self.limits.retry_timeout = timeout;
+        self
+    }
+
     /// Whether `message_id` has an undelivered write — the gate the Live Card
     /// record's removal consults (ADR-0063 amendment): a terminal card's
     /// record stays until its ending write is confirmed. Both classes count
@@ -854,11 +868,25 @@ impl CardDelivery {
             // Serialize with every other writer of this card: the keyless
             // `update_message`, the outbox's retry, another driver. A
             // submission's driver waits for the lock (its write must land
-            // promptly); the drain's retry skips a card a writer already holds
-            // (the Session Sync pass never blocks on one).
+            // promptly) — but only up to the attempt bound (spec #571 review):
+            // a keyless write can hold the lock without a bound of the
+            // submission's own, and a caller awaiting this submission's ticket
+            // (the reap's collect) must never inherit that hang. The drain's
+            // retry skips a card a writer already holds (the Session Sync pass
+            // never blocks on one).
             let lock = card_lock(&state, &message_id);
             let guard = match mode {
-                LockMode::Await => Some(lock.lock().await),
+                LockMode::Await => match tokio::time::timeout(limits.retry_timeout, lock.lock()).await {
+                    Ok(guard) => Some(guard),
+                    Err(_) => {
+                        // The wait expired: answer the owed submission's ticket
+                        // with the recoverable timeout and leave it owed, so
+                        // its caller unblocks and a later drain — whose
+                        // try-lock skips a held card — retries it.
+                        Self::owe_lock_timeout(&state, &message_id, token, limits);
+                        return;
+                    }
+                },
                 LockMode::Try => lock.try_lock().ok(),
             };
             let Some(_delivery) = guard else {
@@ -988,6 +1016,42 @@ impl CardDelivery {
         {
             entry.driver = None;
         }
+    }
+
+    /// The driver's card-lock wait outlived its bound (spec #571 review): the
+    /// owed submission reports the recoverable timeout — so any caller
+    /// awaiting its ticket (the reap's collect) unblocks instead of inheriting
+    /// another writer's hang — and stays owed with a backoff, its reservation
+    /// released so the drain can pick it up. The drain's try-lock skips the
+    /// card while the holder still owns it and retries once it frees.
+    fn owe_lock_timeout(state: &Mutex<State>, message_id: &str, token: u64, limits: Limits) {
+        let mut state = state.lock().unwrap();
+        let Some(entry) = state.entries.get_mut(message_id) else {
+            return;
+        };
+        if entry.driver != Some(token) {
+            return;
+        }
+        let Some(write) = entry.in_flight.as_mut() else {
+            entry.driver = None;
+            return;
+        };
+        if write.token != token {
+            entry.driver = None;
+            return;
+        }
+        write.attempts += 1;
+        write.next_attempt = tokio::time::Instant::now()
+            + backoff_delay(limits.backoff_base, limits.backoff_max, write.attempts);
+        entry.driver = None;
+        Self::settle_ticket(
+            entry,
+            token,
+            WriteOutcome::Failed(BridgeError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "card lock timed out",
+            ))),
+        );
     }
 
     /// Retry one card's owed keyless payload — the Pending Card Update proper —
@@ -2985,6 +3049,54 @@ mod tests {
             inner.attempts(),
             vec![("om_1".to_string(), card.clone()), ("om_1".to_string(), card)],
             "the owed keyed write was retried with its own payload"
+        );
+    }
+
+    /// The driver's card-lock wait is bounded (spec #571 review): a keyless
+    /// write parked while holding the lock must not hold a keyed submission's
+    /// ticket — and so a caller awaiting it (the reap's collect) — forever. The
+    /// expiry reports the recoverable timeout, leaves the submission owed, and
+    /// the drain lands it once the lock frees.
+    #[tokio::test(start_paused = true)]
+    async fn a_keyed_write_never_waits_for_the_card_lock_forever() {
+        let inner = Arc::new(FakePlatform::new());
+        let delivery = Arc::new(
+            CardDelivery::with_limits(inner.clone(), MAX_PENDING, BACKOFF_BASE, BACKOFF_MAX)
+                .with_retry_timeout(Duration::from_secs(5)),
+        );
+        let keyless = serde_json::json!({ "body": "keyless" });
+        let keyed = serde_json::json!({ "body": "keyed" });
+
+        // A keyless write parks mid-flight, holding the card's delivery lock.
+        let (entered, release) = inner.park_next();
+        let writing = tokio::spawn({
+            let delivery = Arc::clone(&delivery);
+            let keyless = keyless.clone();
+            async move { delivery.update_message("om_1", &keyless).await }
+        });
+        entered.notified().await;
+
+        let ticket = submit(&delivery, "om_1", 1, CardWriteIntent::Collect, &keyed).await;
+        // The driver waits for the lock — but only up to the bound: the ticket
+        // must settle so its awaiting caller is never wedged.
+        let outcome = tokio::time::timeout(Duration::from_secs(120), ticket.settled())
+            .await
+            .expect("the lock wait must be bounded, not hang its caller");
+        assert!(matches!(outcome, WriteOutcome::Failed(_)));
+        assert_eq!(
+            inner.attempts().len(),
+            1,
+            "the keyed payload never reached Feishu while the lock was held"
+        );
+
+        // The lock frees; the drain retries the owed submission.
+        release.notify_one();
+        writing.await.unwrap().unwrap();
+        delivery.drain_pending_card_updates(true).await;
+        assert_eq!(
+            inner.attempts(),
+            vec![("om_1".to_string(), keyless), ("om_1".to_string(), keyed)],
+            "the owed keyed write landed once the lock freed"
         );
     }
 
