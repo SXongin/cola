@@ -3962,6 +3962,37 @@ async fn a_rejected_preserved_ending_retries_the_bare_one() {
         "the retry is the bare ending: {}",
         patches[1]
     );
+    // The fallback landed THROUGH the keyed queue (spec #571 review): its
+    // delivery settled the ending's key DELIVERED, so the queue now answers
+    // the key's re-decisions with `Delivered` and writes nothing again. A bare
+    // retry sent outside the queue would have left the key permanently
+    // REFUSED by the preserved attempt's rejection, answering `Superseded`.
+    let again = crate::feishu::card::shell::CardBuilder::new()
+        .with_state(CardState::Done)
+        .build();
+    let ticket = app
+        .cards_handle()
+        .feishu
+        .submit_ordered(crate::feishu::delivery::KeyedSubmission {
+            message_id: "om_frozen",
+            generation: 0,
+            intent: crate::feishu::delivery::CardWriteIntent::Settle,
+            card: &again,
+            fallback: None,
+        })
+        .await;
+    assert!(
+        matches!(
+            ticket.settled().await,
+            crate::feishu::delivery::WriteOutcome::Delivered
+        ),
+        "the keyed fallback settled the key delivered, not refused"
+    );
+    assert_eq!(
+        patches_to(&platform, "om_frozen").await.len(),
+        2,
+        "the settled key never writes again"
+    );
 }
 
 /// A permanently refused ending — the preserved shape AND its bare fallback —
