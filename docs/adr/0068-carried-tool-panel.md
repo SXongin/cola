@@ -13,6 +13,12 @@
 > too. The panel semantics below (display-only, settles exactly once, the
 > collect's strip) stand. See the amendment at the end.
 
+> **Amended by ADR-0072**: the predecessor keep rule the takeover collect
+> recorded on the successor's record — for the #443 stamp's post-PATCH repair
+> to reproduce this collect's strip — retired with the repair. The collect's
+> strip rule is unchanged: its own payload composition. See the amendment at
+> the end.
+
 ## Context
 
 ADR-0045 made an unfinished **Tool Panel** card-tail live content: it rides
@@ -225,3 +231,25 @@ continuation keeps ADR-0061's no-replay scope, and the reap's live adoption is
 ADR-0071's projection rule, not a Wake arm. "No new durable state" is
 narrowed the same way ADR-0061 and ADR-0063 are: the durable fact is the
 Rendered Cursor on the Chain Record, not state about a carry.
+
+## Amendment (2026-10-07): the recorded predecessor keep rule retires (ADR-0072)
+
+The takeover collect's strip rule is exactly what the collect composes: the
+`keep` rule `collect_orphan_after_takeover` applies to its payload — the
+Background Task Ledger always, the running `⏳` panels each call the seed
+actually resolved. That is now the rule's only home. Between the #527 fix and
+this batch the same rule was ALSO recorded on the successor's Chain Record
+(scoped to the predecessor card) before the collect's PATCH, so the #443
+stamp's post-PATCH repair could re-collect the orphan under the takeover's rule
+when the stamp had landed over it. That recording, its lookup and the repair it
+fed retired with the keyed ordering (ADR-0072): the collect and the stamp are
+keyed submissions to one per-card queue, so a stamp can no longer land after
+the collect that outranks it, and there is nothing left to repair — the rule
+lived one object away from the collect that owned it.
+
+The Decision and its 2026-10-06 amendment stand where they describe the
+collect's own composition, and "a failed old-card PATCH is the same
+best-effort degrade as every collect" still holds. The 2026-10-05 amendment's
+observation that the reap's endings — including the #443 stamp — keep
+preserving the body also remains true of the stamp: only its ordering
+mechanism changed (ADR-0063's amendment).

@@ -12,6 +12,14 @@
 > settled in place — and the #443 stamp below narrows to the cursorless
 > fallback. See the amendment at the end.
 
+> **Amended by ADR-0072**: the #443 stamp is now a **keyed submission** the
+> card-delivery queue orders by **chain generation** — the detached
+> never-cancelled write task, the in-flight claim and its decision gates, the
+> post-read pre-check, the post-PATCH repair collect and the #522 give-up mark
+> all retired, and the record-release gate now counts the queue's keyed ending
+> state. The 2026-10-02 amendment's mechanism prose and the 2026-10-05 #522
+> amendment below are read under this amendment; see the amendment at the end.
+
 ## Context
 
 ADR-0059 decided that card state stays in memory — "a cola restart loses live
@@ -210,3 +218,48 @@ The reap's scope is otherwise unchanged — every record, every Session Sync
 pass, the same fail-open store and per-pass read bounds — and Interaction
 Receipts stay in ADR-0038's request-flow domain, re-hosted onto the successor
 by the existing sweeps and never rebuilt.
+
+## Amendment (2026-10-07): the #443 stamp is a keyed submission — the guard cluster retires (ADR-0072)
+
+The stamp is no longer a write whose ordering had to be derived from locks and
+guards. The view read and the composition still run on a small pre-submission
+task — the pass must not await a stuck Feishu call — but the write is submitted
+to the card-delivery queue (ADR-0072) as a **keyed submission** under
+`(chain generation, Stamp)`, the generation of the record snapshot the stamp's
+decision read. The queue owns it, so cancelling that task before the submission
+is safe and an admitted submission always settles. A collect submitted later at
+a newer generation supersedes it; a stamp submitted first lands first; a stamp
+whose generation the queue's floor has passed is dropped without a Feishu call.
+Nothing about the stamp's own behaviour changes: the card's view is read back,
+only the header changes, a failed read claims nothing and the next tick
+re-decides, and a payload Feishu refuses as card content never falls back to a
+bare stamp.
+
+Retired with the guards (spec #571, ticket #575): the detached task's
+never-cancelled write, the `restart_stamping` in-flight claim and every gate it
+fed (no status or transcript read while it held, no successor collect, the
+ladder's first guard), the post-read ownership pre-check, the post-PATCH repair
+collect, the predecessor keep rule recorded for it (ADR-0068's amendment), and
+the `restarted_reaped` / `restart_stamp_rejected` marks. The ordering they
+derived is now a property of the queue: a stamp decided under generation G but
+submitted after a takeover bumped the chain is dropped by the generation rule,
+and a stamp that passed its pre-check can no longer land after a collect —
+both are keyed submissions to the same queue. Re-deciding every tick is free
+once the key settled or is being written: the apply asks the queue's
+covered-key query (`keyed_write_covered`) before composing, so an
+already-stamped orphan costs no card read and no Feishu call; an owed
+recoverable failure is not covered, and the next tick's re-composition
+replaces it.
+
+#522's give-up is the queue's permanent-refusal outcome, not a mark on the
+record: a stamp PATCH Feishu permanently refuses as card content settles its
+`(generation, Stamp)` key, and every later re-submission of that key is dropped
+without a card read and without a Feishu call. The card simply stays without
+its stamp, the record stays with it, and the transcript-truth ending — itself a
+keyed `Settle` now — or a successor's collect still supersedes it.
+
+The record-release rule above ("removed after delivery, not before") is
+unchanged in intent and wider in fact: a terminal card's record is dropped only
+once its ending write is confirmed, and the gate (`release_spent`, via
+`has_pending_card_update`) now counts a keyed `Settle` the queue still owes or
+is writing, not only the keyless Pending Card Update.
