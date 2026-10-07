@@ -119,7 +119,8 @@ async fn stage_rendered_cursor(
     let mut live = cards.cards.lock().await;
     match live.get_mut(session_id) {
         Some(card) => {
-            let id = card.acc.stage_cursor(card_message_id, cursor.clone());
+            let covers_gap = card.acc.gap_rendered;
+            let id = card.acc.stage_cursor(card_message_id, cursor.clone(), covers_gap);
             crate::bridge::turn::state::StagedCursorId {
                 id,
                 awaiting_seq: None,
@@ -163,7 +164,7 @@ async fn confirm_staged_cursor(
     if chain_id.is_some_and(|chain_id| card.chain_id() != chain_id) {
         return;
     }
-    let Some(cursor) = card.acc.take_staged_cursor(card_message_id, expected) else {
+    let Some((cursor, covers_gap)) = card.acc.take_staged_cursor(card_message_id, expected) else {
         return;
     };
     // The ordering test parks one confirmation here (spec #561, review #569):
@@ -173,6 +174,11 @@ async fn confirm_staged_cursor(
         gate.release.notified().await;
     }
     cards.chains.advance_cursor(session_id, card_message_id, &cursor);
+    if covers_gap {
+        // This very body put the chain's orphan gap on a card (spec #561,
+        // review #569): the durable fact has served its purpose.
+        cards.chains.clear_pending_gap(session_id, card_message_id);
+    }
 }
 
 /// A one-shot test gate inside one cursor confirmation (spec #561, review

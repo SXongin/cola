@@ -23,7 +23,7 @@ use crate::backend::{
     ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage,
 };
 use crate::bridge::chain::{
-    ChainRecords, CursorFrontier, CursorPartKind, RenderedCursor, cursor_prefix_digest,
+    ChainRecords, CursorFrontier, CursorPartKind, PendingGap, RenderedCursor, cursor_prefix_digest,
 };
 use crate::bridge::test_support::*;
 use crate::bridge::turn::Turn;
@@ -7113,11 +7113,11 @@ async fn an_unplaceable_cursor_keeps_an_ended_records_record() {
     );
 }
 
-/// A cursor-bearing orphan whose first seed read fails keeps its seed pending
-/// (spec #561, review #569): the chain's cursor stays pinned at the unseeded
-/// gap while later reads cannot place it, and the first read that can lands
-/// the orphan's undelivered tail on the new card exactly once — never settled
-/// away, never skipped by the cursor.
+/// A cursor-bearing orphan whose first seed read fails records its undelivered
+/// tail as a durable GAP (spec #561, review #569): the chain's cursor keeps
+/// advancing with the new Turn's own content — a restart must never replay it
+/// — while the gap waits for a read that can place it, lands on the new card
+/// exactly once, and is cleared by the first confirmed write that carries it.
 #[tokio::test]
 async fn a_failed_seed_read_keeps_a_cursor_bearing_tail_pending() {
     let _wd = test_work_dir();
@@ -7203,15 +7203,24 @@ async fn a_failed_seed_read_keeps_a_cursor_bearing_tail_pending() {
             .expect("the carried cursor survives")
             .frontier,
         Some(CursorFrontier {
-            message_id: MessageId::new("msg_a_orphan"),
+            message_id: MessageId::new("msg_a_2001000"),
             part_index: 0,
             kind: CursorPartKind::Text,
-            started_at: Some(orphan_anchor + 500),
-            delivered_chars: delivered.chars().count(),
-            prefix_digest: Some(cursor_prefix_digest(delivered)),
+            started_at: Some(new_anchor + 1_000),
+            delivered_chars: "新回答一。新回答二。".chars().count(),
+            prefix_digest: Some(cursor_prefix_digest("新回答一。新回答二。")),
         }),
-        "the chain's cursor stays pinned at the unseeded gap"
+        "the delivered answer advances the durable cursor normally"
     );
+    let gap = record
+        .pending_gap
+        .clone()
+        .expect("the unplaceable gap is a durable fact");
+    assert_eq!(
+        gap.cursor.frontier.as_ref().map(|frontier| &frontier.message_id),
+        Some(&MessageId::new("msg_a_orphan"))
+    );
+    assert_eq!(gap.anchor.message_id, MessageId::new("msg_cola_anchor"));
     assert!(
         !card_text(platform.updated_cards().await.last().expect("a card")).contains(missed),
         "the unseeded tail is not on the card yet"
@@ -7238,6 +7247,24 @@ async fn a_failed_seed_read_keeps_a_cursor_bearing_tail_pending() {
         text.contains("新回答二。"),
         "the Turn's own content stays: {text}"
     );
+    // The confirmed write that carried the gap clears the durable fact: a
+    // restart renders it never again (spec #561, review #569).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let cleared = app
+            .cards_handle()
+            .chains
+            .get("ses_test")
+            .is_none_or(|record| record.pending_gap.is_none());
+        if cleared {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the durable gap is never cleared"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     drop(turn);
 }
 
@@ -7563,4 +7590,289 @@ async fn a_definite_refusal_leaves_no_durable_intent_across_a_restart() {
         "the retry is the once-and-only post: {:?}",
         platform.calls.lock().await
     );
+}
+
+/// A capped transcript read never lets an ended projection settle as complete
+/// (spec #561, review #569): the tail beyond the backend's page cap is unseen,
+/// so the old card keeps waiting for a complete read instead of freezing
+/// without it.
+#[tokio::test]
+async fn a_truncated_read_never_settles_an_ended_record_as_complete() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let delivered = "已经写了一半。";
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
+        Some(text_frontier(delivered)),
+        &[],
+    );
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "问题"),
+        assistant(2_000, delivered),
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_truncated();
+    let (app, platform, backend) =
+        restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Idle)).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+
+    spawn_sync(&app);
+    // The reap either settles and releases the record (the bug this test
+    // forbids) or keeps it and keeps observing.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        assert!(
+            app.cards_handle().chains.get("ses_test").is_some(),
+            "a truncated read must never settle and release the record"
+        );
+        if backend.transcript_calls.lock().await.len() >= 3 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the reap never observed the kept record"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    assert!(
+        patches_to(&platform, "om_frozen").await.is_empty(),
+        "a truncated read never settles the old card: {:?}",
+        platform.calls.lock().await
+    );
+    let record = app
+        .cards_handle()
+        .chains
+        .get("ses_test")
+        .expect("the record waits for a complete read");
+    assert!(record.cursor.is_some());
+}
+
+/// A restart while the pending orphan gap is unresolved renders only the gap
+/// (spec #561, review #569): the durable gap records the orphan's undelivered
+/// tail, the Rendered Cursor advances with the delivered answer, and the
+/// recovery never replays that answer.
+#[tokio::test]
+async fn a_restart_while_the_gap_is_pending_renders_only_the_gap() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let orphan_anchor = 1_000_000;
+    let new_anchor = 2_000_000;
+    let delivered = "已经写了一半。";
+    let gap_tail = "停机前没写的尾巴。";
+    let full = format!("{delivered}{gap_tail}");
+    let answer = "新回答一。新回答二。";
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(orphan_anchor),
+        Some("/work"),
+        Some(CursorFrontier {
+            message_id: MessageId::new("msg_a_orphan"),
+            part_index: 0,
+            kind: CursorPartKind::Text,
+            started_at: Some(orphan_anchor + 500),
+            delivered_chars: delivered.chars().count(),
+            prefix_digest: Some(cursor_prefix_digest(delivered)),
+        }),
+        &[],
+    );
+    // Phase A (life 1): the read does not carry the orphan's message, so the
+    // gap cannot resolve; the new Turn's own answer still streams.
+    let phase_a = SessionTranscript::new(vec![
+        user("msg_cola_new", new_anchor, "新问题"),
+        assistant_in_flight(new_anchor + 1_000, answer),
+    ]);
+    let (app, platform, backend, gate) = seeded_app(&session_file, phase_a, SessionStatus::Busy).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+    // Exactly the SEED's read fails; every later read serves normally.
+    backend.fail_transcript_reads(1);
+    gate.add_permits(1);
+
+    let mut context = ctx("ses_test", "新问题");
+    context.cola_message_id = Some("msg_cola_new".into());
+    let turn = spawn_turn(&app, context);
+    wait_for_card_text(&platform, answer).await;
+    // The delivered answer advanced the durable cursor normally, and the
+    // unplaceable gap is a durable fact of its own.
+    let record = app
+        .cards_handle()
+        .chains
+        .get("ses_test")
+        .expect("the fresh Turn's record");
+    assert_eq!(
+        record
+            .cursor
+            .as_ref()
+            .and_then(|cursor| cursor.frontier.as_ref())
+            .map(|frontier| frontier.message_id.clone()),
+        Some(MessageId::new(format!("msg_a_{}", new_anchor + 1_000))),
+        "the delivered answer advances the durable cursor"
+    );
+    assert!(
+        record.pending_gap.is_some(),
+        "the unplaceable gap is a durable fact: {record:?}"
+    );
+    turn.abort();
+    drop(app); // life 1 ends: a crash before any read placed the gap
+
+    // Life 2: the read carries the orphan's message, so the projection renders
+    // the gap — and never the answer the old card already showed.
+    let life2 = SessionTranscript::new(vec![
+        user("msg_cola_anchor", orphan_anchor, "跑个长命令"),
+        TranscriptMessage {
+            id: MessageId::new("msg_a_orphan"),
+            role: MessageRole::Assistant,
+            time: Some(MessageTime {
+                created: orphan_anchor + 500,
+                completed: None,
+            }),
+            model: None,
+            tokens: None,
+            error: None,
+            parts: vec![Part::Text(TextPart {
+                text: full.clone(),
+                started_at: Some(orphan_anchor + 500),
+            })],
+        },
+        user("msg_cola_new", new_anchor, "新问题"),
+        assistant(new_anchor + 1_000, answer),
+    ])
+    .with_executions(vec![execution(orphan_anchor + 2_500)]);
+    let (app2, platform2, _backend2) =
+        restarted_app_with_backend(&session_file, life2, Some(SessionStatus::Idle)).await;
+    platform2.given_card_view("msg_reply", realistic_card_view());
+
+    spawn_sync(&app2);
+    let (successor, successor_text) = wait_for_projection(&platform2, "msg_cola_new").await;
+    assert_eq!(
+        successor_text.matches(gap_tail).count(),
+        1,
+        "the gap lands exactly once on the successor: {successor}"
+    );
+    assert!(
+        !successor_text.contains(answer),
+        "the delivered answer is never replayed on a restart: {successor}"
+    );
+}
+
+/// A fresh Turn that takes over a record still owing an orphan gap carries the
+/// durable fact (spec #561, review #569): the re-point rewrites the record, so
+/// the gap is re-homed onto the new one and its tail renders on this card
+/// exactly once — while the turns the durable cursor already covers are never
+/// replayed — and the first confirmed write clears it.
+#[tokio::test]
+async fn a_fresh_turn_carries_a_pending_gap() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let orphan_anchor = 1_000_000;
+    let prev_anchor = 2_000_000;
+    let fresh_anchor = 3_000_000;
+    let delivered = "已经写了一半。";
+    let missed = "停机前没送达的尾巴。";
+    let full = format!("{delivered}{missed}");
+    let answer = "旧回答。";
+    // The record names the previous Turn's card and its cursor already covers
+    // that Turn's delivered answer, while the orphan gap is still owed.
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_prev",
+        Some(prev_anchor),
+        Some("/work"),
+        Some(CursorFrontier {
+            message_id: MessageId::new(format!("msg_a_{}", prev_anchor + 500)),
+            part_index: 0,
+            kind: CursorPartKind::Text,
+            started_at: Some(prev_anchor + 500),
+            delivered_chars: answer.chars().count(),
+            prefix_digest: Some(cursor_prefix_digest(answer)),
+        }),
+        &[],
+    );
+    ChainRecords::load(sidecar(&session_file)).note_pending_gap(
+        "ses_test",
+        "om_frozen",
+        &PendingGap {
+            cursor: RenderedCursor {
+                frontier: Some(CursorFrontier {
+                    message_id: MessageId::new(format!("msg_a_{}", orphan_anchor + 500)),
+                    part_index: 0,
+                    kind: CursorPartKind::Text,
+                    started_at: Some(orphan_anchor + 500),
+                    delivered_chars: delivered.chars().count(),
+                    prefix_digest: Some(cursor_prefix_digest(delivered)),
+                }),
+                live_calls: Default::default(),
+            },
+            anchor: crate::backend::TurnAnchor {
+                message_id: MessageId::new("msg_cola_anchor"),
+                created_ms: orphan_anchor,
+            },
+            bound: Some(MessageId::new("msg_cola_prev")),
+        },
+    );
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", orphan_anchor, "跑个长命令"),
+        assistant_in_flight(orphan_anchor + 500, &full),
+        user("msg_cola_prev", prev_anchor, "旧问题"),
+        assistant(prev_anchor + 500, answer),
+        user("msg_cola_fresh", fresh_anchor, "新问题"),
+        assistant_in_flight(fresh_anchor + 1_000, "新回答。"),
+    ]);
+    let (app, platform, _backend, gate) = seeded_app(&session_file, transcript, SessionStatus::Busy).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+    platform.given_card_view("msg_reply", realistic_card_view());
+    gate.add_permits(1);
+
+    let mut context = ctx("ses_test", "新问题");
+    context.cola_message_id = Some("msg_cola_fresh".into());
+    let turn = spawn_turn(&app, context);
+    wait_for_card_text(&platform, missed).await;
+    let updates = patches_to(&platform, "msg_reply").await;
+    let text = card_text(updates.last().expect("the carried gap lands on the card"));
+    assert_eq!(
+        text.matches(missed).count(),
+        1,
+        "the carried gap renders exactly once: {text}"
+    );
+    assert!(
+        !text.contains(delivered),
+        "the gap's delivered prefix is never repeated: {text}"
+    );
+    assert!(
+        !text.contains(answer),
+        "the turn the durable cursor already covers is never replayed: {text}"
+    );
+    assert!(
+        text.contains("新回答。"),
+        "the fresh Turn's own content streams: {text}"
+    );
+    // The write that carried the gap clears the durable fact: no later Turn
+    // re-renders the tail.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let cleared = app
+            .cards_handle()
+            .chains
+            .get("ses_test")
+            .is_none_or(|record| record.pending_gap.is_none());
+        if cleared {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the carried gap is never cleared"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    drop(turn);
 }

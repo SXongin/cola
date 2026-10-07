@@ -240,15 +240,42 @@ projects the chain's delta after it onto a successor card.**
   undelivered tail renders once, as a continuation, before the new Turn's
   content, and the live set resolves by identity. A record with no cursor
   keeps the retired carry's semantics — the orphaned Turn's still-live calls,
-  nothing replayed. A cursor-bearing orphan's gap is never dropped: a seed the
+  nothing replayed. A cursor-bearing orphan's tail is never dropped: a seed the
   takeover's read could not resolve — a failed or timed-out read, or one that
-  cannot place the cursor — stays PENDING on the accumulator, and until a later
-  render read lands it (the tail then renders on the new card exactly once)
-  the chain's cursor stays pinned at the gap's frontier: no confirmed write may
-  advance the record past content no card has shown, and the record is not
-  released at a terminal while the seed is pending. No interlock is
+  cannot place the cursor — becomes a **durable orphan gap** on the Chain
+  Record (its `cursor` is the orphaned chain's confirmed frontier, its `anchor`
+  the orphaned Turn), while the chain's cursor keeps advancing with the new
+  Turn's own confirmed writes. One frontier cannot express "gap undelivered,
+  later content delivered", so the gap is a fact of its own rather than a pin
+  at the gap's frontier (review #569). Rendering it is a walk of the gap's own
+  Turn window, cut at the gap's cursor and bounded by the Turn the chain moved
+  to — the gap records that message, falling back to the read's next user
+  message, because `turn_for_user` carries no upper end — whose pushed entries carry
+  **no source**: a successor built from them can never offer a frontier older
+  than the record's, and the delivered content the cursor already covers — the
+  answer of the Turn that followed the gap — is never re-rendered. The gap
+  lands exactly once and is then consumed: a projection takes it with the
+  re-point that rewrites the record (a gap the read could not place rides onto
+  the new record), a fresh Turn's takeover that finds one re-homes it onto the
+  new record and renders it on its own card, and the first confirmed write of
+  a body that includes the gap's content clears the durable fact — the stage
+  carries the coverage, so a write built before the gap rendered can never
+  clear it early. An ended record whose gap this read cannot place claims
+  nothing (`Keep`: a settle would drop the fact forever), and the record is
+  not released while an unrendered gap is owed. No interlock is
   introduced: the projection relies on the
   existing per-card delivery lock for ordering (#527's no-hold property).
+
+- **A truncated read is a prefix, and the ended projection never settles on
+  it.** The V2 transcript read pages to its cap (`MAX_MESSAGE_PAGES`) and
+  returns what it has; the neutral `SessionTranscript` says so with `truncated`
+  (V1 reads are unbounded and always false). A truncated read can place a
+  cursor inside its returned prefix while newer content sits unseen beyond the
+  cap, so an ended projection claims nothing while the read is truncated — no
+  settle-as-complete, no released record — exactly like an unplaceable cursor:
+  the ending itself cannot be trusted. The live adoption is unaffected: it
+  renders what the read carries and the follow streams the rest, so a cap
+  never loses the tail there.
 
 - **The Wake Watermark still closes the announcement.** The projection's
   confirmed create drains the staged Wake Watermark through the same choke
@@ -307,6 +334,11 @@ projects the chain's delta after it onto a successor card.**
 - **Stamp a cursor-carrying record when its cursor cannot be placed.**
   Rejected: the stamp freezes the run the projection is supposed to follow;
   claiming nothing leaves the record for a later read that can seed.
+- **Pin the chain's cursor at the gap while the seed is pending** (the
+  pre-review design). Rejected (review #569): the pin keeps the delivered
+  content that follows the gap out of the cursor, so a restart's recovery
+  renders that already-delivered content again — the successor shows what the
+  old card already showed. The owed tail has to be a durable fact of its own.
 - **Retry a create whose response was lost.** Rejected: Feishu has no
   idempotency key (ADR-0067), so a retry can post a second successor card; the
   single-shot mark prefers an unposted successor with an in-place state repair

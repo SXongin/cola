@@ -654,6 +654,7 @@ async fn send_projected_successor(
         anchor,
         cursor,
         seed,
+        record.pending_gap.as_ref(),
         transcript,
         ending,
         &title,
