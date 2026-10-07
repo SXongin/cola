@@ -198,6 +198,15 @@ projects the chain's delta after it onto a successor card.**
   still owed, so a terminal card's usual record discard is suppressed for it
   and the next life resumes from the cursor.
 
+- **One timeline entry per transcript part.** Every text/reasoning part keeps
+  its own timeline entry and `PartSource`, even when two parts of one message
+  share a server time (review #569): the frontier's identity is the part, so an
+  entry merged from two parts would carry the first part's digest over both
+  extents, resolve to a cut at 0, and re-render content a card already showed.
+  Chunks of the SAME part still merge; a chunk continuing a part whose
+  equal-key run another part's entry follows is inserted beside its own
+  entries, so the card's content and order are unchanged.
+
 - **Render seeding.** The seed resolves the cursor against the read:
   everything at or before the frontier counts as delivered — marked per
   MESSAGE, not by content alone, so the seeded suppression and the Wake step's

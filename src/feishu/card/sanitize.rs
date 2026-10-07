@@ -126,14 +126,16 @@ fn open_construct(prefix: &str) -> Option<OpenConstruct<'_>> {
         return Some(OpenConstruct::Fence { ticks });
     }
     // A table is "open" when its last non-blank line is a row of one: walk
-    // back to the block's start and require the header/delimiter shape (a
-    // header alone counts — the cut landed between it and the delimiter).
+    // back to the TABLE's own start — a line belonging to no table (no `|`)
+    // ends the block, so a paragraph sitting directly above the header is
+    // never crossed — and require the header/delimiter shape (a header alone
+    // counts — the cut landed between it and the delimiter).
     let last = lines.iter().rposition(|line| !line.trim().is_empty())?;
     if !lines[last].contains('|') {
         return None;
     }
     let mut start = last;
-    while start > 0 && !lines[start - 1].trim().is_empty() {
+    while start > 0 && lines[start - 1].trim().contains('|') {
         start -= 1;
     }
     let delimiter = if last > start {
@@ -602,6 +604,27 @@ mod tests {
         assert_eq!(
             CardMarkdown::new().clean(&format!("{lead}| 二 | 2 |")),
             "| 名称 | 值 |\n|---|---|\n| 二 | 2 |"
+        );
+    }
+
+    /// A table directly under a paragraph (no blank line between them) is
+    /// still a table at its own start (spec #561, review #569): the lead's
+    /// backward scan must not cross the paragraph, or a cut inside the table
+    /// gets no lead and the remaining rows render as literal pipe text.
+    #[test]
+    fn a_table_directly_after_a_paragraph_repeats_its_header() {
+        let prefix = "前置段落文字。\n| 名称 | 值 |\n|---|---|\n| 一 | 1 |\n";
+        let lead = neutralize_tail(prefix, "| 二 | 2 |\n").unwrap();
+        assert_eq!(lead, "| 名称 | 值 |\n|---|---|\n");
+        assert_eq!(
+            CardMarkdown::new().clean(&format!("{lead}| 二 | 2 |")),
+            "| 名称 | 值 |\n|---|---|\n| 二 | 2 |"
+        );
+        // Without the lead the leftover row renders as literal pipe text.
+        assert_eq!(
+            CardMarkdown::new().clean("| 二 | 2 |"),
+            "| 二 | 2 |",
+            "the mangling the lead prevents"
         );
     }
 }
