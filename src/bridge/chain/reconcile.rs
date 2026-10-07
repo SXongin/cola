@@ -35,9 +35,10 @@
 //! to keep — so the next pass retries it; a PATCH Feishu *permanently* refuses
 //! as card content is given up for the process life instead (#522). The attempt
 //! is handed to a detached
-//! task and its write is never cancelled: the pass must not await a stuck
-//! Feishu call, while an issued write must run to its own result so the
-//! card-delivery lock can order a successor's later collect after it. A
+//! task: the pass must not await a stuck Feishu call, while the issued write is
+//! submitted as a **keyed write** (spec #571) that the card-delivery queue owns
+//! — it runs to its own result, and a successor's later collect, carrying the
+//! newer chain generation, is ordered after it or drops it by generation. A
 //! per-record in-flight claim holds every other reap decision until the
 //! attempt resolves. Content the chain never showed is published by the
 //! projections above (bounded by their confirmed cursor), by the
@@ -93,6 +94,7 @@ use crate::bridge::turn::{ArmedTakeover, CardOwnership, Disposition, Turn};
 use crate::feishu::card::{
     CardState, error_line, ledger::TASK_LEDGER_ELEMENT_ID, move_line, shell::CardBuilder,
 };
+use crate::feishu::delivery::{CardWriteIntent, KeyedSubmission, WriteOutcome};
 
 /// Collect the orphaned card `card_message_id` because a new card took the
 /// chain over (ADR-0063): one PATCH naming the successor, terminal and grey,
@@ -108,7 +110,15 @@ use crate::feishu::card::{
 /// A failed PATCH only warns; the record follows the successor either way, so
 /// the freeze it leaves behind is the pre-#438 behavior, never a crash.
 pub(crate) async fn collect_orphan(cards: &CardsHandle, session_id: &str, card_message_id: &str) {
-    collect_orphan_with(cards, session_id, card_message_id, KeepBody::Everything).await;
+    let generation = cards.chains.generation(session_id);
+    collect_orphan_with(
+        cards,
+        session_id,
+        card_message_id,
+        KeepBody::Everything,
+        generation,
+    )
+    .await;
 }
 
 /// Collect the orphaned card `card_message_id` for a seeded takeover — the
@@ -124,9 +134,9 @@ pub(crate) async fn collect_orphan(cards: &CardsHandle, session_id: &str, card_m
 /// A failed PATCH only warns, like every collect.
 ///
 /// The rule is recorded on the successor's record **before** the collect's
-/// PATCH: a #443 stamp admitted while the takeover ran may land after this
-/// collect, and its post-PATCH repair reads the rule to reproduce this strip
-/// instead of restoring the tail it removed ([`stamp_restart_attempt`]).
+/// submission: the collect itself now outranks any stamp the ordering let
+/// through, and the record is what the legacy repair reads when one does
+/// ([`stamp_restart_attempt`]).
 pub(crate) async fn collect_orphan_after_takeover(
     cards: &CardsHandle,
     session_id: &str,
@@ -139,7 +149,11 @@ pub(crate) async fn collect_orphan_after_takeover(
     let keep = KeepBody::WithoutLiveTail {
         resolved_calls: resolved_calls.to_vec(),
     };
-    collect_orphan_with(cards, session_id, card_message_id, keep).await;
+    // The takeover has tracked the successor by now, so this reads the NEW
+    // chain state's generation: the collect outranks the orphan-record
+    // generation a stamp decided under (spec #571, ticket #574).
+    let generation = cards.chains.generation(session_id);
+    collect_orphan_with(cards, session_id, card_message_id, keep, generation).await;
 }
 
 /// Collect a projection's LATE successor — the create that landed after a
@@ -149,21 +163,45 @@ pub(crate) async fn collect_orphan_after_takeover(
 /// reader the same text twice. The late card is reduced to the bare
 /// taken-over marker; every other collect keeps its body (ADR-0063).
 pub(crate) async fn collect_late_projection(cards: &CardsHandle, session_id: &str, card_message_id: &str) {
-    collect_orphan_with(cards, session_id, card_message_id, KeepBody::Nothing).await;
+    let generation = cards.chains.generation(session_id);
+    collect_orphan_with(cards, session_id, card_message_id, KeepBody::Nothing, generation).await;
 }
 
 /// The shared takeover collect behind [`collect_orphan`] and
-/// [`collect_orphan_after_takeover`]: one PATCH naming the successor, terminal
-/// and grey, its preserved body under `keep`.
-async fn collect_orphan_with(cards: &CardsHandle, session_id: &str, card_message_id: &str, keep: KeepBody) {
+/// [`collect_orphan_after_takeover`]: one keyed submission naming the
+/// successor, terminal and grey, its preserved body under `keep`, carrying the
+/// **chain generation the write belongs to** — the successor's current
+/// generation for every live collect (spec #571, ticket #574), and the stamp's
+/// older read generation for the legacy repair, whose duplicate submission a
+/// takeover's newer collect then drops. The collect awaits its completion
+/// ticket — the cache release follows a delivery and the warning a failure,
+/// exactly the timing the PATCH's own await had — while the queue owns the
+/// write.
+async fn collect_orphan_with(
+    cards: &CardsHandle,
+    session_id: &str,
+    card_message_id: &str,
+    keep: KeepBody,
+    generation: u64,
+) {
     if card_message_id.is_empty() {
         return;
     }
-    let card = ending_card(CardState::TakenOver, None, None);
-    match patch_ending_keeping_body(cards.feishu.as_ref(), card_message_id, &card, keep).await {
-        // The one reap vocabulary: the INFO line's ending word comes from the
-        // state itself, exactly like every `ApplyPass::settle` line.
-        Ok(()) => {
+    let bare = ending_card(CardState::TakenOver, None, None);
+    let card = preserved_ending(cards.feishu.as_ref(), card_message_id, &bare, keep).await;
+    let outcome = cards
+        .feishu
+        .submit_ordered(KeyedSubmission {
+            message_id: card_message_id,
+            generation,
+            intent: CardWriteIntent::Collect,
+            card: &card,
+        })
+        .await
+        .settled()
+        .await;
+    match outcome {
+        WriteOutcome::Delivered => {
             // The collect repainted the card outside the handle registry, so
             // its cached JSON is now older than what Feishu shows (this PATCH
             // stripped every control). Release it: the card's live blocks stay
@@ -178,9 +216,28 @@ async fn collect_orphan_with(cards: &CardsHandle, session_id: &str, card_message
                 CardState::TakenOver.reap_word()
             );
         }
-        Err(e) => tracing::warn!(
+        WriteOutcome::Failed(e @ crate::error::BridgeError::CardContentRejected { .. }) => {
+            // The preserved payload can never land — the queue settled its key
+            // refused — so retry the bare ending keyless, exactly like every
+            // preserved ending: the card never stays looking live.
+            tracing::warn!(
+                "live-card reap: card {card_message_id} refused the preserved ending ({e}); retrying bare"
+            );
+            if let Err(e) = cards.feishu.update_message(card_message_id, &bare).await {
+                tracing::warn!(
+                    "live-card reap: session {session_id} could not collect card {card_message_id}: {e}"
+                );
+            }
+        }
+        WriteOutcome::Failed(e) => tracing::warn!(
             "live-card reap: session {session_id} could not collect card {card_message_id}: {e}"
         ),
+        WriteOutcome::Superseded => {
+            // A newer chain state owns the card (or its key already settled):
+            // nothing was written for this collect, so there is no repaint to
+            // release the cache for and no failure to warn about — the write
+            // that does own the card decides its own presentation.
+        }
     }
 }
 
@@ -1217,13 +1274,19 @@ impl ApplyPass<'_> {
 /// detached task (#443): the pass must never await the write, and the write
 /// must never be cancelled. Both properties matter — a stuck Feishu call
 /// cannot freeze Session Sync if nobody awaits it, and the card's delivery
-/// lock is what orders a successor's later collect after the stamp, so a
-/// cancelled write that still committed at Feishu could land over that
-/// collect. The task marks the record when the PATCH lands, repairs a takeover
-/// admitted while it was in flight, and releases the claim (landed or failed)
-/// so the next pass may retry.
+/// queue owns the issued write, so it runs to its own result and any
+/// successor's later collect is ordered after it (spec #571, ticket #574).
+/// The task submits the stamp under the generation its decision read, marks
+/// the record when the write lands, repairs a takeover admitted while it was
+/// in flight, and releases the claim (resolved either way) so the next pass
+/// may retry. A submission a newer generation superseded marks nothing: the
+/// takeover's own collect is the card's last word.
 fn stamp_restarted(handles: &FlowHandles, session_id: &str, record: &ChainRecord, read_timeout_ms: u64) {
     let card_message_id = record.card_message_id.clone();
+    // The generation the decision read rides the record snapshot: submitted
+    // with the write, so a takeover that bumps the chain meanwhile outranks
+    // (and drops) this stamp (spec #571, ticket #574).
+    let generation = record.generation;
     if !handles
         .cards
         .chains
@@ -1234,28 +1297,32 @@ fn stamp_restarted(handles: &FlowHandles, session_id: &str, record: &ChainRecord
     let cards = handles.cards.clone();
     let session_id = session_id.to_string();
     tokio::spawn(async move {
-        stamp_restart_attempt(&cards, &session_id, &card_message_id, read_timeout_ms).await;
+        stamp_restart_attempt(&cards, &session_id, &card_message_id, generation, read_timeout_ms).await;
         cards.chains.finish_restart_stamp(&session_id, &card_message_id);
     });
 }
 /// One restart-stamp attempt (#443), detached from the Session Sync pass: the
 /// still-live orphan's card view is read back (bounded — nothing has been sent
 /// yet, so abandoning a timed-out read is safe) and only the header changes —
-/// body kept, controls stripped, exactly like a preserved ending. The PATCH is
-/// deliberately **not** bounded: cancelling an issued card write releases the
-/// card's delivery lock early, and the write could still commit at Feishu
-/// after a successor's collect landed, overwriting it. A failed read or PATCH
-/// claims nothing — no bare fallback: the stamp's whole value is the body it
-/// preserves — and the caller releases the attempt's claim so the next pass
-/// retries; a PATCH permanently refused as card content (#522) is marked given
-/// up instead. On success the in-memory mark is set, and a takeover admitted
-/// while the write was in flight is repaired by the post-PATCH re-collect —
-/// under the fresh-Turn takeover's own keep rule when it recorded one
-/// (ADR-0068), never restoring the tail that collect removed.
+/// body kept, controls stripped, exactly like a preserved ending. The PATCH
+/// itself is submitted as a **keyed write** under the generation the decision
+/// read (spec #571, ticket #574): the queue owns it, and the attempt awaits
+/// its own ticket, so the landing line, the marks and the legacy repair keep
+/// the exact timing the awaited PATCH had. A failed read claims nothing — no
+/// bare fallback: the stamp's whole value is the body it preserves — and the
+/// caller releases the attempt's claim so the next pass retries; a write
+/// permanently refused as card content (#522) is marked given up instead. A
+/// submission superseded by a newer generation is the ordering working: the
+/// takeover's collect owns the card and this stamp is never owed. On success
+/// the in-memory mark is set, and a takeover admitted while the write was in
+/// flight is repaired by the post-PATCH re-collect — under the fresh-Turn
+/// takeover's own keep rule when it recorded one (ADR-0068), never restoring
+/// the tail that collect removed.
 async fn stamp_restart_attempt(
     cards: &CardsHandle,
     session_id: &str,
     card_message_id: &str,
+    generation: u64,
     read_timeout_ms: u64,
 ) {
     let platform = cards.feishu.as_ref();
@@ -1281,23 +1348,51 @@ async fn stamp_restart_attempt(
     // (`take_over_card`'s attach-then-collect order), so any admitted
     // successor is visible here, and its collect is the later terminal: the
     // stamp yields to it rather than overwriting it with an interim status.
+    // The generation rule behind this check catches the same race in the
+    // queue when the successor's card is no longer visible (spec #571).
     if Turn::card_message_id(cards, session_id).await.is_some() {
         return;
     }
     let card = restamped_keeping_body(&ending_card(CardState::Restarted, None, None), &view);
-    if let Err(e) = platform.update_message(card_message_id, &card).await {
-        tracing::warn!("live-card reap: session {session_id} could not stamp card {card_message_id}: {e}");
-        // #522: a definite content rejection is deterministic — the same
-        // preserved payload can never land — so this process life gives the
-        // stamp up instead of retrying it every Session Sync tick. Transient
-        // failures change nothing: the caller releases the claim either way,
-        // and the next pass retries them.
-        if matches!(e, crate::error::BridgeError::CardContentRejected { .. }) {
-            cards
-                .chains
-                .mark_restart_stamp_rejected(session_id, card_message_id);
+    let outcome = platform
+        .submit_ordered(KeyedSubmission {
+            message_id: card_message_id,
+            generation,
+            intent: CardWriteIntent::Stamp,
+            card: &card,
+        })
+        .await
+        .settled()
+        .await;
+    match outcome {
+        WriteOutcome::Delivered => {}
+        WriteOutcome::Failed(e) => {
+            tracing::warn!(
+                "live-card reap: session {session_id} could not stamp card {card_message_id}: {e}"
+            );
+            // #522: a definite content rejection is deterministic — the same
+            // preserved payload can never land — so this process life gives the
+            // stamp up instead of retrying it every Session Sync tick. Transient
+            // failures change nothing: the caller releases the claim either way;
+            // the queue keeps a recoverable failure owed with its key, and the
+            // next pass's re-submission delivers or replaces it.
+            if matches!(e, crate::error::BridgeError::CardContentRejected { .. }) {
+                cards
+                    .chains
+                    .mark_restart_stamp_rejected(session_id, card_message_id);
+            }
+            return;
         }
-        return;
+        WriteOutcome::Superseded => {
+            // A newer chain state owns the card: the takeover's collect was
+            // submitted first (or a newer stamp did), so this stamp is not
+            // owed and never reached Feishu. Nothing to mark and nothing to
+            // repair — the record keeps its place for that owner's decisions.
+            tracing::debug!(
+                "live-card reap: session {session_id} stamp for card {card_message_id} superseded by a newer chain state"
+            );
+            return;
+        }
     }
     tracing::info!(
         "live-card reap: session {session_id} {}",
@@ -1309,7 +1404,11 @@ async fn stamp_restart_attempt(
     // the two writes, not their order of intent): if a successor owns the
     // session now, collect the orphan again so the takeover has the card's
     // last word. A collect that lands after this PATCH wins on its own; this
-    // only repairs the reversed order.
+    // only repairs the reversed order. Under the keyed ordering the takeover's
+    // collect was submitted at the NEW generation, so this repair's submission
+    // under the stamp's older generation is dropped without a call — the
+    // branch stays for the legacy window in which a takeover has tracked but
+    // not yet submitted its collect.
     //
     // The repair reproduces the takeover's own keep rule (ADR-0068), never
     // the plain one: a fresh Turn's collect recorded which of the carry's calls
@@ -1322,7 +1421,7 @@ async fn stamp_restart_attempt(
             Some(resolved_calls) => KeepBody::WithoutLiveTail { resolved_calls },
             None => KeepBody::Everything,
         };
-        collect_orphan_with(cards, session_id, card_message_id, keep).await;
+        collect_orphan_with(cards, session_id, card_message_id, keep, generation).await;
     }
 }
 
@@ -1352,8 +1451,8 @@ fn ending_card(state: CardState, detail: Option<&str>, move_note: Option<&str>) 
 /// PATCH `bare` onto `card_message_id`, keeping the card's existing body
 /// best-effort (#434 acceptance feedback): read the card's own view, merge the
 /// ending over it, PATCH the merge. `keep` is the merge's view-element rule —
-/// [`KeepBody::Everything`] for every ordinary collect, ending and the #443
-/// stamp, [`KeepBody::WithoutLiveTail`] for the fresh-Turn takeover's collect
+/// [`KeepBody::Everything`] for every ordinary ending and the #443 stamp,
+/// [`KeepBody::WithoutLiveTail`] for the fresh-Turn takeover's collect
 /// and the #443 stamp's repair of it (ADR-0068). A failed
 /// read PATCHes `bare` directly — today's behavior — because the ending must
 /// never depend on the read.
@@ -1370,23 +1469,33 @@ async fn patch_ending_keeping_body(
     bare: &serde_json::Value,
     keep: KeepBody,
 ) -> crate::error::Result<()> {
-    match platform.get_card_view(card_message_id).await {
-        Ok(view) => {
-            let card = restamped_keeping_body_with(bare, &view, keep);
-            match platform.update_message(card_message_id, &card).await {
-                Ok(()) => Ok(()),
-                Err(e @ crate::error::BridgeError::CardContentRejected { .. }) => {
-                    tracing::warn!(
-                        "live-card reap: card {card_message_id} refused the preserved ending ({e}); retrying bare"
-                    );
-                    platform.update_message(card_message_id, bare).await
-                }
-                Err(e) => Err(e),
-            }
+    let card = preserved_ending(platform, card_message_id, bare, keep).await;
+    match platform.update_message(card_message_id, &card).await {
+        Ok(()) => Ok(()),
+        Err(e @ crate::error::BridgeError::CardContentRejected { .. }) => {
+            tracing::warn!(
+                "live-card reap: card {card_message_id} refused the preserved ending ({e}); retrying bare"
+            );
+            platform.update_message(card_message_id, bare).await
         }
+        Err(e) => Err(e),
+    }
+}
+
+/// The card one preserved write PATCHes: `bare` merged under `keep` over the
+/// card's own view, or `bare` alone when the read fails — the ending must
+/// never depend on the read.
+async fn preserved_ending(
+    platform: &dyn crate::feishu::Platform,
+    card_message_id: &str,
+    bare: &serde_json::Value,
+    keep: KeepBody,
+) -> serde_json::Value {
+    match platform.get_card_view(card_message_id).await {
+        Ok(view) => restamped_keeping_body_with(bare, &view, keep),
         Err(e) => {
             tracing::debug!("live-card reap: card {card_message_id} view unreadable ({e}); settling bare");
-            platform.update_message(card_message_id, bare).await
+            bare.clone()
         }
     }
 }

@@ -22,9 +22,11 @@ use crate::backend::{
     ContentBlock, FinishReason, MessageId, MessageRole, MessageTime, Part, ReasoningPart, SessionTranscript,
     StepFinish, TextPart, ToolCall, ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage,
 };
+use crate::bridge::card_handles::RenderedBlock;
 use crate::bridge::chain::{
     ChainRecords, CursorFrontier, CursorPartKind, PendingGap, RenderedCursor, cursor_prefix_digest,
 };
+use crate::bridge::snapshot_claims::ClaimKind;
 use crate::bridge::test_support::*;
 use crate::bridge::turn::Turn;
 use crate::config::{SessionEntry, ThreadKey};
@@ -1089,14 +1091,83 @@ async fn a_takeover_during_the_stamp_read_wins_over_the_stamp() {
     assert_eq!(card_header(&patches[0]), "⏳ 已由新卡片接管 · 已停止更新");
 }
 
-/// A successor that owns the session by the time the stamp's PATCH returns is
-/// re-collected: the post-PATCH ownership re-check gives the takeover the
-/// card's last word even when the stamp's write landed over its collect
-/// (#443). The check-to-PATCH interleaving itself cannot be parked (the
-/// card's delivery lock serializes the two actual writes), so this test pins
-/// the repair branch the interleaving would take.
+/// A stamp decided under generation G and submitted after a takeover bumped
+/// the chain to G+1 never PATCHes the card (spec #571, ticket #574): the
+/// takeover's collect owns the latest chain state, and the queue drops the
+/// stale stamp by generation. The parked attempt's pre-check cannot mask the
+/// rule in this test — the takeover's in-memory card is gone by the time the
+/// read resumes, the cardless state every restart starts from — so only the
+/// ordering key stands between the stamp and the collected card.
 #[tokio::test]
-async fn a_successor_owning_the_session_recollects_after_the_stamp() {
+async fn a_stamp_submitted_after_a_takeover_bumped_the_chain_never_patches() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
+    // A second live orphan the reap keeps reading: the pass clock proving
+    // ticks ran after the parked stamp was released.
+    ChainRecords::load(sidecar(&session_file)).track(
+        "ses_other",
+        "om_other",
+        MessageId::new("msg_cola_other"),
+        Some(2_000),
+        Some("/work"),
+    );
+
+    let transcript = SessionTranscript::new(vec![user("msg_cola_anchor", 1_000, "问题")]);
+    let (app, platform, backend) =
+        restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Busy)).await;
+    backend
+        .set_session_status("ses_other", Some(SessionStatus::Busy))
+        .await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+    // Park the stamp's view read: the decision is made, the submission is not.
+    let (entered, release) = platform.pause("card_view", "om_frozen");
+
+    spawn_sync_with_timeout(&app, 5_000);
+    entered.notified().await;
+
+    // A successor takes the orphan over while the stamp's read is parked: the
+    // chain bumps to the new card's generation and its collect lands first.
+    Turn::seed_card(&app.cards_handle(), "ses_test", None).await;
+    Turn::set_turn_anchor(&app.cards_handle(), "ses_test", &turn_anchor(1_000)).await;
+    Turn::take_over_card(&app.cards_handle(), "ses_test", "om_new", Some("/work")).await;
+    wait_for_patches(&platform, "om_frozen", 1).await;
+    // The takeover's card is gone before the stamp resumes (the process no
+    // longer holds one), so the attempt's pre-check finds nothing to yield to
+    // and the stale stamp reaches the queue.
+    Turn::drop_card(&app.cards_handle(), "ses_test").await;
+
+    let before = backend
+        .session_status_reads
+        .lock()
+        .await
+        .iter()
+        .filter(|sid| sid.as_str() == "ses_other")
+        .count();
+    release.notify_one();
+    // Three more observed passes, the takeover already landed: the released
+    // stamp had every chance to (wrongly) land before these.
+    wait_for_status_reads(&backend, "ses_other", before + 3).await;
+
+    let patches = patches_to(&platform, "om_frozen").await;
+    assert_eq!(
+        patches.len(),
+        1,
+        "the takeover collect is the orphan's only write, never a stale stamp: {patches:?}"
+    );
+    assert_eq!(card_header(&patches[0]), "⏳ 已由新卡片接管 · 已停止更新");
+}
+
+/// An in-flight stamp followed by a collect leaves the collect as the card's
+/// last write (spec #571, ticket #574): the takeover's collect is submitted at
+/// the NEW chain generation while the stamp's PATCH is parked, so the queue
+/// writes it after the stamp — and the stamp's legacy post-PATCH repair, a
+/// duplicate collect under the stamp's OLD generation, is dropped without a
+/// call. The branch stays in the code for the legacy window where a takeover
+/// has tracked but not yet submitted its collect.
+#[tokio::test]
+async fn a_successor_owning_the_session_collects_after_the_stamp() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("sessions.json");
@@ -1117,9 +1188,8 @@ async fn a_successor_owning_the_session_recollects_after_the_stamp() {
         .set_session_status("ses_other", Some(SessionStatus::Busy))
         .await;
     // The orphan's view carries a running `⏳` panel and the ledger too: the
-    // plain takeover settles `Everything`, so the repair must keep the whole
-    // preserved body (ADR-0068's strip is scoped to the fresh-Turn path and
-    // its repair).
+    // plain takeover settles `Everything`, so the collect must keep the whole
+    // preserved body (ADR-0068's strip is scoped to the fresh-Turn path).
     platform.given_card_view("om_frozen", live_tail_orphan_view());
     // Park the stamp's PATCH after its pre-PATCH ownership check passed.
     let (entered, release) = platform.pause("update", "om_frozen");
@@ -1128,7 +1198,7 @@ async fn a_successor_owning_the_session_recollects_after_the_stamp() {
     entered.notified().await;
 
     // The successor arms and re-points the record while the stamp is parked;
-    // its collect queues on the card's delivery lock behind the stamp.
+    // its collect takes the queue's waiting slot behind the in-flight stamp.
     let takeover = {
         let app = app.clone();
         tokio::spawn(async move {
@@ -1148,14 +1218,15 @@ async fn a_successor_owning_the_session_recollects_after_the_stamp() {
         .count();
     release.notify_one();
     takeover.await.unwrap();
-    // Three more observed passes: the repair landed with the parked pass.
+    // Three more observed passes: the takeover's collect landed with the
+    // parked pass, and any repair PATCH would have followed it.
     wait_for_status_reads(&backend, "ses_other", before + 3).await;
 
     let patches = patches_to(&platform, "om_frozen").await;
     assert_eq!(
         patches.len(),
-        3,
-        "the stamp, the takeover's collect and the post-PATCH re-collect: {patches:?}"
+        2,
+        "the stamp and the takeover's collect, never a repair: {patches:?}"
     );
     assert_eq!(
         card_header(&patches[0]),
@@ -1168,12 +1239,12 @@ async fn a_successor_owning_the_session_recollects_after_the_stamp() {
         "the takeover has the card's last word: {patches:?}"
     );
     // No fresh-Turn keep rule was recorded (the plain arm: `take_over_card`),
-    // so the repair keeps today's preserved body — the running panel and the
+    // so the collect keeps today's preserved body — the running panel and the
     // ledger both stay, exactly as every Wake/external collect always did.
     let text = card_text(patches.last().unwrap());
     assert!(
         text.contains("⏳ shell") && text.contains("⏳ 后台任务") && text.contains("**正文** 已经写完的部分"),
-        "the plain takeover's repair preserves the whole body: {text}"
+        "the plain takeover's collect preserves the whole body: {text}"
     );
 }
 
@@ -1703,6 +1774,70 @@ async fn a_failed_takeover_collect_warns_and_keeps_the_successor() {
     assert_eq!(warnings, 1, "a failed collect warns exactly once:\n{logs}");
 }
 
+/// The collect's cache release follows its own delivery (spec #571, ticket
+/// #574): while the collect's write is parked at the platform the orphan's
+/// cached JSON stays registered, and it is released once the write lands. The
+/// release belongs to the delivered repaint that stripped the controls — a
+/// submission a newer chain state superseded has nothing to release.
+#[tokio::test]
+async fn a_takeover_collect_releases_the_cache_only_when_its_write_lands() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
+
+    let transcript = SessionTranscript::new(vec![user("msg_cola_anchor", 1_000, "问题")]);
+    let (app, platform, _backend) =
+        restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Busy)).await;
+    // The registry still holds the orphan's last-rendered JSON: a live block
+    // keeps a card cached (a cache with no block is not a cache).
+    app.cards_handle().card_handles.lock().await.record(
+        "om_frozen",
+        &realistic_card_view(),
+        vec![RenderedBlock {
+            request_id: "req_perm".into(),
+            start: 0,
+            end: 1,
+            kind: ClaimKind::Permission,
+            session_id: "ses_test".into(),
+            directory: "/work".into(),
+            target: "om_frozen".into(),
+        }],
+    );
+    // Park the takeover collect's PATCH.
+    let (entered, release) = platform.pause("update", "om_frozen");
+    let takeover = {
+        let app = app.clone();
+        tokio::spawn(async move {
+            Turn::seed_card(&app.cards_handle(), "ses_test", None).await;
+            Turn::set_turn_anchor(&app.cards_handle(), "ses_test", &turn_anchor(1_000)).await;
+            Turn::take_over_card(&app.cards_handle(), "ses_test", "om_new", Some("/work")).await;
+        })
+    };
+    entered.notified().await;
+    assert!(
+        app.cards_handle()
+            .card_handles
+            .lock()
+            .await
+            .cached_card("om_frozen")
+            .is_some(),
+        "the cache stays while the collect's write is in flight"
+    );
+
+    release.notify_one();
+    takeover.await.unwrap();
+    assert!(
+        app.cards_handle()
+            .card_handles
+            .lock()
+            .await
+            .cached_card("om_frozen")
+            .is_none(),
+        "the delivered collect releases the cached presentation"
+    );
+}
+
 /// The seed's live set is scoped to the orphan Turn's projection: an older,
 /// unrelated turn's stale `running` part is never resurrected on the
 /// successor.
@@ -1859,13 +1994,15 @@ async fn a_timed_out_seed_read_seeds_nothing() {
 
 /// The #443 stamp's PATCH passes its pre-PATCH ownership check, then a fresh
 /// Turn takes the orphan over while the stamp is in flight: the takeover's
-/// collect queues behind the stamp's delivery lock, and the stamp's post-PATCH
-/// repair lands last. The repair must reproduce the takeover collect's keep
-/// rule — not `Everything` — so the stamp's stale body never restores the tail
-/// the takeover removed. Seeding one running call, that means no running `⏳`
+/// collect is submitted at the NEW chain generation, so it takes the queue's
+/// waiting slot behind the stamp and lands after it — the collect is the
+/// orphan's last write, and the stamp's duplicate repair under the old
+/// generation is dropped. The collect reproduces the takeover's keep rule —
+/// not `Everything` — so the stamp's stale body never restores the tail the
+/// takeover removed. Seeding one running call, that means no running `⏳`
 /// panel and no ledger on the orphan.
 #[tokio::test]
-async fn a_stamp_over_a_seeding_takeover_repairs_without_the_seeded_tail() {
+async fn a_stamp_over_a_seeding_takeover_collects_without_the_seeded_tail() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("sessions.json");
@@ -1889,7 +2026,7 @@ async fn a_stamp_over_a_seeding_takeover_repairs_without_the_seeded_tail() {
     platform.given_card_view("om_frozen", live_tail_orphan_view());
     // Park the stamp PATCH after its pre-PATCH ownership check passed: it
     // holds the card's delivery lock, so the takeover's collect queues behind
-    // it and the stamp's repair follows the collect.
+    // it.
     let (entered, release) = platform.pause("update", "om_frozen");
 
     spawn_sync_with_timeout(&app, 5_000);
@@ -1900,47 +2037,46 @@ async fn a_stamp_over_a_seeding_takeover_repairs_without_the_seeded_tail() {
     let turn = spawn_turn(&app, context);
     // The recorded rule is the observed proof the takeover attached, seeded
     // (at least one call) and reached its collect before the stamp is
-    // released — so the post-PATCH repair can no longer miss the successor.
+    // released — so the collect, never a repair, carries the strip.
     wait_for_predecessor_keep(&app, "ses_test", "om_frozen", &["call_sleep"]).await;
     release.notify_one();
-    // The repair is the orphan's third write: the parked stamp, the
-    // takeover's queued collect, then the stamp's repair. Waiting for it pins
-    // the interleaving this test creates.
-    wait_for_patches(&platform, "om_frozen", 3).await;
+    // The collect is the orphan's second write: the parked stamp, then the
+    // takeover's queued collect. Waiting for it pins the interleaving this
+    // test creates.
+    wait_for_patches(&platform, "om_frozen", 2).await;
 
     let patches = patches_to(&platform, "om_frozen").await;
     assert_eq!(
         patches.len(),
-        3,
-        "the stamp, the takeover's collect and its repair: {patches:?}"
+        2,
+        "the stamp and the takeover's collect, never a repair: {patches:?}"
     );
     assert_eq!(
         card_header(&patches[0]),
         "⏳ 已重启，等待运行结束",
         "the parked stamp landed first: {patches:?}"
     );
-    // Every write after the stamp is the takeover's collect or the stamp's
-    // repair: none may restore the live tail the takeover removed.
-    for patch in &patches[1..] {
-        assert_eq!(
-            card_header(patch),
-            "⏳ 已由新卡片接管 · 已停止更新",
-            "a post-stamp write is a takeover collect: {patch}"
-        );
-        let text = card_text(patch);
-        assert!(
-            !text.contains("⏳ shell"),
-            "a seeded running marker never returns to the collected card: {text}"
-        );
-        assert!(
-            !text.contains("⏳ 后台任务"),
-            "the ledger leaves every takeover collect and its repair: {text}"
-        );
-        assert!(
-            text.contains("**正文** 已经写完的部分") && text.contains("🌙 shell"),
-            "non-tail body content and the settled launch stay: {text}"
-        );
-    }
+    // The one write after the stamp is the takeover's collect: it must not
+    // restore the live tail the takeover removed.
+    let collect = patches.last().expect("the collect");
+    assert_eq!(
+        card_header(collect),
+        "⏳ 已由新卡片接管 · 已停止更新",
+        "the post-stamp write is the takeover's collect: {collect}"
+    );
+    let text = card_text(collect);
+    assert!(
+        !text.contains("⏳ shell"),
+        "a seeded running marker never returns to the collected card: {text}"
+    );
+    assert!(
+        !text.contains("⏳ 后台任务"),
+        "the ledger leaves every takeover collect: {text}"
+    );
+    assert!(
+        text.contains("**正文** 已经写完的部分") && text.contains("🌙 shell"),
+        "non-tail body content and the settled launch stay: {text}"
+    );
 
     // End the turn as usual: the seeded call settles and the session idles.
     backend
@@ -1973,12 +2109,13 @@ async fn a_stamp_over_a_seeding_takeover_repairs_without_the_seeded_tail() {
 }
 
 /// The same stamp/takeover interleaving for a takeover that seeded nothing (no
-/// live call in the orphan Turn's own window): the repair reproduces the
-/// takeover's rule, so the running `⏳` marker stays — spec #523: "When nothing
-/// was carried … the running marker stays" — while the ledger still leaves the
-/// collected card.
+/// live call in the orphan Turn's own window): the takeover's collect — the
+/// orphan's second and last write, submitting at the new generation — carries
+/// the takeover's rule, so the running `⏳` marker stays — spec #523: "When
+/// nothing was carried … the running marker stays" — while the ledger still
+/// leaves the collected card.
 #[tokio::test]
-async fn a_stamp_over_an_empty_takeover_repairs_without_the_ledger() {
+async fn a_stamp_over_an_empty_takeover_collects_without_the_ledger() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("sessions.json");
@@ -2002,8 +2139,7 @@ async fn a_stamp_over_an_empty_takeover_repairs_without_the_ledger() {
     let (app, platform, backend, gate) = seeded_app(&session_file, live, SessionStatus::Busy).await;
     platform.given_card_view("om_frozen", live_tail_orphan_view());
     // The seed resolves no live call: nothing moves to the successor, so the
-    // collect — and the repair behind it — keep the running panel and drop the
-    // ledger.
+    // collect keeps the running panel and drops the ledger.
     let (entered, release) = platform.pause("update", "om_frozen");
 
     spawn_sync_with_timeout(&app, 5_000);
@@ -2014,39 +2150,38 @@ async fn a_stamp_over_an_empty_takeover_repairs_without_the_ledger() {
     let turn = spawn_turn(&app, context);
     wait_for_predecessor_keep(&app, "ses_test", "om_frozen", &[]).await;
     release.notify_one();
-    wait_for_patches(&platform, "om_frozen", 3).await;
+    wait_for_patches(&platform, "om_frozen", 2).await;
 
     let patches = patches_to(&platform, "om_frozen").await;
     assert_eq!(
         patches.len(),
-        3,
-        "the stamp, the takeover's collect and its repair: {patches:?}"
+        2,
+        "the stamp and the takeover's collect, never a repair: {patches:?}"
     );
     assert_eq!(
         card_header(&patches[0]),
         "⏳ 已重启，等待运行结束",
         "the parked stamp landed first: {patches:?}"
     );
-    for patch in &patches[1..] {
-        assert_eq!(
-            card_header(patch),
-            "⏳ 已由新卡片接管 · 已停止更新",
-            "a post-stamp write is a takeover collect: {patch}"
-        );
-        let text = card_text(patch);
-        assert!(
-            text.contains("⏳ shell"),
-            "an unseeded running marker stays: {text}"
-        );
-        assert!(
-            !text.contains("⏳ 后台任务"),
-            "the ledger leaves the collect and its repair: {text}"
-        );
-        assert!(
-            text.contains("**正文** 已经写完的部分") && text.contains("🌙 shell"),
-            "non-tail body content and the settled launch stay: {text}"
-        );
-    }
+    let collect = patches.last().expect("the collect");
+    assert_eq!(
+        card_header(collect),
+        "⏳ 已由新卡片接管 · 已停止更新",
+        "the post-stamp write is the takeover's collect: {collect}"
+    );
+    let text = card_text(collect);
+    assert!(
+        text.contains("⏳ shell"),
+        "an unseeded running marker stays: {text}"
+    );
+    assert!(
+        !text.contains("⏳ 后台任务"),
+        "the ledger leaves the collect: {text}"
+    );
+    assert!(
+        text.contains("**正文** 已经写完的部分") && text.contains("🌙 shell"),
+        "non-tail body content and the settled launch stay: {text}"
+    );
 
     // End the turn as usual before the held prompt is released.
     backend

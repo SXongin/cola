@@ -435,6 +435,19 @@ impl ChainRecords {
             .collect()
     }
 
+    /// The chain's **current** Chain Generation (spec #571, ticket #574) — the
+    /// version a card write submitted now must carry, read at submission so a
+    /// takeover that landed since the caller's own snapshot (a new collect)
+    /// outranks that snapshot's older generation instead of being refused by
+    /// it. A released chain has no version left, and no writer of it remains;
+    /// zero is what a fresh chain starts at.
+    pub(crate) fn generation(&self, session_id: &str) -> u64 {
+        self.lock()
+            .records
+            .get(session_id)
+            .map_or(0, |record| record.generation)
+    }
+
     /// The one creation/re-point entry: make the record naming
     /// `card_message_id` the session's record from the current Turn facts and
     /// the Session's directory, whether that card opens a chain, continues it
@@ -2005,6 +2018,16 @@ mod tests {
         assert_eq!(
             entries["ses_a"].generation, 1,
             "the snapshot carries the record's current version"
+        );
+        assert_eq!(
+            chains.generation("ses_a"),
+            1,
+            "the live read names the chain's current version"
+        );
+        assert_eq!(
+            chains.generation("ses_missing"),
+            0,
+            "a chain with no record has no version to submit under"
         );
     }
 
