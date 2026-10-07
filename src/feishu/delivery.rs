@@ -944,13 +944,23 @@ impl CardDelivery {
             }
             match attempt.result {
                 Ok(()) => {
-                    // Only when no newer payload of the same key waits behind
-                    // this write: that one is the key's newest payload and will
-                    // settle it.
-                    if write.generation == entry.generation
-                        && entry.waiting.as_ref().is_none_or(|w| w.intent != write.intent)
-                    {
+                    if write.generation == entry.generation {
                         entry.keys.insert(write.intent, KeyState::Delivered);
+                        // A waiter carrying the SAME key is a duplicate of the
+                        // write that just landed: it collapses into it — one
+                        // key, one PATCH — and settles `Superseded`, exactly
+                        // like the refusal branch's same-key drop. A waiter at
+                        // a newer generation or with another intent is a
+                        // different logical write and still lands (spec #571
+                        // review).
+                        if entry
+                            .waiting
+                            .as_ref()
+                            .is_some_and(|w| w.generation == write.generation && w.intent == write.intent)
+                        {
+                            let waiting = entry.waiting.take().expect("checked above");
+                            Self::settle_ticket(entry, waiting.token, WriteOutcome::Superseded);
+                        }
                     }
                     Self::settle_ticket(entry, write.token, WriteOutcome::Delivered);
                 }
@@ -2298,6 +2308,42 @@ mod tests {
             vec![("om_1".to_string(), collect), ("om_1".to_string(), newest)],
             "the displaced payload never reached Feishu"
         );
+    }
+
+    /// A duplicate same-key submission collapses into the in-flight one (spec
+    /// #571 review): while the first write is parked, an identical
+    /// `(generation, intent)` submission waits; the delivery settles the key and
+    /// drops the duplicate without a second PATCH — one key, one write. The
+    /// collapsed duplicate answers `Superseded`, mirroring the refusal path's
+    /// same-key drop, and the settled key makes later re-decisions free.
+    #[tokio::test]
+    async fn a_duplicate_same_key_submission_collapses_into_the_in_flight_one() {
+        let inner = Arc::new(FakePlatform::new());
+        let (entered, release) = inner.park_next();
+        let delivery = Arc::new(CardDelivery::new(inner.clone()));
+        let first = serde_json::json!({ "body": "stamp one" });
+        let duplicate = serde_json::json!({ "body": "stamp two" });
+
+        let leading = submit(&delivery, "om_1", 1, CardWriteIntent::Stamp, &first).await;
+        entered.notified().await;
+        let waiting = submit(&delivery, "om_1", 1, CardWriteIntent::Stamp, &duplicate).await;
+        release.notify_one();
+
+        assert!(matches!(leading.settled().await, WriteOutcome::Delivered));
+        assert!(
+            matches!(waiting.settled().await, WriteOutcome::Superseded),
+            "the duplicate is collapsed into the delivered key, not written again"
+        );
+        assert_eq!(
+            inner.attempts(),
+            vec![("om_1".to_string(), first.clone())],
+            "one PATCH for one (generation, intent)"
+        );
+
+        // The key is settled delivered: a later re-decision is free.
+        let ticket = submit(&delivery, "om_1", 1, CardWriteIntent::Stamp, &duplicate).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Delivered));
+        assert_eq!(inner.attempts().len(), 1, "a settled key never writes again");
     }
 
     /// A key that already delivered never writes again: a writer's per-tick
