@@ -5641,6 +5641,253 @@ async fn a_projection_confirm_advances_the_cursor_it_was_confirmed_on() {
     );
 }
 
+/// Issue #583: a restart whose Waiting settle finds the cursor covering the
+/// whole read — the run idled on a live Background Task with nothing missed —
+/// still projects a successor. The wait's card is the one the task's
+/// completion Wake resumes in place (ADR-0066), so an empty delta must not
+/// drop it: the successor posts the standard waiting header plus the
+/// Background Task Ledger, replays nothing, and the old card is collected as
+/// taken over. The record re-points at the successor with its waiting mark.
+#[tokio::test]
+async fn a_restart_projects_a_waiting_successor_even_when_the_delta_is_empty() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let delivered = "已经写了一半。";
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
+        Some(text_frontier(delivered)),
+        &[],
+    );
+    let waiting = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, delivered),
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_background_tasks(vec![background_shell(2_100)]);
+    let (app, platform, _backend) =
+        restarted_app_with_backend(&session_file, waiting, Some(SessionStatus::Idle)).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+
+    spawn_sync(&app);
+    let (successor, successor_text) = wait_for_projection(&platform, "om_frozen").await;
+
+    assert_eq!(
+        card_header(&successor),
+        "⏳ 等待后台任务",
+        "the empty-delta waiting projection keeps the wait's header"
+    );
+    assert!(
+        successor_text.contains("⏳ 后台任务（"),
+        "the successor carries the Background Task Ledger: {successor}"
+    );
+    assert!(
+        !successor_text.contains(delivered),
+        "the fully delivered prefix is never replayed: {successor}"
+    );
+
+    // The old card is collected as taken over...
+    wait_for_update(&platform, "om_frozen", "the takeover collect", |card| {
+        card_header(card).contains("已由新卡片接管")
+    })
+    .await;
+    // ...and the record follows the successor, marked so no later pass
+    // projects the same wait again.
+    wait_for_record_card(&app, "ses_test", "msg_reply").await;
+    let record = app
+        .cards_handle()
+        .chains
+        .get("ses_test")
+        .expect("a waiting successor keeps its record");
+    assert!(
+        record.waiting_reaped,
+        "the projected yield is marked so no later pass projects it again"
+    );
+}
+
+/// Issue #583: the empty-delta waiting successor is a LIVE card, not a stamped
+/// orphan — the retiring task's completion Wake resumes it IN PLACE (ADR-0066),
+/// so the fixed completion entry, the resumed work and the true ending all
+/// land on the same card, with no second post.
+#[tokio::test]
+async fn a_completion_wake_resumes_the_projected_waiting_successor_in_place() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let delivered = "已经写了一半。";
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
+        Some(text_frontier(delivered)),
+        &[],
+    );
+    let waiting = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, delivered),
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_background_tasks(vec![background_shell(2_100)]);
+    let (app, platform, backend) =
+        restarted_app_with_backend(&session_file, waiting, Some(SessionStatus::Idle)).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+
+    spawn_sync(&app);
+    let (successor, _) = wait_for_projection(&platform, "om_frozen").await;
+    assert_eq!(card_header(&successor), "⏳ 等待后台任务");
+    let posts = card_posts(&platform).await;
+
+    // The task retires and its completion Wake resumes the run: the resumed
+    // work and the execution boundary arrive while cola watches.
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(vec![
+                user("msg_cola_anchor", 1_000, "跑一下 CI"),
+                assistant(2_000, delivered),
+                assistant(3_100, "CI 通过了。"),
+            ])
+            .with_executions(vec![execution(2_500), execution(4_000)])
+            .with_wakes(vec![shell_wake(2_900)]),
+        ],
+    )
+    .await;
+    wait_for_update(
+        &platform,
+        "msg_reply",
+        "the resumed successor's true end",
+        |card| card_header(card).contains("✅") && card_text(card).contains("CI 通过了。"),
+    )
+    .await;
+
+    let resumed = last_update_of(&platform, "msg_reply")
+        .await
+        .expect("the successor is resumed in place");
+    assert_eq!(
+        card_text(&resumed).matches("🔔 shell 完成：gh run watch").count(),
+        1,
+        "the retiring task's fixed entry lands on the successor exactly once: {resumed}"
+    );
+    assert!(
+        !card_text(&resumed).contains("⏳ 后台任务（"),
+        "the retired task's live row is gone: {resumed}"
+    );
+    assert_eq!(
+        card_posts(&platform).await,
+        posts,
+        "an in-place resume posts no second card: {:?}",
+        platform.calls.lock().await
+    );
+    assert!(
+        continuation_sends(&platform).await.is_empty(),
+        "an in-place resume writes no 承接 card: {:?}",
+        platform.calls.lock().await
+    );
+}
+
+/// The ended twin of the empty-delta rule (issue #583): a cursor covering the
+/// whole read over an ENDED run still drops its armed successor and PATCHes
+/// the old card's ending in place — content decides only the terminal case.
+#[tokio::test]
+async fn an_ended_projection_with_an_empty_delta_still_settles_in_place() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let delivered = "已经写完的回答。";
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
+        Some(text_frontier(delivered)),
+        &[],
+    );
+    let ended = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "问题"),
+        assistant(2_000, delivered),
+    ])
+    .with_executions(vec![execution(2_500)]);
+    let (app, platform, _backend) =
+        restarted_app_with_backend(&session_file, ended, Some(SessionStatus::Idle)).await;
+
+    spawn_sync(&app);
+    wait_for_update(&platform, "om_frozen", "the in-place ✅ ending", |card| {
+        card_header(card).contains("✅")
+    })
+    .await;
+
+    assert_eq!(
+        card_posts(&platform).await,
+        0,
+        "an ended empty-delta projection posts no successor: {:?}",
+        platform.calls.lock().await
+    );
+    wait_for_record_gone(&app, "ses_test").await;
+}
+
+/// The accepted per-restart cost (issue #583, ADR-0071 amendment): the waiting
+/// mark never survives a restart, so a second restart during the same wait
+/// projects its own successor and collects the previous one — exactly what the
+/// live adoption costs per restart.
+#[tokio::test]
+async fn each_restart_during_a_wait_projects_its_own_successor() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let delivered = "已经写了一半。";
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
+        Some(text_frontier(delivered)),
+        &[],
+    );
+    let waiting = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, delivered),
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_background_tasks(vec![background_shell(2_100)]);
+
+    // Life 1: the first restart projects its successor.
+    let (app1, platform1, _backend1) =
+        restarted_app_with_backend(&session_file, waiting.clone(), Some(SessionStatus::Idle)).await;
+    platform1.given_card_view("om_frozen", realistic_card_view());
+    platform1.given_reply_id("om_successor_1");
+    spawn_sync(&app1);
+    let (successor1, _) = wait_for_projection(&platform1, "om_frozen").await;
+    assert_eq!(card_header(&successor1), "⏳ 等待后台任务");
+    wait_for_record_card(&app1, "ses_test", "om_successor_1").await;
+    drop(app1); // life 1 ends
+
+    // Life 2: the same wait, still un-retired — and the in-memory waiting mark
+    // is gone with life 1, so the projection runs again onto its own successor.
+    let (app2, platform2, _backend2) =
+        restarted_app_with_backend(&session_file, waiting, Some(SessionStatus::Idle)).await;
+    platform2.given_card_view("om_successor_1", realistic_card_view());
+    platform2.given_reply_id("om_successor_2");
+    spawn_sync(&app2);
+    let (successor2, _) = wait_for_projection(&platform2, "om_frozen").await;
+    assert_eq!(card_header(&successor2), "⏳ 等待后台任务");
+    wait_for_record_card(&app2, "ses_test", "om_successor_2").await;
+
+    // The first successor is collected as taken over by the second, exactly
+    // like any re-projection's predecessor.
+    wait_for_update(&platform2, "om_successor_1", "the takeover collect", |card| {
+        card_header(card).contains("已由新卡片接管")
+    })
+    .await;
+}
+
 /// A create that fails advances nothing (spec #561, tickets #563/#566): the
 /// staged Wake Watermark stays unannounced — only a confirmed write advances
 /// it — and the old card is never collected. The attempt is single-shot
