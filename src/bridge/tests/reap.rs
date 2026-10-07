@@ -4198,13 +4198,17 @@ async fn a_cursorless_record_keeps_todays_in_place_settle() {
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("sessions.json");
     seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
-    let transcript = SessionTranscript::new(vec![
-        user("msg_cola_anchor", 1_000, "问题"),
-        assistant(2_000, "答复。"),
-    ])
-    .with_executions(vec![execution(2_500)]);
+    let delivered = "答复。";
+    let tail = "补上的尾巴。";
+    let transcript = || {
+        SessionTranscript::new(vec![
+            user("msg_cola_anchor", 1_000, "问题"),
+            assistant(2_000, &format!("{delivered}{tail}")),
+        ])
+        .with_executions(vec![execution(2_500)])
+    };
     let (app, platform, backend) =
-        restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Idle)).await;
+        restarted_app_with_backend(&session_file, transcript(), Some(SessionStatus::Idle)).await;
 
     spawn_sync(&app);
     wait_for_card_update(
@@ -4233,7 +4237,44 @@ async fn a_cursorless_record_keeps_todays_in_place_settle() {
         "the projection path is not taken for a cursorless record: {:?}",
         backend.session_info_calls.lock().await
     );
+    // The transcript's undelivered tail never reaches a card: only the settle
+    // ran. A record that took the projection path would have posted it.
+    let seen: String = platform
+        .updated_cards()
+        .await
+        .iter()
+        .map(card_text)
+        .collect::<Vec<_>>()
+        .join(
+            "
+",
+        );
+    assert!(
+        !seen.contains(tail),
+        "the cursorless fallback renders no transcript content: {seen}"
+    );
     assert!(app.cards_handle().chains.get("ses_test").is_none());
+    drop(app);
+    drop(backend);
+
+    // Positive control (spec #561, review #569): the SAME transcript with a
+    // cursor-carrying record DOES project — so this test fails if the
+    // projection path is reverted, not just if the cursorless fallback leaks
+    // into it. The cursor covers the delivered prefix; the tail is undelivered.
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
+        Some(text_frontier(delivered)),
+        &[],
+    );
+    let (app2, platform2, _backend2) =
+        restarted_app_with_backend(&session_file, transcript(), Some(SessionStatus::Idle)).await;
+    platform2.given_card_view("om_frozen", realistic_card_view());
+    spawn_sync(&app2);
+    wait_for_posted_text(&platform2, tail).await;
 }
 
 /// A cursor-carrying record that recorded no card and no Chat mapping still
@@ -6382,6 +6423,22 @@ async fn a_mid_chain_projection_failure_keeps_only_the_landed_slices() {
     assert!(!first_text.contains(&marker(39)), "{first_text}");
 }
 
+/// Wait until the platform observed at least `n` PATCH attempts for
+/// `card_message_id` (failed ones included), or panic after 5 s.
+async fn wait_for_update_attempts(platform: &RecordingPlatform, card_message_id: &str, n: usize) {
+    let probe = async {
+        loop {
+            if patches_to(platform, card_message_id).await.len() >= n {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), probe)
+        .await
+        .expect("the platform must see the write attempts");
+}
+
 /// Wait until a successfully POSTED (created) card carries `needle`, or panic
 /// after 5 s — a projection's chain slices are creates, not PATCHes, so
 /// [`wait_for_card_text`] (which reads updates) never sees them.
@@ -8104,4 +8161,214 @@ async fn a_restart_re_renders_nothing_for_two_parts_at_one_server_time() {
         !text.contains(first) && !text.contains(second),
         "the delivered parts are never re-rendered: {text}"
     );
+}
+
+/// A takeover that resolves its seed still OWES the gap durably (spec #561,
+/// review #569): the old card is collected at the takeover, and a crash before
+/// the new Turn's first confirmed write would otherwise leave the record with
+/// the old cursor and the new Turn's anchor — a recovery that cannot see the
+/// orphaned Turn's window and omits its undelivered tail. The tail lands
+/// exactly once after the crash.
+#[tokio::test]
+async fn a_crash_after_a_resolved_seed_still_lands_the_orphan_tail() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let orphan_anchor = 1_000_000;
+    let new_anchor = 2_000_000;
+    let delivered = "已经写了一半。";
+    let tail = "停机前没送达的尾巴。";
+    let full = format!("{delivered}{tail}");
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(orphan_anchor),
+        Some("/work"),
+        Some(CursorFrontier {
+            message_id: MessageId::new(format!("msg_a_{}", orphan_anchor + 500)),
+            part_index: 0,
+            kind: CursorPartKind::Text,
+            started_at: Some(orphan_anchor + 500),
+            delivered_chars: delivered.chars().count(),
+            prefix_digest: Some(cursor_prefix_digest(delivered)),
+        }),
+        &[],
+    );
+    let transcript = || {
+        SessionTranscript::new(vec![
+            user("msg_cola_anchor", orphan_anchor, "跑个长命令"),
+            TranscriptMessage {
+                id: MessageId::new(format!("msg_a_{}", orphan_anchor + 500)),
+                role: MessageRole::Assistant,
+                time: Some(MessageTime {
+                    created: orphan_anchor + 500,
+                    completed: None,
+                }),
+                model: None,
+                tokens: None,
+                error: None,
+                parts: vec![Part::Text(TextPart {
+                    text: full.clone(),
+                    started_at: Some(orphan_anchor + 500),
+                })],
+            },
+            user("msg_cola_new", new_anchor, "新问题"),
+            assistant(new_anchor + 1_000, "新回答。"),
+        ])
+        .with_executions(vec![execution(orphan_anchor + 2_500)])
+    };
+
+    // Life 1: the fresh Turn takes the chain over and its seed RESOLVES — the
+    // tail renders on the new card — but every card write fails, so nothing is
+    // confirmed before the crash.
+    let (app, platform, _backend, gate) = seeded_app(&session_file, transcript(), SessionStatus::Busy).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+    platform
+        .fail_update_transport_count
+        .store(100, std::sync::atomic::Ordering::SeqCst);
+    gate.add_permits(1);
+    let mut context = ctx("ses_test", "新问题");
+    context.cola_message_id = Some("msg_cola_new".into());
+    let turn = spawn_turn(&app, context);
+    wait_for_update_attempts(&platform, "msg_reply", 1).await;
+    turn.abort();
+    drop(app); // the crash: the tail is on a card that was never confirmed
+
+    // Life 2: the recovery still lands the orphan's undelivered tail.
+    let (app2, platform2, _backend2) =
+        restarted_app_with_backend(&session_file, transcript(), Some(SessionStatus::Idle)).await;
+    platform2.given_card_view("msg_reply", realistic_card_view());
+    spawn_sync(&app2);
+    wait_for_posted_text(&platform2, tail).await;
+    let posted = platform2.replied_cards().await;
+    let all: String = posted.iter().map(card_text).collect::<Vec<_>>().join("\n");
+    assert_eq!(
+        all.matches(tail).count(),
+        1,
+        "the orphaned tail lands exactly once after the crash: {all}"
+    );
+    assert!(
+        !all.contains(delivered),
+        "the delivered prefix is never repeated: {all}"
+    );
+}
+
+/// A confirmation carries the cursor advance AND the gap advance/clear in ONE
+/// durable write (spec #561, review #569): a crash between two writes would
+/// leave the cursor ahead of the gap, and the recovery would re-render gap
+/// content a card already showed.
+#[tokio::test]
+async fn one_confirmed_write_advances_cursor_and_gap_together() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let orphan_anchor = 1_000_000;
+    let new_anchor = 2_000_000;
+    let delivered = "已经写了一半。";
+    let tail = "停机前没送达的尾巴。";
+    let full = format!("{delivered}{tail}");
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(orphan_anchor),
+        Some("/work"),
+        Some(CursorFrontier {
+            message_id: MessageId::new(format!("msg_a_{}", orphan_anchor + 500)),
+            part_index: 0,
+            kind: CursorPartKind::Text,
+            started_at: Some(orphan_anchor + 500),
+            delivered_chars: delivered.chars().count(),
+            prefix_digest: Some(cursor_prefix_digest(delivered)),
+        }),
+        &[],
+    );
+    ChainRecords::load(sidecar(&session_file)).note_pending_gap(
+        "ses_test",
+        "om_frozen",
+        &PendingGap {
+            cursor: RenderedCursor {
+                frontier: Some(CursorFrontier {
+                    message_id: MessageId::new(format!("msg_a_{}", orphan_anchor + 500)),
+                    part_index: 0,
+                    kind: CursorPartKind::Text,
+                    started_at: Some(orphan_anchor + 500),
+                    delivered_chars: delivered.chars().count(),
+                    prefix_digest: Some(cursor_prefix_digest(delivered)),
+                }),
+                live_calls: Default::default(),
+            },
+            anchor: crate::backend::TurnAnchor {
+                message_id: MessageId::new("msg_cola_anchor"),
+                created_ms: orphan_anchor,
+            },
+            bound: Some(MessageId::new("msg_cola_new")),
+        },
+    );
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", orphan_anchor, "跑个长命令"),
+        TranscriptMessage {
+            id: MessageId::new(format!("msg_a_{}", orphan_anchor + 500)),
+            role: MessageRole::Assistant,
+            time: Some(MessageTime {
+                created: orphan_anchor + 500,
+                completed: None,
+            }),
+            model: None,
+            tokens: None,
+            error: None,
+            parts: vec![Part::Text(TextPart {
+                text: full.clone(),
+                started_at: Some(orphan_anchor + 500),
+            })],
+        },
+        user("msg_cola_new", new_anchor, "新问题"),
+        assistant(new_anchor + 1_000, "新回答。"),
+    ]);
+    let (app, platform, _backend, gate) = seeded_app(&session_file, transcript, SessionStatus::Busy).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+    // Every card write fails at the transport until the drain.
+    platform
+        .fail_update_transport_count
+        .store(100, std::sync::atomic::Ordering::SeqCst);
+    gate.add_permits(1);
+    let mut context = ctx("ses_test", "新问题");
+    context.cola_message_id = Some("msg_cola_new".into());
+    let turn = spawn_turn(&app, context);
+    wait_for_card_text(&platform, tail).await;
+    wait_for_update_attempts(&platform, "msg_reply", 1).await;
+
+    let chains = app.cards_handle().chains.clone();
+    let writes0 = chains.writes();
+    // Feishu returns: the drain delivers the failed body, and the reconcile
+    // confirms it. Cursor and gap must move in the SAME record write.
+    platform
+        .fail_update_transport_count
+        .store(0, std::sync::atomic::Ordering::SeqCst);
+    app.core.feishu.drain_pending_card_updates(true).await;
+    crate::bridge::turn::reconcile_staged_cursors(&app.cards_handle()).await;
+
+    assert_eq!(
+        chains.writes() - writes0,
+        1,
+        "the confirmation persists one record write"
+    );
+    let record = app.cards_handle().chains.get("ses_test").expect("the record");
+    assert!(
+        record.pending_gap.is_none(),
+        "the same write consumed the gap: {record:?}"
+    );
+    assert_eq!(
+        record
+            .cursor
+            .and_then(|cursor| cursor.frontier)
+            .map(|frontier| (frontier.message_id, frontier.delivered_chars)),
+        Some((
+            MessageId::new(format!("msg_a_{}", orphan_anchor + 500)),
+            delivered.chars().count()
+        )),
+        "and keeps the chain's own frontier: gap content never moves it"
+    );
+    drop(turn);
 }

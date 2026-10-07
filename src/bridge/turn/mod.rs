@@ -1741,28 +1741,21 @@ impl Turn {
                 return Vec::new();
             }
         };
-        // The seed and the cursor a read could not place: a cursor this read
-        // cannot resolve (a truncated read that dropped the part) keeps its gap
-        // pending while today's live-set fallback still resolves the running
-        // calls — nothing replays, and the tail lands once a later read places
-        // the cursor (spec #561, review #569).
-        // The Turn the chain has moved to ends the gap's window (spec #561,
-        // review #569): the successor card's own Turn message, exactly as the
-        // takeover persisted it.
+        // The gap a takeover from a cursor OWES durably (spec #561, review
+        // #569), whether or not this read can place the cursor: the old card
+        // is collected here, so a crash before the new Turn's first confirmed
+        // write would leave the record with the old cursor and the new Turn's
+        // anchor — a recovery that cannot see the orphaned Turn's window and
+        // would omit its undelivered tail. `bound` is the Turn the chain moved
+        // to (the successor card's own Turn message, exactly as the takeover
+        // persisted it).
         let bound = Self::current_turn_message(handles, session_id).await;
-        let (seed, pending) = match &orphan.cursor {
+        let seed = match &orphan.cursor {
             Some(cursor) => match state::CursorSeed::for_orphan_resolving(&transcript, cursor, &anchor) {
-                Some(seed) => (seed, None),
-                None => (
-                    state::CursorSeed::live_calls_only(&transcript, &anchor),
-                    Some(crate::bridge::chain::PendingGap {
-                        cursor: cursor.clone(),
-                        anchor: anchor.clone(),
-                        bound,
-                    }),
-                ),
+                Some(seed) => seed,
+                None => state::CursorSeed::live_calls_only(&transcript, &anchor),
             },
-            None => (state::CursorSeed::live_calls_only(&transcript, &anchor), None),
+            None => state::CursorSeed::live_calls_only(&transcript, &anchor),
         };
         let resolved = seed.resolved_calls();
         // The cursor the seed derives from: the orphan's confirmed one, or the
@@ -1771,14 +1764,28 @@ impl Turn {
         let applied = {
             let mut live = handles.cards.cards.lock().await;
             let landed = Self::apply_orphan_seed(&mut live, session_id, successor_card_id, &cursor, seed);
+            // A gap the takeover already carried is the more accurate fact
+            // (the record's own cursor may have moved past it): the carry
+            // already noted it durably and seeded the accumulator.
             if landed
-                && let Some(gap) = pending
-                // A gap the takeover already carried is the more accurate
-                // fact: the record's own cursor may have moved past it.
+                && let Some(gap_cursor) = orphan.cursor.clone()
                 && orphan.pending_gap.is_none()
                 && let Some(card) = live.get_mut(session_id)
             {
                 // The same session/card check `apply_orphan_seed` just made.
+                let gap = crate::bridge::chain::PendingGap {
+                    cursor: gap_cursor,
+                    anchor: anchor.clone(),
+                    bound: bound.clone(),
+                };
+                handles
+                    .cards
+                    .chains
+                    .note_pending_gap(session_id, successor_card_id, &gap);
+                // The resolved seed's scope walk renders the tail in-process
+                // (tagging it as gap content and marking `gap_rendered`), so
+                // the durable fact — cleared only by a confirmed write that
+                // covers the gap's end — never double-renders it here.
                 card.acc.pending_gap = Some(gap);
             }
             landed
@@ -1800,23 +1807,18 @@ impl Turn {
             .map(MessageId::new)
     }
 
-    /// Record a cursor-bearing orphan's undelivered tail as the durable gap on
-    /// its successor's record (spec #561, review #569): the takeover's read
-    /// failed, timed out, or could not place the cursor, so the tail the cursor
-    /// guards cannot be resolved now. The gap is persisted — the chain's
-    /// Rendered Cursor keeps advancing with the content that follows it — and
-    /// the successor's accumulator renders it once a read places it; the first
-    /// confirmed write of a body that includes the content clears the fact. A
-    /// cursorless orphan has no frontier to lose and keeps today's behavior.
+    /// Queue a cursor-bearing orphan's undelivered tail as the durable gap on
+    /// its successor's record (spec #561, review #569) when the takeover's read
+    /// could not even supply a transcript: the gap is noted and the successor's
+    /// accumulator renders it once a read places it. A cursorless orphan has no
+    /// frontier to lose and keeps today's behavior, and a gap the takeover
+    /// already carried stays as it is (its cursor may have advanced past).
     async fn note_pending_gap(
         handles: &TurnHandles,
         session_id: &str,
         successor_card_id: &str,
         orphan: &ChainRecord,
     ) {
-        // A predecessor gap the takeover already carried stays as it is: the
-        // record's own cursor may have advanced past it, and it is the only
-        // fact that still points at the tail.
         if orphan.pending_gap.is_some() {
             return;
         }
@@ -1826,9 +1828,6 @@ impl Turn {
         let Some(anchor) = orphan.anchor() else {
             return;
         };
-        // The Turn the chain has moved to ends the gap's window (spec #561,
-        // review #569): the successor card's own Turn message, exactly as the
-        // takeover persisted it.
         let bound = Self::current_turn_message(handles, session_id).await;
         let gap = crate::bridge::chain::PendingGap {
             cursor,
@@ -3842,13 +3841,15 @@ impl Turn {
             // The confirmed body's cursor rides the re-point in ONE chains
             // write, so the record is never observable as (successor card,
             // predecessor cursor) — not even between two chains operations.
-            Some((cursor, _)) => cards.chains.track_carrying_cursor(
+            Some((cursor, gap)) => cards.chains.track_carrying_cursor(
                 session_id,
                 card_message_id,
                 message_id,
                 created_ms,
                 directory.as_deref(),
                 cursor,
+                gap.as_ref()
+                    .map(|coverage| (&coverage.frontier, coverage.complete)),
             ),
             // No staged cursor matched the create's stage: nothing was
             // confirmed, so the re-point carries the previous frontier exactly
@@ -3861,14 +3862,6 @@ impl Turn {
                 directory.as_deref(),
             ),
         };
-        if let Some(coverage) = confirmed.as_ref().and_then(|(_, gap)| gap.clone()) {
-            cards.chains.advance_pending_gap(
-                session_id,
-                card_message_id,
-                &coverage.frontier,
-                coverage.complete,
-            );
-        }
         // A re-point within the chain carries the Rendered Cursor (spec #561):
         // seed the accumulator's empty base with the carried fact, so the
         // successor's first body does not clear the chain's frontier.

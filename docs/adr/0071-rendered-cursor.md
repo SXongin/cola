@@ -94,7 +94,17 @@ projects the chain's delta after it onto a successor card.**
   tied to, and a failure note asks about the sequence ITS payload failed at —
   remembered alongside that payload — so a newer write's success, a cached
   repaint that may omit the older body's delta, can never confirm an older
-  stage and let a restart skip content no card received. A stage
+  stage and let a restart skip content no card received. The delivery layer
+  keeps a **bounded set of the sequences proven delivered** per card (review
+  #569, round 24): a successful write adds its own sequence and the drain adds
+  the retried payload's, so a payload a drain delivered stays confirmable even
+  after a newer write FAILS and replaces the owed one — without it the evidence
+  vanished with the entry, the cursor stayed behind, and a restart re-rendered
+  content already visible on the card — while a repaint still answers only for
+  its own sequence. The confirmation's cursor advance and the gap's
+  advance/clear share ONE record write (review #569, round 24): two updates
+  could leave a crash window with the cursor ahead of the gap, and the recovery
+  would re-render gap content a card already showed. A stage
   older than the one the base already reflects is dropped unapplied, and the
   stage comparison and the durable record write happen in ONE cards critical
   section (review #569, round 5): a concurrent confirmation can never
@@ -256,7 +266,16 @@ projects the chain's delta after it onto a successor card.**
   the orphaned Turn), while the chain's cursor keeps advancing with the new
   Turn's own confirmed writes. One frontier cannot express "gap undelivered,
   later content delivered", so the gap is a fact of its own rather than a pin
-  at the gap's frontier (review #569). Rendering it is a walk of the gap's own
+  at the gap's frontier (review #569). A takeover that seeds from a cursor
+  records the gap durably whether or not its read can place the cursor (review
+  #569, round 24): the old card is collected right there, so a crash before the
+  new Turn's first confirmed write would leave the record with the old cursor
+  and the new Turn's anchor — a recovery that cannot see the orphaned Turn's
+  window and would omit its tail. The in-process render (the resolved seed's
+  scope walk, which tags its entries as gap content and marks the accumulator)
+  never clears it: only a confirmed write covering the gap's END does, so an
+  unconfirmed render is simply re-rendered by recovery. Rendering it is a walk
+  of the gap's own
   Turn window, cut at the gap's cursor and bounded by the Turn the chain moved
   to — the gap records that message, falling back to the read's next user
   message, because `turn_for_user` carries no upper end — whose pushed entries carry
@@ -292,9 +311,10 @@ projects the chain's delta after it onto a successor card.**
   cursor inside its returned prefix while newer content sits unseen beyond the
   cap, so an ended projection claims nothing while the read is truncated — no
   settle-as-complete, no released record — exactly like an unplaceable cursor:
-  the ending itself cannot be trusted. The live adoption is unaffected: it
-  renders what the read carries and the follow streams the rest, so a cap
-  never loses the tail there.
+  the ending itself cannot be trusted. A LIVE record claims nothing either
+  (review #569, round 24): the truncation is the OLDEST prefix, so following it
+  would re-read that same prefix forever and never see newer output. A later
+  complete read adopts or settles normally.
 
 - **The Wake Watermark still closes the announcement.** The projection's
   confirmed create drains the staged Wake Watermark through the same choke

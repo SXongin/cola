@@ -931,6 +931,16 @@ fn render_seed_scope(
     if seed.frontier.is_none() {
         return false;
     }
+    // When the accumulator OWES the durable gap this scope is the window of
+    // (spec #561, review #569), the seed's render IS the gap's render: its
+    // entries are tagged so the chain cursor skips them and the gap's own
+    // progress can be read back, and `gap_rendered` keeps the gap walk from
+    // rendering the same tail again in-process — while the durable fact stays
+    // until a confirmed write covers the gap's end.
+    let gap_scope = acc
+        .pending_gap
+        .as_ref()
+        .is_some_and(|gap| gap.anchor.message_id == scope.message_id);
     let mut rendered = false;
     for message in transcript.turn_for_user(scope).messages {
         walked.insert(message.id.clone());
@@ -941,6 +951,9 @@ fn render_seed_scope(
             match seed.cut(pos, index) {
                 crate::bridge::turn::state::SeedCut::Delivered => acc.mark_delivered_part(&message.id, part),
                 crate::bridge::turn::state::SeedCut::Frontier(delivered) => {
+                    if gap_scope {
+                        acc.gap_messages.insert(message.id.clone());
+                    }
                     if render_seeded_part(acc, message.id.clone(), index, part, delivered) {
                         rendered = true;
                     }
@@ -952,6 +965,9 @@ fn render_seed_scope(
                     if let Part::Tool(call) = part {
                         acc.seeded_calls.remove(&call.identity.call_id);
                     }
+                    if gap_scope {
+                        acc.gap_messages.insert(message.id.clone());
+                    }
                     let source = PartSource::at(message.id.clone(), index);
                     if render_part(acc, Some(source), part) {
                         rendered = true;
@@ -959,6 +975,9 @@ fn render_seed_scope(
                 }
             }
         }
+    }
+    if gap_scope && rendered {
+        acc.gap_rendered = true;
     }
     rendered
 }

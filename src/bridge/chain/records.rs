@@ -459,6 +459,7 @@ impl ChainRecords {
     /// already-delivered tail onto its own card — while the collected successor
     /// keeps its body: the same text twice. Returns the previous record,
     /// exactly like [`Self::track`].
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn track_carrying_cursor(
         &self,
         session_id: &str,
@@ -467,6 +468,7 @@ impl ChainRecords {
         created_ms: Option<i64>,
         directory: Option<&str>,
         cursor: &RenderedCursor,
+        gap: Option<(&CursorFrontier, bool)>,
     ) -> Option<ChainRecord> {
         let mut state = self.lock();
         let previous = state.records.get(session_id).cloned();
@@ -474,11 +476,23 @@ impl ChainRecords {
             .with_directory(directory.map(str::to_string));
         record.cursor = Some(cursor.clone());
         // The gap rides the re-point exactly as it does through [`Self::track`]
-        // (spec #561, review #569): the caller's coverage confirmation then
-        // consumes or advances it in this same critical section.
+        // (spec #561, review #569), and the confirmed body's coverage settles
+        // it in this SAME record write: the cursor and the gap can never be
+        // observable apart — a crash between two updates would leave the
+        // cursor ahead of the gap, and the recovery would re-render gap
+        // content a card already showed.
         record.pending_gap = previous
             .as_ref()
             .and_then(|previous| previous.pending_gap.clone());
+        match (record.pending_gap.as_mut(), gap) {
+            // A body that reached the gap's end consumes it with the re-point.
+            (Some(_), Some((_, true))) => record.pending_gap = None,
+            // A partial body advances the gap past what the successor shows.
+            (Some(recorded), Some((frontier, false))) => {
+                recorded.cursor.frontier = Some(frontier.clone());
+            }
+            _ => {}
+        }
         state.records.insert(session_id.to_string(), record);
         self.write(&state);
         previous
@@ -575,17 +589,52 @@ impl ChainRecords {
     }
 
     /// Advance the Rendered Cursor of the record naming `card_message_id`
-    /// (spec #561): the card write carrying that body landed. A no-op when the
-    /// record names another card (the chain moved on, a successor owns the
-    /// session — the same stale-write guard [`Self::set_anchor`] uses) or the
-    /// cursor is already current, so repeated confirmations do not rewrite the
-    /// file. Best-effort and atomic, like every record write.
+    /// (spec #561) with no gap riding along — the test seam and the seeding
+    /// helpers' form of [`Self::advance_cursor_and_gap`].
+    #[cfg(test)]
     pub(crate) fn advance_cursor(&self, session_id: &str, card_message_id: &str, cursor: &RenderedCursor) {
+        self.advance_cursor_and_gap(session_id, card_message_id, cursor, None);
+    }
+
+    /// Advance the Rendered Cursor AND settle the orphan gap in ONE record
+    /// write (spec #561, review #569): two separate updates would leave a
+    /// crash window between them — the cursor ahead of the gap — and the
+    /// recovery would re-render gap content a card already showed. `gap` is
+    /// `Some((frontier, complete))` when the confirmed body carried gap
+    /// content: a partial coverage advances the gap's cursor (so a restart
+    /// resumes after what a card showed and repeats nothing), and a body that
+    /// reached the gap's end consumes the durable fact. Best-effort and
+    /// atomic, like every record write.
+    pub(crate) fn advance_cursor_and_gap(
+        &self,
+        session_id: &str,
+        card_message_id: &str,
+        cursor: &RenderedCursor,
+        gap: Option<(&CursorFrontier, bool)>,
+    ) {
         let mut state = self.lock();
         let Some(card) = state.records.get_mut(session_id) else {
             return;
         };
-        if card.card_message_id != card_message_id || card.cursor.as_ref() == Some(cursor) {
+        if card.card_message_id != card_message_id {
+            return;
+        }
+        let cursor_current = card.cursor.as_ref() == Some(cursor);
+        let gap_change = match (card.pending_gap.as_mut(), gap) {
+            (Some(recorded), Some((frontier, complete))) => {
+                if complete {
+                    card.pending_gap = None;
+                    true
+                } else if recorded.cursor.frontier.as_ref() == Some(frontier) {
+                    false
+                } else {
+                    recorded.cursor.frontier = Some(frontier.clone());
+                    true
+                }
+            }
+            _ => false,
+        };
+        if cursor_current && !gap_change {
             return;
         }
         card.cursor = Some(cursor.clone());
@@ -692,7 +741,9 @@ impl ChainRecords {
     /// that stopped mid-gap ADVANCES the gap's cursor — so a restart (or the
     /// next slice) resumes after the content a card already showed instead of
     /// re-rendering it — while a body that reached the gap's end consumes the
-    /// durable fact.
+    /// durable fact. Production confirmations go through the ONE-write
+    /// [`Self::advance_cursor_and_gap`]; this is the store tests' seam.
+    #[cfg(test)]
     pub(crate) fn advance_pending_gap(
         &self,
         session_id: &str,
@@ -940,6 +991,7 @@ mod tests {
             Some(2_000),
             None,
             &RenderedCursor::default(),
+            None,
         );
         assert_eq!(
             chains.get("ses_a").expect("the record").pending_gap,
