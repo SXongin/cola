@@ -3411,8 +3411,10 @@ pub(crate) struct ProjectedCard {
     /// Whether any content actually entered the successor. `false` means the
     /// cursor covered the whole read: nothing was missed, so the ended
     /// projection keeps today's in-place settle instead of posting an empty
-    /// successor. The live adoption sends either way — the run is live and the
-    /// follow streams what it produces next (ticket #564).
+    /// successor, while a waiting projection still sends — the wait's card is
+    /// the one its completion Wake resumes in place (#583). The live adoption
+    /// sends either way — the run is live and the follow streams what it
+    /// produces next (ticket #564).
     pub(crate) rendered: bool,
     /// The armed [`state::CardSession::chain_id`] — the identity
     /// [`Turn::take_over_armed_card`] verifies inside its one cards-map

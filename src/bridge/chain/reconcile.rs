@@ -895,8 +895,9 @@ async fn send_projected_chain(
 /// What a projection's shared transition produced (spec #561, review #569).
 enum Projection {
     /// The armed successor rendered nothing and the session was still ours:
-    /// only the ended projection reaches this, and it takes today's in-place
-    /// settle.
+    /// only an ended projection reaches this — a waiting settle keeps its
+    /// successor for the completion Wake to resume (#583) — and it takes
+    /// today's in-place settle.
     NothingRendered,
     /// The create failed DEFINITELY (the platform created no message): the
     /// record stays retryable and the next reconcile pass re-attempts.
@@ -977,12 +978,17 @@ async fn send_projected_successor(
     )
     .await?;
     let chain_id = projected.chain_id;
-    if !projected.rendered && ending.is_some() {
-        // The cursor covered the whole read — nothing was missed: drop the
-        // armed successor and take today's in-place ending, but only while the
-        // session is still the one this pass armed (a fresh Turn that replaced
-        // it is never removed and never settled). A live adoption sends either
-        // way: the run may produce next.
+    // The cursor covered the whole read — nothing was missed. An ENDED
+    // projection drops the armed successor and takes today's in-place ending,
+    // but only while the session is still the one this pass armed (a fresh
+    // Turn that replaced it is never removed and never settled). A WAITING
+    // settle is not ended (issue #583): the chain has a future — its live
+    // Background Task's completion Wake resumes the successor in place
+    // (ADR-0066) — so the wait keeps its successor even with an empty delta;
+    // the old card is collected and the record re-pointed like any landed
+    // projection. A live adoption (`ending` `None`) sends either way: the run
+    // may produce next (ticket #564).
+    if !projected.rendered && ending.is_some_and(|ending| !matches!(ending, Disposition::Waiting)) {
         return if Turn::drop_armed_session(&handles.cards, session_id, chain_id).await {
             Some(Projection::NothingRendered)
         } else {
@@ -1199,11 +1205,13 @@ async fn send_projected_successor(
 /// the Chat, or — with none of those — to claiming nothing at all (never a
 /// write to an empty card id);
 /// a projection that renders nothing new (the cursor covered the whole read)
-/// drops its armed card and settles in place; a DEFINITE create failure falls
-/// to the next target and, when every target provably created no message,
-/// leaves the record retryable for the next pass (the missed tail is never
-/// given up), while an ambiguous one is single-shot and leaves the record for
-/// the reap's state repair. The shared transition itself lives in
+/// drops its armed card and settles in place — only an ended projection: a
+/// waiting settle still sends its successor, because the wait's card is the
+/// one the completion Wake resumes in place (#583) — while a DEFINITE create
+/// failure falls to the next target and, when every target provably created no
+/// message, leaves the record retryable for the next pass (the missed tail is
+/// never given up), and an ambiguous one is single-shot and leaves the record
+/// for the reap's state repair. The shared transition itself lives in
 /// [`send_projected_successor`].
 async fn project_card(
     handles: &FlowHandles,
