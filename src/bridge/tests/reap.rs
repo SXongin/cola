@@ -19,8 +19,8 @@ use super::drain::{
     spawn_turn, tool_assistant, user, wait_for_card_header, wait_for_card_text,
 };
 use crate::backend::{
-    ContentBlock, MessageId, MessageRole, MessageTime, Part, SessionTranscript, TextPart, ToolCall,
-    ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage,
+    ContentBlock, FinishReason, MessageId, MessageRole, MessageTime, Part, ReasoningPart, SessionTranscript,
+    StepFinish, TextPart, ToolCall, ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage,
 };
 use crate::bridge::chain::{
     ChainRecords, CursorFrontier, CursorPartKind, PendingGap, RenderedCursor, cursor_prefix_digest,
@@ -8371,4 +8371,80 @@ async fn one_confirmed_write_advances_cursor_and_gap_together() {
         "and keeps the chain's own frontier: gap content never moves it"
     );
     drop(turn);
+}
+
+/// A reasoning part longer than the card's reasoning cap (spec #561, review
+/// #569): the confirmed cursor records only the characters the card displayed,
+/// so a restart renders the undisclosed suffix on the successor. Before the
+/// fix the cursor claimed the whole part, the frontier resolved at its full
+/// length, and the recovery settled in place without ever showing the rest.
+#[tokio::test]
+async fn a_restart_renders_a_long_reasoning_parts_undisclosed_suffix() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let shown = "【已显示的前缀】";
+    let hidden = "【未显示的后缀】";
+    let reasoning = format!("{shown}{}{hidden}", "隐".repeat(800));
+    let transcript = || {
+        SessionTranscript::new(vec![
+            user("msg_cola_anchor", 1_000, "问题"),
+            typed_message(
+                "msg_a_2000",
+                MessageRole::Assistant,
+                Some(2_000),
+                vec![
+                    Part::Reasoning(ReasoningPart {
+                        text: reasoning.clone(),
+                        started_at: Some(2_000),
+                    }),
+                    Part::StepFinish(StepFinish {
+                        reason: FinishReason::Stop,
+                    }),
+                ],
+            ),
+        ])
+        .with_executions(vec![execution(2_500)])
+    };
+
+    // Life 1: a live turn renders the reasoning part; the card element shows
+    // its cap, and the confirmed cursor must record no more than that.
+    let (app, platform, _backend, gate) = seeded_app(&session_file, transcript(), SessionStatus::Busy).await;
+    platform.given_card_view("msg_reply", realistic_card_view());
+    gate.add_permits(1);
+    let mut context = ctx("ses_test", "问题");
+    context.cola_message_id = Some("msg_cola_anchor".into());
+    let turn = spawn_turn(&app, context);
+    wait_for_card_text(&platform, shown).await;
+    let cursor = wait_for_cursor(&app, |cursor| cursor.frontier.is_some()).await;
+    assert_eq!(
+        cursor
+            .frontier
+            .as_ref()
+            .map(|frontier| (frontier.kind, frontier.delivered_chars)),
+        Some((CursorPartKind::Reasoning, crate::feishu::card::REASONING_TEXT_CAP)),
+        "the frontier counts only the characters the card displayed"
+    );
+    turn.abort();
+    drop(app);
+
+    // Life 2: the restart renders the undisclosed suffix as a continuation.
+    let (app2, platform2, _backend2) =
+        restarted_app_with_backend(&session_file, transcript(), Some(SessionStatus::Idle)).await;
+    platform2.given_card_view("msg_reply", realistic_card_view());
+    spawn_sync(&app2);
+    wait_for_posted_text(&platform2, hidden).await;
+    let all: String = platform2
+        .replied_cards()
+        .await
+        .iter()
+        .map(card_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        all.matches(hidden).count(),
+        1,
+        "the undisclosed suffix lands exactly once: {all}"
+    );
+    assert!(!all.contains(shown), "the displayed prefix never repeats: {all}");
 }

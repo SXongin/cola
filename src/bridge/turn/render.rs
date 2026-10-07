@@ -203,7 +203,7 @@ fn render_part(acc: &mut StreamAccumulator, source: Option<PartSource>, part: &P
                 // double-count the part and leave the cursor digestless.
                 acc.replace_text_run(rewritten, &text.text, text.started_at);
             } else {
-                let (source, chunk) = source_chunk(acc, source, &text.text);
+                let (source, chunk) = source_chunk(acc, source, &text.text, None);
                 acc.push_text_from(text.started_at, source, &chunk);
             }
             acc.card_state = crate::feishu::card::CardState::Streaming;
@@ -217,7 +217,12 @@ fn render_part(acc: &mut StreamAccumulator, source: Option<PartSource>, part: &P
             {
                 acc.replace_reasoning_run(rewritten, &reasoning.text, reasoning.started_at);
             } else {
-                let (source, chunk) = source_chunk(acc, source, &reasoning.text);
+                let (source, chunk) = source_chunk(
+                    acc,
+                    source,
+                    &reasoning.text,
+                    Some(crate::feishu::card::REASONING_TEXT_CAP),
+                );
                 acc.push_reasoning_from(reasoning.started_at, source, &chunk);
             }
             acc.card_state = crate::feishu::card::CardState::Reasoning;
@@ -268,6 +273,7 @@ fn source_chunk(
     acc: &StreamAccumulator,
     source: Option<PartSource>,
     text: &str,
+    cap: Option<usize>,
 ) -> (Option<PartSource>, String) {
     let Some(source) = source else {
         return (None, text.to_string());
@@ -278,16 +284,27 @@ fn source_chunk(
     // pushes its tail, and both leave the new snapshot as the delivered prefix.
     // A seeded offset entry keeps no digest — resolution then falls back rather
     // than trust an ambiguous prefix (a rewrite never reaches here: it replaced
-    // the part's run).
+    // the part's run). `cap` is the entry's visible-character cap (a reasoning
+    // element's): the digest then covers exactly the delivered prefix the card
+    // showed, never characters beyond it (spec #561, review #569).
+    let delivered = acc.source_extent(&source);
+    let shown = |chunk: &str| match cap {
+        Some(cap) => chunk.chars().count().min(cap),
+        None => chunk.chars().count(),
+    };
+    let digest_of = |chunk: &str| {
+        let len = (delivered + shown(chunk)).min(text.chars().count());
+        Some(crate::bridge::chain::cursor_prefix_digest(
+            &text.chars().take(len).collect::<String>(),
+        ))
+    };
     let (chunk, digest) = match &rendered {
-        None if !acc.has_source(&source) => (
-            text.to_string(),
-            Some(crate::bridge::chain::cursor_prefix_digest(text)),
-        ),
-        Some(rendered) if !rendered.is_empty() && text.starts_with(rendered) => (
-            text[rendered.len()..].to_string(),
-            Some(crate::bridge::chain::cursor_prefix_digest(text)),
-        ),
+        None if !acc.has_source(&source) => (text.to_string(), digest_of(text)),
+        Some(rendered) if !rendered.is_empty() && text.starts_with(rendered) => {
+            let tail = text[rendered.len()..].to_string();
+            let digest = digest_of(&tail);
+            (tail, digest)
+        }
         _ => (text.to_string(), None),
     };
     (
@@ -884,11 +901,25 @@ fn render_gap_part(
         return false;
     }
     let lead = crate::feishu::card::sanitize::neutralize_tail(&prefix, &suffix);
+    // The delivered prefix after this push: a reasoning element shows only its
+    // cap, so the digest never covers characters the card cannot display
+    // (spec #561, review #569).
+    let delivered_len = match is_text {
+        true => full_len,
+        false => (cut
+            + suffix
+                .chars()
+                .count()
+                .min(crate::feishu::card::REASONING_TEXT_CAP))
+        .min(full_len),
+    };
     let source = PartSource {
         message_id,
         index,
         delivered_before: cut,
-        prefix_digest: Some(crate::bridge::chain::cursor_prefix_digest(full)),
+        prefix_digest: Some(crate::bridge::chain::cursor_prefix_digest(
+            &full.chars().take(delivered_len).collect::<String>(),
+        )),
     };
     if is_text {
         acc.push_text_lead(started_at, Some(source), &suffix, lead);
@@ -1048,14 +1079,27 @@ fn render_seeded_part(
     acc.mark_delivered_part(&message_id, part);
     if !suffix.is_empty() {
         let lead = crate::feishu::card::sanitize::neutralize_tail(&prefix, &suffix);
+        // The delivered prefix after this push: the whole read's part for a
+        // text entry, and only the characters a reasoning element can show for
+        // a reasoning one (spec #561, review #569) — so its digest lets a later
+        // resolution tell growth from a same-slot replacement AND never claims
+        // characters the card could not display.
+        let delivered_len = match is_text {
+            true => full.chars().count(),
+            false => (cut
+                + suffix
+                    .chars()
+                    .count()
+                    .min(crate::feishu::card::REASONING_TEXT_CAP))
+            .min(full.chars().count()),
+        };
         let source = PartSource {
             message_id,
             index,
             delivered_before: before,
-            // The delivered prefix after this push is the read's whole part:
-            // its digest lets a later resolution tell growth from a same-slot
-            // replacement even with no server start time (review #569).
-            prefix_digest: Some(crate::bridge::chain::cursor_prefix_digest(full)),
+            prefix_digest: Some(crate::bridge::chain::cursor_prefix_digest(
+                &full.chars().take(delivered_len).collect::<String>(),
+            )),
         };
         if is_text {
             acc.push_text_lead(started_at, Some(source), &suffix, lead);
@@ -3213,6 +3257,113 @@ Index: /x/src/main.rs
         assert!(
             text.contains("表后的答案。"),
             "a part after the frontier renders in full: {text}"
+        );
+    }
+
+    /// A reasoning part longer than the card's reasoning cap (spec #561,
+    /// review #569): the card shows only the first 800 characters, so the
+    /// frontier must record only those — the undisclosed suffix is NOT
+    /// delivered. Before the fix the frontier counted the whole part, the
+    /// read-side resolution verified it, and the undisclosed content never
+    /// rendered.
+    #[test]
+    fn a_long_reasoning_part_confirms_only_what_the_card_shows() {
+        let shown = "【已显示的前缀】";
+        let hidden = "【未显示的后缀】";
+        let full = format!("{shown}{}{hidden}", "隐".repeat(800));
+        assert!(full.chars().count() > 800);
+        let transcript = SessionTranscript::new(vec![
+            typed_message(
+                "msg_cola_anchor",
+                MessageRole::User,
+                Some(1_000),
+                vec![text_part("问题")],
+            ),
+            message("msg_a_2000", 2_000, vec![reasoning_at(&full, 2_000)]),
+        ]);
+
+        // The live render: the whole part is pushed, the card truncates it.
+        let mut acc = StreamAccumulator::new("live");
+        acc.turn_anchor = Some(turn_anchor(1_000));
+        assert!(render_new_turn_parts(&mut acc, &transcript));
+        let built = acc.build_card_with_info();
+        let card = card_text(&built.card);
+        assert!(
+            card.contains(shown) && card.contains('…'),
+            "the card shows the capped reasoning with its ellipsis: {card}"
+        );
+        let delivered = built
+            .cursor
+            .frontier
+            .as_ref()
+            .expect("the reasoning frontier")
+            .delivered_chars;
+        assert_eq!(
+            delivered,
+            crate::feishu::card::REASONING_TEXT_CAP,
+            "the frontier counts only the characters the card displayed"
+        );
+
+        // The restart: the same read, a fresh accumulator, the seed from that
+        // frontier. The undisclosed suffix renders as a continuation.
+        let mut restarted = StreamAccumulator::new("proj");
+        restarted.turn_anchor = Some(turn_anchor(1_000));
+        let seed = CursorSeed::resolve(&transcript, &built.cursor).expect("the frontier resolves");
+        restarted.seed_projection(&built.cursor, seed);
+        assert!(render_new_turn_parts(&mut restarted, &transcript));
+        let recovered = card_text(&restarted.build_card_with_info().card);
+        assert!(
+            recovered.contains(hidden),
+            "the content beyond the cap renders on recovery: {recovered}"
+        );
+        assert!(
+            !recovered.contains(shown),
+            "the delivered prefix is not repeated: {recovered}"
+        );
+    }
+
+    /// A long reasoning part that grew while cola was down (spec #561, review
+    /// #569): the recovery renders everything beyond the delivered extent —
+    /// the undisclosed middle AND the growth — never repeating what a card
+    /// showed.
+    #[test]
+    fn a_grown_long_reasoning_part_renders_only_what_is_beyond_the_extent() {
+        let shown = "【已显示的】";
+        let middle = "【未显示的中间】";
+        let growth = "【停机期间的追加】";
+        let before = format!("{shown}{}{middle}", "隐".repeat(800));
+        let after = format!("{before}{growth}");
+
+        let build = |reasoning: &str| {
+            SessionTranscript::new(vec![
+                typed_message(
+                    "msg_cola_anchor",
+                    MessageRole::User,
+                    Some(1_000),
+                    vec![text_part("问题")],
+                ),
+                message("msg_a_2000", 2_000, vec![reasoning_at(reasoning, 2_000)]),
+            ])
+        };
+        let mut acc = StreamAccumulator::new("live");
+        acc.turn_anchor = Some(turn_anchor(1_000));
+        assert!(render_new_turn_parts(&mut acc, &build(&before)));
+        let cursor = acc.build_card_with_info().cursor;
+
+        let restarted = build(&after);
+        let mut recovered = StreamAccumulator::new("proj");
+        recovered.turn_anchor = Some(turn_anchor(1_000));
+        let seed = CursorSeed::resolve(&restarted, &cursor).expect("the frontier resolves");
+        recovered.seed_projection(&cursor, seed);
+        assert!(render_new_turn_parts(&mut recovered, &restarted));
+        let text = card_text(&recovered.build_card_with_info().card);
+        assert!(
+            text.contains(middle) && text.contains(growth),
+            "the undisclosed middle and the growth render: {text}"
+        );
+        assert!(
+            !text.contains(shown),
+            "nothing at or before the delivered extent repeats: {text}"
         );
     }
 
