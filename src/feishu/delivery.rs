@@ -101,7 +101,7 @@ const MAX_DELIVERED_SEQS: usize = 16;
 /// cancelled update may have landed, and re-sending one is idempotent.
 const DRAIN_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How long an entry's order state (a closed generation's floor, an ending
+/// How long an entry's order state (a raised generation floor, an ending
 /// shadow) outranks the cap (spec #571 review). The state only guards
 /// against a **stale stamp submission**: one whose card-view read outlived its
 /// decision. That read is bounded at 30 s and the reap ticks every 8 s, so
@@ -314,11 +314,13 @@ struct PendingEntry {
     /// generation rule anyway.
     generation: u64,
     /// The lowest generation this card still accepts (spec #571's amendment).
-    /// A plain submission raises it to its own generation; an accepted
+    /// A plain submission raises it to its own generation — an accepted
+    /// `Collect` at G drops every G−1 writer — and an accepted
     /// `Settle` at generation G closes G, so it rises to G+1 and a later
     /// submission at ≤ G — the stamp whose read outlived the ending — is
-    /// dropped. It lives as long as the entry (and its tombstone) does: an
-    /// evicted floor would reopen the window it exists to close.
+    /// dropped. A raised floor is **order state**: protected from the cap
+    /// while a stale writer could still be composing, last-resort evictable
+    /// after the protection window (spec #571 review).
     floor: u64,
     /// The highest generation an accepted **ending** write (`Yield` or
     /// `Settle`) belonged to (spec #571's amendment 2): `None` until one was
@@ -327,11 +329,13 @@ struct PendingEntry {
     /// so the true end's terminal settle still lands after a yield. Lives with
     /// the entry, like [`Self::floor`].
     ending_gen: Option<u64>,
-    /// When this entry's order state (a floor above the newest generation, or
-    /// an ending shadow) was (re)established; `None` while it carries none.
-    /// The cap may evict such an entry as a last resort once this is older
-    /// than the protection window (spec #571 review): past it, no stale
-    /// submission it guards against can still be composing.
+    /// When this entry's order state (a raised floor, or an ending shadow) was
+    /// (re)established; `None` while it carries none. Only a state that is
+    /// *established* starts the clock — a same-generation write that raises
+    /// nothing keeps the running window. The cap may evict such an entry as a
+    /// last resort once this is older than the protection window (spec #571
+    /// review): past it, no stale submission it guards against can still be
+    /// composing.
     order_state_since: Option<tokio::time::Instant>,
     /// This entry's age, a monotonic stamp from [`State::age`], refreshed by
     /// every accepted write. The cap evicts the oldest ordinary entry, never
@@ -418,14 +422,15 @@ impl PendingEntry {
     }
 
     /// Whether this entry still carries order state a stale writer may need
-    /// (spec #571's amendments): a closed generation (`floor` above the newest
-    /// seen — a settle ended it), or an ending shadow still sitting at the
-    /// card's floor (a yield landed and nothing newer has pushed the floor
-    /// past it; above that the floor's own drop covers every stamp the shadow
-    /// would). Such an entry holds no payload. It outranks the cap while a
-    /// stale writer could still be composing (see [`Self::order_state_expired`]).
+    /// (spec #571's reviews): a **raised generation floor** — an accepted keyed
+    /// submission at generation ≥ 1, which drops every older-generation writer
+    /// (the ordinary collect's floor, a settle's closed generation) — or an
+    /// ending shadow sitting at the card's floor (a yield landed and nothing
+    /// newer has pushed the floor past it). Such an entry holds no payload. It
+    /// outranks the cap while a stale writer could still be composing (see
+    /// [`Self::order_state_expired`]).
     fn keeps_order_state(&self) -> bool {
-        self.floor > self.generation || self.ending_gen == Some(self.floor)
+        self.floor > 0 || self.ending_gen == Some(self.floor)
     }
 
     /// Whether this entry's order state has outlived the window in which a
@@ -629,12 +634,13 @@ impl CardDelivery {
     /// Keep the state under the cap. A settled tombstone leaves before an
     /// undelivered payload (the cap bounds undelivered payloads; a tombstone
     /// only guards against a still-in-flight older write), oldest first by
-    /// entry age. An entry that still carries order state is never chosen
-    /// while another victim exists (spec #571's amendments); once **every**
+    /// entry age. An entry that still carries order state — a raised generation
+    /// floor, an ending shadow — is never chosen
+    /// while another victim exists (spec #571's reviews); once **every**
     /// entry carries order state, one past its protection window leaves as
     /// the last resort, oldest state first (spec #571 review) — its
-    /// stale writer can no longer be composing, so the map stays bounded
-    /// under keyed-only traffic too. `protect` is the entry the caller just
+    /// stale writer can no longer be composing, so keyed-only traffic stays
+    /// bounded over the window. `protect` is the entry the caller just
     /// admitted: dropping the very write being recorded is never the cap's
     /// answer to its own growth. If every other entry is fresh order state
     /// the map may sit above the cap until one ages out. A pending payload
@@ -768,6 +774,12 @@ impl CardDelivery {
             let _ = ticket.send(WriteOutcome::Superseded);
             return None;
         }
+        // The order state (floor / ending shadow) established BEFORE this
+        // submission, so only a raise starts a fresh protection window
+        // (spec #571 review): a same-generation write that raises nothing must
+        // not keep an old floor alive, and a submission the state DROPS never
+        // reaches here at all.
+        let state_before = (entry.floor, entry.ending_gen);
         entry.floor = entry.floor.max(submission.generation);
         // An accepted `Settle` closes its own generation (spec #571's
         // amendment): the floor rises to G+1, so any LATER submission at ≤ G
@@ -792,13 +804,17 @@ impl CardDelivery {
             );
         }
         // An accepted submission refreshes the entry's age — the cap never
-        // picks the newest submission first — and (re)stamps the order
-        // state's clock. Only established state starts the protection window
-        // (spec #571 review): a later submission the state DROPS never
-        // reaches here, so a stream of dropped stamps cannot keep an old
-        // floor alive past its window.
+        // picks the newest submission first — and re-stamps the order state's
+        // clock when the state is (re)established: a raised floor or a new
+        // ending shadow starts its protection window. A write that leaves the
+        // state unchanged keeps the running clock, so a stream of
+        // same-generation writes cannot keep an old floor alive.
         entry.age = age;
-        entry.order_state_since = entry.keeps_order_state().then_some(now);
+        if !entry.keeps_order_state() {
+            entry.order_state_since = None;
+        } else if (entry.floor, entry.ending_gen) != state_before {
+            entry.order_state_since = Some(now);
+        }
         let write = QueuedWrite::new(token, submission, now);
         // The ticket lives with the queue until the submission settles: a
         // displaced or dropped slot still answers its caller.
@@ -2851,11 +2867,13 @@ mod tests {
         );
     }
 
-    /// The cap bounds KEYED-ONLY traffic too (spec #571 review): a
-    /// process life that only ever admits keyed writes — a collect or an
-    /// ending per card — must not retain one payload-less entry per card
-    /// forever. Every admission runs the same cap check the keyless observe
-    /// runs, so the map stays at the injected cap.
+    /// The cap bounds KEYED-ONLY traffic too (spec #571's first review):
+    /// writes that raise no floor — a collect on a chain still at generation 0
+    /// — leave ordinary entries, and every admission runs the same cap check
+    /// the keyless observe runs, so a life that only ever collects cannot
+    /// retain one payload-less entry per card forever. A raised floor is order
+    /// state and protected within its window instead (the windowed tests
+    /// below).
     #[tokio::test]
     async fn the_cap_bounds_keyed_only_cards() {
         let inner = Arc::new(FakePlatform::new());
@@ -2863,7 +2881,7 @@ mod tests {
 
         for n in 0..5 {
             let card = serde_json::json!({ "body": n });
-            let ticket = submit(&delivery, &format!("om_{n}"), 1, CardWriteIntent::Collect, &card).await;
+            let ticket = submit(&delivery, &format!("om_{n}"), 0, CardWriteIntent::Collect, &card).await;
             assert!(matches!(ticket.settled().await, WriteOutcome::Delivered));
         }
 
@@ -2947,6 +2965,86 @@ mod tests {
             4,
             "one settle per card and the evicted floor's late stamp: never the protected one"
         );
+    }
+
+    /// An ordinary raised floor is the same time-bounded order state as a
+    /// closed generation (spec #571 review): an accepted collect at generation
+    /// 1 guards against older-generation writers, so cap pressure must not
+    /// evict it while a stale G−1 stamp could still be composing.
+    #[tokio::test]
+    async fn a_raised_floor_survives_cap_pressure_while_a_stale_writer_could_arrive() {
+        let inner = Arc::new(FakePlatform::new());
+        let delivery = CardDelivery::with_limits(inner.clone(), 1, BACKOFF_BASE, BACKOFF_MAX);
+        let collect = serde_json::json!({ "body": "collected" });
+        let other = serde_json::json!({ "body": "other card" });
+        let stale = serde_json::json!({ "body": "stale stamp" });
+
+        // The collect at generation 1 raises card X's floor: a generation-0
+        // writer is stale now.
+        let ticket = submit(&delivery, "om_x", 1, CardWriteIntent::Collect, &collect).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Delivered));
+        // An unrelated keyed write pushes the map over the cap: X's floor is
+        // order state and must not be the victim.
+        let ticket = submit(&delivery, "om_y", 1, CardWriteIntent::Collect, &other).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Delivered));
+        assert!(
+            delivery.state.lock().unwrap().entries.contains_key("om_x"),
+            "the raised floor survived the cap"
+        );
+
+        // The stale writer whose read outlived the re-point never lands.
+        let ticket = submit(&delivery, "om_x", 0, CardWriteIntent::Stamp, &stale).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Superseded));
+        assert_eq!(
+            inner.attempts(),
+            vec![("om_x".to_string(), collect), ("om_y".to_string(), other)],
+            "the stale stamp never reached Feishu"
+        );
+    }
+
+    /// An ordinary raised floor ages out of its window exactly like a closed
+    /// generation (spec #571 review): inside the window it outranks the cap,
+    /// past it the oldest expired state is the last-resort victim — so the map
+    /// stays bounded without ever dropping a floor a live late stamp still
+    /// needs.
+    #[tokio::test(start_paused = true)]
+    async fn a_raised_floor_is_protected_only_inside_its_window() {
+        let inner = Arc::new(FakePlatform::new());
+        let delivery = CardDelivery::with_limits(inner.clone(), 1, BACKOFF_BASE, BACKOFF_MAX)
+            .with_order_state_protection(Duration::from_secs(30));
+        let collect = serde_json::json!({ "body": "collected" });
+        let stale = serde_json::json!({ "body": "stale stamp" });
+
+        // t0: the floor is raised at generation 1.
+        let ticket = submit(&delivery, "om_x", 1, CardWriteIntent::Collect, &collect).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Delivered));
+        // Inside the window a second card's admission cannot evict it, and the
+        // stale generation-0 stamp is dropped.
+        tokio::time::advance(Duration::from_secs(10)).await;
+        let ticket = submit(&delivery, "om_y", 1, CardWriteIntent::Collect, &collect).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Delivered));
+        assert!(
+            delivery.state.lock().unwrap().entries.contains_key("om_x"),
+            "the fresh floor is never chosen while another victim exists"
+        );
+        let ticket = submit(&delivery, "om_x", 0, CardWriteIntent::Stamp, &stale).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Superseded));
+
+        // Past the window: with nothing ordinary left, the oldest expired
+        // floor leaves as the last resort.
+        tokio::time::advance(Duration::from_secs(25)).await;
+        let ticket = submit(&delivery, "om_z", 1, CardWriteIntent::Collect, &collect).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Delivered));
+        assert!(
+            !delivery.state.lock().unwrap().entries.contains_key("om_x"),
+            "the oldest expired floor is evicted"
+        );
+        // The evicted floor is forgotten — its stale writer's read is bounded
+        // well inside the window — while the fresh floor still drops its own.
+        let ticket = submit(&delivery, "om_x", 0, CardWriteIntent::Stamp, &stale).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Delivered));
+        let ticket = submit(&delivery, "om_y", 0, CardWriteIntent::Stamp, &stale).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Superseded));
     }
 
     /// A keyed submission's entry never answers for a keyless write that has
