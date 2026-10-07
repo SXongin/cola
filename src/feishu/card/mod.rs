@@ -436,6 +436,13 @@ pub(crate) fn test_local_ms(y: i32, m: u32, d: u32, h: u32, min: u32) -> i64 {
         .timestamp_millis()
 }
 
+/// How many characters of one reasoning entry a card element displays: the
+/// reasoning panel is clipped to this many model characters plus a "…" marker
+/// (spec #561, review #569). The Rendered Cursor's delivered extent for a
+/// reasoning part is clamped to it — a frontier must never claim characters
+/// the card never showed, or a restart would skip them.
+pub(crate) const REASONING_TEXT_CAP: usize = 800;
+
 /// Clip `text` to at most `max_len` characters, appending a "…" marker when it
 /// was cut. Character-counted so CJK content (3 bytes/char) is truncated at the
 /// same visual length as ASCII instead of at a byte budget.

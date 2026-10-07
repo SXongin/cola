@@ -203,7 +203,9 @@ impl CardBuilder {
         element_id: Option<&str>,
     ) -> Self {
         if !reasoning.is_empty() {
-            let body = self.markdown.element(&truncate_md(reasoning, 800));
+            let body = self
+                .markdown
+                .element(&truncate_md(reasoning, crate::feishu::card::REASONING_TEXT_CAP));
             self.body.push(collapsible_panel(
                 &format!("💭 推理过程{}", panel_time_suffix(at_ms)),
                 &body,

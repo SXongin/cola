@@ -48,6 +48,12 @@ projects the chain's delta after it onto a successor card.**
   identity is the message, the ordinal, the kind AND the part's server start
   time: a read carrying a different part in that slot resolves nothing and the
   projection falls back rather than skip a replacement's prefix (review #569).
+  The delivered extent counts only what the card could DISPLAY: a reasoning
+  entry is clipped to the card's reasoning cap (800 characters plus the
+  builder's ellipsis), so the extent clamps to it — and the
+  digest covers exactly that clamped prefix — and the characters beyond the cap
+  render as a continuation after a restart instead of being skipped (review
+  #569, round 25).
   Because V2 decodes text parts without `time.start`, identity alone cannot
   tell growth from a same-slot replacement there: the frontier also stores a
   small **digest of the delivered prefix** — derived metadata, never content —

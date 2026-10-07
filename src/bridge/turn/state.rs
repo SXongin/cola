@@ -3237,7 +3237,16 @@ impl StreamAccumulator {
             }
             if let TimelineKind::Text(text) | TimelineKind::Reasoning(text) = &item.kind {
                 offset = offset.max(item.source.as_ref().map_or(0, |s| s.delivered_before));
-                chars += text.chars().count();
+                // A reasoning entry shows at most the card's cap (spec #561,
+                // review #569): the delivered extent counts only what the
+                // element could display, so a restart still renders the
+                // characters beyond the cap instead of skipping them.
+                chars += match &item.kind {
+                    TimelineKind::Reasoning(_) => {
+                        text.chars().count().min(crate::feishu::card::REASONING_TEXT_CAP)
+                    }
+                    _ => text.chars().count(),
+                };
             }
         }
         offset + chars
