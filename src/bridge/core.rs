@@ -209,6 +209,11 @@ pub struct SharedCore {
     /// writer per session at a time; entries are never evicted (bounded by the
     /// session store). Private: `card_write_lock` is the accessor.
     card_write_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    /// How long a preserved-ending card-view read is awaited before the ending
+    /// degrades to the bare card (ms, spec #571 review). Shared with the
+    /// [`CardsHandle`] the reap's collect and settle paths read it through; the
+    /// Session Sync pass's own request bound is the default.
+    preserved_view_timeout_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl SharedCore {
@@ -301,6 +306,9 @@ impl SharedCore {
             generation: cfg.opencode.generation,
             server_lock: Arc::new(tokio::sync::Mutex::new(())),
             card_write_locks: Arc::new(Mutex::new(HashMap::new())),
+            // The preserved-ending view read's bound: the Session Sync pass's
+            // own request bound (spec #571 review).
+            preserved_view_timeout_ms: Arc::new(std::sync::atomic::AtomicU64::new(30_000)),
         })
     }
 
@@ -388,6 +396,7 @@ impl SharedCore {
             Arc::clone(&self.feishu),
             Arc::clone(&self.chains),
             Arc::clone(&self.card_write_locks),
+            Arc::clone(&self.preserved_view_timeout_ms),
         )
     }
 

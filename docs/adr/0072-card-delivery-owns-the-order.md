@@ -56,6 +56,15 @@ drops stale intents, collapses duplicates and retries failures.
   submission order, one in flight and one waiting; a newer submission replaces
   the waiting slot, so the queue holds at most two and a submission displaced
   before its write settles its caller as `Superseded` instead of hanging. A
+  generation advance also invalidates older **waits** (spec #571 review): a
+  waiting write below the new generation is dropped (`Superseded`) the moment
+  the newer generation is admitted, mirroring the forgotten keys, and every
+  promotion of the waiting slot re-validates the waiter against the current
+  state — a newer generation since, an accepted ending's shadow over a
+  `Stamp`, or a settled key drops it — so a stale waiter can never be written
+  after a newer state. (The floor itself is not the promotion test: a waiter
+  may legitimately have raised it, since accepting a `Settle` closes its OWN
+  generation and that settle must still land.) A
   duplicate `(generation, intent)` collapses to one write: a
   **delivered** key answers every later re-submission `Delivered` without a
   second write (per-tick re-decisions are free), a **permanently refused**
@@ -149,11 +158,18 @@ drops stale intents, collapses duplicates and retries failures.
   releasing its cached card on delivery and warning on failure, the ending's
   confirmation, the stamp's pre-submission task — awaits the completion ticket
   with `KEYED_TICKET_AWAIT`, after which it proceeds without a verdict (the
-  queue still owns the write, which may yet land). A collect that gives up on
-  an indeterminate ticket releases its cache anyway: the release exists so a
-  re-host cannot resurrect the collected presentation, and a collect that lands
-  later would do exactly that. The keyless Pending Card Update retry keeps its
-  own pre-existing bound (`DRAIN_RETRY_TIMEOUT`), outside this contract.
+  queue still owns the write, which may yet land). The **composition read**
+  before such a write is bounded too (spec #571 review): a collect's or
+  ending's preserved card-view GET is awaited with the preserved-view bound
+  (`CardsHandle::preserved_view_timeout_ms`), and a read that times out or
+  fails degrades to the bare ending — the ending never depends on the read,
+  and the pass never waits on Feishu unboundedly (the #443 stamp's own view
+  read takes the pass's configured read bound the same way). A collect that
+  gives up on an indeterminate ticket releases its cache anyway: the release
+  exists so a re-host cannot resurrect the collected presentation, and a
+  collect that lands later would do exactly that. The keyless Pending Card
+  Update retry keeps its own pre-existing bound (`DRAIN_RETRY_TIMEOUT`),
+  outside this contract.
 
 **The two amendments (2026-10-07).** The vocabulary gained the endings while
 ticket #575 retired the claim, because each retirement exposed a window the
