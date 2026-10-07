@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use super::{MAX_CARD_CHAIN, PredecessorCollect, Turn};
+use super::{MAX_CARD_CHAIN, Turn};
 
 use crate::bridge::card_handles::RenderedBlock;
 use crate::bridge::chain::{RenderedCursor, release_spent};
@@ -736,10 +736,14 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, spl
                     }
                 }
                 card_is_live = !built.full;
-                // The chain continues on a new card: the durable record
-                // follows it (ADR-0063). No predecessor is collected — the
-                // split above finalized the outgoing card itself.
-                Turn::track_live_card(cards, session_id, &new_id, PredecessorCollect::Never, None).await;
+                // The chain continues on a new card: its durable record
+                // follows it, re-pointed AND carrying the confirmed create's
+                // Rendered Cursor in ONE record write (spec #561, review
+                // #569). No predecessor is collected — the split above
+                // finalized the outgoing card itself — and a crash right after
+                // Feishu accepted the create can never leave the record naming
+                // this card with the predecessor's frontier.
+                Turn::track_continuation_card(cards, session_id, &new_id, stage).await;
                 // The continuation takes the blocks over from the finalized
                 // slice it follows (its spans are the tail this card renders).
                 cards
@@ -747,11 +751,6 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, spl
                     .lock()
                     .await
                     .record(&new_id, &built.card, rendered);
-                // The confirmed create carries this body's Rendered Cursor
-                // (spec #561): advance the chain's record, now naming the new
-                // card — only while the exact stage this send carried is still
-                // the staged one.
-                confirm_staged_cursor(cards, session_id, &new_id, None, stage, None).await;
                 // The send delivered the 承接 line (or the size-split slice):
                 // the staged Wake Watermark is user-visible now (ADR-0061).
                 drain_wake_watermark(cards, session_id, watermark).await;

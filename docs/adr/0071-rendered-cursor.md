@@ -252,12 +252,14 @@ projects the chain's delta after it onto a successor card.**
   panel's call-named element id, `tool_{call_id}`), while a call outside the
   read — a V2 transcript truncated at its page cap — keeps its panel on the
   collected old card as a frozen witness rather than being stripped from a
-  card the successor cannot repair (review #569). Truncation is not reportable
-  at this seam — the read
-  stops at its page cap with a log, and the generation-neutral
-  `SessionTranscript` carries no truncation fact — so the projection cannot
-  withhold itself on a truncated read, and the frozen marker is the honest
-  signal; a later complete read adopts normally.
+  card the successor cannot repair (review #569). The read DOES report that
+  truncation: the V2 adapter sets `SessionTranscript::truncated` when it stops
+  at its page cap, and V1 always reports false. A truncated read therefore
+  adopts nothing — the ended projection and the live adoption alike claim
+  nothing, and the message-first seed does not resolve against it (its gap is
+  never marked complete, so the unseen tail still lands once a complete read
+  shows the gap's end) — and the frozen marker is what the user sees until a
+  later complete read adopts normally (review #569, rounds 22/24/26).
 
 - **The message-first race uses the same primitive.** When a user message wins
   the race against the adoption, the fresh Turn's takeover seeds its card from

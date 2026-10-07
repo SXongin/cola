@@ -1616,6 +1616,79 @@ impl Turn {
         Some(previous)
     }
 
+    /// The split continuation's atomic transition (spec #561, review #569):
+    /// re-point the record onto the new card AND settle the create's confirmed
+    /// Rendered Cursor in ONE chains write — the shape the projection's
+    /// takeover uses. Two writes leave a window where the record names the
+    /// continuation with the predecessor's frontier; a crash right after
+    /// Feishu accepted the create would let the next recovery project content
+    /// the continuation already shows. `expected` is the exact stage the
+    /// create carried: a superseded stage re-points with the carried cursor
+    /// alone, exactly as [`Self::track_live_card`] does. A create's stage
+    /// names no card (its id is unknown until it lands).
+    pub(crate) async fn track_continuation_card(
+        cards: &CardsHandle,
+        session_id: &str,
+        card_message_id: &str,
+        expected: state::StagedCursorId,
+    ) {
+        let (message_id, created_ms, context_directory, confirmed) = {
+            let mut live = cards.cards.lock().await;
+            let Some(card) = live.get_mut(session_id) else {
+                return;
+            };
+            let confirmed = card.acc.take_staged_cursor(card_message_id, expected);
+            (
+                card.acc.cola_message_id.clone().map(MessageId::new).or_else(|| {
+                    card.acc
+                        .turn_anchor
+                        .as_ref()
+                        .map(|anchor| anchor.message_id.clone())
+                }),
+                card.acc.turn_anchor.as_ref().map(|anchor| anchor.created_ms),
+                card.acc.directory.clone(),
+                (confirmed),
+            )
+        };
+        // A card with no Turn message to scope a settle decision with cannot be
+        // reaped: no record, no reap attempt after a restart — the same rule
+        // [`Self::track_live_card`] applies.
+        let Some(message_id) = message_id else {
+            return;
+        };
+        let previous = match confirmed {
+            Some((cursor, gap)) => cards.chains.track_carrying_cursor(
+                session_id,
+                card_message_id,
+                message_id,
+                created_ms,
+                context_directory.as_deref(),
+                &cursor,
+                gap.as_ref()
+                    .map(|coverage| (&coverage.frontier, coverage.complete)),
+            ),
+            None => cards.chains.track(
+                session_id,
+                card_message_id,
+                message_id,
+                created_ms,
+                context_directory.as_deref(),
+            ),
+        };
+        // A re-point within the chain carries the Rendered Cursor (spec #561):
+        // seed a fresh accumulator's empty base with the carried fact, while a
+        // split continuation's accumulator already carries the same value (the
+        // stage's take advanced it) and keeps its own.
+        if let Some(cursor) = previous.as_ref().and_then(|record| record.cursor.clone()) {
+            let mut live = cards.cards.lock().await;
+            if let Some(card) = live.get_mut(session_id)
+                && card.acc.cursor == RenderedCursor::default()
+            {
+                card.acc.cursor = cursor;
+            }
+        }
+    }
+
     /// Make `card_message_id` the session's live card, taking the chain over
     /// from whatever card the durable record still names (ADR-0063): attach the
     /// id to the in-memory card FIRST — so a reap tick racing the send never
@@ -1750,11 +1823,19 @@ impl Turn {
         // to (the successor card's own Turn message, exactly as the takeover
         // persisted it).
         let bound = Self::current_turn_message(handles, session_id).await;
+        // A TRUNCATED read is a prefix (spec #561, review #569): the cursor
+        // must NOT resolve against it — the visible prefix may render (the gap
+        // walk does that), but the gap's end may be beyond the page cap, so
+        // only the live-set fallback applies and nothing may mark the gap
+        // complete until a complete read shows its end.
         let seed = match &orphan.cursor {
-            Some(cursor) => match state::CursorSeed::for_orphan_resolving(&transcript, cursor, &anchor) {
-                Some(seed) => seed,
-                None => state::CursorSeed::live_calls_only(&transcript, &anchor),
-            },
+            Some(cursor) if !transcript.truncated => {
+                match state::CursorSeed::for_orphan_resolving(&transcript, cursor, &anchor) {
+                    Some(seed) => seed,
+                    None => state::CursorSeed::live_calls_only(&transcript, &anchor),
+                }
+            }
+            Some(_) => state::CursorSeed::live_calls_only(&transcript, &anchor),
             None => state::CursorSeed::live_calls_only(&transcript, &anchor),
         };
         let resolved = seed.resolved_calls();

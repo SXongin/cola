@@ -287,26 +287,34 @@ fn source_chunk(
     // the part's run). `cap` is the entry's visible-character cap (a reasoning
     // element's): the digest then covers exactly the delivered prefix the card
     // showed, never characters beyond it (spec #561, review #569).
-    let delivered = acc.source_extent(&source);
-    let shown = |chunk: &str| match cap {
-        Some(cap) => chunk.chars().count().min(cap),
-        None => chunk.chars().count(),
+    let shown = |chars: usize| match cap {
+        Some(cap) => chars.min(cap),
+        None => chars,
     };
-    let digest_of = |chunk: &str| {
-        let len = (delivered + shown(chunk)).min(text.chars().count());
-        Some(crate::bridge::chain::cursor_prefix_digest(
-            &text.chars().take(len).collect::<String>(),
-        ))
+    let merging = matches!(&rendered, Some(rendered) if !rendered.is_empty() && text.starts_with(rendered));
+    let (chunk, fresh_source) = match &rendered {
+        Some(rendered) if merging => (text[rendered.len()..].to_string(), false),
+        _ => (text.to_string(), !acc.has_source(&source)),
     };
-    let (chunk, digest) = match &rendered {
-        None if !acc.has_source(&source) => (text.to_string(), digest_of(text)),
-        Some(rendered) if !rendered.is_empty() && text.starts_with(rendered) => {
-            let tail = text[rendered.len()..].to_string();
-            let digest = digest_of(&tail);
-            (tail, digest)
-        }
-        _ => (text.to_string(), None),
+    // The digest covers EXACTLY the delivered prefix the card shows after this
+    // push (spec #561, review #569): an entry merged with its predecessor holds
+    // the whole snapshot — so a part growing past the cap fingerprints
+    // `min(part length, cap)`, never `delivered + cap` — while a fresh entry
+    // holds only its chunk, on top of the offset a seeded entry carries.
+    let entry_chars = if merging {
+        text.chars().count()
+    } else {
+        chunk.chars().count()
     };
+    let delivered_before = if merging {
+        acc.source_delivered_before(&source)
+    } else {
+        0
+    };
+    let digest = (fresh_source || merging).then(|| {
+        let len = (delivered_before + shown(entry_chars)).min(text.chars().count());
+        crate::bridge::chain::cursor_prefix_digest(&text.chars().take(len).collect::<String>())
+    });
     (
         Some(PartSource {
             message_id: source.message_id,
@@ -755,8 +763,16 @@ fn render_pending_gap_once(acc: &mut StreamAccumulator, transcript: &SessionTran
     let Some(gap) = acc.pending_gap.clone() else {
         return false;
     };
+    // A TRUNCATED read is a prefix (spec #561, review #569): render what it
+    // shows, but NEVER treat the gap as rendered through — its end may be
+    // beyond the page cap, so nothing may mark it complete and the walk runs
+    // again on the next read, until a complete one shows the end.
+    acc.gap_truncated = transcript.truncated;
     if !render_pending_gap(acc, transcript, &gap) {
         return false;
+    }
+    if transcript.truncated {
+        return true;
     }
     acc.gap_rendered = true;
     tracing::info!(
@@ -3319,6 +3335,72 @@ Index: /x/src/main.rs
         assert!(
             !recovered.contains(shown),
             "the delivered prefix is not repeated: {recovered}"
+        );
+    }
+
+    /// A reasoning part that grows from BELOW the cap to above it (spec #561,
+    /// review #569): the incremental push merges into the part's own entry, so
+    /// its digest must fingerprint exactly the delivered prefix the card shows
+    /// — `min(part length, cap)` — never `delivered + cap`. Before the fix the
+    /// digest covered the whole grown part, the clamped extent could not verify
+    /// it, and the recovery re-rendered the part from zero.
+    #[test]
+    fn a_reasoning_part_growing_across_the_cap_keeps_its_digest_in_step() {
+        let shown = "【已显示的】";
+        let beyond = "【跨过上限后才有的】";
+        let first = format!("{shown}{}", "隐".repeat(700));
+        // The growth crosses the cap: the marker sits past it, where only the
+        // recovery may show it.
+        let grown = format!("{first}{}{beyond}", "跨".repeat(200));
+        assert!(first.chars().count() <= crate::feishu::card::REASONING_TEXT_CAP);
+        assert!(grown.chars().count() > crate::feishu::card::REASONING_TEXT_CAP);
+        let build = |reasoning: &str| {
+            SessionTranscript::new(vec![
+                typed_message(
+                    "msg_cola_anchor",
+                    MessageRole::User,
+                    Some(1_000),
+                    vec![text_part("问题")],
+                ),
+                message("msg_a_2000", 2_000, vec![reasoning_at(reasoning, 2_000)]),
+            ])
+        };
+
+        // The live render: the first push is below the cap, the growth merges
+        // into the same entry and crosses it.
+        let mut acc = StreamAccumulator::new("live");
+        acc.turn_anchor = Some(turn_anchor(1_000));
+        assert!(render_new_turn_parts(&mut acc, &build(&first)));
+        assert!(render_new_turn_parts(&mut acc, &build(&grown)));
+        let built = acc.build_card_with_info();
+        let delivered = built
+            .cursor
+            .frontier
+            .as_ref()
+            .expect("the reasoning frontier")
+            .delivered_chars;
+        assert_eq!(
+            delivered,
+            crate::feishu::card::REASONING_TEXT_CAP,
+            "the grown frontier is the cap, not the part's full length"
+        );
+
+        // The restart: the frontier RESOLVES (its digest must hash the read's
+        // capped prefix) and renders only what is beyond it.
+        let restarted_read = build(&grown);
+        let mut recovered = StreamAccumulator::new("proj");
+        recovered.turn_anchor = Some(turn_anchor(1_000));
+        let seed = CursorSeed::resolve(&restarted_read, &built.cursor).expect("the grown frontier resolves");
+        recovered.seed_projection(&built.cursor, seed);
+        assert!(render_new_turn_parts(&mut recovered, &restarted_read));
+        let text = card_text(&recovered.build_card_with_info().card);
+        assert!(
+            text.contains(beyond),
+            "the content beyond the cap renders on recovery: {text}"
+        );
+        assert!(
+            !text.contains(shown),
+            "nothing the card displayed repeats: {text}"
         );
     }
 
