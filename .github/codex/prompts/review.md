@@ -3,14 +3,17 @@ section, then add one adversarial pass.
 
 The repository is checked out at the PR head; the base commit is in history.
 Read `CONTRIBUTING.md` ("Reviewing"), `CODING_STANDARDS.md`, and any ADR under
-`docs/adr/` the diff touches before writing findings. The PR metadata (and the
-linked issue, when the workflow could fetch it) is appended below.
+`docs/adr/` the diff touches before writing findings. The PR metadata and every
+issue the PR references — the body's closing/ref keywords and the commits'
+`Refs:` trailers, deduplicated, body references first — are appended below.
 
 ## The two axes
 
 - **Spec**: does the diff implement what the originating issue or spec asked
   for? Report requirements that are missing, partial, or implemented wrongly,
-  and any scope creep. Quote the issue line for each finding.
+  and any scope creep. When several issues are linked, the body's first
+  reference is the spec by convention; the rest are its tickets. Quote the
+  issue line for each finding.
 - **Standards**: does the diff follow `CODING_STANDARDS.md` and the repo's
   conventions? Report every place it violates a documented standard (cite the
   standard) and every place it contradicts an existing ADR.

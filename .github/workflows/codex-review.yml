@@ -21,6 +21,16 @@
 # (ADR-0034, 2026-10-04 amendment); comment-ID anchoring removes the scan, so
 # the marker rule died with the trial workflow.
 #
+# Linked issues (#555): the prompt carries every issue the PR references — the
+# body's closing/ref keywords and the commits' `Refs:` trailers, deduplicated,
+# body references first, capped (`CODEX_MAX_LINKED_ISSUES`). The collector is
+# written by the workflow itself and tested by `cargo test -p xtask codex_gate`
+# like the verdict parser. A PR that references nothing, or whose reference
+# cannot be fetched, fails the prompt step before Codex runs: the sandboxed
+# reviewer can fetch nothing itself, and a review that never saw a spec must
+# not look complete. `edited` sits in the trigger types so a body correction
+# that adds a missing reference re-runs the gate by itself.
+#
 # Robustness (#530): the Codex action can hang AFTER Codex has written its
 # complete output — a surviving descendant keeps the runner's stdio open, so
 # the action never returns and the job dies on its timeout with the result
@@ -52,7 +62,9 @@ name: Codex Review
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    # `edited` so a body correction that adds a missing issue reference
+    # re-runs the gate by itself (#555); body edits fire no `synchronize`.
+    types: [opened, synchronize, reopened, ready_for_review, edited]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
@@ -91,15 +103,15 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      # The verdict parser (#530) is written from THIS workflow, not sourced
-      # from the reviewed tree: the post and approve steps run against
-      # `refs/pull/N/head`, a checkout that may predate the parser (a PR
+      # The gate's scripts (#530, #555) are written from THIS workflow, not
+      # sourced from the reviewed tree: the post, approve and prompt steps run
+      # against `refs/pull/N/head`, a checkout that may predate them (a PR
       # branched before it failed with "verdict.sh: No such file or directory"
       # — #527 did, discarding a completed PASS review). The workflow
-      # definition always comes from the merge ref, so the parser travels with
-      # it; xtask extracts this heredoc and tests it (`cargo test -p xtask
+      # definition always comes from the merge ref, so the scripts travel with
+      # it; xtask extracts these heredocs and tests them (`cargo test -p xtask
       # codex_gate`), keeping one definition.
-      - name: Write the verdict parser
+      - name: Write the workflow scripts
         run: |
           cat > "$RUNNER_TEMP/codex-verdict.sh" <<'VERDICT_SH'
           # Shared verdict parsing for the Codex review gate (#530).
@@ -161,23 +173,80 @@ jobs:
           }
           VERDICT_SH
           echo "parser written to $RUNNER_TEMP/codex-verdict.sh"
+          cat > "$RUNNER_TEMP/codex-linked-issues.sh" <<'LINKED_ISSUES_SH'
+          # Linked-issue collection for the Codex review gate (#555).
+          #
+          # One definition of which issue references a PR carries (its body's
+          # closing/ref keywords and its commits' `Refs:` trailers), of their
+          # order (body first, first-seen), and of how many the review prompt
+          # embeds. Both definitions are exercised by
+          # `cargo test -p xtask codex_gate`.
 
-      # The prompt = the committed rubric + this PR's metadata + its linked
-      # issue when one can be fetched, so the reviewer does not depend on
-      # network access inside the read-only sandbox.
+          # The prompt embeds at most this many issues; further references are
+          # listed by number only, so a reference never disappears silently.
+          # Tests override it.
+          : "${CODEX_MAX_LINKED_ISSUES:=8}"
+
+          # The issue numbers stdin references with a closing/ref keyword, in
+          # first-seen order and deduplicated, one per line; nothing when there
+          # is no match. Two shapes count: `Closes #12` in a body and
+          # `Refs: #12` in a commit trailer (the colon is optional).
+          codex_issue_refs_stdin() {
+            grep -oiE '(Closes|Fixes|Resolves|Refs|Part of):? *#[0-9]+' \
+              | grep -oE '[0-9]+' \
+              | awk '!seen[$0]++' || true
+          }
+
+          # The references stdin carries beyond the embed cap, one per line;
+          # the prompt names them without their bodies. Reads plain numbers.
+          codex_issue_refs_overflow_stdin() {
+            tail -n +"$((CODEX_MAX_LINKED_ISSUES + 1))" || true
+          }
+          LINKED_ISSUES_SH
+          echo "linked-issue collector written to $RUNNER_TEMP/codex-linked-issues.sh"
+
+      # The prompt = the committed rubric + this PR's metadata + every linked
+      # issue. References are collected from the PR body's closing/ref keywords
+      # and the commits' `Refs:` trailers (#555: body-only, first-match
+      # discovery silently dropped the spec when the body lost its keyword),
+      # deduplicated, body references first, capped by the collector. No
+      # reference at all, or a reference that cannot be fetched, fails this
+      # step before Codex runs: the reviewer cannot fetch anything itself, and
+      # a review that never saw a spec must not look complete. GH_TOKEN stays
+      # on this step (and the posting steps) only.
       - name: Build the review prompt
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          . "$RUNNER_TEMP/codex-linked-issues.sh"
           gh pr view "$PR" --json number,title,body,url,baseRefOid > pr.json
           base=$(jq -r .baseRefOid pr.json)
           # The prompt must describe the tree actually checked out, not a head
           # that moved between checkout and this call.
           head=$(git rev-parse HEAD)
-          issue=$(jq -r '.body // ""' pr.json \
-            | grep -oiE '(Closes|Fixes|Resolves|Refs|Part of) #[0-9]+' \
-            | grep -oE '[0-9]+' | head -1 || true)
+          # The body's references come first (its first one is the spec by
+          # convention), then the commits'; `Closes #12` and `Refs: #12` both
+          # count.
+          refs=$( { jq -r '.body // ""' pr.json; git log --format=%B "$base..$head"; } \
+            | codex_issue_refs_stdin )
+          if [ -z "$refs" ]; then
+            echo "::error title=No linked issue::The PR body and commits reference no issue. Add a 'Closes #N' line to the body or a 'Refs: #N' trailer to a commit; the gate re-runs by itself."
+            exit 1
+          fi
+          linked=$(printf '%s\n' "$refs" | head -n "$CODEX_MAX_LINKED_ISSUES")
+          omitted=$(printf '%s\n' "$refs" | codex_issue_refs_overflow_stdin)
+          # Fetch every linked issue before the model runs: a missing or
+          # unfetchable reference fails the step, never a silently spec-less
+          # review.
+          for n in $linked; do
+            if ! gh issue view "$n" --json number,title,body \
+              --jq '"### #" + (.number | tostring) + " " + .title + "\n\n" + (.body // "(empty)")' \
+              > "issue-$n.md" 2> "issue-$n.err"; then
+              echo "::error title=Linked issue unfetchable::gh issue view #$n failed: $(tr '\n' ' ' < "issue-$n.err")"
+              exit 1
+            fi
+          done
           {
             cat .github/codex/prompts/review.md
             echo
@@ -196,13 +265,17 @@ jobs:
             echo "## PR body"
             echo
             jq -r '.body // "(empty)"' pr.json
-            if [ -n "$issue" ] \
-              && gh issue view "$issue" --json title,body \
-                --jq '"### " + .title + "\n\n" + (.body // "(empty)")' > issue.md 2>/dev/null; then
+            echo
+            echo "## Linked issues"
+            echo
+            echo "Every issue the PR body and commits reference, deduplicated, body references first, capped at $CODEX_MAX_LINKED_ISSUES."
+            for n in $linked; do
               echo
-              echo "## Linked issue #$issue"
+              cat "issue-$n.md"
+            done
+            if [ -n "$omitted" ]; then
               echo
-              cat issue.md
+              echo "Further referenced but not embedded (over the cap): $(printf '#%s ' $omitted)"
             fi
           } > codex-prompt.md
 
@@ -274,9 +347,11 @@ jobs:
             -F body=@comment.md --jq .id)
           echo "comment_id=$comment_id" >> "$GITHUB_OUTPUT"
 
-      # The approve step reads back exactly the comment posted above. A FAIL
-      # stays silent on purpose: GitHub Actions bots may not request changes,
-      # because they cannot dismiss their own review and would lock the PR.
+      # The approve step reads back exactly the comment posted above. A
+      # non-PASS verdict fails this step so `gh pr checks`'s red/green mirrors
+      # the verdict (#555), but posts no review event: GitHub Actions bots may
+      # not request changes, because they cannot dismiss their own review and
+      # would lock the PR. Approval remains the merge gate.
       - name: Approve when the verdict is clean
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -297,8 +372,8 @@ jobs:
           last=$(printf '%s\n' "$body" | codex_last_line_stdin)
           verdict=$(codex_strict_verdict_of_line "$last")
           if [ "$verdict" != "PASS" ]; then
-            echo "Verdict: ${verdict:-none}; not approving."
-            exit 0
+            echo "::error title=Codex review::Verdict: ${verdict:-incomplete}; not approving. The findings are in this run's review comment."
+            exit 1
           fi
           # Pin the approval to the reviewed commit, so a push racing this call
           # cannot land an approval on a commit no review has seen.
