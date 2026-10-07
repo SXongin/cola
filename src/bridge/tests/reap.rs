@@ -242,6 +242,30 @@ async fn wait_for_patches(platform: &RecordingPlatform, message_id: &str, n: usi
         .unwrap_or_else(|_| panic!("{message_id} never reached {n} PATCHes"));
 }
 
+/// Wait until the registry no longer caches `message_id`, or panic after 5 s.
+/// The collect's cache release now runs in a **detached continuation** (spec
+/// #571 review), so a test observes it instead of racing it.
+async fn wait_for_cache_release(app: &Arc<App>, message_id: &str) {
+    let probe = async {
+        loop {
+            if app
+                .cards_handle()
+                .card_handles
+                .lock()
+                .await
+                .cached_card(message_id)
+                .is_none()
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), probe)
+        .await
+        .unwrap_or_else(|_| panic!("{message_id}'s cached presentation was never released"));
+}
+
 /// How many `get_card_view` reads the platform served for `message_id` — the
 /// count the settled-key churn test pins (spec #571, ticket #575): a stamp that
 /// already settled must never make the reap read the card again.
@@ -2141,15 +2165,9 @@ async fn a_takeover_collect_releases_the_cache_only_when_its_write_lands() {
 
     release.notify_one();
     takeover.await.unwrap();
-    assert!(
-        app.cards_handle()
-            .card_handles
-            .lock()
-            .await
-            .cached_card("om_frozen")
-            .is_none(),
-        "the delivered collect releases the cached presentation"
-    );
+    // The release follows the delivery in the detached continuation (spec #571
+    // review).
+    wait_for_cache_release(&app, "om_frozen").await;
 }
 
 /// A collect that fails recoverably and is later delivered by the drain still
@@ -2192,17 +2210,9 @@ async fn a_recoverably_failed_collect_releases_the_cache() {
     Turn::set_turn_anchor(&app.cards_handle(), "ses_test", &turn_anchor(1_000)).await;
     Turn::take_over_card(&app.cards_handle(), "ses_test", "om_new", Some("/work")).await;
 
-    // The write is owed — its delivery comes later, without this caller — so
-    // the cache is released now.
-    assert!(
-        app.cards_handle()
-            .card_handles
-            .lock()
-            .await
-            .cached_card("om_frozen")
-            .is_none(),
-        "an owed collect releases the cached presentation"
-    );
+    // The write is owed — its delivery comes later, without this caller — and
+    // the detached continuation releases the cache at the failure.
+    wait_for_cache_release(&app, "om_frozen").await;
 
     // The drain delivers the owed collect: the card is collected, and the
     // stale cache stays gone.
@@ -3734,12 +3744,13 @@ async fn an_anchor_armed_during_the_collect_still_repoints_the_record() {
     // The process's live card: a handover the record missed — attached, but
     // its anchor is armed only while the collect is in flight.
     Turn::seed_card(&app.cards_handle(), "ses_test", Some("om_live")).await;
-    // Park the collect's PATCH after the pass entered the successor branch.
-    let (entered, release) = platform.pause("update", "om_old");
+    // Park the collect's composition read: the submission (and the anchor
+    // re-read that follows it) are still outstanding.
+    let (entered, release) = platform.pause("card_view", "om_old");
 
     spawn_sync_with_timeout(&app, 5_000);
     entered.notified().await;
-    // The takeover arms its anchor while the collect awaits.
+    // The takeover arms its anchor while the collect composes.
     Turn::set_turn_anchor(&app.cards_handle(), "ses_test", &turn_anchor(1_000)).await;
     release.notify_one();
 
@@ -4198,6 +4209,9 @@ async fn a_rejected_preserved_collect_lands_the_bare_marker() {
     Turn::set_turn_anchor(&app.cards_handle(), "ses_test", &turn_anchor(1_000)).await;
     Turn::take_over_card(&app.cards_handle(), "ses_test", "om_new", Some("/work")).await;
 
+    // The collect's submission is detached (spec #571 review): the refused
+    // attempt and its delivered fallback both land through the queue.
+    wait_for_patches(&platform, "om_frozen", 2).await;
     let patches = patches_to(&platform, "om_frozen").await;
     assert_eq!(
         patches.len(),
@@ -4214,6 +4228,68 @@ async fn a_rejected_preserved_collect_lands_the_bare_marker() {
         patches[1]["body"]["elements"].as_array().unwrap().is_empty(),
         "the fallback is the bare taken-over marker: {}",
         patches[1]
+    );
+}
+
+/// Different collect variants are different logical writes (spec #571 review):
+/// the ordinary collect (the reap's successor collect, keeping the whole body)
+/// and the fresh-Turn takeover's strip collect share a generation but carry
+/// different payload rules, so the strip collect must not collapse into the
+/// ordinary one as a duplicate — it lands after it, and the stripped live tail
+/// (the ledger) is the card's last word.
+#[tokio::test]
+async fn a_takeover_collect_is_not_dropped_behind_an_ordinary_collect() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
+
+    let (app, platform) = restarted_app(&session_file, completed(1_000), None).await;
+    platform.given_card_view("om_frozen", live_tail_orphan_view());
+    // Park the ordinary collect's PATCH.
+    let (entered, release) = platform.pause("update", "om_frozen");
+
+    let cards = app.cards_handle();
+    let ordinary = {
+        let cards = cards.clone();
+        tokio::spawn(
+            async move { crate::bridge::chain::collect_orphan(&cards, "ses_test", "om_frozen").await },
+        )
+    };
+    entered.notified().await;
+
+    // The fresh-Turn takeover's strip collect queues at the SAME generation
+    // behind the in-flight ordinary collect.
+    let strip = {
+        let cards = cards.clone();
+        tokio::spawn(async move {
+            crate::bridge::chain::collect_orphan_after_takeover(&cards, "ses_test", "om_frozen", &[]).await
+        })
+    };
+    // Both collects read the card (the ordinary one's read was the first).
+    wait_for_card_views(&platform, "om_frozen", 2).await;
+
+    release.notify_one();
+    ordinary.await.unwrap();
+    strip.await.unwrap();
+    // The submission is detached (spec #571 review): the strip collect lands
+    // through the queue after its submitter returned.
+    wait_for_patches(&platform, "om_frozen", 2).await;
+
+    let patches = patches_to(&platform, "om_frozen").await;
+    assert_eq!(
+        patches.len(),
+        2,
+        "the ordinary collect and the takeover's strip collect, never a collapsed duplicate: {patches:?}"
+    );
+    let text = card_text(patches.last().expect("the strip collect"));
+    assert!(
+        !text.contains("⏳ 后台任务"),
+        "the strip collect owns the card's last word: {text}"
+    );
+    assert!(
+        text.contains("**正文** 已经写完的部分"),
+        "the strip collect keeps the rest of the body: {text}"
     );
 }
 
@@ -4423,6 +4499,49 @@ async fn a_hung_keyed_write_does_not_block_the_pass() {
         "one issued write, never a retry behind it: {patches:?}"
     );
     assert_eq!(card_header(&patches[0]), "✅ 完成");
+}
+
+/// The reap pass itself never awaits an ending write (spec #571 review): with
+/// the production ticket bound (30 s), a hung settle PATCH must not stop the
+/// pass from reading its other records, and the ending's outcome handling —
+/// the terminal record release — still arrives through the detached
+/// continuation once the write resolves.
+#[tokio::test]
+async fn a_hung_ending_write_does_not_block_the_pass() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_record(&session_file, "om_frozen", "msg_cola_anchor", Some(1_000));
+    // A second live orphan the reap keeps reading: the pass clock.
+    ChainRecords::load(sidecar(&session_file)).track(
+        "ses_other",
+        "om_other",
+        MessageId::new("msg_cola_other"),
+        Some(2_000),
+        Some("/work"),
+    );
+
+    let (app, platform, backend) =
+        restarted_app_with_backend(&session_file, completed(1_000), Some(SessionStatus::Idle)).await;
+    backend
+        .set_session_status("ses_other", Some(SessionStatus::Busy))
+        .await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+    // Park the ending's keyed ✅: the production ticket bound is what the pass
+    // would otherwise wait on.
+    let (entered, release) = platform.pause("update", "om_frozen");
+
+    spawn_sync_with_timeout(&app, 5_000);
+    entered.notified().await;
+
+    // The pass keeps processing its other records while the write hangs — the
+    // 5 s read bound cannot cover a 30 s ticket await.
+    wait_for_status_reads(&backend, "ses_other", 3).await;
+
+    // The write resolves: the detached continuation confirms the ending and
+    // releases the record.
+    release.notify_one();
+    wait_for_record_gone(&app, "ses_test").await;
 }
 
 /// A hung card-view read never freezes Session Sync (spec #571 review): a

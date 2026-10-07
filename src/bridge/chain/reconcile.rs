@@ -108,7 +108,7 @@ use crate::bridge::turn::{ArmedTakeover, CardOwnership, Disposition, Turn};
 use crate::feishu::card::{
     CardState, error_line, ledger::TASK_LEDGER_ELEMENT_ID, move_line, shell::CardBuilder,
 };
-use crate::feishu::delivery::{CardWriteIntent, KeyedSubmission, WriteOutcome};
+use crate::feishu::delivery::{CardWriteIntent, CardWriteTicket, KeyedSubmission, WriteOutcome};
 
 /// Collect the orphaned card `card_message_id` because a new card took the
 /// chain over (ADR-0063): one PATCH naming the successor, terminal and grey,
@@ -122,7 +122,14 @@ use crate::feishu::delivery::{CardWriteIntent, KeyedSubmission, WriteOutcome};
 /// A failed PATCH only warns; the record follows the successor either way, so
 /// the freeze it leaves behind is the pre-#438 behavior, never a crash.
 pub(crate) async fn collect_orphan(cards: &CardsHandle, session_id: &str, card_message_id: &str) {
-    collect_orphan_with(cards, session_id, card_message_id, KeepBody::Everything).await;
+    collect_orphan_with(
+        cards,
+        session_id,
+        card_message_id,
+        KeepBody::Everything,
+        CardWriteIntent::Collect,
+    )
+    .await;
 }
 
 /// Collect the orphaned card `card_message_id` for a seeded takeover — the
@@ -150,7 +157,14 @@ pub(crate) async fn collect_orphan_after_takeover(
     let keep = KeepBody::WithoutLiveTail {
         resolved_calls: resolved_calls.to_vec(),
     };
-    collect_orphan_with(cards, session_id, card_message_id, keep).await;
+    collect_orphan_with(
+        cards,
+        session_id,
+        card_message_id,
+        keep,
+        CardWriteIntent::TakeoverCollect,
+    )
+    .await;
 }
 
 /// Collect a projection's LATE successor — the create that landed after a
@@ -160,7 +174,14 @@ pub(crate) async fn collect_orphan_after_takeover(
 /// reader the same text twice. The late card is reduced to the bare
 /// taken-over marker; every other collect keeps its body (ADR-0063).
 pub(crate) async fn collect_late_projection(cards: &CardsHandle, session_id: &str, card_message_id: &str) {
-    collect_orphan_with(cards, session_id, card_message_id, KeepBody::Nothing).await;
+    collect_orphan_with(
+        cards,
+        session_id,
+        card_message_id,
+        KeepBody::Nothing,
+        CardWriteIntent::LateProjectionCollect,
+    )
+    .await;
 }
 
 /// The shared takeover collect behind [`collect_orphan`] and
@@ -173,11 +194,21 @@ pub(crate) async fn collect_late_projection(cards: &CardsHandle, session_id: &st
 /// stale one the queue would drop. The bare ending rides as the submission's
 /// fallback (spec #571 review): a platform that refuses the preserved shape as
 /// card content degrades to it inside the queue, under the same key and lock,
-/// so the degradation can never land over a newer generation. The collect
-/// awaits its completion ticket with a bound — the reap's pass must never wait
-/// on Feishu unboundedly — and the queue owns the write past it: an issued
-/// keyed write is never cancelled and may still land.
-async fn collect_orphan_with(cards: &CardsHandle, session_id: &str, card_message_id: &str, keep: KeepBody) {
+/// so the degradation can never land over a newer generation.
+///
+/// The submission is **detached** (spec #571 review): the caller — the reap
+/// pass above all — must never await a Feishu write, so a small continuation
+/// awaits the completion ticket (bounded) and performs the cache release, the
+/// INFO line and the warning exactly as this function once did. The queue owns
+/// the write either way: an issued keyed write is never cancelled and may
+/// still land.
+async fn collect_orphan_with(
+    cards: &CardsHandle,
+    session_id: &str,
+    card_message_id: &str,
+    keep: KeepBody,
+    intent: CardWriteIntent,
+) {
     if card_message_id.is_empty() {
         return;
     }
@@ -193,18 +224,40 @@ async fn collect_orphan_with(cards: &CardsHandle, session_id: &str, card_message
     .await;
     let generation = cards.chains.generation(session_id);
     let bound = cards.feishu.keyed_ticket_await();
-    let outcome = cards
+    let ticket = cards
         .feishu
         .submit_ordered(KeyedSubmission {
             message_id: card_message_id,
             generation,
-            intent: CardWriteIntent::Collect,
+            intent,
             card: &card,
             fallback: Some(&bare),
         })
-        .await
-        .settled_within(bound)
         .await;
+    // Hand the waiting to a detached continuation: the pass proceeds now.
+    let cards = cards.clone();
+    let session_id = session_id.to_string();
+    let card_message_id = card_message_id.to_string();
+    tokio::spawn(async move {
+        collect_orphan_outcome(
+            &cards,
+            &session_id,
+            &card_message_id,
+            ticket.settled_within(bound).await,
+        )
+        .await;
+    });
+}
+
+/// One collect submission's outcome handling — the cache release, the INFO
+/// line and the warning — run by the detached continuation so no caller ever
+/// waits on Feishu (spec #571 review).
+async fn collect_orphan_outcome(
+    cards: &CardsHandle,
+    session_id: &str,
+    card_message_id: &str,
+    outcome: Option<WriteOutcome>,
+) {
     match outcome {
         Some(WriteOutcome::Delivered) => {
             // The collect repainted the card outside the handle registry, so
@@ -294,12 +347,12 @@ pub(crate) async fn reconcile(
     read_timeout_ms: u64,
 ) -> Option<AdoptedFollow> {
     let mut reads = gather_reads(handles, session_id, record, directory, tracked_directory).await;
-    // The successor branch's collect runs before the decision: its awaited
-    // orphan PATCH is exactly where a takeover can arm the successor's anchor,
-    // and the pre-split pass re-read the anchor after the collect so an anchor
-    // landing in that window re-points the record instead of being missed.
-    // Only the anchor is re-read — the id and running stay the pre-collect
-    // facts the pre-split pass entered the branch with.
+    // The successor branch's collect runs before the decision: its composition
+    // read is where a takeover can arm the successor's anchor, and the anchor
+    // is re-read right after the (detached, spec #571 review) submission so an
+    // anchor landing in that window re-points the record instead of being
+    // missed. Only the anchor is re-read — the id and running stay the
+    // pre-collect facts the pre-split pass entered the branch with.
     if reads.needs_successor_collect() {
         collect_orphan(&handles.cards, session_id, &record.card_message_id).await;
         let anchor = Turn::armed_turn_anchor(&handles.cards, session_id).await;
@@ -1182,15 +1235,11 @@ async fn settle_card(
         // `Observe`: the ending is not decided, so no card is claimed.
         return;
     };
-    // The waiting mark follows a landed Waiting PATCH alone (ADR-0059).
+    // The waiting mark follows a landed Waiting PATCH alone (ADR-0059): the
+    // ending's detached continuation applies it with the rest of the outcome.
     let waiting = matches!(disposition, Disposition::Waiting);
     let detail = disposition.failure().map(error_line);
-    if pass.settle(state, detail.as_deref()).await && waiting {
-        handles
-            .cards
-            .chains
-            .mark_waiting_reaped(session_id, &record.card_message_id);
-    }
+    pass.settle(state, detail.as_deref(), waiting).await;
 }
 
 /// One record's apply state for the transcript settle: the handles, the
@@ -1222,6 +1271,118 @@ enum EndingOutcome {
     Owed,
 }
 
+/// One ending submission as the pass leaves it (spec #571 review): the queue's
+/// settled-key answer already resolved it, or the write is issued with the
+/// ticket its detached continuation observes.
+enum EndingSubmission {
+    Settled(EndingOutcome),
+    Issued(CardWriteTicket, std::time::Duration),
+}
+
+/// The owned context one ending's detached continuation needs (spec #571
+/// review): the card store, the session, the record's card, the decision's
+/// labels, and whether the waiting mark belongs to a landing.
+struct EndingContinuation {
+    cards: CardsHandle,
+    session_id: String,
+    card_message_id: String,
+    terminal: bool,
+    waiting: bool,
+    moved: bool,
+    word: &'static str,
+}
+
+impl EndingContinuation {
+    /// Apply one ending outcome: the INFO line, the terminal record release,
+    /// the waiting mark (ADR-0059: it follows a landed Waiting PATCH alone),
+    /// and the refusal's record-spending.
+    fn apply(self, outcome: EndingOutcome) {
+        match outcome {
+            EndingOutcome::Landed => {
+                let moved = if self.moved {
+                    " on a session that moved"
+                } else {
+                    ""
+                };
+                tracing::info!("live-card reap: session {} {}{moved}", self.session_id, self.word);
+                if self.terminal {
+                    // Release only the record this ending belongs to (review
+                    // #569): between the PATCH and here a fresh Turn can take
+                    // the session over and re-point the chain; that chain keeps
+                    // its own record.
+                    self.cards
+                        .chains
+                        .release_if_card(&self.session_id, &self.card_message_id);
+                } else if self.waiting {
+                    self.cards
+                        .chains
+                        .mark_waiting_reaped(&self.session_id, &self.card_message_id);
+                }
+            }
+            EndingOutcome::Refused => {
+                // A confirmed non-delivery: nothing will ever be written for
+                // this card again, so the record must not survive every pass
+                // (ADR-0067: a terminal record is removed after delivery OR
+                // permanent refusal — which is also the outbox's pre-batch
+                // behavior). A Waiting yield keeps its record: only the true
+                // end spends it.
+                tracing::info!(
+                    "live-card reap: session {} ending for card {} permanently refused; record spent",
+                    self.session_id,
+                    self.card_message_id
+                );
+                if self.terminal {
+                    self.cards
+                        .chains
+                        .release_if_card(&self.session_id, &self.card_message_id);
+                }
+            }
+            EndingOutcome::Owed => {}
+        }
+    }
+}
+
+/// Resolve one issued ending's ticket, bounded (spec #571 review): the mapping
+/// the pass once did inline, now run by the detached continuation so no pass
+/// waits on Feishu. An indeterminate ticket keeps the record — the write may
+/// still land — and the release gate sees the keyed ending the queue owes.
+async fn await_ending(
+    ticket: CardWriteTicket,
+    bound: std::time::Duration,
+    session_id: &str,
+    card_message_id: &str,
+) -> EndingOutcome {
+    match ticket.settled_within(bound).await {
+        Some(WriteOutcome::Delivered) => EndingOutcome::Landed,
+        Some(WriteOutcome::Failed(e)) => {
+            tracing::warn!(
+                "live-card reap: session {session_id} could not settle card {card_message_id}: {e}"
+            );
+            // A permanently refused ending is a CONFIRMED non-delivery: the
+            // queue settled the key refused, so no payload is ever retried for
+            // it (#522) and the record is spent. A recoverable failure keeps
+            // the record (the queue retries).
+            if e.is_recoverable_card_write() {
+                EndingOutcome::Owed
+            } else {
+                EndingOutcome::Refused
+            }
+        }
+        Some(WriteOutcome::Superseded) => {
+            tracing::debug!(
+                "live-card reap: session {session_id} settle for card {card_message_id} superseded by a newer chain state"
+            );
+            EndingOutcome::Owed
+        }
+        None => {
+            tracing::info!(
+                "live-card reap: session {session_id} ending for card {card_message_id} still in flight"
+            );
+            EndingOutcome::Owed
+        }
+    }
+}
+
 impl ApplyPass<'_> {
     /// PATCH the record's card into `state`, keeping the card's existing body
     /// best-effort (#434 acceptance feedback), as the card's keyed **ending**
@@ -1235,13 +1396,17 @@ impl ApplyPass<'_> {
     /// delivery-or-refusal rule, #522). A terminal ending whose Session's
     /// current directory differs from the pass's baseline directory gains one
     /// extra line naming the move (#439), on top of `detail` (the failure's
-    /// message when there is one); a Waiting yield carries none. Returns
-    /// whether the ending is spent (landed, already delivered, or permanently
-    /// refused) — an unconfirmed ending keeps the record for the queue's retry
+    /// message when there is one); a Waiting yield carries none.
+    ///
+    /// The submission itself is made here; its outcome handling (the INFO line,
+    /// the terminal record release, the waiting mark, the warning) runs in a
+    /// **detached continuation** (spec #571 review) — the same pattern the
+    /// stamp's pre-submission task uses — so the pass never awaits a Feishu
+    /// write. An unconfirmed ending keeps the record for the queue's retry
     /// (the release gate sees the keyed write it still owes). One INFO line per
     /// action, naming the session and the decision — never chat content; a
     /// settle that named a move says so.
-    async fn settle(&self, state: CardState, detail: Option<&str>) -> bool {
+    async fn settle(&self, state: CardState, detail: Option<&str>, waiting: bool) {
         let terminal = state.is_terminal();
         let move_note = if terminal { self.move_note().await } else { None };
         let card = ending_card(state.clone(), detail, move_note.as_deref());
@@ -1250,51 +1415,26 @@ impl ApplyPass<'_> {
         } else {
             CardWriteIntent::Yield
         };
-        match self.submit_ending(&card, intent).await {
-            EndingOutcome::Landed => {}
-            EndingOutcome::Refused => {
-                // A confirmed non-delivery: nothing will ever be written for
-                // this card again, so the record must not survive every pass
-                // (ADR-0067: a terminal record is removed after delivery OR
-                // permanent refusal — which is also the outbox's pre-batch
-                // behavior). A Waiting yield keeps its record: only the true
-                // end spends it.
-                tracing::info!(
-                    "live-card reap: session {} ending for card {} permanently refused; record spent",
-                    self.session_id,
-                    self.record.card_message_id
-                );
-                if terminal {
-                    self.handles
-                        .cards
-                        .chains
-                        .release_if_card(self.session_id, &self.record.card_message_id);
-                    return true;
-                }
-                return false;
-            }
-            EndingOutcome::Owed => return false,
-        }
-        let moved = if move_note.is_some() {
-            " on a session that moved"
-        } else {
-            ""
+        let continuation = EndingContinuation {
+            cards: self.handles.cards.clone(),
+            session_id: self.session_id.to_string(),
+            card_message_id: self.record.card_message_id.clone(),
+            terminal,
+            waiting,
+            moved: move_note.is_some(),
+            word: state.reap_word(),
         };
-        tracing::info!(
-            "live-card reap: session {} {}{moved}",
-            self.session_id,
-            state.reap_word()
-        );
-        if terminal {
-            // Release only the record this ending belongs to (review #569):
-            // between the PATCH and here a fresh Turn can take the session over
-            // and re-point the chain; that chain keeps its own record.
-            self.handles
-                .cards
-                .chains
-                .release_if_card(self.session_id, &self.record.card_message_id);
+        match self.submit_ending(&card, intent).await {
+            EndingSubmission::Settled(outcome) => continuation.apply(outcome),
+            EndingSubmission::Issued(ticket, bound) => {
+                let session_id = continuation.session_id.clone();
+                let card_message_id = continuation.card_message_id.clone();
+                tokio::spawn(async move {
+                    let outcome = await_ending(ticket, bound, &session_id, &card_message_id).await;
+                    continuation.apply(outcome);
+                });
+            }
         }
-        true
     }
 
     /// Submit the record's keyed **ending** write (spec #571's amendments):
@@ -1308,20 +1448,19 @@ impl ApplyPass<'_> {
     /// the same key and the same held card lock, so the degradation can never
     /// land over a newer generation. The key is consulted first: an already
     /// **settled** ending — delivered, so the card holds it, or permanently
-    /// refused, so it can never land (#522) — costs no card-view read and no
-    /// submission (spec #571 review). Then await the ticket, bounded: the pass
-    /// must never wait on Feishu unboundedly (an issued keyed write is never
-    /// cancelled and the queue may still land it).
-    async fn submit_ending(&self, card: &serde_json::Value, intent: CardWriteIntent) -> EndingOutcome {
+    /// refused, so it can never land (#522) — resolves inline with no card-view
+    /// read and no submission (spec #571 review). An issued write hands its
+    /// ticket and await bound back to the caller's detached continuation.
+    async fn submit_ending(&self, card: &serde_json::Value, intent: CardWriteIntent) -> EndingSubmission {
         let platform = self.handles.cards.feishu.as_ref();
         let card_message_id = self.record.card_message_id.as_str();
         let generation = self.record.generation;
         if let Some(delivered) = platform.keyed_write_settled(card_message_id, generation, intent) {
-            return if delivered {
+            return EndingSubmission::Settled(if delivered {
                 EndingOutcome::Landed
             } else {
                 EndingOutcome::Refused
-            };
+            });
         }
         let view_timeout_ms = self.handles.cards.preserved_view_timeout_ms();
         let preserved = preserved_ending(
@@ -1333,7 +1472,7 @@ impl ApplyPass<'_> {
         )
         .await;
         let bound = platform.keyed_ticket_await();
-        match platform
+        let ticket = platform
             .submit_ordered(KeyedSubmission {
                 message_id: card_message_id,
                 generation,
@@ -1341,47 +1480,8 @@ impl ApplyPass<'_> {
                 card: &preserved,
                 fallback: Some(card),
             })
-            .await
-            .settled_within(bound)
-            .await
-        {
-            Some(WriteOutcome::Delivered) => EndingOutcome::Landed,
-            Some(WriteOutcome::Failed(e)) => {
-                tracing::warn!(
-                    "live-card reap: session {} could not settle card {card_message_id}: {e}",
-                    self.session_id
-                );
-                // A permanently refused ending is a CONFIRMED non-delivery:
-                // the queue settled the key refused, so no payload is ever
-                // retried for it (#522) and the record is spent. A recoverable
-                // failure keeps the record (the queue retries).
-                if e.is_recoverable_card_write() {
-                    EndingOutcome::Owed
-                } else {
-                    EndingOutcome::Refused
-                }
-            }
-            Some(WriteOutcome::Superseded) => {
-                tracing::debug!(
-                    "live-card reap: session {} settle for card {card_message_id} superseded by a newer chain state",
-                    self.session_id
-                );
-                EndingOutcome::Owed
-            }
-            None => {
-                // Indeterminate: the ticket outlived the await bound. The
-                // ending is issued and owned by the queue — never cancelled —
-                // and may still land, so keep the record: the release gate
-                // counts the keyed ending the queue still owes (spec #571's
-                // amendment), and a later pass settles the card truthfully if
-                // the write never lands.
-                tracing::info!(
-                    "live-card reap: session {} ending for card {card_message_id} still in flight",
-                    self.session_id
-                );
-                EndingOutcome::Owed
-            }
-        }
+            .await;
+        EndingSubmission::Issued(ticket, bound)
     }
 
     /// The one line a settling card carries when the Session's location changed

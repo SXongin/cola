@@ -43,10 +43,18 @@ drops stale intents, collapses duplicates and retries failures.
   at submission (`ChainRecords::generation`), so a takeover that landed since
   the caller's own snapshot outranks that snapshot's older intent instead of
   being refused by it. The second half is the intent vocabulary: `Stamp` (the
-  #443 restart stamp), `Collect` (a takeover's old-card collect — the
-  fresh-Turn message takeover, a late projection, the reap's successor
-  collect), `Yield` (the waiting ending 「⏳ 等待后台任务」) and `Settle` (the
-  terminal ending). `(generation, intent)` names one logical write.
+  #443 restart stamp), the three collect variants — `Collect` (the ordinary
+  collect: the reap's successor collect, the Wake continuation's arm, the
+  external arm, keeping the whole preserved body), `TakeoverCollect` (the
+  fresh-Turn message takeover's collect, which strips the orphan's live tail,
+  ADR-0068) and `LateProjectionCollect` (the late projection's collect, which
+  reduces the late card to the bare marker) — `Yield` (the waiting ending
+  「⏳ 等待后台任务」) and `Settle` (the terminal ending). The collect variants
+  are distinct intents because their payload rules differ (spec #571 review): a
+  reap collect and a takeover's strip collect may share a generation and must
+  both land — the strip collect last — rather than one collapsing into the
+  other as a same-key duplicate. `(generation, intent)` names one logical
+  write.
 
 - **The queue rules.** A submission whose generation is below the card's
   **floor** — the lowest generation the card still accepts, raised to every
@@ -181,7 +189,11 @@ drops stale intents, collapses duplicates and retries failures.
   itself. A submission's write is owned by a spawned driver task, not by the
   submitting task, so cancelling a submitter cannot strand an admitted
   payload. The stamp's view read and composition still run on a small
-  pre-submission task that the Session Sync pass never awaits.
+  pre-submission task that the Session Sync pass never awaits — and so do the
+  collects and the endings (spec #571 review): the pass submits them and a
+  **detached continuation** awaits the ticket (bounded) to perform the cache
+  release, the INFO line, the terminal record release and the warning, so no
+  Session Sync pass ever waits on a Feishu write at all.
   **An issued keyed write is never cancelled** (spec #571 review): a timed-out
   PATCH could still commit at Feishu and land over a newer generation, the very
   hazard the ordering exists to remove (ADR-0063's rule), so the driver awaits

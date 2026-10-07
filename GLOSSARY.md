@@ -302,7 +302,11 @@ payload (spec #571 review): a typed card-content rejection of the primary
 tries it under the same held card lock and the same key, so a preserved
 ending's degradation to its bare shape stays one ordered write. The intent
 vocabulary is `Stamp` (the #443
-restart stamp), `Collect` (a takeover's old-card collect), `Settle` (the
+restart stamp), the three collect variants — `Collect` (the ordinary collect,
+whole body kept), `TakeoverCollect` (the fresh-Turn takeover's strip collect)
+and `LateProjectionCollect` (the late projection's bare-marker collect); they
+are distinct intents because their payload rules differ (spec #571 review) —
+`Settle` (the
 terminal ending) and `Yield` (the waiting ending, which shadows a later
 `Stamp` without closing the generation). Distinct from a keyless
 `update_message`, which serializes on the same per-card delivery lock but is
