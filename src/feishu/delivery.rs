@@ -11,7 +11,9 @@
 //! Entries carry a monotonic per-card sequence: a slow failed retry can never
 //! resurrect a payload a newer write has superseded, and a newer delivery
 //! clears the older pending state. Bounded by an entry cap (oldest-first
-//! eviction with a WARN) and retried with per-entry exponential backoff by
+//! eviction with a WARN), never above a hard ceiling that even fresh order
+//! state cannot push past (spec #571 review), and retried with per-entry
+//! exponential backoff by
 //! [`CardDelivery::drain_pending_card_updates`] — called by the Session Sync
 //! pass each tick, and with `force` immediately after a Feishu WS reconnect.
 //!
@@ -113,6 +115,17 @@ const MAX_DELIVERED_SEQS: usize = 16;
 /// existing behavior outside the keyed ordering contract (spec #571 review):
 /// an issued **keyed** write is never cancelled.
 const DRAIN_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The hard ceiling on the entries map, as a multiple of `MAX_PENDING` (spec
+/// #571 review): `max_pending` × this factor. The soft cap prefers victims
+/// without order state, and fresh order state is protected while a stale
+/// writer could still be composing — so a flood of more protected admissions
+/// than this forces the oldest entry out regardless of protection. The map can
+/// therefore never exceed the ceiling, even when every entry carries fresh
+/// order state; the trade is the same narrow stale-writer window expiry
+/// accepts, forced early to keep the hard bound. Four is comfortably above any
+/// real burst of cards a process settles or collects at once.
+const MAX_ENTRIES_FACTOR: usize = 4;
 
 /// How long a submission's driver waits for the card's delivery lock before
 /// reporting the recoverable timeout and leaving the payload owed (spec #571
@@ -552,7 +565,14 @@ pub(crate) struct CardDelivery {
     /// both walk the set (a superseded retry is harmless, but a shared walk
     /// keeps the bookkeeping single-writer).
     drain_lock: tokio::sync::Mutex<()>,
+    /// The soft cap: the preferred eviction threshold (`MAX_PENDING` in
+    /// production).
     max_pending: usize,
+    /// The hard ceiling on the entries map — `max_pending` ×
+    /// [`MAX_ENTRIES_FACTOR`] — above which the oldest entry leaves regardless
+    /// of order-state protection, so a flood of protected admissions can never
+    /// grow memory without bound (spec #571 review).
+    max_entries: usize,
     limits: Limits,
 }
 
@@ -574,6 +594,7 @@ impl CardDelivery {
             state: Arc::new(Mutex::new(State::default())),
             drain_lock: tokio::sync::Mutex::new(()),
             max_pending,
+            max_entries: max_pending.saturating_mul(MAX_ENTRIES_FACTOR),
             limits: Limits {
                 backoff_base,
                 backoff_max,
@@ -581,6 +602,14 @@ impl CardDelivery {
                 order_state_protection: ORDER_STATE_PROTECTION,
             },
         }
+    }
+
+    /// [`Self::with_limits`] with an explicit hard ceiling, so a test can reach
+    /// it with a handful of admissions (spec #571 review).
+    #[cfg(test)]
+    fn with_max_entries(mut self, max_entries: usize) -> Self {
+        self.max_entries = max_entries;
+        self
     }
 
     /// [`Self::with_limits`] with a shorter order-state protection window, so
@@ -702,24 +731,26 @@ impl CardDelivery {
         }
     }
 
-    /// Keep the state under the cap. A settled tombstone leaves before an
-    /// undelivered payload (the cap bounds undelivered payloads; a tombstone
-    /// only guards against a still-in-flight older write), oldest first by
-    /// entry age. An entry that still carries order state — a raised generation
-    /// floor, an ending shadow — is never chosen
-    /// while another victim exists (spec #571's reviews); once **every**
-    /// entry carries order state, one past its protection window leaves as
-    /// the last resort, oldest state first (spec #571 review) — its
-    /// stale writer can no longer be composing, so keyed-only traffic stays
-    /// bounded over the window. `protect` is the entry the caller just
-    /// admitted: dropping the very write being recorded is never the cap's
-    /// answer to its own growth. If every other entry is fresh order state
-    /// the map may sit above the cap until one ages out. A pending payload
-    /// evicted (only when more than the cap are owed) warns; a tombstone
-    /// leaves quietly.
+    /// Keep the state under the cap, and never above the hard ceiling. A
+    /// settled tombstone leaves before an undelivered payload (the cap bounds
+    /// undelivered payloads; a tombstone only guards against a still-in-flight
+    /// older write), oldest first by entry age. An entry that still carries
+    /// order state — a raised generation floor, an ending shadow — is never
+    /// chosen while another victim exists (spec #571's reviews); once **every**
+    /// entry carries order state, one past its protection window leaves as the
+    /// last resort, oldest state first (spec #571 review) — its stale writer
+    /// can no longer be composing. Above the **hard ceiling** the oldest entry
+    /// leaves regardless of protection (spec #571 review): the map can never
+    /// exceed it, even under a flood of fresh order states, at the cost of the
+    /// same narrow stale-writer window expiry accepts — forced early. `protect`
+    /// is the entry the caller just admitted: dropping the very write being
+    /// recorded is never the cap's answer to its own growth. Between the cap
+    /// and the ceiling, the map may sit above the cap until an order state ages
+    /// out. A pending payload evicted warns; a tombstone leaves quietly.
     fn evict_over_cap(&self, state: &mut State, protect: Option<&str>) {
         while state.entries.len() > self.max_pending {
             let now = tokio::time::Instant::now();
+            let over_ceiling = state.entries.len() > self.max_entries;
             let evictable = |message_id: &String| protect != Some(message_id.as_str());
             // A settled, unneeded tombstone is the preferred victim; then any
             // entry without order state, oldest first.
@@ -736,22 +767,33 @@ impl CardDelivery {
             // Nothing ordinary is left: an order state past its window is the
             // last-resort victim, the oldest first. A fresh one stays — the
             // window it protects is still open.
-            let victim = ordinary.or_else(|| {
+            let expired = state
+                .entries
+                .iter()
+                .filter(|(message_id, entry)| {
+                    entry.order_state_expired(self.limits.order_state_protection, now)
+                        && evictable(message_id)
+                })
+                .min_by_key(|(_, entry)| entry.order_state_since)
+                .map(|(message_id, _)| message_id.clone());
+            // Above the ceiling, protection yields: the oldest entry leaves.
+            let victim = ordinary.or(expired).or_else(|| {
+                if !over_ceiling {
+                    return None;
+                }
                 state
                     .entries
                     .iter()
-                    .filter(|(message_id, entry)| {
-                        entry.order_state_expired(self.limits.order_state_protection, now)
-                            && evictable(message_id)
-                    })
-                    .min_by_key(|(_, entry)| entry.order_state_since)
+                    .filter(|(message_id, _)| evictable(message_id))
+                    .min_by_key(|(_, entry)| entry.age)
                     .map(|(message_id, _)| message_id.clone())
             });
             let Some(victim) = victim else {
                 // Every remaining entry carries order state inside its
-                // protection window (or is the admission itself): dropping one
-                // would reopen the window its floor or shadow exists to close.
-                // It ages into evictability.
+                // protection window (or is the admission itself), and the map
+                // is still below the hard ceiling: dropping one would reopen
+                // the window its floor or shadow exists to close. It ages into
+                // evictability, and the ceiling above bounds the growth.
                 return;
             };
             let evicted = state.entries.remove(&victim);
@@ -2999,6 +3041,54 @@ mod tests {
         let ticket = submit(&delivery, "om_1", 2, CardWriteIntent::Stamp, &stamp).await;
         assert!(matches!(ticket.settled().await, WriteOutcome::Delivered));
         assert_eq!(inner.attempts().len(), 3, "the newer generation's stamp wrote");
+    }
+
+    /// The hard ceiling bounds the map even when every entry carries fresh
+    /// order state (spec #571 review): the soft cap's protection cannot grow
+    /// memory without bound, so a flood of protected admissions forces the
+    /// oldest entry out — and only at the ceiling.
+    #[tokio::test]
+    async fn a_flood_of_protected_admissions_stays_under_the_hard_ceiling() {
+        let inner = Arc::new(FakePlatform::new());
+        let delivery =
+            CardDelivery::with_limits(inner.clone(), 2, BACKOFF_BASE, BACKOFF_MAX).with_max_entries(6);
+        let settle = serde_json::json!({ "body": "ending" });
+
+        // Filling up to the ceiling evicts nothing: every fresh floor is
+        // protected there.
+        for n in 0..6 {
+            let ticket = submit(&delivery, &format!("om_{n}"), 1, CardWriteIntent::Settle, &settle).await;
+            assert!(matches!(ticket.settled().await, WriteOutcome::Delivered));
+            assert_eq!(
+                delivery.state.lock().unwrap().entries.len(),
+                n + 1,
+                "nothing leaves below the ceiling"
+            );
+        }
+
+        // At the ceiling the oldest protected entry is the victim, one
+        // admission at a time — the bound holds at every step.
+        for n in 6..20 {
+            let ticket = submit(&delivery, &format!("om_{n}"), 1, CardWriteIntent::Settle, &settle).await;
+            assert!(matches!(ticket.settled().await, WriteOutcome::Delivered));
+            let len = delivery.state.lock().unwrap().entries.len();
+            assert!(
+                len <= 6,
+                "the map never exceeds the hard ceiling at om_{n}: {len}"
+            );
+        }
+
+        let state = delivery.state.lock().unwrap();
+        assert!(
+            !state.entries.contains_key("om_0") && !state.entries.contains_key("om_13"),
+            "the oldest protected entries left: {:?}",
+            state.entries.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            state.entries.contains_key("om_19"),
+            "the newest admission stays: {:?}",
+            state.entries.keys().collect::<Vec<_>>()
+        );
     }
 
     /// The cap keeps the ending shadow alive while a stale stamp could still

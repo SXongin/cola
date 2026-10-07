@@ -136,8 +136,12 @@ drops stale intents, collapses duplicates and retries failures.
   the entry a write is being admitted into is never evicted by its own
   admission; once no stale writer can still be composing — an order state older
   than a generous protection window, past every bounded card-view read — the
-  oldest such state is the cap's last-resort victim, so keyed-only traffic
-  cannot grow the map without bound). Its own
+  oldest such state is the cap's last-resort victim). Above a **hard ceiling**
+  — a small documented multiple of the cap
+  (`MAX_PENDING × MAX_ENTRIES_FACTOR`) — the oldest entry leaves regardless of
+  protection (spec #571 review), so a flood of fresh order states can never
+  grow the map without bound: the trade is the same narrow stale-writer window
+  expiry accepts, forced early. Its own
   state lock is taken only to admit, snapshot or settle — never held across an
   await — and the card's delivery lock is held only across the Feishu write
   itself. A submission's write is owned by a spawned driver task, not by the
@@ -199,6 +203,16 @@ key, and every same-key attempt that arrives meanwhile collapses into it
 without a Feishu call — spec #571 review), and the churn is bounded and
 one-shot; resurrecting attempt-lifecycle state (the retired claim's fragment)
 for it was rejected.
+
+**Accepted residual: the hard ceiling evicts young order state.** Under a flood
+of more protected admissions than `MAX_PENDING × MAX_ENTRIES_FACTOR`, the
+ceiling's oldest-first eviction may drop a raised floor or ending shadow while
+its protection window is still open — a stale writer from an older generation
+could then land over the newer state. This is deliberately the *same* narrow
+window the protection window already accepts at its expiry, forced early to
+keep the map hard-bounded (issue #571: "an outage or a flood of writers cannot
+grow memory without bound"); the window's own reasoning (a bounded card-view
+read) still bounds how stale such a writer can be.
 
 ## Considered options
 
