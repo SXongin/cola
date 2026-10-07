@@ -1,42 +1,59 @@
-//! The Codex gate's shared verdict parser (#530): one definition of "a
-//! complete review" (publication) and one of "the marker stands on its own
-//! line" (approval), exercised against the shapes the live gate has produced
-//! (plain, bolded, code span, CRLF, cut streams, quoted markers) plus a
-//! wiring check that the workflow actually uses the parser.
+//! The Codex gate's shared scripts: the verdict parser (#530) — one
+//! definition of "a complete review" (publication) and one of "the marker
+//! stands on its own line" (approval), exercised against the shapes the live
+//! gate has produced (plain, bolded, code span, CRLF, cut streams, quoted
+//! markers) — and the linked-issue collector (#555), one definition of which
+//! references the review prompt carries and how many of them it embeds. A
+//! wiring check guards that the workflow actually uses both.
 //!
-//! The parser's single definition is the heredoc the workflow writes to
+//! Each script's single definition is the heredoc the workflow writes to
 //! `$RUNNER_TEMP` at run time — never a file from the reviewed checkout, which
 //! may predate it (#527 lost a completed review that way). These tests
-//! extract that heredoc from `.github/workflows/codex-review.yml` and run it,
-//! so the tested text and the executed text are one.
+//! extract those heredocs from `.github/workflows/codex-review.yml` and run
+//! them, so the tested text and the executed text are one.
 
 #[cfg(all(test, unix))]
 mod tests {
+    use std::io::Write;
     use std::path::PathBuf;
-    use std::process::Command;
+    use std::process::{Command, Stdio};
 
-    /// The parser as the workflow writes it: the body between `<<'VERDICT_SH'`
-    /// and its terminator line. The YAML block indents the body, which bash
-    /// ignores, so the extracted text runs as-is.
-    fn verdict_script() -> String {
-        let workflow =
-            std::fs::read_to_string(crate::repo_root().join(".github/workflows/codex-review.yml")).unwrap();
-        let lines = workflow
-            .split("<<'VERDICT_SH'")
+    /// The workflow the gate reads its scripts from.
+    fn workflow() -> String {
+        std::fs::read_to_string(crate::repo_root().join(".github/workflows/codex-review.yml")).unwrap()
+    }
+
+    /// The body of `text`'s `<<'marker'` heredoc, up to its terminator line.
+    /// The YAML block indents the body, which bash ignores, so the extracted
+    /// text runs as-is.
+    fn heredoc(text: &str, marker: &str) -> String {
+        let opener = format!("<<'{marker}'");
+        let lines = text
+            .split(&opener)
             .nth(1)
-            .expect("the workflow writes the parser")
+            .unwrap_or_else(|| panic!("the workflow writes the {marker} heredoc"))
             .lines()
             .skip(1);
         let mut body = String::new();
         for line in lines {
-            if line.trim() == "VERDICT_SH" {
-                assert!(!body.is_empty(), "the parser heredoc has a body");
+            if line.trim() == marker {
+                assert!(!body.is_empty(), "the {marker} heredoc has a body");
                 return body;
             }
             body.push_str(line);
             body.push('\n');
         }
-        panic!("the parser heredoc is terminated");
+        panic!("the {marker} heredoc is terminated");
+    }
+
+    /// The verdict parser as the workflow writes it.
+    fn verdict_script() -> String {
+        heredoc(&workflow(), "VERDICT_SH")
+    }
+
+    /// The linked-issue collector as the workflow writes it.
+    fn linked_issues_script() -> String {
+        heredoc(&workflow(), "LINKED_ISSUES_SH")
     }
 
     /// The extracted parser, written once for all tests.
@@ -52,14 +69,65 @@ mod tests {
             .clone()
     }
 
-    /// Run `expr` with the extracted parser sourced; stdout verbatim.
+    /// The extracted collector, written once for all tests.
+    fn linked_issues_file() -> PathBuf {
+        static LINKED: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        LINKED
+            .get_or_init(|| {
+                let dir = temp_dir("linked-issues");
+                let file = dir.join("codex-linked-issues.sh");
+                std::fs::write(&file, linked_issues_script()).unwrap();
+                file
+            })
+            .clone()
+    }
+
+    /// Run `expr` with both extracted scripts sourced; stdout verbatim.
     fn run_raw(expr: &str) -> String {
         let script = parser_file();
+        let linked = linked_issues_file();
         let out = Command::new("bash")
             .arg("-c")
-            .arg(format!(". '{}'; {expr}", script.display()))
+            .arg(format!(
+                ". '{}'; . '{}'; {expr}",
+                script.display(),
+                linked.display()
+            ))
             .output()
             .expect("bash runs");
+        assert!(
+            out.status.success(),
+            "bash failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// Run `expr` with both extracted scripts sourced and `input` on stdin;
+    /// stdout verbatim.
+    fn run_stdin(expr: &str, input: &str) -> String {
+        let script = parser_file();
+        let linked = linked_issues_file();
+        let mut child = Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                ". '{}'; . '{}'; {expr}",
+                script.display(),
+                linked.display()
+            ))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("bash spawns");
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin is piped")
+            .write_all(input.as_bytes())
+            .expect("stdin accepts the input");
+        drop(child.stdin.take());
+        let out = child.wait_with_output().expect("bash runs");
         assert!(
             out.status.success(),
             "bash failed: {}",
@@ -143,9 +211,52 @@ mod tests {
     }
 
     #[test]
-    fn the_workflow_uses_the_shared_parser() {
-        let workflow =
-            std::fs::read_to_string(crate::repo_root().join(".github/workflows/codex-review.yml")).unwrap();
+    fn linked_issue_refs_come_from_body_keywords_and_commit_trailers() {
+        for (input, want) in [
+            ("Closes #545\n", "545"),
+            ("Fixes: #12\n", "12"),
+            ("Resolves #7.\n", "7"),
+            ("Refs: #571\n", "571"),
+            ("Part of #123\n", "123"),
+            ("closes #10, closes #11\n", "10\n11"),
+            // The keyword must abut the number: prose around it does not count.
+            ("Closes the gap of #545\n", ""),
+            ("no reference here\n", ""),
+        ] {
+            assert_eq!(
+                run_stdin("codex_issue_refs_stdin", input).trim(),
+                want,
+                "input: {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn linked_issue_refs_are_deduplicated_in_first_seen_order() {
+        let out = run_stdin(
+            "codex_issue_refs_stdin",
+            "Closes #545\nRefs: #571\n\nCloses #545\nFixes #12\nRefs: #571\n",
+        );
+        assert_eq!(out.trim(), "545\n571\n12");
+    }
+
+    #[test]
+    fn references_beyond_the_embed_cap_are_listed_for_the_prompt() {
+        let out = run_stdin(
+            "CODEX_MAX_LINKED_ISSUES=2; codex_issue_refs_overflow_stdin",
+            "1\n2\n3\n4\n",
+        );
+        assert_eq!(out.trim(), "3\n4");
+    }
+
+    #[test]
+    fn the_embed_cap_defaults_to_eight() {
+        assert_eq!(run_raw(r#"printf '%s\n' "$CODEX_MAX_LINKED_ISSUES""#).trim(), "8");
+    }
+
+    #[test]
+    fn the_workflow_uses_the_shared_scripts() {
+        let workflow = workflow();
         // The Codex step itself: the bound and the pin must stay, or a hang
         // burns the whole job and discards a finished review again (#530).
         // The live salvage path is exercised by the gate's own runs on every
@@ -182,11 +293,32 @@ mod tests {
             !approve.contains("codex_verdict_of_line"),
             "approval must not use the publication parser"
         );
-        // The parser is written by the workflow itself (the heredoc
-        // `verdict_script` extracts); a tree-file source is the bug #527 hit.
+        // Both scripts are written by the workflow itself (the heredocs
+        // `verdict_script` and `linked_issues_script` extract); a tree-file
+        // source is the bug #527 hit.
+        let write = step(&workflow, "Write the workflow scripts");
+        for marker in ["VERDICT_SH", "LINKED_ISSUES_SH"] {
+            assert!(write.contains(marker), "the workflow must write its own {marker}");
+        }
+        // The prompt step fetches every linked issue through the collector the
+        // workflow wrote, from the body and the commits (#555).
+        let prompt = step(&workflow, "Build the review prompt");
         assert!(
-            step(&workflow, "Write the verdict parser").contains("VERDICT_SH"),
-            "the workflow must write its own parser"
+            prompt.contains(r#". "$RUNNER_TEMP/codex-linked-issues.sh""#),
+            "the prompt step must source the collector the workflow wrote"
+        );
+        for function in ["codex_issue_refs_stdin", "codex_issue_refs_overflow_stdin"] {
+            assert!(prompt.contains(function), "the prompt step must use {function}");
+        }
+        assert!(
+            prompt.contains("git log --format=%B"),
+            "the prompt step must read the commits' refs too (#555)"
+        );
+        // A non-PASS verdict fails the check so `gh pr checks` mirrors the
+        // verdict (#555); the approval itself stays fail-closed.
+        assert!(
+            approve.contains("exit 1"),
+            "a non-PASS verdict must fail the approve step (#555)"
         );
     }
 
