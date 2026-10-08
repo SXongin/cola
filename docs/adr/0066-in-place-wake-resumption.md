@@ -1,5 +1,12 @@
 # In-place Wake resumption: one card per request
 
+> **Amended by ADR-0074**: the Wake-less late tail no longer keeps the split —
+> it resumes an open yielded card in place or lands on the one neutral residual
+> Card (「📄 还有更新」), never a 「已恢复执行」 receipt. The no-reopen-terminal
+> rule stands and is reconciled below: a terminal Card is never rewritten, and
+> the neutral residual Card is the honest floor for a Wake-less tail past it.
+> See the amendment at the end.
+
 ## Context
 
 ADR-0059 made a Turn's card yield 「⏳ 等待后台任务」 when its Execution ended
@@ -167,3 +174,44 @@ chain (ADR-0059's 2026-10-08 amendment):
 Restart/interrupt Wakes and the Wake-less late tail keep the split; for an
 external chain after its true end (or on a collected card) wakes stay
 unrendered per #408.
+
+## Amendment (2026-10-09, #602): the terminal exception, the same-snapshot ending, and the honest residual floor
+
+Two things in the Decision above changed when spec #602 made the post-prompt
+ending one unbounded path and every continuation honest about what resumed.
+
+**The split-on-late-tail rule is narrowed.** The Decision (and the 2026-10-08
+amendment's closing line "Restart/interrupt Wakes and the Wake-less late tail
+keep the split") treated every Wake the chain had not taken over, and the
+Wake-less content diff, as a reason to split a new Card. Only a **genuine
+resumption** now may open one: a Shell/Subagent completion, a restart or an
+interruption (`WakeSource::is_genuine_resumption`). A Wake-less content diff —
+content the Backend wrote with no Wake, including a same-request tail after a
+finalize — never produces a 「🔔 已恢复执行」 receipt:
+
+- on an **open yielded card** it resumes that card in place (the same
+  one-card-per-request handoff, no receipt);
+- on a card **past its wait** (terminal or restart-stamped) it lands on the one
+  **neutral residual Card** (「📄 还有更新」), bounded to one per request by the
+  chain's `residual_card_posted` marker, with a `WARN`. This is a defensive
+  floor: the same-snapshot ending rule below makes it near-unreachable.
+
+**The same-snapshot ending rule underlies it.** `Done` is decided only on a
+snapshot that was both rendered *and* shows no new content, so a later separate
+execution-status read can no longer finalize a stale snapshot — the race that
+orphaned a same-turn tail into a second Card is closed at the source
+(`ses_ee3f4531fffeBcOYDY3vHUQDPw`, spec #602).
+
+**The no-reopen-terminal rule stands, reconciled.** The Decision's "a card
+already at a terminal (✅/❌/⏹) keeps…" and the rejected alternative "a ✅ card
+flipping back to 🔄 reads as broken; the terminal case is a race and a fresh
+continuation card is honest about it" are not reversed: the terminal Card's
+recorded ending is never rewritten. What is refined is what the honest fresh
+continuation looks like — a genuine Wake still continues it by split with the
+承接 line, while a Wake-less tail gets the neutral residual Card instead of a
+false 「已恢复执行」 receipt.
+
+See ADR-0074 for the three invariants (one unbounded post-prompt path, exactly
+one Card per resumption, the notice gated on delivery).
+
+Source: #602, #604, #605, #606.

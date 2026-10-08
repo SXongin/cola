@@ -22,6 +22,13 @@ the conversation while a Turn needs attention.
 > run one coherent story (ADR-0059). ADR-0059 also gives a Turn whose
 > Background Tasks are live the waiting disposition (等待后台任务) and renders
 > Wakes as continuation cards.
+>
+> **Amended by ADR-0074**: the post-prompt drain is one unbounded path owned by
+> the Turn's own task. The 2026-09-24 "the drain bound hands the card to an
+> out-of-turn follow" and the 2026-09-28 grace amendment below describe a
+> follow that no longer continues the post-prompt path; the no-total-budget
+> conclusion stands, but the Turn owns the whole path. See the amendment at the
+> end.
 
 ## Context
 
@@ -534,3 +541,35 @@ after one last reconcile render. That line is superseded by the stop terminal
 
 Source: #394 (spec #391).
 
+## Amendment (2026-10-09, #602): the post-prompt path is one unbounded loop; there is no hand-off
+
+The 2026-09-24 amendment bounded the drain with a fixed clock (10 min,
+`turn_drain_timeout_ms`) and, at the bound, handed the still-running Turn to an
+out-of-turn follow that kept the same accumulator and Card Chain. The
+2026-09-28 amendment removed the total budget but kept that hand-off as the
+drain's exit: the follow owned the running Turn from the bound onward.
+
+Spec #602 removed the hand-off itself. The inline drain and the out-of-turn
+follow are now one loop owned by the Turn's own task (`Turn::finish` →
+`drain_after_prompt`), rendering a submitted prompt to its true end with no
+seam, no total budget and no guard-release window:
+
+- **The drain is unbounded.** The `turn_drain_timeout_ms` knob and the
+  budget-derived per-read timeout are removed. The per-read timeout unifies on
+  the follow's fixed read timeout (`turn_follow_read_timeout_ms`); the
+  `turn_follow_grace_ms` grace is the single clock, bounding only lost contact,
+  an unreconcilable live panel on an idle Session, and the unreceived hint —
+  never a healthy, merely-long run.
+- **The guard is held for the whole path.** There is no ownership hand-off, so
+  a message arriving mid-request is a Supplement and the server-yield's busy
+  read never sees the Session as idle. The follow remains, but only for the
+  paths with no Turn task of their own: the recovery re-attach and the Wake
+  continuation.
+- **The 2026-09-24 stop-terminal and 2026-09-28 grace amendments stand**: the
+  graces still end a run nobody can act on, and `/stop` still finalizes
+  `Stopped`.
+
+See ADR-0074 for the three one-card-per-request invariants this concluded (one
+unbounded path, exactly one Card per resumption, the notice gated on delivery).
+
+Source: #602, #603.

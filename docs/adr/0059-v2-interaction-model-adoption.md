@@ -31,6 +31,12 @@
 > the true end carries the Completion Notice and a failed resumed run keeps the
 > ordinary Retry (the request's card still carries its prompt).
 >
+> **Amended by ADR-0074**: "with no total budget the follow owns it" is
+> superseded — the post-prompt drain is one unbounded path owned by the Turn's
+> own task, and the follow serves only the paths with no Turn task (the
+> recovery re-attach, the Wake continuation). The routing-key and waiting
+> semantics below stand. See the amendment at the end.
+>
 > **Amended 2026-10-01 (#470)**: V2 persists a running tool call with empty
 > metadata and publishes `context.progress` on the event bus only — the message
 > projection folds in terminal events alone — so the polled message read cannot
@@ -214,3 +220,26 @@ onto the V1-shaped one.**
 
 Related: #403 (the bug this subsumes), ADR-0017, ADR-0026, ADR-0028, ADR-0043,
 ADR-0050, ADR-0053, ADR-0055, ADR-0058.
+
+## Amendment (2026-10-09, #602): the merged post-prompt path; the follow is not the owner
+
+The Decision above says that, with no total budget, "the follow owns" a long
+Turn's ending and that holding the guard is what keeps it one coherent story.
+Spec #602 merged the post-prompt drain and the out-of-turn follow into one
+unbounded loop owned by the Turn's own task, so the follow no longer continues
+a post-prompt hand-off:
+
+- **The Turn owns the whole path.** A submitted prompt is rendered to its true
+  end on the Turn's own task (`Turn::finish` → `drain_after_prompt`), holding
+  the inflight guard throughout — no hand-off, no guard-free window, no total
+  budget.
+- **The follow serves only the paths with no Turn task**: the recovery
+  re-attach and the Wake continuation. Its no-total-budget graces (lost
+  contact, an unreconcilable live panel) and its guard semantics are unchanged.
+- **The waiting disposition and the routing key stand**: an idle read with
+  live Background Tasks yields 等待后台任务, and a message during a live run is
+  a Supplement. A Wake-less content diff no longer opens a 「已恢复执行」 Card —
+  it resumes an open yielded card in place or lands on the neutral residual
+  Card (ADR-0074).
+
+Source: #602, #603.
