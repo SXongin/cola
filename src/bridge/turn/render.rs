@@ -1452,6 +1452,35 @@ pub(crate) struct RenderPass {
     pub(crate) flush: FlushOutcome,
 }
 
+/// What a [`render_and_flush_inner`] pass may do beyond rendering its read.
+/// The two callers use exactly two modes — the axes move together — so one
+/// named mode replaces the pair of booleans they used to pass.
+#[derive(Clone, Copy)]
+enum RenderMode {
+    /// A normal streaming render: persist the captured anchor and flush when
+    /// the pass owes a card write.
+    Streaming,
+    /// A settling drain tick (#604): render only — no anchor persist, no
+    /// flush. Finalization's own render on the same read owns the card write,
+    /// so the settle tick adds no second durable write and no out-of-order
+    /// flush (a pending split still serves on finalization, as before).
+    Settling,
+}
+
+impl RenderMode {
+    /// Whether the pass persists the captured anchor on the durable record
+    /// (ADR-0063).
+    fn persists_anchor(self) -> bool {
+        matches!(self, Self::Streaming)
+    }
+
+    /// Whether the pass may issue a card write; a settling pass leaves it to
+    /// finalization.
+    fn flushes(self) -> bool {
+        matches!(self, Self::Streaming)
+    }
+}
+
 /// [`render_and_flush`] for a drain tick that is settling (#604): it renders the
 /// read into the accumulator but does not flush — finalization's own render on
 /// the same read owns the card write, so the settle tick adds no second durable
@@ -1466,7 +1495,13 @@ pub(super) async fn render_and_flush_settling(
     transcript: &SessionTranscript,
 ) -> Option<RenderPass> {
     render_and_flush_inner(
-        cards, sessions, backend, requests, session_id, transcript, false, false,
+        cards,
+        sessions,
+        backend,
+        requests,
+        session_id,
+        transcript,
+        RenderMode::Settling,
     )
     .await
 }
@@ -1493,12 +1528,17 @@ pub(super) async fn render_and_flush(
     transcript: &SessionTranscript,
 ) -> Option<RenderPass> {
     render_and_flush_inner(
-        cards, sessions, backend, requests, session_id, transcript, true, true,
+        cards,
+        sessions,
+        backend,
+        requests,
+        session_id,
+        transcript,
+        RenderMode::Streaming,
     )
     .await
 }
 
-#[allow(clippy::too_many_arguments)] // the render axes plus the anchor-persist and flush choices
 async fn render_and_flush_inner(
     cards: &CardsHandle,
     sessions: &SessionsHandle,
@@ -1506,8 +1546,7 @@ async fn render_and_flush_inner(
     requests: &RequestsHandle,
     session_id: &str,
     transcript: &SessionTranscript,
-    persist_anchor: bool,
-    flush_allowed: bool,
+    mode: RenderMode,
 ) -> Option<RenderPass> {
     // OpenCode auto-renames sessions after a turn; follow the server's live
     // title so the card subtitle doesn't stay on the "new session" default.
@@ -1582,7 +1621,9 @@ async fn render_and_flush_inner(
     // A caller that will finalize on this same read defers it (#604): the
     // finalization's own render names the anchor, and the extra write here
     // would be a second persist for one turn.
-    if persist_anchor && let Some((card_message_id, anchor)) = &anchor {
+    if mode.persists_anchor()
+        && let Some((card_message_id, anchor)) = &anchor
+    {
         cards.chains.set_anchor(session_id, card_message_id, anchor);
     }
     // Keep the footer's context segment current (ADR-0044): the token usage
@@ -1640,7 +1681,7 @@ async fn render_and_flush_inner(
             None => (super::state::LedgerChange::default(), false),
         }
     };
-    let flush = if !flush_allowed {
+    let flush = if !mode.flushes() {
         // A settling render (#604) leaves the card write to finalization, which
         // renders and flushes this same read: no carrier here.
         FlushOutcome::Unwritten
