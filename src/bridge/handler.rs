@@ -2167,7 +2167,7 @@ impl App {
             if let Some(Ok(runtime)) = runtime {
                 transcript.apply_task_runtime(&runtime);
                 let retired: Vec<String> = transcript
-                    .runtime_retired
+                    .task_retirements
                     .iter()
                     .map(|retirement| retirement.task.tool.call_id.clone())
                     .collect();
@@ -2182,7 +2182,7 @@ impl App {
             .filter(|task| transcript.unconfirmed_tasks.contains(&task.tool.call_id))
             .map(|task| task.tool.call_id.clone())
             .collect();
-        if cleared.is_empty() && transcript.runtime_retired.is_empty() {
+        if cleared.is_empty() && transcript.task_retirements.is_empty() {
             tracing::warn!("cleanup: no unconfirmed task left on session {session_id}");
             crate::bridge::turn::Turn::release_cleanup_claim(&handles.cards, &session_id).await;
             return;

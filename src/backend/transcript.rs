@@ -38,15 +38,16 @@ pub struct SessionTranscript {
     /// assistant tool parts that started them, with every matching Wake
     /// applied. Empty on a generation without them (V1).
     pub background_tasks: Vec<BackgroundTask>,
-    /// The Background Tasks a **runtime reconciliation** read retired while no
-    /// Wake retired them ([`SessionTranscript::apply_task_runtime`]) — or the
-    /// user's cleanup retired ([`SessionTranscript::apply_cleanup`]): the
-    /// completion record was lost, and the runtime either reported a terminal
-    /// end or no longer knows the task. They have already left
-    /// [`Self::background_tasks`], so the settle decision treats them as
+    /// The Background Tasks the read retired while no Wake retired them: a
+    /// **runtime reconciliation** read that reported a terminal end or no
+    /// longer knows the task ([`SessionTranscript::apply_task_runtime`]), a
+    /// child-evidence read that concluded the subagent's own transcript
+    /// ([`SessionTranscript::apply_child_evidence`]), or the user's own
+    /// cleanup click ([`SessionTranscript::apply_cleanup`]). They have already
+    /// left [`Self::background_tasks`], so the settle decision treats them as
     /// ended; the ledger renders each as a completion entry. Empty unless a
-    /// reconciliation read or a cleanup ran.
-    pub runtime_retired: Vec<TaskRetirement>,
+    /// reconciliation read, an evidence read or a cleanup ran.
+    pub task_retirements: Vec<TaskRetirement>,
     /// The call ids of live Background Tasks a reconciliation read could not
     /// confirm as running (a subagent child the runtime reports inactive) while
     /// no Wake retired them. The ledger renders those rows as 状态待确认; the
@@ -77,7 +78,7 @@ impl SessionTranscript {
             executions: Vec::new(),
             wakes: Vec::new(),
             background_tasks: Vec::new(),
-            runtime_retired: Vec::new(),
+            task_retirements: Vec::new(),
             unconfirmed_tasks: std::collections::HashSet::new(),
             truncated: false,
             shell_outputs: std::collections::HashMap::new(),
@@ -160,7 +161,7 @@ impl SessionTranscript {
             kept.push(task);
         }
         self.background_tasks = kept;
-        self.runtime_retired.extend(retired);
+        self.task_retirements.extend(retired);
     }
 
     /// Apply the user's manual cleanup (spec #588, ticket #590): every named
@@ -181,7 +182,7 @@ impl SessionTranscript {
         let mut kept = Vec::with_capacity(self.background_tasks.len());
         for task in std::mem::take(&mut self.background_tasks) {
             if clearing.contains(task.tool.call_id.as_str()) {
-                self.runtime_retired.push(TaskRetirement {
+                self.task_retirements.push(TaskRetirement {
                     task,
                     ending: TaskRetirementEnding::Cleaned,
                     finished_at: Some(now_ms),
@@ -224,7 +225,7 @@ impl SessionTranscript {
             // Returned above; kept for the match's exhaustiveness.
             ChildEvidence::Unfinished => return,
         };
-        self.runtime_retired.push(TaskRetirement {
+        self.task_retirements.push(TaskRetirement {
             task,
             ending,
             finished_at,
@@ -1858,7 +1859,7 @@ mod tests {
         );
         assert!(transcript.unconfirmed_tasks.contains("call_sub"));
         assert_eq!(
-            transcript.runtime_retired,
+            transcript.task_retirements,
             vec![TaskRetirement {
                 task: shell_task("call_done", "sh_done"),
                 ending: TaskRetirementEnding::Ended(ShellEnd::Exited),
@@ -1881,11 +1882,11 @@ mod tests {
             children: vec![],
         });
         assert_eq!(
-            lost.runtime_retired[0].ending,
+            lost.task_retirements[0].ending,
             TaskRetirementEnding::Lost,
             "a runtime without the record is the Lost ending"
         );
-        assert_eq!(lost.runtime_retired[0].finished_at, None);
+        assert_eq!(lost.task_retirements[0].finished_at, None);
         assert!(lost.background_tasks.is_empty());
         assert_eq!(
             lost.settle(Some(&anchor)),
@@ -1904,7 +1905,7 @@ mod tests {
         });
         untouched.apply_task_runtime(&TaskRuntime::default());
         assert_eq!(untouched.background_tasks.len(), 1);
-        assert!(untouched.runtime_retired.is_empty());
+        assert!(untouched.task_retirements.is_empty());
         assert_eq!(untouched.settle(Some(&anchor)), TurnSettle::Waiting);
     }
 
@@ -1946,7 +1947,7 @@ mod tests {
             "only the named task left the live list"
         );
         assert_eq!(
-            transcript.runtime_retired,
+            transcript.task_retirements,
             vec![TaskRetirement {
                 task: shell_task("call_clear", "sh_clear"),
                 ending: TaskRetirementEnding::Cleaned,
@@ -1970,12 +1971,12 @@ mod tests {
 
         // An id with no live task invents no retirement.
         transcript.apply_cleanup(&["call_absent".to_string()], 4_000);
-        assert_eq!(transcript.runtime_retired.len(), 1);
+        assert_eq!(transcript.task_retirements.len(), 1);
 
         // The last live task's cleanup is the true end.
         transcript.apply_cleanup(&["call_keep".to_string()], 4_000);
         assert!(transcript.background_tasks.is_empty());
-        assert_eq!(transcript.runtime_retired.len(), 2);
+        assert_eq!(transcript.task_retirements.len(), 2);
         assert_eq!(transcript.settle(Some(&anchor)), TurnSettle::Complete);
     }
 
@@ -2015,7 +2016,7 @@ mod tests {
             "a retired suspect leaves the unconfirmed set"
         );
         assert_eq!(
-            terminal.runtime_retired,
+            terminal.task_retirements,
             vec![TaskRetirement {
                 task: child_task("call_sub", "ses_child"),
                 ending: TaskRetirementEnding::ChildEnded,
@@ -2036,7 +2037,7 @@ mod tests {
         gone.unconfirmed_tasks.insert("call_sub".into());
         gone.apply_child_evidence("call_sub", ChildEvidence::Gone);
         assert_eq!(
-            gone.runtime_retired,
+            gone.task_retirements,
             vec![TaskRetirement {
                 task: child_task("call_sub", "ses_child"),
                 ending: TaskRetirementEnding::Lost,
@@ -2056,7 +2057,7 @@ mod tests {
         assert_eq!(unfinished.background_tasks.len(), 1);
         assert!(unfinished.unconfirmed_tasks.contains("call_sub"));
         assert!(
-            unfinished.runtime_retired.is_empty(),
+            unfinished.task_retirements.is_empty(),
             "nothing settles on no evidence"
         );
         assert_eq!(unfinished.settle(Some(&anchor)), TurnSettle::Waiting);
@@ -2064,7 +2065,7 @@ mod tests {
         // An id with no live task invents no retirement.
         unfinished.apply_child_evidence("call_absent", ChildEvidence::Terminal { completed_at: 3_000 });
         assert_eq!(unfinished.background_tasks.len(), 1);
-        assert!(unfinished.runtime_retired.is_empty());
+        assert!(unfinished.task_retirements.is_empty());
     }
 
     /// Spec #588 / #591: the suspects one reconcile cycle may read — only the

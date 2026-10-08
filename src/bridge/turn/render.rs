@@ -568,7 +568,7 @@ fn plan_runtime_entries(
     anchor: &TurnAnchor,
 ) -> Vec<PlannedEntry> {
     let mut plans = Vec::new();
-    for retirement in &transcript.runtime_retired {
+    for retirement in &transcript.task_retirements {
         let task = &retirement.task;
         let key = format!("runtime:{}", task.tool.call_id);
         if acc.wake_announced(&key) {
