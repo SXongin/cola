@@ -118,14 +118,17 @@ the user already looks at.
   the same admitted reconcile cycle (the server's own tail idiom — a probe
   cursor past the end learns the record's size, then one page reads the last
   window), decoded and clipped to the last 15 lines of the last 4 KiB, with the
-  byte boundary kept char-safe. The window is labelled 「截至于 HH:MM」, plus
+  byte boundary kept char-safe. The live window is labelled 「截至于 HH:MM」, plus
   「仅最后 N 行 · 已截断」 when the record held more (N = the lines the window
   actually renders); a read that fails, vanishes or answers nothing omits the
   window entirely — never a placeholder — and the accumulator keeps the last
   established window between throttled cycles, so a row never flickers. When
   the shell ends, its completion entry (完成 / 取消 / 失败 / 结束) carries the
   same bounded tail (≤ 4 KB, its last 15 lines) in its fold body under the
-  identity line, or
+  identity line, with only
+  「仅最后 N 行 · 已截断」 when the record held more — no 「截至于 HH:MM」: the
+  identity line already carries the run's own start and duration, and a
+  completed capture cannot grow (review, PR #595) — or
   「输出已不可用」 when the record cannot be read; the 已失联 entry, a 🧹
   cleanup and a subagent carry identity only. The reads are display-only — they
   never prompt, retire or settle — and generation-aware: V1 spends no request.
