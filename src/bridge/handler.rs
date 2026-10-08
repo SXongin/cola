@@ -2125,9 +2125,11 @@ impl App {
     /// refresh renders the result — rows dropped, one 🧹 entry per cleared
     /// task (and per runtime/evidence retirement the read observed), and the
     /// card settled by the same rules as a quiet true end (the last task gone
-    /// is ✅ in place, ADR-0060). A read that fails, and a read that leaves
-    /// nothing to clear and nothing to retire, give the claim back so the
-    /// button stays usable.
+    /// is ✅ in place, ADR-0060). Every verdict that moved the read refreshes
+    /// the card, a marker-resolving `Running` verdict included (review, PR
+    /// #595): the stale ⚠️ 状态待确认 row and its button leave on the click's
+    /// own pass. A read that fails, and a verdict that changed nothing at all,
+    /// give the claim back so the button stays usable.
     async fn run_cleanup(
         handles: crate::bridge::handles::TurnHandles,
         session_id: String,
@@ -2161,18 +2163,25 @@ impl App {
             read_timeout_ms,
         )
         .await;
-        if verdict.is_none() {
+        let Some(changed) = verdict else {
             tracing::warn!("cleanup: no runtime verdict on session {session_id}; clearing nothing");
             crate::bridge::turn::Turn::release_cleanup_claim(&handles.cards, &session_id).await;
             return;
-        }
+        };
         let cleared: Vec<String> = transcript
             .background_tasks
             .iter()
             .filter(|task| transcript.unconfirmed_tasks.contains(&task.tool.call_id))
             .map(|task| task.tool.call_id.clone())
             .collect();
-        if cleared.is_empty() && transcript.task_retirements.is_empty() {
+        // The click owes the card a refresh whenever its own verdict moved the
+        // read — not only when a row was cleared or retired (spec #588, review
+        // PR #595): a verdict that reports a carried child RUNNING resolves the
+        // ⚠️ 状态待确认 marker with nothing to clear, and the stale row and its
+        // 「清理待确认任务」 button must leave on this click's own refresh, not
+        // on a later Session Sync pass. A verdict that changed nothing at all —
+        // no marker moved, no retirement — gives the claim back unwritten.
+        if cleared.is_empty() && transcript.task_retirements.is_empty() && !changed {
             tracing::warn!("cleanup: no unconfirmed task left on session {session_id}");
             crate::bridge::turn::Turn::release_cleanup_claim(&handles.cards, &session_id).await;
             return;
