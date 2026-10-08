@@ -418,6 +418,66 @@ async fn a_split_registers_the_continuation_card() {
     assert_eq!(handles.cached_count(), 0);
 }
 
+/// Spec #602, ticket #607: a size-split terminal write announces AFTER the new
+/// Card's send. The continuation create carries no owed Pending Card Update, so
+/// the notice's gate answers "delivered now", and the send it follows has
+/// already happened — the notice trails the new card rather than preceding it.
+#[tokio::test]
+async fn a_size_split_terminal_write_notifies_after_the_new_card() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = Arc::new(MockBackend::new(realistic_parts()));
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend, platform.clone()).unwrap());
+
+    let cards = app.cards_handle();
+    Turn::seed_card(&cards, "ses_split", Some("om_filled")).await;
+    Turn::set_card_state(&cards, "ses_split", CardState::Done).await;
+    for i in 0..50 {
+        Turn::push_tool(
+            &cards,
+            "ses_split",
+            &format!("call_{i}"),
+            ToolPanel::for_test(&format!("tool{i}"), ToolStatus::Completed, None, None),
+        )
+        .await;
+    }
+    add_permission_block(&app, "per_split", "ses_split", "/work").await;
+    Turn::set_reply_target(&cards, "ses_split", "msg_1").await;
+    Turn::set_turn_identity(&cards, "ses_split", TEST_HOST, true, 1).await;
+
+    // The terminal flush finalizes the filled card and sends the continuation
+    // carrying the tail.
+    Turn::flush_card(&cards, "ses_split").await;
+    let before = platform.calls.lock().await.len();
+
+    crate::bridge::turn::announce_completion(
+        &cards,
+        &app.feishu,
+        &app.turn_config().notice_rules(),
+        "ses_split",
+        std::time::Instant::now(),
+        &crate::bridge::turn::Disposition::Done,
+    )
+    .await;
+
+    let calls = platform.calls.lock().await.clone();
+    let reply_at = calls
+        .iter()
+        .position(|c| matches!(c, PlatformCall::ReplyCard { .. }))
+        .expect("a continuation card was sent");
+    let notice_at = calls[before..]
+        .iter()
+        .position(|c| matches!(c, PlatformCall::CompletionNotice { .. }))
+        .map(|i| i + before)
+        .expect("the notice fired");
+    assert!(
+        reply_at < notice_at,
+        "the notice must follow the new card's send: {calls:?}"
+    );
+}
+
 /// A partial answer click on a card that is no longer the accumulator's
 /// current card refreshes THAT card's cached JSON (the 已选 markers), carried
 /// in the ack.

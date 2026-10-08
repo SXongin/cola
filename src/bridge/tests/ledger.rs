@@ -1492,6 +1492,56 @@ async fn a_quiet_true_end_settles_the_host_card_in_place() {
     );
 }
 
+/// Spec #602, ticket #607: the quiet in-place settle is gated identically. A
+/// settle PATCH that failed recoverably is owed as a Pending Card Update, so
+/// the notice waits for the drain instead of announcing over an ending that is
+/// not yet on the card.
+#[tokio::test]
+async fn a_quiet_settle_defers_the_notice_until_the_retry_drains() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = waiting_shell(now - 5_000);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    let mut context = ctx("ses_test", "跑一下构建并审阅");
+    context.is_group = true;
+    context.requester_open_id = Some(TEST_HOST.to_string());
+    yield_one_task_card(&app, &platform, context).await;
+
+    // The settle PATCH fails recoverably: the ending is owed, so the notice
+    // must wait. (BACKOFF_BASE is 5 s, so no sync-tick drain retries it within
+    // this test's window — the count is not consumed behind the assertion.)
+    platform.fail_update_transport_count.store(100, Ordering::SeqCst);
+    script_quiet_true_end(&backend).await;
+    spawn_sync(&app);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while Turn::card_state(&app.cards_handle(), "ses_test").await != Some(CardState::Done) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the quiet true end never settled the card"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // Let the settle's own announce land (it trails the PATCH it gates): with
+    // the gate armed nothing is sent, but a send outside the gate would surface.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !noticed(&platform).await,
+        "an owed settle must not announce before it drains: {:?}",
+        platform.calls.lock().await
+    );
+
+    // Feishu returns: the drain delivers the owed update, and the notice fires.
+    platform.fail_update_transport_count.store(0, Ordering::SeqCst);
+    app.core.feishu.drain_pending_card_updates(true).await;
+    let notices = wait_for_notice(&platform).await;
+    assert_eq!(notices.len(), 1, "exactly one notice: {notices:?}");
+    assert!(
+        notices[0].3.contains("已完成"),
+        "unexpected notice text: {}",
+        notices[0].3
+    );
+}
+
 /// Issue #454: a shell the runtime reports ENDED — while its completion Wake
 /// never arrives — retires on the same Session Sync read that refreshes the
 /// yielded ledger, and the last retirement settles the waiting card in place

@@ -424,7 +424,7 @@ impl ExternalFlow {
                     // notice's classification and copy cannot disagree with the
                     // card.
                     if let Some(started_at) = notice_at {
-                        crate::bridge::turn::send_completion_notice(
+                        crate::bridge::turn::announce_completion(
                             &handles.cards,
                             &handles.platform,
                             &self.notice,
@@ -1174,7 +1174,7 @@ impl ExternalFlow {
                 let Some(started_at) = Turn::turn_started_at(&flow.cards, &session_id).await else {
                     return;
                 };
-                crate::bridge::turn::send_completion_notice(
+                crate::bridge::turn::announce_completion(
                     &flow.cards,
                     &flow.platform,
                     &rules,

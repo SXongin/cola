@@ -996,7 +996,7 @@ impl Turn {
         // classification declines a Waiting yield, so it never notifies — the
         // notice belongs to the true end (ADR-0059).
         if !follow {
-            send_completion_notice(
+            announce_completion(
                 &handles.cards,
                 &handles.platform,
                 &handles.config.notice_rules(),
@@ -4330,6 +4330,73 @@ impl Turn {
 async fn release_inflight(handles: &TurnHandles, session_id: &str) {
     let mut inflight = handles.waits.inflight.lock().await;
     inflight.remove(session_id);
+}
+
+/// Send the Completion Notice gated on the terminal write being **accepted**
+/// (spec #602, ticket #607): the write must have been delivered now, or be
+/// owed by the delivery layer's retry. A direct PATCH to the current card and a
+/// size-split that continued on a new card both answer "accepted now" and
+/// announce at once; a failed ending PATCH queued as a Pending Card Update
+/// announces only when that update DRAINS, so the notice never lands before the
+/// terminal slice it announces. A permanently refused terminal write suppresses
+/// the notice. The disposition's own classification and the opt-in rules are
+/// unchanged — this only fixes the timing/gate.
+///
+/// The one entry point every ending takes (the in-Turn `finish`, the out-of-turn
+/// follow, the Wake in-place resume and Session Sync's quiet true end) — so all
+/// carriers are covered by one rule. The notice's own lookup and copy stay in
+/// [`send_completion_notice`], the primitive this gates.
+pub(crate) async fn announce_completion(
+    cards: &CardsHandle,
+    platform: &Arc<dyn crate::feishu::Platform>,
+    rules: &NoticeRules,
+    session_id: &str,
+    started_at: std::time::Instant,
+    disposition: &Disposition,
+) {
+    // Not an ending the notice may announce: stay silent before any gate (the
+    // primitive would decline anyway; this keeps the deferred path quiet too).
+    if disposition.notice_copy().is_none() {
+        return;
+    }
+    // The card carrying the terminal slice: the session's tracked card. With
+    // none there is no write to gate on (the loading window or an already-
+    // collected card), so fall through to the primitive, as before.
+    let card_id = {
+        let live = cards.cards.lock().await;
+        live.get(session_id).and_then(|card| card.card_message_id.clone())
+    };
+    let Some(card_id) = card_id else {
+        send_completion_notice(cards, platform, rules, session_id, started_at, disposition).await;
+        return;
+    };
+    // The deferred closure spawns the send on fire: the delivery layer calls it
+    // from a drain, and the notice's own lookup and reply must not run under
+    // the delivery layer's lock.
+    let notice: crate::feishu::DeferredNotice = {
+        let cards = cards.clone();
+        let platform = Arc::clone(platform);
+        let rules = rules.clone();
+        let session_id = session_id.to_string();
+        let disposition = disposition.clone();
+        Box::new(move || {
+            tokio::spawn(async move {
+                send_completion_notice(&cards, &platform, &rules, &session_id, started_at, &disposition)
+                    .await;
+            });
+        })
+    };
+    match platform.defer_notice_until_delivered(&card_id, notice) {
+        crate::feishu::NoticeGate::Armed => {}
+        crate::feishu::NoticeGate::Delivered => {
+            send_completion_notice(cards, platform, rules, session_id, started_at, disposition).await;
+        }
+        crate::feishu::NoticeGate::Never => {
+            tracing::warn!(
+                "completion notice suppressed: the terminal write for {session_id} will never land"
+            );
+        }
+    }
 }
 
 /// The completion notice (ADR-0043 amendment 2026-09-21): the streaming card is
