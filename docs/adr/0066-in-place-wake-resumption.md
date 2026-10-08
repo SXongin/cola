@@ -136,3 +136,34 @@ Precisely:
 
 Related: #426, #424, #412, #403, ADR-0059, ADR-0060, ADR-0061, ADR-0062,
 ADR-0043, ADR-0038, ADR-0058.
+
+## Amendment (2026-10-08, #568): the in-place handoff serves external follows
+
+The handoff was unreachable for an external follow: the Wake pass it runs
+from was gated on the newest user message's authorship, while the external
+render loop — which renders followed Sessions — ended on the first terminal
+step and never yielded at all. A followed run that left a Background Task
+✅'d early and every later Wake stayed invisible (#568: #403's shape on the
+follow path; the restart-adopted follow hit the same rule one poll later,
+✅'ing an already-complete anchor turn before the pending Wake's run landed).
+
+Now the external render loop ends by the shared settle decision, and a
+yielded external card is served by Session Sync like any cola-held yielded
+chain (ADR-0059's 2026-10-08 amendment):
+
+- On a complete read the loop asks `settle`: `Waiting` stamps the ⏳ yield
+  and stops; `Running` keeps observing until the Wake's Execution boundary
+  arrives; `Complete` is ✅; `Failed` is ❌ (the loop no longer ✅'s a failed
+  external run either).
+- The completion Wake resumes the yielded card **in place** — the same
+  one-card-per-request handoff, no 承接 line, no second card — and the
+  resumed run ends it by the same mapping (back to ⏳ while tasks remain,
+  ✅/❌ at the true end).
+- No notice fires for an external chain (its 有新消息 card was the
+  notification, and the card carries no Turn clock), and a failed resumed
+  run ends ❌ with no Retry — the external card carries no cola prompt to
+  re-ask.
+
+Restart/interrupt Wakes and the Wake-less late tail keep the split; for an
+external chain after its true end (or on a collected card) wakes stay
+unrendered per #408.

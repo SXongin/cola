@@ -312,3 +312,18 @@ amendment's example is updated above, and the #502 amendment's example is marked
 superseded.
 
 Related: #501, #503, #504, ADR-0054, ADR-0060.
+
+## Amendment (2026-10-08, #568): the ledger and the quiet true end serve any yielded chain cola holds
+
+The freeze's carve-out was reachable for a cola-authored Session only, because
+Session Sync ran its Wake and ledger steps behind that gate. #568 widens the
+pass to any active Session's **yielded card chain cola holds** — an
+**External Message** follow's waiting card included — so that card's ledger
+stays fresh through the wait and its last task retiring with nothing to
+render settles it in place (✅, or ❌ on a settled failure) exactly as for a
+cola request. The write admission is unchanged (only a yielded card admits
+the ledger write), so widening the caller adds no new write path.
+
+The Completion Notice keeps the rule that a chain cola did not start owes
+none: an external follow's card carries no Turn clock, and its 有新消息 send
+was its notification (ADR-0059's 2026-10-08 amendment).
