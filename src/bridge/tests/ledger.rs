@@ -1794,9 +1794,11 @@ async fn the_shared_throttle_bounds_the_waiting_cards_reconcile() {
     );
 }
 
-/// Issue #454: a subagent the runtime reports INACTIVE is evidence, not an
-/// ending — the row gains the 待确认 marker, the card stays waiting, and its
-/// Wake (or the user's own decision) remains the only retirement.
+/// Issue #454, extended by #591: a subagent the runtime reports INACTIVE is
+/// evidence, not an ending — the row gains the 待确认 marker, the card stays
+/// waiting, and only its own terminal child transcript (#591), its Wake, the
+/// cleanup button or the user's own decision can retire it. Its evidence read
+/// is spent on the suspect alone and yields nothing here.
 #[tokio::test]
 async fn an_inactive_child_marks_its_row_unconfirmed_without_settling() {
     let _wd = test_work_dir();
@@ -1839,6 +1841,13 @@ async fn an_inactive_child_marks_its_row_unconfirmed_without_settling() {
             && shells == &vec!["sh_call_bg".to_string()]
             && children == &vec!["ses_call_sub".to_string()]),
         "the reconcile read named the live tasks: {calls:?}"
+    );
+    // The suspect's own transcript was read for evidence — on the suspect
+    // alone — and yielded none, so the marker stands.
+    let evidence_reads = backend.child_evidence_calls.lock().await.clone();
+    assert!(
+        !evidence_reads.is_empty() && evidence_reads.iter().all(|child| child == "ses_call_sub"),
+        "the child evidence read was spent on the suspect alone: {evidence_reads:?}"
     );
 }
 
@@ -1921,6 +1930,197 @@ async fn a_terminal_child_settles_the_waiting_card() {
     assert!(
         later.background_tasks.is_empty(),
         "the retirement overlay filters every later read"
+    );
+}
+
+/// Spec #588 / #591: a child session the server no longer knows (404) is
+/// evidence too — the suspect retires as 「🔔 subagent 已失联：<描述>」 with no
+/// invented clock, and the last task's retirement settles the wait ✅ in place.
+#[tokio::test]
+async fn a_gone_child_retires_as_lost() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = SessionTranscript::new(two_task_timeline(vec![]))
+        .with_executions(vec![execution(2_500)])
+        .with_background_tasks(vec![live_subagent(now - 3_000, "call_sub")]);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    script_child_without_activity(&backend).await;
+    yield_one_task_card(&app, &platform, ctx("ses_test", "跑一下构建并审阅")).await;
+
+    backend.task_runtime.lock().unwrap().children = vec![("ses_call_sub".into(), ChildRuntime::Inactive)];
+    backend
+        .with_child_evidence("ses_call_sub", ChildEvidence::Gone)
+        .await;
+    spawn_sync(&app);
+    wait_for_card_update(&platform, "the lost settle", CardUpdates::Latest, |card| {
+        card_header(card).contains("✅") && card_text(card).contains("🔔 subagent 已失联：review the diff")
+    })
+    .await;
+
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Done),
+        "a gone child cannot hold the wait"
+    );
+    let patches = patches_to(&platform, "om_waiting").await;
+    let settled = patches.last().cloned().unwrap();
+    let text = card_text(&settled);
+    assert!(
+        text.contains("subagent ses_call_sub") && !text.contains("subagent ses_call_sub · "),
+        "a lost entry carries identity but no invented clock: {settled}"
+    );
+}
+
+/// Acceptance (#591): a failed child-evidence read is no verdict — the row
+/// keeps its ⚠️ 状态待确认 marker, no entry renders, and nothing settles; the
+/// next cycle retries the read.
+#[tokio::test]
+async fn a_failed_child_evidence_read_keeps_the_row_unconfirmed() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = SessionTranscript::new(two_task_timeline(vec![]))
+        .with_executions(vec![execution(2_500)])
+        .with_background_tasks(vec![live_subagent(now - 3_000, "call_sub")]);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    script_child_without_activity(&backend).await;
+    yield_one_task_card(&app, &platform, ctx("ses_test", "跑一下构建并审阅")).await;
+
+    backend.task_runtime.lock().unwrap().children = vec![("ses_call_sub".into(), ChildRuntime::Inactive)];
+    backend
+        .fail_child_evidence_reads
+        .store(usize::MAX, Ordering::SeqCst);
+    spawn_sync(&app);
+    wait_for_card_update(&platform, "the unconfirmed marker", CardUpdates::Latest, |card| {
+        card_text(card).contains("⚠️ 状态待确认")
+    })
+    .await;
+
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Waiting),
+        "an unreadable child never settles the card"
+    );
+    let latest = platform.updated_cards().await.last().cloned().unwrap();
+    let text = card_text(&latest);
+    assert!(
+        text.contains("⏳ 后台任务（1 · 1 待确认）") && !text.contains("🔔 subagent"),
+        "the marker stands and no entry renders: {latest}"
+    );
+    let calls = backend.child_evidence_calls.lock().await.clone();
+    assert!(
+        !calls.is_empty() && calls.iter().all(|child| child == "ses_call_sub"),
+        "the read was attempted, on the suspect alone: {calls:?}"
+    );
+}
+
+/// Acceptance (#591): the child evidence works on the live card too — a
+/// subagent the runtime no longer reports active, whose own transcript shows
+/// a terminal finish, ends the turn ✅ directly on the drain read: no
+/// 「⏳ 等待后台任务」 detour, the row gone, one 「🔔 subagent 结束」 entry.
+#[tokio::test]
+async fn a_terminal_child_ends_the_turn_directly() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = SessionTranscript::new(two_task_timeline(vec![]))
+        .with_executions(vec![execution(2_500)])
+        .with_background_tasks(vec![live_subagent(now - 3_000, "call_sub")]);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    script_child_without_activity(&backend).await;
+    backend.task_runtime.lock().unwrap().children = vec![("ses_call_sub".into(), ChildRuntime::Inactive)];
+    backend
+        .with_child_evidence(
+            "ses_call_sub",
+            ChildEvidence::Terminal {
+                completed_at: now - 1_000,
+            },
+        )
+        .await;
+
+    Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下构建并审阅"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Done),
+        "the child's terminal evidence ends the turn directly"
+    );
+    let updates = platform.updated_cards().await;
+    assert!(
+        updates
+            .iter()
+            .all(|card| !card_header(card).contains("等待后台任务")),
+        "the settle is direct — no waiting detour: {updates:?}"
+    );
+    let final_card = updates.last().cloned().unwrap();
+    let text = card_text(&final_card);
+    assert!(
+        !text.contains("后台任务（") && !text.contains("状态待确认"),
+        "the retired suspect's row left the live ledger: {final_card}"
+    );
+    assert_eq!(
+        text.matches("🔔 subagent 结束：review the diff").count(),
+        1,
+        "exactly one retirement entry renders on the live card: {final_card}"
+    );
+    assert_eq!(
+        backend.child_evidence_calls.lock().await.as_slice(),
+        ["ses_call_sub".to_string()],
+        "one evidence read for the one suspect"
+    );
+}
+
+/// Acceptance (#591): at most ONE evidence read per suspected child per
+/// reconcile cycle — and a child the runtime still confirms RUNNING is never
+/// read at all. The suspect's terminal evidence retires it, and the retirement
+/// overlay drops it from every later read, so no cycle can read it twice.
+#[tokio::test]
+async fn one_evidence_read_is_spent_per_suspected_child_per_cycle() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = SessionTranscript::new(two_task_timeline(vec![]))
+        .with_executions(vec![execution(2_500)])
+        .with_background_tasks(vec![
+            live_subagent(now - 3_000, "call_sub"),
+            live_subagent(now - 2_000, "call_run"),
+        ]);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    script_child_without_activity(&backend).await;
+    yield_waiting_card(&app, &platform, 2).await;
+
+    backend.task_runtime.lock().unwrap().children = vec![
+        ("ses_call_sub".into(), ChildRuntime::Inactive),
+        ("ses_call_run".into(), ChildRuntime::Running),
+    ];
+    backend
+        .with_child_evidence(
+            "ses_call_sub",
+            ChildEvidence::Terminal {
+                completed_at: now - 1_000,
+            },
+        )
+        .await;
+    spawn_sync(&app);
+    wait_for_card_update(&platform, "the suspect's entry", CardUpdates::Latest, |card| {
+        card_text(card).contains("🔔 subagent 结束：review the diff")
+    })
+    .await;
+
+    assert_eq!(
+        backend.child_evidence_calls.lock().await.as_slice(),
+        ["ses_call_sub".to_string()],
+        "one read for the suspect, none for the running child"
+    );
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Waiting),
+        "the running child keeps the wait"
+    );
+    let latest = platform.updated_cards().await.last().cloned().unwrap();
+    let text = card_text(&latest);
+    assert!(
+        text.contains("⏳ 后台任务（1）") && !text.contains("状态待确认"),
+        "the running child keeps a confirmed row: {latest}"
     );
 }
 
