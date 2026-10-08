@@ -39,12 +39,13 @@ pub struct SessionTranscript {
     /// applied. Empty on a generation without them (V1).
     pub background_tasks: Vec<BackgroundTask>,
     /// The Background Tasks a **runtime reconciliation** read retired while no
-    /// Wake retired them ([`SessionTranscript::apply_task_runtime`]): the
+    /// Wake retired them ([`SessionTranscript::apply_task_runtime`]) — or the
+    /// user's cleanup retired ([`SessionTranscript::apply_cleanup`]): the
     /// completion record was lost, and the runtime either reported a terminal
     /// end or no longer knows the task. They have already left
     /// [`Self::background_tasks`], so the settle decision treats them as
     /// ended; the ledger renders each as a completion entry. Empty unless a
-    /// reconciliation read ran.
+    /// reconciliation read or a cleanup ran.
     pub runtime_retired: Vec<TaskRetirement>,
     /// The call ids of live Background Tasks a reconciliation read could not
     /// confirm as running (a subagent child the runtime reports inactive) while
@@ -151,6 +152,38 @@ impl SessionTranscript {
         }
         self.background_tasks = kept;
         self.runtime_retired.extend(retired);
+    }
+
+    /// Apply the user's manual cleanup (spec #588, ticket #590): every named
+    /// **live** Background Task leaves [`Self::background_tasks`] as a
+    /// [`TaskRetirement`] with the [`TaskRetirementEnding::Cleaned`] ending and
+    /// the click's own clock, exactly as a runtime reconciliation retires what
+    /// the runtime confirmed — so the settle rule follows (the last task gone is
+    /// the true end) and the ledger renders one 🧹 entry per cleared row. The
+    /// ids come from the caller's read of this same transcript, so an id with
+    /// no live task is ignored: a cleanup never invents a retirement for a task
+    /// the read no longer lists. The cleared task also leaves
+    /// [`Self::unconfirmed_tasks`]; every other id stays as the read left it.
+    pub fn apply_cleanup(&mut self, call_ids: &[String], now_ms: i64) {
+        let clearing: std::collections::HashSet<&str> = call_ids.iter().map(String::as_str).collect();
+        if clearing.is_empty() {
+            return;
+        }
+        let mut kept = Vec::with_capacity(self.background_tasks.len());
+        for task in std::mem::take(&mut self.background_tasks) {
+            if clearing.contains(task.tool.call_id.as_str()) {
+                self.runtime_retired.push(TaskRetirement {
+                    task,
+                    ending: TaskRetirementEnding::Cleaned,
+                    finished_at: Some(now_ms),
+                });
+            } else {
+                kept.push(task);
+            }
+        }
+        self.background_tasks = kept;
+        self.unconfirmed_tasks
+            .retain(|id| !clearing.contains(id.as_str()));
     }
 
     /// The newest user message by server time, if any — the message a Turn's
@@ -903,13 +936,18 @@ pub enum TaskRetirementEnding {
     Ended(ShellEnd),
     /// The runtime has no record of the task.
     Lost,
+    /// The user's cleanup click retired the task (spec #588, ticket #590):
+    /// never produced by a read, only by
+    /// [`SessionTranscript::apply_cleanup`], and recorded in the process-local
+    /// overlay like every other retirement.
+    Cleaned,
 }
 
 /// The process-local overlay of Background Tasks the runtime confirmed ended
-/// (issue #454): the transcript's launch record never flips, so without this
-/// every re-read of the transcript would resurrect a task the runtime already
-/// retired — a live turn's ledger would show it again, and the next Turn would
-/// yield waiting on it, forever.
+/// (issue #454) or the user cleared (spec #588, #590): the transcript's launch
+/// record never flips, so without this every re-read of the transcript would
+/// resurrect a task the runtime already retired — a live turn's ledger would
+/// show it again, and the next Turn would yield waiting on it, forever.
 ///
 /// The Bridge records each retirement here right after a reconciliation read
 /// ([`SessionTranscript::apply_task_runtime`]); the adapter applies the overlay
@@ -917,7 +955,8 @@ pub enum TaskRetirementEnding {
 /// `background_tasks` minus the recorded call ids), so no read path can
 /// disagree. It is deliberately in-memory: a cola restart loses it, the next
 /// read re-derives the same retirement and re-renders one entry on the newest
-/// chain, and the runtime explains the task again.
+/// chain, and the runtime explains the task again. A manual cleanup is no
+/// different — it is a cola-life dismissal, re-derived at restart.
 #[derive(Default)]
 pub struct TaskRetirements {
     retired: std::sync::Mutex<std::collections::HashMap<String, std::collections::HashSet<String>>>,
@@ -1712,6 +1751,77 @@ mod tests {
         assert_eq!(untouched.background_tasks.len(), 1);
         assert!(untouched.runtime_retired.is_empty());
         assert_eq!(untouched.settle(Some(&anchor)), TurnSettle::Waiting);
+    }
+
+    /// Spec #588 / #590: the manual cleanup ends exactly the named live tasks —
+    /// each moves to the retirement list with the Cleaned ending and the click's
+    /// own clock, an unnamed live task stays live, and the settle rule follows
+    /// (the last task's cleanup is the true end). An id that is not live invents
+    /// no retirement.
+    #[test]
+    fn a_manual_cleanup_retires_only_the_named_live_tasks() {
+        let (_, anchor) = anchored("msg_u1", 1_000);
+        let shell_task = |call_id: &str, shell_id: &str| BackgroundTask {
+            tool: ToolIdentity {
+                name: "shell".into(),
+                call_id: call_id.into(),
+            },
+            shell_id: Some(shell_id.into()),
+            child_id: None,
+            started_at: Some(1_100),
+        };
+        let mut transcript = SessionTranscript::new(vec![assistant_step("msg_a1", 1_100, None)])
+            .with_executions(vec![boundary(1_200)])
+            .with_background_tasks(vec![
+                shell_task("call_clear", "sh_clear"),
+                shell_task("call_keep", "sh_keep"),
+            ]);
+        transcript.unconfirmed_tasks.insert("call_clear".into());
+        transcript.unconfirmed_tasks.insert("call_keep".into());
+
+        transcript.apply_cleanup(&["call_clear".to_string()], 3_000);
+
+        assert_eq!(
+            transcript
+                .background_tasks
+                .iter()
+                .map(|task| task.tool.call_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["call_keep"],
+            "only the named task left the live list"
+        );
+        assert_eq!(
+            transcript.runtime_retired,
+            vec![TaskRetirement {
+                task: shell_task("call_clear", "sh_clear"),
+                ending: TaskRetirementEnding::Cleaned,
+                finished_at: Some(3_000),
+            }],
+            "the cleaned task keeps its identity, the click's clock, and the manual ending"
+        );
+        assert!(
+            !transcript.unconfirmed_tasks.contains("call_clear"),
+            "the cleared task leaves the unconfirmed set too"
+        );
+        assert!(
+            transcript.unconfirmed_tasks.contains("call_keep"),
+            "an unnamed id stays exactly as the read left it"
+        );
+        assert_eq!(
+            transcript.settle(Some(&anchor)),
+            TurnSettle::Waiting,
+            "a live task still holds the wait"
+        );
+
+        // An id with no live task invents no retirement.
+        transcript.apply_cleanup(&["call_absent".to_string()], 4_000);
+        assert_eq!(transcript.runtime_retired.len(), 1);
+
+        // The last live task's cleanup is the true end.
+        transcript.apply_cleanup(&["call_keep".to_string()], 4_000);
+        assert!(transcript.background_tasks.is_empty());
+        assert_eq!(transcript.runtime_retired.len(), 2);
+        assert_eq!(transcript.settle(Some(&anchor)), TurnSettle::Complete);
     }
 
     /// The process-local retirement overlay (issue #454 review): a recorded

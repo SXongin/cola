@@ -1143,11 +1143,13 @@ pub(super) struct StreamAccumulator {
     /// The full original prompt text of this turn, kept so the error-card
     /// "retry" button can re-submit it without the user retyping.
     pub(super) prompt: Option<String>,
-    /// Whether this card's terminal recovery action has been claimed (spec
-    /// #391's Error retry, #437's Unreceived 重新发起). The click is acked
-    /// immediately, so a second click can arrive before the retry's own
-    /// Error→Retried marking lands; the claim is checked and set under the
-    /// cards lock, so exactly one click submits.
+    /// Whether this card's terminal recovery action — spec #391's Error retry,
+    /// #437's Unreceived 重新发起 — or its waiting-card cleanup (spec #588,
+    /// #590) has been claimed. The click is acked immediately, so a second
+    /// click can arrive before the action's own marking lands; the claim is
+    /// checked and set under the cards lock, so exactly one click runs the
+    /// action — and the cleanup's pipeline releases it once done (a recovery
+    /// action keeps it, its card being terminal).
     pub(super) recovery_claimed: bool,
     /// The id this turn's user message carries (`msg_cola_…`, ADR-0026), so a
     /// later error-card retry reuses it and the server deduplicates by id.
@@ -3058,6 +3060,19 @@ impl StreamAccumulator {
             // handover. Empty renders nothing, so V1 (no Background Task
             // facts) shows exactly what it always did.
             builder = builder.with_task_ledger(&self.ledger);
+            // The cleanup exit (spec #588, ticket #590): a Waiting card that
+            // carries at least one ⚠️ 状态待确认 row offers ONE section-level
+            // button right below the ledger — the wait's home, never a live or
+            // terminal card — and the button disappears with the last
+            // unconfirmed row, because its presence is derived from the same
+            // rows the ledger renders. The click's handler re-derives the rows
+            // from the transcript (the card's own list is only the affordance).
+            if state == CardState::Waiting
+                && self.ledger.iter().any(|row| row.unconfirmed)
+                && let Some(sid) = &self.session_id
+            {
+                builder = builder.with_element(crate::feishu::card::ledger::cleanup_button(sid));
+            }
             // Running tools are live content, so their panels ride the tail —
             // after the todo list and before the interaction blocks, keeping a
             // running tool's Permission/Question below its own panel. A split
@@ -4221,6 +4236,66 @@ mod tests {
             text.contains("⏳ 后台任务（1）") && text.contains("npm run build"),
             "the ledger tail rides the unsplit card: {}",
             unsplit.card
+        );
+    }
+
+    /// Spec #588 / #590: the cleanup button rides the ledger section of a
+    /// WAITING card carrying ≥1 unconfirmed row — one section-level element
+    /// right below the ledger panel — and is absent for a confirmed-only
+    /// ledger, a card without a session id, and every non-waiting state (a live
+    /// card stays click-free).
+    #[test]
+    fn the_cleanup_button_rides_a_waiting_card_with_unconfirmed_rows_only() {
+        let row = |unconfirmed: bool| TaskLedgerRow {
+            kind: TaskKind::Shell,
+            label: Some("npm run build".into()),
+            started_at: None,
+            unconfirmed,
+            activity: None,
+        };
+        let cleanup_element = |card: &serde_json::Value| {
+            card["body"]["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .position(|el| el["value"]["action"] == "cleanup")
+        };
+        let build = |state: CardState, session: Option<&str>, unconfirmed: bool| {
+            let mut acc = StreamAccumulator::new("test");
+            acc.card_state = state;
+            acc.session_id = session.map(str::to_string);
+            acc.set_ledger(vec![row(unconfirmed)], 0, LedgerCadence::Minute);
+            acc.build_card_unsplit().card
+        };
+
+        let waiting = build(CardState::Waiting, Some("ses_1"), true);
+        let button = cleanup_element(&waiting).expect("the waiting card offers the cleanup button");
+        let ledger = waiting["body"]["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|el| el["element_id"] == "task_ledger")
+            .expect("the ledger panel");
+        assert!(
+            button > ledger,
+            "the button sits below the ledger section: {waiting}"
+        );
+        assert_eq!(
+            waiting["body"]["elements"][button]["value"]["session_id"], "ses_1",
+            "the click names the session it clears"
+        );
+
+        assert!(
+            cleanup_element(&build(CardState::Waiting, Some("ses_1"), false)).is_none(),
+            "no unconfirmed row, no button"
+        );
+        assert!(
+            cleanup_element(&build(CardState::Waiting, None, true)).is_none(),
+            "no session id, no actionable button"
+        );
+        assert!(
+            cleanup_element(&build(CardState::Streaming, Some("ses_1"), true)).is_none(),
+            "a live card stays click-free: the cleanup lives on the wait's home only"
         );
     }
 

@@ -489,12 +489,15 @@ fn render_wake_entries(
 }
 
 /// Insert the completion entry for every Background Task a runtime
-/// reconciliation retired without a Wake (issue #454) and report whether any
-/// was inserted. The retired task has already left the live list, so this entry
-/// is its one record when no Wake will ever arrive: the runtime's own
-/// completion time when it reported one (the `Lost` ending reports none), the
-/// task's launch and identity from the read, and the label joined from the
-/// originating tool part's input by `call_id` (the live row's own join).
+/// reconciliation retired without a Wake (issue #454) — or the user's cleanup
+/// click retired (spec #588, #590) — and report whether any was inserted. The
+/// retired task has already left the live list, so this entry is its one record
+/// when no Wake will ever arrive: the runtime's own completion time when it
+/// reported one (the `Lost` ending reports none), the task's launch and
+/// identity from the read, and the label joined from the originating tool
+/// part's input by `call_id` (the live row's own join). A cleaned retirement
+/// carries the click's own clock and renders through the same site, so the two
+/// retirement kinds cannot drift apart.
 ///
 /// The entry renders on the chain that OBSERVED the retirement, whatever
 /// anchor that chain has: the launch record never flips, so the observing chain
@@ -526,6 +529,10 @@ fn render_runtime_entries(
         let ending = match &retirement.ending {
             TaskRetirementEnding::Ended(_) => TaskEnding::RuntimeEnded,
             TaskRetirementEnding::Lost => TaskEnding::Lost,
+            // The user's own cleanup (spec #588, #590): the click recorded the
+            // overlay and synthesized the retirement, and the same render site
+            // gives it its 🧹 entry — exactly once, through the announce key.
+            TaskRetirementEnding::Cleaned => TaskEnding::Cleaned,
         };
         let input = transcript.tool_input(task.tool.call_id.as_str());
         let id = match kind {
