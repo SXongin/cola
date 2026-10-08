@@ -13,6 +13,30 @@ use client::Client;
 use serde_json::Value;
 use std::time::Duration;
 
+/// A one-shot callback the delivery layer runs when the Pending Card Update a
+/// Completion Notice is gated on finally drains (spec #602, ticket #607). The
+/// bridge builds the closure (it spawns the notice send, which needs the Turn's
+/// own facts); the delivery layer only fires it, exactly once, when the write
+/// it was armed against delivers.
+pub(crate) type DeferredNotice = Box<dyn FnOnce() + Send + 'static>;
+
+/// What a Completion Notice gate found (spec #602, ticket #607): whether the
+/// card the terminal slice was written to still owes that write, so the notice
+/// must wait for the retry's drain instead of racing it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NoticeGate {
+    /// The card still owes a keyless Pending Card Update: the callback was
+    /// stored and fires when that update delivers.
+    Armed,
+    /// Nothing is owed — the terminal write already landed (or the platform
+    /// does not observe card writes): send the notice now.
+    Delivered,
+    /// The card's newest write settled without delivering (a permanent
+    /// refusal): nothing will ever carry the terminal slice there, so the
+    /// notice is suppressed.
+    Never,
+}
+
 /// The Feishu platform, abstracted so the bridge core can be tested with a
 /// recording adapter (captures every card cola would send) or, in the live
 /// smoke test, the real [`Client`].
@@ -247,6 +271,21 @@ pub trait Platform: Send + Sync {
     /// may confirm its staged cursor immediately instead of discarding it.
     fn settled_card_write_delivered(&self, _message_id: &str) -> Option<bool> {
         None
+    }
+
+    /// Gate a Completion Notice on the terminal write being **accepted** (spec
+    /// #602, ticket #607): delivered now, or owed by the delivery layer's
+    /// retry. `message_id` is the card carrying the terminal slice.
+    /// [`NoticeGate::Armed`] stores `notice` to fire once that card's owed
+    /// Pending Card Update drains; [`NoticeGate::Delivered`] means nothing is
+    /// owed and the caller sends the notice at once; [`NoticeGate::Never`]
+    /// means the card's newest write settled refused, so the notice is
+    /// suppressed — a write that will never land must not announce the end. The
+    /// default — a platform with no delivery decorator — answers
+    /// [`NoticeGate::Delivered`], the ungated notice.
+    fn defer_notice_until_delivered(&self, _message_id: &str, notice: DeferredNotice) -> NoticeGate {
+        let _ = notice;
+        NoticeGate::Delivered
     }
 }
 
