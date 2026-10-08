@@ -4976,8 +4976,9 @@ fn given_shell_tail(backend: &Arc<MockBackend>, shell_id: &str, text: &str, clip
 }
 
 /// Acceptance 1 (spec #588, #593): a runtime-retired shell's completion entry
-/// carries its output tail on the LIVE card — labelled 截至于 and 已截断 — and
-/// spends exactly one read, at the entry's own render. The retirement read
+/// carries its output tail on the LIVE card — the 已截断 label when clipped,
+/// never the live row's 截至于 read clock — and spends exactly one read, at the
+/// entry's own render. The retirement read
 /// spends no live-window read (the shell leaves the live list first), and no
 /// later pass re-reads the retired shell.
 #[tokio::test]
@@ -5011,11 +5012,11 @@ async fn a_live_retirements_entry_carries_the_output_tail_once() {
         "the ending's entry renders: {final_card}"
     );
     assert!(
-        text.contains("截至于")
+        !text.contains("截至于")
             && text.contains("仅最后 2 行 · 已截断")
             && text.contains("step 1")
             && text.contains("step 2"),
-        "the entry's fold body carries the labelled tail: {final_card}"
+        "the entry's fold body carries the truncated tail, no read clock: {final_card}"
     );
     assert_eq!(
         backend.shell_output_calls.lock().await.clone(),
@@ -5062,11 +5063,11 @@ async fn a_finalization_entry_carries_the_output_tail() {
         "the final read's entry renders: {final_card}"
     );
     assert!(
-        text.contains("截至于")
+        !text.contains("截至于")
             && text.contains("仅最后 2 行 · 已截断")
             && text.contains("step 1")
             && text.contains("step 2"),
-        "the final-render entry carries the labelled tail: {final_card}"
+        "the final-render entry carries the truncated tail, no read clock: {final_card}"
     );
     assert_eq!(
         backend.shell_output_calls.lock().await.clone(),
@@ -5137,8 +5138,8 @@ async fn a_waiting_cards_completion_entry_carries_the_output_tail() {
     let settled = platform.updated_cards().await.last().cloned().unwrap();
     let text = card_text(&settled);
     assert!(
-        text.contains("截至于") && text.contains("仅最后 1 行 · 已截断") && text.contains("build ok"),
-        "the waiting card's entry carries the labelled tail: {settled}"
+        !text.contains("截至于") && text.contains("仅最后 1 行 · 已截断") && text.contains("build ok"),
+        "the waiting card's entry carries the truncated tail, no read clock: {settled}"
     );
     assert_eq!(
         backend.shell_output_calls.lock().await.clone(),
