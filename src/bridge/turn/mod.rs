@@ -4137,7 +4137,15 @@ impl Turn {
         // the read facts are judged by. The corroboration the gate cannot
         // decide — the in-process inbound claim and the anchor re-read — stays
         // with `render_wake_continuation`'s caller.
-        let wake = newest_wake.and_then(|wake| wake.anchor());
+        // Only a GENUINE resumption may open a continuation Card (spec #602):
+        // a Wake whose source this build cannot classify (an `Other(_)` marker,
+        // or `Unknown` on a payload that named none) is not a resumption, so it
+        // reads as no Wake here — the Fresh gate then decides NoDecision/Keep
+        // and opens nothing. The live-card path gates on the same predicate
+        // (#605); this is the Fresh-path half of one rule.
+        let wake = newest_wake
+            .filter(|wake| wake.source.is_genuine_resumption())
+            .and_then(|wake| wake.anchor());
         // A Wake older than the newest user message is STALE: the conversation
         // has moved past it — a later cola life already saw or superseded it —
         // and re-posting it after a restart would replay every turn that

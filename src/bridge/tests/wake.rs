@@ -2736,6 +2736,70 @@ async fn a_stale_wake_is_not_reposted_after_a_restart() {
     );
 }
 
+/// The Fresh read a restart continuation is judged on: the yielded CI turn
+/// whose `wake` resumed it, the resumed work already arrived, and the Execution
+/// boundaries that leave it ended — so the read renders.
+fn fresh_resume_after(wake: Wake) -> SessionTranscript {
+    SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+        assistant(3_100, "CI 通过了。"),
+    ])
+    .with_executions(vec![execution(2_500), execution(4_000)])
+    .with_wakes(vec![wake])
+}
+
+/// Spec #602: only a GENUINE resumption may open a continuation Card. On the
+/// Fresh path (a restart with no chain in this process) a Wake whose source
+/// this build cannot classify — `Other(_)` or `Unknown` — is not a resumption,
+/// so even with renderable work it must read as no Wake and open no Card. The
+/// live-card path already gates on the source (#605); this locks the Fresh path
+/// to the same rule. The genuine `Restart` source still posts on the same read.
+#[tokio::test]
+async fn an_other_wake_opens_no_fresh_continuation() {
+    a_non_genuine_wake_opens_no_fresh_continuation(WakeSource::Other("mystery".into())).await;
+}
+
+/// The `Unknown` sibling of [`an_other_wake_opens_no_fresh_continuation`].
+#[tokio::test]
+async fn an_unknown_wake_opens_no_fresh_continuation() {
+    a_non_genuine_wake_opens_no_fresh_continuation(WakeSource::Unknown).await;
+}
+
+async fn a_non_genuine_wake_opens_no_fresh_continuation(source: WakeSource) {
+    let _wd = test_work_dir();
+    let mut mislabelled = shell_wake(2_900);
+    mislabelled.source = source;
+    let (_dir, app, backend, platform) =
+        scripted_app(vec![fresh_resume_after(mislabelled)], Some(SessionStatus::Idle)).await;
+    assert!(
+        !Turn::has_card(&app.cards_handle(), "ses_test").await,
+        "the restart fixture has no card chain"
+    );
+
+    spawn_sync(&app);
+    // Several sync passes over the read: no Fresh card may be posted.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        continuation_sends(&platform).await.is_empty(),
+        "a non-genuine Wake must not open a Fresh continuation: {:?}",
+        platform.calls.lock().await
+    );
+
+    // The same restart read with a GENUINE source still posts: the filter drops
+    // only the non-resumption, never the resumption itself.
+    let mut restart = shell_wake(2_900);
+    restart.source = WakeSource::Restart;
+    restart.label = None;
+    script_transcript(&backend, vec![fresh_resume_after(restart)]).await;
+    wait_for_any_card(&platform, WAKE_LEAD).await;
+    assert!(
+        platform.sent_cards().await.iter().any(is_continuation),
+        "a genuine restart Wake still posts: {:?}",
+        platform.calls.lock().await
+    );
+}
+
 /// Acceptance 1 (ADR-0061): a Wake a previous cola life already announced is
 /// never re-posted after a restart — the durable Wake Watermark is the fact
 /// the lost card left behind, and without it the Fresh path re-announces
