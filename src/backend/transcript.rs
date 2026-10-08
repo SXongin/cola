@@ -961,7 +961,9 @@ pub const SHELL_OUTPUT_WINDOW_LINES: usize = 15;
 pub struct ShellOutputWindow {
     /// The window's text: the last [`SHELL_OUTPUT_WINDOW_LINES`] lines of the
     /// record's last [`SHELL_OUTPUT_WINDOW_BYTES`] bytes, decoded UTF-8, with
-    /// no trailing newline. Never empty for a window ([`ShellOutputRead`]).
+    /// no trailing newline. Empty when the record exists but captured nothing
+    /// (a successful read with nothing to show): a readable-empty window that
+    /// the row and the entry omit, never an error and never 「输出已不可用」.
     pub text: String,
     /// Whether the record held more output than the window shows — the byte
     /// slice clipped it, or whole lines were dropped at its head. The card
@@ -980,12 +982,29 @@ pub struct ShellOutputWindow {
 /// stands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShellOutputRead {
-    /// The record answered with output to show.
+    /// The record answered: output to show, or a readable-empty capture (an
+    /// empty window) — both are successes, and [`Self::window`] tells apart
+    /// what renders.
     Window(ShellOutputWindow),
-    /// The read was spent and there is nothing to show — a failed or vanished
-    /// record, or an empty capture. The window is omitted entirely, never
-    /// rendered as an empty panel.
+    /// The read was spent and answered no record at all — a failed read or a
+    /// vanished record. The window is omitted entirely, never rendered as an
+    /// empty panel; the completion entry's own read says 「输出已不可用」 for
+    /// this outcome (and only for it).
     Unavailable,
+}
+
+impl ShellOutputRead {
+    /// The window this read renders, when it established one: `None` for an
+    /// empty capture and for an unavailable record — the row omits both —
+    /// while the completion entry's own read keeps the two apart: an empty
+    /// capture leaves the entry identity-only and only a vanished or
+    /// unreadable record says 「输出已不可用」 (spec #588, review).
+    pub fn window(&self) -> Option<&ShellOutputWindow> {
+        match self {
+            Self::Window(window) if !window.text.is_empty() => Some(window),
+            _ => None,
+        }
+    }
 }
 
 /// One subagent child session's runtime verdict: whether the server owns a live

@@ -4561,6 +4561,54 @@ async fn an_unreadable_entry_record_says_output_unavailable() {
     assert!(!text.contains("截至于"), "never an empty panel: {settled}");
 }
 
+/// Spec #588/#593 (review): a readable-but-EMPTY capture is not the
+/// unavailable copy — the record answered, it just holds nothing — so the
+/// live row shows no window and the completion entry renders no output
+/// section at all, while still spending its one read.
+#[tokio::test]
+async fn an_empty_capture_renders_no_window_and_no_output_section() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = waiting_shell(now - 5_000);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    // The record answers an empty capture — a successful read with nothing to
+    // show — so the live row's window is omitted, never a placeholder.
+    given_shell_tail(&backend, "sh_call_bg", "", false, now);
+    yield_one_task_card(&app, &platform, ctx("ses_test", "跑一下构建并审阅")).await;
+    let yielded = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        !card_text(&yielded).contains("截至于"),
+        "an empty capture renders no live window: {yielded}"
+    );
+
+    // The entry's own read answers the same empty capture: the fold body stays
+    // identity-only — 「输出已不可用」 belongs to a gone or unreadable record.
+    given_shell_tail(&backend, "sh_bg", "", false, now);
+    backend.shell_output_calls.lock().await.clear();
+    script_quiet_true_end(&backend).await;
+    spawn_sync(&app);
+    wait_for_card_update(&platform, "the settled card", CardUpdates::Latest, |card| {
+        card_header(card).contains("✅") && card_text(card).contains("🔔 shell 完成：gh run watch")
+    })
+    .await;
+
+    let settled = platform.updated_cards().await.last().cloned().unwrap();
+    let text = card_text(&settled);
+    assert!(
+        !text.contains("输出已不可用"),
+        "an empty capture is readable, not unavailable: {settled}"
+    );
+    assert!(
+        !text.contains("截至于"),
+        "nothing to show: no output section: {settled}"
+    );
+    assert_eq!(
+        backend.shell_output_calls.lock().await.clone(),
+        vec!["sh_bg".to_string()],
+        "the entry's read is still spent exactly once"
+    );
+}
+
 /// Acceptance 2 (spec #588, #593): the 已失联 entry carries identity only —
 /// there is no record to read, so it must not spend an output read nor invent
 /// one, even when a window is scripted for its shell id.

@@ -233,12 +233,14 @@ impl TaskLedgerRow {
 /// result its fold body carries under the identity line. The Bridge reads it
 /// once, when the entry renders — [`TaskOutput::Unavailable`] when the record
 /// was gone or the read failed, so the body says 「输出已不可用」 rather than
-/// posing an empty panel as output.
+/// posing an empty panel as output; a successful empty capture carries no fact
+/// at all, so the entry stays identity-only (spec #588, review).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskOutput {
     /// The record answered with the tail to show: the same bounded window the
     /// live row renders ([`ShellOutputWindow`]), labelled 截至于 HH:MM and
-    /// clipped when the capture held more.
+    /// clipped when the capture held more. Never an empty window — the
+    /// readable-empty capture leaves the entry's output `None`.
     Window(ShellOutputWindow),
     /// The read was spent and there is nothing to show — a failed or vanished
     /// record. The body says 「输出已不可用」.

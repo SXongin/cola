@@ -855,9 +855,12 @@ impl GenerationStrategy for V2Strategy {
     /// [`SHELL_OUTPUT_WINDOW_BYTES`] bytes, and [`output_window`] decodes and
     /// clips that page to its last [`SHELL_OUTPUT_WINDOW_LINES`] lines. A 404
     /// is the runtime's positive "no record" (like [`Self::shell_runtime`]) and
-    /// maps to the no-output case ([`Ok(None)`]); any other failure is an `Err`
-    /// the caller omits the window for, never guesses. Display-only: the read
-    /// touches no session state.
+    /// maps to the no-record case ([`Ok(None)`]) — the entry's
+    /// 「输出已不可用」 — while a successful read of an empty capture answers a
+    /// window with no text: the record exists and holds nothing, and the row
+    /// and the entry omit it (spec #588, review). Any other failure is an
+    /// `Err` the caller omits the window for, never guesses. Display-only:
+    /// the read touches no session state.
     async fn shell_output(
         &self,
         http: &Transport,
@@ -871,7 +874,11 @@ impl GenerationStrategy for V2Strategy {
             return Ok(None);
         };
         if probe.size == 0 {
-            return Ok(None);
+            return Ok(Some(crate::backend::ShellOutputWindow {
+                text: String::new(),
+                clipped: false,
+                captured_ms: chrono::Utc::now().timestamp_millis(),
+            }));
         }
         let start = probe
             .size
@@ -888,7 +895,7 @@ impl GenerationStrategy for V2Strategy {
         else {
             return Ok(None);
         };
-        Ok(output_window(tail, start > 0))
+        Ok(Some(output_window(tail, start > 0)))
     }
 }
 
@@ -1159,9 +1166,12 @@ impl V2Strategy {
 
 /// One output page as its neutral window (spec #588, ticket #592): the last
 /// [`SHELL_OUTPUT_WINDOW_LINES`] lines of the page, with the byte-boundary
-/// artifact trimmed and the clipped flag derived. `None` when the page carries
-/// nothing to render (an empty capture, or a race that shrank the file): the
-/// caller omits the window, never an empty panel.
+/// artifact trimmed and the clipped flag derived. The window's text is EMPTY
+/// when the page carries nothing to render (a successful read of a record that
+/// captured nothing, or a race that shrank the file): a readable-empty window,
+/// which the row and the completion entry omit — never 「输出已不可用」, which
+/// belongs to a record that is gone or unreadable (`Ok(None)` from
+/// [`V2Strategy::shell_output`]).
 ///
 /// `started_mid_record` is the tail read's own cursor > 0: it means the window
 /// begins inside the capture, so the head line is partial and the window is
@@ -1170,10 +1180,7 @@ impl V2Strategy {
 /// replacement character anywhere else is the command's own bytes and stays.
 /// The server's `truncated` flag is decoded too (always false on today's
 /// server, but a future one may clip a page) and counts as clipped.
-fn output_window(
-    page: wire::ShellOutputPage,
-    started_mid_record: bool,
-) -> Option<crate::backend::ShellOutputWindow> {
+fn output_window(page: wire::ShellOutputPage, started_mid_record: bool) -> crate::backend::ShellOutputWindow {
     let mut lines: Vec<&str> = page.output.lines().collect();
     let mut clipped = started_mid_record || page.truncated;
     if lines.len() > crate::backend::SHELL_OUTPUT_WINDOW_LINES {
@@ -1184,12 +1191,9 @@ fn output_window(
     if started_mid_record && text.starts_with('\u{FFFD}') {
         text.remove(0);
     }
-    if text.is_empty() {
-        return None;
-    }
-    Some(crate::backend::ShellOutputWindow {
+    crate::backend::ShellOutputWindow {
         text,
         clipped,
         captured_ms: chrono::Utc::now().timestamp_millis(),
-    })
+    }
 }
