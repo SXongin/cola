@@ -40,6 +40,23 @@
 > volatile by contract and the overlay is additive; the polled message stays
 > the source of truth, so a lost stream degrades to no live line, never to a
 > wrong one.
+>
+> **Amended 2026-10-08 (#568)**: the Wake pass's applicability is widened
+> from authorship to **ownership**. "Wake rendering applies only while the
+> Session's newest user message is a Cola-Authored Message" is narrowed: the
+> pass also serves an **External Message** follow's yielded card — a
+> cola-held chain — so a followed run's wait is served instead of freezing.
+> The external render loop's ending is the shared settle decision, not the
+> first terminal step: at an idle read with live Background Tasks it stamps
+> the ⏳ yield and stops (never ✅), a settled failure ends ❌, and an
+> unanswered Wake keeps it observing (the adopted follow no longer ✅'s
+> before a pending Wake's run has landed). The completion Wake then resumes
+> the yielded card in place, exactly as for a cola request (ADR-0066). An
+> external chain owes no Completion Notice: its 有新消息 card carried its own
+> send and the card has no Turn clock. Every other #408 exclusion stands —
+> nothing renders for a non-active Session, and a Wake after the chain's
+> true end or on a collected card stays unrendered — as does the Sync
+> Watermark's user-message scope.
 
 ## Context
 
