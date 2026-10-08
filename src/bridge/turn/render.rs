@@ -618,13 +618,16 @@ fn plan_runtime_entries(
 }
 
 /// Spend each planned shell completion's one output read (spec #588, #593):
-/// the record's tail, or [`TaskOutput::Unavailable`] when the read fails,
-/// vanishes or answers nothing — the entry then says 「输出已不可用」 rather
-/// than posing an empty panel. Runs OUTSIDE the cards lock (the reads are
-/// network) and before the commit; a plan that never commits (a racing render
-/// announced it first) still spends its read at most once. Endings that show
-/// no output — a subagent, the 已失联 entry, the 🧹 cleanup — are left
-/// identity-only and spend nothing.
+/// the record's tail, or [`TaskOutput::Unavailable`] when the read fails, the
+/// record is gone or answers nothing at all — the entry then says
+/// 「输出已不可用」 rather than posing an empty panel. A successful read that
+/// captured NOTHING is a readable-empty window instead (spec #588, review):
+/// the entry stays identity-only — the entry's read is the one place the two
+/// outcomes stay apart, because only this path renders the copy. Runs OUTSIDE
+/// the cards lock (the reads are network) and before the commit; a plan that
+/// never commits (a racing render announced it first) still spends its read at
+/// most once. Endings that show no output — a subagent, the 已失联 entry, the
+/// 🧹 cleanup — are left identity-only and spend nothing.
 pub(super) async fn read_planned_outputs(
     backend: &Arc<dyn crate::backend::Backend>,
     plans: &mut [PlannedEntry],
@@ -641,14 +644,17 @@ pub(super) async fn read_planned_outputs(
             )
             .await
             {
-                Some(Ok(Some(window))) if !window.text.is_empty() => TaskOutput::Window(window),
-                _ => TaskOutput::Unavailable,
+                // A readable-empty capture: the record answered and holds
+                // nothing, so no output section is rendered at all.
+                Some(Ok(Some(window))) if window.text.is_empty() => None,
+                Some(Ok(Some(window))) => Some(TaskOutput::Window(window)),
+                _ => Some(TaskOutput::Unavailable),
             },
             // The read has no identity to ask for: the record cannot be read,
             // so the entry says so instead of posing as output.
-            None => TaskOutput::Unavailable,
+            None => Some(TaskOutput::Unavailable),
         };
-        plan.entry.output = Some(output);
+        plan.entry.output = output;
     }
 }
 

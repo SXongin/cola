@@ -8,7 +8,7 @@
 //! accumulator's own tests are the module's internal seam.
 
 use super::disposition::Disposition;
-use crate::backend::{MessageId, Part, SessionTranscript, ShellOutputRead, TurnAnchor};
+use crate::backend::{MessageId, Part, SessionTranscript, TurnAnchor};
 use crate::bridge::chain::{CursorFrontier, CursorPartKind, RenderedCursor};
 use crate::bridge::handles::CardsHandle;
 use crate::feishu::card::first_n_chars_bytes;
@@ -2699,16 +2699,18 @@ impl StreamAccumulator {
                     .flatten();
                 // The shell's output window (spec #592): the read's own outcome
                 // when it spent one, the last established window when the
-                // shared cycle's throttle spent nothing.
+                // shared cycle's throttle spent nothing. An empty capture is a
+                // success the row still omits (spec #588, review) — only the
+                // entry's own read tells it apart from 「输出已不可用」.
                 let output = if kind == TaskKind::Shell {
                     task.shell_id.as_deref().and_then(|shell_id| {
                         match transcript.shell_outputs.get(shell_id) {
-                            Some(ShellOutputRead::Window(window)) => Some(window.clone()),
-                            // The read spent a tail read and found nothing to
-                            // show: the window is omitted, and any stored one
+                            // The read spent a tail read and found nothing
+                            // renderable: an empty capture or an unavailable
+                            // record. The window is omitted, and any stored one
                             // leaves with it — never a stale window posing as
                             // current, never a placeholder.
-                            Some(ShellOutputRead::Unavailable) => None,
+                            Some(read) => read.window().cloned(),
                             // No tail read this cycle (the shared throttle):
                             // the last established window stands, exactly like
                             // a subagent's stored activity fragment.
@@ -2765,11 +2767,16 @@ impl StreamAccumulator {
             if !live_shells.contains(shell_id.as_str()) {
                 continue;
             }
-            match output {
-                ShellOutputRead::Window(window) => {
+            // Only a readable window with text is established; an empty
+            // capture and an unavailable record both clear the stored window,
+            // so a failed or empty read's window leaves rather than posing as
+            // current, and the throttled reads between cycles keep rendering
+            // the last real one.
+            match output.window() {
+                Some(window) => {
                     self.ledger_outputs.insert(shell_id.clone(), window.clone());
                 }
-                ShellOutputRead::Unavailable => {
+                None => {
                     self.ledger_outputs.remove(shell_id);
                 }
             }
