@@ -2112,6 +2112,7 @@ impl Turn {
     /// renderer owns it.
     pub(crate) async fn split_chain_for_wake(
         cards: &CardsHandle,
+        backend: &Arc<dyn crate::backend::Backend>,
         session_id: &str,
         reply_to: &str,
         line: ContinuationLine,
@@ -2120,6 +2121,21 @@ impl Turn {
     ) -> bool {
         let write_lock = cards.write_lock(session_id).await;
         let _guard = write_lock.lock().await;
+        // Plan the handover's completion entries under a brief read of the
+        // card, then spend their one output read each OUTSIDE the cards lock
+        // (spec #593; the reads are network). The write-lock stays held
+        // throughout — this sequence's own serialization — while the cards
+        // lock is released for the reads.
+        let mut plans = {
+            let live = cards.cards.lock().await;
+            match live.get(session_id) {
+                Some(card) if !card.acc.card_state.is_render_owned() => {
+                    render::plan_ledger_entries(&card.acc, transcript, card.acc.turn_anchor.as_ref())
+                }
+                _ => return false,
+            }
+        };
+        render::read_planned_outputs(backend, &mut plans).await;
         {
             let mut live = cards.cards.lock().await;
             let Some(card) = live.get_mut(session_id) else {
@@ -2128,17 +2144,18 @@ impl Turn {
             if card.acc.card_state.is_render_owned() {
                 return false;
             }
-            let anchor = card.acc.turn_anchor.clone();
-            let handover = anchor.as_ref().is_some_and(|anchor| {
-                render::apply_ledger_read(
+            // A card with no Turn anchor to scope the entries with owes no
+            // handover: its outgoing read writes nothing, exactly as before
+            // (spec #593 keeps the same gate — only the reads moved out).
+            let handover = card.acc.turn_anchor.is_some()
+                && render::apply_ledger_read(
                     &mut card.acc,
                     transcript,
                     &HashMap::new(),
-                    Some(anchor),
                     now_ms,
                     state::LedgerCadence::Minute,
-                )
-            });
+                    plans,
+                );
             card.pending_split.push(state::PendingSplit {
                 reply_to: reply_to.to_string(),
                 kind: SplitKind::Wake,
@@ -2181,6 +2198,7 @@ impl Turn {
     /// the split handover of the same read.
     pub(crate) async fn resume_yielded_card(
         cards: &CardsHandle,
+        backend: &Arc<dyn crate::backend::Backend>,
         session_id: &str,
         wake_id: &str,
         transcript: &SessionTranscript,
@@ -2188,6 +2206,19 @@ impl Turn {
     ) -> bool {
         let write_lock = cards.write_lock(session_id).await;
         let _guard = write_lock.lock().await;
+        // Plan the entries this read would place under a brief read of the
+        // card, then spend their one output read each OUTSIDE the cards lock
+        // (spec #593; the reads are network).
+        let mut plans = {
+            let live = cards.cards.lock().await;
+            match live.get(session_id) {
+                Some(card) => {
+                    render::plan_ledger_entries(&card.acc, transcript, card.acc.turn_anchor.as_ref())
+                }
+                None => Vec::new(),
+            }
+        };
+        render::read_planned_outputs(backend, &mut plans).await;
         {
             // The yielded-card write admission, re-checked under the write lock
             // through the module's lock-scoped helper: the returned card is
@@ -2196,14 +2227,13 @@ impl Turn {
             let Some(mut card) = CardOwnership::admit_ledger_write(cards, session_id).await else {
                 return false;
             };
-            let anchor = card.acc.turn_anchor.clone();
             render::apply_ledger_read(
                 &mut card.acc,
                 transcript,
                 &HashMap::new(),
-                anchor.as_ref(),
                 now_ms,
                 state::LedgerCadence::Second,
+                plans,
             );
             // The chain has taken this completion's work over. Its entry may
             // already be on the card (a yielded ledger refresh placed it while
@@ -2283,11 +2313,22 @@ impl Turn {
     ) -> YieldedUpdate {
         // The read-time form of the yielded-card write admission: whether this
         // pass should spend the child-liveness reads at all. The write below
-        // re-checks the same rule under the card-write lock.
-        let admitted = {
+        // re-checks the same rule under the card-write lock. The completion
+        // entries this read owes are planned here too (spec #593) — on the
+        // same admission, so a card this pass cannot serve spends neither the
+        // child reads nor any output read — and their one output read each
+        // runs outside the cards lock below.
+        let (admitted, mut plans) = {
             let live = cards.cards.lock().await;
-            live.get(session_id).is_some_and(ownership::admits_ledger_refresh)
+            match live.get(session_id) {
+                Some(card) if ownership::admits_ledger_refresh(card) => (
+                    true,
+                    render::plan_ledger_entries(&card.acc, transcript, card.acc.turn_anchor.as_ref()),
+                ),
+                _ => (false, Vec::new()),
+            }
         };
+        render::read_planned_outputs(backend, &mut plans).await;
         let activities = if admitted {
             let children = render::background_subagent_children(transcript);
             if children.is_empty() {
@@ -2319,9 +2360,9 @@ impl Turn {
                 &mut card.acc,
                 transcript,
                 &activities,
-                anchor.as_ref(),
                 now_ms,
                 state::LedgerCadence::Second,
+                plans,
             );
             // The read's own settle decision judges the true end (ADR-0059):
             // only a read whose Wakes are answered and that retired the last
@@ -3307,6 +3348,7 @@ impl Turn {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn arm_projected_card(
         cards: &CardsHandle,
+        backend: &Arc<dyn crate::backend::Backend>,
         session_id: &str,
         anchor: &TurnAnchor,
         cursor: &RenderedCursor,
@@ -3320,10 +3362,9 @@ impl Turn {
         variant: Option<String>,
     ) -> Option<ProjectedCard> {
         let work_context = StreamAccumulator::capture_work_context(directory).await;
-        let mut live = cards.cards.lock().await;
-        if live.contains_key(session_id) {
-            return None;
-        }
+        // Build the successor's accumulator first, OUTSIDE the cards lock: the
+        // completion entries it owes are planned on it and their output tails
+        // read before the lock is taken (spec #593; the reads are network).
         let mut acc = StreamAccumulator::new(title);
         Self::seed_wake_floor(cards, session_id, &mut acc);
         acc.turn_anchor = Some(anchor.clone());
@@ -3347,14 +3388,26 @@ impl Turn {
         if let Some(gap) = gap {
             acc.pending_gap = Some(gap.clone());
         }
+        let mut plans = {
+            let live = cards.cards.lock().await;
+            if live.contains_key(session_id) {
+                return None;
+            }
+            render::plan_ledger_entries(&acc, transcript, Some(anchor))
+        };
+        render::read_planned_outputs(backend, &mut plans).await;
+        let mut live = cards.cards.lock().await;
+        if live.contains_key(session_id) {
+            return None;
+        }
         let rendered = render::render_turn_parts(&mut acc, transcript);
         render::apply_ledger_read(
             &mut acc,
             transcript,
             &std::collections::HashMap::new(),
-            Some(anchor),
             chrono::Utc::now().timestamp_millis(),
             state::LedgerCadence::Minute,
+            plans,
         );
         match ending {
             Some(ending) => acc.apply_ending(ending),

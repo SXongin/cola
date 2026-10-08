@@ -1649,6 +1649,14 @@ impl StreamAccumulator {
         self.handed_over_wakes.insert(wake_id.to_string());
     }
 
+    /// Whether `wake_id`'s completion was already announced on this chain (spec
+    /// #588, #593): the read-only half of [`Self::announce_wake`], so a render
+    /// can plan its completion entries — and skip their output reads for the
+    /// ones already placed — without mutating the accumulator.
+    pub(super) fn wake_announced(&self, wake_id: &str) -> bool {
+        self.announced_wakes.contains(wake_id)
+    }
+
     /// Mark `wake_id`'s completion as announced on this chain — by the opening
     /// 承接 line or by the merged-path completion entry. Returns false when it
     /// already was: the exactly-once gate both paths honour (ADR-0059). A new

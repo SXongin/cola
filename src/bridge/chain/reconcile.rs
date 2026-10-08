@@ -967,6 +967,7 @@ async fn send_projected_successor(
         .and_then(|entry| entry.variant.clone());
     let projected = Turn::arm_projected_card(
         &handles.cards,
+        &handles.backend,
         session_id,
         anchor,
         cursor,

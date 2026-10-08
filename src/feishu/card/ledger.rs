@@ -41,6 +41,12 @@ pub(crate) const TASK_LEDGER_ELEMENT_ID: &str = "task_ledger";
 /// facts while the marker says the liveness is unverified.
 const UNCONFIRMED_MARKER: &str = " · ⚠️ 状态待确认";
 
+/// What a shell completion entry whose record cannot be read says in place of
+/// its tail (spec #588, #593): the record was gone (server restart, the
+/// 25-record ceiling, retention) or the read failed — never an empty panel
+/// posing as output.
+const OUTPUT_UNAVAILABLE: &str = "输出已不可用";
+
 /// The cleanup action's label (spec #588, ticket #590): the ONE section-level
 /// button a Waiting card carrying unconfirmed rows offers below the ledger —
 /// the user's exit for a wait no machine can confirm. Pinned here with the
@@ -223,9 +229,26 @@ impl TaskLedgerRow {
     }
 }
 
+/// One shell completion entry's output fact (spec #588, ticket #593): the
+/// result its fold body carries under the identity line. The Bridge reads it
+/// once, when the entry renders — [`TaskOutput::Unavailable`] when the record
+/// was gone or the read failed, so the body says 「输出已不可用」 rather than
+/// posing an empty panel as output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskOutput {
+    /// The record answered with the tail to show: the same bounded window the
+    /// live row renders ([`ShellOutputWindow`]), labelled 截至于 HH:MM and
+    /// clipped when the capture held more.
+    Window(ShellOutputWindow),
+    /// The read was spent and there is nothing to show — a failed or vanished
+    /// record. The body says 「输出已不可用」.
+    Unavailable,
+}
+
 /// One completed Background Task as its ledger entry renders it (ADR-0060):
 /// the mechanical completion line as the collapsed title, the task's identity
-/// and its run's own server-time span in the fold. The Bridge gathers the
+/// and its run's own server-time span in the fold — plus, for a shell the read
+/// could answer for, the output tail (spec #588, #593). The Bridge gathers the
 /// facts (which Wake completed what, the task it retired, or the runtime
 /// ending that retired it without a Wake) and hands them over; this module owns
 /// the pinned copy and the formats.
@@ -248,6 +271,25 @@ pub struct TaskCompletionEntry {
     pub finished_at: Option<i64>,
     /// What ended the task, and how the collapsed title names it.
     pub ending: TaskEnding,
+    /// The shell's output tail as the fold body renders it (spec #588, #593):
+    /// the last bounded lines with their 截至于/已截断 labels after the
+    /// identity line, or [`TaskOutput::Unavailable`]'s 「输出已不可用」 when the
+    /// record could not be read. `None` when the ending shows no output (a
+    /// subagent, the 已失联 ending, the 🧹 cleanup) or when no read was spent,
+    /// so the body stays identity-only.
+    pub output: Option<TaskOutput>,
+}
+
+impl TaskCompletionEntry {
+    /// Whether this entry's ending shows the shell's output (spec #588,
+    /// #593): only a shell's Wake ending (完成/取消/失败) or its runtime
+    /// 结束. The 已失联 entry has no record to show by definition, a 🧹
+    /// cleanup is the user's own ending, and a subagent has no shell output —
+    /// all stay identity-only whatever `output` holds.
+    pub(crate) fn shows_output(&self) -> bool {
+        self.kind == TaskKind::Shell
+            && matches!(self.ending, TaskEnding::Wake { .. } | TaskEnding::RuntimeEnded)
+    }
 }
 
 /// The completion entry's collapsed title (ADR-0060) — the mechanical
@@ -286,29 +328,52 @@ pub(crate) fn cleanup_button(session_id: &str) -> serde_json::Value {
 
 /// The completion entry's fold body: the task's identity and the run's timing —
 /// `shell sh_abc · 14:02 · 12m`, and `subagent ses_child · 14:02 · 1m` for the
-/// subagent kind, whose noun is the ledger's own ([`TaskKind::noun`]). The
-/// timing parts carry no Chinese labels (ADR-0060). Each part is omitted when
-/// the read named none (an id-less or start-less entry stays honest rather than
-/// inventing detail), the duration is the run's own server-time span
-/// (finished − started), so re-rendering the entry never drifts, and a task
-/// with no completion time (the lost ending) renders identity only.
+/// subagent kind, whose noun is the ledger's own ([`TaskKind::noun`]) — plus,
+/// under it, the shell's output tail (spec #588, #593) when the ending shows
+/// one. The timing parts carry no Chinese labels (ADR-0060). Each part is
+/// omitted when the read named none (an id-less or start-less entry stays
+/// honest rather than inventing detail), the duration is the run's own
+/// server-time span (finished − started), so re-rendering the entry never
+/// drifts, and a task with no completion time (the lost ending) renders
+/// identity only.
 pub(crate) fn task_entry_body(entry: &TaskCompletionEntry) -> String {
     let mut body = entry.kind.noun().to_string();
     if let Some(id) = entry.id.as_deref().filter(|id| !id.is_empty()) {
         body.push(' ');
         body.push_str(id);
     }
-    let Some(finished) = entry.finished_at else {
-        return body;
-    };
-    if let Some(clock) = fmt_local_time(finished) {
-        body.push_str(&format!(" · {clock}"));
+    match entry.finished_at {
+        Some(finished) => {
+            if let Some(clock) = fmt_local_time(finished) {
+                body.push_str(&format!(" · {clock}"));
+            }
+            if let Some(started) = entry.started_at {
+                body.push_str(&format!(
+                    " · {}",
+                    fmt_entry_elapsed(secs_since(started, finished))
+                ));
+            }
+        }
+        // A task with no completion time (the lost ending) renders identity
+        // only — never an invented clock, duration or output line.
+        None => return body,
     }
-    if let Some(started) = entry.started_at {
-        body.push_str(&format!(
-            " · {}",
-            fmt_entry_elapsed(secs_since(started, finished))
-        ));
+    // The shell's own result follows the identity line (spec #588, #593): the
+    // same labelled, fenced window the live row renders, or the honest
+    // 「输出已不可用」 when the record could not be read. Only the endings that
+    // show an output carry one ([`TaskCompletionEntry::shows_output`]).
+    if entry.shows_output() {
+        match &entry.output {
+            Some(TaskOutput::Window(window)) if !window.text.is_empty() => {
+                body.push('\n');
+                body.push_str(&output_window_block(window));
+            }
+            Some(TaskOutput::Unavailable) => {
+                body.push_str("\n  ");
+                body.push_str(OUTPUT_UNAVAILABLE);
+            }
+            _ => {}
+        }
     }
     body
 }
@@ -603,8 +668,9 @@ fn activity_estimate(activity: &TaskLiveness) -> usize {
 
 /// Estimated serialized size (bytes) of one completion entry's folded panel,
 /// for the card splitter's timeline accounting: the title (its label clipped
-/// like [`task_entry_title`] clips it), the body's identity and clock, and the
-/// panel's element overhead. Owned here so it cannot drift from the render.
+/// like [`task_entry_title`] clips it), the body's identity, clock and output
+/// tail (spec #593), and the panel's element overhead. Owned here so it cannot
+/// drift from the render.
 pub(crate) fn task_entry_estimate(entry: &TaskCompletionEntry) -> usize {
     let label = entry
         .label
@@ -612,7 +678,23 @@ pub(crate) fn task_entry_estimate(entry: &TaskCompletionEntry) -> usize {
         .map(|label| first_n_chars_bytes(label, TASK_LABEL_CHARS))
         .unwrap_or(0);
     let id = entry.id.as_deref().map(str::len).unwrap_or(0);
-    300 + label + id + 80
+    300 + label + id + entry_output_estimate(entry) + 80
+}
+
+/// The bytes one completion entry's output adds to the body (spec #588,
+/// #593): the same block builder the body renders, plus the newline that
+/// separates it from the identity line, or the 输出已不可用 line. Zero for
+/// every ending that shows no output — measured from the render, so the
+/// estimate and the body cannot drift.
+fn entry_output_estimate(entry: &TaskCompletionEntry) -> usize {
+    if !entry.shows_output() {
+        return 0;
+    }
+    match &entry.output {
+        Some(TaskOutput::Window(window)) if !window.text.is_empty() => output_window_block(window).len() + 1,
+        Some(TaskOutput::Unavailable) => "\n  ".len() + OUTPUT_UNAVAILABLE.len(),
+        _ => 0,
+    }
 }
 
 /// A shell ledger row's elapsed: bare, with no Chinese label (ADR-0060) —
@@ -1121,6 +1203,7 @@ mod tests {
             started_at: Some(finished - 12 * 60_000),
             finished_at,
             ending,
+            output: None,
         };
         let wake = |state: Option<&str>| TaskEnding::Wake {
             state: state.map(str::to_string),
@@ -1164,6 +1247,7 @@ mod tests {
             started_at: None,
             finished_at: None,
             ending,
+            output: None,
         };
         assert_eq!(
             task_entry_title(&subagent(TaskEnding::Lost)),
@@ -1189,6 +1273,7 @@ mod tests {
             started_at: Some(finished - 12 * 60_000),
             finished_at: Some(finished),
             ending: TaskEnding::Cleaned,
+            output: None,
         };
         assert_eq!(
             task_entry_title(&shell_entry),
@@ -1203,6 +1288,7 @@ mod tests {
             started_at: None,
             finished_at: Some(finished),
             ending: TaskEnding::Cleaned,
+            output: None,
         };
         assert_eq!(task_entry_title(&bare), "🧹 subagent 已清理（人工）");
         assert_eq!(task_entry_body(&bare), "subagent ses_child · 14:02");
@@ -1214,6 +1300,7 @@ mod tests {
             started_at: None,
             finished_at: Some(finished),
             ending: TaskEnding::Wake { state: None },
+            output: None,
         };
         assert_eq!(task_entry_title(&wake), "🔔 shell 完成：gh run watch");
     }
@@ -1727,6 +1814,7 @@ mod tests {
             started_at: Some(finished - 12 * 60_000),
             finished_at: Some(finished),
             ending: TaskEnding::Wake { state: None },
+            output: None,
         };
         assert_eq!(task_entry_title(&entry), "🔔 shell 完成：gh run watch");
         assert_eq!(task_entry_body(&entry), "shell sh_abc · 14:02 · 12m");
@@ -1738,9 +1826,167 @@ mod tests {
             started_at: Some(finished - 65_000),
             finished_at: Some(finished),
             ending: TaskEnding::Wake { state: None },
+            output: None,
         };
         assert_eq!(task_entry_title(&subagent), "🔔 subagent 完成：review the diff");
         assert_eq!(task_entry_body(&subagent), "subagent ses_child · 14:02 · 1m");
+    }
+
+    /// Spec #588 / #593: a shell's completion entry carries the result — the
+    /// output tail under the identity line, labelled with the same pinned copy
+    /// the live window uses (截至于 HH:MM, plus 仅最后 N 行 · 已截断 when the
+    /// record held more).
+    #[test]
+    fn a_shell_entries_fold_body_carries_the_output_tail() {
+        let finished = crate::feishu::card::test_local_ms(2026, 9, 29, 14, 2);
+        let captured = crate::feishu::card::test_local_ms(2026, 9, 29, 14, 5);
+        let entry = |output: Option<TaskOutput>| TaskCompletionEntry {
+            kind: TaskKind::Shell,
+            label: Some("gh run watch".into()),
+            id: Some("sh_abc".into()),
+            started_at: Some(finished - 12 * 60_000),
+            finished_at: Some(finished),
+            ending: TaskEnding::Wake { state: None },
+            output,
+        };
+        let window = |text: &str, clipped: bool| {
+            TaskOutput::Window(ShellOutputWindow {
+                text: text.into(),
+                clipped,
+                captured_ms: captured,
+            })
+        };
+
+        assert_eq!(
+            task_entry_body(&entry(Some(window("line 1\nline 2", false)))),
+            "shell sh_abc · 14:02 · 12m\n  截至于 14:05\n```\nline 1\nline 2\n```",
+            "the tail follows the identity line, labelled and fenced"
+        );
+        assert_eq!(
+            task_entry_body(&entry(Some(window("a\nb\nc\nd", true)))),
+            "shell sh_abc · 14:02 · 12m\n  截至于 14:05 · 仅最后 4 行 · 已截断\n```\na\nb\nc\nd\n```",
+            "a clipped window names its lines"
+        );
+        assert_eq!(
+            task_entry_body(&entry(None)),
+            "shell sh_abc · 14:02 · 12m",
+            "no output fact renders the identity line alone"
+        );
+    }
+
+    /// Spec #588 / #593: a record that cannot be read says so in place of the
+    /// tail, while the endings with nothing to show stay identity-only whatever
+    /// the entry carries — the 已失联 entry has no record, the 🧹 cleanup is
+    /// the user's own ending, and a subagent has no shell output.
+    #[test]
+    fn an_unreadable_record_says_output_unavailable() {
+        let finished = crate::feishu::card::test_local_ms(2026, 9, 29, 14, 2);
+        let shell =
+            |ending: TaskEnding, finished_at: Option<i64>, output: Option<TaskOutput>| TaskCompletionEntry {
+                kind: TaskKind::Shell,
+                label: Some("gh run watch".into()),
+                id: Some("sh_abc".into()),
+                started_at: Some(finished - 12 * 60_000),
+                finished_at,
+                ending,
+                output,
+            };
+        let window = TaskOutput::Window(ShellOutputWindow {
+            text: "late output".into(),
+            clipped: false,
+            captured_ms: finished,
+        });
+
+        assert_eq!(
+            task_entry_body(&shell(
+                TaskEnding::Wake {
+                    state: Some("error".into()),
+                },
+                Some(finished),
+                Some(TaskOutput::Unavailable),
+            )),
+            "shell sh_abc · 14:02 · 12m\n  输出已不可用",
+            "a failed or vanished record says so, never an empty panel"
+        );
+        assert_eq!(
+            task_entry_body(&shell(TaskEnding::Lost, None, Some(window.clone()))),
+            "shell sh_abc",
+            "the 已失联 entry has no completion clock and no record to show"
+        );
+        assert_eq!(
+            task_entry_body(&shell(TaskEnding::Lost, Some(finished), Some(window.clone()))),
+            "shell sh_abc · 14:02 · 12m",
+            "the 已失联 ending never shows output, whatever the entry carries"
+        );
+        assert_eq!(
+            task_entry_body(&shell(TaskEnding::Cleaned, Some(finished), Some(window.clone()))),
+            "shell sh_abc · 14:02 · 12m",
+            "the 🧹 cleanup entry is identity-only"
+        );
+
+        let subagent = TaskCompletionEntry {
+            kind: TaskKind::Subagent,
+            label: Some("review the diff".into()),
+            id: Some("ses_child".into()),
+            started_at: None,
+            finished_at: Some(finished),
+            ending: TaskEnding::Wake { state: None },
+            output: Some(window),
+        };
+        assert_eq!(
+            task_entry_body(&subagent),
+            "subagent ses_child · 14:02",
+            "a subagent entry has no shell output"
+        );
+    }
+
+    /// Spec #588 / #593: the entry's estimate charges its output tail exactly
+    /// as the body renders it — the same block builder — so a noisy shell's
+    /// completion entry is reserved before the card splitter runs and cannot
+    /// balloon the budget.
+    #[test]
+    fn the_entry_estimate_covers_the_output_tail() {
+        let finished = crate::feishu::card::test_local_ms(2026, 9, 29, 14, 2);
+        let captured = crate::feishu::card::test_local_ms(2026, 9, 29, 14, 5);
+        let entry = |output: Option<TaskOutput>| TaskCompletionEntry {
+            kind: TaskKind::Shell,
+            label: Some("gh run watch".into()),
+            id: Some("sh_abc".into()),
+            started_at: Some(finished - 12 * 60_000),
+            finished_at: Some(finished),
+            ending: TaskEnding::Wake { state: None },
+            output,
+        };
+        let window = |text: String| {
+            TaskOutput::Window(ShellOutputWindow {
+                text,
+                clipped: true,
+                captured_ms: captured,
+            })
+        };
+        let tail = (1..=15)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let with_tail = entry(Some(window(tail)));
+        let without = entry(None);
+        assert_eq!(
+            task_entry_estimate(&with_tail) - task_entry_estimate(&without),
+            task_entry_body(&with_tail).len() - task_entry_body(&without).len(),
+            "the estimate grows by exactly what the tail renders"
+        );
+        let long = entry(Some(window("x".repeat(2000))));
+        assert!(
+            task_entry_estimate(&long) >= task_entry_estimate(&without) + 2000,
+            "a 2000-byte tail is reserved"
+        );
+        let unavailable = entry(Some(TaskOutput::Unavailable));
+        assert_eq!(
+            task_entry_estimate(&unavailable) - task_entry_estimate(&without),
+            task_entry_body(&unavailable).len() - task_entry_body(&without).len(),
+            "the unavailable line is reserved too"
+        );
     }
 
     /// A Wake that named no label renders the bare completion line — it says
@@ -1759,6 +2005,7 @@ mod tests {
                 started_at: None,
                 finished_at: Some(finished),
                 ending: TaskEnding::Wake { state: None },
+                output: None,
             };
             assert_eq!(task_entry_title(&entry), title);
             assert_eq!(task_entry_body(&entry), format!("{} sh_abc · 14:02", kind.noun()));
@@ -1771,6 +2018,7 @@ mod tests {
             started_at: None,
             finished_at: Some(finished),
             ending: TaskEnding::Wake { state: None },
+            output: None,
         };
         assert_eq!(task_entry_title(&empty), "🔔 shell 完成");
     }
@@ -1789,6 +2037,7 @@ mod tests {
                 started_at,
                 finished_at: Some(finished),
                 ending: TaskEnding::Wake { state: None },
+                output: None,
             })
         };
         assert_eq!(
@@ -1815,6 +2064,7 @@ mod tests {
             started_at: None,
             finished_at: Some(finished),
             ending: TaskEnding::Wake { state: None },
+            output: None,
         };
         assert_eq!(
             task_entry_title(&entry),

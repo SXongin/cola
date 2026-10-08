@@ -744,6 +744,7 @@ mod tests {
             started_at: Some(finished - 12 * 60_000),
             finished_at: Some(finished),
             ending: TaskEnding::Wake { state: None },
+            output: None,
         };
         let card = CardBuilder::new()
             .with_state(CardState::Streaming)
