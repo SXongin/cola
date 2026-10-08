@@ -175,9 +175,12 @@ required). It serves a chain with no durable **Chain Record** alone: a recorded
 chain's Wake belongs to the **Rendered Cursor**'s projection (or, cursorless,
 to the reap's fallback), and the projection's confirmed create drains the same
 watermark, so a Wake a successor rendered is never re-posted either (ADR-0071).
-Distinct from the **Sync Watermark**, which accounts user messages,
-lives in memory, and is never moved by a Wake (ADR-0061). One section of the
-**Chain Record** since ADR-0069.
+Synthetic retirement entries — a runtime/child-evidence ending, the user's
+**Cleanup** — are not Wakes: they keep exactly-once through the chain's
+in-memory announced set and never advance this mark (ADR-0073). Distinct from
+the **Sync Watermark**, which accounts user messages, lives in memory, and is
+never moved by a Wake (ADR-0061). One section of the **Chain Record** since
+ADR-0069.
 _Avoid_: Sync Watermark (the user-message-scoped one), announced set (the
 in-memory per-chain predecessor)
 
