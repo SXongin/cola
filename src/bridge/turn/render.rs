@@ -1189,24 +1189,35 @@ fn resolve_seeded_calls(acc: &mut StreamAccumulator, transcript: &SessionTranscr
 /// clock would be churn. The decision's clock is this read's own; the card
 /// renders the rows from its build clock, the same second. A fresh fragment is
 /// a rendered change that owes its flush, while a gather that established
-/// nothing keeps each row's stored fragment growing truthfully. Returns the
-/// split decision ([`super::state::LedgerChange`]): a caller that only flushes
-/// reads `owes`, while one telling new work from clock churn reads `rows`
-/// (#457).
+/// nothing keeps each row's stored fragment growing truthfully.
+///
+/// The read's runtime retirements render here too (#589): the live path must
+/// place each `🔔 shell 结束`/`已失联` entry on the very read that observed it
+/// — the process-local overlay filters every later read, so a missed render is
+/// a swallowed entry. The announce set keeps it exactly once whichever path
+/// renders that read. Returns the split decision
+/// ([`super::state::LedgerChange`]): a caller that only flushes reads `owes`,
+/// while one telling new work from clock churn reads `rows` (#457).
 fn refresh_ledger(
     acc: &mut StreamAccumulator,
     transcript: &SessionTranscript,
     activities: &std::collections::HashMap<String, TaskLiveness>,
 ) -> super::state::LedgerChange {
-    if acc.turn_anchor.is_none() {
+    let Some(anchor) = acc.turn_anchor.clone() else {
         return super::state::LedgerChange::default();
-    }
-    acc.set_ledger_from_read(
+    };
+    let mut change = acc.set_ledger_from_read(
         transcript,
         activities,
         chrono::Utc::now().timestamp_millis(),
         LedgerCadence::Minute,
-    )
+    );
+    if render_runtime_entries(acc, transcript, &anchor) {
+        // An inserted entry is rendered content, not clock churn: it owes its
+        // flush and counts as progress (a silent task's ticking age must not).
+        change.rows = true;
+    }
+    change
 }
 
 /// Whether rendering `transcript` scoped at `anchor` would add ANY part to

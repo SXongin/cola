@@ -118,7 +118,27 @@ pub(super) async fn run(
         )
         .await
         {
-            Some(Ok(transcript)) => {
+            Some(Ok(mut transcript)) => {
+                // The shared Background Task runtime reconciliation (#589) on
+                // this tick's own read, before the render and the settle below:
+                // a task the runtime confirms ended leaves the live list, its
+                // entry renders with the same read, and the settle sees the
+                // true end instead of a stranded wait. It observes only once
+                // the loop owns an anchor — the card places the entry by it,
+                // and a recorded retirement with no anchor would be swallowed
+                // by the overlay; the unreceived watch picks the task up on the
+                // tick after its message lands and the anchor is captured.
+                if anchor.is_some() {
+                    flow.runtime_reconcile
+                        .observe(
+                            &flow.backend,
+                            session_id,
+                            directory,
+                            &mut transcript,
+                            timing.read_timeout_ms,
+                        )
+                        .await;
+                }
                 // Stream the parts into the SAME card (the accumulator this
                 // chain has been rendering into all along); `None` means the
                 // accumulator vanished and the loop no longer owns anything.
