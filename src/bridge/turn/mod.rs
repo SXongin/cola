@@ -2907,6 +2907,41 @@ impl Turn {
         })
     }
 
+    /// Claim a Waiting card's cleanup click (spec #588, ticket #590) — the
+    /// same atomic double-click guard the recovery actions use, on the wait's
+    /// own home. The claim is taken only when the card is Waiting, was sent,
+    /// owes no split, and still carries at least one unconfirmed ledger row —
+    /// the very predicate the button's render reads, plus the write
+    /// admission's own liveness/handoff conditions, so a click on a card the
+    /// pipeline could not write is refused rather than recording a clearance
+    /// whose 🧹 entry would have nowhere to land. The click is acked
+    /// immediately, so the claim is what keeps a second click from running a
+    /// second cleanup; [`Self::release_recovery_claim`] gives it back when the
+    /// pipeline is done (or could not proceed).
+    pub(crate) async fn claim_cleanup(cards: &CardsHandle, session_id: &str) -> bool {
+        let mut live = cards.cards.lock().await;
+        let Some(card) = live.get_mut(session_id) else {
+            return false;
+        };
+        if card.acc.card_state != crate::feishu::card::CardState::Waiting
+            || card.acc.recovery_claimed
+            || card.card_message_id.is_none()
+            || !card.card_is_live
+            || !card.pending_split.is_empty()
+            || !card.acc.ledger.iter().any(|row| row.unconfirmed)
+        {
+            return false;
+        }
+        card.acc.recovery_claimed = true;
+        true
+    }
+
+    /// Give an unused cleanup claim back (spec #588, #590): the recovery
+    /// claim's own release, named for its caller.
+    pub(crate) async fn release_cleanup_claim(cards: &CardsHandle, session_id: &str) {
+        Self::release_recovery_claim(cards, session_id).await;
+    }
+
     /// Release an unused recovery claim. A click that neither submits nor
     /// re-attaches (the `Busy` decision with no anchor to follow, a retry that
     /// lost the inflight guard, a resume whose write failed, or a vanished
