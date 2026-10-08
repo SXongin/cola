@@ -107,9 +107,11 @@ the user already looks at.
   rows dropped and entries placed, and the card settles by ADR-0060's rules —
   the last task gone is ✅ in place, one PATCH, no continuation, the Completion
   Notice per its existing rules. A late Wake afterwards behaves exactly as
-  before. The dismissal is process-local and re-derived at restart, like the
-  retirement overlay — no durable format change — and the claim is released
-  after the write, so a later unconfirmed row is cleanable again.
+  before: the cleanup's entry is synthetic and never advances the durable Wake
+  Watermark (see Consequences). The dismissal is process-local and re-derived
+  at restart, like the retirement overlay — no durable format change — and the
+  claim is released after the write, so a later unconfirmed row is cleanable
+  again.
 
 - **Output tails where the user already looks.** While a shell runs, its ledger
   row carries a bounded output window under it: one tail read per live shell on
@@ -180,7 +182,13 @@ the user already looks at.
 - Retirements — runtime, child evidence and cleanup alike — are process-local:
   a cola restart loses the overlay and the dismissal, and the next reconcile
   re-derives the same wait. Accepted: honest re-derivation, no durable format
-  change.
+  change. Their completion entries are synthetic: they keep exactly-once
+  through the observing chain's in-memory announcement set alone and never
+  advance the durable **Wake Watermark**, which ADR-0061 defines as the newest
+  **Wake** whose completion a card announced. Staging a synthetic clock there
+  would make a restart read a genuinely un-announced late Wake at or below it
+  as already announced and suppress its continuation — #590's "a late Wake for
+  a cleared task behaves as before; nothing is suppressed" (review, PR #595).
 - **#454 closes with its upstream half explicitly left open upstream**: run the
   restart sweep for a plain `opencode serve` (or reconcile stale
   `job.background/*` markers at boot), clean up the stale markers, and expose a
