@@ -4401,3 +4401,289 @@ async fn a_v1_read_spends_no_output_window_request() {
         "a V1 card never shows a window: {latest}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// A completion entry's output tail (spec #588, ticket #593): when a shell
+// ends — a Wake's 完成/取消/失败 or the runtime's 结束 — its folded body
+// carries the result, read once at the entry's own render. A record the read
+// cannot answer for says 「输出已不可用」; the 已失联 and 🧹 endings stay
+// identity-only, and a subagent entry never spends a shell read.
+// ---------------------------------------------------------------------------
+
+/// Script one shell's output window (spec #588, #593) under an arbitrary shell
+/// id: the entry fixtures retire `sh_bg`/`sh_call_bg` alike, while
+/// [`given_shell_output`] names the live-row fixture alone.
+fn given_shell_tail(backend: &Arc<MockBackend>, shell_id: &str, text: &str, clipped: bool, captured_ms: i64) {
+    backend.shell_outputs.lock().unwrap().insert(
+        shell_id.into(),
+        Some(crate::backend::ShellOutputWindow {
+            text: text.into(),
+            clipped,
+            captured_ms,
+        }),
+    );
+}
+
+/// Acceptance 1 (spec #588, #593): a runtime-retired shell's completion entry
+/// carries its output tail on the LIVE card — labelled 截至于 and 已截断 — and
+/// spends exactly one read, at the entry's own render. The retirement read
+/// spends no live-window read (the shell leaves the live list first), and no
+/// later pass re-reads the retired shell.
+#[tokio::test]
+async fn a_live_retirements_entry_carries_the_output_tail_once() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = waiting_shell(now - 5_000);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    given_shell_tail(&backend, "sh_call_bg", "step 1\nstep 2", true, now);
+    backend.task_runtime.lock().unwrap().shells = vec![(
+        "sh_call_bg".into(),
+        ShellRuntime::Ended {
+            end: ShellEnd::Killed,
+            completed_at: Some(now - 1_000),
+        },
+    )];
+
+    Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下构建并审阅"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Done),
+        "the runtime end still settles the turn directly"
+    );
+    let final_card = platform.updated_cards().await.last().cloned().unwrap();
+    let text = card_text(&final_card);
+    assert!(
+        text.contains("🔔 shell 结束：gh run watch"),
+        "the ending's entry renders: {final_card}"
+    );
+    assert!(
+        text.contains("截至于")
+            && text.contains("仅最后 2 行 · 已截断")
+            && text.contains("step 1")
+            && text.contains("step 2"),
+        "the entry's fold body carries the labelled tail: {final_card}"
+    );
+    assert_eq!(
+        backend.shell_output_calls.lock().await.clone(),
+        vec!["sh_call_bg".to_string()],
+        "one output read for the entry render, no live-window read"
+    );
+    assert_eq!(
+        backend.prompt_calls.lock().await.len(),
+        1,
+        "the tail is a pure read: the turn's own prompt is the card's only one"
+    );
+}
+
+/// Acceptance 1 (spec #588, #593): the same tail lands on the WAITING card's
+/// quiet true end — the entry is planned, read and committed through the
+/// yielded refresh's own site, still exactly one read.
+#[tokio::test]
+async fn a_waiting_cards_completion_entry_carries_the_output_tail() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = waiting_shell(now - 5_000);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    yield_one_task_card(&app, &platform, ctx("ses_test", "跑一下构建并审阅")).await;
+
+    // The entry's own render is the only read this test counts: clear the
+    // yield's live-window reads and script the tail afterwards.
+    given_shell_tail(&backend, "sh_bg", "build ok", true, now);
+    backend.shell_output_calls.lock().await.clear();
+    script_quiet_true_end(&backend).await;
+    spawn_sync(&app);
+    wait_for_card_update(&platform, "the settled card", CardUpdates::Latest, |card| {
+        card_header(card).contains("✅") && card_text(card).contains("🔔 shell 完成：gh run watch")
+    })
+    .await;
+
+    let settled = platform.updated_cards().await.last().cloned().unwrap();
+    let text = card_text(&settled);
+    assert!(
+        text.contains("截至于") && text.contains("仅最后 1 行 · 已截断") && text.contains("build ok"),
+        "the waiting card's entry carries the labelled tail: {settled}"
+    );
+    assert_eq!(
+        backend.shell_output_calls.lock().await.clone(),
+        vec!["sh_bg".to_string()],
+        "exactly one output read, spent by the entry's own render"
+    );
+}
+
+/// Acceptance 2 (spec #588, #593): a record that cannot be read says
+/// 「输出已不可用」 — a failed read and a vanished record alike — never an
+/// empty panel posing as output.
+#[tokio::test]
+async fn an_unreadable_entry_record_says_output_unavailable() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+
+    // A failed read: every output read fails, so the entry's own read fails
+    // whichever cycle reaches it first.
+    let live = waiting_shell(now - 5_000);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    yield_one_task_card(&app, &platform, ctx("ses_test", "跑一下构建并审阅")).await;
+    backend.fail_shell_output_reads.store(1_000, Ordering::SeqCst);
+    script_quiet_true_end(&backend).await;
+    spawn_sync(&app);
+    wait_for_card_update(&platform, "the settled card", CardUpdates::Latest, |card| {
+        card_header(card).contains("✅") && card_text(card).contains("🔔 shell 完成：gh run watch")
+    })
+    .await;
+    let settled = platform.updated_cards().await.last().cloned().unwrap();
+    let text = card_text(&settled);
+    assert!(
+        text.contains("输出已不可用"),
+        "a failed read says the record is unavailable: {settled}"
+    );
+    assert!(!text.contains("截至于"), "never a stale tail: {settled}");
+
+    // A vanished record: the read succeeds and answers nothing (the runtime
+    // no longer keeps it), which is the same no-output case.
+    let live = waiting_shell(now - 5_000);
+    let (_dir2, app2, backend2, platform2) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    yield_one_task_card(&app2, &platform2, ctx("ses_test", "跑一下构建并审阅")).await;
+    script_quiet_true_end(&backend2).await;
+    spawn_sync(&app2);
+    wait_for_card_update(&platform2, "the settled card", CardUpdates::Latest, |card| {
+        card_header(card).contains("✅") && card_text(card).contains("🔔 shell 完成：gh run watch")
+    })
+    .await;
+    let settled = platform2.updated_cards().await.last().cloned().unwrap();
+    let text = card_text(&settled);
+    assert!(
+        text.contains("输出已不可用"),
+        "a vanished record says the same: {settled}"
+    );
+    assert!(!text.contains("截至于"), "never an empty panel: {settled}");
+}
+
+/// Acceptance 2 (spec #588, #593): the 已失联 entry carries identity only —
+/// there is no record to read, so it must not spend an output read nor invent
+/// one, even when a window is scripted for its shell id.
+#[tokio::test]
+async fn a_lost_entry_stays_identity_only_with_no_output_read() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = waiting_shell(now - 5_000);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    yield_one_task_card(&app, &platform, ctx("ses_test", "跑一下构建并审阅")).await;
+
+    // A window exists for the shell, but the lost ending must never show it.
+    given_shell_tail(&backend, "sh_call_bg", "should never render", false, now);
+    backend.shell_output_calls.lock().await.clear();
+    backend.task_runtime.lock().unwrap().shells = vec![("sh_call_bg".into(), ShellRuntime::Missing)];
+    spawn_sync(&app);
+    wait_for_card_update(&platform, "the lost settle", CardUpdates::Latest, |card| {
+        card_header(card).contains("✅") && card_text(card).contains("🔔 shell 已失联：gh run watch")
+    })
+    .await;
+
+    let settled = platform.updated_cards().await.last().cloned().unwrap();
+    let text = card_text(&settled);
+    assert!(
+        text.contains("shell sh_call_bg") && !text.contains("shell sh_call_bg · "),
+        "the lost entry keeps identity and no invented clock: {settled}"
+    );
+    assert!(
+        !text.contains("输出已不可用") && !text.contains("截至于") && !text.contains("should never render"),
+        "the lost entry stays identity-only: {settled}"
+    );
+    assert!(
+        backend.shell_output_calls.lock().await.is_empty(),
+        "the lost entry spends no output read"
+    );
+}
+
+/// Acceptance 2 (spec #588, #593): a subagent's runtime/evidence ending has no
+/// shell output — the entry stays identity-only and spends no output read,
+/// even with a window scripted for its child id.
+#[tokio::test]
+async fn a_subagent_entry_spends_no_output_read() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = SessionTranscript::new(two_task_timeline(vec![]))
+        .with_executions(vec![execution(2_500)])
+        .with_background_tasks(vec![live_subagent(now - 3_000, "call_sub")]);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    script_child_without_activity(&backend).await;
+    given_shell_tail(&backend, "ses_call_sub", "should never render", false, now);
+    backend.task_runtime.lock().unwrap().children = vec![("ses_call_sub".into(), ChildRuntime::Inactive)];
+    backend
+        .with_child_evidence(
+            "ses_call_sub",
+            ChildEvidence::Terminal {
+                completed_at: now - 1_000,
+            },
+        )
+        .await;
+
+    Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下构建并审阅"))
+        .await
+        .unwrap();
+
+    let final_card = platform.updated_cards().await.last().cloned().unwrap();
+    let text = card_text(&final_card);
+    assert_eq!(
+        text.matches("🔔 subagent 结束：review the diff").count(),
+        1,
+        "the subagent's evidence ending renders: {final_card}"
+    );
+    assert!(
+        !text.contains("输出已不可用") && !text.contains("截至于") && !text.contains("should never render"),
+        "a subagent entry has no shell output: {final_card}"
+    );
+    assert!(
+        backend.shell_output_calls.lock().await.is_empty(),
+        "no shell read is ever spent on a subagent entry"
+    );
+}
+
+/// Acceptance 2 (spec #588, #590/#593): the user's own cleanup entry never
+/// carries an output tail — it is not the shell's ending — so its render
+/// spends no read, whatever window exists for the task's id.
+#[tokio::test]
+async fn a_cleaned_entry_spends_no_output_read() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = SessionTranscript::new(two_task_timeline(vec![]))
+        .with_executions(vec![execution(2_500)])
+        .with_background_tasks(vec![live_subagent(now - 3_000, "call_sub")]);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    script_child_without_activity(&backend).await;
+    yield_one_task_card(&app, &platform, ctx("ses_test", "跑一下构建并审阅")).await;
+
+    // The runtime reports the child inactive with no concluding evidence: the
+    // row gains the marker — and the waiting card the cleanup button.
+    backend.task_runtime.lock().unwrap().children = vec![("ses_call_sub".into(), ChildRuntime::Inactive)];
+    spawn_sync(&app);
+    wait_for_card_update(&platform, "the unconfirmed marker", CardUpdates::Latest, |card| {
+        card_text(card).contains("⚠️ 状态待确认")
+    })
+    .await;
+
+    given_shell_tail(&backend, "ses_call_sub", "should never render", false, now);
+    backend.shell_output_calls.lock().await.clear();
+    app.host_action(serde_json::json!({ "action": "cleanup", "session_id": "ses_test" }))
+        .await
+        .expect("the cleanup click acks");
+    wait_for_card_update(&platform, "the cleaned settle", CardUpdates::Latest, |card| {
+        card_header(card).contains("✅")
+            && card_text(card).contains("🧹 subagent 已清理：review the diff（人工）")
+    })
+    .await;
+
+    let settled = platform.updated_cards().await.last().cloned().unwrap();
+    let text = card_text(&settled);
+    assert!(
+        !text.contains("输出已不可用") && !text.contains("截至于") && !text.contains("should never render"),
+        "the 🧹 entry is identity-only: {settled}"
+    );
+    assert!(
+        backend.shell_output_calls.lock().await.is_empty(),
+        "the cleanup ending spends no output read"
+    );
+}
