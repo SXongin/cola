@@ -749,7 +749,7 @@ fn decode_wake_source(metadata: Option<&Value>) -> WakeSource {
 /// background handle) carries no request-time flag, and the app counts it.
 /// A settled tool's metadata says `completed`, so it is not live.
 fn decode_background_tasks(messages: &[TranscriptMessage], wakes: &[Wake]) -> Vec<BackgroundTask> {
-    let mut tasks = Vec::new();
+    let mut tasks: Vec<BackgroundTask> = Vec::new();
     for message in messages {
         if message.role != MessageRole::Assistant {
             continue;
@@ -763,6 +763,22 @@ fn decode_background_tasks(messages: &[TranscriptMessage], wakes: &[Wake]) -> Ve
             };
             if wakes.iter().any(|wake| wake.retires(&task)) {
                 continue;
+            }
+            // A resumed subagent (#552): a child session runs at most one run
+            // at a time, so a later launch on the SAME child supersedes the
+            // earlier one — the earlier launch is the run the resume replaced,
+            // never a second live task. The read is oldest-first (V2 reads
+            // `order=asc`), so the later launch wins; removing the earlier one
+            // first keeps the survivor at its own (later) position in the
+            // list. The replaced launch records no entry and no retirement:
+            // the interrupted run has no completion to report, and the
+            // child's eventual Wake renders exactly one completion entry.
+            if let Some(child) = task.child_id.as_deref()
+                && let Some(superseded) = tasks
+                    .iter()
+                    .position(|existing| existing.child_id.as_deref() == Some(child))
+            {
+                tasks.remove(superseded);
             }
             tasks.push(task);
         }
@@ -1958,6 +1974,101 @@ mod tests {
         let live = &transcript.background_tasks[0];
         assert!(wake.retires(&retired), "the recorded Wake must retire its child");
         assert!(!wake.retires(live), "and must not retire the live child");
+    }
+
+    /// #552: a resumed subagent — the same child session relaunched after an
+    /// interruption — must not leave its earlier launch as a SECOND live task.
+    /// A child runs one run at a time, so the decoder keeps only the newest
+    /// launch per child, and the child's completion Wake then retires that one.
+    #[test]
+    fn a_resumed_subagent_supersedes_its_earlier_launch_by_child_id() {
+        let read = |wakes: Vec<Value>| {
+            let mut data = vec![
+                serde_json::json!({
+                    "id": "msg_a1",
+                    "type": "assistant",
+                    "time": {"created": 1000, "completed": 1500},
+                    "content": [background_subagent_part("call_subagent_1", "ses_child")],
+                }),
+                serde_json::json!({
+                    "id": "msg_a2",
+                    "type": "assistant",
+                    "time": {"created": 3000, "completed": 3500},
+                    "content": [background_subagent_part("call_subagent_2", "ses_child")],
+                }),
+            ];
+            data.extend(wakes);
+            decode_messages(&data)
+        };
+
+        // While the resume runs: ONE live task, the newest call.
+        let transcript = read(vec![]);
+        assert_eq!(
+            transcript.background_tasks.len(),
+            1,
+            "one child, one live task: {:#?}",
+            transcript.background_tasks
+        );
+        let live = &transcript.background_tasks[0];
+        assert_eq!(
+            live.tool.call_id.as_str(),
+            "call_subagent_2",
+            "the newest launch supersedes the earlier one"
+        );
+        assert_eq!(live.child_id.as_deref(), Some("ses_child"));
+
+        // The resume completing: the child's Wake retires the survivor.
+        let transcript = read(vec![synthetic_wake(
+            "msg_wake_sub",
+            4_000,
+            serde_json::json!({"source": "subagent", "childID": "ses_child", "state": "completed"}),
+        )]);
+        assert!(
+            transcript.background_tasks.is_empty(),
+            "the child's Wake retires the one surviving launch: {:#?}",
+            transcript.background_tasks
+        );
+    }
+
+    /// A `subagent` launch whose metadata names no child session carries no
+    /// identity to merge on: two such launches stay two live tasks.
+    #[test]
+    fn a_subagent_launch_without_a_child_id_is_never_merged() {
+        let mut first = background_subagent_part("call_subagent_1", "");
+        let mut second = background_subagent_part("call_subagent_2", "");
+        for part in [&mut first, &mut second] {
+            part["state"]["metadata"]
+                .as_object_mut()
+                .expect("metadata object")
+                .remove("sessionID");
+        }
+        let data = vec![
+            serde_json::json!({
+                "id": "msg_a1",
+                "type": "assistant",
+                "time": {"created": 1000, "completed": 1500},
+                "content": [first],
+            }),
+            serde_json::json!({
+                "id": "msg_a2",
+                "type": "assistant",
+                "time": {"created": 3000, "completed": 3500},
+                "content": [second],
+            }),
+        ];
+        let transcript = decode_messages(&data);
+        assert_eq!(
+            transcript.background_tasks.len(),
+            2,
+            "no child id, nothing to supersede: {:#?}",
+            transcript.background_tasks
+        );
+        assert!(
+            transcript
+                .background_tasks
+                .iter()
+                .all(|task| task.child_id.is_none())
+        );
     }
 
     /// A backgrounded run is retired by its Wake under every correlation key
