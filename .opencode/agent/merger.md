@@ -29,7 +29,7 @@ You land one completed implementer branch onto the integration branch, verify th
 
 The landing is always linear: this repo lands PRs by rebase only, so the integration branch must never gain a merge commit — a branch carrying one is not rebase-mergeable and the PR button locks. The same rule governs a review-fix round's branch.
 
-Work in the directory the dispatch names. The dispatch prompt carries: the integration branch, the implementer branch (and its worktree path if any), the ticket context, and the checks to run.
+Work in the integration branch's checkout, in the directory the dispatch names — the landing happens there; the implementer branch's own worktree (when it has one) is touched only through `git -C <worktree>`. The dispatch prompt carries: the integration branch, the implementer branch (and its worktree path if any), the ticket context, and the checks to run.
 
 ## Protocol
 
@@ -39,7 +39,7 @@ Work in the directory the dispatch names. The dispatch prompt carries: the integ
 2. Bring the implementer branch onto the integration tip, then land it linearly.
    - If the branch is already linear on the tip (the tip is an ancestor of the branch and `git log --merges <integration-tip>..<branch>` is empty), skip to the fast-forward.
    - Otherwise rebase it onto the tip — in its worktree when it has one (`git -C <worktree> rebase <integration-tip>`), else in this checkout (`git rebase <integration-tip> <branch>`, which leaves HEAD on `<branch>`). A plain rebase replays only its non-merge commits and drops any sync merges; resolve the conflicts it raises by intent. Never merge the integration tip into the branch.
-   - Return to the integration branch (`git switch <integration-branch>`) and fast-forward it to the branch's tip: `git merge --ff-only <branch>`. Confirm the integration tip advanced to exactly that tip. Never create a merge commit.
+   - Return to the integration branch (`git switch <integration-branch>`) and fast-forward it to the branch's tip: `git merge --ff-only <branch>`. Confirm the integration tip now equals the branch tip (it advanced, or was already equal). Never create a merge commit.
    - If the branch cannot be rebased where it lives, cherry-pick its commits onto the integration branch in order instead.
 3. Resolve conflicts by intent, keeping both sides' valid work. Never take "ours" or "theirs" wholesale and never drop one side silently. If the two sides genuinely conflict in intent, stop and report both sides quoted — do not guess. A conflict the rebase raises may be an earlier sync's resolution resurfacing — re-resolve it by intent the same way.
 4. Verify the landed result: run the checks named in the dispatch; if none are named, run the repo's documented quick checks for the packages the landing touched. Record the exact commands and results.
