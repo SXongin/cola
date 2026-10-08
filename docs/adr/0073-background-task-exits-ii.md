@@ -99,16 +99,18 @@ the user already looks at.
   Feishu's 3 s budget. The pipeline re-reads the transcript and the runtime
   once, re-deriving the unconfirmed set on its own read (a failed runtime read
   clears nothing), then clears ALL unconfirmed rows at once — never a
-  positively running task — records their call ids in the same process-local
-  overlay only when its refresh lands (review, PR #595: the write admission is
-  re-checked under the card lock and a card replaced while the reads were in
-  flight refuses the write — recording anyway would hide the tasks from every
-  later read without ever rendering their entries, which no later read can
-  reconstruct), synthesizes one clean retirement per row at the click's own clock,
-  and pushes one completion entry per cleared row:
+  positively running task — synthesizes one clean retirement per row at the
+  click's own clock, and pushes one completion entry per cleared row:
   `🧹 shell 已清理：<命令>（人工）` / `🧹 subagent 已清理：<描述>（人工）`
-  (bare: `🧹 <noun> 已清理（人工）`). The ordinary yielded-card refresh renders
-  rows dropped and entries placed, and the card settles by ADR-0060's rules —
+  (bare: `🧹 <noun> 已清理（人工）`). EVERY overlay record the pass owes — the
+  runtime/evidence retirements it applied, the cleared ids and the resolved
+  marker set — commits only when its refresh lands (review, PR #595: the write
+  admission is re-checked under the card lock and a card replaced while the
+  reads were in flight refuses the write — recording any of it anyway would
+  hide the tasks, or drop their marker and button, with no card ever rendering
+  the change, which no later read can reconstruct). The ordinary yielded-card
+  refresh renders rows dropped and entries placed, and the card settles by
+  ADR-0060's rules —
   the last task gone is ✅ in place, one PATCH, no continuation, the Completion
   Notice per its existing rules. A late Wake afterwards behaves exactly as
   before: the cleanup's entry is synthetic and never advances the durable Wake
@@ -208,7 +210,9 @@ the user already looks at.
   (claim, 3 s ack, all rows at once, a running task keeps the wait, button
   presence only with unconfirmed rows on a waiting card, late Wake untouched,
   the successor carrying the button, a replaced card's refused refresh
-  recording nothing and the successor still clearing the tasks exactly once); the output windows (labels, budget, live
+  recording nothing — the runtime retirement its own reconcile found included
+  — and the successor still rendering and clearing the tasks exactly once);
+  the output windows (labels, budget, live
   omission, entry tails, 「输出已不可用」 on a failed or vanished record, no
   re-read on the settled successor); and the projected successor's affordances.
 
