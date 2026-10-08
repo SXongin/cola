@@ -214,6 +214,15 @@ impl CardOwnership {
         self.chain_id
     }
 
+    /// The card's Turn anchor, when a card exists — the identity the widened
+    /// Wake-step gate compares against the read's newest user message (#568):
+    /// Session Sync may resume a yielded card only while it is still the chain
+    /// the newest message opened, so a newer external message (which supersedes
+    /// and collects the waiting card) is never raced by a Wake resumption.
+    pub(crate) fn anchor(&self) -> Option<&TurnAnchor> {
+        self.turn_anchor.as_ref()
+    }
+
     /// The Supplement routing key (ADR-0062): `Some(label)` when cola owns the
     /// Session's live card chain — a guard held, or a render-owned card — with
     /// the label the prompt router's INFO line logs (`guard` / `card-chain`),

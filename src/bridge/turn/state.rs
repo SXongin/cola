@@ -3147,7 +3147,15 @@ impl StreamAccumulator {
                 && let Some(sid) = &self.session_id
             {
                 let button = match self.card_state {
-                    CardState::Error if !self.wake_continuation => {
+                    // An external render's ending carries no prompt to
+                    // re-submit (#568): its Error must not offer the Retry the
+                    // claim below would refuse — the same promptless fact
+                    // `claim_recovery` reads, so the button and the click
+                    // cannot disagree about whether anything is askable.
+                    CardState::Error
+                        if !self.wake_continuation
+                            && self.prompt.as_deref().is_some_and(|prompt| !prompt.is_empty()) =>
+                    {
                         Some(crate::feishu::card::CardActionButton {
                             text: "🔄 重试".to_string(),
                             kind: "primary",
@@ -5105,26 +5113,33 @@ mod tests {
         );
     }
 
-    /// The Error card's Retry button (spec #391) is gated by the card's KIND,
-    /// not by what an attempt happens to have stored: an Error card offers it
-    /// as before (the external/snapshot renderers included), while a Wake
-    /// continuation never does — it carries no question to re-ask (ADR-0059).
+    /// The Error card's Retry button (spec #391) is gated by the card's KIND
+    /// and by its having a question to re-ask: an Error card carrying its
+    /// prompt offers it as before, while a Wake continuation never does — it
+    /// carries no question to re-ask (ADR-0059) — and neither does a
+    /// promptless card (an external follow's ending, #568), where the render
+    /// must not offer the dead Retry `claim_recovery` refuses.
     #[test]
-    fn a_wake_continuation_never_offers_retry() {
-        let error_card = |wake_continuation: bool| {
+    fn an_error_card_offers_retry_only_with_a_question_to_reask() {
+        let error_card = |wake_continuation: bool, prompt: Option<&str>| {
             let mut acc = StreamAccumulator::new("test");
             acc.card_state = CardState::Error;
             acc.session_id = Some("ses_1".into());
             acc.wake_continuation = wake_continuation;
+            acc.prompt = prompt.map(str::to_string);
             acc.build_card().to_string()
         };
         assert!(
-            error_card(false).contains("重试"),
-            "an Error card offers Retry exactly as before"
+            error_card(false, Some("跑一下 CI")).contains("重试"),
+            "an Error card with its prompt offers Retry exactly as before"
         );
         assert!(
-            !error_card(true).contains("重试"),
+            !error_card(true, Some("跑一下 CI")).contains("重试"),
             "a Wake continuation never offers Retry"
+        );
+        assert!(
+            !error_card(false, None).contains("重试"),
+            "a promptless Error card (an external follow) offers no dead Retry"
         );
     }
 

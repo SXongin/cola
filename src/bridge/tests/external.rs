@@ -1,7 +1,9 @@
+use super::drain::{noticed, spawn_sync};
 use crate::backend::{
     ContentBlock, FinishReason, MessageId, MessageRole, Part, ReasoningPart, SessionTranscript, StepFinish,
     StepStart, ToolCall, ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage, TurnAnchor,
 };
+use crate::bridge::chain::AdoptedFollow;
 use crate::bridge::test_support::*;
 
 /// A user message's typed view; the Session Transcript's newest-user projection
@@ -2517,4 +2519,702 @@ async fn session_sync_follows_a_moved_session_to_its_new_directory() {
         !dirs.contains(&"/work/old".to_string()),
         "the old directory must be dropped: {dirs:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #568: an external follow's wait is served like a cola request's — the render
+// loop yields ⏳ on live Background Tasks (never ✅), Session Sync resumes the
+// completion Wake in place, and the true end settles the card.
+// ---------------------------------------------------------------------------
+
+/// The waiting read: the external message answered, then the Session idled
+/// with a live background shell — the `⏳` yield's shape (ADR-0059).
+fn external_waiting_read() -> SessionTranscript {
+    SessionTranscript::new(vec![
+        user("msg_user_1000", 1_000, "跑一下 CI"),
+        finished("msg_ext_assist", 2_000, FinishReason::Stop),
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_background_tasks(vec![background_shell(2_100)])
+}
+
+/// The woke read: the shell Wake retired the task and its run landed the
+/// answer, with the Execution boundary after the Wake answering it.
+fn external_woken_read() -> SessionTranscript {
+    SessionTranscript::new(vec![
+        user("msg_user_1000", 1_000, "跑一下 CI"),
+        finished("msg_ext_assist", 2_000, FinishReason::Stop),
+        assistant_text("msg_ext_resumed", 3_600, "CI 通过了。"),
+    ])
+    .with_executions(vec![execution(2_500), execution(4_000)])
+    .with_wakes(vec![shell_wake(2_900)])
+}
+
+/// The undecided read: a fired shell Wake whose Execution boundary has not
+/// landed — `settle` keeps observing while the resumed run's content renders.
+fn external_observing_read() -> SessionTranscript {
+    SessionTranscript::new(vec![
+        user("msg_user_1000", 1_000, "跑一下 CI"),
+        finished("msg_ext_assist", 2_000, FinishReason::Stop),
+        assistant_text("msg_ext_resumed", 3_600, "恢复中…"),
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_wakes(vec![shell_wake(2_900)])
+}
+
+/// [`external_observing_read`] with the Wake's Execution boundary landed: the
+/// read is the chain's true end.
+fn external_resumed_end_read() -> SessionTranscript {
+    external_observing_read().with_executions(vec![execution(2_500), execution(4_000)])
+}
+
+/// The read whose newest user message is a NEWER external one, with the old
+/// chain's completion Wake already recorded — the notify path's turn.
+fn external_superseding_read() -> SessionTranscript {
+    SessionTranscript::new(vec![
+        user("msg_user_1000", 1_000, "跑一下 CI"),
+        finished("msg_ext_assist", 2_000, FinishReason::Stop),
+        user("msg_ext_new", 3_000, "新消息"),
+    ])
+    .with_executions(vec![execution(2_500), execution(4_000)])
+    .with_wakes(vec![shell_wake(2_900)])
+}
+
+/// An assistant text message for the resumed work a Wake's run lands.
+fn assistant_text(id: &str, created: i64, text: &str) -> TranscriptMessage {
+    typed_message(id, MessageRole::Assistant, Some(created), vec![text_part(text)])
+}
+
+/// The mapped entry every test in this batch follows.
+fn external_entry() -> crate::config::SessionEntry {
+    crate::config::SessionEntry {
+        thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
+        session_id: "ses_ext".into(),
+        directory: "/tmp/ext".into(),
+        agent: None,
+        model: None,
+        auto_accept: false,
+        topic_anchor: None,
+        topic_root: None,
+        variant: None,
+    }
+}
+
+/// Await any card — sent, replied or updated — carrying `needle`, or panic
+/// after 5 s: the external path's notification is a SEND and its render an
+/// in-place update, so a test must accept either call.
+async fn wait_for_any_card(platform: &RecordingPlatform, needle: &str) {
+    let probe = async {
+        loop {
+            let found = {
+                let calls = platform.calls.lock().await;
+                calls.iter().any(|call| match call {
+                    PlatformCall::ReplyCard { card, .. }
+                    | PlatformCall::SendCard { card, .. }
+                    | PlatformCall::UpdateMessage { card, .. }
+                    | PlatformCall::ReplyCardInThread { card, .. } => card_text(card).contains(needle),
+                    _ => false,
+                })
+            };
+            if found {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), probe)
+        .await
+        .unwrap_or_else(|_| panic!("no card ever carried {needle:?}"));
+}
+
+/// #568: an external follow whose turn idles with a live Background Task
+/// yields the waiting card (⏳ + its ledger) instead of ✅'ing. Before the fix
+/// the loop stamped ✅ on the first terminal step and exited, freezing the
+/// chain until the user spoke again.
+#[tokio::test]
+async fn external_reply_render_yields_waiting_on_a_live_background_task() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut mock = MockBackend::new(realistic_parts());
+    mock.given_transcript("ses_ext", vec![external_waiting_read()]);
+    let (app, platform) = build_app(cfg, mock).await;
+    seed_entry(&app, external_entry()).await;
+    app.external
+        .render_poll_ms
+        .store(5, std::sync::atomic::Ordering::Relaxed);
+
+    app.external
+        .start_reply_render(
+            &app.flow_handles(),
+            "ses_ext",
+            &anchor(1_000),
+            "om_wait",
+            "跑一下 CI",
+        )
+        .await;
+
+    wait_for_card_update(&platform, "the waiting card", CardUpdates::Latest, |card| {
+        card_header(card).contains("等待后台任务")
+    })
+    .await;
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_ext").await,
+        Some(crate::feishu::card::CardState::Waiting),
+        "the yield is not a terminal"
+    );
+    let card = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_text(&card).contains("后台任务（1）"),
+        "the yield carries the live task's ledger: {card}"
+    );
+}
+
+/// #568: the completion Wake resumes the yielded external card IN PLACE — no
+/// continuation card, no notice — and the true end settles it ✅ there.
+#[tokio::test]
+async fn external_waiting_chain_resumes_in_place_to_the_true_end() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut mock = MockBackend::new(realistic_parts());
+    mock.given_transcript("ses_ext", vec![external_waiting_read()]);
+    let backend = Arc::new(mock);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    seed_entry(&app, external_entry()).await;
+    spawn_sync(&app);
+    // The Sync Watermark already covers the first message, so a later external
+    // one reads as an External Message (a first observation is a silent
+    // baseline, ADR-0017) — never racing the sync pass's own baseline.
+    app.external
+        .last_user_msg_epoch
+        .lock()
+        .await
+        .insert("ses_ext".into(), 1_000);
+
+    app.external
+        .start_reply_render(
+            &app.flow_handles(),
+            "ses_ext",
+            &anchor(1_000),
+            "om_wait",
+            "跑一下 CI",
+        )
+        .await;
+    wait_for_card_update(&platform, "the waiting card", CardUpdates::Latest, |card| {
+        card_header(card).contains("等待后台任务")
+    })
+    .await;
+
+    // The shell retires, its Wake's run lands the answer, and the read
+    // settles: the waiting card resumes in place and ends ✅.
+    backend
+        .given_transcript_after_build("ses_ext", vec![external_woken_read()])
+        .await;
+    wait_for_card_update(&platform, "the true end", CardUpdates::Latest, |card| {
+        card_header(card).contains("✅")
+    })
+    .await;
+
+    let calls = platform.calls.lock().await.clone();
+    let last = calls
+        .iter()
+        .rev()
+        .find_map(|call| match call {
+            PlatformCall::UpdateMessage { message_id, card } => Some((message_id.clone(), card.clone())),
+            _ => None,
+        })
+        .expect("the card was updated");
+    assert_eq!(last.0, "om_wait", "the same card resumes in place");
+    let text = card_text(&last.1);
+    assert!(
+        text.contains("CI 通过了。"),
+        "the resumed run's content lands: {last:?}"
+    );
+    assert!(
+        text.contains("🔔 shell 完成：gh run watch"),
+        "the completion entry lands on the same card: {last:?}"
+    );
+    assert!(
+        continuation_sends(&platform).await.is_empty(),
+        "an in-place resume posts no continuation card: {calls:?}"
+    );
+    assert!(
+        !noticed(&platform).await,
+        "an external chain owes no Completion Notice"
+    );
+}
+
+/// #568 (the adopted follow's full acceptance): the restart-adopted follow
+/// yields ⏳ on a live Background Task instead of ✅'ing, keeps observing while
+/// a fired Wake's run has not landed (the 00:17 shape the bare terminal step
+/// used to ✅ one poll in), and settles ✅ at the true end — Session Sync
+/// serving the wait from the yield onward.
+#[tokio::test]
+async fn external_adopted_follow_yields_and_observes_until_the_true_end() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    // Phase 1: the run idles with a live background shell — the adopted follow
+    // must yield ⏳ on this, never ✅.
+    let live = SessionTranscript::new(vec![
+        user("msg_user_1000", 1_000, "跑一下 CI"),
+        finished("msg_ext_assist", 2_000, FinishReason::Stop),
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_background_tasks(vec![background_shell(2_100)]);
+    // Phase 2: the shell retires (its Wake) but the resumed run's content has
+    // no Execution boundary after the Wake yet: the settlement is undecided
+    // and the card must keep observing, not ✅.
+    let pending = external_observing_read();
+    // Phase 3: the boundary lands; the read settles the true end.
+    let closed = external_resumed_end_read();
+    let mut mock = MockBackend::new(realistic_parts());
+    mock.given_transcript("ses_ext", vec![live]);
+    let backend = Arc::new(mock);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    seed_entry(&app, external_entry()).await;
+    spawn_sync(&app);
+
+    // The successor card an adoption arms, and the follow the reap spawns on
+    // it — the anchor turn is already complete by the time the follow starts.
+    Turn::arm_external_render(
+        &app.cards_handle(),
+        "ses_ext",
+        "om_adopted",
+        &anchor(1_000),
+        "sub",
+        "/tmp/ext",
+        None,
+        None,
+    )
+    .await;
+    app.external
+        .start_adopted_follow(
+            &app.flow_handles(),
+            "ses_ext",
+            &AdoptedFollow {
+                card_message_id: "om_adopted".into(),
+                anchor: anchor(1_000),
+            },
+        )
+        .await;
+
+    // Phase 1: the wait yields in place, ledger included — never ✅.
+    wait_for_card_update(&platform, "the waiting card", CardUpdates::Latest, |card| {
+        card_header(card).contains("等待后台任务")
+    })
+    .await;
+    let yielded = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_text(&yielded).contains("后台任务（1）"),
+        "the adopted yield carries the ledger: {yielded}"
+    );
+
+    // Phase 2: the Wake fired but its run has not landed; the card keeps
+    // observing and renders what arrives.
+    backend
+        .given_transcript_after_build("ses_ext", vec![pending])
+        .await;
+    wait_for_card_update(&platform, "the resumed content", CardUpdates::Any, |card| {
+        card_text(card).contains("恢复中")
+    })
+    .await;
+    let early = platform.updated_cards().await;
+    assert!(
+        !early.iter().any(|card| card_header(card).contains("✅")),
+        "no ✅ before the pending Wake's run lands: {early:?}"
+    );
+
+    // Phase 3: the boundary lands; the read now settles the true end.
+    backend
+        .given_transcript_after_build("ses_ext", vec![closed])
+        .await;
+    wait_for_card_update(&platform, "the true end", CardUpdates::Latest, |card| {
+        card_header(card).contains("✅")
+    })
+    .await;
+}
+
+/// #568: a settled failure ends the external card ❌ through the same settle
+/// mapping — and the promptless card offers no dead Retry.
+#[tokio::test]
+async fn external_failed_run_ends_error_not_done() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut failed = finished("msg_ext_assist", 2_000, FinishReason::Error);
+    failed.error = Some("provider 503".into());
+    let mut mock = MockBackend::new(realistic_parts());
+    mock.given_transcript(
+        "ses_ext",
+        vec![
+            SessionTranscript::new(vec![user("msg_user_1000", 1_000, "跑一下 CI"), failed])
+                .with_executions(vec![execution(2_500)]),
+        ],
+    );
+    let (app, platform) = build_app(cfg, mock).await;
+    seed_entry(&app, external_entry()).await;
+    app.external
+        .render_poll_ms
+        .store(5, std::sync::atomic::Ordering::Relaxed);
+
+    app.external
+        .start_reply_render(
+            &app.flow_handles(),
+            "ses_ext",
+            &anchor(1_000),
+            "om_fail",
+            "跑一下 CI",
+        )
+        .await;
+
+    wait_for_card_update(&platform, "the error card", CardUpdates::Latest, |card| {
+        card_header(card).contains("出错")
+    })
+    .await;
+    let card = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_text(&card).contains("provider 503"),
+        "the server's failure line lands: {card}"
+    );
+    assert!(
+        card_buttons(&card)
+            .iter()
+            .all(|button| !button.to_string().contains("重试")),
+        "a promptless external Error offers no dead Retry: {card}"
+    );
+}
+
+/// #568's gate boundary: once a NEWER external message arrives, the waiting
+/// card is the notify path's to supersede — the widened Wake step must not
+/// resume it under the new message (the #408 exclusion, ownership-scoped).
+#[tokio::test]
+async fn a_newer_external_message_supersedes_a_waiting_card_without_a_wake_race() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut mock = MockBackend::new(realistic_parts());
+    mock.given_transcript("ses_ext", vec![external_waiting_read()]);
+    let backend = Arc::new(mock);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    seed_entry(&app, external_entry()).await;
+    spawn_sync(&app);
+    // The Sync Watermark already covers the first message, so a later external
+    // one reads as an External Message (a first observation is a silent
+    // baseline, ADR-0017) — never racing the sync pass's own baseline.
+    app.external
+        .last_user_msg_epoch
+        .lock()
+        .await
+        .insert("ses_ext".into(), 1_000);
+
+    app.external
+        .start_reply_render(
+            &app.flow_handles(),
+            "ses_ext",
+            &anchor(1_000),
+            "om_wait",
+            "跑一下 CI",
+        )
+        .await;
+    wait_for_card_update(&platform, "the waiting card", CardUpdates::Latest, |card| {
+        card_header(card).contains("等待后台任务")
+    })
+    .await;
+
+    // The user posts a new external message while the task waits, and the old
+    // chain's completion Wake is already in the same read.
+    backend
+        .given_transcript_after_build("ses_ext", vec![external_superseding_read()])
+        .await;
+    wait_for_any_card(&platform, "新消息").await;
+
+    // The old card was superseded, never wake-resumed: no completion entry
+    // may land on it (the notify path's collect owns its ending).
+    let resumed_old = platform.calls.lock().await.iter().any(|call| {
+        matches!(call, PlatformCall::UpdateMessage { message_id, card }
+            if message_id == "om_wait" && card_text(card).contains("🔔 shell 完成"))
+    });
+    assert!(!resumed_old, "a superseded waiting card must not be wake-resumed");
+}
+
+/// #568: the quiet true end (the task retires and nothing renders) settles the
+/// yielded external card through the refresh path — and owes no Completion
+/// Notice there either (the card carries no Turn clock).
+#[tokio::test]
+async fn external_quiet_true_end_sends_no_notice() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    // The task retires with no new content: the read is the chain's true end.
+    let quiet_end = SessionTranscript::new(vec![
+        user("msg_user_1000", 1_000, "跑一下 CI"),
+        finished("msg_ext_assist", 2_000, FinishReason::Stop),
+    ])
+    .with_executions(vec![execution(2_500), execution(4_000)])
+    .with_wakes(vec![shell_wake(2_900)]);
+    let mut mock = MockBackend::new(realistic_parts());
+    mock.given_transcript("ses_ext", vec![external_waiting_read()]);
+    let backend = Arc::new(mock);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    seed_entry(&app, external_entry()).await;
+    spawn_sync(&app);
+
+    app.external
+        .start_reply_render(
+            &app.flow_handles(),
+            "ses_ext",
+            &anchor(1_000),
+            "om_wait",
+            "跑一下 CI",
+        )
+        .await;
+    wait_for_card_update(&platform, "the waiting card", CardUpdates::Latest, |card| {
+        card_header(card).contains("等待后台任务")
+    })
+    .await;
+
+    backend
+        .given_transcript_after_build("ses_ext", vec![quiet_end])
+        .await;
+    wait_for_card_update(&platform, "the quiet true end", CardUpdates::Latest, |card| {
+        card_header(card).contains("✅")
+    })
+    .await;
+
+    let card = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_text(&card).contains("🔔 shell 完成：gh run watch"),
+        "the completion entry stays on the card the task lived on: {card}"
+    );
+    assert!(
+        continuation_sends(&platform).await.is_empty(),
+        "a quiet true end owes no continuation"
+    );
+    assert!(
+        !noticed(&platform).await,
+        "an external chain owes no Completion Notice: {:?}",
+        platform.calls.lock().await
+    );
+}
+
+/// #568's no-progress boundary: while the settlement is undecided (a fired
+/// Wake's Execution boundary is still owed), the render idle bound must not
+/// end the card — the wait has no time bound (ADR-0059) — so a quiet resumed
+/// run past the bound still reaches its true ending instead of a premature ✅.
+#[tokio::test]
+async fn external_undecided_settlement_survives_the_idle_bound() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let observing = external_observing_read();
+    let closed = external_resumed_end_read();
+    let mut mock = MockBackend::new(realistic_parts());
+    mock.given_transcript("ses_ext", vec![observing]);
+    let backend = Arc::new(mock);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    seed_entry(&app, external_entry()).await;
+    app.external
+        .render_poll_ms
+        .store(5, std::sync::atomic::Ordering::Relaxed);
+    app.external
+        .render_idle_timeout_ms
+        .store(150, std::sync::atomic::Ordering::Relaxed);
+
+    Turn::arm_external_render(
+        &app.cards_handle(),
+        "ses_ext",
+        "om_adopted",
+        &anchor(1_000),
+        "sub",
+        "/tmp/ext",
+        None,
+        None,
+    )
+    .await;
+    app.external
+        .start_adopted_follow(
+            &app.flow_handles(),
+            "ses_ext",
+            &AdoptedFollow {
+                card_message_id: "om_adopted".into(),
+                anchor: anchor(1_000),
+            },
+        )
+        .await;
+
+    // The resumed content renders; then the read stays identical well past the
+    // (injected) idle bound — the undecided settlement must keep the card open.
+    wait_for_card_update(&platform, "the resumed content", CardUpdates::Any, |card| {
+        card_text(card).contains("恢复中")
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let held = platform.updated_cards().await;
+    assert!(
+        !held.iter().any(|card| card_header(card).contains("✅")),
+        "an undecided settlement must survive the idle bound: {held:?}"
+    );
+
+    // The boundary lands; the loop still owned the card and settles the true end.
+    backend
+        .given_transcript_after_build("ses_ext", vec![closed])
+        .await;
+    wait_for_card_update(&platform, "the true end", CardUpdates::Latest, |card| {
+        card_header(card).contains("✅")
+    })
+    .await;
+}
+
+/// #568: the undecided exemption survives FAILED reads too — a read that goes
+/// bad while a fired Wake's boundary is still owed must not become the blind
+/// spot through which the no-progress bound stamps ✅.
+#[tokio::test]
+async fn external_undecided_settlement_survives_failed_reads() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let observing = external_observing_read();
+    let closed = external_resumed_end_read();
+    let mut mock = MockBackend::new(realistic_parts());
+    mock.given_transcript("ses_ext", vec![observing]);
+    let backend = Arc::new(mock);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    seed_entry(&app, external_entry()).await;
+    app.external
+        .render_poll_ms
+        .store(5, std::sync::atomic::Ordering::Relaxed);
+    app.external
+        .render_idle_timeout_ms
+        .store(150, std::sync::atomic::Ordering::Relaxed);
+
+    Turn::arm_external_render(
+        &app.cards_handle(),
+        "ses_ext",
+        "om_adopted",
+        &anchor(1_000),
+        "sub",
+        "/tmp/ext",
+        None,
+        None,
+    )
+    .await;
+    app.external
+        .start_adopted_follow(
+            &app.flow_handles(),
+            "ses_ext",
+            &AdoptedFollow {
+                card_message_id: "om_adopted".into(),
+                anchor: anchor(1_000),
+            },
+        )
+        .await;
+
+    // The resumed content renders, leaving the settlement undecided; then every
+    // read fails for well past the (injected) idle bound.
+    wait_for_card_update(&platform, "the resumed content", CardUpdates::Any, |card| {
+        card_text(card).contains("恢复中")
+    })
+    .await;
+    backend.fail_transcript_for("ses_ext").await;
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let held = platform.updated_cards().await;
+    assert!(
+        !held.iter().any(|card| card_header(card).contains("✅")),
+        "a failed read must not end an undecided settlement: {held:?}"
+    );
+
+    // The reads heal and the boundary lands: the loop still owns the card and
+    // settles the true end.
+    backend.heal_transcript("ses_ext").await;
+    backend
+        .given_transcript_after_build("ses_ext", vec![closed])
+        .await;
+    wait_for_card_update(&platform, "the true end", CardUpdates::Latest, |card| {
+        card_header(card).contains("✅")
+    })
+    .await;
+}
+
+/// #568: the same exemption through a TIMED-OUT read — a hung transcript past
+/// its bound is `None`, not an `Err`, and it must not become the blind spot
+/// through which the no-progress bound stamps ✅ either.
+#[tokio::test]
+async fn external_undecided_settlement_survives_timed_out_reads() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let observing = external_observing_read();
+    let closed = external_resumed_end_read();
+    let mut mock = MockBackend::new(realistic_parts());
+    mock.given_transcript("ses_ext", vec![observing]);
+    let backend = Arc::new(mock);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    seed_entry(&app, external_entry()).await;
+    app.external
+        .render_poll_ms
+        .store(5, std::sync::atomic::Ordering::Relaxed);
+    app.external
+        .render_idle_timeout_ms
+        .store(150, std::sync::atomic::Ordering::Relaxed);
+    // The transcript read and the render pass share this bound: small enough
+    // for the hung read to time out inside the test, loose enough that a
+    // render pass on a loaded runner still lands.
+    app.external
+        .request_timeout_ms
+        .store(100, std::sync::atomic::Ordering::Relaxed);
+
+    Turn::arm_external_render(
+        &app.cards_handle(),
+        "ses_ext",
+        "om_adopted",
+        &anchor(1_000),
+        "sub",
+        "/tmp/ext",
+        None,
+        None,
+    )
+    .await;
+    app.external
+        .start_adopted_follow(
+            &app.flow_handles(),
+            "ses_ext",
+            &AdoptedFollow {
+                card_message_id: "om_adopted".into(),
+                anchor: anchor(1_000),
+            },
+        )
+        .await;
+
+    // The resumed content renders; then every read hangs past its bound for
+    // well past the (injected) idle bound.
+    wait_for_card_update(&platform, "the resumed content", CardUpdates::Any, |card| {
+        card_text(card).contains("恢复中")
+    })
+    .await;
+    backend.hang_transcript_for("ses_ext").await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let held = platform.updated_cards().await;
+    assert!(
+        !held.iter().any(|card| card_header(card).contains("✅")),
+        "a timed-out read must not end an undecided settlement: {held:?}"
+    );
+
+    // The read recovers and the boundary lands: the true end settles.
+    backend.release_transcript_for("ses_ext").await;
+    backend
+        .given_transcript_after_build("ses_ext", vec![closed])
+        .await;
+    wait_for_card_update(&platform, "the true end", CardUpdates::Latest, |card| {
+        card_header(card).contains("✅")
+    })
+    .await;
 }

@@ -1,3 +1,5 @@
+use super::drain::spawn_sync;
+use crate::backend::{FinishReason, MessageRole, Part, SessionTranscript, StepFinish, TranscriptMessage};
 use crate::bridge::test_support::*;
 
 /// A lobby adopt of a session that carries a pending permission ends in ONE
@@ -920,5 +922,138 @@ async fn user_prompt_during_follow_merges_as_a_supplement() {
             PlatformCall::UpdateMessage { card, .. } if card_header(card).contains("部分完成")
         )),
         "the followed card is finalized with the standard split header: {calls:?}"
+    );
+}
+
+/// The waiting read the snapshot adopt gathers and the follow renders: an
+/// answered external turn that idled with a live background shell.
+fn snapshot_waiting_read() -> SessionTranscript {
+    SessionTranscript::new(vec![user_text(1_000, "帮我重构这个模块"), finished_stop(2_000)])
+        .with_executions(vec![execution(2_500)])
+        .with_background_tasks(vec![background_shell(2_100)])
+}
+
+/// The woke read: the shell Wake retired the task and its run landed the
+/// answer, with the Execution boundary after the Wake answering it.
+fn snapshot_woken_read() -> SessionTranscript {
+    SessionTranscript::new(vec![
+        user_text(1_000, "帮我重构这个模块"),
+        finished_stop(2_000),
+        assistant_text(3_600, "CI 通过了。"),
+    ])
+    .with_executions(vec![execution(2_500), execution(4_000)])
+    .with_wakes(vec![shell_wake(2_900)])
+}
+
+fn user_text(created: i64, text: &str) -> TranscriptMessage {
+    typed_message(
+        "msg_user_1000",
+        MessageRole::User,
+        Some(created),
+        vec![text_part(text)],
+    )
+}
+
+fn finished_stop(created: i64) -> TranscriptMessage {
+    typed_message(
+        "msg_ext_assist",
+        MessageRole::Assistant,
+        Some(created),
+        vec![Part::StepFinish(StepFinish {
+            reason: FinishReason::Stop,
+        })],
+    )
+}
+
+fn assistant_text(created: i64, text: &str) -> TranscriptMessage {
+    typed_message(
+        "msg_ext_resumed",
+        MessageRole::Assistant,
+        Some(created),
+        vec![text_part(text)],
+    )
+}
+
+/// #568: the snapshot follow's in-flight external turn yields ⏳ on a live
+/// Background Task (never ✅), and Session Sync's completion Wake resumes the
+/// snapshot card in place to the true end — the reply arm's contract, driven
+/// through the `/switch` busy-adopt arm.
+#[tokio::test]
+async fn busy_snapshot_follow_yields_and_resumes_in_place() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_sessions(vec![list_session(
+        "ses_alpha01",
+        "唯一外部标题",
+        "/work/ext",
+        100,
+    )]);
+    backend.with_session_status("ses_alpha01", Some(opencode::types::SessionStatus::Busy));
+    backend.given_transcript("ses_alpha01", vec![snapshot_waiting_read()]);
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    app.core
+        .external
+        .render_poll_ms
+        .store(5, std::sync::atomic::Ordering::Relaxed);
+
+    send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
+
+    // The followed turn idles with a live Background Task: the snapshot card
+    // yields ⏳ in place.
+    wait_for_card_update(
+        &platform,
+        "the snapshot's waiting yield",
+        CardUpdates::Latest,
+        |card| card_header(card).contains("等待后台任务"),
+    )
+    .await;
+
+    // The task retires and its run lands the answer; Session Sync resumes the
+    // snapshot card in place and settles ✅ there.
+    // The task retires and its run lands the answer; the server goes idle, so
+    // the Wake's settlement loop can read the true end. Session Sync resumes
+    // the snapshot card in place.
+    spawn_sync(&app);
+    backend
+        .set_session_status("ses_alpha01", Some(opencode::types::SessionStatus::Idle))
+        .await;
+    backend
+        .given_transcript_after_build("ses_alpha01", vec![snapshot_woken_read()])
+        .await;
+    wait_for_card_update(&platform, "the true end", CardUpdates::Latest, |card| {
+        card_header(card).contains("✅")
+    })
+    .await;
+
+    let calls = platform.calls.lock().await.clone();
+    let last = calls
+        .iter()
+        .rev()
+        .find_map(|call| match call {
+            PlatformCall::UpdateMessage { message_id, card } => Some((message_id.clone(), card.clone())),
+            _ => None,
+        })
+        .expect("the snapshot card was updated");
+    assert_eq!(last.0, "msg_reply", "the snapshot card resumes in place");
+    let text = card_text(&last.1);
+    assert!(
+        text.contains("已接管 唯一外部标题"),
+        "the snapshot identity stays visible: {last:?}"
+    );
+    assert!(
+        text.contains("CI 通过了。"),
+        "the resumed content lands: {last:?}"
+    );
+    assert!(
+        text.contains("🔔 shell 完成：gh run watch"),
+        "the completion entry lands on the same card: {last:?}"
+    );
+    assert!(
+        continuation_sends(&platform).await.is_empty(),
+        "an in-place resume posts no continuation card: {calls:?}"
     );
 }
