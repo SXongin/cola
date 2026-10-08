@@ -3576,3 +3576,47 @@ async fn a_queued_ending_patch_notifies_only_after_it_drains() {
         "the notice trails the terminal content: {delivered}"
     );
 }
+
+/// Acceptance (ticket #607), at the mandated lifecycle seam: a scripted run
+/// whose terminal answer outgrows one Card size-splits on its own flush, and
+/// the Completion Notice must follow the new Card's send — never precede it.
+/// Unlike the hand-seeded companion in `card_handles.rs`, this drives the real
+/// `Turn::run`, so the gate is exercised end to end.
+#[tokio::test]
+async fn a_size_split_terminal_flush_notifies_after_the_new_card() {
+    let _wd = test_work_dir();
+    // A terminal answer far past one Card's text budget, ending on a marker
+    // only the continuation can carry (the first Card cannot hold the tail).
+    let long = format!("{}【尾部标记】", "很长的回答。".repeat(1200));
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "你好"),
+        assistant(2_000, &long),
+    ]);
+    let (_dir, app, _backend, platform) = scripted_app(vec![transcript], Some(SessionStatus::Idle)).await;
+    let mut context = ctx("ses_test", "你好");
+    context.is_group = true;
+    context.requester_open_id = Some(TEST_HOST.to_string());
+
+    Turn::run(&app.turn_handles(), context).await.unwrap();
+    wait_for_notice(&platform).await;
+
+    let calls = platform.calls.lock().await.clone();
+    // The continuation is the card POST carrying the terminal tail.
+    let continuation_at = calls
+        .iter()
+        .position(|c| match c {
+            PlatformCall::ReplyCard { card, .. } | PlatformCall::SendCard { card, .. } => {
+                card_text(card).contains("【尾部标记】")
+            }
+            _ => false,
+        })
+        .expect("a continuation card carrying the terminal tail was sent");
+    let notice_at = calls
+        .iter()
+        .position(|c| matches!(c, PlatformCall::CompletionNotice { .. }))
+        .expect("the notice fired");
+    assert!(
+        continuation_at < notice_at,
+        "the notice must follow the new card's send: {calls:?}"
+    );
+}
