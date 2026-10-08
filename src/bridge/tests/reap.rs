@@ -5862,6 +5862,98 @@ async fn a_completion_wake_resumes_the_projected_waiting_successor_in_place() {
     );
 }
 
+/// Spec #588 / #593: the projected successor's completion entry carries the
+/// result too — the task's completion Wake resumes the successor in place, and
+/// its entry's fold body shows the shell's output tail, read once at that
+/// render; no later pass re-reads the retired shell.
+#[tokio::test]
+async fn a_successor_wakes_entry_carries_the_output_tail() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let delivered = "已经写了一半。";
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
+        Some(text_frontier(delivered)),
+        &[],
+    );
+    let waiting = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, delivered),
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_background_tasks(vec![background_shell(2_100)]);
+    let (app, platform, backend) =
+        restarted_app_with_backend(&session_file, waiting, Some(SessionStatus::Idle)).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+
+    spawn_sync(&app);
+    let (successor, _) = wait_for_projection(&platform, "om_frozen").await;
+    assert_eq!(card_header(&successor), "⏳ 等待后台任务");
+
+    // The task retires and its Wake resumes the successor in place; the tail is
+    // scripted for the entry's own read.
+    let captured = chrono::Utc::now().timestamp_millis();
+    backend.shell_outputs.lock().unwrap().insert(
+        "sh_bg".into(),
+        Some(crate::backend::ShellOutputWindow {
+            text: "CI ok".into(),
+            clipped: true,
+            captured_ms: captured,
+        }),
+    );
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(vec![
+                user("msg_cola_anchor", 1_000, "跑一下 CI"),
+                assistant(2_000, delivered),
+                assistant(3_100, "CI 通过了。"),
+            ])
+            .with_executions(vec![execution(2_500), execution(4_000)])
+            .with_wakes(vec![shell_wake(2_900)]),
+        ],
+    )
+    .await;
+    wait_for_update(
+        &platform,
+        "msg_reply",
+        "the resumed successor's true end",
+        |card| card_header(card).contains("✅") && card_text(card).contains("CI 通过了。"),
+    )
+    .await;
+
+    let resumed = last_update_of(&platform, "msg_reply")
+        .await
+        .expect("the successor is resumed in place");
+    let text = card_text(&resumed);
+    assert!(
+        text.matches("🔔 shell 完成：gh run watch").count() == 1,
+        "the entry lands on the successor exactly once: {resumed}"
+    );
+    assert!(
+        text.contains("截至于") && text.contains("仅最后 1 行 · 已截断") && text.contains("CI ok"),
+        "the resumed successor's entry carries the labelled tail: {resumed}"
+    );
+    // The retired shell spends one read (the entry's own); a settled wait does
+    // not keep re-reading it.
+    let reads = backend.shell_output_calls.lock().await.clone();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(
+        backend.shell_output_calls.lock().await.clone(),
+        reads,
+        "a settled successor never re-reads its retired shell's output"
+    );
+    assert!(
+        reads.contains(&"sh_bg".to_string()),
+        "the entry's own read named the shell: {reads:?}"
+    );
+}
+
 /// Spec #588 / #590: the restart-projected successor carries the same cleanup
 /// affordance — a live subagent the runtime reports inactive gains its
 /// ⚠️ 状态待确认 row and the 清理待确认任务 button through the ordinary card
