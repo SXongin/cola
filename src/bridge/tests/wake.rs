@@ -4,13 +4,17 @@
 //! yielded (⏳) card resumes THAT card in place: one card per request, so the
 //! retiring task's fixed entry, the resumed work and the eventual ending all
 //! stay on the card the user's message opened, and no 承接 line is written.
-//! Every other continuation keeps the ADR-0059 split — the card is finalized
-//! and a NEW continuation card, replied to the user's message (or sent
-//! top-level after a restart) and opening with the 承接 line, carries only the
-//! work the chain had not rendered. Either path ends through the single settle
-//! decision: ✅ at the true end, ❌ for a settled failure (the request's own
-//! in-place card keeps its ordinary Retry, ADR-0066), ⏹ 已停止 for `/stop`, or
-//! the waiting yield when the Wake backgrounded work of its own.
+//! Only a GENUINE resumption this chain has not handed over yet — a restart, an
+//! interruption, or a shell/subagent completion on a card past its wait — opens
+//! a NEW continuation card, replied to the user's message (or sent top-level
+//! after a restart) and opening with the 承接 line; it carries only the work the
+//! chain had not rendered. A Wake-less content diff, and a tail past a Wake the
+//! chain already handed over, open no card at all: the chain's open yielded card
+//! renders the content in place (spec #602), and a card past its wait is #606's
+//! neutral residual. Either path ends through the single settle decision: ✅ at
+//! the true end, ❌ for a settled failure (the request's own in-place card keeps
+//! its ordinary Retry, ADR-0066), ⏹ 已停止 for `/stop`, or the waiting yield
+//! when the Wake backgrounded work of its own.
 //!
 //! A shell/subagent completion that lands in an already-live card leaves the
 //! Background Task Ledger's fixed completion entry there instead of a receipt
@@ -700,14 +704,15 @@ async fn a_completion_wake_resumes_in_place_after_its_entry_was_placed() {
     );
 }
 
-/// The boundary the handoff mark protects (ADR-0059, ADR-0066): once a Wake's
-/// work has been TAKEN OVER — here by an in-place resume — content that no new
-/// completion announced is the Wake-less content-diff fallback, so it continues
-/// the chain on a new 承接 card instead of re-opening the resumed one. The
+/// The handoff mark's rule, rewritten by spec #602: once a Wake's work has been
+/// TAKEN OVER — here by an in-place resume — content that no new completion
+/// announced is a Wake-less content diff. It renders onto the chain's own card
+/// IN PLACE and never opens a second 承接 card: the receipt is pushed exactly
+/// once per resumption, and a later tail must not re-open the card. The
 /// announcement mark alone cannot tell the two apart (both Wakes are announced
 /// by their entries); the handoff can.
 #[tokio::test]
-async fn a_tail_after_a_taken_over_wake_still_splits() {
+async fn a_tail_after_a_taken_over_wake_renders_in_place() {
     let _wd = test_work_dir();
     let waiting = yielding_shell_and_subagent_transcript();
     let (_dir, app, backend, platform) = scripted_app(vec![waiting], Some(SessionStatus::Idle)).await;
@@ -742,12 +747,13 @@ async fn a_tail_after_a_taken_over_wake_still_splits() {
     let resumed = platform.updated_cards().await.last().cloned().unwrap();
     assert!(
         !card_text(&resumed).contains(WAKE_LEAD),
-        "the completion resumes in place — the premise of the tail's split: {resumed}"
+        "the completion resumes in place — the premise of the tail's rule: {resumed}"
     );
     let posts = card_posts(&platform).await;
 
     // A later tail, with the SAME Wake as the newest one and no new completion:
-    // the Wake is this chain's already, so this is the content-diff fallback.
+    // the Wake is this chain's already, so this is a Wake-less content diff. It
+    // must render in place — no second card, no 承接 receipt.
     script_transcript(
         &backend,
         vec![woken_shell_and_subagent_transcript(
@@ -762,14 +768,24 @@ async fn a_tail_after_a_taken_over_wake_still_splits() {
     .await;
     wait_for_card_update(
         &platform,
-        "the tail's continuation",
+        "the tail rendered in place",
         CardUpdates::Latest,
-        |card| card_text(card).contains(WAKE_LEAD) && card_text(card).contains("收尾时补上的一段。"),
+        |card| card_text(card).contains("收尾时补上的一段。"),
     )
     .await;
+    assert_eq!(
+        card_posts(&platform).await,
+        posts,
+        "a tail past a taken-over Wake must not open a second card: {:?}",
+        platform.calls.lock().await
+    );
     assert!(
-        card_posts(&platform).await > posts,
-        "a tail past a taken-over Wake still continues on a new card: {:?}",
+        !platform
+            .updated_cards()
+            .await
+            .iter()
+            .any(|card| card_text(card).contains(WAKE_LEAD)),
+        "the chain never grew a 承接 receipt: {:?}",
         platform.calls.lock().await
     );
 }
@@ -1513,11 +1529,97 @@ async fn an_interrupt_wake_on_a_waiting_card_still_splits() {
     restart_like_wake_on_a_waiting_card_still_splits(WakeSource::Interrupt).await;
 }
 
-/// The other kept boundary: the Wake-less content-diff fallback. New content
-/// with no placeable Wake has no completion to name, so 「后台任务完成」 would
-/// lie — the yielded card keeps the ADR-0059 split.
+/// The restart double-card regression (spec #602 evidence
+/// `ses_ee3f19fc4ffefrgIFcTk6zV8yH`): a restart Wake opens exactly ONE
+/// continuation card; content still streaming after it renders onto THAT card
+/// in place, never a second 承接 card. The receipt is pushed exactly once.
 #[tokio::test]
-async fn a_wake_less_tail_on_a_waiting_card_still_splits() {
+async fn a_restart_tail_stays_on_its_continuation_card() {
+    let _wd = test_work_dir();
+    let waiting = yielding_shell_and_subagent_transcript();
+    let (_dir, app, backend, platform) = scripted_app(vec![waiting], Some(SessionStatus::Idle)).await;
+    Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下 CI 并审阅"))
+        .await
+        .unwrap();
+    name_request_card(&app).await;
+    let posts_before = card_posts(&platform).await;
+
+    // The restart Wake opens the continuation: a new card with the 承接 line,
+    // which yields back to ⏳ on the still-live subagent.
+    let mut restart = shell_wake(2_900);
+    restart.source = WakeSource::Restart;
+    restart.label = None;
+    script_transcript(
+        &backend,
+        vec![woken_shell_and_subagent_transcript(
+            restart.clone(),
+            vec![assistant(3_100, "重启后继续。")],
+            &[2_500, 4_000],
+        )],
+    )
+    .await;
+    spawn_sync(&app);
+    wait_for_card_update(
+        &platform,
+        "the restart continuation's wait",
+        CardUpdates::Latest,
+        |card| {
+            card_header(card).contains("等待后台任务")
+                && card_text(card).contains(WAKE_LEAD)
+                && card_text(card).contains("重启后继续。")
+        },
+    )
+    .await;
+    assert_eq!(
+        card_posts(&platform).await,
+        posts_before + 1,
+        "a restart Wake opens exactly one continuation: {:?}",
+        platform.calls.lock().await
+    );
+
+    // A still-streaming tail with the SAME restart Wake: it must render onto
+    // the continuation card in place — no third card.
+    script_transcript(
+        &backend,
+        vec![woken_shell_and_subagent_transcript(
+            restart,
+            vec![
+                assistant(3_100, "重启后继续。"),
+                assistant(5_000, "收尾时补上的一段。"),
+            ],
+            &[2_500, 4_000],
+        )],
+    )
+    .await;
+    wait_for_card_update(
+        &platform,
+        "the tail on the continuation card",
+        CardUpdates::Latest,
+        |card| card_text(card).contains("收尾时补上的一段。"),
+    )
+    .await;
+
+    assert_eq!(
+        card_posts(&platform).await,
+        posts_before + 1,
+        "a restart tail must not open a second continuation: {:?}",
+        platform.calls.lock().await
+    );
+    // The 承接 line opened the one continuation and was never doubled.
+    let last = platform.updated_cards().await.last().cloned().unwrap();
+    assert_eq!(
+        card_text(&last).matches(WAKE_LEAD).count(),
+        1,
+        "the receipt is pushed exactly once per resumption: {last}"
+    );
+}
+
+/// The kept boundary, rewritten by spec #602: a Wake-less content diff has no
+/// completion to name, so 「已恢复执行」 would lie — and it must not open a
+/// continuation Card either. The content is the residual #606 owns; here the
+/// chain opens nothing and writes no receipt.
+#[tokio::test]
+async fn a_wake_less_tail_on_a_waiting_card_opens_no_card() {
     let _wd = test_work_dir();
     let waiting = yielding_shell_transcript();
     let (_dir, app, backend, platform) = scripted_app(vec![waiting], Some(SessionStatus::Idle)).await;
@@ -1543,17 +1645,29 @@ async fn a_wake_less_tail_on_a_waiting_card_still_splits() {
     .await;
 
     spawn_sync(&app);
+    // The tail renders onto the open yielded card IN PLACE — no new card, and
+    // no 承接 receipt for work no Wake announced. The content is not dropped.
     wait_for_card_update(
         &platform,
-        "the content-diff continuation",
+        "the Wake-less tail rendered in place",
         CardUpdates::Latest,
-        |card| card_text(card).contains(WAKE_LEAD) && card_text(card).contains("收尾时补上的一段。"),
+        |card| card_text(card).contains("收尾时补上的一段。"),
     )
     .await;
 
+    assert_eq!(
+        card_posts(&platform).await,
+        posts_before,
+        "a Wake-less content diff must not open a continuation card: {:?}",
+        platform.calls.lock().await
+    );
     assert!(
-        card_posts(&platform).await > posts_before,
-        "the Wake-less fallback still continues on a new card: {:?}",
+        !platform
+            .updated_cards()
+            .await
+            .iter()
+            .any(|card| card_text(card).contains(WAKE_LEAD)),
+        "a Wake-less diff writes no 承接 receipt: {:?}",
         platform.calls.lock().await
     );
 }
@@ -1757,11 +1871,11 @@ async fn a_failed_split_continuation_offers_no_retry() {
     );
 }
 
-/// The content-diff fallback: content the finalized card missed — here with no
-/// Wake recorded at all — still continues the chain, rendering only the missed
-/// part.
+/// The content-diff fallback, rewritten by spec #602: content the finalized
+/// card missed — here with no Wake recorded at all — opens no continuation Card
+/// and writes no 承接 receipt. The residual that shows it honestly is #606's.
 #[tokio::test]
-async fn content_a_finalized_card_missed_still_continues() {
+async fn content_a_finalized_card_missed_opens_no_card() {
     let _wd = test_work_dir();
     let done = SessionTranscript::new(vec![
         user("msg_cola_anchor", 1_000, "第一条消息"),
@@ -1772,6 +1886,11 @@ async fn content_a_finalized_card_missed_still_continues() {
     Turn::run(&app.turn_handles(), ctx("ses_test", "第一条消息"))
         .await
         .unwrap();
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Done)
+    );
+    let posts_before = card_posts(&platform).await;
 
     script_transcript(
         &backend,
@@ -1787,27 +1906,22 @@ async fn content_a_finalized_card_missed_still_continues() {
     .await;
 
     spawn_sync(&app);
-    wait_for_card_update(
-        &platform,
-        "the content-diff continuation",
-        CardUpdates::Latest,
-        |card| card_header(card).contains("✅") && card_text(card).contains("收尾时补上的一段。"),
-    )
-    .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
 
-    let last = platform.updated_cards().await.last().cloned().unwrap();
-    assert!(
-        !card_text(&last).contains("第一轮回答。"),
-        "only the missed content renders: {last}"
-    );
     assert_eq!(
-        body_index(&last, WAKE_LEAD),
-        Some(0),
-        "the 承接 line opens the content-diff continuation too: {last}"
+        card_posts(&platform).await,
+        posts_before,
+        "content a finalized card missed must not open a continuation card: {:?}",
+        platform.calls.lock().await
     );
     assert!(
-        platform.replied_cards().await.iter().any(is_continuation),
-        "the content-diff continuation replies to the user's message"
+        !platform
+            .updated_cards()
+            .await
+            .iter()
+            .any(|card| card_text(card).contains(WAKE_LEAD)),
+        "the missed content writes no 承接 receipt: {:?}",
+        platform.calls.lock().await
     );
 }
 

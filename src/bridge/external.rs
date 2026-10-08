@@ -886,7 +886,7 @@ impl ExternalFlow {
                     &handles.cards,
                     &handles.backend,
                     sid,
-                    &wake_id,
+                    wake_id.as_deref(),
                     transcript,
                     now_ms,
                 )
