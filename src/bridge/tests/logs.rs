@@ -588,6 +588,7 @@ async fn a_snapshot_settle_carries_the_session() {
         session_id: "ses_test".into(),
         directory: "/work/project".into(),
         status: Some(crate::opencode::types::SessionStatus::Busy),
+        waiting: false,
         pending: Vec::new(),
         pending_elsewhere: None,
         tail: Vec::new(),

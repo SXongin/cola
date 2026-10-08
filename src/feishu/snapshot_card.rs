@@ -4,14 +4,21 @@ use crate::feishu::card::session::{BackToList, back_to_list_button};
 use crate::opencode;
 use serde_json::json;
 
-/// One hint phrase shown under the 运行中 chip when the adopted session is busy
-/// (ADR-0028): the snapshot's only live behaviour, the busy-follow (ticket 06),
-/// will stream the in-flight turn into this card, so the chip says so up front.
-pub(crate) const BUSY_HINT: &str = "有新进展会自动更新";
+/// The update promise both live-adoption chips carry (ADR-0028): the busy chip
+/// and the 等待后台任务 chip (#586) each say the snapshot keeps updating — the
+/// follow streams the in-flight turn into the card, or the wait is served in
+/// place and resumed by its completion Wake.
+pub(crate) const FOLLOW_HINT: &str = "有新进展会自动更新";
 
 /// The busy run-state chip (ADR-0028). Tests assert this constant so a copy
 /// tweak lives in one place.
 pub(crate) const BUSY_CHIP: &str = "⚙️ 运行中";
+
+/// The 等待后台任务 chip (#586, ADR-0059): the adopted Session's Execution has
+/// ended while Background Tasks are still live, so the snapshot follows the
+/// wait instead of reporting 空闲 — the card yields ⏳ with the ledger, and the
+/// completion Wake resumes it in place.
+pub(crate) const WAITING_BACKGROUND_CHIP: &str = "⏳ 等待后台任务";
 
 /// The retry run-state chip.
 pub(crate) const RETRY_CHIP: &str = "🔁 需要重试";
@@ -32,15 +39,18 @@ pub(crate) const WAITING_ELSEWHERE_PINNED_CHIP: &str = "⏳ 等待你的确认�
 /// promising a pin, since the opt-in gates the pin itself.
 pub(crate) const WAITING_ELSEWHERE_CHIP: &str = "⏳ 等待你的确认（见原卡片）";
 
-/// The status chip content for a server run state (ADR-0028 precedence
-/// 等待你的确认 > 运行中 > 需要重试 > 空闲; a busy session carries one hint
-/// phrase). A pending already surfaced elsewhere keeps the operator action
-/// ahead of the server state too, pointing at its hosting card instead. `None`
-/// when there is no status to report — the chip is omitted rather than
-/// guessed.
+/// The status chip content for a session's state (ADR-0028 precedence
+/// 等待你的确认 > 等待后台任务 > 运行中 > 需要重试 > 空闲; the busy and waiting
+/// chips each carry one hint phrase). A pending already surfaced elsewhere
+/// keeps the operator action ahead of the state too, pointing at its hosting
+/// card instead. `waiting` is the gather's ADR-0059 fact (server-idle with
+/// live Background Tasks, #586) — it names the wait even though the server
+/// reads idle. `None` when there is no status to report — the chip is omitted
+/// rather than guessed.
 fn status_chip(
     has_pending: bool,
     pending_elsewhere: Option<ElsewherePending>,
+    waiting: bool,
     status: Option<opencode::types::SessionStatus>,
 ) -> Option<String> {
     if has_pending {
@@ -55,8 +65,11 @@ fn status_chip(
             .to_string(),
         );
     }
+    if waiting {
+        return Some(format!("{WAITING_BACKGROUND_CHIP}\n{FOLLOW_HINT}"));
+    }
     match status {
-        Some(opencode::types::SessionStatus::Busy) => Some(format!("{BUSY_CHIP}\n{BUSY_HINT}")),
+        Some(opencode::types::SessionStatus::Busy) => Some(format!("{BUSY_CHIP}\n{FOLLOW_HINT}")),
         Some(opencode::types::SessionStatus::Retry) => Some(RETRY_CHIP.to_string()),
         Some(opencode::types::SessionStatus::Idle) => Some(IDLE_CHIP.to_string()),
         None => None,
@@ -67,9 +80,10 @@ fn status_chip(
 fn status_chip_element(
     has_pending: bool,
     pending_elsewhere: Option<ElsewherePending>,
+    waiting: bool,
     status: Option<opencode::types::SessionStatus>,
 ) -> Option<serde_json::Value> {
-    status_chip(has_pending, pending_elsewhere, status)
+    status_chip(has_pending, pending_elsewhere, waiting, status)
         .map(|content| json!({ "tag": "markdown", "content": content }))
 }
 /// The live answer state of one claimed question block on the snapshot
@@ -205,7 +219,12 @@ pub fn build_snapshot_card_with_state(
         .collect();
 
     let mut elements: Vec<serde_json::Value> = Vec::new();
-    if let Some(chip) = status_chip_element(!pending.is_empty(), data.pending_elsewhere, data.status) {
+    if let Some(chip) = status_chip_element(
+        !pending.is_empty(),
+        data.pending_elsewhere,
+        data.waiting,
+        data.status,
+    ) {
         elements.push(chip);
     }
     for (i, req) in pending.iter().enumerate() {
@@ -311,6 +330,7 @@ mod tests {
             session_id: "ses_adopted".into(),
             directory: "/work/proj".into(),
             status,
+            waiting: false,
             pending,
             pending_elsewhere: None,
             tail,
@@ -342,20 +362,35 @@ mod tests {
 
     #[test]
     fn status_chip_precedence_matrix() {
-        // Pending beats every run state.
+        // The Waiting fact (idle + live Background Tasks, #586): the chip names
+        // the wait instead of 空闲, with the follow hint.
+        let waiting = status_chip(false, None, true, Some(opencode::types::SessionStatus::Idle))
+            .expect("a Waiting turn renders its chip");
+        assert!(waiting.contains(WAITING_BACKGROUND_CHIP), "{waiting}");
+        assert!(waiting.contains(FOLLOW_HINT), "{waiting}");
+        assert!(!waiting.contains(IDLE_CHIP), "{waiting}");
+
+        // Pending beats every run state and the Waiting fact.
         assert_eq!(
-            status_chip(true, None, Some(opencode::types::SessionStatus::Busy)).as_deref(),
+            status_chip(true, None, false, Some(opencode::types::SessionStatus::Busy)).as_deref(),
             Some(WAITING_CHIP)
         );
         assert_eq!(
-            status_chip(true, None, Some(opencode::types::SessionStatus::Retry)).as_deref(),
+            status_chip(true, None, false, Some(opencode::types::SessionStatus::Retry)).as_deref(),
             Some(WAITING_CHIP)
         );
         assert_eq!(
-            status_chip(true, None, Some(opencode::types::SessionStatus::Idle)).as_deref(),
+            status_chip(true, None, false, Some(opencode::types::SessionStatus::Idle)).as_deref(),
             Some(WAITING_CHIP)
         );
-        assert_eq!(status_chip(true, None, None).as_deref(), Some(WAITING_CHIP));
+        assert_eq!(
+            status_chip(true, None, true, Some(opencode::types::SessionStatus::Idle)).as_deref(),
+            Some(WAITING_CHIP)
+        );
+        assert_eq!(
+            status_chip(true, None, false, None).as_deref(),
+            Some(WAITING_CHIP)
+        );
 
         // An embedded pending beats a pending surfaced elsewhere: the pointer
         // is only for pendings the snapshot does NOT show.
@@ -363,18 +398,31 @@ mod tests {
             status_chip(
                 true,
                 Some(ElsewherePending::Unpinned),
+                false,
                 Some(opencode::types::SessionStatus::Busy)
             )
             .as_deref(),
             Some(WAITING_CHIP)
         );
 
-        // A pending surfaced elsewhere beats every run state too (ADR-0028
-        // update 2026-09-25): the pointer copy depends on Message Pin.
+        // A pending surfaced elsewhere beats every run state and the Waiting
+        // fact too (ADR-0028 update 2026-09-25): the pointer copy depends on
+        // Message Pin.
         assert_eq!(
             status_chip(
                 false,
                 Some(ElsewherePending::Pinned),
+                true,
+                Some(opencode::types::SessionStatus::Idle)
+            )
+            .as_deref(),
+            Some(WAITING_ELSEWHERE_PINNED_CHIP)
+        );
+        assert_eq!(
+            status_chip(
+                false,
+                Some(ElsewherePending::Pinned),
+                false,
                 Some(opencode::types::SessionStatus::Busy)
             )
             .as_deref(),
@@ -384,28 +432,29 @@ mod tests {
             status_chip(
                 false,
                 Some(ElsewherePending::Unpinned),
+                false,
                 Some(opencode::types::SessionStatus::Idle)
             )
             .as_deref(),
             Some(WAITING_ELSEWHERE_CHIP)
         );
 
-        // No pending: the server state decides.
+        // No pending and not waiting: the server state decides.
         assert!(
-            status_chip(false, None, Some(opencode::types::SessionStatus::Busy))
+            status_chip(false, None, false, Some(opencode::types::SessionStatus::Busy))
                 .unwrap()
                 .contains(BUSY_CHIP)
         );
         assert_eq!(
-            status_chip(false, None, Some(opencode::types::SessionStatus::Retry)).as_deref(),
+            status_chip(false, None, false, Some(opencode::types::SessionStatus::Retry)).as_deref(),
             Some(RETRY_CHIP)
         );
         assert_eq!(
-            status_chip(false, None, Some(opencode::types::SessionStatus::Idle)).as_deref(),
+            status_chip(false, None, false, Some(opencode::types::SessionStatus::Idle)).as_deref(),
             Some(IDLE_CHIP)
         );
         // Unknown status and nothing pending → no chip, never guessed.
-        assert_eq!(status_chip(false, None, None), None);
+        assert_eq!(status_chip(false, None, false, None), None);
     }
 
     /// ADR-0028 update (2026-09-25): a pending already hosted by another card
@@ -421,7 +470,7 @@ mod tests {
         assert_eq!(body, WAITING_ELSEWHERE_CHIP);
         let s = card.to_string();
         assert!(!s.contains(BUSY_CHIP), "no server run state: {s}");
-        assert!(!s.contains(BUSY_HINT), "no busy hint: {s}");
+        assert!(!s.contains(FOLLOW_HINT), "no follow hint: {s}");
     }
 
     /// The pointer promises 置顶 only when Message Pin is on (the same
@@ -463,7 +512,23 @@ mod tests {
         let card = build_snapshot_card("接管", "t", &d, None);
         let body = elements(&card)[0]["content"].as_str().unwrap();
         assert!(body.contains(BUSY_CHIP));
-        assert!(body.contains(BUSY_HINT));
+        assert!(body.contains(FOLLOW_HINT));
+    }
+
+    /// #586: a Waiting gather (idle + live Background Tasks) shows the
+    /// 等待后台任务 chip and the follow hint instead of 空闲 — the card is
+    /// about to yield ⏳ with the ledger, and the chip says so up front.
+    #[test]
+    fn waiting_chip_names_the_background_wait() {
+        let mut d = data(Some(opencode::types::SessionStatus::Idle), vec![], vec![]);
+        d.waiting = true;
+        let card = build_snapshot_card("接管", "t", &d, None);
+        let body = elements(&card)[0]["content"].as_str().unwrap();
+        assert!(body.contains(WAITING_BACKGROUND_CHIP), "{body}");
+        assert!(body.contains(FOLLOW_HINT), "{body}");
+        let s = card.to_string();
+        assert!(!s.contains(IDLE_CHIP), "the plain idle chip must not render: {s}");
+        assert!(!s.contains(BUSY_CHIP), "not a running turn: {s}");
     }
 
     #[test]

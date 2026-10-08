@@ -685,7 +685,11 @@ impl ExternalFlow {
         data: &crate::bridge::snapshot::SnapshotData,
     ) -> bool {
         // Race (ADR-0028): busy at gather but idle by now → the turn already
-        // finished; keep the static snapshot and never arm a renderer.
+        // finished; keep the static snapshot and never arm a renderer. A
+        // gathered Waiting turn (server-idle with live Background Tasks,
+        // ADR-0059) needs no fresh busy read to stay follow-worthy: its
+        // Execution already ended, and the follow yields ⏳ on its first
+        // settle read (#586).
         let busy_now = matches!(
             handles
                 .backend
@@ -693,9 +697,9 @@ impl ExternalFlow {
                 .await,
             Ok(Some(crate::opencode::types::SessionStatus::Busy))
         );
-        if !busy_now {
+        if !busy_now && !data.waiting {
             tracing::info!(
-                "snapshot follow: session {} no longer busy; keeping static snapshot",
+                "snapshot follow: session {} neither busy nor waiting; keeping static snapshot",
                 session_id
             );
             return false;
@@ -751,11 +755,16 @@ impl ExternalFlow {
         // visible while the turn streams, and the 最近对话 tail keeps the
         // verbatim context the static layout showed (spec: tail verbatim).
         // `push_text` chunks long text, and the card splitter breaks overflow
-        // into continuation cards, so no truncation happens here.
-        let mut static_text = format!(
-            "已{verb} {}（正在继续该会话的回合，有新进展会自动更新）",
-            crate::feishu::snapshot_card::display_title(title, session_id)
-        );
+        // into continuation cards, so no truncation happens here. A Waiting
+        // adoption (#586) names the wait instead of claiming a turn is being
+        // continued; a busy run that started after a waiting gather keeps the
+        // continuing copy.
+        let title = crate::feishu::snapshot_card::display_title(title, session_id);
+        let mut static_text = if data.waiting && !busy_now {
+            format!("已{verb} {title}（等待后台任务完成，有新进展会自动更新）")
+        } else {
+            format!("已{verb} {title}（正在继续该会话的回合，有新进展会自动更新）")
+        };
         if !data.tail.is_empty() {
             static_text.push_str("\n\n**最近对话**");
             for entry in &data.tail {
@@ -1244,7 +1253,11 @@ pub(crate) async fn settle_snapshot_after_send(
     let thread_key = crate::bridge::span::thread_key_of(&handles.sessions, &data.session_id).await;
     let span = crate::bridge::span::snapshot(&data.session_id, thread_key.as_ref());
     async {
-        let followed = data.status == Some(crate::opencode::types::SessionStatus::Busy)
+        // Busy follows the in-flight Execution; waiting follows a Waiting turn
+        // (server-idle with live Background Tasks, ADR-0059) — the follow's
+        // first settle read then stamps the ⏳ yield in place and Session Sync
+        // serves the wait (#586). Anything else keeps the static snapshot.
+        let followed = (data.status == Some(crate::opencode::types::SessionStatus::Busy) || data.waiting)
             && external
                 .start_snapshot_follow(handles, &data.session_id, snapshot_message_id, verb, title, data)
                 .await;

@@ -131,3 +131,29 @@ successor replaced the accumulator never finalizes the successor's card. The
 Wake continuation's settle grace (the shared loop's lost-contact / stuck-panel
 bound) now lives in its own field, separate from the renderer's idle bound, so
 retuning one can no longer move the other.
+
+## Update (2026-10-08, #586): the busy follow also serves a Waiting turn
+
+The follow's boundary is no longer the server's `Busy` alone. A Session whose
+Execution ended while Background Tasks are still live reads `idle` (ADR-0059's
+Waiting turn) but its Turn has a future — the completion Wake — so an adoption
+of it follows too: the Waiting fact is gathered from the snapshot's own
+transcript read (server-idle with live Background Tasks), the follow's first
+settle decision stamps 「⏳ 等待后台任务」 with the ledger and stops, and Session
+Sync then serves the yielded card exactly as it serves a cola request's — the
+ledger refreshes through the wait and the completion Wake resumes the card in
+place (ADR-0066). Freezing the one-shot static snapshot here rendered the
+Wake, the resumed content and the ending nowhere (#586's live evidence).
+
+The status line gains the matching arm, ahead of 运行中: 等待你的确认 >
+等待后台任务 > 运行中 > 需要重试 > 空闲 — a pending (embedded or elsewhere)
+still wins, and the Waiting chip carries the same follow hint the busy chip
+does (有新进展会自动更新). The follow's static line says the Session waits on
+its background tasks rather than claiming a turn is being continued.
+
+Unchanged: the busy gate and arm-time race (a busy gather with neither busy
+nor waiting at arm time still keeps the static snapshot; a Waiting gather
+needs no fresh busy read), the suppression predicate (Waiting is not content
+to report — a suppressed re-`/switch` stays suppressed), the cola-authored
+guard (cola's own accumulator is never re-pointed), truly idle adoptions, and
+V1 (no Background Task facts — today's behavior).
