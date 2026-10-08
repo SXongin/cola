@@ -78,3 +78,24 @@ landed as follows:
 The V2 parity declaration is deliberately NOT made here: that is the gate
 ticket (spec #364 S9), which requires the real-Feishu smoke against live V2
 plus a V1 regression pass.
+
+## Amendment (2026-10-09, #602): the "drain budget" and "follow ceiling" asides are stale
+
+The 2026-09-27 amendment's drain rules were written when the drain had a total
+budget and a follow awaited it past a ceiling. Spec #602 removed both: the
+post-prompt drain is one unbounded loop on the Turn's own task, and the
+per-read timeout is the follow's fixed read timeout alone (ADR-0074). So two
+asides no longer describe the code:
+
+- "so it cannot burn the drain budget plus the follow ceiling" — there is no
+  drain budget and no follow ceiling; a failing or timing-out **status** read
+  still takes the confirmed-absence window, bounded only by the one per-read
+  timeout.
+- "retried to the drain bound" — a failing **transcript** read observed after
+  the run started is retried while the loop runs, with no bound other than the
+  grace that ends a run nobody can act on.
+
+Every other rule above — the submit+observe end state, the settle rule, the
+kept last-observed failure, the V1 wire shape — is unchanged.
+
+Source: #602, #603.
