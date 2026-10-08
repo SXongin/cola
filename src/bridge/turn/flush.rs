@@ -66,6 +66,50 @@ enum FallbackAdvance {
     Stop,
 }
 
+/// What became of the card write(s) one flush issued (ADR-0073's
+/// record-after-flush invariant, write outcome; review, PR #595). The
+/// classification reuses the delivery layer's own (ADR-0067): a recoverable
+/// failure is still owed a retry, so its payload counts as accepted; only a
+/// permanent refusal — or a flush that issued no write at all — is not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FlushOutcome {
+    /// The flush issued no write: no card id yet, nothing built, or a create
+    /// that failed with its slice still owed to a later flush. Never read as
+    /// acceptance: nothing reached a card.
+    Unwritten,
+    /// The carrying write was delivered, or failed recoverably and is still
+    /// owed by the delivery layer's retry (ADR-0067): the payload is accepted
+    /// and the card converges to it. A refusal elsewhere in the same flush
+    /// dominates.
+    Accepted,
+    /// The write was permanently refused — a typed content rejection the
+    /// fenced fallback shared (the card is suspended), or any non-recoverable
+    /// error. Nothing will ever be written for it; a caller that gates a
+    /// record on this write must record nothing.
+    Refused,
+}
+
+impl FlushOutcome {
+    /// Whether a caller may read the carrying write as accepted (ADR-0073):
+    /// delivered now, or owed by the delivery layer's retry.
+    pub(crate) fn accepted(self) -> bool {
+        matches!(self, Self::Accepted)
+    }
+}
+
+/// The one answer a flush's tracked write facts sum to: a permanent refusal
+/// dominates, an accepted write answers [`FlushOutcome::Accepted`], and no
+/// write at all is [`FlushOutcome::Unwritten`].
+fn flush_outcome(wrote: bool, refused: bool) -> FlushOutcome {
+    if refused {
+        FlushOutcome::Refused
+    } else if wrote {
+        FlushOutcome::Accepted
+    } else {
+        FlushOutcome::Unwritten
+    }
+}
+
 /// Whether a flush may finalize the tracked card and continue on a new one.
 #[derive(Clone, Copy)]
 pub(super) enum SplitPolicy {
@@ -343,7 +387,18 @@ async fn discard_staged_cursor(
 /// [`Turn::refresh_yielded_ledger`](super::Turn::refresh_yielded_ledger).
 /// `split_policy` decides whether an over-budget slice may finalize the card
 /// and continue on a new one ([`SplitPolicy`]).
-pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, split_policy: SplitPolicy) {
+///
+/// Returns what became of the writes it issued ([`FlushOutcome`], review, PR
+/// #595): the carriers (the render pass, the yielded refresh, the wake
+/// split/resume) report it so a reconcile pass commits only on an accepted
+/// write — delivered, or owed by the delivery layer's retry. A refused one
+/// records nothing and the task stays live for the next card that can render
+/// its entry.
+pub(super) async fn flush_card_locked(
+    cards: &CardsHandle,
+    session_id: &str,
+    split_policy: SplitPolicy,
+) -> FlushOutcome {
     // A terminal card's durable record is dropped only once its ending write
     // is confirmed (ADR-0063 amendment): each ending PATCH below goes through
     // `chain::release_spent`, which re-checks the pending outbox before
@@ -356,7 +411,7 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, spl
     let (pending_split, mut card_is_live, suspended) = {
         let cards = cards.cards.lock().await;
         let Some(card) = cards.get(session_id) else {
-            return;
+            return FlushOutcome::Unwritten;
         };
         (
             card.pending_split.clone(),
@@ -366,9 +421,16 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, spl
     };
     if suspended {
         // The fenced fallback was rejected too: the card cannot be delivered,
-        // and re-PATCHing it on every poll would only hammer the API.
-        return;
+        // and re-PATCHing it on every poll would only hammer the API. Nothing
+        // will ever be written for its payloads — a permanent refusal for the
+        // caller's record gate (review, PR #595).
+        return FlushOutcome::Refused;
     }
+    // The writes this flush issues, tracked for its answer (review, PR #595):
+    // `wrote` is any delivered or owed write, `refused` any permanent refusal.
+    // A refusal dominates; no write at all answers `Unwritten`.
+    let mut wrote = false;
+    let mut refused = false;
     // The size bound must never refuse a supplement split: it gets one
     // continuation slot of its own beyond the cap, and any remaining slice is
     // reconciled on the next flush.
@@ -396,12 +458,14 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, spl
             let cards = cards.cards.lock().await;
             cards.get(session_id).and_then(|c| c.card_message_id.clone())
         };
-        let Some(card_id) = card_id else { return };
+        let Some(card_id) = card_id else {
+            return FlushOutcome::Unwritten;
+        };
 
         let (built, rendered, slice_from, slice_to) = {
             let mut cards = cards.cards.lock().await;
             let Some(card) = cards.get_mut(session_id) else {
-                return;
+                return FlushOutcome::Unwritten;
             };
             // `build_card_with_info` advances `render_from` when the built
             // card is a finalized (full) slice. Remember the boundary: a
@@ -444,7 +508,10 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, spl
                 .await;
                 let watermark = staged_watermark_id(cards, session_id).await;
                 let delivered = match cards.feishu.update_message(&card_id, &built.card).await {
-                    Ok(()) => true,
+                    Ok(()) => {
+                        wrote = true;
+                        true
+                    }
                     Err(e) => {
                         tracing::warn!("Card update failed: {}", e);
                         if is_card_content_rejected(&e) {
@@ -471,12 +538,20 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, spl
                                     )
                                     .await;
                                     release_spent(cards, session_id).await;
-                                    return;
+                                    return FlushOutcome::Refused;
                                 }
                             }
                         }
                         note_cursor_write_failure(cards, session_id, Some(&card_id), &built.card, &e, stage)
                             .await;
+                        // The delivery layer's own split (ADR-0067): a
+                        // recoverable failure stays owed a retry — accepted;
+                        // anything else is settled as permanently refused.
+                        if e.is_recoverable_card_write() {
+                            wrote = true;
+                        } else {
+                            refused = true;
+                        }
                         false
                     }
                 };
@@ -498,7 +573,7 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, spl
                     // staged Wake Watermark is now user-visible (ADR-0061).
                     drain_wake_watermark(cards, session_id, watermark).await;
                 }
-                return;
+                return flush_outcome(wrote, refused);
             }
             // The tracked card is finalized: it overflowed (size split) or a
             // supplement forced the split. Either way the finalized card
@@ -520,7 +595,7 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, spl
                 // content that arrives after them, exactly like a size split.
                 let mut cards = cards.cards.lock().await;
                 let Some(card) = cards.get_mut(session_id) else {
-                    return;
+                    return FlushOutcome::Unwritten;
                 };
                 // A cause that continues an ENDED card (a Wake) advances the
                 // render boundary either way, but only a waiting or live card
@@ -588,7 +663,10 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, spl
             let delivered = if should_patch {
                 let stage = stage.expect("a PATCHed slice stages its cursor");
                 match cards.feishu.update_message(&card_id, &finalized.card).await {
-                    Ok(()) => true,
+                    Ok(()) => {
+                        wrote = true;
+                        true
+                    }
                     Err(e) => {
                         tracing::warn!("Card update failed: {}", e);
                         if is_card_content_rejected(&e) {
@@ -630,7 +708,7 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, spl
                                 .lock()
                                 .await
                                 .record(&card_id, &finalized.card, Vec::new());
-                            return;
+                            return FlushOutcome::Refused;
                         }
                         note_cursor_write_failure(
                             cards,
@@ -641,6 +719,14 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, spl
                             stage,
                         )
                         .await;
+                        // The delivery layer's own split (ADR-0067): a
+                        // recoverable failure stays owed a retry — accepted;
+                        // anything else is settled as permanently refused.
+                        if e.is_recoverable_card_write() {
+                            wrote = true;
+                        } else {
+                            refused = true;
+                        }
                         false
                     }
                 }
@@ -698,8 +784,9 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, spl
         };
         if reply_to.is_none() && fallback_chat.is_none() {
             // Nothing can reach a card: no continuation is attempted, so no
-            // cursor is staged.
-            return;
+            // cursor is staged. Whatever this flush already wrote keeps its
+            // outcome; without one, the payload stays owed in the accumulator.
+            return flush_outcome(wrote, refused);
         }
         // Stage this continuation body's Rendered Cursor before the create:
         // creates are never outbox-retried, so only this send's own Ok drains
@@ -714,6 +801,7 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, spl
         };
         match sent {
             Ok(new_id) => {
+                wrote = true;
                 {
                     let mut cards = cards.cards.lock().await;
                     if let Some(card) = cards.get_mut(session_id) {
@@ -755,7 +843,7 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, spl
                 // the staged Wake Watermark is user-visible now (ADR-0061).
                 drain_wake_watermark(cards, session_id, watermark).await;
                 if !built.full {
-                    return;
+                    return flush_outcome(wrote, refused);
                 }
                 // The continuation is itself over the limit → loop for the
                 // next slice's card.
@@ -788,10 +876,14 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, spl
                     // falls through to the plain retry-next-flush path.
                     continue;
                 }
-                return;
+                // A create is never outbox-retried (ADR-0067), so a failed one
+                // proves no write landed here: the slice stays owed to a later
+                // flush, never accepted (review, PR #595).
+                return flush_outcome(wrote, refused);
             }
         }
     }
+    flush_outcome(wrote, refused)
 }
 
 /// Write one receipt line per queued supplement that does not have one yet, in

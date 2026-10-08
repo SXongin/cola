@@ -146,7 +146,7 @@ pub(super) async fn run(
                 // Stream the parts into the SAME card (the accumulator this
                 // chain has been rendering into all along); `None` means the
                 // accumulator vanished and the loop no longer owns anything.
-                Turn::render_and_flush(
+                let rendered = Turn::render_and_flush(
                     &flow.cards,
                     &flow.sessions,
                     &flow.backend,
@@ -157,10 +157,15 @@ pub(super) async fn run(
                 .await?;
                 // The record-after-flush invariant (review, PR #595): the
                 // pass commits only once the render that carried its entries
-                // returned an accumulator it wrote to. A render that never
-                // landed records nothing — the task stays live and the next
-                // card that can render its entry claims it.
-                if let Some(pass) = pass.take() {
+                // returned an accumulator it wrote to AND the flush that
+                // carried them was accepted — delivered, or owed by the
+                // delivery layer's retry (ADR-0067). A render that never
+                // landed, and a permanently refused write, both record
+                // nothing — the task stays live and the next card that can
+                // render its entry claims it.
+                if rendered.flush.accepted()
+                    && let Some(pass) = pass.take()
+                {
                     pass.commit(&flow.backend, session_id, &transcript);
                 }
                 Some(transcript)

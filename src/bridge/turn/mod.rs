@@ -18,6 +18,11 @@ pub(crate) use state::CardSession;
 /// (ticket #563, review #569).
 pub(crate) use flush::{drain_armed_watermark, reconcile_staged_cursors};
 
+/// What became of a flush's write(s) (review, PR #595): the disposition the
+/// render/refresh/split carriers report so a reconcile pass commits only on an
+/// accepted write.
+pub(crate) use flush::FlushOutcome;
+
 /// The drain reconcile's test seam (spec #561, review #569): the gate parks
 /// the pass between its delivery check and the confirmation.
 #[cfg(test)]
@@ -1179,9 +1184,12 @@ impl Turn {
         .await;
         // The record-after-flush invariant (review, PR #595): the pass commits
         // only once the render that carried its entries returned an accumulator
-        // it wrote to. A vanished accumulator (`None`) records nothing — the
-        // task stays live and the next live card renders its entry.
-        if rendered.is_some()
+        // it wrote to AND the flush that carried them was accepted — delivered
+        // now, or owed by the delivery layer's retry (ADR-0067). A vanished
+        // accumulator (`None`) and a permanently refused write both record
+        // nothing: the task stays live and the next live card renders its
+        // entry.
+        if rendered.as_ref().is_some_and(|pass| pass.flush.accepted())
             && let Some(pass) = pass
         {
             pass.commit(&handles.backend, &self.session_id, &transcript);
@@ -1558,6 +1566,22 @@ pub(crate) enum YieldedUpdate {
         disposition: Disposition,
         notice_at: Option<std::time::Instant>,
     },
+    /// The refresh's write was permanently refused (review, PR #595): the card
+    /// is suspended and nothing will ever carry this read's ledger delta or
+    /// its retirement entries. The caller records nothing — the tasks stay
+    /// live for a card that can render their entries — and claims neither
+    /// `Refreshed` nor `Settled`.
+    Refused,
+}
+
+impl YieldedUpdate {
+    /// Whether this read's write was accepted — delivered, or owed by the
+    /// delivery layer's retry (ADR-0067). The one gate every caller's record
+    /// reads (review, PR #595): an `Unchanged` card admitted nothing and a
+    /// `Refused` one will never write, so neither may record.
+    pub(crate) fn accepted(&self) -> bool {
+        matches!(self, Self::Refreshed | Self::Settled { .. })
+    }
 }
 
 /// How a card that becomes a Session's live card disposes of the DIFFERENT
@@ -1596,10 +1620,15 @@ impl Turn {
     /// its continuation slice onto it — two identical messages, only one
     /// tracked and repaintable. The resolution paths take the same lock
     /// (`resolve_blocks`), so a click cannot be overwritten by a stale flush.
-    pub(crate) async fn flush_card(cards: &CardsHandle, session_id: &str) {
+    ///
+    /// Returns what became of the writes this flush issued ([`FlushOutcome`],
+    /// review, PR #595): the caller's record gate reads
+    /// [`FlushOutcome::accepted`] — a permanently refused payload must not be
+    /// recorded as delivered.
+    pub(crate) async fn flush_card(cards: &CardsHandle, session_id: &str) -> FlushOutcome {
         let write_lock = cards.write_lock(session_id).await;
         let _guard = write_lock.lock().await;
-        flush::flush_card_locked(cards, session_id, flush::SplitPolicy::Allow).await;
+        flush::flush_card_locked(cards, session_id, flush::SplitPolicy::Allow).await
     }
 
     /// Record that `card_message_id` is now `session_id`'s live card
@@ -2136,12 +2165,14 @@ impl Turn {
     /// yielded refresh of the same read.
     ///
     /// Returns `None` — nothing queued — when the session has no card or a live
-    /// renderer owns it. `Some(handover)` once the split is queued and flushed,
-    /// where `handover` says whether the outgoing accumulator's ledger write
-    /// ran: the read's remaining live list and its retirement entries rode the
-    /// finalize PATCH (review, PR #595 — the caller's carrier signal for its
-    /// reconcile pass). A card with no Turn anchor to scope the entries with
-    /// still splits, but carries nothing (`Some(false)`).
+    /// renderer owns it. `Some(carried)` once the split is queued and flushed,
+    /// where `carried` says whether the outgoing accumulator's ledger write ran
+    /// AND the flush that carried it was accepted — delivered or owed by the
+    /// delivery layer's retry (review, PR #595; [`FlushOutcome::accepted`]): the
+    /// read's remaining live list and its retirement entries rode the finalize
+    /// PATCH (the caller's carrier signal for its reconcile pass). A card with
+    /// no Turn anchor to scope the entries with still splits, but carries
+    /// nothing (`Some(false)`), and so does a permanently refused write.
     pub(crate) async fn split_chain_for_wake(
         cards: &CardsHandle,
         backend: &Arc<dyn crate::backend::Backend>,
@@ -2195,8 +2226,11 @@ impl Turn {
             });
             handover
         };
-        flush::flush_card_locked(cards, session_id, flush::SplitPolicy::Allow).await;
-        Some(handover)
+        let flush = flush::flush_card_locked(cards, session_id, flush::SplitPolicy::Allow).await;
+        // The carrier answer is the write's (review, PR #595): a handover the
+        // flush could not accept (a permanent refusal) never reached the
+        // outgoing card, so the caller's pass must not record.
+        Some(handover && flush.accepted())
     }
 
     /// Resume a yielded card IN PLACE for a shell/subagent completion Wake
@@ -2222,7 +2256,9 @@ impl Turn {
     /// yielded one this handoff admits
     /// ([`CardOwnership::admits_ledger_refresh`]: still `Waiting`, live, no
     /// split owed), so a race with a collect, a new Turn or a handoff can
-    /// never resume a card somebody else took over. `wake_id` is the completion
+    /// never resume a card somebody else took over — and when the resume's
+    /// flush was permanently refused (review, PR #595), because the caller's
+    /// record gate reads this same answer. `wake_id` is the completion
     /// this resume takes over, marked as such in the same locked write, so a
     /// later tail past it splits (ADR-0059) and the resume is never re-decided.
     /// `now_ms` is the read's clock — the Session Sync pass's own, shared with
@@ -2273,8 +2309,12 @@ impl Turn {
             card.acc.hand_over_wake(wake_id);
             card.acc.set_resuming();
         }
-        flush::flush_card_locked(cards, session_id, flush::SplitPolicy::Allow).await;
-        true
+        // The carrier answer is the write's (review, PR #595): a permanently
+        // refused resume never reached the card, so the caller records nothing
+        // and does not treat the chain as resumed.
+        flush::flush_card_locked(cards, session_id, flush::SplitPolicy::Allow)
+            .await
+            .accepted()
     }
 
     /// Refresh a yielded card's ledger from a Session Sync read, in place
@@ -2424,11 +2464,21 @@ impl Turn {
             // Best effort, like every other finalize. The flush's own entry
             // drops the card's now-spent durable record (ADR-0063).
             state::refresh_work_context(cards, session_id).await;
-            flush::flush_card_locked(cards, session_id, flush::SplitPolicy::Forbid).await;
+            let flush = flush::flush_card_locked(cards, session_id, flush::SplitPolicy::Forbid).await;
             tracing::info!("yielded card settled in place: session {session_id} ({disposition:?})");
-            return YieldedUpdate::Settled {
-                disposition,
-                notice_at,
+            // The settle answer is the write's (review, PR #595): a
+            // permanently refused ending never reached the card, so the caller
+            // records nothing, announces nothing, and the task stays live for
+            // a card that can render its entry.
+            return match flush {
+                FlushOutcome::Accepted => YieldedUpdate::Settled {
+                    disposition,
+                    notice_at,
+                },
+                FlushOutcome::Refused => YieldedUpdate::Refused,
+                // No write was issued (no card id): the card keeps what it
+                // showed, like any other read that changed nothing.
+                FlushOutcome::Unwritten => YieldedUpdate::Unchanged,
             };
         }
         if !changed {
@@ -2436,8 +2486,15 @@ impl Turn {
         }
         // The guard (ADR-0060): a ledger-only refresh must never post a new
         // card, so this flush may not finalize and continue the chain.
-        flush::flush_card_locked(cards, session_id, flush::SplitPolicy::Forbid).await;
-        YieldedUpdate::Refreshed
+        let flush = flush::flush_card_locked(cards, session_id, flush::SplitPolicy::Forbid).await;
+        // `Refreshed` is reserved for an accepted write (review, PR #595): a
+        // permanently refused payload leaves the card as it was, so the caller
+        // records nothing.
+        match flush {
+            FlushOutcome::Accepted => YieldedUpdate::Refreshed,
+            FlushOutcome::Refused => YieldedUpdate::Refused,
+            FlushOutcome::Unwritten => YieldedUpdate::Unchanged,
+        }
     }
 }
 
@@ -2461,7 +2518,10 @@ impl Turn {
 
     /// Render a polled Session Transcript into `session_id`'s live card,
     /// flushing when the content, header or context footer changed. Returns
-    /// `None` when the session's accumulator vanished (the caller should stop).
+    /// `None` when the session's accumulator vanished (the caller should stop);
+    /// otherwise the pass's rendering facts together with the flush's write
+    /// disposition ([`render::RenderPass::flush`]), which a reconcile caller
+    /// gates its record on (review, PR #595).
     pub(crate) async fn render_and_flush(
         cards: &CardsHandle,
         sessions: &SessionsHandle,
@@ -2469,7 +2529,7 @@ impl Turn {
         requests: &RequestsHandle,
         session_id: &str,
         transcript: &SessionTranscript,
-    ) -> Option<render::RenderStats> {
+    ) -> Option<render::RenderPass> {
         render::render_and_flush(cards, sessions, backend, requests, session_id, transcript).await
     }
 }

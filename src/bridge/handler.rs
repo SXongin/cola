@@ -2235,25 +2235,27 @@ impl App {
         // and its button on a card that never took the resolution; no later
         // read can reconstruct either. An accepted write counts even when the
         // delivery layer drains it later (ADR-0067/0072), the same rule the
-        // Wake Watermark's drain uses; `Unchanged` records nothing, so the
-        // tasks stay live and the still-usable button can clear them on the
-        // card that took the chain. The commit is one call for the union —
-        // the pass's retirements, the cleaned retirements `apply_cleanup`
-        // appended above, and the post-verdict marker set — so no part can
-        // outlive the others.
-        if matches!(update, crate::bridge::turn::YieldedUpdate::Unchanged) {
+        // Wake Watermark's drain uses, while a permanently refused one never
+        // writes (the card suspended; review, PR #595): `update.accepted()` is
+        // the one gate over both, and a refusal records nothing so the tasks
+        // stay live and the still-usable button can clear them on the card
+        // that took the chain. The commit is one call for the union — the
+        // pass's retirements, the cleaned retirements `apply_cleanup` appended
+        // above, and the post-verdict marker set — so no part can outlive the
+        // others.
+        if update.accepted() {
+            pass.commit(&handles.backend, &session_id, &transcript);
+        } else {
             tracing::warn!(
-                "cleanup: the card stopped admitting the refresh on session {session_id}; \
+                "cleanup: the refresh was not accepted on session {session_id}; \
                  recording nothing ({} task(s) stay live)",
                 transcript.task_retirements.len()
             );
-        } else {
-            pass.commit(&handles.backend, &session_id, &transcript);
         }
         tracing::info!(
             "cleanup: cleared {} task(s) on session {session_id} (refreshed: {})",
             cleared.len(),
-            !matches!(update, crate::bridge::turn::YieldedUpdate::Unchanged)
+            update.accepted()
         );
         // The claim's job ends with this write: a later unconfirmed row on the
         // same card (new work going inactive) must be cleanable again, and a

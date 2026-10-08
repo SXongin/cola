@@ -23,6 +23,7 @@ use crate::feishu::card::ledger::{TaskCompletionEntry, TaskEnding, TaskKind, Tas
 use crate::feishu::card::tool_render::{ChildActivity, TaskLiveness};
 
 use super::Turn;
+use super::flush::FlushOutcome;
 
 /// How long one completion entry's output read may take (spec #588, #593): the
 /// entry renders once, so the read is spent exactly once, but it must not park
@@ -1432,13 +1433,27 @@ pub(crate) struct RenderStats {
     pub(crate) reasoning_len: usize,
 }
 
+/// What one completed render pass did (review, PR #595): the stats the loops
+/// log, and the disposition of the flush that carried this pass's committed
+/// entries — the write-outcome half of ADR-0073's record-after-flush gate. A
+/// caller that holds a reconcile pass reads [`Self::flush`] and commits only
+/// on [`FlushOutcome::accepted`]; a permanently refused write records nothing.
+pub(crate) struct RenderPass {
+    /// The pass's rendering facts (logging).
+    pub(crate) stats: RenderStats,
+    /// What became of the flush this pass issued.
+    pub(crate) flush: FlushOutcome,
+}
+
 /// Render the session's transcript into the streaming card and flush it when
 /// something changed. The shared heart of both render loops — `render_poll_loop`
 /// (cola's own prompts) and the external-message renderer
 /// (`bridge::external`) — so the two never drift apart.
 ///
-/// Returns `Some(stats)` when the accumulator is still present; `None` when it
-/// vanished (the caller should stop). The pass bumps the accumulator's
+/// Returns `Some(pass)` when the accumulator is still present; `None` when it
+/// vanished (the caller should stop). `pass.flush` reports what became of the
+/// write the pass issued (review, PR #595): the reconcile callers commit their
+/// pass only on an accepted one. The pass bumps the accumulator's
 /// observable-progress mark ([`StreamAccumulator::progress_mark`], exposed as
 /// `Turn::progress_mark`) as each stage renders, which is what the external
 /// renderer's idle bound renews on; a pass abandoned by a timeout still
@@ -1450,7 +1465,7 @@ pub(super) async fn render_and_flush(
     requests: &RequestsHandle,
     session_id: &str,
     transcript: &SessionTranscript,
-) -> Option<RenderStats> {
+) -> Option<RenderPass> {
     // OpenCode auto-renames sessions after a turn; follow the server's live
     // title so the card subtitle doesn't stay on the "new session" default.
     refresh_session_title(cards, sessions, backend, session_id).await;
@@ -1579,13 +1594,26 @@ pub(super) async fn render_and_flush(
             None => (super::state::LedgerChange::default(), false),
         }
     };
-    if changed || entries_changed || header_changed || context_changed || ledger.owes() || liveness_changed {
-        Turn::flush_card(cards, session_id).await;
-    }
-    Some(RenderStats {
-        new_parts,
-        text_len,
-        reasoning_len,
+    let flush = if changed
+        || entries_changed
+        || header_changed
+        || context_changed
+        || ledger.owes()
+        || liveness_changed
+    {
+        Turn::flush_card(cards, session_id).await
+    } else {
+        // Nothing this pass did owed a card write: no carrier, so nothing a
+        // caller may read as accepted (review, PR #595).
+        FlushOutcome::Unwritten
+    };
+    Some(RenderPass {
+        stats: RenderStats {
+            new_parts,
+            text_len,
+            reasoning_len,
+        },
+        flush,
     })
 }
 
@@ -1790,7 +1818,8 @@ async fn render_poll_loop(
             // Accumulator gone (turn completed and was cleaned up); keep polling
             // until the prompt returns so late parts are still caught.
             None => continue,
-            Some(stats) => {
+            Some(pass) => {
+                let stats = pass.stats;
                 if stats.new_parts > 0 {
                     tracing::info!(
                         "render poll: {} new parts, text={} reasoning={}",
