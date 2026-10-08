@@ -2654,9 +2654,13 @@ async fn a_cleanup_click_whose_card_is_replaced_never_hides_the_tasks() {
     // the waiting card grows its marker and its cleanup button.
     backend.task_runtime.lock().unwrap().children = vec![("ses_call_sub".into(), ChildRuntime::Inactive)];
     spawn_sync(&app);
-    wait_for_card_update(&platform, "the unconfirmed marker", CardUpdates::Latest, |card| {
-        card_text(card).contains("⚠️ 状态待确认") && card_text(card).contains("清理待确认任务")
-    })
+    wait_for_card_update_within(
+        &platform,
+        "the unconfirmed marker",
+        Duration::from_secs(10),
+        CardUpdates::Latest,
+        |card| card_text(card).contains("⚠️ 状态待确认") && card_text(card).contains("清理待确认任务"),
+    )
     .await;
     // Park Session Sync behind a decoy active session (the harness's ordinary
     // inactive-session state, ADR-0017) and freeze the shared throttle wide:
@@ -2810,9 +2814,10 @@ async fn a_cleanup_click_whose_card_is_replaced_never_hides_the_tasks() {
     // The successor's turn runs to its waiting yield: with nothing recorded,
     // the live tasks, their marker and the cleanup button are still there.
     next_turn.await.unwrap().unwrap();
-    wait_for_card_update(
+    wait_for_card_update_within(
         &platform,
         "the successor's waiting card",
+        Duration::from_secs(10),
         CardUpdates::Latest,
         |card| card_text(card).contains("⚠️ 状态待确认") && card_text(card).contains("清理待确认任务"),
     )
@@ -2826,9 +2831,10 @@ async fn a_cleanup_click_whose_card_is_replaced_never_hides_the_tasks() {
     // the unconfirmed child keeps its row, marker and button.
     seed_session(&app, "ses_test", "/work").await;
     app.runtime_reconcile.interval_ms.store(0, Ordering::Relaxed);
-    wait_for_card_update(
+    wait_for_card_update_within(
         &platform,
         "the shell's 已失联 entry",
+        Duration::from_secs(10),
         CardUpdates::Latest,
         |card| {
             card_header(card).contains("⏳")
@@ -2865,9 +2871,10 @@ async fn a_cleanup_click_whose_card_is_replaced_never_hides_the_tasks() {
         .await
         .expect("the cleanup click on the successor acks");
     assert_eq!(ack.toast.as_deref(), Some("正在清理..."));
-    wait_for_card_update(
+    wait_for_card_update_within(
         &platform,
         "the successor's cleaned settle",
+        Duration::from_secs(10),
         CardUpdates::Latest,
         |card| {
             card_header(card).contains("✅")
