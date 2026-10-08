@@ -3820,15 +3820,17 @@ impl Turn {
     /// takes it before the cards lock).
     ///
     /// `chain_id` is the armed session's [`state::CardSession::chain_id`].
-    /// `cursor_stage` is the exact Rendered Cursor stage the create's body
-    /// carried: it is confirmed in the SAME critical section as the re-point
-    /// (review #569), so the record never names the successor with the
-    /// predecessor's frontier. [`ArmedTakeover::Lost`] means the session was
-    /// replaced or attached meanwhile: nothing was touched. Otherwise the
-    /// successor id is attached, the record re-pointed carrying the confirmed
-    /// cursor into the armed accumulator exactly as [`Self::track_live_card`]
-    /// does, and the predecessor record handed back for the caller's deferred
-    /// collect.
+    /// `reply_to` is the rung the successor's create actually landed on — a
+    /// deliverable reply target, or `None` for the Chat's top level (an
+    /// explicit clear; #580/#582). `cursor_stage` is the exact Rendered Cursor
+    /// stage the create's body carried: it is confirmed in the SAME critical
+    /// section as the re-point (review #569), so the record never names the
+    /// successor with the predecessor's frontier. [`ArmedTakeover::Lost`] means
+    /// the session was replaced or attached meanwhile: nothing was touched.
+    /// Otherwise the successor id is attached, the record re-pointed carrying
+    /// the confirmed cursor into the armed accumulator exactly as
+    /// [`Self::track_live_card`] does, and the predecessor record handed back
+    /// for the caller's deferred collect.
     pub(crate) async fn take_over_armed_card(
         cards: &CardsHandle,
         session_id: &str,
@@ -3863,15 +3865,20 @@ impl Turn {
     /// — one cards-map critical section, exactly like the armed takeover, so a
     /// fresh Turn that replaced the session is never touched and the record
     /// never names the new card with the previous slice's frontier. The chain
-    /// continues (no predecessor collect). Returns `false` when a fresh Turn
-    /// owns the session now: the caller collects the late card and stops the
-    /// chain.
+    /// continues (no predecessor collect). `reply_to` is the rung this slice's
+    /// create actually landed on (#582) — a later slice may fall to a
+    /// different rung than the first, so it rides the same re-point; `None` (a
+    /// top-level slice) clears the durable target. Returns `false` when a
+    /// fresh Turn owns the session now: the caller collects the late card and
+    /// stops the chain.
+    #[allow(clippy::too_many_arguments)] // the slice transition's whole fixture
     pub(crate) async fn track_projected_continuation(
         cards: &CardsHandle,
         session_id: &str,
         chain_id: u64,
         card_message_id: &str,
         card_is_live: bool,
+        reply_to: Option<&str>,
         directory: Option<&str>,
         cursor_stage: state::StagedCursorId,
     ) -> bool {
@@ -3882,9 +3889,7 @@ impl Turn {
             false,
             card_message_id,
             Some(card_is_live),
-            // The armed takeover already set the chain's reply target; a
-            // continuation keeps it (issue #580).
-            None,
+            reply_to,
             directory,
             cursor_stage,
         )
@@ -3920,13 +3925,15 @@ impl Turn {
         if let Some(card_is_live) = card_is_live {
             card.card_is_live = card_is_live;
         }
-        // The armed successor's landing reply target (issue #580): the target
+        // The armed successor's landing reply target (#580/#582): the target
         // its create actually reached — the durable reply target, or the
-        // recorded card a refused target fell back to. Set before the record
-        // facts are read so the re-point and the accumulator never disagree.
-        if let Some(reply_to) = reply_to {
-            card.acc.reply_to_message_id = Some(reply_to.to_string());
-        }
+        // recorded card a refused target fell back to — and `None` when every
+        // target was refused and the create landed at the Chat's top level.
+        // Applied unconditionally so the accumulator and the record write
+        // below agree on the rung, and an explicit None CLEARS both: the
+        // landing adopts its rung in ONE write, never a second clear (which a
+        // crash could lose, leaving a refused target persisted).
+        card.acc.reply_to_message_id = reply_to.map(str::to_string);
         let (message_id, created_ms, context_directory, reply_to) = (
             card.acc.cola_message_id.clone().map(MessageId::new).or_else(|| {
                 card.acc
@@ -3969,8 +3976,9 @@ impl Turn {
         let previous = match &confirmed {
             // The confirmed body's cursor rides the re-point in ONE chains
             // write, so the record is never observable as (successor card,
-            // predecessor cursor) — not even between two chains operations.
-            Some((cursor, gap)) => cards.chains.track_carrying_cursor(
+            // predecessor cursor) — not even between two chains operations —
+            // and the landing's reply target rides the same write (#582).
+            Some((cursor, gap)) => cards.chains.track_carrying_cursor_landing(
                 session_id,
                 card_message_id,
                 message_id,
@@ -3983,8 +3991,8 @@ impl Turn {
             ),
             // No staged cursor matched the create's stage: nothing was
             // confirmed, so the re-point carries the previous frontier exactly
-            // as a plain re-point does.
-            None => cards.chains.track(
+            // as a plain re-point does — with the landing's reply target.
+            None => cards.chains.track_landing(
                 session_id,
                 card_message_id,
                 message_id,

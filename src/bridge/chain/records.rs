@@ -287,13 +287,37 @@ struct ChainRecordFile {
     announcements: HashMap<String, WakeMark>,
 }
 
+/// How a re-point updates the chain's durable reply target (#580/#582): the
+/// carry-only rule a plain re-point needs, and the landing rule the
+/// projection's create paths need — the record adopts the rung the create
+/// actually landed on, `Set(None)` included.
+#[derive(Clone, Copy)]
+enum ReplyToUpdate<'a> {
+    /// Carry the previous record's target: a re-point that learns no new one
+    /// never loses the one it had.
+    Keep,
+    /// Write the caller's target; `Set(None)` clears it. In the SAME record
+    /// write as the re-point, so no crash can leave a refused target behind
+    /// (#582).
+    Set(Option<&'a str>),
+}
+
+/// [`ChainRecords::track`]'s rule as a [`ReplyToUpdate`]: a known target
+/// sets, an unknown one carries.
+fn known_or_carry(reply_to: Option<&str>) -> ReplyToUpdate<'_> {
+    match reply_to {
+        Some(reply_to) => ReplyToUpdate::Set(Some(reply_to)),
+        None => ReplyToUpdate::Keep,
+    }
+}
+
 /// The durable reply target a track leaves on the new record (issue #580):
-/// the caller's new value when it knows one, else the previous record's — one
-/// rule for all three re-point entries.
-fn carried_reply_to(previous: Option<&ChainRecord>, reply_to: Option<&str>) -> Option<String> {
-    reply_to
-        .map(str::to_string)
-        .or_else(|| previous.and_then(|previous| previous.reply_to.clone()))
+/// the update's value, one rule for all three re-point entries.
+fn resolved_reply_to(previous: Option<&ChainRecord>, update: ReplyToUpdate<'_>) -> Option<String> {
+    match update {
+        ReplyToUpdate::Keep => previous.and_then(|previous| previous.reply_to.clone()),
+        ReplyToUpdate::Set(reply_to) => reply_to.map(str::to_string),
+    }
 }
 
 /// The pre-ADR-0069 shape, read once when `chain_records.json` is absent and
@@ -425,7 +449,9 @@ impl ChainRecords {
     ///
     /// `reply_to` is the chain's new durable reply target (issue #580), when
     /// the caller knows one; `None` carries the previous record's — a re-point
-    /// that learns no new target never loses the one it had.
+    /// that learns no new target never loses the one it had. A create that
+    /// landed must use [`Self::track_landing`] instead: it must be able to
+    /// clear the target explicitly (#582).
     pub(crate) fn track(
         &self,
         session_id: &str,
@@ -434,6 +460,51 @@ impl ChainRecords {
         created_ms: Option<i64>,
         directory: Option<&str>,
         reply_to: Option<&str>,
+    ) -> Option<ChainRecord> {
+        self.track_with(
+            session_id,
+            card_message_id,
+            message_id,
+            created_ms,
+            directory,
+            known_or_carry(reply_to),
+        )
+    }
+
+    /// [`Self::track`] for a create that LANDED on its rung (#582): the chain's
+    /// durable reply target becomes exactly what the create reached —
+    /// `Some(id)` for a reply target, `None` for the top level (an explicit
+    /// clear) — in the SAME record write as the re-point. The projection's
+    /// landing paths use this so a crash can never leave the record naming a
+    /// target the landing just refused; the ladder's bounded fall-through
+    /// stays as defense in depth for records older builds wrote.
+    pub(crate) fn track_landing(
+        &self,
+        session_id: &str,
+        card_message_id: impl Into<String>,
+        message_id: MessageId,
+        created_ms: Option<i64>,
+        directory: Option<&str>,
+        reply_to: Option<&str>,
+    ) -> Option<ChainRecord> {
+        self.track_with(
+            session_id,
+            card_message_id,
+            message_id,
+            created_ms,
+            directory,
+            ReplyToUpdate::Set(reply_to),
+        )
+    }
+
+    fn track_with(
+        &self,
+        session_id: &str,
+        card_message_id: impl Into<String>,
+        message_id: MessageId,
+        created_ms: Option<i64>,
+        directory: Option<&str>,
+        reply_to: ReplyToUpdate<'_>,
     ) -> Option<ChainRecord> {
         let mut state = self.lock();
         // A re-point within the chain carries the Rendered Cursor (spec #561):
@@ -444,7 +515,7 @@ impl ChainRecords {
         let mut record = ChainRecord::new(card_message_id, message_id, created_ms)
             .with_directory(directory.map(str::to_string));
         record.generation = chain_generation(previous.as_ref(), &record.card_message_id);
-        record.reply_to = carried_reply_to(previous.as_ref(), reply_to);
+        record.reply_to = resolved_reply_to(previous.as_ref(), reply_to);
         if let Some(previous) = &previous {
             record.cursor = previous.cursor.clone();
             // The owed orphan gap is chain-level too (spec #561, review #569):
@@ -492,7 +563,7 @@ impl ChainRecords {
         let mut record = ChainRecord::new(card_message_id, message_id.clone(), created_ms)
             .with_directory(directory.map(str::to_string));
         record.generation = chain_generation(previous.as_ref(), &record.card_message_id);
-        record.reply_to = carried_reply_to(previous.as_ref(), reply_to);
+        record.reply_to = resolved_reply_to(previous.as_ref(), known_or_carry(reply_to));
         if let Some(previous) = &previous {
             record.cursor = previous.cursor.clone();
             record.pending_gap = previous.pending_gap.clone().or_else(|| {
@@ -528,26 +599,6 @@ impl ChainRecords {
         true
     }
 
-    /// Clear `session_id`'s durable reply target while the record still names
-    /// `card_message_id` (issue #580): a successor create that landed at the
-    /// Chat's top level has no reply anchor, and a later projection must not
-    /// retry the target the platform just refused. A crash between the
-    /// re-point and this write leaves the stale target on the record, which
-    /// the ladder falls through on its first attempt — bounded, never stuck.
-    /// Returns whether a target was cleared.
-    pub(crate) fn clear_reply_to(&self, session_id: &str, card_message_id: &str) -> bool {
-        let mut state = self.lock();
-        let Some(record) = state.records.get_mut(session_id) else {
-            return false;
-        };
-        if record.card_message_id != card_message_id || record.reply_to.is_none() {
-            return false;
-        }
-        record.reply_to = None;
-        self.write(&state);
-        true
-    }
-
     /// Re-point the session's record AND set its Rendered Cursor in ONE chains
     /// critical section (spec #561, review #569): a projection's atomic
     /// takeover. A separate [`Self::track`] + [`Self::advance_cursor`] would
@@ -556,7 +607,8 @@ impl ChainRecords {
     /// window would seed from the stale cursor and re-render the successor's
     /// already-delivered tail onto its own card — while the collected successor
     /// keeps its body: the same text twice. Returns the previous record,
-    /// exactly like [`Self::track`].
+    /// exactly like [`Self::track`]. `reply_to` follows [`Self::track`]'s rule;
+    /// a create that landed uses [`Self::track_carrying_cursor_landing`].
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn track_carrying_cursor(
         &self,
@@ -569,12 +621,63 @@ impl ChainRecords {
         cursor: &RenderedCursor,
         gap: Option<(&CursorFrontier, bool)>,
     ) -> Option<ChainRecord> {
+        self.track_carrying_cursor_with(
+            session_id,
+            card_message_id,
+            message_id,
+            created_ms,
+            directory,
+            known_or_carry(reply_to),
+            cursor,
+            gap,
+        )
+    }
+
+    /// [`Self::track_carrying_cursor`] for a create that LANDED on its rung
+    /// (#582): the confirmed cursor AND the landing's reply target — an
+    /// explicit `None` clears — ride the re-point in the same record write.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn track_carrying_cursor_landing(
+        &self,
+        session_id: &str,
+        card_message_id: impl Into<String>,
+        message_id: MessageId,
+        created_ms: Option<i64>,
+        directory: Option<&str>,
+        reply_to: Option<&str>,
+        cursor: &RenderedCursor,
+        gap: Option<(&CursorFrontier, bool)>,
+    ) -> Option<ChainRecord> {
+        self.track_carrying_cursor_with(
+            session_id,
+            card_message_id,
+            message_id,
+            created_ms,
+            directory,
+            ReplyToUpdate::Set(reply_to),
+            cursor,
+            gap,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn track_carrying_cursor_with(
+        &self,
+        session_id: &str,
+        card_message_id: impl Into<String>,
+        message_id: MessageId,
+        created_ms: Option<i64>,
+        directory: Option<&str>,
+        reply_to: ReplyToUpdate<'_>,
+        cursor: &RenderedCursor,
+        gap: Option<(&CursorFrontier, bool)>,
+    ) -> Option<ChainRecord> {
         let mut state = self.lock();
         let previous = state.records.get(session_id).cloned();
         let mut record = ChainRecord::new(card_message_id, message_id, created_ms)
             .with_directory(directory.map(str::to_string));
         record.generation = chain_generation(previous.as_ref(), &record.card_message_id);
-        record.reply_to = carried_reply_to(previous.as_ref(), reply_to);
+        record.reply_to = resolved_reply_to(previous.as_ref(), reply_to);
         record.cursor = Some(cursor.clone());
         // The gap rides the re-point exactly as it does through [`Self::track`]
         // (spec #561, review #569), and the confirmed body's coverage settles
@@ -1009,10 +1112,12 @@ mod tests {
         );
     }
 
-    /// Clearing the durable reply target (issue #580): only the record still
-    /// naming the given card loses it, and only once.
+    /// The landing re-point (#582): `track_landing` writes the rung the create
+    /// actually landed on IN THE SAME record write — `Some(id)` sets it, and a
+    /// top-level landing clears it, which the carry-only `track` cannot
+    /// express. The two-write window the old `clear_reply_to` left is gone.
     #[test]
-    fn clear_reply_to_drops_the_target_of_the_named_card_only() {
+    fn a_landing_track_sets_or_clears_the_reply_target_atomically() {
         let dir = tempfile::tempdir().unwrap();
         let chains = ChainRecords::load(dir.path().join(FILE));
         chains.track(
@@ -1024,17 +1129,60 @@ mod tests {
             Some("om_user_1"),
         );
 
-        assert!(!chains.clear_reply_to("ses_a", "om_other"));
+        // A top-level landing clears the refused target in the same write.
+        chains.track_landing("ses_a", "om_2", MessageId::new("msg_cola_1"), None, None, None);
+        assert_eq!(
+            chains.get("ses_a").expect("the record").reply_to,
+            None,
+            "the top-level landing clears the target"
+        );
+
+        // A reply-rung landing sets its own target.
+        chains.track_landing(
+            "ses_a",
+            "om_3",
+            MessageId::new("msg_cola_1"),
+            None,
+            None,
+            Some("om_user_2"),
+        );
         assert_eq!(
             chains.get("ses_a").expect("the record").reply_to.as_deref(),
-            Some("om_user_1"),
-            "a card mismatch clears nothing"
+            Some("om_user_2"),
+            "the reply landing records its rung"
         );
-        assert!(chains.clear_reply_to("ses_a", "om_1"));
-        assert_eq!(chains.get("ses_a").expect("the record").reply_to, None);
+    }
+
+    /// [`a_landing_track_sets_or_clears_the_reply_target_atomically`] for the
+    /// cursor-carrying landing: the confirmed cursor and the cleared target
+    /// ride ONE write.
+    #[test]
+    fn a_landing_cursor_track_clears_the_reply_target_in_the_same_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let chains = ChainRecords::load(dir.path().join(FILE));
+        chains.track(
+            "ses_a",
+            "om_1",
+            MessageId::new("msg_cola_1"),
+            Some(1_000),
+            None,
+            Some("om_user_1"),
+        );
+        chains.track_carrying_cursor_landing(
+            "ses_a",
+            "om_2",
+            MessageId::new("msg_cola_1"),
+            None,
+            None,
+            None,
+            &RenderedCursor::default(),
+            None,
+        );
+        let record = chains.get("ses_a").expect("the record");
+        assert_eq!(record.reply_to, None, "the landing cleared the target");
         assert!(
-            !chains.clear_reply_to("ses_a", "om_1"),
-            "nothing is cleared twice"
+            record.cursor.is_some(),
+            "the confirmed cursor rode the same write"
         );
     }
 
