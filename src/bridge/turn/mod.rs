@@ -872,11 +872,27 @@ impl Turn {
                 // takes its own terminal.
                 disposition = Disposition::Stopped;
             }
+            // The completion entries this final read owes (spec #588, #593):
+            // plan them under a brief read of the card, spend each entry's one
+            // output read OUTSIDE the cards lock (the reads are network), and
+            // commit the surviving plan with the final render below — the same
+            // plan/read/commit seam the live path uses, so a shell completion
+            // first seen here carries its tail (or 「输出已不可用」) instead of
+            // a bare entry. The plan is pure and the commit's announce gate
+            // keeps the entry exactly once.
+            let mut plans = Vec::new();
+            if let Some(transcript) = &final_transcript {
+                let mut cards = handles.cards.cards.lock().await;
+                if let Some(card) = cards.get_mut(&self.session_id) {
+                    plans = render::plan_finalization_entries(&mut card.acc, transcript);
+                }
+            }
+            render::read_planned_outputs(&handles.backend, &mut plans).await;
             {
                 let mut cards = handles.cards.cards.lock().await;
                 if let Some(acc) = cards.get_mut(&self.session_id).map(|c| &mut c.acc) {
                     if let Some(transcript) = &final_transcript {
-                        render::render_new_turn_parts(acc, transcript);
+                        render::render_new_turn_parts_committing(acc, transcript, plans);
                     }
                     // Capture the answering model + token usage from the LATEST
                     // assistant message unconditionally — the render dedup may have

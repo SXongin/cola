@@ -712,14 +712,50 @@ pub(super) fn apply_ledger_read(
 /// with NO gathered child liveness (the sync callers — tests, the turn-end
 /// reconcile — have no gather): every `subagent` row keeps the last fragment
 /// that established one. Completion entries commit through the same plan/commit
-/// primitives the async venues use, with no output reads (this path has no
-/// backend): a Wake/runtime entry renders identity-only, as before spec #593.
-/// The live render's own entry is [`render_turn_parts`], whose caller applies
-/// the ledger from the render's shared gather. Returns true if anything new was
-/// rendered.
+/// primitives the async venues use, with no output reads (this function has no
+/// backend): a Wake/runtime entry renders identity-only. The live render's own
+/// entry is [`render_turn_parts`], whose caller applies the ledger from the
+/// render's shared gather; a caller WITH a backend plans, reads and commits
+/// through [`plan_finalization_entries`] + [`read_planned_outputs`] +
+/// [`render_new_turn_parts_committing`], so its entries carry their output
+/// tails too (spec #588, #593). Returns true if anything new was rendered.
+#[cfg(test)]
 pub(super) fn render_new_turn_parts(acc: &mut StreamAccumulator, transcript: &SessionTranscript) -> bool {
     let rendered = render_turn_parts(acc, transcript);
     let plans = plan_ledger_entries(acc, transcript, acc.turn_anchor.as_ref());
+    let entries = commit_planned_entries(acc, plans);
+    rendered | refresh_ledger(acc, transcript, &std::collections::HashMap::new()).owes() | entries
+}
+
+/// The completion entries a FINALIZATION read owes (spec #588, #593): capture
+/// the read's Turn anchor first — the same idempotent capture
+/// [`render_turn_parts`] runs, so a card whose anchor this read is the first
+/// to establish can still place them — then plan every entry whose
+/// exactly-once gates pass. The caller spends each entry's one output read
+/// outside the cards lock ([`read_planned_outputs`]) and commits the surviving
+/// plan with the final render ([`render_new_turn_parts_committing`]), exactly
+/// like the live path ([`render_and_flush`]).
+pub(super) fn plan_finalization_entries(
+    acc: &mut StreamAccumulator,
+    transcript: &SessionTranscript,
+) -> Vec<PlannedEntry> {
+    capture_turn_anchor(acc, transcript);
+    plan_ledger_entries(acc, transcript, acc.turn_anchor.as_ref())
+}
+
+/// [`render_new_turn_parts`] with the caller's already-planned (and already
+/// output-read) entries committed under the same call: the finalization path
+/// plans under a brief read of the card, spends the entries' output reads
+/// OUTSIDE the cards lock and commits here, so a shell completion first seen
+/// on the final read carries its tail — or 「输出已不可用」 — like every other
+/// venue (spec #588, #593). The commit's announce gate keeps the entry exactly
+/// once whatever racing venue announced it first.
+pub(super) fn render_new_turn_parts_committing(
+    acc: &mut StreamAccumulator,
+    transcript: &SessionTranscript,
+    plans: Vec<PlannedEntry>,
+) -> bool {
+    let rendered = render_turn_parts(acc, transcript);
     let entries = commit_planned_entries(acc, plans);
     rendered | refresh_ledger(acc, transcript, &std::collections::HashMap::new()).owes() | entries
 }
