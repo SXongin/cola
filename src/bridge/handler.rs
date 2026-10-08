@@ -2125,11 +2125,15 @@ impl App {
     /// refresh renders the result — rows dropped, one 🧹 entry per cleared
     /// task (and per runtime/evidence retirement the read observed), and the
     /// card settled by the same rules as a quiet true end (the last task gone
-    /// is ✅ in place, ADR-0060). Every verdict that moved the read refreshes
-    /// the card, a marker-resolving `Running` verdict included (review, PR
-    /// #595): the stale ⚠️ 状态待确认 row and its button leave on the click's
-    /// own pass. A read that fails, and a verdict that changed nothing at all,
-    /// give the claim back so the button stays usable.
+    /// is ✅ in place, ADR-0060). The cleared tasks' own overlay record is
+    /// gated on that refresh landing (review, PR #595): a card that refuses
+    /// the write — a new Turn superseded it mid-pipeline — records nothing, so
+    /// the tasks stay live and the successor's button can clear them, instead
+    /// of being hidden without their entries. Every verdict that moved the
+    /// read refreshes the card, a marker-resolving `Running` verdict included
+    /// (review, PR #595): the stale ⚠️ 状态待确认 row and its button leave on
+    /// the click's own pass. A read that fails, and a verdict that changed
+    /// nothing at all, give the claim back so the button stays usable.
     async fn run_cleanup(
         handles: crate::bridge::handles::TurnHandles,
         session_id: String,
