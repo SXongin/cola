@@ -841,7 +841,16 @@ impl ExternalFlow {
                 // so this path needs no Feishu reply target — which is exactly
                 // what closes the lobby/restart gap where a split had nowhere
                 // to go and the work never rendered.
-                if !Turn::resume_yielded_card(&handles.cards, sid, &wake_id, transcript, now_ms).await {
+                if !Turn::resume_yielded_card(
+                    &handles.cards,
+                    &handles.backend,
+                    sid,
+                    &wake_id,
+                    transcript,
+                    now_ms,
+                )
+                .await
+                {
                     return;
                 }
                 // Both facts are read AFTER the resume: its flush may split an
@@ -901,7 +910,16 @@ impl ExternalFlow {
                 // the retiring Wakes' entries, and the continuation — whose
                 // slice starts after both — opens with only its 承接 line and
                 // the remaining list.
-                if !Turn::split_chain_for_wake(&handles.cards, sid, &reply_to, line, transcript, now_ms).await
+                if !Turn::split_chain_for_wake(
+                    &handles.cards,
+                    &handles.backend,
+                    sid,
+                    &reply_to,
+                    line,
+                    transcript,
+                    now_ms,
+                )
+                .await
                 {
                     return;
                 }

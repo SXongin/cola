@@ -19,10 +19,16 @@ use crate::bridge::span;
 use crate::bridge::turn::state;
 use crate::bridge::turn::state::{LedgerCadence, PartSource, RenderedPart, StreamAccumulator};
 use crate::config::ThreadKey;
-use crate::feishu::card::ledger::{TaskCompletionEntry, TaskEnding, TaskKind};
+use crate::feishu::card::ledger::{TaskCompletionEntry, TaskEnding, TaskKind, TaskOutput};
 use crate::feishu::card::tool_render::{ChildActivity, TaskLiveness};
 
 use super::Turn;
+
+/// How long one completion entry's output read may take (spec #588, #593): the
+/// entry renders once, so the read is spent exactly once, but it must not park
+/// a render pass on a half-open connection. Matches the flows' own request
+/// bound (`ExternalFlow::request_timeout_ms`).
+const ENTRY_OUTPUT_READ_TIMEOUT_MS: u64 = 30_000;
 
 /// The session/thread name shown as the card subtitle, formatted as
 /// `<title> · <id-tail>` (e.g. "你好 · 01ba0ed"). The OpenCode server's OWN
@@ -441,24 +447,66 @@ fn wake_completion_entry(
         ending: TaskEnding::Wake {
             state: wake.state.clone(),
         },
+        output: None,
     })
 }
 
-/// Insert the completion entry for every Wake whose resumed work this render is
-/// about to show, and report whether any was inserted (so an entry reaches the
-/// card even when no part changed). A Wake that opened the card itself was
+/// One completion entry a ledger read has planned but not yet inserted (spec
+/// #588, #593): every exactly-once gate the insertion applies has passed, but
+/// the shell output read is still owed. A venue plans under a brief read of the
+/// card, spends the reads OUTSIDE the cards lock ([`read_planned_outputs`]) and
+/// commits the surviving plan under the lock ([`commit_planned_entries`]) —
+/// entries render at most once, so each spends at most one read, and a plan a
+/// racing render beat to the announce is simply not committed.
+pub(super) struct PlannedEntry {
+    /// The exactly-once announce key (the Wake's id / `runtime:<call_id>`).
+    key: String,
+    /// The clock the announcement stages with.
+    announce_at: i64,
+    /// The timeline insert key.
+    at: Option<i64>,
+    /// The directory the shell output read routes under: the card's own work
+    /// directory, when it carries one.
+    directory: Option<String>,
+    entry: TaskCompletionEntry,
+}
+
+/// Plan the completion entries a ledger read owes (spec #593): the Wakes whose
+/// resumed work this render is about to show and the Background Tasks a runtime
+/// reconciliation retired without a Wake (issue #454) — or the user's cleanup
+/// retired (spec #588, #590). Every gate the insertion applies is checked here
+/// (the anchor, the durable Wake floor, the announce set, the
+/// `runtime:<call_id>` synthetic key) but NOTHING is mutated: a caller can plan
+/// under a short lock, read each shell's output tail outside it and commit the
+/// plan the gates still admit. Without an anchor no entry can be placed, so no
+/// plan is made at all.
+pub(super) fn plan_ledger_entries(
+    acc: &StreamAccumulator,
+    transcript: &SessionTranscript,
+    anchor: Option<&TurnAnchor>,
+) -> Vec<PlannedEntry> {
+    let Some(anchor) = anchor else {
+        return Vec::new();
+    };
+    let mut plans = plan_wake_entries(acc, transcript, anchor);
+    plans.extend(plan_runtime_entries(acc, transcript, anchor));
+    plans
+}
+
+/// Plan the completion entry for every Wake whose resumed work this render is
+/// about to show, in the read's order. A Wake that opened the card itself was
 /// already announced by its 承接 line, a Wake with no server time cannot be
 /// ordered (so it is skipped before its entry is built — the guard supplies
 /// `created_ms`), and a Wake outside this card's Turn is not this render's
 /// content — all are skipped. Each Wake marks at most once per chain
 /// ([`StreamAccumulator::announce_wake`]), so a repeated poll never doubles an
 /// entry.
-fn render_wake_entries(
-    acc: &mut StreamAccumulator,
+fn plan_wake_entries(
+    acc: &StreamAccumulator,
     transcript: &SessionTranscript,
     anchor: &TurnAnchor,
-) -> bool {
-    let mut inserted = false;
+) -> Vec<PlannedEntry> {
+    let mut plans = Vec::new();
     for wake in &transcript.wakes {
         let Some(created_ms) = wake.created_ms else {
             continue;
@@ -473,31 +521,36 @@ fn render_wake_entries(
         if acc.wake_floor.is_some_and(|floor| created_ms <= floor) {
             continue;
         }
+        if acc.wake_announced(wake.id.as_str()) {
+            continue;
+        }
         let Some(entry) = wake_completion_entry(wake, transcript, created_ms) else {
             continue;
         };
-        if !acc.announce_wake(wake.id.as_str(), created_ms) {
-            continue;
-        }
-        // Keyed at the Wake's moment, so the entry sorts before the work it
-        // announces, whose server times are at/after it (the 承接 line's own
-        // lesson).
-        acc.push_ledger_entry_at(Some(created_ms.saturating_sub(1)), entry);
-        inserted = true;
+        plans.push(PlannedEntry {
+            key: wake.id.as_str().to_string(),
+            announce_at: created_ms,
+            // Keyed at the Wake's moment, so the entry sorts before the work it
+            // announces, whose server times are at/after it (the 承接 line's own
+            // lesson).
+            at: Some(created_ms.saturating_sub(1)),
+            directory: acc.directory.clone(),
+            entry,
+        });
     }
-    inserted
+    plans
 }
 
-/// Insert the completion entry for every Background Task a runtime
+/// Plan the completion entry for every Background Task a runtime
 /// reconciliation retired without a Wake (issue #454) — or the user's cleanup
-/// click retired (spec #588, #590) — and report whether any was inserted. The
-/// retired task has already left the live list, so this entry is its one record
-/// when no Wake will ever arrive: the runtime's own completion time when it
-/// reported one (the `Lost` ending reports none), the task's launch and
-/// identity from the read, and the label joined from the originating tool
-/// part's input by `call_id` (the live row's own join). A cleaned retirement
-/// carries the click's own clock and renders through the same site, so the
-/// runtime's endings and the manual one cannot drift apart.
+/// click retired (spec #588, #590). The retired task has already left the live
+/// list, so this entry is its one record when no Wake will ever arrive: the
+/// runtime's own completion time when it reported one (the `Lost` ending
+/// reports none), the task's launch and identity from the read, and the label
+/// joined from the originating tool part's input by `call_id` (the live row's
+/// own join). A cleaned retirement carries the click's own clock and renders
+/// through the same site, so the runtime's endings and the manual one cannot
+/// drift apart.
 ///
 /// The entry renders on the chain that OBSERVED the retirement, whatever
 /// anchor that chain has: the launch record never flips, so the observing chain
@@ -509,22 +562,22 @@ fn render_wake_entries(
 /// backend's process-local overlay, so no later read derives it again, and the
 /// Wake announcement set (keyed by a synthetic `runtime:<call_id>` id) covers
 /// the reads within the observing chain.
-fn render_runtime_entries(
-    acc: &mut StreamAccumulator,
+fn plan_runtime_entries(
+    acc: &StreamAccumulator,
     transcript: &SessionTranscript,
     anchor: &TurnAnchor,
-) -> bool {
-    let mut inserted = false;
+) -> Vec<PlannedEntry> {
+    let mut plans = Vec::new();
     for retirement in &transcript.runtime_retired {
         let task = &retirement.task;
         let key = format!("runtime:{}", task.tool.call_id);
+        if acc.wake_announced(&key) {
+            continue;
+        }
         let at = retirement
             .finished_at
             .or(task.started_at)
             .unwrap_or(anchor.created_ms);
-        if !acc.announce_wake(&key, at) {
-            continue;
-        }
         let kind = super::state::task_kind(&task.tool.name);
         let ending = match &retirement.ending {
             TaskRetirementEnding::Ended(_) => TaskEnding::RuntimeEnded,
@@ -551,8 +604,65 @@ fn render_runtime_entries(
             started_at: task.started_at,
             finished_at: retirement.finished_at,
             ending,
+            output: None,
         };
-        acc.push_ledger_entry_at(retirement.finished_at, entry);
+        plans.push(PlannedEntry {
+            key,
+            announce_at: at,
+            at: retirement.finished_at,
+            directory: acc.directory.clone(),
+            entry,
+        });
+    }
+    plans
+}
+
+/// Spend each planned shell completion's one output read (spec #588, #593):
+/// the record's tail, or [`TaskOutput::Unavailable`] when the read fails,
+/// vanishes or answers nothing — the entry then says 「输出已不可用」 rather
+/// than posing an empty panel. Runs OUTSIDE the cards lock (the reads are
+/// network) and before the commit; a plan that never commits (a racing render
+/// announced it first) still spends its read at most once. Endings that show
+/// no output — a subagent, the 已失联 entry, the 🧹 cleanup — are left
+/// identity-only and spend nothing.
+pub(super) async fn read_planned_outputs(
+    backend: &Arc<dyn crate::backend::Backend>,
+    plans: &mut [PlannedEntry],
+) {
+    for plan in plans.iter_mut() {
+        if !plan.entry.shows_output() {
+            continue;
+        }
+        let output = match plan.entry.id.as_deref() {
+            Some(shell_id) => match crate::bridge::bounded_call(
+                "shell output read",
+                ENTRY_OUTPUT_READ_TIMEOUT_MS,
+                backend.shell_output(shell_id, plan.directory.as_deref()),
+            )
+            .await
+            {
+                Some(Ok(Some(window))) if !window.text.is_empty() => TaskOutput::Window(window),
+                _ => TaskOutput::Unavailable,
+            },
+            // The read has no identity to ask for: the record cannot be read,
+            // so the entry says so instead of posing as output.
+            None => TaskOutput::Unavailable,
+        };
+        plan.entry.output = Some(output);
+    }
+}
+
+/// Commit a planned read (spec #593): announce each entry and insert it, under
+/// the cards lock. The announce is the exactly-once gate, so a plan a racing
+/// render already committed is skipped — the entry renders once, wherever the
+/// read met it. Returns whether any entry was inserted.
+pub(super) fn commit_planned_entries(acc: &mut StreamAccumulator, plans: Vec<PlannedEntry>) -> bool {
+    let mut inserted = false;
+    for plan in plans {
+        if !acc.announce_wake(&plan.key, plan.announce_at) {
+            continue;
+        }
+        acc.push_ledger_entry_at(plan.at, plan.entry);
         inserted = true;
     }
     inserted
@@ -561,42 +671,33 @@ fn render_runtime_entries(
 /// The ledger facts a transcript read owes a card (ADR-0060): the read's
 /// remaining live list — so a retired task's row leaves and the still-running
 /// ones stay, on a continuation's very first payload or on a yielded card's
-/// in-place refresh — and each retiring shell/subagent Wake's completion entry,
-/// keyed where the completion happened, so the entry stays on the card that
-/// hosted the task. A runtime reconciliation's retirements (issue #454) render
-/// their entries through the same site. Both enter the accumulator through the
-/// same one-site primitives the live render uses
-/// ([`set_ledger_from_read`](StreamAccumulator::set_ledger_from_read),
-/// [`render_wake_entries`], [`render_runtime_entries`]), so no path can drift
-/// from it. `activities` is the child liveness this read gathered for the
-/// ledger's live subagents, keyed by call id (spec #501) — empty on the paths
-/// that gather nothing, where a stored fragment is kept rather than dropped.
-/// `now_ms` is the read's clock; `cadence` is the granularity its ledger clock
-/// is compared at (the live render and its Wake handover at whole minutes, the
-/// yielded refresh at whole seconds — [`LedgerCadence`]).
+/// in-place refresh — and the completion entries the caller planned and read
+/// ([`plan_ledger_entries`] + [`read_planned_outputs`]), committed here under
+/// the same one-site primitive the live render uses. `activities` is the child
+/// liveness this read gathered for the ledger's live subagents, keyed by call
+/// id (spec #501) — empty on the paths that gather nothing, where a stored
+/// fragment is kept rather than dropped. `now_ms` is the read's clock;
+/// `cadence` is the granularity its ledger clock is compared at (the live
+/// render and its Wake handover at whole minutes, the yielded refresh at whole
+/// seconds — [`LedgerCadence`]).
 ///
 /// A Wake handover calls this on the OUTGOING card before its chain splits;
 /// Session Sync's in-place pass calls it on a yielded card. Returns whether the
 /// card changed at all: a terminal card that did still owes its handover PATCH,
 /// while one the read did not touch keeps the ending it shows, and a yielded
-/// card is only PATCHed for a real change. `anchor` scopes the completion
-/// entries; without one the live list still moves, but a Wake's entry cannot
-/// be placed.
+/// card is only PATCHed for a real change.
 pub(super) fn apply_ledger_read(
     acc: &mut StreamAccumulator,
     transcript: &SessionTranscript,
     activities: &std::collections::HashMap<String, TaskLiveness>,
-    anchor: Option<&TurnAnchor>,
     now_ms: i64,
     cadence: LedgerCadence,
+    plans: Vec<PlannedEntry>,
 ) -> bool {
     let mut changed = acc
         .set_ledger_from_read(transcript, activities, now_ms, cadence)
         .owes();
-    if let Some(anchor) = anchor {
-        changed |= render_wake_entries(acc, transcript, anchor);
-        changed |= render_runtime_entries(acc, transcript, anchor);
-    }
+    changed |= commit_planned_entries(acc, plans);
     changed
 }
 
@@ -604,12 +705,17 @@ pub(super) fn apply_ledger_read(
 /// rendered yet, and refresh the live Background Task ledger from the read
 /// with NO gathered child liveness (the sync callers — tests, the turn-end
 /// reconcile — have no gather): every `subagent` row keeps the last fragment
-/// that established one. The live render's own entry is [`render_turn_parts`],
-/// whose caller applies the ledger from the render's shared gather.
-/// Returns true if anything new was rendered.
+/// that established one. Completion entries commit through the same plan/commit
+/// primitives the async venues use, with no output reads (this path has no
+/// backend): a Wake/runtime entry renders identity-only, as before spec #593.
+/// The live render's own entry is [`render_turn_parts`], whose caller applies
+/// the ledger from the render's shared gather. Returns true if anything new was
+/// rendered.
 pub(super) fn render_new_turn_parts(acc: &mut StreamAccumulator, transcript: &SessionTranscript) -> bool {
     let rendered = render_turn_parts(acc, transcript);
-    rendered | refresh_ledger(acc, transcript, &std::collections::HashMap::new()).owes()
+    let plans = plan_ledger_entries(acc, transcript, acc.turn_anchor.as_ref());
+    let entries = commit_planned_entries(acc, plans);
+    rendered | refresh_ledger(acc, transcript, &std::collections::HashMap::new()).owes() | entries
 }
 
 /// Render the parts of this turn's assistant messages that haven't been
@@ -685,9 +791,11 @@ pub(super) fn render_turn_parts(acc: &mut StreamAccumulator, transcript: &Sessio
     let Some(anchor) = acc.turn_anchor.clone() else {
         return rendered_any;
     };
-    // A merged Wake's completion entry is written before its work renders, so
-    // the entry sorts above the parts it announces.
-    rendered_any |= render_wake_entries(acc, transcript, &anchor);
+    // A merged Wake's completion entry (spec #593) is planned and committed by
+    // the caller — [`plan_ledger_entries`] + [`read_planned_outputs`] +
+    // [`commit_planned_entries`] — so its output read happens outside the cards
+    // lock. The timeline keys the entry before the work it announces, so
+    // committing it here or after the parts render is one card.
     let seed = acc.seed.clone();
     for message in transcript.turn_for_user(&anchor).messages {
         // A message the seed's own scope already walked is done: walking it
@@ -1203,11 +1311,13 @@ fn resolve_seeded_calls(acc: &mut StreamAccumulator, transcript: &SessionTranscr
 /// a rendered change that owes its flush, while a gather that established
 /// nothing keeps each row's stored fragment growing truthfully.
 ///
-/// The read's runtime retirements render here too (#589): the live path must
-/// place each `🔔 shell 结束`/`已失联` entry on the very read that observed it
-/// — the process-local overlay filters every later read, so a missed render is
-/// a swallowed entry. The announce set keeps it exactly once whichever path
-/// renders that read. Returns the split decision
+/// The read's completion entries are the caller's (spec #593): every venue
+/// plans them on the same read ([`plan_ledger_entries`]), reads their output
+/// tails outside the cards lock and commits them with their rows — the live
+/// path must place each `🔔 shell 结束`/`已失联` entry on the very read that
+/// observed it, because the process-local overlay filters every later read, and
+/// the announce set keeps it exactly once whichever path renders that read.
+/// This function owns the live list alone. Returns the split decision
 /// ([`super::state::LedgerChange`]): a caller that only flushes reads `owes`,
 /// while one telling new work from clock churn reads `rows` (#457).
 fn refresh_ledger(
@@ -1215,21 +1325,15 @@ fn refresh_ledger(
     transcript: &SessionTranscript,
     activities: &std::collections::HashMap<String, TaskLiveness>,
 ) -> super::state::LedgerChange {
-    let Some(anchor) = acc.turn_anchor.clone() else {
+    if acc.turn_anchor.is_none() {
         return super::state::LedgerChange::default();
-    };
-    let mut change = acc.set_ledger_from_read(
+    }
+    acc.set_ledger_from_read(
         transcript,
         activities,
         chrono::Utc::now().timestamp_millis(),
         LedgerCadence::Minute,
-    );
-    if render_runtime_entries(acc, transcript, &anchor) {
-        // An inserted entry is rendered content, not clock churn: it owes its
-        // flush and counts as progress (a silent task's ticking age must not).
-        change.rows = true;
-    }
-    change
+    )
 }
 
 /// Whether rendering `transcript` scoped at `anchor` would add ANY part to
@@ -1290,10 +1394,21 @@ pub(super) async fn render_and_flush(
     // OpenCode auto-renames sessions after a turn; follow the server's live
     // title so the card subtitle doesn't stay on the "new session" default.
     refresh_session_title(cards, sessions, backend, session_id).await;
-    let (changed, header_changed, new_parts, text_len, reasoning_len, anchor) = {
+    let (changed, header_changed, new_parts, text_len, reasoning_len, anchor, mut plans) = {
         let mut live = cards.cards.lock().await;
         let card = live.get_mut(session_id)?;
         let before = card.acc.rendered_parts.len();
+        // The anchor this read establishes (or already carries) is the scope
+        // both the parts and the completion entries place against: capture it
+        // BEFORE planning the entries, so their output reads can run outside
+        // this lock below. `render_turn_parts` re-runs the same idempotent
+        // capture.
+        capture_turn_anchor(&mut card.acc, transcript);
+        // The completion entries this read owes (spec #593): planned here
+        // (pure), their output tails read below, committed before the flush —
+        // the live path must render the retirement entry on the very read that
+        // observed it.
+        let plans = plan_ledger_entries(&card.acc, transcript, card.acc.turn_anchor.as_ref());
         let changed = render_turn_parts(&mut card.acc, transcript);
         if changed {
             // Mark the progress NOW: a later stage of this pass may be
@@ -1322,7 +1437,26 @@ pub(super) async fn render_and_flush(
             card.acc.text.len(),
             card.acc.reasoning.len(),
             anchor,
+            plans,
         )
+    };
+    // One output read per planned entry, OUTSIDE the cards lock (the reads are
+    // network), then one short lock to announce and insert them (spec #593).
+    read_planned_outputs(backend, &mut plans).await;
+    let entries_changed = {
+        let mut live = cards.cards.lock().await;
+        match live.get_mut(session_id) {
+            Some(card) => {
+                let inserted = commit_planned_entries(&mut card.acc, plans);
+                if inserted {
+                    // An inserted entry is rendered content, not clock churn:
+                    // it owes its flush and counts as progress, like a part.
+                    card.acc.progress_mark += 1;
+                }
+                inserted
+            }
+            None => false,
+        }
     };
     // Persist the captured anchor on the durable record (ADR-0063), so a
     // restart's reap can ask the transcript what became of this Turn's message
@@ -1385,7 +1519,7 @@ pub(super) async fn render_and_flush(
             None => (super::state::LedgerChange::default(), false),
         }
     };
-    if changed || header_changed || context_changed || ledger.owes() || liveness_changed {
+    if changed || entries_changed || header_changed || context_changed || ledger.owes() || liveness_changed {
         Turn::flush_card(cards, session_id).await;
     }
     Some(RenderStats {
