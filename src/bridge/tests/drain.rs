@@ -3277,6 +3277,9 @@ async fn a_runtime_retirement_during_the_follow_ends_the_turn() {
         app.inflight.lock().await.contains("ses_test"),
         "the follow covers the hand-off window with the guard"
     );
+    // The live row first (the still-busy session keeps the follow rendering):
+    // the retirement below must remove it IN PLACE.
+    wait_for_card_text(&platform, "⏳ 后台任务（1）").await;
 
     // The runtime confirms the shell ended while the follow is still
     // rendering: the follow's own read retires it and renders the entry.
@@ -3291,6 +3294,11 @@ async fn a_runtime_retirement_during_the_follow_ends_the_turn() {
         card_text(card).contains("🔔 shell 结束")
     })
     .await;
+    let retired_card = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        !card_text(&retired_card).contains("后台任务（"),
+        "the row left the live card the moment the runtime retired it: {retired_card}"
+    );
 
     // The Execution then idles: the follow's settle is the true end.
     backend
