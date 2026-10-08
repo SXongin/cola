@@ -8,7 +8,7 @@
 //! accumulator's own tests are the module's internal seam.
 
 use super::disposition::Disposition;
-use crate::backend::{MessageId, Part, SessionTranscript, TurnAnchor};
+use crate::backend::{MessageId, Part, SessionTranscript, ShellOutputRead, TurnAnchor};
 use crate::bridge::chain::{CursorFrontier, CursorPartKind, RenderedCursor};
 use crate::bridge::handles::CardsHandle;
 use crate::feishu::card::first_n_chars_bytes;
@@ -922,11 +922,12 @@ pub(super) enum LedgerCadence {
 
 /// What a ledger refresh moved (#457), split so the live render can tell real
 /// work from clock churn: `rows` — a visible fact moved (membership, a row's
-/// label or status, the fragment's words) — is progress; `clock` — only a
-/// rendered elapsed or age crossed the path's cadence — owes the flush but is
-/// not new work. Both halves flush the card; the external renderer's idle
-/// bound renews on `rows` alone, or a silent task's ticking age would keep its
-/// card live forever.
+/// label or status, the fragment's words, the output window's text) — is
+/// progress; `clock` — only a rendered elapsed, a fragment's age or the output
+/// window's cutoff crossed the path's cadence — owes the flush but is not new
+/// work. Both halves flush the card; the external renderer's idle bound renews
+/// on `rows` alone, or a silent task's ticking age would keep its card live
+/// forever.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct LedgerChange {
     pub(super) rows: bool,
@@ -1068,6 +1069,13 @@ pub(super) struct StreamAccumulator {
     /// live subagents on every read, so a retired task's fragment leaves with
     /// its row and the map cannot grow past the session's current tasks.
     ledger_activity: HashMap<String, TaskLiveness>,
+    /// Each live shell's last established output window, keyed by shell id
+    /// (spec #588, #592): a read that spent no output read on a shell (the
+    /// shared cycle's throttle) keeps rendering this window, while a read that
+    /// spent one and found nothing clears it — a stale window never poses as
+    /// current, and a failure never renders a placeholder. Pruned to the live
+    /// shells on every read, like [`Self::ledger_activity`].
+    ledger_outputs: HashMap<String, crate::backend::ShellOutputWindow>,
     /// The ledger's render clock ([`Self::set_ledger`]): each row's rendered
     /// numbers — a shell row's elapsed, and any row's activity fragment age, in
     /// whole seconds as of the read that last moved the section (ADR-0060, spec
@@ -2617,7 +2625,13 @@ impl StreamAccumulator {
                 .zip(&rows)
                 .all(|(rendered, new)| rendered.renders_like(new));
         let clock_alike = self.ledger_clock.iter().zip(&clock).all(|(rendered, new)| {
-            !moved(rendered.elapsed, new.elapsed) && !moved(rendered.activity, new.activity)
+            !moved(rendered.elapsed, new.elapsed)
+                && !moved(rendered.activity, new.activity)
+                // The output window's cutoff (spec #592): a re-read inside the
+                // minute the label shows owes nothing, a crossing minute owes
+                // its flush — as a clock change, never the row half, so a
+                // silent shell's window cannot renew the idle bound (#457).
+                && !moved(rendered.output, new.output)
         });
         self.ledger = rows;
         self.ledger_clock = clock;
@@ -2651,10 +2665,11 @@ impl StreamAccumulator {
         activities: &HashMap<String, TaskLiveness>,
     ) -> Vec<TaskLedgerRow> {
         // The common case (V1, or a session with no live task) does no scan: an
-        // empty read clears an empty ledger — and every cached fragment with
-        // it, so a retired task's activity cannot outlive its row.
+        // empty read clears an empty ledger — and every cached fragment and
+        // window with it, so a retired task's facts cannot outlive its row.
         if transcript.background_tasks.is_empty() {
             self.ledger_activity.clear();
+            self.ledger_outputs.clear();
             return Vec::new();
         }
         let rows: Vec<TaskLedgerRow> = transcript
@@ -2674,6 +2689,27 @@ impl StreamAccumulator {
                             .cloned()
                     })
                     .flatten();
+                // The shell's output window (spec #592): the read's own outcome
+                // when it spent one, the last established window when the
+                // shared cycle's throttle spent nothing.
+                let output = if kind == TaskKind::Shell {
+                    task.shell_id.as_deref().and_then(|shell_id| {
+                        match transcript.shell_outputs.get(shell_id) {
+                            Some(ShellOutputRead::Window(window)) => Some(window.clone()),
+                            // The read spent a tail read and found nothing to
+                            // show: the window is omitted, and any stored one
+                            // leaves with it — never a stale window posing as
+                            // current, never a placeholder.
+                            Some(ShellOutputRead::Unavailable) => None,
+                            // No tail read this cycle (the shared throttle):
+                            // the last established window stands, exactly like
+                            // a subagent's stored activity fragment.
+                            None => self.ledger_outputs.get(shell_id).cloned(),
+                        }
+                    })
+                } else {
+                    None
+                };
                 TaskLedgerRow {
                     kind,
                     label: task_label(kind, transcript.tool_input(call_id)),
@@ -2683,6 +2719,7 @@ impl StreamAccumulator {
                     // live until its Wake or a positive terminal verdict retires it.
                     unconfirmed: transcript.unconfirmed_tasks.contains(call_id),
                     activity,
+                    output,
                 }
             })
             .collect();
@@ -2701,6 +2738,32 @@ impl StreamAccumulator {
         for (call_id, liveness) in activities {
             if live_subagents.contains(call_id.as_str()) {
                 self.ledger_activity.insert(call_id.clone(), liveness.clone());
+            }
+        }
+        // The output cache follows the same rule (spec #592): pruned to the
+        // live shells, folded with this read's windows, and cleared for a shell
+        // the read spent on and found nothing — so a failed read's window
+        // leaves rather than posing as current, and the throttled reads
+        // between cycles keep rendering the last real one.
+        let live_shells: std::collections::HashSet<&str> = transcript
+            .background_tasks
+            .iter()
+            .filter(|task| task_kind(&task.tool.name) == TaskKind::Shell)
+            .filter_map(|task| task.shell_id.as_deref())
+            .collect();
+        self.ledger_outputs
+            .retain(|shell_id, _| live_shells.contains(shell_id.as_str()));
+        for (shell_id, output) in &transcript.shell_outputs {
+            if !live_shells.contains(shell_id.as_str()) {
+                continue;
+            }
+            match output {
+                ShellOutputRead::Window(window) => {
+                    self.ledger_outputs.insert(shell_id.clone(), window.clone());
+                }
+                ShellOutputRead::Unavailable => {
+                    self.ledger_outputs.remove(shell_id);
+                }
             }
         }
         rows
@@ -4205,6 +4268,8 @@ mod tests {
                 started_at: None,
                 unconfirmed: false,
                 activity: None,
+
+                output: None,
             }],
             0,
             LedgerCadence::Minute,
@@ -4252,6 +4317,8 @@ mod tests {
             started_at: None,
             unconfirmed,
             activity: None,
+
+            output: None,
         };
         let cleanup_element = |card: &serde_json::Value| {
             card["body"]["elements"]
@@ -4315,6 +4382,8 @@ mod tests {
                 started_at: Some(start),
                 unconfirmed: false,
                 activity: None,
+
+                output: None,
             }]
         };
         let cadence = |acc: &mut StreamAccumulator, at: i64, cadence| acc.set_ledger(rows(), at, cadence);
@@ -4344,6 +4413,63 @@ mod tests {
         assert!(!cadence(&mut acc, start + 61_500, LedgerCadence::Second));
     }
 
+    /// Spec #588 / #592: the output window's cutoff is a rendered clock — a
+    /// re-read inside the minute the label shows owes nothing, a crossing
+    /// minute owes its flush through the CLOCK half only (a silent shell's
+    /// window must not renew the renderer's idle bound, #457), and different
+    /// tail text is a rendered-fact change on the row half.
+    #[test]
+    fn the_windows_cutoff_owes_only_a_clock_flush() {
+        let start = 1_800_000_000_000;
+        let row = |captured_ms: i64, text: &str| TaskLedgerRow {
+            kind: TaskKind::Shell,
+            label: Some("npm run build".into()),
+            started_at: None,
+            unconfirmed: false,
+            activity: None,
+            output: Some(crate::backend::ShellOutputWindow {
+                text: text.into(),
+                clipped: false,
+                captured_ms,
+            }),
+        };
+        let mut acc = StreamAccumulator::new("test");
+        assert!(
+            acc.set_ledger_change(vec![row(start, "a")], start, LedgerCadence::Minute)
+                .owes()
+        );
+
+        let change = acc.set_ledger_change(
+            vec![row(start + 30_000, "a")],
+            start + 30_000,
+            LedgerCadence::Minute,
+        );
+        assert!(
+            !change.owes() && !change.rows && !change.clock,
+            "a re-read inside the label's minute moved nothing: {change:?}"
+        );
+
+        let change = acc.set_ledger_change(
+            vec![row(start + 60_000, "a")],
+            start + 60_000,
+            LedgerCadence::Minute,
+        );
+        assert!(
+            change.clock && !change.rows,
+            "the cutoff crossing a minute is a clock-only flush: {change:?}"
+        );
+
+        let change = acc.set_ledger_change(
+            vec![row(start + 60_000, "b")],
+            start + 60_000,
+            LedgerCadence::Minute,
+        );
+        assert!(
+            change.rows && !change.clock,
+            "different tail text is a row change: {change:?}"
+        );
+    }
+
     /// #457: the live render's idle-bound renewal reads the ledger's `rows`
     /// half only. A silent task's rendered elapsed/age crossing a whole minute
     /// is clock churn — it owes the flush but must not renew the bound, or the
@@ -4358,6 +4484,8 @@ mod tests {
                 started_at: Some(start),
                 unconfirmed: false,
                 activity: None,
+
+                output: None,
             }]
         };
         let mut acc = StreamAccumulator::new("test");
@@ -4393,6 +4521,8 @@ mod tests {
                 started_at: None,
                 unconfirmed: false,
                 activity: Some(activity),
+
+                output: None,
             }]
         };
         let thinking = |last_activity_ms: i64| TaskLiveness {
@@ -4446,6 +4576,7 @@ mod tests {
                 started_at: None,
                 unconfirmed: false,
                 activity,
+                output: None,
             }]
         };
         let tool = |name: &str, wait: Option<crate::feishu::card::AwaitingAction>| TaskLiveness {
@@ -4606,6 +4737,8 @@ mod tests {
                 started_at,
                 unconfirmed: false,
                 activity: None,
+
+                output: None,
             }]
         };
         let clipped = "x".repeat(crate::feishu::card::ledger::TASK_LABEL_CHARS);
@@ -4679,6 +4812,8 @@ mod tests {
                     last_activity_ms: activity_at,
                     wait: None,
                 }),
+
+                output: None,
             }]
         };
         let mut acc = StreamAccumulator::new("test");
@@ -4710,6 +4845,8 @@ mod tests {
                 started_at: None,
                 unconfirmed: false,
                 activity: None,
+
+                output: None,
             }]
         };
         let mut acc = StreamAccumulator::new("test");

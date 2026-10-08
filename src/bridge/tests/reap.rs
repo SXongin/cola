@@ -10792,3 +10792,64 @@ async fn a_takeover_keeps_an_unresolved_projection_intent() {
         "the late card's tail is never projected again"
     );
 }
+
+/// Spec #588 / #592: the restart-projected successor carries the running
+/// shell's output window, on the ordinary ledger/entry path. The successor's
+/// first payload is armed before any cycle is spent; the next Session Sync
+/// pass reads the tail on the shared reconcile cycle and refreshes the
+/// successor in place — exactly one tail read for its one live shell.
+#[tokio::test]
+async fn a_restart_successor_carries_the_shell_output_window() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let delivered = "已经写了一半。";
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
+        Some(text_frontier(delivered)),
+        &[],
+    );
+    let waiting = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, delivered),
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_background_tasks(vec![background_shell(2_100)]);
+    let (app, platform, backend) =
+        restarted_app_with_backend(&session_file, waiting, Some(SessionStatus::Idle)).await;
+    let captured = chrono::Utc::now().timestamp_millis();
+    backend.shell_outputs.lock().unwrap().insert(
+        "sh_bg".into(),
+        Some(crate::backend::ShellOutputWindow {
+            text: "running tests…".into(),
+            clipped: false,
+            captured_ms: captured,
+        }),
+    );
+    platform.given_card_view("om_frozen", realistic_card_view());
+
+    spawn_sync(&app);
+    let (successor, _) = wait_for_projection(&platform, "om_frozen").await;
+    assert_eq!(
+        card_header(&successor),
+        "⏳ 等待后台任务",
+        "the successor is the wait's card"
+    );
+    // The next pass reads the window on the shared cycle and refreshes the
+    // successor in place: the row and its tail arrive together. (The fixture's
+    // transcript carries no launch part, so the row renders bare.)
+    wait_for_update(&platform, "msg_reply", "the successor's output window", |card| {
+        let text = card_text(card);
+        text.contains("· shell") && text.contains("截至于") && text.contains("running tests…")
+    })
+    .await;
+    assert_eq!(
+        backend.shell_output_calls.lock().await.clone(),
+        vec!["sh_bg".to_string()],
+        "one tail read for the successor's one live shell"
+    );
+}

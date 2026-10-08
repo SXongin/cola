@@ -3910,3 +3910,205 @@ async fn a_live_session_without_background_subagents_spends_no_child_read() {
         "no task names a child, so only the session itself is read: {calls:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// A running shell's output window (spec #588, ticket #592): the shared
+// runtime reconcile's own cycle reads the record's tail, and the ledger
+// renders it under the shell's row — labelled, clipped when truncated, and
+// refreshed at the shared cadence. Display-only: a failed or vanished read
+// omits the window, and nothing ever prompts, retires or settles.
+// ---------------------------------------------------------------------------
+
+/// Script the live shell `sh_call_bg`'s output window (the shell id
+/// [`live_shell`] derives from its `call_bg` call id).
+fn given_shell_output(backend: &Arc<MockBackend>, text: &str, clipped: bool, captured_ms: i64) {
+    backend.shell_outputs.lock().unwrap().insert(
+        "sh_call_bg".into(),
+        Some(crate::backend::ShellOutputWindow {
+            text: text.into(),
+            clipped,
+            captured_ms,
+        }),
+    );
+}
+
+/// Acceptance 1/2 (spec #588, #592): a running shell's row carries its output
+/// window on the LIVE card, and the window refreshes only on the shared
+/// reconcile cycle — many drain ticks inside one cycle spend one tail read per
+/// live shell.
+#[tokio::test]
+async fn a_live_turns_shell_window_renders_on_the_shared_cadence() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = SessionTranscript::new(two_task_timeline(vec![]))
+        .with_executions(vec![execution(2_500)])
+        .with_background_tasks(vec![
+            live_shell(now - 5_000, "call_bg"),
+            live_shell(now - 3_000, "call_bg2"),
+        ]);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Busy)).await;
+    // One cycle, pinned wide before the turn starts: its first drain tick
+    // spends it, every later tick in the window must not.
+    app.runtime_reconcile.interval_ms.store(60_000, Ordering::Relaxed);
+    given_shell_output(&backend, "step 1\nstep 2", false, now);
+    backend.shell_outputs.lock().unwrap().insert(
+        "sh_call_bg2".into(),
+        Some(crate::backend::ShellOutputWindow {
+            text: "other 1\nother 2".into(),
+            clipped: true,
+            captured_ms: now,
+        }),
+    );
+
+    let _turn = spawn_turn(&app, ctx("ses_test", "跑一下构建并审阅"));
+    wait_for_card_update(&platform, "the live output window", CardUpdates::Latest, |card| {
+        let text = card_text(card);
+        text.contains("· shell：**gh run watch**")
+            && text.contains("截至于")
+            && text.contains("step 1")
+            && text.contains("other 2")
+    })
+    .await;
+
+    // Many more ticks inside the same cycle: one tail read per live shell.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        backend.shell_output_calls.lock().await.clone(),
+        vec!["sh_call_bg".to_string(), "sh_call_bg2".to_string()],
+        "at most one tail read per live shell per shared cycle"
+    );
+
+    // The cadence admits the next attempt: the changed tail lands.
+    given_shell_output(&backend, "step 3\nstep 4", false, now + 60_000);
+    app.runtime_reconcile.interval_ms.store(0, Ordering::Relaxed);
+    wait_for_card_update(&platform, "the refreshed window", CardUpdates::Latest, |card| {
+        card_text(card).contains("step 4")
+    })
+    .await;
+    assert_eq!(
+        backend.prompt_calls.lock().await.len(),
+        1,
+        "the window is a pure read: the turn's own prompt is the card's only one"
+    );
+}
+
+/// Acceptance 1/3/4 (spec #588, #592): the yielded (waiting) card carries the
+/// window too; a failed read takes it away entirely — never a stale window or
+/// an empty panel — and a later successful read brings the fresh one back.
+/// The wait itself is untouched by any of it.
+#[tokio::test]
+async fn a_failed_window_read_omits_it_and_a_later_read_restores_it() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = waiting_shell(now - 5_000);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    given_shell_output(&backend, "build ok", false, now);
+    yield_one_task_card(&app, &platform, ctx("ses_test", "跑一下构建并审阅")).await;
+
+    // The yield already carried the window (the drain's shared cycle read it).
+    let yielded = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_text(&yielded).contains("截至于") && card_text(&yielded).contains("build ok"),
+        "the waiting card shows its running shell's tail: {yielded}"
+    );
+    assert_eq!(
+        backend.shell_output_calls.lock().await.len(),
+        1,
+        "the yield's cycle spent one tail read"
+    );
+
+    // The next reads fail: the window leaves the card, and stays gone while
+    // the reads keep failing — no placeholder, no stale window.
+    backend
+        .fail_shell_output_reads
+        .store(1_000, std::sync::atomic::Ordering::SeqCst);
+    spawn_sync(&app);
+    wait_for_card_update(&platform, "the window leaving", CardUpdates::Latest, |card| {
+        !card_text(card).contains("截至于")
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let latest = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        !card_text(&latest).contains("截至于") && !card_text(&latest).contains("build ok"),
+        "a failed read never keeps or invents a window: {latest}"
+    );
+
+    // The read recovers: the fresh window returns on the next cycle.
+    backend
+        .fail_shell_output_reads
+        .store(0, std::sync::atomic::Ordering::SeqCst);
+    given_shell_output(&backend, "build done", false, now + 120_000);
+    wait_for_card_update(&platform, "the window returning", CardUpdates::Latest, |card| {
+        card_text(card).contains("build done")
+    })
+    .await;
+
+    // A vanished record is the same no-output case (a successful read that
+    // answers nothing): the window leaves again, never an empty panel.
+    backend.shell_outputs.lock().unwrap().remove("sh_call_bg");
+    wait_for_card_update(&platform, "the vanished window", CardUpdates::Latest, |card| {
+        !card_text(card).contains("截至于")
+    })
+    .await;
+
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Waiting),
+        "display-only: the failed and refreshed windows never settle or liveness"
+    );
+    assert_eq!(
+        backend.prompt_calls.lock().await.len(),
+        1,
+        "the window is a pure read: the yield's own prompt is the card's only one"
+    );
+}
+
+/// Acceptance 6 (spec #588, #592): V1 carries no Background Task facts, so the
+/// window read is never issued either — a V1 card shows nothing.
+#[tokio::test]
+async fn a_v1_read_spends_no_output_window_request() {
+    let _wd = test_work_dir();
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下构建"),
+        typed_message(
+            "msg_launch",
+            MessageRole::Assistant,
+            Some(2_000),
+            vec![Part::Tool(ToolCall {
+                identity: ToolIdentity {
+                    name: "shell".into(),
+                    call_id: "call_bg".into(),
+                },
+                status: ToolStatus::Running,
+                started_at: Some(2_000),
+                input: Some(serde_json::json!({ "command": "npm run build" })),
+                metadata: Some(serde_json::json!({ "background": true })),
+                output: ToolOutput {
+                    raw: None,
+                    blocks: vec![ContentBlock::Text("moved to background".into())],
+                    error: None,
+                },
+            })],
+        ),
+    ]);
+    let (_dir, app, backend, platform) = scripted_app(vec![transcript], Some(SessionStatus::Busy)).await;
+
+    let _turn = spawn_turn(&app, ctx("ses_test", "跑一下构建"));
+    wait_for_card_update(&platform, "the V1 panel", CardUpdates::Latest, |card| {
+        card_text(card).contains("moved to background")
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    assert!(
+        backend.shell_output_calls.lock().await.is_empty()
+            && backend.task_runtime_calls.lock().await.is_empty(),
+        "a read with no live shell spends no window or runtime request, whatever the generation"
+    );
+    let latest = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        !card_text(&latest).contains("截至于"),
+        "a V1 card never shows a window: {latest}"
+    );
+}

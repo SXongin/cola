@@ -24,6 +24,7 @@
 use super::sanitize::escaped_entities;
 use super::tool_render::TaskLiveness;
 use super::{first_n_chars_bytes, fmt_local_time, truncate_md};
+use crate::backend::ShellOutputWindow;
 
 /// Characters of a task label the ledger row shows before clipping — shared
 /// with the completion entry's collapsed title (`🔔 shell 完成：<label>`), so
@@ -141,6 +142,12 @@ pub struct TaskLedgerRow {
     /// establish one; the timestamps inside are never refreshed by a failed
     /// read, so the rendered age keeps growing truthfully (ADR-0054).
     pub activity: Option<TaskLiveness>,
+    /// The shell's captured output window (spec #588, ticket #592), rendered
+    /// as a labelled code block under the row: the last lines the shared
+    /// reconcile read established, or `None` when the read spent nothing, the
+    /// record had nothing to show, or the read failed — never a placeholder.
+    /// Only a `shell` row ever carries one.
+    pub output: Option<ShellOutputWindow>,
 }
 
 impl TaskLedgerRow {
@@ -170,22 +177,36 @@ impl TaskLedgerRow {
         self.started_at.and_then(fmt_local_time)
     }
 
+    /// The output facts the row RENDERS (spec #592): the window's text and
+    /// whether it is clipped. The cutoff's `HH:MM` is the render clock's
+    /// business ([`task_ledger_clock`]) — two captures inside the minute the
+    /// label shows are one rendered window and owe no PATCH.
+    fn rendered_output(&self) -> Option<(&str, bool)> {
+        self.output
+            .as_ref()
+            .filter(|window| !window.text.is_empty())
+            .map(|window| (window.text.as_str(), window.clipped))
+    }
+
     /// Whether this row RENDERS like `previous` (ADR-0060's flush rule, spec
     /// #501): the visible facts only — the type, the label as the row folds,
     /// clips and bolds it (an empty label as absent), the local `HH:MM` start
-    /// clock, the unconfirmed flag, and, while the row is confirmed, the
-    /// fragment's label and wait — never the raw label/start values that
-    /// render identically, nor the gathered liveness's stored timestamps. The
-    /// rendered numbers (a shell row's elapsed and the fragment's age) are the
-    /// render clock's business ([`task_ledger_clock`]), compared at the path's
-    /// own cadence: text past the clip, an empty label, a start moving inside
-    /// the displayed minute and elapsed second, or a child part landing inside
-    /// the shown second must not owe a PATCH.
+    /// clock, the unconfirmed flag, the output window's text and clipping
+    /// (spec #592, its cutoff minute is the clock's), and, while the row is
+    /// confirmed, the fragment's label and wait — never the raw label/start
+    /// values that render identically, nor the gathered liveness's stored
+    /// timestamps. The rendered numbers (a shell row's elapsed, the fragment's
+    /// age and the window's cutoff) are the render clock's business
+    /// ([`task_ledger_clock`]), compared at the path's own cadence: text past
+    /// the clip, an empty label, a start moving inside the displayed minute
+    /// and elapsed second, or a child part landing inside the shown second must
+    /// not owe a PATCH.
     pub(crate) fn renders_like(&self, previous: &Self) -> bool {
         self.kind == previous.kind
             && self.rendered_label() == previous.rendered_label()
             && self.rendered_clock() == previous.rendered_clock()
             && self.unconfirmed == previous.unconfirmed
+            && self.rendered_output() == previous.rendered_output()
             && (self.unconfirmed
                 || match (&self.activity, &previous.activity) {
                     (None, None) => true,
@@ -376,8 +397,73 @@ pub(crate) fn task_ledger_text(rows: &[TaskLedgerRow], now_ms: i64) -> Option<St
         if row.unconfirmed {
             text.push_str(UNCONFIRMED_MARKER);
         }
+        // The shell's output window (spec #592) reads UNDER its row: the
+        // labelled, fenced last lines. A window with no text renders nothing
+        // (never an empty panel posing as output).
+        if let Some(window) = row.output.as_ref().filter(|window| !window.text.is_empty()) {
+            text.push('\n');
+            text.push_str(&output_window_block(window));
+        }
     }
     Some(text)
+}
+
+/// The output window's own label (spec #588, #592): the pinned copy
+/// `截至于 HH:MM`, with ` · 仅最后 N 行 · 已截断` appended when the record held
+/// more than the window shows. N is the lines the window RENDERS (the retained
+/// count), so a byte-clipped window whose lines were huge names its real
+/// count. An unformattable clock (out of range) drops its part rather than
+/// inventing one.
+fn output_window_label(window: &ShellOutputWindow) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(clock) = fmt_local_time(window.captured_ms) {
+        parts.push(format!("截至于 {clock}"));
+    }
+    if window.clipped {
+        parts.push(format!("仅最后 {} 行 · 已截断", window.text.lines().count()));
+    }
+    parts.join(" · ")
+}
+
+/// One shell's output window as the ledger body renders it (spec #588, #592):
+/// the indented label line, then the tail as a fenced code block so the
+/// command's own markdown cannot bleed into the section. The fence is one
+/// backtick longer than the longest run inside the tail (at least three), so a
+/// tail line can never close the block early; the sanitizer passes fenced
+/// content through verbatim.
+fn output_window_block(window: &ShellOutputWindow) -> String {
+    let mut block = String::new();
+    let label = output_window_label(window);
+    if !label.is_empty() {
+        block.push_str("  ");
+        block.push_str(&label);
+        block.push('\n');
+    }
+    block.push_str(&output_fence(&window.text));
+    block.push('\n');
+    block.push_str(&window.text);
+    block.push('\n');
+    block.push_str(&output_fence(&window.text));
+    block
+}
+
+/// The fence one output window needs: one backtick past the longest backtick
+/// run in the tail, never under the markdown minimum of three. A run computed
+/// per line, so a multi-line tail cannot smuggle a closer past it.
+fn output_fence(text: &str) -> String {
+    let mut longest = 0;
+    for line in text.lines() {
+        let mut run = 0;
+        for c in line.chars() {
+            if c == '`' {
+                run += 1;
+                longest = longest.max(run);
+            } else {
+                run = 0;
+            }
+        }
+    }
+    "`".repeat((longest + 1).max(3))
 }
 
 /// One row's rendered clock (ADR-0060, spec #501): every rendered number that
@@ -391,6 +477,10 @@ pub(crate) fn task_ledger_text(rows: &[TaskLedgerRow], now_ms: i64) -> Option<St
 pub(crate) struct LedgerRowClock {
     pub elapsed: Option<u64>,
     pub activity: Option<u64>,
+    /// The output window's rendered cutoff (`截至于 HH:MM`, spec #592) in whole
+    /// seconds, minute-aligned so the label's own granularity is what moves.
+    /// `None` where the row renders no window.
+    pub output: Option<u64>,
 }
 
 /// The ledger's render clock (ADR-0060): a shell row's elapsed — and any row's
@@ -415,8 +505,18 @@ pub(crate) fn task_ledger_clock(rows: &[TaskLedgerRow], now_ms: i64) -> Vec<Ledg
                 .rendered_activity()
                 .and_then(TaskLiveness::age_clock_ms)
                 .map(|at| secs_since(at, now_ms)),
+            output: row.output.as_ref().map(window_clock_secs),
         })
         .collect()
+}
+
+/// The output window's rendered cutoff in whole seconds, minute-aligned (spec
+/// #592): the label renders `HH:MM` (local time, offsets are whole minutes), so
+/// the live path's minute cadence and the yielded path's second cadence both
+/// see exactly the label's own change — a re-read inside the shown minute owes
+/// nothing, a crossing minute owes its flush.
+fn window_clock_secs(window: &ShellOutputWindow) -> u64 {
+    (window.captured_ms.max(0) as u64) / 60_000 * 60
 }
 
 /// The one shape a task label takes inside the ledger: newlines fold to spaces
@@ -462,9 +562,17 @@ pub(crate) fn task_ledger_estimate(rows: &[TaskLedgerRow]) -> usize {
         .iter()
         .filter_map(|row| row.rendered_activity().map(activity_estimate))
         .sum();
+    // Each output window (spec #592) costs exactly what its block renders —
+    // the label, the fence and the tail — measured from the same builder the
+    // body uses, plus the newline the row inserts before it.
+    let outputs: usize = rows
+        .iter()
+        .filter_map(|row| row.output.as_ref().filter(|window| !window.text.is_empty()))
+        .map(|window| output_window_block(window).len() + 1)
+        .sum();
     // The +80 is the folded panel's own element overhead, exactly like the
     // completion entry's estimate charges it (`task_entry_estimate`).
-    300 + labels + activities + rows.len() * 120 + 80
+    300 + labels + activities + outputs + rows.len() * 120 + 80
 }
 
 /// Estimated bytes of one row's activity fragment, measured from the same
@@ -541,6 +649,221 @@ mod tests {
     use super::*;
     use crate::feishu::card::tool_render::ChildActivity;
 
+    /// A shell row's output window (spec #588, #592) renders under the row as
+    /// the pinned copy: the cutoff label (`截至于 HH:MM`) then the tail as a
+    /// fenced code block, so the command's own lines cannot break the section.
+    #[test]
+    fn a_shell_rows_output_window_renders_under_the_row() {
+        let start = crate::feishu::card::test_local_ms(2026, 9, 29, 14, 2);
+        let cut = crate::feishu::card::test_local_ms(2026, 9, 29, 14, 5);
+        let now = start + 192_000; // 14:05:12, elapsed 3m12s
+        let row = |window: Option<ShellOutputWindow>| TaskLedgerRow {
+            kind: TaskKind::Shell,
+            label: Some("gh run watch".into()),
+            started_at: Some(start),
+            unconfirmed: false,
+            activity: None,
+            output: window,
+        };
+        let window = |text: &str, clipped: bool| ShellOutputWindow {
+            text: text.into(),
+            clipped,
+            captured_ms: cut,
+        };
+
+        assert_eq!(
+            task_ledger_text(&[row(Some(window("line 1\nline 2", false)))], now).unwrap(),
+            "· shell：**gh run watch** · 14:02 · 3m12s\n  截至于 14:05\n```\nline 1\nline 2\n```",
+            "the window sits under its row, labelled and fenced"
+        );
+        // A row with no window renders its old shape; an empty window (never
+        // produced by the read, but possible in a script) renders nothing too:
+        // never an empty panel posing as output.
+        assert_eq!(
+            task_ledger_text(&[row(None)], now).unwrap(),
+            "· shell：**gh run watch** · 14:02 · 3m12s"
+        );
+        assert_eq!(
+            task_ledger_text(&[row(Some(window("", false)))], now).unwrap(),
+            "· shell：**gh run watch** · 14:02 · 3m12s"
+        );
+    }
+
+    /// A clipped window names its own truncation and its line count: the pinned
+    /// 「仅最后 N 行 · 已截断」 appends to the cutoff, N being what the window
+    /// actually renders.
+    #[test]
+    fn a_clipped_window_names_its_line_count() {
+        let cut = crate::feishu::card::test_local_ms(2026, 9, 29, 14, 5);
+        let row = |text: String| TaskLedgerRow {
+            kind: TaskKind::Shell,
+            label: None,
+            started_at: None,
+            unconfirmed: false,
+            activity: None,
+            output: Some(ShellOutputWindow {
+                text,
+                clipped: true,
+                captured_ms: cut,
+            }),
+        };
+        let fifteen = (1..=15)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let rendered = task_ledger_text(&[row(fifteen)], 0).unwrap();
+        assert!(
+            rendered.starts_with("· shell\n  截至于 14:05 · 仅最后 15 行 · 已截断\n```\nline 1"),
+            "the clipped copy names the lines and the cutoff: {rendered}"
+        );
+        let rendered = task_ledger_text(&[row("a\nb\nc".into())], 0).unwrap();
+        assert!(
+            rendered.contains("截至于 14:05 · 仅最后 3 行 · 已截断"),
+            "N is the lines the window renders: {rendered}"
+        );
+    }
+
+    /// A tail carrying fence characters cannot close the window's code block:
+    /// the fence grows one backtick past the longest run, and the sanitizer
+    /// passes the fenced content through verbatim (spec #592).
+    #[test]
+    fn a_windows_fence_outgrows_the_tail() {
+        use crate::feishu::card::CardState;
+        use crate::feishu::card::shell::CardBuilder;
+
+        let cut = crate::feishu::card::test_local_ms(2026, 9, 29, 14, 5);
+        let row = TaskLedgerRow {
+            kind: TaskKind::Shell,
+            label: Some("npm run build".into()),
+            started_at: None,
+            unconfirmed: false,
+            activity: None,
+            output: Some(ShellOutputWindow {
+                text: "before\n```\n<number_tag> 的 ```\nafter".into(),
+                clipped: true,
+                captured_ms: cut,
+            }),
+        };
+        let rendered = task_ledger_text(std::slice::from_ref(&row), 0).unwrap();
+        let expected = "· shell：**npm run build**\n  截至于 14:05 · 仅最后 4 行 · 已截断\n\
+                        ````\nbefore\n```\n<number_tag> 的 ```\nafter\n````";
+        assert_eq!(rendered, expected, "the fence outgrows the tail's longest run");
+
+        // Through the builder's sanitizer the fenced content is verbatim: the
+        // `<` stays authored and the section cannot break out of the block.
+        let built = CardBuilder::new()
+            .with_state(CardState::Streaming)
+            .with_task_ledger(std::slice::from_ref(&row))
+            .build();
+        let body = built["body"]["elements"][0]["elements"][0]["content"]
+            .as_str()
+            .unwrap();
+        assert_eq!(body, expected, "one clean body, fence intact: {built}");
+    }
+
+    /// The window's cutoff is a rendered clock, not a row fact (spec #592):
+    /// re-reads inside the rendered minute don't owe a PATCH, a crossing minute
+    /// does, and the clock carries the label's own minute — while different
+    /// tail text or clipping is a row change.
+    #[test]
+    fn the_windows_cutoff_is_the_render_clocks_business() {
+        let at = crate::feishu::card::test_local_ms(2026, 9, 29, 14, 5);
+        let row = |text: &str, clipped: bool, captured_ms: i64| TaskLedgerRow {
+            kind: TaskKind::Shell,
+            label: None,
+            started_at: None,
+            unconfirmed: false,
+            activity: None,
+            output: Some(ShellOutputWindow {
+                text: text.into(),
+                clipped,
+                captured_ms,
+            }),
+        };
+        let bare = TaskLedgerRow {
+            kind: TaskKind::Shell,
+            label: None,
+            started_at: None,
+            unconfirmed: false,
+            activity: None,
+            output: None,
+        };
+
+        assert!(
+            row("a", false, at).renders_like(&row("a", false, at + 30_000)),
+            "a re-read inside the shown minute is one rendered window"
+        );
+        assert!(
+            row("a", false, at).renders_like(&row("a", false, at + 60_000)),
+            "the cutoff minute is the clock's half, not the row's"
+        );
+        assert!(!row("a", false, at).renders_like(&row("b", false, at)));
+        assert!(!row("a", false, at).renders_like(&row("a", true, at)));
+        assert!(!row("a", false, at).renders_like(&bare), "appearing is a change");
+        assert!(!bare.renders_like(&row("a", false, at)), "leaving too");
+
+        let clock = task_ledger_clock(&[row("a", false, at)], 0);
+        assert_eq!(
+            clock[0].output,
+            Some((at as u64) / 60_000 * 60),
+            "the clock is the rendered cutoff, minute-aligned"
+        );
+        assert_ne!(
+            clock[0].output,
+            task_ledger_clock(&[row("a", false, at + 60_000)], 0)[0].output,
+            "a crossing minute moves the rendered cutoff"
+        );
+        assert_eq!(
+            task_ledger_clock(&[bare], 0)[0].output,
+            None,
+            "a row with no window has no output clock"
+        );
+    }
+
+    /// The section estimate charges the window exactly as it renders (spec
+    /// #592): the same builder the body uses, so the card budget and the row
+    /// cannot drift.
+    #[test]
+    fn the_estimate_covers_the_rendered_window() {
+        let cut = crate::feishu::card::test_local_ms(2026, 9, 29, 14, 5);
+        let row = |window: Option<ShellOutputWindow>| TaskLedgerRow {
+            kind: TaskKind::Shell,
+            label: Some("npm run build".into()),
+            started_at: None,
+            unconfirmed: false,
+            activity: None,
+            output: window,
+        };
+        let rows = |output: Option<ShellOutputWindow>| vec![row(output)];
+        let window = ShellOutputWindow {
+            text: (1..=15)
+                .map(|i| format!("line {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            clipped: true,
+            captured_ms: cut,
+        };
+
+        let rendered = task_ledger_text(&rows(Some(window.clone())), 0).unwrap();
+        let without = task_ledger_text(&rows(None), 0).unwrap();
+        assert_eq!(
+            task_ledger_estimate(&rows(Some(window))) - task_ledger_estimate(&rows(None)),
+            rendered.len() - without.len(),
+            "the estimate grows by exactly what the window renders"
+        );
+        // A long tail is reserved before the splitter runs: the estimate covers
+        // the tail bytes, so a noisy shell cannot balloon the card past budget.
+        let long = task_ledger_estimate(&rows(Some(ShellOutputWindow {
+            text: "x".repeat(2000),
+            clipped: true,
+            captured_ms: cut,
+        })));
+        assert!(
+            long >= task_ledger_estimate(&rows(None)) + 2000,
+            "a 2000-byte tail is reserved"
+        );
+    }
+
     /// The pinned copy (ADR-0060, #412/#423/#501): the title is the count, the
     /// body one row per task — type noun, bolded label, start clock; a shell
     /// row's bare elapsed follows (`3m12s`), while a subagent row stops at its
@@ -559,6 +882,8 @@ mod tests {
                 started_at: Some(start),
                 unconfirmed: false,
                 activity: None,
+
+                output: None,
             },
             TaskLedgerRow {
                 kind: TaskKind::Subagent,
@@ -566,6 +891,8 @@ mod tests {
                 started_at: Some(second_start),
                 unconfirmed: false,
                 activity: None,
+
+                output: None,
             },
         ];
         assert_eq!(task_ledger_title(&rows).unwrap(), "⏳ 后台任务（2）");
@@ -592,6 +919,8 @@ mod tests {
             started_at,
             unconfirmed: false,
             activity: None,
+
+            output: None,
         };
         let render = |row: &TaskLedgerRow| task_ledger_text(std::slice::from_ref(row), now).unwrap();
 
@@ -614,6 +943,8 @@ mod tests {
                     started_at: Some(at),
                     unconfirmed: false,
                     activity: None,
+
+                    output: None,
                 }],
                 now,
             )
@@ -638,6 +969,7 @@ mod tests {
             started_at: Some(at),
             unconfirmed,
             activity,
+            output: None,
         };
         let render = |row: &TaskLedgerRow| task_ledger_text(std::slice::from_ref(row), now).unwrap();
 
@@ -712,6 +1044,8 @@ mod tests {
                     started_at: Some(at),
                     unconfirmed: false,
                     activity: None,
+
+                    output: None,
                 }],
                 now,
             )
@@ -734,6 +1068,8 @@ mod tests {
                 started_at: Some(start),
                 unconfirmed: true,
                 activity: None,
+
+                output: None,
             },
             TaskLedgerRow {
                 kind: TaskKind::Subagent,
@@ -741,6 +1077,8 @@ mod tests {
                 started_at: None,
                 unconfirmed: false,
                 activity: None,
+
+                output: None,
             },
         ];
         assert_eq!(task_ledger_title(&rows).unwrap(), "⏳ 后台任务（2 · 1 待确认）");
@@ -756,6 +1094,8 @@ mod tests {
             started_at: None,
             unconfirmed: true,
             activity: None,
+
+            output: None,
         }];
         assert_eq!(
             task_ledger_title(&all_unconfirmed).unwrap(),
@@ -906,6 +1246,8 @@ mod tests {
             started_at: None,
             unconfirmed: false,
             activity: None,
+
+            output: None,
         };
         let render = |label: &str| task_ledger_text(&[row(label)], 0).unwrap();
 
@@ -978,6 +1320,8 @@ mod tests {
                 started_at: Some(now - 5_000), // 14:01:55
                 unconfirmed: false,
                 activity: None,
+
+                output: None,
             },
             TaskLedgerRow {
                 kind: TaskKind::Subagent,
@@ -985,6 +1329,8 @@ mod tests {
                 started_at: None,
                 unconfirmed: false,
                 activity: None,
+
+                output: None,
             },
         ];
         assert_eq!(
@@ -1006,6 +1352,8 @@ mod tests {
             started_at: Some(now),
             unconfirmed: false,
             activity: None,
+
+            output: None,
         }];
         let text = task_ledger_text(&rows, now).unwrap();
         let row = text.lines().next().unwrap();
@@ -1038,6 +1386,8 @@ mod tests {
             started_at: Some(2_000),
             unconfirmed: false,
             activity: None,
+
+            output: None,
         }];
         assert!(
             task_ledger_text(&rows, 1_000).unwrap().ends_with(" · 0m00s"),
@@ -1066,6 +1416,8 @@ mod tests {
                 last_activity_ms: start + 7_000,
                 wait: None,
             }),
+
+            output: None,
         };
         let rows = vec![
             TaskLedgerRow {
@@ -1074,6 +1426,8 @@ mod tests {
                 started_at: Some(start),
                 unconfirmed: false,
                 activity: None,
+
+                output: None,
             },
             TaskLedgerRow {
                 kind: TaskKind::Subagent,
@@ -1081,6 +1435,8 @@ mod tests {
                 started_at: None,
                 unconfirmed: false,
                 activity: None,
+
+                output: None,
             },
             activity_row(false),
         ];
@@ -1091,17 +1447,23 @@ mod tests {
             vec![
                 LedgerRowClock {
                     elapsed: Some(59),
-                    activity: None
+                    activity: None,
+
+                    output: None,
                 },
                 LedgerRowClock {
                     elapsed: None,
-                    activity: None
+                    activity: None,
+
+                    output: None,
                 },
                 LedgerRowClock {
                     // The subagent's start is not rendered as an elapsed, so
                     // it has no elapsed clock — only its fragment's age ticks.
                     elapsed: None,
-                    activity: Some(52)
+                    activity: Some(52),
+
+                    output: None,
                 },
             ],
             "the rendered seconds, in row order"
@@ -1115,7 +1477,9 @@ mod tests {
             task_ledger_clock(&rows, start - 5_000)[2],
             LedgerRowClock {
                 elapsed: None,
-                activity: Some(0)
+                activity: Some(0),
+
+                output: None,
             },
             "a future activity start clamps like the render"
         );
@@ -1125,7 +1489,9 @@ mod tests {
             task_ledger_clock(&[activity_row(true)], start + 59_000)[0],
             LedgerRowClock {
                 elapsed: None,
-                activity: None
+                activity: None,
+
+                output: None,
             }
         );
         assert_eq!(task_ledger_clock(&[], start), Vec::<LedgerRowClock>::new());
@@ -1144,6 +1510,7 @@ mod tests {
             started_at: Some(at),
             unconfirmed: false,
             activity,
+            output: None,
         };
         assert_eq!(
             task_ledger_text(&[row(TaskKind::Shell, None)], now).unwrap(),
@@ -1191,12 +1558,16 @@ mod tests {
                 last_activity_ms: 1_000,
                 wait: None,
             }),
+
+            output: None,
         }];
         assert_eq!(
             task_ledger_clock(&rows, 99_000)[0],
             LedgerRowClock {
                 elapsed: None,
-                activity: None
+                activity: None,
+
+                output: None,
             }
         );
     }
@@ -1211,6 +1582,8 @@ mod tests {
             started_at: None,
             unconfirmed: false,
             activity: None,
+
+            output: None,
         };
         let long = row("x".repeat(TASK_LABEL_CHARS + 500));
         let capped = row("x".repeat(TASK_LABEL_CHARS));
@@ -1239,6 +1612,8 @@ mod tests {
             started_at: None,
             unconfirmed: false,
             activity: None,
+
+            output: None,
         };
         let with_activity = |wait: Option<crate::feishu::card::AwaitingAction>| TaskLedgerRow {
             kind: TaskKind::Subagent,
@@ -1250,6 +1625,8 @@ mod tests {
                 last_activity_ms: 0,
                 wait,
             }),
+
+            output: None,
         };
         let untimed = TaskLedgerRow {
             kind: TaskKind::Subagent,
@@ -1264,6 +1641,8 @@ mod tests {
                 last_activity_ms: 0,
                 wait: None,
             }),
+
+            output: None,
         };
         assert!(
             task_ledger_estimate(&[with_activity(None)]) > task_ledger_estimate(std::slice::from_ref(&plain)),

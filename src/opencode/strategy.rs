@@ -188,6 +188,18 @@ pub(crate) trait GenerationStrategy: Send + Sync {
         children: &[String],
     ) -> Result<TaskRuntime>;
 
+    /// One shell's captured output window (spec #588, #592): V2 reads
+    /// `GET /api/shell/{id}/output` twice — once with a cursor past the end to
+    /// learn the record's size, then once for its last bytes. V1 carries no
+    /// shell records and answers `Ok(None)` without a request. See
+    /// [`crate::backend::Backend::shell_output`].
+    async fn shell_output(
+        &self,
+        http: &Transport,
+        shell_id: &str,
+        directory: Option<&str>,
+    ) -> Result<Option<crate::backend::ShellOutputWindow>>;
+
     async fn model_context_window(
         &self,
         http: &Transport,

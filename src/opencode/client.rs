@@ -432,6 +432,18 @@ impl OpenCodeBackend {
             .await
     }
 
+    /// One shell's captured output window (spec #588, #592). See
+    /// [`crate::backend::Backend::shell_output`].
+    pub async fn shell_output(
+        &self,
+        shell_id: &str,
+        directory: Option<&str>,
+    ) -> crate::error::Result<Option<crate::backend::ShellOutputWindow>> {
+        self.strategy()
+            .shell_output(&self.transport, shell_id, directory)
+            .await
+    }
+
     pub async fn model_context_window(
         &self,
         provider: &str,

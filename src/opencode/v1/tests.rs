@@ -1228,3 +1228,18 @@ async fn session_selection_is_none_and_switches_are_no_ops_on_v1() {
         server.requests()
     );
 }
+
+/// V1 carries no shell records: the output window read answers `Ok(None)`
+/// without a request, exactly like its empty runtime verdict (spec #588, #592).
+#[tokio::test]
+async fn shell_output_is_none_without_a_v1_request() {
+    let server = TestHttpServer::start().await;
+    let client = v1_wire_client(&server, None);
+
+    assert_eq!(client.shell_output("sh_1", Some("/work")).await.unwrap(), None);
+    assert!(
+        server.requests().is_empty(),
+        "V1's output read must not reach the wire: {:?}",
+        server.requests()
+    );
+}
