@@ -1842,6 +1842,385 @@ async fn an_inactive_child_marks_its_row_unconfirmed_without_settling() {
     );
 }
 
+/// Spec #588 / #590: the waiting card's 「清理待确认任务」 click clears the
+/// unconfirmed subagent — the click re-derives the runtime verdict itself, so
+/// only the row the runtime cannot confirm is cleared — records its call id in
+/// the retirement overlay, renders one 🧹 entry, and settles the last task's
+/// wait ✅ in place: one in-place PATCH, no new card, no continuation, and the
+/// task never re-enters the live list within the process.
+#[tokio::test]
+async fn a_cleanup_click_clears_the_unconfirmed_row_and_settles_in_place() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = SessionTranscript::new(two_task_timeline(vec![]))
+        .with_executions(vec![execution(2_500)])
+        .with_background_tasks(vec![live_subagent(now - 3_000, "call_sub")]);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    // The child read must not tick (no fragment): the settle's PATCH count
+    // below is the cleanup's alone.
+    script_child_without_activity(&backend).await;
+    yield_one_task_card(&app, &platform, ctx("ses_test", "跑一下构建并审阅")).await;
+
+    // The runtime reports the child inactive with no concluding evidence: the
+    // row gains the marker — and the waiting card the cleanup button.
+    backend.task_runtime.lock().unwrap().children = vec![("ses_call_sub".into(), ChildRuntime::Inactive)];
+    spawn_sync(&app);
+    wait_for_card_update(&platform, "the unconfirmed marker", CardUpdates::Latest, |card| {
+        card_text(card).contains("⚠️ 状态待确认")
+    })
+    .await;
+
+    let marked = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_text(&marked).contains("清理待确认任务"),
+        "the waiting card offers the cleanup exit: {marked}"
+    );
+    assert!(
+        marked["body"]["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|el| { el["value"]["action"] == "cleanup" && el["value"]["session_id"] == "ses_test" }),
+        "the button carries the session it clears: {marked}"
+    );
+
+    // The click acks immediately (claim + spawn + toast), off the pipeline.
+    let patches_before = patches_to(&platform, "om_waiting").await.len();
+    let created_before = created_cards(&platform).await.len();
+    let ack = app
+        .host_action(serde_json::json!({ "action": "cleanup", "session_id": "ses_test" }))
+        .await
+        .expect("the cleanup click acks");
+    assert!(
+        ack.card.is_none(),
+        "the ack keeps the card: the pipeline PATCHes it"
+    );
+    assert_eq!(ack.toast.as_deref(), Some("正在清理..."));
+
+    wait_for_card_update(&platform, "the cleaned settle", CardUpdates::Latest, |card| {
+        card_header(card).contains("✅")
+            && card_text(card).contains("🧹 subagent 已清理：review the diff（人工）")
+    })
+    .await;
+
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Done),
+        "clearing the last task settles the wait"
+    );
+    let patches = patches_to(&platform, "om_waiting").await;
+    assert_eq!(
+        patches.len(),
+        patches_before + 1,
+        "the cleanup settles in one in-place PATCH after the marker: {patches:?}"
+    );
+    let settled = patches.last().unwrap();
+    let text = card_text(settled);
+    assert!(
+        !text.contains("后台任务（"),
+        "the cleared row's live list is gone: {settled}"
+    );
+    assert_eq!(
+        text.matches("🧹 subagent 已清理：review the diff（人工）")
+            .count(),
+        1,
+        "one entry per cleared row, exactly once: {settled}"
+    );
+    assert!(
+        text.contains("subagent ses_call_sub · "),
+        "the entry keeps the task's identity and clock: {settled}"
+    );
+    assert!(
+        !text.contains("清理待确认任务"),
+        "the button leaves with the last unconfirmed row: {settled}"
+    );
+    assert_eq!(
+        created_cards(&platform).await.len(),
+        created_before,
+        "no new card: the settle is in place"
+    );
+    assert!(
+        continuation_sends(&platform).await.is_empty(),
+        "a cleanup settle owes no continuation: {:?}",
+        platform.calls.lock().await
+    );
+
+    // The overlay keeps the cleared task out of every later read: within this
+    // process life it never re-enters a live list.
+    let later = crate::backend::Backend::transcript(backend.as_ref(), "ses_test")
+        .await
+        .unwrap();
+    assert!(
+        later.background_tasks.is_empty(),
+        "the cleared task never re-enters the live list within the process"
+    );
+}
+
+/// Spec #588 / #590: one click clears EVERY unconfirmed row — each gets its own
+/// 🧹 entry — and the positively running shell's row keeps the card waiting.
+#[tokio::test]
+async fn a_cleanup_click_clears_every_unconfirmed_row_at_once() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = SessionTranscript::new(two_task_timeline(vec![]))
+        .with_executions(vec![execution(2_500)])
+        .with_background_tasks(vec![
+            live_shell(frozen_start(now), "call_bg"),
+            live_subagent(now - 3_000, "call_sub"),
+            live_subagent_child(now - 2_000, "call_sub2", "ses_child2"),
+        ]);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    script_child_without_activity(&backend).await;
+    yield_waiting_card(&app, &platform, 3).await;
+
+    {
+        let mut runtime = backend.task_runtime.lock().unwrap();
+        runtime.shells = vec![("sh_call_bg".into(), ShellRuntime::Running)];
+        runtime.children = vec![
+            ("ses_call_sub".into(), ChildRuntime::Inactive),
+            ("ses_child2".into(), ChildRuntime::Inactive),
+        ];
+    }
+    spawn_sync(&app);
+    wait_for_card_update(
+        &platform,
+        "the two unconfirmed rows",
+        CardUpdates::Latest,
+        |card| card_text(card).contains("⏳ 后台任务（3 · 2 待确认）"),
+    )
+    .await;
+
+    app.host_action(serde_json::json!({ "action": "cleanup", "session_id": "ses_test" }))
+        .await
+        .expect("the cleanup click acks");
+    wait_for_card_update(&platform, "the multi-row cleanup", CardUpdates::Latest, |card| {
+        card_text(card).contains("🧹 subagent 已清理：review the diff（人工）")
+            && card_text(card).contains("🧹 subagent 已清理（人工）")
+    })
+    .await;
+
+    let refreshed = platform.updated_cards().await.last().cloned().unwrap();
+    let text = card_text(&refreshed);
+    assert_eq!(
+        text.matches("🧹 subagent 已清理").count(),
+        2,
+        "one 🧹 entry per cleared row: {refreshed}"
+    );
+    assert!(
+        text.contains("⏳ 后台任务（1）") && text.contains("**gh run watch**"),
+        "the running shell's row keeps the wait: {refreshed}"
+    );
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Waiting),
+        "a live task keeps the card waiting"
+    );
+    assert!(
+        !text.contains("清理待确认任务"),
+        "the button leaves with the last unconfirmed row: {refreshed}"
+    );
+}
+
+/// Spec #588 / #590: cleanup clears ONLY the unconfirmed rows — a positively
+/// running task's row is untouched and the card keeps waiting — the 🧹 entry
+/// names just the cleared task, the button disappears with the last unconfirmed
+/// row, and a later click finds nothing to claim.
+#[tokio::test]
+async fn a_cleanup_click_keeps_a_running_task_and_the_wait() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    // The running shell's start is frozen (future) so its rendered elapsed can
+    // never tick: the PATCH count is the marker's and the cleanup's alone.
+    let live = waiting_shell_and_subagent(frozen_start(now), now - 3_000);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    script_child_without_activity(&backend).await;
+    // A group turn with a requester: a settle would notify, so the silence is
+    // evidence rather than a missing opt-in.
+    let mut context = ctx("ses_test", "跑一下构建并审阅");
+    context.is_group = true;
+    context.requester_open_id = Some(TEST_HOST.to_string());
+    yield_waiting_card_with(&app, &platform, 2, context).await;
+
+    {
+        let mut runtime = backend.task_runtime.lock().unwrap();
+        runtime.shells = vec![("sh_call_bg".into(), ShellRuntime::Running)];
+        runtime.children = vec![("ses_call_sub".into(), ChildRuntime::Inactive)];
+    }
+    spawn_sync(&app);
+    wait_for_card_update(&platform, "the unconfirmed marker", CardUpdates::Latest, |card| {
+        card_text(card).contains("⚠️ 状态待确认")
+    })
+    .await;
+
+    let patches_before = patches_to(&platform, "om_waiting").await.len();
+    app.host_action(serde_json::json!({ "action": "cleanup", "session_id": "ses_test" }))
+        .await
+        .expect("the cleanup click acks");
+
+    wait_for_card_update(&platform, "the cleaned wait", CardUpdates::Latest, |card| {
+        card_text(card).contains("🧹 subagent 已清理：review the diff（人工）")
+    })
+    .await;
+
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Waiting),
+        "a positively running task keeps the wait"
+    );
+    let patches = patches_to(&platform, "om_waiting").await;
+    assert_eq!(
+        patches.len(),
+        patches_before + 1,
+        "the cleanup refreshes the waiting card once: {patches:?}"
+    );
+    let refreshed = patches.last().unwrap();
+    let text = card_text(refreshed);
+    assert!(
+        card_header(refreshed).contains("等待后台任务"),
+        "the card keeps its waiting header: {refreshed}"
+    );
+    assert!(
+        text.contains("⏳ 后台任务（1）") && text.contains("**gh run watch**"),
+        "the running task's row survives, now the only one: {refreshed}"
+    );
+    assert!(
+        text.matches("🧹 subagent 已清理：review the diff（人工）")
+            .count()
+            == 1,
+        "one 🧹 entry for the cleared row: {refreshed}"
+    );
+    assert!(
+        !text.contains("清理待确认任务"),
+        "the button disappears once no unconfirmed row remains: {refreshed}"
+    );
+    assert!(
+        platform.completion_notices().await.is_empty(),
+        "a wait that keeps running notifies nothing: {:?}",
+        platform.calls.lock().await
+    );
+
+    // The overlay filtered only the cleared child; the running shell stays.
+    let later = crate::backend::Backend::transcript(backend.as_ref(), "ses_test")
+        .await
+        .unwrap();
+    assert_eq!(
+        later
+            .background_tasks
+            .iter()
+            .map(|task| task.tool.call_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["call_bg"],
+        "only the unconfirmed task is gone from later reads"
+    );
+
+    // A second click finds no claim (the card no longer carries an unconfirmed
+    // row), so the stale button can clear nothing.
+    assert!(
+        app.host_action(serde_json::json!({ "action": "cleanup", "session_id": "ses_test" }))
+            .await
+            .is_none(),
+        "a click with no unconfirmed row is refused"
+    );
+}
+
+/// Spec #588 / #590: a late Wake after a cleanup is untouched — the cleaned
+/// task's completion still resumes the chain (the split continuation opens with
+/// its own work) and the Wake's completion entry still renders on the card
+/// whose chain observed it. The cleanup suppresses nothing.
+#[tokio::test]
+async fn a_late_wake_after_a_cleanup_still_resumes_the_chain() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = SessionTranscript::new(two_task_timeline(vec![]))
+        .with_executions(vec![execution(2_500)])
+        .with_background_tasks(vec![live_subagent(now - 3_000, "call_sub")]);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    script_child_without_activity(&backend).await;
+    yield_one_task_card(&app, &platform, ctx("ses_test", "跑一下构建并审阅")).await;
+
+    backend.task_runtime.lock().unwrap().children = vec![("ses_call_sub".into(), ChildRuntime::Inactive)];
+    spawn_sync(&app);
+    wait_for_card_update(&platform, "the unconfirmed marker", CardUpdates::Latest, |card| {
+        card_text(card).contains("⚠️ 状态待确认")
+    })
+    .await;
+    app.host_action(serde_json::json!({ "action": "cleanup", "session_id": "ses_test" }))
+        .await
+        .expect("the cleanup click acks");
+    wait_for_card_update(&platform, "the cleaned settle", CardUpdates::Latest, |card| {
+        card_header(card).contains("✅")
+    })
+    .await;
+    let posts_before = created_cards(&platform).await.len();
+
+    // The lost Wake now arrives with the subagent's resumed work: nothing the
+    // cleanup did suppresses it — the chain continues on a new card with the
+    // resumed work, and the Wake's own completion entry lands where the chain
+    // observed it.
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(two_task_timeline(vec![assistant(3_100, "审阅完成。")]))
+                .with_executions(vec![execution(2_500), execution(4_000)])
+                .with_wakes(vec![Wake {
+                    id: MessageId::new("msg_wake_sub_2900"),
+                    created_ms: Some(2_900),
+                    source: WakeSource::Subagent,
+                    shell_id: None,
+                    job_id: None,
+                    child_id: Some("ses_call_sub".into()),
+                    state: Some("completed".into()),
+                    label: Some("review the diff".into()),
+                }]),
+        ],
+    )
+    .await;
+    wait_for_card_update(
+        &platform,
+        "the continuation's true end",
+        CardUpdates::Latest,
+        |card| card_header(card).contains("✅") && card_text(card).contains("审阅完成。"),
+    )
+    .await;
+
+    assert!(
+        created_cards(&platform).await.len() > posts_before
+            || !continuation_sends(&platform).await.is_empty(),
+        "the late Wake still continues the chain: {:?}",
+        platform.calls.lock().await
+    );
+    // The handover PATCH on the card that hosted the task carries the Wake's
+    // own completion entry — nothing the cleanup did suppresses it — and the
+    // cleanup's 🧹 entry stays there exactly once.
+    let handover = patches_to(&platform, "om_waiting")
+        .await
+        .last()
+        .cloned()
+        .expect("the handover PATCH lands on the hosted card");
+    assert!(
+        card_text(&handover).contains("🔔 subagent 完成：review the diff"),
+        "the late Wake's completion entry is never suppressed: {handover}"
+    );
+    assert_eq!(
+        card_text(&handover)
+            .matches("🧹 subagent 已清理：review the diff（人工）")
+            .count(),
+        1,
+        "the cleanup entry stays exactly once on the card that hosted the task: {handover}"
+    );
+    // The continuation opens with the resumed work and never replays the
+    // cleanup entry: entries never migrate to a continuation.
+    let continuation = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_text(&continuation).contains("审阅完成。"),
+        "the resumed work lands on the continuation: {continuation}"
+    );
+    assert!(
+        !card_text(&continuation).contains("🧹 subagent 已清理"),
+        "the cleanup entry stays on its own card: {continuation}"
+    );
+}
+
 /// Acceptance 3 (#420): a deliberate `/stop` during the wait dominates the
 /// quiet true end — the settle stamps ⏹ 已停止 in place, never ✅ — and the
 /// notice follows the card's real terminal.

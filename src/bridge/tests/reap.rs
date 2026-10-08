@@ -19,8 +19,9 @@ use super::drain::{
     spawn_turn, tool_assistant, user, wait_for_card_header, wait_for_card_text,
 };
 use crate::backend::{
-    ContentBlock, FinishReason, MessageId, MessageRole, MessageTime, Part, ReasoningPart, SessionTranscript,
-    StepFinish, TextPart, ToolCall, ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage,
+    BackgroundTask, ChildRuntime, ContentBlock, FinishReason, MessageId, MessageRole, MessageTime, Part,
+    ReasoningPart, SessionTranscript, StepFinish, TextPart, ToolCall, ToolIdentity, ToolOutput, ToolStatus,
+    TranscriptMessage,
 };
 use crate::bridge::card_handles::RenderedBlock;
 use crate::bridge::chain::{
@@ -5858,6 +5859,81 @@ async fn a_completion_wake_resumes_the_projected_waiting_successor_in_place() {
         continuation_sends(&platform).await.is_empty(),
         "an in-place resume writes no 承接 card: {:?}",
         platform.calls.lock().await
+    );
+}
+
+/// Spec #588 / #590: the restart-projected successor carries the same cleanup
+/// affordance — a live subagent the runtime reports inactive gains its
+/// ⚠️ 状态待确认 row and the 清理待确认任务 button through the ordinary card
+/// build — and the click works from there: one in-place PATCH clears the row,
+/// renders its 🧹 entry and settles the successor ✅.
+#[tokio::test]
+async fn a_restart_successor_carries_the_cleanup_button_and_the_click_works() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let delivered = "已经写了一半。";
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
+        Some(text_frontier(delivered)),
+        &[],
+    );
+    let waiting = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, delivered),
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_background_tasks(vec![BackgroundTask {
+        tool: ToolIdentity {
+            name: "subagent".into(),
+            call_id: "call_sub".into(),
+        },
+        shell_id: None,
+        child_id: Some("ses_child".into()),
+        started_at: Some(2_100),
+    }]);
+    let (app, platform, backend) =
+        restarted_app_with_backend(&session_file, waiting, Some(SessionStatus::Idle)).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+
+    spawn_sync(&app);
+    let (successor, _) = wait_for_projection(&platform, "om_frozen").await;
+    assert_eq!(card_header(&successor), "⏳ 等待后台任务");
+
+    // The runtime cannot confirm the child: the successor's next pass renders
+    // the unconfirmed row and the cleanup button through the same card build.
+    backend.task_runtime.lock().unwrap().children = vec![("ses_child".into(), ChildRuntime::Inactive)];
+    wait_for_update(&platform, "msg_reply", "the unconfirmed successor", |card| {
+        card_text(card).contains("⚠️ 状态待确认")
+    })
+    .await;
+    let marked = last_update_of(&platform, "msg_reply").await.unwrap();
+    assert!(
+        marked["body"]["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|el| { el["value"]["action"] == "cleanup" && el["value"]["session_id"] == "ses_test" }),
+        "the projected successor carries the cleanup button: {marked}"
+    );
+
+    let ack = app
+        .host_action(serde_json::json!({ "action": "cleanup", "session_id": "ses_test" }))
+        .await
+        .expect("the cleanup click acks on the successor");
+    assert_eq!(ack.toast.as_deref(), Some("正在清理..."));
+    wait_for_update(&platform, "msg_reply", "the successor's cleaned settle", |card| {
+        card_header(card).contains("✅") && card_text(card).contains("🧹 subagent 已清理（人工）")
+    })
+    .await;
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Done),
+        "clearing the successor's last task settles it in place"
     );
 }
 

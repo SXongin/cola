@@ -997,6 +997,7 @@ impl App {
                         .await
                 }
                 "retry" => self.handle_retry_action(&value).await,
+                "cleanup" => self.handle_cleanup_action(&value).await,
                 "resume" => self.handle_resume_action(&value).await,
                 "switch" => self.handle_switch_card_action(&self.core, &value).await,
                 "sub" => self.handle_sub_card_action(&self.core, &value).await,
@@ -2065,6 +2066,154 @@ impl App {
             card: None,
             toast: Some("正在重试...".to_string()),
         })
+    }
+
+    /// The waiting card's 「清理待确认任务」 click (spec #588, ticket #590): the
+    /// user's exit for the ⚠️ 状态待确认 residue no machine can confirm. The
+    /// card callback must ack within 3s, so the click claims the cleanup (the
+    /// same atomic double-click guard the retry uses, on the waiting card),
+    /// spawns the pipeline and returns a "cleaning" toast immediately; the
+    /// pipeline then reads the session's transcript once, retires exactly the
+    /// unconfirmed live tasks it finds, and re-renders the waiting card.
+    async fn handle_cleanup_action(self: &Arc<Self>, value: &serde_json::Value) -> Option<CardActionResult> {
+        let sid = value.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
+        if sid.is_empty() {
+            return None;
+        }
+        let handles = self.turn_handles();
+        if !crate::bridge::turn::Turn::claim_cleanup(&handles.cards, sid).await {
+            tracing::warn!("cleanup: no waiting card with unconfirmed tasks for session {sid}");
+            return None;
+        }
+        let (thread_key, directory) = {
+            let sessions = self.sessions.lock().await;
+            (
+                sessions.thread_for_session(sid),
+                sessions.directory_for_session(sid),
+            )
+        };
+        let Some(thread_key) = thread_key else {
+            crate::bridge::turn::Turn::release_cleanup_claim(&handles.cards, sid).await;
+            tracing::warn!("cleanup: no thread mapped for session {sid}");
+            return None;
+        };
+        let session_id = sid.to_string();
+        let span = span::turn(&session_id, &thread_key, None);
+        tokio::spawn(
+            async move {
+                Self::run_cleanup(handles, session_id, directory).await;
+            }
+            .instrument(span),
+        );
+        Some(CardActionResult {
+            card: None,
+            toast: Some("正在清理...".to_string()),
+        })
+    }
+
+    /// The cleanup's read → reconcile → retire → re-render pipeline, off the
+    /// ack path (spec #588, #590). The transcript's unconfirmed set is derived
+    /// per read, so the click's own read runs the same runtime reconciliation a
+    /// Session Sync pass would (one `task_runtime` read; a failed one leaves
+    /// the read exactly as decoded and clears nothing): the live tasks the
+    /// runtime cannot confirm yet are then exactly the
+    /// [`SessionTranscript::unconfirmed_tasks`], and only those are cleared.
+    /// Their call ids go into the ADR-0065 retirement overlay (process-local; a
+    /// restart loses it and the next read re-derives the wait from transcript +
+    /// runtime), the same read carries their synthetic Cleaned retirements, and
+    /// the ordinary yielded-card refresh renders the result — rows dropped, one
+    /// 🧹 entry per cleared task (and per runtime retirement the read observed),
+    /// and the card settled by the same rules as a quiet true end (the last
+    /// task gone is ✅ in place, ADR-0060). A read that fails, and a read that
+    /// leaves nothing to clear and nothing to retire, give the claim back so
+    /// the button stays usable.
+    async fn run_cleanup(
+        handles: crate::bridge::handles::TurnHandles,
+        session_id: String,
+        directory: Option<String>,
+    ) {
+        let read_timeout_ms = handles.config.follow_read_timeout_ms();
+        let transcript = crate::bridge::bounded_call(
+            "cleanup transcript",
+            read_timeout_ms,
+            handles.backend.transcript(&session_id),
+        )
+        .await;
+        let Some(Ok(mut transcript)) = transcript else {
+            tracing::warn!("cleanup: could not read session {session_id}");
+            crate::bridge::turn::Turn::release_cleanup_claim(&handles.cards, &session_id).await;
+            return;
+        };
+        let shells: Vec<String> = transcript
+            .background_tasks
+            .iter()
+            .filter_map(|task| task.shell_id.clone())
+            .collect();
+        let children: Vec<String> = transcript
+            .background_tasks
+            .iter()
+            .filter_map(|task| task.child_id.clone())
+            .collect();
+        if !shells.is_empty() || !children.is_empty() {
+            let runtime = crate::bridge::bounded_call(
+                "cleanup task runtime",
+                read_timeout_ms,
+                handles
+                    .backend
+                    .task_runtime(&session_id, directory.as_deref(), &shells, &children),
+            )
+            .await;
+            if let Some(Ok(runtime)) = runtime {
+                transcript.apply_task_runtime(&runtime);
+                let retired: Vec<String> = transcript
+                    .runtime_retired
+                    .iter()
+                    .map(|retirement| retirement.task.tool.call_id.clone())
+                    .collect();
+                if !retired.is_empty() {
+                    handles.backend.retire_background_tasks(&session_id, &retired);
+                }
+            }
+        }
+        let cleared: Vec<String> = transcript
+            .background_tasks
+            .iter()
+            .filter(|task| transcript.unconfirmed_tasks.contains(&task.tool.call_id))
+            .map(|task| task.tool.call_id.clone())
+            .collect();
+        if cleared.is_empty() && transcript.runtime_retired.is_empty() {
+            tracing::warn!("cleanup: no unconfirmed task left on session {session_id}");
+            crate::bridge::turn::Turn::release_cleanup_claim(&handles.cards, &session_id).await;
+            return;
+        }
+        if !cleared.is_empty() {
+            handles.backend.retire_background_tasks(&session_id, &cleared);
+            transcript.apply_cleanup(&cleared, chrono::Utc::now().timestamp_millis());
+        }
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let stopped = handles.waits.is_stopped(&session_id).await;
+        let update = crate::bridge::turn::Turn::refresh_yielded_ledger(
+            &handles.cards,
+            &handles.backend,
+            &handles.requests,
+            &session_id,
+            &transcript,
+            now_ms,
+            stopped,
+            read_timeout_ms,
+        )
+        .await;
+        tracing::info!(
+            "cleanup: cleared {} task(s) on session {session_id} (refreshed: {})",
+            cleared.len(),
+            !matches!(update, crate::bridge::turn::YieldedUpdate::Unchanged)
+        );
+        // The claim's job ends with this write: a later unconfirmed row on the
+        // same card (new work going inactive) must be cleanable again, and a
+        // refresh that did not land (the card stopped admitting it between the
+        // claim and the write) must leave the button usable too. Releasing is
+        // harmless on a settled card — no state offers the claim there.
+        crate::bridge::turn::Turn::release_cleanup_claim(&handles.cards, &session_id).await;
     }
 
     /// The retry's read → decide → act pipeline, off the ack path.
