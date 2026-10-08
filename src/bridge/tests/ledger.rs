@@ -2611,6 +2611,224 @@ async fn a_cleanup_click_with_a_failed_verdict_read_clears_nothing() {
     );
 }
 
+/// Review (spec #588 / #590, PR #595): the cleanup's overlay record is gated on
+/// its refresh landing. When a new Turn takes the chain between the click's
+/// reads and its refresh, the waiting card stops admitting the write: the
+/// cleared tasks must stay live on every later read — hiding them without their
+/// 🧹 entries is unrecoverable, since no later transcript read can reconstruct
+/// them — and the successor's own cleanup click then clears them, rendering
+/// each 🧹 entry exactly once.
+///
+/// The arrangement is deterministic: the test holds the session's card-write
+/// lock across the click, so the pipeline parks at its refresh after its reads;
+/// the new Turn's supersede step then collects the waiting card (the takeover's
+/// own mark, `CardState::Superseded`, which never admits a ledger write) while
+/// the refresh is parked. Releasing the lock and re-taking it runs the parked
+/// refresh first (the lock is FIFO), so the assertions see the cleanup's own
+/// outcome, not a later poll's.
+#[tokio::test]
+async fn a_cleanup_click_whose_card_is_replaced_never_hides_the_tasks() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = SessionTranscript::new(two_task_timeline(vec![]))
+        .with_executions(vec![execution(2_500)])
+        .with_background_tasks(vec![live_subagent(now - 3_000, "call_sub")]);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    script_child_without_activity(&backend).await;
+    yield_one_task_card(&app, &platform, ctx("ses_test", "跑一下构建并审阅")).await;
+
+    // The runtime cannot confirm the child: the row gains its marker and the
+    // waiting card its cleanup button.
+    backend.task_runtime.lock().unwrap().children = vec![("ses_call_sub".into(), ChildRuntime::Inactive)];
+    spawn_sync(&app);
+    wait_for_card_update(&platform, "the unconfirmed marker", CardUpdates::Latest, |card| {
+        card_text(card).contains("⚠️ 状态待确认") && card_text(card).contains("清理待确认任务")
+    })
+    .await;
+    // Park Session Sync behind a decoy active session (the harness's ordinary
+    // inactive-session state, ADR-0017): the click's pass is the card's only
+    // writer, so its non-write below is evidence rather than a lost race.
+    seed_session(&app, "ses_parked", "/work").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Hold the session's card-write lock across the click: its reads complete,
+    // then its refresh parks before the write admission.
+    let write_lock = app.cards_handle().write_lock("ses_test").await;
+    let guard = write_lock.lock().await;
+    let transcript_reads = backend.transcript_calls.lock().await.len();
+    let runtime_reads = backend.task_runtime_calls.lock().await.len();
+    let evidence_reads = backend.child_evidence_calls.lock().await.len();
+    let patches_before = patches_to(&platform, "om_waiting").await.len();
+    let ack = app
+        .host_action(serde_json::json!({ "action": "cleanup", "session_id": "ses_test" }))
+        .await
+        .expect("the cleanup click acks");
+    assert_eq!(ack.toast.as_deref(), Some("正在清理..."));
+
+    // The click's own reads (transcript, runtime verdict, child evidence) all
+    // complete while its refresh waits on the lock.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while backend.transcript_calls.lock().await.len() <= transcript_reads
+        || backend.task_runtime_calls.lock().await.len() <= runtime_reads
+        || backend.child_evidence_calls.lock().await.len() <= evidence_reads
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the cleanup pipeline never spent its reads"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // Margin for the pipeline to reach the write lock it is now blocked on.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // The chain moves under the parked refresh: the new Turn's own supersede
+    // step collects the waiting card, and the collect's flush then waits on the
+    // lock too.
+    let second = {
+        let mut second = ctx("ses_test", "新问题");
+        second.message_id = "msg_next".into();
+        second.cola_message_id = Some("msg_cola_next".into());
+        second
+    };
+    let next_turn = spawn_turn(&app, second);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while Turn::card_state(&app.cards_handle(), "ses_test").await != Some(CardState::Superseded) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the new Turn never superseded the waiting card"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // The successor's own read is scripted for its anchor while it is still
+    // parked at the collect's flush: the live task stays, so the successor
+    // yields Waiting with its ledger, marker and button.
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(two_task_timeline(vec![user("msg_cola_next", 3_000, "新问题")]))
+                .with_executions(vec![execution(2_500)])
+                .with_background_tasks(vec![live_subagent(now - 3_000, "call_sub")]),
+        ],
+    )
+    .await;
+    drop(guard);
+    // FIFO: the parked refresh runs before the collect's flush, so holding the
+    // lock again means the cleanup's write admission has passed.
+    let guard2 = write_lock.lock().await;
+    // The replaced card admitted nothing: the task is still live for every
+    // later read — its dismissal can only ride a landed refresh — and no card
+    // carries a half-rendered 🧹 entry.
+    let later = crate::backend::Backend::transcript(backend.as_ref(), "ses_test")
+        .await
+        .unwrap();
+    assert_eq!(
+        later
+            .background_tasks
+            .iter()
+            .map(|task| task.tool.call_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["call_sub"],
+        "a refresh that never landed must not hide the task: it would have no 🧹 entry"
+    );
+    assert!(
+        later.unconfirmed_tasks.contains("call_sub"),
+        "the carried marker survives for the successor's button: {later:?}"
+    );
+    let mut cards = platform.updated_cards().await;
+    cards.extend(platform.replied_cards().await);
+    cards.extend(platform.sent_cards().await);
+    assert!(
+        cards.iter().all(|card| !card_text(card).contains("🧹")),
+        "a refresh that never landed renders no cleanup entry: {cards:?}"
+    );
+    let patches = patches_to(&platform, "om_waiting").await;
+    assert_eq!(
+        patches.len(),
+        patches_before + 1,
+        "only the takeover's collect lands on the old card: {patches:?}"
+    );
+    let collected = patches.last().unwrap();
+    assert!(
+        card_header(collected).contains("已由新消息接管"),
+        "the takeover stamped the old card: {collected}"
+    );
+    assert!(
+        !card_text(collected).contains("🧹"),
+        "the old card received no cleanup entry: {collected}"
+    );
+    drop(guard2);
+
+    // The successor's turn runs to its waiting yield: with the dismissal never
+    // recorded, the live task and its marker are still there — and so is the
+    // cleanup button, on the assembled card view.
+    next_turn.await.unwrap().unwrap();
+    wait_for_card_update(
+        &platform,
+        "the successor's waiting card",
+        CardUpdates::Latest,
+        |card| card_text(card).contains("⚠️ 状态待确认") && card_text(card).contains("清理待确认任务"),
+    )
+    .await;
+    let successor = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        successor["body"]["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|el| {
+                el["tag"] == "button"
+                    && el["text"]["content"] == "清理待确认任务"
+                    && el["value"]["action"] == "cleanup"
+                    && el["value"]["session_id"] == "ses_test"
+            }),
+        "the successor's assembled view carries the pinned cleanup button: {successor}"
+    );
+    let successor_id = Turn::card_message_id(&app.cards_handle(), "ses_test")
+        .await
+        .expect("the successor carries its card id");
+
+    // The successor's own click clears the task and renders its 🧹 entry
+    // exactly once; now the refresh landed, so the dismissal is recorded and
+    // every later read keeps the task out.
+    let ack = app
+        .host_action(serde_json::json!({ "action": "cleanup", "session_id": "ses_test" }))
+        .await
+        .expect("the cleanup click on the successor acks");
+    assert_eq!(ack.toast.as_deref(), Some("正在清理..."));
+    wait_for_card_update(
+        &platform,
+        "the successor's cleaned settle",
+        CardUpdates::Latest,
+        |card| {
+            card_header(card).contains("✅")
+                && card_text(card).contains("🧹 subagent 已清理：review the diff（人工）")
+        },
+    )
+    .await;
+    let updates = patches_to(&platform, &successor_id).await;
+    assert_eq!(
+        updates
+            .iter()
+            .filter(|card| card_text(card).contains("🧹 subagent 已清理"))
+            .count(),
+        1,
+        "one cleanup entry, rendered exactly once: {updates:?}"
+    );
+    let settled = updates.last().unwrap();
+    let text = card_text(settled);
+    assert!(
+        !text.contains("后台任务（") && !text.contains("清理待确认任务"),
+        "the cleared row and its button leave the successor: {settled}"
+    );
+    let later = crate::backend::Backend::transcript(backend.as_ref(), "ses_test")
+        .await
+        .unwrap();
+    assert!(
+        later.background_tasks.is_empty(),
+        "an accepted cleanup keeps the task out of later reads: {later:?}"
+    );
+}
+
 /// Review (spec #588, #590): the unconfirmed marker and its cleanup button are
 /// process-local state the reconcile owns. A Session Sync read within the
 /// shared throttle (no verdict) must not drop them — the read's transcript is
