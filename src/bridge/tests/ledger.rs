@@ -2949,20 +2949,11 @@ async fn a_cleanup_never_advances_the_durable_watermark_for_a_late_wake() {
             state: Some("completed".into()),
             label: Some("review the diff".into()),
         }]);
-    let mut restarted_backend = MockBackend::new(realistic_parts());
-    restarted_backend.given_transcript("ses_test", vec![late]);
-    restarted_backend.with_session_status("ses_test", Some(SessionStatus::Idle));
-    let restarted_backend = Arc::new(restarted_backend);
-    let restarted_platform = Arc::new(RecordingPlatform::new());
-    let restarted = Arc::new(
-        App::new(
-            test_config(&session_file),
-            restarted_backend.clone(),
-            restarted_platform.clone(),
-        )
-        .expect("the restarted app builds"),
+    let (restarted, restarted_platform) = restarted_app_with_transcript(&session_file, late).await;
+    assert!(
+        restarted.cards_handle().chains.get("ses_test").is_none(),
+        "life 1's settled card left no durable record: the Fresh gate decides"
     );
-    seed_session(&restarted, "ses_test", "/work").await;
 
     spawn_sync(&restarted);
     wait_for_card_update(
@@ -2970,6 +2961,93 @@ async fn a_cleanup_never_advances_the_durable_watermark_for_a_late_wake() {
         "the late Wake's continuation",
         CardUpdates::Latest,
         |card| card_header(card).contains("✅") && card_text(card).contains("审阅完成。"),
+    )
+    .await;
+    assert!(
+        restarted_platform
+            .sent_cards()
+            .await
+            .iter()
+            .any(|card| card_text(card).contains(WAKE_LEAD)),
+        "the late Wake still resumes the chain after the restart: {:?}",
+        restarted_platform.calls.lock().await
+    );
+}
+
+/// The second life of a restart test (spec #588, review PR #595): a fresh app
+/// over `session_file` with `transcript` scripted — no in-memory chain, only
+/// what the sidecar and the session's own reads carry.
+async fn restarted_app_with_transcript(
+    session_file: &std::path::Path,
+    transcript: SessionTranscript,
+) -> (Arc<App>, Arc<RecordingPlatform>) {
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_transcript("ses_test", vec![transcript]);
+    backend.with_session_status("ses_test", Some(SessionStatus::Idle));
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(
+        App::new(test_config(session_file), Arc::new(backend), platform.clone())
+            .expect("the restarted app builds"),
+    );
+    seed_session(&app, "ses_test", "/work").await;
+    (app, platform)
+}
+
+/// Spec #588 / #590, review PR #595: the runtime-retirement class of the same
+/// invariant — an evidence/runtime 结束 entry is synthetic too, so its clock
+/// never advances the durable Wake Watermark. Life 1's Session Sync observes
+/// the runtime's own end of the live shell (its card write is confirmed); the
+/// restart reloads the sidecar, and a genuinely un-announced late Wake at or
+/// before the runtime's `finished_at` still resumes the chain.
+#[tokio::test]
+async fn a_runtime_retirement_never_advances_the_durable_watermark_for_a_late_wake() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = waiting_shell(now - 5_000);
+    let (dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    yield_one_task_card(&app, &platform, ctx("ses_test", "跑一下构建并审阅")).await;
+
+    // Life 1: the runtime confirms the shell ended at its own completion time
+    // — no Wake will ever arrive — and the settle's card write is confirmed.
+    let finished = now - 1_000;
+    backend.task_runtime.lock().unwrap().shells = vec![(
+        "sh_call_bg".into(),
+        ShellRuntime::Ended {
+            end: ShellEnd::Killed,
+            completed_at: Some(finished),
+        },
+    )];
+    spawn_sync(&app);
+    wait_for_card_update(&platform, "the settled card", CardUpdates::Latest, |card| {
+        card_header(card).contains("✅") && card_text(card).contains("🔔 shell 结束：gh run watch")
+    })
+    .await;
+
+    let session_file = dir.path().join("sessions.json");
+    let persisted = ChainRecords::load(session_file.with_file_name("chain_records.json"));
+    assert_eq!(
+        persisted.announced("ses_test"),
+        None,
+        "a synthetic runtime retirement never advances the durable Wake Watermark"
+    );
+
+    // Life 2: the lost Wake now arrives at or before the runtime's own end —
+    // never announced — and still resumes the chain after the restart.
+    let late = SessionTranscript::new(two_task_timeline(vec![assistant(3_100, "构建完成。")]))
+        .with_executions(vec![execution(2_500), execution(4_000)])
+        .with_wakes(vec![shell_wake(2_900)]);
+    let (restarted, restarted_platform) = restarted_app_with_transcript(&session_file, late).await;
+    assert!(
+        restarted.cards_handle().chains.get("ses_test").is_none(),
+        "life 1's settled card left no durable record: the Fresh gate decides"
+    );
+
+    spawn_sync(&restarted);
+    wait_for_card_update(
+        &restarted_platform,
+        "the late Wake's continuation",
+        CardUpdates::Latest,
+        |card| card_header(card).contains("✅") && card_text(card).contains("构建完成。"),
     )
     .await;
     assert!(
