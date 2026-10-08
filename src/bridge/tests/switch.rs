@@ -496,8 +496,8 @@ async fn switch_reeswitch_elsewhere_case(pins_enabled: bool, expected_chip: &str
         "the server run state is not shown: {text}"
     );
     assert!(
-        !text.contains(crate::feishu::snapshot_card::BUSY_HINT),
-        "no busy hint on a pending pointer: {text}"
+        !text.contains(crate::feishu::snapshot_card::FOLLOW_HINT),
+        "no hint on a pending pointer: {text}"
     );
     assert!(
         !text.contains("🔐 **权限请求**"),

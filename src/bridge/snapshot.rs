@@ -21,6 +21,21 @@ pub struct SnapshotData {
     /// the status read failed or returned an unrecognised type — the chip is
     /// omitted rather than guessed (ADR-0028).
     pub status: Option<opencode::types::SessionStatus>,
+    /// Whether the Session is in a Waiting turn (ADR-0059) at activation time:
+    /// the newest user message's Turn has finished while the read's transcript
+    /// still carries live Background Tasks, so the Turn will wake by itself.
+    /// An adoption of such a Session follows the wait — the card yields ⏳
+    /// with the ledger and Session Sync serves the completion Wake in place
+    /// (#586) — instead of freezing the one-shot static card, and the status
+    /// chip names the wait instead of 空闲. Scoped to the newest Turn on
+    /// purpose: a NEWER user message whose own Turn has not finished (an
+    /// external message just submitted, say) leaves the fact false — the
+    /// older Turn's Wake belongs to the Session Sync continuation, never to a
+    /// follow anchored at the newer message. Always `false` on a generation
+    /// without Background Task facts (V1) and when the server reads anything
+    /// but idle (never guessed — the same rule the suppression predicate's
+    /// idle check uses).
+    pub waiting: bool,
     /// Pending permission/question requests whose `sessionID` is the adopted
     /// session (never another session's in the same directory, and never a
     /// sub-task child's — ADR-0028 keeps those on today's standalone flow).
@@ -186,11 +201,23 @@ pub(crate) async fn gather_snapshot(
         .map(|message| opencode::parsing::is_cola_message_id(message.id.as_str()))
         .unwrap_or(false);
     let tail = transcript.transcript_tail();
+    // The ADR-0059 Waiting fact (#586): the newest user message's Turn is
+    // complete (an assistant step finished it) while live Background Tasks
+    // remain, and the server reads idle — exactly the read the follow's own
+    // settle decision turns into the ⏳ yield. A running Execution takes the
+    // busy arm; a retry, an unread status, or a newer user message whose Turn
+    // has not finished is never guessed into a wait.
+    let waiting = status == Some(opencode::types::SessionStatus::Idle)
+        && newest_user_anchor.as_ref().is_some_and(|anchor| {
+            transcript.turn_for_user(anchor).complete
+                && transcript.settle(Some(anchor)) == crate::backend::TurnSettle::Waiting
+        });
 
     SnapshotData {
         session_id: session_id.to_string(),
         directory: directory.to_string(),
         status,
+        waiting,
         pending,
         pending_elsewhere: None,
         tail,
@@ -298,10 +325,10 @@ pub(crate) async fn re_switch_snapshot(
 mod tests {
     use super::*;
     use crate::backend::{
-        FinishReason, MessageRole, OtherPart, Part, ReasoningPart, StepFinish, StepStart, ToolCall,
-        ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage,
+        BackgroundTask, FinishReason, MessageRole, OtherPart, Part, ReasoningPart, StepFinish, StepStart,
+        ToolCall, ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage,
     };
-    use crate::bridge::test_support::{MockBackend, text_part, typed_message};
+    use crate::bridge::test_support::{MockBackend, background_shell, execution, text_part, typed_message};
 
     fn user(id: &str, created: i64, texts: &[&str]) -> TranscriptMessage {
         typed_message(
@@ -321,12 +348,41 @@ mod tests {
         )
     }
 
+    /// An assistant step that finishes its Turn — the fact
+    /// [`SessionTranscript::turn_for_user`]'s `complete` reads.
+    fn finished_turn(id: &str, created: i64) -> TranscriptMessage {
+        typed_message(
+            id,
+            MessageRole::Assistant,
+            Some(created),
+            vec![Part::StepFinish(StepFinish {
+                reason: FinishReason::Stop,
+            })],
+        )
+    }
+
     /// A mock whose session serves exactly this typed transcript: a scripted
     /// transcript wins over the mock's default shape, so the fixture is the
     /// only thing the snapshot can be reading.
     fn typed_backend(messages: Vec<TranscriptMessage>) -> MockBackend {
         let mut mock = MockBackend::new(Vec::new());
         mock.given_transcript("ses_adopted", vec![SessionTranscript::new(messages)]);
+        mock
+    }
+
+    /// Like [`typed_backend`], with live Background Tasks on the served read —
+    /// the fact the Waiting detection derives from (#586). An Execution
+    /// boundary rides along so a finished turn reads as idle.
+    fn typed_backend_with_tasks(messages: Vec<TranscriptMessage>, tasks: Vec<BackgroundTask>) -> MockBackend {
+        let mut mock = MockBackend::new(Vec::new());
+        mock.given_transcript(
+            "ses_adopted",
+            vec![
+                SessionTranscript::new(messages)
+                    .with_executions(vec![execution(2_500)])
+                    .with_background_tasks(tasks),
+            ],
+        );
         mock
     }
 
@@ -587,5 +643,58 @@ mod tests {
         let mock = typed_backend(vec![user("msg_u1", 1000, &["你好"])]);
         let snap = gather_from_typed_backend(mock).await;
         assert_eq!(snap.status, Some(opencode::types::SessionStatus::Idle));
+    }
+
+    /// #586: the Waiting fact holds only when the server reads idle AND the
+    /// newest user message's Turn is complete with live Background Tasks. A
+    /// running Execution, a retry, an unread status, and a newer user message
+    /// whose own Turn has not finished are all "not waiting" — never guessed.
+    #[tokio::test]
+    async fn gather_detects_a_waiting_turn_only_on_idle_with_live_tasks() {
+        let finished = || vec![user("msg_u1", 1000, &["你好"]), finished_turn("msg_a1", 2000)];
+        let waiting =
+            gather_from_typed_backend(typed_backend_with_tasks(finished(), vec![background_shell(1100)]))
+                .await;
+        assert!(waiting.waiting, "a finished turn + a live task is a Waiting turn");
+
+        let idle = gather_from_typed_backend(typed_backend(vec![user("msg_u1", 1000, &["你好"])])).await;
+        assert!(!idle.waiting, "idle with no live task is not waiting");
+
+        let mut busy = typed_backend_with_tasks(finished(), vec![background_shell(1100)]);
+        busy.with_session_status("ses_adopted", Some(opencode::types::SessionStatus::Busy));
+        let snap = gather_from_typed_backend(busy).await;
+        assert!(
+            !snap.waiting,
+            "a running Execution takes the busy arm, not waiting"
+        );
+
+        let mut retry = typed_backend_with_tasks(finished(), vec![background_shell(1100)]);
+        retry.with_session_status("ses_adopted", Some(opencode::types::SessionStatus::Retry));
+        let snap = gather_from_typed_backend(retry).await;
+        assert!(!snap.waiting, "retry is never guessed into a wait");
+
+        let mut unread = typed_backend_with_tasks(finished(), vec![background_shell(1100)]);
+        unread.status_read_fails("simulated failure");
+        let snap = gather_from_typed_backend(unread).await;
+        assert_eq!(snap.status, None);
+        assert!(!snap.waiting, "an unknown status is not idle");
+
+        // A NEWER user message whose own Turn has not finished: the live task
+        // belongs to the older Turn, whose missed Wake must stay with the
+        // Session Sync continuation — never a follow anchored at the newer
+        // message (the collect fixture this guards).
+        let newer = gather_from_typed_backend(typed_backend_with_tasks(
+            vec![
+                user("msg_u1", 1000, &["你好"]),
+                finished_turn("msg_a1", 2000),
+                user("msg_u2", 3000, &["外部新消息"]),
+            ],
+            vec![background_shell(1100)],
+        ))
+        .await;
+        assert!(
+            !newer.waiting,
+            "a newer unfinished turn is not the Waiting turn of the older one"
+        );
     }
 }

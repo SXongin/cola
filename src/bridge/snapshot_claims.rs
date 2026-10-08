@@ -382,6 +382,7 @@ mod tests {
             session_id: "ses_1".into(),
             directory: "/work".into(),
             status: None,
+            waiting: false,
             pending: ids.iter().map(|id| perm(id)).collect(),
             pending_elsewhere: None,
             tail: vec![],

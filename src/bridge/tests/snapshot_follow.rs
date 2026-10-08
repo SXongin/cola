@@ -1057,3 +1057,168 @@ async fn busy_snapshot_follow_yields_and_resumes_in_place() {
         "an in-place resume posts no continuation card: {calls:?}"
     );
 }
+
+/// #586: an IDLE-but-Waiting external session adopted via `/switch` — the
+/// server reads idle while a live Background Task remains (ADR-0059) — is
+/// followed exactly like a busy one: the snapshot carries the 等待后台任务
+/// chip, the follow's first settle read yields ⏳ with the ledger in place,
+/// and Session Sync resumes the card in place to the true end. Before the
+/// fix this adoption froze the static 空闲 snapshot and every later Wake was
+/// invisible.
+#[tokio::test]
+async fn waiting_adopt_yields_and_resumes_in_place() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_sessions(vec![list_session(
+        "ses_alpha01",
+        "唯一外部标题",
+        "/work/ext",
+        100,
+    )]);
+    // The gather's read: the Execution ended (the server reads idle) with the
+    // Background Task still live.
+    backend.given_transcript("ses_alpha01", vec![snapshot_waiting_read()]);
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    app.core
+        .external
+        .render_poll_ms
+        .store(5, std::sync::atomic::Ordering::Relaxed);
+
+    send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
+
+    // The snapshot names the wait instead of 空闲, and the follow is armed.
+    let calls = platform.calls.lock().await.clone();
+    let snapshot = calls
+        .iter()
+        .find_map(|call| match call {
+            PlatformCall::ReplyCard { card, .. } => Some(card.to_string()),
+            _ => None,
+        })
+        .expect("the snapshot was sent");
+    assert!(
+        snapshot.contains(crate::feishu::snapshot_card::WAITING_BACKGROUND_CHIP),
+        "the waiting chip names the wait: {snapshot}"
+    );
+    assert!(
+        snapshot.contains(crate::feishu::snapshot_card::FOLLOW_HINT),
+        "the waiting chip carries the follow hint: {snapshot}"
+    );
+    assert!(
+        !snapshot.contains(crate::feishu::snapshot_card::IDLE_CHIP),
+        "the static 空闲 chip must not render: {snapshot}"
+    );
+    assert!(
+        Turn::armed_turn_anchor(&app.core.cards_handle(), "ses_alpha01")
+            .await
+            .is_some(),
+        "a waiting adopt arms the follow"
+    );
+
+    // The follow's first settle read idles with the live task: ⏳ in place.
+    // The follow's first settle read idles with the live task: ⏳ in place,
+    // carrying the Background Task Ledger.
+    wait_for_card_update(&platform, "the waiting yield", CardUpdates::Latest, |card| {
+        card_header(card).contains("等待后台任务")
+            && card.to_string().contains("task_ledger")
+            && card.to_string().contains("后台任务（1）")
+    })
+    .await;
+
+    // The task retires and its run lands the answer; Session Sync resumes the
+    // snapshot card in place and settles ✅ there.
+    spawn_sync(&app);
+    backend
+        .given_transcript_after_build("ses_alpha01", vec![snapshot_woken_read()])
+        .await;
+    wait_for_card_update(&platform, "the true end", CardUpdates::Latest, |card| {
+        card_header(card).contains("✅")
+    })
+    .await;
+
+    let calls = platform.calls.lock().await.clone();
+    let last = calls
+        .iter()
+        .rev()
+        .find_map(|call| match call {
+            PlatformCall::UpdateMessage { message_id, card } => Some((message_id.clone(), card.clone())),
+            _ => None,
+        })
+        .expect("the snapshot card was updated");
+    assert_eq!(last.0, "msg_reply", "the snapshot card resumes in place");
+    let text = card_text(&last.1);
+    assert!(
+        text.contains("已接管 唯一外部标题"),
+        "the snapshot identity stays visible: {last:?}"
+    );
+    assert!(
+        text.contains("等待后台任务完成"),
+        "the waiting-copy static line survives: {last:?}"
+    );
+    assert!(
+        text.contains("CI 通过了。"),
+        "the resumed content lands: {last:?}"
+    );
+    assert!(
+        text.contains("🔔 shell 完成：gh run watch"),
+        "the completion entry lands on the same card: {last:?}"
+    );
+    assert!(
+        continuation_sends(&platform).await.is_empty(),
+        "an in-place resume posts no continuation card: {calls:?}"
+    );
+}
+
+/// #586 boundary: a Waiting session whose newest user message is
+/// cola-authored keeps the static snapshot — cola's own accumulator is never
+/// re-pointed, exactly like the busy guard.
+#[tokio::test]
+async fn waiting_adopt_cola_authored_turn_stays_static() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_sessions(vec![list_session(
+        "ses_alpha01",
+        "唯一外部标题",
+        "/work/ext",
+        100,
+    )]);
+    // Cola's own prompt is the newest user message, and its finished Turn
+    // idles with a live Background Task (idle = the mock's absent-session
+    // default) — so only the cola-authored guard keeps this static.
+    backend.given_transcript(
+        "ses_alpha01",
+        vec![
+            SessionTranscript::new(vec![
+                typed_message(
+                    "msg_cola_1",
+                    MessageRole::User,
+                    Some(1_000),
+                    vec![text_part("我在问的问题")],
+                ),
+                typed_message(
+                    "msg_a1",
+                    MessageRole::Assistant,
+                    Some(2_000),
+                    vec![Part::StepFinish(StepFinish {
+                        reason: FinishReason::Stop,
+                    })],
+                ),
+            ])
+            .with_executions(vec![execution(2_500)])
+            .with_background_tasks(vec![background_shell(1_100)]),
+        ],
+    );
+    let (app, _platform) = build_app(cfg, backend).await;
+
+    send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
+
+    assert!(
+        !Turn::has_card(&app.cards_handle(), "ses_alpha01").await,
+        "cola's own turn is never followed"
+    );
+}

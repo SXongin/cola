@@ -158,6 +158,7 @@ async fn a_snapshot_claimed_wait_pins_the_snapshot_card() {
             session_id: "ses_1".into(),
             directory: "/work".into(),
             status: None,
+            waiting: false,
             pending: vec![crate::bridge::request::kind::PendingRequest::Permission(
                 permission("per_1", "ses_1"),
             )],
