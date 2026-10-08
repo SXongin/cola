@@ -2347,8 +2347,6 @@ async fn a_message_in_the_waiting_window_starts_a_new_turn() {
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
     seed_session(&app, "ses_test", "/work").await;
     app.turn_render_poll_ms.store(5, Ordering::Relaxed);
-    app.turn_drain_timeout_ms.store(5_000, Ordering::Relaxed);
-
     // The first Turn: idle + a live Background Task yields 「等待后台任务」 and
     // hands the guard back.
     let first = spawn_turn(&app, ctx("ses_test", "跑一下 CI"));

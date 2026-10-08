@@ -1054,12 +1054,10 @@ pub(crate) struct TurnConfig {
     pub(crate) long_task_notice_ms: Arc<AtomicU64>,
     /// A Turn's render poll cadence (ms); injectable for tests.
     pub(crate) turn_render_poll_ms: Arc<AtomicU64>,
-    /// Bound on a Turn's post-prompt drain (ms); injectable for tests.
-    pub(crate) turn_drain_timeout_ms: Arc<AtomicU64>,
-    /// The long follow grace (ms): the out-of-turn drain follow's lost-contact
-    /// / stuck-panel bound (#284/#386) and the unreceived watch's waiting-hint
-    /// delay (ADR-0062) — deliberately one knob, the follow grace the spec
-    /// names; injectable for tests.
+    /// The single grace (ms) on the post-prompt path (#603): the merged
+    /// unbounded drain's lost-contact / stuck-panel bound (#284/#386) and the
+    /// unreceived waiting-hint delay (ADR-0062) — deliberately one knob;
+    /// injectable for tests.
     pub(crate) turn_follow_grace_ms: Arc<AtomicU64>,
     /// Per-read bound on the out-of-turn drain follow (ms, #386); injectable
     /// for tests.
@@ -1075,7 +1073,6 @@ impl TurnConfig {
         long_task_notice: bool,
         long_task_notice_ms: Arc<AtomicU64>,
         turn_render_poll_ms: Arc<AtomicU64>,
-        turn_drain_timeout_ms: Arc<AtomicU64>,
         turn_follow_grace_ms: Arc<AtomicU64>,
         turn_follow_read_timeout_ms: Arc<AtomicU64>,
         work_dir: Option<String>,
@@ -1085,7 +1082,6 @@ impl TurnConfig {
             long_task_notice,
             long_task_notice_ms,
             turn_render_poll_ms,
-            turn_drain_timeout_ms,
             turn_follow_grace_ms,
             turn_follow_read_timeout_ms,
             work_dir,
@@ -1112,19 +1108,15 @@ impl TurnConfig {
         self.turn_render_poll_ms.load(Ordering::Relaxed)
     }
 
-    /// The drain bound for a Turn (ms).
-    pub(crate) fn drain_timeout_ms(&self) -> u64 {
-        self.turn_drain_timeout_ms.load(Ordering::Relaxed)
-    }
-
-    /// The long follow grace (ms): the out-of-turn follow's lost-contact /
-    /// stuck-panel bound and the unreceived watch's waiting-hint delay — one
-    /// knob by design (#284/#386, ADR-0062). See the field's own docs.
+    /// The single grace (ms) on the post-prompt path: the merged drain's
+    /// lost-contact / stuck-panel bound and the unreceived waiting-hint delay —
+    /// one knob by design (#284/#386, ADR-0062, #603). See the field's docs.
     pub(crate) fn follow_grace_ms(&self) -> u64 {
         self.turn_follow_grace_ms.load(Ordering::Relaxed)
     }
 
-    /// The per-read bound on the out-of-turn drain follow (ms, #386).
+    /// The unified per-read bound on the post-prompt path (ms, #386/#603): every
+    /// drain read (transcript and status) and the out-of-turn follow's reads.
     pub(crate) fn follow_read_timeout_ms(&self) -> u64 {
         self.turn_follow_read_timeout_ms.load(Ordering::Relaxed)
     }

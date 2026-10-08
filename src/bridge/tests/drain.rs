@@ -129,7 +129,6 @@ pub(crate) async fn scripted_app_with(
     // Tiny cadences so the whole lifecycle runs in milliseconds; the timeouts
     // below assert the exits are state-driven, not the default 10 min bound.
     app.turn_render_poll_ms.store(5, Ordering::Relaxed);
-    app.turn_drain_timeout_ms.store(60_000, Ordering::Relaxed);
     // A tiny per-read bound: a scripted hung read must fail fast instead of
     // eating a test's whole grace.
     app.turn_follow_read_timeout_ms.store(20, Ordering::Relaxed);
@@ -149,8 +148,7 @@ pub(crate) fn spawn_turn(
 }
 
 /// The #284 scenario app: a Supplement whose `bash` tool is still `running`
-/// when the drain bound lands, on a Busy session, with a tiny drain bound and
-/// the given follow grace.
+/// on a Busy session, with the given single grace.
 async fn busy_supplement_app(
     follow_grace_ms: u64,
 ) -> (
@@ -167,27 +165,35 @@ async fn busy_supplement_app(
     ];
     let (dir, app, backend, platform) =
         scripted_app(vec![SessionTranscript::new(timeline)], Some(SessionStatus::Busy)).await;
-    app.turn_drain_timeout_ms.store(30, Ordering::Relaxed);
     app.turn_follow_grace_ms.store(follow_grace_ms, Ordering::Relaxed);
     (dir, app, backend, platform)
 }
 
-/// Run the #284 scenario turn to its drain-bound hand-off: the running panel
-/// is on the card, and `Turn::run` returning IS the hand-off. The guard is NOT
-/// released at the bound any more — the follow inherits it (ADR-0059) and
-/// covers the whole follow window with it.
-async fn run_to_handoff(app: &Arc<App>, platform: &RecordingPlatform) {
-    let turn = spawn_turn(app, ctx("ses_test", "第一条消息"));
+/// Run the #284 scenario turn until its running `bash` panel is on the live
+/// card. The turn's own task now owns the merged unbounded drain (#603) — there
+/// is no hand-off and `Turn::run` does not return at a bound — so this detaches
+/// the task (dropping its handle) and the caller drives the Backend, then awaits
+/// [`wait_for_guard_release`] at the true end.
+async fn run_to_panel(app: &Arc<App>, platform: &RecordingPlatform) {
+    let _turn = spawn_turn(app, ctx("ses_test", "第一条消息"));
     wait_for_card_text(platform, "⏳ bash").await;
-    let result = tokio::time::timeout(Duration::from_secs(5), turn)
-        .await
-        .expect("the turn must hand off at the drain bound")
-        .unwrap();
-    result.unwrap();
     assert!(
         app.inflight.lock().await.contains("ses_test"),
-        "the follow must inherit the guard at the bound"
+        "the merged drain holds the guard while it renders"
     );
+}
+
+/// Await the merged drain's guard release (the turn's true end), or panic: the
+/// guard is held for the WHOLE path and released only at the ending.
+pub(crate) async fn wait_for_guard_release(app: &Arc<App>) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while app.inflight.lock().await.contains("ses_test") {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the turn never released the guard"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 }
 
 /// Settle the scenario's `bash` panel in the scripted transcript the follow
@@ -664,14 +670,12 @@ async fn a_stopped_turn_logs_finalizing_once_per_turn() {
     );
 }
 
-/// A session that stays busy runs the drain to its bound. The TURN ends there,
-/// but the CARD does not: it is handed to the out-of-turn follow together with
-/// the guard (ADR-0059), which keeps the card live and never reads the
-/// followed Session as idle to the server-yield path. The follow has no
-/// total budget (#386) — a readable run stays live for as long as it runs —
-/// so only the session going idle finalizes it, and only then Done (#284).
+/// A long, healthy run renders to its true end on ONE card: the merged
+/// unbounded drain (#603) has no total budget, so a readable, busy session
+/// simply keeps updating its Card — no hand-off, no 「部分完成」/continuation
+/// pair — and only the session going idle finalizes it, and only then Done.
 #[tokio::test]
-async fn the_drain_bound_exits_cleanly_and_finishes_the_turn() {
+async fn a_long_healthy_run_finishes_on_one_card() {
     let _wd = test_work_dir();
     let timeline = vec![
         user("msg_cola_anchor", 1_000, "第一条消息"),
@@ -679,30 +683,19 @@ async fn the_drain_bound_exits_cleanly_and_finishes_the_turn() {
     ];
     let (_dir, app, backend, platform) =
         scripted_app(vec![SessionTranscript::new(timeline)], Some(SessionStatus::Busy)).await;
-    // Tiny bounds so the long-poll branch and the follow grace run in
-    // milliseconds.
-    app.turn_drain_timeout_ms.store(30, Ordering::Relaxed);
+    // A grace the readable run never trips: only the session going idle ends it.
     app.turn_follow_grace_ms.store(30, Ordering::Relaxed);
-    // Group + requester: the follow's finalization sends the completion notice.
+    // Group + requester: the merged path's finalization sends the completion notice.
     let mut context = ctx("ses_test", "第一条消息");
     context.is_group = true;
     context.requester_open_id = Some(TEST_HOST.to_string());
 
-    Turn::run(&app.turn_handles(), context).await.unwrap();
+    let turn = spawn_turn(&app, context);
+    wait_for_card_text(&platform, "第一轮回答。").await;
 
-    // The turn handed the card to the follow; the follow inherited the guard
-    // (ADR-0059) and keeps it while the run stays live.
-    assert!(
-        app.inflight.lock().await.contains("ses_test"),
-        "the follow must hold the guard at the bound"
-    );
-    assert!(
-        backend.transcript_calls.lock().await.len() > 1,
-        "the drain must keep polling while the session is busy"
-    );
-
-    // The follow keeps the card live well past the grace while the run stays
-    // readable: no total budget, no forced Error.
+    // Well past the grace while the run stays readable: no total budget, no
+    // forced Error, and the same card keeps streaming — never a 「部分完成」
+    // hand-off artifact.
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert!(
         !platform
@@ -718,13 +711,35 @@ async fn the_drain_bound_exits_cleanly_and_finishes_the_turn() {
         Some(CardState::Streaming),
         "the card stays live while the session is readable and busy"
     );
+    assert!(
+        app.inflight.lock().await.contains("ses_test"),
+        "the guard is held for the whole path"
+    );
+    assert!(
+        platform
+            .updated_cards()
+            .await
+            .iter()
+            .all(|c| !card_header(c).contains("部分完成")),
+        "a long healthy run must show no hand-off artifact: {:?}",
+        platform.updated_cards().await
+    );
+    assert!(
+        backend.transcript_calls.lock().await.len() > 1,
+        "the drain must keep polling while the session is busy"
+    );
 
-    // It genuinely ends: the session goes idle and the follow finalizes Done.
+    // It genuinely ends: the session goes idle and the merged drain finalizes Done.
     backend
         .set_session_status("ses_test", Some(SessionStatus::Idle))
         .await;
-    wait_for_card_header(&platform, "完成").await;
+    let result = tokio::time::timeout(Duration::from_secs(5), turn)
+        .await
+        .expect("the idle session must end the drain")
+        .unwrap();
+    result.unwrap();
     let final_card = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(card_header(&final_card).contains("完成"));
     assert!(card_text(&final_card).contains("第一轮回答。"));
     assert!(
         platform
@@ -739,27 +754,27 @@ async fn the_drain_bound_exits_cleanly_and_finishes_the_turn() {
     assert_no_further_rendering(&backend, &platform).await;
 }
 
-/// #284 regression: a Supplement whose tool part is still `running` at the
-/// drain bound must not freeze the card. The follow keeps rendering the SAME
-/// card past the bound — not Done, the panel still live — refuses to finalize
-/// even when the session reports idle while the panel is still live, and ends
-/// Done with the tool's completion once the panel settles.
+/// #284 regression: a Supplement whose tool part is still `running` must not
+/// freeze the card. The merged drain keeps rendering the SAME card — not Done,
+/// the panel still live — refuses to finalize even when the session reports
+/// idle while the panel is still live, and ends Done with the tool's completion
+/// once the panel settles.
 #[tokio::test]
-async fn a_running_supplement_panel_rides_past_the_drain_bound_until_idle() {
+async fn a_running_supplement_panel_rides_past_the_grace_until_idle() {
     let _wd = test_work_dir();
-    // A ceiling the test would never wait out: only the panel settling ends it.
+    // A grace the test would never wait out: only the panel settling ends it.
     let (_dir, app, backend, platform) = busy_supplement_app(60_000).await;
 
-    run_to_handoff(&app, &platform).await;
+    run_to_panel(&app, &platform).await;
     assert_eq!(
         Turn::card_state(&app.cards_handle(), "ses_test").await,
         Some(CardState::Streaming),
-        "the hand-off must leave the card live, not Done"
+        "the merged drain leaves the card live, not Done"
     );
     let live = platform.updated_cards().await.last().cloned().unwrap();
     assert!(
         !card_header(&live).contains("完成"),
-        "the card must not be Done at the bound: {}",
+        "the card must not be Done over a running panel: {}",
         card_header(&live)
     );
     assert!(
@@ -782,10 +797,11 @@ async fn a_running_supplement_panel_rides_past_the_drain_bound_until_idle() {
     // The tool settles; the next tick renders it and finalizes Done.
     settle_tool(&backend, ToolStatus::Completed, "done").await;
     wait_for_card_header(&platform, "完成").await;
+    wait_for_guard_release(&app).await;
     let final_card = platform.updated_cards().await.last().cloned().unwrap();
     assert!(
         card_text(&final_card).contains("done"),
-        "the tool's completion must render after the bound: {final_card}"
+        "the tool's completion must render: {final_card}"
     );
     assert!(
         !card_text(&final_card).contains("⏳ bash"),
@@ -801,17 +817,16 @@ async fn a_running_supplement_panel_rides_past_the_drain_bound_until_idle() {
     assert_no_further_rendering(&backend, &platform).await;
 }
 
-/// A followed long turn that ends in a provider failure must finalize Error,
-/// not Done: the failure lives on the transcript's newest assistant message,
-/// and the out-of-turn follow reads the same shared rule the Turn's own
-/// finalization uses (ADR-0056).
+/// A long turn that ends in a provider failure must finalize Error, not Done:
+/// the failure lives on the transcript's newest assistant message, and the
+/// merged drain reads the same shared rule the finalization uses (ADR-0056).
 #[tokio::test]
-async fn a_followed_failure_finalizes_error_not_done() {
+async fn a_late_failure_finalizes_error_not_done() {
     let _wd = test_work_dir();
-    // A ceiling the test would never wait out: only the settled failure ends it.
+    // A grace the test would never wait out: only the settled failure ends it.
     let (_dir, app, backend, platform) = busy_supplement_app(60_000).await;
 
-    run_to_handoff(&app, &platform).await;
+    run_to_panel(&app, &platform).await;
 
     // The run settles: the tool completes and the server records the provider
     // failure on the newest assistant message, with the session idle.
@@ -826,6 +841,7 @@ async fn a_followed_failure_finalizes_error_not_done() {
         .await;
 
     wait_for_card_header(&platform, "出错").await;
+    wait_for_guard_release(&app).await;
     let final_card = platform.updated_cards().await.last().cloned().unwrap();
     assert!(card_header(&final_card).contains("出错"), "final card Error");
     assert!(
@@ -835,14 +851,14 @@ async fn a_followed_failure_finalizes_error_not_done() {
     assert_no_further_rendering(&backend, &platform).await;
 }
 
-/// `/stop` during the follow finalizes the card promptly — the same sticky
+/// `/stop` during the drain finalizes the card promptly — the same sticky
 /// stopped-session marker the drain observes — instead of waiting out the
-/// follow's ceiling.
+/// grace.
 #[tokio::test]
-async fn stop_during_the_follow_finalizes_promptly() {
+async fn stop_during_the_drain_finalizes_promptly() {
     let _wd = test_work_dir();
     let (_dir, app, backend, platform) = busy_supplement_app(60_000).await;
-    run_to_handoff(&app, &platform).await;
+    run_to_panel(&app, &platform).await;
 
     // The interrupt settles the running tool server-side (OpenCode writes it
     // as `error`): mirror that, so the final render shows the aborted panel.
@@ -867,8 +883,9 @@ async fn stop_during_the_follow_finalizes_promptly() {
     wait_for_card_header(&platform, "已停止").await;
     assert!(
         started.elapsed() < Duration::from_secs(3),
-        "the follow must end on the stop, not the 60 s grace"
+        "the drain must end on the stop, not the 60 s grace"
     );
+    wait_for_guard_release(&app).await;
     let final_card = platform.updated_cards().await.last().cloned().unwrap();
     assert!(
         card_buttons(&final_card).is_empty(),
@@ -876,17 +893,16 @@ async fn stop_during_the_follow_finalizes_promptly() {
     );
     assert!(
         platform.texts().await.is_empty(),
-        "a followed stop sends no text reply either — the finalized card carries 已停止: {:?}",
+        "a stopped drain sends no text reply either — the finalized card carries 已停止: {:?}",
         platform.calls.lock().await
     );
     assert_no_further_rendering(&backend, &platform).await;
 }
 
-/// The follow's mid-tick stop re-check (#394): a stop landing AFTER a tick's
+/// The drain's mid-tick stop re-check (#394): a stop landing AFTER a tick's
 /// top marker check — while its transcript read is already in flight — must
 /// still finalize `Stopped`, not the settled run's Done. The gate parks the
-/// follow's read (the only transcript reader after the hand-off), so the
-/// `/stop` deterministically lands inside the tick.
+/// drain's read, so the `/stop` deterministically lands inside the tick.
 #[tokio::test]
 async fn a_stop_landing_mid_tick_finalizes_stopped_not_done() {
     let _wd = test_work_dir();
@@ -895,7 +911,7 @@ async fn a_stop_landing_mid_tick_finalizes_stopped_not_done() {
     // The parked read must stay parked until the test releases it: the
     // follow's default per-read bound would cancel it first.
     app.turn_follow_read_timeout_ms.store(60_000, Ordering::Relaxed);
-    run_to_handoff(&app, &platform).await;
+    run_to_panel(&app, &platform).await;
 
     // Park the follow's next read. It has already passed the tick's top
     // marker check (no marker is set yet), so only the mid-tick re-check can
@@ -940,6 +956,7 @@ async fn a_stop_landing_mid_tick_finalizes_stopped_not_done() {
 
     gate.add_permits(1);
     wait_for_card_header(&platform, "已停止").await;
+    wait_for_guard_release(&app).await;
     assert_eq!(
         Turn::card_state(&app.cards_handle(), "ses_test").await,
         Some(CardState::Stopped),
@@ -957,12 +974,12 @@ async fn a_stop_landing_mid_tick_finalizes_stopped_not_done() {
 /// never sits on an eternal "streaming" state over a run cola cannot see
 /// (#284/#386).
 #[tokio::test]
-async fn a_hung_backend_ends_the_follow_in_error() {
+async fn a_hung_backend_ends_the_drain_in_error() {
     let _wd = test_work_dir();
     let (_dir, app, backend, platform) = busy_supplement_app(50).await;
-    run_to_handoff(&app, &platform).await;
+    run_to_panel(&app, &platform).await;
 
-    // Every transcript read the follow makes now hangs (a wedged per-session
+    // Every transcript read the drain makes now hangs (a wedged per-session
     // read); the status read alone is not a full read pair, so the
     // lost-contact grace ends the card.
     backend.hang_transcript_reads(100);
@@ -971,8 +988,9 @@ async fn a_hung_backend_ends_the_follow_in_error() {
     wait_for_card_header(&platform, "出错").await;
     assert!(
         started.elapsed() < Duration::from_secs(3),
-        "the hung read must end at the follow's grace, not the per-read bound"
+        "the hung read must end at the grace, not the per-read bound"
     );
+    wait_for_guard_release(&app).await;
     let final_card = platform.updated_cards().await.last().cloned().unwrap();
     assert!(
         !card_header(&final_card).contains("完成"),
@@ -986,13 +1004,13 @@ async fn a_hung_backend_ends_the_follow_in_error() {
 }
 
 /// A live `⏳` panel on a readable, idle session that never settles is an
-/// unreconcilable panel: the follow gives it the grace to settle, then ends
+/// unreconcilable panel: the drain gives it the grace to settle, then ends
 /// Error — never Done over a `⏳`, never an eternal card (#386).
 #[tokio::test]
-async fn an_orphaned_panel_ends_the_follow_in_error() {
+async fn an_orphaned_panel_ends_the_drain_in_error() {
     let _wd = test_work_dir();
     let (_dir, app, backend, platform) = busy_supplement_app(50).await;
-    run_to_handoff(&app, &platform).await;
+    run_to_panel(&app, &platform).await;
 
     // The run is gone (idle) but its last panel stays `running`: a crash
     // orphan nothing will ever settle.
@@ -1001,6 +1019,7 @@ async fn an_orphaned_panel_ends_the_follow_in_error() {
         .await;
 
     wait_for_card_header(&platform, "出错").await;
+    wait_for_guard_release(&app).await;
     let final_card = platform.updated_cards().await.last().cloned().unwrap();
     assert!(
         card_text(&final_card).contains("未收尾"),
@@ -1026,7 +1045,7 @@ async fn an_orphaned_panel_ends_the_follow_in_error() {
 async fn a_successful_read_resets_the_lost_contact_grace() {
     let _wd = test_work_dir();
     let (_dir, app, backend, platform) = busy_supplement_app(500).await;
-    run_to_handoff(&app, &platform).await;
+    run_to_panel(&app, &platform).await;
 
     // Three hung transcript reads: no full read pair for well under 500 ms.
     backend.hang_transcript_reads(3);
@@ -1046,6 +1065,7 @@ async fn a_successful_read_resets_the_lost_contact_grace() {
     // The same outage sustained without a full answer ends it.
     backend.hang_transcript_reads(100);
     wait_for_card_header(&platform, "出错").await;
+    wait_for_guard_release(&app).await;
     let final_card = platform.updated_cards().await.last().cloned().unwrap();
     assert!(
         card_text(&final_card).contains("失去联系"),
@@ -1055,7 +1075,7 @@ async fn a_successful_read_resets_the_lost_contact_grace() {
 }
 
 /// The wait scenario (#386): a Busy session with one pending permission
-/// inlined on its live card, driven through the drain-bound hand-off.
+/// inlined on its live card, drip-fed by the merged unbounded drain.
 async fn pending_permission_app() -> (
     tempfile::TempDir,
     Arc<App>,
@@ -1086,13 +1106,13 @@ async fn pending_permission_app() -> (
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
     seed_session(&app, "ses_test", "/work").await;
     app.turn_render_poll_ms.store(5, Ordering::Relaxed);
-    app.turn_drain_timeout_ms.store(30, Ordering::Relaxed);
     app.turn_follow_grace_ms.store(30, Ordering::Relaxed);
     app.turn_follow_read_timeout_ms.store(20, Ordering::Relaxed);
 
-    // Run the turn to its hand-off, then surface the permission the way
-    // `App::run` does — after the accumulator arms, so it inlines on the card.
-    let turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
+    // The turn runs on its own task (the merged drain owns it to the true
+    // end), then surface the permission the way `App::run` does — after the
+    // accumulator arms, so it inlines on the card.
+    let _turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
     let armed = async {
         while Turn::armed_turn_anchor(&app.cards_handle(), "ses_test")
             .await
@@ -1111,11 +1131,6 @@ async fn pending_permission_app() -> (
             let _ = app.permission.poll_loop(&app.flow_handles()).await;
         }
     });
-    let result = tokio::time::timeout(Duration::from_secs(5), turn)
-        .await
-        .expect("the turn must hand off at the drain bound")
-        .unwrap();
-    result.unwrap();
     wait_for_card_header(&platform, "等待你的授权").await;
     (dir, app, backend, platform)
 }
@@ -1156,7 +1171,7 @@ async fn a_pending_permission_waits_past_the_grace_without_error() {
 
     // The operator answers elsewhere while the run is still live: the
     // permission poller's sweep repaints the card with the neutral
-    // 「已由其他客户端处理」 receipt independently of the follow (one more
+    // 「已由其他客户端处理」 receipt independently of the drain (one more
     // legitimate PATCH); account for it before asserting the drain stopped —
     // otherwise this races the sweep, not the drain.
     backend.permission_resolved_by_another("per_1").await;
@@ -1167,12 +1182,13 @@ async fn a_pending_permission_waits_past_the_grace_without_error() {
         |card| card_text(card).contains("已由其他客户端处理"),
     )
     .await;
-    // Then the run settles: the follow finalizes Done, not Error — the wait
-    // was never a failure.
+    // Then the run settles: the merged drain finalizes Done, not Error — the
+    // wait was never a failure.
     backend
         .set_session_status("ses_test", Some(SessionStatus::Idle))
         .await;
     wait_for_card_header(&platform, "完成").await;
+    wait_for_guard_release(&app).await;
     assert_no_further_rendering(&backend, &platform).await;
 }
 
@@ -1182,10 +1198,11 @@ async fn a_pending_permission_waits_past_the_grace_without_error() {
 #[tokio::test]
 async fn a_pending_wait_with_lost_contact_still_ends_in_error() {
     let _wd = test_work_dir();
-    let (_dir, _app, backend, platform) = pending_permission_app().await;
+    let (_dir, app, backend, platform) = pending_permission_app().await;
 
     backend.hang_transcript_reads(100);
     wait_for_card_header(&platform, "出错").await;
+    wait_for_guard_release(&app).await;
     let final_card = platform.updated_cards().await.last().cloned().unwrap();
     assert!(
         card_text(&final_card).contains("失去联系"),
@@ -1194,23 +1211,23 @@ async fn a_pending_wait_with_lost_contact_still_ends_in_error() {
     assert_no_further_rendering(&backend, &platform).await;
 }
 
-/// ADR-0059's routing key, follow-window half: a run that outlived the drain
-/// bound keeps its guard, so a message arriving during the follow is a
-/// Supplement. It merges into the still-live chain — the Card Chain splits at
-/// the message and the follow keeps rendering on the continuation — instead of
-/// freezing the old card and starting an overlapping Turn. The accumulator is
-/// never replaced and the follow's guard is never read as idle.
+/// ADR-0059's routing key, drain-window half: a run that keeps its guard
+/// through the merged drain receives a message as a Supplement. It merges into
+/// the still-live chain — the Card Chain splits at the message and the drain
+/// keeps rendering on the continuation — instead of freezing the old card and
+/// starting an overlapping Turn. The accumulator is never replaced and the
+/// drain's guard is never read as idle.
 #[tokio::test]
-async fn a_message_during_the_follow_window_splits_the_live_chain() {
+async fn a_message_during_the_drain_window_splits_the_live_chain() {
     let _wd = test_work_dir();
     let (_dir, app, backend, platform) = busy_supplement_app(60_000).await;
-    run_to_handoff(&app, &platform).await;
+    run_to_panel(&app, &platform).await;
 
-    let followed_anchor = Turn::armed_turn_anchor(&app.cards_handle(), "ses_test").await;
+    let drained_anchor = Turn::armed_turn_anchor(&app.cards_handle(), "ses_test").await;
     assert_eq!(
-        followed_anchor.as_ref().map(|anchor| anchor.created_ms),
+        drained_anchor.as_ref().map(|anchor| anchor.created_ms),
         Some(1_000),
-        "the follow watches the turn anchor"
+        "the drain watches the turn anchor"
     );
 
     app.handle_message(incoming(
@@ -1223,7 +1240,7 @@ async fn a_message_during_the_follow_window_splits_the_live_chain() {
     ))
     .await;
 
-    // The message was submitted to merge into the live run — the follow's
+    // The message was submitted to merge into the live run — the drain's
     // guard made it a Supplement, not a busy answer and not a new Turn.
     assert!(
         backend.prompt_calls.lock().await.iter().any(|t| t == "接着问"),
@@ -1232,17 +1249,17 @@ async fn a_message_during_the_follow_window_splits_the_live_chain() {
     );
     assert!(
         !platform.texts().await.iter().any(|t| t.contains("还在处理中")),
-        "a follow-window message is never answered busy: {:?}",
+        "a drain-window message is never answered busy: {:?}",
         platform.calls.lock().await
     );
     assert_eq!(
         Turn::armed_turn_anchor(&app.cards_handle(), "ses_test").await,
-        followed_anchor,
-        "no competing Turn: the follow's accumulator survives"
+        drained_anchor,
+        "no competing Turn: the drain's accumulator survives"
     );
     assert!(
         app.inflight.lock().await.contains("ses_test"),
-        "the follow still owns the session's guard"
+        "the drain still owns the session's guard"
     );
 
     // Exactly ONE card replies to the message — the split continuation, with
@@ -1283,7 +1300,7 @@ async fn a_message_during_the_follow_window_splits_the_live_chain() {
         "the running panel rides the live continuation (ADR-0045): {continuation}"
     );
 
-    // The run goes on: the follow keeps rendering into the continuation. The
+    // The run goes on: the drain keeps rendering into the continuation. The
     // tool settles and the answer lands — on the split continuation.
     settle_tool(&backend, ToolStatus::Completed, "构建完成").await;
     backend
@@ -1315,11 +1332,8 @@ async fn a_message_during_the_follow_window_splits_the_live_chain() {
         "the continuation is a delta, never a replay: {final_card}"
     );
 
-    // The follow window closed: the guard went back with the ending.
-    assert!(
-        !app.inflight.lock().await.contains("ses_test"),
-        "the follow must release the guard when it ends"
-    );
+    // The drain window closed: the guard went back with the ending.
+    wait_for_guard_release(&app).await;
     assert_no_further_rendering(&backend, &platform).await;
 }
 
@@ -1408,43 +1422,34 @@ async fn a_message_after_the_release_becomes_a_normal_new_turn() {
     assert!(!app.inflight.lock().await.contains("ses_test"));
 }
 
-/// A single hung Backend read is bounded by the drain budget, not the fixed
-/// request timeout: with a tiny injected bound the drain ends at ~the bound
-/// (not after 30 s) and finalization proceeds normally.
+/// The unified per-read bound (#603): a hung transcript read is abandoned at
+/// `follow_read_timeout_ms`, not the fixed 30 s request bound — the drain keeps
+/// ticking (so `/stop` stays observable) while a wedged read would otherwise
+/// freeze the tick.
 #[tokio::test]
-async fn a_hung_backend_read_ends_the_drain_at_the_bound() {
+async fn a_hung_read_is_abandoned_at_the_per_read_bound() {
     let _wd = test_work_dir();
-    let timeline = vec![
-        user("msg_cola_anchor", 1_000, "第一条消息"),
-        assistant(2_000, "第一轮回答。"),
-    ];
-    let (_dir, app, backend, platform) =
-        scripted_app(vec![SessionTranscript::new(timeline)], Some(SessionStatus::Busy)).await;
-    app.turn_render_poll_ms.store(20, Ordering::Relaxed);
-    app.turn_drain_timeout_ms.store(30, Ordering::Relaxed);
-    // The first Backend read hangs forever (a half-open connection left by a
-    // server restart); later reads serve normally.
-    backend.hang_transcript_reads(1);
+    // A grace the test would never wait out: only the read bound is under test.
+    let (_dir, app, backend, platform) = busy_supplement_app(60_000).await;
+    app.turn_follow_read_timeout_ms.store(30, Ordering::Relaxed);
+    run_to_panel(&app, &platform).await;
 
+    backend.transcript_calls.lock().await.clear();
+    // Three hung reads: each is abandoned at the 30 ms per-read bound, then the
+    // reads answer again. Blocking on the fixed 30 s request bound instead would
+    // make this take ~90 s.
+    backend.hang_transcript_reads(3);
     let started = std::time::Instant::now();
-    let result = tokio::time::timeout(
-        Duration::from_secs(5),
-        spawn_turn(&app, ctx("ses_test", "第一条消息")),
-    )
-    .await
-    .expect("the drain must not wait out DRAIN_REQUEST_TIMEOUT_MS")
-    .unwrap();
-    result.unwrap();
-
+    wait_for_transcript_reads(&backend, "ses_test", 1).await;
     assert!(
-        started.elapsed() < Duration::from_secs(1),
-        "a hung read must be bounded by the drain bound: {:?}",
+        started.elapsed() < Duration::from_secs(2),
+        "a hung read must be abandoned at the per-read bound: {:?}",
         started.elapsed()
     );
-    let final_card = platform.updated_cards().await.last().cloned().unwrap();
-    assert!(card_header(&final_card).contains("完成"), "final card Done");
-    assert!(!app.inflight.lock().await.contains("ses_test"));
-    assert_no_further_rendering(&backend, &platform).await;
+    assert!(
+        app.inflight.lock().await.contains("ses_test"),
+        "the drain still holds the guard (the grace is 60 s)"
+    );
 }
 
 /// The same scripted sequence started through the real message handler (not
@@ -1467,8 +1472,6 @@ async fn a_handler_started_turn_drains_the_new_turns_reply() {
     // The prompt gate is held for a few ms; a cadence well above that keeps
     // the render poll out of the window and the drain the first renderer.
     app.turn_render_poll_ms.store(50, Ordering::Relaxed);
-    app.turn_drain_timeout_ms.store(60_000, Ordering::Relaxed);
-
     let turn = {
         let app = Arc::clone(&app);
         tokio::spawn(async move {
@@ -1540,46 +1543,6 @@ async fn a_handler_started_turn_drains_the_new_turns_reply() {
     assert_no_further_rendering(&backend, &platform).await;
 }
 
-/// A hung re-check read is bounded by the injected drain budget, not the
-/// fixed 30 s request timeout: both the drain's read and the re-check's read
-/// hang, and the turn still finalizes at ~2× the tiny bound instead of
-/// holding the card (and the guard) for 30 s.
-#[tokio::test]
-async fn a_hung_recheck_read_does_not_extend_finalization() {
-    let _wd = test_work_dir();
-    let timeline = vec![
-        user("msg_cola_anchor", 1_000, "第一条消息"),
-        assistant(2_000, "第一轮回答。"),
-    ];
-    let (_dir, app, backend, platform) =
-        scripted_app(vec![SessionTranscript::new(timeline)], Some(SessionStatus::Busy)).await;
-    app.turn_render_poll_ms.store(50, Ordering::Relaxed);
-    app.turn_drain_timeout_ms.store(30, Ordering::Relaxed);
-    // Both the drain's read and the re-check's read hang; the final reconcile
-    // read serves normally.
-    backend.hang_transcript_reads(2);
-
-    let started = std::time::Instant::now();
-    let result = tokio::time::timeout(
-        Duration::from_secs(5),
-        spawn_turn(&app, ctx("ses_test", "第一条消息")),
-    )
-    .await
-    .expect("the hung re-check must not wait out DRAIN_REQUEST_TIMEOUT_MS")
-    .unwrap();
-    result.unwrap();
-
-    assert!(
-        started.elapsed() < Duration::from_secs(1),
-        "the re-check must be bounded by the injected drain budget: {:?}",
-        started.elapsed()
-    );
-    let final_card = platform.updated_cards().await.last().cloned().unwrap();
-    assert!(card_header(&final_card).contains("完成"), "final card Done");
-    assert!(!app.inflight.lock().await.contains("ses_test"));
-    assert_no_further_rendering(&backend, &platform).await;
-}
-
 /// A supplement that first becomes visible only after the drain exited is
 /// still drained: the drain's read shows a settled timeline and it stops, the
 /// re-check's read is the first to see the unanswered supplement, and the new
@@ -1606,8 +1569,6 @@ async fn a_supplement_landing_after_the_drain_exit_is_still_drained() {
     )
     .await;
     app.turn_render_poll_ms.store(20, Ordering::Relaxed);
-    app.turn_drain_timeout_ms.store(200, Ordering::Relaxed);
-
     let turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
 
     // The re-check drained the supplement: the first run's reply renders on a
@@ -1730,8 +1691,6 @@ async fn a_never_registering_run_settles_after_the_confirmation_window() {
         scripted_app(vec![SessionTranscript::new(admitted)], Some(SessionStatus::Idle)).await;
     app.turn_render_poll_ms.store(5, Ordering::Relaxed);
     // A bound the test would never wait out: only the window can end the drain.
-    app.turn_drain_timeout_ms.store(60_000, Ordering::Relaxed);
-
     let started = std::time::Instant::now();
     Turn::run(&app.turn_handles(), ctx("ses_test", "第一条消息"))
         .await
@@ -1765,8 +1724,6 @@ async fn a_never_promoted_submit_at_idle_ends_unreceived() {
     .await;
     app.turn_render_poll_ms.store(5, Ordering::Relaxed);
     // A bound the test would never wait out: only the window can end the drain.
-    app.turn_drain_timeout_ms.store(60_000, Ordering::Relaxed);
-
     let started = std::time::Instant::now();
     Turn::run(&app.turn_handles(), ctx("ses_test", "第一条消息"))
         .await
@@ -1824,8 +1781,6 @@ async fn pressing_resume_interrupts_then_resumes_and_renders_the_promoted_messag
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
     seed_session(&app, "ses_test", "/work").await;
     app.turn_render_poll_ms.store(5, Ordering::Relaxed);
-    app.turn_drain_timeout_ms.store(60_000, Ordering::Relaxed);
-
     Turn::run(&app.turn_handles(), ctx("ses_test", "第一条消息"))
         .await
         .unwrap();
@@ -1939,8 +1894,6 @@ async fn resume_on_v1_resubmits_a_never_landed_message_into_a_new_turn() {
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
     seed_session(&app, "ses_test", "/work").await;
     app.turn_render_poll_ms.store(5, Ordering::Relaxed);
-    app.turn_drain_timeout_ms.store(60_000, Ordering::Relaxed);
-
     Turn::run(&app.turn_handles(), ctx("ses_test", "第一条消息"))
         .await
         .unwrap();
@@ -2004,8 +1957,6 @@ async fn resume_on_v1_reuses_the_message_id_when_it_landed_in_between() {
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
     seed_session(&app, "ses_test", "/work").await;
     app.turn_render_poll_ms.store(5, Ordering::Relaxed);
-    app.turn_drain_timeout_ms.store(60_000, Ordering::Relaxed);
-
     Turn::run(&app.turn_handles(), ctx("ses_test", "第一条消息"))
         .await
         .unwrap();
@@ -2096,8 +2047,6 @@ async fn a_failed_resume_leaves_the_unreceived_card_actionable() {
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
     seed_session(&app, "ses_test", "/work").await;
     app.turn_render_poll_ms.store(5, Ordering::Relaxed);
-    app.turn_drain_timeout_ms.store(60_000, Ordering::Relaxed);
-
     Turn::run(&app.turn_handles(), ctx("ses_test", "第一条消息"))
         .await
         .unwrap();
@@ -2160,8 +2109,6 @@ async fn a_stale_live_submit_that_never_lands_ends_unreceived() {
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
     seed_session(&app, "ses_test", "/work").await;
     app.turn_render_poll_ms.store(5, Ordering::Relaxed);
-    app.turn_drain_timeout_ms.store(60_000, Ordering::Relaxed);
-
     app.handle_message(incoming(
         "msg_1".into(),
         "chat_1".into(),
@@ -2206,12 +2153,12 @@ async fn a_stale_live_submit_that_never_lands_ends_unreceived() {
 }
 
 /// ADR-0062 (spec #434, ticket #436): while the session reads live but the
-/// submitted message has not landed, the drained Turn hands the card to the
-/// unreceived watch; the card gains the neutral 「⏳ 等待当前运行接收…」 line
-/// only once the follow grace has passed since the turn's start — a genuine
-/// long tool call and a dead run look identical from outside, so cola does not
-/// nag early. When the session then idles with the message still absent, the
-/// watch ends it Unreceived, never ✅, and the hint stays on the settled card.
+/// submitted message has not landed, the merged drain keeps the card and the
+/// guard; it gains the neutral 「⏳ 等待当前运行接收…」 line only once the grace
+/// has passed since the turn's start — a genuine long tool call and a dead run
+/// look identical from outside, so cola does not nag early. When the session
+/// then idles with the message still absent, the drain ends it Unreceived,
+/// never ✅, and the hint stays on the settled card.
 #[tokio::test]
 async fn a_never_promoted_submit_on_a_live_run_waits_out_the_grace_then_ends_unreceived() {
     let _wd = test_work_dir();
@@ -2223,23 +2170,19 @@ async fn a_never_promoted_submit_on_a_live_run_waits_out_the_grace_then_ends_unr
     )
     .await;
     app.turn_render_poll_ms.store(5, Ordering::Relaxed);
-    // The drain bound hands the card off while the session still reads live;
-    // the grace (the hint's delay) is measured from the turn's own start, so
-    // it has not passed when the watch takes over.
-    app.turn_drain_timeout_ms.store(30, Ordering::Relaxed);
+    // The grace is both the hint's delay and the failure ceiling; measured
+    // from the turn's own start.
     app.turn_follow_grace_ms.store(800, Ordering::Relaxed);
     app.turn_follow_read_timeout_ms.store(20, Ordering::Relaxed);
 
-    let turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
-    let result = tokio::time::timeout(Duration::from_secs(5), turn)
-        .await
-        .expect("the turn must hand off at the drain bound")
-        .unwrap();
-    result.unwrap();
-    assert!(
-        app.inflight.lock().await.contains("ses_test"),
-        "the unreceived watch must inherit the guard at the bound"
-    );
+    let _turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !app.inflight.lock().await.contains("ses_test") {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("the drain holds the guard while the message has not landed");
 
     // Before the grace passes the card must not nag: the live session may
     // still be a genuine long tool call that merges the message.
@@ -2281,19 +2224,16 @@ async fn a_never_promoted_submit_on_a_live_run_waits_out_the_grace_then_ends_unr
         !card_header(&final_card).contains("完成"),
         "an Unreceived card is never ✅: {final_card}"
     );
-    assert!(
-        !app.inflight.lock().await.contains("ses_test"),
-        "the watch releases the guard when it ends"
-    );
+    wait_for_guard_release(&app).await;
     assert_no_further_rendering(&backend, &platform).await;
 }
 
-/// ADR-0062 (spec #434, ticket #436): the unreceived watch is a wait, not a
+/// ADR-0062 (spec #434, ticket #436): the unreceived wait is a wait, not a
 /// verdict — the submitted message may still land. A genuinely live run that
-/// merges the steer after the hand-off must be captured by the watch, its
-/// reply rendered, and the card settled normally (Done), never Unreceived.
+/// merges the steer must be captured by the drain, its reply rendered, and the
+/// card settled normally (Done), never Unreceived.
 #[tokio::test]
-async fn the_unreceived_watch_captures_a_message_that_lands_after_the_handoff() {
+async fn the_unreceived_wait_captures_a_message_that_lands_after_the_grace() {
     let _wd = test_work_dir();
     // The stale-looking start: Busy, with no transcript carrying the message.
     let (_dir, app, backend, platform) = scripted_app(
@@ -2302,21 +2242,18 @@ async fn the_unreceived_watch_captures_a_message_that_lands_after_the_handoff() 
     )
     .await;
     app.turn_render_poll_ms.store(5, Ordering::Relaxed);
-    app.turn_drain_timeout_ms.store(30, Ordering::Relaxed);
     // No hint in this test: the message lands well inside the grace.
     app.turn_follow_grace_ms.store(60_000, Ordering::Relaxed);
     app.turn_follow_read_timeout_ms.store(20, Ordering::Relaxed);
 
-    let turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
-    let result = tokio::time::timeout(Duration::from_secs(5), turn)
-        .await
-        .expect("the turn must hand off at the drain bound")
-        .unwrap();
-    result.unwrap();
-    assert!(
-        app.inflight.lock().await.contains("ses_test"),
-        "the watch inherits the guard at the bound"
-    );
+    let _turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !app.inflight.lock().await.contains("ses_test") {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("the drain holds the guard while the message has not landed");
 
     // The run merges the steered message: it lands, with its answer.
     script_transcript(
@@ -2327,12 +2264,12 @@ async fn the_unreceived_watch_captures_a_message_that_lands_after_the_handoff() 
         ])],
     )
     .await;
-    // The watch captures the anchor and renders the answer while the session
+    // The drain captures the anchor and renders the answer while the session
     // still reads live.
     wait_for_card_text(&platform, "第一轮回答。").await;
     assert!(
         app.inflight.lock().await.contains("ses_test"),
-        "the watch keeps observing while the session reads live"
+        "the drain keeps observing while the session reads live"
     );
 
     // The run ends: the settle decision judges the captured Turn and Done.
@@ -2340,32 +2277,29 @@ async fn the_unreceived_watch_captures_a_message_that_lands_after_the_handoff() 
         .set_session_status("ses_test", Some(SessionStatus::Idle))
         .await;
     wait_for_card_header(&platform, "完成").await;
+    wait_for_guard_release(&app).await;
     let final_card = platform.updated_cards().await.last().cloned().unwrap();
     assert!(
         !card_header(&final_card).contains("未被接收"),
         "a message that landed is never Unreceived: {final_card}"
     );
-    assert!(
-        !app.inflight.lock().await.contains("ses_test"),
-        "the watch releases the guard at the true end"
-    );
     assert_no_further_rendering(&backend, &platform).await;
 }
 
-/// The finalization boundary honors an undecided final read (ADR-0062's "no
-/// divergent ending path"): the drain settles, but the read taken at
-/// finalization carries an unanswered Wake — no ending may be claimed from
-/// it, so the card is handed to the follow, never finalized from the drain's
-/// last disposition (the pre-#436 path stamped Done here). The follow then
-/// settles it once the Wake's Execution boundary arrives.
+/// An undecided read keeps the Turn observing (ADR-0062's "no divergent
+/// ending path"): the drain settles on one read, but the re-check finds a read
+/// carrying an unanswered Wake — no ending may be claimed from it, so the Turn
+/// keeps observing rather than finalizing from the drain's last disposition
+/// (the pre-#436 path stamped Done here). It settles once the Wake's Execution
+/// boundary arrives.
 #[tokio::test]
-async fn an_undecided_final_read_hands_the_card_to_the_follow_not_done() {
+async fn an_undecided_read_keeps_the_turn_observing_not_done() {
     let _wd = test_work_dir();
     let settled = SessionTranscript::new(vec![
         user("msg_cola_anchor", 1_000, "跑一下 CI"),
         assistant(2_000, "已经交给后台了。"),
     ]);
-    // The finalization read: a Wake resumed the run and its Execution has not
+    // The re-check read: a Wake resumed the run and its Execution has not
     // reached a boundary yet — the read cannot judge the Turn.
     let waked = SessionTranscript::new(vec![
         user("msg_cola_anchor", 1_000, "跑一下 CI"),
@@ -2382,29 +2316,29 @@ async fn an_undecided_final_read_hands_the_card_to_the_follow_not_done() {
     let (_dir, app, backend, platform) = scripted_app(vec![settled, waked], Some(SessionStatus::Idle)).await;
     app.turn_render_poll_ms.store(5, Ordering::Relaxed);
 
-    Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下 CI"))
-        .await
-        .unwrap();
-
+    let _turn = spawn_turn(&app, ctx("ses_test", "跑一下 CI"));
+    // The undecided read keeps the Turn observing: never Done/Unreceived, the
+    // guard still held.
+    tokio::time::sleep(Duration::from_millis(40)).await;
     let state = Turn::card_state(&app.cards_handle(), "ses_test").await;
     assert!(
         !matches!(state, Some(CardState::Done | CardState::Unreceived)),
-        "an undecided final read must not finalize the card: {state:?}"
+        "an undecided read must not finalize the card: {state:?}"
     );
     assert!(
         app.inflight.lock().await.contains("ses_test"),
-        "the card is handed to the follow instead"
+        "the Turn keeps observing instead of finalizing"
     );
 
-    // The Wake's Execution boundary arrives: the follow settles the true end.
+    // The Wake's Execution boundary arrives: the true end settles on the card.
     script_transcript(&backend, vec![answered]).await;
     wait_for_card_header(&platform, "完成").await;
+    wait_for_guard_release(&app).await;
     let final_card = platform.updated_cards().await.last().cloned().unwrap();
     assert!(
         card_text(&final_card).contains("CI 通过了。"),
         "the Wake's resumed work lands at the true end: {final_card}"
     );
-    assert!(!app.inflight.lock().await.contains("ses_test"));
     assert_no_further_rendering(&backend, &platform).await;
 }
 
@@ -2423,8 +2357,6 @@ async fn an_unobserved_run_with_live_background_tasks_yields_waiting() {
     let (_dir, app, _backend, platform) = scripted_app(vec![transcript], Some(SessionStatus::Idle)).await;
     app.turn_render_poll_ms.store(5, Ordering::Relaxed);
     // A bound the test would never wait out: only the window can end the drain.
-    app.turn_drain_timeout_ms.store(60_000, Ordering::Relaxed);
-
     let started = std::time::Instant::now();
     Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下 CI"))
         .await
@@ -2480,8 +2412,6 @@ async fn a_final_read_dropping_the_message_does_not_become_unreceived() {
     )
     .await;
     app.turn_render_poll_ms.store(5, Ordering::Relaxed);
-    app.turn_drain_timeout_ms.store(60_000, Ordering::Relaxed);
-
     let turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
     // The busy drain renders and anchors the turn...
     wait_for_card_text(&platform, "第一轮回答。").await;
@@ -2542,8 +2472,6 @@ async fn a_failed_final_read_keeps_the_drains_observed_failure() {
     )
     .await;
     app.turn_render_poll_ms.store(20, Ordering::Relaxed);
-    app.turn_drain_timeout_ms.store(60_000, Ordering::Relaxed);
-
     Turn::run(&app.turn_handles(), ctx("ses_test", "第一条消息"))
         .await
         .unwrap();
@@ -2581,8 +2509,6 @@ async fn a_rejected_submit_does_not_wait_out_the_drain_bound() {
     app.turn_render_poll_ms.store(5, Ordering::Relaxed);
     // A bound the test would never wait out: only the submit-failure rule can
     // end the drain promptly.
-    app.turn_drain_timeout_ms.store(60_000, Ordering::Relaxed);
-
     let started = std::time::Instant::now();
     Turn::run(&app.turn_handles(), ctx("ses_test", "第一条消息"))
         .await
@@ -2932,11 +2858,11 @@ async fn a_wake_in_the_finalization_window_cannot_complete_the_turn_early() {
     assert!(noticed(&platform).await, "the notice fires at the true end");
 }
 
-/// A retirement observed while the out-of-turn follow is still rendering ends
-/// the turn normally: the follow's settle decision sees the Wake's answered
-/// Execution and no live task, so the card finalizes ✅ with its notice.
+/// A retirement observed while the drain is still rendering ends the turn
+/// normally: the settle decision sees the Wake's answered Execution and no live
+/// task, so the card finalizes ✅ with its notice.
 #[tokio::test]
-async fn a_task_retiring_while_the_follow_renders_ends_the_turn_normally() {
+async fn a_task_retiring_while_the_drain_renders_ends_the_turn_normally() {
     let _wd = test_work_dir();
     let running = SessionTranscript::new(vec![
         user("msg_cola_anchor", 1_000, "跑一下 CI"),
@@ -2945,25 +2871,21 @@ async fn a_task_retiring_while_the_follow_renders_ends_the_turn_normally() {
     .with_executions(vec![execution(2_500)])
     .with_background_tasks(vec![background_shell(2_100)]);
     let (_dir, app, backend, platform) = scripted_app(vec![running], Some(SessionStatus::Busy)).await;
-    app.turn_drain_timeout_ms.store(30, Ordering::Relaxed);
     app.turn_follow_grace_ms.store(30, Ordering::Relaxed);
     let mut context = ctx("ses_test", "跑一下 CI");
     context.is_group = true;
     context.requester_open_id = Some(TEST_HOST.to_string());
 
-    // The drain bound hands the still-busy session to the follow.
-    let result = tokio::time::timeout(Duration::from_secs(5), spawn_turn(&app, context))
-        .await
-        .expect("the turn must hand off at the drain bound")
-        .unwrap();
-    result.unwrap();
+    // The still-busy session keeps the merged drain rendering on its own task.
+    let _turn = spawn_turn(&app, context);
+    wait_for_card_text(&platform, "已经交给后台了。").await;
     assert!(
         app.inflight.lock().await.contains("ses_test"),
-        "the follow covers the bound window with the guard"
+        "the drain holds the guard while it renders"
     );
 
-    // The task retires while the follow renders, and its Execution ends: the
-    // true end, on the followed card.
+    // The task retires while the drain renders, and its Execution ends: the
+    // true end, on the same card.
     script_transcript(
         &backend,
         vec![
@@ -2982,6 +2904,7 @@ async fn a_task_retiring_while_the_follow_renders_ends_the_turn_normally() {
         .await;
 
     wait_for_card_header(&platform, "完成").await;
+    wait_for_guard_release(&app).await;
     let final_card = platform.updated_cards().await.last().cloned().unwrap();
     assert!(
         card_text(&final_card).contains("CI 通过了。"),
@@ -3094,11 +3017,11 @@ async fn a_v2_idle_read_with_no_live_background_task_completes_as_before() {
     );
 }
 
-/// The out-of-turn follow takes the same waiting yield when the run it
-/// inherited idles with live Background Tasks: the card yields
-/// 「⏳ 等待后台任务」, no Completion Notice fires, and the follow stops.
+/// The merged drain takes the waiting yield when the run it watches idles with
+/// live Background Tasks: the card yields 「⏳ 等待后台任务」, no Completion
+/// Notice fires, and the drain stops.
 #[tokio::test]
-async fn a_follow_idling_with_a_live_background_task_yields_waiting() {
+async fn a_drain_idling_with_a_live_background_task_yields_waiting() {
     let _wd = test_work_dir();
     let live = SessionTranscript::new(vec![
         user("msg_cola_anchor", 1_000, "跑一下 CI"),
@@ -3107,44 +3030,42 @@ async fn a_follow_idling_with_a_live_background_task_yields_waiting() {
     .with_executions(vec![execution(2_500)])
     .with_background_tasks(vec![background_shell(2_100)]);
     let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Busy)).await;
-    app.turn_drain_timeout_ms.store(30, Ordering::Relaxed);
     app.turn_follow_grace_ms.store(30, Ordering::Relaxed);
     let mut context = ctx("ses_test", "跑一下 CI");
     context.is_group = true;
     context.requester_open_id = Some(TEST_HOST.to_string());
 
-    // The drain bound hands the still-busy session to the follow.
-    let result = tokio::time::timeout(Duration::from_secs(5), spawn_turn(&app, context))
-        .await
-        .expect("the turn must hand off at the drain bound")
-        .unwrap();
-    result.unwrap();
+    // The still-busy session keeps the merged drain rendering on its own task.
+    let _turn = spawn_turn(&app, context);
+    wait_for_card_text(&platform, "已经交给后台了。").await;
 
-    // The Execution then idles with the task still live: the follow yields.
+    // The Execution then idles with the task still live: the drain yields.
     backend
         .set_session_status("ses_test", Some(SessionStatus::Idle))
         .await;
 
     wait_for_card_header(&platform, "等待后台任务").await;
+    wait_for_guard_release(&app).await;
     assert_eq!(
         Turn::card_state(&app.cards_handle(), "ses_test").await,
         Some(CardState::Waiting)
     );
     assert!(
         !noticed(&platform).await,
-        "the follow's yield sends no notice: {:?}",
+        "the yield sends no notice: {:?}",
         platform.calls.lock().await
     );
     assert_no_further_rendering(&backend, &platform).await;
 }
 
 // ---------------------------------------------------------------------------
-// The shared runtime reconcile on the live reads (#589): the drain and the
-// follow observe the runtime registries on the transcript read each already
-// performs — one process-wide verdict per Session per interval, shared with
-// Session Sync — so a task that died mid-turn ends the turn directly. A read
-// that lists no live task spends nothing; a failed or timed-out one changes
-// nothing at all.
+// The shared runtime reconcile on the live reads (#589): the merged drain and
+// the out-of-turn follow (the recovery re-attach, the Wake continuation)
+// observe the runtime registries on the transcript read each already performs
+// — one process-wide verdict per Session per interval, shared with Session
+// Sync — so a task that died mid-turn ends the turn directly. A read that
+// lists no live task spends nothing; a failed or timed-out one changes nothing
+// at all.
 // ---------------------------------------------------------------------------
 
 /// Acceptance (#589): a read that lists no live Background Task spends no
@@ -3226,7 +3147,6 @@ async fn a_timed_out_runtime_read_leaves_the_turn_waiting() {
     .with_background_tasks(vec![background_shell(2_100)]);
     let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
     // A tiny drain budget so the wedged runtime read is abandoned fast.
-    app.turn_drain_timeout_ms.store(40, Ordering::Relaxed);
     backend.hang_task_runtime_reads(usize::MAX);
 
     Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下 CI"))
@@ -3247,12 +3167,11 @@ async fn a_timed_out_runtime_read_leaves_the_turn_waiting() {
     );
 }
 
-/// Acceptance (#589): the out-of-turn follow reconciles on its own read too —
-/// a task the runtime reports ended while the follow renders retires there,
-/// the entry lands on the followed card, and the loop's settle is the true end
-/// instead of a stranded wait.
+/// Acceptance (#589): the merged drain reconciles on its own read — a task the
+/// runtime reports ended while the drain renders retires there, the entry lands
+/// on the same card, and the settle is the true end instead of a stranded wait.
 #[tokio::test]
-async fn a_runtime_retirement_during_the_follow_ends_the_turn() {
+async fn a_runtime_retirement_during_the_drain_ends_the_turn() {
     let _wd = test_work_dir();
     let running = SessionTranscript::new(vec![
         user("msg_cola_anchor", 1_000, "跑一下 CI"),
@@ -3261,28 +3180,20 @@ async fn a_runtime_retirement_during_the_follow_ends_the_turn() {
     .with_executions(vec![execution(2_500)])
     .with_background_tasks(vec![background_shell(2_100)]);
     let (_dir, app, backend, platform) = scripted_app(vec![running], Some(SessionStatus::Busy)).await;
-    app.turn_drain_timeout_ms.store(30, Ordering::Relaxed);
     app.turn_follow_grace_ms.store(30, Ordering::Relaxed);
 
-    // The drain bound hands the still-busy session to the follow.
-    let result = tokio::time::timeout(
-        Duration::from_secs(5),
-        spawn_turn(&app, ctx("ses_test", "跑一下 CI")),
-    )
-    .await
-    .expect("the turn must hand off at the drain bound")
-    .unwrap();
-    result.unwrap();
-    assert!(
-        app.inflight.lock().await.contains("ses_test"),
-        "the follow covers the hand-off window with the guard"
-    );
-    // The live row first (the still-busy session keeps the follow rendering):
+    // The still-busy session keeps the merged drain rendering on its own task.
+    let _turn = spawn_turn(&app, ctx("ses_test", "跑一下 CI"));
+    // The live row first (the still-busy session keeps the drain rendering):
     // the retirement below must remove it IN PLACE.
     wait_for_card_text(&platform, "⏳ 后台任务（1）").await;
+    assert!(
+        app.inflight.lock().await.contains("ses_test"),
+        "the drain holds the guard while it renders"
+    );
 
-    // The runtime confirms the shell ended while the follow is still
-    // rendering: the follow's own read retires it and renders the entry.
+    // The runtime confirms the shell ended while the drain is still
+    // rendering: the drain's own read retires it and renders the entry.
     backend.task_runtime.lock().unwrap().shells = vec![(
         "sh_bg".into(),
         ShellRuntime::Ended {
@@ -3290,7 +3201,7 @@ async fn a_runtime_retirement_during_the_follow_ends_the_turn() {
             completed_at: Some(2_900),
         },
     )];
-    wait_for_card_update(&platform, "the follow's entry", CardUpdates::Latest, |card| {
+    wait_for_card_update(&platform, "the drain's entry", CardUpdates::Latest, |card| {
         card_text(card).contains("🔔 shell 结束")
     })
     .await;
@@ -3300,46 +3211,44 @@ async fn a_runtime_retirement_during_the_follow_ends_the_turn() {
         "the row left the live card the moment the runtime retired it: {retired_card}"
     );
 
-    // The Execution then idles: the follow's settle is the true end.
+    // The Execution then idles: the settle is the true end.
     backend
         .set_session_status("ses_test", Some(SessionStatus::Idle))
         .await;
     wait_for_card_header(&platform, "完成").await;
+    wait_for_guard_release(&app).await;
     let final_card = platform.updated_cards().await.last().cloned().unwrap();
     let text = card_text(&final_card);
     assert!(
         text.contains("🔔 shell 结束") && !text.contains("后台任务（"),
-        "the follow's read retired the task and kept its entry: {final_card}"
-    );
-    assert!(
-        !app.inflight.lock().await.contains("ses_test"),
-        "the follow ended the turn"
+        "the drain's read retired the task and kept its entry: {final_card}"
     );
     // Review (spec #588 / #589, PR #595): the retirement reaches the overlay
-    // only once the follow's render carried its entry — the same
+    // only once the drain's render carried its entry — the same
     // record-after-flush invariant, pinned on this path.
     assert_eq!(
         backend.overlay.retired_call_ids("ses_test"),
         vec!["call_bg".to_string()],
-        "the follow's accepted render records the retirement"
+        "the drain's accepted render records the retirement"
     );
 }
 
-/// Review (spec #588 / #589, PR #595): the follow's reconcile commits its
+/// Review (spec #588 / #589, PR #595): the drain's reconcile commits its
 /// overlay record only when the render that carried its entries completed —
 /// the shared invariant, enforced by construction for every caller. If the
 /// accumulator vanishes between the tick's read and its render (a replacement
 /// collected the card), the retirement has no card to render on; recording it
 /// anyway would hide the task from every later read without an entry ever
-/// landing. The read was still spent — only the record is gated.
+/// landing. The read was still spent — only the record is gated, and the drain
+/// ends silently.
 ///
-/// Deterministic, no wall-clock margin decides: the follow's next transcript
+/// Deterministic, no wall-clock margin decides: the drain's next transcript
 /// read is parked on the mock's gate, both facts it will read (the missing
 /// shell and the vanished card) are moved while it is parked, then the read is
-/// released; the follow's exit releases the guard, which is awaited as a
+/// released; the drain's exit releases the guard, which is awaited as a
 /// condition.
 #[tokio::test]
-async fn a_follow_whose_render_never_lands_records_nothing() {
+async fn a_drain_whose_render_never_lands_records_nothing() {
     let _wd = test_work_dir();
     let running = SessionTranscript::new(vec![
         user("msg_cola_anchor", 1_000, "跑一下 CI"),
@@ -3348,34 +3257,27 @@ async fn a_follow_whose_render_never_lands_records_nothing() {
     .with_executions(vec![execution(2_500)])
     .with_background_tasks(vec![background_shell(2_100)]);
     let (_dir, app, backend, platform) = scripted_app(vec![running], Some(SessionStatus::Busy)).await;
-    app.turn_drain_timeout_ms.store(30, Ordering::Relaxed);
     // The parked tick must outlive the test's own work: no grace and no
     // per-read bound may end the loop while the read is held.
     app.turn_follow_grace_ms.store(60_000, Ordering::Relaxed);
     app.turn_follow_read_timeout_ms.store(60_000, Ordering::Relaxed);
 
-    // The drain bound hands the still-busy session to the follow.
-    let result = tokio::time::timeout(
-        Duration::from_secs(5),
-        spawn_turn(&app, ctx("ses_test", "跑一下 CI")),
-    )
-    .await
-    .expect("the turn must hand off at the drain bound")
-    .unwrap();
-    result.unwrap();
+    // The still-busy session keeps the merged drain rendering on its own task.
+    let _turn = spawn_turn(&app, ctx("ses_test", "跑一下 CI"));
+    wait_for_card_text(&platform, "⏳ 后台任务（1）").await;
     assert!(
         app.inflight.lock().await.contains("ses_test"),
-        "the follow covers the bound window with the guard"
+        "the drain holds the guard while it renders"
     );
 
-    // Park the follow's next read — its tick's ownership check already passed.
+    // Park the drain's next read.
     let gate = backend.hold_transcripts();
     let entered = backend.transcript_gate_entered.load(Ordering::SeqCst);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while backend.transcript_gate_entered.load(Ordering::SeqCst) == entered {
         assert!(
             tokio::time::Instant::now() < deadline,
-            "the follow never reached the parked read"
+            "the drain never reached the parked read"
         );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
@@ -3388,13 +3290,13 @@ async fn a_follow_whose_render_never_lands_records_nothing() {
     *backend.transcript_gate.lock().unwrap() = None;
     gate.add_permits(1);
 
-    // The follow ended without a card to carry the retirement: nothing was
+    // The drain ended without a card to carry the retirement: nothing was
     // recorded, and the task stays live on every later read.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while app.inflight.lock().await.contains("ses_test") {
         assert!(
             tokio::time::Instant::now() < deadline,
-            "the follow never ended on its vanished accumulator"
+            "the drain never ended on its vanished accumulator"
         );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }

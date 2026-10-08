@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use super::drain::{
     assistant, ctx, script_transcript, scripted_app, settle_tool, spawn_sync, spawn_sync_with_timeout,
-    spawn_turn, tool_assistant, user, wait_for_card_header, wait_for_card_text,
+    spawn_turn, tool_assistant, user, wait_for_card_header, wait_for_card_text, wait_for_guard_release,
 };
 use crate::backend::{
     BackgroundTask, ChildRuntime, ContentBlock, FinishReason, MessageId, MessageRole, MessageTime, Part,
@@ -157,8 +157,6 @@ async fn turn_capable_app(
     seed_session(&app, "ses_test", "/work").await;
     app.turn_render_poll_ms
         .store(5, std::sync::atomic::Ordering::Relaxed);
-    app.turn_drain_timeout_ms
-        .store(60_000, std::sync::atomic::Ordering::Relaxed);
     app.turn_follow_read_timeout_ms
         .store(20, std::sync::atomic::Ordering::Relaxed);
     (app, platform, backend)
@@ -1716,8 +1714,6 @@ async fn seeded_app(
     seed_session(&app, "ses_test", "/work").await;
     app.turn_render_poll_ms
         .store(5, std::sync::atomic::Ordering::Relaxed);
-    app.turn_drain_timeout_ms
-        .store(60_000, std::sync::atomic::Ordering::Relaxed);
     app.turn_follow_read_timeout_ms
         .store(20, std::sync::atomic::Ordering::Relaxed);
     (app, platform, backend, gate)
@@ -2728,29 +2724,22 @@ async fn a_killed_runs_seeded_call_does_not_outlive_the_turn() {
         assistant(new_anchor + 1_000, "新回答"),
     ]);
     let (app, platform, backend, gate) = seeded_app(&session_file, live, SessionStatus::Busy).await;
-    // The drain bound hands the card to the follow, where the live-panel guard
-    // would otherwise keep waiting on the seeded call.
-    app.turn_drain_timeout_ms
-        .store(30, std::sync::atomic::Ordering::Relaxed);
-
+    // The merged drain owns the card to its true end; the seeded live-panel
+    // guard must not keep it waiting on the killed run's call.
     let mut context = ctx("ses_test", "新问题");
     context.cola_message_id = Some("msg_cola_new".into());
-    let turn = spawn_turn(&app, context);
+    let _turn = spawn_turn(&app, context);
     // The seeded panel is live on the successor while the prompt is held.
     wait_for_card_text(&platform, "⏳ shell").await;
 
     gate.add_permits(1);
-    tokio::time::timeout(Duration::from_secs(5), turn)
-        .await
-        .expect("the turn must hand off at the drain bound")
-        .unwrap()
-        .unwrap();
-    // The follow observes an idle session; the seeded call is display-only, so
-    // it neither extends the settle decision nor outlives the Turn.
+    // The drain observes an idle session; the seeded call is display-only, so it
+    // neither extends the settle decision nor outlives the Turn.
     backend
         .set_session_status("ses_test", Some(SessionStatus::Idle))
         .await;
     wait_for_card_header(&platform, "✅").await;
+    wait_for_guard_release(&app).await;
 
     let cards = platform.updated_cards().await;
     let settled = cards
@@ -7472,8 +7461,6 @@ async fn a_message_before_the_adoption_shows_the_orphans_tail_once() {
     seed_session(&app, "ses_test", "/work").await;
     app.turn_render_poll_ms
         .store(5, std::sync::atomic::Ordering::Relaxed);
-    app.turn_drain_timeout_ms
-        .store(60_000, std::sync::atomic::Ordering::Relaxed);
     app.turn_follow_read_timeout_ms
         .store(200, std::sync::atomic::Ordering::Relaxed);
     platform.given_card_view("om_frozen", orphan_running_card_view());
@@ -7649,8 +7636,6 @@ async fn a_turn_winning_the_create_window_keeps_the_chain_and_its_late_card_is_c
     seed_session(&app, "ses_test", "/work").await;
     app.turn_render_poll_ms
         .store(5, std::sync::atomic::Ordering::Relaxed);
-    app.turn_drain_timeout_ms
-        .store(60_000, std::sync::atomic::Ordering::Relaxed);
     app.turn_follow_read_timeout_ms
         .store(200, std::sync::atomic::Ordering::Relaxed);
     platform.given_card_view("om_frozen", orphan_running_card_view());
@@ -7845,8 +7830,6 @@ async fn a_turn_winning_the_create_window_keeps_the_chain_when_the_run_ended_whi
     seed_session(&app, "ses_test", "/work").await;
     app.turn_render_poll_ms
         .store(5, std::sync::atomic::Ordering::Relaxed);
-    app.turn_drain_timeout_ms
-        .store(60_000, std::sync::atomic::Ordering::Relaxed);
     app.turn_follow_read_timeout_ms
         .store(200, std::sync::atomic::Ordering::Relaxed);
     platform.given_card_view("om_frozen", realistic_card_view());
@@ -8017,17 +8000,14 @@ async fn a_restart_does_not_re_render_a_settled_tool_delivered_after_the_text() 
     seed_session(&app1, "ses_test", "/work").await;
     app1.turn_render_poll_ms
         .store(5, std::sync::atomic::Ordering::Relaxed);
-    app1.turn_drain_timeout_ms
-        .store(30, std::sync::atomic::Ordering::Relaxed);
     app1.turn_follow_read_timeout_ms
         .store(50, std::sync::atomic::Ordering::Relaxed);
-    let turn = spawn_turn(&app1, ctx("ses_test", "跑个长命令"));
+    // The merged unbounded drain runs on the turn's own task and keeps the card
+    // (and the record) live; the test drives the Backend while it renders, then
+    // drops its own handle — the task keeps the process's handles alive exactly
+    // as the old out-of-turn follow did.
+    let _turn = spawn_turn(&app1, ctx("ses_test", "跑个长命令"));
     wait_for_card_text(&platform1, delivered).await;
-    let result = tokio::time::timeout(Duration::from_secs(5), turn)
-        .await
-        .expect("the turn must hand off at the drain bound")
-        .unwrap();
-    result.unwrap();
     wait_for_cursor(&app1, |cursor| cursor.live_calls.contains("call_sleep")).await;
 
     // The server settles the call: the next confirmed write's frontier must
@@ -8735,17 +8715,13 @@ async fn a_rewritten_part_persists_a_resolvable_cursor_for_the_restart() {
         seed_session(&app1, "ses_test", "/work").await;
         app1.turn_render_poll_ms
             .store(5, std::sync::atomic::Ordering::Relaxed);
-        app1.turn_drain_timeout_ms
-            .store(30, std::sync::atomic::Ordering::Relaxed);
         app1.turn_follow_read_timeout_ms
             .store(50, std::sync::atomic::Ordering::Relaxed);
-        let turn = spawn_turn(&app1, ctx("ses_test", "问题"));
+        // The merged unbounded drain runs on the turn's own task and keeps the
+        // card (and the record) live; the test drives the Backend while it
+        // renders, then drops its own handle.
+        let _turn = spawn_turn(&app1, ctx("ses_test", "问题"));
         wait_for_card_text(&platform1, first).await;
-        let result = tokio::time::timeout(Duration::from_secs(5), turn)
-            .await
-            .expect("the turn must hand off at the drain bound")
-            .unwrap();
-        result.unwrap();
         wait_for_cursor(&app1, |cursor| {
             cursor
                 .frontier
@@ -8925,8 +8901,6 @@ async fn a_turn_winning_the_collect_window_never_re_renders_the_delivered_tail()
     seed_session(&app, "ses_test", "/work").await;
     app.turn_render_poll_ms
         .store(5, std::sync::atomic::Ordering::Relaxed);
-    app.turn_drain_timeout_ms
-        .store(60_000, std::sync::atomic::Ordering::Relaxed);
     app.turn_follow_read_timeout_ms
         .store(200, std::sync::atomic::Ordering::Relaxed);
     platform.given_card_view("om_frozen", realistic_card_view());

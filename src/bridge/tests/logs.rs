@@ -152,7 +152,6 @@ async fn render_poll_and_final_render_lines_carry_the_session() {
     let (app, _platform) = build_app(cfg, backend).await;
     seed_session(&app, "ses_test", "/work").await;
     app.turn_render_poll_ms.store(5, Ordering::Relaxed);
-    app.turn_drain_timeout_ms.store(60_000, Ordering::Relaxed);
     // Release the prompt only after the poll has read the Backend: the tick
     // that read is the tick that renders and logs, and `RenderPoll::stop`
     // always awaits that tick, so the line cannot be lost to a race.
@@ -196,7 +195,6 @@ async fn the_render_poll_logs_at_info_only_on_progress() {
     let (app, _platform) = build_app(cfg, backend).await;
     seed_session(&app, "ses_test", "/work").await;
     app.turn_render_poll_ms.store(5, Ordering::Relaxed);
-    app.turn_drain_timeout_ms.store(60_000, Ordering::Relaxed);
     // Release the prompt only after several poll ticks have read the same
     // snapshot: the first renders (and logs), the rest dedupe to nothing.
     let releaser = tokio::spawn(async move {
