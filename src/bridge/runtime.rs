@@ -1,24 +1,34 @@
 //! The shared Background Task runtime reconciliation (#589, issue #454):
-//! one positive-evidence runtime read, spent on the transcript read each
-//! caller already made, and one process-wide throttle all callers share.
+//! one positive-evidence runtime read per cycle, spent on the transcript read
+//! each caller already made, and one process-wide throttle all callers share.
+//! A subagent the runtime leaves unconfirmed gets the second, lighter read
+//! (#591, issue #464): the child session's own newest assistant message.
 //!
 //! The reconcile used to be a private step of the external flow, reachable
 //! only from the Session Sync pass — which skips an inflight Session — so a
 //! Background Task that died mid-turn kept its ledger row, forced an
 //! intermediate 「⏳ 等待后台任务」 yield, and only retired on a later pass.
 //! It is now one step with three callers on the read each already performs:
-//! Session Sync, the Turn's drain tick and the out-of-turn follow/settle loop.
-//! The live render path renders the retirement entries the read carries, so
-//! nothing is swallowed by the process-local retirement overlay (ADR-0065).
+//! Session Sync, the Turn's drain tick and the out-of-turn follow/settle loop
+//! ([`RuntimeReconcile::observe`], throttled), plus the cleanup click, which
+//! calls the same step's non-throttled form ([`reconcile_now`]) directly: a
+//! click must never no-op behind a recent poll's verdict. The live render path
+//! renders the retirement entries the read carries, so nothing is swallowed by
+//! the process-local retirement overlay (ADR-0065).
 //!
 //! Guard rails, all shared:
 //!
 //! - a read that lists no live Background Task spends nothing;
 //! - one verdict per Session per [`RuntimeReconcile::interval_ms`], across
-//!   every caller — the reconcile's cost has a bound independent of the poll
-//!   cadences that observe it;
+//!   every throttled caller — the reconcile's cost has a bound independent of
+//!   the poll cadences that observe it;
 //! - a failed or timed-out read leaves the transcript exactly as read: no
-//!   verdict, no retirement, no settle (a flaky runtime can never end a wait).
+//!   verdict, no retirement, no settle (a flaky runtime can never end a wait);
+//! - the child-evidence step spends at most one light read per suspect per
+//!   cycle: a terminal step finish with its completion stamp retires the task
+//!   as ended, a child session the server no longer knows (404) retires it as
+//!   lost, and an unreadable or non-terminal child keeps its row unconfirmed —
+//!   nothing is guessed.
 //!
 //! The same admitted cycle carries the live shells' output windows (spec #588,
 //! ticket #592): one tail read per live shell, display-only, so the ledger's
@@ -83,27 +93,23 @@ impl RuntimeReconcile {
         }
     }
 
-    /// The one shared reconcile step (issue #454): read the runtime registries
-    /// for the transcript's still-live Background Tasks and apply the
-    /// positive-evidence verdicts to it. The caller passes the transcript read
-    /// it already made; a shell the runtime reports ended — or no longer knows
-    /// — leaves the live list as a retirement the caller's render will record,
-    /// and its call ids go into the process-local overlay so every later read
-    /// agrees (the launch record never flips).
-    ///
-    /// The same admitted cycle also fills the read's shell output windows
-    /// (spec #588, #592): one tail read per still-live shell, so the ledger's
-    /// window refreshes at this shared cadence and never at the caller's poll
+    /// The shared, throttled reconcile step (issue #454): admit at most one
+    /// runtime verdict per Session per [`Self::interval_ms`] across every
+    /// caller, compose [`reconcile_now`] on the caller's own transcript read,
+    /// then fill the same admitted cycle's shell output windows (spec #588,
+    /// #592) — one tail read per still-live shell, so the ledger's window
+    /// refreshes at this shared cadence and never at the caller's poll
     /// cadence. A window read is display-only — it never prompts, retires or
-    /// settles — and a failed, vanished or empty one records
+    /// settles — and a failed or vanished record records
     /// [`ShellOutputRead::Unavailable`], which the row renders as no window at
-    /// all (never a placeholder).
+    /// all (never a placeholder); a successful empty capture is a
+    /// readable-empty window the row omits the same way (spec #588, review).
     ///
-    /// Returns whether the read carried evidence that changed it (a retirement
-    /// or a newly unconfirmed task) — a caller that is about to skip its render
-    /// reads this so a retirement is never dropped on the floor. Zero requests
-    /// when the read lists no live task; the throttle consumes the attempt even
-    /// when the read fails or times out, and such a read changes nothing.
+    /// Zero requests when the read lists no live task: the empty check runs
+    /// BEFORE the throttle, so an idle Session never consumes an attempt. The
+    /// throttle consumes the attempt even when the read fails or times out,
+    /// and such a read changes nothing (the composed pass leaves the
+    /// transcript exactly as read).
     ///
     /// The step is deliberately gate-free: each caller decides whether it can
     /// render what it observes (Session Sync's waiting-card admission, the live
@@ -116,89 +122,16 @@ impl RuntimeReconcile {
         transcript: &mut SessionTranscript,
         read_timeout_ms: u64,
     ) -> bool {
-        let shells: Vec<String> = transcript
-            .background_tasks
-            .iter()
-            .filter_map(|task| task.shell_id.clone())
-            .collect();
-        let children: Vec<String> = transcript
-            .background_tasks
-            .iter()
-            .filter_map(|task| task.child_id.clone())
-            .collect();
+        let (shells, children) = live_task_ids(transcript);
         if shells.is_empty() && children.is_empty() {
             return false;
         }
         if !self.begin(session_id) {
             return false;
         }
-        let changed = match crate::bridge::bounded_call(
-            "task runtime read",
-            read_timeout_ms,
-            backend.task_runtime(session_id, Some(directory), &shells, &children),
-        )
-        .await
-        {
-            Some(Ok(runtime)) => {
-                let retired_before = transcript.runtime_retired.len();
-                let unconfirmed_before = transcript.unconfirmed_tasks.len();
-                transcript.apply_task_runtime(&runtime);
-                // The child-evidence step (#591, issue #464): a subagent the
-                // runtime no longer reports active can still be retirable on
-                // its own transcript's evidence — and the very failure mode
-                // this family exists for is the missing Wake. At most ONE
-                // light read per suspect per cycle (the throttle above admits
-                // one cycle per interval): a terminal step finish with its
-                // completion stamp retires the task, a gone child session
-                // retires it as lost, and a read that cannot conclude — or
-                // fails, or times out — keeps the row exactly as the runtime
-                // marked it, never guessed.
-                for (call_id, child_id) in transcript.unconfirmed_children() {
-                    match crate::bridge::bounded_call(
-                        "child evidence read",
-                        read_timeout_ms,
-                        backend.child_evidence(&child_id),
-                    )
-                    .await
-                    {
-                        Some(Ok(evidence)) => transcript.apply_child_evidence(&call_id, evidence),
-                        Some(Err(error)) => {
-                            tracing::debug!(
-                                "session {session_id} child {child_id} evidence read failed: {error}; keeping its row"
-                            );
-                        }
-                        // A timed-out read yields no verdict, like the runtime
-                        // read above.
-                        None => {}
-                    }
-                }
-                // Record the retirements so every later transcript read — the
-                // live render, the drain's settle, the follow, the reap — sees
-                // them gone: the launch record never flips (issue #454), so
-                // without the overlay the next read would resurrect the task.
-                if !transcript.runtime_retired.is_empty() {
-                    let call_ids: Vec<String> = transcript
-                        .runtime_retired
-                        .iter()
-                        .map(|retirement| retirement.task.tool.call_id.clone())
-                        .collect();
-                    tracing::info!(
-                        "session {session_id}: runtime reconciliation retired {} background task(s)",
-                        call_ids.len()
-                    );
-                    backend.retire_background_tasks(session_id, &call_ids);
-                }
-                transcript.runtime_retired.len() > retired_before
-                    || transcript.unconfirmed_tasks.len() > unconfirmed_before
-            }
-            Some(Err(error)) => {
-                tracing::debug!(
-                    "session {session_id} task runtime read failed: {error}; waiting for the next read"
-                );
-                false
-            }
-            None => false,
-        };
+        let changed = reconcile_now(backend, session_id, Some(directory), transcript, read_timeout_ms)
+            .await
+            .unwrap_or(false);
         // The windows are read after the verdicts: a shell the runtime just
         // retired leaves the live list here and spends no tail read. A failed
         // runtime read changes nothing about them — the transcript still lists
@@ -208,11 +141,148 @@ impl RuntimeReconcile {
     }
 }
 
+/// One NON-throttled reconcile pass over a read's still-live Background Tasks
+/// (issue #454): the shell and child ids the read names, one bounded runtime
+/// read, the positive-evidence verdicts applied to the transcript, at most one
+/// child-evidence read (#591) per subagent the verdict left unconfirmed, and
+/// the process-local overlay recording of what was retired. Zero requests when
+/// the read lists no live task; a failed or timed-out read leaves the
+/// transcript exactly as read — no verdict, no retirement, no settle — so a
+/// flaky runtime can never end a wait.
+///
+/// [`RuntimeReconcile::observe`] composes this under its attempt-stamped 30 s
+/// throttle, which is how the poll paths (Session Sync, the drain, the
+/// follow/settle loop) share one verdict; the cleanup click calls it directly
+/// (spec #588, #590), because a click must never no-op behind a recent poll's
+/// verdict — it spends its own runtime read on the transcript it just read.
+/// Either way the overlay recording stays this one path, so every later read
+/// of the Session agrees on what retired.
+///
+/// Returns whether an applied verdict changed the read — `None` when no
+/// verdict was applied at all: the read lists no live task (nothing was asked),
+/// or the runtime read failed or timed out (the transcript stays exactly as
+/// read). A caller about to skip its render flattens with `unwrap_or(false)`,
+/// so a retirement is never dropped on the floor; the cleanup click keeps the
+/// two apart, because only a re-derived set may clear rows (ADR-0073).
+pub(crate) async fn reconcile_now(
+    backend: &Arc<dyn Backend>,
+    session_id: &str,
+    directory: Option<&str>,
+    transcript: &mut SessionTranscript,
+    read_timeout_ms: u64,
+) -> Option<bool> {
+    let (shells, children) = live_task_ids(transcript);
+    if shells.is_empty() && children.is_empty() {
+        return None;
+    }
+    match crate::bridge::bounded_call(
+        "task runtime read",
+        read_timeout_ms,
+        backend.task_runtime(session_id, directory, &shells, &children),
+    )
+    .await
+    {
+        Some(Ok(runtime)) => {
+            let retired_before = transcript.task_retirements.len();
+            // The read carries the previous reconciles' markers (the adapter's
+            // overlay re-applied them), so "changed" is measured against them:
+            // a marker the verdict resolves is a change too.
+            let unconfirmed_before = transcript.unconfirmed_tasks.clone();
+            transcript.apply_task_runtime(&runtime);
+            // The child-evidence step (#591, issue #464): a subagent the
+            // runtime no longer reports active can still be retirable on its
+            // own transcript's evidence — and the very failure mode this
+            // family exists for is the missing Wake. At most ONE light read
+            // per suspect per pass: a terminal step finish with its completion
+            // stamp retires the task, a gone child session retires it as lost,
+            // and a read that cannot conclude — or fails, or times out —
+            // keeps the row exactly as the runtime marked it, never guessed.
+            for (call_id, child_id) in transcript.unconfirmed_children() {
+                match crate::bridge::bounded_call(
+                    "child evidence read",
+                    read_timeout_ms,
+                    backend.child_evidence(&child_id),
+                )
+                .await
+                {
+                    Some(Ok(evidence)) => transcript.apply_child_evidence(&call_id, evidence),
+                    Some(Err(error)) => {
+                        tracing::debug!(
+                            "session {session_id} child {child_id} evidence read failed: {error}; keeping its row"
+                        );
+                    }
+                    // A timed-out read yields no verdict, like the runtime
+                    // read above.
+                    None => {}
+                }
+            }
+            // Record the retirements so every later transcript read — the
+            // live render, the drain's settle, the follow, the reap — sees
+            // them gone: the launch record never flips (issue #454), so
+            // without the overlay the next read would resurrect the task.
+            if !transcript.task_retirements.is_empty() {
+                let call_ids: Vec<String> = transcript
+                    .task_retirements
+                    .iter()
+                    .map(|retirement| retirement.task.tool.call_id.clone())
+                    .collect();
+                tracing::info!(
+                    "session {session_id}: runtime reconciliation retired {} background task(s)",
+                    call_ids.len()
+                );
+                backend.retire_background_tasks(session_id, &call_ids);
+            }
+            // The unconfirmed markers are process-local state too (review, spec
+            // #588): the read is fresh, and the ledger derives 状态待确认 from
+            // it, so a read the shared throttle does not spend a verdict on
+            // would drop the marker (and the cleanup button it gates) without
+            // any evidence the child is running. Record this verdict's
+            // post-evidence set — carried markers included, resolved ones
+            // absent — so the adapter re-applies it to every later read until
+            // the next verdict. The one writer; a failed or timed-out read
+            // never reaches here, so it clears nothing.
+            let unconfirmed: Vec<String> = transcript.unconfirmed_tasks.iter().cloned().collect();
+            backend.set_unconfirmed_tasks(session_id, &unconfirmed);
+            Some(
+                transcript.task_retirements.len() > retired_before
+                    || transcript.unconfirmed_tasks != unconfirmed_before,
+            )
+        }
+        Some(Err(error)) => {
+            tracing::debug!(
+                "session {session_id} task runtime read failed: {error}; waiting for the next read"
+            );
+            None
+        }
+        None => None,
+    }
+}
+
+/// The shell and child session ids a read's still-live Background Tasks name,
+/// in the read's own order — the reconcile's ask list. Empty when the read
+/// lists no live task, which is what makes the reconcile spend nothing (and,
+/// under [`RuntimeReconcile::observe`], not even consume a throttle attempt).
+fn live_task_ids(transcript: &SessionTranscript) -> (Vec<String>, Vec<String>) {
+    let shells = transcript
+        .background_tasks
+        .iter()
+        .filter_map(|task| task.shell_id.clone())
+        .collect();
+    let children = transcript
+        .background_tasks
+        .iter()
+        .filter_map(|task| task.child_id.clone())
+        .collect();
+    (shells, children)
+}
+
 /// Fill one read's shell output windows (spec #588, #592): one tail read per
 /// still-live shell, deduped, each bounded by the caller's read timeout. A
-/// shell whose read fails, vanishes or answers nothing records
-/// [`ShellOutputRead::Unavailable`] — the row omits the window — while a shell
-/// is never asked twice in one cycle.
+/// shell whose read fails or vanishes records [`ShellOutputRead::Unavailable`]
+/// — the row omits the window — and a successful empty capture records an
+/// empty window, which the row omits the same way; only the completion entry's
+/// own read keeps 「输出已不可用」 to the unavailable case (spec #588,
+/// review). A shell is never asked twice in one cycle.
 async fn capture_shell_outputs(
     backend: &Arc<dyn Backend>,
     session_id: &str,
