@@ -1879,8 +1879,8 @@ async fn a_queued_retirement_write_still_records() {
 /// became of its write. Feishu permanently refuses the refresh that carries the
 /// retirement entry — the plain attempt AND its fenced retry — so the card
 /// suspends and the entry can never land. The pass must not be recorded, the
-/// task must stay live for a card that CAN render its entry, and no card may
-/// show a half-rendered entry; `Refreshed`/`Settled` stay reserved for an
+/// task must stay live for a card that CAN render its entry, and the suspended
+/// card must not be PATCHed again; `Refreshed`/`Settled` stay reserved for an
 /// accepted write.
 #[tokio::test]
 async fn a_permanently_refused_yielded_refresh_records_nothing() {
