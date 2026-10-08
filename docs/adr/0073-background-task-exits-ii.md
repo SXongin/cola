@@ -64,8 +64,15 @@ the user already looks at.
   that pass to the overlay only after the flush that carried the read's entries
   was accepted** — Session Sync's landed wake/ledger refresh, the drain tick's
   and the follow/settle loop's completed render, the cleanup click's landed
-  refresh. A carrier that never lands records nothing: the task stays live, and
-  the next card that can render its entry claims it again (ADR-0065's designed
+  refresh. **Accepted is the delivery layer's own write outcome (ADR-0067,
+  ADR-0072): the carrying payload was delivered, or failed recoverably and is
+  still owed its retry by the pending outbox.** A **permanent refusal** — a
+  typed content rejection the fenced fallback was rejected with too, so the
+  card is suspended, or any other non-recoverable error — is NOT accepted:
+  nothing will ever be written for that payload, so the pass records nothing
+  and the yielded refresh reports neither `Refreshed` nor `Settled`. A carrier
+  that never lands records nothing either: the task stays live, and the next
+  card that can render its entry claims it again (ADR-0065's designed
   behavior).
 
 - **Live-path retirement entries render exactly once.** The live render path —
@@ -187,7 +194,9 @@ the user already looks at.
   waiting card can receive it" gate is replaced by the shared step plus the
   announce-key/overlay pair — each caller observes only where it can render and
   commits the overlay only after the flush that carried the read's entries was
-  accepted (review, PR #595), and exactly-once holds across paths.
+  accepted (delivered, or owed by the delivery layer's retry; a permanent
+  refusal records nothing — review, PR #595), and exactly-once holds across
+  paths.
 - The GLOSSARY gains **Runtime Reconciliation** and **Cleanup**; **Background
   Task**, **Background Task Ledger** and **Waiting on Background Work** record
   the widened retirement rule, the cleanup exit and the output tails.
@@ -218,7 +227,10 @@ the user already looks at.
   presence only with unconfirmed rows on a waiting card, late Wake untouched,
   the successor carrying the button, a replaced card's refused refresh
   recording nothing — the runtime retirement its own reconcile found included
-  — and the successor still rendering and clearing the tasks exactly once);
+  — a permanently refused write recording nothing and rendering on the next
+  card that can carry its entry, a recoverably failed (queued) one still
+  recording, and the successor still rendering and clearing the tasks exactly
+  once);
   the output windows (labels, budget, live
   omission, entry tails, 「输出已不可用」 on a failed or vanished record, no
   re-read on the settled successor); and the projected successor's affordances.
