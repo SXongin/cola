@@ -38,6 +38,11 @@ issue the PR references — the body's closing/ref keywords and the commits'
 - Keep the review under ~800 words; findings first, no summary of what the
   diff does.
 - A missing or failed part of the review is a blocking finding.
+- The host-only reference trees named in AGENTS.md (e.g.
+  `/root/workspace/dev/opencode`) are absent in CI. Their absence is not a
+  missing part of this review: verify wire-contract claims against the diff's
+  tests and recorded fixtures, and any upstream shapes quoted in the PR body or
+  the linked issues.
 
 Finish with exactly one final line, on its own line and with nothing after it —
 no punctuation, no code fence, no bold or code-span formatting:
