@@ -6,8 +6,8 @@ use tracing::Instrument;
 use crate::backend::{MessageRole, Part, SessionTranscript, TurnAnchor, TurnSettle};
 use crate::bridge::handles::{CardsHandle, FlowHandles, NoticeRules};
 use crate::bridge::turn::{
-    CardClass, CardOwnership, ContinuationFacts, Disposition, SettleTiming, Turn, WakeContinuation,
-    YieldedUpdate,
+    CardClass, CardOwnership, ContinuationFacts, ContinuationLine, Disposition, SettleTiming, Turn,
+    WakeContinuation, YieldedUpdate,
 };
 
 /// The external-message flow: watches for user messages that were NOT sent by
@@ -930,61 +930,16 @@ impl ExternalFlow {
                 true
             }
             WakeContinuation::ContinueChain { line } => {
-                // The Feishu reply target: the Turn's own when the chain still
-                // knows it (the user's message the exchange continues from),
-                // else an in-topic anchor — the external path's fallback order.
-                // `None` means only a top-level send can reach the thread,
-                // which a split cannot do.
-                let reply_target = self.wake_reply_target(handles, sid, thread_key).await;
-                // The split carries the continuation: its flush re-stamps the
-                // previous card, sends the new card and tracks it.
-                let Some(reply_to) = reply_target else {
-                    tracing::warn!(
-                        "wake continuation: session {} has a chain but no reachable reply target",
-                        sid
-                    );
-                    return false;
-                };
-                // The ledger handover (ADR-0060) rides the split: writing it,
-                // queueing the split and flushing are one write-lock-held
-                // sequence inside `split_chain_for_wake`, so the outgoing
-                // card's finalize PATCH carries the read's remaining list and
-                // the retiring Wakes' entries, and the continuation — whose
-                // slice starts after both — opens with only its 承接 line and
-                // the remaining list. The split's answer is exactly "did that
-                // handover write this read's entries": a card the handover
-                // cannot scope (an anchorless one) still splits, but carries
-                // nothing, so the caller's pass must not record.
-                let Some(handover) = Turn::split_chain_for_wake(
-                    &handles.cards,
-                    &handles.backend,
-                    sid,
-                    &reply_to,
-                    line,
-                    transcript,
-                    now_ms,
+                self.split_wake_continuation(
+                    handles, sid, thread_key, directory, transcript, now_ms, line, false,
                 )
                 .await
-                else {
-                    return false;
-                };
-                // The loop's guard facts are read AFTER the split, so they
-                // describe the chain the continuation actually lives on. The
-                // chain identity is the ownership verdict's (ADR-0070); the
-                // anchor stays on the Turn (arming/capture is not an ownership
-                // question).
-                let Some(anchor) = Turn::armed_turn_anchor(&handles.cards, sid).await else {
-                    return handover;
-                };
-                let Some(chain) = CardOwnership::read(&handles.cards, &handles.waits, sid)
-                    .await
-                    .chain_id()
-                else {
-                    return handover;
-                };
-                tracing::info!("wake continuation: session {} continues its card chain", sid);
-                self.spawn_wake_render(handles, sid, thread_key, anchor, directory, chain, None);
-                handover
+            }
+            WakeContinuation::Residual { line } => {
+                self.split_wake_continuation(
+                    handles, sid, thread_key, directory, transcript, now_ms, line, true,
+                )
+                .await
             }
             WakeContinuation::Fresh { anchor } => {
                 // The Feishu reply target, the split path's own fallback order:
@@ -1099,6 +1054,86 @@ impl ExternalFlow {
                 false
             }
         }
+    }
+
+    /// Split an ended card chain for a continuation (ADR-0059): the Wake case
+    /// (`residual == false`) and the neutral RESIDUAL floor (`residual ==
+    /// true`, spec #602/#606) share everything but the receipt copy and the
+    /// log. Resolve the Feishu reply target (a split needs one; a top-level
+    /// send cannot reach a thread), hand the chain over through
+    /// [`Turn::split_chain_for_continuation`], then re-read the loop's guard
+    /// facts from the chain the continuation actually lives on and spawn its
+    /// settle loop. A residual logs a WARN — it is a defensive floor, not a
+    /// normal path — while a Wake logs the ordinary INFO.
+    #[allow(clippy::too_many_arguments)] // the pass's facts + the chain it continues + the cause
+    async fn split_wake_continuation(
+        &self,
+        handles: &FlowHandles,
+        sid: &str,
+        thread_key: &crate::config::ThreadKey,
+        directory: &str,
+        transcript: &SessionTranscript,
+        now_ms: i64,
+        line: ContinuationLine,
+        residual: bool,
+    ) -> bool {
+        // The Feishu reply target: the Turn's own when the chain still knows it
+        // (the user's message the exchange continues from), else an in-topic
+        // anchor — the external path's fallback order. `None` means only a
+        // top-level send can reach the thread, which a split cannot do.
+        let reply_target = self.wake_reply_target(handles, sid, thread_key).await;
+        let Some(reply_to) = reply_target else {
+            tracing::warn!(
+                "wake continuation: session {} has a chain but no reachable reply target",
+                sid
+            );
+            return false;
+        };
+        // The ledger handover (ADR-0060) rides the split: writing it, queueing
+        // the split and flushing are one write-lock-held sequence inside
+        // `split_chain_for_continuation`, so the outgoing card's finalize PATCH
+        // carries the read's remaining list and the retiring Wakes' entries,
+        // and the continuation — whose slice starts after both — opens with
+        // only its receipt and the remaining list. The split's answer is
+        // exactly "did that handover write this read's entries": a card the
+        // handover cannot scope (an anchorless one) still splits, but carries
+        // nothing, so the caller's pass must not record.
+        let Some(handover) = Turn::split_chain_for_continuation(
+            &handles.cards,
+            &handles.backend,
+            sid,
+            &reply_to,
+            line,
+            transcript,
+            now_ms,
+        )
+        .await
+        else {
+            return false;
+        };
+        if residual {
+            tracing::warn!(
+                "wake continuation: session {} posts its one neutral residual card for content written after the run went idle",
+                sid
+            );
+        } else {
+            tracing::info!("wake continuation: session {} continues its card chain", sid);
+        }
+        // The loop's guard facts are read AFTER the split, so they describe the
+        // chain the continuation actually lives on. The chain identity is the
+        // ownership verdict's (ADR-0070); the anchor stays on the Turn
+        // (arming/capture is not an ownership question).
+        let Some(anchor) = Turn::armed_turn_anchor(&handles.cards, sid).await else {
+            return handover;
+        };
+        let Some(chain) = CardOwnership::read(&handles.cards, &handles.waits, sid)
+            .await
+            .chain_id()
+        else {
+            return handover;
+        };
+        self.spawn_wake_render(handles, sid, thread_key, anchor, directory, chain, None);
+        handover
     }
 
     /// The Feishu message a Wake continuation card replies to: the Turn's own

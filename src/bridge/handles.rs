@@ -868,8 +868,8 @@ impl CardsHandle {
     /// The lock serializing card writes for `session_id`. Every path that reads
     /// a session's card state, sends the result to Feishu, and then records it
     /// must hold this across the whole sequence: `flush_card`, `split_card_chain`
-    /// and `split_chain_for_wake` (which enqueue their split and flush it under
-    /// the same lock; `split_chain_for_wake` also writes the outgoing card's
+    /// and `split_chain_for_continuation` (which enqueue their split and flush it under
+    /// the same lock; `split_chain_for_continuation` also writes the outgoing card's
     /// ledger handover), `refresh_yielded_ledger` (a yielded card's in-place
     /// ledger update and quiet true-end settle) and `resolve_blocks` are the
     /// holders.

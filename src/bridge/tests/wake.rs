@@ -9,9 +9,11 @@
 //! a NEW continuation card, replied to the user's message (or sent top-level
 //! after a restart) and opening with the 承接 line; it carries only the work the
 //! chain had not rendered. A Wake-less content diff, and a tail past a Wake the
-//! chain already handed over, open no card at all: the chain's open yielded card
-//! renders the content in place (spec #602), and a card past its wait is #606's
-//! neutral residual. Either path ends through the single settle decision: ✅ at
+//! chain already handed over, open no card while their card is an OPEN yielded
+//! one (the chain renders the content in place, spec #602); on a card PAST its
+//! wait they open exactly ONE neutral residual card (spec #602, ticket #606) —
+//! never a 承接 line, never a second card. Either path ends through the single
+//! settle decision: ✅ at
 //! the true end, ❌ for a settled failure (the request's own in-place card keeps
 //! its ordinary Retry, ADR-0066), ⏹ 已停止 for `/stop`, or the waiting yield
 //! when the Wake backgrounded work of its own.
@@ -1871,11 +1873,15 @@ async fn a_failed_split_continuation_offers_no_retry() {
     );
 }
 
-/// The content-diff fallback, rewritten by spec #602: content the finalized
-/// card missed — here with no Wake recorded at all — opens no continuation Card
-/// and writes no 承接 receipt. The residual that shows it honestly is #606's.
+/// The residual floor (spec #602, ticket #606): content the finalized card
+/// missed — a Wake-less part the Backend wrote after the run reported idle — is
+/// never dropped and never lied about. It renders on ONE neutrally-labeled
+/// continuation Card (「📄 还有更新」), never a 「🔔 已恢复执行」 one, and the
+/// chain logs a warning when the floor fires. The same-snapshot rule (#604)
+/// makes this near-unreachable; the test pins the honest floor the wrong-but-
+/// observed order used to produce.
 #[tokio::test]
-async fn content_a_finalized_card_missed_opens_no_card() {
+async fn content_a_finalized_card_missed_renders_on_a_neutral_card() {
     let _wd = test_work_dir();
     let done = SessionTranscript::new(vec![
         user("msg_cola_anchor", 1_000, "第一条消息"),
@@ -1890,6 +1896,7 @@ async fn content_a_finalized_card_missed_opens_no_card() {
         Turn::card_state(&app.cards_handle(), "ses_test").await,
         Some(CardState::Done)
     );
+    name_request_card(&app).await;
     let posts_before = card_posts(&platform).await;
 
     script_transcript(
@@ -1905,22 +1912,133 @@ async fn content_a_finalized_card_missed_opens_no_card() {
     )
     .await;
 
-    spawn_sync(&app);
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    let ((), logs) = capture_logs(async {
+        spawn_sync(&app);
+        // The neutral continuation posts carrying its receipt; the missed tail
+        // then streams into that same card and ends ✅ there.
+        wait_for_card_update(&platform, "the neutral residual card", CardUpdates::Any, |card| {
+            card_text(card).contains(RESIDUAL_LEAD)
+        })
+        .await;
+        wait_for_card_update(
+            &platform,
+            "the residual's done card",
+            CardUpdates::Latest,
+            |card| card_header(card).contains("✅") && card_text(card).contains("收尾时补上的一段。"),
+        )
+        .await;
+    })
+    .await;
 
     assert_eq!(
         card_posts(&platform).await,
-        posts_before,
-        "content a finalized card missed must not open a continuation card: {:?}",
+        posts_before + 1,
+        "the residual opens exactly one neutral card: {:?}",
         platform.calls.lock().await
     );
+    // The POST carries the neutral receipt — never the Wake's 承接 line.
+    let posted = platform
+        .replied_cards()
+        .await
+        .into_iter()
+        .chain(platform.sent_cards().await)
+        .find(|card| card_text(card).contains(RESIDUAL_LEAD))
+        .expect("the neutral residual continuation was posted");
     assert!(
-        !platform
-            .updated_cards()
+        !card_text(&posted).contains(WAKE_LEAD),
+        "nothing resumed, so the card must not claim 「已恢复执行」: {posted}"
+    );
+    // The missed content is never dropped: it lands on that neutral card.
+    let rendered = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_text(&rendered).contains("收尾时补上的一段。") && card_text(&rendered).contains(RESIDUAL_LEAD),
+        "the missed content renders on the neutral card: {rendered}"
+    );
+    // The finalized ✅ card keeps its ending — the residual never rewrites it.
+    assert!(
+        !patches_to(&platform, "om_waiting")
             .await
             .iter()
-            .any(|card| card_text(card).contains(WAKE_LEAD)),
-        "the missed content writes no 承接 receipt: {:?}",
+            .any(|card| card_text(card).contains("收尾时补上的一段。")),
+        "the finalized card is never rebuilt with the late tail: {:?}",
+        platform.calls.lock().await
+    );
+    // The floor logs a warning when it fires.
+    assert_line_level(&logs, "neutral residual card", "WARN");
+}
+
+/// Acceptance 2 of #606: the neutral residual floor fires AT MOST ONCE per
+/// request. Once the chain has posted its one neutral card, a later late tail
+/// cannot post a second — the chain's marker suppresses it. (The same-snapshot
+/// rule #604 keeps this whole path near-unreachable, so the floor's overflow
+/// is rare by construction.)
+#[tokio::test]
+async fn a_second_late_tail_does_not_post_a_second_neutral_card() {
+    let _wd = test_work_dir();
+    let done = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "第一条消息"),
+        assistant(2_000, "第一轮回答。"),
+    ])
+    .with_executions(vec![execution(2_500)]);
+    let (_dir, app, backend, platform) = scripted_app(vec![done], Some(SessionStatus::Idle)).await;
+    Turn::run(&app.turn_handles(), ctx("ses_test", "第一条消息"))
+        .await
+        .unwrap();
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Done)
+    );
+    name_request_card(&app).await;
+    let posts_before = card_posts(&platform).await;
+
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(vec![
+                user("msg_cola_anchor", 1_000, "第一条消息"),
+                assistant(2_000, "第一轮回答。"),
+                assistant(3_100, "收尾时补上的一段。"),
+            ])
+            .with_executions(vec![execution(2_500), execution(4_000)]),
+        ],
+    )
+    .await;
+    spawn_sync(&app);
+    wait_for_card_update(
+        &platform,
+        "the neutral residual card's tail",
+        CardUpdates::Any,
+        |card| card_text(card).contains(RESIDUAL_LEAD) && card_text(card).contains("收尾时补上的一段。"),
+    )
+    .await;
+    assert_eq!(
+        card_posts(&platform).await,
+        posts_before + 1,
+        "the floor posts its one neutral card: {:?}",
+        platform.calls.lock().await
+    );
+
+    // A later tail arrives after that neutral card settled: the marker must
+    // suppress a second neutral card.
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(vec![
+                user("msg_cola_anchor", 1_000, "第一条消息"),
+                assistant(2_000, "第一轮回答。"),
+                assistant(3_100, "收尾时补上的一段。"),
+                assistant(5_000, "又晚来的一段。"),
+            ])
+            .with_executions(vec![execution(2_500), execution(4_000), execution(6_000)]),
+        ],
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    assert_eq!(
+        card_posts(&platform).await,
+        posts_before + 1,
+        "the residual floor posts exactly one neutral card per request: {:?}",
         platform.calls.lock().await
     );
 }

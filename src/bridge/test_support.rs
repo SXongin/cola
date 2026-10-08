@@ -165,6 +165,13 @@ pub(crate) fn subagent_wake(created_ms: i64, description: &str) -> Wake {
 /// what the platform-call helpers key on to recognise a continuation card.
 pub(crate) const WAKE_LEAD: &str = "已恢复执行";
 
+/// The neutral receipt the Wake-less RESIDUAL continuation opens with (spec
+/// #602, ticket #606): content the Backend wrote after the run reported idle
+/// renders honestly — never the Wake's 「已恢复执行」 receipt, because nothing
+/// resumed. Kept in lockstep with `turn::RESIDUAL_RECEIPT` by the residual
+/// tests (the production copy is the source of truth).
+pub(crate) const RESIDUAL_LEAD: &str = "还有更新";
+
 /// Every card SEND (a reply or a top-level send) carrying the Wake
 /// continuation's 承接 line, in call order. A re-post would be another SEND,
 /// while the render updates the one continuation card in place many times —

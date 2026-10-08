@@ -1241,6 +1241,18 @@ pub(super) struct StreamAccumulator {
     /// (spec #602). Like the announcement set, one mark per Wake id, kept across
     /// [`Self::continue_on_new_card`].
     pub(super) handed_over_wakes: std::collections::HashSet<String>,
+    /// Whether this chain has already posted its ONE neutral residual
+    /// continuation (spec #602, ticket #606): a Wake-less part the Backend
+    /// wrote after the run reported idle renders on exactly one neutral card
+    /// per request. Set when the residual split's receipt is written (the same
+    /// exactly-once point the Wake handoff's marks are set) and kept across
+    /// [`Self::continue_on_new_card`], so a later pass over further late
+    /// content can never post a second neutral card. Distinct from
+    /// [`Self::handed_over_wakes`] — the residual answers no Wake — and never
+    /// persisted: a restart has no in-process chain to re-decide on, and the
+    /// Fresh (recordless) path is Wake-scoped, so a Wake-less read there owes
+    /// nothing.
+    pub(super) residual_card_posted: bool,
     /// The Wake Watermarks this chain has staged but not yet drained:
     /// `(wake id, created_ms)` stages, advanced by [`Self::announce_wake`] and
     /// persisted into the durable Wake Watermark once a card write actually
