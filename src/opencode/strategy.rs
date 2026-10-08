@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::backend::{SessionTranscript, TaskRuntime};
+use crate::backend::{ChildEvidence, SessionTranscript, TaskRuntime};
 use crate::error::Result;
 
 use super::transport::Transport;
@@ -199,6 +199,13 @@ pub(crate) trait GenerationStrategy: Send + Sync {
         shell_id: &str,
         directory: Option<&str>,
     ) -> Result<Option<crate::backend::ShellOutputWindow>>;
+
+    /// The evidence one child session's newest assistant message carries about
+    /// its run (#591, issue #464): V2 reads ONE page, newest assistant first
+    /// (`GET /api/session/{id}/message?type=assistant&order=desc&limit=1`),
+    /// with a 404 as the `Gone` arm. V1 carries no Background Tasks and
+    /// answers `Unfinished` without a request.
+    async fn child_evidence(&self, http: &Transport, session_id: &str) -> Result<ChildEvidence>;
 
     async fn model_context_window(
         &self,

@@ -324,13 +324,31 @@ pub trait Backend: Send + Sync {
     /// restart loses it and the next read re-derives the same retirement.
     fn retire_background_tasks(&self, session_id: &str, call_ids: &[String]);
 
+    /// Replace one session's unconfirmed-Background-Task marker set (review,
+    /// spec #588) with exactly `call_ids` — the reconciliation's post-verdict
+    /// set of live tasks it could not confirm as running. Every later
+    /// [`Self::transcript`] read re-applies the recorded markers (a marker
+    /// only surfaces for a task still live in that read), so a read the shared
+    /// 30 s throttle did not spend a verdict on — a Session Sync refresh, a
+    /// drain tick, the follow, the cleanup click's own read — cannot drop a
+    /// `⚠️ 状态待确认` marker and the cleanup button it gates; only a verdict
+    /// resolves one (a `Running` child clears its marker). Called by the
+    /// reconcile, the one writer, and only after a successful verdict read: a
+    /// failed or timed-out one changes nothing.
+    ///
+    /// In-memory on purpose, like [`Self::retire_background_tasks`]: a restart
+    /// loses the markers and the next verdict re-derives them.
+    fn set_unconfirmed_tasks(&self, session_id: &str, call_ids: &[String]);
+
     /// Read one shell's captured output window (spec #588, ticket #592): the
     /// record's last [`SHELL_OUTPUT_WINDOW_BYTES`] bytes, decoded and clipped
     /// to its last [`SHELL_OUTPUT_WINDOW_LINES`] lines. V2 pages the capture
     /// by absolute byte cursor — the server's own tail idiom asks for the size
-    /// first, then the last window. `Ok(None)` is "nothing to show": a record
-    /// the runtime no longer keeps (404) or an empty capture; `Err` is a
-    /// failed read. V1 carries no shell records, so it answers `Ok(None)`
+    /// first, then the last window. `Ok(None)` is strictly "no record to
+    /// read": the runtime no longer keeps it (404). A record that exists and
+    /// captured nothing answers `Some` with an empty window — a readable-empty
+    /// result the row and the entry omit, never 「输出已不可用」 — while `Err`
+    /// is a failed read. V1 carries no shell records, so it answers `Ok(None)`
     /// without a request.
     ///
     /// Display-only: the read never prompts, never changes a task's liveness
@@ -340,6 +358,17 @@ pub trait Backend: Send + Sync {
         shell_id: &str,
         directory: Option<&str>,
     ) -> Result<Option<ShellOutputWindow>>;
+    /// The evidence one child session's newest assistant message carries about
+    /// its Background Task's run (#591, issue #464): one page of projected
+    /// messages, newest assistant first (V2 reads
+    /// `GET /api/session/{id}/message?type=assistant&order=desc&limit=1`).
+    /// [`ChildEvidence::Terminal`] is a terminal step finish with the message's
+    /// completion stamp — positive evidence the run ended; [`ChildEvidence::Gone`]
+    /// is a 404 — positive evidence the session no longer exists; an
+    /// `Ok(ChildEvidence::Unfinished)` is no evidence at all (the caller must
+    /// not retire from it), and an `Err` is an unreadable child (same). V1
+    /// carries no Background Tasks; it answers `Unfinished` without a request.
+    async fn child_evidence(&self, session_id: &str) -> Result<ChildEvidence>;
 
     /// The model's context-window size (tokens), from `GET /provider`. Used to
     /// compute the context-usage ratio for the card footer. Best-effort: None

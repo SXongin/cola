@@ -8,9 +8,9 @@ pub(crate) use crate::feishu;
 pub(crate) use crate::opencode;
 
 use crate::backend::{
-    BackgroundTask, ContentBlock, Execution, ExecutionOutcome, FinishReason, MessageId, MessageRole,
-    MessageTime, Part, ReasoningPart, SessionTranscript, StepFinish, StepStart, TextPart, ToolCall,
-    ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage, TurnAnchor, Wake, WakeSource,
+    BackgroundTask, ChildEvidence, ContentBlock, Execution, ExecutionOutcome, FinishReason, MessageId,
+    MessageRole, MessageTime, Part, ReasoningPart, SessionTranscript, StepFinish, StepStart, TextPart,
+    ToolCall, ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage, TurnAnchor, Wake, WakeSource,
 };
 
 /// One typed transcript message for view-shaped fixtures (spec #332): identity,
@@ -1259,6 +1259,17 @@ pub struct MockBackend {
     /// runtime read the caller's own request bound must abandon; the
     /// transcript must stay exactly as read (#589).
     pub hang_task_runtime: Arc<std::sync::atomic::AtomicUsize>,
+    /// The child-evidence read's scripted answers, keyed by child session id
+    /// (#591, issue #464): the newest assistant message's evidence for a
+    /// suspect. A child with no entry answers `Unfinished` — no evidence,
+    /// exactly like V1.
+    pub child_evidence: Arc<tokio::sync::Mutex<std::collections::HashMap<String, ChildEvidence>>>,
+    /// Records every `child_evidence` call's child session id, in order.
+    pub child_evidence_calls: Arc<tokio::sync::Mutex<Vec<String>>>,
+    /// Number of initial `child_evidence` calls to fail with a 500 (then later
+    /// reads serve normally) — an unreadable child leaves the row exactly as
+    /// the runtime marked it (#591).
+    pub fail_child_evidence_reads: Arc<std::sync::atomic::AtomicUsize>,
     /// The output windows `shell_output` serves, keyed by shell id (spec #588,
     /// #592). A missing key (or a stored `None`) is the no-output case — a
     /// vanished record answers `Ok(None)`.
@@ -1270,10 +1281,10 @@ pub struct MockBackend {
     /// Number of initial `shell_output` calls to fail with a 500 (then later
     /// reads serve normally) — a window must be omitted, never guessed.
     pub fail_shell_output_reads: Arc<std::sync::atomic::AtomicUsize>,
-    /// The Background Task retirement overlay (issue #454): recorded through
-    /// `retire_background_tasks` and applied inside `transcript`, exactly like
-    /// the real adapter's.
-    pub retirements: crate::backend::TaskRetirements,
+    /// The Background Task overlay (issue #454, review #588): recorded
+    /// through `retire_background_tasks` / `set_unconfirmed_tasks` and applied
+    /// inside `transcript`, exactly like the real adapter's.
+    pub overlay: crate::backend::BackgroundTaskOverlay,
     /// When set, `session_status` fails with this message (simulates a read
     /// failure — the caller must not guess a status).
     pub session_status_error: Option<String>,
@@ -1391,10 +1402,13 @@ impl MockBackend {
             task_runtime_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             fail_task_runtime_reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             hang_task_runtime: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            child_evidence: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            child_evidence_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            fail_child_evidence_reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             shell_outputs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             shell_output_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             fail_shell_output_reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            retirements: crate::backend::TaskRetirements::default(),
+            overlay: crate::backend::BackgroundTaskOverlay::default(),
             session_status_error: None,
             session_status_fails: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             status_busy_once: std::sync::atomic::AtomicBool::new(false),
@@ -1833,6 +1847,17 @@ impl MockBackend {
         self
     }
 
+    /// Scenario: script one child session's newest-assistant evidence (#591,
+    /// issue #464) — the read the shared reconcile spends on a suspect it
+    /// cannot confirm as running.
+    pub(crate) async fn with_child_evidence(&self, child_id: &str, evidence: ChildEvidence) -> &Self {
+        self.child_evidence
+            .lock()
+            .await
+            .insert(child_id.to_string(), evidence);
+        self
+    }
+
     /// Scenario: the next `count` `session_info` calls hang forever (a wedged
     /// subtitle fetch on a freshly spawned server).
     pub(crate) fn hang_session_info_reads(&self, count: usize) -> &Self {
@@ -2256,9 +2281,10 @@ impl crate::backend::Backend for MockBackend {
             Some(transcript) => transcript,
             None => self.default_transcript(session_id),
         };
-        // The runtime retirement overlay, applied exactly like the real
-        // adapter's (issue #454).
-        self.retirements.apply(session_id, &mut transcript);
+        // The Background Task overlay, applied exactly like the real adapter's
+        // (issue #454, review #588): retirements leave the live list and
+        // unconfirmed markers ride every read.
+        self.overlay.apply(session_id, &mut transcript);
         self.transcript_calls.lock().await.push(session_id.to_string());
         Ok(transcript)
     }
@@ -2550,8 +2576,41 @@ impl crate::backend::Backend for MockBackend {
             .clone())
     }
 
+    /// The scripted child-evidence read (#591, issue #464). A child with no
+    /// scripted evidence answers `Unfinished` — no evidence, exactly like V1's
+    /// arm — so a test only scripts the suspects whose evidence it means to
+    /// pin.
+    async fn child_evidence(&self, session_id: &str) -> crate::error::Result<crate::backend::ChildEvidence> {
+        self.child_evidence_calls
+            .lock()
+            .await
+            .push(session_id.to_string());
+        if self
+            .fail_child_evidence_reads
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0
+        {
+            self.fail_child_evidence_reads
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            return Err(crate::error::BridgeError::OpenCode(format!(
+                "child evidence {session_id} failed: 500 Internal Server Error"
+            )));
+        }
+        Ok(self
+            .child_evidence
+            .lock()
+            .await
+            .get(session_id)
+            .copied()
+            .unwrap_or(crate::backend::ChildEvidence::Unfinished))
+    }
+
     fn retire_background_tasks(&self, session_id: &str, call_ids: &[String]) {
-        self.retirements.record(session_id, call_ids);
+        self.overlay.record(session_id, call_ids);
+    }
+
+    fn set_unconfirmed_tasks(&self, session_id: &str, call_ids: &[String]) {
+        self.overlay.set_unconfirmed(session_id, call_ids);
     }
 
     /// The scripted output window (spec #588, #592), keyed by shell id; a

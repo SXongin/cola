@@ -143,6 +143,35 @@ impl RuntimeReconcile {
                 let retired_before = transcript.runtime_retired.len();
                 let unconfirmed_before = transcript.unconfirmed_tasks.len();
                 transcript.apply_task_runtime(&runtime);
+                // The child-evidence step (#591, issue #464): a subagent the
+                // runtime no longer reports active can still be retirable on
+                // its own transcript's evidence — and the very failure mode
+                // this family exists for is the missing Wake. At most ONE
+                // light read per suspect per cycle (the throttle above admits
+                // one cycle per interval): a terminal step finish with its
+                // completion stamp retires the task, a gone child session
+                // retires it as lost, and a read that cannot conclude — or
+                // fails, or times out — keeps the row exactly as the runtime
+                // marked it, never guessed.
+                for (call_id, child_id) in transcript.unconfirmed_children() {
+                    match crate::bridge::bounded_call(
+                        "child evidence read",
+                        read_timeout_ms,
+                        backend.child_evidence(&child_id),
+                    )
+                    .await
+                    {
+                        Some(Ok(evidence)) => transcript.apply_child_evidence(&call_id, evidence),
+                        Some(Err(error)) => {
+                            tracing::debug!(
+                                "session {session_id} child {child_id} evidence read failed: {error}; keeping its row"
+                            );
+                        }
+                        // A timed-out read yields no verdict, like the runtime
+                        // read above.
+                        None => {}
+                    }
+                }
                 // Record the retirements so every later transcript read — the
                 // live render, the drain's settle, the follow, the reap — sees
                 // them gone: the launch record never flips (issue #454), so
