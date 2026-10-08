@@ -2694,8 +2694,6 @@ async fn an_in_flight_step_before_the_anchor_renders_live() {
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
     seed_session(&app, "ses_test", "/work").await;
     app.turn_render_poll_ms.store(5, Ordering::Relaxed);
-    app.turn_drain_timeout_ms.store(60_000, Ordering::Relaxed);
-
     let turn = spawn_turn(&app, ctx("ses_test", "我的问题你回答了吗"));
 
     // The in-flight step renders on the live card while the prompt is still
@@ -2776,8 +2774,6 @@ async fn an_orphaned_in_flight_message_does_not_render_on_a_later_turn() {
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
     seed_session(&app, "ses_test", "/work").await;
     app.turn_render_poll_ms.store(5, Ordering::Relaxed);
-    app.turn_drain_timeout_ms.store(60_000, Ordering::Relaxed);
-
     let turn = spawn_turn(&app, ctx("ses_test", "新消息"));
 
     // The new Turn's own content renders live …
@@ -2844,8 +2840,6 @@ async fn a_later_turn_does_not_inherit_an_orphans_failure() {
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
     seed_session(&app, "ses_test", "/work").await;
     app.turn_render_poll_ms.store(5, Ordering::Relaxed);
-    app.turn_drain_timeout_ms.store(60_000, Ordering::Relaxed);
-
     let turn = spawn_turn(&app, ctx("ses_test", "新消息"));
     tokio::time::timeout(Duration::from_secs(5), turn)
         .await

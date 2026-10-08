@@ -5730,8 +5730,6 @@ async fn a_retirement_cycle_stays_within_one_read_budget() {
     backend.task_runtime.lock().unwrap().shells = vec![("sh_call_bg".into(), ShellRuntime::Missing)];
     backend.hang_shell_output_reads(usize::MAX);
     let budget = 2_000;
-    app.turn_drain_timeout_ms.store(budget, Ordering::Relaxed);
-
     let started = std::time::Instant::now();
     Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下构建并审阅"))
         .await
@@ -5804,8 +5802,6 @@ async fn hanging_evidence_reads_stay_within_one_read_budget() {
     ];
     backend.hang_child_evidence_reads(usize::MAX);
     let budget = 2_000;
-    app.turn_drain_timeout_ms.store(budget, Ordering::Relaxed);
-
     let started = std::time::Instant::now();
     Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下构建并审阅"))
         .await

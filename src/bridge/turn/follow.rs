@@ -1,14 +1,14 @@
-//! The out-of-turn drain follow (#284, #386).
+//! The out-of-turn follow (#284, #386).
 //!
-//! When a Turn's post-prompt drain reaches its bound while the session is
-//! still running (a Supplement's continuation work outliving the 10-minute
-//! budget — typically `task` subagents), the Turn is over but its card is not:
-//! finalizing from that snapshot stamps `✅ 完成` on a card whose tool panels
-//! still say `⏳` and freezes everything after the bound. The released Turn
-//! therefore hands the SAME accumulator and card chain to this follow.
+//! The turn's OWN task renders a submitted prompt to its true end on the
+//! merged unbounded drain (#603), so this follow no longer continues a
+//! post-prompt hand-off. It remains for the paths that have no Turn task of
+//! their own: the recovery re-attach (a retry click on a still-running run,
+//! a resumed re-arm — [`super::Turn::rearm_and_follow`]) and the Wake
+//! continuation. It watches a card no live Turn owns.
 //!
 //! The follow is the shared out-of-turn settle loop ([`super::settle`]) under
-//! this Turn's anchor — the same reads, the same no-total-budget graces and
+//! this card's identity — the same reads, the same no-total-budget graces and
 //! the same settle decision — and adds the one fact only it owns: an ending is
 //! the Turn's TRUE end (or its fallback Error), so it announces it with the
 //! Completion Notice; the notice itself declines a disposition that is not a
@@ -61,25 +61,23 @@ pub(super) struct FollowFacts {
 }
 
 /// Take the Session's inflight guard for a follow window (ADR-0059).
-/// Idempotent by design: the drain hand-off's Turn deliberately did not
-/// release, so its call finds the guard already held, while the retry
-/// re-attach acquires it here — either way the hand-off has no guard-free gap.
-/// [`run`] hands the guard back when the loop ends.
+/// Idempotent by design: the call site holds no guard (the recovery re-attach
+/// had none), so this acquires it. [`run`] hands the guard back when the loop
+/// ends.
 pub(super) async fn inherit_guard(handles: &TurnHandles, session_id: &str) {
     handles.waits.inflight.lock().await.insert(session_id.to_string());
 }
 
-/// Spawn the out-of-turn follow for a turn whose drain bound was reached with
-/// the session still running.
+/// Spawn the out-of-turn follow for a card no live Turn owns (the recovery
+/// re-attach, the Wake continuation).
 ///
 /// **Guard hand-off (ADR-0059):** the follow takes the Session's inflight
 /// guard via [`inherit_guard`] BEFORE its task is spawned, so a caller must
-/// never release between handing the card over and this call — the drain
-/// hand-off's Turn deliberately does not release, and the retry re-attach has
-/// no guard to release. The guard then covers the whole follow window: a
-/// message arriving meanwhile is a Supplement merging into the still-live
-/// chain, and the server-yield's busy read never sees a followed Session as
-/// idle. [`run`] releases it when the window closes.
+/// never release between handing the card over and this call. The guard then
+/// covers the whole follow window: a message arriving meanwhile is a
+/// Supplement merging into the still-live chain, and the server-yield's busy
+/// read never sees a followed Session as idle. [`run`] releases it when the
+/// window closes.
 pub(super) async fn spawn(handles: &TurnHandles, facts: FollowFacts) {
     inherit_guard(handles, &facts.session_id).await;
     let handles = handles.clone();

@@ -122,18 +122,11 @@ async fn a_live_turn_advances_the_record_cursor_to_the_delivered_body() {
     ];
     let (_dir, app, backend, platform) =
         scripted_app(vec![SessionTranscript::new(timeline)], Some(SessionStatus::Busy)).await;
-    app.turn_drain_timeout_ms.store(30, Ordering::Relaxed);
-
-    let turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
+    // The merged unbounded drain keeps the card (and the record) live on the
+    // turn's own task; the test inspects the cursor while it runs.
+    let _turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
     wait_for_card_text(&platform, "第一段回答。").await;
     wait_for_card_text(&platform, "⏳ bash").await;
-    // The turn hands off at the tiny drain bound; the follow keeps the card
-    // (and the record) live.
-    let result = tokio::time::timeout(Duration::from_secs(5), turn)
-        .await
-        .expect("the turn must hand off at the drain bound")
-        .unwrap();
-    result.unwrap();
 
     let cursor = wait_for_cursor(&app, |cursor| {
         cursor
@@ -209,15 +202,8 @@ async fn two_text_parts_at_one_server_time_confirm_their_own_frontier() {
     ];
     let (_dir, app, _backend, platform) =
         scripted_app(vec![SessionTranscript::new(timeline)], Some(SessionStatus::Busy)).await;
-    app.turn_drain_timeout_ms.store(30, Ordering::Relaxed);
-
-    let turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
+    let _turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
     wait_for_card_text(&platform, second).await;
-    let result = tokio::time::timeout(Duration::from_secs(5), turn)
-        .await
-        .expect("the turn must hand off at the drain bound")
-        .unwrap();
-    result.unwrap();
 
     let cursor = wait_for_cursor(&app, |cursor| cursor.frontier.is_some()).await;
     assert_eq!(
@@ -304,17 +290,8 @@ async fn a_grown_part_advances_the_cursor_to_its_own_extent() {
     ];
     let (_dir, app, backend, platform) =
         scripted_app(vec![SessionTranscript::new(timeline)], Some(SessionStatus::Busy)).await;
-    app.turn_drain_timeout_ms.store(30, Ordering::Relaxed);
-
-    let turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
+    let _turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
     wait_for_card_text(&platform, first).await;
-    // The turn hands off at the tiny drain bound; the follow keeps the card
-    // (and the record) live.
-    let result = tokio::time::timeout(Duration::from_secs(5), turn)
-        .await
-        .expect("the turn must hand off at the drain bound")
-        .unwrap();
-    result.unwrap();
     wait_for_cursor(&app, |cursor| {
         cursor
             .frontier
@@ -375,16 +352,9 @@ async fn a_live_turn_persists_the_record_once_per_confirmed_write_not_per_poll()
     ];
     let (_dir, app, backend, platform) =
         scripted_app(vec![SessionTranscript::new(timeline)], Some(SessionStatus::Busy)).await;
-    app.turn_drain_timeout_ms.store(30, Ordering::Relaxed);
-
-    let turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
+    let _turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
     wait_for_card_text(&platform, "第一段回答。").await;
     wait_for_card_text(&platform, "⏳ bash").await;
-    let result = tokio::time::timeout(Duration::from_secs(5), turn)
-        .await
-        .expect("the turn must hand off at the drain bound")
-        .unwrap();
-    result.unwrap();
     wait_for_cursor(&app, |cursor| cursor.frontier.is_some()).await;
     // The follow reads twice with nothing new before the baseline: any flush
     // the hand-off still owed has landed, so the window starts quiescent.
@@ -549,14 +519,15 @@ async fn a_permanently_rejected_write_advances_nothing() {
     ];
     let (_dir, app, _backend, platform) =
         scripted_app(vec![SessionTranscript::new(timeline)], Some(SessionStatus::Busy)).await;
-    app.turn_drain_timeout_ms.store(30, Ordering::Relaxed);
     // The plain attempt and its fenced retry are both refused: the card is
     // suspended and no later write will ever carry the text.
     platform
         .fail_update_card_content_count
         .store(100, Ordering::SeqCst);
 
-    let turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
+    // The merged drain keeps the turn running on its own task; the test
+    // inspects the refused write's tombstone while it runs.
+    let _turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
     // The loading card is the recorded card (`msg_reply` is the recording
     // platform's create id), and its content update gets the plain rejection
     // and the fenced retry: both refused.
@@ -572,12 +543,6 @@ async fn a_permanently_rejected_write_advances_nothing() {
         None,
         "a permanently refused write advances nothing"
     );
-
-    let result = tokio::time::timeout(Duration::from_secs(5), turn)
-        .await
-        .expect("the turn must hand off at the drain bound")
-        .unwrap();
-    result.unwrap();
 }
 
 /// Both writes confirmed, the older one's durable write attempted LAST (spec

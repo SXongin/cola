@@ -72,22 +72,16 @@ use crate::feishu::client::ImageAttachment;
 use crate::opencode;
 use crate::opencode::types::SessionStatus;
 
-/// How long one Backend read in the post-prompt drain may take before it is
-/// abandoned. The drain's own bound caps this further per call: a hung
-/// Backend must not hold the card (and the inflight guard) past the drain
-/// deadline, and `/stop` must be observable within one bounded request.
-const DRAIN_REQUEST_TIMEOUT_MS: u64 = 30_000;
-
 /// How many consecutive drain reads must see no run before an unobserved
 /// submit is treated as never having registered. A prompt admit only
 /// *schedules* execution (ADR-0056), so a single non-busy read can precede the
 /// run's registration; the value is the retired V2 poll fallback's confirmation
-/// window, kept so the unstarted case is bounded by this window instead of the
-/// whole drain budget. After it the turn finalizes from what it has — a reply
+/// window, kept so the unstarted case is bounded by this window instead of
+/// waiting forever. After it the turn finalizes from what it has — a reply
 /// arriving later is deliberately not followed (the retired fallback's accepted
 /// degradation). A failing or timing-out STATUS read takes the same window; a
-/// failing TRANSCRIPT read is the drain's own rule (first-tick failure before
-/// anything was observed ends the drain, later ones are retried).
+/// failing TRANSCRIPT read is the drain's own rule (the merged path's
+/// lost-contact grace bounds it).
 const IDLE_CONFIRMATIONS: usize = 3;
 
 /// A p2p Turn that ran at least this long notifies on completion (ADR-0043
@@ -116,6 +110,18 @@ enum DrainState {
     /// idle (ADR-0062): nobody will answer it, so the card ends Unreceived —
     /// 「⚠️ 这条消息未被接收」, never ✅.
     Unreceived,
+    /// No full read pair answered for the follow grace: the Backend is wedged
+    /// (#284/#386). The merged unbounded drain ends the card Error here rather
+    /// than observing forever.
+    LostContact,
+    /// A readable, settled card still carries a live `⏳` panel past the grace
+    /// (a crash-orphaned call, #386): the card ends Error rather than a false
+    /// ✅ over an unfinished panel.
+    StuckPanel,
+    /// The accumulator vanished from under the drain (a replacement or a
+    /// collect took the card): nothing is owned any more, so the drain ends
+    /// silently — no ending is stamped and no notice is sent.
+    Vanished,
 }
 
 /// What a non-busy status read said, as [`Turn::settle_or_yield`] reads it
@@ -130,25 +136,28 @@ enum IdleRead {
     Unreadable,
 }
 
-/// The per-call timeout for one drain request: the fixed request bound,
-/// shrunk to the remaining drain budget so a hung Backend cannot hold the
-/// drain (or `/stop`) past its deadline. Never zero — a deadline already
-/// passed still gets a token slice, enough for a healthy Backend to answer
-/// and for a hung one to fail fast.
-fn drain_request_timeout(deadline: tokio::time::Instant) -> u64 {
-    let remaining = deadline
-        .saturating_duration_since(tokio::time::Instant::now())
-        .as_millis()
-        .min(u128::from(DRAIN_REQUEST_TIMEOUT_MS)) as u64;
-    remaining.max(1)
+/// What one [`Turn::drain_state`] pass classified, plus the read-contact facts
+/// the merged unbounded loop's graces watch (#603): whether the status read
+/// answered live, answered non-live (the readable, settled read the stuck-panel
+/// grace watches), or did not answer at all.
+struct DrainRead {
+    state: DrainState,
+    /// The status read answered and was live (Busy/Retry).
+    live: bool,
+    /// The transcript and a non-live status both answered: a readable, settled
+    /// read, the one the stuck-panel grace watches.
+    settled_readable: bool,
+    /// Both the transcript and the status read answered.
+    contact: bool,
 }
 
-/// A fresh drain budget from the injected bound (`turn_drain_timeout_ms`):
-/// every drain phase — the post-prompt drain and its single re-check — gets
-/// its own, so a tiny injected bound keeps the whole lifecycle short and a
-/// hung Backend can never fall back to the fixed request timeout.
-fn drain_deadline(handles: &TurnHandles) -> tokio::time::Instant {
-    tokio::time::Instant::now() + std::time::Duration::from_millis(handles.config.drain_timeout_ms())
+/// One drain tick's outcome: the rule state plus the read-contact facts. The
+/// state is `None` when the transcript read failed (no rule could be applied).
+struct DrainTick {
+    state: Option<DrainState>,
+    live: bool,
+    settled_readable: bool,
+    contact: bool,
 }
 
 /// Everything [`Turn::run`] needs for one turn. Built by `handle_prompt` for a
@@ -689,17 +698,27 @@ impl Turn {
     /// Finalization begins with the post-prompt drain (ADR-0043): a Supplement
     /// that missed the running run starts a new Turn on the server, and the
     /// drain keeps the render poll alive (still holding the inflight guard, so
-    /// a further message is treated as a Supplement) until that Turn is
-    /// answered — then the card is marked Done and the guard released. A drain
-    /// that runs out its bound while the session is still running is NOT
-    /// completion (#284): the guard is released, but the card is handed to the
-    /// out-of-turn [`follow`], which finalizes it when the session goes idle.
+    /// a further message is treated as a Supplement) until the run reaches its
+    /// true end — then the card is marked with the decided ending and the guard
+    /// released. The drain is UNBOUNDED (#603): there is no total budget and no
+    /// hand-off; the only ceilings are the lost-contact and stuck-panel graces,
+    /// which end a run nobody can act on.
     async fn finish(&mut self, handles: &TurnHandles, prompt_resp: &crate::error::Result<()>) {
         // Post-prompt drain + the pre-finalization re-check: a Supplement
         // racing the drain's exit is drained here rather than dropped, and one
         // that lands after the release becomes a normal new Turn on the
         // handler's not-busy path.
         let drain_outcome = self.drain_after_prompt(handles).await;
+
+        // The accumulator vanished under the drain (a replacement or a collect
+        // took the card): the Turn owns nothing any more, so it ends silently —
+        // no ending is stamped and no notice is sent, exactly as the out-of-turn
+        // follow does when its render finds no accumulator (review, PR #595).
+        if drain_outcome == Some(DrainState::Vanished) {
+            tracing::info!("turn drain: card vanished on session {}", self.session_id);
+            self.release(handles).await;
+            return;
+        }
 
         // The turn's outcome is OBSERVED, not returned (ADR-0056): a rejected
         // submit is the call's Err, and a submitted run's failure is recorded
@@ -709,16 +728,22 @@ impl Turn {
         //
         // A read that fails or has no anchor is NOT completion: the failure the
         // drain last observed stands in, so a hiccup cannot stamp Done over a
-        // failed turn.
-        let final_transcript = handles.backend.transcript(&self.session_id).await.ok();
+        // failed turn. Bounded by the same per-read timeout as every drain read
+        // (#603): a hung Backend must not freeze finalization after the drain
+        // already ended (a lost-contact run reaches here).
+        let final_transcript = crate::bridge::bounded_call(
+            "turn final transcript",
+            self.drain_read_timeout_ms(handles),
+            handles.backend.transcript(&self.session_id),
+        )
+        .await
+        .and_then(std::result::Result::ok);
 
         // A deliberate `/stop` owns this turn's ending (#394): the abort the
         // server recorded is NOT a failure, its text must never reach the
-        // card, and the card finalizes `Stopped` — here, or by the follow's own
-        // stop branch if the drain had already handed the card off. The marker
-        // is sticky until the next Turn's `start` clears it. Read it AFTER the
-        // transcript read: that read is an await, so a stop landing during it
-        // must still win.
+        // card, and the card finalizes `Stopped`. The marker is sticky until
+        // the next Turn's `start` clears it. Read it AFTER the transcript read:
+        // that read is an await, so a stop landing during it must still win.
         let mut stopped = handles.waits.is_stopped(&self.session_id).await;
         let prompt_err = match prompt_resp {
             Err(e) => Some(e.to_string()),
@@ -766,21 +791,25 @@ impl Turn {
                 .or_else(|| captured_anchor.clone());
             transcript.settle(anchor.as_ref())
         });
-        // Read before the match consumes the decision (a `Failed` carries its
-        // message): an undecided read keeps the follow observing.
-        let final_running = final_settle == Some(TurnSettle::Running);
-        // The ending the settle decision gives the Turn, through the one
-        // disposition table: a decided read is its disposition; an undecided
-        // one (a Wake's Execution has not reached its boundary yet, or the read
-        // failed) keeps the drain's own last word — Waiting or Unreceived when
-        // that found one, else no ending yet (Observe).
-        let ending = match final_settle {
-            Some(TurnSettle::Running) | None => match drain_outcome {
-                Some(DrainState::Waiting) => Disposition::Waiting,
-                Some(DrainState::Unreceived) => Disposition::Unreceived,
-                _ => Disposition::Observe,
+        // The ending the drain already decided outranks a later re-decision:
+        // its two graces (#603) are loop-only endings the settle table cannot
+        // produce, so they pass straight through. Every other case reads the
+        // settle decision through the one disposition table: a decided read is
+        // its disposition; an undecided one (a Wake's Execution has not reached
+        // its boundary yet, or the read failed) keeps the drain's own last word
+        // — Waiting or Unreceived when that found one, else no ending yet
+        // (Observe).
+        let ending = match drain_outcome {
+            Some(DrainState::LostContact) => Disposition::LostContact,
+            Some(DrainState::StuckPanel) => Disposition::StuckPanel,
+            _ => match final_settle {
+                Some(TurnSettle::Running) | None => match drain_outcome {
+                    Some(DrainState::Waiting) => Disposition::Waiting,
+                    Some(DrainState::Unreceived) => Disposition::Unreceived,
+                    _ => Disposition::Observe,
+                },
+                Some(settle) => Disposition::from(settle),
             },
-            Some(settle) => Disposition::from(settle),
         };
         // The ending this finalization applies, in its precedence: a
         // deliberate `/stop` dominates every other signal (#394) — applied
@@ -794,37 +823,18 @@ impl Turn {
             None => match ending {
                 Disposition::Waiting => Disposition::Waiting,
                 Disposition::Unreceived => Disposition::Unreceived,
-                // No ending yet (the undecided, unfollowed read), the true
-                // end, and a decided `Failed` whose message did not surface
-                // through `prompt_err` (the same projection: the final read
-                // lost the anchor) all finalize Done, exactly as the replaced
-                // else branch did.
+                // The merged loop's own graces: a wedged Backend and an
+                // unreconcilable panel end the card Error, never a false ✅.
+                Disposition::LostContact => Disposition::LostContact,
+                Disposition::StuckPanel => Disposition::StuckPanel,
+                // No ending yet (the undecided read), the true end, a decided
+                // `Failed` whose message did not surface through `prompt_err`
+                // (the same projection: the final read lost the anchor), and
+                // the loop-only `Stopped` (set below from the sticky marker)
+                // all finalize Done here.
                 Disposition::Observe | Disposition::Done | Disposition::Failed(_) => Disposition::Done,
-                // The loop-only endings are never settle outcomes. Naming them
-                // keeps this mapping exhaustive, so a new disposition is a
-                // compile error here, not a silent Done.
-                Disposition::Stopped | Disposition::LostContact | Disposition::StuckPanel => {
-                    Disposition::Done
-                }
+                Disposition::Stopped => Disposition::Done,
             },
-        };
-
-        // The card is followed instead of finalized when the drain bound was
-        // reached with the session still running (#284) or the final read
-        // itself is undecided (a Wake's Execution has not reached its
-        // boundary): the follow keeps the SAME accumulator and card chain and
-        // settles it when the session reports non-busy. The armed anchor is
-        // the follow's identity; with none — the submitted message never
-        // landed (ADR-0062) — the card goes to the unreceived watch instead,
-        // which owns it by chain identity and captures the anchor the moment
-        // the message appears. A stopped turn never hands off: the stop is its
-        // ending, so it finalizes right here (#394).
-        let follow =
-            !stopped && prompt_err.is_none() && (drain_outcome == Some(DrainState::Running) || final_running);
-        let follow_anchor = if follow {
-            Turn::armed_turn_anchor(&handles.cards, &self.session_id).await
-        } else {
-            None
         };
 
         // #187: a turn that ended without completing (abort, interrupt, prompt
@@ -848,114 +858,104 @@ impl Turn {
         }
 
         // The Turn Footer's variant is a fact of THIS turn (captured at send
-        // time, ADR-0019), and `self` is gone once the follow owns the card —
-        // apply it before either end. The model/token halves are captured from
-        // the transcript's messages themselves, so the follow's renders keep
-        // them current.
+        // time, ADR-0019). The model/token halves are captured from the
+        // transcript's messages themselves.
         if let Some(card) = handles.cards.cards.lock().await.get_mut(&self.session_id) {
             card.acc.variant = self.turn_variant.clone();
         }
 
-        // A followed card is NOT finalized here: the follow owns it now. Its
-        // render ticks keep the footer's context window current, and its own
-        // finalization refreshes the work context and flushes. Everything
-        // below the guard is the normal end of a turn.
-        if !follow {
-            // Reconcile: render any parts the incremental poll missed from the
-            // settled transcript read above, then apply this Turn's ending.
-            //
-            // A stop landing after the read above (during the leftover
-            // rejection, or any scheduler hop since) must still win: re-read
-            // the marker immediately before the stamp. The residual window is
-            // the cards-lock acquisition below; a stop landing after it is
-            // indistinguishable from one landing just after a completed turn,
-            // and the next Turn owns it.
-            stopped = stopped || handles.waits.is_stopped(&self.session_id).await;
-            if stopped {
-                // The stop is this Turn's ending, whatever the settle decision
-                // said (#394): it discards a recorded failure and the card
-                // takes its own terminal.
-                disposition = Disposition::Stopped;
+        // Reconcile: render any parts the incremental poll missed from the
+        // settled transcript read above, then apply this Turn's ending.
+        //
+        // A stop landing after the read above (during the leftover rejection,
+        // or any scheduler hop since) must still win: re-read the marker
+        // immediately before the stamp. The residual window is the cards-lock
+        // acquisition below; a stop landing after it is indistinguishable from
+        // one landing just after a completed turn, and the next Turn owns it.
+        stopped = stopped || handles.waits.is_stopped(&self.session_id).await;
+        if stopped {
+            // The stop is this Turn's ending, whatever the settle decision
+            // said (#394): it discards a recorded failure and the card takes
+            // its own terminal.
+            disposition = Disposition::Stopped;
+        }
+        // The completion entries this final read owes (spec #588, #593): plan
+        // them under a brief read of the card, spend each entry's one output
+        // read OUTSIDE the cards lock (the reads are network), and commit the
+        // surviving plan with the final render below — the same plan/read/commit
+        // seam the live path uses, so a shell completion first seen here carries
+        // its tail (or 「输出已不可用」) instead of a bare entry. The plan is
+        // pure and the commit's announce gate keeps the entry exactly once.
+        let mut plans = Vec::new();
+        if let Some(transcript) = &final_transcript {
+            let mut cards = handles.cards.cards.lock().await;
+            if let Some(card) = cards.get_mut(&self.session_id) {
+                plans = render::plan_finalization_entries(&mut card.acc, transcript);
             }
-            // The completion entries this final read owes (spec #588, #593):
-            // plan them under a brief read of the card, spend each entry's one
-            // output read OUTSIDE the cards lock (the reads are network), and
-            // commit the surviving plan with the final render below — the same
-            // plan/read/commit seam the live path uses, so a shell completion
-            // first seen here carries its tail (or 「输出已不可用」) instead of
-            // a bare entry. The plan is pure and the commit's announce gate
-            // keeps the entry exactly once.
-            let mut plans = Vec::new();
-            if let Some(transcript) = &final_transcript {
-                let mut cards = handles.cards.cards.lock().await;
-                if let Some(card) = cards.get_mut(&self.session_id) {
-                    plans = render::plan_finalization_entries(&mut card.acc, transcript);
+        }
+        render::read_planned_outputs(&handles.backend, &mut plans).await;
+        {
+            let mut cards = handles.cards.cards.lock().await;
+            if let Some(acc) = cards.get_mut(&self.session_id).map(|c| &mut c.acc) {
+                if let Some(transcript) = &final_transcript {
+                    render::render_new_turn_parts_committing(acc, transcript, plans);
                 }
-            }
-            render::read_planned_outputs(&handles.backend, &mut plans).await;
-            {
-                let mut cards = handles.cards.cards.lock().await;
-                if let Some(acc) = cards.get_mut(&self.session_id).map(|c| &mut c.acc) {
-                    if let Some(transcript) = &final_transcript {
-                        render::render_new_turn_parts_committing(acc, transcript, plans);
-                    }
-                    // Capture the answering model + token usage from the LATEST
-                    // assistant message unconditionally — the render dedup may have
-                    // captured them before the message carried its final tokens.
-                    // Usage only when nonzero: an in-flight step's message carries
-                    // zeros and must not wipe the last completed step's figure.
-                    if let Some(transcript) = &final_transcript {
-                        let latest_assistant = transcript
-                            .messages
-                            .iter()
-                            .rfind(|message| message.role == MessageRole::Assistant);
-                        if let Some(message) = latest_assistant {
-                            render::capture_footer_model(acc, message);
-                            if let Some(tokens) = &message.tokens {
-                                let used = tokens.context_used();
-                                if used > 0 {
-                                    acc.context_tokens = used;
-                                }
+                // Capture the answering model + token usage from the LATEST
+                // assistant message unconditionally — the render dedup may have
+                // captured them before the message carried its final tokens.
+                // Usage only when nonzero: an in-flight step's message carries
+                // zeros and must not wipe the last completed step's figure.
+                if let Some(transcript) = &final_transcript {
+                    let latest_assistant = transcript
+                        .messages
+                        .iter()
+                        .rfind(|message| message.role == MessageRole::Assistant);
+                    if let Some(message) = latest_assistant {
+                        render::capture_footer_model(acc, message);
+                        if let Some(tokens) = &message.tokens {
+                            let used = tokens.context_used();
+                            if used > 0 {
+                                acc.context_tokens = used;
                             }
                         }
                     }
-                    // The one ending application every path shares (spec #538):
-                    // the card's state, failure line and phase timer all come
-                    // from the disposition decided above — a stop discards a
-                    // recorded failure, a failure records its own line, and the
-                    // yield / true end leave it as it was.
-                    acc.apply_ending(&disposition);
-                    tracing::info!(
-                        "final render: fetched_messages={} text={} reasoning={} tools={} rendered_parts={} error={}",
-                        final_transcript
-                            .as_ref()
-                            .map(|transcript| transcript.messages.len())
-                            .unwrap_or(0),
-                        acc.text.len(),
-                        acc.reasoning.len(),
-                        acc.tools.len(),
-                        acc.rendered_parts.len(),
-                        acc.error.as_deref().unwrap_or("none"),
-                    );
                 }
+                // The one ending application every path shares (spec #538):
+                // the card's state, failure line and phase timer all come from
+                // the disposition decided above — a stop discards a recorded
+                // failure, a failure records its own line, and the yield / true
+                // end leave it as it was.
+                acc.apply_ending(&disposition);
+                tracing::info!(
+                    "final render: fetched_messages={} text={} reasoning={} tools={} rendered_parts={} error={}",
+                    final_transcript
+                        .as_ref()
+                        .map(|transcript| transcript.messages.len())
+                        .unwrap_or(0),
+                    acc.text.len(),
+                    acc.reasoning.len(),
+                    acc.tools.len(),
+                    acc.rendered_parts.len(),
+                    acc.error.as_deref().unwrap_or("none"),
+                );
             }
-            // Refresh the Turn Footer's work context at turn end (ADR-0019): the AI
-            // may have created or switched branches, or committed, so re-read the
-            // git state before the final flush — the footer shows where the turn
-            // landed, not just where it started.
-            crate::bridge::turn::state::refresh_work_context(&handles.cards, &self.session_id).await;
-            // Refresh the Turn Footer's context window (ADR-0044) before the final
-            // flush: the render-poll refresh usually covered it, but the reconcile
-            // above may have just captured a final usage the polls never saw. Runs
-            // on a failed prompt too — the card already carries that usage.
-            crate::bridge::turn::state::refresh_context_window(
-                &handles.cards,
-                &handles.backend,
-                &self.session_id,
-            )
-            .await;
-            Self::flush_card(&handles.cards, &self.session_id).await;
         }
+        // Refresh the Turn Footer's work context at turn end (ADR-0019): the AI
+        // may have created or switched branches, or committed, so re-read the
+        // git state before the final flush — the footer shows where the turn
+        // landed, not just where it started.
+        crate::bridge::turn::state::refresh_work_context(&handles.cards, &self.session_id).await;
+        // Refresh the Turn Footer's context window (ADR-0044) before the final
+        // flush: the render-poll refresh usually covered it, but the reconcile
+        // above may have just captured a final usage the polls never saw. Runs
+        // on a failed prompt too — the card already carries that usage.
+        crate::bridge::turn::state::refresh_context_window(
+            &handles.cards,
+            &handles.backend,
+            &self.session_id,
+        )
+        .await;
+        Self::flush_card(&handles.cards, &self.session_id).await;
 
         // Topic cover card (ADR-0023): once the server holds a real title for
         // the session — auto-generated after the first exchange, or set by
@@ -991,52 +991,25 @@ impl Turn {
         // Completion notice (ADR-0043 amendment 2026-09-21): the streaming
         // card is patched in place, which pushes no notification and does not
         // bump the conversation — so reply to the requester's message to
-        // notify them. A followed turn notifies when the FOLLOW finalizes (its
-        // real end), not at the drain bound; the disposition's own
-        // classification declines a Waiting yield, so it never notifies — the
-        // notice belongs to the true end (ADR-0059).
-        if !follow {
-            announce_completion(
-                &handles.cards,
-                &handles.platform,
-                &handles.config.notice_rules(),
-                &self.session_id,
-                self.started_at,
-                &disposition,
-            )
-            .await;
-        }
+        // notify them. The disposition's own classification declines a Waiting
+        // yield and an Unreceived ending, so neither notifies — the notice
+        // belongs to the true end (ADR-0059). `announce_completion` gates the
+        // notice on the terminal write's own acceptance (#607).
+        announce_completion(
+            &handles.cards,
+            &handles.platform,
+            &handles.config.notice_rules(),
+            &self.session_id,
+            self.started_at,
+            &disposition,
+        )
+        .await;
 
-        // The guard is released here for every end except a follow hand-off:
-        // the follow (the unreceived watch included) inherits it (ADR-0059,
-        // ADR-0062) and hands it back when its own loop ends, so the follow
-        // window has no guard-free gap and `busy()` (the server-yield read)
-        // never sees a followed Session as idle.
-        if !follow {
-            self.release(handles).await;
-        }
-        if follow {
-            tracing::info!(
-                "turn drain: session {} not finalized; handing off to the follow",
-                self.session_id
-            );
-            // No release happened above: the follow inherits the guard this
-            // Turn is still holding (ADR-0059) and hands it back when its loop
-            // ends. `anchor` is None when the submitted message never landed:
-            // the follow then watches the card chain until it does — or ends
-            // it Unreceived (ADR-0062).
-            follow::spawn(
-                handles,
-                follow::FollowFacts {
-                    session_id: self.session_id.clone(),
-                    thread_key: self.thread_key.clone(),
-                    directory: self.directory.clone(),
-                    started_at: self.started_at,
-                    anchor: follow_anchor,
-                },
-            )
-            .await;
-        }
+        // The guard is released at the true end. The drain ran to its end on
+        // this very task, so there is no ownership hand-off and no guard-free
+        // gap by construction: `busy()` (the server-yield read) never sees a
+        // mid-request Session as idle.
+        self.release(handles).await;
         // Permissions are handled by the independent poller spawned in App::run,
         // so a run waiting on a permission still gets its card shown.
     }
@@ -1053,91 +1026,161 @@ impl Turn {
     /// live (continuation) card instead of nowhere.
     ///
     /// The drain's exit is not the last word: finalization re-checks once more
-    /// BEFORE the card is marked Done and the guard released, no matter how
-    /// the drain ended (settled, the bound, or a failed read). The re-check
-    /// gets its own fresh budget from the same injected bound, so it can never
-    /// hold the card (or delay `/stop`) past a tiny injected drain timeout. A
-    /// Supplement the re-check finds is drained again — one bounded drain, so
-    /// a session that merely stays busy cannot extend finalization. A
-    /// Supplement that lands after the release is seen by the handler's
-    /// not-busy path and becomes a normal new Turn.
+    /// BEFORE the card is marked with its ending and the guard released, so a
+    /// Supplement racing a settled drain's exit is drained rather than dropped.
+    /// A Supplement the re-check finds is drained again; a Supplement that
+    /// lands after the release is seen by the handler's not-busy path and
+    /// becomes a normal new Turn.
     ///
-    /// Returns the state the last drain observed at its bound when that was
-    /// still pending (`Some(Running)` / `Some(Supplement)`), `Some(Waiting)`
-    /// when the settle decision ended it with live Background Tasks,
-    /// `Some(Unreceived)` when the decision found the submitted message never
-    /// landed at an idle session, `None` when the drain settled or never saw
-    /// anything pending. `finish` turns bound-with-`Running` into the
-    /// out-of-turn follow (#284) instead of finalizing a card under a live
-    /// session, and `Some(Waiting)` / `Some(Unreceived)` into the card's own
-    /// ending (ADR-0059, ADR-0062).
+    /// Returns `Some(Waiting)` when the settle decision ended the drain with
+    /// live Background Tasks, `Some(Unreceived)` when it found the submitted
+    /// message never landed at an idle session (ADR-0059, ADR-0062), and
+    /// `Some(LostContact)` / `Some(StuckPanel)` when the merged loop's graces
+    /// ended a run nobody can act on (#603). `None` when the drain settled or
+    /// stopped. `finish` maps each into the card's own ending.
     async fn drain_after_prompt(&mut self, handles: &TurnHandles) -> Option<DrainState> {
-        let last = self.drain(handles).await;
-        // A waiting yield or an Unreceived ending is the decision: no
-        // racing-Supplement re-check may reopen the drain (its render would add
-        // content to a card that is about to stop updating, and the ending was
-        // already decided).
-        if matches!(last, Some(DrainState::Waiting | DrainState::Unreceived)) {
-            return last;
+        loop {
+            let last = self.drain(handles).await;
+            // A decided ending — the waiting yield, the Unreceived ending and
+            // the two graces — is final: no re-check may reopen the drain (its
+            // render would add content to a card that is about to stop
+            // updating, and the ending was already decided).
+            if matches!(
+                last,
+                Some(
+                    DrainState::Waiting
+                        | DrainState::Unreceived
+                        | DrainState::LostContact
+                        | DrainState::StuckPanel
+                        | DrainState::Vanished
+                )
+            ) {
+                return last;
+            }
+            // The drain settled: one more tick must confirm it. A Supplement
+            // racing the exit is drained; an undecided (Running) read — a
+            // Wake's Execution not yet bounded, or a session that reads live —
+            // reopens the drain, so the ending is never decided from a read a
+            // later read contradicts (the same-snapshot rule's spirit). A
+            // failed re-check read leaves the settled decision standing.
+            match self
+                .drain_tick(handles, self.drain_read_timeout_ms(handles))
+                .await
+                .state
+            {
+                Some(DrainState::Settled) | None => return last,
+                Some(DrainState::Supplement) => {
+                    tracing::info!(
+                        "turn drain: supplement racing the finish on session {}; draining",
+                        self.session_id
+                    );
+                }
+                Some(_) => {}
+            }
         }
-        if self
-            .drain_tick(handles, drain_request_timeout(drain_deadline(handles)))
-            .await
-            == Some(DrainState::Supplement)
-        {
-            tracing::info!(
-                "turn drain: supplement racing the finish on session {}; draining",
-                self.session_id
-            );
-            return self.drain(handles).await;
-        }
-        last
     }
 
-    /// Poll the Backend, render it into the live card, and stop when nothing
-    /// is pending or the bound is reached. A failed Backend read while a run
-    /// was already observed pending is retried (the render poll's own policy):
-    /// dropping the drain on one transient error would lose the reply this
-    /// phase exists to render. Each request is bounded by the remaining drain
-    /// budget, so a hung Backend cannot hold the drain past the bound.
+    /// The per-read bound the merged unbounded drain uses for every Backend
+    /// read (the follow's one fixed read timeout, #386/#603): a hung Backend
+    /// fails fast per call instead of freezing a tick.
+    fn drain_read_timeout_ms(&self, handles: &TurnHandles) -> u64 {
+        handles.config.follow_read_timeout_ms()
+    }
+
+    /// Poll the Backend and render it into the live card until the run reaches
+    /// its true end. UNBOUNDED (#603): there is no total budget — a readable
+    /// run may take as long as it takes. The only ceilings are the two graces
+    /// for states nobody can act on: **lost contact** (no tick in the grace
+    /// produced a full read pair) and **stuck panel** (a readable, settled card
+    /// still carries a live `⏳`). A failed transcript read while a run was
+    /// already observed pending is retried; every read is bounded by the one
+    /// per-read timeout so a hung Backend fails fast.
     ///
-    /// `Some(state)` means the bound was reached with `state` the last thing
-    /// observed — the caller must not read it as completion (#284) — except
-    /// for [`DrainState::Waiting`] and [`DrainState::Unreceived`], the settle
-    /// decision's endings, which end the drain immediately; `None` means the
-    /// drain settled, stopped, or never observed anything pending.
+    /// `Some(Waiting)`/`Some(Unreceived)` are the settle decision's endings;
+    /// `Some(LostContact)`/`Some(StuckPanel)` are the two graces; `None` means
+    /// the drain settled or stopped.
     async fn drain(&mut self, handles: &TurnHandles) -> Option<DrainState> {
         let poll_ms = handles.config.render_poll_ms();
-        let deadline = drain_deadline(handles);
-        let mut last: Option<DrainState> = None;
+        let read_timeout_ms = self.drain_read_timeout_ms(handles);
+        let grace = std::time::Duration::from_millis(handles.config.follow_grace_ms());
+        let hint_at = self.started_at + grace;
+        let mut last_contact = tokio::time::Instant::now();
+        let mut stuck_since: Option<tokio::time::Instant> = None;
         loop {
             // The first check runs before any sleep: a Supplement that missed
             // the run is already on the Backend when the submit returns.
-            match self.drain_tick(handles, drain_request_timeout(deadline)).await {
-                Some(DrainState::Settled) => return None,
-                // The Turn yields waiting (ADR-0059) or ends Unreceived
-                // (ADR-0062): the ending is decided, so there is nothing left
-                // to observe — the card stops updating (the next Wake
-                // continues a waiting chain on a new card).
-                Some(state @ (DrainState::Waiting | DrainState::Unreceived)) => return Some(state),
-                Some(state) => last = Some(state),
-                None if last.is_none() => return None,
-                None => {}
+            let tick = self.drain_tick(handles, read_timeout_ms).await;
+            // The waiting hint (ADR-0062), folded in from the unreceived watch
+            // (#603): while the run reads live but the submitted message has
+            // not landed, the card gains the neutral line once the grace has
+            // passed since the turn started — a genuine long tool call and a
+            // dead run look identical from outside, so cola does not nag early.
+            // Pushed once, then flushed.
+            if tick.live
+                && self.card_turn_anchor(handles).await.is_none()
+                && std::time::Instant::now() >= hint_at
+                && Turn::show_receive_hint(&handles.cards, &self.session_id).await
+            {
+                Turn::flush_card(&handles.cards, &self.session_id).await;
             }
-            if tokio::time::Instant::now() >= deadline {
-                tracing::info!("turn drain: bound reached on session {}", self.session_id);
-                return last;
+            // The stuck-panel grace (#386): a readable, settled card still
+            // carrying a live `⏳` panel must not be stamped Done over it — give
+            // the panel the grace to settle, then end Error.
+            if tick.settled_readable && Turn::has_live_tools(&handles.cards, &self.session_id).await {
+                let since = *stuck_since.get_or_insert_with(tokio::time::Instant::now);
+                if since.elapsed() >= grace {
+                    tracing::info!("turn drain: unreconcilable panel on session {}", self.session_id);
+                    return Some(DrainState::StuckPanel);
+                }
+            } else {
+                stuck_since = None;
+                match tick.state {
+                    Some(DrainState::Settled) => return None,
+                    // The card vanished (a replacement or a collect): the Turn
+                    // owns nothing any more, so stop silently.
+                    Some(DrainState::Vanished) => return Some(DrainState::Vanished),
+                    // The Turn yields waiting (ADR-0059) or ends Unreceived
+                    // (ADR-0062): the ending is decided, so there is nothing
+                    // left to observe.
+                    Some(state @ (DrainState::Waiting | DrainState::Unreceived)) => return Some(state),
+                    _ => {}
+                }
+            }
+            // The lost-contact ceiling (#386): a tick that did not answer both
+            // reads is no contact. A Settled/ending decision above still wins
+            // (the drain reads an unreadable status as idle for a landed run,
+            // so a hung status cannot hold forever); when nothing is decidable
+            // this grace ends the card.
+            if tick.contact {
+                last_contact = tokio::time::Instant::now();
+            } else if last_contact.elapsed() >= grace {
+                tracing::info!("turn drain: lost contact on session {}", self.session_id);
+                return Some(DrainState::LostContact);
             }
             tokio::time::sleep(std::time::Duration::from_millis(poll_ms)).await;
         }
     }
 
+    /// The live card's armed Turn anchor, if any — the merged drain's "the
+    /// submitted message has landed" fact (the hint is owed only while it has
+    /// not).
+    async fn card_turn_anchor(&self, handles: &TurnHandles) -> Option<TurnAnchor> {
+        Turn::armed_turn_anchor(&handles.cards, &self.session_id).await
+    }
+
     /// One drain tick: read the Backend, decide whether rendering must go on,
-    /// and — when it must — render the very snapshot the decision was made
-    /// from, so the live card follows the new Turn. `None` means the Backend
-    /// read failed (unknown state).
-    async fn drain_tick(&mut self, handles: &TurnHandles, timeout_ms: u64) -> Option<DrainState> {
-        let mut transcript = self.drain_transcript(handles, timeout_ms).await?;
+    /// and render the very snapshot the decision was made from, so the live
+    /// card follows the new Turn. The returned [`DrainTick`] carries `None` for
+    /// its state when the transcript read failed (unknown state).
+    async fn drain_tick(&mut self, handles: &TurnHandles, timeout_ms: u64) -> DrainTick {
+        let Some(mut transcript) = self.drain_transcript(handles, timeout_ms).await else {
+            return DrainTick {
+                state: None,
+                live: false,
+                settled_readable: false,
+                contact: false,
+            };
+        };
         // The shared Background Task runtime reconciliation (#589), on this
         // tick's own read and BEFORE the settle decision below: a task the
         // runtime confirms ended leaves the live list here, so the decision
@@ -1164,16 +1207,27 @@ impl Turn {
         } else {
             None
         };
-        let state = self.drain_state(handles, &transcript, timeout_ms).await;
+        let read = self.drain_state(handles, &transcript, timeout_ms).await;
         // A settled drain normally leaves the render to finalization (which
-        // re-reads the transcript and flushes the ending); when THIS read
-        // retired a task, the entry renders here first — the overlay means no
+        // re-reads the transcript and flushes the ending). It must still render
+        // HERE when the card carries a live `⏳` panel — that render is what
+        // updates the panel's status, so skipping it would freeze a panel that
+        // had already settled (the stuck-panel grace would then fire on a
+        // finished run) — or when THIS read retired a task (the overlay means no
         // later read carries the retirement, so skipping the render would drop
-        // it (the settle would still be ✅, just without the record).
-        if state == DrainState::Settled && !pass.as_ref().is_some_and(|pass| pass.changed()) {
-            return Some(DrainState::Settled);
+        // it).
+        if read.state == DrainState::Settled
+            && !pass.as_ref().is_some_and(|pass| pass.changed())
+            && !Turn::has_live_tools(&handles.cards, &self.session_id).await
+        {
+            return DrainTick {
+                state: Some(read.state),
+                live: read.live,
+                settled_readable: read.settled_readable,
+                contact: read.contact,
+            };
         }
-        let rendered = render::render_and_flush(
+        let Some(rendered) = render::render_and_flush(
             &handles.cards,
             &handles.sessions,
             &handles.backend,
@@ -1181,20 +1235,36 @@ impl Turn {
             &self.session_id,
             &transcript,
         )
-        .await;
+        .await
+        else {
+            // The accumulator vanished under the tick (a replacement or a
+            // collect took the card): nothing is owned any more, so the drain
+            // ends silently rather than recording a task the card cannot carry
+            // (review, PR #595).
+            return DrainTick {
+                state: Some(DrainState::Vanished),
+                live: read.live,
+                settled_readable: false,
+                contact: read.contact,
+            };
+        };
         // The record-after-flush invariant (review, PR #595): the pass commits
         // only once the render that carried its entries returned an accumulator
         // it wrote to AND the flush that carried them was accepted — delivered
-        // now, or owed by the delivery layer's retry (ADR-0067). A vanished
-        // accumulator (`None`) and a permanently refused write both record
-        // nothing: the task stays live and the next live card renders its
-        // entry.
-        if rendered.as_ref().is_some_and(|pass| pass.flush.accepted())
+        // now, or owed by the delivery layer's retry (ADR-0067). A permanently
+        // refused write records nothing: the task stays live and the next live
+        // card renders its entry.
+        if rendered.flush.accepted()
             && let Some(pass) = pass
         {
             pass.commit(&handles.backend, &self.session_id, &transcript);
         }
-        Some(state)
+        DrainTick {
+            state: Some(read.state),
+            live: read.live,
+            settled_readable: read.settled_readable,
+            contact: read.contact,
+        }
     }
 
     /// Whether this drain tick may spend the runtime reconciliation: the card
@@ -1228,7 +1298,7 @@ impl Turn {
         handles: &TurnHandles,
         transcript: &SessionTranscript,
         timeout_ms: u64,
-    ) -> DrainState {
+    ) -> DrainRead {
         // `/stop` interrupted this session's run: no answer is coming, so the
         // drain must end promptly instead of waiting out its bound on a
         // Supplement the abort left unanswered (no rendering may continue once
@@ -1240,7 +1310,12 @@ impl Turn {
                 self.stop_finalization_logged = true;
                 tracing::info!("turn drain: session {} was stopped; finalizing", self.session_id);
             }
-            return DrainState::Settled;
+            return DrainRead {
+                state: DrainState::Settled,
+                live: false,
+                settled_readable: false,
+                contact: true,
+            };
         }
         // Capture the turn's anchor from this snapshot if the incremental poll
         // never saw it — the supplement comparison is meaningless without it,
@@ -1278,7 +1353,12 @@ impl Turn {
                         .unwrap_or(false)
             });
             if !answered {
-                return DrainState::Supplement;
+                return DrainRead {
+                    state: DrainState::Supplement,
+                    live: false,
+                    settled_readable: false,
+                    contact: true,
+                };
             }
         }
         // The submit only SCHEDULED the run (ADR-0056): before any sign of it
@@ -1329,7 +1409,12 @@ impl Turn {
             // schedules the next attempt, so the run is still cola's to watch.
             Some(Ok(Some(status))) if status.is_live() => {
                 self.drain_started = true;
-                DrainState::Running
+                DrainRead {
+                    state: DrainState::Running,
+                    live: true,
+                    settled_readable: false,
+                    contact: true,
+                }
             }
             // A non-busy status: the settle decision owns the ending (ADR-0059,
             // ADR-0062) once the run was observed; before that the
@@ -1337,13 +1422,28 @@ impl Turn {
             // failed and timed-out paths pass [`IdleRead::Unreadable`]: no
             // evidence the session is not live, so it can never decide the
             // Unreceived ending — see `settle_or_yield`.
-            Some(Ok(_)) => self.settle_or_yield(transcript, anchor.as_ref(), observed, IdleRead::Idle),
+            Some(Ok(_)) => DrainRead {
+                state: self.settle_or_yield(transcript, anchor.as_ref(), observed, IdleRead::Idle),
+                live: false,
+                settled_readable: true,
+                contact: true,
+            },
             Some(Err(e)) => {
                 tracing::warn!("turn drain session status: {}", e);
-                self.settle_or_yield(transcript, anchor.as_ref(), observed, IdleRead::Unreadable)
+                DrainRead {
+                    state: self.settle_or_yield(transcript, anchor.as_ref(), observed, IdleRead::Unreadable),
+                    live: false,
+                    settled_readable: false,
+                    contact: false,
+                }
             }
             // The bounded status call timed out: same rule as a failed read.
-            None => self.settle_or_yield(transcript, anchor.as_ref(), observed, IdleRead::Unreadable),
+            None => DrainRead {
+                state: self.settle_or_yield(transcript, anchor.as_ref(), observed, IdleRead::Unreadable),
+                live: false,
+                settled_readable: false,
+                contact: false,
+            },
         }
     }
 
@@ -1419,9 +1519,10 @@ impl Turn {
         transcript.turn_for_user(&anchor).error
     }
 
-    /// The drain's Backend read, bounded by the caller's per-call timeout so a
-    /// hung Backend cannot hold the card (and the inflight guard) past the
-    /// drain bound.
+    /// The drain's Backend read, bounded by the unified per-read timeout
+    /// (`follow_read_timeout_ms`) so a hung Backend fails fast instead of
+    /// freezing the tick; the lost-contact grace is the ceiling when reads
+    /// never answer.
     async fn drain_transcript(&self, handles: &TurnHandles, timeout_ms: u64) -> Option<SessionTranscript> {
         match crate::bridge::bounded_call(
             "turn drain transcript",
@@ -3092,10 +3193,10 @@ impl Turn {
     /// route under — or `None` when the card is no longer in that ending (a new
     /// Turn may have replaced it since the claim). The new live state is
     /// flushed now, so the operator's click is visible before the follow's
-    /// first sleep, then the out-of-turn [`follow`] is spawned: it inherits the
-    /// Session's guard — this path held none — exactly like the drain hand-off
-    /// (ADR-0059), and its window owns Busy→non-busy finalization, `/stop`, the
-    /// graces and the silent exit when a new Turn replaces the accumulator.
+    /// first sleep, then the out-of-turn [`follow`] is spawned: it takes the
+    /// Session's guard — this path held none (ADR-0059) — and its window owns
+    /// Busy→non-busy finalization, `/stop`, the graces and the silent exit when
+    /// a new Turn replaces the accumulator.
     ///
     /// `directory` routes the follow's status reads (the caller's
     /// session-mapped one first, the accumulator's work context as the
@@ -4408,13 +4509,13 @@ pub(crate) async fn announce_completion(
 /// around.
 ///
 /// A free function because every end of a turn calls it: `finish` for a turn
-/// that ended normally, the out-of-turn drain follow (#284) when the turn it
-/// inherited actually ends, and Session Sync when a yielded card's quiet true
-/// end settles in place (ADR-0060). A drain hand-off keeps the ORIGINAL turn's
-/// start, so the long-task threshold measures the whole run; a retry re-attach
-/// (#393) arms the follow with "now" instead, because the original turn's
-/// start is no longer known there; the quiet true end reads the start the card
-/// recorded at turn start. The copy follows the ending's [`Disposition`]
+/// that ended normally, the out-of-turn follow (#284) when a card it inherited
+/// actually ends, and Session Sync when a yielded card's quiet true end settles
+/// in place (ADR-0060). `finish` keeps the ORIGINAL turn's start, so the
+/// long-task threshold measures the whole run; a retry re-attach (#393) arms
+/// the follow with "now" instead, because the original turn's start is no
+/// longer known there; the quiet true end reads the start the card recorded at
+/// turn start. The copy follows the ending's [`Disposition`]
 /// (#394): ✅ for the true end, ⏹ for a deliberate `/stop`, ❌ for a failure —
 /// and the disposition's classification is the refusal, so a Waiting yield
 /// (whose true end is not reached, ADR-0059) and an Unreceived ending
