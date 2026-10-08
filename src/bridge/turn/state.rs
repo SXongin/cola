@@ -1219,10 +1219,14 @@ pub(super) struct StreamAccumulator {
     /// completion entry — the merged-path render of a live card, or a yielded
     /// card's ledger refresh. One mark per Wake id; the set is kept across
     /// [`Self::continue_on_new_card`], so a Wake that resumes a
-    /// wake-continuation card still marks exactly once (ADR-0059). This is the
-    /// ANNOUNCEMENT gate (it keeps an entry single); the Wake step's in-place
-    /// decision reads [`Self::handed_over_wakes`], because an entry a ledger
-    /// refresh placed is not a handoff.
+    /// wake-continuation card still marks exactly once (ADR-0059). Synthetic
+    /// retirements — a runtime/child-evidence retirement or the user's cleanup
+    /// — share the set under their `runtime:<call_id>` key, marked through
+    /// [`Self::announce_synthetic`]: the same exactly-once gate, staging
+    /// nothing durable (spec #588, review PR #595). This is the ANNOUNCEMENT
+    /// gate (it keeps an entry single); the Wake step's in-place decision reads
+    /// [`Self::handed_over_wakes`], because an entry a ledger refresh placed is
+    /// not a handoff.
     pub(super) announced_wakes: std::collections::HashSet<String>,
     /// The Wakes whose resumed work this chain has HANDED OVER to a card
     /// (ADR-0066): a 承接 line's split (a continuation card takes it) or the
@@ -1660,11 +1664,11 @@ impl StreamAccumulator {
     /// Mark `wake_id`'s completion as announced on this chain — by the opening
     /// 承接 line or by the merged-path completion entry. Returns false when it
     /// already was: the exactly-once gate both paths honour (ADR-0059). A new
-    /// mark also stages the durable Wake Watermark (ADR-0061), which only a
-    /// delivering card write drains; the stage's generation is what a drain
+    /// WAKE mark also stages the durable Wake Watermark (ADR-0061), which only
+    /// a delivering card write drains; the stage's generation is what a drain
     /// must match (spec #561, review #569).
     pub(super) fn announce_wake(&mut self, wake_id: &str, created_ms: i64) -> bool {
-        if !self.announced_wakes.insert(wake_id.to_string()) {
+        if !self.announce_entry(wake_id) {
             return false;
         }
         if self
@@ -1684,6 +1688,26 @@ impl StreamAccumulator {
             }
         }
         true
+    }
+
+    /// Mark a SYNTHETIC completion — a runtime verdict's retirement, a child's
+    /// own terminal transcript, or the user's cleanup, keyed
+    /// `runtime:<call_id>` — as announced on this chain (spec #588, review PR
+    /// #595): the same exactly-once gate [`Self::announce_wake`] applies, but
+    /// NOTHING durable is staged. The durable Wake Watermark is the newest
+    /// WAKE whose completion a card announced (ADR-0061); staging a synthetic
+    /// entry's clock there would make a restart read a genuinely un-announced
+    /// late Wake at or below it as covered and suppress its continuation —
+    /// #590's "a late Wake for a cleared task behaves as before; nothing is
+    /// suppressed".
+    pub(super) fn announce_synthetic(&mut self, key: &str) -> bool {
+        self.announce_entry(key)
+    }
+
+    /// The one exactly-once announcement gate every class shares (ADR-0059):
+    /// insert the key and report whether it was new.
+    fn announce_entry(&mut self, key: &str) -> bool {
+        self.announced_wakes.insert(key.to_string())
     }
 
     /// Stage the Rendered Cursor of the body about to be written (spec #561):
@@ -5470,5 +5494,37 @@ mod tests {
         let frontier = seed.frontier.as_ref().expect("a frontier");
         assert_eq!(frontier.part_index, 1);
         assert_eq!(frontier.delivered_chars, second.chars().count());
+    }
+
+    /// The announcement split (spec #588, review PR #595): a synthetic
+    /// retirement marks the chain's exactly-once set and stages NOTHING
+    /// durable, while a real Wake still stages the Wake Watermark — the
+    /// watermark stays Wake-scoped (ADR-0061), so a late real Wake at or below
+    /// a synthetic clock is never read as covered after a restart.
+    #[test]
+    fn a_synthetic_announcement_marks_exactly_once_and_stages_nothing() {
+        let mut acc = StreamAccumulator::new("test");
+        assert!(
+            acc.announce_synthetic("runtime:call_1"),
+            "the first synthetic mark lands"
+        );
+        assert!(
+            !acc.announce_synthetic("runtime:call_1"),
+            "a repeated synthetic announce never doubles"
+        );
+        assert!(acc.wake_announced("runtime:call_1"));
+        assert_eq!(
+            acc.pending_watermark_id(),
+            None,
+            "a synthetic entry stages no durable Wake Watermark"
+        );
+
+        assert!(acc.announce_wake("msg_wake_1", 1_000));
+        let id = acc.pending_watermark_id();
+        let staged = id
+            .and_then(|id| acc.take_staged_watermark(id))
+            .expect("a real Wake stages its durable mark");
+        assert_eq!(staged.wake_id, "msg_wake_1");
+        assert_eq!(staged.created_ms, 1_000);
     }
 }
