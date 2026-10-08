@@ -2412,6 +2412,49 @@ async fn a_cleanup_click_keeps_a_running_task_and_the_wait() {
     );
 }
 
+/// Review (spec #588, #590): the cleanup click is never throttled — a recent
+/// poll's verdict must not make it no-op. Even with the shared interval pinned
+/// wide right after a sync pass stamped it, the click spends its own runtime
+/// read and clears the row.
+#[tokio::test]
+async fn a_cleanup_click_is_not_throttled_by_a_recent_poll() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = SessionTranscript::new(two_task_timeline(vec![]))
+        .with_executions(vec![execution(2_500)])
+        .with_background_tasks(vec![live_subagent(now - 3_000, "call_sub")]);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    script_child_without_activity(&backend).await;
+    yield_one_task_card(&app, &platform, ctx("ses_test", "跑一下构建并审阅")).await;
+
+    // The sync pass reconciles (stamping the shared throttle) and the row
+    // gains its marker.
+    backend.task_runtime.lock().unwrap().children = vec![("ses_call_sub".into(), ChildRuntime::Inactive)];
+    spawn_sync(&app);
+    wait_for_card_update(&platform, "the unconfirmed marker", CardUpdates::Latest, |card| {
+        card_text(card).contains("⚠️ 状态待确认")
+    })
+    .await;
+
+    // Pin the shared interval wide: any reconcile behind the throttle would
+    // now no-op, so only a direct, unthrottled read can clear the row.
+    app.runtime_reconcile.interval_ms.store(60_000, Ordering::Relaxed);
+    backend.task_runtime_calls.lock().await.clear();
+    app.host_action(serde_json::json!({ "action": "cleanup", "session_id": "ses_test" }))
+        .await
+        .expect("the cleanup click acks");
+    wait_for_card_update(&platform, "the cleaned settle", CardUpdates::Latest, |card| {
+        card_header(card).contains("✅")
+            && card_text(card).contains("🧹 subagent 已清理：review the diff（人工）")
+    })
+    .await;
+
+    assert!(
+        !backend.task_runtime_calls.lock().await.is_empty(),
+        "the click spends its own runtime read, never a poll's throttled one"
+    );
+}
+
 /// Spec #588 / #590: a late Wake after a cleanup is untouched — the cleaned
 /// task's completion still resumes the chain (the split continuation opens with
 /// its own work) and the Wake's completion entry still renders on the card
