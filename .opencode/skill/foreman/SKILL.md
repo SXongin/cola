@@ -77,10 +77,11 @@ Present the dossier and stop. Do not push. Continue only on the user's explicit 
 
 On the user's go:
 
-- Push the branch.
+- Push the branch — `git log --merges main..HEAD` must be empty first (rebase is the only merge method this repo allows).
 - Open exactly one PR against `main`: a Conventional Commits title derived from the spec (`CONTRIBUTING.md`, "Pull request rules"), body with what the batch delivers, the per-ticket summary, the risks, and a close line listing **every ticket and the spec issue itself** — one keyword per issue (`Closes #a, closes #b, …, closes #<spec>`). The batch PR is the spec's delivery, so the spec closes with it; it stays open only when the drop list named a child the batch did not cover, and the body then names that child.
+- Verify the PR is rebase-mergeable: `gh api repos/<owner>/<repo>/pulls/<n> --jq .rebaseable` must be `true`. A conflict with `main` can leave a merge-free branch `rebaseable: false`; if so, rebase onto `origin/main`, push, and check again.
 
-Done when the PR exists. Stop there — the user merges.
+Done when the PR exists, its branch is merge-commit-free, and `rebaseable` is `true`. Stop there — the user merges.
 
 ## Dispatch prompt
 
@@ -118,7 +119,7 @@ Put the decision to the user when:
 - One ticket at a time, blockers first.
 - Progress comments are the only writes the batch makes to the tracker; the PR closes the tickets.
 - The implementer stays on the batch branch — `main` is never its checkout.
-- The batch branch ends merge-commit-free: syncs and landings are rebases onto the integration tip, never merges — before the push, `git log --merges main..HEAD` must be empty (rebase is the only merge method this repo allows; a merge commit blocks the PR button).
+- The batch branch is merge-commit-free and rebase-mergeable: syncs and landings are rebases onto the integration tip, never merges — before the push, `git log --merges main..HEAD` must be empty, and once the PR exists `gh api repos/<owner>/<repo>/pulls/<n> --jq .rebaseable` must be `true` (rebase is the only merge method this repo allows; a merge commit or a conflict with `main` blocks the button).
 
 ## Recovery
 
