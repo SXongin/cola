@@ -618,16 +618,16 @@ fn plan_runtime_entries(
 }
 
 /// Spend each planned shell completion's one output read (spec #588, #593):
-/// the record's tail, or [`TaskOutput::Unavailable`] when the read fails, the
-/// record is gone or answers nothing at all — the entry then says
-/// 「输出已不可用」 rather than posing an empty panel. A successful read that
-/// captured NOTHING is a readable-empty window instead (spec #588, review):
-/// the entry stays identity-only — the entry's read is the one place the two
-/// outcomes stay apart, because only this path renders the copy. Runs OUTSIDE
-/// the cards lock (the reads are network) and before the commit; a plan that
-/// never commits (a racing render announced it first) still spends its read at
-/// most once. Endings that show no output — a subagent, the 已失联 entry, the
-/// 🧹 cleanup — are left identity-only and spend nothing.
+/// the record's tail, or [`TaskOutput::Unavailable`] when the read fails or
+/// there is no record to read (404) — the entry then says 「输出已不可用」
+/// rather than posing an empty panel. A successful read that captured NOTHING
+/// is a readable-empty window instead (spec #588, review): the entry stays
+/// identity-only — the entry's read is the one place the two outcomes stay
+/// apart, because only this path renders the copy. Runs OUTSIDE the cards lock
+/// (the reads are network) and before the commit; a plan that never commits (a
+/// racing render announced it first) still spends its read at most once.
+/// Endings that show no output — a subagent, the 已失联 entry, the 🧹 cleanup —
+/// are left identity-only and spend nothing.
 pub(super) async fn read_planned_outputs(
     backend: &Arc<dyn crate::backend::Backend>,
     plans: &mut [PlannedEntry],
@@ -743,7 +743,7 @@ pub(super) fn plan_finalization_entries(
     plan_ledger_entries(acc, transcript, acc.turn_anchor.as_ref())
 }
 
-/// [`render_new_turn_parts`] with the caller's already-planned (and already
+/// The finalization render, with the caller's already-planned (and already
 /// output-read) entries committed under the same call: the finalization path
 /// plans under a brief read of the card, spends the entries' output reads
 /// OUTSIDE the cards lock and commits here, so a shell completion first seen
