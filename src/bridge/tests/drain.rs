@@ -3315,6 +3315,120 @@ async fn a_runtime_retirement_during_the_follow_ends_the_turn() {
         !app.inflight.lock().await.contains("ses_test"),
         "the follow ended the turn"
     );
+    // Review (spec #588 / #589, PR #595): the retirement reaches the overlay
+    // only once the follow's render carried its entry — the same
+    // record-after-flush invariant, pinned on this path.
+    assert_eq!(
+        backend.overlay.retired_call_ids("ses_test"),
+        vec!["call_bg".to_string()],
+        "the follow's accepted render records the retirement"
+    );
+}
+
+/// Review (spec #588 / #589, PR #595): the follow's reconcile commits its
+/// overlay record only when the render that carried its entries completed —
+/// the shared invariant, enforced by construction for every caller. If the
+/// accumulator vanishes between the tick's read and its render (a replacement
+/// collected the card), the retirement has no card to render on; recording it
+/// anyway would hide the task from every later read without an entry ever
+/// landing. The read was still spent — only the record is gated.
+///
+/// Deterministic, no wall-clock margin decides: the follow's next transcript
+/// read is parked on the mock's gate, both facts it will read (the missing
+/// shell and the vanished card) are moved while it is parked, then the read is
+/// released; the follow's exit releases the guard, which is awaited as a
+/// condition.
+#[tokio::test]
+async fn a_follow_whose_render_never_lands_records_nothing() {
+    let _wd = test_work_dir();
+    let running = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_background_tasks(vec![background_shell(2_100)]);
+    let (_dir, app, backend, platform) = scripted_app(vec![running], Some(SessionStatus::Busy)).await;
+    app.turn_drain_timeout_ms.store(30, Ordering::Relaxed);
+    // The parked tick must outlive the test's own work: no grace and no
+    // per-read bound may end the loop while the read is held.
+    app.turn_follow_grace_ms.store(60_000, Ordering::Relaxed);
+    app.turn_follow_read_timeout_ms.store(60_000, Ordering::Relaxed);
+
+    // The drain bound hands the still-busy session to the follow.
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        spawn_turn(&app, ctx("ses_test", "跑一下 CI")),
+    )
+    .await
+    .expect("the turn must hand off at the drain bound")
+    .unwrap();
+    result.unwrap();
+    assert!(
+        app.inflight.lock().await.contains("ses_test"),
+        "the follow covers the bound window with the guard"
+    );
+
+    // Park the follow's next read — its tick's ownership check already passed.
+    let gate = backend.hold_transcripts();
+    let entered = backend.transcript_gate_entered.load(Ordering::SeqCst);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while backend.transcript_gate_entered.load(Ordering::SeqCst) == entered {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the follow never reached the parked read"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // While it is parked, the runtime misses the shell and the accumulator is
+    // collected from under it.
+    backend.task_runtime.lock().unwrap().shells = vec![("sh_bg".into(), ShellRuntime::Missing)];
+    app.cards_handle().cards.lock().await.remove("ses_test");
+    // Disarm so no later read parks, then release the tick: its reconcile
+    // retires the shell, and its render finds no accumulator.
+    *backend.transcript_gate.lock().unwrap() = None;
+    gate.add_permits(1);
+
+    // The follow ended without a card to carry the retirement: nothing was
+    // recorded, and the task stays live on every later read.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while app.inflight.lock().await.contains("ses_test") {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the follow never ended on its vanished accumulator"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        backend.overlay.retired_call_ids("ses_test").is_empty(),
+        "a render that never landed records nothing: {:?}",
+        backend.overlay.retired_call_ids("ses_test")
+    );
+    let later = crate::backend::Backend::transcript(backend.as_ref(), "ses_test")
+        .await
+        .unwrap();
+    assert_eq!(
+        later
+            .background_tasks
+            .iter()
+            .map(|task| task.tool.call_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["call_bg"],
+        "the task stays live until a render can carry its entry"
+    );
+    // The parked tick DID observe — the read was spent; only the record is
+    // gated on the render it never got.
+    assert!(
+        !backend.task_runtime_calls.lock().await.is_empty(),
+        "the parked tick's reconcile spent its read"
+    );
+    // No card ever received an entry.
+    let mut cards = platform.updated_cards().await;
+    cards.extend(platform.sent_cards().await);
+    cards.extend(platform.replied_cards().await);
+    assert!(
+        cards.iter().all(|card| !card_text(card).contains("🔔")),
+        "no card carries a half-rendered entry: {cards:?}"
+    );
 }
 
 /// Review (spec #588): the unconfirmed marker survives the live-turn reads
