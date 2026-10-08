@@ -189,11 +189,17 @@ impl CycleBudget {
         let remaining = self
             .deadline
             .saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
+        // A remainder at or below the timer wheel's resolution counts as spent:
+        // a read granted it would be abandoned on the same tick (and a tokio
+        // timer may fire up to ~1 ms early), so issuing it would spend a
+        // request with no budget. The granted timeout rounds UP, so a hung
+        // read cannot leave a sub-millisecond remainder behind for the next
+        // read to be issued against (spec #588, review PR #595).
+        if remaining <= std::time::Duration::from_millis(1) {
             tracing::debug!("{what} skipped: the reconcile cycle's read budget is spent");
             return None;
         }
-        crate::bridge::bounded_call(what, remaining.as_millis().max(1) as u64, fut).await
+        crate::bridge::bounded_call(what, remaining.as_millis() as u64 + 1, fut).await
     }
 }
 
