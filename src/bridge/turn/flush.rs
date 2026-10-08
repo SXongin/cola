@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use super::{MAX_CARD_CHAIN, Turn};
+use super::{MAX_CARD_CHAIN, SplitKind, Turn};
 
 use crate::bridge::card_handles::RenderedBlock;
 use crate::bridge::chain::{RenderedCursor, release_spent};
@@ -383,7 +383,7 @@ async fn discard_staged_cursor(
 /// The flush machine proper, entered with the session's card-write lock
 /// already held by [`Turn::flush_card`](super::Turn::flush_card),
 /// [`Turn::split_card_chain`](super::Turn::split_card_chain),
-/// [`Turn::split_chain_for_wake`](super::Turn::split_chain_for_wake) or
+/// [`Turn::split_chain_for_continuation`](super::Turn::split_chain_for_continuation) or
 /// [`Turn::refresh_yielded_ledger`](super::Turn::refresh_yielded_ledger).
 /// `split_policy` decides whether an over-budget slice may finalize the card
 /// and continue on a new one ([`SplitPolicy`]).
@@ -903,6 +903,15 @@ async fn push_queued_receipts(cards: &CardsHandle, session_id: &str) {
         let line = card.pending_split[i].line.clone();
         card.acc
             .push_receipt_at(line.as_ref().map(|line| line.at), kind.receipt());
+        if kind == SplitKind::Residual {
+            // The neutral residual floor fires at most once per request (spec
+            // #602, ticket #606): mark the chain the moment its receipt is
+            // written, so a later pass over further late content cannot post a
+            // second neutral card. The split itself may still be owed (a failed
+            // create is retried by a later flush), so the mark never drops the
+            // content it announced.
+            card.acc.residual_card_posted = true;
+        }
         if let Some((wake, created_ms)) = line.as_ref().and_then(|line| line.wake.as_ref()) {
             // The 承接 line announces this Wake's completion and hands its work
             // to the continuation card: mark both, so the merged-path entry (a

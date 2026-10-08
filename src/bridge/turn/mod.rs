@@ -1676,6 +1676,14 @@ pub(crate) enum SplitKind {
     /// (ADR-0059): the chain continues on a new card below the user's
     /// message, and that new message is the notification.
     Wake,
+    /// A Wake-less part the Backend wrote after the run already reported idle
+    /// — the chain's card is past its wait (spec #602, ticket #606). It opens
+    /// the same kind of continuation card a Wake split does, but with a
+    /// NEUTRAL receipt: nothing resumed, so 「已恢复执行」 would lie. A
+    /// defensive floor the same-snapshot ending rule (#604) makes
+    /// near-unreachable, bounded to one card per request by the chain's
+    /// `StreamAccumulator::residual_card_posted` marker.
+    Residual,
 }
 
 /// The receipt line a Supplement's continuation carries (ADR-0043).
@@ -1690,6 +1698,14 @@ const PULL_RECEIPT: &str = "⏬ 实时卡片已移到底部";
 /// can be a finished background task, a subagent, an interruption or a server
 /// restart, and cola never claims more than "the work resumed".
 const WAKE_RECEIPT: &str = "🔔 已恢复执行，继续处理…";
+
+/// The neutral receipt a Wake-less RESIDUAL continuation opens with (spec
+/// #602, ticket #606): the Backend wrote a part after the run already reported
+/// idle, so cola shows it honestly — the content is never dropped, and the
+/// card never claims a resumption that did not happen. Deliberately neutral
+/// ("there is more") rather than a claim. A defensive floor: the same-snapshot
+/// ending rule (#604) makes this near-unreachable.
+const RESIDUAL_RECEIPT: &str = "📄 还有更新";
 
 /// The opening line a new Turn's card carries when cola owned no live chain
 /// but the Backend's ADVISORY status read reported the Session live
@@ -1714,16 +1730,19 @@ impl SplitKind {
             Self::Supplement => SUPPLEMENT_RECEIPT,
             Self::Pull => PULL_RECEIPT,
             Self::Wake => WAKE_RECEIPT,
+            Self::Residual => RESIDUAL_RECEIPT,
         }
     }
 
     /// Whether this cause continues a card that has already ENDED: a Wake
-    /// arrives after the Turn yielded 等待后台任务 or its card ended, so the
-    /// handoff must not restamp a terminal card's ending, and the continuation
-    /// starts a fresh live phase (the ended attempt's display facts stay
-    /// behind). Every other cause splits a card that is still live.
+    /// arrives after the Turn yielded 等待后台任务 or its card ended, and the
+    /// neutral residual always fires on a card past its wait (terminal or
+    /// restart-stamped), so the handoff must not restamp a terminal card's
+    /// ending and the continuation starts a fresh live phase (the ended
+    /// attempt's display facts stay behind). Every other cause splits a card
+    /// that is still live.
     pub(crate) fn continues_an_ended_card(self) -> bool {
-        matches!(self, Self::Wake)
+        matches!(self, Self::Wake | Self::Residual)
     }
 }
 
@@ -2342,20 +2361,23 @@ impl Turn {
         true
     }
 
-    /// Hand an ENDED card chain over to a Wake continuation (ADR-0059): write
-    /// the ledger handover the continuation owes the chain it is leaving
-    /// (ADR-0060), queue the [`SplitKind::Wake`] split and flush it, so the
-    /// tracked card is finalized and a NEW continuation card — replied to
-    /// `reply_to`, opening with the 承接 receipt — becomes the chain's newest
-    /// card. A Waiting card is stamped 「部分完成，继续中…」 (its wait is over,
-    /// the chain moves on); a terminal card keeps the ending it recorded —
-    /// unless the handover just wrote it, in which case even a terminal card is
-    /// PATCHed, with its ending intact. Unlike [`Self::split_card_chain`], the
-    /// chain must NOT be owned by a live Turn/renderer: the Wake decision reads
-    /// a snapshot, and a Wake continuation must never split a card somebody
-    /// else is still streaming into. `line` carries the 承接 line's key (just
-    /// before the resumed work, whose server times are already in the past at
-    /// poll time) and the Wake it covers.
+    /// Hand an ENDED card chain over to a Wake continuation or the neutral
+    /// residual floor (ADR-0059, spec #602/#606): write the ledger handover the
+    /// continuation owes the chain it is leaving (ADR-0060), queue the
+    /// continuation split and flush it, so the tracked card is finalized and a
+    /// NEW continuation card — replied to `reply_to`, opening with the cause's
+    /// receipt — becomes the chain's newest card. A Waiting card is stamped
+    /// 「部分完成，继续中…」 (its wait is over, the chain moves on); a terminal
+    /// card keeps the ending it recorded — unless the handover just wrote it, in
+    /// which case even a terminal card is PATCHed, with its ending intact.
+    /// Unlike [`Self::split_card_chain`], the chain must NOT be owned by a live
+    /// Turn/renderer: the Wake decision reads a snapshot, and a continuation
+    /// must never split a card somebody else is still streaming into. `line`
+    /// carries the receipt's key (just before the resumed/legacy work, whose
+    /// server times are already in the past at poll time) and — for a Wake —
+    /// the Wake it covers; a `line.wake` of `None` is the neutral residual,
+    /// which no Wake announced and which therefore opens the neutral receipt
+    /// (never 「已恢复执行」).
     ///
     /// The handover is part of the SAME write-lock-held sequence as the enqueue
     /// and the flush ([`CardsHandle::write_lock`]): inside the cards lock,
@@ -2378,7 +2400,7 @@ impl Turn {
     /// PATCH (the caller's carrier signal for its reconcile pass). A card with
     /// no Turn anchor to scope the entries with still splits, but carries
     /// nothing (`Some(false)`), and so does a permanently refused write.
-    pub(crate) async fn split_chain_for_wake(
+    pub(crate) async fn split_chain_for_continuation(
         cards: &CardsHandle,
         backend: &Arc<dyn crate::backend::Backend>,
         session_id: &str,
@@ -2387,6 +2409,15 @@ impl Turn {
         transcript: &SessionTranscript,
         now_ms: i64,
     ) -> Option<bool> {
+        // A line that names a Wake is the Wake continuation; one that names
+        // none is the neutral residual (spec #602, #606). The cause selects the
+        // receipt copy and, with it, whether the continuation claims a
+        // resumption at all.
+        let kind = if line.wake.is_some() {
+            SplitKind::Wake
+        } else {
+            SplitKind::Residual
+        };
         let write_lock = cards.write_lock(session_id).await;
         let _guard = write_lock.lock().await;
         // Plan the handover's completion entries under a brief read of the
@@ -2424,7 +2455,7 @@ impl Turn {
                 );
             card.pending_split.push(state::PendingSplit {
                 reply_to: reply_to.to_string(),
-                kind: SplitKind::Wake,
+                kind,
                 receipt_pushed: false,
                 line: Some(line),
                 handover,
@@ -3838,20 +3869,33 @@ pub(crate) enum WakeContinuation {
     /// render (that work is already in the past at poll time, so a key at
     /// cola's "now" would sort the receipt after it — the live order bug).
     ContinueChain { line: ContinuationLine },
+    /// A card chain exists but its card is past its wait (terminal or
+    /// restart-stamped) and unrendered content remains that no un-handed-over
+    /// genuine Wake announced — the RESIDUAL floor (spec #602, ticket #606).
+    /// The Backend wrote a Wake-less part after the run already reported idle;
+    /// cola renders it honestly on ONE neutrally-labeled continuation card
+    /// (「📄 还有更新」), never 「已恢复执行」. `line` carries the neutral
+    /// receipt's key and no Wake (`wake: None`), so it writes no 承接 line and
+    /// marks nothing as handed over. The chain's own `residual_card_posted`
+    /// marker bounds it to one per request, and the same-snapshot ending rule
+    /// (#604) makes the whole arm near-unreachable.
+    Residual { line: ContinuationLine },
     /// No chain in this process and no durable record (a cola restart that
     /// left nothing behind): arm a fresh card, scoped at the newest Wake's own
     /// anchor so the lost card's content is never replayed.
     Fresh { anchor: TurnAnchor },
 }
 
-/// The opening 承接 line of a Wake continuation card (ADR-0059): the timeline
-/// key the line takes — just before the work the continuation renders — and
-/// the Wake whose completion the line already announces, with its own server
-/// time (the durable Wake Watermark's value once the line's card sends,
-/// ADR-0061), so the merged-path receipt (the render pass's) cannot double it.
-/// Every [`WakeContinuation::ContinueChain`] line names its Wake; the `Option`
-/// is kept for the neutral residual continuation #606 arms, which answers no
-/// Wake ([`WakeContinuation::ResumeInPlace`] carries no line at all).
+/// The opening receipt line of a continuation card (ADR-0059): the timeline
+/// key the line takes — just before the work the continuation renders — and,
+/// when the continuation answers a Wake, the Wake whose completion the line
+/// already announces, with its own server time (the durable Wake Watermark's
+/// value once the line's card sends, ADR-0061), so the merged-path receipt (the
+/// render pass's) cannot double it. A [`WakeContinuation::ContinueChain`] line
+/// always names its Wake; the neutral residual
+/// ([`WakeContinuation::Residual`], spec #602/#606) carries `wake: None` — it
+/// announces no resumption — and [`WakeContinuation::ResumeInPlace`] carries no
+/// line at all.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ContinuationLine {
     pub(crate) at: i64,
@@ -3962,8 +4006,10 @@ impl Turn {
     ///   chain that already took a Wake over — and only a GENUINE resumption the
     ///   chain has not handed over yet (a shell/subagent completion past its
     ///   wait, a restart, an interrupt) continues the chain by split. A
-    ///   Wake-less content diff and an already-handed-over Wake owe no card and
-    ///   no receipt.
+    ///   Wake-less content diff on an OPEN yielded card resumes in place; on a
+    ///   card PAST its wait it is the RESIDUAL floor ([`WakeContinuation::Residual`],
+    ///   spec #602/#606): it renders on one neutral card, never a 「已恢复执行」
+    ///   receipt, and never a second one.
     /// - **No chain in this process (a cola restart).** A durable Chain Record
     ///   means the projection — or, cursorless, the reap's one-release
     ///   fallback — owns the chain's Wake, so the Fresh path owes nothing
@@ -4059,9 +4105,28 @@ impl Turn {
                     });
                 }
                 // 4. A card past its wait (terminal or restart-stamped) with
-                //    unrendered Wake-less content owes no continuation from this
-                //    step: the residual is #606's neutral card, and this `None`
-                //    leaves that path open.
+                //    unrendered content and no un-handed-over genuine Wake is
+                //    the RESIDUAL floor (spec #602, ticket #606): the Backend
+                //    wrote a Wake-less part after the run reported idle. The
+                //    same-snapshot rule (#604) makes it near-unreachable; as a
+                //    floor it renders honestly on ONE neutral continuation card,
+                //    never a 「已恢复执行」 receipt, and the content is never
+                //    dropped. The chain's own marker bounds it to one per
+                //    request — once the floor has fired, later late content can
+                //    no longer post a second neutral card.
+                if !card.acc.residual_card_posted {
+                    return Some(WakeContinuation::Residual {
+                        line: ContinuationLine {
+                            // Key the neutral receipt just before the missed
+                            // work: the chain's own anchor precedes everything
+                            // the card renders, so the receipt sorts to the top
+                            // of the continuation's live slice (the same
+                            // live-order rule the Wake's 承接 line follows).
+                            at: anchor.created_ms.saturating_sub(1),
+                            wake: None,
+                        },
+                    });
+                }
                 return None;
             }
         }
