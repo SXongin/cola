@@ -100,7 +100,11 @@ the user already looks at.
   once, re-deriving the unconfirmed set on its own read (a failed runtime read
   clears nothing), then clears ALL unconfirmed rows at once — never a
   positively running task — records their call ids in the same process-local
-  overlay, synthesizes one clean retirement per row at the click's own clock,
+  overlay only when its refresh lands (review, PR #595: the write admission is
+  re-checked under the card lock and a card replaced while the reads were in
+  flight refuses the write — recording anyway would hide the tasks from every
+  later read without ever rendering their entries, which no later read can
+  reconstruct), synthesizes one clean retirement per row at the click's own clock,
   and pushes one completion entry per cleared row:
   `🧹 shell 已清理：<命令>（人工）` / `🧹 subagent 已清理：<描述>（人工）`
   (bare: `🧹 <noun> 已清理（人工）`). The ordinary yielded-card refresh renders
@@ -203,7 +207,8 @@ the user already looks at.
   gone / unreadable / non-terminal) and V1's zero requests; the cleanup click
   (claim, 3 s ack, all rows at once, a running task keeps the wait, button
   presence only with unconfirmed rows on a waiting card, late Wake untouched,
-  the successor carrying the button); the output windows (labels, budget, live
+  the successor carrying the button, a replaced card's refused refresh
+  recording nothing and the successor still clearing the tasks exactly once); the output windows (labels, budget, live
   omission, entry tails, 「输出已不可用」 on a failed or vanished record, no
   re-read on the settled successor); and the projected successor's affordances.
 
