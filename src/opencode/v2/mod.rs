@@ -80,6 +80,12 @@ const SHELL: &str = "/api/shell";
 /// empty body. The server's own tail idiom uses `Number.MAX_SAFE_INTEGER`;
 /// keeping that value avoids a server-side integer overflow.
 const SHELL_OUTPUT_PROBE_CURSOR: u64 = (1 << 53) - 1;
+/// The bytes an output tail read starts BEFORE the window's content start
+/// (spec #588, #592; review, PR #595): one maximum-length UTF-8 character, so
+/// a character the content start splits is decoded whole and can be trimmed
+/// back by whole characters — never guessed from a leading replacement
+/// character.
+const SHELL_OUTPUT_BOUNDARY_BYTES: u64 = 4;
 /// The per-session projected-message read: the S4b transcript decode and, for
 /// active sessions, the run state's retry derivation.
 const SESSION_MESSAGES_SUFFIX: &str = "/message";
@@ -852,15 +858,16 @@ impl GenerationStrategy for V2Strategy {
     /// One shell's captured output window (spec #588, ticket #592), the
     /// server's own tail idiom: a first page with a cursor past the end learns
     /// the record's total size, a second reads its last
-    /// [`SHELL_OUTPUT_WINDOW_BYTES`] bytes, and [`output_window`] decodes and
-    /// clips that page to its last [`SHELL_OUTPUT_WINDOW_LINES`] lines. A 404
-    /// is the runtime's positive "no record" (like [`Self::shell_runtime`]) and
-    /// maps to the no-record case ([`Ok(None)`]) — the entry's
-    /// 「输出已不可用」 — while a successful read of an empty capture answers a
-    /// window with no text: the record exists and holds nothing, and the row
-    /// and the entry omit it (spec #588, review). Any other failure is an
-    /// `Err` the caller omits the window for, never guesses. Display-only:
-    /// the read touches no session state.
+    /// [`SHELL_OUTPUT_WINDOW_BYTES`] bytes plus [`SHELL_OUTPUT_BOUNDARY_BYTES`]
+    /// bytes of run-up, and [`output_window`] trims that run-up back to the
+    /// window's content start and clips the page to its last
+    /// [`SHELL_OUTPUT_WINDOW_LINES`] lines. A 404 is the runtime's positive "no
+    /// record" (like [`Self::shell_runtime`]) and maps to the no-record case
+    /// ([`Ok(None)`]) — the entry's 「输出已不可用」 — while a successful read
+    /// of an empty capture answers a window with no text: the record exists and
+    /// holds nothing, and the row and the entry omit it (spec #588, review).
+    /// Any other failure is an `Err` the caller omits the window for, never
+    /// guesses. Display-only: the read touches no session state.
     async fn shell_output(
         &self,
         http: &Transport,
@@ -883,19 +890,22 @@ impl GenerationStrategy for V2Strategy {
         let start = probe
             .size
             .saturating_sub(crate::backend::SHELL_OUTPUT_WINDOW_BYTES as u64);
+        // Start one character early, so a character straddling the window's
+        // first byte is decoded whole (review, PR #595).
+        let read_start = start.saturating_sub(SHELL_OUTPUT_BOUNDARY_BYTES);
         let Some(tail) = self
             .shell_output_page(
                 http,
                 directory,
                 shell_id,
-                start,
-                Some(crate::backend::SHELL_OUTPUT_WINDOW_BYTES as u64),
+                read_start,
+                Some(crate::backend::SHELL_OUTPUT_WINDOW_BYTES as u64 + SHELL_OUTPUT_BOUNDARY_BYTES),
             )
             .await?
         else {
             return Ok(None);
         };
-        Ok(Some(output_window(tail, start > 0)))
+        Ok(Some(output_window(tail, read_start, start)))
     }
 }
 
@@ -1165,35 +1175,96 @@ impl V2Strategy {
 }
 
 /// One output page as its neutral window (spec #588, ticket #592): the last
-/// [`SHELL_OUTPUT_WINDOW_LINES`] lines of the page, with the byte-boundary
-/// artifact trimmed and the clipped flag derived. The window's text is EMPTY
-/// when the page carries nothing to render (a successful read of a record that
-/// captured nothing, or a race that shrank the file): a readable-empty window,
-/// which the row and the completion entry omit — never 「输出已不可用」, which
-/// belongs to a record that is gone or unreadable (`Ok(None)` from
-/// [`V2Strategy::shell_output`]).
+/// [`SHELL_OUTPUT_WINDOW_LINES`] lines of the page, trimmed back from the
+/// read's run-up to the window's content start and with the clipped flag
+/// derived. The window's text is EMPTY when the page carries nothing to render
+/// (a successful read of a record that captured nothing, or a race that shrank
+/// the file): a readable-empty window, which the row and the completion entry
+/// omit — never 「输出已不可用」, which belongs to a record that is gone or
+/// unreadable (`Ok(None)` from [`V2Strategy::shell_output`]).
 ///
-/// `started_mid_record` is the tail read's own cursor > 0: it means the window
-/// begins inside the capture, so the head line is partial and the window is
-/// clipped by definition. The server decodes a cursor that splits a multi-byte
-/// character to a leading U+FFFD — that single artifact is trimmed; a
-/// replacement character anywhere else is the command's own bytes and stays.
-/// The server's `truncated` flag is decoded too (always false on today's
-/// server, but a future one may clip a page) and counts as clipped.
-fn output_window(page: wire::ShellOutputPage, started_mid_record: bool) -> crate::backend::ShellOutputWindow {
-    let mut lines: Vec<&str> = page.output.lines().collect();
-    let mut clipped = started_mid_record || page.truncated;
+/// The page was read from `read_start`, up to [`SHELL_OUTPUT_BOUNDARY_BYTES`]
+/// bytes before `content_start`; the trim keeps the first whole character at or
+/// after `content_start` — the fraction before it is outside the byte window
+/// either way. `content_start > read_start` means the window begins inside the
+/// capture, so its head line is partial and the window is clipped by
+/// definition. The server's `truncated` flag is decoded too (always false on
+/// today's server, but a future one may clip a page) and counts as clipped.
+fn output_window(
+    page: wire::ShellOutputPage,
+    read_start: u64,
+    content_start: u64,
+) -> crate::backend::ShellOutputWindow {
+    let extra = content_start.saturating_sub(read_start) as usize;
+    let bytes_read = page.cursor.saturating_sub(read_start) as usize;
+    let mut lines: Vec<&str> = trim_to_content_start(&page.output, extra, bytes_read)
+        .lines()
+        .collect();
+    let mut clipped = extra > 0 || page.truncated;
     if lines.len() > crate::backend::SHELL_OUTPUT_WINDOW_LINES {
         clipped = true;
         lines.drain(..lines.len() - crate::backend::SHELL_OUTPUT_WINDOW_LINES);
     }
-    let mut text = lines.join("\n");
-    if started_mid_record && text.starts_with('\u{FFFD}') {
-        text.remove(0);
-    }
     crate::backend::ShellOutputWindow {
-        text,
+        text: lines.join("\n"),
         clipped,
         captured_ms: chrono::Utc::now().timestamp_millis(),
+    }
+}
+
+/// The first whole character at or after byte `extra` of a page that was
+/// decoded from `extra` bytes before the window's content start (spec #588,
+/// #592; review, PR #595). A clipped tail therefore keeps every character that
+/// begins at or after its byte boundary, drops only the one the boundary cuts —
+/// and never mistakes a genuine U+FFFD for that cut.
+///
+/// The server decodes a byte range without regard for character boundaries: a
+/// page whose first byte sits inside a character opens with one U+FFFD per
+/// leading continuation byte, each standing for the single byte it replaced.
+/// `bytes_read` is the page's true byte span (the response cursor after the
+/// requested start), so a decoded length above it exposes that head run — every
+/// later character decodes faithfully, so the walk can account exact byte
+/// spans. The artifacts are continuations of ONE split character: a boundary
+/// inside the run drops the character whole, never half.
+fn trim_to_content_start(text: &str, extra: usize, bytes_read: usize) -> &str {
+    if extra == 0 || text.is_empty() {
+        return text;
+    }
+    let artifacts = split_char_artifacts(text, bytes_read);
+    let mut consumed = 0usize;
+    for (eaten, (i, ch)) in text.char_indices().enumerate() {
+        if eaten < artifacts {
+            consumed += 1;
+            if eaten + 1 == artifacts && consumed >= extra {
+                return &text[i + ch.len_utf8()..];
+            }
+            continue;
+        }
+        consumed += ch.len_utf8();
+        if consumed >= extra {
+            return &text[i + ch.len_utf8()..];
+        }
+    }
+    ""
+}
+
+/// How many leading U+FFFDs of a page are split-character artifacts rather
+/// than the record's own bytes: a faithful U+FFFD decodes three bytes for the
+/// three read, while an artifact decodes three for the one continuation byte it
+/// replaced — so `text.len() - bytes_read` is twice the artifact count. A run
+/// longer than a character's continuation bytes, or one whose head is not
+/// replacement characters, is not that artifact and counts as none.
+fn split_char_artifacts(text: &str, bytes_read: usize) -> usize {
+    let Some(overhead) = text.len().checked_sub(bytes_read) else {
+        return 0;
+    };
+    let artifacts = overhead / 2;
+    if overhead % 2 != 0 || artifacts == 0 || artifacts > 3 {
+        return 0;
+    }
+    if text.chars().take(artifacts).all(|ch| ch == '\u{FFFD}') {
+        artifacts
+    } else {
+        0
     }
 }

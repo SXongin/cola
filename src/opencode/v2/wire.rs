@@ -285,12 +285,15 @@ pub(super) struct RawShell {
 
 /// One page of a shell's captured output (`GET /api/shell/{id}/output`, spec
 /// #588, #592): the page's decoded byte range, the record's total captured
-/// size and whether the server itself clipped the page. The absolute cursor
-/// the envelope also carries is deliberately not decoded — the tail read
-/// computes its own from `size`.
+/// size, the absolute cursor after the page, and whether the server itself
+/// clipped the page. The cursor is what tells the decode's own byte span: a
+/// page that begins inside a character opens with one replacement character per
+/// split continuation byte, and the span distinguishes that artifact from the
+/// record's genuine U+FFFD (review, PR #595).
 #[derive(Debug, Deserialize)]
 pub(super) struct ShellOutputPage {
     pub(super) output: String,
+    pub(super) cursor: u64,
     pub(super) size: u64,
     #[serde(default)]
     pub(super) truncated: bool,
