@@ -496,8 +496,8 @@ fn render_wake_entries(
 /// reported one (the `Lost` ending reports none), the task's launch and
 /// identity from the read, and the label joined from the originating tool
 /// part's input by `call_id` (the live row's own join). A cleaned retirement
-/// carries the click's own clock and renders through the same site, so the two
-/// retirement kinds cannot drift apart.
+/// carries the click's own clock and renders through the same site, so the
+/// runtime's endings and the manual one cannot drift apart.
 ///
 /// The entry renders on the chain that OBSERVED the retirement, whatever
 /// anchor that chain has: the launch record never flips, so the observing chain

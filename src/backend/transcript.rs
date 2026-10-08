@@ -929,7 +929,7 @@ pub struct TaskRetirement {
     pub finished_at: Option<i64>,
 }
 
-/// What the runtime said about a retired task.
+/// What took a task out of the live list, as its [`TaskRetirement`] records it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskRetirementEnding {
     /// The runtime reported a terminal end for the shell.

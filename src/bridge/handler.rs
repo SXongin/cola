@@ -2073,8 +2073,9 @@ impl App {
     /// card callback must ack within 3s, so the click claims the cleanup (the
     /// same atomic double-click guard the retry uses, on the waiting card),
     /// spawns the pipeline and returns a "cleaning" toast immediately; the
-    /// pipeline then reads the session's transcript once, retires exactly the
-    /// unconfirmed live tasks it finds, and re-renders the waiting card.
+    /// pipeline then reads the session's transcript and runtime once, retires
+    /// exactly the unconfirmed live tasks it finds, and re-renders the waiting
+    /// card.
     async fn handle_cleanup_action(self: &Arc<Self>, value: &serde_json::Value) -> Option<CardActionResult> {
         let sid = value.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
         if sid.is_empty() {
