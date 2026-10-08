@@ -445,10 +445,13 @@ struct PendingEntry {
     tickets: HashMap<u64, oneshot::Sender<WriteOutcome>>,
     /// Completion Notices gated on this card's owed keyless Pending Card Update
     /// draining (spec #602, ticket #607): armed while `card` is owed, fired
-    /// exactly once when that write settles **delivered** (a drain retry or a
-    /// later direct write), and dropped if the entry is evicted or the write
-    /// settles refused (the notice is suppressed).
-    deferred_notices: Vec<crate::feishu::DeferredNotice>,
+    /// exactly once when **that write's own sequence** settles delivered (a
+    /// drain retry or a later direct write of the same seq), and dropped when a
+    /// newer write supersedes it, when the entry is evicted, or when the write
+    /// settles refused (the notice is suppressed). Each entry carries the seq of
+    /// the owed write it was gated on, so a newer unrelated repaint can never
+    /// answer for it.
+    deferred_notices: Vec<(u64, crate::feishu::DeferredNotice)>,
 }
 
 impl PendingEntry {
@@ -769,12 +772,12 @@ impl CardDelivery {
             entry.card = None;
             entry.next_attempt = tokio::time::Instant::now();
         }
-        // A delivery settles whatever Completion Notice waited on this card's
-        // owed write (spec #602, ticket #607): the gated update has landed, so
-        // the notice may fire. A permanent refusal, a superseding failure or an
-        // eviction leaves the notices to drop — suppressed.
+        // A delivery settles only the Completion Notices gated on THIS
+        // write's own sequence (spec #602, ticket #607): the gated update has
+        // landed, so the notice may fire. A permanent refusal, a superseding
+        // failure or an eviction leaves the notices to drop — suppressed.
         let notices = if result.is_ok() {
-            Self::take_deferred_notices(entry)
+            Self::take_deferred_notices(entry, seq)
         } else {
             Vec::new()
         };
@@ -788,13 +791,32 @@ impl CardDelivery {
         }
     }
 
-    /// Take this card's armed Completion Notices (spec #602, ticket #607): the
-    /// owed write they were gated on has just settled **delivered**, so they may
-    /// fire. Called under the state lock; the caller runs them after releasing
-    /// it, so a notice send (which can reach Feishu) never runs under the lock
-    /// — and fires exactly once, since the callbacks leave with this take.
-    fn take_deferred_notices(entry: &mut PendingEntry) -> Vec<crate::feishu::DeferredNotice> {
-        std::mem::take(&mut entry.deferred_notices)
+    /// Take the card's armed Completion Notices whose owed write just settled
+    /// **delivered** at `delivered_seq` (spec #602, ticket #607). A notice gated
+    /// on a seq `< delivered_seq` is dropped: its payload was superseded before
+    /// it delivered — neither delivered nor retried — so the spec suppresses it
+    /// (the card moved on without the terminal content). A notice gated on a
+    /// seq `>` `delivered_seq` is kept: a still-owed later write may yet carry
+    /// it. Called under the state lock; the caller runs the returned callbacks
+    /// after releasing it, so a notice send (which can reach Feishu) never runs
+    /// under the lock — and fires exactly once, since the callbacks leave with
+    /// this take.
+    fn take_deferred_notices(
+        entry: &mut PendingEntry,
+        delivered_seq: u64,
+    ) -> Vec<crate::feishu::DeferredNotice> {
+        let mut fired = Vec::new();
+        let mut kept = Vec::new();
+        for (seq, notice) in entry.deferred_notices.drain(..) {
+            if seq == delivered_seq {
+                fired.push(notice);
+            } else if seq > delivered_seq {
+                kept.push((seq, notice));
+            }
+            // `seq < delivered_seq`: superseded — drop (suppressed).
+        }
+        entry.deferred_notices = kept;
+        fired
     }
 
     /// Add one proven-delivered sequence to a card's bounded set (spec #561,
@@ -1446,7 +1468,7 @@ impl CardDelivery {
                 if let Some(current) = state.entries.get_mut(&message_id) {
                     current.card = None;
                     Self::remember_delivered(&mut current.delivered, seq);
-                    notices = Self::take_deferred_notices(current);
+                    notices = Self::take_deferred_notices(current, seq);
                 }
                 if attempts > 0 {
                     tracing::info!("pending card update for {message_id} delivered after {attempts} retries");
@@ -1914,8 +1936,10 @@ impl Platform for CardDelivery {
         if entry.card.is_some() {
             // The card still owes its newest keyless write as a Pending Card
             // Update: the notice fires when a retry (or a later direct write)
-            // delivers it. The entry owns the callback now.
-            entry.deferred_notices.push(notice);
+            // delivers **that sequence**. The entry owns the callback, tagged
+            // with the seq of the owed write it is gated on, so a newer
+            // unrelated repaint can never answer for it (spec #607).
+            entry.deferred_notices.push((entry.seq, notice));
             crate::feishu::NoticeGate::Armed
         } else if entry.seq == 0 || entry.delivered.contains(&entry.seq) {
             // The newest keyless write settled delivered (or there was none):
@@ -2259,6 +2283,75 @@ mod tests {
             fired.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "a later drain never doubles the notice"
+        );
+    }
+
+    /// Spec #607: the notice is bound to the write that carried the terminal
+    /// content, not to the card. A terminal PATCH that failed recoverably is
+    /// queued at seq N with the notice armed; a newer repaint at seq M > N that
+    /// does NOT carry the terminal delta supersedes it and delivers — the notice
+    /// must NOT fire on that unrelated write. A queued write's own drain retry
+    /// still fires its notice exactly once.
+    #[tokio::test]
+    async fn a_notice_fires_only_for_the_write_it_was_gated_on() {
+        use crate::feishu::NoticeGate;
+        let inner = Arc::new(FakePlatform::new());
+        let delivery = CardDelivery::new(inner.clone());
+        let fired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        // The ending PATCH fails recoverably and is queued at seq N; the notice
+        // is armed against THAT write.
+        inner.fail_next(Fail::Transport);
+        let terminal = serde_json::json!({ "body": "terminal" });
+        assert!(
+            delivery.update_message("om_1", &terminal).await.is_err(),
+            "the ending PATCH failed recoverably and is queued"
+        );
+        let f = fired.clone();
+        assert_eq!(
+            delivery.defer_notice_until_delivered(
+                "om_1",
+                Box::new(move || {
+                    f.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }),
+            ),
+            NoticeGate::Armed,
+            "an owed update arms the notice"
+        );
+
+        // A NEWER successful repaint (seq M > N) supersedes the owed terminal
+        // write without carrying it: the notice must stay silent.
+        let repaint = serde_json::json!({ "body": "live" });
+        delivery
+            .update_message("om_1", &repaint)
+            .await
+            .expect("the repaint delivers");
+        assert_eq!(
+            fired.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a newer unrelated write must not fire the notice"
+        );
+
+        // The positive half: a fresh card's queued write still fires its notice
+        // when its OWN drain retry delivers it.
+        let terminal = serde_json::json!({ "body": "terminal-2" });
+        inner.fail_next(Fail::Transport);
+        assert!(delivery.update_message("om_2", &terminal).await.is_err());
+        let f = fired.clone();
+        assert_eq!(
+            delivery.defer_notice_until_delivered(
+                "om_2",
+                Box::new(move || {
+                    f.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }),
+            ),
+            NoticeGate::Armed
+        );
+        delivery.drain_pending_card_updates(true).await;
+        assert_eq!(
+            fired.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the queued write's own retry fires its notice once"
         );
     }
 
