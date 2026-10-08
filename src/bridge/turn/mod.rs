@@ -1116,21 +1116,68 @@ impl Turn {
     /// from, so the live card follows the new Turn. `None` means the Backend
     /// read failed (unknown state).
     async fn drain_tick(&mut self, handles: &TurnHandles, timeout_ms: u64) -> Option<DrainState> {
-        let transcript = self.drain_transcript(handles, timeout_ms).await?;
-        match self.drain_state(handles, &transcript, timeout_ms).await {
-            DrainState::Settled => Some(DrainState::Settled),
-            pending => {
-                render::render_and_flush(
-                    &handles.cards,
-                    &handles.sessions,
+        let mut transcript = self.drain_transcript(handles, timeout_ms).await?;
+        // The shared Background Task runtime reconciliation (#589), on this
+        // tick's own read and BEFORE the settle decision below: a task the
+        // runtime confirms ended leaves the live list here, so the decision
+        // sees the true end — the turn settles ✅ directly instead of yielding
+        // 「⏳ 等待后台任务」 until a later Session Sync pass. It observes only
+        // while the card can render the entry: the tick's render below needs
+        // the Turn anchor (its own or the one this read carries) to place it,
+        // and observing without one would record the task in the overlay with
+        // no entry left to render. Zero requests when the read lists no live
+        // task; a failed or timed-out read changes nothing.
+        let reconciled = if self.drain_anchor_visible(handles, &transcript).await {
+            handles
+                .runtime_reconcile
+                .observe(
                     &handles.backend,
-                    &handles.requests,
                     &self.session_id,
-                    &transcript,
+                    &self.directory,
+                    &mut transcript,
+                    timeout_ms,
                 )
-                .await;
-                Some(pending)
+                .await
+        } else {
+            false
+        };
+        let state = self.drain_state(handles, &transcript, timeout_ms).await;
+        // A settled drain normally leaves the render to finalization (which
+        // reconciles from its own read); when THIS read retired a task, the
+        // entry renders here first — the overlay means no later read carries
+        // the retirement, so skipping the render would drop it (the settle
+        // would still be ✅, just without the record).
+        if state == DrainState::Settled && !reconciled {
+            return Some(DrainState::Settled);
+        }
+        render::render_and_flush(
+            &handles.cards,
+            &handles.sessions,
+            &handles.backend,
+            &handles.requests,
+            &self.session_id,
+            &transcript,
+        )
+        .await;
+        Some(state)
+    }
+
+    /// Whether this drain tick may spend the runtime reconciliation: the card
+    /// can render the retirement entry the read would produce. That is exactly
+    /// "the accumulator has the Turn's anchor, or this read carries the
+    /// submitted message" — [`render::capture_turn_anchor`] takes the anchor
+    /// from that message on the render below. An anchorless (or card-less)
+    /// tick is on its way to the Unreceived ending, where a recorded
+    /// retirement would be swallowed by the overlay with no entry rendered;
+    /// observing resumes on the first tick whose read is anchored.
+    async fn drain_anchor_visible(&self, handles: &TurnHandles, transcript: &SessionTranscript) -> bool {
+        let mut cards = handles.cards.cards.lock().await;
+        match cards.get_mut(&self.session_id) {
+            Some(card) => {
+                render::capture_turn_anchor(&mut card.acc, transcript);
+                card.acc.turn_anchor.is_some()
             }
+            None => false,
         }
     }
 

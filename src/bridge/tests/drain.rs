@@ -11,8 +11,8 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crate::backend::{
-    ContentBlock, FinishReason, MessageRole, Part, SessionTranscript, StepFinish, TextPart, ToolOutput,
-    ToolStatus, TranscriptMessage,
+    ContentBlock, FinishReason, MessageRole, Part, SessionTranscript, ShellEnd, ShellRuntime, StepFinish,
+    TextPart, ToolOutput, ToolStatus, TranscriptMessage,
 };
 use crate::bridge::test_support::*;
 use crate::bridge::turn::{PromptContext, Turn};
@@ -133,6 +133,9 @@ pub(crate) async fn scripted_app_with(
     // A tiny per-read bound: a scripted hung read must fail fast instead of
     // eating a test's whole grace.
     app.turn_follow_read_timeout_ms.store(20, Ordering::Relaxed);
+    // The shared runtime-reconcile cadence (#589) is test time too: every
+    // tick may observe unless a test pins the throttle with a large interval.
+    app.runtime_reconcile.interval_ms.store(0, Ordering::Relaxed);
     (dir, app, backend, platform)
 }
 
@@ -3133,4 +3136,175 @@ async fn a_follow_idling_with_a_live_background_task_yields_waiting() {
         platform.calls.lock().await
     );
     assert_no_further_rendering(&backend, &platform).await;
+}
+
+// ---------------------------------------------------------------------------
+// The shared runtime reconcile on the live reads (#589): the drain and the
+// follow observe the runtime registries on the transcript read each already
+// performs — one process-wide verdict per Session per interval, shared with
+// Session Sync — so a task that died mid-turn ends the turn directly. A read
+// that lists no live task spends nothing; a failed or timed-out one changes
+// nothing at all.
+// ---------------------------------------------------------------------------
+
+/// Acceptance (#589): a read that lists no live Background Task spends no
+/// runtime request on the live path either — the shared step's own guard, not
+/// the throttle (the harness admits every attempt).
+#[tokio::test]
+async fn an_empty_ledger_spends_no_runtime_read() {
+    let _wd = test_work_dir();
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "第一条消息"),
+        assistant(2_000, "第一轮回答。"),
+    ])
+    .with_executions(vec![execution(2_500)]);
+    let (_dir, app, backend, platform) = scripted_app(vec![transcript], Some(SessionStatus::Idle)).await;
+
+    Turn::run(&app.turn_handles(), ctx("ses_test", "第一条消息"))
+        .await
+        .unwrap();
+
+    assert!(
+        backend.task_runtime_calls.lock().await.is_empty(),
+        "no live task means no runtime read"
+    );
+    let card = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_header(&card).contains("完成"),
+        "the turn is otherwise unchanged: {card}"
+    );
+}
+
+/// Acceptance (#589): a failed runtime read changes nothing on the live path —
+/// the task keeps its row, no entry renders, and the settle still yields
+/// waiting because the read could not end anything.
+#[tokio::test]
+async fn a_failed_runtime_read_leaves_the_turn_waiting() {
+    let _wd = test_work_dir();
+    let live = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_background_tasks(vec![background_shell(2_100)]);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    backend.fail_task_runtime_reads(usize::MAX);
+
+    Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下 CI"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Waiting),
+        "a failed read cannot end the wait"
+    );
+    let card = platform.updated_cards().await.last().cloned().unwrap();
+    let text = card_text(&card);
+    assert!(text.contains("⏳ 后台任务（1）"), "the row stays: {card}");
+    assert!(
+        !text.contains("🔔 shell"),
+        "no entry from a read that failed: {card}"
+    );
+    assert!(
+        !backend.task_runtime_calls.lock().await.is_empty(),
+        "the attempt was made (and failed)"
+    );
+}
+
+/// Acceptance (#589): a runtime read that times out changes nothing either —
+/// the caller's bound abandons the wedged read and the drain moves on with the
+/// transcript exactly as read.
+#[tokio::test]
+async fn a_timed_out_runtime_read_leaves_the_turn_waiting() {
+    let _wd = test_work_dir();
+    let live = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_background_tasks(vec![background_shell(2_100)]);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    // A tiny drain budget so the wedged runtime read is abandoned fast.
+    app.turn_drain_timeout_ms.store(40, Ordering::Relaxed);
+    backend.hang_task_runtime_reads(usize::MAX);
+
+    Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下 CI"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Waiting),
+        "a timed-out read cannot end the wait"
+    );
+    let card = platform.updated_cards().await.last().cloned().unwrap();
+    let text = card_text(&card);
+    assert!(text.contains("⏳ 后台任务（1）"), "the row stays: {card}");
+    assert!(
+        !text.contains("🔔 shell"),
+        "no entry from a read that timed out: {card}"
+    );
+}
+
+/// Acceptance (#589): the out-of-turn follow reconciles on its own read too —
+/// a task the runtime reports ended while the follow renders retires there,
+/// the entry lands on the followed card, and the loop's settle is the true end
+/// instead of a stranded wait.
+#[tokio::test]
+async fn a_runtime_retirement_during_the_follow_ends_the_turn() {
+    let _wd = test_work_dir();
+    let running = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_background_tasks(vec![background_shell(2_100)]);
+    let (_dir, app, backend, platform) = scripted_app(vec![running], Some(SessionStatus::Busy)).await;
+    app.turn_drain_timeout_ms.store(30, Ordering::Relaxed);
+    app.turn_follow_grace_ms.store(30, Ordering::Relaxed);
+
+    // The drain bound hands the still-busy session to the follow.
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        spawn_turn(&app, ctx("ses_test", "跑一下 CI")),
+    )
+    .await
+    .expect("the turn must hand off at the drain bound")
+    .unwrap();
+    result.unwrap();
+    assert!(
+        app.inflight.lock().await.contains("ses_test"),
+        "the follow covers the hand-off window with the guard"
+    );
+
+    // The runtime confirms the shell ended while the follow is still
+    // rendering: the follow's own read retires it and renders the entry.
+    backend.task_runtime.lock().unwrap().shells = vec![(
+        "sh_bg".into(),
+        ShellRuntime::Ended {
+            end: ShellEnd::Exited,
+            completed_at: Some(2_900),
+        },
+    )];
+    wait_for_card_update(&platform, "the follow's entry", CardUpdates::Latest, |card| {
+        card_text(card).contains("🔔 shell 结束")
+    })
+    .await;
+
+    // The Execution then idles: the follow's settle is the true end.
+    backend
+        .set_session_status("ses_test", Some(SessionStatus::Idle))
+        .await;
+    wait_for_card_header(&platform, "完成").await;
+    let final_card = platform.updated_cards().await.last().cloned().unwrap();
+    let text = card_text(&final_card);
+    assert!(
+        text.contains("🔔 shell 结束") && !text.contains("后台任务（"),
+        "the follow's read retired the task and kept its entry: {final_card}"
+    );
+    assert!(
+        !app.inflight.lock().await.contains("ses_test"),
+        "the follow ended the turn"
+    );
 }

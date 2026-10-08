@@ -214,6 +214,9 @@ pub struct SharedCore {
     /// [`CardsHandle`] the reap's collect and settle paths read it through; the
     /// Session Sync pass's own request bound is the default.
     preserved_view_timeout_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// The shared Background Task runtime reconciliation (#589): one verdict
+    /// per Session per interval across Session Sync and the live loops.
+    pub runtime_reconcile: Arc<crate::bridge::runtime::RuntimeReconcile>,
 }
 
 impl SharedCore {
@@ -309,6 +312,7 @@ impl SharedCore {
             // The preserved-ending view read's bound: the Session Sync pass's
             // own request bound (spec #571 review).
             preserved_view_timeout_ms: Arc::new(std::sync::atomic::AtomicU64::new(30_000)),
+            runtime_reconcile: Arc::new(crate::bridge::runtime::RuntimeReconcile::new()),
         })
     }
 
@@ -325,6 +329,7 @@ impl SharedCore {
             backend: Arc::clone(&self.opencode),
             platform: Arc::clone(&self.feishu),
             config: self.turn_config(),
+            runtime_reconcile: Arc::clone(&self.runtime_reconcile),
         }
     }
 
@@ -338,6 +343,7 @@ impl SharedCore {
             waits: self.waits_handle(),
             backend: Arc::clone(&self.opencode),
             platform: Arc::clone(&self.feishu),
+            runtime_reconcile: Arc::clone(&self.runtime_reconcile),
         }
     }
 

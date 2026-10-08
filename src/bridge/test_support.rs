@@ -1251,6 +1251,14 @@ pub struct MockBackend {
     pub task_runtime: Arc<std::sync::Mutex<crate::backend::TaskRuntime>>,
     /// Records every `task_runtime` call: `(session_id, shells, children)`.
     pub task_runtime_calls: Arc<tokio::sync::Mutex<Vec<TaskRuntimeCall>>>,
+    /// Number of initial `task_runtime` calls to fail with a 500 (then later
+    /// reads serve normally) — the shared reconcile must leave the transcript
+    /// exactly as read, never guess a verdict (#589).
+    pub fail_task_runtime_reads: Arc<std::sync::atomic::AtomicUsize>,
+    /// Number of initial `task_runtime` calls to hang forever — a wedged
+    /// runtime read the caller's own request bound must abandon; the
+    /// transcript must stay exactly as read (#589).
+    pub hang_task_runtime: Arc<std::sync::atomic::AtomicUsize>,
     /// The Background Task retirement overlay (issue #454): recorded through
     /// `retire_background_tasks` and applied inside `transcript`, exactly like
     /// the real adapter's.
@@ -1370,6 +1378,8 @@ impl MockBackend {
             session_status_reads: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             task_runtime: Arc::new(std::sync::Mutex::new(crate::backend::TaskRuntime::default())),
             task_runtime_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            fail_task_runtime_reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            hang_task_runtime: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             retirements: crate::backend::TaskRetirements::default(),
             session_status_error: None,
             session_status_fails: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1787,6 +1797,24 @@ impl MockBackend {
     /// (a wedged per-session read).
     pub(crate) fn hang_transcript_reads(&self, count: usize) -> &Self {
         self.hang_transcript
+            .store(count, std::sync::atomic::Ordering::SeqCst);
+        self
+    }
+
+    /// Scenario: the next `count` runtime verdict reads hang forever (a wedged
+    /// runtime registry, #589) — the caller's own request bound must abandon
+    /// the read and change nothing.
+    pub(crate) fn hang_task_runtime_reads(&self, count: usize) -> &Self {
+        self.hang_task_runtime
+            .store(count, std::sync::atomic::Ordering::SeqCst);
+        self
+    }
+
+    /// Scenario: the next `count` runtime verdict reads fail with a 500 (a
+    /// flaky runtime, #589) — the shared reconcile must leave the transcript
+    /// exactly as read and retry after its interval.
+    pub(crate) fn fail_task_runtime_reads(&self, count: usize) -> &Self {
+        self.fail_task_runtime_reads
             .store(count, std::sync::atomic::Ordering::SeqCst);
         self
     }
@@ -2489,6 +2517,18 @@ impl crate::backend::Backend for MockBackend {
             shells.to_vec(),
             children.to_vec(),
         ));
+        hang_if_scripted(&self.hang_task_runtime).await;
+        if self
+            .fail_task_runtime_reads
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0
+        {
+            self.fail_task_runtime_reads
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            return Err(crate::error::BridgeError::OpenCode(format!(
+                "task runtime {session_id} failed: 500 Internal Server Error"
+            )));
+        }
         Ok(self
             .task_runtime
             .lock()

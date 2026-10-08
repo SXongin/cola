@@ -1554,13 +1554,15 @@ async fn a_runtime_confirmed_end_settles_the_waiting_card() {
     );
 }
 
-/// Issue #454 review: the reconcile observes a retirement only while a card can
-/// still receive the ledger. With no card — a settled chain, or right after a
-/// restart — observing would record the task and swallow its entry (the real
-/// restart retired at 02:25:13 with no card and showed nothing); the next
-/// Waiting card reconciles instead, and the task is still there to be seen.
+/// Issue #454 review, kept under the shared step (#589): the Session Sync
+/// reconcile observes a retirement only while a card can still receive the
+/// ledger. With no card — a settled chain, or right after a restart —
+/// observing would record the task and swallow its entry (the real restart
+/// retired at 02:25:13 with no card and showed nothing). The Turn's own live
+/// card is the observer that serves it now, through the drain read: the entry
+/// renders there and the turn settles ✅ directly.
 #[tokio::test]
-async fn a_runtime_retirement_waits_for_a_waiting_card() {
+async fn a_runtime_retirement_waits_for_a_card_that_can_render_it() {
     let _wd = test_work_dir();
     let now = chrono::Utc::now().timestamp_millis();
     let live = waiting_shell(now - 5_000);
@@ -1573,22 +1575,27 @@ async fn a_runtime_retirement_waits_for_a_waiting_card() {
     tokio::time::sleep(Duration::from_millis(60)).await;
     assert!(
         backend.task_runtime_calls.lock().await.is_empty(),
-        "no waiting card means no runtime observation"
+        "no card means no Session Sync observation"
     );
 
-    // A card exists and yields waiting: the same read now observes, renders the
-    // entry, and settles.
-    yield_one_task_card(&app, &platform, ctx("ses_test", "跑一下构建并审阅")).await;
-    wait_for_card_update(
-        &platform,
-        "the entry after the card exists",
-        CardUpdates::Latest,
-        |card| card_header(card).contains("✅") && card_text(card).contains("🔔 shell 已失联：gh run watch"),
-    )
-    .await;
+    // The Turn's own card now exists: its drain read observes the retirement,
+    // renders the entry, and the settle is ✅ directly.
+    Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下构建并审阅"))
+        .await
+        .unwrap();
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Done),
+        "the live card's read observed the retirement"
+    );
+    let final_card = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_text(&final_card).contains("🔔 shell 已失联：gh run watch"),
+        "the retirement entry renders on the observing card: {final_card}"
+    );
     assert!(
         !backend.task_runtime_calls.lock().await.is_empty(),
-        "the waiting card's pass observed the retirement"
+        "the live card's read observed the retirement"
     );
 }
 
@@ -1706,6 +1713,78 @@ async fn a_task_ended_mid_turn_settles_the_turn_directly() {
     assert!(
         text.contains("shell sh_call_bg · "),
         "the entry carries the task's identity: {final_card}"
+    );
+}
+
+/// Acceptance (#589): the runtime reconcile is one process-wide verdict per
+/// Session per interval, shared by every path — and a waiting card's
+/// retirement still lands per ADR-0065 once the cadence admits it. The Turn's
+/// own drain read spends the first attempt; with the interval pinned wide, no
+/// number of Session Sync passes may spend another, and the card keeps its
+/// wait. Admitting the next attempt (the injectable knob) retires the task,
+/// renders its entry, and settles the card in place with ONE PATCH.
+#[tokio::test]
+async fn the_shared_throttle_bounds_the_waiting_cards_reconcile() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    // A start ahead of cola's clock: the row's elapsed clamps to 0m00s, so no
+    // second-granular clock churn can add a PATCH while the throttle holds.
+    let live = waiting_shell(frozen_start(now));
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    // The turn's drain read spends its attempt on the (empty) runtime and the
+    // card yields waiting — one live task, no verdict.
+    yield_one_task_card(&app, &platform, ctx("ses_test", "跑一下构建并审阅")).await;
+
+    // The runtime now reports the shell ended, but the interval is pinned
+    // wide: the drain already spent this Session's verdict, so no Session Sync
+    // pass may spend another — the shared gate bounds both paths together.
+    backend.task_runtime_calls.lock().await.clear();
+    backend.task_runtime.lock().unwrap().shells = vec![(
+        "sh_call_bg".into(),
+        ShellRuntime::Ended {
+            end: ShellEnd::Killed,
+            completed_at: Some(now - 1_000),
+        },
+    )];
+    app.runtime_reconcile
+        .interval_ms
+        .store(60_000, std::sync::atomic::Ordering::Relaxed);
+    spawn_sync(&app);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        backend.task_runtime_calls.lock().await.is_empty(),
+        "the shared throttle bounds every path's runtime read"
+    );
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Waiting),
+        "no verdict means no retirement: the wait keeps its card"
+    );
+
+    // The cadence admits the next attempt: the deferred retirement retires the
+    // task, renders its entry, and settles the waiting card ✅ in place.
+    app.runtime_reconcile
+        .interval_ms
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    wait_for_card_update(&platform, "the settled card", CardUpdates::Latest, |card| {
+        card_header(card).contains("✅") && card_text(card).contains("🔔 shell 结束：gh run watch")
+    })
+    .await;
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Done),
+        "the admitted verdict settles the waiting card"
+    );
+    let patches = patches_to(&platform, "om_waiting").await;
+    assert_eq!(
+        patches.len(),
+        1,
+        "the deferred retirement is still one in-place PATCH: {patches:?}"
+    );
+    assert!(
+        !card_text(&patches[0]).contains("后台任务（"),
+        "the retired task's live list is gone: {:?}",
+        patches[0]
     );
 }
 

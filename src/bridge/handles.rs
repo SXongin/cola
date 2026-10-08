@@ -1185,6 +1185,9 @@ pub(crate) struct TurnHandles {
     pub(crate) backend: Arc<dyn crate::backend::Backend>,
     pub(crate) platform: Arc<dyn feishu::Platform>,
     pub(crate) config: TurnConfig,
+    /// The shared Background Task runtime reconciliation (#589): the drain's
+    /// read observes it, so a task that dies mid-turn ends the turn directly.
+    pub(crate) runtime_reconcile: Arc<crate::bridge::runtime::RuntimeReconcile>,
 }
 
 impl TurnHandles {
@@ -1199,6 +1202,7 @@ impl TurnHandles {
             waits: self.waits.clone(),
             backend: Arc::clone(&self.backend),
             platform: Arc::clone(&self.platform),
+            runtime_reconcile: Arc::clone(&self.runtime_reconcile),
         }
     }
 }
@@ -1217,6 +1221,10 @@ pub(crate) struct FlowHandles {
     pub(crate) waits: WaitsHandle,
     pub(crate) backend: Arc<dyn crate::backend::Backend>,
     pub(crate) platform: Arc<dyn feishu::Platform>,
+    /// The shared Background Task runtime reconciliation (#589): Session Sync
+    /// and the out-of-turn settle loop observe through the one process-wide
+    /// throttle this carries.
+    pub(crate) runtime_reconcile: Arc<crate::bridge::runtime::RuntimeReconcile>,
 }
 
 impl FlowHandles {

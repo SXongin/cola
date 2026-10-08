@@ -207,86 +207,6 @@ impl ExternalFlow {
         crate::bridge::turn::reconcile_staged_cursors(&handles.cards).await;
     }
 
-    /// Reconcile the transcript's live Background Tasks against the server's
-    /// runtime registries (issue #454), on the Session Sync read the yielded
-    /// ledger and the Wake step already share. A shell the runtime reports
-    /// ended — or no longer knows — leaves the live list as a retirement (its
-    /// completion entry renders where a Wake's would); a subagent the runtime
-    /// reports inactive stays live but reads as unconfirmed; a task with no
-    /// verdict is untouched. One read, made only while the transcript lists
-    /// live tasks, sharing the pass's request bound; any failure leaves the
-    /// transcript exactly as read, so a flaky runtime read can never end a
-    /// wait on its own.
-    async fn reconcile_task_runtime(
-        &self,
-        handles: &FlowHandles,
-        sid: &str,
-        directory: &str,
-        transcript: &mut SessionTranscript,
-    ) {
-        // Observe only while a card can still receive the ledger — the
-        // ownership verdict's yielded-card write admission
-        // ([`CardOwnership::admits_ledger_refresh`], ADR-0060/0070): the entry
-        // renders on the chain that observes the retirement, so observing with
-        // a settled chain — or no chain at all — would record the task and
-        // swallow its entry (found on a real restart, 2026-10-01). The next
-        // Waiting card reconciles instead; nothing is lost, the transcript
-        // stays as read.
-        if !CardOwnership::read(&handles.cards, &handles.waits, sid)
-            .await
-            .admits_ledger_refresh()
-        {
-            return;
-        }
-        let shells: Vec<String> = transcript
-            .background_tasks
-            .iter()
-            .filter_map(|task| task.shell_id.clone())
-            .collect();
-        let children: Vec<String> = transcript
-            .background_tasks
-            .iter()
-            .filter_map(|task| task.child_id.clone())
-            .collect();
-        if shells.is_empty() && children.is_empty() {
-            return;
-        }
-        let read_timeout_ms = self.request_timeout_ms.load(std::sync::atomic::Ordering::Relaxed);
-        match crate::bridge::bounded_call(
-            "task runtime read",
-            read_timeout_ms,
-            handles
-                .backend
-                .task_runtime(sid, Some(directory), &shells, &children),
-        )
-        .await
-        {
-            Some(Ok(runtime)) => {
-                transcript.apply_task_runtime(&runtime);
-                // Record the retirements so every later transcript read — the
-                // live render, the drain's settle, the reap — sees them gone:
-                // the launch record never flips (issue #454), so without the
-                // overlay the next read would resurrect the task.
-                if !transcript.runtime_retired.is_empty() {
-                    let call_ids: Vec<String> = transcript
-                        .runtime_retired
-                        .iter()
-                        .map(|retirement| retirement.task.tool.call_id.clone())
-                        .collect();
-                    tracing::info!(
-                        "session {sid}: runtime reconciliation retired {} background task(s)",
-                        call_ids.len()
-                    );
-                    handles.backend.retire_background_tasks(sid, &call_ids);
-                }
-            }
-            Some(Err(error)) => {
-                tracing::debug!("session {sid} task runtime read failed: {error}; waiting for the next read");
-            }
-            None => {}
-        }
-    }
-
     /// Follow every mapped Session's server-reported location (#433): a
     /// Session can move itself into another directory mid-life (an agent
     /// creating and entering a git worktree), and the directory-routed reads
@@ -377,14 +297,34 @@ impl ExternalFlow {
         else {
             return;
         };
-        // The Background Task runtime reconciliation (issue #454), on the same
-        // read the ledger paths below consume: a shell/subagent whose
-        // completion record was lost is retired here (or marked unconfirmed) so
-        // a Waiting card cannot be stranded on a task that is not running. One
-        // extra read only while the transcript still lists live tasks, and a
-        // failed one leaves the read exactly as it was (never guessed).
-        self.reconcile_task_runtime(handles, sid, directory, &mut transcript)
-            .await;
+        // The shared Background Task runtime reconciliation (#589, issue
+        // #454), on the same read the ledger paths below consume: a
+        // shell/subagent whose completion record was lost is retired here (or
+        // marked unconfirmed) so a Waiting card cannot be stranded on a task
+        // that is not running. Observe only while a card can still receive the
+        // ledger — the ownership verdict's yielded-card write admission
+        // ([`CardOwnership::admits_ledger_refresh`], ADR-0060/0070): the entry
+        // renders on the chain that observes the retirement, so observing with
+        // a settled chain — or no chain at all — would record the task and
+        // swallow its entry (found on a real restart, 2026-10-01). The live
+        // paths observe under their own live card instead; the throttle is the
+        // one process-wide gate they all share, a read that lists no live task
+        // spends nothing, and a failed one changes nothing.
+        if CardOwnership::read(&handles.cards, &handles.waits, sid)
+            .await
+            .admits_ledger_refresh()
+        {
+            handles
+                .runtime_reconcile
+                .observe(
+                    &handles.backend,
+                    sid,
+                    directory,
+                    &mut transcript,
+                    self.request_timeout_ms.load(std::sync::atomic::Ordering::Relaxed),
+                )
+                .await;
+        }
         let Some(newest) = transcript.newest_user() else {
             return;
         };
