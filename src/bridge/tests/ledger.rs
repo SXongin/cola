@@ -1651,6 +1651,64 @@ async fn a_runtime_lost_shell_settles_as_lost() {
     );
 }
 
+/// Ticket #589: the runtime reconcile runs on the Turn's own drain read, so a
+/// task the runtime confirms ended mid-turn — no Wake ever arrives — loses its
+/// row in place, renders its 结束 entry exactly once on the live card, and the
+/// settle that follows is ✅ directly. Session Sync used to be the only
+/// reconciler and it skips an inflight session, so the turn yielded
+/// 「⏳ 等待后台任务」 first and only a later pass retired the task.
+#[tokio::test]
+async fn a_task_ended_mid_turn_settles_the_turn_directly() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = waiting_shell(now - 5_000);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    // The runtime reports the shell killed while the Turn is still live; no
+    // Wake will ever retire it. The transcript stays as scripted and keeps
+    // listing the task, so only the runtime read can end the wait.
+    backend.task_runtime.lock().unwrap().shells = vec![(
+        "sh_call_bg".into(),
+        ShellRuntime::Ended {
+            end: ShellEnd::Killed,
+            completed_at: Some(now - 1_000),
+        },
+    )];
+
+    Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下构建并审阅"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Done),
+        "a task observed ended mid-turn ends the turn directly"
+    );
+    // No intermediate wait: the ledger never showed 「⏳ 等待后台任务」, and the
+    // turn never yielded Waiting on the way to the settle.
+    let updates = platform.updated_cards().await;
+    assert!(
+        updates
+            .iter()
+            .all(|card| !card_header(card).contains("等待后台任务")),
+        "the settle is direct — no waiting detour: {updates:?}"
+    );
+    let final_card = updates.last().cloned().unwrap();
+    let text = card_text(&final_card);
+    assert!(
+        !text.contains("后台任务（"),
+        "the retired task's row left the live ledger: {final_card}"
+    );
+    assert_eq!(
+        text.matches("🔔 shell 结束：gh run watch").count(),
+        1,
+        "exactly one retirement entry renders on the live card: {final_card}"
+    );
+    assert!(
+        text.contains("shell sh_call_bg · "),
+        "the entry carries the task's identity: {final_card}"
+    );
+}
+
 /// Issue #454: a subagent the runtime reports INACTIVE is evidence, not an
 /// ending — the row gains the 待确认 marker, the card stays waiting, and its
 /// Wake (or the user's own decision) remains the only retirement.
