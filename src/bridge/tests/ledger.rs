@@ -37,6 +37,7 @@ use crate::backend::{
     SessionTranscript, ShellEnd, ShellRuntime, StepFinish, ToolCall, ToolIdentity, ToolOutput, ToolStatus,
     TranscriptMessage, Wake, WakeSource,
 };
+use crate::bridge::chain::ChainRecords;
 use crate::bridge::test_support::*;
 use crate::bridge::turn::{PromptContext, Turn};
 use crate::feishu::card::CardState;
@@ -2881,6 +2882,104 @@ async fn a_late_wake_after_a_cleanup_still_resumes_the_chain() {
     assert!(
         !card_text(&continuation).contains("🧹 subagent 已清理"),
         "the cleanup entry stays on its own card: {continuation}"
+    );
+}
+
+/// Spec #588 / #590, review PR #595: the cleanup's synthetic 🧹 retirement —
+/// like every runtime/evidence retirement — keeps exactly-once through the
+/// chain's in-memory announce set alone and never advances the durable Wake
+/// Watermark (ADR-0061, which is Wake-scoped). The cleanup overlay is
+/// process-local; the watermark is not. If the cleanup's own clock staged the
+/// mark, a restart would read a genuinely un-announced late Wake at or below
+/// that clock as already announced, `fresh()` would keep, and the
+/// continuation would be suppressed — #590's "a late Wake for a cleared task
+/// behaves as before; nothing is suppressed". Two lives: life 1 cleans up
+/// (its card write is confirmed, draining whatever the stage holds), the
+/// persisted sidecar is reloaded by a fresh process, and the late Wake still
+/// resumes the chain.
+#[tokio::test]
+async fn a_cleanup_never_advances_the_durable_watermark_for_a_late_wake() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = SessionTranscript::new(two_task_timeline(vec![]))
+        .with_executions(vec![execution(2_500)])
+        .with_background_tasks(vec![live_subagent(now - 3_000, "call_sub")]);
+    let (dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    script_child_without_activity(&backend).await;
+    yield_one_task_card(&app, &platform, ctx("ses_test", "跑一下构建并审阅")).await;
+
+    // Life 1: the child reads inactive, the user cleans it up, and the
+    // settle's card write is confirmed — its stage would drain right here.
+    backend.task_runtime.lock().unwrap().children = vec![("ses_call_sub".into(), ChildRuntime::Inactive)];
+    spawn_sync(&app);
+    wait_for_card_update(&platform, "the unconfirmed marker", CardUpdates::Latest, |card| {
+        card_text(card).contains("⚠️ 状态待确认")
+    })
+    .await;
+    app.host_action(serde_json::json!({ "action": "cleanup", "session_id": "ses_test" }))
+        .await
+        .expect("the cleanup click acks");
+    wait_for_card_update(&platform, "the cleaned settle", CardUpdates::Latest, |card| {
+        card_header(card).contains("✅")
+    })
+    .await;
+
+    // The persisted sidecar, read as a fresh process reads it: the cleanup's
+    // synthetic clock is not a Wake and must not be there.
+    let session_file = dir.path().join("sessions.json");
+    let persisted = ChainRecords::load(session_file.with_file_name("chain_records.json"));
+    assert_eq!(
+        persisted.announced("ses_test"),
+        None,
+        "a synthetic cleanup entry never advances the durable Wake Watermark"
+    );
+
+    // Life 2: a fresh process over the same files. The late Wake arrives with
+    // the subagent's resumed work, its server clock at or before the cleanup
+    // click's — and nothing ever announced it.
+    let late = SessionTranscript::new(two_task_timeline(vec![assistant(3_100, "审阅完成。")]))
+        .with_executions(vec![execution(2_500), execution(4_000)])
+        .with_wakes(vec![Wake {
+            id: MessageId::new("msg_wake_sub_2900"),
+            created_ms: Some(2_900),
+            source: WakeSource::Subagent,
+            shell_id: None,
+            job_id: None,
+            child_id: Some("ses_call_sub".into()),
+            state: Some("completed".into()),
+            label: Some("review the diff".into()),
+        }]);
+    let mut restarted_backend = MockBackend::new(realistic_parts());
+    restarted_backend.given_transcript("ses_test", vec![late]);
+    restarted_backend.with_session_status("ses_test", Some(SessionStatus::Idle));
+    let restarted_backend = Arc::new(restarted_backend);
+    let restarted_platform = Arc::new(RecordingPlatform::new());
+    let restarted = Arc::new(
+        App::new(
+            test_config(&session_file),
+            restarted_backend.clone(),
+            restarted_platform.clone(),
+        )
+        .expect("the restarted app builds"),
+    );
+    seed_session(&restarted, "ses_test", "/work").await;
+
+    spawn_sync(&restarted);
+    wait_for_card_update(
+        &restarted_platform,
+        "the late Wake's continuation",
+        CardUpdates::Latest,
+        |card| card_header(card).contains("✅") && card_text(card).contains("审阅完成。"),
+    )
+    .await;
+    assert!(
+        restarted_platform
+            .sent_cards()
+            .await
+            .iter()
+            .any(|card| card_text(card).contains(WAKE_LEAD)),
+        "the late Wake still resumes the chain after the restart: {:?}",
+        restarted_platform.calls.lock().await
     );
 }
 
