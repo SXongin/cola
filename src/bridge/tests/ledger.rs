@@ -4478,6 +4478,89 @@ async fn a_live_retirements_entry_carries_the_output_tail_once() {
     );
 }
 
+/// Spec #588/#593 (review): the turn's FINAL-render path carries the tail too
+/// — the Wake that retires the shell lands on the finalization read after the
+/// drain's last read, so its entry is first rendered there; it still spends
+/// its one output read, like every other venue, never a bare entry.
+#[tokio::test]
+async fn a_finalization_entry_carries_the_output_tail() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let settled = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+    ]);
+    let waked = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+        assistant(3_100, "CI 通过了。"),
+    ])
+    .with_executions(vec![execution(2_500), execution(4_000)])
+    .with_wakes(vec![shell_wake(2_900)]);
+    let (_dir, app, backend, platform) = scripted_app(vec![settled, waked], Some(SessionStatus::Idle)).await;
+    given_shell_tail(&backend, "sh_bg", "step 1\nstep 2", true, now);
+
+    Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下 CI"))
+        .await
+        .unwrap();
+
+    let final_card = platform.updated_cards().await.last().cloned().unwrap();
+    let text = card_text(&final_card);
+    assert!(
+        text.contains("🔔 shell 完成：gh run watch"),
+        "the final read's entry renders: {final_card}"
+    );
+    assert!(
+        text.contains("截至于")
+            && text.contains("仅最后 2 行 · 已截断")
+            && text.contains("step 1")
+            && text.contains("step 2"),
+        "the final-render entry carries the labelled tail: {final_card}"
+    );
+    assert_eq!(
+        backend.shell_output_calls.lock().await.clone(),
+        vec!["sh_bg".to_string()],
+        "one output read, spent by the final-render entry itself"
+    );
+}
+
+/// Spec #588/#593 (review): an unreadable record on the final-render path gets
+/// the same honest copy as every other venue — 「输出已不可用」, exactly one
+/// read.
+#[tokio::test]
+async fn a_finalization_entry_with_no_record_says_output_unavailable() {
+    let _wd = test_work_dir();
+    let settled = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+    ]);
+    let waked = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+        assistant(3_100, "CI 通过了。"),
+    ])
+    .with_executions(vec![execution(2_500), execution(4_000)])
+    .with_wakes(vec![shell_wake(2_900)]);
+    let (_dir, app, backend, platform) = scripted_app(vec![settled, waked], Some(SessionStatus::Idle)).await;
+
+    Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下 CI"))
+        .await
+        .unwrap();
+
+    let final_card = platform.updated_cards().await.last().cloned().unwrap();
+    let text = card_text(&final_card);
+    assert!(
+        text.contains("🔔 shell 完成：gh run watch") && text.contains("输出已不可用"),
+        "the final-render entry says the record is unavailable: {final_card}"
+    );
+    assert!(!text.contains("截至于"), "never an empty panel: {final_card}");
+    assert_eq!(
+        backend.shell_output_calls.lock().await.clone(),
+        vec!["sh_bg".to_string()],
+        "one output read, spent by the final-render entry itself"
+    );
+}
+
 /// Acceptance 1 (spec #588, #593): the same tail lands on the WAITING card's
 /// quiet true end — the entry is planned, read and committed through the
 /// yielded refresh's own site, still exactly one read.
