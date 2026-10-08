@@ -2401,6 +2401,13 @@ async fn a_cleanup_click_keeps_a_running_task_and_the_wait() {
         vec!["call_bg"],
         "only the unconfirmed task is gone from later reads"
     );
+    // Review (spec #588): the marker rides the overlay, so a cleared task's
+    // marker must not survive as live state either — the overlay only re-applies
+    // markers to tasks still live in the read.
+    assert!(
+        !later.unconfirmed_tasks.contains("call_sub"),
+        "the cleared task's marker does not come back: {later:?}"
+    );
 
     // A second click finds no claim (the card no longer carries an unconfirmed
     // row), so the stale button can clear nothing.
@@ -2452,6 +2459,51 @@ async fn a_cleanup_click_is_not_throttled_by_a_recent_poll() {
     assert!(
         !backend.task_runtime_calls.lock().await.is_empty(),
         "the click spends its own runtime read, never a poll's throttled one"
+    );
+}
+
+/// ADR-0073 (spec #588, #590): a cleanup click whose own runtime read fails
+/// re-derives nothing, so it clears nothing — the carried markers stay on the
+/// card, the button stays usable, and no 🧹 entry is invented.
+#[tokio::test]
+async fn a_cleanup_click_with_a_failed_verdict_read_clears_nothing() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = SessionTranscript::new(two_task_timeline(vec![]))
+        .with_executions(vec![execution(2_500)])
+        .with_background_tasks(vec![live_subagent(now - 3_000, "call_sub")]);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    script_child_without_activity(&backend).await;
+    yield_one_task_card(&app, &platform, ctx("ses_test", "跑一下构建并审阅")).await;
+
+    backend.task_runtime.lock().unwrap().children = vec![("ses_call_sub".into(), ChildRuntime::Inactive)];
+    spawn_sync(&app);
+    wait_for_card_update(&platform, "the unconfirmed marker", CardUpdates::Latest, |card| {
+        card_text(card).contains("⚠️ 状态待确认")
+    })
+    .await;
+
+    // The click's own verdict read fails: it must not clear the carried row.
+    backend.fail_task_runtime_reads(usize::MAX);
+    app.host_action(serde_json::json!({ "action": "cleanup", "session_id": "ses_test" }))
+        .await
+        .expect("the cleanup click acks");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Waiting),
+        "a failed verdict read cannot settle the wait"
+    );
+    let latest = platform.updated_cards().await.last().cloned().unwrap();
+    let text = card_text(&latest);
+    assert!(
+        text.contains("⚠️ 状态待确认") && text.contains("清理待确认任务"),
+        "the carried row and its button stay: {latest}"
+    );
+    assert!(
+        !text.contains("🧹"),
+        "a failed read invents no cleanup entry: {latest}"
     );
 }
 

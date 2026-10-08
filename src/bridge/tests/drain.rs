@@ -11,8 +11,8 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crate::backend::{
-    ContentBlock, FinishReason, MessageRole, Part, SessionTranscript, ShellEnd, ShellRuntime, StepFinish,
-    TextPart, ToolOutput, ToolStatus, TranscriptMessage,
+    BackgroundTask, ChildRuntime, ContentBlock, FinishReason, MessageRole, Part, SessionTranscript, ShellEnd,
+    ShellRuntime, StepFinish, TextPart, ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage,
 };
 use crate::bridge::test_support::*;
 use crate::bridge::turn::{PromptContext, Turn};
@@ -3315,4 +3315,66 @@ async fn a_runtime_retirement_during_the_follow_ends_the_turn() {
         !app.inflight.lock().await.contains("ses_test"),
         "the follow ended the turn"
     );
+}
+
+/// Review (spec #588): the unconfirmed marker survives the live-turn reads
+/// too. A drain tick within the shared throttle renders the transcript it just
+/// read — a read the runtime was not asked about — so without the carried
+/// marker the live card would drop the row's `⚠️ 状态待确认` and its title
+/// count mid-turn, with no evidence the child is running. The Codex sequence's
+/// drain-path twin.
+#[tokio::test]
+async fn a_throttled_drain_read_keeps_the_unconfirmed_marker() {
+    let _wd = test_work_dir();
+    let live = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_background_tasks(vec![BackgroundTask {
+        tool: ToolIdentity {
+            name: "subagent".into(),
+            call_id: "call_sub".into(),
+        },
+        shell_id: None,
+        child_id: Some("ses_call_sub".into()),
+        started_at: Some(2_100),
+    }]);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Busy)).await;
+    // The child's own read finds no activity and no concluding evidence: the
+    // row stays unconfirmed and nothing ticks (the title count is pinned).
+    backend
+        .given_transcript_after_build("ses_call_sub", vec![SessionTranscript::new(vec![])])
+        .await;
+    backend.task_runtime.lock().unwrap().children = vec![("ses_call_sub".into(), ChildRuntime::Inactive)];
+
+    // The still-busy session keeps the drain rendering; its admitted read marks
+    // the child on the live card.
+    let turn = spawn_turn(&app, ctx("ses_test", "跑一下 CI"));
+    wait_for_card_update(&platform, "the unconfirmed marker", CardUpdates::Latest, |card| {
+        card_text(card).contains("⚠️ 状态待确认")
+    })
+    .await;
+
+    // Pin the shared throttle wide: the next drain reads get no verdict, and
+    // nothing positive said the child is running.
+    app.runtime_reconcile.interval_ms.store(60_000, Ordering::Relaxed);
+    backend.transcript_calls.lock().await.clear();
+    wait_for_transcript_reads(&backend, "ses_test", 1).await;
+    // Let the throttled tick's render land: it must owe none.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let latest = platform.updated_cards().await.last().cloned().unwrap();
+    let text = card_text(&latest);
+    assert!(
+        text.contains("⏳ 后台任务（1 · 1 待确认）"),
+        "the live card keeps counting the unconfirmed row: {latest}"
+    );
+    assert!(
+        text.contains("⚠️ 状态待确认"),
+        "the marker survives a drain read the runtime was not asked about: {latest}"
+    );
+
+    turn.abort();
+    let _ = turn.await;
 }

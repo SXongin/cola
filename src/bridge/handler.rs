@@ -2149,10 +2149,11 @@ impl App {
         // read, positive-evidence verdicts, child evidence and overlay
         // recording every poll path runs through `observe`, without the
         // process-wide throttle — a click is a user action, not a poll, and
-        // must spend its own read. A failed or timed-out one leaves the
-        // transcript exactly as decoded, so nothing is cleared on a flaky
-        // runtime.
-        crate::bridge::runtime::reconcile_now(
+        // must spend its own read. A failed or timed-out one re-derives
+        // nothing and so clears nothing (ADR-0073): the carried markers stay
+        // on the card and the claim goes back, keeping the button usable.
+        // (`None` is also the zero-live-task case: there is nothing to clear.)
+        let verdict = crate::bridge::runtime::reconcile_now(
             &handles.backend,
             &session_id,
             directory.as_deref(),
@@ -2160,6 +2161,11 @@ impl App {
             read_timeout_ms,
         )
         .await;
+        if verdict.is_none() {
+            tracing::warn!("cleanup: no runtime verdict on session {session_id}; clearing nothing");
+            crate::bridge::turn::Turn::release_cleanup_claim(&handles.cards, &session_id).await;
+            return;
+        }
         let cleared: Vec<String> = transcript
             .background_tasks
             .iter()

@@ -52,7 +52,11 @@ pub struct SessionTranscript {
     /// confirm as running (a subagent child the runtime reports inactive) while
     /// no Wake retired them. The ledger renders those rows as 状态待确认; the
     /// settle rule is deliberately unchanged (only a Wake or a positive
-    /// terminal verdict retires a task).
+    /// terminal verdict retires a task). The adapter's overlay re-applies the
+    /// previous reconciles' markers to every read, so a read the shared
+    /// throttle did not spend a verdict on keeps them; only a verdict resolves
+    /// one — `Running` clears it, and a task that leaves the live list drops
+    /// it with its row.
     pub unconfirmed_tasks: std::collections::HashSet<String>,
     /// Whether the backend's read stopped at its own page cap with more
     /// content behind it (spec #561, review #569): the V2 projected-message
@@ -123,8 +127,13 @@ impl SessionTranscript {
     ///
     /// The retirement is deliberately limited to positive evidence: an id the
     /// runtime did not mention (a failed per-shell read, an unrecognised active
-    /// entry) never retires a task, and a subagent only ever gains the
-    /// unconfirmed marker. A Wake-retired task is already absent here.
+    /// entry) never retires a task. The unconfirmed marker is resolved only on
+    /// evidence too: the read carries the markers the overlay re-applied (the
+    /// previous reconciles' state), a `Running` verdict clears that child's
+    /// marker, an `Inactive` one (re)sets it, and a verdict that does not answer
+    /// for the child keeps exactly what the read carried. A task the verdict
+    /// retires drops its marker with it. A Wake-retired task is already absent
+    /// here.
     pub fn apply_task_runtime(&mut self, runtime: &TaskRuntime) {
         if runtime.shells.is_empty() && runtime.children.is_empty() {
             return;
@@ -132,21 +141,28 @@ impl SessionTranscript {
         let mut kept = Vec::with_capacity(self.background_tasks.len());
         let mut retired = Vec::new();
         for task in std::mem::take(&mut self.background_tasks) {
+            let call_id = task.tool.call_id.clone();
             if let Some(shell_id) = task.shell_id.clone() {
                 match runtime.shell(&shell_id) {
                     // No verdict: the read could not place this shell — leave
                     // the task exactly as the transcript read it.
                     None | Some(ShellRuntime::Running) => kept.push(task),
-                    Some(ShellRuntime::Ended { end, completed_at }) => retired.push(TaskRetirement {
-                        task,
-                        ending: TaskRetirementEnding::Ended(end.clone()),
-                        finished_at: *completed_at,
-                    }),
-                    Some(ShellRuntime::Missing) => retired.push(TaskRetirement {
-                        task,
-                        ending: TaskRetirementEnding::Lost,
-                        finished_at: None,
-                    }),
+                    Some(ShellRuntime::Ended { end, completed_at }) => {
+                        self.unconfirmed_tasks.remove(&call_id);
+                        retired.push(TaskRetirement {
+                            task,
+                            ending: TaskRetirementEnding::Ended(end.clone()),
+                            finished_at: *completed_at,
+                        });
+                    }
+                    Some(ShellRuntime::Missing) => {
+                        self.unconfirmed_tasks.remove(&call_id);
+                        retired.push(TaskRetirement {
+                            task,
+                            ending: TaskRetirementEnding::Lost,
+                            finished_at: None,
+                        });
+                    }
                 }
                 continue;
             }
@@ -155,8 +171,17 @@ impl SessionTranscript {
                 kept.push(task);
                 continue;
             };
-            if runtime.child(&child_id) == Some(ChildRuntime::Inactive) {
-                self.unconfirmed_tasks.insert(task.tool.call_id.clone());
+            match runtime.child(&child_id) {
+                // Positive evidence the run is live: the marker resolves.
+                Some(ChildRuntime::Running) => {
+                    self.unconfirmed_tasks.remove(&call_id);
+                }
+                Some(ChildRuntime::Inactive) => {
+                    self.unconfirmed_tasks.insert(call_id);
+                }
+                // No answer (a read that could not place the child): keep the
+                // marker exactly as the read carried it.
+                None => {}
             }
             kept.push(task);
         }
@@ -1099,52 +1124,97 @@ pub enum TaskRetirementEnding {
     Cleaned,
 }
 
-/// The process-local overlay of Background Tasks the runtime confirmed ended
-/// (issue #454) or the user cleared (spec #588, #590): the transcript's launch
-/// record never flips, so without this every re-read of the transcript would
-/// resurrect a task the runtime already retired — a live turn's ledger would
-/// show it again, and the next Turn would yield waiting on it, forever.
+/// The process-local overlay of the Background Task facts a **Runtime
+/// Reconciliation** established this cola life (issue #454): the tasks the
+/// runtime confirmed ended or the user cleared (spec #588, #590), and the live
+/// tasks the runtime could not confirm as running (the `⚠️ 状态待确认`
+/// markers). The transcript's launch record never flips, so without the first
+/// every re-read would resurrect a task the runtime already retired — a live
+/// turn's ledger would show it again, and the next Turn would yield waiting on
+/// it, forever. And the marker state is derived per read
+/// ([`SessionTranscript::apply_task_runtime`]) from a verdict the shared
+/// throttle rations, so without the second any read the runtime was not asked
+/// about — a Session Sync refresh, a drain tick, a follow — would drop the
+/// marker (and the cleanup button it gates) with no evidence the child is
+/// running (review, spec #588).
 ///
-/// The Bridge records each retirement here right after a reconciliation read
-/// ([`SessionTranscript::apply_task_runtime`]); the adapter applies the overlay
-/// to every transcript it returns ([`SessionTranscript`]'s
-/// `background_tasks` minus the recorded call ids), so no read path can
-/// disagree. It is deliberately in-memory: a cola restart loses it, the next
-/// read re-derives the same retirement and re-renders one entry on the newest
-/// chain, and the runtime explains the task again. A manual cleanup is no
-/// different — it is a cola-life dismissal, re-derived at restart.
+/// The Bridge records every retirement ([`Self::record`]) and replaces the
+/// unconfirmed set ([`Self::set_unconfirmed`]) right after a reconciliation
+/// read; the adapter applies the overlay to every transcript it returns, so no
+/// read path can disagree. A marker is re-applied only to a task still live in
+/// the read, so a retired task's marker never surfaces as live state. The
+/// overlay is deliberately in-memory: a cola restart loses it, the next read
+/// re-derives the same retirements and the next verdict the same markers, and
+/// the runtime explains the task again. A manual cleanup is no different — it
+/// is a cola-life dismissal, re-derived at restart.
 #[derive(Default)]
-pub struct TaskRetirements {
-    retired: std::sync::Mutex<std::collections::HashMap<String, std::collections::HashSet<String>>>,
+pub struct BackgroundTaskOverlay {
+    state: std::sync::Mutex<OverlayState>,
 }
 
-impl TaskRetirements {
+#[derive(Default)]
+struct OverlayState {
+    /// session_id → the call ids the runtime (or a cleanup) retired.
+    retired: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    /// session_id → the live call ids the runtime could not confirm as
+    /// running.
+    unconfirmed: std::collections::HashMap<String, std::collections::HashSet<String>>,
+}
+
+impl BackgroundTaskOverlay {
     /// Record the call ids the runtime retired for one session. Idempotent.
     pub fn record(&self, session_id: &str, call_ids: &[String]) {
-        let mut retired = self
-            .retired
+        let mut state = self
+            .state
             .lock()
-            .expect("the task-retirement lock is never poisoned");
-        let session = retired.entry(session_id.to_string()).or_default();
+            .expect("the task-overlay lock is never poisoned");
+        let session = state.retired.entry(session_id.to_string()).or_default();
         for call_id in call_ids {
             session.insert(call_id.clone());
         }
     }
 
-    /// Remove every Background Task the runtime already retired for
-    /// `session_id` from `transcript`'s live list. A session with no recorded
-    /// retirement is untouched (the common case does no set lookup per task).
-    pub fn apply(&self, session_id: &str, transcript: &mut SessionTranscript) {
-        let retired = self
-            .retired
+    /// Replace one session's unconfirmed-marker set with exactly `call_ids` —
+    /// the reconcile's post-verdict set of live tasks it could not confirm as
+    /// running. Replace semantics let a verdict clear a marker: a set without
+    /// the id stops riding later reads, while a failed read never calls this
+    /// and so clears nothing.
+    pub fn set_unconfirmed(&self, session_id: &str, call_ids: &[String]) {
+        let mut state = self
+            .state
             .lock()
-            .expect("the task-retirement lock is never poisoned");
-        let Some(ids) = retired.get(session_id) else {
+            .expect("the task-overlay lock is never poisoned");
+        if call_ids.is_empty() {
+            state.unconfirmed.remove(session_id);
+            return;
+        }
+        state
+            .unconfirmed
+            .insert(session_id.to_string(), call_ids.iter().cloned().collect());
+    }
+
+    /// Apply the overlay to one read: every recorded retirement leaves
+    /// `transcript`'s live list, and every recorded unconfirmed marker is
+    /// re-inserted for a task still live in it. A session with nothing
+    /// recorded is untouched (the common case does no set lookup per task).
+    pub fn apply(&self, session_id: &str, transcript: &mut SessionTranscript) {
+        let state = self
+            .state
+            .lock()
+            .expect("the task-overlay lock is never poisoned");
+        if let Some(ids) = state.retired.get(session_id) {
+            transcript
+                .background_tasks
+                .retain(|task| !ids.contains(task.tool.call_id.as_str()));
+        }
+        let Some(ids) = state.unconfirmed.get(session_id) else {
             return;
         };
-        transcript
-            .background_tasks
-            .retain(|task| !ids.contains(task.tool.call_id.as_str()));
+        for task in &transcript.background_tasks {
+            if ids.contains(task.tool.call_id.as_str()) {
+                transcript.unconfirmed_tasks.insert(task.tool.call_id.clone());
+            }
+        }
     }
 }
 
@@ -2101,32 +2171,32 @@ mod tests {
         );
     }
 
-    /// The process-local retirement overlay (issue #454 review): a recorded
-    /// call id leaves every later read of that session's live list, other
-    /// sessions and other call ids stay untouched, and the live list's own
-    /// facts (the retirement entries) are not what it filters.
+    /// The process-local Background Task overlay's retirement half (issue #454
+    /// review): a recorded call id leaves every later read of that session's
+    /// live list, other sessions and other call ids stay untouched, and the
+    /// live list's own facts (the retirement entries) are not what it filters.
     #[test]
     fn recorded_retirements_leave_later_reads_of_the_live_list() {
-        let retirements = TaskRetirements::default();
+        let overlay = BackgroundTaskOverlay::default();
         let live = || SessionTranscript::new(vec![]).with_background_tasks(vec![background_shell(1_100)]);
         let mut transcript = live();
-        retirements.apply("ses_a", &mut transcript);
+        overlay.apply("ses_a", &mut transcript);
         assert_eq!(
             transcript.background_tasks.len(),
             1,
             "nothing recorded yet leaves the read as decoded"
         );
 
-        retirements.record("ses_a", &["call_bg".to_string()]);
+        overlay.record("ses_a", &["call_bg".to_string()]);
         let mut filtered = live();
-        retirements.apply("ses_a", &mut filtered);
+        overlay.apply("ses_a", &mut filtered);
         assert!(
             filtered.background_tasks.is_empty(),
             "the recorded task leaves the live list"
         );
 
         let mut other_session = live();
-        retirements.apply("ses_b", &mut other_session);
+        overlay.apply("ses_b", &mut other_session);
         assert_eq!(
             other_session.background_tasks.len(),
             1,
@@ -2142,8 +2212,134 @@ mod tests {
             child_id: None,
             started_at: Some(1_100),
         }]);
-        retirements.apply("ses_a", &mut other_id);
+        overlay.apply("ses_a", &mut other_id);
         assert_eq!(other_id.background_tasks.len(), 1, "another call id is untouched");
+    }
+
+    /// Review (spec #588, #590): the overlay carries the unconfirmed markers
+    /// too — a recorded marker is re-applied to every later read's live task,
+    /// replacing the set (the reconcile's post-verdict write) is how a verdict
+    /// stops it riding reads, and a task the retirement half removed never gets
+    /// its marker back: a marker only ever surfaces for live state.
+    #[test]
+    fn recorded_unconfirmed_markers_ride_later_reads_of_live_tasks_only() {
+        let child_task = || BackgroundTask {
+            tool: ToolIdentity {
+                name: "subagent".into(),
+                call_id: "call_sub".into(),
+            },
+            shell_id: None,
+            child_id: Some("ses_child".into()),
+            started_at: Some(1_100),
+        };
+        let overlay = BackgroundTaskOverlay::default();
+        let live = || SessionTranscript::new(vec![]).with_background_tasks(vec![child_task()]);
+
+        let mut untouched = live();
+        overlay.apply("ses_a", &mut untouched);
+        assert!(
+            untouched.unconfirmed_tasks.is_empty(),
+            "nothing recorded yet marks nothing"
+        );
+
+        overlay.set_unconfirmed("ses_a", &["call_sub".to_string()]);
+        let mut marked = live();
+        overlay.apply("ses_a", &mut marked);
+        assert!(
+            marked.unconfirmed_tasks.contains("call_sub"),
+            "the recorded marker rides every later read"
+        );
+
+        let mut other_session = live();
+        overlay.apply("ses_b", &mut other_session);
+        assert!(
+            other_session.unconfirmed_tasks.is_empty(),
+            "another session is untouched"
+        );
+
+        // The reconcile's replace write is how a verdict resolves a marker.
+        overlay.set_unconfirmed("ses_a", &[]);
+        let mut resolved = live();
+        overlay.apply("ses_a", &mut resolved);
+        assert!(
+            resolved.unconfirmed_tasks.is_empty(),
+            "a resolved verdict's replacement stops the marker riding reads"
+        );
+
+        // A retired task is not live state: its marker must not come back.
+        overlay.set_unconfirmed("ses_a", &["call_sub".to_string()]);
+        overlay.record("ses_a", &["call_sub".to_string()]);
+        let mut retired = live();
+        overlay.apply("ses_a", &mut retired);
+        assert!(
+            retired.background_tasks.is_empty(),
+            "the retirement removes the task"
+        );
+        assert!(
+            retired.unconfirmed_tasks.is_empty(),
+            "a retired task's marker does not survive as live state"
+        );
+    }
+
+    /// Review (spec #588): a runtime verdict resolves the carried unconfirmed
+    /// marker only on evidence — the child RUNNING clears it, INACTIVE
+    /// (re)sets it, and a verdict that does not answer for the child keeps
+    /// exactly what the read carried.
+    #[test]
+    fn a_runtime_read_resolves_the_carried_unconfirmed_marker_only_on_evidence() {
+        let child_task = || BackgroundTask {
+            tool: ToolIdentity {
+                name: "subagent".into(),
+                call_id: "call_sub".into(),
+            },
+            shell_id: None,
+            child_id: Some("ses_child".into()),
+            started_at: Some(1_100),
+        };
+
+        // A Running verdict resolves the carried marker; the task stays live.
+        let mut running = SessionTranscript::new(vec![]).with_background_tasks(vec![child_task()]);
+        running.unconfirmed_tasks.insert("call_sub".into());
+        running.apply_task_runtime(&TaskRuntime {
+            shells: vec![],
+            children: vec![("ses_child".into(), ChildRuntime::Running)],
+        });
+        assert!(
+            running.unconfirmed_tasks.is_empty(),
+            "positive evidence resolves the marker"
+        );
+        assert_eq!(running.background_tasks.len(), 1, "a running child stays live");
+
+        // An Inactive verdict (re)sets it, carried or not.
+        let mut inactive = SessionTranscript::new(vec![]).with_background_tasks(vec![child_task()]);
+        inactive.apply_task_runtime(&TaskRuntime {
+            shells: vec![],
+            children: vec![("ses_child".into(), ChildRuntime::Inactive)],
+        });
+        assert!(inactive.unconfirmed_tasks.contains("call_sub"));
+        let mut re_marked = SessionTranscript::new(vec![]).with_background_tasks(vec![child_task()]);
+        re_marked.unconfirmed_tasks.insert("call_sub".into());
+        re_marked.apply_task_runtime(&TaskRuntime {
+            shells: vec![],
+            children: vec![("ses_child".into(), ChildRuntime::Inactive)],
+        });
+        assert!(
+            re_marked.unconfirmed_tasks.contains("call_sub"),
+            "an inactive child keeps its marker"
+        );
+
+        // A verdict that does not answer for the child keeps the carried
+        // marker; a shell verdict elsewhere does not touch it either.
+        let mut unanswered = SessionTranscript::new(vec![]).with_background_tasks(vec![child_task()]);
+        unanswered.unconfirmed_tasks.insert("call_sub".into());
+        unanswered.apply_task_runtime(&TaskRuntime {
+            shells: vec![("sh_other".into(), ShellRuntime::Running)],
+            children: vec![],
+        });
+        assert!(
+            unanswered.unconfirmed_tasks.contains("call_sub"),
+            "a verdict with no answer for the child changes nothing"
+        );
     }
 
     /// A Wake opens an Execution, so its content landing before that

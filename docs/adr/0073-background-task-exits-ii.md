@@ -50,11 +50,17 @@ the user already looks at.
   failing runtime is not hammered at the poll cadence) and injectable beside
   the other timing atomics; a failed or timed-out read yields no verdict and
   changes nothing — no retirement, no settle — so a flaky runtime can never
-  end a wait. The step itself is gate-free: each caller decides whether it can
-  render what it observes before calling (Session Sync's waiting-card
-  admission; the live loops only once the card carries the Turn anchor the
-  entry can be placed by), because an observation with no render home would be
-  recorded in the overlay with its entry swallowed.
+  end a wait. The unconfirmed markers stay that invariant too (review, PR
+  #595): they are process-local, the same adapter overlay re-applies them to
+  every later transcript read — only for a task still live in it — so a read
+  the throttle did not spend a verdict on cannot drop a marker and the cleanup
+  button it gates, and only a verdict resolves one (a Running child clears its
+  marker, an Inactive one keeps it, and a read that does not answer for the
+  child keeps the previous state). The step itself is gate-free: each caller
+  decides whether it can render what it observes before calling (Session Sync's
+  waiting-card admission; the live loops only once the card carries the Turn
+  anchor the entry can be placed by), because an observation with no render
+  home would be recorded in the overlay with its entry swallowed.
 
 - **Live-path retirement entries render exactly once.** The live render path —
   until now only refreshing ledger rows — gains the entry machinery: entries
