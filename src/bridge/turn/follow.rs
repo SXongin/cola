@@ -182,7 +182,7 @@ async fn run(handles: TurnHandles, facts: FollowFacts, timing: SettleTiming) {
     {
         return;
     }
-    super::send_completion_notice(
+    super::announce_completion(
         &handles.cards,
         &handles.platform,
         &handles.config.notice_rules(),

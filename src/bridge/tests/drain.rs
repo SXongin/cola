@@ -3492,3 +3492,88 @@ async fn a_throttled_drain_read_keeps_the_unconfirmed_marker() {
     turn.abort();
     let _ = turn.await;
 }
+
+// ---------------------------------------------------------------------------
+// The Completion Notice gate (spec #602, ticket #607): the notice follows the
+// terminal write's carrier — delivered now, or owed by a Pending Card Update
+// that must drain first. One rule for every carrier (the direct PATCH, the
+// size split, the queued retry); the quiet in-place settle is gated identically
+// in `refreshed_yielded_card`.
+// ---------------------------------------------------------------------------
+
+/// Await the Completion Notice or panic after 5 s: a gated notice is fired from
+/// the delivery layer's drain on its own spawned task, so it trails the drain
+/// call that delivered the write.
+pub(crate) async fn wait_for_notice(platform: &RecordingPlatform) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !noticed(platform).await {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no Completion Notice arrived: {:?}",
+            platform.calls.lock().await
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// Acceptance (ticket #607): a terminal PATCH that lands directly announces at
+/// once — the gate must never defer a delivered write.
+#[tokio::test]
+async fn a_direct_terminal_patch_notifies_at_once() {
+    let _wd = test_work_dir();
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "你好"),
+        assistant(2_000, "最终答复。"),
+    ]);
+    let (_dir, app, _backend, platform) = scripted_app(vec![transcript], Some(SessionStatus::Idle)).await;
+    let mut context = ctx("ses_test", "你好");
+    context.is_group = true;
+    context.requester_open_id = Some(TEST_HOST.to_string());
+
+    Turn::run(&app.turn_handles(), context).await.unwrap();
+
+    assert!(
+        noticed(&platform).await,
+        "a delivered terminal PATCH notifies without waiting for a drain: {:?}",
+        platform.calls.lock().await
+    );
+}
+
+/// Acceptance (ticket #607): a terminal PATCH that failed recoverably is queued
+/// as a Pending Card Update; the notice must NOT fire while it is owed, and
+/// must fire once the drain delivers it. Group turn, so the notice is on and a
+/// missing one is the gate's doing, not the rules'.
+#[tokio::test]
+async fn a_queued_ending_patch_notifies_only_after_it_drains() {
+    let _wd = test_work_dir();
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "你好"),
+        assistant(2_000, "最终答复。"),
+    ]);
+    let (_dir, app, _backend, platform) = scripted_app(vec![transcript], Some(SessionStatus::Idle)).await;
+    // Every content write fails at the transport: the ending PATCH is owed.
+    platform.fail_update_transport_count.store(100, Ordering::SeqCst);
+    let mut context = ctx("ses_test", "你好");
+    context.is_group = true;
+    context.requester_open_id = Some(TEST_HOST.to_string());
+
+    Turn::run(&app.turn_handles(), context).await.unwrap();
+
+    assert!(
+        !noticed(&platform).await,
+        "an owed terminal write must not announce before it drains: {:?}",
+        platform.calls.lock().await
+    );
+
+    // Feishu returns: the drain delivers the owed update, and the notice fires.
+    platform.fail_update_transport_count.store(0, Ordering::SeqCst);
+    app.core.feishu.drain_pending_card_updates(true).await;
+    wait_for_notice(&platform).await;
+
+    // The delivered card is the terminal content the notice announces.
+    let delivered = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_text(&delivered).contains("最终答复。"),
+        "the notice trails the terminal content: {delivered}"
+    );
+}
