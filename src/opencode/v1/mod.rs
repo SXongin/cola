@@ -21,7 +21,7 @@ mod tests;
 
 use async_trait::async_trait;
 
-use crate::backend::{SessionTranscript, TaskRuntime};
+use crate::backend::{ChildEvidence, SessionTranscript, TaskRuntime};
 use crate::error::Result;
 
 use super::strategy::GenerationStrategy;
@@ -430,7 +430,7 @@ impl GenerationStrategy for V1Strategy {
         Ok(TaskRuntime::default())
     }
 
-    /// V1 carries no shell records: an empty window without a request, exactly
+    /// V1 carries no shell records: no output without a request, exactly
     /// like its empty runtime verdict (spec #588, #592).
     async fn shell_output(
         &self,
@@ -439,6 +439,14 @@ impl GenerationStrategy for V1Strategy {
         _directory: Option<&str>,
     ) -> Result<Option<crate::backend::ShellOutputWindow>> {
         Ok(None)
+    }
+
+    /// V1 carries no Background Tasks and so no child sessions, so the
+    /// child-evidence read answers no evidence without a request (#591, issue
+    /// #464). The caller's suspect list is empty there anyway; this arm exists
+    /// so the trait has no unimplemented generation.
+    async fn child_evidence(&self, _http: &Transport, _session_id: &str) -> Result<ChildEvidence> {
+        Ok(ChildEvidence::Unfinished)
     }
 
     /// List pending question requests for an instance (canonical:

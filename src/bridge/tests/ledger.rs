@@ -33,7 +33,7 @@ use super::drain::{
     user, wait_for_card_text,
 };
 use crate::backend::{
-    BackgroundTask, ChildRuntime, ContentBlock, FinishReason, MessageId, MessageRole, Part,
+    BackgroundTask, ChildEvidence, ChildRuntime, ContentBlock, FinishReason, MessageId, MessageRole, Part,
     SessionTranscript, ShellEnd, ShellRuntime, StepFinish, ToolCall, ToolIdentity, ToolOutput, ToolStatus,
     TranscriptMessage, Wake, WakeSource,
 };
@@ -1839,6 +1839,88 @@ async fn an_inactive_child_marks_its_row_unconfirmed_without_settling() {
             && shells == &vec!["sh_call_bg".to_string()]
             && children == &vec!["ses_call_sub".to_string()]),
         "the reconcile read named the live tasks: {calls:?}"
+    );
+}
+
+/// Spec #588 / #591: a subagent the runtime no longer reports active is
+/// retirable on its OWN child transcript's evidence — the terminal step finish
+/// (with its completion stamp) its newest assistant message carries, which is
+/// exactly the read a missing Wake leaves as the only way out. One light read
+/// per suspect per cycle: the row leaves, the card records
+/// 「🔔 subagent 结束：<描述>」 exactly once and settles ✅ in place, and the
+/// retirement is overlay-recorded so no later read resurrects the task.
+#[tokio::test]
+async fn a_terminal_child_settles_the_waiting_card() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = SessionTranscript::new(two_task_timeline(vec![]))
+        .with_executions(vec![execution(2_500)])
+        .with_background_tasks(vec![live_subagent(now - 3_000, "call_sub")]);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    script_child_without_activity(&backend).await;
+    yield_one_task_card(&app, &platform, ctx("ses_test", "跑一下构建并审阅")).await;
+    let cards_before = created_cards(&platform).await.len();
+
+    // The runtime no longer lists the child active; the child's own newest
+    // assistant message shows the run finished at `finished`.
+    let finished = now - 1_000;
+    backend.task_runtime.lock().unwrap().children = vec![("ses_call_sub".into(), ChildRuntime::Inactive)];
+    backend
+        .with_child_evidence(
+            "ses_call_sub",
+            ChildEvidence::Terminal {
+                completed_at: finished,
+            },
+        )
+        .await;
+    spawn_sync(&app);
+    wait_for_card_update(&platform, "the settled card", CardUpdates::Latest, |card| {
+        card_header(card).contains("✅") && card_text(card).contains("🔔 subagent 结束：review the diff")
+    })
+    .await;
+
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Done),
+        "the child's own terminal evidence is the card's true end"
+    );
+    let patches = patches_to(&platform, "om_waiting").await;
+    let settled = patches.last().cloned().unwrap();
+    let text = card_text(&settled);
+    assert!(
+        !text.contains("后台任务（") && !text.contains("状态待确认"),
+        "the retired suspect's row is gone: {settled}"
+    );
+    assert_eq!(
+        text.matches("🔔 subagent 结束：review the diff").count(),
+        1,
+        "exactly one retirement entry renders: {settled}"
+    );
+    assert!(
+        text.contains("subagent ses_call_sub · "),
+        "the entry carries the child's identity and its clock: {settled}"
+    );
+    assert!(
+        continuation_sends(&platform).await.is_empty()
+            && created_cards(&platform).await.len() == cards_before,
+        "an evidence settle posts nothing: {:?}",
+        platform.calls.lock().await
+    );
+    // Exactly one light read, on the one suspect — never a transcript read.
+    assert_eq!(
+        backend.child_evidence_calls.lock().await.as_slice(),
+        ["ses_call_sub".to_string()],
+        "one evidence read per suspected child per cycle"
+    );
+    // The retirement is overlay-recorded: a later read of the same scripted
+    // transcript no longer lists the task (#591 review — without this the next
+    // live card would resurrect it).
+    let later = crate::backend::Backend::transcript(backend.as_ref(), "ses_test")
+        .await
+        .unwrap();
+    assert!(
+        later.background_tasks.is_empty(),
+        "the retirement overlay filters every later read"
     );
 }
 

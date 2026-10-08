@@ -1243,3 +1243,24 @@ async fn shell_output_is_none_without_a_v1_request() {
         server.requests()
     );
 }
+
+/// V1 carries no Background Tasks (no child sessions), so the child-evidence
+/// read answers no evidence without a request (#591, issue #464). The caller's
+/// subagent list is empty there anyway; this arm exists so the trait has no
+/// unimplemented generation.
+#[tokio::test]
+async fn child_evidence_answers_unfinished_without_a_request_on_v1() {
+    let server = TestHttpServer::start().await;
+    let client = v1_wire_client(&server, None);
+
+    assert_eq!(
+        client.child_evidence("ses_child").await.unwrap(),
+        crate::backend::ChildEvidence::Unfinished,
+        "V1 never produces child evidence"
+    );
+    assert!(
+        server.requests().is_empty(),
+        "the read must not reach the wire: {:?}",
+        server.requests()
+    );
+}

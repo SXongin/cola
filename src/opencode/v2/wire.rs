@@ -29,9 +29,9 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::backend::{
-    BackgroundLaunch, BackgroundTask, ContentBlock, Execution, ExecutionOutcome, FinishReason, MessageId,
-    MessageRole, MessageTime, ModelIdentity, OtherPart, Part, ReasoningPart, SessionTranscript, ShellEnd,
-    ShellRuntime, StepFinish, TextPart, TokenUsage, ToolCall, ToolIdentity, ToolOutput, ToolStatus,
+    BackgroundLaunch, BackgroundTask, ChildEvidence, ContentBlock, Execution, ExecutionOutcome, FinishReason,
+    MessageId, MessageRole, MessageTime, ModelIdentity, OtherPart, Part, ReasoningPart, SessionTranscript,
+    ShellEnd, ShellRuntime, StepFinish, TextPart, TokenUsage, ToolCall, ToolIdentity, ToolOutput, ToolStatus,
     TranscriptMessage, Wake, WakeSource,
 };
 use crate::opencode::types::{
@@ -621,6 +621,31 @@ impl MessagesPage {
         self.newest_assistant()
             .and_then(|message| message.get("retry"))
             .is_some_and(|retry| !retry.is_null())
+    }
+
+    /// The evidence the newest assistant message carries about its run (#591,
+    /// issue #464). A terminal `finish` TOGETHER WITH the message's completion
+    /// stamp is terminal evidence — the server writes both in the same step-end
+    /// update, so a terminal reason still missing its stamp is a read that
+    /// cannot conclude; everything else (no assistant message, a non-terminal
+    /// finish, a missing finish) is no evidence, never a guess. The finish
+    /// decode is the transcript decode's own, so a spelled-out `"unknown"`
+    /// stays terminal exactly as it does there.
+    pub(super) fn newest_assistant_evidence(&self) -> ChildEvidence {
+        let Some(message) = self.newest_assistant() else {
+            return ChildEvidence::Unfinished;
+        };
+        let terminal = message
+            .get("finish")
+            .and_then(Value::as_str)
+            .is_some_and(|reason| decode_finish_reason(Some(reason)).is_terminal());
+        match (
+            terminal,
+            message.pointer("/time/completed").and_then(Value::as_i64),
+        ) {
+            (true, Some(completed_at)) => ChildEvidence::Terminal { completed_at },
+            _ => ChildEvidence::Unfinished,
+        }
     }
 }
 

@@ -33,7 +33,9 @@ mod wire;
 
 use std::sync::Arc;
 
-use crate::backend::{Backend, BackendDirectory, DirectoryBackend, SessionTranscript, TaskRuntime};
+use crate::backend::{
+    Backend, BackendDirectory, ChildEvidence, DirectoryBackend, SessionTranscript, TaskRuntime,
+};
 use crate::error::Result;
 use async_trait::async_trait;
 use client::OpenCodeBackend;
@@ -180,8 +182,16 @@ impl Backend for OpenCodeBackend {
         OpenCodeBackend::shell_output(self, shell_id, directory).await
     }
 
+    async fn child_evidence(&self, session_id: &str) -> Result<ChildEvidence> {
+        OpenCodeBackend::child_evidence(self, session_id).await
+    }
+
     fn retire_background_tasks(&self, session_id: &str, call_ids: &[String]) {
         OpenCodeBackend::retire_background_tasks(self, session_id, call_ids);
+    }
+
+    fn set_unconfirmed_tasks(&self, session_id: &str, call_ids: &[String]) {
+        OpenCodeBackend::set_unconfirmed_tasks(self, session_id, call_ids);
     }
 
     async fn model_context_window(&self, provider: &str, model: &str) -> Result<Option<i64>> {

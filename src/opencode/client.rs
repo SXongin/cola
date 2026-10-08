@@ -10,7 +10,7 @@
 
 use std::sync::{Arc, RwLock};
 
-use crate::backend::{SessionTranscript, TaskRetirements, TaskRuntime};
+use crate::backend::{BackgroundTaskOverlay, ChildEvidence, SessionTranscript, TaskRuntime};
 
 use super::parsing::parse_model;
 use super::strategy::{Generation, GenerationStrategy};
@@ -49,10 +49,12 @@ pub struct OpenCodeBackend {
     /// replacement on the same port (a new generation or password). Shared
     /// across clones like the strategy.
     attached_pid: Arc<RwLock<Option<i32>>>,
-    /// The Background Tasks a runtime reconciliation retired this cola life
-    /// (issue #454), applied to every transcript read so the durable launch
-    /// record cannot resurrect them. Shared across clones like the strategy.
-    retirements: Arc<TaskRetirements>,
+    /// The Background Task overlay a Runtime Reconciliation (or a cleanup)
+    /// established this cola life (issue #454, review #588), applied to every
+    /// transcript read so the durable launch record cannot resurrect a retired
+    /// task and a marker survives the reads the shared throttle spends no
+    /// verdict on. Shared across clones like the strategy.
+    overlay: Arc<BackgroundTaskOverlay>,
 }
 
 impl Clone for OpenCodeBackend {
@@ -63,7 +65,7 @@ impl Clone for OpenCodeBackend {
             model: self.model.clone(),
             strategy: Arc::clone(&self.strategy),
             attached_pid: Arc::clone(&self.attached_pid),
-            retirements: Arc::clone(&self.retirements),
+            overlay: Arc::clone(&self.overlay),
         }
     }
 }
@@ -131,7 +133,7 @@ impl OpenCodeBackend {
             model: model.and_then(parse_model),
             strategy: Arc::new(RwLock::new(generation.strategy())),
             attached_pid: Arc::new(RwLock::new(attached_pid)),
-            retirements: Arc::new(TaskRetirements::default()),
+            overlay: Arc::new(BackgroundTaskOverlay::default()),
         }
     }
 
@@ -328,19 +330,28 @@ impl OpenCodeBackend {
             .await
     }
 
-    /// The session transcript, with this cola life's runtime retirements
-    /// applied ([`TaskRetirements`], issue #454): a Background Task the runtime
-    /// confirmed ended leaves the live list here, so no read path resurrects it.
+    /// The session transcript, with this cola life's Background Task overlay
+    /// applied ([`BackgroundTaskOverlay`], issue #454, review #588): a
+    /// Background Task the runtime confirmed ended leaves the live list here,
+    /// and a task the runtime could not confirm as running carries its
+    /// `⚠️ 状态待确认` marker, so no read path resurrects a retired task or
+    /// drops a marker between verdicts.
     pub async fn transcript(&self, session_id: &str) -> crate::error::Result<SessionTranscript> {
         let mut transcript = self.strategy().transcript(&self.transport, session_id).await?;
-        self.retirements.apply(session_id, &mut transcript);
+        self.overlay.apply(session_id, &mut transcript);
         Ok(transcript)
     }
 
     /// Record the Background Tasks a runtime reconciliation retired (issue
     /// #454). See [`crate::backend::Backend::retire_background_tasks`].
     pub fn retire_background_tasks(&self, session_id: &str, call_ids: &[String]) {
-        self.retirements.record(session_id, call_ids);
+        self.overlay.record(session_id, call_ids);
+    }
+
+    /// Replace one session's unconfirmed-Background-Task marker set (review,
+    /// spec #588). See [`crate::backend::Backend::set_unconfirmed_tasks`].
+    pub fn set_unconfirmed_tasks(&self, session_id: &str, call_ids: &[String]) {
+        self.overlay.set_unconfirmed(session_id, call_ids);
     }
 
     /// The session's durable model/agent selection where the generation keeps
@@ -442,6 +453,13 @@ impl OpenCodeBackend {
         self.strategy()
             .shell_output(&self.transport, shell_id, directory)
             .await
+    }
+
+    /// The evidence one child session's newest assistant message carries about
+    /// its run (#591, issue #464). See
+    /// [`crate::backend::Backend::child_evidence`].
+    pub async fn child_evidence(&self, session_id: &str) -> crate::error::Result<ChildEvidence> {
+        self.strategy().child_evidence(&self.transport, session_id).await
     }
 
     pub async fn model_context_window(

@@ -37,7 +37,7 @@ mod tests;
 
 use async_trait::async_trait;
 
-use crate::backend::{ChildRuntime, SessionTranscript, ShellRuntime, TaskRuntime};
+use crate::backend::{ChildEvidence, ChildRuntime, SessionTranscript, ShellRuntime, TaskRuntime};
 use crate::error::Result;
 
 use super::strategy::GenerationStrategy;
@@ -128,6 +128,21 @@ fn location_url(base: &str, directory: Option<&str>) -> Result<reqwest::Url> {
     if let Some(directory) = directory {
         url.query_pairs_mut()
             .append_pair("location[directory]", directory);
+    }
+    Ok(url)
+}
+
+/// One session's projected-message page URL: the session's message route plus
+/// exactly `query`, so each minimal read's own wire shape stays its own
+/// (`message_page` and the child-evidence read share the transport half only).
+fn message_page_url(http: &Transport, session_id: &str, query: &[(&str, &str)]) -> Result<reqwest::Url> {
+    let mut url =
+        reqwest::Url::parse(&http.url(&format!("{SESSION}/{session_id}{SESSION_MESSAGES_SUFFIX}")))?;
+    {
+        let mut pairs = url.query_pairs_mut();
+        for (key, value) in query {
+            pairs.append_pair(key, value);
+        }
     }
     Ok(url)
 }
@@ -569,6 +584,37 @@ impl GenerationStrategy for V2Strategy {
             }
         }
         Ok(runtime)
+    }
+
+    /// The evidence one child session's newest assistant message carries (#591,
+    /// issue #464): ONE page, newest assistant first — the same minimal wire
+    /// shape as the retry read, so it never decodes the child transcript. A
+    /// terminal step finish together with the message's completion stamp is
+    /// terminal evidence; a 404 is the session-gone evidence (the child cannot
+    /// be running under the attached server); anything else is no evidence at
+    /// all, never guessed. The decode lives with the message page
+    /// ([`wire::MessagesPage::newest_assistant_evidence`]).
+    async fn child_evidence(&self, http: &Transport, session_id: &str) -> Result<ChildEvidence> {
+        let url = message_page_url(
+            http,
+            session_id,
+            &[("type", "assistant"), ("order", "desc"), ("limit", "1")],
+        )?;
+        let resp = http.client().get(url).send().await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(ChildEvidence::Gone);
+        }
+        if !resp.status().is_success() {
+            return Err(read_failure(resp, "child evidence").await);
+        }
+        let text = resp.text().await?;
+        let page: wire::MessagesPage = serde_json::from_str(&text).map_err(|e| {
+            crate::error::BridgeError::OpenCode(format!(
+                "session child evidence read parse: {e} — body: {}",
+                body_preview(&text)
+            ))
+        })?;
+        Ok(page.newest_assistant_evidence())
     }
 
     /// The session's durable selection (`GET /api/session/{id}`): the model
@@ -1072,14 +1118,7 @@ impl V2Strategy {
         read: &str,
         query: &[(&str, &str)],
     ) -> Result<wire::MessagesPage> {
-        let mut url =
-            reqwest::Url::parse(&http.url(&format!("{SESSION}/{session_id}{SESSION_MESSAGES_SUFFIX}")))?;
-        {
-            let mut pairs = url.query_pairs_mut();
-            for (key, value) in query {
-                pairs.append_pair(key, value);
-            }
-        }
+        let url = message_page_url(http, session_id, query)?;
         let resp = http.client().get(url).send().await?;
         let status = resp.status();
         if !status.is_success() {

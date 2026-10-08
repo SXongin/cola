@@ -195,6 +195,59 @@ impl SessionTranscript {
             .retain(|id| !clearing.contains(id.as_str()));
     }
 
+    /// Apply one child-evidence read (#591, issue #464) to the suspect task
+    /// `call_id` — a live subagent the runtime reported inactive and whose own
+    /// newest assistant message was just read. A terminal [`ChildEvidence`]
+    /// retires the task with the message's completion clock (the
+    /// [`TaskRetirementEnding::ChildEnded`] ending), [`ChildEvidence::Gone`]
+    /// retires it as [`TaskRetirementEnding::Lost`] identity-only, and
+    /// [`ChildEvidence::Unfinished`] changes nothing — the row stays exactly as
+    /// the runtime marked it. An id with no live task invents no retirement.
+    pub fn apply_child_evidence(&mut self, call_id: &str, evidence: ChildEvidence) {
+        if evidence == ChildEvidence::Unfinished {
+            return;
+        }
+        let Some(index) = self
+            .background_tasks
+            .iter()
+            .position(|task| task.tool.call_id == call_id)
+        else {
+            return;
+        };
+        let task = self.background_tasks.remove(index);
+        self.unconfirmed_tasks.remove(call_id);
+        let (ending, finished_at) = match evidence {
+            ChildEvidence::Terminal { completed_at } => {
+                (TaskRetirementEnding::ChildEnded, Some(completed_at))
+            }
+            ChildEvidence::Gone => (TaskRetirementEnding::Lost, None),
+            // Returned above; kept for the match's exhaustiveness.
+            ChildEvidence::Unfinished => return,
+        };
+        self.runtime_retired.push(TaskRetirement {
+            task,
+            ending,
+            finished_at,
+        });
+    }
+
+    /// The live subagent tasks a reconciliation read could not confirm as
+    /// running — one `(call_id, child_id)` per suspect, in the read's order.
+    /// The shared reconcile step spends at most one child-evidence read per
+    /// suspect per cycle (#591, issue #464); a child the runtime reports
+    /// running is never read, and neither is a task without a child session.
+    pub fn unconfirmed_children(&self) -> Vec<(String, String)> {
+        self.background_tasks
+            .iter()
+            .filter(|task| self.unconfirmed_tasks.contains(task.tool.call_id.as_str()))
+            .filter_map(|task| {
+                task.child_id
+                    .as_ref()
+                    .map(|child_id| (task.tool.call_id.clone(), child_id.clone()))
+            })
+            .collect()
+    }
+
     /// The newest user message by server time, if any — the message a Turn's
     /// anchor comes from. A user message without a server time cannot be
     /// ordered and is ignored.
@@ -973,6 +1026,27 @@ impl TaskRuntime {
     }
 }
 
+/// The evidence one child session's newest assistant message carries about its
+/// Background Task's run (#591, issue #464): the shared reconcile step's
+/// second, lighter read — one page, newest assistant first — spent on a
+/// suspect the runtime no longer reports active. Positive evidence only: a
+/// terminal step finish with the message's completion stamp, or a child
+/// session the server no longer knows; anything else is no evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildEvidence {
+    /// The newest assistant message finished its run with a terminal step
+    /// finish and the server's completion stamp: the retirement's clock.
+    Terminal { completed_at: i64 },
+    /// The child session does not exist at the attached server (a 404 read):
+    /// the run cannot still be hosted there. The retirement is identity-only,
+    /// like a shell the runtime has no record of.
+    Gone,
+    /// No evidence: the newest assistant message is not terminal (or no
+    /// assistant message was read at all). The task stays exactly as the
+    /// runtime marked it — never guessed dead.
+    Unfinished,
+}
+
 /// A Background Task a runtime reconciliation retired while no Wake retired it
 /// (issue #454): the completion record was lost, and the runtime either
 /// reported a terminal end or no longer knows the task.
@@ -992,6 +1066,12 @@ pub enum TaskRetirementEnding {
     Ended(ShellEnd),
     /// The runtime has no record of the task.
     Lost,
+    /// The child session's own newest assistant message reported a terminal
+    /// run (#591, issue #464): the runtime no longer lists the child active,
+    /// and the child transcript's terminal step finish (with its completion
+    /// stamp) ends the task without a Wake. Only a subagent carries it; the
+    /// ledger renders it as the runtime's own 结束 ending.
+    ChildEnded,
     /// The user's cleanup click retired the task (spec #588, ticket #590):
     /// never produced by a read, only by
     /// [`SessionTranscript::apply_cleanup`], and recorded in the process-local
@@ -1878,6 +1958,127 @@ mod tests {
         assert!(transcript.background_tasks.is_empty());
         assert_eq!(transcript.runtime_retired.len(), 2);
         assert_eq!(transcript.settle(Some(&anchor)), TurnSettle::Complete);
+    }
+
+    /// Spec #588 / #591: a subagent the runtime reports inactive is retirable
+    /// on its own child session's evidence — a terminal finish retires it with
+    /// the child's own completion clock (the ChildEnded ending), a gone child
+    /// session retires it as Lost with no clock, and any other evidence leaves
+    /// the row exactly as the runtime marked it. Positive evidence only: the
+    /// settle follows (the last task's evidence is the true end), and an id
+    /// with no live task invents no retirement.
+    #[test]
+    fn child_evidence_retires_a_suspect_on_terminal_or_gone_and_keeps_the_rest() {
+        let (_, anchor) = anchored("msg_u1", 1_000);
+        let child_task = |call_id: &str, child_id: &str| BackgroundTask {
+            tool: ToolIdentity {
+                name: "subagent".into(),
+                call_id: call_id.into(),
+            },
+            shell_id: None,
+            child_id: Some(child_id.into()),
+            started_at: Some(1_100),
+        };
+
+        // The runtime marked the child inactive; its own terminal message ends
+        // it with the message's completion clock.
+        let mut terminal = SessionTranscript::new(vec![assistant_step("msg_a1", 1_100, None)])
+            .with_executions(vec![boundary(1_200)])
+            .with_background_tasks(vec![child_task("call_sub", "ses_child")]);
+        terminal.unconfirmed_tasks.insert("call_sub".into());
+        terminal.apply_child_evidence("call_sub", ChildEvidence::Terminal { completed_at: 2_000 });
+        assert!(
+            terminal.background_tasks.is_empty(),
+            "a terminal child leaves the live list"
+        );
+        assert!(
+            !terminal.unconfirmed_tasks.contains("call_sub"),
+            "a retired suspect leaves the unconfirmed set"
+        );
+        assert_eq!(
+            terminal.runtime_retired,
+            vec![TaskRetirement {
+                task: child_task("call_sub", "ses_child"),
+                ending: TaskRetirementEnding::ChildEnded,
+                finished_at: Some(2_000),
+            }],
+            "the child's own ending carries its completion clock"
+        );
+        assert_eq!(
+            terminal.settle(Some(&anchor)),
+            TurnSettle::Complete,
+            "the last task's evidence is the true end"
+        );
+
+        // A child session that is gone retires as Lost, identity-only.
+        let mut gone = SessionTranscript::new(vec![assistant_step("msg_a1", 1_100, None)])
+            .with_executions(vec![boundary(1_200)])
+            .with_background_tasks(vec![child_task("call_sub", "ses_child")]);
+        gone.unconfirmed_tasks.insert("call_sub".into());
+        gone.apply_child_evidence("call_sub", ChildEvidence::Gone);
+        assert_eq!(
+            gone.runtime_retired,
+            vec![TaskRetirement {
+                task: child_task("call_sub", "ses_child"),
+                ending: TaskRetirementEnding::Lost,
+                finished_at: None,
+            }],
+            "a gone child is the Lost ending with no invented clock"
+        );
+        assert_eq!(gone.settle(Some(&anchor)), TurnSettle::Complete);
+
+        // No evidence (a non-terminal read) leaves the task exactly as the
+        // runtime marked it.
+        let mut unfinished = SessionTranscript::new(vec![assistant_step("msg_a1", 1_100, None)])
+            .with_executions(vec![boundary(1_200)])
+            .with_background_tasks(vec![child_task("call_sub", "ses_child")]);
+        unfinished.unconfirmed_tasks.insert("call_sub".into());
+        unfinished.apply_child_evidence("call_sub", ChildEvidence::Unfinished);
+        assert_eq!(unfinished.background_tasks.len(), 1);
+        assert!(unfinished.unconfirmed_tasks.contains("call_sub"));
+        assert!(
+            unfinished.runtime_retired.is_empty(),
+            "nothing settles on no evidence"
+        );
+        assert_eq!(unfinished.settle(Some(&anchor)), TurnSettle::Waiting);
+
+        // An id with no live task invents no retirement.
+        unfinished.apply_child_evidence("call_absent", ChildEvidence::Terminal { completed_at: 3_000 });
+        assert_eq!(unfinished.background_tasks.len(), 1);
+        assert!(unfinished.runtime_retired.is_empty());
+    }
+
+    /// Spec #588 / #591: the suspects one reconcile cycle may read — only the
+    /// live children the runtime marked unconfirmed; a running child, a shell,
+    /// and an unmarked child are never suspects.
+    #[test]
+    fn unconfirmed_children_names_only_the_marked_live_children() {
+        let child = |call_id: &str, child_id: &str| BackgroundTask {
+            tool: ToolIdentity {
+                name: "subagent".into(),
+                call_id: call_id.into(),
+            },
+            shell_id: None,
+            child_id: Some(child_id.into()),
+            started_at: Some(1_100),
+        };
+        let task = child("call_sub", "ses_child");
+        let mut transcript = SessionTranscript::new(vec![]).with_background_tasks(vec![
+            child("call_run", "ses_run"),
+            task.clone(),
+            background_shell(1_100),
+        ]);
+        assert!(
+            transcript.unconfirmed_children().is_empty(),
+            "no marker means no suspect"
+        );
+
+        transcript.unconfirmed_tasks.insert("call_sub".into());
+        assert_eq!(
+            transcript.unconfirmed_children(),
+            vec![("call_sub".to_string(), "ses_child".to_string())],
+            "only the marked live child is a suspect"
+        );
     }
 
     /// The process-local retirement overlay (issue #454 review): a recorded

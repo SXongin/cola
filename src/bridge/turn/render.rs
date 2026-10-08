@@ -529,6 +529,11 @@ fn render_runtime_entries(
         let ending = match &retirement.ending {
             TaskRetirementEnding::Ended(_) => TaskEnding::RuntimeEnded,
             TaskRetirementEnding::Lost => TaskEnding::Lost,
+            // The child session's own terminal transcript (#591, issue #464):
+            // the runtime no longer lists the child active and its newest
+            // assistant message finished — the same 结束 entry the runtime's
+            // own shell ending renders.
+            TaskRetirementEnding::ChildEnded => TaskEnding::RuntimeEnded,
             // The user's own cleanup (spec #588, #590): the click recorded the
             // overlay and synthesized the retirement, and the same render site
             // gives it its 🧹 entry — exactly once, through the announce key.
