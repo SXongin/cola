@@ -1270,6 +1270,11 @@ pub struct MockBackend {
     /// reads serve normally) — an unreadable child leaves the row exactly as
     /// the runtime marked it (#591).
     pub fail_child_evidence_reads: Arc<std::sync::atomic::AtomicUsize>,
+    /// Number of initial `child_evidence` calls to hang forever — a wedged
+    /// child read the cycle's own read budget must abandon, skipping the
+    /// cycle's later reads instead of stacking another timeout (spec #588,
+    /// review PR #595).
+    pub hang_child_evidence: Arc<std::sync::atomic::AtomicUsize>,
     /// The output windows `shell_output` serves, keyed by shell id (spec #588,
     /// #592). A missing key (or a stored `None`) is the no-output case — a
     /// vanished record answers `Ok(None)`.
@@ -1281,6 +1286,11 @@ pub struct MockBackend {
     /// Number of initial `shell_output` calls to fail with a 500 (then later
     /// reads serve normally) — a window must be omitted, never guessed.
     pub fail_shell_output_reads: Arc<std::sync::atomic::AtomicUsize>,
+    /// Number of initial `shell_output` calls to hang forever — a wedged
+    /// capture the cycle's own read budget must abandon, skipping the cycle's
+    /// later window reads instead of stacking another timeout (spec #588,
+    /// review PR #595).
+    pub hang_shell_output: Arc<std::sync::atomic::AtomicUsize>,
     /// The Background Task overlay (issue #454, review #588): recorded
     /// through `retire_background_tasks` / `set_unconfirmed_tasks` and applied
     /// inside `transcript`, exactly like the real adapter's.
@@ -1405,9 +1415,11 @@ impl MockBackend {
             child_evidence: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             child_evidence_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             fail_child_evidence_reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            hang_child_evidence: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             shell_outputs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             shell_output_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             fail_shell_output_reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            hang_shell_output: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             overlay: crate::backend::BackgroundTaskOverlay::default(),
             session_status_error: None,
             session_status_fails: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1834,6 +1846,26 @@ impl MockBackend {
     /// the read and change nothing.
     pub(crate) fn hang_task_runtime_reads(&self, count: usize) -> &Self {
         self.hang_task_runtime
+            .store(count, std::sync::atomic::Ordering::SeqCst);
+        self
+    }
+
+    /// Scenario: the next `count` child-evidence reads hang forever (a wedged
+    /// child read). The cycle's one read budget must abandon the read and skip
+    /// its later reads — not stack another full timeout per suspect (spec
+    /// #588, review PR #595).
+    pub(crate) fn hang_child_evidence_reads(&self, count: usize) -> &Self {
+        self.hang_child_evidence
+            .store(count, std::sync::atomic::Ordering::SeqCst);
+        self
+    }
+
+    /// Scenario: the next `count` shell-output reads hang forever (a wedged
+    /// capture). The cycle's one read budget must abandon the read and skip
+    /// its later window reads — not stack another full timeout per shell
+    /// (spec #588, review PR #595).
+    pub(crate) fn hang_shell_output_reads(&self, count: usize) -> &Self {
+        self.hang_shell_output
             .store(count, std::sync::atomic::Ordering::SeqCst);
         self
     }
@@ -2585,6 +2617,7 @@ impl crate::backend::Backend for MockBackend {
             .lock()
             .await
             .push(session_id.to_string());
+        hang_if_scripted(&self.hang_child_evidence).await;
         if self
             .fail_child_evidence_reads
             .load(std::sync::atomic::Ordering::SeqCst)
@@ -2621,6 +2654,7 @@ impl crate::backend::Backend for MockBackend {
         _directory: Option<&str>,
     ) -> crate::error::Result<Option<crate::backend::ShellOutputWindow>> {
         self.shell_output_calls.lock().await.push(shell_id.to_string());
+        hang_if_scripted(&self.hang_shell_output).await;
         if self
             .fail_shell_output_reads
             .load(std::sync::atomic::Ordering::SeqCst)
