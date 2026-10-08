@@ -451,6 +451,22 @@ fn wake_completion_entry(
     })
 }
 
+/// What a [`PlannedEntry`]'s commit announces (spec #588, review PR #595): the
+/// exactly-once class decides whether the durable Wake Watermark may move.
+pub(super) enum PlannedAnnounce {
+    /// A real Wake's completion at this `created_ms`: the exactly-once mark
+    /// plus the durable Wake Watermark stage (ADR-0061), so a restart never
+    /// re-announces a Wake a card already showed.
+    Wake { created_ms: i64 },
+    /// A synthetic retirement — a runtime verdict, a child's own terminal
+    /// transcript, or the user's cleanup (key `runtime:<call_id>`): the
+    /// exactly-once mark alone. Nothing durable is staged, so a restart still
+    /// continues a genuinely un-announced late Wake at or below the synthetic
+    /// clock (#590: "a late Wake for a cleared task behaves as before; nothing
+    /// is suppressed").
+    Synthetic,
+}
+
 /// One completion entry a ledger read has planned but not yet inserted (spec
 /// #588, #593): every exactly-once gate the insertion applies has passed, but
 /// the shell output read is still owed. A venue plans under a brief read of the
@@ -461,8 +477,9 @@ fn wake_completion_entry(
 pub(super) struct PlannedEntry {
     /// The exactly-once announce key (the Wake's id / `runtime:<call_id>`).
     key: String,
-    /// The clock the announcement stages with.
-    announce_at: i64,
+    /// What the commit announces: a real Wake's completion additionally stages
+    /// the durable Wake Watermark (ADR-0061), a synthetic retirement does not.
+    announce: PlannedAnnounce,
     /// The timeline insert key.
     at: Option<i64>,
     /// The directory the shell output read routes under: the card's own work
@@ -489,7 +506,7 @@ pub(super) fn plan_ledger_entries(
         return Vec::new();
     };
     let mut plans = plan_wake_entries(acc, transcript, anchor);
-    plans.extend(plan_runtime_entries(acc, transcript, anchor));
+    plans.extend(plan_runtime_entries(acc, transcript));
     plans
 }
 
@@ -529,7 +546,7 @@ fn plan_wake_entries(
         };
         plans.push(PlannedEntry {
             key: wake.id.as_str().to_string(),
-            announce_at: created_ms,
+            announce: PlannedAnnounce::Wake { created_ms },
             // Keyed at the Wake's moment, so the entry sorts before the work it
             // announces, whose server times are at/after it (the 承接 line's own
             // lesson).
@@ -561,12 +578,10 @@ fn plan_wake_entries(
 /// from the anchor: the read that carries a retirement records it in the
 /// backend's process-local overlay, so no later read derives it again, and the
 /// Wake announcement set (keyed by a synthetic `runtime:<call_id>` id) covers
-/// the reads within the observing chain.
-fn plan_runtime_entries(
-    acc: &StreamAccumulator,
-    transcript: &SessionTranscript,
-    anchor: &TurnAnchor,
-) -> Vec<PlannedEntry> {
+/// the reads within the observing chain. That synthetic mark is in-memory
+/// only: a retirement is not a Wake, so it stages nothing durable and never
+/// advances the Wake Watermark (ADR-0061; spec #588, review PR #595).
+fn plan_runtime_entries(acc: &StreamAccumulator, transcript: &SessionTranscript) -> Vec<PlannedEntry> {
     let mut plans = Vec::new();
     for retirement in &transcript.task_retirements {
         let task = &retirement.task;
@@ -574,10 +589,6 @@ fn plan_runtime_entries(
         if acc.wake_announced(&key) {
             continue;
         }
-        let at = retirement
-            .finished_at
-            .or(task.started_at)
-            .unwrap_or(anchor.created_ms);
         let kind = super::state::task_kind(&task.tool.name);
         let ending = match &retirement.ending {
             TaskRetirementEnding::Ended(_) => TaskEnding::RuntimeEnded,
@@ -608,7 +619,7 @@ fn plan_runtime_entries(
         };
         plans.push(PlannedEntry {
             key,
-            announce_at: at,
+            announce: PlannedAnnounce::Synthetic,
             at: retirement.finished_at,
             directory: acc.directory.clone(),
             entry,
@@ -661,11 +672,18 @@ pub(super) async fn read_planned_outputs(
 /// Commit a planned read (spec #593): announce each entry and insert it, under
 /// the cards lock. The announce is the exactly-once gate, so a plan a racing
 /// render already committed is skipped — the entry renders once, wherever the
-/// read met it. Returns whether any entry was inserted.
+/// read met it. The plan's own class decides what it stages (spec #588, review
+/// PR #595): a real Wake's completion advances the durable Wake Watermark, a
+/// synthetic retirement only marks the in-memory announce set (ADR-0061).
+/// Returns whether any entry was inserted.
 pub(super) fn commit_planned_entries(acc: &mut StreamAccumulator, plans: Vec<PlannedEntry>) -> bool {
     let mut inserted = false;
     for plan in plans {
-        if !acc.announce_wake(&plan.key, plan.announce_at) {
+        let announced = match plan.announce {
+            PlannedAnnounce::Wake { created_ms } => acc.announce_wake(&plan.key, created_ms),
+            PlannedAnnounce::Synthetic => acc.announce_synthetic(&plan.key),
+        };
+        if !announced {
             continue;
         }
         acc.push_ledger_entry_at(plan.at, plan.entry);
