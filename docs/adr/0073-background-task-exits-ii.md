@@ -56,11 +56,17 @@ the user already looks at.
   the throttle did not spend a verdict on cannot drop a marker and the cleanup
   button it gates, and only a verdict resolves one (a Running child clears its
   marker, an Inactive one keeps it, and a read that does not answer for the
-  child keeps the previous state). The step itself is gate-free: each caller
-  decides whether it can render what it observes before calling (Session Sync's
+  child keeps the previous state). The step is gate-free on the READ side: each
+  caller first decides whether it can render what it observes (Session Sync's
   waiting-card admission; the live loops only once the card carries the Turn
-  anchor the entry can be placed by), because an observation with no render
-  home would be recorded in the overlay with its entry swallowed.
+  anchor the entry can be placed by). The WRITE side is one uniform invariant
+  (review, PR #595): the reconcile returns a pass, and **every caller commits
+  that pass to the overlay only after the flush that carried the read's entries
+  was accepted** — Session Sync's landed wake/ledger refresh, the drain tick's
+  and the follow/settle loop's completed render, the cleanup click's landed
+  refresh. A carrier that never lands records nothing: the task stays live, and
+  the next card that can render its entry claims it again (ADR-0065's designed
+  behavior).
 
 - **Live-path retirement entries render exactly once.** The live render path —
   until now only refreshing ledger rows — gains the entry machinery: entries
@@ -179,8 +185,9 @@ the user already looks at.
 - **ADR-0065's deferred items now landed**: the cleanup action exists with its
   own interaction design, and the "a retirement is observed only while a
   waiting card can receive it" gate is replaced by the shared step plus the
-  announce-key/overlay pair — each caller observes only where it can render,
-  and exactly-once holds across paths.
+  announce-key/overlay pair — each caller observes only where it can render and
+  commits the overlay only after the flush that carried the read's entries was
+  accepted (review, PR #595), and exactly-once holds across paths.
 - The GLOSSARY gains **Runtime Reconciliation** and **Cleanup**; **Background
   Task**, **Background Task Ledger** and **Waiting on Background Work** record
   the widened retirement rule, the cleanup exit and the output tails.
