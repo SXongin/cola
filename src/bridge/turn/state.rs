@@ -1236,8 +1236,9 @@ pub(super) struct StreamAccumulator {
     /// unrendered (live 2026-10-01 — the resumed message's text part was empty
     /// at the read that placed it), and that entry must not read as a handoff,
     /// or the work would split into a 承接 card when it arrives. Once a Wake IS
-    /// handed over, a later tail past it is the content-diff fallback and
-    /// splits. Like the announcement set, one mark per Wake id, kept across
+    /// handed over, a later tail past it is a Wake-less content diff: it renders
+    /// in place on the chain's open yielded card, never a second continuation
+    /// (spec #602). Like the announcement set, one mark per Wake id, kept across
     /// [`Self::continue_on_new_card`].
     pub(super) handed_over_wakes: std::collections::HashSet<String>,
     /// The Wake Watermarks this chain has staged but not yet drained:

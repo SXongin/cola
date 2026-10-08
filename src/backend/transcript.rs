@@ -924,6 +924,22 @@ pub enum WakeSource {
     Unknown,
 }
 
+impl WakeSource {
+    /// Whether this Wake is a genuine resumption (spec #602): the Backend
+    /// resumed work the Turn had left — a finished background shell or
+    /// subagent, a server restart, an interrupted response. Only these may
+    /// open a Wake continuation Card; a source this build cannot classify (an
+    /// `Other(_)` marker, or [`Self::Unknown`] on a payload that named none)
+    /// never does, so a Wake-less content diff and a mislabelled event both
+    /// stay off the 「已恢复执行」 path.
+    pub fn is_genuine_resumption(&self) -> bool {
+        matches!(
+            self,
+            Self::Shell | Self::Subagent | Self::Restart | Self::Interrupt
+        )
+    }
+}
+
 /// Work the agent left running in the background: derived from the assistant
 /// tool part that started it, live until its Wake retires it (ADR-0059). While
 /// one is live its Turn is not complete.

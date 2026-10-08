@@ -2438,17 +2438,24 @@ impl Turn {
         Some(handover && flush.accepted())
     }
 
-    /// Resume a yielded card IN PLACE for a shell/subagent completion Wake
-    /// (ADR-0066): the one-card-per-request handoff, beside the split. One
-    /// write-lock-held sequence, exactly like the split handover: the read's
-    /// remaining live list and the retiring Wake's fixed completion entry are
-    /// written onto the card's OWN accumulator, so the entry lands at its own
-    /// moment on the card that hosted the task (ADR-0060) and the live list
-    /// stays; the card then takes [`CardState::Resuming`] and the flush
+    /// Resume a yielded card IN PLACE for a genuine resumption Wake
+    /// (ADR-0066, spec #602): the one-card-per-request handoff, beside the
+    /// split. One write-lock-held sequence, exactly like the split handover:
+    /// the read's remaining live list and the retiring Wake's fixed completion
+    /// entry are written onto the card's OWN accumulator, so the entry lands at
+    /// its own moment on the card that hosted the task (ADR-0060) and the live
+    /// list stays; the card then takes [`CardState::Resuming`] and the flush
     /// renders the whole live slice on the SAME card. No card is sent and
     /// nothing is replied to: the PATCH is the announcement, so it drains the
     /// staged Wake Watermark exactly as the 承接 line's send did (ADR-0061) —
     /// a restart after it cannot re-post the Wake.
+    ///
+    /// This is also the in-place render of a Wake-less tail and of a resumption
+    /// card's further work (spec #602): the same resume, so no second
+    /// continuation card ever opens on an already-resumed chain. `wake_id` is
+    /// the completion this resume takes over, marked as such in the same locked
+    /// write so the resume is never re-decided; `None` for a Wake-less tail,
+    /// which has no completion to announce or hand over.
     ///
     /// The flush keeps [`SplitPolicy::Allow`]: a resumed run that outgrows one
     /// card still finalizes it and continues the chain on a new one (ADR-0066
@@ -2463,16 +2470,13 @@ impl Turn {
     /// split owed), so a race with a collect, a new Turn or a handoff can
     /// never resume a card somebody else took over — and when the resume's
     /// flush was permanently refused (review, PR #595), because the caller's
-    /// record gate reads this same answer. `wake_id` is the completion
-    /// this resume takes over, marked as such in the same locked write, so a
-    /// later tail past it splits (ADR-0059) and the resume is never re-decided.
-    /// `now_ms` is the read's clock — the Session Sync pass's own, shared with
-    /// the split handover of the same read.
+    /// record gate reads this same answer. `now_ms` is the read's clock — the
+    /// Session Sync pass's own, shared with the split handover of the same read.
     pub(crate) async fn resume_yielded_card(
         cards: &CardsHandle,
         backend: &Arc<dyn crate::backend::Backend>,
         session_id: &str,
-        wake_id: &str,
+        wake_id: Option<&str>,
         transcript: &SessionTranscript,
         now_ms: i64,
     ) -> bool {
@@ -2507,11 +2511,14 @@ impl Turn {
                 state::LedgerCadence::Second,
                 plans,
             );
-            // The chain has taken this completion's work over. Its entry may
-            // already be on the card (a yielded ledger refresh placed it while
-            // the work was unrendered): the announcement set stays untouched,
-            // so the entry is never doubled — only the handoff is recorded.
-            card.acc.hand_over_wake(wake_id);
+            // The chain has taken this completion's work over, when there is
+            // one. Its entry may already be on the card (a yielded ledger
+            // refresh placed it while the work was unrendered): the
+            // announcement set stays untouched, so the entry is never doubled
+            // — only the handoff is recorded. A Wake-less tail marks nothing.
+            if let Some(wake_id) = wake_id {
+                card.acc.hand_over_wake(wake_id);
+            }
             card.acc.set_resuming();
         }
         // The carrier answer is the write's (review, PR #595): a permanently
@@ -3801,22 +3808,32 @@ impl Turn {
 /// that found the chain also says which handoff to use — nothing is
 /// re-derived under a second look.
 pub(crate) enum WakeContinuation {
-    /// A card chain exists whose newest placeable Wake is a shell/subagent
-    /// completion this chain has not yet TAKEN OVER, and whose card is still
-    /// yielded 「⏳ 等待后台任务」: resume that card IN PLACE (ADR-0066) — no new
-    /// card, no 承接 line. The retiring task's completion entry and the
-    /// remaining live list land on the card the task lived on, the card takes
-    /// the resuming state, and the shared out-of-turn settle loop streams the
-    /// resumed work into it. `wake_id` is the completion this resume takes
-    /// over, marked as such under the delivery's own write lock — so a later
-    /// tail past it splits (ADR-0059), while the entry a yielded ledger refresh
-    /// already placed stays single. Decided only for the state this delivery
+    /// A card chain exists whose card is an OPEN yielded card (「⏳ 等待后台任务」)
+    /// and has unrendered content: resume that card IN PLACE (ADR-0066) — no new
+    /// card, no 承接 line. Two resumption shapes reach it (spec #602):
+    ///
+    /// - the newest placeable Wake is a shell/subagent completion this chain has
+    ///   not TAKEN OVER yet — the task-completion handoff: its completion entry
+    ///   and the remaining live list land on the card the task lived on, and the
+    ///   shared out-of-turn settle loop streams the resumed work into it;
+    /// - the chain already handed a Wake over (a 承接 line's split or an earlier
+    ///   resume) and further content arrived — a Wake-less tail, or the same
+    ///   Wake's still-streaming work. It renders onto this same card, never a
+    ///   second continuation: exactly one Card per resumption, the receipt
+    ///   pushed once.
+    ///
+    /// `wake_id` is the completion this resume takes over, when there is one,
+    /// marked as such under the delivery's own write lock — so a later tail
+    /// past it keeps resuming this card, and the resume is never re-decided. A
+    /// Wake-less tail carries `None`. Decided only for the state this delivery
     /// admits ([`ownership::admits_ledger_refresh`]), so a decision and its
     /// write can never disagree about which card resumes.
-    ResumeInPlace { wake_id: String },
-    /// A card chain exists: continue it by split. Only the content the chain
-    /// has not rendered lands on the continuation, and the accumulator's own
-    /// anchor scopes the settle decision. `line` is the new card's opening
+    ResumeInPlace { wake_id: Option<String> },
+    /// A card chain exists: a GENUINE resumption the chain has not handed over
+    /// yet (a restart, an interruption, a shell/subagent completion on a card
+    /// past its wait) continues it by split (spec #602). Only the content the
+    /// chain has not rendered lands on the continuation, and the accumulator's
+    /// own anchor scopes the settle decision. `line` is the new card's opening
     /// 承接 line, whose key sits just before the work this continuation will
     /// render (that work is already in the past at poll time, so a key at
     /// cola's "now" would sort the receipt after it — the live order bug).
@@ -3832,7 +3849,9 @@ pub(crate) enum WakeContinuation {
 /// the Wake whose completion the line already announces, with its own server
 /// time (the durable Wake Watermark's value once the line's card sends,
 /// ADR-0061), so the merged-path receipt (the render pass's) cannot double it.
-/// `wake` is `None` for the content-diff fallback, which answers no Wake.
+/// Every [`WakeContinuation::ContinueChain`] line names its Wake; the `Option`
+/// is kept for the neutral residual continuation #606 arms, which answers no
+/// Wake ([`WakeContinuation::ResumeInPlace`] carries no line at all).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ContinuationLine {
     pub(crate) at: i64,
@@ -3937,11 +3956,14 @@ impl Turn {
     ///   state must produce a part — a Wake's resumed work, or content that
     ///   landed after the card was finalized. Nothing new renders -> nothing
     ///   is owed, which is also what keeps a rendered Wake from being
-    ///   re-posted on every poll. What it owes is then one of two handoffs: a
-    ///   yielded card whose newest placeable Wake is a shell/subagent
-    ///   completion the chain has not taken over yet resumes in place
-    ///   ([`WakeContinuation::ResumeInPlace`], ADR-0066), and every other
-    ///   continuation continues the chain by split.
+    ///   re-posted on every poll. What it owes then obeys spec #602: an open
+    ///   yielded card resumes in place ([`WakeContinuation::ResumeInPlace`],
+    ///   ADR-0066) — for a task-completion handoff, or for a Wake-less tail on a
+    ///   chain that already took a Wake over — and only a GENUINE resumption the
+    ///   chain has not handed over yet (a shell/subagent completion past its
+    ///   wait, a restart, an interrupt) continues the chain by split. A
+    ///   Wake-less content diff and an already-handed-over Wake owe no card and
+    ///   no receipt.
     /// - **No chain in this process (a cola restart).** A durable Chain Record
     ///   means the projection — or, cursorless, the reap's one-release
     ///   fallback — owns the chain's Wake, so the Fresh path owes nothing
@@ -3978,52 +4000,69 @@ impl Turn {
                 if !render::renders_new_content(&card.acc, transcript, anchor) {
                     return None;
                 }
-                // A yielded card resumes IN PLACE (ADR-0066) iff the newest
-                // placeable Wake — the completion whose work this continuation
-                // would render — is a shell/subagent completion this chain has
-                // not TAKEN OVER yet. One card per request: the entry, the
-                // resumed work and the ending all stay on the card the user's
-                // message opened. The gate reads the HANDOFF, not the
-                // announcement: a yielded card's ledger refresh places the
-                // completion entry while the Wake's work is still unrendered
-                // (live 2026-10-01 — the resumed message's text part was empty
-                // at that read), and that entry must not masquerade as a
-                // handoff, or the work would split into a 承接 card when it
-                // arrives. Every other continuation keeps the ADR-0059 split: a
-                // restart/interrupt Wake is not a task completion (no entry to
-                // place), a Wake this chain already handed over (a 承接 line or
-                // an earlier resume) is the Wake-less content-diff fallback — a
-                // later tail past it must not re-open the card — and a card past
-                // its wait (terminal, or a handoff already owed) must not be
-                // re-opened either: a ✅ flipping back to 🔄 would misread the
-                // ending it recorded.
+                // An OPEN yielded card resumes IN PLACE (ADR-0066), so no second
+                // card ever opens on it (spec #602). Precedence matters:
+                //
+                // 1. The newest placeable Wake is a shell/subagent completion
+                //    this chain has not TAKEN OVER yet — the task-completion
+                //    handoff. One card per request: the entry, the resumed work
+                //    and the ending all stay on the card the task lived on. The
+                //    gate reads the HANDOFF, not the announcement: a yielded
+                //    card's ledger refresh places the completion entry while the
+                //    Wake's work is still unrendered (live 2026-10-01), and that
+                //    entry must not masquerade as a handoff.
                 if ownership::admits_ledger_refresh(card)
                     && let Some(wake) = newest_wake
                     && matches!(wake.source, WakeSource::Shell | WakeSource::Subagent)
                     && !card.acc.handed_over_wakes.contains(wake.id.as_str())
                 {
                     return Some(WakeContinuation::ResumeInPlace {
-                        wake_id: wake.id.to_string(),
+                        wake_id: Some(wake.id.to_string()),
                     });
                 }
-                // Key the 承接 receipt just before the work the continuation
-                // will render: the newest Wake's own server time when there is
-                // one, else the Turn's own content (the content-diff
-                // fallback). That work's parts carry server times already in
-                // the past at poll time, so they sort after this key. The
-                // covered Wake is marked too: its completion is announced by
-                // this line, never doubled by the merged-path entry.
-                let wake = newest_wake.and_then(|wake| wake.anchor());
-                let at = wake
-                    .as_ref()
-                    .map_or(turn_anchor.created_ms, |wake| wake.created_ms)
-                    .saturating_sub(1);
-                return Some(WakeContinuation::ContinueChain {
-                    line: ContinuationLine {
-                        at,
-                        wake: wake.map(|wake| (wake.message_id.to_string(), wake.created_ms)),
-                    },
-                });
+                // 2. A chain continuation opens a NEW card ONLY for a genuine
+                //    resumption this chain has not handed over yet: a restart or
+                //    an interruption (a shell/subagent completion on a card past
+                //    its wait reached the same branch). Key the 承接 receipt just
+                //    before the work the continuation will render: the Wake's own
+                //    server time (that work's parts are already in the past at
+                //    poll time, so they sort after this key). The covered Wake is
+                //    marked too, so its completion is announced by this line,
+                //    never doubled by the merged-path entry — and, once marked, a
+                //    later tail resumes the continuation in place instead of
+                //    splitting again.
+                if let Some(wake) = newest_wake
+                    && wake.source.is_genuine_resumption()
+                    && !card.acc.handed_over_wakes.contains(wake.id.as_str())
+                    && let Some(anchor) = wake.anchor()
+                {
+                    return Some(WakeContinuation::ContinueChain {
+                        line: ContinuationLine {
+                            at: anchor.created_ms.saturating_sub(1),
+                            wake: Some((anchor.message_id.to_string(), anchor.created_ms)),
+                        },
+                    });
+                }
+                // 3. Any other OPEN yielded card with unrendered content resumes
+                //    IN PLACE: a Wake-less tail, or the same Wake's still-
+                //    streaming work past a handoff. It renders onto the SAME
+                //    card — the restart double-Card fix (spec #602,
+                //    `ses_ee3f19fc4ffefrgIFcTk6zV8yH`) — so it never opens a
+                //    second continuation and never writes a receipt for work no
+                //    Wake announced. The newest Wake, when there is one, is
+                //    already handed over, so re-marking it is a no-op; a Wake-less
+                //    tail (`None`) marks nothing. This is also why a Wake-less
+                //    tail is not dropped: an open yielded card renders it.
+                if ownership::admits_ledger_refresh(card) {
+                    return Some(WakeContinuation::ResumeInPlace {
+                        wake_id: newest_wake.map(|wake| wake.id.to_string()),
+                    });
+                }
+                // 4. A card past its wait (terminal or restart-stamped) with
+                //    unrendered Wake-less content owes no continuation from this
+                //    step: the residual is #606's neutral card, and this `None`
+                //    leaves that path open.
+                return None;
             }
         }
         // No chain in this process (a cola restart). The Fresh gate is the
