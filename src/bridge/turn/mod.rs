@@ -1143,10 +1143,10 @@ impl Turn {
         };
         let state = self.drain_state(handles, &transcript, timeout_ms).await;
         // A settled drain normally leaves the render to finalization (which
-        // reconciles from its own read); when THIS read retired a task, the
-        // entry renders here first — the overlay means no later read carries
-        // the retirement, so skipping the render would drop it (the settle
-        // would still be ✅, just without the record).
+        // re-reads the transcript and flushes the ending); when THIS read
+        // retired a task, the entry renders here first — the overlay means no
+        // later read carries the retirement, so skipping the render would drop
+        // it (the settle would still be ✅, just without the record).
         if state == DrainState::Settled && !reconciled {
             return Some(DrainState::Settled);
         }

@@ -28,7 +28,7 @@ use crate::backend::{Backend, SessionTranscript};
 
 /// The default spacing between two runtime verdicts of one Session (ms): the
 /// shared cadence Session Sync and the live loops observe together.
-pub(crate) const RUNTIME_RECONCILE_INTERVAL_MS: u64 = 30_000;
+const RUNTIME_RECONCILE_INTERVAL_MS: u64 = 30_000;
 
 /// One runtime verdict per Session per interval, process-wide (#589): the one
 /// gate Session Sync, the Turn's drain and the follow/settle loop share, so

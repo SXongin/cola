@@ -594,8 +594,10 @@ async fn a_task_appears_and_retires_on_the_live_card_in_cadence() {
     );
 }
 
-/// Acceptance 5: V1 carries no Background Task facts — a V1 `task` call that
-/// looks backgrounded renders its panel and never a ledger section.
+/// Acceptance 5 (#589 keeps it under the shared step): V1 carries no
+/// Background Task facts — a V1 `task` call that looks backgrounded renders
+/// its panel and never a ledger section, and the empty list short-circuits the
+/// shared runtime reconcile before any request.
 #[tokio::test]
 async fn a_v1_task_part_is_never_a_ledger_row() {
     let _wd = test_work_dir();
@@ -612,7 +614,7 @@ async fn a_v1_task_part_is_never_a_ledger_row() {
             serde_json::json!({ "background": true }),
         ),
     ]);
-    let (_dir, app, _backend, platform) = scripted_app(vec![transcript], Some(SessionStatus::Busy)).await;
+    let (_dir, app, backend, platform) = scripted_app(vec![transcript], Some(SessionStatus::Busy)).await;
 
     let _turn = spawn_turn(&app, ctx("ses_test", "跑一下"));
     wait_for_card_update(&platform, "the V1 panel", CardUpdates::Any, |card| {
@@ -629,6 +631,10 @@ async fn a_v1_task_part_is_never_a_ledger_row() {
     assert!(
         card_text(&card).contains("moved to background"),
         "the V1 panel itself is unchanged: {card}"
+    );
+    assert!(
+        backend.task_runtime_calls.lock().await.is_empty(),
+        "a read with no live task spends no runtime request, whatever the generation"
     );
 }
 
