@@ -2419,6 +2419,109 @@ async fn a_cleanup_click_keeps_a_running_task_and_the_wait() {
     );
 }
 
+/// Review (spec #588 / #590, PR #595): the cleanup click's own reconcile pass
+/// is the card's refresh point. When that pass positively reports the child
+/// RUNNING, it resolves the carried ⚠️ 状态待确认 marker — nothing is cleared —
+/// and the same click must re-render the card: marker and button gone, the
+/// running row kept, the wait still waiting. Without the click's refresh the
+/// stale button would survive until a later Session Sync read. Session Sync is
+/// parked behind another active session on the thread (the harness's ordinary
+/// inactive-session state, ADR-0017) so the click's pass is the card's only
+/// writer and its refresh cannot be masked by the poll loop.
+#[tokio::test]
+async fn a_cleanup_click_that_finds_the_child_running_refreshes_the_card() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    // The shell's start is frozen (future) so its rendered elapsed can never
+    // tick: the PATCH count is the marker's and the click's alone.
+    let live = waiting_shell_and_subagent(frozen_start(now), now - 3_000);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    script_child_without_activity(&backend).await;
+    yield_waiting_card(&app, &platform, 2).await;
+
+    // An admitted reconcile marks the inactive child: the row marker, the
+    // title count and the cleanup button land together.
+    {
+        let mut runtime = backend.task_runtime.lock().unwrap();
+        runtime.shells = vec![("sh_call_bg".into(), ShellRuntime::Running)];
+        runtime.children = vec![("ses_call_sub".into(), ChildRuntime::Inactive)];
+    }
+    spawn_sync(&app);
+    wait_for_card_update(&platform, "the unconfirmed marker", CardUpdates::Latest, |card| {
+        card_text(card).contains("⚠️ 状态待确认") && card_text(card).contains("清理待确认任务")
+    })
+    .await;
+
+    // Park Session Sync: the click's pass must be the card's only writer, so a
+    // refresh the click never does cannot be covered by a later poll.
+    seed_session(&app, "ses_parked", "/work").await;
+
+    // The runtime now positively reports the child running: the click's own
+    // reconcile resolves the marker without clearing anything.
+    backend.task_runtime.lock().unwrap().children = vec![("ses_call_sub".into(), ChildRuntime::Running)];
+    let patches_before = patches_to(&platform, "om_waiting").await.len();
+    let ack = app
+        .host_action(serde_json::json!({ "action": "cleanup", "session_id": "ses_test" }))
+        .await
+        .expect("the cleanup click acks");
+    assert!(
+        ack.card.is_none(),
+        "the ack keeps the card: the pipeline PATCHes it"
+    );
+    assert_eq!(ack.toast.as_deref(), Some("正在清理..."));
+
+    wait_for_card_update(&platform, "the resolved ledger", CardUpdates::Latest, |card| {
+        let text = card_text(card);
+        text.contains("⏳ 后台任务（2）") && !text.contains("待确认") && !text.contains("清理待确认任务")
+    })
+    .await;
+
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Waiting),
+        "the positively running child's row keeps the wait"
+    );
+    let patches = patches_to(&platform, "om_waiting").await;
+    assert_eq!(
+        patches.len(),
+        patches_before + 1,
+        "the click's own pass re-renders the waiting card exactly once: {patches:?}"
+    );
+    let refreshed = patches.last().unwrap();
+    let text = card_text(refreshed);
+    assert!(
+        text.contains("subagent：**review the diff**"),
+        "the running child's row remains: {refreshed}"
+    );
+    assert!(
+        !text.contains("⚠️ 状态待确认") && !text.contains("清理待确认任务"),
+        "the resolved marker and its button leave in the click's refresh: {refreshed}"
+    );
+    assert!(
+        !text.contains("🧹"),
+        "a run the click did not clear invents no cleanup entry: {refreshed}"
+    );
+
+    // The click's verdict owns the marker state for later reads too: resolved
+    // means resolved, and nothing was cleared.
+    let later = crate::backend::Backend::transcript(backend.as_ref(), "ses_test")
+        .await
+        .unwrap();
+    assert!(
+        !later.unconfirmed_tasks.contains("call_sub"),
+        "the resolved marker does not ride later reads: {later:?}"
+    );
+    assert_eq!(
+        later
+            .background_tasks
+            .iter()
+            .map(|task| task.tool.call_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["call_bg", "call_sub"],
+        "the click cleared nothing"
+    );
+}
+
 /// Review (spec #588, #590): the cleanup click is never throttled — a recent
 /// poll's verdict must not make it no-op. Even with the shared interval pinned
 /// wide right after a sync pass stamped it, the click spends its own runtime
