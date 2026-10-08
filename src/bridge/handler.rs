@@ -2160,7 +2160,11 @@ impl App {
             &session_id,
             directory.as_deref(),
             &mut transcript,
-            read_timeout_ms,
+            // The click's own read budget (spec #588, review PR #595): the
+            // verdict and its child-evidence reads share one `read_timeout_ms`
+            // window, exactly like a poll cycle's, so a stalled read cannot
+            // stack per-suspect timeouts on the click either.
+            crate::bridge::runtime::CycleBudget::within(read_timeout_ms),
         )
         .await;
         let Some(changed) = verdict else {
