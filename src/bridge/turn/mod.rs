@@ -251,6 +251,12 @@ pub(crate) struct Turn {
     /// then taken from this snapshot instead of silently stamping Done. Only
     /// ever a fallback — an authoritative final read (with the anchor) decides.
     last_drain_error: Option<String>,
+    /// The transcript snapshot of the drain's most recent rendered read (#604).
+    /// When the drain settled cleanly this is the read that was rendered AND
+    /// showed no new content, and finalization decides the ending on it — never
+    /// a later separate read that can disagree. `None` before the first drain
+    /// read (a rejected submit or a vanished card).
+    last_transcript: Option<SessionTranscript>,
     /// The stopped-finalization line is logged once per Turn (ADR-0048): both
     /// the post-prompt drain and its pre-finalization re-check observe the
     /// same sticky `/stop` marker, so the second observation must stay silent.
@@ -573,6 +579,7 @@ impl Turn {
             unstarted_reads: 0,
             submit_failed: false,
             last_drain_error: None,
+            last_transcript: None,
             stop_finalization_logged: false,
         }))
     }
@@ -723,21 +730,19 @@ impl Turn {
         // The turn's outcome is OBSERVED, not returned (ADR-0056): a rejected
         // submit is the call's Err, and a submitted run's failure is recorded
         // on its newest assistant message — the blocking response used to carry
-        // it inline, and the transcript now does. One read serves both the
-        // error decision and the final reconcile below.
+        // it inline, and the transcript now does.
         //
-        // A read that fails or has no anchor is NOT completion: the failure the
+        // The read the ending is decided on (#604): the drain's own rendered,
+        // quiescent snapshot when it settled cleanly — never a later separate
+        // read that could disagree and finalize a stale one. Otherwise a fresh
+        // bounded read, repeated while it still carries content the card lacks:
+        // the same rendered-and-quiescent rule the drain applies, so the two
+        // paths cannot diverge. `None` here is NOT completion: the failure the
         // drain last observed stands in, so a hiccup cannot stamp Done over a
-        // failed turn. Bounded by the same per-read timeout as every drain read
-        // (#603): a hung Backend must not freeze finalization after the drain
-        // already ended (a lost-contact run reaches here).
-        let final_transcript = crate::bridge::bounded_call(
-            "turn final transcript",
-            self.drain_read_timeout_ms(handles),
-            handles.backend.transcript(&self.session_id),
-        )
-        .await
-        .and_then(std::result::Result::ok);
+        // failed turn. Every read is bounded by the same per-read timeout as the
+        // drain (#603): a hung Backend must not freeze finalization after the
+        // drain already ended (a lost-contact run reaches here).
+        let final_transcript = self.final_transcript(handles, drain_outcome.is_none()).await;
 
         // A deliberate `/stop` owns this turn's ending (#394): the abort the
         // server recorded is NOT a failure, its text must never reach the
@@ -1087,6 +1092,52 @@ impl Turn {
         handles.config.follow_read_timeout_ms()
     }
 
+    /// The transcript finalization decides the ending on (#604), obeying the
+    /// same rendered-and-quiescent rule as the drain. When the drain settled
+    /// cleanly (`drain_settled`) that is its own last rendered read — the
+    /// snapshot that was rendered and showed no new content — so the ending can
+    /// never be decided from a later read that disagrees with it. Otherwise a
+    /// fresh bounded read, repeated while it still carries content the card
+    /// lacks: each such read is rendered before the next, so the ending is
+    /// never stamped over an unrendered tail. `None` when no read answers.
+    async fn final_transcript(
+        &self,
+        handles: &TurnHandles,
+        drain_settled: bool,
+    ) -> Option<SessionTranscript> {
+        if drain_settled && let Some(transcript) = &self.last_transcript {
+            return Some(transcript.clone());
+        }
+        loop {
+            let transcript = crate::bridge::bounded_call(
+                "turn final transcript",
+                self.drain_read_timeout_ms(handles),
+                handles.backend.transcript(&self.session_id),
+            )
+            .await
+            .and_then(std::result::Result::ok)?;
+            // Render this read, then repeat only if it carried content the card
+            // lacked: the ending may only be stamped on a read that shows no
+            // new content. A vanished accumulator ends the loop with the read
+            // it last saw.
+            let Some(rendered) = render::render_and_flush(
+                &handles.cards,
+                &handles.sessions,
+                &handles.backend,
+                &handles.requests,
+                &self.session_id,
+                &transcript,
+            )
+            .await
+            else {
+                return Some(transcript);
+            };
+            if !rendered.stats.new_content {
+                return Some(transcript);
+            }
+        }
+    }
+
     /// Poll the Backend and render it into the live card until the run reaches
     /// its true end. UNBOUNDED (#603): there is no total budget — a readable
     /// run may take as long as it takes. The only ceilings are the two graces
@@ -1208,18 +1259,17 @@ impl Turn {
             None
         };
         let read = self.drain_state(handles, &transcript, timeout_ms).await;
-        // A settled drain normally leaves the render to finalization (which
-        // re-reads the transcript and flushes the ending). It must still render
-        // HERE when the card carries a live `⏳` panel — that render is what
-        // updates the panel's status, so skipping it would freeze a panel that
-        // had already settled (the stuck-panel grace would then fire on a
-        // finished run) — or when THIS read retired a task (the overlay means no
-        // later read carries the retirement, so skipping the render would drop
-        // it).
+        // A settled read whose content is already on the card owes no render:
+        // it is the snapshot the ending is decided from — rendered, and showing
+        // no new content — so the drain settles without another write. Rendering
+        // it anyway would re-spend the cycle's ledger reads and re-persist the
+        // chain record for nothing.
         if read.state == DrainState::Settled
             && !pass.as_ref().is_some_and(|pass| pass.changed())
             && !Turn::has_live_tools(&handles.cards, &self.session_id).await
+            && !self.drain_owes_render(handles, &transcript).await
         {
+            self.last_transcript = Some(transcript);
             return DrainTick {
                 state: Some(read.state),
                 live: read.live,
@@ -1227,16 +1277,33 @@ impl Turn {
                 contact: read.contact,
             };
         }
-        let Some(rendered) = render::render_and_flush(
-            &handles.cards,
-            &handles.sessions,
-            &handles.backend,
-            &handles.requests,
-            &self.session_id,
-            &transcript,
-        )
-        .await
-        else {
+        // A settle whose tick has a retiring task must flush so the pass can
+        // commit; a settle that lands nothing but turn parts leaves the card
+        // write to finalization's own render on this same read (#604), so the
+        // settle tick adds no second durable write and no out-of-order flush.
+        let settling = read.state == DrainState::Settled && !pass.as_ref().is_some_and(|pass| pass.changed());
+        let rendered = if settling {
+            render::render_and_flush_settling(
+                &handles.cards,
+                &handles.sessions,
+                &handles.backend,
+                &handles.requests,
+                &self.session_id,
+                &transcript,
+            )
+            .await
+        } else {
+            render::render_and_flush(
+                &handles.cards,
+                &handles.sessions,
+                &handles.backend,
+                &handles.requests,
+                &self.session_id,
+                &transcript,
+            )
+            .await
+        };
+        let Some(rendered) = rendered else {
             // The accumulator vanished under the tick (a replacement or a
             // collect took the card): nothing is owned any more, so the drain
             // ends silently rather than recording a task the card cannot carry
@@ -1259,11 +1326,48 @@ impl Turn {
         {
             pass.commit(&handles.backend, &self.session_id, &transcript);
         }
+        // The same-snapshot ending rule (#604): the TRUE end is only real when
+        // the read it was decided from was rendered AND showed no new content.
+        // If this read still carried parts the card lacked it was not quiescent
+        // — report `Running` so the drain re-reads and re-decides on a fresh
+        // snapshot instead of finalizing a read a later one contradicts. A
+        // waiting yield or an Unreceived ending owns its own card already (the
+        // render above landed anything new), so only the true end gates; a
+        // retirement entry is content too, but its settle decision was made on
+        // the same transcript, so it does not gate.
+        let state = if read.state == DrainState::Settled && rendered.stats.new_content {
+            DrainState::Running
+        } else {
+            read.state
+        };
+        // Keep the read finalization will decide on: when the drain settled this
+        // is the rendered, quiescent snapshot, so `finish` never needs a later,
+        // disagreeing read (#604).
+        self.last_transcript = Some(transcript);
         DrainTick {
-            state: Some(read.state),
+            state: Some(state),
             live: read.live,
             settled_readable: read.settled_readable,
             contact: read.contact,
+        }
+    }
+
+    /// Whether a settled read still carries turn parts the card lacks — the
+    /// pure probe ([`render::renders_new_content`]) that decides whether the
+    /// settled tick must render before it may settle (#604). Only the turn's own
+    /// window is covered: seeded/gap content the probe cannot place is rendered
+    /// by finalization's own reconcile.
+    async fn drain_owes_render(&self, handles: &TurnHandles, transcript: &SessionTranscript) -> bool {
+        let mut cards = handles.cards.cards.lock().await;
+        match cards.get_mut(&self.session_id) {
+            Some(card) => {
+                render::capture_turn_anchor(&mut card.acc, transcript);
+                match card.acc.turn_anchor.clone() {
+                    Some(anchor) => render::renders_new_content(&card.acc, transcript, &anchor),
+                    None => false,
+                }
+            }
+            None => false,
         }
     }
 
