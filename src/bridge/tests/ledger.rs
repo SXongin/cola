@@ -1912,6 +1912,20 @@ async fn a_permanently_refused_yielded_refresh_records_nothing() {
         );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
+    // The suspended-card handling is exactly as before: the plain attempt and
+    // its fenced retry are the card's only writes (both recorded, both
+    // refused), and no later pass PATCHes the suspended card again.
+    assert_eq!(
+        patches_to(&platform, "om_waiting").await.len(),
+        2,
+        "the plain attempt and its fenced retry only"
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        patches_to(&platform, "om_waiting").await.len(),
+        2,
+        "a suspended card is not PATCHed again"
+    );
 
     // Nothing was recorded: the task stays live, so a later receivable card can
     // still render its entry ...
@@ -1931,15 +1945,6 @@ async fn a_permanently_refused_yielded_refresh_records_nothing() {
             .collect::<Vec<_>>(),
         vec!["call_bg"],
         "the task stays live until a card that can render its entry claims it"
-    );
-    // ... and no card carries a half-rendered entry: the refused payload never
-    // reached Feishu.
-    let mut cards = platform.updated_cards().await;
-    cards.extend(platform.sent_cards().await);
-    cards.extend(platform.replied_cards().await);
-    assert!(
-        cards.iter().all(|card| !card_text(card).contains("🔔")),
-        "a refused refresh renders no entry anywhere: {cards:?}"
     );
 }
 

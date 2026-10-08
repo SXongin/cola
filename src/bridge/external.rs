@@ -399,6 +399,13 @@ impl ExternalFlow {
             .await
             {
                 YieldedUpdate::Unchanged => {}
+                YieldedUpdate::Refused => {
+                    // The write was permanently refused (the card suspended):
+                    // nothing will ever carry this read's entries, so the pass
+                    // must not commit — the task stays live for a card that
+                    // can render its entry (review, PR #595).
+                    tracing::warn!("yielded ledger refresh refused: session {sid}");
+                }
                 YieldedUpdate::Refreshed => {
                     carried = true;
                     tracing::info!("yielded ledger refreshed: session {sid}");
@@ -1400,7 +1407,7 @@ async fn external_render_loop(
         )
         .await;
         let stats = match rendered {
-            Ok(Some(stats)) => Some(stats),
+            Ok(Some(pass)) => Some(pass.stats),
             // The accumulator vanished: nothing left to render.
             Ok(None) => break,
             Err(_) => {
