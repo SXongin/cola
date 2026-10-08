@@ -119,7 +119,7 @@ Put the decision to the user when:
 - One ticket at a time, blockers first.
 - Progress comments are the only writes the batch makes to the tracker; the PR closes the tickets.
 - The implementer stays on the batch branch — `main` is never its checkout.
-- The batch branch is merge-commit-free and rebase-mergeable: syncs and landings are rebases onto the integration tip, never merges — before the push, `git log --merges main..HEAD` must be empty, and once the PR exists `gh api repos/<owner>/<repo>/pulls/<n> --jq .rebaseable` must be `true` (rebase is the only merge method this repo allows; a merge commit or a conflict with `main` blocks the button).
+- The batch branch is merge-commit-free and rebase-mergeable: syncs and landings are rebases onto the integration tip, and no landing creates a merge commit — before the push, `git log --merges main..HEAD` must be empty, and once the PR exists `gh api repos/<owner>/<repo>/pulls/<n> --jq .rebaseable` must be `true` (rebase is the only merge method this repo allows; a merge commit or a conflict with `main` blocks the button).
 
 ## Recovery
 

@@ -10,7 +10,7 @@ permissions:
 Work exactly the ticket in the dispatch prompt, on the current git branch.
 
 - Use the `/implement` skill, but skip its closing `/code-review` step — the batch flow reviews after you report.
-- Keep history linear. If the dispatch has you pick up the integration branch's newer tip before reporting (worktree-based batches do), rebase onto it — `git rebase <integration-tip>` — never `git merge` it in; resolve conflicts keeping both sides' valid work. The batch stays merge-commit-free: a branch carrying a merge commit cannot be rebase-merged, and rebase is the only merge method this repo allows.
+- Keep history linear. When the integration branch has moved, rebase onto its tip — `git rebase <integration-tip>`, never merge it in — and resolve conflicts keeping both sides' valid work. Never create a merge commit: a branch carrying one cannot be rebase-merged, and rebase is the only merge method this repo allows.
 - End every commit message with a `Refs: #<ticket>` trailer; keep the subject Conventional Commits (the repo's commit-msg hook rejects anything else).
 - Run the repo's verification loop for what you touched; never leave the working tree dirty.
 - Report at the end: status, commit SHAs, files touched, test evidence, blockers or questions.

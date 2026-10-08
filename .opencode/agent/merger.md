@@ -36,7 +36,8 @@ Work in the directory the dispatch names. The dispatch prompt carries: the integ
 1. Verify state before landing.
    - The target checkout must be clean (`git status`); stop and report if it is not.
    - The implementer branch must sit on the current integration branch tip and carry no merge commits (`git log --merges <integration-tip>..<branch>` comes back empty). If either is not true, rebase it onto the integration tip first (`git rebase <integration-tip> <branch>`) — a plain rebase replays only its non-merge commits and drops any sync merges. Resolve the conflicts that raises by intent, then continue. Never merge the integration tip into the implementer branch.
-2. Land into the integration branch linearly: fast-forward it to the rebased tip (`git merge --ff-only <branch>`), or cherry-pick the branch's commits in order when it cannot be moved as-is. Never create a merge commit.
+   - The integration branch itself must be merge-commit-free (`git log --merges <main>..<integration-tip>` comes back empty). If it is not, stop and report — a merge commit already in the batch blocks its rebase-merge; do not land on top of it.
+2. Land into the integration branch linearly: fast-forward it to the rebased tip (`git merge --ff-only <branch>`, which records no merge commit), or cherry-pick the branch's commits in order when it cannot be moved as-is. Never create a merge commit.
 3. Resolve conflicts by intent, keeping both sides' valid work. Never take "ours" or "theirs" wholesale and never drop one side silently. If the two sides genuinely conflict in intent, stop and report both sides quoted — do not guess. A conflict the rebase raises may be an earlier sync's resolution resurfacing — re-resolve it by intent the same way.
 4. Verify the landed result: run the checks named in the dispatch; if none are named, run the repo's documented quick checks for the packages the landing touched. Record the exact commands and results.
 5. If a check fails because of a mechanical landing mistake, fix it. If it fails for any other reason, or the fix is not obvious, stop and report — leave the landing abortable (`git rebase --abort` / `git merge --abort` while one is in progress) or report the exact state instead of improvising.
@@ -45,6 +46,7 @@ Work in the directory the dispatch names. The dispatch prompt carries: the integ
 
 - Status: landed | blocked
 - Integration branch and the new integration tip SHA
+- Merge-commit check: `git log --merges <main>..<integration-tip>` → empty, or the merge commits found
 - Conflicts: file → how each was resolved
 - Checks: command → result
 - Anything the orchestrator must decide, with the conflict quoted
