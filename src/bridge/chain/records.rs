@@ -1130,14 +1130,21 @@ mod tests {
         );
 
         // A top-level landing clears the refused target in the same write.
+        let writes = chains.writes();
         chains.track_landing("ses_a", "om_2", MessageId::new("msg_cola_1"), None, None, None);
         assert_eq!(
             chains.get("ses_a").expect("the record").reply_to,
             None,
             "the top-level landing clears the target"
         );
+        assert_eq!(
+            chains.writes() - writes,
+            1,
+            "the clear rides the re-point's OWN write — never a second one a crash could lose"
+        );
 
         // A reply-rung landing sets its own target.
+        let writes = chains.writes();
         chains.track_landing(
             "ses_a",
             "om_3",
@@ -1151,6 +1158,7 @@ mod tests {
             Some("om_user_2"),
             "the reply landing records its rung"
         );
+        assert_eq!(chains.writes() - writes, 1, "the set is one write too");
     }
 
     /// [`a_landing_track_sets_or_clears_the_reply_target_atomically`] for the
@@ -1168,6 +1176,7 @@ mod tests {
             None,
             Some("om_user_1"),
         );
+        let writes = chains.writes();
         chains.track_carrying_cursor_landing(
             "ses_a",
             "om_2",
@@ -1183,6 +1192,11 @@ mod tests {
         assert!(
             record.cursor.is_some(),
             "the confirmed cursor rode the same write"
+        );
+        assert_eq!(
+            chains.writes() - writes,
+            1,
+            "cursor confirm + rung clear are ONE write"
         );
     }
 

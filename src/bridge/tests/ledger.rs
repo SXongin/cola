@@ -33,8 +33,9 @@ use super::drain::{
     user, wait_for_card_text,
 };
 use crate::backend::{
-    BackgroundTask, ChildRuntime, ContentBlock, FinishReason, MessageRole, Part, SessionTranscript, ShellEnd,
-    ShellRuntime, StepFinish, ToolCall, ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage,
+    BackgroundTask, ChildRuntime, ContentBlock, FinishReason, MessageId, MessageRole, Part,
+    SessionTranscript, ShellEnd, ShellRuntime, StepFinish, ToolCall, ToolIdentity, ToolOutput, ToolStatus,
+    TranscriptMessage, Wake, WakeSource,
 };
 use crate::bridge::test_support::*;
 use crate::bridge::turn::{PromptContext, Turn};
@@ -858,6 +859,138 @@ async fn a_resumed_card_carries_every_completion_of_the_read() {
         !text.contains(WAKE_LEAD),
         "an in-place resume writes no 承接 line: {resumed}"
     );
+}
+
+/// #552: a resumed subagent leaves TWO launch parts for one child. The
+/// decoder's merged live list keeps only the newest launch — and the child's
+/// completion Wake must render exactly ONE entry, never one per launch part —
+/// with no live row left behind.
+#[tokio::test]
+async fn a_resumed_subagents_wake_renders_one_completion_entry() {
+    let _wd = test_work_dir();
+    let (_dir, app, backend, platform) =
+        scripted_app(vec![resumed_subagent_waiting()], Some(SessionStatus::Idle)).await;
+
+    // The turn idles with the (deduplicated) live child: one row.
+    Turn::run(&app.turn_handles(), ctx("ses_test", "审阅一下"))
+        .await
+        .unwrap();
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Waiting),
+        "idle with a live task yields waiting"
+    );
+    let yielded = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_text(&yielded).contains("⏳ 后台任务（1）"),
+        "the merged live list shows one row: {yielded}"
+    );
+    Turn::set_card_message_id(&app.cards_handle(), "ses_test", "om_waiting").await;
+
+    // The resume completes: the child's Wake retires the survivor and the
+    // resumed work lands on the same card.
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(resumed_subagent_timeline())
+                .with_executions(vec![execution(2_500), execution(4_000)])
+                .with_wakes(vec![resumed_child_wake(3_500)]),
+        ],
+    )
+    .await;
+    spawn_sync(&app);
+    wait_for_card_update(
+        &platform,
+        "the resumed card's true end",
+        CardUpdates::Latest,
+        |card| card_header(card).contains("✅") && card_text(card).contains("审阅完成了。"),
+    )
+    .await;
+
+    let resumed = platform.updated_cards().await.last().cloned().unwrap();
+    let text = card_text(&resumed);
+    assert_eq!(
+        text.matches("🔔 subagent 完成").count(),
+        1,
+        "one Wake, one entry — never one per launch part: {resumed}"
+    );
+    assert!(
+        !text.contains("后台任务（"),
+        "no live list after the true end: {resumed}"
+    );
+}
+
+/// The resumed-subagent waiting read: one child launched twice (the earlier
+/// run interrupted, the later resume replacing it), carrying the merged live
+/// list the decoder produces — the newest launch only (#552).
+fn resumed_subagent_waiting() -> SessionTranscript {
+    SessionTranscript::new(resumed_subagent_timeline())
+        .with_executions(vec![execution(2_500)])
+        .with_background_tasks(vec![live_subagent_child(2_600, "call_sub_2", "ses_child")])
+}
+
+/// One child, two launches, and the resumed work — the read a completed
+/// resume produces (#552).
+fn resumed_subagent_timeline() -> Vec<TranscriptMessage> {
+    vec![
+        user("msg_cola_anchor", 1_000, "审阅一下"),
+        subagent_launch(2_000, "call_sub_1", "ses_child"),
+        subagent_launch(2_600, "call_sub_2", "ses_child"),
+        assistant(3_700, "审阅完成了。"),
+    ]
+}
+
+/// A settled background `subagent` launch whose metadata names its child
+/// session — two of these appear when a run is relaunched on the same child.
+fn subagent_launch(created: i64, call_id: &str, child_id: &str) -> TranscriptMessage {
+    typed_message(
+        &format!("msg_launch_{call_id}"),
+        MessageRole::Assistant,
+        Some(created),
+        vec![
+            Part::Tool(ToolCall {
+                identity: ToolIdentity {
+                    name: "subagent".into(),
+                    call_id: call_id.into(),
+                },
+                status: ToolStatus::Completed,
+                started_at: Some(created),
+                input: Some(serde_json::json!({ "description": "review the diff", "background": true })),
+                metadata: Some(serde_json::json!({ "status": "running", "sessionID": child_id })),
+                output: ToolOutput::default(),
+            }),
+            Part::StepFinish(StepFinish {
+                reason: FinishReason::ToolCalls,
+            }),
+        ],
+    )
+}
+
+/// The merged live task the decoder keeps for the resumed child (#552).
+fn live_subagent_child(started_at: i64, call_id: &str, child_id: &str) -> BackgroundTask {
+    BackgroundTask {
+        tool: ToolIdentity {
+            name: "subagent".into(),
+            call_id: call_id.into(),
+        },
+        shell_id: None,
+        child_id: Some(child_id.into()),
+        started_at: Some(started_at),
+    }
+}
+
+/// The resumed child's completion Wake.
+fn resumed_child_wake(created_ms: i64) -> Wake {
+    Wake {
+        id: MessageId::new(format!("msg_wake_sub_{created_ms}")),
+        created_ms: Some(created_ms),
+        source: WakeSource::Subagent,
+        shell_id: None,
+        job_id: None,
+        child_id: Some("ses_child".into()),
+        state: Some("completed".into()),
+        label: Some("review the diff".into()),
+    }
 }
 
 /// Handover cause 2 (#418): a new Turn supersedes a waiting card. The collect
