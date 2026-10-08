@@ -1431,6 +1431,13 @@ pub(crate) struct RenderStats {
     pub(crate) text_len: usize,
     /// The card's cumulative reasoning length after the pass (logging).
     pub(crate) reasoning_len: usize,
+    /// Whether this pass rendered turn parts the card did not already carry.
+    /// The same-snapshot ending rule (#604) reads it: an ending may only be
+    /// decided on a read that was rendered and shows no new part content, so a
+    /// pass whose render added parts cannot settle. Completion entries are not
+    /// counted: the settle decision was made on the same transcript that
+    /// produced them, so a retirement does not gate.
+    pub(crate) new_content: bool,
 }
 
 /// What one completed render pass did (review, PR #595): the stats the loops
@@ -1443,6 +1450,25 @@ pub(crate) struct RenderPass {
     pub(crate) stats: RenderStats,
     /// What became of the flush this pass issued.
     pub(crate) flush: FlushOutcome,
+}
+
+/// [`render_and_flush`] for a drain tick that is settling (#604): it renders the
+/// read into the accumulator but does not flush — finalization's own render on
+/// the same read owns the card write, so the settle tick adds no second durable
+/// write and no out-of-order flush (a pending split still serves on
+/// finalization, exactly as before).
+pub(super) async fn render_and_flush_settling(
+    cards: &CardsHandle,
+    sessions: &SessionsHandle,
+    backend: &Arc<dyn crate::backend::Backend>,
+    requests: &RequestsHandle,
+    session_id: &str,
+    transcript: &SessionTranscript,
+) -> Option<RenderPass> {
+    render_and_flush_inner(
+        cards, sessions, backend, requests, session_id, transcript, false, false,
+    )
+    .await
 }
 
 /// Render the session's transcript into the streaming card and flush it when
@@ -1465,6 +1491,23 @@ pub(super) async fn render_and_flush(
     requests: &RequestsHandle,
     session_id: &str,
     transcript: &SessionTranscript,
+) -> Option<RenderPass> {
+    render_and_flush_inner(
+        cards, sessions, backend, requests, session_id, transcript, true, true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)] // the render axes plus the anchor-persist and flush choices
+async fn render_and_flush_inner(
+    cards: &CardsHandle,
+    sessions: &SessionsHandle,
+    backend: &Arc<dyn crate::backend::Backend>,
+    requests: &RequestsHandle,
+    session_id: &str,
+    transcript: &SessionTranscript,
+    persist_anchor: bool,
+    flush_allowed: bool,
 ) -> Option<RenderPass> {
     // OpenCode auto-renames sessions after a turn; follow the server's live
     // title so the card subtitle doesn't stay on the "new session" default.
@@ -1536,7 +1579,10 @@ pub(super) async fn render_and_flush(
     // Persist the captured anchor on the durable record (ADR-0063), so a
     // restart's reap can ask the transcript what became of this Turn's message
     // instead of probing for it. A no-op while the record names another card.
-    if let Some((card_message_id, anchor)) = &anchor {
+    // A caller that will finalize on this same read defers it (#604): the
+    // finalization's own render names the anchor, and the extra write here
+    // would be a second persist for one turn.
+    if persist_anchor && let Some((card_message_id, anchor)) = &anchor {
         cards.chains.set_anchor(session_id, card_message_id, anchor);
     }
     // Keep the footer's context segment current (ADR-0044): the token usage
@@ -1594,7 +1640,11 @@ pub(super) async fn render_and_flush(
             None => (super::state::LedgerChange::default(), false),
         }
     };
-    let flush = if changed
+    let flush = if !flush_allowed {
+        // A settling render (#604) leaves the card write to finalization, which
+        // renders and flushes this same read: no carrier here.
+        FlushOutcome::Unwritten
+    } else if changed
         || entries_changed
         || header_changed
         || context_changed
@@ -1612,6 +1662,7 @@ pub(super) async fn render_and_flush(
             new_parts,
             text_len,
             reasoning_len,
+            new_content: changed,
         },
         flush,
     })

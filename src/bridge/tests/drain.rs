@@ -2769,6 +2769,103 @@ async fn a_retirement_inside_the_finalization_window_ends_the_turn_normally() {
     );
 }
 
+/// Spec #604: the final part that lands between the drain's render read and
+/// the later idle status read still lands on the Card, and the turn ends on
+/// that same rendered, quiescent snapshot. The drain must render the read it
+/// settles on; a later read that dropped the tail (a partial or compacted
+/// read) may not finalize the stale snapshot the drain skipped rendering into
+/// a Wake-less continuation Card (spec evidence
+/// `ses_ee3f4531fffeBcOYDY3vHUQDPw`).
+#[tokio::test]
+async fn a_final_part_landing_between_the_render_and_idle_read_still_lands() {
+    let _wd = test_work_dir();
+    let rendered = vec![
+        user("msg_cola_anchor", 1_000, "第一条消息"),
+        assistant(2_000, "第一段。"),
+    ];
+    let with_tail = vec![
+        user("msg_cola_anchor", 1_000, "第一条消息"),
+        assistant(2_000, "第一段。"),
+        assistant(3_000, "第二段。"),
+    ];
+    let (_dir, app, backend, platform) = scripted_app(
+        vec![SessionTranscript::new(rendered.clone())],
+        Some(SessionStatus::Busy),
+    )
+    .await;
+    // A grace and a per-read bound the test would never wait out: only the
+    // state transitions below may end the drain.
+    app.turn_follow_grace_ms.store(60_000, Ordering::Relaxed);
+    app.turn_follow_read_timeout_ms.store(60_000, Ordering::Relaxed);
+
+    let _turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
+    wait_for_card_text(&platform, "第一段。").await;
+    // Let the in-flight render poll (the submit window) stop: from here the
+    // drain is the only transcript reader, so the read parked below is its own.
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    // Park the drain's next read. It is about to classify the still-Busy run.
+    let gate = backend.hold_transcripts();
+    let entered = backend.transcript_gate_entered.load(Ordering::SeqCst);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while backend.transcript_gate_entered.load(Ordering::SeqCst) == entered {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the drain never reached the parked read"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+
+    // The tail lands while the read is parked: the parked read is the render
+    // read that carries it, and the session idles with it. The reads AFTER it
+    // serve a lagging snapshot that dropped the tail — the read-ordering race
+    // (a partial/compacted read the ending must not be finalized from).
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(with_tail.clone()),
+            SessionTranscript::new(rendered),
+        ],
+    )
+    .await;
+    backend
+        .set_session_status("ses_test", Some(SessionStatus::Idle))
+        .await;
+    // Disarm first: only the one parked read is gated, so the reads that follow
+    // serve the lagging snapshot without parking.
+    *backend.transcript_gate.lock().unwrap() = None;
+    gate.add_permits(1);
+
+    wait_for_guard_release(&app).await;
+    let final_card = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_header(&final_card).contains("完成"),
+        "the turn ends on the Card: {final_card}"
+    );
+    assert!(
+        card_text(&final_card).contains("第二段。"),
+        "the read the drain rendered must land on the Card: {final_card}"
+    );
+
+    // The durable transcript still carries the tail: Session Sync must find
+    // nothing unrendered, so no second (Wake-less continuation) Card opens.
+    let posts = card_posts(&platform).await;
+    script_transcript(&backend, vec![SessionTranscript::new(with_tail)]).await;
+    spawn_sync(&app);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        card_posts(&platform).await,
+        posts,
+        "a rendered tail must not orphan into a second Card: {:?}",
+        platform.calls.lock().await
+    );
+    assert!(
+        continuation_sends(&platform).await.is_empty(),
+        "no Wake-less continuation Card opens: {:?}",
+        platform.calls.lock().await
+    );
+}
+
 /// A Wake's content landing in the finalization window must not satisfy the
 /// Turn's completion check: its Execution has not reached a boundary yet, so
 /// the Turn keeps observing (the old "any terminal step since the anchor" rule
