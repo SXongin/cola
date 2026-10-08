@@ -4954,6 +4954,146 @@ async fn a_v1_read_spends_no_output_window_request() {
 }
 
 // ---------------------------------------------------------------------------
+// One admitted reconcile cycle, ONE read budget (spec #588, review PR #595):
+// the runtime verdict read, the child-evidence reads and the shell-window
+// reads all spend one `read_timeout_ms` window. Each later read gets only the
+// remainder; a read the spent budget cannot fund is skipped — no request at
+// all — and the next cycle retries it. A stalled runtime or capture can never
+// stack another full timeout per task.
+// ---------------------------------------------------------------------------
+
+/// Review PR #595: the runtime retires one shell while two surviving shells'
+/// window reads hang — the retirement is still observed and rendered, and the
+/// whole cycle stays within ONE read budget. The first hung window read spends
+/// the remainder; the second is skipped (never issued, no second timeout
+/// stacked), and both omitted windows render as no window at all — never a
+/// placeholder. The retiree ends 已失联 (identity-only): its entry spends no
+/// output read of its own, so the cycle's reads are exactly the two windows.
+#[tokio::test]
+async fn a_retirement_cycle_stays_within_one_read_budget() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = SessionTranscript::new(two_task_timeline(vec![]))
+        .with_executions(vec![execution(2_500)])
+        .with_background_tasks(vec![
+            live_shell(now - 5_000, "call_bg"),
+            live_shell(now - 4_000, "call_bg2"),
+            live_shell(now - 3_000, "call_bg3"),
+        ]);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    backend.task_runtime.lock().unwrap().shells = vec![("sh_call_bg".into(), ShellRuntime::Missing)];
+    backend.hang_shell_output_reads(usize::MAX);
+    let budget = 200;
+    app.turn_drain_timeout_ms.store(budget, Ordering::Relaxed);
+
+    let started = std::time::Instant::now();
+    Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下构建并审阅"))
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+
+    // The first hung window read spends the cycle's remaining budget; the
+    // second survivor's read is skipped — never issued, so no timeout stacks.
+    let window_reads = backend.shell_output_calls.lock().await.clone();
+    assert_eq!(
+        window_reads,
+        vec!["sh_call_bg2".to_string()],
+        "one hung window read spends the budget, the rest are skipped: {window_reads:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(budget * 2),
+        "the cycle must stay within one read budget, not one per shell: {elapsed:?}"
+    );
+
+    // The retirement rendered on the very cycle that observed it...
+    let card = platform.updated_cards().await.last().cloned().unwrap();
+    let text = card_text(&card);
+    assert!(
+        text.contains("🔔 shell 已失联：gh run watch"),
+        "the retirement entry renders after the bounded cycle: {card}"
+    );
+    // ...the skipped windows are omitted, and the two live shells keep the
+    // wait: nothing was guessed dead.
+    assert!(
+        !text.contains("截至于"),
+        "a skipped window read renders no window at all: {card}"
+    );
+    assert!(
+        text.contains("⏳ 后台任务（2）"),
+        "the two surviving shells keep the wait: {card}"
+    );
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Waiting),
+        "the bounded cycle never ends the wait by itself"
+    );
+}
+
+/// Review PR #595: several suspects' evidence reads hang — the cycle stays
+/// within ONE read budget and every marker stays unconfirmed. The first hung
+/// read spends the remainder; the later suspects are skipped (no request, no
+/// extra timeout), and with no evidence applied nothing is guessed dead:
+/// every row keeps ⚠️ 状态待确认 and the card keeps its wait.
+#[tokio::test]
+async fn hanging_evidence_reads_stay_within_one_read_budget() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = SessionTranscript::new(two_task_timeline(vec![]))
+        .with_executions(vec![execution(2_500)])
+        .with_background_tasks(vec![
+            live_subagent(now - 5_000, "call_sub1"),
+            live_subagent(now - 4_000, "call_sub2"),
+            live_subagent(now - 3_000, "call_sub3"),
+        ]);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    backend.task_runtime.lock().unwrap().children = vec![
+        ("ses_call_sub1".into(), ChildRuntime::Inactive),
+        ("ses_call_sub2".into(), ChildRuntime::Inactive),
+        ("ses_call_sub3".into(), ChildRuntime::Inactive),
+    ];
+    backend.hang_child_evidence_reads(usize::MAX);
+    let budget = 200;
+    app.turn_drain_timeout_ms.store(budget, Ordering::Relaxed);
+
+    let started = std::time::Instant::now();
+    Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下构建并审阅"))
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+
+    // The first hung evidence read spends the cycle's remaining budget; every
+    // later suspect is skipped — never issued, so no timeout stacks.
+    let reads = backend.child_evidence_calls.lock().await.clone();
+    assert_eq!(
+        reads,
+        vec!["ses_call_sub1".to_string()],
+        "one hung evidence read spends the budget, the rest are skipped: {reads:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(budget * 2),
+        "the cycle must stay within one read budget, not one per suspect: {elapsed:?}"
+    );
+
+    // No evidence means no guess: every suspect keeps its marker, no entry
+    // renders, and the wait stands.
+    let card = platform.updated_cards().await.last().cloned().unwrap();
+    let text = card_text(&card);
+    assert!(
+        text.contains("⏳ 后台任务（3 · 3 待确认）"),
+        "every hung suspect keeps its marker: {card}"
+    );
+    assert!(
+        !text.contains("🔔 subagent"),
+        "a hung evidence read never guesses an ending: {card}"
+    );
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Waiting),
+        "no evidence means no ending: the card keeps its wait"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // A completion entry's output tail (spec #588, ticket #593): when a shell
 // ends — a Wake's 完成/取消/失败 or the runtime's 结束 — its folded body
 // carries the result, read once at the entry's own render. A record the read
