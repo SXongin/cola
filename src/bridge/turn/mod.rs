@@ -4540,6 +4540,19 @@ impl Turn {
             .map(|c| c.acc.card_state.clone())
     }
 
+    /// Whether the card's fallback reached the suspended state (the fenced
+    /// retry was refused too): the flush's terminal mark, so a test can pin
+    /// that a refused write leaves the card exactly as the suspension rules
+    /// always did.
+    pub(crate) async fn card_is_suspended(cards: &CardsHandle, session_id: &str) -> bool {
+        cards
+            .cards
+            .lock()
+            .await
+            .get(session_id)
+            .is_some_and(|c| c.acc.card_fallback == state::CardFallback::Suspended)
+    }
+
     /// The live permission blocks' `(request_id, session_id)`, in render order.
     pub(crate) async fn live_permissions(cards: &CardsHandle, session_id: &str) -> Vec<(String, String)> {
         cards
