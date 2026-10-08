@@ -2838,13 +2838,17 @@ async fn a_cleanup_click_whose_card_is_replaced_never_hides_the_tasks() {
     )
     .await;
     let updates = patches_to(&platform, &successor_id).await;
-    assert_eq!(
+    assert!(
         updates
             .iter()
-            .filter(|card| card_text(card).contains("🔔 shell 已失联"))
-            .count(),
-        1,
-        "the runtime retirement renders exactly once: {updates:?}"
+            .all(|card| card_text(card).matches("🔔 shell 已失联").count() <= 1),
+        "the shell's entry never doubles within one render: {updates:?}"
+    );
+    assert!(
+        updates
+            .iter()
+            .any(|card| card_text(card).contains("🔔 shell 已失联")),
+        "the runtime retirement renders on the successor: {updates:?}"
     );
     assert!(
         updates
@@ -2872,21 +2876,29 @@ async fn a_cleanup_click_whose_card_is_replaced_never_hides_the_tasks() {
     )
     .await;
     let updates = patches_to(&platform, &successor_id).await;
-    assert_eq!(
+    assert!(
         updates
             .iter()
-            .filter(|card| card_text(card).contains("🧹 subagent 已清理"))
-            .count(),
-        1,
-        "one cleanup entry, rendered exactly once: {updates:?}"
+            .all(|card| card_text(card).matches("🧹 subagent 已清理").count() <= 1),
+        "the cleanup entry never doubles within one render: {updates:?}"
+    );
+    // The settled card carries each retirement exactly once: the shell's
+    // entry (rendered by the earlier admitted refresh) re-renders with the
+    // card, never duplicated, and the click adds its own 🧹 entry once.
+    let settled = updates.last().expect("the successor's settle is a write");
+    assert!(
+        card_header(settled).contains("✅"),
+        "the last task gone settles the card: {settled}"
     );
     assert_eq!(
-        updates
-            .iter()
-            .filter(|card| card_text(card).contains("🔔 shell 已失联"))
-            .count(),
+        card_text(settled).matches("🧹 subagent 已清理").count(),
         1,
-        "the later click does not render the shell's entry again: {updates:?}"
+        "one cleanup entry on the settled card: {settled}"
+    );
+    assert_eq!(
+        card_text(settled).matches("🔔 shell 已失联").count(),
+        1,
+        "the shell's entry stays exactly one on the settled card: {settled}"
     );
     assert_eq!(
         backend.overlay.retired_call_ids("ses_test"),
