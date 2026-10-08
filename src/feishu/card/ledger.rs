@@ -40,6 +40,12 @@ pub(crate) const TASK_LEDGER_ELEMENT_ID: &str = "task_ledger";
 /// facts while the marker says the liveness is unverified.
 const UNCONFIRMED_MARKER: &str = " · ⚠️ 状态待确认";
 
+/// The cleanup action's label (spec #588, ticket #590): the ONE section-level
+/// button a Waiting card carrying unconfirmed rows offers below the ledger —
+/// the user's exit for a wait no machine can confirm. Pinned here with the
+/// ledger's other copy.
+pub(crate) const CLEANUP_BUTTON_TEXT: &str = "清理待确认任务";
+
 /// The kind of Background Task a ledger row names. Only these two background
 /// through the V2 tool shape (ADR-0059/0060).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +79,7 @@ impl TaskKind {
             TaskEnding::Wake { .. } => "完成",
             TaskEnding::RuntimeEnded => "结束",
             TaskEnding::Lost => "已失联",
+            TaskEnding::Cleaned => "已清理",
         };
         format!("{} {ending}", self.noun())
     }
@@ -91,6 +98,21 @@ pub enum TaskEnding {
     /// The runtime has no record of the task at all: the completion record was
     /// lost, and the task cannot be running under the attached server.
     Lost,
+    /// The user's own cleanup click retired the task (spec #588, ticket #590):
+    /// no machine could confirm it, so the waiting card's 清理待确认任务 button
+    /// ended it. Never derived by a read — the Bridge synthesizes this ending
+    /// from the click, together with the retirement overlay record.
+    Cleaned,
+}
+
+impl TaskEnding {
+    /// Whether this ending was the user's own cleanup (spec #588, #590): the
+    /// title swaps the completion bell for the broom and appends the 人工
+    /// marker, so a manual retirement never reads like the runtime's or a
+    /// Wake's.
+    fn is_manual(&self) -> bool {
+        matches!(self, Self::Cleaned)
+    }
 }
 
 /// One live Background Task as its ledger row renders it: the task's type, the
@@ -210,14 +232,35 @@ pub struct TaskCompletionEntry {
 /// The completion entry's collapsed title (ADR-0060) — the mechanical
 /// completion line the merged-path receipt always carried,
 /// `🔔 shell 完成：<label>` / `🔔 subagent 完成：<label>`, bare when the Wake
-/// named no label. The label goes through the shared [`folded_label`], so one
-/// label has one visible shape wherever the ledger renders it.
+/// named no label. A manual cleanup (spec #588, #590) swaps the bell for the
+/// broom and marks the ending 人工: `🧹 shell 已清理：<label>（人工）`. The label
+/// goes through the shared [`folded_label`], so one label has one visible shape
+/// wherever the ledger renders it.
 pub(crate) fn task_entry_title(entry: &TaskCompletionEntry) -> String {
     let noun = entry.kind.completion_noun(&entry.ending);
+    let (icon, manual) = if entry.ending.is_manual() {
+        ("🧹", "（人工）")
+    } else {
+        ("🔔", "")
+    };
     match entry.label.as_deref().filter(|label| !label.is_empty()) {
-        Some(label) => format!("🔔 {noun}：{}", folded_label(label)),
-        None => format!("🔔 {noun}"),
+        Some(label) => format!("{icon} {noun}：{}{manual}", folded_label(label)),
+        None => format!("{icon} {noun}{manual}"),
     }
+}
+
+/// The cleanup button a Waiting card carrying unconfirmed rows renders below
+/// the ledger (spec #588, ticket #590): one section-level action whose click
+/// clears every ⚠️ 状态待确认 row. The value carries the session id alone, like
+/// the recovery buttons — the handler resolves the Chat/Topic from the
+/// SessionStore.
+pub(crate) fn cleanup_button(session_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "tag": "button",
+        "text": { "tag": "plain_text", "content": CLEANUP_BUTTON_TEXT },
+        "type": "default",
+        "value": { "action": "cleanup", "session_id": session_id },
+    })
 }
 
 /// The completion entry's fold body: the task's identity and the run's timing —
@@ -790,6 +833,62 @@ mod tests {
             task_entry_title(&subagent(wake(Some("cancelled")))),
             "🔔 subagent 已取消"
         );
+    }
+
+    /// Spec #588 / #590: the manual cleanup's entry names the ending as the
+    /// user's, not the runtime's or a Wake's — the broom replaces the completion
+    /// bell and the title marks the ending 人工 — while the fold body keeps the
+    /// ordinary identity/timing shape.
+    #[test]
+    fn a_cleaned_entry_names_the_manual_ending() {
+        let finished = crate::feishu::card::test_local_ms(2026, 9, 29, 14, 2);
+        let shell_entry = TaskCompletionEntry {
+            kind: TaskKind::Shell,
+            label: Some("gh run watch".into()),
+            id: Some("sh_abc".into()),
+            started_at: Some(finished - 12 * 60_000),
+            finished_at: Some(finished),
+            ending: TaskEnding::Cleaned,
+        };
+        assert_eq!(
+            task_entry_title(&shell_entry),
+            "🧹 shell 已清理：gh run watch（人工）"
+        );
+        assert_eq!(task_entry_body(&shell_entry), "shell sh_abc · 14:02 · 12m");
+        // A label-less cleanup still says who ended it.
+        let bare = TaskCompletionEntry {
+            kind: TaskKind::Subagent,
+            label: None,
+            id: Some("ses_child".into()),
+            started_at: None,
+            finished_at: Some(finished),
+            ending: TaskEnding::Cleaned,
+        };
+        assert_eq!(task_entry_title(&bare), "🧹 subagent 已清理（人工）");
+        assert_eq!(task_entry_body(&bare), "subagent ses_child · 14:02");
+        // The other endings keep their bell and carry no manual marker.
+        let wake = TaskCompletionEntry {
+            kind: TaskKind::Shell,
+            label: Some("gh run watch".into()),
+            id: None,
+            started_at: None,
+            finished_at: Some(finished),
+            ending: TaskEnding::Wake { state: None },
+        };
+        assert_eq!(task_entry_title(&wake), "🔔 shell 完成：gh run watch");
+    }
+
+    /// The cleanup button (spec #588, #590): the pinned copy, the handler's
+    /// action, and the session the click works on — the card layer owns the
+    /// shape so the button and the handler cannot drift.
+    #[test]
+    fn the_cleanup_button_carries_the_pinned_copy() {
+        let button = cleanup_button("ses_1");
+        assert_eq!(button["tag"], "button");
+        assert_eq!(button["text"]["tag"], "plain_text");
+        assert_eq!(button["text"]["content"], "清理待确认任务");
+        assert_eq!(button["value"]["action"], "cleanup");
+        assert_eq!(button["value"]["session_id"], "ses_1");
     }
 
     /// A label's own markdown characters cannot bleed out of its bold span:
