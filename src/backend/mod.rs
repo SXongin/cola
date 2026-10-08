@@ -318,7 +318,9 @@ pub trait Backend: Send + Sync {
     /// session (issue #454), so every later [`Self::transcript`] read drops
     /// them from its live list. The launch record in the transcript never
     /// flips, so without this overlay the next read would resurrect the task
-    /// on a live card and the next Turn would yield waiting on it again.
+    /// on a live card and the next Turn would yield waiting on it again. The
+    /// cleanup click's own reconcile rides its card refresh's gate (review,
+    /// PR #595): a refused write records nothing.
     ///
     /// In-memory on purpose: it is a cola-life overlay, not durable state. A
     /// restart loses it and the next read re-derives the same retirement.
@@ -332,9 +334,10 @@ pub trait Backend: Send + Sync {
     /// 30 s throttle did not spend a verdict on — a Session Sync refresh, a
     /// drain tick, the follow, the cleanup click's own read — cannot drop a
     /// `⚠️ 状态待确认` marker and the cleanup button it gates; only a verdict
-    /// resolves one (a `Running` child clears its marker). Called by the
-    /// reconcile, the one writer, and only after a successful verdict read: a
-    /// failed or timed-out one changes nothing.
+    /// resolves one (a `Running` child clears its marker). Called only after a
+    /// successful verdict read — a failed or timed-out one changes nothing —
+    /// by the reconcile itself or, from the cleanup click, once its card
+    /// refresh landed (review, PR #595).
     ///
     /// In-memory on purpose, like [`Self::retire_background_tasks`]: a restart
     /// loses the markers and the next verdict re-derives them.
