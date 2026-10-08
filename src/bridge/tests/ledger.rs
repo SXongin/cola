@@ -1728,6 +1728,14 @@ async fn a_task_ended_mid_turn_settles_the_turn_directly() {
         text.contains("shell sh_call_bg · "),
         "the entry carries the task's identity: {final_card}"
     );
+    // Review (spec #588 / #589, PR #595): the retirement is committed to the
+    // process-local overlay only once the drain's render carried its entry —
+    // the shared record-after-flush invariant, pinned on this path.
+    assert_eq!(
+        backend.overlay.retired_call_ids("ses_test"),
+        vec!["call_bg".to_string()],
+        "the drain's accepted render records the retirement"
+    );
 }
 
 /// Acceptance (#589): the runtime reconcile is one process-wide verdict per
@@ -2922,6 +2930,170 @@ async fn a_cleanup_click_whose_card_is_replaced_never_hides_the_tasks() {
     assert!(
         later.background_tasks.is_empty(),
         "accepted retirements keep the tasks out of later reads: {later:?}"
+    );
+}
+
+/// Await the External Message notification (the 有新消息 card) or panic after
+/// 10 s — the condition the supersede below is observed by, never a sleep.
+async fn wait_for_external_notify(platform: &RecordingPlatform) -> serde_json::Value {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut cards = platform.sent_cards().await;
+        cards.extend(platform.replied_cards().await);
+        if let Some(card) = cards
+            .into_iter()
+            .find(|card| card_text(card).contains("有新消息"))
+        {
+            return card;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no external-message notification arrived: {:?}",
+            platform.calls.lock().await
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// Review (spec #588 / #589, PR #595): Session Sync commits its reconcile
+/// pass's overlay record only after the flush that carried its entries was
+/// accepted — the same invariant the cleanup click obeys for its own pass.
+///
+/// A newer External Message in the same read as the reconcile supersedes the
+/// waiting card: the yielded-card write admission passes (the card is still
+/// the live, no-handoff Waiting one), the runtime retires the shell, and only
+/// THEN does the chain-held check reject the card — the notification path
+/// collects it and arms the fresh renderer, so this read's retirement entry has
+/// no card to land on. Recording the retirement anyway would hide the task from
+/// every later read (the launch record never flips) with no entry ever
+/// rendered; the task must stay live until a card that can carry its entry
+/// receives one.
+///
+/// Deterministic, no wall-clock margin decides: the pass's transcript read is
+/// parked on the mock's gate while the test scripts BOTH facts it will read
+/// (the newer message and the missing-shell verdict), then released; the
+/// notification's landing is awaited as a condition, and the reads behind it
+/// stay parked while the assertions run.
+#[tokio::test]
+async fn an_external_supersede_records_no_runtime_retirement() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let (_dir, app, backend, platform) =
+        scripted_app(vec![waiting_shell(now - 5_000)], Some(SessionStatus::Idle)).await;
+    yield_one_task_card(&app, &platform, ctx("ses_test", "跑一下构建并审阅")).await;
+    // The notify path only fires for a message newer than the watermark: seed
+    // the anchor's own message as already read (the parked pass below would
+    // otherwise be the session's first observation, which never notifies).
+    app.external
+        .last_user_msg_epoch
+        .lock()
+        .await
+        .insert("ses_test".into(), 1_000);
+
+    // Park Session Sync's first read, then move BOTH facts the pass will read:
+    // the transcript now carries a newer EXTERNAL message, and the runtime no
+    // longer knows the shell.
+    let gate = backend.hold_transcripts();
+    spawn_sync(&app);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while backend.transcript_gate_entered.load(Ordering::SeqCst) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Session Sync never reached the parked read"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    backend.task_runtime.lock().unwrap().shells = vec![("sh_call_bg".into(), ShellRuntime::Missing)];
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(two_task_timeline(vec![
+                user("msg_ext_next", 3_000, "新问题"),
+                assistant(3_500, "答复。"),
+            ]))
+            .with_executions(vec![execution(2_500), execution(4_000)])
+            .with_background_tasks(vec![live_shell(now - 3_000, "call_bg")]),
+        ],
+    )
+    .await;
+    gate.add_permits(1);
+
+    // The pass runs: the yielded-card admission passes, the runtime retires the
+    // shell, and the chain-held check then rejects the superseded card — the
+    // notify path collects it and arms the fresh renderer. The next reads stay
+    // parked on the same gate, so the world is frozen at the supersede while
+    // the assertions below read it.
+    let notify = wait_for_external_notify(&platform).await;
+    assert!(
+        card_text(&notify).contains("新问题"),
+        "the notification previews the newer message: {notify}"
+    );
+    assert!(
+        backend.overlay.retired_call_ids("ses_test").is_empty(),
+        "a superseded pass records nothing: {:?}",
+        backend.overlay.retired_call_ids("ses_test")
+    );
+    assert!(
+        backend.overlay.unconfirmed_call_ids("ses_test").is_empty(),
+        "a superseded pass records no marker state either: {:?}",
+        backend.overlay.unconfirmed_call_ids("ses_test")
+    );
+    let mut cards = platform.updated_cards().await;
+    cards.extend(platform.replied_cards().await);
+    cards.extend(platform.sent_cards().await);
+    assert!(
+        cards
+            .iter()
+            .all(|card| !card_text(card).contains("🔔") && !card_text(card).contains("🧹")),
+        "a superseded pass half-renders no entry anywhere: {cards:?}"
+    );
+
+    // Freeze the shared throttle wide, THEN release the readers parked behind
+    // the notification: no later pass can spend a verdict, so the world stays
+    // frozen and the task provably stays live on every read.
+    app.runtime_reconcile
+        .interval_ms
+        .store(600_000, Ordering::Relaxed);
+    *backend.transcript_gate.lock().unwrap() = None;
+    gate.add_permits(64);
+    let later = crate::backend::Backend::transcript(backend.as_ref(), "ses_test")
+        .await
+        .unwrap();
+    assert_eq!(
+        later
+            .background_tasks
+            .iter()
+            .map(|task| task.tool.call_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["call_bg"],
+        "the task stays live until a card that can render its entry takes the chain"
+    );
+
+    // A later receivable card renders exactly one entry: the external render's
+    // own waiting yield (the run completed with the shell still live), then
+    // Session Sync's next admitted pass retires the shell and settles the card.
+    app.runtime_reconcile.interval_ms.store(0, Ordering::Relaxed);
+    wait_for_card_update_within(
+        &platform,
+        "the shell's 已失联 entry on the successor",
+        Duration::from_secs(10),
+        CardUpdates::Latest,
+        |card| card_header(card).contains("✅") && card_text(card).contains("🔔 shell 已失联：gh run watch"),
+    )
+    .await;
+    assert_eq!(
+        backend.overlay.retired_call_ids("ses_test"),
+        vec!["call_bg".to_string()],
+        "the accepted refresh records the retirement"
+    );
+    let mut cards = platform.updated_cards().await;
+    cards.extend(platform.replied_cards().await);
+    cards.extend(platform.sent_cards().await);
+    assert!(
+        cards
+            .iter()
+            .all(|card| card_text(card).matches("🔔 shell 已失联").count() <= 1),
+        "the entry renders exactly once on the card that carried it: {cards:?}"
     );
 }
 
