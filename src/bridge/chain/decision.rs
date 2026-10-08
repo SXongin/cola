@@ -157,6 +157,12 @@ pub(crate) enum StatusRead {
 }
 
 /// The Session's history as the reap read it.
+// The neutral read model carries its interaction facts inline (spec #332); the
+// output windows (spec #588, #592) are one more of them, pushing the inline
+// transcript past clippy's variant-size threshold. Boxing the read would only
+// move the same allocation — the apply holds one transcript on its way to the
+// projection — so the size difference is accepted, documented here.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub(crate) enum TranscriptRead {
     /// The server answered the read.

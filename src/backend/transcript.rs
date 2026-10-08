@@ -60,6 +60,14 @@ pub struct SessionTranscript {
     /// prove the tail beyond the cap absent, and an ended projection must not
     /// settle on it. V1 reads are unbounded and always `false`.
     pub truncated: bool,
+    /// The live shells' output windows a shared reconcile read established
+    /// (spec #588, ticket #592), keyed by shell id: the last bounded lines
+    /// under each running shell's ledger row. A shell the read spent nothing
+    /// on has no key — its row keeps rendering the window a previous cycle
+    /// established (the accumulator's own cache) — while [`ShellOutputRead`]
+    /// carries the read's own outcome for the shells it did spend on. Empty on
+    /// V1 and on every path that does not reconcile.
+    pub shell_outputs: std::collections::HashMap<String, ShellOutputRead>,
 }
 
 impl SessionTranscript {
@@ -72,6 +80,7 @@ impl SessionTranscript {
             runtime_retired: Vec::new(),
             unconfirmed_tasks: std::collections::HashSet::new(),
             truncated: false,
+            shell_outputs: std::collections::HashMap::new(),
         }
     }
 
@@ -877,6 +886,53 @@ pub enum ShellRuntime {
     /// process that hosted it is gone. The task is not running under the
     /// attached server.
     Missing,
+}
+
+/// The bytes one shell output window reads (spec #588, ticket #592): the
+/// server's own tail idiom asks for the record's last slice, so the window is
+/// bounded whatever the command printed. Four KiB matches the completion
+/// entry's own tail bound (#593).
+pub const SHELL_OUTPUT_WINDOW_BYTES: usize = 4 * 1024;
+
+/// The lines one shell output window shows (spec #588, ticket #592): the last
+/// ones of the byte window, so "it is actually alive" reads at a glance. The
+/// card's copy names the actual count when the window clipped.
+pub const SHELL_OUTPUT_WINDOW_LINES: usize = 15;
+
+/// One live shell's captured output window as an output read established it
+/// (spec #588, ticket #592): the record's last bounded bytes, decoded and
+/// clipped to the last bounded lines. The Bridge renders it under the shell's
+/// ledger row; the completion entry reuses the same read for its fold body
+/// (#593). Display-only: it never prompts, retires or settles anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellOutputWindow {
+    /// The window's text: the last [`SHELL_OUTPUT_WINDOW_LINES`] lines of the
+    /// record's last [`SHELL_OUTPUT_WINDOW_BYTES`] bytes, decoded UTF-8, with
+    /// no trailing newline. Never empty for a window ([`ShellOutputRead`]).
+    pub text: String,
+    /// Whether the record held more output than the window shows — the byte
+    /// slice clipped it, or whole lines were dropped at its head. The card
+    /// appends 「仅最后 N 行 · 已截断」; `false` means the window is the whole
+    /// capture.
+    pub clipped: bool,
+    /// When the window was captured (cola's clock, ms): the 「截至于 HH:MM」
+    /// label's own clock, stamped at the read that established it.
+    pub captured_ms: i64,
+}
+
+/// One shell's output as a shared reconcile read established it (spec #588,
+/// #592), keyed by shell id on the read: the window the row renders, or the
+/// read spent with nothing to show. An absent key means no output read was
+/// spent this cycle (the shared throttle), so a previously rendered window
+/// stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShellOutputRead {
+    /// The record answered with output to show.
+    Window(ShellOutputWindow),
+    /// The read was spent and there is nothing to show — a failed or vanished
+    /// record, or an empty capture. The window is omitted entirely, never
+    /// rendered as an empty panel.
+    Unavailable,
 }
 
 /// One subagent child session's runtime verdict: whether the server owns a live

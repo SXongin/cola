@@ -662,6 +662,8 @@ mod tests {
             started_at: Some(start),
             unconfirmed: false,
             activity: None,
+
+            output: None,
         }];
         let card = CardBuilder::new()
             .with_state(CardState::Streaming)

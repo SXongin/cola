@@ -172,6 +172,14 @@ impl Backend for OpenCodeBackend {
         OpenCodeBackend::task_runtime(self, session_id, directory, shells, children).await
     }
 
+    async fn shell_output(
+        &self,
+        shell_id: &str,
+        directory: Option<&str>,
+    ) -> Result<Option<crate::backend::ShellOutputWindow>> {
+        OpenCodeBackend::shell_output(self, shell_id, directory).await
+    }
+
     fn retire_background_tasks(&self, session_id: &str, call_ids: &[String]) {
         OpenCodeBackend::retire_background_tasks(self, session_id, call_ids);
     }

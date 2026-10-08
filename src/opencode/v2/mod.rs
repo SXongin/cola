@@ -75,6 +75,11 @@ const SESSION_ACTIVE: &str = "/api/session/active";
 /// `GET /api/shell/{id}` reads one retained shell (running or terminated).
 /// The Background Task runtime reconciliation (issue #454) is its one caller.
 const SHELL: &str = "/api/shell";
+/// The probe cursor of a shell output read (spec #588, #592): a sentinel past
+/// any real capture, so the first page answers the record's total size with an
+/// empty body. The server's own tail idiom uses `Number.MAX_SAFE_INTEGER`;
+/// keeping that value avoids a server-side integer overflow.
+const SHELL_OUTPUT_PROBE_CURSOR: u64 = (1 << 53) - 1;
 /// The per-session projected-message read: the S4b transcript decode and, for
 /// active sessions, the run state's retry derivation.
 const SESSION_MESSAGES_SUFFIX: &str = "/message";
@@ -797,6 +802,48 @@ impl GenerationStrategy for V2Strategy {
         }
         Ok(())
     }
+
+    /// One shell's captured output window (spec #588, ticket #592), the
+    /// server's own tail idiom: a first page with a cursor past the end learns
+    /// the record's total size, a second reads its last
+    /// [`SHELL_OUTPUT_WINDOW_BYTES`] bytes, and [`output_window`] decodes and
+    /// clips that page to its last [`SHELL_OUTPUT_WINDOW_LINES`] lines. A 404
+    /// is the runtime's positive "no record" (like [`Self::shell_runtime`]) and
+    /// maps to the no-output case ([`Ok(None)`]); any other failure is an `Err`
+    /// the caller omits the window for, never guesses. Display-only: the read
+    /// touches no session state.
+    async fn shell_output(
+        &self,
+        http: &Transport,
+        shell_id: &str,
+        directory: Option<&str>,
+    ) -> Result<Option<crate::backend::ShellOutputWindow>> {
+        let Some(probe) = self
+            .shell_output_page(http, directory, shell_id, SHELL_OUTPUT_PROBE_CURSOR, None)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if probe.size == 0 {
+            return Ok(None);
+        }
+        let start = probe
+            .size
+            .saturating_sub(crate::backend::SHELL_OUTPUT_WINDOW_BYTES as u64);
+        let Some(tail) = self
+            .shell_output_page(
+                http,
+                directory,
+                shell_id,
+                start,
+                Some(crate::backend::SHELL_OUTPUT_WINDOW_BYTES as u64),
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        Ok(output_window(tail, start > 0))
+    }
 }
 
 impl V2Strategy {
@@ -921,6 +968,43 @@ impl V2Strategy {
         Ok(body.data.into_runtime())
     }
 
+    /// One output page (`GET /api/shell/{id}/output?location[directory]=…&
+    /// cursor=…[&limit=…]`). `None` is the record the runtime no longer keeps
+    /// (404) — the caller's no-output case; any other non-success is an `Err`,
+    /// so a vanished record and a failed read stay distinguishable.
+    async fn shell_output_page(
+        &self,
+        http: &Transport,
+        directory: Option<&str>,
+        shell_id: &str,
+        cursor: u64,
+        limit: Option<u64>,
+    ) -> Result<Option<wire::ShellOutputPage>> {
+        let mut url = location_url(&http.url(&format!("{SHELL}/{shell_id}/output")), directory)?;
+        {
+            let mut query = url.query_pairs_mut();
+            query.append_pair("cursor", &cursor.to_string());
+            if let Some(limit) = limit {
+                query.append_pair("limit", &limit.to_string());
+            }
+        }
+        let resp = http.client().get(url).send().await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(read_failure(resp, "shell output").await);
+        }
+        let text = resp.text().await?;
+        let body: wire::DataEnvelope<wire::ShellOutputPage> = serde_json::from_str(&text).map_err(|e| {
+            crate::error::BridgeError::OpenCode(format!(
+                "shell output parse: {e} — body: {}",
+                body_preview(&text)
+            ))
+        })?;
+        Ok(Some(body.data))
+    }
+
     /// Read the session's projected messages, decoded-ready: the raw `data`
     /// arrays a `GET /api/session/{id}/message` read carries, in server order.
     /// The transcript decode's raw input.
@@ -1032,4 +1116,41 @@ impl V2Strategy {
             .await?;
         Ok(page.newest_assistant_retrying())
     }
+}
+
+/// One output page as its neutral window (spec #588, ticket #592): the last
+/// [`SHELL_OUTPUT_WINDOW_LINES`] lines of the page, with the byte-boundary
+/// artifact trimmed and the clipped flag derived. `None` when the page carries
+/// nothing to render (an empty capture, or a race that shrank the file): the
+/// caller omits the window, never an empty panel.
+///
+/// `started_mid_record` is the tail read's own cursor > 0: it means the window
+/// begins inside the capture, so the head line is partial and the window is
+/// clipped by definition. The server decodes a cursor that splits a multi-byte
+/// character to a leading U+FFFD — that single artifact is trimmed; a
+/// replacement character anywhere else is the command's own bytes and stays.
+/// The server's `truncated` flag is decoded too (always false on today's
+/// server, but a future one may clip a page) and counts as clipped.
+fn output_window(
+    page: wire::ShellOutputPage,
+    started_mid_record: bool,
+) -> Option<crate::backend::ShellOutputWindow> {
+    let mut lines: Vec<&str> = page.output.lines().collect();
+    let mut clipped = started_mid_record || page.truncated;
+    if lines.len() > crate::backend::SHELL_OUTPUT_WINDOW_LINES {
+        clipped = true;
+        lines.drain(..lines.len() - crate::backend::SHELL_OUTPUT_WINDOW_LINES);
+    }
+    let mut text = lines.join("\n");
+    if started_mid_record && text.starts_with('\u{FFFD}') {
+        text.remove(0);
+    }
+    if text.is_empty() {
+        return None;
+    }
+    Some(crate::backend::ShellOutputWindow {
+        text,
+        clipped,
+        captured_ms: chrono::Utc::now().timestamp_millis(),
+    })
 }

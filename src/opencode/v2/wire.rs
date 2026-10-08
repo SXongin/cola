@@ -283,6 +283,19 @@ pub(super) struct RawShell {
     pub(super) time: Option<RawShellTime>,
 }
 
+/// One page of a shell's captured output (`GET /api/shell/{id}/output`, spec
+/// #588, #592): the page's decoded byte range, the record's total captured
+/// size and whether the server itself clipped the page. The absolute cursor
+/// the envelope also carries is deliberately not decoded — the tail read
+/// computes its own from `size`.
+#[derive(Debug, Deserialize)]
+pub(super) struct ShellOutputPage {
+    pub(super) output: String,
+    pub(super) size: u64,
+    #[serde(default)]
+    pub(super) truncated: bool,
+}
+
 #[derive(Debug, Deserialize)]
 pub(super) struct RawShellTime {
     #[serde(default)]

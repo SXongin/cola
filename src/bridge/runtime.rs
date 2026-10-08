@@ -19,12 +19,17 @@
 //!   cadences that observe it;
 //! - a failed or timed-out read leaves the transcript exactly as read: no
 //!   verdict, no retirement, no settle (a flaky runtime can never end a wait).
+//!
+//! The same admitted cycle carries the live shells' output windows (spec #588,
+//! ticket #592): one tail read per live shell, display-only, so the ledger's
+//! window refreshes at the shared cadence and a failed or empty read simply
+//! omits it.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::backend::{Backend, SessionTranscript};
+use crate::backend::{Backend, SessionTranscript, ShellOutputRead};
 
 /// The default spacing between two runtime verdicts of one Session (ms): the
 /// shared cadence Session Sync and the live loops observe together.
@@ -86,6 +91,14 @@ impl RuntimeReconcile {
     /// and its call ids go into the process-local overlay so every later read
     /// agrees (the launch record never flips).
     ///
+    /// The same admitted cycle also fills the read's shell output windows
+    /// (spec #588, #592): one tail read per still-live shell, so the ledger's
+    /// window refreshes at this shared cadence and never at the caller's poll
+    /// cadence. A window read is display-only — it never prompts, retires or
+    /// settles — and a failed, vanished or empty one records
+    /// [`ShellOutputRead::Unavailable`], which the row renders as no window at
+    /// all (never a placeholder).
+    ///
     /// Returns whether the read carried evidence that changed it (a retirement
     /// or a newly unconfirmed task) — a caller that is about to skip its render
     /// reads this so a retirement is never dropped on the floor. Zero requests
@@ -119,7 +132,7 @@ impl RuntimeReconcile {
         if !self.begin(session_id) {
             return false;
         }
-        match crate::bridge::bounded_call(
+        let changed = match crate::bridge::bounded_call(
             "task runtime read",
             read_timeout_ms,
             backend.task_runtime(session_id, Some(directory), &shells, &children),
@@ -156,6 +169,53 @@ impl RuntimeReconcile {
                 false
             }
             None => false,
-        }
+        };
+        // The windows are read after the verdicts: a shell the runtime just
+        // retired leaves the live list here and spends no tail read. A failed
+        // runtime read changes nothing about them — the transcript still lists
+        // the shells, and the window is display-only.
+        capture_shell_outputs(backend, session_id, directory, transcript, read_timeout_ms).await;
+        changed
+    }
+}
+
+/// Fill one read's shell output windows (spec #588, #592): one tail read per
+/// still-live shell, deduped, each bounded by the caller's read timeout. A
+/// shell whose read fails, vanishes or answers nothing records
+/// [`ShellOutputRead::Unavailable`] — the row omits the window — while a shell
+/// is never asked twice in one cycle.
+async fn capture_shell_outputs(
+    backend: &Arc<dyn Backend>,
+    session_id: &str,
+    directory: &str,
+    transcript: &mut SessionTranscript,
+    read_timeout_ms: u64,
+) {
+    let mut seen = std::collections::HashSet::new();
+    let shells: Vec<String> = transcript
+        .background_tasks
+        .iter()
+        .filter_map(|task| task.shell_id.clone())
+        .filter(|shell_id| seen.insert(shell_id.clone()))
+        .collect();
+    for shell_id in shells {
+        let output = match crate::bridge::bounded_call(
+            "shell output read",
+            read_timeout_ms,
+            backend.shell_output(&shell_id, Some(directory)),
+        )
+        .await
+        {
+            Some(Ok(Some(window))) => ShellOutputRead::Window(window),
+            Some(Ok(None)) => ShellOutputRead::Unavailable,
+            Some(Err(error)) => {
+                tracing::debug!(
+                    "session {session_id} shell output read for {shell_id} failed: {error}; omitting its window"
+                );
+                ShellOutputRead::Unavailable
+            }
+            None => ShellOutputRead::Unavailable,
+        };
+        transcript.shell_outputs.insert(shell_id, output);
     }
 }

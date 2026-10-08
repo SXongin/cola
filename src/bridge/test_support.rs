@@ -1259,6 +1259,17 @@ pub struct MockBackend {
     /// runtime read the caller's own request bound must abandon; the
     /// transcript must stay exactly as read (#589).
     pub hang_task_runtime: Arc<std::sync::atomic::AtomicUsize>,
+    /// The output windows `shell_output` serves, keyed by shell id (spec #588,
+    /// #592). A missing key (or a stored `None`) is the no-output case — a
+    /// vanished record answers `Ok(None)`.
+    pub shell_outputs:
+        Arc<std::sync::Mutex<std::collections::HashMap<String, Option<crate::backend::ShellOutputWindow>>>>,
+    /// Records every `shell_output` call's shell id, in order — the shared
+    /// reconcile's one-tail-read-per-shell-per-cycle bound.
+    pub shell_output_calls: Arc<tokio::sync::Mutex<Vec<String>>>,
+    /// Number of initial `shell_output` calls to fail with a 500 (then later
+    /// reads serve normally) — a window must be omitted, never guessed.
+    pub fail_shell_output_reads: Arc<std::sync::atomic::AtomicUsize>,
     /// The Background Task retirement overlay (issue #454): recorded through
     /// `retire_background_tasks` and applied inside `transcript`, exactly like
     /// the real adapter's.
@@ -1380,6 +1391,9 @@ impl MockBackend {
             task_runtime_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             fail_task_runtime_reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             hang_task_runtime: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            shell_outputs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            shell_output_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            fail_shell_output_reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             retirements: crate::backend::TaskRetirements::default(),
             session_status_error: None,
             session_status_fails: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2538,6 +2552,34 @@ impl crate::backend::Backend for MockBackend {
 
     fn retire_background_tasks(&self, session_id: &str, call_ids: &[String]) {
         self.retirements.record(session_id, call_ids);
+    }
+
+    /// The scripted output window (spec #588, #592), keyed by shell id; a
+    /// missing key answers `Ok(None)` like a vanished record.
+    async fn shell_output(
+        &self,
+        shell_id: &str,
+        _directory: Option<&str>,
+    ) -> crate::error::Result<Option<crate::backend::ShellOutputWindow>> {
+        self.shell_output_calls.lock().await.push(shell_id.to_string());
+        if self
+            .fail_shell_output_reads
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0
+        {
+            self.fail_shell_output_reads
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            return Err(crate::error::BridgeError::OpenCode(format!(
+                "shell output {shell_id} failed: 500 Internal Server Error"
+            )));
+        }
+        Ok(self
+            .shell_outputs
+            .lock()
+            .expect("the shell-output lock is never poisoned")
+            .get(shell_id)
+            .cloned()
+            .flatten())
     }
 
     async fn interrupt(&self, session_id: &str) -> crate::error::Result<()> {

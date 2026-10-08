@@ -430,6 +430,17 @@ impl GenerationStrategy for V1Strategy {
         Ok(TaskRuntime::default())
     }
 
+    /// V1 carries no shell records: an empty window without a request, exactly
+    /// like its empty runtime verdict (spec #588, #592).
+    async fn shell_output(
+        &self,
+        _http: &Transport,
+        _shell_id: &str,
+        _directory: Option<&str>,
+    ) -> Result<Option<crate::backend::ShellOutputWindow>> {
+        Ok(None)
+    }
+
     /// List pending question requests for an instance (canonical:
     /// `GET /question`).
     async fn list_questions(

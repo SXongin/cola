@@ -12,7 +12,7 @@ use crate::error::BridgeError;
 use crate::opencode::client::OpenCodeBackend;
 use crate::opencode::strategy::Generation;
 use crate::opencode::types::{ImageInput, SessionStatus};
-use crate::test_http::{MockResponse, RecordedRequest, TestHttpServer};
+use crate::test_http::{DynamicResponse, MockResponse, RecordedRequest, TestHttpServer};
 
 /// A client pointed at the fake server with both Basic-auth parts set, speaking
 /// V2 — what attach detection hands production for a `/api` server. The
@@ -734,6 +734,238 @@ async fn task_runtime_degrades_one_bad_shell_read() {
         debug.contains("500"),
         "the debug line carries the status: {debug}"
     );
+}
+
+/// Spec #588 / #592: a shell's output window is the server's own tail idiom —
+/// a probe page with a cursor past any real capture answers the record's size,
+/// then one tail page reads its last bounded bytes. The client decodes the
+/// page, keeps the last bounded lines, and flags the window clipped because
+/// the read started inside the record.
+#[tokio::test]
+async fn shell_output_reads_the_size_then_the_tail_window() {
+    let server = TestHttpServer::start().await;
+    let tail_text = (1..=40)
+        .map(|i| format!("line {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    server.route_sequence(
+        "GET",
+        "/api/shell/sh_out/output",
+        vec![
+            MockResponse::json(
+                serde_json::json!({
+                    "location": {"directory": "/work/cola"},
+                    "data": {"output": "", "cursor": 5000, "size": 5000, "truncated": false},
+                })
+                .to_string(),
+            ),
+            MockResponse::json(
+                serde_json::json!({
+                    "location": {"directory": "/work/cola"},
+                    "data": {"output": tail_text, "cursor": 5000, "size": 5000, "truncated": false},
+                })
+                .to_string(),
+            ),
+        ],
+    );
+    let client = v2_wire_client(&server);
+
+    let window = client
+        .shell_output("sh_out", Some("/work/cola"))
+        .await
+        .unwrap()
+        .expect("a capture with bytes answers a window");
+
+    // The probe: the location query plus a cursor past any real capture, no
+    // limit. The tail: the last window of bytes.
+    let probe = request_at(&server, 0);
+    assert_eq!(probe.path, "/api/shell/sh_out/output");
+    assert_eq!(
+        probe.query_param("location[directory]").as_deref(),
+        Some("/work/cola")
+    );
+    assert_eq!(
+        probe.query_param("cursor").as_deref(),
+        Some("9007199254740991"),
+        "the probe cursor sits past any real capture"
+    );
+    assert_eq!(probe.query_param("limit"), None);
+    let tail = request_at(&server, 1);
+    assert_eq!(tail.query_param("cursor").as_deref(), Some("904"));
+    assert_eq!(tail.query_param("limit").as_deref(), Some("4096"));
+    assert_eq!(wired_requests(&server).len(), 2, "exactly the two-call tail read");
+
+    assert!(window.clipped, "the window starts inside the record");
+    let lines: Vec<&str> = window.text.lines().collect();
+    assert_eq!(lines.len(), 15, "the window keeps the last lines");
+    assert_eq!(lines[0], "line 26");
+    assert_eq!(lines[14], "line 40");
+    assert!(window.captured_ms > 0, "the cutoff is stamped at the read");
+}
+
+/// A capture at or under the window is the whole record: the tail call starts
+/// at byte zero and the window is not clipped.
+#[tokio::test]
+async fn a_short_capture_reads_unclipped_from_zero() {
+    let server = TestHttpServer::start().await;
+    server.route_sequence(
+        "GET",
+        "/api/shell/sh_short/output",
+        vec![
+            MockResponse::json(
+                serde_json::json!({
+                    "data": {"output": "", "cursor": 17, "size": 17, "truncated": false},
+                })
+                .to_string(),
+            ),
+            MockResponse::json(
+                serde_json::json!({
+                    "data": {"output": "hello\nworld", "cursor": 17, "size": 17, "truncated": false},
+                })
+                .to_string(),
+            ),
+        ],
+    );
+    let client = v2_wire_client(&server);
+
+    let window = client.shell_output("sh_short", None).await.unwrap().unwrap();
+    assert_eq!(
+        request_at(&server, 1).query_param("cursor").as_deref(),
+        Some("0"),
+        "a capture under the window reads from its start"
+    );
+    assert!(!window.clipped, "the whole record fits the window");
+    assert_eq!(window.text, "hello\nworld");
+}
+
+/// The no-output cases — an empty capture and a vanished record — answer
+/// `Ok(None)` (the window is omitted, never an empty panel), and the empty
+/// capture spends no tail call.
+#[tokio::test]
+async fn an_empty_or_vanished_record_answers_no_window() {
+    let empty = TestHttpServer::start().await;
+    empty.route(
+        "GET",
+        "/api/shell/sh_empty/output",
+        200,
+        serde_json::json!({"data": {"output": "", "cursor": 0, "size": 0, "truncated": false}}).to_string(),
+    );
+    let client = v2_wire_client(&empty);
+    assert_eq!(client.shell_output("sh_empty", None).await.unwrap(), None);
+    assert_eq!(
+        wired_requests(&empty).len(),
+        1,
+        "an empty capture needs no tail call"
+    );
+
+    let vanished = TestHttpServer::start().await;
+    vanished.route(
+        "GET",
+        "/api/shell/sh_gone/output",
+        404,
+        r#"{"_tag":"ShellNotFoundError","message":"Shell command not found: sh_gone"}"#,
+    );
+    let client = v2_wire_client(&vanished);
+    assert_eq!(client.shell_output("sh_gone", None).await.unwrap(), None);
+    assert_eq!(
+        wired_requests(&vanished).len(),
+        1,
+        "a vanished record is one probe, not a retry loop"
+    );
+}
+
+/// A record that vanishes between the two calls is the same no-output case —
+/// the tail page's 404 answers `Ok(None)`; any other failed page is a real
+/// error the caller omits the window for, never a guess.
+#[tokio::test]
+async fn a_tail_page_degrades_like_the_probe() {
+    let vanished = TestHttpServer::start().await;
+    let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    vanished.route_dynamic("GET", "/api/shell/sh_race/output", move |_| {
+        if served.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            DynamicResponse::new(
+                200,
+                "application/json",
+                serde_json::json!({"data": {"output": "", "size": 9000}}).to_string(),
+            )
+        } else {
+            DynamicResponse::new(
+                404,
+                "application/json",
+                r#"{"_tag":"ShellNotFoundError","message":"gone"}"#,
+            )
+        }
+    });
+    let client = v2_wire_client(&vanished);
+    assert_eq!(client.shell_output("sh_race", None).await.unwrap(), None);
+    assert_eq!(wired_requests(&vanished).len(), 2);
+
+    let failed = TestHttpServer::start().await;
+    let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    failed.route_dynamic("GET", "/api/shell/sh_boom/output", move |_| {
+        if served.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            DynamicResponse::new(
+                200,
+                "application/json",
+                serde_json::json!({"data": {"output": "", "size": 9000}}).to_string(),
+            )
+        } else {
+            DynamicResponse::new(500, "application/json", r#"{"message":"boom"}"#)
+        }
+    });
+    let client = v2_wire_client(&failed);
+    let message = opencode_error(client.shell_output("sh_boom", None).await.unwrap_err());
+    assert!(message.contains("shell output failed"), "unexpected: {message}");
+    assert!(message.contains("500"), "unexpected: {message}");
+}
+
+/// The byte cursor can split a multi-byte character: the server decodes the
+/// split byte to a replacement character at the window's head, which is the
+/// read's own artifact and is trimmed. A replacement character anywhere else
+/// is the command's own bytes and stays, and multibyte text survives whole.
+#[tokio::test]
+async fn a_window_boundary_never_leaks_a_split_character() {
+    let server = TestHttpServer::start().await;
+    server.route_sequence(
+        "GET",
+        "/api/shell/sh_cjk/output",
+        vec![
+            MockResponse::json(serde_json::json!({"data": {"output": "", "size": 9000}}).to_string()),
+            MockResponse::json(
+                serde_json::json!({
+                    "data": {
+                        "output": "\u{FFFD}构建 完成\n好\u{FFFD}的",
+                        "size": 9000,
+                    },
+                })
+                .to_string(),
+            ),
+        ],
+    );
+    let client = v2_wire_client(&server);
+
+    let window = client.shell_output("sh_cjk", None).await.unwrap().unwrap();
+    assert_eq!(
+        window.text, "构建 完成\n好\u{FFFD}的",
+        "the boundary artifact is trimmed; the command's own bytes stay"
+    );
+
+    // The same page as the record's head (cursor 0) is not a boundary split:
+    // its leading replacement character is content.
+    let whole = TestHttpServer::start().await;
+    whole.route(
+        "GET",
+        "/api/shell/sh_cjk/output",
+        200,
+        serde_json::json!({
+            "data": {"output": "\u{FFFD}构建", "size": 9, "cursor": 9},
+        })
+        .to_string(),
+    );
+    let client = v2_wire_client(&whole);
+    let window = client.shell_output("sh_cjk", None).await.unwrap().unwrap();
+    assert_eq!(window.text, "\u{FFFD}构建");
+    assert!(!window.clipped, "the whole capture fits");
 }
 
 /// The admitted-prompt response body (`{data: SessionInbox.User}`); the write

@@ -324,6 +324,23 @@ pub trait Backend: Send + Sync {
     /// restart loses it and the next read re-derives the same retirement.
     fn retire_background_tasks(&self, session_id: &str, call_ids: &[String]);
 
+    /// Read one shell's captured output window (spec #588, ticket #592): the
+    /// record's last [`SHELL_OUTPUT_WINDOW_BYTES`] bytes, decoded and clipped
+    /// to its last [`SHELL_OUTPUT_WINDOW_LINES`] lines. V2 pages the capture
+    /// by absolute byte cursor — the server's own tail idiom asks for the size
+    /// first, then the last window. `Ok(None)` is "nothing to show": a record
+    /// the runtime no longer keeps (404) or an empty capture; `Err` is a
+    /// failed read. V1 carries no shell records, so it answers `Ok(None)`
+    /// without a request.
+    ///
+    /// Display-only: the read never prompts, never changes a task's liveness
+    /// and never settles anything.
+    async fn shell_output(
+        &self,
+        shell_id: &str,
+        directory: Option<&str>,
+    ) -> Result<Option<ShellOutputWindow>>;
+
     /// The model's context-window size (tokens), from `GET /provider`. Used to
     /// compute the context-usage ratio for the card footer. Best-effort: None
     /// when the provider/model can't be resolved.
