@@ -855,12 +855,20 @@ async fn send_projected_chain(
             return ProjectedChain::Stopped(last);
         };
         rung = landed_rung;
+        // This slice's landing rung rides the re-point (#582): a later slice
+        // can fall to a different rung than the first, so the durable reply
+        // target adopts what THIS create reached — a top level clears it.
+        let landing_reply_to = match &targets[rung] {
+            ProjectTarget::Reply(id) => Some(id.as_str()),
+            ProjectTarget::TopLevel(_) => None,
+        };
         if !Turn::track_projected_continuation(
             &handles.cards,
             session_id,
             chain_id,
             &new_card_id,
             !slice.full,
+            landing_reply_to,
             Some(directory),
             slice.cursor_stage,
         )
@@ -872,11 +880,6 @@ async fn send_projected_chain(
             // chain stops.
             collect_late_projection_detached(&handles.cards, session_id, &new_card_id);
             return ProjectedChain::Stopped(last);
-        }
-        if matches!(targets[rung], ProjectTarget::TopLevel(_)) {
-            // A top-level slice has no reply anchor: clear the durable target
-            // so a later projection does not retry the rung just refused.
-            handles.cards.chains.clear_reply_to(session_id, &new_card_id);
         }
         crate::bridge::turn::drain_armed_watermark(
             &handles.cards,
@@ -1137,11 +1140,6 @@ async fn send_projected_successor(
         );
         return Some(Projection::Stopped);
     };
-    if matches!(landing_target, ProjectTarget::TopLevel(_)) {
-        // A top-level successor has no reply anchor: clear the durable target
-        // so a later projection does not retry the rung just refused.
-        handles.cards.chains.clear_reply_to(session_id, &new_card_id);
-    }
     // The same write carried every Wake completion entry the seeded render
     // staged: the confirmed create is what makes the announcement durable
     // (ADR-0061, ticket #566), so a later recordless restart cannot

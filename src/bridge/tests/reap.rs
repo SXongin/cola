@@ -5464,6 +5464,76 @@ async fn a_projection_falls_back_to_the_chat_when_every_reply_target_is_refused(
     assert_eq!(card_header(&successor), "✅ 完成");
 }
 
+/// #582: a projection whose create lands at the Chat's top level clears the
+/// chain record's durable reply target in the SAME record write as the
+/// re-point — no separate clear write a crash could lose, leaving the refused
+/// target persisted. The Waiting settle keeps the record (#583), so the
+/// persisted fact is observable deterministically.
+#[tokio::test]
+async fn a_top_level_projection_landing_clears_the_reply_target_in_one_write() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let delivered = "已经写了一半。";
+    seed_cursor_record_reply_to(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
+        "om_withdrawn",
+        Some(text_frontier(delivered)),
+        &[],
+    );
+    // The turn idles with a live Background Task (a Waiting settle): the
+    // projected successor yields ⏳ and keeps its record (#583), so this test
+    // can read the record the landing wrote.
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "问题"),
+        assistant(2_000, delivered),
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_background_tasks(vec![background_shell(2_100)]);
+    let (app, platform, _backend) =
+        restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Idle)).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+    // Both reply rungs are gone definitively: the Chat is the landing rung.
+    platform.given_reply_card_outcome(ReplyOutcome::Refused(400));
+    platform.given_reply_card_outcome(ReplyOutcome::Refused(400));
+
+    spawn_sync(&app);
+    // The top-level successor lands ⏳ and the landing's own write clears the
+    // refused target. A carry would leave `om_withdrawn` on the record.
+    let probe = async {
+        loop {
+            let landed = platform
+                .sent_cards()
+                .await
+                .iter()
+                .any(|card| card_header(card).contains("等待后台任务"));
+            let cleared = app
+                .cards_handle()
+                .chains
+                .get("ses_test")
+                .is_some_and(|record| record.reply_to.is_none());
+            if landed && cleared {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    let observed = tokio::time::timeout(Duration::from_secs(5), probe).await.is_ok();
+    assert!(
+        observed,
+        "the waiting successor never landed with the target cleared: {:?}",
+        platform.calls.lock().await
+    );
+    assert!(
+        app.cards_handle().chains.get("ses_test").is_some(),
+        "a waiting landing keeps its record"
+    );
+}
+
 /// A tail cut inside a code fence (spec #561, ticket #563): the successor's
 /// markdown reopens the fence, so the missed code stays code and the text
 /// after the original closer is not swallowed.
