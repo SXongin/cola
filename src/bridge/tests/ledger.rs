@@ -2455,6 +2455,182 @@ async fn a_cleanup_click_is_not_throttled_by_a_recent_poll() {
     );
 }
 
+/// Review (spec #588, #590): the unconfirmed marker and its cleanup button are
+/// process-local state the reconcile owns. A Session Sync read within the
+/// shared throttle (no verdict) must not drop them — the read's transcript is
+/// fresh and carries no marker of its own, so the state has to ride the
+/// backend adapter's overlay until a verdict resolves it. A throttled read is
+/// not evidence that the child is running.
+#[tokio::test]
+async fn a_throttled_read_keeps_the_unconfirmed_marker_and_its_button() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = waiting_shell_and_subagent(frozen_start(now), now - 3_000);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    script_child_without_activity(&backend).await;
+    yield_waiting_card(&app, &platform, 2).await;
+
+    // An admitted reconcile marks the inactive child: the row marker, the
+    // title count and the cleanup button land together.
+    {
+        let mut runtime = backend.task_runtime.lock().unwrap();
+        runtime.shells = vec![("sh_call_bg".into(), ShellRuntime::Running)];
+        runtime.children = vec![("ses_call_sub".into(), ChildRuntime::Inactive)];
+    }
+    spawn_sync(&app);
+    wait_for_card_update(&platform, "the unconfirmed marker", CardUpdates::Latest, |card| {
+        card_text(card).contains("⚠️ 状态待确认") && card_text(card).contains("清理待确认任务")
+    })
+    .await;
+
+    // Pin the shared throttle wide: every later read is a read the runtime was
+    // not asked about, so nothing positive confirms the child.
+    app.runtime_reconcile.interval_ms.store(60_000, Ordering::Relaxed);
+    backend.transcript_calls.lock().await.clear();
+    wait_for_transcript_reads(&backend, "ses_test", 1).await;
+    // Let the throttled read's refresh land: it must owe no PATCH.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let latest = platform.updated_cards().await.last().cloned().unwrap();
+    let text = card_text(&latest);
+    assert!(
+        text.contains("⏳ 后台任务（2 · 1 待确认）"),
+        "the title keeps counting the unconfirmed row across a throttled read: {latest}"
+    );
+    assert!(
+        text.contains("⚠️ 状态待确认"),
+        "the marker survives a read the runtime was not asked about: {latest}"
+    );
+    assert!(
+        text.contains("清理待确认任务"),
+        "the cleanup button stays while the unconfirmed row does: {latest}"
+    );
+}
+
+/// Review (spec #588): a verdict that positively reports the child RUNNING
+/// resolves the marker — the live row stays, the title count and the cleanup
+/// button leave. With the marker carried across reads, only evidence may clear
+/// it; a stale marker must not outlive the verdict that resolves it.
+#[tokio::test]
+async fn a_running_verdict_resolves_the_unconfirmed_marker_and_its_button() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = waiting_shell_and_subagent(frozen_start(now), now - 3_000);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    script_child_without_activity(&backend).await;
+    yield_waiting_card(&app, &platform, 2).await;
+
+    backend.task_runtime.lock().unwrap().children = vec![("ses_call_sub".into(), ChildRuntime::Inactive)];
+    spawn_sync(&app);
+    wait_for_card_update(&platform, "the unconfirmed marker", CardUpdates::Latest, |card| {
+        card_text(card).contains("⚠️ 状态待确认")
+    })
+    .await;
+
+    // The runtime now positively reports the child running: the marker and its
+    // button leave on the ledger refresh, with the row itself still live.
+    backend.task_runtime.lock().unwrap().children = vec![("ses_call_sub".into(), ChildRuntime::Running)];
+    wait_for_card_update(&platform, "the resolved ledger", CardUpdates::Latest, |card| {
+        let text = card_text(card);
+        text.contains("⏳ 后台任务（2）") && !text.contains("待确认")
+    })
+    .await;
+    let latest = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        !card_text(&latest).contains("清理待确认任务"),
+        "the button leaves with the resolved row: {latest}"
+    );
+}
+
+/// Review (spec #588): a failed verdict read clears nothing — the marker and
+/// its cleanup button stay until positive evidence resolves them. The attempt
+/// is spent (and the throttle counts it), but a read that answered nothing is
+/// no evidence; the carried marker must survive it.
+#[tokio::test]
+async fn a_failed_verdict_read_keeps_the_unconfirmed_marker() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = waiting_shell_and_subagent(frozen_start(now), now - 3_000);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    script_child_without_activity(&backend).await;
+    yield_waiting_card(&app, &platform, 2).await;
+
+    {
+        let mut runtime = backend.task_runtime.lock().unwrap();
+        runtime.shells = vec![("sh_call_bg".into(), ShellRuntime::Running)];
+        runtime.children = vec![("ses_call_sub".into(), ChildRuntime::Inactive)];
+    }
+    spawn_sync(&app);
+    wait_for_card_update(&platform, "the unconfirmed marker", CardUpdates::Latest, |card| {
+        card_text(card).contains("⚠️ 状态待确认")
+    })
+    .await;
+
+    // Every later verdict read fails: no verdict, no marker change.
+    backend.fail_task_runtime_reads(usize::MAX);
+    backend.task_runtime_calls.lock().await.clear();
+    backend.transcript_calls.lock().await.clear();
+    wait_for_transcript_reads(&backend, "ses_test", 1).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !backend.task_runtime_calls.lock().await.is_empty(),
+        "the failing verdict read was attempted"
+    );
+
+    let latest = platform.updated_cards().await.last().cloned().unwrap();
+    let text = card_text(&latest);
+    assert!(
+        text.contains("⚠️ 状态待确认"),
+        "a failed verdict read keeps the marker: {latest}"
+    );
+    assert!(
+        text.contains("清理待确认任务"),
+        "a failed verdict read keeps the cleanup button: {latest}"
+    );
+}
+
+/// Review (spec #588): a verdict that does not answer for the child — an empty
+/// runtime read, an id the active map could not place — keeps the marker
+/// exactly as the read carried it. No answer is no evidence either way.
+#[tokio::test]
+async fn a_verdict_that_does_not_answer_for_the_child_keeps_its_marker() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = waiting_shell_and_subagent(frozen_start(now), now - 3_000);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    script_child_without_activity(&backend).await;
+    yield_waiting_card(&app, &platform, 2).await;
+
+    backend.task_runtime.lock().unwrap().children = vec![("ses_call_sub".into(), ChildRuntime::Inactive)];
+    spawn_sync(&app);
+    wait_for_card_update(&platform, "the unconfirmed marker", CardUpdates::Latest, |card| {
+        card_text(card).contains("⚠️ 状态待确认")
+    })
+    .await;
+
+    // The runtime read now names no task at all: no verdict for the child, so
+    // the carried marker stands.
+    backend.task_runtime.lock().unwrap().children = vec![];
+    backend.transcript_calls.lock().await.clear();
+    wait_for_transcript_reads(&backend, "ses_test", 1).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let latest = platform.updated_cards().await.last().cloned().unwrap();
+    let text = card_text(&latest);
+    assert!(
+        text.contains("⏳ 后台任务（2 · 1 待确认）"),
+        "no answer for the child keeps the title count: {latest}"
+    );
+    assert!(
+        text.contains("⚠️ 状态待确认"),
+        "no answer for the child keeps the marker: {latest}"
+    );
+    assert!(
+        text.contains("清理待确认任务"),
+        "no answer for the child keeps the cleanup button: {latest}"
+    );
+}
+
 /// Spec #588 / #590: a late Wake after a cleanup is untouched — the cleaned
 /// task's completion still resumes the chain (the split continuation opens with
 /// its own work) and the Wake's completion entry still renders on the card
