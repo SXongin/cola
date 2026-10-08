@@ -3,10 +3,11 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::Instrument;
 
-use crate::backend::{MessageRole, Part, SessionTranscript, TurnAnchor};
+use crate::backend::{MessageRole, Part, SessionTranscript, TurnAnchor, TurnSettle};
 use crate::bridge::handles::{CardsHandle, FlowHandles, NoticeRules};
 use crate::bridge::turn::{
-    CardOwnership, ContinuationFacts, SettleTiming, Turn, WakeContinuation, YieldedUpdate,
+    CardClass, CardOwnership, ContinuationFacts, Disposition, SettleTiming, Turn, WakeContinuation,
+    YieldedUpdate,
 };
 
 /// The external-message flow: watches for user messages that were NOT sent by
@@ -396,14 +397,20 @@ impl ExternalFlow {
         // the Wake decision and the yielded refresh of this same read must
         // stamp one moment, not two.
         let now_ms = chrono::Utc::now().timestamp_millis();
-        if cola_authored {
-            // The Session Sync Wake step (ADR-0059): the newest user message is
-            // cola's own, so any work in this Session that the card chain has
-            // not rendered was resumed by the Backend (a Wake) or landed after
-            // its card was finalized — render it as a continuation. Runs before
-            // the watermark's early returns on purpose: a Wake's visibility
-            // must never depend on the Sync Watermark, which accounts user
-            // messages only and is never moved by a Wake (ADR-0026).
+        // The Wake steps serve any cola-held card chain (#568): a cola-authored
+        // read as before, and an external one whose yielded card this newest
+        // user message opened — a followed external Session's wait is served
+        // exactly like a cola request's, instead of freezing at its yield. A
+        // newer external message fails the identity check and stays with the
+        // notify path below, which supersedes and collects the waiting card.
+        if cola_authored || yielded_chain_held(handles, sid, &turn_anchor).await {
+            // The Session Sync Wake step (ADR-0059): any work in this Session
+            // that the card chain has not rendered was resumed by the Backend
+            // (a Wake) or landed after its card was finalized — render it as a
+            // continuation. Runs before the watermark's early returns on
+            // purpose: a Wake's visibility must never depend on the Sync
+            // Watermark, which accounts user messages only and is never moved
+            // by a Wake (ADR-0026).
             self.render_wake_continuation(
                 handles,
                 &transcript,
@@ -1277,14 +1284,20 @@ async fn external_render_loop(
     // resets the clock, so a running model that keeps producing is never cut
     // at 10 minutes; only a run whose card shows nothing new for the whole
     // window gives up. A failed or timed-out read is no progress either, so a
-    // wedged Backend idles out too; the header's per-second tick and other
-    // footer churn are not progress — reading them as such would make the
-    // bound never fire.
+    // wedged Backend idles out too — EXCEPT while the settlement is undecided
+    // (`undecided` below): the wait for a fired Wake's Execution boundary has
+    // no time bound (ADR-0059, #568), so nothing may end it, not even an
+    // unreadable Backend. The header's per-second tick and other footer churn
+    // are not progress — reading them as such would make the bound never fire.
     let idle_bound = tokio::time::Duration::from_millis(idle_timeout_ms);
     let mut last_progress = tokio::time::Instant::now();
     let mut last_mark = Turn::progress_mark(&handles.cards, &session_id)
         .await
         .unwrap_or(0);
+    // Whether the LAST successful read still owed a Wake's Execution boundary
+    // (#568) — remembered across ticks, so a failed or timed-out read cannot
+    // let the no-progress bound end the wait through its own blind spot.
+    let mut undecided = false;
     loop {
         tokio::time::sleep(tokio::time::Duration::from_millis(poll_ms)).await;
         // Completion, the newer-turn boundary and the streaming render all
@@ -1310,12 +1323,33 @@ async fn external_render_loop(
             // A failed or timed-out read is the "nothing observable is
             // happening" state: the stalled-poll rule owns what happens next
             // (a replacement ends this renderer silently; otherwise the idle
-            // bound may end the card).
-            if !stalled_poll(handles, &session_id, &anchor, last_progress, idle_bound).await {
+            // bound may end the card — unless the last readable state was an
+            // undecided settlement).
+            if !stalled_poll(
+                handles,
+                &session_id,
+                &anchor,
+                last_progress,
+                idle_bound,
+                undecided,
+            )
+            .await
+            {
                 break;
             }
             continue;
         };
+        // The shared settle decision, read once per successful poll (#568): it
+        // decides the ending below, and its `Running` state (a fired Wake's
+        // Execution boundary still owed) carries into this tick's stalled arms
+        // so no bound can end the wait. A Turn that has not wrapped up is
+        // never undecided: the ordinary bound still guards a stream that
+        // never lands.
+        let settle = transcript
+            .turn_for_user(&anchor)
+            .complete
+            .then(|| transcript.settle(Some(&anchor)));
+        undecided = matches!(settle, Some(TurnSettle::Running));
         // The accumulator was replaced (cola's own `run_prompt` inserted a fresh
         // one, or a newer external message's renderer took over): exit so this
         // turn isn't double-rendered into two cards. The full anchor is the
@@ -1371,7 +1405,16 @@ async fn external_render_loop(
             last_progress = tokio::time::Instant::now();
         }
         let Some(stats) = stats else {
-            if !stalled_poll(handles, &session_id, &anchor, last_progress, idle_bound).await {
+            if !stalled_poll(
+                handles,
+                &session_id,
+                &anchor,
+                last_progress,
+                idle_bound,
+                undecided,
+            )
+            .await
+            {
                 break;
             }
             continue;
@@ -1386,15 +1429,44 @@ async fn external_render_loop(
             break;
         }
         // The model finished answering this turn: the transcript's turn
-        // projection says so — finalize the card, then stop. The guarded
-        // finalize re-checks the anchor under the stamp's own lock, so a
-        // successor that replaced the accumulator during the render keeps its
-        // own card (#457).
-        if transcript.turn_for_user(&anchor).complete {
-            if Turn::finalize_done_if_anchor(&handles.cards, &session_id, &anchor).await {
-                tracing::info!("external reply rendered: session {} done", session_id);
+        // projection says so. The ending is the shared settle decision (#568),
+        // never the bare terminal step: the read may still owe a Wake's
+        // Execution boundary (keep observing — an adopted follow's anchor turn
+        // is already complete while the pending Wake's run has not landed), or
+        // it may idle with live Background Tasks (yield ⏳ in place and stop —
+        // Session Sync serves the wait), or settle Done/Failed. The guarded
+        // apply re-checks the anchor under the stamp's own lock, so a successor
+        // that replaced the accumulator during the render keeps its own card
+        // (#457).
+        if let Some(settle) = settle {
+            match settle {
+                // The undecided read keeps observing (`undecided` carries it
+                // to the bound checks); whatever the resumed run produces next
+                // is rendered by the ordinary pass above.
+                TurnSettle::Running => {}
+                TurnSettle::Complete => {
+                    if Turn::finalize_done_if_anchor(&handles.cards, &session_id, &anchor).await {
+                        tracing::info!("external reply rendered: session {} done", session_id);
+                    }
+                    break;
+                }
+                settle => {
+                    // The waiting yield and the settled failure, through the one
+                    // disposition table — the card state and failure line cannot
+                    // disagree with the other ending paths (ADR-0059).
+                    let disposition = Disposition::from(settle);
+                    if Turn::apply_disposition_if_anchor(&handles.cards, &session_id, &anchor, &disposition)
+                        .await
+                    {
+                        tracing::info!(
+                            "external reply rendered: session {} {}",
+                            session_id,
+                            disposition.log_line()
+                        );
+                    }
+                    break;
+                }
             }
-            break;
         }
         // A NEWER EXTERNAL user message is a turn boundary — the poller
         // notifies and arms a fresh renderer for it (ADR-0028). A message cola
@@ -1418,30 +1490,51 @@ async fn external_render_loop(
         // Safety net for messages that never trigger a run, and for a run that
         // goes quiet: if a partial reply was rendered, finalize it so the card
         // never sits on an eternal spinner; otherwise leave the "有新消息"
-        // notification as-is.
-        if last_progress.elapsed() >= idle_bound {
+        // notification as-is. An UNDECIDED settlement is exempt (#568): the
+        // pending Wake's wait has no time bound (ADR-0059), so a ✅ here would
+        // be the premature ending this change exists to remove, one grace later.
+        if !undecided && last_progress.elapsed() >= idle_bound {
             idle_bound_reached(handles, &session_id, &anchor).await;
             break;
         }
     }
 }
 
+/// Whether Session Sync owes the Wake steps for a read whose newest user
+/// message is external (#568): cola still holds the Session's yielded card
+/// chain — the card waits (⏳) and its Turn anchor is this read's newest user
+/// message, so the wait is this chain's own and not a superseded one's. A
+/// newer external message fails the identity check: that read belongs to the
+/// notify path, which collects the waiting card as 已由新消息接管 and arms the
+/// fresh renderer. A terminal or render-owned card owes nothing here (the
+/// Wake step's own ownership guard would filter the latter anyway, but the
+/// gate keeps the pass's work off chains the wait does not own).
+async fn yielded_chain_held(handles: &FlowHandles, session_id: &str, newest: &TurnAnchor) -> bool {
+    let ownership = CardOwnership::read(&handles.cards, &handles.waits, session_id).await;
+    matches!(ownership.card_class(), CardClass::Yielded { .. }) && ownership.anchor() == Some(newest)
+}
+
 /// A stalled poll's disposition (#457): `true` keeps the loop polling, `false`
 /// stops it. A successor that replaced this renderer's accumulator ends it
 /// silently — stamping by session id could hit the successor's live card. The
 /// idle bound (checked second, so a replacement always wins) ends the card
-/// through the anchor-guarded ending.
+/// through the anchor-guarded ending — unless the last successful read left
+/// the settlement undecided (#568): the wait for a fired Wake's Execution
+/// boundary has no time bound (ADR-0059), so a failed or timed-out read must
+/// not become the blind spot that ends it; the loop keeps polling through the
+/// stall, and a recovered read lands the boundary's own ending.
 async fn stalled_poll(
     handles: &FlowHandles,
     session_id: &str,
     anchor: &TurnAnchor,
     last_progress: tokio::time::Instant,
     idle_bound: tokio::time::Duration,
+    undecided: bool,
 ) -> bool {
     if Turn::armed_turn_anchor(&handles.cards, session_id).await.as_ref() != Some(anchor) {
         return false;
     }
-    if last_progress.elapsed() >= idle_bound {
+    if !undecided && last_progress.elapsed() >= idle_bound {
         idle_bound_reached(handles, session_id, anchor).await;
         return false;
     }

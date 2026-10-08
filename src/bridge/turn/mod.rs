@@ -38,7 +38,7 @@ pub(crate) use state::CursorSeed;
 /// over the waits state and the card map; the prompt router, the Wake gate,
 /// the reap and the `/stop` acknowledgement read its named rules. Its module
 /// docs state the sources.
-pub(crate) use ownership::{CardOwnership, StopDisposition};
+pub(crate) use ownership::{CardClass, CardOwnership, StopDisposition};
 
 /// The one ending vocabulary (spec #538): the table every path that ends a
 /// card reads — the in-Turn paths through `StreamAccumulator::apply_ending`,
@@ -2659,7 +2659,12 @@ impl Turn {
     /// can never stamp the successor's live card (#457). Reads the anchor the
     /// external arm stored on the accumulator. Returns whether it applied
     /// (false: a successor owns the card now — nothing is touched).
-    async fn apply_disposition_if_anchor(
+    /// The anchor-guarded ending application, for callers that decided their own
+    /// disposition through the one table: an external render loop's settle
+    /// mapping (Waiting/Failed) applies here, beside the Done and Stopped
+    /// endpoints below, so the successor guard (`false`: a successor owns the
+    /// card — nothing is touched) and the flush are shared by every ending.
+    pub(crate) async fn apply_disposition_if_anchor(
         cards: &CardsHandle,
         session_id: &str,
         anchor: &TurnAnchor,
