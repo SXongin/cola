@@ -238,9 +238,12 @@ impl TaskLedgerRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskOutput {
     /// The record answered with the tail to show: the same bounded window the
-    /// live row renders ([`ShellOutputWindow`]), labelled 截至于 HH:MM and
-    /// clipped when the capture held more. Never an empty window — the
-    /// readable-empty capture leaves the entry's output `None`.
+    /// live row renders ([`ShellOutputWindow`]), carrying only its truncation
+    /// label (仅最后 N 行 · 已截断) when the capture held more — never the live
+    /// row's 截至于 HH:MM read clock: the identity line already carries the
+    /// run's own timing and a completed capture cannot grow (review, PR #595).
+    /// Never an empty window — the readable-empty capture leaves the entry's
+    /// output `None`.
     Window(ShellOutputWindow),
     /// The read was spent and there is nothing to show — a failed or vanished
     /// record. The body says 「输出已不可用」.
@@ -274,8 +277,9 @@ pub struct TaskCompletionEntry {
     /// What ended the task, and how the collapsed title names it.
     pub ending: TaskEnding,
     /// The shell's output tail as the fold body renders it (spec #588, #593):
-    /// the last bounded lines with their 截至于/已截断 labels after the
-    /// identity line, or [`TaskOutput::Unavailable`]'s 「输出已不可用」 when the
+    /// the last bounded lines with their 已截断 label (never the live row's
+    /// 截至于 read clock) after the identity line, or
+    /// [`TaskOutput::Unavailable`]'s 「输出已不可用」 when the
     /// record could not be read. `None` when the ending shows no output (a
     /// subagent, the 已失联 ending, the 🧹 cleanup) or when no read was spent,
     /// so the body stays identity-only.
@@ -361,14 +365,17 @@ pub(crate) fn task_entry_body(entry: &TaskCompletionEntry) -> String {
         None => return body,
     }
     // The shell's own result follows the identity line (spec #588, #593): the
-    // same labelled, fenced window the live row renders, or the honest
-    // 「输出已不可用」 when the record could not be read. Only the endings that
-    // show an output carry one ([`TaskCompletionEntry::shows_output`]).
+    // fenced tail with only its truncation label when clipped — the identity
+    // line above already carries the run's own start/duration, and a completed
+    // capture cannot grow, so the live row's 截至于 read clock stays out
+    // (review, PR #595) — or the honest 「输出已不可用」 when the record could
+    // not be read. Only the endings that show an output carry one
+    // ([`TaskCompletionEntry::shows_output`]).
     if entry.shows_output() {
         match &entry.output {
             Some(TaskOutput::Window(window)) if !window.text.is_empty() => {
                 body.push('\n');
-                body.push_str(&output_window_block(window));
+                body.push_str(&entry_output_block(window));
             }
             Some(TaskOutput::Unavailable) => {
                 body.push_str("\n  ");
@@ -475,35 +482,64 @@ pub(crate) fn task_ledger_text(rows: &[TaskLedgerRow], now_ms: i64) -> Option<St
     Some(text)
 }
 
-/// The output window's own label (spec #588, #592): the pinned copy
+/// The LIVE ROW's output window label (spec #588, #592): the pinned copy
 /// `截至于 HH:MM`, with ` · 仅最后 N 行 · 已截断` appended when the record held
-/// more than the window shows. N is the lines the window RENDERS (the retained
-/// count), so a byte-clipped window whose lines were huge names its real
-/// count. An unformattable clock (out of range) drops its part rather than
-/// inventing one.
+/// more than the window shows. An unformattable clock (out of range) drops its
+/// part rather than inventing one. A completion entry never renders this
+/// label: its identity line already carries the run's own timing and its
+/// capture cannot grow, so it carries the truncation part alone
+/// ([`entry_output_block`], review PR #595).
 fn output_window_label(window: &ShellOutputWindow) -> String {
     let mut parts: Vec<String> = Vec::new();
     if let Some(clock) = fmt_local_time(window.captured_ms) {
         parts.push(format!("截至于 {clock}"));
     }
-    if window.clipped {
-        parts.push(format!("仅最后 {} 行 · 已截断", window.text.lines().count()));
+    let truncation = window_truncation_label(window);
+    if !truncation.is_empty() {
+        parts.push(truncation);
     }
     parts.join(" · ")
 }
 
-/// One shell's output window as the ledger body renders it (spec #588, #592):
-/// the indented label line, then the tail as a fenced code block so the
-/// command's own markdown cannot bleed into the section. The fence is one
-/// backtick longer than the longest run inside the tail (at least three), so a
-/// tail line can never close the block early; the sanitizer passes fenced
-/// content through verbatim.
+/// The truncation copy the live row's label and a completion entry's tail
+/// share (spec #588): `仅最后 N 行 · 已截断` when the record held more than the
+/// window shows, empty otherwise. N is the lines the window RENDERS (the
+/// retained count), so a byte-clipped window whose lines were huge names its
+/// real count.
+fn window_truncation_label(window: &ShellOutputWindow) -> String {
+    if window.clipped {
+        format!("仅最后 {} 行 · 已截断", window.text.lines().count())
+    } else {
+        String::new()
+    }
+}
+
+/// One running shell's output window as the ledger row renders it (spec #588,
+/// #592): the indented label line, then the tail as a fenced code block so the
+/// command's own markdown cannot bleed into the section.
 fn output_window_block(window: &ShellOutputWindow) -> String {
+    fenced_window_block(&output_window_label(window), window)
+}
+
+/// One finished shell's output tail as its completion entry renders it (spec
+/// #588, #593, review): the fenced tail with the truncation label alone when
+/// the record held more — no `截至于 HH:MM`, because the entry's identity line
+/// already carries the run's own start and duration and the capture cannot
+/// grow after the end. An unclipped tail renders no label line at all.
+fn entry_output_block(window: &ShellOutputWindow) -> String {
+    fenced_window_block(&window_truncation_label(window), window)
+}
+
+/// The fenced tail both the live row and the completion entry render: the
+/// indented label line when the label is non-empty, then the tail wrapped in a
+/// fence one backtick longer than the longest run inside it (at least three),
+/// so a tail line can never close the block early; the sanitizer passes fenced
+/// content through verbatim.
+fn fenced_window_block(label: &str, window: &ShellOutputWindow) -> String {
     let mut block = String::new();
-    let label = output_window_label(window);
     if !label.is_empty() {
         block.push_str("  ");
-        block.push_str(&label);
+        block.push_str(label);
         block.push('\n');
     }
     block.push_str(&output_fence(&window.text));
@@ -693,7 +729,7 @@ fn entry_output_estimate(entry: &TaskCompletionEntry) -> usize {
         return 0;
     }
     match &entry.output {
-        Some(TaskOutput::Window(window)) if !window.text.is_empty() => output_window_block(window).len() + 1,
+        Some(TaskOutput::Window(window)) if !window.text.is_empty() => entry_output_block(window).len() + 1,
         Some(TaskOutput::Unavailable) => "\n  ".len() + OUTPUT_UNAVAILABLE.len(),
         _ => 0,
     }
