@@ -443,6 +443,12 @@ struct PendingEntry {
     /// ticket leaves with its outcome, so a dropped or superseded submission
     /// still settles its caller.
     tickets: HashMap<u64, oneshot::Sender<WriteOutcome>>,
+    /// Completion Notices gated on this card's owed keyless Pending Card Update
+    /// draining (spec #602, ticket #607): armed while `card` is owed, fired
+    /// exactly once when that write settles **delivered** (a drain retry or a
+    /// later direct write), and dropped if the entry is evicted or the write
+    /// settles refused (the notice is suppressed).
+    deferred_notices: Vec<crate::feishu::DeferredNotice>,
 }
 
 impl PendingEntry {
@@ -464,6 +470,7 @@ impl PendingEntry {
             waiting: None,
             driver: None,
             tickets: HashMap::new(),
+            deferred_notices: Vec::new(),
         }
     }
 
@@ -762,10 +769,32 @@ impl CardDelivery {
             entry.card = None;
             entry.next_attempt = tokio::time::Instant::now();
         }
+        // A delivery settles whatever Completion Notice waited on this card's
+        // owed write (spec #602, ticket #607): the gated update has landed, so
+        // the notice may fire. A permanent refusal, a superseding failure or an
+        // eviction leaves the notices to drop — suppressed.
+        let notices = if result.is_ok() {
+            Self::take_deferred_notices(entry)
+        } else {
+            Vec::new()
+        };
         // The write just recorded is never this admission's own victim: the
         // cap evicts another entry, or waits for one to age out.
         self.evict_over_cap(&mut state, Some(message_id));
         Self::prune_locks(&mut state);
+        drop(state);
+        for notice in notices {
+            notice();
+        }
+    }
+
+    /// Take this card's armed Completion Notices (spec #602, ticket #607): the
+    /// owed write they were gated on has just settled **delivered**, so they may
+    /// fire. Called under the state lock; the caller runs them after releasing
+    /// it, so a notice send (which can reach Feishu) never runs under the lock
+    /// — and fires exactly once, since the callbacks leave with this take.
+    fn take_deferred_notices(entry: &mut PendingEntry) -> Vec<crate::feishu::DeferredNotice> {
+        std::mem::take(&mut entry.deferred_notices)
     }
 
     /// Add one proven-delivered sequence to a card's bounded set (spec #561,
@@ -1402,6 +1431,10 @@ impl CardDelivery {
             Self::prune_locks(&mut state);
             return;
         }
+        // The Completion Notices gated on this card's owed write (spec #602,
+        // ticket #607): a delivery fires them after the lock is released, so
+        // the notice never races the write it announces.
+        let mut notices = Vec::new();
         match result {
             Ok(()) => {
                 // Keep the sequence as a settled tombstone: an outcome that
@@ -1413,6 +1446,7 @@ impl CardDelivery {
                 if let Some(current) = state.entries.get_mut(&message_id) {
                     current.card = None;
                     Self::remember_delivered(&mut current.delivered, seq);
+                    notices = Self::take_deferred_notices(current);
                 }
                 if attempts > 0 {
                     tracing::info!("pending card update for {message_id} delivered after {attempts} retries");
@@ -1436,6 +1470,10 @@ impl CardDelivery {
             }
         }
         Self::prune_locks(&mut state);
+        drop(state);
+        for notice in notices {
+            notice();
+        }
     }
 
     /// Re-arm a card's owed keyed write when it is due (spec #571 review): the
@@ -1862,6 +1900,33 @@ impl Platform for CardDelivery {
         // so the card's keyed queue cannot answer for the Rendered Cursor.
         (entry.seq > 0 && entry.card.is_none()).then(|| entry.delivered.contains(&entry.seq))
     }
+
+    fn defer_notice_until_delivered(
+        &self,
+        message_id: &str,
+        notice: crate::feishu::DeferredNotice,
+    ) -> crate::feishu::NoticeGate {
+        let mut state = self.state.lock().unwrap();
+        let Some(entry) = state.entries.get_mut(message_id) else {
+            // No delivery state: nothing keyless is owed, so nothing to gate.
+            return crate::feishu::NoticeGate::Delivered;
+        };
+        if entry.card.is_some() {
+            // The card still owes its newest keyless write as a Pending Card
+            // Update: the notice fires when a retry (or a later direct write)
+            // delivers it. The entry owns the callback now.
+            entry.deferred_notices.push(notice);
+            crate::feishu::NoticeGate::Armed
+        } else if entry.seq == 0 || entry.delivered.contains(&entry.seq) {
+            // The newest keyless write settled delivered (or there was none):
+            // the terminal slice is on the card — announce now.
+            crate::feishu::NoticeGate::Delivered
+        } else {
+            // The newest keyless write settled without delivering (a permanent
+            // refusal): it will never carry the terminal slice — suppress.
+            crate::feishu::NoticeGate::Never
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2147,6 +2212,86 @@ mod tests {
             "the newest payload went out"
         );
         assert!(!delivery.pending("om_1"), "a delivered retry clears the entry");
+    }
+
+    /// Spec #602, ticket #607: a Completion Notice gated on a queued Pending
+    /// Card Update fires only when that update drains — never at arm time — and
+    /// exactly once.
+    #[tokio::test]
+    async fn a_notice_gated_on_a_queued_update_fires_when_it_drains() {
+        use crate::feishu::NoticeGate;
+        let inner = Arc::new(FakePlatform::new());
+        inner.fail_next(Fail::Transport);
+        let delivery = CardDelivery::new(inner.clone());
+        let card = serde_json::json!({ "body": "terminal" });
+        let fired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        assert!(
+            delivery.update_message("om_1", &card).await.is_err(),
+            "the ending PATCH failed recoverably and is queued"
+        );
+        let f = fired.clone();
+        assert_eq!(
+            delivery.defer_notice_until_delivered(
+                "om_1",
+                Box::new(move || {
+                    f.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }),
+            ),
+            NoticeGate::Armed,
+            "an owed update arms the notice"
+        );
+        assert_eq!(
+            fired.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "arming must not fire the notice early"
+        );
+
+        delivery.drain_pending_card_updates(true).await;
+        assert_eq!(
+            fired.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the notice fires when the queued update drains"
+        );
+
+        delivery.drain_pending_card_updates(true).await;
+        assert_eq!(
+            fired.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a later drain never doubles the notice"
+        );
+    }
+
+    /// Spec #602, ticket #607: a terminal write delivered now (or with no
+    /// keyless state to gate on) reports `Delivered`, so the caller announces at
+    /// once; a permanently refused one reports `Never`, so the notice is
+    /// suppressed rather than racing a write that can never land.
+    #[tokio::test]
+    async fn the_notice_gate_reports_delivered_or_refused() {
+        use crate::feishu::NoticeGate;
+        let inner = Arc::new(FakePlatform::new());
+        let delivery = CardDelivery::new(inner.clone());
+        let card = serde_json::json!({ "body": "terminal" });
+
+        delivery.update_message("om_ok", &card).await.unwrap();
+        assert_eq!(
+            delivery.defer_notice_until_delivered("om_ok", Box::new(|| {})),
+            NoticeGate::Delivered,
+            "a delivered write reports delivered"
+        );
+        assert_eq!(
+            delivery.defer_notice_until_delivered("om_absent", Box::new(|| {})),
+            NoticeGate::Delivered,
+            "no delivery state means nothing to gate"
+        );
+
+        inner.fail_next(Fail::Http(400));
+        assert!(delivery.update_message("om_bad", &card).await.is_err());
+        assert_eq!(
+            delivery.defer_notice_until_delivered("om_bad", Box::new(|| {})),
+            NoticeGate::Never,
+            "a permanently refused write suppresses the notice"
+        );
     }
 
     /// Spec #561: the Rendered Cursor's tie to the outbox. Only the owed
