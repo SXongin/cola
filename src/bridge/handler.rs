@@ -2118,11 +2118,10 @@ impl App {
     /// a click must never no-op behind a recent poll's verdict: the live tasks
     /// the runtime cannot confirm yet are then exactly the
     /// [`SessionTranscript::unconfirmed_tasks`], and only those are cleared.
-    /// The pass runs with
-    /// [`OverlayRecord::Deferred`](crate::bridge::runtime::OverlayRecord), so
-    /// none of it reaches the ADR-0065 overlay yet (process-local; a restart
-    /// loses it and the next read re-derives the wait from the transcript and
-    /// the runtime). The same read carries the cleared tasks' synthetic
+    /// The pass applies its verdicts to the read and is committed to the
+    /// ADR-0065 overlay only under the refresh gate below (review, PR #595):
+    /// every caller's reconcile pass commits after the flush that carried its
+    /// entries, never before. The same read carries the cleared tasks' synthetic
     /// Cleaned retirements, and the ordinary yielded-card refresh renders the
     /// result — rows dropped, one 🧹 entry per cleared task (and per
     /// runtime/evidence retirement the read observed), and the card settled by
@@ -2156,8 +2155,8 @@ impl App {
             return;
         };
         // The shared reconcile, directly and unthrottled: the same runtime
-        // read, positive-evidence verdicts, child evidence and overlay
-        // recording every poll path runs through `observe`, without the
+        // read, positive-evidence verdicts, child evidence and deferred overlay
+        // record every poll path runs through `observe`, without the
         // process-wide throttle — a click is a user action, not a poll, and
         // must spend its own read. A failed or timed-out one re-derives
         // nothing and so clears nothing (ADR-0073): the carried markers stay
@@ -2173,17 +2172,17 @@ impl App {
             // window, exactly like a poll cycle's, so a stalled read cannot
             // stack per-suspect timeouts on the click either.
             crate::bridge::runtime::CycleBudget::within(read_timeout_ms),
-            // Deferred, not Now: none of this pass's overlay records may
-            // outlive a refresh the card refuses (review, PR #595). The
-            // record rides the write below.
-            crate::bridge::runtime::OverlayRecord::Deferred,
         )
         .await;
-        let Some(changed) = verdict else {
+        // Apply-only, never recorded here (review, PR #595): the pass commits
+        // its overlay record below, and only when the refresh that carried it
+        // landed — a card that refuses the write records nothing.
+        let Some(pass) = verdict else {
             tracing::warn!("cleanup: no runtime verdict on session {session_id}; clearing nothing");
             crate::bridge::turn::Turn::release_cleanup_claim(&handles.cards, &session_id).await;
             return;
         };
+        let changed = pass.changed();
         let cleared: Vec<String> = transcript
             .background_tasks
             .iter()
@@ -2249,7 +2248,7 @@ impl App {
                 transcript.task_retirements.len()
             );
         } else {
-            crate::bridge::runtime::record_overlay(&handles.backend, &session_id, &transcript);
+            pass.commit(&handles.backend, &session_id, &transcript);
         }
         tracing::info!(
             "cleanup: cleared {} task(s) on session {session_id} (refreshed: {})",

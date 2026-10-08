@@ -1143,7 +1143,9 @@ impl Turn {
         // and observing without one would record the task in the overlay with
         // no entry left to render. Zero requests when the read lists no live
         // task; a failed or timed-out read changes nothing.
-        let reconciled = if self.drain_anchor_visible(handles, &transcript).await {
+        // The pass is applied to the transcript only (review, PR #595): it is
+        // committed below, after the render that carries its entries lands.
+        let pass = if self.drain_anchor_visible(handles, &transcript).await {
             handles
                 .runtime_reconcile
                 .observe(
@@ -1155,7 +1157,7 @@ impl Turn {
                 )
                 .await
         } else {
-            false
+            None
         };
         let state = self.drain_state(handles, &transcript, timeout_ms).await;
         // A settled drain normally leaves the render to finalization (which
@@ -1163,10 +1165,10 @@ impl Turn {
         // retired a task, the entry renders here first — the overlay means no
         // later read carries the retirement, so skipping the render would drop
         // it (the settle would still be ✅, just without the record).
-        if state == DrainState::Settled && !reconciled {
+        if state == DrainState::Settled && !pass.as_ref().is_some_and(|pass| pass.changed()) {
             return Some(DrainState::Settled);
         }
-        render::render_and_flush(
+        let rendered = render::render_and_flush(
             &handles.cards,
             &handles.sessions,
             &handles.backend,
@@ -1175,6 +1177,15 @@ impl Turn {
             &transcript,
         )
         .await;
+        // The record-after-flush invariant (review, PR #595): the pass commits
+        // only once the render that carried its entries returned an accumulator
+        // it wrote to. A vanished accumulator (`None`) records nothing — the
+        // task stays live and the next live card renders its entry.
+        if rendered.is_some()
+            && let Some(pass) = pass
+        {
+            pass.commit(&handles.backend, &self.session_id, &transcript);
+        }
         Some(state)
     }
 
@@ -2124,8 +2135,13 @@ impl Turn {
     /// is the read's clock — the Session Sync pass's own, shared with the
     /// yielded refresh of the same read.
     ///
-    /// Returns false — nothing queued — when the session has no card or a live
-    /// renderer owns it.
+    /// Returns `None` — nothing queued — when the session has no card or a live
+    /// renderer owns it. `Some(handover)` once the split is queued and flushed,
+    /// where `handover` says whether the outgoing accumulator's ledger write
+    /// ran: the read's remaining live list and its retirement entries rode the
+    /// finalize PATCH (review, PR #595 — the caller's carrier signal for its
+    /// reconcile pass). A card with no Turn anchor to scope the entries with
+    /// still splits, but carries nothing (`Some(false)`).
     pub(crate) async fn split_chain_for_wake(
         cards: &CardsHandle,
         backend: &Arc<dyn crate::backend::Backend>,
@@ -2134,7 +2150,7 @@ impl Turn {
         line: ContinuationLine,
         transcript: &SessionTranscript,
         now_ms: i64,
-    ) -> bool {
+    ) -> Option<bool> {
         let write_lock = cards.write_lock(session_id).await;
         let _guard = write_lock.lock().await;
         // Plan the handover's completion entries under a brief read of the
@@ -2148,17 +2164,15 @@ impl Turn {
                 Some(card) if !card.acc.card_state.is_render_owned() => {
                     render::plan_ledger_entries(&card.acc, transcript, card.acc.turn_anchor.as_ref())
                 }
-                _ => return false,
+                _ => return None,
             }
         };
         render::read_planned_outputs(backend, &mut plans).await;
-        {
+        let handover = {
             let mut live = cards.cards.lock().await;
-            let Some(card) = live.get_mut(session_id) else {
-                return false;
-            };
+            let card = live.get_mut(session_id)?;
             if card.acc.card_state.is_render_owned() {
-                return false;
+                return None;
             }
             // A card with no Turn anchor to scope the entries with owes no
             // handover: its outgoing read writes nothing, exactly as before
@@ -2179,9 +2193,10 @@ impl Turn {
                 line: Some(line),
                 handover,
             });
-        }
+            handover
+        };
         flush::flush_card_locked(cards, session_id, flush::SplitPolicy::Allow).await;
-        true
+        Some(handover)
     }
 
     /// Resume a yielded card IN PLACE for a shell/subagent completion Wake

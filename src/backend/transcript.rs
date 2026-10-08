@@ -1139,11 +1139,11 @@ pub enum TaskRetirementEnding {
 /// running (review, spec #588).
 ///
 /// The Bridge records every retirement ([`Self::record`]) and replaces the
-/// unconfirmed set ([`Self::set_unconfirmed`]) right after a reconciliation
-/// read — the cleanup click's own read records the same way, but only once its
-/// card refresh landed, so a refused write records nothing (review, PR #595);
-/// the adapter applies the overlay to every transcript it returns, so no read
-/// path can disagree. A marker is re-applied only to a task still live in
+/// unconfirmed set ([`Self::set_unconfirmed`]) only after the flush that
+/// carried a reconciliation read's entries was accepted — every caller's pass
+/// commits then (review, PR #595), so a refused carrier records nothing and
+/// the task stays live; the adapter applies the overlay to every transcript it
+/// returns, so no read path can disagree. A marker is re-applied only to a task still live in
 /// the read, so a retired task's marker never surfaces as live state. The
 /// overlay is deliberately in-memory: a cola restart loses it, the next read
 /// re-derives the same retirements and the next verdict the same markers, and

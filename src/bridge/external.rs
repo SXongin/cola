@@ -301,16 +301,22 @@ impl ExternalFlow {
         // #454), on the same read the ledger paths below consume: a
         // shell/subagent whose completion record was lost is retired here (or
         // marked unconfirmed) so a Waiting card cannot be stranded on a task
-        // that is not running. Observe only while a card can still receive the
-        // ledger — the ownership verdict's yielded-card write admission
-        // ([`CardOwnership::admits_ledger_refresh`], ADR-0060/0070): the entry
-        // renders on the chain that observes the retirement, so observing with
-        // a settled chain — or no chain at all — would record the task and
-        // swallow its entry (found on a real restart, 2026-10-01). The live
-        // paths observe under their own live card instead; the throttle is the
-        // one process-wide gate they all share, a read that lists no live task
-        // spends nothing, and a failed one changes nothing.
-        if CardOwnership::read(&handles.cards, &handles.waits, sid)
+        // that is not running. Spend the read only while a card can still
+        // receive the ledger — the ownership verdict's yielded-card write
+        // admission ([`CardOwnership::admits_ledger_refresh`], ADR-0060/0070):
+        // the entry renders on the chain that observes the retirement, so
+        // spending it with a settled chain — or no chain at all — would hide
+        // the task with no entry ever rendered (found on a real restart,
+        // 2026-10-01). The live paths observe under their own live card
+        // instead; the throttle is the one process-wide gate they all share, a
+        // read that lists no live task spends nothing, and a failed one changes
+        // nothing.
+        // The pass is NOT recorded here: it commits below, and only after the
+        // flush that carried this read's entries was accepted (review, PR
+        // #595) — a card the supersede path collects cannot render the
+        // retirement, so recording it would hide the task with no entry ever
+        // rendered. A dropped pass changes nothing.
+        let pass = if CardOwnership::read(&handles.cards, &handles.waits, sid)
             .await
             .admits_ledger_refresh()
         {
@@ -323,8 +329,10 @@ impl ExternalFlow {
                     &mut transcript,
                     self.request_timeout_ms.load(std::sync::atomic::Ordering::Relaxed),
                 )
-                .await;
-        }
+                .await
+        } else {
+            None
+        };
         let Some(newest) = transcript.newest_user() else {
             return;
         };
@@ -351,16 +359,25 @@ impl ExternalFlow {
             // purpose: a Wake's visibility must never depend on the Sync
             // Watermark, which accounts user messages only and is never moved
             // by a Wake (ADR-0026).
-            self.render_wake_continuation(
-                handles,
-                &transcript,
-                sid,
-                thread_key,
-                directory,
-                &turn_anchor,
-                now_ms,
-            )
-            .await;
+            //
+            // Its answer is one of the read's two carriers: a successful
+            // in-place resume or split handover renders this read's ledger —
+            // the reconcile pass's retirement entries included — on an
+            // accepted flush, exactly like the refresh below (review, PR
+            // #595). A refused continuation (or a fresh restart card, which
+            // opens at the newest Wake and carries none of this read's
+            // entries) carries nothing.
+            let mut carried = self
+                .render_wake_continuation(
+                    handles,
+                    &transcript,
+                    sid,
+                    thread_key,
+                    directory,
+                    &turn_anchor,
+                    now_ms,
+                )
+                .await;
             // The same read also keeps a yielded (Waiting) card's ledger fresh
             // in place — and settles the card when that read is its true end
             // (ADR-0060): the freeze's carve-out. Ordered after the Wake step on
@@ -383,12 +400,14 @@ impl ExternalFlow {
             {
                 YieldedUpdate::Unchanged => {}
                 YieldedUpdate::Refreshed => {
+                    carried = true;
                     tracing::info!("yielded ledger refreshed: session {sid}");
                 }
                 YieldedUpdate::Settled {
                     disposition,
                     notice_at,
                 } => {
+                    carried = true;
                     tracing::info!("yielded ledger settled the true end: session {sid}");
                     // The Completion Notice's existing rules (ADR-0043): groups
                     // per the opt-in, p2p per the long-task threshold. A Wake
@@ -409,6 +428,14 @@ impl ExternalFlow {
                         .await;
                     }
                 }
+            }
+            // The uniform record-after-flush invariant (review, PR #595): the
+            // pass commits only now, after a carrier accepted the read. The
+            // supersede path skips this block entirely, so a collected card
+            // records nothing and the task stays live for the next card that
+            // can render its entry.
+            if carried && let Some(pass) = pass {
+                pass.commit(&handles.backend, sid, &transcript);
             }
         }
         let mut map = self.last_user_msg_epoch.lock().await;
@@ -800,8 +827,15 @@ impl ExternalFlow {
     /// accumulator from before: the card-exists case diffs the chain's own
     /// rendered state, the restart case scopes by the Wake's server time.
     ///
-    /// `now_ms` is this pass's clock, carried to the split's ledger handover so
-    /// one read stamps one moment (ADR-0060).
+    /// The answer is the caller's carrier signal (review, PR #595): `true` only
+    /// when an accepted flush carried THIS read's ledger — the in-place
+    /// resume's own flush, or the split's outgoing handover PATCH (which
+    /// writes the remaining live list and the retirement entries). A refused
+    /// resume or split carries nothing, and a fresh restart card opens at the
+    /// newest Wake with none of this read's entries — both answer `false`, so
+    /// the caller's reconcile pass records nothing. `now_ms` is this pass's
+    /// clock, carried to the split's ledger handover so one read stamps one
+    /// moment (ADR-0060).
     #[allow(clippy::too_many_arguments)] // the pass's read: handles + transcript + session/thread/directory + anchor + clock
     async fn render_wake_continuation(
         &self,
@@ -812,7 +846,7 @@ impl ExternalFlow {
         directory: &str,
         turn_anchor: &TurnAnchor,
         now_ms: i64,
-    ) {
+    ) -> bool {
         // A live Turn/follow/renderer owns the session: it renders (or will
         // render) whatever arrives — never double-render into a second card.
         // The same ownership verdict's routing rule the prompt router reads
@@ -822,11 +856,11 @@ impl ExternalFlow {
             .routing_label()
             .is_some()
         {
-            return;
+            return false;
         }
         let Some(continuation) = Turn::wake_continuation(&handles.cards, sid, transcript, turn_anchor).await
         else {
-            return;
+            return false;
         };
         // The Wake starts new work: a `/stop` from before it is not this run's
         // ending — the same rule a fresh Turn applies to the sticky marker
@@ -851,7 +885,7 @@ impl ExternalFlow {
                 )
                 .await
                 {
-                    return;
+                    return false;
                 }
                 // Both facts are read AFTER the resume: its flush may split an
                 // overgrown card onto a new chain (`SplitPolicy::Allow`), so
@@ -860,13 +894,13 @@ impl ExternalFlow {
                 // the anchor stays on the Turn (arming/capture is not an
                 // ownership question).
                 let Some(anchor) = Turn::armed_turn_anchor(&handles.cards, sid).await else {
-                    return;
+                    return true;
                 };
                 let Some(chain) = CardOwnership::read(&handles.cards, &handles.waits, sid)
                     .await
                     .chain_id()
                 else {
-                    return;
+                    return true;
                 };
                 tracing::info!(
                     "wake continuation: session {} resumes its yielded card in place",
@@ -886,6 +920,7 @@ impl ExternalFlow {
                     chain,
                     Some(self.notice.clone()),
                 );
+                true
             }
             WakeContinuation::ContinueChain { line } => {
                 // The Feishu reply target: the Turn's own when the chain still
@@ -901,7 +936,7 @@ impl ExternalFlow {
                         "wake continuation: session {} has a chain but no reachable reply target",
                         sid
                     );
-                    return;
+                    return false;
                 };
                 // The ledger handover (ADR-0060) rides the split: writing it,
                 // queueing the split and flushing are one write-lock-held
@@ -909,8 +944,11 @@ impl ExternalFlow {
                 // card's finalize PATCH carries the read's remaining list and
                 // the retiring Wakes' entries, and the continuation — whose
                 // slice starts after both — opens with only its 承接 line and
-                // the remaining list.
-                if !Turn::split_chain_for_wake(
+                // the remaining list. The split's answer is exactly "did that
+                // handover write this read's entries": a card the handover
+                // cannot scope (an anchorless one) still splits, but carries
+                // nothing, so the caller's pass must not record.
+                let Some(handover) = Turn::split_chain_for_wake(
                     &handles.cards,
                     &handles.backend,
                     sid,
@@ -920,25 +958,26 @@ impl ExternalFlow {
                     now_ms,
                 )
                 .await
-                {
-                    return;
-                }
+                else {
+                    return false;
+                };
                 // The loop's guard facts are read AFTER the split, so they
                 // describe the chain the continuation actually lives on. The
                 // chain identity is the ownership verdict's (ADR-0070); the
                 // anchor stays on the Turn (arming/capture is not an ownership
                 // question).
                 let Some(anchor) = Turn::armed_turn_anchor(&handles.cards, sid).await else {
-                    return;
+                    return handover;
                 };
                 let Some(chain) = CardOwnership::read(&handles.cards, &handles.waits, sid)
                     .await
                     .chain_id()
                 else {
-                    return;
+                    return handover;
                 };
                 tracing::info!("wake continuation: session {} continues its card chain", sid);
                 self.spawn_wake_render(handles, sid, thread_key, anchor, directory, chain, None);
+                handover
             }
             WakeContinuation::Fresh { anchor } => {
                 // The Feishu reply target, the split path's own fallback order:
@@ -957,7 +996,7 @@ impl ExternalFlow {
                 if handles.waits.inbound_pending(sid).await
                     || handles.waits.inflight.lock().await.contains(sid)
                 {
-                    return;
+                    return false;
                 }
                 let Some(Ok(fresh)) = crate::bridge::bounded_call(
                     "wake continuation recheck",
@@ -966,12 +1005,12 @@ impl ExternalFlow {
                 )
                 .await
                 else {
-                    return;
+                    return false;
                 };
                 if fresh.newest_user().map(|message| message.id.as_str())
                     != Some(turn_anchor.message_id.as_str())
                 {
-                    return;
+                    return false;
                 }
                 let subtitle = self.session_subtitle(handles, sid, directory).await;
                 let variant = handles
@@ -995,7 +1034,7 @@ impl ExternalFlow {
                 )
                 .await
                 else {
-                    return;
+                    return false;
                 };
                 let sent = match &reply_target {
                     Some(target) => handles.platform.reply_card(target, &card).await,
@@ -1037,7 +1076,7 @@ impl ExternalFlow {
                             .await
                             .chain_id()
                         else {
-                            return;
+                            return false;
                         };
                         tracing::info!("wake continuation: session {} continues after a restart", sid);
                         self.spawn_wake_render(handles, sid, thread_key, anchor, directory, chain, None);
@@ -1047,6 +1086,10 @@ impl ExternalFlow {
                         Turn::drop_armed_card(&handles.cards, sid, &anchor).await;
                     }
                 }
+                // The fresh card opens at the newest Wake and carries none of
+                // this read's ledger entries: never a carrier for the caller's
+                // reconcile pass.
+                false
             }
         }
     }
