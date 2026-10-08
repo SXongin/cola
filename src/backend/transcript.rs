@@ -1193,6 +1193,37 @@ impl BackgroundTaskOverlay {
             .insert(session_id.to_string(), call_ids.iter().cloned().collect());
     }
 
+    /// The call ids one session's overlay has recorded as retired, sorted —
+    /// the test seam for "a refused refresh records nothing" (spec #588,
+    /// review PR #595). Production reads the overlay only through
+    /// [`Self::apply`].
+    #[cfg(test)]
+    pub fn retired_call_ids(&self, session_id: &str) -> Vec<String> {
+        Self::sorted_ids(&self.state, |state| state.retired.get(session_id))
+    }
+
+    /// The call ids one session's overlay carries as unconfirmed, sorted —
+    /// [`Self::retired_call_ids`]'s marker-side twin.
+    #[cfg(test)]
+    pub fn unconfirmed_call_ids(&self, session_id: &str) -> Vec<String> {
+        Self::sorted_ids(&self.state, |state| state.unconfirmed.get(session_id))
+    }
+
+    /// A session's recorded id set, cloned and sorted for an order-free test
+    /// assertion.
+    #[cfg(test)]
+    fn sorted_ids(
+        state: &std::sync::Mutex<OverlayState>,
+        pick: impl Fn(&OverlayState) -> Option<&std::collections::HashSet<String>>,
+    ) -> Vec<String> {
+        let state = state.lock().expect("the task-overlay lock is never poisoned");
+        let mut ids: Vec<String> = pick(&state)
+            .map(|ids| ids.iter().cloned().collect())
+            .unwrap_or_default();
+        ids.sort();
+        ids
+    }
+
     /// Apply the overlay to one read: every recorded retirement leaves
     /// `transcript`'s live list, and every recorded unconfirmed marker is
     /// re-inserted for a task still live in it. A session with nothing
