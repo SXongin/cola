@@ -2113,21 +2113,21 @@ impl App {
     }
 
     /// The cleanup's read → reconcile → retire → re-render pipeline, off the
-    /// ack path (spec #588, #590). The transcript's unconfirmed set is derived
-    /// per read, so the click's own read runs the same runtime reconciliation a
-    /// Session Sync pass would (one `task_runtime` read; a failed one leaves
-    /// the read exactly as decoded and clears nothing): the live tasks the
-    /// runtime cannot confirm yet are then exactly the
+    /// ack path (spec #588, #590). The click's own read runs the shared,
+    /// NON-throttled reconcile ([`crate::bridge::runtime::reconcile_now`]) —
+    /// a click must never no-op behind a recent poll's verdict: the live tasks
+    /// the runtime cannot confirm yet are then exactly the
     /// [`SessionTranscript::unconfirmed_tasks`], and only those are cleared.
-    /// Their call ids go into the ADR-0065 retirement overlay (process-local; a
-    /// restart loses it and the next read re-derives the wait from transcript +
-    /// runtime), the same read carries their synthetic Cleaned retirements, and
-    /// the ordinary yielded-card refresh renders the result — rows dropped, one
-    /// 🧹 entry per cleared task (and per runtime retirement the read observed),
-    /// and the card settled by the same rules as a quiet true end (the last
-    /// task gone is ✅ in place, ADR-0060). A read that fails, and a read that
-    /// leaves nothing to clear and nothing to retire, give the claim back so
-    /// the button stays usable.
+    /// The shared step records every retirement it observes in the ADR-0065
+    /// overlay (process-local; a restart loses it and the next read re-derives
+    /// the wait from transcript + runtime), the same read carries the cleared
+    /// tasks' synthetic Cleaned retirements, and the ordinary yielded-card
+    /// refresh renders the result — rows dropped, one 🧹 entry per cleared
+    /// task (and per runtime/evidence retirement the read observed), and the
+    /// card settled by the same rules as a quiet true end (the last task gone
+    /// is ✅ in place, ADR-0060). A read that fails, and a read that leaves
+    /// nothing to clear and nothing to retire, give the claim back so the
+    /// button stays usable.
     async fn run_cleanup(
         handles: crate::bridge::handles::TurnHandles,
         session_id: String,
@@ -2145,37 +2145,21 @@ impl App {
             crate::bridge::turn::Turn::release_cleanup_claim(&handles.cards, &session_id).await;
             return;
         };
-        let shells: Vec<String> = transcript
-            .background_tasks
-            .iter()
-            .filter_map(|task| task.shell_id.clone())
-            .collect();
-        let children: Vec<String> = transcript
-            .background_tasks
-            .iter()
-            .filter_map(|task| task.child_id.clone())
-            .collect();
-        if !shells.is_empty() || !children.is_empty() {
-            let runtime = crate::bridge::bounded_call(
-                "cleanup task runtime",
-                read_timeout_ms,
-                handles
-                    .backend
-                    .task_runtime(&session_id, directory.as_deref(), &shells, &children),
-            )
-            .await;
-            if let Some(Ok(runtime)) = runtime {
-                transcript.apply_task_runtime(&runtime);
-                let retired: Vec<String> = transcript
-                    .task_retirements
-                    .iter()
-                    .map(|retirement| retirement.task.tool.call_id.clone())
-                    .collect();
-                if !retired.is_empty() {
-                    handles.backend.retire_background_tasks(&session_id, &retired);
-                }
-            }
-        }
+        // The shared reconcile, directly and unthrottled: the same runtime
+        // read, positive-evidence verdicts, child evidence and overlay
+        // recording every poll path runs through `observe`, without the
+        // process-wide throttle — a click is a user action, not a poll, and
+        // must spend its own read. A failed or timed-out one leaves the
+        // transcript exactly as decoded, so nothing is cleared on a flaky
+        // runtime.
+        crate::bridge::runtime::reconcile_now(
+            &handles.backend,
+            &session_id,
+            directory.as_deref(),
+            &mut transcript,
+            read_timeout_ms,
+        )
+        .await;
         let cleared: Vec<String> = transcript
             .background_tasks
             .iter()
