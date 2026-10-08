@@ -16,6 +16,15 @@
 //! renders the retirement entries the read carries, so nothing is swallowed by
 //! the process-local retirement overlay (ADR-0065).
 //!
+//! One uniform invariant covers every caller (spec #588, review PR #595): a
+//! reconcile pass hands back a [`ReconcilePass`] but writes NOTHING to the
+//! overlay itself. The caller commits it — one [`ReconcilePass::commit`] call —
+//! only AFTER the card write that carried the read's entries was accepted
+//! (Session Sync's wake/ledger refresh, the drain tick's and the settle loop's
+//! completed render, the cleanup click's landed refresh). A caller whose
+//! carrier was refused drops the pass: the task stays live on every later
+//! read, and the next card that can render its entry claims it again.
+//!
 //! Guard rails, all shared:
 //!
 //! - a read that lists no live Background Task spends nothing;
@@ -123,9 +132,11 @@ impl RuntimeReconcile {
     /// spent budget cannot fund is skipped — no request — and the next cycle
     /// retries it.
     ///
-    /// The step is deliberately gate-free: each caller decides whether it can
-    /// render what it observes (Session Sync's waiting-card admission, the live
-    /// loops' own anchor) before calling.
+    /// The step is deliberately gate-free on the READ side: each caller decides
+    /// whether it can render what it observes (Session Sync's waiting-card
+    /// admission, the live loops' own anchor) before calling. The WRITE side is
+    /// deferred: the returned [`ReconcilePass`] is the caller's to commit after
+    /// its card write landed, and a pass that never commits records nothing.
     pub(crate) async fn observe(
         &self,
         backend: &Arc<dyn Backend>,
@@ -133,31 +144,22 @@ impl RuntimeReconcile {
         directory: &str,
         transcript: &mut SessionTranscript,
         read_timeout_ms: u64,
-    ) -> bool {
+    ) -> Option<ReconcilePass> {
         let (shells, children) = live_task_ids(transcript);
         if shells.is_empty() && children.is_empty() {
-            return false;
+            return None;
         }
         if !self.begin(session_id) {
-            return false;
+            return None;
         }
         let budget = CycleBudget::within(read_timeout_ms);
-        let changed = reconcile_now(
-            backend,
-            session_id,
-            Some(directory),
-            transcript,
-            budget,
-            OverlayRecord::Now,
-        )
-        .await
-        .unwrap_or(false);
+        let pass = reconcile_now(backend, session_id, Some(directory), transcript, budget).await;
         // The windows are read after the verdicts: a shell the runtime just
         // retired leaves the live list here and spends no tail read. A failed
         // runtime read changes nothing about them — the transcript still lists
         // the shells, and the window is display-only.
         capture_shell_outputs(backend, session_id, directory, transcript, budget).await;
-        changed
+        pass
     }
 }
 
@@ -210,40 +212,69 @@ impl CycleBudget {
     }
 }
 
-/// Whether a reconcile pass commits its verdicts to the process-local
-/// Background Task overlay itself, or leaves the writes to its caller (spec
-/// #588, review PR #595).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum OverlayRecord {
-    /// Commit the pass's retirements and its post-evidence unconfirmed set
-    /// here. The poll paths' mode: each caller spends the read only where a
-    /// card can render what it observes, so the record and its render are one
-    /// decision.
-    Now,
-    /// Apply the verdicts to the transcript only. The cleanup click's mode:
-    /// its overlay writes ride its card refresh, so a refresh the card
-    /// refuses records nothing — recording a retirement anyway would hide
-    /// the task from every later read with no entry ever rendered.
-    Deferred,
+/// One reconcile pass's admission to commit its verdicts to the process-local
+/// Background Task overlay (spec #588, review PR #595). Returned by
+/// [`RuntimeReconcile::observe`] and [`reconcile_now`] when — and only when — a
+/// verdict was applied to the read.
+///
+/// **The one uniform invariant**: a retirement (or marker-set change) reaches
+/// the overlay only after the flush that carried its entries was accepted.
+/// This type is the only door to [`record_overlay`], so no reconcile can write
+/// the overlay from inside itself; each caller commits after the card write
+/// that carried the read's entries landed. Dropping the pass records nothing:
+/// the task stays live on every later read, and the next card that can render
+/// its entry claims it again.
+#[must_use = "commit the pass after the flush that carried its entries; dropping it records nothing"]
+pub(crate) struct ReconcilePass {
+    /// Whether the pass moved the read: a new retirement, or a changed
+    /// unconfirmed-marker set. A pass that changed nothing is still a pass —
+    /// its post-verdict marker set is what a commit writes.
+    changed: bool,
+}
+
+impl ReconcilePass {
+    /// Whether the pass moved the read: a retirement joined, or the
+    /// unconfirmed-marker set changed.
+    pub(crate) fn changed(&self) -> bool {
+        self.changed
+    }
+
+    /// Commit the pass's verdicts to the process-local overlay: every
+    /// retirement the transcript carries — the runtime verdict's, the child
+    /// evidence's, and the cleanup click's own synthetic Cleaned entries when
+    /// it calls this — so every later read (the live render, the drain's
+    /// settle, the follow, the reap) sees them gone; the launch record never
+    /// flips, so without the overlay the next read would resurrect the task.
+    /// And the pass's post-evidence unconfirmed set — carried markers
+    /// included, resolved ones absent — so a read the shared throttle does not
+    /// spend a verdict on keeps the markers and the cleanup button they gate
+    /// (review, spec #588).
+    ///
+    /// The caller's contract: the flush that carried this read's entries was
+    /// accepted, so every later read agrees with the card the user just saw.
+    pub(crate) fn commit(self, backend: &Arc<dyn Backend>, session_id: &str, transcript: &SessionTranscript) {
+        record_overlay(backend, session_id, transcript);
+    }
 }
 
 /// One NON-throttled reconcile pass over a read's still-live Background Tasks
 /// (issue #454): the shell and child ids the read names, one bounded runtime
-/// read, the positive-evidence verdicts applied to the transcript, at most one
-/// child-evidence read (#591) per subagent the verdict left unconfirmed, and —
-/// under [`OverlayRecord::Now`] — the process-local overlay recording of what
-/// was retired. Zero requests when the read lists no live task; a failed or
-/// timed-out read leaves the transcript exactly as read — no verdict, no
-/// retirement, no settle — so a flaky runtime can never end a wait.
+/// read, the positive-evidence verdicts applied to the transcript, and at most
+/// one child-evidence read (#591) per subagent the verdict left unconfirmed.
+/// Zero requests when the read lists no live task; a failed or timed-out read
+/// leaves the transcript exactly as read — no verdict, no retirement, no
+/// settle — so a flaky runtime can never end a wait.
 ///
-/// [`RuntimeReconcile::observe`] composes this under its attempt-stamped 30 s
-/// throttle, which is how the poll paths (Session Sync, the drain, the
-/// follow/settle loop) share one verdict; the cleanup click calls it directly
-/// (spec #588, #590) with [`OverlayRecord::Deferred`], because a click must
+/// NOTHING is written to the overlay here (review, PR #595): the returned
+/// [`ReconcilePass`] is the caller's to commit once the card write that carried
+/// the read's entries was accepted. [`RuntimeReconcile::observe`] composes this
+/// under its attempt-stamped 30 s throttle, which is how the poll paths
+/// (Session Sync, the drain, the follow/settle loop) share one verdict; the
+/// cleanup click calls it directly (spec #588, #590), because a click must
 /// never no-op behind a recent poll's verdict — it spends its own runtime read
-/// on the transcript it just read, and commits the overlay itself only once
-/// its card refresh landed. The recording stays this one path either way, so
-/// every later read of the Session agrees on what retired.
+/// on the transcript it just read and commits the overlay itself only once its
+/// card refresh landed. The recording stays this one path either way, so every
+/// later read of the Session agrees on what retired.
 ///
 /// The caller hands in the cycle's [`CycleBudget`] (spec #588, review PR
 /// #595): `observe` starts one for the whole admitted cycle (this pass plus
@@ -252,20 +283,18 @@ pub(crate) enum OverlayRecord {
 /// budget skips the read — no request — so no caller can stack one timeout
 /// per suspect.
 ///
-/// Returns whether an applied verdict changed the read — `None` when no
-/// verdict was applied at all: the read lists no live task (nothing was asked),
-/// or the runtime read failed or timed out (the transcript stays exactly as
-/// read). A caller about to skip its render flattens with `unwrap_or(false)`,
-/// so a retirement is never dropped on the floor; the cleanup click keeps the
-/// two apart, because only a re-derived set may clear rows (ADR-0073).
+/// `None` when no verdict was applied at all: the read lists no live task
+/// (nothing was asked), or the runtime read failed or timed out (the transcript
+/// stays exactly as read). The cleanup click keeps `None` and a
+/// changed-nothing pass apart, because only a re-derived set may clear rows
+/// (ADR-0073).
 pub(crate) async fn reconcile_now(
     backend: &Arc<dyn Backend>,
     session_id: &str,
     directory: Option<&str>,
     transcript: &mut SessionTranscript,
     budget: CycleBudget,
-    record: OverlayRecord,
-) -> Option<bool> {
+) -> Option<ReconcilePass> {
     let (shells, children) = live_task_ids(transcript);
     if shells.is_empty() && children.is_empty() {
         return None;
@@ -309,18 +338,13 @@ pub(crate) async fn reconcile_now(
                     None => {}
                 }
             }
-            // The overlay commit rides the caller's mode (review, PR #595):
-            // the poll paths record here — their card admission already
-            // decided the pass can render what it observes — while the
-            // cleanup click defers it until its refresh landed, so a refresh
-            // the card refuses records nothing.
-            if record == OverlayRecord::Now {
-                record_overlay(backend, session_id, transcript);
-            }
-            Some(
-                transcript.task_retirements.len() > retired_before
+            // NOTHING is committed here (review, PR #595): the caller commits
+            // the returned pass only after the flush that carried this read's
+            // entries was accepted.
+            Some(ReconcilePass {
+                changed: transcript.task_retirements.len() > retired_before
                     || transcript.unconfirmed_tasks != unconfirmed_before,
-            )
+            })
         }
         Some(Err(error)) => {
             tracing::debug!(
@@ -333,18 +357,12 @@ pub(crate) async fn reconcile_now(
 }
 
 /// Commit one reconcile pass's verdicts to the process-local overlay (issue
-/// #454, review PR #595): every retirement the transcript carries — the
-/// runtime verdict's, the child evidence's, and the cleanup click's own
-/// synthetic Cleaned entries when it calls this — so every later read (the
-/// live render, the drain's settle, the follow, the reap) sees them gone; the
-/// launch record never flips, so without the overlay the next read would
-/// resurrect the task. And the pass's post-evidence unconfirmed set — carried
-/// markers included, resolved ones absent — so a read the shared throttle does
-/// not spend a verdict on keeps the markers and the cleanup button they gate
-/// (review, spec #588). [`reconcile_now`] calls this itself under
-/// [`OverlayRecord::Now`]; the cleanup click calls it under its own refresh
-/// gate, so a refused refresh records nothing.
-pub(crate) fn record_overlay(backend: &Arc<dyn Backend>, session_id: &str, transcript: &SessionTranscript) {
+/// #454, review PR #595) — the body [`ReconcilePass::commit`] wraps, private so
+/// the pass is the only door: every retirement the transcript carries, and the
+/// pass's post-evidence unconfirmed set. [`reconcile_now`] never calls it
+/// itself; the caller commits only after the flush that carried the read's
+/// entries was accepted.
+fn record_overlay(backend: &Arc<dyn Backend>, session_id: &str, transcript: &SessionTranscript) {
     if !transcript.task_retirements.is_empty() {
         let call_ids: Vec<String> = transcript
             .task_retirements

@@ -111,6 +111,7 @@ pub(super) async fn run(
         // transcript freezes the card and a wedged status hides the ending —
         // each is exactly the "cannot see the run" state the grace bounds.
         let mut in_contact = true;
+        let mut pass = None;
         let transcript = match crate::bridge::bounded_call(
             &format!("{label} transcript"),
             timing.read_timeout_ms,
@@ -127,9 +128,12 @@ pub(super) async fn run(
                 // the loop owns an anchor — the card places the entry by it,
                 // and a recorded retirement with no anchor would be swallowed
                 // by the overlay; the unreceived watch picks the task up on the
-                // tick after its message lands and the anchor is captured.
+                // tick after its message lands and the anchor is captured. The
+                // pass is committed below, after the render that carries its
+                // entries lands (review, PR #595).
                 if anchor.is_some() {
-                    flow.runtime_reconcile
+                    pass = flow
+                        .runtime_reconcile
                         .observe(
                             &flow.backend,
                             session_id,
@@ -151,6 +155,14 @@ pub(super) async fn run(
                     &transcript,
                 )
                 .await?;
+                // The record-after-flush invariant (review, PR #595): the
+                // pass commits only once the render that carried its entries
+                // returned an accumulator it wrote to. A render that never
+                // landed records nothing — the task stays live and the next
+                // card that can render its entry claims it.
+                if let Some(pass) = pass.take() {
+                    pass.commit(&flow.backend, session_id, &transcript);
+                }
                 Some(transcript)
             }
             Some(Err(e)) => {
