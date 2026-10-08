@@ -1738,6 +1738,211 @@ async fn a_task_ended_mid_turn_settles_the_turn_directly() {
     );
 }
 
+/// Review (spec #588, PR #595): the record-after-flush gate reads the real
+/// write outcome, not the accumulator's survival. Feishu permanently refuses
+/// the flush that carries the retirement entry — the plain attempt AND its
+/// fenced retry — so the card suspends and nothing will ever carry the entry.
+/// Recording the retirement anyway would hide the task from every later read
+/// with no entry ever rendered; the task must stay live, and the next card
+/// that CAN render its entry claims it — exactly once.
+#[tokio::test]
+async fn a_permanently_refused_retirement_write_records_nothing() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = waiting_shell(now - 5_000);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    // The runtime confirms the shell ended mid-turn; no Wake will ever retire
+    // it. The transcript stays as scripted and keeps listing the task, so only
+    // the runtime read can end it.
+    backend.task_runtime.lock().unwrap().shells = vec![(
+        "sh_call_bg".into(),
+        ShellRuntime::Ended {
+            end: ShellEnd::Killed,
+            completed_at: Some(now - 1_000),
+        },
+    )];
+    // Feishu refuses the content of both the plain write and the fenced retry.
+    platform.fail_update_card_content_count.store(2, Ordering::SeqCst);
+
+    Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下构建并审阅"))
+        .await
+        .unwrap();
+
+    // The card is suspended exactly as before: two attempts, then no more.
+    assert!(
+        Turn::card_is_suspended(&app.cards_handle(), "ses_test").await,
+        "the doubly-refused card suspends"
+    );
+    assert_eq!(
+        patches_to(&platform, "msg_reply").await.len(),
+        2,
+        "the plain attempt and the fenced one only"
+    );
+    // Nothing may be recorded: the task stays live on every later read ...
+    assert!(
+        backend.overlay.retired_call_ids("ses_test").is_empty(),
+        "a permanently refused write records nothing: {:?}",
+        backend.overlay.retired_call_ids("ses_test")
+    );
+    let later = crate::backend::Backend::transcript(backend.as_ref(), "ses_test")
+        .await
+        .unwrap();
+    assert_eq!(
+        later
+            .background_tasks
+            .iter()
+            .map(|task| task.tool.call_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["call_bg"],
+        "the task stays live until a card that can render its entry claims it"
+    );
+
+    // ... and the next card that CAN render it claims it exactly once: a new
+    // Turn on the same session still reads the live task, the runtime still
+    // confirms the end, and this accepted write lands the entry.
+    platform.fail_update_card_content_count.store(0, Ordering::SeqCst);
+    // Name the refused card, so its updates cannot be confused with the
+    // successor's (the harness serves one id per send).
+    Turn::set_card_message_id(&app.cards_handle(), "ses_test", "om_refused").await;
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(two_task_timeline(vec![user(
+                "msg_cola_second",
+                3_000,
+                "再来一次",
+            )]))
+            .with_executions(vec![execution(2_500)])
+            .with_background_tasks(vec![live_shell(now - 3_000, "call_bg")]),
+        ],
+    )
+    .await;
+    let mut second = ctx("ses_test", "再来一次");
+    second.message_id = "msg_2".into();
+    second.cola_message_id = Some("msg_cola_second".into());
+    spawn_turn(&app, second).await.unwrap().unwrap();
+
+    wait_for_card_update(
+        &platform,
+        "the successor's retirement entry",
+        CardUpdates::Latest,
+        |card| card_text(card).contains("🔔 shell 结束：gh run watch"),
+    )
+    .await;
+    let successor = platform.updated_cards().await.last().cloned().unwrap();
+    assert_eq!(
+        card_text(&successor)
+            .matches("🔔 shell 结束：gh run watch")
+            .count(),
+        1,
+        "the entry renders exactly once on the card that can carry it: {successor}"
+    );
+    assert_eq!(
+        backend.overlay.retired_call_ids("ses_test"),
+        vec!["call_bg".to_string()],
+        "the accepted successor render records the retirement"
+    );
+}
+
+/// Review (spec #588, PR #595): a recoverable refusal is not a permanent one.
+/// The delivery layer queues the failed write and keeps retrying it (ADR-0067),
+/// so the carrying payload is accepted: the drain's reconcile pass still
+/// records, and the queued write converges the card later.
+#[tokio::test]
+async fn a_queued_retirement_write_still_records() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = waiting_shell(now - 5_000);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    backend.task_runtime.lock().unwrap().shells = vec![(
+        "sh_call_bg".into(),
+        ShellRuntime::Ended {
+            end: ShellEnd::Killed,
+            completed_at: Some(now - 1_000),
+        },
+    )];
+    // A transport failure (recoverable): the delivery layer owns the retry.
+    platform.fail_update_transport_count.store(1, Ordering::SeqCst);
+
+    Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下构建并审阅"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        backend.overlay.retired_call_ids("ses_test"),
+        vec!["call_bg".to_string()],
+        "a queued-for-retry write is accepted: the pass records"
+    );
+}
+
+/// Review (spec #588, PR #595): the yielded-card refresh reports what really
+/// became of its write. Feishu permanently refuses the refresh that carries the
+/// retirement entry — the plain attempt AND its fenced retry — so the card
+/// suspends and the entry can never land. The pass must not be recorded, the
+/// task must stay live for a card that CAN render its entry, and no card may
+/// show a half-rendered entry; `Refreshed`/`Settled` stay reserved for an
+/// accepted write.
+#[tokio::test]
+async fn a_permanently_refused_yielded_refresh_records_nothing() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    // A frozen row clock: no second-granular ledger churn can add a PATCH
+    // while the assertion window is open.
+    let live = waiting_shell(frozen_start(now));
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    yield_one_task_card(&app, &platform, ctx("ses_test", "跑一下构建并审阅")).await;
+
+    // The runtime confirms the end on the next Session Sync pass; the pass's
+    // in-place PATCH is refused on both the plain attempt and the fenced one.
+    backend.task_runtime.lock().unwrap().shells = vec![(
+        "sh_call_bg".into(),
+        ShellRuntime::Ended {
+            end: ShellEnd::Killed,
+            completed_at: Some(now - 1_000),
+        },
+    )];
+    platform.fail_update_card_content_count.store(2, Ordering::SeqCst);
+    spawn_sync(&app);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !Turn::card_is_suspended(&app.cards_handle(), "ses_test").await {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the doubly-refused refresh never suspended the card"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // Nothing was recorded: the task stays live, so a later receivable card can
+    // still render its entry ...
+    assert!(
+        backend.overlay.retired_call_ids("ses_test").is_empty(),
+        "a permanently refused refresh records nothing: {:?}",
+        backend.overlay.retired_call_ids("ses_test")
+    );
+    let later = crate::backend::Backend::transcript(backend.as_ref(), "ses_test")
+        .await
+        .unwrap();
+    assert_eq!(
+        later
+            .background_tasks
+            .iter()
+            .map(|task| task.tool.call_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["call_bg"],
+        "the task stays live until a card that can render its entry claims it"
+    );
+    // ... and no card carries a half-rendered entry: the refused payload never
+    // reached Feishu.
+    let mut cards = platform.updated_cards().await;
+    cards.extend(platform.sent_cards().await);
+    cards.extend(platform.replied_cards().await);
+    assert!(
+        cards.iter().all(|card| !card_text(card).contains("🔔")),
+        "a refused refresh renders no entry anywhere: {cards:?}"
+    );
+}
+
 /// Acceptance (#589): the runtime reconcile is one process-wide verdict per
 /// Session per interval, shared by every path — and a waiting card's
 /// retirement still lands per ADR-0065 once the cadence admits it. The Turn's
