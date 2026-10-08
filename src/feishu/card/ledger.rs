@@ -1834,10 +1834,12 @@ mod tests {
         assert_eq!(task_entry_body(&subagent), "subagent ses_child · 14:02 · 1m");
     }
 
-    /// Spec #588 / #593: a shell's completion entry carries the result — the
-    /// output tail under the identity line, labelled with the same pinned copy
-    /// the live window uses (截至于 HH:MM, plus 仅最后 N 行 · 已截断 when the
-    /// record held more).
+    /// Spec #588 / #593 (review): a shell's completion entry carries the result
+    /// — the output tail under the identity line, with only its truncation
+    /// label (`仅最后 N 行 · 已截断`) when the record held more. The entry never
+    /// renders the live row's 截至于 read clock: its identity line already
+    /// carries the run's own start/duration, and a completed capture cannot
+    /// grow — an unclipped tail renders the fence alone, no label line.
     #[test]
     fn a_shell_entries_fold_body_carries_the_output_tail() {
         let finished = crate::feishu::card::test_local_ms(2026, 9, 29, 14, 2);
@@ -1861,13 +1863,13 @@ mod tests {
 
         assert_eq!(
             task_entry_body(&entry(Some(window("line 1\nline 2", false)))),
-            "shell sh_abc · 14:02 · 12m\n  截至于 14:05\n```\nline 1\nline 2\n```",
-            "the tail follows the identity line, labelled and fenced"
+            "shell sh_abc · 14:02 · 12m\n```\nline 1\nline 2\n```",
+            "the tail follows the identity line, fenced, with no label line"
         );
         assert_eq!(
             task_entry_body(&entry(Some(window("a\nb\nc\nd", true)))),
-            "shell sh_abc · 14:02 · 12m\n  截至于 14:05 · 仅最后 4 行 · 已截断\n```\na\nb\nc\nd\n```",
-            "a clipped window names its lines"
+            "shell sh_abc · 14:02 · 12m\n  仅最后 4 行 · 已截断\n```\na\nb\nc\nd\n```",
+            "a clipped tail names its lines and nothing else — no read clock"
         );
         assert_eq!(
             task_entry_body(&entry(None)),

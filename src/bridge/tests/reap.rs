@@ -5936,8 +5936,8 @@ async fn a_successor_wakes_entry_carries_the_output_tail() {
         "the entry lands on the successor exactly once: {resumed}"
     );
     assert!(
-        text.contains("截至于") && text.contains("仅最后 1 行 · 已截断") && text.contains("CI ok"),
-        "the resumed successor's entry carries the labelled tail: {resumed}"
+        !text.contains("截至于") && text.contains("仅最后 1 行 · 已截断") && text.contains("CI ok"),
+        "the resumed successor's entry carries the truncated tail, no read clock: {resumed}"
     );
     // The retired shell spends one read (the entry's own); a settled wait does
     // not keep re-reading it.
