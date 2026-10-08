@@ -672,8 +672,9 @@ async fn a_stopped_turn_logs_finalizing_once_per_turn() {
 
 /// A long, healthy run renders to its true end on ONE card: the merged
 /// unbounded drain (#603) has no total budget, so a readable, busy session
-/// simply keeps updating its Card — no hand-off, no 「部分完成」/continuation
-/// pair — and only the session going idle finalizes it, and only then Done.
+/// simply keeps updating its Card — across as many drain ticks as it takes —
+/// and only the session going idle finalizes it, and only then Done. No
+/// hand-off, no 「部分完成」/continuation pair.
 #[tokio::test]
 async fn a_long_healthy_run_finishes_on_one_card() {
     let _wd = test_work_dir();
@@ -683,7 +684,9 @@ async fn a_long_healthy_run_finishes_on_one_card() {
     ];
     let (_dir, app, backend, platform) =
         scripted_app(vec![SessionTranscript::new(timeline)], Some(SessionStatus::Busy)).await;
-    // A grace the readable run never trips: only the session going idle ends it.
+    // A fast poll so MANY drain ticks elapse inside the readable stretch, and a
+    // grace the readable run never trips: only the session going idle ends it.
+    app.turn_render_poll_ms.store(5, Ordering::Relaxed);
     app.turn_follow_grace_ms.store(30, Ordering::Relaxed);
     // Group + requester: the merged path's finalization sends the completion notice.
     let mut context = ctx("ses_test", "第一条消息");
@@ -693,18 +696,15 @@ async fn a_long_healthy_run_finishes_on_one_card() {
     let turn = spawn_turn(&app, context);
     wait_for_card_text(&platform, "第一轮回答。").await;
 
-    // Well past the grace while the run stays readable: no total budget, no
-    // forced Error, and the same card keeps streaming — never a 「部分完成」
-    // hand-off artifact.
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // Stay readable across MANY ticks (well past the grace): the run must keep
+    // rendering the SAME card. A fixed total budget — the retired 10-minute
+    // hand-off — would eventually split or 「出错」; the unbounded path never
+    // does. The tiny cadence makes the tick count observable.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let reads = backend.transcript_calls.lock().await.len();
     assert!(
-        !platform
-            .updated_cards()
-            .await
-            .iter()
-            .any(|c| card_header(c).contains("出错")),
-        "a readable run must not error on a budget: {:?}",
-        platform.updated_cards().await
+        reads >= 20,
+        "the drain must keep ticking while the session is readable (saw {reads} reads)"
     );
     assert_eq!(
         Turn::card_state(&app.cards_handle(), "ses_test").await,
@@ -715,18 +715,26 @@ async fn a_long_healthy_run_finishes_on_one_card() {
         app.inflight.lock().await.contains("ses_test"),
         "the guard is held for the whole path"
     );
+    // ONE card so far: the run was never handed off to a new card.
+    assert_eq!(
+        card_posts(&platform).await,
+        1,
+        "a long healthy run must stay on its one card: {:?}",
+        platform.calls.lock().await
+    );
+    assert!(
+        continuation_sends(&platform).await.is_empty(),
+        "no continuation card may open: {:?}",
+        platform.calls.lock().await
+    );
     assert!(
         platform
             .updated_cards()
             .await
             .iter()
-            .all(|c| !card_header(c).contains("部分完成")),
+            .all(|c| !card_header(c).contains("部分完成") && !card_header(c).contains("出错")),
         "a long healthy run must show no hand-off artifact: {:?}",
         platform.updated_cards().await
-    );
-    assert!(
-        backend.transcript_calls.lock().await.len() > 1,
-        "the drain must keep polling while the session is busy"
     );
 
     // It genuinely ends: the session goes idle and the merged drain finalizes Done.
@@ -741,6 +749,13 @@ async fn a_long_healthy_run_finishes_on_one_card() {
     let final_card = platform.updated_cards().await.last().cloned().unwrap();
     assert!(card_header(&final_card).contains("完成"));
     assert!(card_text(&final_card).contains("第一轮回答。"));
+    // The whole run lived on the one card: no post beyond the initial reply.
+    assert_eq!(
+        card_posts(&platform).await,
+        1,
+        "the whole run lives on one card: {:?}",
+        platform.calls.lock().await
+    );
     assert!(
         platform
             .calls
