@@ -636,6 +636,13 @@ async fn a_v1_task_part_is_never_a_ledger_row() {
         backend.task_runtime_calls.lock().await.is_empty(),
         "a read with no live task spends no runtime request, whatever the generation"
     );
+    // The child-evidence step rides the same guard (#591): with no live task
+    // there is no suspect, so no child read is ever issued on V1.
+    assert!(
+        backend.child_evidence_calls.lock().await.is_empty(),
+        "no live task, no child evidence request: {:?}",
+        backend.child_evidence_calls.lock().await
+    );
 }
 
 /// The two-task timeline both handover causes share: the anchor prompt, the
