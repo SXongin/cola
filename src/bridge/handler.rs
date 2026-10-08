@@ -2190,11 +2190,17 @@ impl App {
             crate::bridge::turn::Turn::release_cleanup_claim(&handles.cards, &session_id).await;
             return;
         }
-        if !cleared.is_empty() {
-            handles.backend.retire_background_tasks(&session_id, &cleared);
-            transcript.apply_cleanup(&cleared, chrono::Utc::now().timestamp_millis());
-        }
+        // One clock for the click's whole write: the synthetic retirements'
+        // own timestamps and the refresh's render clock are the same moment.
         let now_ms = chrono::Utc::now().timestamp_millis();
+        if !cleared.is_empty() {
+            // The read's own cleanup rides the local transcript BEFORE the
+            // refresh (review, PR #595): the dropped rows, the 🧹 entries and
+            // the settle decision all come from this transcript, so it carries
+            // them into the write. The process-local overlay record does NOT
+            // sit here — it is gated on the refresh's outcome below.
+            transcript.apply_cleanup(&cleared, now_ms);
+        }
         let stopped = handles.waits.is_stopped(&session_id).await;
         let update = crate::bridge::turn::Turn::refresh_yielded_ledger(
             &handles.cards,
@@ -2207,6 +2213,28 @@ impl App {
             read_timeout_ms,
         )
         .await;
+        // The overlay record is gated on the refresh's outcome (review, PR
+        // #595): the write admission is re-checked under the card lock, and a
+        // card replaced while this pipeline's reads were in flight (a new
+        // Turn's supersede, a late Wake) refuses the write — `Unchanged`,
+        // nothing submitted. Recording the cleared ids anyway would hide the
+        // tasks from every later transcript read without ever rendering their
+        // 🧹 entries, and no later read can reconstruct them. An accepted write
+        // counts even when the delivery layer drains it later (ADR-0067/0072),
+        // the same rule the Wake Watermark's drain uses; `Unchanged` records
+        // nothing, so the tasks stay live and the still-usable button can
+        // clear them on the card that took the chain.
+        if !cleared.is_empty() {
+            if matches!(update, crate::bridge::turn::YieldedUpdate::Unchanged) {
+                tracing::warn!(
+                    "cleanup: the card stopped admitting the refresh on session {session_id}; \
+                     keeping {} task(s) live",
+                    cleared.len()
+                );
+            } else {
+                handles.backend.retire_background_tasks(&session_id, &cleared);
+            }
+        }
         tracing::info!(
             "cleanup: cleared {} task(s) on session {session_id} (refreshed: {})",
             cleared.len(),
