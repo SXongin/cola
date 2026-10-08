@@ -142,9 +142,16 @@ impl RuntimeReconcile {
             return false;
         }
         let budget = CycleBudget::within(read_timeout_ms);
-        let changed = reconcile_now(backend, session_id, Some(directory), transcript, budget)
-            .await
-            .unwrap_or(false);
+        let changed = reconcile_now(
+            backend,
+            session_id,
+            Some(directory),
+            transcript,
+            budget,
+            OverlayRecord::Now,
+        )
+        .await
+        .unwrap_or(false);
         // The windows are read after the verdicts: a shell the runtime just
         // retired leaves the live list here and spends no tail read. A failed
         // runtime read changes nothing about them — the transcript still lists
@@ -203,22 +210,40 @@ impl CycleBudget {
     }
 }
 
+/// Whether a reconcile pass commits its verdicts to the process-local
+/// Background Task overlay itself, or leaves the writes to its caller (spec
+/// #588, review PR #595).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OverlayRecord {
+    /// Commit the pass's retirements and its post-evidence unconfirmed set
+    /// here. The poll paths' mode: each caller spends the read only where a
+    /// card can render what it observes, so the record and its render are one
+    /// decision.
+    Now,
+    /// Apply the verdicts to the transcript only. The cleanup click's mode:
+    /// its overlay writes ride its card refresh, so a refresh the card
+    /// refuses records nothing — recording a retirement anyway would hide
+    /// the task from every later read with no entry ever rendered.
+    Deferred,
+}
+
 /// One NON-throttled reconcile pass over a read's still-live Background Tasks
 /// (issue #454): the shell and child ids the read names, one bounded runtime
 /// read, the positive-evidence verdicts applied to the transcript, at most one
-/// child-evidence read (#591) per subagent the verdict left unconfirmed, and
-/// the process-local overlay recording of what was retired. Zero requests when
-/// the read lists no live task; a failed or timed-out read leaves the
-/// transcript exactly as read — no verdict, no retirement, no settle — so a
-/// flaky runtime can never end a wait.
+/// child-evidence read (#591) per subagent the verdict left unconfirmed, and —
+/// under [`OverlayRecord::Now`] — the process-local overlay recording of what
+/// was retired. Zero requests when the read lists no live task; a failed or
+/// timed-out read leaves the transcript exactly as read — no verdict, no
+/// retirement, no settle — so a flaky runtime can never end a wait.
 ///
 /// [`RuntimeReconcile::observe`] composes this under its attempt-stamped 30 s
 /// throttle, which is how the poll paths (Session Sync, the drain, the
 /// follow/settle loop) share one verdict; the cleanup click calls it directly
-/// (spec #588, #590), because a click must never no-op behind a recent poll's
-/// verdict — it spends its own runtime read on the transcript it just read.
-/// Either way the overlay recording stays this one path, so every later read
-/// of the Session agrees on what retired.
+/// (spec #588, #590) with [`OverlayRecord::Deferred`], because a click must
+/// never no-op behind a recent poll's verdict — it spends its own runtime read
+/// on the transcript it just read, and commits the overlay itself only once
+/// its card refresh landed. The recording stays this one path either way, so
+/// every later read of the Session agrees on what retired.
 ///
 /// The caller hands in the cycle's [`CycleBudget`] (spec #588, review PR
 /// #595): `observe` starts one for the whole admitted cycle (this pass plus
@@ -239,6 +264,7 @@ pub(crate) async fn reconcile_now(
     directory: Option<&str>,
     transcript: &mut SessionTranscript,
     budget: CycleBudget,
+    record: OverlayRecord,
 ) -> Option<bool> {
     let (shells, children) = live_task_ids(transcript);
     if shells.is_empty() && children.is_empty() {
@@ -283,33 +309,14 @@ pub(crate) async fn reconcile_now(
                     None => {}
                 }
             }
-            // Record the retirements so every later transcript read — the
-            // live render, the drain's settle, the follow, the reap — sees
-            // them gone: the launch record never flips (issue #454), so
-            // without the overlay the next read would resurrect the task.
-            if !transcript.task_retirements.is_empty() {
-                let call_ids: Vec<String> = transcript
-                    .task_retirements
-                    .iter()
-                    .map(|retirement| retirement.task.tool.call_id.clone())
-                    .collect();
-                tracing::info!(
-                    "session {session_id}: runtime reconciliation retired {} background task(s)",
-                    call_ids.len()
-                );
-                backend.retire_background_tasks(session_id, &call_ids);
+            // The overlay commit rides the caller's mode (review, PR #595):
+            // the poll paths record here — their card admission already
+            // decided the pass can render what it observes — while the
+            // cleanup click defers it until its refresh landed, so a refresh
+            // the card refuses records nothing.
+            if record == OverlayRecord::Now {
+                record_overlay(backend, session_id, transcript);
             }
-            // The unconfirmed markers are process-local state too (review, spec
-            // #588): the read is fresh, and the ledger derives 状态待确认 from
-            // it, so a read the shared throttle does not spend a verdict on
-            // would drop the marker (and the cleanup button it gates) without
-            // any evidence the child is running. Record this verdict's
-            // post-evidence set — carried markers included, resolved ones
-            // absent — so the adapter re-applies it to every later read until
-            // the next verdict. The one writer; a failed or timed-out read
-            // never reaches here, so it clears nothing.
-            let unconfirmed: Vec<String> = transcript.unconfirmed_tasks.iter().cloned().collect();
-            backend.set_unconfirmed_tasks(session_id, &unconfirmed);
             Some(
                 transcript.task_retirements.len() > retired_before
                     || transcript.unconfirmed_tasks != unconfirmed_before,
@@ -323,6 +330,35 @@ pub(crate) async fn reconcile_now(
         }
         None => None,
     }
+}
+
+/// Commit one reconcile pass's verdicts to the process-local overlay (issue
+/// #454, review PR #595): every retirement the transcript carries — the
+/// runtime verdict's, the child evidence's, and the cleanup click's own
+/// synthetic Cleaned entries when it calls this — so every later read (the
+/// live render, the drain's settle, the follow, the reap) sees them gone; the
+/// launch record never flips, so without the overlay the next read would
+/// resurrect the task. And the pass's post-evidence unconfirmed set — carried
+/// markers included, resolved ones absent — so a read the shared throttle does
+/// not spend a verdict on keeps the markers and the cleanup button they gate
+/// (review, spec #588). [`reconcile_now`] calls this itself under
+/// [`OverlayRecord::Now`]; the cleanup click calls it under its own refresh
+/// gate, so a refused refresh records nothing.
+pub(crate) fn record_overlay(backend: &Arc<dyn Backend>, session_id: &str, transcript: &SessionTranscript) {
+    if !transcript.task_retirements.is_empty() {
+        let call_ids: Vec<String> = transcript
+            .task_retirements
+            .iter()
+            .map(|retirement| retirement.task.tool.call_id.clone())
+            .collect();
+        tracing::info!(
+            "session {session_id}: runtime reconciliation retired {} background task(s)",
+            call_ids.len()
+        );
+        backend.retire_background_tasks(session_id, &call_ids);
+    }
+    let unconfirmed: Vec<String> = transcript.unconfirmed_tasks.iter().cloned().collect();
+    backend.set_unconfirmed_tasks(session_id, &unconfirmed);
 }
 
 /// The shell and child session ids a read's still-live Background Tasks name,

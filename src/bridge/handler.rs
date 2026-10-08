@@ -2118,22 +2118,26 @@ impl App {
     /// a click must never no-op behind a recent poll's verdict: the live tasks
     /// the runtime cannot confirm yet are then exactly the
     /// [`SessionTranscript::unconfirmed_tasks`], and only those are cleared.
-    /// The shared step records every retirement it observes in the ADR-0065
-    /// overlay (process-local; a restart loses it and the next read re-derives
-    /// the wait from transcript + runtime), the same read carries the cleared
-    /// tasks' synthetic Cleaned retirements, and the ordinary yielded-card
-    /// refresh renders the result — rows dropped, one 🧹 entry per cleared
-    /// task (and per runtime/evidence retirement the read observed), and the
-    /// card settled by the same rules as a quiet true end (the last task gone
-    /// is ✅ in place, ADR-0060). The cleared tasks' own overlay record is
-    /// gated on that refresh landing (review, PR #595): a card that refuses
-    /// the write — a new Turn superseded it mid-pipeline — records nothing, so
-    /// the tasks stay live and the successor's button can clear them, instead
-    /// of being hidden without their entries. Every verdict that moved the
-    /// read refreshes the card, a marker-resolving `Running` verdict included
-    /// (review, PR #595): the stale ⚠️ 状态待确认 row and its button leave on
-    /// the click's own pass. A read that fails, and a verdict that changed
-    /// nothing at all, give the claim back so the button stays usable.
+    /// The pass runs with
+    /// [`OverlayRecord::Deferred`](crate::bridge::runtime::OverlayRecord), so
+    /// none of it reaches the ADR-0065 overlay yet (process-local; a restart
+    /// loses it and the next read re-derives the wait from the transcript and
+    /// the runtime). The same read carries the cleared tasks' synthetic
+    /// Cleaned retirements, and the ordinary yielded-card refresh renders the
+    /// result — rows dropped, one 🧹 entry per cleared task (and per
+    /// runtime/evidence retirement the read observed), and the card settled by
+    /// the same rules as a quiet true end (the last task gone is ✅ in place,
+    /// ADR-0060).
+    /// EVERY overlay record the click owes — the runtime/evidence retirements
+    /// its pass applied, the cleared ids, and the resolved marker set — is
+    /// committed only when that refresh lands (review, PR #595): a card that
+    /// refuses the write — a new Turn superseded it mid-pipeline — records
+    /// nothing, so the tasks stay live and the successor's button can clear
+    /// them, instead of being hidden without their entries. Every verdict that
+    /// moved the read refreshes the card, a marker-resolving `Running` verdict
+    /// included (review, PR #595): the stale ⚠️ 状态待确认 row and its button
+    /// leave on the click's own pass. A read that fails, and a verdict that
+    /// changed nothing at all, give the claim back so the button stays usable.
     async fn run_cleanup(
         handles: crate::bridge::handles::TurnHandles,
         session_id: String,
@@ -2169,6 +2173,10 @@ impl App {
             // window, exactly like a poll cycle's, so a stalled read cannot
             // stack per-suspect timeouts on the click either.
             crate::bridge::runtime::CycleBudget::within(read_timeout_ms),
+            // Deferred, not Now: none of this pass's overlay records may
+            // outlive a refresh the card refuses (review, PR #595). The
+            // record rides the write below.
+            crate::bridge::runtime::OverlayRecord::Deferred,
         )
         .await;
         let Some(changed) = verdict else {
@@ -2217,27 +2225,31 @@ impl App {
             read_timeout_ms,
         )
         .await;
-        // The overlay record is gated on the refresh's outcome (review, PR
-        // #595): the write admission is re-checked under the card lock, and a
-        // card replaced while this pipeline's reads were in flight (a new
-        // Turn's supersede, a late Wake) refuses the write — `Unchanged`,
-        // nothing submitted. Recording the cleared ids anyway would hide the
+        // EVERY overlay record the click owes is gated on the refresh's
+        // outcome (review, PR #595): the write admission is re-checked under
+        // the card lock, and a card replaced while this pipeline's reads were
+        // in flight (a new Turn's supersede, a late Wake) refuses the write —
+        // `Unchanged`, nothing submitted. The runtime/evidence retirements the
+        // pass applied and the cleared ids recorded anyway would hide the
         // tasks from every later transcript read without ever rendering their
-        // 🧹 entries, and no later read can reconstruct them. An accepted write
-        // counts even when the delivery layer drains it later (ADR-0067/0072),
-        // the same rule the Wake Watermark's drain uses; `Unchanged` records
-        // nothing, so the tasks stay live and the still-usable button can
-        // clear them on the card that took the chain.
-        if !cleared.is_empty() {
-            if matches!(update, crate::bridge::turn::YieldedUpdate::Unchanged) {
-                tracing::warn!(
-                    "cleanup: the card stopped admitting the refresh on session {session_id}; \
-                     keeping {} task(s) live",
-                    cleared.len()
-                );
-            } else {
-                handles.backend.retire_background_tasks(&session_id, &cleared);
-            }
+        // entries, and a resolved marker recorded anyway would drop the ⚠️ row
+        // and its button on a card that never took the resolution; no later
+        // read can reconstruct either. An accepted write counts even when the
+        // delivery layer drains it later (ADR-0067/0072), the same rule the
+        // Wake Watermark's drain uses; `Unchanged` records nothing, so the
+        // tasks stay live and the still-usable button can clear them on the
+        // card that took the chain. The commit is one call for the union —
+        // the pass's retirements, the cleaned retirements `apply_cleanup`
+        // appended above, and the post-verdict marker set — so no part can
+        // outlive the others.
+        if matches!(update, crate::bridge::turn::YieldedUpdate::Unchanged) {
+            tracing::warn!(
+                "cleanup: the card stopped admitting the refresh on session {session_id}; \
+                 recording nothing ({} task(s) stay live)",
+                transcript.task_retirements.len()
+            );
+        } else {
+            crate::bridge::runtime::record_overlay(&handles.backend, &session_id, &transcript);
         }
         tracing::info!(
             "cleanup: cleared {} task(s) on session {session_id} (refreshed: {})",
