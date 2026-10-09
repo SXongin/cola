@@ -1204,16 +1204,29 @@ impl Turn {
                     Some(DrainState::Vanished) => return Some(DrainState::Vanished),
                     // The Turn yields waiting (ADR-0059) or ends Unreceived
                     // (ADR-0062): the ending is decided, so there is nothing
-                    // left to observe.
-                    Some(state @ (DrainState::Waiting | DrainState::Unreceived)) => return Some(state),
+                    // left to observe — but only on a FULL read pair (spec
+                    // #602, review): a `Waiting`/`Unreceived` read (just like a
+                    // `Settled` one above) read out of an unreadable status
+                    // (`contact == false`) comes only from the transcript, which
+                    // cannot prove the Session's state. Acting on it would end
+                    // the run *before* the lost-contact grace, contradicting
+                    // #603's "a lost-contact run still ends in error at the
+                    // grace". Keep observing: the grace ends the card in error,
+                    // or a later readable tick yields. A readable non-live
+                    // status still yields promptly.
+                    Some(state @ (DrainState::Waiting | DrainState::Unreceived)) if tick.contact => {
+                        return Some(state);
+                    }
+                    Some(DrainState::Waiting | DrainState::Unreceived) => {}
                     _ => {}
                 }
             }
             // The lost-contact ceiling (#386): a tick that did not answer both
             // reads is no contact. A Settled/ending decision above still wins
-            // (the drain reads an unreadable status as idle for a landed run,
-            // so a hung status cannot hold forever); when nothing is decidable
-            // this grace ends the card.
+            // when it came from a full read pair (contact == true); a decision
+            // read out of an unreadable status never returns above (spec #602,
+            // review), so this grace owns that state — a hung status cannot
+            // hold the card forever, and it cannot short-circuit the grace.
             if tick.contact {
                 last_contact = tokio::time::Instant::now();
             } else if last_contact.elapsed() >= grace {
