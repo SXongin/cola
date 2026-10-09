@@ -1,6 +1,6 @@
 ---
 name: foreman
-description: Run one spec's tickets as a serial batch — resolve them via ## Parent, order by native blocking edges, implement each with an `implementer` sub-agent, run the `/code-review` + `/adversarial-review` pair on each ticket's commit window and once more over the whole branch, then stop for one spec-level acceptance before a single PR. Use ONLY when the user explicitly asks to run a spec's tickets (e.g. "/foreman 123"); never start a batch on your own.
+description: Run one spec's tickets as a serial batch — resolve them via ## Parent, order by native blocking edges, implement each with an `implementer` sub-agent, run the repo's review pair on each ticket's commit window and once more over the whole branch (`docs/agents/flow.md`), then stop for one spec-level acceptance before a single PR. Use ONLY when the user explicitly asks to run a spec's tickets (e.g. "/foreman 123"); never start a batch on your own.
 ---
 
 # Foreman
@@ -37,8 +37,8 @@ For each ticket, in order:
 
 1. **Mark the window** — `PRE=$(git rev-parse HEAD)`, the review's fixed point.
 2. **Dispatch the implementer** (`subagent_type: implementer`) with the dispatch prompt below.
-3. **Review the window** — load the `/code-review` and `/adversarial-review` skills and run both over `PRE...HEAD` with the ticket as the spec source. The review sub-agents dispatch from this main session; a sub-agent cannot spawn them.
-4. **Fix findings** — resume the same implementer session (`task_id`) with the findings, then re-review. Stop and ask after two fix rounds.
+3. **Review the window** — run the repo's review pair over `PRE...HEAD` with the ticket as the spec source (`docs/agents/flow.md`). The review sub-agents dispatch from this main session; a sub-agent cannot spawn them.
+4. **Fix findings** — resume the same implementer session (`task_id`) with the findings, then re-review under the binding's re-review bound (`docs/agents/flow.md`).
 5. **Record progress** — post the progress comment below. It carries the review outcome and marks the batch's sanctioned `/compact` boundary; never compact mid-ticket.
 
 Done when the ticket's commits are on the branch, its window review is clean or fixed, and the progress comment is posted. Then take the next ticket; never two at once.
@@ -47,7 +47,7 @@ Done when the ticket's commits are on the branch, its window review is clean or 
 
 Fetch and, if `origin/main` advanced, rebase the branch onto it — a conflict pauses the batch.
 
-Then close the per-ticket review's fidelity gap: no per-ticket pass saw the tickets together, and two tickets on different files can still interact (a config default one changes, the code another consumes). Run `/code-review` and `/adversarial-review` once each over the **whole branch** — `git diff origin/main...HEAD` (the branch was just rebased onto the fetched `origin/main`), the spec issue as the spec source — the same diff the PR's Codex gate will review. Fix findings like step 3.4 (the originating implementer for a ticket-local finding, a fresh implementer for a cross-ticket one or when the ticket's session is gone) and re-run the pass over the whole branch until clean or two rounds have passed.
+Then close the per-ticket review's fidelity gap: no per-ticket pass saw the tickets together, and two tickets on different files can still interact (a config default one changes, the code another consumes). Run the repo's review pair once each over the **whole branch** — `git diff origin/main...HEAD` (the branch was just rebased onto the fetched `origin/main`), the spec issue as the spec source — the same diff the PR's Codex gate will review. Fix findings like step 3.4 (the originating implementer for a ticket-local finding, a fresh implementer for a cross-ticket one or when the ticket's session is gone) and re-run the pass over the whole branch under the binding's re-review bound (`docs/agents/flow.md`).
 
 Then run the repo's full verification loop (`AGENTS.md`, "Local development") on the branch: fmt check, clippy, tests, release build.
 
@@ -89,7 +89,7 @@ Every implementer dispatch carries:
 
 - The ticket's number, title, and full body, fetched with `gh issue view <n>` and included verbatim.
 - The batch context: branch name, this is the only ticket this session touches, and `AGENTS.md` / `CONTRIBUTING.md` hold the conventions.
-- "Use `/implement`, but skip its closing `/code-review` and `/adversarial-review` steps — the foreman reviews after you report."
+- "Use `/implement`, but skip its closing review steps — the foreman runs the repo's review pair after you report (`docs/agents/flow.md`)."
 - "Do not push, open PRs, close issues, or comment on the tracker."
 
 Fix rounds resume the same `task_id` and carry the findings verbatim, plus: "Fix what is valid, say why for what isn't, rerun the affected tests, commit, and report again."
