@@ -2985,6 +2985,79 @@ async fn a_final_part_landing_between_the_render_and_idle_read_still_lands() {
     );
 }
 
+/// Finding 3 (spec #602 pre-push review, #604): a tail that lands AFTER the
+/// drain has settled — after its last transcript read — must still reach the
+/// Card. Finalization may not trust the drain's cached `last_transcript`
+/// blindly; it must re-read and re-render until it observes a rendered,
+/// quiescent snapshot. The old short-circuit stamped the ending on the stale,
+/// tail-less snapshot, and the tail later orphaned into a second (residual)
+/// Wake-less Card — the very #604 race.
+#[tokio::test]
+async fn a_tail_landing_after_the_drain_settled_still_lands_on_the_card() {
+    let _wd = test_work_dir();
+    let tail_less = vec![
+        user("msg_cola_anchor", 1_000, "第一条消息"),
+        assistant(2_000, "第一段。"),
+    ];
+    let with_tail = vec![
+        user("msg_cola_anchor", 1_000, "第一条消息"),
+        assistant(2_000, "第一段。"),
+        assistant(3_000, "第二段。"),
+    ];
+    let (_dir, app, backend, platform) = scripted_app(
+        vec![SessionTranscript::new(tail_less.clone())],
+        Some(SessionStatus::Busy),
+    )
+    .await;
+    app.turn_follow_grace_ms.store(60_000, Ordering::Relaxed);
+    app.turn_follow_read_timeout_ms.store(60_000, Ordering::Relaxed);
+
+    let _turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
+    wait_for_card_text(&platform, "第一段。").await;
+    // Let the in-flight submit-window render poll stop: from here the drain is
+    // the only transcript reader, so the read frozen below is its own.
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    // Freeze the drain at its next transcript read: with the session still
+    // reading Busy this is a settle candidate, and no permit is added until the
+    // state below is staged.
+    let gate = backend.hold_transcripts();
+    wait_for_parked_reads(&backend, 1).await;
+    // The session goes Idle: the frozen read is the settle tick. Both it and the
+    // drain's corroborating re-check are served the tail-less snapshot; the tail
+    // is scripted only for the read AFTER them — finalization's own fresh read.
+    backend
+        .set_session_status("ses_test", Some(SessionStatus::Idle))
+        .await;
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(tail_less.clone()),
+            SessionTranscript::new(tail_less.clone()),
+            SessionTranscript::new(with_tail.clone()),
+        ],
+    )
+    .await;
+    *backend.transcript_gate.lock().unwrap() = None;
+    gate.add_permits(1);
+
+    wait_for_guard_release(&app).await;
+    let final_card = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_header(&final_card).contains("完成"),
+        "the turn ends on the Card: {final_card}"
+    );
+    assert!(
+        card_text(&final_card).contains("第二段。"),
+        "a tail that landed after the drain settled must reach the Card: {final_card}"
+    );
+    assert!(
+        continuation_sends(&platform).await.is_empty(),
+        "no second/residual Card may open for the tail: {:?}",
+        platform.calls.lock().await
+    );
+}
+
 /// A Wake's content landing in the finalization window must not satisfy the
 /// Turn's completion check: its Execution has not reached a boundary yet, so
 /// the Turn keeps observing (the old "any terminal step since the anchor" rule
