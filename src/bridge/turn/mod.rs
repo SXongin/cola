@@ -4749,9 +4749,15 @@ async fn release_inflight(handles: &TurnHandles, session_id: &str) {
 /// size-split that continued on a new card both answer "accepted now" and
 /// announce at once; a failed ending PATCH queued as a Pending Card Update
 /// announces only when that update DRAINS, so the notice never lands before the
-/// terminal slice it announces. A permanently refused terminal write suppresses
-/// the notice. The disposition's own classification and the opt-in rules are
-/// unchanged — this only fixes the timing/gate.
+/// terminal slice it announces. A permanently refused terminal write — and a
+/// size-split continuation create that failed, whose slice never reached Feishu
+/// — suppresses the notice through the accumulator's
+/// [`ending_write_accepted`](super::state::EndingWriteAccepted), read before the
+/// delivery-layer gate so the OLD card's delivered write can never answer for
+/// the failed continuation. A missing tracked card is likewise suppressed:
+/// without a card there is no write to gate on. The disposition's own
+/// classification and the opt-in rules are unchanged — this only fixes the
+/// timing/gate.
 ///
 /// The one entry point every ending takes (the in-Turn `finish`, the out-of-turn
 /// follow, the Wake in-place resume and Session Sync's quiet true end) — so all
@@ -4770,17 +4776,32 @@ pub(crate) async fn announce_completion(
     if disposition.notice_copy().is_none() {
         return;
     }
-    // The card carrying the terminal slice: the session's tracked card. With
-    // none there is no write to gate on (the loading window or an already-
-    // collected card), so fall through to the primitive, as before.
-    let card_id = {
+    // The card carrying the terminal slice and whether that write was accepted
+    // by delivery (#607), read under one lock. `ending_write_accepted` is
+    // `false` when a size-split continuation create failed or an ending PATCH
+    // was permanently refused — the tail never reached Feishu.
+    let (card_id, ending_write_accepted) = {
         let live = cards.cards.lock().await;
-        live.get(session_id).and_then(|card| card.card_message_id.clone())
+        match live.get(session_id) {
+            Some(card) => (card.card_message_id.clone(), card.acc.ending_write_accepted.0),
+            None => (None, true),
+        }
     };
+    // No tracked card: there is no write to gate on, so the notice is
+    // suppressed rather than sent without a delivery verdict (spec #602,
+    // review). A card collected before its ending has no terminal write that
+    // could have reached Feishu.
     let Some(card_id) = card_id else {
-        send_completion_notice(cards, platform, rules, session_id, started_at, disposition).await;
+        tracing::warn!("completion notice suppressed: no tracked card for {session_id} to gate delivery on");
         return;
     };
+    // The terminal write's own carrier refused: the delivery layer would answer
+    // for the OLD card (whose earlier write delivered), so the notice would be
+    // announced over a terminal tail that never landed. Suppress instead.
+    if !ending_write_accepted {
+        tracing::warn!("completion notice suppressed: the terminal write for {session_id} was refused");
+        return;
+    }
     // The deferred closure spawns the send on fire: the delivery layer calls it
     // from a drain, and the notice's own lookup and reply must not run under
     // the delivery layer's lock.

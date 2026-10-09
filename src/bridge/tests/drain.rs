@@ -3668,3 +3668,41 @@ async fn a_size_split_terminal_flush_notifies_after_the_new_card() {
         "the notice must follow the new card's send: {calls:?}"
     );
 }
+
+/// Finding D (spec #602 review): a size-split whose continuation create FAILS
+/// leaves the tracked card id on the OLD card, whose finalize PATCH delivered —
+/// so the delivery layer would answer "Delivered" for the wrong card and the
+/// notice would fire although the terminal tail never reached Feishu. The
+/// terminal write's own acceptance must suppress it.
+#[tokio::test]
+async fn a_failed_size_split_continuation_create_suppresses_the_notice() {
+    let _wd = test_work_dir();
+    let long = format!("{}【尾部标记】", "很长的回答。".repeat(1200));
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "你好"),
+        assistant(2_000, &long),
+    ]);
+    let (_dir, app, _backend, platform) = scripted_app(vec![transcript], Some(SessionStatus::Idle)).await;
+    // The loading card (the first create) lands; every continuation create
+    // fails with an ambiguous transport error, so the terminal tail never
+    // reaches Feishu. One outcome per card the chain could attempt (MAX_CARD_CHAIN).
+    {
+        let mut outcomes = platform.reply_card_outcomes.lock().unwrap();
+        outcomes.push_back(ReplyOutcome::Lands);
+        for _ in 0..(crate::bridge::turn::MAX_CARD_CHAIN + 1) {
+            outcomes.push_back(ReplyOutcome::Ambiguous);
+        }
+    }
+    let mut context = ctx("ses_test", "你好");
+    context.is_group = true;
+    context.requester_open_id = Some(TEST_HOST.to_string());
+
+    Turn::run(&app.turn_handles(), context).await.unwrap();
+    // Give a suppressed notice no window to land late.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !noticed(&platform).await,
+        "a continuation create that never carried the tail must suppress the notice: {:?}",
+        platform.calls.lock().await
+    );
+}
