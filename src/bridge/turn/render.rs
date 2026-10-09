@@ -109,16 +109,16 @@ async fn refresh_session_title(
     let Some(card) = live.get_mut(session_id) else {
         return false;
     };
-    if card.acc.title == fresh {
+    if card.acc.title() == fresh {
         return false;
     }
     tracing::info!(
         "session {} title updated: {:?} -> {:?}",
         session_id,
-        card.acc.title,
+        card.acc.title(),
         fresh
     );
-    card.acc.title = fresh;
+    card.acc.set_title(&fresh);
     drop(live);
     Turn::flush_card(cards, session_id).await;
     // The topic cover card is the chat-list topic entry — sync it the MOMENT
@@ -378,15 +378,9 @@ pub(super) fn capture_footer_model(acc: &mut StreamAccumulator, message: &crate:
     let Some(model) = &message.model else {
         return;
     };
-    acc.model_id = Some(model.model_id.clone());
     // The decoder reports an absent provider as an empty string; an empty
     // value leaves the last known provider in place.
-    if !model.provider_id.is_empty() {
-        acc.provider_id = Some(model.provider_id.clone());
-    }
-    if let Some(variant) = &model.variant {
-        acc.variant = Some(variant.clone());
-    }
+    acc.apply_footer_model(&model.model_id, &model.provider_id, model.variant.as_deref());
 }
 
 /// The completion entry a shell/subagent Wake leaves on the card that hosted
@@ -552,7 +546,7 @@ fn plan_wake_entries(
             // announces, whose server times are at/after it (the 承接 line's own
             // lesson).
             at: Some(created_ms.saturating_sub(1)),
-            directory: acc.directory.clone(),
+            directory: acc.directory().map(str::to_string),
             entry,
         });
     }
@@ -622,7 +616,7 @@ fn plan_runtime_entries(acc: &StreamAccumulator, transcript: &SessionTranscript)
             key,
             announce: PlannedAnnounce::Synthetic,
             at: retirement.finished_at,
-            directory: acc.directory.clone(),
+            directory: acc.directory().map(str::to_string),
             entry,
         });
     }
@@ -880,7 +874,7 @@ pub(super) fn render_turn_parts(acc: &mut StreamAccumulator, transcript: &Sessio
         if let Some(tokens) = &message.tokens {
             let used = tokens.context_used();
             if used > 0 {
-                acc.context_tokens = used;
+                acc.set_context_tokens(used);
             }
         }
         let message_pos = message_positions.get(message.id.as_str()).copied();
@@ -1571,7 +1565,7 @@ async fn render_and_flush_inner(
             // abandoned by the caller's timeout (#457), and the external
             // renderer renews from the accumulator's mark, not from a flag a
             // cancelled pass can never return.
-            card.acc.progress_mark += 1;
+            card.acc.bump_progress_mark();
         }
         // The Turn anchor this render captured (or already carried) plus the
         // card it belongs to: the durable live-card record's anchor is written
@@ -1607,7 +1601,7 @@ async fn render_and_flush_inner(
                 if inserted {
                     // An inserted entry is rendered content, not clock churn:
                     // it owes its flush and counts as progress, like a part.
-                    card.acc.progress_mark += 1;
+                    card.acc.bump_progress_mark();
                 }
                 inserted
             }
@@ -1641,7 +1635,7 @@ async fn render_and_flush_inner(
                 let changed = card.last_context_sig != sig;
                 card.last_context_sig = sig;
                 if changed {
-                    card.acc.progress_mark += 1;
+                    card.acc.bump_progress_mark();
                 }
                 changed
             }
@@ -1673,7 +1667,7 @@ async fn render_and_flush_inner(
                 // external renderer's idle bound, or a silent task's ticking
                 // age would keep its card live forever (#457).
                 if ledger.rows || liveness_changed {
-                    card.acc.progress_mark += 1;
+                    card.acc.bump_progress_mark();
                 }
                 (ledger, liveness_changed)
             }
@@ -2142,7 +2136,7 @@ mod tests {
             message("a2", 200, TokenUsage::default()),
         ]);
         render_new_turn_parts(&mut acc, &transcript);
-        assert_eq!(acc.context_tokens, 210_239);
+        assert_eq!(acc.context_tokens(), 210_239);
 
         // The next completed step updates the figure as usual.
         let transcript = SessionTranscript::new(vec![
@@ -2157,7 +2151,7 @@ mod tests {
             ),
         ]);
         render_new_turn_parts(&mut acc, &transcript);
-        assert_eq!(acc.context_tokens, 216_860);
+        assert_eq!(acc.context_tokens(), 216_860);
     }
 
     #[test]
@@ -5390,7 +5384,15 @@ Index: /x/src/main.rs
         )
         .await;
         assert!(refreshed, "a server rename must refresh the card title");
-        let title = app.cards.lock().await.get("ses_test").unwrap().acc.title.clone();
+        let title = app
+            .cards
+            .lock()
+            .await
+            .get("ses_test")
+            .unwrap()
+            .acc
+            .title()
+            .to_string();
         assert_eq!(title, "修复登录鉴权问题 · test");
         // A second refresh with no further change must be a no-op (no churn).
         assert!(

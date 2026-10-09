@@ -912,7 +912,7 @@ impl Turn {
         // time, ADR-0019). The model/token halves are captured from the
         // transcript's messages themselves.
         if let Some(card) = handles.cards.cards.lock().await.get_mut(&self.session_id) {
-            card.acc.variant = self.turn_variant.clone();
+            card.acc.set_variant(self.turn_variant.clone());
         }
 
         // Reconcile: render any parts the incremental poll missed from the
@@ -967,7 +967,7 @@ impl Turn {
                         if let Some(tokens) = &message.tokens {
                             let used = tokens.context_used();
                             if used > 0 {
-                                acc.context_tokens = used;
+                                acc.set_context_tokens(used);
                             }
                         }
                     }
@@ -2034,7 +2034,7 @@ impl Turn {
                             .map(|anchor| anchor.message_id.clone())
                     }),
                     card.acc.turn_anchor.as_ref().map(|anchor| anchor.created_ms),
-                    card.acc.directory.clone(),
+                    card.acc.directory().map(str::to_string),
                     // The chain's durable reply target (issue #580): the Feishu
                     // message the card replies under — an OpenCode message id
                     // is never a deliverable target.
@@ -2127,7 +2127,7 @@ impl Turn {
                         .map(|anchor| anchor.message_id.clone())
                 }),
                 card.acc.turn_anchor.as_ref().map(|anchor| anchor.created_ms),
-                card.acc.directory.clone(),
+                card.acc.directory().map(str::to_string),
                 // The chain's durable reply target (issue #580): a split whose
                 // supplement moved the anchor carries the newest one.
                 card.acc.reply_to_message_id().map(str::to_string),
@@ -3255,7 +3255,7 @@ impl Turn {
             .lock()
             .await
             .get(session_id)
-            .map(|c| c.acc.progress_mark)
+            .map(|c| c.acc.progress_mark())
     }
 
     /// Whether the session's card still carries an unfinished Tool Panel the
@@ -3465,7 +3465,7 @@ impl Turn {
             session_id: session_id.to_string(),
             prompt,
             reply_to: card.acc.reply_to_message_id().unwrap_or_default().to_string(),
-            subtitle: card.acc.title.clone(),
+            subtitle: card.acc.title().to_string(),
             requester_open_id: card.acc.requester_open_id().map(str::to_string),
             is_group: card.acc.is_group(),
             cola_message_id: card.acc.cola_message_id().map(str::to_string),
@@ -4021,7 +4021,7 @@ impl Turn {
     /// Set the card's subtitle/title.
     pub(crate) async fn set_title(cards: &CardsHandle, session_id: &str, title: &str) {
         if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
-            card.acc.title = title.to_string();
+            card.acc.set_title(title);
         }
     }
 
@@ -4059,8 +4059,7 @@ impl Turn {
     /// Record the answering model and its provider.
     pub(crate) async fn set_model(cards: &CardsHandle, session_id: &str, provider: &str, model: &str) {
         if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
-            card.acc.provider_id = Some(provider.to_string());
-            card.acc.model_id = Some(model.to_string());
+            card.acc.apply_footer_model(model, provider, None);
         }
     }
 
@@ -4634,7 +4633,9 @@ mod tests {
             "the attempt sends the session's variant"
         );
         let cards = app.cards.lock().await;
-        let footer_variant = cards.get("ses_a").and_then(|c| c.acc.variant.clone());
+        let footer_variant = cards
+            .get("ses_a")
+            .and_then(|c| c.acc.variant().map(str::to_string));
         assert_eq!(footer_variant.as_deref(), Some("high"));
     }
 
@@ -4695,11 +4696,11 @@ mod tests {
         let cards = app.cards.lock().await;
         let acc = cards.get("ses_a").expect("the turn's card");
         assert_eq!(
-            acc.acc.variant.as_deref(),
+            acc.acc.variant(),
             Some("high"),
             "the footer reads the transcript's variant"
         );
-        assert_eq!(acc.acc.model_id.as_deref(), Some("deepseek-v4-flash"));
+        assert_eq!(acc.acc.model_id(), Some("deepseek-v4-flash"));
     }
 
     /// On a durable generation the turn's variant comes from the SESSION's
@@ -4743,7 +4744,10 @@ mod tests {
         );
         let cards = app.cards.lock().await;
         assert!(
-            cards.get("ses_a").and_then(|c| c.acc.variant.clone()).is_none(),
+            cards
+                .get("ses_a")
+                .and_then(|c| c.acc.variant().map(str::to_string))
+                .is_none(),
             "nor tag the footer"
         );
     }
