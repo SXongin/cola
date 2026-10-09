@@ -110,6 +110,20 @@ fn flush_outcome(wrote: bool, refused: bool) -> FlushOutcome {
     }
 }
 
+/// Record on the session's accumulator whether the write carrying this flush's
+/// **terminal slice** was accepted by delivery (spec #602, ticket #607): `true`
+/// when delivered now or owed by the delivery layer's pending retry, `false`
+/// when permanently refused — a size-split continuation create that failed, a
+/// suspended card, a non-recoverable ending PATCH. A later flush overwrites it,
+/// and `announce_completion` reads it to suppress the notice over a terminal
+/// slice that never reached Feishu.
+async fn set_ending_write_accepted(cards: &CardsHandle, session_id: &str, accepted: bool) {
+    let mut live = cards.cards.lock().await;
+    if let Some(card) = live.get_mut(session_id) {
+        card.acc.ending_write_accepted = super::state::EndingWriteAccepted(accepted);
+    }
+}
+
 /// Whether a flush may finalize the tracked card and continue on a new one.
 #[derive(Clone, Copy)]
 pub(super) enum SplitPolicy {
@@ -423,7 +437,8 @@ pub(super) async fn flush_card_locked(
         // The fenced fallback was rejected too: the card cannot be delivered,
         // and re-PATCHing it on every poll would only hammer the API. Nothing
         // will ever be written for its payloads — a permanent refusal for the
-        // caller's record gate (review, PR #595).
+        // caller's record gate (review, PR #595) and for the notice (#607).
+        set_ending_write_accepted(cards, session_id, false).await;
         return FlushOutcome::Refused;
     }
     // The writes this flush issues, tracked for its answer (review, PR #595):
@@ -538,6 +553,7 @@ pub(super) async fn flush_card_locked(
                                     )
                                     .await;
                                     release_spent(cards, session_id).await;
+                                    set_ending_write_accepted(cards, session_id, false).await;
                                     return FlushOutcome::Refused;
                                 }
                             }
@@ -573,6 +589,9 @@ pub(super) async fn flush_card_locked(
                     // staged Wake Watermark is now user-visible (ADR-0061).
                     drain_wake_watermark(cards, session_id, watermark).await;
                 }
+                // The direct PATCH is this flush's terminal carrier: delivered
+                // or owed reads accepted, permanently refused reads not.
+                set_ending_write_accepted(cards, session_id, !refused).await;
                 return flush_outcome(wrote, refused);
             }
             // The tracked card is finalized: it overflowed (size split) or a
@@ -708,6 +727,7 @@ pub(super) async fn flush_card_locked(
                                 .lock()
                                 .await
                                 .record(&card_id, &finalized.card, Vec::new());
+                            set_ending_write_accepted(cards, session_id, false).await;
                             return FlushOutcome::Refused;
                         }
                         note_cursor_write_failure(
@@ -753,6 +773,13 @@ pub(super) async fn flush_card_locked(
                 // (a queued split's 承接 line still owes the continuation send
                 // — the drain helper holds it back).
                 drain_wake_watermark(cards, session_id, watermark).await;
+            }
+            // The finalized slice's PATCH is the terminal carrier only when no
+            // continuation create follows (both the reply target and the
+            // fallback Chat unknown) — the create below overwrites this when it
+            // runs. Record its verdict so the no-continuation case is gated too.
+            if should_patch {
+                set_ending_write_accepted(cards, session_id, !refused).await;
             }
             continue;
         }
@@ -805,6 +832,9 @@ pub(super) async fn flush_card_locked(
                 {
                     let mut cards = cards.cards.lock().await;
                     if let Some(card) = cards.get_mut(session_id) {
+                        // The continuation create carried the terminal slice:
+                        // its delivery is the flush's terminal fact (#607).
+                        card.acc.ending_write_accepted = super::state::EndingWriteAccepted(true);
                         card.card_message_id = Some(new_id.clone());
                         // A continuation that fits becomes the live card; one
                         // that is itself over the budget stays finalized and
@@ -865,10 +895,14 @@ pub(super) async fn flush_card_locked(
                 // moved elsewhere (defensive; the card-write lock serializes
                 // flushes) from being rewound.
                 let mut cards = cards.cards.lock().await;
-                if let Some(card) = cards.get_mut(session_id)
-                    && card.acc.render_from == slice_to
-                {
-                    card.acc.render_from = slice_from;
+                if let Some(card) = cards.get_mut(session_id) {
+                    // The continuation create reached no card: the terminal
+                    // slice never landed, so the notice must be suppressed
+                    // (#607). A fenced retry overwrites this on its next send.
+                    card.acc.ending_write_accepted = super::state::EndingWriteAccepted(false);
+                    if card.acc.render_from == slice_to {
+                        card.acc.render_from = slice_from;
+                    }
                 }
                 drop(cards);
                 if retry_fenced {

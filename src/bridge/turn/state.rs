@@ -1011,6 +1011,21 @@ pub(super) struct StagedWatermark {
     pub(super) id: u64,
 }
 
+/// Whether the write carrying a flush's **terminal slice** was accepted by
+/// delivery (spec #602, ticket #607): delivered now, or owed by the delivery
+/// layer's pending retry. A `bool` newtype so [`StreamAccumulator`] can keep
+/// deriving `Default` while this field defaults to `true` — before any flush
+/// there is no terminal write to doubt, and the Completion Notice gate must not
+/// suppress on that absence. A later flush overwrites it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct EndingWriteAccepted(pub(super) bool);
+
+impl Default for EndingWriteAccepted {
+    fn default() -> Self {
+        Self(true)
+    }
+}
+
 /// Accumulates streaming state for one session.
 #[derive(Default, Clone)]
 pub(super) struct StreamAccumulator {
@@ -1019,6 +1034,13 @@ pub(super) struct StreamAccumulator {
     /// `None` and is advanced by the flush when Feishu rejects a card it
     /// built. A fresh turn starts clean and re-tries the normal rendering.
     pub(super) card_fallback: CardFallback,
+    /// Whether the write carrying this card's flush's terminal slice was
+    /// accepted by delivery (spec #602, ticket #607): `true` when delivered now
+    /// or owed by the pending retry, `false` when permanently refused — a
+    /// size-split continuation create that failed, or a refused ending PATCH.
+    /// The Completion Notice gate reads it to suppress a notice over a tail
+    /// that never reached Feishu.
+    pub(super) ending_write_accepted: EndingWriteAccepted,
     pub(super) text: String,
     pub(super) reasoning: String,
     /// Tool panels keyed by call ID (current state; `timeline` keeps order).
