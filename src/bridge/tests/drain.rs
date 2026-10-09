@@ -1051,6 +1051,70 @@ async fn a_settled_read_over_an_unanswered_status_does_not_finalize_done() {
     assert_no_further_rendering(&backend, &platform).await;
 }
 
+/// Finding (spec #602 review): an unreadable status must not yield a Waiting
+/// card either. Here the transcript is readable and settles to `Waiting` (an
+/// idle boundary with a live Background Task), but `session_status` never
+/// answers — so no tick is a full read pair. The `Waiting` decision comes only
+/// from the transcript; yielding it would end the run *before* the lost-contact
+/// grace, contradicting #603's "a lost-contact run still ends in error at the
+/// grace". The grace owns the state: the card stays live (never 「等待后台任务」)
+/// and ends Error with the lost-contact copy.
+#[tokio::test]
+async fn an_unreadable_status_never_yields_a_waiting_card() {
+    let _wd = test_work_dir();
+    let live = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_background_tasks(vec![background_shell(2_100)]);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    // The status read never answers: every tick is a partial read pair, so the
+    // settle decision's `Waiting` may not be acted on.
+    backend.session_status_fails.store(true, Ordering::SeqCst);
+    // A grace the test can observe: short enough to wait out, long enough that
+    // an immediate yield would have shown itself.
+    app.turn_follow_grace_ms.store(300, Ordering::Relaxed);
+
+    let turn = spawn_turn(&app, ctx("ses_test", "跑一下 CI"));
+    // The still-readable transcript renders the turn's content...
+    wait_for_card_text(&platform, "已经交给后台了。").await;
+    // ...but well before the grace the card must NOT carry the waiting yield:
+    // no ending may be claimed from a read that never answered.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !platform
+            .updated_cards()
+            .await
+            .iter()
+            .any(|card| card_header(card).contains("等待后台任务")),
+        "an unreadable status must not yield Waiting before the grace: {:?}",
+        platform.updated_cards().await
+    );
+    assert!(
+        app.inflight.lock().await.contains("ses_test"),
+        "the drain keeps observing instead of yielding"
+    );
+
+    // The grace then ends the run in error with the lost-contact copy.
+    wait_for_card_header(&platform, "出错").await;
+    let result = tokio::time::timeout(Duration::from_secs(5), turn)
+        .await
+        .expect("the lost-contact grace must end the turn")
+        .unwrap();
+    result.unwrap();
+    let final_card = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_text(&final_card).contains("失去联系"),
+        "the lost-contact copy: {final_card}"
+    );
+    assert!(
+        !card_header(&final_card).contains("等待后台任务"),
+        "the grace's ending is never the waiting yield: {final_card}"
+    );
+    assert_no_further_rendering(&backend, &platform).await;
+}
+
 /// A live `⏳` panel on a readable, idle session that never settles is an
 /// unreconcilable panel: the drain gives it the grace to settle, then ends
 /// Error — never Done over a `⏳`, never an eternal card (#386).
