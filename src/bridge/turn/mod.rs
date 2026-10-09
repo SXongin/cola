@@ -4764,8 +4764,23 @@ async fn release_inflight(handles: &TurnHandles, session_id: &str) {
     inflight.remove(session_id);
 }
 
-/// Send the Completion Notice gated on the terminal write's own **fate** (spec
-/// #602, ticket #607): the write must have been delivered now, or be owed by the
+/// Send the Completion Notice (ADR-0043 amendment 2026-09-21) gated on the
+/// terminal write's own **fate** (spec #602, ticket #607): the streaming card is
+/// patched in place, which pushes no notification and does not bump the
+/// conversation — so reply to the requester's message to notify them. Groups
+/// notify on every turn (`[bridge] group_completion_notice`); p2p only for a
+/// long task (`[bridge] long_task_notice`, past the injected threshold), where
+/// "long" is the one event worth surfacing even though the user was presumably
+/// around. The copy follows the ending's [`Disposition`] (#394): ✅ for the true
+/// end, ⏹ for a deliberate `/stop`, ❌ for a failure — and the disposition's
+/// classification is the refusal, so a Waiting yield (whose true end is not
+/// reached, ADR-0059) and an Unreceived ending (ADR-0062) can never be announced
+/// even by a caller that forgot to guard. A free function because every end of a
+/// turn calls it (`finish`, the out-of-turn follow, the Wake in-place resume and
+/// Session Sync's quiet true end); `finish` keeps the ORIGINAL turn's start, so
+/// the long-task threshold measures the whole run.
+///
+/// The write must have been delivered now, or be owed by the
 /// delivery layer's retry. A direct PATCH to the current card and a size-split
 /// that continued on a new card both read [`EndingWrite::Delivered`] and
 /// announce at once; a failed ending PATCH queued as a Pending Card Update reads
@@ -4780,8 +4795,12 @@ async fn release_inflight(handles: &TurnHandles, session_id: &str) {
 ///
 /// The one entry point every ending takes (the in-Turn `finish`, the out-of-turn
 /// follow, the Wake in-place resume and Session Sync's quiet true end) — so all
-/// carriers are covered by one rule. The notice's own lookup and copy stay in
-/// [`send_completion_notice`], the primitive this gates.
+/// carriers are covered by one rule. The recipient and copy are resolved ONCE
+/// here ([`resolve_completion_notice`]), against the card that carried the
+/// terminal write: a deferred notice therefore carries the ORIGINAL request's
+/// requester and re-checks the card's identity before sending
+/// ([`deliver_deferred_notice`]), so a newer Turn's card is never announced over
+/// the old request's ending (review finding 1).
 pub(crate) async fn announce_completion(
     cards: &CardsHandle,
     platform: &Arc<dyn crate::feishu::Platform>,
@@ -4814,6 +4833,12 @@ pub(crate) async fn announce_completion(
         tracing::warn!("completion notice suppressed: no tracked card for {session_id} to gate delivery on");
         return;
     };
+    // Resolve the notice's recipient, chat kind and copy ONCE, against the card
+    // that carried the terminal write (spec #602, review finding 1). A deferred
+    // notice must send to THIS request's requester, never to a card a newer Turn
+    // replaced while the terminal write was still owed. `None` keeps it silent
+    // (the disposition, the opt-ins or a missing requester/reply target).
+    let resolved = resolve_completion_notice(cards, rules, session_id, started_at, disposition).await;
     match ending {
         // The terminal slice's own carrier refused: the delivery layer would
         // answer for the OLD card (whose earlier write delivered), so the
@@ -4822,9 +4847,12 @@ pub(crate) async fn announce_completion(
         EndingWrite::Failed => {
             tracing::warn!("completion notice suppressed: the terminal write for {session_id} was refused");
         }
-        // The terminal slice is on Feishu: announce at once.
+        // The terminal slice is on Feishu: announce at once, to the request that
+        // ended.
         EndingWrite::Delivered => {
-            send_completion_notice(cards, platform, rules, session_id, started_at, disposition).await;
+            if let Some(notice) = resolved {
+                send_resolved_notice(platform, &notice).await;
+            }
         }
         // The terminal slice is owed by the delivery layer's retry at THIS
         // sequence. The gate arms the notice against that exact sequence (so an
@@ -4832,33 +4860,28 @@ pub(crate) async fn announce_completion(
         // already drained it announces now, and if it was superseded or evicted
         // it is suppressed.
         EndingWrite::Owed(seq) => {
+            let Some(notice) = resolved else {
+                return;
+            };
             // The deferred closure spawns the send on fire: the delivery layer
-            // calls it from a drain, and the notice's own lookup and reply must
-            // not run under the delivery layer's lock.
-            let notice: crate::feishu::DeferredNotice = {
+            // calls it from a drain, and the notice's own reply must not run
+            // under the delivery layer's lock. It carries the resolved recipient
+            // AND the original card's identity, so it re-checks ownership before
+            // sending (review finding 1).
+            let deferred: crate::feishu::DeferredNotice = {
                 let cards = cards.clone();
                 let platform = Arc::clone(platform);
-                let rules = rules.clone();
-                let session_id = session_id.to_string();
-                let disposition = disposition.clone();
+                let notice = notice.clone();
                 Box::new(move || {
                     tokio::spawn(async move {
-                        send_completion_notice(
-                            &cards,
-                            &platform,
-                            &rules,
-                            &session_id,
-                            started_at,
-                            &disposition,
-                        )
-                        .await;
+                        deliver_deferred_notice(&cards, &platform, notice).await;
                     });
                 })
             };
-            match platform.defer_notice_until_delivered(&card_id, seq, notice) {
+            match platform.defer_notice_until_delivered(&card_id, seq, deferred) {
                 crate::feishu::NoticeGate::Armed => {}
                 crate::feishu::NoticeGate::Delivered => {
-                    send_completion_notice(cards, platform, rules, session_id, started_at, disposition).await;
+                    send_resolved_notice(platform, &notice).await;
                 }
                 crate::feishu::NoticeGate::Never => {
                     tracing::warn!(
@@ -4870,73 +4893,98 @@ pub(crate) async fn announce_completion(
     }
 }
 
-/// The completion notice (ADR-0043 amendment 2026-09-21): the streaming card is
-/// patched in place, which pushes no notification and does not bump the
-/// conversation — so reply to the requester's message to notify them. Groups
-/// notify on every turn (`[bridge] group_completion_notice`); p2p only for a
-/// long task (`[bridge] long_task_notice`, past the injected threshold), where
-/// "long" is the one event worth surfacing even though the user was presumably
-/// around.
-///
-/// A free function because every end of a turn calls it: `finish` for a turn
-/// that ended normally, the out-of-turn follow (#284) when a card it inherited
-/// actually ends, and Session Sync when a yielded card's quiet true end settles
-/// in place (ADR-0060). `finish` keeps the ORIGINAL turn's start, so the
-/// long-task threshold measures the whole run; a retry re-attach (#393) arms
-/// the follow with "now" instead, because the original turn's start is no
-/// longer known there; the quiet true end reads the start the card recorded at
-/// turn start. The copy follows the ending's [`Disposition`]
-/// (#394): ✅ for the true end, ⏹ for a deliberate `/stop`, ❌ for a failure —
-/// and the disposition's classification is the refusal, so a Waiting yield
-/// (whose true end is not reached, ADR-0059) and an Unreceived ending
-/// (ADR-0062) can never be announced even by a caller that forgot to guard.
-pub(crate) async fn send_completion_notice(
+/// A Completion Notice resolved against the card that carried the terminal
+/// write: the recipient, chat kind and copy fixed at arm time, plus the card
+/// identity it belonged to (spec #602, review finding 1). Resolving once means
+/// a deferred notice can never be redirected to a card a newer Turn replaced
+/// while the terminal write was still owed.
+#[derive(Clone)]
+struct ResolvedNotice {
+    session_id: String,
+    card_message_id: String,
+    reply_to: String,
+    requester: String,
+    is_group: bool,
+    text: &'static str,
+}
+
+/// Resolve the Completion Notice against the session's current card, or `None`
+/// when the disposition, the opt-ins or a missing recipient keep it silent.
+/// Reading the card here (not at fire time) is what binds a deferred notice to
+/// the request that ended.
+async fn resolve_completion_notice(
     cards: &CardsHandle,
-    platform: &Arc<dyn crate::feishu::Platform>,
     rules: &NoticeRules,
     session_id: &str,
     started_at: std::time::Instant,
     disposition: &Disposition,
-) {
-    // Not an ending the notice may announce: stay silent before any lookup.
-    let Some(text) = disposition.notice_copy() else {
-        return;
-    };
+) -> Option<ResolvedNotice> {
+    let text = disposition.notice_copy()?;
     if !(rules.group_completion_notice || rules.long_task_notice) {
+        return None;
+    }
+    let live = cards.cards.lock().await;
+    let card = live.get(session_id)?;
+    let card_message_id = card.card_message_id.clone()?;
+    let acc = &card.acc;
+    let requester = acc.requester_open_id.clone()?;
+    let reply_to = acc.reply_to_message_id.clone()?;
+    let long_task = started_at.elapsed() >= std::time::Duration::from_millis(rules.long_task_notice_ms());
+    if !(acc.is_group && rules.group_completion_notice
+        || !acc.is_group && rules.long_task_notice && long_task)
+    {
+        return None;
+    }
+    Some(ResolvedNotice {
+        session_id: session_id.to_string(),
+        card_message_id,
+        reply_to,
+        requester,
+        is_group: acc.is_group,
+        text,
+    })
+}
+
+/// Send a resolved notice to its own recipient — the request that actually
+/// ended — with the best-effort @-mention. On any lookup failure cola falls
+/// back to a plain reply, which still notifies the message author; p2p needs no
+/// @ because the reply itself is the notification.
+async fn send_resolved_notice(platform: &Arc<dyn crate::feishu::Platform>, notice: &ResolvedNotice) {
+    let name = if notice.is_group {
+        platform.user_name(&notice.requester).await.unwrap_or(None)
+    } else {
+        None
+    };
+    if let Err(e) = platform
+        .reply_completion_notice(&notice.reply_to, &notice.requester, name.as_deref(), notice.text)
+        .await
+    {
+        tracing::warn!("completion notice: {}", e);
+    }
+}
+
+/// Fire a deferred Completion Notice, but only if the session's card is STILL
+/// the one the notice was armed against (spec #602, review finding 1): a newer
+/// Turn that replaced the card must not have the OLD request's ending announced
+/// to its requester. A missing card is a replacement/collect too — suppress.
+async fn deliver_deferred_notice(
+    cards: &CardsHandle,
+    platform: &Arc<dyn crate::feishu::Platform>,
+    notice: ResolvedNotice,
+) {
+    let current = {
+        let live = cards.cards.lock().await;
+        live.get(&notice.session_id)
+            .and_then(|c| c.card_message_id.clone())
+    };
+    if current.as_deref() != Some(notice.card_message_id.as_str()) {
+        tracing::warn!(
+            "completion notice suppressed: the card for {} was replaced before its terminal write drained",
+            notice.session_id
+        );
         return;
     }
-    let notice = {
-        let cards = cards.cards.lock().await;
-        cards.get(session_id).map(|c| &c.acc).and_then(|a| {
-            let requester = a.requester_open_id.clone()?;
-            let reply_to = a.reply_to_message_id.clone()?;
-            let long_task =
-                started_at.elapsed() >= std::time::Duration::from_millis(rules.long_task_notice_ms());
-            if !(a.is_group && rules.group_completion_notice
-                || !a.is_group && rules.long_task_notice && long_task)
-            {
-                return None;
-            }
-            Some((reply_to, requester, a.is_group))
-        })
-    };
-    if let Some((reply_to, requester, is_group)) = notice {
-        // Best-effort @-mention: the display name needs the contact API
-        // (permission granted). On any lookup failure cola falls back to a
-        // plain reply, which still notifies the message author. p2p needs no
-        // @ — the reply itself is the notification.
-        let name = if is_group {
-            platform.user_name(&requester).await.unwrap_or(None)
-        } else {
-            None
-        };
-        if let Err(e) = platform
-            .reply_completion_notice(&reply_to, &requester, name.as_deref(), text)
-            .await
-        {
-            tracing::warn!("completion notice: {}", e);
-        }
-    }
+    send_resolved_notice(platform, &notice).await;
 }
 
 /// The Turn's test seam (spec #298, A3): the fixtures tests outside the Turn
@@ -5544,7 +5592,7 @@ mod tests {
         )
         .await;
 
-        send_completion_notice(
+        announce_completion(
             &app.cards_handle(),
             &app.feishu,
             &app.turn_config().notice_rules(),
@@ -5561,7 +5609,7 @@ mod tests {
             "a waiting disposition must never be announced"
         );
 
-        send_completion_notice(
+        announce_completion(
             &app.cards_handle(),
             &app.feishu,
             &app.turn_config().notice_rules(),
