@@ -1958,6 +1958,17 @@ async fn v2_unfinished_retry_submits_a_new_id_and_never_replays_the_orphan() {
         .entry("ses_test".into())
         .or_default() = vec![orphaned_attempt_window(ANCHOR)];
 
+    // The orphaned turn's transcript leaves a live `⏳` panel, so the merged
+    // post-prompt drain waits its stuck-panel grace; bound it and the render
+    // poll (the other migrated lifecycle tests do the same) so the inline
+    // `Turn::run` returns promptly instead of waiting the default ~10 minutes
+    // / 1.5 s cadence. The card assertions are unchanged — the orphan's ❌ +
+    // text still land.
+    app.turn_render_poll_ms
+        .store(5, std::sync::atomic::Ordering::Relaxed);
+    app.turn_follow_grace_ms
+        .store(50, std::sync::atomic::Ordering::Relaxed);
+
     // Attempt 1 (the orphaned turn): its recorded failure ends the card Error.
     gate.add_permits(1);
     crate::bridge::turn::Turn::run(&app.turn_handles(), retry_ctx("ses_test", "hi", ANCHOR))
@@ -2073,6 +2084,16 @@ async fn v2_retries_chain_under_fresh_ids() {
         .await
         .entry("ses_test".into())
         .or_default() = vec![orphaned_attempt_window(ANCHOR)];
+
+    // The orphaned turn's transcript leaves a live `⏳` panel, so the merged
+    // post-prompt drain waits its stuck-panel grace; bound it and the render
+    // poll (the other migrated lifecycle tests do the same) so the inline
+    // `Turn::run` returns promptly instead of waiting the default ~10 minutes
+    // / 1.5 s cadence. The card assertions are unchanged.
+    app.turn_render_poll_ms
+        .store(5, std::sync::atomic::Ordering::Relaxed);
+    app.turn_follow_grace_ms
+        .store(50, std::sync::atomic::Ordering::Relaxed);
 
     gate.add_permits(1);
     crate::bridge::turn::Turn::run(&app.turn_handles(), retry_ctx("ses_test", "hi", ANCHOR))
