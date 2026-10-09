@@ -2817,13 +2817,32 @@ async fn a_retirement_inside_the_finalization_window_ends_the_turn_normally() {
     );
 }
 
-/// Spec #604: the final part that lands between the drain's render read and
-/// the later idle status read still lands on the Card, and the turn ends on
-/// that same rendered, quiescent snapshot. The drain must render the read it
-/// settles on; a later read that dropped the tail (a partial or compacted
-/// read) may not finalize the stale snapshot the drain skipped rendering into
-/// a Wake-less continuation Card (spec evidence
+/// Wait until at least `target` transcript reads have reached the mock's hold
+/// gate, or panic after 5 s.
+async fn wait_for_parked_reads(backend: &Arc<MockBackend>, target: usize) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while backend.transcript_gate_entered.load(Ordering::SeqCst) < target {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the drain never reached parked read #{target}"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}
+
+/// Spec #604: the final part lands BETWEEN the drain's render read and the
+/// later idle-status read, and still lands on the Card — the turn ends on that
+/// same rendered, quiescent snapshot, never finalizing the stale read into a
+/// Wake-less continuation Card (spec evidence
 /// `ses_ee3f4531fffeBcOYDY3vHUQDPw`).
+///
+/// The render read genuinely PREDATES the tail: it is served the tail-less
+/// snapshot (the session still busy) and returns before the tail exists. The
+/// tail then lands while the next read is parked, and the session idles with
+/// it; that LATER read is the one that must carry the tail and render it, so
+/// the ending is never stamped over the stale read and no second Card appears.
+/// (Contrast the short-cut this test used to take: it served the tail to the
+/// parked read itself, so the render read already carried it.)
 #[tokio::test]
 async fn a_final_part_landing_between_the_render_and_idle_read_still_lands() {
     let _wd = test_work_dir();
@@ -2852,35 +2871,23 @@ async fn a_final_part_landing_between_the_render_and_idle_read_still_lands() {
     // drain is the only transcript reader, so the read parked below is its own.
     tokio::time::sleep(Duration::from_millis(30)).await;
 
-    // Park the drain's next read. It is about to classify the still-Busy run.
+    // Park the drain's RENDER read. The session is still busy and this read
+    // serves the tail-less snapshot: the render read genuinely predates the
+    // tail.
     let gate = backend.hold_transcripts();
-    let entered = backend.transcript_gate_entered.load(Ordering::SeqCst);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while backend.transcript_gate_entered.load(Ordering::SeqCst) == entered {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the drain never reached the parked read"
-        );
-        tokio::time::sleep(Duration::from_millis(2)).await;
-    }
+    wait_for_parked_reads(&backend, 1).await;
+    script_transcript(&backend, vec![SessionTranscript::new(rendered.clone())]).await;
+    gate.add_permits(1);
 
-    // The tail lands while the read is parked: the parked read is the render
-    // read that carries it, and the session idles with it. The reads AFTER it
-    // serve a lagging snapshot that dropped the tail — the read-ordering race
-    // (a partial/compacted read the ending must not be finalized from).
-    script_transcript(
-        &backend,
-        vec![
-            SessionTranscript::new(with_tail.clone()),
-            SessionTranscript::new(rendered),
-        ],
-    )
-    .await;
+    // Park the LATER read — the settle re-check. The tail lands now, AFTER the
+    // render read, and the session idles: this later read carries the tail.
+    wait_for_parked_reads(&backend, 2).await;
+    script_transcript(&backend, vec![SessionTranscript::new(with_tail.clone())]).await;
     backend
         .set_session_status("ses_test", Some(SessionStatus::Idle))
         .await;
-    // Disarm first: only the one parked read is gated, so the reads that follow
-    // serve the lagging snapshot without parking.
+    // Disarm first: only the two parked reads are gated, so the reads that
+    // follow serve the tail (now on the Card) without parking.
     *backend.transcript_gate.lock().unwrap() = None;
     gate.add_permits(1);
 
@@ -2892,7 +2899,7 @@ async fn a_final_part_landing_between_the_render_and_idle_read_still_lands() {
     );
     assert!(
         card_text(&final_card).contains("第二段。"),
-        "the read the drain rendered must land on the Card: {final_card}"
+        "the tail that landed after the render read must reach the Card: {final_card}"
     );
 
     // The durable transcript still carries the tail: Session Sync must find
