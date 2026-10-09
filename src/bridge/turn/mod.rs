@@ -2685,8 +2685,10 @@ impl Turn {
     /// residual card (spec #602, ticket #606): the "content is never dropped"
     /// half of the floor, after [`Self::wake_continuation`]'s
     /// [`WakeContinuation::Residual`] posted the one card. The tail renders on
-    /// that same card in place — no second card, no receipt, no resumption —
-    /// and the ending the card already carries is restored over the render and
+    /// that same card in place — no second card, no resumption — and gains the
+    /// neutral 「📄 还有更新」 receipt exactly once (the first in-place residual;
+    /// a later tail keeps the receipt already carried). The ending the card
+    /// already carries is restored over the render and
     /// carried by the single flush, so a settled (terminal) card's recorded
     /// ending is never rewritten (ADR-0074). Returns whether a write was
     /// accepted (the caller's carrier signal); the content itself stays owed
@@ -2756,6 +2758,16 @@ impl Turn {
             let Some(card) = live.get_mut(session_id) else {
                 return false;
             };
+            // The FIRST in-place residual gains the neutral residual receipt
+            // (spec #602, ticket #606): the tail renders honestly on a
+            // neutrally-labeled card, never a 「已恢复执行」 resumption, and the
+            // receipt is written exactly once — this same locked write marks the
+            // floor fired, so a later tail adds no second receipt. A card whose
+            // one neutral residual already posted (the split arm set the marker)
+            // keeps the receipt it already carries.
+            if !card.acc.residual_card_posted {
+                card.acc.push_receipt(SplitKind::Residual.receipt());
+            }
             card.acc.card_state = ending_state;
             card.acc.error = ending_error;
             card.acc.residual_card_posted = true;
