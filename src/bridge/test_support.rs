@@ -1323,6 +1323,13 @@ pub struct MockBackend {
     pub growing_transcript: Arc<std::sync::atomic::AtomicBool>,
     /// The number of `transcript` reads the growing stream has rewritten.
     pub growing_transcript_reads: Arc<std::sync::atomic::AtomicUsize>,
+    /// A targeted, one-shot `transcript` read delay (spec #602 review, round 7):
+    /// when set, the FIRST read whose newest assistant text equals the marker
+    /// sleeps the duration before it is served — a delayed-but-SUCCESSFUL read
+    /// carrying a specific late part, distinct from a hang. Used to prove the
+    /// finalization read gets the full per-read timeout, never a grace-capped
+    /// one.
+    pub delay_reads_with_tail: std::sync::Mutex<Option<(String, std::time::Duration)>>,
     /// A test hook run on every `transcript` read with the number of
     /// gate-entered reads so far (spec #602 review, round 5): it lets a test
     /// flip state at a specific read — the finalization confirmation read is
@@ -1450,6 +1457,7 @@ impl MockBackend {
             session_status_fails: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             growing_transcript: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             growing_transcript_reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            delay_reads_with_tail: std::sync::Mutex::new(None),
             on_transcript_read: std::sync::Mutex::new(None),
             status_busy_once: std::sync::atomic::AtomicBool::new(false),
             prompt_scripts: Vec::new(),
@@ -2378,6 +2386,32 @@ impl crate::backend::Backend for MockBackend {
         // (issue #454, review #588): retirements leave the live list and
         // unconfirmed markers ride every read.
         self.overlay.apply(session_id, &mut transcript);
+        // A targeted read delay (spec #602 review, round 7): a read whose newest
+        // assistant text matches the configured marker is a delayed-but-
+        // SUCCESSFUL read — one-shot, so later reads flow. Used to prove the
+        // finalization read gets the full per-read timeout, not a grace-capped
+        // one.
+        let delay = {
+            let guard = self.delay_reads_with_tail.lock().unwrap();
+            guard.as_ref().and_then(|(tail, delay)| {
+                let newest_text = transcript
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|message| message.role == MessageRole::Assistant)
+                    .and_then(|message| {
+                        message.parts.iter().find_map(|part| match part {
+                            Part::Text(text) => Some(text.text.as_str()),
+                            _ => None,
+                        })
+                    });
+                (newest_text == Some(tail.as_str())).then_some(*delay)
+            })
+        };
+        if let Some(delay) = delay {
+            *self.delay_reads_with_tail.lock().unwrap() = None;
+            tokio::time::sleep(delay).await;
+        }
         self.transcript_calls.lock().await.push(session_id.to_string());
         Ok(transcript)
     }
