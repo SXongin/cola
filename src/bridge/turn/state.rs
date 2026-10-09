@@ -1216,8 +1216,11 @@ pub(super) struct StreamAccumulator {
     /// module: set by [`Self::set_session`]; read through [`Self::session_id`].
     session_id: Option<String>,
     /// The full original prompt text of this turn, kept so the error-card
-    /// "retry" button can re-submit it without the user retyping.
-    pub(super) prompt: Option<String>,
+    /// "retry" button can re-submit it without the user retyping. Private to
+    /// this module: set by [`Self::set_prompt`], cleared by
+    /// [`Self::continue_on_new_card`] (a Wake continuation carries no question
+    /// to re-ask); read through [`Self::prompt`].
+    prompt: Option<String>,
     /// Whether this card's terminal recovery action — spec #391's Error retry,
     /// #437's Unreceived 重新发起 — or its waiting-card cleanup (spec #588,
     /// #590) has been claimed. The click is acked immediately, so a second
@@ -1228,7 +1231,9 @@ pub(super) struct StreamAccumulator {
     pub(super) recovery_claimed: bool,
     /// The id this turn's user message carries (`msg_cola_…`, ADR-0026), so a
     /// later error-card retry reuses it and the server deduplicates by id.
-    pub(super) cola_message_id: Option<String>,
+    /// Private to this module: set by [`Self::set_cola_message_id`]; read
+    /// through [`Self::cola_message_id`].
+    cola_message_id: Option<String>,
     /// Who sent the prompt (Feishu open_id), so the group completion notice can
     /// be replied to them / @-mention them. Private to this module: set by
     /// [`Self::set_requester`]; read through [`Self::requester_open_id`].
@@ -1243,13 +1248,17 @@ pub(super) struct StreamAccumulator {
     /// Sync, which has no Turn object: the card carries the notice's clock.
     /// `None` for a card no Turn started (an external render's, or a Wake
     /// continuation armed after a restart) — a Wake continuation never owes the
-    /// notice anyway, its own send was the notification (ADR-0059).
-    pub(super) turn_started_at: Option<std::time::Instant>,
+    /// notice anyway, its own send was the notification (ADR-0059). Private to
+    /// this module: set by [`Self::set_turn_started_at`]; read through
+    /// [`Self::turn_started_at`].
+    turn_started_at: Option<std::time::Instant>,
     /// The Chat/Topic's turn generation at this turn's start (ADR-0043),
     /// assigned by [`crate::bridge::reminder::ReminderState::begin_turn`]. The Instant
     /// Reminder pin lifecycle reads it so every pin carries the turn it
-    /// belongs to and a stale clear cannot unpin a newer turn's pin.
-    pub(super) turn_generation: Option<u64>,
+    /// belongs to and a stale clear cannot unpin a newer turn's pin. Private to
+    /// this module: set by [`Self::set_turn_generation`]; read through
+    /// [`Self::turn_generation`].
+    turn_generation: Option<u64>,
     /// Text/reasoning parts already rendered into this card, keyed by their
     /// typed content — dedupes incremental polling. Reasoning/text parts are
     /// written empty first and updated with full text, so they are only tracked
@@ -1731,6 +1740,57 @@ impl StreamAccumulator {
     /// Record whether this turn's prompt came from a group chat.
     pub(super) fn set_is_group(&mut self, is_group: bool) {
         self.is_group = is_group;
+    }
+
+    /// The full original prompt this turn submitted, if recorded — the
+    /// error-card "retry" re-submits it (spec #391). Private to this module:
+    /// set by [`Self::set_prompt`].
+    pub(super) fn prompt(&self) -> Option<&str> {
+        self.prompt.as_deref()
+    }
+
+    /// Record this turn's full original prompt (set once, at `Turn::start`).
+    pub(super) fn set_prompt(&mut self, prompt: &str) {
+        self.prompt = Some(prompt.to_string());
+    }
+
+    /// The `msg_cola_…` id this turn's user message carries (ADR-0026), if
+    /// recorded — the Chain Record's message id and the retry's dedup key.
+    /// Private to this module: set by [`Self::set_cola_message_id`].
+    pub(super) fn cola_message_id(&self) -> Option<&str> {
+        self.cola_message_id.as_deref()
+    }
+
+    /// Record the `msg_cola_…` id this turn's user message carries (set at
+    /// `Turn::start`; the rendering fixtures set it through this method too).
+    pub(super) fn set_cola_message_id(&mut self, cola_message_id: &str) {
+        self.cola_message_id = Some(cola_message_id.to_string());
+    }
+
+    /// When the Turn that owns this chain started, if recorded — the Completion
+    /// Notice's long-task clock. `None` for a card no Turn started. Private to
+    /// this module: set by [`Self::set_turn_started_at`].
+    pub(super) fn turn_started_at(&self) -> Option<std::time::Instant> {
+        self.turn_started_at
+    }
+
+    /// Record when this chain's Turn started (set once, at `Turn::start`).
+    pub(super) fn set_turn_started_at(&mut self, started_at: std::time::Instant) {
+        self.turn_started_at = Some(started_at);
+    }
+
+    /// The Chat/Topic's turn generation this turn registered (ADR-0043), if
+    /// recorded — the Instant Reminder pin lifecycle reads it. Private to this
+    /// module: set by [`Self::set_turn_generation`].
+    pub(super) fn turn_generation(&self) -> Option<u64> {
+        self.turn_generation
+    }
+
+    /// Record this turn's Chat/Topic generation (set at `Turn::start` from
+    /// [`crate::bridge::reminder::ReminderState::begin_turn`], and by the
+    /// `set_turn_identity` test seam).
+    pub(super) fn set_turn_generation(&mut self, generation: u64) {
+        self.turn_generation = Some(generation);
     }
 
     /// A waiting card's collect (ADR-0059, spec #405): the card yielded

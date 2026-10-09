@@ -43,7 +43,7 @@ impl Turn {
     pub(crate) async fn pin_source(cards: &CardsHandle, session_id: &str) -> Option<TurnPinSource> {
         let live = cards.cards.lock().await;
         let card = live.get(session_id)?;
-        let generation = card.acc.turn_generation?;
+        let generation = card.acc.turn_generation()?;
         let requester_open_id = card.acc.requester_open_id().map(str::to_string)?;
         if requester_open_id.is_empty() {
             return None;
