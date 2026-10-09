@@ -804,14 +804,13 @@ pub(super) async fn flush_card_locked(
                 // — the drain helper holds it back).
                 drain_wake_watermark(cards, session_id, watermark).await;
             }
-            // The finalized slice's PATCH is the terminal carrier only when no
-            // continuation create follows (both the reply target and the
-            // fallback Chat unknown) — the create below overwrites this when it
-            // runs. Record its fate so the no-continuation case is gated too.
-            if should_patch {
-                let ending = ending_write_for_patch(cards, &card_id, &finalized.card, delivered, refused);
-                set_ending_write(cards, session_id, ending).await;
-            }
+            // The finalized prefix's PATCH is NOT this flush's terminal carrier
+            // (spec #602 review, finding B): a split is queued, so the terminal
+            // slice lives on the continuation create below — that create (or
+            // the no-reachable-target dead end) records `ending_write`, never
+            // this prefix. Recording the prefix here would mark its `Delivered`
+            // as terminal even when the continuation never runs, firing the
+            // notice though the tail never reached Feishu (#607).
             continue;
         }
 
@@ -844,6 +843,11 @@ pub(super) async fn flush_card_locked(
             // Nothing can reach a card: no continuation is attempted, so no
             // cursor is staged. Whatever this flush already wrote keeps its
             // outcome; without one, the payload stays owed in the accumulator.
+            // The terminal slice this flush built is the continuation's, and it
+            // never landed — so the ending write is Failed, suppressing the
+            // notice rather than standing on the finalized prefix's delivered
+            // PATCH (spec #602 review, finding B; #607).
+            set_ending_write(cards, session_id, super::state::EndingWrite::Failed).await;
             return flush_outcome(wrote, refused);
         }
         // Stage this continuation body's Rendered Cursor before the create:
@@ -863,9 +867,19 @@ pub(super) async fn flush_card_locked(
                 {
                     let mut cards = cards.cards.lock().await;
                     if let Some(card) = cards.get_mut(session_id) {
-                        // The continuation create carried the terminal slice:
-                        // its delivery is the flush's terminal fact (#607).
-                        card.acc.ending_write = super::state::EndingWrite::Delivered;
+                        // This continuation create is the flush's terminal
+                        // carrier only when no further slice is owed (spec #602
+                        // review, finding B): a create that is itself over the
+                        // budget (`built.full`) hands the terminal content to a
+                        // LATER slice, so its delivery must NOT read Delivered.
+                        // The next slice's send overwrites this; if the flush
+                        // stops here, `Failed` suppresses the notice over a tail
+                        // that never landed (#607).
+                        card.acc.ending_write = if built.full {
+                            super::state::EndingWrite::Failed
+                        } else {
+                            super::state::EndingWrite::Delivered
+                        };
                         card.card_message_id = Some(new_id.clone());
                         // A continuation that fits becomes the live card; one
                         // that is itself over the budget stays finalized and
@@ -1078,7 +1092,7 @@ mod tests {
     use super::{drain_wake_watermark, note_cursor_write_failure, staged_watermark_id};
     use crate::bridge::test_support::*;
     use crate::bridge::turn::Turn;
-    use crate::bridge::turn::state::{CardFallback, CardSession, StreamAccumulator};
+    use crate::bridge::turn::state::{CardFallback, CardSession, EndingWrite, StreamAccumulator};
     use crate::feishu::card::CardState;
 
     /// The markdown content of the first body element.
@@ -1555,6 +1569,69 @@ mod tests {
             Turn::staged_cursor(&cards, "ses_test").await,
             None,
             "the stage was consumed exactly once"
+        );
+    }
+
+    /// Finding B (spec #602 review, ticket #607): a size-split terminal flush
+    /// whose continuation has NO reachable target (no reply target, no fallback
+    /// Chat) records the terminal write as failed — the terminal tail never
+    /// reached Feishu, so the notice gate must not read the finalized prefix's
+    /// delivered PATCH as acceptance.
+    #[tokio::test]
+    async fn a_size_split_with_no_reachable_continuation_target_records_failed() {
+        let (app, platform) = app_with_session().await;
+        let mut acc = StreamAccumulator::new("回合");
+        acc.card_state = CardState::Streaming;
+        acc.push_text(&"很长的回答。".repeat(2000));
+        // Deliberately no reply target and no fallback Chat: the continuation
+        // cannot be attempted, so the terminal tail never lands.
+        let mut session = CardSession::new(acc, Some("om_live".into()));
+        session.fallback_chat = None;
+        app.cards.lock().await.insert("ses_test".into(), session);
+        app.inflight.lock().await.insert("ses_test".to_string());
+
+        Turn::flush_card(&app.cards_handle(), "ses_test").await;
+
+        // The prefix was finalized and its PATCH delivered...
+        assert!(
+            !patches_to(&platform, "om_live").await.is_empty(),
+            "the prefix is finalized in place"
+        );
+        // ...but the terminal tail never landed, so the ending write must not
+        // read Delivered.
+        let ending = app.cards.lock().await.get("ses_test").unwrap().acc.ending_write;
+        assert_eq!(
+            ending,
+            EndingWrite::Failed,
+            "a split with no continuation target never landed the tail"
+        );
+    }
+
+    /// Finding B (spec #602 review, ticket #607): a size-split chain that needs
+    /// more slices than one flush sends stops with the terminal slice still owed
+    /// — the last continuation create was itself over the budget, so it must not
+    /// read Delivered and the notice must be suppressed.
+    #[tokio::test]
+    async fn a_size_split_chain_that_stops_mid_way_records_failed() {
+        let (app, _platform) = app_with_session().await;
+        let mut acc = StreamAccumulator::new("回合");
+        acc.card_state = CardState::Streaming;
+        // Far more content than one flush's MAX_CARD_CHAIN slices can carry.
+        acc.push_text(&"很长的回答。".repeat(12000));
+        acc.reply_to_message_id = Some("msg_1".into());
+        app.cards
+            .lock()
+            .await
+            .insert("ses_test".into(), CardSession::new(acc, Some("om_live".into())));
+        app.inflight.lock().await.insert("ses_test".to_string());
+
+        Turn::flush_card(&app.cards_handle(), "ses_test").await;
+
+        let ending = app.cards.lock().await.get("ses_test").unwrap().acc.ending_write;
+        assert_eq!(
+            ending,
+            EndingWrite::Failed,
+            "the flush stopped before the terminal slice landed"
         );
     }
 }
