@@ -377,19 +377,34 @@ impl Ticket {
         session_id: &str,
         disposition: &Disposition,
     ) -> Option<String> {
-        let stamped = {
+        // The chain identity the ending lands on, captured with the stamp under
+        // ONE lock: a replacement takes the session over with a FRESH chain, so
+        // this is what tells "my own flush split the card onto a continuation"
+        // (same chain) from "a new Turn replaced it" (new chain).
+        let chain = {
             let mut live = cards.cards.lock().await;
             match live.get_mut(session_id) {
                 Some(card) if self.matches(card.acc.turn_anchor.as_ref(), Some(card.chain_id())) => {
                     card.acc.apply_ending(disposition);
-                    card.card_message_id.clone()
+                    card.chain_id()
                 }
                 _ => return None,
             }
         };
         Turn::refresh_work_context(cards, session_id).await;
         Turn::flush_card(cards, session_id).await;
-        stamped
+        // The card the ending landed on, read AFTER the flush (spec #602, review
+        // finding 6; ticket #607): our own terminal flush may size-split the
+        // slice onto a continuation — the SAME chain — and the notice must bind
+        // to the continuation, not the finalized prefix it replaced (read as a
+        // "newer Turn replaced the card", that would suppress the notice). A new
+        // Turn's fresh chain means the ending's card is gone: stay silent rather
+        // than announce over the replacement.
+        let live = cards.cards.lock().await;
+        match live.get(session_id) {
+            Some(card) if card.chain_id() == chain => card.card_message_id.clone(),
+            _ => None,
+        }
     }
 
     /// The Turn anchor the settle decision reads; `None` for the unreceived

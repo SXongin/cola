@@ -929,15 +929,9 @@ impl Turn {
             }
         }
         render::read_planned_outputs(&handles.backend, &mut plans).await;
-        // The identity of the card this Turn's ending lands on (spec #602,
-        // review finding 6): captured under the same lock as the stamp, so the
-        // notice below is bound to it and can never ride a card a newer Turn
-        // swapped in during the finalization awaits.
-        let mut stamped_card: Option<String> = None;
         {
             let mut cards = handles.cards.cards.lock().await;
             if let Some(card) = cards.get_mut(&self.session_id) {
-                stamped_card = card.card_message_id.clone();
                 let acc = &mut card.acc;
                 if let Some(transcript) = &final_transcript {
                     render::render_new_turn_parts_committing(acc, transcript, plans);
@@ -998,6 +992,23 @@ impl Turn {
         )
         .await;
         Self::flush_card(&handles.cards, &self.session_id).await;
+        // The identity of the card this Turn's ending actually landed on (spec
+        // #602, review finding 6; ticket #607): captured AFTER the ending flush,
+        // so a size split that moved the terminal slice onto a continuation
+        // names the continuation — the card carrying the ending — not the
+        // finalized prefix the split replaced (which would read as a "newer
+        // Turn replaced the card" and suppress the notice). A genuine NEW Turn
+        // that swaps the card in the awaits below still differs from it, so the
+        // notice stays bound to the card the ending landed on. The ending's
+        // fate and the recipient are read from this same post-flush card under
+        // one lock inside `announce_completion`.
+        let stamped_card = handles
+            .cards
+            .cards
+            .lock()
+            .await
+            .get(&self.session_id)
+            .and_then(|card| card.card_message_id.clone());
 
         // Topic cover card (ADR-0023): once the server holds a real title for
         // the session — auto-generated after the first exchange, or set by
