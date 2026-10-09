@@ -970,6 +970,11 @@ impl feishu::Platform for RecordingPlatform {
 /// shell / child ids the reconcile asked about, in order (issue #454).
 pub(crate) type TaskRuntimeCall = (String, Vec<String>, Vec<String>);
 
+/// A per-read test hook (spec #602 review, round 5): run on every `transcript`
+/// read with the number of gate-entered reads so far, so a test can flip state
+/// at a specific read without a timing race.
+pub(crate) type TranscriptReadHook = Box<dyn Fn(usize) + Send + Sync>;
+
 /// Serves scripted parts/permissions instead of a live OpenCode server.
 pub struct MockBackend {
     /// The parts the default assistant turn carries: reasoning → tool → text.
@@ -1318,6 +1323,11 @@ pub struct MockBackend {
     pub growing_transcript: Arc<std::sync::atomic::AtomicBool>,
     /// The number of `transcript` reads the growing stream has rewritten.
     pub growing_transcript_reads: Arc<std::sync::atomic::AtomicUsize>,
+    /// A test hook run on every `transcript` read with the number of
+    /// gate-entered reads so far (spec #602 review, round 5): it lets a test
+    /// flip state at a specific read — the finalization confirmation read is
+    /// the third gate-entered read — without a timing race.
+    pub on_transcript_read: std::sync::Mutex<Option<TranscriptReadHook>>,
     /// Scripts the ADR-0028 busy→idle race: the first `session_status` read
     /// returns Busy (and clears the flag), later reads serve the map.
     pub status_busy_once: std::sync::atomic::AtomicBool,
@@ -1440,6 +1450,7 @@ impl MockBackend {
             session_status_fails: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             growing_transcript: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             growing_transcript_reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            on_transcript_read: std::sync::Mutex::new(None),
             status_busy_once: std::sync::atomic::AtomicBool::new(false),
             prompt_scripts: Vec::new(),
             last_prompt_parts: std::sync::Mutex::new(None),
@@ -2282,6 +2293,16 @@ impl crate::backend::Backend for MockBackend {
             self.transcript_gate_entered
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let _permit = gate.acquire().await;
+        }
+        // A test hook keyed on the gate-entered read index: state that must
+        // change at a specific read (spec #602 review, round 5 — the
+        // finalization confirmation read is the third gate-entered read) is
+        // flipped here, before the read is served.
+        if let Some(hook) = self.on_transcript_read.lock().unwrap().as_ref() {
+            hook(
+                self.transcript_gate_entered
+                    .load(std::sync::atomic::Ordering::SeqCst),
+            );
         }
         hang_if_scripted(&self.hang_transcript).await;
         // A one-shot failure: exactly `count` initial reads serve a 500, the
