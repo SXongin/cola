@@ -450,8 +450,8 @@ impl Turn {
         if advisory_live {
             acc.push_receipt(MERGE_OPENING);
         }
-        acc.reply_to_message_id = Some(message_id.clone());
-        acc.session_id = Some(session_id.clone());
+        acc.set_reply_target(Some(message_id.clone()));
+        acc.set_session(&session_id);
         // The notice's clock travels on the card (ADR-0060): a quiet true end
         // is settled by Session Sync, which has no Turn to read `started_at`
         // from.
@@ -461,8 +461,8 @@ impl Turn {
         acc.cola_message_id = Some(cola_message_id.clone());
         // Full original prompt, so the error-card "retry" can re-submit it.
         acc.prompt = Some(text.clone());
-        acc.requester_open_id = requester_open_id.clone();
-        acc.is_group = is_group;
+        acc.set_requester(requester_open_id.clone());
+        acc.set_is_group(is_group);
         // An explicit retry carries the failed attempt's render baseline
         // (#387, spec #391; ADR-0040's amendment): load-bearing on V1's
         // reused-id branch and on V2's fresh-id killed-run case (an admitted,
@@ -701,7 +701,7 @@ impl Turn {
         {
             let mut cards = handles.cards.cards.lock().await;
             if let Some(mut card) = cards.remove(&self.session_id) {
-                card.acc.session_id = Some(fresh_id.clone());
+                card.acc.set_session(&fresh_id);
                 cards.insert(fresh_id.clone(), card);
             }
         }
@@ -2038,7 +2038,7 @@ impl Turn {
                     // The chain's durable reply target (issue #580): the Feishu
                     // message the card replies under — an OpenCode message id
                     // is never a deliverable target.
-                    card.acc.reply_to_message_id.clone(),
+                    card.acc.reply_to_message_id().map(str::to_string),
                 ),
                 None => (None, None, None, None),
             }
@@ -2130,7 +2130,7 @@ impl Turn {
                 card.acc.directory.clone(),
                 // The chain's durable reply target (issue #580): a split whose
                 // supplement moved the anchor carries the newest one.
-                card.acc.reply_to_message_id.clone(),
+                card.acc.reply_to_message_id().map(str::to_string),
                 (confirmed),
             )
         };
@@ -3219,7 +3219,7 @@ impl Turn {
             .lock()
             .await
             .get(session_id)
-            .and_then(|c| c.acc.reply_to_message_id.clone())
+            .and_then(|c| c.acc.reply_to_message_id().map(str::to_string))
     }
 
     /// Seed `acc`'s Wake floor from the chain's durable Wake Watermark (spec
@@ -3460,10 +3460,10 @@ impl Turn {
         Some(TurnRecovery {
             session_id: session_id.to_string(),
             prompt,
-            reply_to: card.acc.reply_to_message_id.clone().unwrap_or_default(),
+            reply_to: card.acc.reply_to_message_id().unwrap_or_default().to_string(),
             subtitle: card.acc.title.clone(),
-            requester_open_id: card.acc.requester_open_id.clone(),
-            is_group: card.acc.is_group,
+            requester_open_id: card.acc.requester_open_id().map(str::to_string),
+            is_group: card.acc.is_group(),
             cola_message_id: card.acc.cola_message_id.clone(),
         })
     }
@@ -3727,9 +3727,9 @@ pub(crate) async fn announce_completion(
             Some(card) if card.card_message_id.as_deref() == expected_card => Some(CapturedNotice {
                 card_message_id: card.card_message_id.clone(),
                 ending: card.acc.ending_write,
-                requester: card.acc.requester_open_id.clone(),
-                reply_to: card.acc.reply_to_message_id.clone(),
-                is_group: card.acc.is_group,
+                requester: card.acc.requester_open_id().map(str::to_string),
+                reply_to: card.acc.reply_to_message_id().map(str::to_string),
+                is_group: card.acc.is_group(),
             }),
             // A card exists but is NOT the one the ending was applied to: a
             // newer Turn replaced it (or a collect took it). Announcing the old
@@ -4024,7 +4024,7 @@ impl Turn {
     /// Set the card's reply target.
     pub(crate) async fn set_reply_target(cards: &CardsHandle, session_id: &str, reply_to: &str) {
         if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
-            card.acc.reply_to_message_id = Some(reply_to.to_string());
+            card.acc.set_reply_target(Some(reply_to.to_string()));
         }
     }
 
@@ -4046,8 +4046,8 @@ impl Turn {
         generation: u64,
     ) {
         if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
-            card.acc.requester_open_id = Some(requester_open_id.to_string());
-            card.acc.is_group = is_group;
+            card.acc.set_requester(Some(requester_open_id.to_string()));
+            card.acc.set_is_group(is_group);
             card.acc.turn_generation = Some(generation);
         }
     }
@@ -4436,9 +4436,9 @@ mod tests {
                     state::StreamAccumulator::new("turn"),
                     Some("om_new".to_string()),
                 );
-                card.acc.reply_to_message_id = Some("msg_new".to_string());
-                card.acc.requester_open_id = Some("ou_new_requester".to_string());
-                card.acc.is_group = true;
+                card.acc.set_reply_target(Some("msg_new".to_string()));
+                card.acc.set_requester(Some("ou_new_requester".to_string()));
+                card.acc.set_is_group(true);
                 cards.cards.lock().await.insert("ses_test".to_string(), card);
             })
         };
@@ -4498,9 +4498,9 @@ mod tests {
         // `Delivered`, so the old ending must NOT ride it.
         let mut replacement =
             state::CardSession::new(state::StreamAccumulator::new("turn"), Some("om_new".to_string()));
-        replacement.acc.reply_to_message_id = Some("msg_new".to_string());
-        replacement.acc.requester_open_id = Some("ou_new".to_string());
-        replacement.acc.is_group = true;
+        replacement.acc.set_reply_target(Some("msg_new".to_string()));
+        replacement.acc.set_requester(Some("ou_new".to_string()));
+        replacement.acc.set_is_group(true);
         cards
             .cards
             .lock()

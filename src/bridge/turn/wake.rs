@@ -242,7 +242,7 @@ impl Turn {
         let mut acc = StreamAccumulator::new(title);
         Self::seed_wake_floor(cards, session_id, &mut acc);
         acc.turn_anchor = Some(anchor.clone());
-        acc.session_id = Some(session_id.to_string());
+        acc.set_session(session_id);
         // The chain's reply target (issue #580) is the target the successor's
         // create actually lands on — the durable reply target, or the recorded
         // card a refused target falls back to. `take_over_armed_card` sets it
@@ -352,8 +352,8 @@ impl Turn {
         // guard all read it, and cola's clock is never part of the card
         // (#183, #190).
         acc.turn_anchor = Some(anchor.clone());
-        acc.session_id = Some(session_id.to_string());
-        acc.reply_to_message_id = Some(card_id.to_string());
+        acc.set_session(session_id);
+        acc.set_reply_target(Some(card_id.to_string()));
         acc.attach_work_context(session_dir).await;
         acc.variant = variant;
         if let Some(text) = anchor_text.filter(|text| !text.is_empty()) {
@@ -617,8 +617,8 @@ impl Turn {
         let mut acc = StreamAccumulator::new(facts.subtitle);
         Self::seed_wake_floor(cards, session_id, &mut acc);
         acc.turn_anchor = Some(anchor.clone());
-        acc.session_id = Some(session_id.to_string());
-        acc.reply_to_message_id = facts.reply_to.map(str::to_string);
+        acc.set_session(session_id);
+        acc.set_reply_target(facts.reply_to.map(str::to_string));
         acc.variant = facts.variant;
         acc.wake_continuation = true;
         // The 承接 line announces this Wake's completion and hands its work to
@@ -853,7 +853,7 @@ impl Turn {
         // below agree on the rung, and an explicit None CLEARS both: the
         // landing adopts its rung in ONE write, never a second clear (which a
         // crash could lose, leaving a refused target persisted).
-        card.acc.reply_to_message_id = reply_to.map(str::to_string);
+        card.acc.set_reply_target(reply_to.map(str::to_string));
         let (message_id, created_ms, context_directory, reply_to) = (
             card.acc.cola_message_id.clone().map(MessageId::new).or_else(|| {
                 card.acc
@@ -863,7 +863,7 @@ impl Turn {
             }),
             card.acc.turn_anchor.as_ref().map(|anchor| anchor.created_ms),
             card.acc.directory.clone(),
-            card.acc.reply_to_message_id.clone(),
+            card.acc.reply_to_message_id().map(str::to_string),
         );
         card.card_message_id = Some(card_message_id.to_string());
         // The create landed: take its exact staged Rendered Cursor NOW, inside

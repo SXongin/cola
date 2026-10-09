@@ -834,7 +834,7 @@ pub(super) async fn flush_card_locked(
                 // supplement: one continuation serves the whole queued batch.
                 Some(split) => (Some(split.reply_to.clone()), None),
                 None => (
-                    card.and_then(|c| c.acc.reply_to_message_id.clone()),
+                    card.and_then(|c| c.acc.reply_to_message_id().map(str::to_string)),
                     card.and_then(|c| c.fallback_chat.clone()),
                 ),
             }
@@ -892,7 +892,7 @@ pub(super) async fn flush_card_locked(
                             // queue is served — its receipts are on the card —
                             // so a later supplement starts a fresh one.
                             if let Some(newest) = pending_split.last() {
-                                card.acc.reply_to_message_id = Some(newest.reply_to.clone());
+                                card.acc.set_reply_target(Some(newest.reply_to.clone()));
                             }
                             card.pending_split.clear();
                         }
@@ -1123,7 +1123,7 @@ mod tests {
         let mut acc = StreamAccumulator::new("回合");
         acc.set_card_state(CardState::Streaming);
         acc.push_text(text);
-        acc.reply_to_message_id = Some("msg_1".into());
+        acc.set_reply_target(Some("msg_1".into()));
         app.cards
             .lock()
             .await
@@ -1198,7 +1198,7 @@ mod tests {
         acc.set_card_state(CardState::Streaming);
         acc.push_text(&slice(0));
         acc.push_text(&slice(1));
-        acc.reply_to_message_id = Some("msg_1".into());
+        acc.set_reply_target(Some("msg_1".into()));
         app.cards
             .lock()
             .await
@@ -1252,7 +1252,7 @@ mod tests {
             let mut cards = app.cards.lock().await;
             let session = cards.get_mut("ses_test").unwrap();
             session.card_is_live = false;
-            session.acc.reply_to_message_id = Some("msg_1".into());
+            session.acc.set_reply_target(Some("msg_1".into()));
         }
         platform
             .fail_reply_card_content_count
@@ -1622,7 +1622,7 @@ mod tests {
         acc.set_card_state(CardState::Streaming);
         // Far more content than one flush's MAX_CARD_CHAIN slices can carry.
         acc.push_text(&"很长的回答。".repeat(12000));
-        acc.reply_to_message_id = Some("msg_1".into());
+        acc.set_reply_target(Some("msg_1".into()));
         app.cards
             .lock()
             .await
