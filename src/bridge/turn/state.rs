@@ -1153,16 +1153,26 @@ pub(super) struct StreamAccumulator {
     /// remaining timeline from there.
     pub(super) render_from: usize,
     /// Provider ID of the model answering this turn (e.g. "opencode-go").
-    pub(super) provider_id: Option<String>,
+    /// Private to this module: set by [`Self::apply_footer_model`] (a transcript
+    /// read) and the `set_model` test seam; read only inside this module (the
+    /// footer render and the context-window memo key).
+    provider_id: Option<String>,
     /// Model ID of the model answering this turn (e.g. "deepseek-v4-flash").
-    pub(super) model_id: Option<String>,
+    /// Private to this module: set by [`Self::apply_footer_model`] (a transcript
+    /// read) and the `set_model` test seam; read inside this module and through
+    /// the `#[cfg(test)]` [`Self::model_id`].
+    model_id: Option<String>,
     /// The `/think` variant cola sent this turn (e.g. "high"), shown as
     /// `model@variant` on the footer. Sourced from the session store — the
-    /// server reports the model but not the variant.
-    pub(super) variant: Option<String>,
+    /// server reports the model but not the variant. Private to this module:
+    /// set by [`Self::apply_footer_model`] and [`Self::set_variant`]; read
+    /// inside this module and through the `#[cfg(test)]` [`Self::variant`].
+    variant: Option<String>,
     /// Context tokens the model consumed this turn (includes cached prefix), for
-    /// the context-usage segment in the card footer.
-    pub(super) context_tokens: i64,
+    /// the context-usage segment in the card footer. Private to this module:
+    /// set by [`Self::set_context_tokens`]; read inside this module and through
+    /// the `#[cfg(test)]` [`Self::context_tokens`].
+    context_tokens: i64,
     /// The answering model's context-window size (tokens), fetched from
     /// `GET /provider` and memoized for the turn — `None` before the lookup or
     /// when the server reports none (ADR-0044). Private to this module (no
@@ -1174,8 +1184,10 @@ pub(super) struct StreamAccumulator {
     /// Private to this module (no external reader or writer): moves with
     /// [`Self::context_window`] in `refresh_context_window`.
     context_window_key: Option<(String, String)>,
-    /// Working directory of the session, shown in the card footer.
-    pub(super) directory: Option<String>,
+    /// Working directory of the session, shown in the card footer. Private to
+    /// this module: set by [`Self::apply_work_context`] (and
+    /// [`Self::attach_work_context`]); read through [`Self::directory`].
+    directory: Option<String>,
     /// Project name (directory basename) for the Turn Footer's 📁 segment.
     /// Private to this module (no external reader or writer): set by
     /// [`Self::apply_work_context`].
@@ -1196,7 +1208,9 @@ pub(super) struct StreamAccumulator {
     worktree: bool,
     /// The session/thread name; shown as the card subtitle so the header can
     /// stay focused on state (the question is already in the reply context).
-    pub(super) title: String,
+    /// Private to this module: initialised by [`Self::new`] and re-stamped
+    /// mid-turn by [`Self::set_title`]; read through [`Self::title`].
+    title: String,
     /// The failure line recorded on the card, if any. Private to this module:
     /// it moves only through [`Self::apply_ending`] (a failure ending records
     /// its line, a stop/unreceived ending clears one),
@@ -1280,8 +1294,10 @@ pub(super) struct StreamAccumulator {
     /// never by the header tick or a rendered clock number. The external
     /// renderer renews its idle bound when this advances, so progress a pass
     /// had already rendered before it was abandoned by its timeout still
-    /// counts (a cancelled pass cannot return its stats).
-    pub(super) progress_mark: u64,
+    /// counts (a cancelled pass cannot return its stats). Private to this
+    /// module: advanced only by [`Self::bump_progress_mark`]; read through
+    /// [`Self::progress_mark`].
+    progress_mark: u64,
     /// Assistant message ids this accumulator must NOT render and the ones it
     /// has observed — the retry render baseline (#387). Kept as one fact: the
     /// two sets are seeded and consumed together, and only this type's docs
@@ -1791,6 +1807,89 @@ impl StreamAccumulator {
     /// `set_turn_identity` test seam).
     pub(super) fn set_turn_generation(&mut self, generation: u64) {
         self.turn_generation = Some(generation);
+    }
+
+    /// The session's working directory, if recorded — the Turn Footer's 📁
+    /// segment and every directory-routed read. Private to this module: set by
+    /// [`Self::apply_work_context`]; read through this.
+    pub(super) fn directory(&self) -> Option<&str> {
+        self.directory.as_deref()
+    }
+
+    /// The session/thread name shown as the card subtitle. Private to this
+    /// module: initialised by [`Self::new`], re-stamped by [`Self::set_title`].
+    pub(super) fn title(&self) -> &str {
+        &self.title
+    }
+
+    /// Re-stamp the card's subtitle when the server renamed the session
+    /// (ADR-0023): set by `refresh_session_title` and the `Turn::set_title`
+    /// test seam.
+    pub(super) fn set_title(&mut self, title: &str) {
+        self.title = title.to_string();
+    }
+
+    /// The model answering this turn, if recorded — a test read of the footer
+    /// fact [`Self::apply_footer_model`] sets.
+    #[cfg(test)]
+    pub(super) fn model_id(&self) -> Option<&str> {
+        self.model_id.as_deref()
+    }
+
+    /// The `/think` variant shown on the footer, if recorded — a test read of
+    /// the footer fact [`Self::apply_footer_model`] / [`Self::set_variant`]
+    /// set.
+    #[cfg(test)]
+    pub(super) fn variant(&self) -> Option<&str> {
+        self.variant.as_deref()
+    }
+
+    /// Capture one transcript message's footer model facts (ADR-0019,
+    /// ADR-0044): the answering model, and — when the decoder reports them — the
+    /// provider and the variant. An EMPTY provider is V1's "none", so it leaves
+    /// the last known provider in place; an absent variant likewise leaves the
+    /// last known one. Both the render poll and the final reconcile call this
+    /// through `capture_footer_model`, so the two cannot drift.
+    pub(super) fn apply_footer_model(&mut self, model_id: &str, provider_id: &str, variant: Option<&str>) {
+        self.model_id = Some(model_id.to_string());
+        if !provider_id.is_empty() {
+            self.provider_id = Some(provider_id.to_string());
+        }
+        if let Some(variant) = variant {
+            self.variant = Some(variant.to_string());
+        }
+    }
+
+    /// Set (or clear) the `/think` variant shown on the footer: a Wake
+    /// successor's copied fixture and a Turn's own `/think` selection.
+    pub(super) fn set_variant(&mut self, variant: Option<String>) {
+        self.variant = variant;
+    }
+
+    /// The context tokens consumed this turn — a test read of the footer fact
+    /// [`Self::set_context_tokens`] sets.
+    #[cfg(test)]
+    pub(super) fn context_tokens(&self) -> i64 {
+        self.context_tokens
+    }
+
+    /// Record the context tokens a completed assistant message consumed
+    /// (ADR-0044). The caller guards against an all-zero in-flight usage before
+    /// calling.
+    pub(super) fn set_context_tokens(&mut self, tokens: i64) {
+        self.context_tokens = tokens;
+    }
+
+    /// The monotonic progress mark (#457). Private to this module: advanced by
+    /// [`Self::bump_progress_mark`].
+    pub(super) fn progress_mark(&self) -> u64 {
+        self.progress_mark
+    }
+
+    /// Record observable progress: the external renderer renews its idle bound
+    /// when the mark advances (#457).
+    pub(super) fn bump_progress_mark(&mut self) {
+        self.progress_mark += 1;
     }
 
     /// A waiting card's collect (ADR-0059, spec #405): the card yielded
@@ -4257,6 +4356,42 @@ mod tests {
             "unset variant must not render @: {}",
             text2
         );
+    }
+
+    /// `apply_footer_model` always advances the model id, but an EMPTY provider
+    /// (V1's decoder emits `""` for "none") or an absent variant leaves the last
+    /// known fact in place — the footer never drops a provider/variant it had
+    /// (ADR-0019, ADR-0044).
+    #[test]
+    fn apply_footer_model_keeps_the_last_provider_and_variant() {
+        let mut acc = StreamAccumulator::new("test");
+        acc.apply_footer_model("m1", "provider-a", Some("high"));
+        assert_eq!(acc.model_id.as_deref(), Some("m1"));
+        assert_eq!(acc.provider_id.as_deref(), Some("provider-a"));
+        assert_eq!(acc.variant.as_deref(), Some("high"));
+
+        // A later message with an empty provider and no variant keeps both.
+        acc.apply_footer_model("m2", "", None);
+        assert_eq!(
+            acc.model_id.as_deref(),
+            Some("m2"),
+            "the model id always advances"
+        );
+        assert_eq!(
+            acc.provider_id.as_deref(),
+            Some("provider-a"),
+            "an empty provider is not a provider"
+        );
+        assert_eq!(
+            acc.variant.as_deref(),
+            Some("high"),
+            "an absent variant leaves the last one"
+        );
+
+        // A reported provider/variant replaces them.
+        acc.apply_footer_model("m3", "provider-b", Some("low"));
+        assert_eq!(acc.provider_id.as_deref(), Some("provider-b"));
+        assert_eq!(acc.variant.as_deref(), Some("low"));
     }
 
     /// The work-context 📁 segment (ADR-0019): project basename + branch + dirty

@@ -248,7 +248,7 @@ impl Turn {
         // card a refused target falls back to. `take_over_armed_card` sets it
         // under the takeover's own critical section; an OpenCode message id is
         // never a deliverable Feishu target, so the anchor is not one.
-        acc.variant = variant;
+        acc.set_variant(variant);
         // The successor continues a chain: it carries no question to re-ask,
         // so an Error ending never offers Retry (ADR-0059).
         acc.wake_continuation = true;
@@ -355,7 +355,7 @@ impl Turn {
         acc.set_session(session_id);
         acc.set_reply_target(Some(card_id.to_string()));
         acc.attach_work_context(session_dir).await;
-        acc.variant = variant;
+        acc.set_variant(variant);
         if let Some(text) = anchor_text.filter(|text| !text.is_empty()) {
             acc.push_text_at(Some(anchor.created_ms - 1), text);
         }
@@ -619,7 +619,7 @@ impl Turn {
         acc.turn_anchor = Some(anchor.clone());
         acc.set_session(session_id);
         acc.set_reply_target(facts.reply_to.map(str::to_string));
-        acc.variant = facts.variant;
+        acc.set_variant(facts.variant);
         acc.wake_continuation = true;
         // The 承接 line announces this Wake's completion and hands its work to
         // this fresh card: mark both, so the merged-path entry never doubles
@@ -862,7 +862,7 @@ impl Turn {
                     .map(|anchor| anchor.message_id.clone())
             }),
             card.acc.turn_anchor.as_ref().map(|anchor| anchor.created_ms),
-            card.acc.directory.clone(),
+            card.acc.directory().map(str::to_string),
             card.acc.reply_to_message_id().map(str::to_string),
         );
         card.card_message_id = Some(card_message_id.to_string());
