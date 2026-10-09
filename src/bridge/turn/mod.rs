@@ -1494,8 +1494,8 @@ impl Turn {
         let mut cards = handles.cards.cards.lock().await;
         match cards.get_mut(&self.session_id) {
             Some(card) => {
-                render::capture_turn_anchor(&mut card.acc, transcript);
-                match card.acc.turn_anchor.clone() {
+                card.acc.capture_turn_anchor(transcript);
+                match card.acc.turn_anchor().cloned() {
                     Some(anchor) => render::renders_new_content(&card.acc, transcript, &anchor),
                     None => false,
                 }
@@ -1507,7 +1507,7 @@ impl Turn {
     /// Whether this drain tick may spend the runtime reconciliation: the card
     /// can render the retirement entry the read would produce. That is exactly
     /// "the accumulator has the Turn's anchor, or this read carries the
-    /// submitted message" — [`render::capture_turn_anchor`] takes the anchor
+    /// submitted message" — [`StreamAccumulator::capture_turn_anchor`] takes the anchor
     /// from that message on the render below. An anchorless (or card-less)
     /// tick is on its way to the Unreceived ending, where a recorded
     /// retirement would be swallowed by the overlay with no entry rendered;
@@ -1516,8 +1516,8 @@ impl Turn {
         let mut cards = handles.cards.cards.lock().await;
         match cards.get_mut(&self.session_id) {
             Some(card) => {
-                render::capture_turn_anchor(&mut card.acc, transcript);
-                card.acc.turn_anchor.is_some()
+                card.acc.capture_turn_anchor(transcript);
+                card.acc.has_turn_anchor()
             }
             None => false,
         }
@@ -1562,8 +1562,8 @@ impl Turn {
             let mut cards = handles.cards.cards.lock().await;
             match cards.get_mut(&self.session_id) {
                 Some(card) => {
-                    render::capture_turn_anchor(&mut card.acc, transcript);
-                    card.acc.turn_anchor.clone()
+                    card.acc.capture_turn_anchor(transcript);
+                    card.acc.turn_anchor().cloned()
                 }
                 None => None,
             }
@@ -2027,13 +2027,11 @@ impl Turn {
             let live = cards.cards.lock().await;
             match live.get(session_id) {
                 Some(card) => (
-                    card.acc.cola_message_id().map(MessageId::new).or_else(|| {
-                        card.acc
-                            .turn_anchor
-                            .as_ref()
-                            .map(|anchor| anchor.message_id.clone())
-                    }),
-                    card.acc.turn_anchor.as_ref().map(|anchor| anchor.created_ms),
+                    card.acc
+                        .cola_message_id()
+                        .map(MessageId::new)
+                        .or_else(|| card.acc.turn_anchor().map(|anchor| anchor.message_id.clone())),
+                    card.acc.turn_anchor().map(|anchor| anchor.created_ms),
                     card.acc.directory().map(str::to_string),
                     // The chain's durable reply target (issue #580): the Feishu
                     // message the card replies under — an OpenCode message id
@@ -2120,13 +2118,11 @@ impl Turn {
             };
             let confirmed = card.acc.take_staged_cursor(card_message_id, expected);
             (
-                card.acc.cola_message_id().map(MessageId::new).or_else(|| {
-                    card.acc
-                        .turn_anchor
-                        .as_ref()
-                        .map(|anchor| anchor.message_id.clone())
-                }),
-                card.acc.turn_anchor.as_ref().map(|anchor| anchor.created_ms),
+                card.acc
+                    .cola_message_id()
+                    .map(MessageId::new)
+                    .or_else(|| card.acc.turn_anchor().map(|anchor| anchor.message_id.clone())),
+                card.acc.turn_anchor().map(|anchor| anchor.created_ms),
                 card.acc.directory().map(str::to_string),
                 // The chain's durable reply target (issue #580): a split whose
                 // supplement moved the anchor carries the newest one.
@@ -2561,7 +2557,7 @@ impl Turn {
             let live = cards.cards.lock().await;
             match live.get(session_id) {
                 Some(card) if !card.acc.card_state().is_render_owned() => {
-                    render::plan_ledger_entries(&card.acc, transcript, card.acc.turn_anchor.as_ref())
+                    render::plan_ledger_entries(&card.acc, transcript, card.acc.turn_anchor())
                 }
                 _ => return None,
             }
@@ -2576,7 +2572,7 @@ impl Turn {
             // A card with no Turn anchor to scope the entries with owes no
             // handover: its outgoing read writes nothing, exactly as before
             // (spec #593 keeps the same gate — only the reads moved out).
-            let handover = card.acc.turn_anchor.is_some()
+            let handover = card.acc.has_turn_anchor()
                 && render::apply_ledger_read(
                     &mut card.acc,
                     transcript,
@@ -2651,9 +2647,7 @@ impl Turn {
         let mut plans = {
             let live = cards.cards.lock().await;
             match live.get(session_id) {
-                Some(card) => {
-                    render::plan_ledger_entries(&card.acc, transcript, card.acc.turn_anchor.as_ref())
-                }
+                Some(card) => render::plan_ledger_entries(&card.acc, transcript, card.acc.turn_anchor()),
                 None => Vec::new(),
             }
         };
@@ -2873,7 +2867,7 @@ impl Turn {
             match live.get(session_id) {
                 Some(card) if ownership::admits_ledger_refresh(card) => (
                     true,
-                    render::plan_ledger_entries(&card.acc, transcript, card.acc.turn_anchor.as_ref()),
+                    render::plan_ledger_entries(&card.acc, transcript, card.acc.turn_anchor()),
                 ),
                 _ => (false, Vec::new()),
             }
@@ -2905,7 +2899,7 @@ impl Turn {
             let Some(mut card) = CardOwnership::admit_ledger_write(cards, session_id).await else {
                 return YieldedUpdate::Unchanged;
             };
-            let anchor = card.acc.turn_anchor.clone();
+            let anchor = card.acc.turn_anchor().cloned();
             let changed = render::apply_ledger_read(
                 &mut card.acc,
                 transcript,
@@ -3317,7 +3311,7 @@ impl Turn {
         let stamped = {
             let mut live = cards.cards.lock().await;
             match live.get_mut(session_id) {
-                Some(card) if card.acc.turn_anchor.as_ref() == Some(anchor) => {
+                Some(card) if card.acc.turn_anchor() == Some(anchor) => {
                     card.acc.apply_ending(disposition);
                     true
                 }
@@ -4032,7 +4026,7 @@ impl Turn {
     /// `capture_turn_anchor`.
     pub(crate) async fn set_turn_anchor(cards: &CardsHandle, session_id: &str, anchor: &TurnAnchor) {
         if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
-            card.acc.turn_anchor = Some(anchor.clone());
+            card.acc.repoint_turn_anchor(anchor);
         }
     }
 
