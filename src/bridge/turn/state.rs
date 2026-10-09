@@ -1141,8 +1141,12 @@ pub(super) struct StreamAccumulator {
     item_seq: u64,
     /// The card's interaction section: the live permission/question blocks
     /// (rendered in the tail) and the tombstones of resolved ones (their
-    /// receipt is a timeline entry).
-    pub(super) interactions: Vec<InteractionBlock>,
+    /// receipt is a timeline entry). Private to this module (no external
+    /// reader or writer): it moves only through [`Self::add_interaction`],
+    /// [`Self::resolve_interaction`], [`Self::dismiss_interaction`] and
+    /// [`Self::update_question_state`]; `resolve_vanished` sweeps through
+    /// [`Self::resolve_interaction`].
+    interactions: Vec<InteractionBlock>,
     /// Timeline index the CURRENT card starts rendering from. When a card fills
     /// up (Feishu component limit) it is finalized with a "to be continued"
     /// marker and `render_from` advances — a fresh continuation card renders the
@@ -1161,25 +1165,35 @@ pub(super) struct StreamAccumulator {
     pub(super) context_tokens: i64,
     /// The answering model's context-window size (tokens), fetched from
     /// `GET /provider` and memoized for the turn — `None` before the lookup or
-    /// when the server reports none (ADR-0044).
-    pub(super) context_window: Option<i64>,
+    /// when the server reports none (ADR-0044). Private to this module (no
+    /// external reader or writer): written by `refresh_context_window`, read
+    /// through [`Self::current_context_window`] / [`Self::context_sig`].
+    context_window: Option<i64>,
     /// The (provider, model) pair [`Self::context_window`] was fetched for; a
     /// mismatch triggers a re-fetch, since the answering model can change.
-    pub(super) context_window_key: Option<(String, String)>,
+    /// Private to this module (no external reader or writer): moves with
+    /// [`Self::context_window`] in `refresh_context_window`.
+    context_window_key: Option<(String, String)>,
     /// Working directory of the session, shown in the card footer.
     pub(super) directory: Option<String>,
     /// Project name (directory basename) for the Turn Footer's 📁 segment.
-    pub(super) project_name: Option<String>,
+    /// Private to this module (no external reader or writer): set by
+    /// [`Self::apply_work_context`].
+    project_name: Option<String>,
     /// Git branch: captured at turn start, refreshed at turn end (ADR-0019);
-    /// the short commit hash when detached.
-    pub(super) branch: Option<String>,
+    /// the short commit hash when detached. Private to this module (no external
+    /// reader or writer): set by [`Self::apply_git_state`].
+    branch: Option<String>,
     /// Working tree differs from HEAD, including untracked files: captured at
     /// turn start, refreshed at turn end. Only set alongside `branch`
-    /// (ADR-0019: the halves are omitted together).
-    pub(super) dirty: bool,
+    /// (ADR-0019: the halves are omitted together). Private to this module (no
+    /// external reader or writer): set by [`Self::apply_git_state`].
+    dirty: bool,
     /// The session's directory is a linked git worktree (#433): the 📁
-    /// segment marks it with 🌲. Moves with the branch/dirty halves.
-    pub(super) worktree: bool,
+    /// segment marks it with 🌲. Moves with the branch/dirty halves. Private to
+    /// this module (no external reader or writer): set by
+    /// [`Self::apply_git_state`].
+    worktree: bool,
     /// The session/thread name; shown as the card subtitle so the header can
     /// stay focused on state (the question is already in the reply context).
     pub(super) title: String,
@@ -1274,8 +1288,11 @@ pub(super) struct StreamAccumulator {
     /// nothing durable (spec #588, review PR #595). This is the ANNOUNCEMENT
     /// gate (it keeps an entry single); the Wake step's in-place decision reads
     /// [`Self::handed_over_wakes`], because an entry a ledger refresh placed is
-    /// not a handoff.
-    pub(super) announced_wakes: std::collections::HashSet<String>,
+    /// not a handoff. Private to this module (no external reader or writer):
+    /// written by [`Self::announce_wake`] and [`Self::announce_synthetic`]
+    /// through the private `announce_entry` (the one insert), read by
+    /// [`Self::wake_announced`].
+    announced_wakes: std::collections::HashSet<String>,
     /// The Wakes whose resumed work this chain has HANDED OVER to a card
     /// (ADR-0066): a 承接 line's split (a continuation card takes it) or the
     /// in-place resume (the same card takes it). The Wake step's in-place gate
@@ -1311,8 +1328,11 @@ pub(super) struct StreamAccumulator {
     /// exactly-once gate. Newest last; a delivered body's mark stays drainable
     /// even after a newer mark is staged (spec #561, review #569), so a
     /// restart can never re-announce a Wake the card already showed. Bounded
-    /// by [`MAX_STAGED_MARKS`].
-    pub(super) pending_watermarks: Vec<StagedWatermark>,
+    /// by [`MAX_STAGED_MARKS`]. Private to this module (no external reader or
+    /// writer): staged by [`Self::announce_wake`], read by
+    /// [`Self::pending_watermark_id`], drained by
+    /// [`Self::take_staged_watermark`].
+    pending_watermarks: Vec<StagedWatermark>,
     /// The chain's last confirmed Rendered Cursor (spec #561): the in-memory
     /// mirror of the record's fact. Every staged candidate derives from it,
     /// and a fresh accumulator taking over a chain is seeded from the record
