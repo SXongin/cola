@@ -2237,15 +2237,16 @@ async fn a_top_level_cards_wake_less_tail_lands_in_place() {
         "the tail is never dropped: {last}"
     );
     // The card was opened by a genuine restart Wake, so it already carries that
-    // one 承接 line; the residual must add no SECOND resumption receipt.
+    // one 承接 line; the residual must add no SECOND resumption receipt — it
+    // carries the neutral 「📄 还有更新」 label instead (#606).
     assert_eq!(
         card_text(&last).matches(WAKE_LEAD).count(),
         1,
         "the residual adds no second 「已恢复执行」 receipt: {last}"
     );
     assert!(
-        !card_text(&last).contains(RESIDUAL_LEAD),
-        "the in-place floor writes no residual receipt: {last}"
+        card_text(&last).contains(RESIDUAL_LEAD),
+        "the first in-place residual carries the neutral 「📄 还有更新」 label: {last}"
     );
 }
 

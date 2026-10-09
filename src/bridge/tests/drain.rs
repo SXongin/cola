@@ -3984,6 +3984,20 @@ async fn a_size_split_terminal_flush_notifies_after_the_new_card() {
         assistant(2_000, &long),
     ]);
     let (_dir, app, _backend, platform) = scripted_app(vec![transcript], Some(SessionStatus::Idle)).await;
+    // Keep the submit-window render poll from flushing the long answer first:
+    // its first read is gated a full poll cycle away, so `attempt` sets the stop
+    // flag before the poll ever reads. The split then happens in finalization's
+    // OWN ending flush — the flush the notice gate is bound to — instead of
+    // earlier, which is what the bug is about (#607). The drain shares this
+    // cadence, so the turn still finishes in well under the notice's deadline.
+    app.turn_render_poll_ms.store(200, Ordering::Relaxed);
+    // Distinct create ids: the loading card and the split's continuation must be
+    // DIFFERENT card ids. The mock's constant `msg_reply` would hide the bug —
+    // the size split would move the terminal slice to a continuation that
+    // reports the same id as the prefix it replaced, so the notice's identity
+    // guard would not notice the swap.
+    platform.given_reply_id("om_loading");
+    platform.given_reply_id("om_continuation");
     let mut context = ctx("ses_test", "你好");
     context.is_group = true;
     context.requester_open_id = Some(TEST_HOST.to_string());
