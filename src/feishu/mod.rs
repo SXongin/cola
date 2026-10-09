@@ -275,15 +275,23 @@ pub trait Platform: Send + Sync {
 
     /// Gate a Completion Notice on the terminal write being **accepted** (spec
     /// #602, ticket #607): delivered now, or owed by the delivery layer's
-    /// retry. `message_id` is the card carrying the terminal slice.
-    /// [`NoticeGate::Armed`] stores `notice` to fire once that card's owed
-    /// Pending Card Update drains; [`NoticeGate::Delivered`] means nothing is
-    /// owed and the caller sends the notice at once; [`NoticeGate::Never`]
-    /// means the card's newest write settled refused, so the notice is
+    /// retry. `message_id` is the card carrying the terminal slice and `seq` is
+    /// that terminal write's **own** keyless sequence (from
+    /// [`Self::pending_card_write`] / [`Self::failed_card_write`]) — the gate
+    /// binds to it, never to the entry's current newest, so a newer unrelated
+    /// repaint can never answer for it. [`NoticeGate::Armed`] stores `notice` to
+    /// fire once that exact write drains; [`NoticeGate::Delivered`] means it
+    /// already delivered and the caller sends at once; [`NoticeGate::Never`]
+    /// means it was superseded, evicted or permanently refused, so the notice is
     /// suppressed — a write that will never land must not announce the end. The
     /// default — a platform with no delivery decorator — answers
     /// [`NoticeGate::Delivered`], the ungated notice.
-    fn defer_notice_until_delivered(&self, _message_id: &str, notice: DeferredNotice) -> NoticeGate {
+    fn defer_notice_until_delivered(
+        &self,
+        _message_id: &str,
+        _seq: u64,
+        notice: DeferredNotice,
+    ) -> NoticeGate {
         let _ = notice;
         NoticeGate::Delivered
     }
