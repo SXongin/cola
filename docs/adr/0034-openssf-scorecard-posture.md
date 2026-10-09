@@ -304,3 +304,39 @@ verdict instead of always reading green, while the no-`request-changes`
 contract is untouched — a FAIL is still a comment without an approval, and the
 approval remains the merge gate (`review` is not a required check; the
 approval is).
+
+## Amendment (2026-10-09): the author-side review gains the gate's adversarial pass
+
+The 2026-10-04 amendment kept the adversarial pass in CI alone so the two
+signals stayed independent. The measured cost of that split is the review
+round-trip: every push re-runs the gate's full-base adversarial review
+(`.github/workflows/codex-review.yml`, `git diff <base>...<head>`), a fix grows
+the diff, and the next run finds the new surface. Across the gate's first five
+days the merged PRs carried ~3.8 FAIL rounds each against ~0.4 under the
+OpenCode gate, and PR #609's eight rounds each named a genuinely *different*
+missed requirement (#603/#606/#607) — while several of its tests still passed
+with the change reverted. The size hypothesis does not hold: a 76-line
+agents-only PR drew six rounds where an 8.5k-line feature had drawn none.
+
+The repo therefore adds a local companion, `/adversarial-review`
+(`.opencode/skill/adversarial-review/SKILL.md`), run *alongside* `/code-review`
+before the PR — the pair invoked together at **every** review point
+(`docs/agents/flow.md`): a ticket window, the whole branch, a fix round,
+never the adversarial pass alone. The upstream `/implement` and
+`/implement-spec` skills are never forked (PR #601's policy); the binding in
+`AGENTS.md` and `flow.md` supersedes their single `/code-review` step. It
+authors no rubric of its own: it lifts the pass and its rules verbatim from
+`.github/codex/prompts/review.md`, so the local pass and the gate cannot drift.
+This deliberately spends the independence the 2026-10-04 amendment bought —
+the author-side review now shares the gate's lens (and, with `code-reviewer` on
+`gpt-6-luna`, its model family) — in exchange for far fewer review round-trips.
+The gate stays the independent final run (a fresh sandbox, its own execution),
+and the two axes stay a separate report from the adversarial pass, exactly as CI
+keeps them.
+
+Who runs it is fixed by the agent permissions, not preference: `implementer` and
+`merger` deny `subagent`, so only the orchestrating session can dispatch the
+read-only `code-reviewer`, and the reviewer is never the author. Fixes return to
+an implementer (`docs/agents/flow.md`): the originating session for a
+ticket-local finding, a fresh one for a cross-ticket finding, with the merger
+landing the result and the pass re-run at that same scope.
