@@ -1026,8 +1026,13 @@ pub(super) enum EndingWrite {
     /// as the keyless write at this exact sequence. The Completion Notice arms
     /// against THIS sequence, never the card's current newest (spec #607).
     Owed(u64),
-    /// The terminal slice can never reach Feishu: a permanently refused or
-    /// suspended ending PATCH, or a size-split continuation create that failed.
+    /// The terminal slice is not on Feishu and nothing will carry it as this
+    /// flush's terminal write: a permanently refused or suspended ending PATCH,
+    /// a size-split continuation create that failed, a size split with no
+    /// reachable continuation target, or a continuation create that is itself
+    /// over the budget with further slices still owed (the next slice's send
+    /// overwrites this transient state; if the flush stops first, the notice is
+    /// suppressed). Never announced over (spec #607).
     Failed,
 }
 
