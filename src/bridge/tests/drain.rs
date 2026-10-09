@@ -3058,6 +3058,101 @@ async fn a_tail_landing_after_the_drain_settled_still_lands_on_the_card() {
     );
 }
 
+/// Spec #602 review, round 7, finding 1 (#604): the final confirmation read must
+/// use the FIXED per-read timeout, never one capped by the (possibly tiny) grace.
+/// A short grace must not shorten a read the Backend answers within the read
+/// timeout: with a delayed-but-SUCCESSFUL final read carrying a late part, the
+/// part must still land on the Card and no residual Card may open.
+///
+/// A grace-capped read abandons the still-in-flight read as "unreadable", falls
+/// back to the drain's earlier tail-less snapshot, and finalizes before the part
+/// renders — so the tail later orphans into a Wake-less residual Card, the very
+/// #604 race. The delay sits well above the grace and well below the read
+/// timeout, so only the cap decides the outcome.
+#[tokio::test]
+async fn a_delayed_but_successful_final_read_still_lands_the_tail() {
+    let _wd = test_work_dir();
+    let tail_less = vec![
+        user("msg_cola_anchor", 1_000, "第一条消息"),
+        assistant(2_000, "第一段。"),
+    ];
+    let with_tail = vec![
+        user("msg_cola_anchor", 1_000, "第一条消息"),
+        assistant(2_000, "第一段。"),
+        assistant(3_000, "第二段。"),
+    ];
+    let (_dir, app, backend, platform) = scripted_app(
+        vec![SessionTranscript::new(tail_less.clone())],
+        Some(SessionStatus::Busy),
+    )
+    .await;
+    // A SHORT grace against a much larger per-read timeout: the final read must
+    // be given the read timeout, never shortened to the grace.
+    app.turn_follow_grace_ms.store(60, Ordering::Relaxed);
+    app.turn_follow_read_timeout_ms.store(600, Ordering::Relaxed);
+    // Delay ONLY the read that carries the tail: the drain's settle reads are
+    // tail-less and immediate, so the delayed read is finalization's own. The
+    // delay is above the grace (60 ms) and well below the read timeout (600 ms).
+    *backend.delay_reads_with_tail.lock().unwrap() =
+        Some(("第二段。".to_string(), Duration::from_millis(150)));
+
+    let _turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
+    wait_for_card_text(&platform, "第一段。").await;
+    // Let the submit-window render poll stop: from here the drain is the only
+    // transcript reader, so the read parked below is its own.
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    // Park the drain's settle read, then — while it is held — go Idle and script
+    // the sequence deterministically: the parked read and the drain's
+    // corroborating re-check serve tail-less, and finalization's own read serves
+    // the tail. Disarm so the later reads flow.
+    let gate = backend.hold_transcripts();
+    wait_for_parked_reads(&backend, 1).await;
+    backend
+        .set_session_status("ses_test", Some(SessionStatus::Idle))
+        .await;
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(tail_less.clone()),
+            SessionTranscript::new(tail_less.clone()),
+            SessionTranscript::new(with_tail.clone()),
+        ],
+    )
+    .await;
+    *backend.transcript_gate.lock().unwrap() = None;
+    gate.add_permits(1);
+
+    wait_for_guard_release(&app).await;
+    let final_card = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_header(&final_card).contains("完成"),
+        "the turn ends on the Card: {final_card}"
+    );
+    assert!(
+        card_text(&final_card).contains("第二段。"),
+        "a delayed-but-successful final read must render its tail on the Card: {final_card}"
+    );
+    assert!(
+        continuation_sends(&platform).await.is_empty(),
+        "no second/residual Card may open for the tail: {:?}",
+        platform.calls.lock().await
+    );
+
+    // The durable transcript still carries the tail: Session Sync must find
+    // nothing unrendered, so no Wake-less residual Card opens.
+    let posts = card_posts(&platform).await;
+    script_transcript(&backend, vec![SessionTranscript::new(with_tail)]).await;
+    spawn_sync(&app);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        card_posts(&platform).await,
+        posts,
+        "a rendered tail must not orphan into a second Card: {:?}",
+        platform.calls.lock().await
+    );
+}
+
 /// Finding 1 (spec #602 review, round 4): finalization must never hold the
 /// inflight guard on a CONTINUING stream. A run whose `session_status` never
 /// answers but whose every transcript read succeeds WITH new content ends the
@@ -3108,16 +3203,21 @@ async fn a_continuing_stream_on_a_failed_status_read_still_finalizes_at_the_grac
     );
 }
 
-/// Spec #602 review, round 5: finalization's reads are bounded by the REMAINING
-/// grace budget, not the full per-read timeout. A read begun when the budget is
-/// nearly spent must not hold the inflight guard for a whole
-/// `follow_read_timeout_ms` past the grace. Here the drain's transcript reads
-/// never answer (all parked), so the drain ends in the lost-contact grace and
-/// finalization's own read is the last bounded call before the guard releases.
-/// With the read timeout far above the grace, an unbounded finalization read
-/// spends the full timeout; a bounded one spends only the remaining budget.
+/// Spec #602 review, round 7 (#603/#604): finalization's read uses the FIXED
+/// per-read timeout, never one capped by the remaining grace. The round-5 form
+/// of this test pinned a grace-capped read; this re-expression pins what
+/// actually bounds the guard — the per-read timeout itself (so the flow is still
+/// bounded, never held forever) — while the read keeps the full timeout so a
+/// reachable Backend answering after a small grace is not misread as unreadable.
+///
+/// Here every transcript read is parked (no permit is ever added) and the status
+/// leg never answers, so the drain ends in the lost-contact grace and
+/// finalization makes its OWN full-timeout read. The guard therefore releases
+/// after the drain's read PLUS finalization's read — each the full read timeout.
+/// A grace-capped finalization read (~the 60 ms grace) would release far sooner;
+/// a read held forever would never release. Both are distinguished below.
 #[tokio::test]
-async fn finalization_reads_are_bounded_by_the_remaining_grace_budget() {
+async fn finalization_reads_use_the_full_per_read_timeout_and_stay_bounded() {
     let _wd = test_work_dir();
     let timeline = vec![
         user("msg_cola_anchor", 1_000, "第一条消息"),
@@ -3125,8 +3225,9 @@ async fn finalization_reads_are_bounded_by_the_remaining_grace_budget() {
     ];
     let (_dir, app, backend, _platform) =
         scripted_app(vec![SessionTranscript::new(timeline)], Some(SessionStatus::Busy)).await;
-    // A tiny grace; the per-read timeout is far larger, so an unbounded
-    // finalization read overshoots the grace by a full read timeout.
+    // A tiny grace against a far larger per-read timeout: the finalization read
+    // must not be shortened to the grace, and the flow must stay bounded by the
+    // read timeout.
     app.turn_follow_grace_ms.store(60, Ordering::Relaxed);
     app.turn_follow_read_timeout_ms.store(600, Ordering::Relaxed);
     // The status leg never answers either: the drain can only end through the
@@ -3145,14 +3246,17 @@ async fn finalization_reads_are_bounded_by_the_remaining_grace_budget() {
     wait_for_guard_release(&app).await;
     let held = start.elapsed();
 
-    // `held` spans the drain's own (fixed 600 ms) read PLUS finalization. Fixed:
-    // ~600 ms + the ~60 ms remaining grace ≈ 660 ms. A regression that spent the
-    // FULL 600 ms read timeout in finalization would instead be ~1200 ms, so a
-    // threshold well under that (800 ms) distinguishes the two and fails a
-    // full-timeout read.
+    // `held` spans the drain's own (fixed 600 ms) read PLUS finalization's own
+    // read, EACH the full 600 ms: ~1200 ms. A grace-capped finalization read
+    // (~60 ms) would release at ~660 ms, and a read held forever would never
+    // release — the window below fails both.
     assert!(
-        held < Duration::from_millis(800),
-        "finalization held the guard {held:?} after the drain — a read must be bound by the remaining budget, not the full read timeout"
+        held >= Duration::from_millis(1000),
+        "finalization held the guard {held:?} after the drain — the read must use the full per-read timeout, not a grace-capped one"
+    );
+    assert!(
+        held < Duration::from_secs(3),
+        "finalization held the guard {held:?} after the drain — the read must stay bounded by the per-read timeout"
     );
 
     tokio::time::timeout(Duration::from_secs(3), turn)
