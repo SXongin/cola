@@ -1306,9 +1306,11 @@ pub(super) struct StreamAccumulator {
     /// Whether this card continues its Turn after a Wake (ADR-0059): the
     /// chain moved on a new card after the previous one yielded or ended, so
     /// this card carries no question to re-ask — an Error ending never offers
-    /// Retry, whatever the previous attempt's facts were. Set by
-    /// [`Self::continue_on_new_card`] and by a fresh (restart) arm.
-    pub(super) wake_continuation: bool,
+    /// Retry, whatever the previous attempt's facts were. Private to this
+    /// module: set by [`Self::mark_wake_continuation`] — from
+    /// [`Self::continue_on_new_card`] and the fresh arms `arm_projected_card`
+    /// and `arm_wake_continuation`; read through [`Self::wake_continuation`].
+    wake_continuation: bool,
     /// The Wakes whose completion this chain has already announced: marked by
     /// its own opening 承接 line (a Wake that opened a card) or by a
     /// completion entry — the merged-path render of a live card, or a yielded
@@ -1337,8 +1339,9 @@ pub(super) struct StreamAccumulator {
     /// handed over, a later tail past it is a Wake-less content diff: it renders
     /// in place on the chain's open yielded card, never a second continuation
     /// (spec #602). Like the announcement set, one mark per Wake id, kept across
-    /// [`Self::continue_on_new_card`].
-    pub(super) handed_over_wakes: std::collections::HashSet<String>,
+    /// [`Self::continue_on_new_card`]. Private to this module: written by
+    /// [`Self::hand_over_wake`]; read through [`Self::has_handed_over_wake`].
+    handed_over_wakes: std::collections::HashSet<String>,
     /// Whether this chain's ONE neutral residual continuation has already
     /// fired (spec #602, ticket #606): a Wake-less part the Backend wrote after
     /// the run reported idle renders on exactly one neutral card per request.
@@ -1352,8 +1355,11 @@ pub(super) struct StreamAccumulator {
     /// [`Self::handed_over_wakes`] — the residual answers no Wake — and never
     /// persisted: a restart has no in-process chain to re-decide on, and the
     /// Fresh (recordless) path is Wake-scoped, so a Wake-less read there owes
-    /// nothing.
-    pub(super) residual_card_posted: bool,
+    /// nothing. Private to this module: set by
+    /// [`Self::mark_residual_card_posted`] (`flush_card_locked` and
+    /// `Turn::render_residual_in_place`); read through
+    /// [`Self::residual_card_posted`].
+    residual_card_posted: bool,
     /// The Wake Watermarks this chain has staged but not yet drained:
     /// `(wake id, created_ms)` stages, advanced by [`Self::announce_wake`] and
     /// persisted into the durable Wake Watermark once a card write actually
@@ -1410,8 +1416,10 @@ pub(super) struct StreamAccumulator {
     /// entry nor stages a watermark advance for it. Seeded when a card starts
     /// rendering a session (`Turn`'s start, the projection/external arms, the
     /// Wake continuation); a strictly newer Wake still announces. `None` when
-    /// the session announced no Wake.
-    pub(super) wake_floor: Option<i64>,
+    /// the session announced no Wake. Private to this module: seeded by
+    /// [`Self::set_wake_floor`] (`Turn::seed_wake_floor`); read through
+    /// [`Self::wake_floor`].
+    wake_floor: Option<i64>,
     /// The Rendered Cursors of the card bodies built and not yet confirmed,
     /// newest last (spec #561, review #569): the flush stages one before each
     /// write and a confirmed write drains its exact stage — while a stage whose
@@ -1445,7 +1453,9 @@ pub(super) struct StreamAccumulator {
     /// exactly once while the Session reads live but the submitted message
     /// has not landed — a genuine long tool call and a dead run look
     /// identical, so the line waits out the follow grace and never doubles.
-    pub(super) receive_hint_shown: bool,
+    /// Private to this module: set by [`Self::mark_receive_hint_shown`] (the
+    /// unreceived watch); read through [`Self::receive_hint_shown`].
+    receive_hint_shown: bool,
     /// ADR-0014: progress/liveness signals for the header.
     /// The active header phase; None when the turn is not actively working
     /// (Done/Error/Continued show no timer).
@@ -1892,6 +1902,64 @@ impl StreamAccumulator {
         self.progress_mark += 1;
     }
 
+    /// Whether this card continues its Turn after a Wake (ADR-0059) — an Error
+    /// ending on it never offers Retry. Private to this module: set by
+    /// [`Self::mark_wake_continuation`].
+    pub(super) fn wake_continuation(&self) -> bool {
+        self.wake_continuation
+    }
+
+    /// Mark this card as a Wake continuation: a 承接 line's fresh card
+    /// (`arm_projected_card` / `arm_wake_continuation`), or a card resuming
+    /// after its predecessor yielded ([`Self::continue_on_new_card`]).
+    pub(super) fn mark_wake_continuation(&mut self) {
+        self.wake_continuation = true;
+    }
+
+    /// Whether this chain has already HANDED a Wake's resumed work over to a
+    /// card (ADR-0066). Private to this module: written by
+    /// [`Self::hand_over_wake`].
+    pub(super) fn has_handed_over_wake(&self, wake_id: &str) -> bool {
+        self.handed_over_wakes.contains(wake_id)
+    }
+
+    /// Whether this chain's one neutral residual continuation has already fired
+    /// (spec #602, ticket #606). Private to this module: set by
+    /// [`Self::mark_residual_card_posted`].
+    pub(super) fn residual_card_posted(&self) -> bool {
+        self.residual_card_posted
+    }
+
+    /// Mark the chain's one neutral residual continuation as posted.
+    pub(super) fn mark_residual_card_posted(&mut self) {
+        self.residual_card_posted = true;
+    }
+
+    /// The chain's durable Wake Watermark floor, if any (spec #561): every Wake
+    /// at or below this `created_ms` was announced by an earlier card. Private
+    /// to this module: seeded by [`Self::set_wake_floor`].
+    pub(super) fn wake_floor(&self) -> Option<i64> {
+        self.wake_floor
+    }
+
+    /// Seed the Wake floor from the chain's durable Watermark (`None` when the
+    /// session announced no Wake).
+    pub(super) fn set_wake_floor(&mut self, floor: Option<i64>) {
+        self.wake_floor = floor;
+    }
+
+    /// Whether the neutral waiting line 「⏳ 等待当前运行接收…」 was already shown
+    /// (ADR-0062). Private to this module: set by
+    /// [`Self::mark_receive_hint_shown`].
+    pub(super) fn receive_hint_shown(&self) -> bool {
+        self.receive_hint_shown
+    }
+
+    /// Mark the neutral waiting line as shown (pushed exactly once).
+    pub(super) fn mark_receive_hint_shown(&mut self) {
+        self.receive_hint_shown = true;
+    }
+
     /// A waiting card's collect (ADR-0059, spec #405): the card yielded
     /// 「⏳ 等待后台任务」 and then its wait was taken over — a new Turn in the
     /// thread superseded it, or the Session stopped being the thread's Active
@@ -1926,7 +1994,7 @@ impl StreamAccumulator {
         self.error = None;
         self.prompt = None;
         self.recovery_claimed = false;
-        self.wake_continuation = true;
+        self.mark_wake_continuation();
         self.card_fallback = CardFallback::None;
         self.card_state = CardState::Loading;
         // The previous phase ended with the card; `refresh_phase` only resets

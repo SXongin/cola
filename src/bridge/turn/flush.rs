@@ -989,7 +989,7 @@ async fn push_queued_receipts(cards: &CardsHandle, session_id: &str) {
             // second neutral card. The split itself may still be owed (a failed
             // create is retried by a later flush), so the mark never drops the
             // content it announced.
-            card.acc.residual_card_posted = true;
+            card.acc.mark_residual_card_posted();
         }
         if let Some((wake, created_ms)) = line.as_ref().and_then(|line| line.wake.as_ref()) {
             // The 承接 line announces this Wake's completion and hands its work

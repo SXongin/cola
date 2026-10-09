@@ -530,7 +530,7 @@ fn plan_wake_entries(
         // announced by an earlier card (spec #561, review #569; ADR-0061): its
         // completion entry is never re-inserted, and no new announcement is
         // staged for it. A strictly newer Wake renders and announces normally.
-        if acc.wake_floor.is_some_and(|floor| created_ms <= floor) {
+        if acc.wake_floor().is_some_and(|floor| created_ms <= floor) {
             continue;
         }
         if acc.wake_announced(wake.id.as_str()) {

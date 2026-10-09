@@ -2485,10 +2485,10 @@ impl Turn {
         let Some(card) = live.get_mut(session_id) else {
             return false;
         };
-        if card.acc.receive_hint_shown {
+        if card.acc.receive_hint_shown() {
             return false;
         }
-        card.acc.receive_hint_shown = true;
+        card.acc.mark_receive_hint_shown();
         card.acc.push_receipt(RECEIVE_HINT);
         true
     }
@@ -2781,11 +2781,11 @@ impl Turn {
             // floor fired, so a later tail adds no second receipt. A card whose
             // one neutral residual already posted (the split arm set the marker)
             // keeps the receipt it already carries.
-            if !card.acc.residual_card_posted {
+            if !card.acc.residual_card_posted() {
                 card.acc.push_receipt(SplitKind::Residual.receipt());
             }
             card.acc.restore_ending(ending_state, ending_error);
-            card.acc.residual_card_posted = true;
+            card.acc.mark_residual_card_posted();
             card.acc.refresh_phase();
         }
         // `SplitPolicy::Allow`: an over-budget tail finalizes this card and
@@ -2928,7 +2928,7 @@ impl Turn {
             // A settled Wake continuation owes no notice: its own card send was
             // the notification (ADR-0059). The Turn's own waiting card carries
             // its start as the long-task clock.
-            let notice_at = if card.acc.wake_continuation {
+            let notice_at = if card.acc.wake_continuation() {
                 None
             } else {
                 card.acc.turn_started_at()
@@ -3229,7 +3229,7 @@ impl Turn {
     /// entry nor stages a watermark advance for it. A strictly newer Wake still
     /// renders and announces.
     fn seed_wake_floor(cards: &CardsHandle, session_id: &str, acc: &mut state::StreamAccumulator) {
-        acc.wake_floor = cards.chains.announced(session_id).map(|mark| mark.created_ms);
+        acc.set_wake_floor(cards.chains.announced(session_id).map(|mark| mark.created_ms));
     }
 
     /// Whether the session's card has rendered any part — the external
@@ -3445,7 +3445,7 @@ impl Turn {
             || card.acc.recovery_claimed
             // A Wake continuation carries no question to re-ask (ADR-0059):
             // its card never offers Retry, so no click may claim one either.
-            || card.acc.wake_continuation
+            || card.acc.wake_continuation()
         {
             return None;
         }

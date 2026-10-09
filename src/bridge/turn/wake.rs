@@ -251,7 +251,7 @@ impl Turn {
         acc.set_variant(variant);
         // The successor continues a chain: it carries no question to re-ask,
         // so an Error ending never offers Retry (ADR-0059).
-        acc.wake_continuation = true;
+        acc.mark_wake_continuation();
         acc.apply_work_context(work_context);
         acc.seed_projection(cursor, seed.clone());
         // A pending orphan gap renders first (spec #561, review #569): its
@@ -446,7 +446,7 @@ impl Turn {
                 if ownership::admits_ledger_refresh(card)
                     && let Some(wake) = newest_wake
                     && matches!(wake.source, WakeSource::Shell | WakeSource::Subagent)
-                    && !card.acc.handed_over_wakes.contains(wake.id.as_str())
+                    && !card.acc.has_handed_over_wake(wake.id.as_str())
                 {
                     return Some(WakeContinuation::ResumeInPlace {
                         wake_id: Some(wake.id.to_string()),
@@ -465,7 +465,7 @@ impl Turn {
                 //    splitting again.
                 if let Some(wake) = newest_wake
                     && wake.source.is_genuine_resumption()
-                    && !card.acc.handed_over_wakes.contains(wake.id.as_str())
+                    && !card.acc.has_handed_over_wake(wake.id.as_str())
                     && let Some(anchor) = wake.anchor()
                 {
                     return Some(WakeContinuation::ContinueChain {
@@ -502,7 +502,7 @@ impl Turn {
                 //    renders IN PLACE on that one neutral card (a second neutral
                 //    card would break one-card-per-request; dropping the content
                 //    would break "never dropped").
-                if !card.acc.residual_card_posted {
+                if !card.acc.residual_card_posted() {
                     return Some(WakeContinuation::Residual {
                         line: ContinuationLine {
                             // Key the neutral receipt just before the missed
@@ -620,7 +620,7 @@ impl Turn {
         acc.set_session(session_id);
         acc.set_reply_target(facts.reply_to.map(str::to_string));
         acc.set_variant(facts.variant);
-        acc.wake_continuation = true;
+        acc.mark_wake_continuation();
         // The 承接 line announces this Wake's completion and hands its work to
         // this fresh card: mark both, so the merged-path entry never doubles
         // the line when the work renders, and a later tail past the Wake still
