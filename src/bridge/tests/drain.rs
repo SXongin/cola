@@ -3108,6 +3108,58 @@ async fn a_continuing_stream_on_a_failed_status_read_still_finalizes_at_the_grac
     );
 }
 
+/// Spec #602 review, round 5: finalization's reads are bounded by the REMAINING
+/// grace budget, not the full per-read timeout. A read begun when the budget is
+/// nearly spent must not hold the inflight guard for a whole
+/// `follow_read_timeout_ms` past the grace. Here the drain's transcript reads
+/// never answer (all parked), so the drain ends in the lost-contact grace and
+/// finalization's own read is the last bounded call before the guard releases.
+/// With the read timeout far above the grace, an unbounded finalization read
+/// spends the full timeout; a bounded one spends only the remaining budget.
+#[tokio::test]
+async fn finalization_reads_are_bounded_by_the_remaining_grace_budget() {
+    let _wd = test_work_dir();
+    let timeline = vec![
+        user("msg_cola_anchor", 1_000, "第一条消息"),
+        assistant(2_000, "第一段。"),
+    ];
+    let (_dir, app, backend, _platform) =
+        scripted_app(vec![SessionTranscript::new(timeline)], Some(SessionStatus::Busy)).await;
+    // A tiny grace; the per-read timeout is far larger, so an unbounded
+    // finalization read overshoots the grace by a full read timeout.
+    app.turn_follow_grace_ms.store(60, Ordering::Relaxed);
+    app.turn_follow_read_timeout_ms.store(600, Ordering::Relaxed);
+    // The status leg never answers either: the drain can only end through the
+    // lost-contact grace, and finalization reads exactly once.
+    backend.session_status_fails.store(true, Ordering::SeqCst);
+
+    // Park EVERY transcript read from the start (no permit is ever added), so
+    // each read runs to its own bound before the caller gives up.
+    let _gate = backend.hold_transcripts();
+    let turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
+
+    // Time from the first hung transcript read: the drain's own read bound is
+    // fixed, so the extra time to the guard release is what finalization spends.
+    wait_for_parked_reads(&backend, 1).await;
+    let start = tokio::time::Instant::now();
+    wait_for_guard_release(&app).await;
+    let held = start.elapsed();
+
+    // Finalization is bounded by the remaining grace (~60 ms), never the full
+    // 600 ms read timeout: the guard releases comfortably under one full read
+    // timeout after the drain's own read. An unbounded read would add ~600 ms.
+    assert!(
+        held < Duration::from_millis(900),
+        "finalization held the guard {held:?} after the drain — a read must be bound by the remaining budget, not the full read timeout"
+    );
+
+    tokio::time::timeout(Duration::from_secs(3), turn)
+        .await
+        .expect("the turn task must end with the finalized card")
+        .unwrap()
+        .unwrap();
+}
+
 /// A Wake's content landing in the finalization window must not satisfy the
 /// Turn's completion check: its Execution has not reached a boundary yet, so
 /// the Turn keeps observing (the old "any terminal step since the anchor" rule
