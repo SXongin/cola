@@ -1,18 +1,13 @@
 ---
 name: adversarial-review
-description: Repo-local companion to the two-axis `/code-review`. Run the Codex gate's adversarial pass — correctness, test adequacy, robustness — on a branch, a ticket window, or a PR diff before the PR is opened, so the CI gate is far less likely to raise a new blocking finding. Use alongside `/code-review`, never instead of it; the two axes are that skill's job. The orchestrating session runs this — a sub-agent cannot spawn the reviewer.
+description: Repo-local companion to the two-axis `/code-review`. Run the Codex gate's adversarial pass — correctness, test adequacy, robustness — on a branch, a ticket window, or a PR diff before the PR is opened, so the CI gate is far less likely to raise a new blocking finding.
 ---
 
 # Adversarial review
 
-The repo's author-side review is two skills that run side by side:
+The binding — its pairing with `/code-review`, which review points, who runs it, how findings route, the re-review bound — is `docs/agents/flow.md`; this skill adds only the pass below.
 
-- **`/code-review`** — the two axes (Standards, Spec), the upstream skill unchanged.
-- **`/adversarial-review`** — this skill: the CI gate's *adversarial* pass, run before the PR so the gate's first review finds far less it has not already seen.
-
-The pair runs together at **every** review point — a ticket window, the whole branch, a fix round — and never the adversarial pass alone: run `/code-review` alongside this one every time, or the Standards and Spec axes go unchecked. Reporting is two separate reports, never merged.
-
-CI deliberately kept this pass out of `/code-review` (`ADR-0034`, 2026-10-04 amendment), which left the author-side review blind to exactly the class the gate blocks on: a negative path the new test never walks, a test that still passes with the change reverted, an unhandled error/cleanup/ordering path, a lost tail under a size split. Running it locally is the deliberate trade recorded in `ADR-0034`'s 2026-10-09 amendment — one fewer independent lens for far fewer review round-trips.
+CI deliberately kept this pass out of `/code-review` (`ADR-0034`, 2026-10-04 amendment), which left the author-side review blind to exactly the class the gate blocks on: a negative path the new test never walks, a test that still passes with the change reverted, an unhandled error/cleanup/ordering path, a lost tail under a size split. Running it locally is the deliberate trade recorded in `ADR-0034`'s 2026-10-09 amendment — fewer review round-trips.
 
 ## The rubric is not written here
 
@@ -40,12 +35,3 @@ Dispatch a single `code-reviewer` sub-agent **from the orchestrating session** �
 Present the findings under `## Adversarial`, verbatim or lightly cleaned, keeping the reviewer's final `CODEX_REVIEW_VERDICT` line. Do **not** merge or rerank them against `/code-review`'s two-axis report — the axes stay separate, exactly as CI reports them.
 
 This skill reports; it never edits.
-
-## Who runs it, and who fixes
-
-The **orchestrating session** runs it. `implementer` and `merger` both deny `subagent`, so neither can dispatch the reviewer, and the reviewer must not be the author. Fix routing is the caller's and follows `docs/agents/flow.md`:
-
-- a finding on one ticket returns to **that ticket's implementer** — resume the same `task_id`, its worktree still alive;
-- a cross-ticket finding goes to a **fresh implementer**;
-- the **merger** only lands the fix, never judges it;
-- re-run this skill at the scope that raised the finding until clean, or two rounds have passed.

@@ -8,7 +8,7 @@ A bridge bot that brings the OpenCode AI coding experience into Feishu.
 
 Which skill runs when: the main flow (idea → ship), the bug/issue on-ramps, and the local bindings. See `docs/agents/flow.md`.
 
-**Review is always the pair.** Where an installed skill (`/implement`, `/implement-spec`) says to run `/code-review`, run `/code-review` **and** the repo's `/adversarial-review` together — this repo binding supersedes the skill's single review step. The upstream skills are never forked; the pair is bound here and in `flow.md`. The orchestrating session runs the reviewers; `implementer` and `merger` cannot spawn one.
+**Review is always the pair** — `/code-review` plus `/adversarial-review` — even where an installed skill names only `/code-review`. `docs/agents/flow.md` is the binding.
 
 ### Issue tracker
 
