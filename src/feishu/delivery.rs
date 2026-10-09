@@ -111,6 +111,13 @@ const BACKOFF_MAX: Duration = Duration::from_secs(300);
 /// #569): enough to cover the writes between a payload's delivery and its
 /// cursor confirmation — a handful — while the memory stays bounded.
 const MAX_DELIVERED_SEQS: usize = 16;
+/// The most cards one process remembers a DROPPED keyless write for (spec #602,
+/// ticket #607): a card whose newest keyless write was evicted while still owed,
+/// or permanently refused, and whose [`State::entries`] state has therefore aged
+/// out. Each tombstone is a message id and the dropped write's sequence, so the
+/// bound is cheap; the window it serves is short — the notice gate reads it in
+/// the same pass as the write.
+const MAX_DROPPED: usize = MAX_PENDING;
 
 /// One keyless retry's own bound. The client has no default timeout, and the
 /// drain is a background convergence path: a hung PATCH must not hold the
@@ -584,6 +591,17 @@ struct State {
     /// write may replace `entries` before the note runs, and the note must
     /// still learn whether that payload's own sequence delivered.
     failed: HashMap<String, (u64, Value)>,
+    /// The cards whose newest keyless write was dropped without delivering — an
+    /// owed payload evicted under cap pressure, or a permanently refused write —
+    /// and that therefore have no [`Self::entries`] state to consult any more
+    /// (spec #602, ticket #607). Each maps to the **sequence** of the dropped
+    /// write, so the map is evicted oldest-first and stays bounded by
+    /// [`MAX_DROPPED`], and a later delivery clears the mark only when it is at
+    /// least as new (the same newest-wins rule the entry state keeps). The mark
+    /// is consulted only on the notice gate's no-entry path, where the absent
+    /// entry alone cannot tell a dropped owed write from a delivered one that
+    /// aged out.
+    dropped: HashMap<String, u64>,
     /// One delivery lock per card while its entry lives — plus while any call
     /// still holds it. Every write to a message is serialized on it, so the
     /// outbox's retries and the live writers cannot reorder each other at
@@ -719,6 +737,22 @@ impl CardDelivery {
         locks.retain(|message_id, lock| entries.contains_key(message_id) || Arc::strong_count(lock) > 1);
     }
 
+    /// Bound the drop memory (spec #602, ticket #607): the oldest cards leave
+    /// first, so the newest dropped writes — the ones a notice gate can still
+    /// read in the pass that follows the write — survive.
+    fn prune_dropped(dropped: &mut HashMap<String, u64>) {
+        while dropped.len() > MAX_DROPPED {
+            let Some(oldest) = dropped
+                .iter()
+                .min_by_key(|(_, seq)| **seq)
+                .map(|(message_id, _)| message_id.clone())
+            else {
+                return;
+            };
+            dropped.remove(&oldest);
+        }
+    }
+
     /// Fold one write's outcome into the state. The newest sequence wins: a
     /// recoverable failure records the payload as the card's newest Pending
     /// Card Update; a delivery (or a permanent refusal) leaves a settled
@@ -738,6 +772,26 @@ impl CardDelivery {
             state.age += 1;
             state.age
         };
+        // The no-entry drop memory (spec #602, ticket #607): a delivery at least
+        // as new as the dropped write proves the card's newest content reached
+        // Feishu, so its tombstone is spent; a permanent refusal proves nothing
+        // will ever carry it, so the card must keep reading `Never` even after
+        // its entry ages out. An owed (recoverable) failure records nothing here
+        // — its entry is the live state, and eviction records the drop below.
+        if result.is_ok() {
+            // Only a write at least as new as the dropped one may clear it: an
+            // older write completing late must not answer for a newer dropped
+            // payload (the newest-wins rule the entry state keeps).
+            if state
+                .dropped
+                .get(message_id)
+                .is_some_and(|dropped| seq >= *dropped)
+            {
+                state.dropped.remove(message_id);
+            }
+        } else if !recoverable {
+            state.dropped.insert(message_id.to_string(), seq);
+        }
         if recoverable {
             // Remember the exact write a failure note will ask about (spec
             // #561, review #569): a newer write may replace the entry before
@@ -785,6 +839,7 @@ impl CardDelivery {
         // cap evicts another entry, or waits for one to age out.
         self.evict_over_cap(&mut state, Some(message_id));
         Self::prune_locks(&mut state);
+        Self::prune_dropped(&mut state.dropped);
         drop(state);
         for notice in notices {
             notice();
@@ -930,6 +985,12 @@ impl CardDelivery {
                     let _ = ticket.send(WriteOutcome::Superseded);
                 }
                 if entry.card.is_some() {
+                    // The owed keyless write is dropped with the entry: nothing
+                    // will ever carry it, so the card must read `Never` on the
+                    // notice gate's no-entry path (spec #602, ticket #607) even
+                    // though its entry is gone. Recorded with the entry's own
+                    // sequence so the drop memory evicts oldest-first.
+                    state.dropped.insert(victim.clone(), entry.seq);
                     tracing::warn!(
                         "pending card update for {victim} evicted: {} card writes reached",
                         self.max_pending
@@ -1692,6 +1753,7 @@ impl Platform for CardDelivery {
             // one payload-less entry per card forever.
             self.evict_over_cap(&mut state, Some(&message_id));
             Self::prune_locks(&mut state);
+            Self::prune_dropped(&mut state.dropped);
             drive
         };
         if let Some(token) = drive {
@@ -1930,8 +1992,17 @@ impl Platform for CardDelivery {
     ) -> crate::feishu::NoticeGate {
         let mut state = self.state.lock().unwrap();
         let Some(entry) = state.entries.get_mut(message_id) else {
-            // No delivery state: nothing keyless is owed, so nothing to gate.
-            return crate::feishu::NoticeGate::Delivered;
+            // No delivery state. A drop tombstone means this card's newest
+            // keyless write was dropped without delivering — an owed payload
+            // evicted under cap pressure, or a permanent refusal — so nothing
+            // will ever carry the terminal slice: suppress. Otherwise nothing
+            // keyless is owed (or it delivered and its settled tombstone aged
+            // out): announce now.
+            return if state.dropped.contains_key(message_id) {
+                crate::feishu::NoticeGate::Never
+            } else {
+                crate::feishu::NoticeGate::Delivered
+            };
         };
         if entry.card.is_some() {
             // The card still owes its newest keyless write as a Pending Card
@@ -2384,6 +2455,79 @@ mod tests {
             delivery.defer_notice_until_delivered("om_bad", Box::new(|| {})),
             NoticeGate::Never,
             "a permanently refused write suppresses the notice"
+        );
+    }
+
+    /// Spec #602, ticket #607: a terminal PATCH queued as a Pending Card Update
+    /// that is then EVICTED under cap pressure before the notice arms must not
+    /// read as delivered. The write was dropped and never retried, so arming the
+    /// notice would announce terminal content that never reached Feishu — the
+    /// gate must suppress it.
+    #[tokio::test]
+    async fn an_evicted_owed_write_suppresses_the_notice() {
+        use crate::feishu::NoticeGate;
+        let inner = Arc::new(FakePlatform::new());
+        // A cap of one: a second card's write evicts the first card's owed
+        // payload before the notice can be armed against it.
+        let delivery = CardDelivery::with_limits(inner.clone(), 1, BACKOFF_BASE, BACKOFF_MAX);
+        let terminal = serde_json::json!({ "body": "terminal" });
+
+        // The ending PATCH fails recoverably and is queued for retry.
+        inner.fail_next(Fail::Transport);
+        assert!(
+            delivery.update_message("om_owed", &terminal).await.is_err(),
+            "the ending PATCH failed recoverably and is queued"
+        );
+
+        // Another card's write lands: the cap evicts om_owed's owed payload —
+        // the queued-then-evicted terminal write.
+        delivery
+            .update_message("om_other", &serde_json::json!({ "body": "other" }))
+            .await
+            .expect("the other card's write delivers");
+
+        assert_eq!(
+            delivery.defer_notice_until_delivered("om_owed", Box::new(|| {})),
+            NoticeGate::Never,
+            "an evicted owed write never carries the terminal content, so the notice is suppressed"
+        );
+    }
+
+    /// Spec #607: the no-entry path must tell apart the ways a card can have no
+    /// live entry. An owed payload evicted under pressure, and a permanently
+    /// refused write evicted with it, both read `Never` (nothing will carry the
+    /// terminal slice); a delivered write whose settled tombstone aged out still
+    /// reads `Delivered` (the slice already landed).
+    #[tokio::test]
+    async fn the_drop_tombstone_distinguishes_refused_from_delivered_evictions() {
+        use crate::feishu::NoticeGate;
+        let inner = Arc::new(FakePlatform::new());
+        let delivery = CardDelivery::with_limits(inner.clone(), 1, BACKOFF_BASE, BACKOFF_MAX);
+        let terminal = serde_json::json!({ "body": "terminal" });
+        let other = serde_json::json!({ "body": "other" });
+
+        // A permanently refused write, then evicted by another card's write.
+        inner.fail_next(Fail::Http(400));
+        assert!(delivery.update_message("om_refused", &terminal).await.is_err());
+        delivery.update_message("om_other_a", &other).await.unwrap();
+        assert_eq!(
+            delivery.defer_notice_until_delivered("om_refused", Box::new(|| {})),
+            NoticeGate::Never,
+            "a permanently refused write reads Never even after its entry aged out"
+        );
+
+        // A delivered write whose settled tombstone then ages out reads
+        // Delivered: the terminal slice already reached Feishu.
+        delivery.update_message("om_done", &terminal).await.unwrap();
+        delivery.update_message("om_other_b", &other).await.unwrap();
+        assert!(
+            !delivery.state.lock().unwrap().entries.contains_key("om_done"),
+            "the delivered tombstone aged out"
+        );
+        assert_eq!(
+            delivery.defer_notice_until_delivered("om_done", Box::new(|| {})),
+            NoticeGate::Delivered,
+            "a delivered write reads Delivered even after its tombstone aged out"
         );
     }
 
