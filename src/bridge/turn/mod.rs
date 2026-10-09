@@ -567,7 +567,7 @@ impl Turn {
                 if let Some(card) = live.get_mut(&session_id)
                     && card.card_message_id.as_deref() == Some(new_card_id.as_str())
                 {
-                    card.acc.pending_gap = Some(gap);
+                    card.acc.set_pending_gap(gap);
                 }
             }
             let resolved = Self::seed_orphan_delta(handles, &session_id, &new_card_id, &orphan).await;
@@ -2080,10 +2080,8 @@ impl Turn {
         // value and keeps its own.
         if let Some(cursor) = previous.as_ref().and_then(|record| record.cursor.clone()) {
             let mut live = cards.cards.lock().await;
-            if let Some(card) = live.get_mut(session_id)
-                && card.acc.cursor == RenderedCursor::default()
-            {
-                card.acc.cursor = cursor;
+            if let Some(card) = live.get_mut(session_id) {
+                card.acc.seed_cursor_if_empty(cursor);
             }
         }
         if collect == PredecessorCollect::Never {
@@ -2169,10 +2167,8 @@ impl Turn {
         // stage's take advanced it) and keeps its own.
         if let Some(cursor) = previous.as_ref().and_then(|record| record.cursor.clone()) {
             let mut live = cards.cards.lock().await;
-            if let Some(card) = live.get_mut(session_id)
-                && card.acc.cursor == RenderedCursor::default()
-            {
-                card.acc.cursor = cursor;
+            if let Some(card) = live.get_mut(session_id) {
+                card.acc.seed_cursor_if_empty(cursor);
             }
         }
     }
@@ -2355,7 +2351,7 @@ impl Turn {
                 // (tagging it as gap content and marking `gap_rendered`), so
                 // the durable fact — cleared only by a confirmed write that
                 // covers the gap's end — never double-renders it here.
-                card.acc.pending_gap = Some(gap);
+                card.acc.set_pending_gap(gap);
             }
             landed
         };
@@ -2411,7 +2407,7 @@ impl Turn {
         if let Some(card) = live.get_mut(session_id)
             && card.card_message_id.as_deref() == Some(successor_card_id)
         {
-            card.acc.pending_gap = Some(gap);
+            card.acc.set_pending_gap(gap);
         }
     }
 
@@ -3955,7 +3951,7 @@ impl Turn {
             .lock()
             .await
             .get(session_id)
-            .and_then(|card| card.acc.staged_cursors.last().map(|staged| staged.cursor.clone()))
+            .and_then(|card| card.acc.last_staged_cursor().map(|staged| staged.cursor.clone()))
     }
 
     /// Stage a Rendered Cursor directly (spec #561, review #569) — a test seam
@@ -3998,13 +3994,10 @@ impl Turn {
         session_id: &str,
     ) -> Option<state::StagedCursorId> {
         cards.cards.lock().await.get(session_id).and_then(|card| {
-            card.acc
-                .staged_cursors
-                .last()
-                .map(|staged| state::StagedCursorId {
-                    id: staged.id,
-                    awaiting_seq: staged.awaiting_seq,
-                })
+            card.acc.last_staged_cursor().map(|staged| state::StagedCursorId {
+                id: staged.id,
+                awaiting_seq: staged.awaiting_seq,
+            })
         })
     }
 

@@ -260,7 +260,7 @@ impl Turn {
         // governs the successor's own window — the delivered content is never
         // re-rendered.
         if let Some(gap) = gap {
-            acc.pending_gap = Some(gap.clone());
+            acc.set_pending_gap(gap.clone());
         }
         let mut plans = {
             let live = cards.cards.lock().await;
@@ -937,9 +937,7 @@ impl Turn {
             let card = live
                 .get_mut(session_id)
                 .expect("the cards map still holds the session");
-            if card.acc.cursor == RenderedCursor::default() {
-                card.acc.cursor = cursor;
-            }
+            card.acc.seed_cursor_if_empty(cursor);
         }
         match previous {
             Some(previous) if previous.card_message_id != card_message_id => Some(Some(Box::new(previous))),
@@ -1205,7 +1203,7 @@ mod tests {
             "a replaced session is never attached"
         );
         assert_eq!(
-            fresh.acc.cursor,
+            *fresh.acc.cursor(),
             RenderedCursor::default(),
             "no carried cursor is seeded into a replaced session"
         );

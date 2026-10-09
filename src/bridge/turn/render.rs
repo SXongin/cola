@@ -941,7 +941,7 @@ fn render_pending_gap_once(acc: &mut StreamAccumulator, transcript: &SessionTran
     if acc.gap_rendered {
         return false;
     }
-    let Some(gap) = acc.pending_gap.clone() else {
+    let Some(gap) = acc.pending_gap().cloned() else {
         return false;
     };
     // A TRUNCATED read is a prefix (spec #561, review #569): render what it
@@ -1166,8 +1166,7 @@ fn render_seed_scope(
     // rendering the same tail again in-process — while the durable fact stays
     // until a confirmed write covers the gap's end.
     let gap_scope = acc
-        .pending_gap
-        .as_ref()
+        .pending_gap()
         .is_some_and(|gap| gap.anchor.message_id == scope.message_id);
     let mut rendered = false;
     for message in transcript.turn_for_user(scope).messages {
@@ -5805,10 +5804,10 @@ Index: /x/src/main.rs
 
         // The flush confirmed this frontier: mirror it into the base (a
         // confirmed write) and deliver a tool-only body afterwards.
-        acc.cursor = RenderedCursor {
+        acc.set_cursor(RenderedCursor {
             frontier: Some(frontier.clone()),
             live_calls: Default::default(),
-        };
+        });
         let tool_only = SessionTranscript::new(vec![message(
             "msg_a_2",
             200,

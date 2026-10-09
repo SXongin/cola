@@ -1300,8 +1300,12 @@ pub(super) struct StreamAccumulator {
     /// mirror of the record's fact. Every staged candidate derives from it,
     /// and a fresh accumulator taking over a chain is seeded from the record
     /// (`Turn::track_live_card`), so a successor's first write can never clear
-    /// the chain's frontier.
-    pub(super) cursor: RenderedCursor,
+    /// the chain's frontier. Private to this module: its production writers are
+    /// the confirmed take ([`Self::take_staged_cursor`]), the re-point restore
+    /// ([`Self::seed_cursor_if_empty`]) and the projection's resolved seed
+    /// ([`Self::seed_projection`], spec #561); the `#[cfg(test)]` `set_cursor`
+    /// seam serves fixtures only.
+    cursor: RenderedCursor,
     /// The projection's render seed (spec #561, ticket #563): resolved against
     /// the read being rendered, it makes everything at or before the cursor's
     /// frontier count as delivered — the frontier part renders only its
@@ -1312,8 +1316,9 @@ pub(super) struct StreamAccumulator {
     /// durable gap, rendered once by the first render read that can place it.
     /// The chain's Rendered Cursor keeps advancing past the delivered content
     /// that follows the gap — one frontier cannot express both — so the gap's
-    /// recovery lives on the record instead.
-    pub(super) pending_gap: Option<crate::bridge::chain::PendingGap>,
+    /// recovery lives on the record instead. Private: read and seeded through
+    /// [`Self::pending_gap`] / [`Self::set_pending_gap`].
+    pending_gap: Option<crate::bridge::chain::PendingGap>,
     /// The messages whose parts the pending gap's own walk rendered (spec #561,
     /// review #569). Their content sits EARLIER in the read than the chain's
     /// confirmed frontier, so the chain cursor must never be built from their
@@ -1342,8 +1347,9 @@ pub(super) struct StreamAccumulator {
     /// write and a confirmed write drains its exact stage — while a stage whose
     /// payload a drain delivered but has not confirmed yet is RETAINED, so a
     /// newer body replacing the pending slot can never lose its confirmation.
-    /// Bounded by [`MAX_STAGED_CURSORS`].
-    pub(super) staged_cursors: Vec<StagedCursor>,
+    /// Bounded by [`MAX_STAGED_CURSORS`]. Private: staged and drained only by
+    /// [`Self::stage_cursor`] / [`Self::take_staged_cursor`].
+    staged_cursors: Vec<StagedCursor>,
     /// The stage generation handed to the next [`StagedCursor`] (spec #561,
     /// review #569): a confirmation names the generation it confirms, so a
     /// body staged later is never advanced by an earlier write's confirmation.
@@ -1832,6 +1838,53 @@ impl StreamAccumulator {
         self.confirmed_cursor_stage = staged.id;
         self.cursor = staged.cursor.clone();
         Some((staged.cursor, staged.gap))
+    }
+
+    /// Seed a fresh accumulator's empty base with a Rendered Cursor a re-point
+    /// carried (spec #561, review #569): the chain's frontier must survive a new
+    /// Turn or a takeover, while a continuation whose base already carries a
+    /// value (its stage's take advanced it) keeps its own. Never moves the base
+    /// backwards — an empty base only.
+    pub(super) fn seed_cursor_if_empty(&mut self, cursor: RenderedCursor) {
+        if self.cursor == RenderedCursor::default() {
+            self.cursor = cursor;
+        }
+    }
+
+    /// The orphan gap this accumulator owes, if any (spec #561, review #569):
+    /// the durable gap, rendered once by the first render read that can place
+    /// it.
+    pub(super) fn pending_gap(&self) -> Option<&crate::bridge::chain::PendingGap> {
+        self.pending_gap.as_ref()
+    }
+
+    /// Seed the durable orphan gap this accumulator owes (spec #561, review
+    /// #569): set on a successor's accumulator so the first render read that
+    /// can place it lands it there.
+    pub(super) fn set_pending_gap(&mut self, gap: crate::bridge::chain::PendingGap) {
+        self.pending_gap = Some(gap);
+    }
+
+    /// The accumulator's confirmed Rendered Cursor (spec #561): a test read of
+    /// the frontier only a confirmed write moves.
+    #[cfg(test)]
+    pub(super) fn cursor(&self) -> &RenderedCursor {
+        &self.cursor
+    }
+
+    /// Set the confirmed Rendered Cursor directly (spec #561): a test seam
+    /// standing in for the confirmed write that mirrors a frontier into the
+    /// base.
+    #[cfg(test)]
+    pub(super) fn set_cursor(&mut self, cursor: RenderedCursor) {
+        self.cursor = cursor;
+    }
+
+    /// The newest staged Rendered Cursor, if any (spec #561, review #569): the
+    /// stage a confirmation names — a test read for the confirmation seams.
+    #[cfg(test)]
+    pub(super) fn last_staged_cursor(&self) -> Option<&StagedCursor> {
+        self.staged_cursors.last()
     }
 
     /// The stage generation of the NEWEST staged Wake Watermark, when one is
