@@ -985,18 +985,13 @@ impl Turn {
         session_id: &str,
         chain_id: u64,
     ) -> Option<ProjectedSlice> {
-        use crate::bridge::turn::state::CardFallback;
         let mut live = cards.cards.lock().await;
         let card = live.get_mut(session_id)?;
         if card.chain_id() != chain_id {
             return None;
         }
-        match card.acc.card_fallback {
-            CardFallback::None => card.acc.card_fallback = CardFallback::Fenced,
-            CardFallback::Fenced | CardFallback::Suspended => {
-                card.acc.card_fallback = CardFallback::Suspended;
-                return None;
-            }
+        if !card.acc.advance_card_fallback() {
+            return None;
         }
         // The arm built the first slice already: the fenced retry re-renders
         // the SAME body, so its render boundary rewinds.

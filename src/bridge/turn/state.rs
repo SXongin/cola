@@ -1050,17 +1050,28 @@ pub(super) struct StreamAccumulator {
     /// the `#[cfg(test)]` seam. Read through [`Self::card_state`].
     card_state: CardState,
     /// This turn's card-content fallback (see [`CardFallback`]): starts at
-    /// `None` and is advanced by the flush when Feishu rejects a card it
-    /// built. A fresh turn starts clean and re-tries the normal rendering.
-    pub(super) card_fallback: CardFallback,
+    /// `None` and is advanced when Feishu rejects a card it built. A fresh turn
+    /// starts clean and re-tries the normal rendering. Private to this module:
+    /// advanced by [`Self::advance_card_fallback`] and reset to `None` by
+    /// [`Self::continue_on_new_card`]; read through [`Self::card_fallback`].
+    card_fallback: CardFallback,
     /// The fate of the write carrying this card's flush's **terminal slice**
     /// (spec #602, ticket #607). The Completion Notice reads it: [`EndingWrite::Delivered`]
     /// announces at once, [`EndingWrite::Owed`] arms against that exact
     /// sequence, and [`EndingWrite::Failed`] suppresses a notice over a tail
-    /// that never reached Feishu.
-    pub(super) ending_write: EndingWrite,
-    pub(super) text: String,
-    pub(super) reasoning: String,
+    /// that never reached Feishu. Private to this module: set by
+    /// [`Self::set_ending_write`]; read through [`Self::ending_write`].
+    ending_write: EndingWrite,
+    /// The card's streamed assistant text, in arrival order — the reply body.
+    /// Private to this module: written only by [`Self::push_text_lead`] (the
+    /// sink for `push_text` / `push_text_at` / `push_text_from` /
+    /// `replace_text_run`); read through [`Self::text`].
+    text: String,
+    /// The card's streamed reasoning text, in arrival order. Private to this
+    /// module: written only by [`Self::push_reasoning_lead`] (the sink for
+    /// `push_reasoning` / `push_reasoning_from` / `replace_reasoning_run`); read
+    /// through [`Self::reasoning`].
+    reasoning: String,
     /// Tool panels keyed by call ID (current state; `timeline` keeps order).
     pub(super) tools: IndexMap<String, ToolPanel>,
     /// Live (unfinished) Tool Panels keyed by call ID: the timeline key,
@@ -2006,6 +2017,52 @@ impl StreamAccumulator {
     /// (spec #561, review #569).
     pub(super) fn set_gap_truncated(&mut self, truncated: bool) {
         self.gap_truncated = truncated;
+    }
+
+    /// The card's streamed assistant text. Private to this module: written by
+    /// [`Self::push_text_lead`].
+    pub(super) fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// The card's streamed reasoning text. Private to this module: written by
+    /// [`Self::push_reasoning_lead`].
+    pub(super) fn reasoning(&self) -> &str {
+        &self.reasoning
+    }
+
+    /// The card-content fallback state (spec #379). Private to this module:
+    /// advanced only by [`Self::advance_card_fallback`].
+    pub(super) fn card_fallback(&self) -> CardFallback {
+        self.card_fallback
+    }
+
+    /// Advance the fallback after Feishu refused a body, returning whether the
+    /// retry should be attempted: a card not yet fenced goes `None → Fenced`
+    /// (`true`, retry the same body fenced); an already-fenced or suspended card
+    /// goes to `Suspended` (`false`, stop).
+    pub(super) fn advance_card_fallback(&mut self) -> bool {
+        match self.card_fallback {
+            CardFallback::None => {
+                self.card_fallback = CardFallback::Fenced;
+                true
+            }
+            CardFallback::Fenced | CardFallback::Suspended => {
+                self.card_fallback = CardFallback::Suspended;
+                false
+            }
+        }
+    }
+
+    /// The fate of the write carrying this flush's terminal slice (spec #602).
+    /// Private to this module: set by [`Self::set_ending_write`].
+    pub(super) fn ending_write(&self) -> EndingWrite {
+        self.ending_write
+    }
+
+    /// Record the terminal slice's write fate.
+    pub(super) fn set_ending_write(&mut self, ending: EndingWrite) {
+        self.ending_write = ending;
     }
 
     /// A waiting card's collect (ADR-0059, spec #405): the card yielded

@@ -984,8 +984,8 @@ impl Turn {
                         .as_ref()
                         .map(|transcript| transcript.messages.len())
                         .unwrap_or(0),
-                    acc.text.len(),
-                    acc.reasoning.len(),
+                    acc.text().len(),
+                    acc.reasoning().len(),
                     acc.tools.len(),
                     acc.rendered_parts.len(),
                     acc.error().unwrap_or("none"),
@@ -3730,7 +3730,7 @@ pub(crate) async fn announce_completion(
         match live.get(session_id) {
             Some(card) if card.card_message_id.as_deref() == expected_card => Some(CapturedNotice {
                 card_message_id: card.card_message_id.clone(),
-                ending: card.acc.ending_write,
+                ending: card.acc.ending_write(),
                 requester: card.acc.requester_open_id().map(str::to_string),
                 reply_to: card.acc.reply_to_message_id().map(str::to_string),
                 is_group: card.acc.is_group(),
@@ -4133,7 +4133,7 @@ impl Turn {
             .lock()
             .await
             .get(session_id)
-            .is_some_and(|c| c.acc.card_fallback == state::CardFallback::Suspended)
+            .is_some_and(|c| c.acc.card_fallback() == state::CardFallback::Suspended)
     }
 
     /// The live permission blocks' `(request_id, session_id)`, in render order.
