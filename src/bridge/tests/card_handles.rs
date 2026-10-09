@@ -448,8 +448,12 @@ async fn a_size_split_terminal_write_notifies_after_the_new_card() {
     Turn::set_turn_identity(&cards, "ses_split", TEST_HOST, true, 1).await;
 
     // The terminal flush finalizes the filled card and sends the continuation
-    // carrying the tail.
+    // carrying the tail. The notice must be bound to the continuation card the
+    // ending landed on (spec #602, review finding 6).
     Turn::flush_card(&cards, "ses_split").await;
+    let terminal_card = Turn::card_message_id(&cards, "ses_split")
+        .await
+        .expect("the continuation card is the session's current card");
     let before = platform.calls.lock().await.len();
 
     crate::bridge::turn::announce_completion(
@@ -459,6 +463,7 @@ async fn a_size_split_terminal_write_notifies_after_the_new_card() {
         "ses_split",
         std::time::Instant::now(),
         &crate::bridge::turn::Disposition::Done,
+        Some(&terminal_card),
     )
     .await;
 

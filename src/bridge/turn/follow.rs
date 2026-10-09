@@ -172,14 +172,16 @@ async fn run(handles: TurnHandles, facts: FollowFacts, timing: SettleTiming) {
     };
     // The ownership re-check and the stamp share ONE cards lock (#539): the
     // guard is already released, so a new Turn may have replaced the card —
-    // and its live card must never inherit this loop's ending. False means the
-    // card is gone or replaced: stamp nothing and stay silent.
-    if !ticket
+    // and its live card must never inherit this loop's ending. `None` means the
+    // card is gone or replaced: stamp nothing and stay silent. The returned id
+    // is the card the ending landed on, passed to the notice so it can never be
+    // announced on a card a newer Turn swapped in afterwards (review finding 6).
+    let Some(card_id) = ticket
         .apply_ending_if_owned(&flow.cards, &session_id, &disposition)
         .await
-    {
+    else {
         return;
-    }
+    };
     super::announce_completion(
         &handles.cards,
         &handles.platform,
@@ -187,6 +189,7 @@ async fn run(handles: TurnHandles, facts: FollowFacts, timing: SettleTiming) {
         &session_id,
         started_at,
         &disposition,
+        Some(&card_id),
     )
     .await;
 }

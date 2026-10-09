@@ -899,9 +899,16 @@ impl Turn {
             }
         }
         render::read_planned_outputs(&handles.backend, &mut plans).await;
+        // The identity of the card this Turn's ending lands on (spec #602,
+        // review finding 6): captured under the same lock as the stamp, so the
+        // notice below is bound to it and can never ride a card a newer Turn
+        // swapped in during the finalization awaits.
+        let mut stamped_card: Option<String> = None;
         {
             let mut cards = handles.cards.cards.lock().await;
-            if let Some(acc) = cards.get_mut(&self.session_id).map(|c| &mut c.acc) {
+            if let Some(card) = cards.get_mut(&self.session_id) {
+                stamped_card = card.card_message_id.clone();
+                let acc = &mut card.acc;
                 if let Some(transcript) = &final_transcript {
                     render::render_new_turn_parts_committing(acc, transcript, plans);
                 }
@@ -1007,6 +1014,7 @@ impl Turn {
             &self.session_id,
             self.started_at,
             &disposition,
+            stamped_card.as_deref(),
         )
         .await;
 
@@ -1845,10 +1853,13 @@ pub(crate) enum YieldedUpdate {
     /// the Completion Notice's clock — `Some` when this card owes the notice
     /// (the Turn's own waiting card), `None` when it must stay silent (a Wake
     /// continuation, whose own send was the notification, or a card with no
-    /// recorded turn start).
+    /// recorded turn start). `card_message_id` is the identity of the card the
+    /// ending landed on (spec #602, review finding 6), so the caller's notice is
+    /// bound to it and can never ride a newer Turn's card.
     Settled {
         disposition: Disposition,
         notice_at: Option<std::time::Instant>,
+        card_message_id: Option<String>,
     },
     /// The refresh's write was permanently refused (review, PR #595): the card
     /// is suspended and nothing will ever carry this read's ledger delta or
@@ -2791,7 +2802,7 @@ impl Turn {
         };
         let write_lock = cards.write_lock(session_id).await;
         let _guard = write_lock.lock().await;
-        let (changed, settled, notice_at) = {
+        let (changed, settled, notice_at, stamped_card) = {
             // The same admission, re-checked under the write lock through the
             // module's lock-scoped helper: the returned card is still locked,
             // so the check and the write below share one lock.
@@ -2826,7 +2837,10 @@ impl Turn {
             } else {
                 card.acc.turn_started_at
             };
-            (changed, settled, notice_at)
+            // The card the ending landed on (spec #602, review finding 6):
+            // captured under the same lock as the stamp, so the caller's notice
+            // is bound to it.
+            (changed, settled, notice_at, card.card_message_id.clone())
         };
         if let Some(disposition) = settled {
             // The footer is refreshed one last time (ADR-0019): the card
@@ -2846,6 +2860,7 @@ impl Turn {
                 FlushOutcome::Accepted => YieldedUpdate::Settled {
                     disposition,
                     notice_at,
+                    card_message_id: stamped_card,
                 },
                 FlushOutcome::Refused => YieldedUpdate::Refused,
                 // No write was issued (no card id): the card keeps what it
@@ -4406,9 +4421,12 @@ impl Turn {
     /// shared, ownership-checked application
     /// ([`ownership::Ticket::apply_ending_if_owned`], #539). Returns the ending
     /// disposition the loop
-    /// reached and applied, or `None` when it stopped owning the card (its
+    /// reached and applied together with the identity of the card it landed on,
+    /// or `None` when it stopped owning the card (its
     /// accumulator vanished or a successor took it over) and stamped nothing;
-    /// the caller owns the announcement. A split continuation needs none — its
+    /// the caller owns the announcement and passes that card id so the notice
+    /// is bound to the card the ending landed on (spec #602, review finding 6).
+    /// A split continuation needs no notice — its
     /// own card send was the notification — while an in-place resume, which
     /// never sends, notifies at the true end (ADR-0066); the caller holds the
     /// notice rules this module has no config for.
@@ -4419,7 +4437,7 @@ impl Turn {
         anchor: &TurnAnchor,
         chain: u64,
         timing: SettleTiming,
-    ) -> Option<Disposition> {
+    ) -> Option<(Disposition, String)> {
         let ticket = ownership::Ticket::Chain {
             chain,
             anchor: anchor.clone(),
@@ -4428,14 +4446,12 @@ impl Turn {
         // The same post-run gap as the follow's: the loop's last probe may be
         // stale by now, so the ending is applied atomically with a fresh
         // ownership check. Ownership lost is a loop that ended nothing — the
-        // same `None` `run` returns.
-        if !ticket
+        // same `None` `run` returns. The returned id is the card the ending
+        // landed on, so the caller's notice is bound to it.
+        let card_id = ticket
             .apply_ending_if_owned(&flow.cards, session_id, &disposition)
-            .await
-        {
-            return None;
-        }
-        Some(disposition)
+            .await?;
+        Some((disposition, card_id))
     }
 
     /// The request's original Turn start on `session_id`'s card, when it
@@ -4824,10 +4840,15 @@ async fn release_inflight(handles: &TurnHandles, session_id: &str) {
 /// follow, the Wake in-place resume and Session Sync's quiet true end) — so all
 /// carriers are covered by one rule. The recipient and copy are resolved ONCE
 /// here, from [`CapturedNotice`] — the card id, ending fate and request identity
-/// read in a SINGLE critical section. A deferred notice therefore carries the
+/// read in a SINGLE critical section. `expected_card` is the identity of the
+/// card the ending was APPLIED to (the id the stamp returned, `None` when the
+/// card carries no id); a session whose current card differs from it has had
+/// that card replaced in the released gap between the stamp and this capture, so
+/// the notice is suppressed rather than announced on the successor. A deferred
+/// notice additionally carries the
 /// ORIGINAL request's requester and re-checks the card's identity before sending
 /// ([`deliver_deferred_notice`]), so a newer Turn's card is never announced over
-/// the old request's ending (review findings 1 and 5).
+/// the old request's ending (review findings 1, 5 and 6).
 pub(crate) async fn announce_completion(
     cards: &CardsHandle,
     platform: &Arc<dyn crate::feishu::Platform>,
@@ -4835,6 +4856,7 @@ pub(crate) async fn announce_completion(
     session_id: &str,
     started_at: std::time::Instant,
     disposition: &Disposition,
+    expected_card: Option<&str>,
 ) {
     // Not an ending the notice may announce: stay silent before any gate (the
     // primitive would decline anyway; this keeps the deferred path quiet too).
@@ -4842,22 +4864,40 @@ pub(crate) async fn announce_completion(
         return;
     }
     // The card carrying the terminal slice, that write's own fate (#607) AND
-    // the request's identity, read under ONE lock (spec #602, review finding
-    // 5): a newer Turn that replaces the card must never redirect the notice,
-    // so the recipient, chat kind and copy are resolved against the SAME card
-    // identity the terminal write was gated on. `Failed` when a size-split
-    // continuation create failed or an ending PATCH was permanently refused —
-    // the tail never reached Feishu; `Owed(seq)` when delivery still owes that
-    // exact write.
+    // the request's identity, read under ONE lock (spec #602, review findings
+    // 5 and 6): a newer Turn that replaces the card must never redirect the
+    // notice, so the recipient, chat kind and copy are resolved against the
+    // SAME card identity the terminal write was gated on. The ending was
+    // applied to `expected_card`; a session whose CURRENT card is a different
+    // identity has had that card replaced (or collected) in the released gap
+    // between the stamp and this capture — the old ending must not ride the
+    // replacement's (default-`Delivered`) accumulator. `Failed` when a
+    // size-split continuation create failed or an ending PATCH was permanently
+    // refused — the tail never reached Feishu; `Owed(seq)` when delivery still
+    // owes that exact write.
     let captured = {
         let live = cards.cards.lock().await;
-        live.get(session_id).map(|card| CapturedNotice {
-            card_message_id: card.card_message_id.clone(),
-            ending: card.acc.ending_write,
-            requester: card.acc.requester_open_id.clone(),
-            reply_to: card.acc.reply_to_message_id.clone(),
-            is_group: card.acc.is_group,
-        })
+        match live.get(session_id) {
+            Some(card) if card.card_message_id.as_deref() == expected_card => Some(CapturedNotice {
+                card_message_id: card.card_message_id.clone(),
+                ending: card.acc.ending_write,
+                requester: card.acc.requester_open_id.clone(),
+                reply_to: card.acc.reply_to_message_id.clone(),
+                is_group: card.acc.is_group,
+            }),
+            // A card exists but is NOT the one the ending was applied to: a
+            // newer Turn replaced it (or a collect took it). Announcing the old
+            // request's ending on it would notify the wrong requester.
+            Some(card) => {
+                tracing::warn!(
+                    "completion notice suppressed: the card for {session_id} was replaced after the ending (applied to {:?}, current {:?})",
+                    expected_card,
+                    card.card_message_id,
+                );
+                None
+            }
+            None => None,
+        }
     };
     // No tracked card: there is no write to gate on, so the notice is
     // suppressed rather than sent without a delivery verdict (spec #602,
@@ -5368,6 +5408,7 @@ mod tests {
     use crate::bridge::App;
     use crate::bridge::test_support::{
         MockBackend, RecordingPlatform, build_app, realistic_parts, seed_entry, test_config, test_work_dir,
+        turn_anchor,
     };
 
     fn ctx(session_id: &str, text: &str) -> PromptContext {
@@ -5650,6 +5691,7 @@ mod tests {
             "ses_test",
             std::time::Instant::now(),
             &Disposition::Waiting,
+            Some("om_1"),
         )
         .await;
         assert!(
@@ -5667,6 +5709,7 @@ mod tests {
             "ses_test",
             std::time::Instant::now(),
             &Disposition::Done,
+            Some("om_1"),
         )
         .await;
         assert!(
@@ -5722,6 +5765,7 @@ mod tests {
                     "ses_test",
                     std::time::Instant::now(),
                     &Disposition::Done,
+                    Some("om_old"),
                 )
                 .await;
             })
@@ -5764,8 +5808,70 @@ mod tests {
         );
     }
 
-    /// The control for the race above: with no replacement, a delivered notice
-    /// still targets the request that ended.
+    /// Finding (spec #602 pre-push review 6): the ending was applied to a
+    /// SPECIFIC card under one lock, but `announce_completion` then re-read the
+    /// session's CURRENT card. A newer Turn that replaced the card between the
+    /// stamp and the announce had its (default-`Delivered`) accumulator
+    /// announced the OLD ending — to the NEW request's requester. The notice
+    /// must be bound to the card the ending was applied to.
+    #[tokio::test]
+    async fn an_out_of_turn_ending_is_not_announced_on_a_replaced_card() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        let cards = app.cards_handle();
+        // The card the out-of-turn loop watches and stamps its ending on.
+        Turn::seed_card(&cards, "ses_test", Some("om_old")).await;
+        Turn::set_turn_anchor(&cards, "ses_test", &turn_anchor(1)).await;
+        Turn::set_reply_target(&cards, "ses_test", "msg_old").await;
+        Turn::set_turn_identity(&cards, "ses_test", "ou_old", true, 1).await;
+
+        // The ending lands on om_old, atomically with the ownership re-check;
+        // the returned id is the card it landed on.
+        let stamped = ownership::Ticket::TurnAnchor(turn_anchor(1))
+            .apply_ending_if_owned(&cards, "ses_test", &Disposition::Done)
+            .await;
+        assert_eq!(
+            stamped.as_deref(),
+            Some("om_old"),
+            "the stamp names the card the ending landed on"
+        );
+
+        // The guard is released; a newer Turn replaces the card before the
+        // notice resolves. Its accumulator's `ending_write` defaults to
+        // `Delivered`, so the old ending must NOT ride it.
+        let mut replacement =
+            state::CardSession::new(state::StreamAccumulator::new("turn"), Some("om_new".to_string()));
+        replacement.acc.reply_to_message_id = Some("msg_new".to_string());
+        replacement.acc.requester_open_id = Some("ou_new".to_string());
+        replacement.acc.is_group = true;
+        cards
+            .cards
+            .lock()
+            .await
+            .insert("ses_test".to_string(), replacement);
+
+        announce_completion(
+            &cards,
+            &app.feishu,
+            &app.turn_config().notice_rules(),
+            "ses_test",
+            std::time::Instant::now(),
+            &Disposition::Done,
+            stamped.as_deref(),
+        )
+        .await;
+
+        let notices = platform.completion_notices().await;
+        assert!(
+            notices.is_empty(),
+            "a replaced card must never be announced the old ending: {notices:?}"
+        );
+    }
+
+    /// The control for the replacement above: with no replacement, a delivered
+    /// notice still targets the request that ended.
     #[tokio::test]
     async fn a_delivered_notice_uses_the_original_recipient() {
         let _wd = test_work_dir();
@@ -5784,6 +5890,7 @@ mod tests {
             "ses_test",
             std::time::Instant::now(),
             &Disposition::Done,
+            Some("om_old"),
         )
         .await;
 
