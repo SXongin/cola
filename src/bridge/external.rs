@@ -413,6 +413,7 @@ impl ExternalFlow {
                 YieldedUpdate::Settled {
                     disposition,
                     notice_at,
+                    card_message_id,
                 } => {
                     carried = true;
                     tracing::info!("yielded ledger settled the true end: session {sid}");
@@ -422,7 +423,9 @@ impl ExternalFlow {
                     // send was the notification (ADR-0059). The disposition is
                     // the one the settle decided and applied (#540), so the
                     // notice's classification and copy cannot disagree with the
-                    // card.
+                    // card. The `card_message_id` is the card the ending landed
+                    // on, so the notice can never ride a newer Turn's card
+                    // (spec #602, review finding 6).
                     if let Some(started_at) = notice_at {
                         crate::bridge::turn::announce_completion(
                             &handles.cards,
@@ -431,6 +434,7 @@ impl ExternalFlow {
                             sid,
                             started_at,
                             &disposition,
+                            card_message_id.as_deref(),
                         )
                         .await;
                     }
@@ -1214,7 +1218,7 @@ impl ExternalFlow {
         let span = crate::bridge::span::external(sid, Some(thread_key));
         tokio::spawn(
             async move {
-                let Some(disposition) =
+                let Some((disposition, card_id)) =
                     Turn::wake_settle_loop(&flow, &session_id, &directory, &anchor, chain, timing).await
                 else {
                     // The loop stopped owning the card (a new Turn, another
@@ -1228,7 +1232,8 @@ impl ExternalFlow {
                 // true end reads (ADR-0066). The disposition's own
                 // classification declines an ending that is not a true end, so
                 // a yield back to 「⏳」 stays silent and the quiet true end that
-                // follows owns the one notice.
+                // follows owns the one notice. `card_id` binds the notice to the
+                // card the ending landed on (spec #602, review finding 6).
                 let Some(started_at) = Turn::turn_started_at(&flow.cards, &session_id).await else {
                     return;
                 };
@@ -1239,6 +1244,7 @@ impl ExternalFlow {
                     &session_id,
                     started_at,
                     &disposition,
+                    Some(&card_id),
                 )
                 .await;
             }

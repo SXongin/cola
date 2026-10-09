@@ -366,30 +366,30 @@ impl Ticket {
     /// (#539). The callers run after the Session's guard was released, so a
     /// new Turn may replace the card at any moment; a separate re-check would
     /// let the old ending land on the successor's live card in the gap.
-    /// Returns whether it applied (false: the card was replaced or vanished —
-    /// nothing is touched, and the caller must not announce an ending).
+    /// Returns the identity of the card the ending was STAMPED on (`None`: the
+    /// card was replaced, vanished, or carries no id — nothing was applied, and
+    /// the caller must not announce an ending). The caller passes this id to
+    /// [`crate::bridge::turn::announce_completion`] so the notice is bound to
+    /// the very card the ending landed on (spec #602, review finding 6).
     pub(super) async fn apply_ending_if_owned(
         &self,
         cards: &CardsHandle,
         session_id: &str,
         disposition: &Disposition,
-    ) -> bool {
+    ) -> Option<String> {
         let stamped = {
             let mut live = cards.cards.lock().await;
             match live.get_mut(session_id) {
                 Some(card) if self.matches(card.acc.turn_anchor.as_ref(), Some(card.chain_id())) => {
                     card.acc.apply_ending(disposition);
-                    true
+                    card.card_message_id.clone()
                 }
-                _ => false,
+                _ => return None,
             }
         };
-        if !stamped {
-            return false;
-        }
         Turn::refresh_work_context(cards, session_id).await;
         Turn::flush_card(cards, session_id).await;
-        true
+        stamped
     }
 
     /// The Turn anchor the settle decision reads; `None` for the unreceived
@@ -1017,7 +1017,7 @@ mod tests {
     /// ([`Ticket::apply_ending_if_owned`]), so the released moment between the
     /// settle loop and the stamp cannot hand a successor's live card the old
     /// ending. A stale anchor applies nothing (state and failure untouched,
-    /// false); the matching anchor applies (true).
+    /// `None`); the matching anchor applies and returns its card id (`Some`).
     #[tokio::test]
     async fn apply_ending_if_owned_stamps_only_the_anchor_it_still_owns() {
         let fx = fixture().await;
@@ -1030,10 +1030,12 @@ mod tests {
         // The ending the loop decided is applied to the card it watched.
         Turn::seed_card(cards, SID, Some("om_live")).await;
         Turn::set_turn_anchor(cards, SID, &live).await;
-        assert!(
+        assert_eq!(
             owns.apply_ending_if_owned(cards, SID, &Disposition::Failed("loop failure".into()))
-                .await,
-            "the matching anchor applies"
+                .await
+                .as_deref(),
+            Some("om_live"),
+            "the matching anchor applies to its own card"
         );
         assert_eq!(Turn::card_state(cards, SID).await, Some(CardState::Error));
         assert_eq!(card_error(cards, SID).await.as_deref(), Some("loop failure"));
@@ -1046,9 +1048,9 @@ mod tests {
         Turn::set_card_state(cards, SID, CardState::Streaming).await;
         set_card_error(cards, SID, "successor failure").await;
         assert!(
-            !owns
-                .apply_ending_if_owned(cards, SID, &Disposition::Stopped)
-                .await,
+            owns.apply_ending_if_owned(cards, SID, &Disposition::Stopped)
+                .await
+                .is_none(),
             "a stale anchor applies nothing"
         );
         assert_eq!(
@@ -1079,9 +1081,12 @@ mod tests {
             chain,
             anchor: turn_anchor(3),
         };
-        assert!(
-            owns.apply_ending_if_owned(cards, SID, &Disposition::Done).await,
-            "the matching chain applies"
+        assert_eq!(
+            owns.apply_ending_if_owned(cards, SID, &Disposition::Done)
+                .await
+                .as_deref(),
+            Some("om_live"),
+            "the matching chain applies to its own card"
         );
         assert_eq!(Turn::card_state(cards, SID).await, Some(CardState::Done));
 
@@ -1090,9 +1095,9 @@ mod tests {
         Turn::seed_card(cards, SID, Some("om_successor")).await;
         Turn::set_card_state(cards, SID, CardState::Streaming).await;
         assert!(
-            !owns
-                .apply_ending_if_owned(cards, SID, &Disposition::Stopped)
-                .await,
+            owns.apply_ending_if_owned(cards, SID, &Disposition::Stopped)
+                .await
+                .is_none(),
             "a stale chain applies nothing"
         );
         assert_eq!(
@@ -1104,7 +1109,9 @@ mod tests {
         // The card vanishing is ownership lost as well.
         Turn::drop_card(cards, SID).await;
         assert!(
-            !owns.apply_ending_if_owned(cards, SID, &Disposition::Done).await,
+            owns.apply_ending_if_owned(cards, SID, &Disposition::Done)
+                .await
+                .is_none(),
             "a vanished card applies nothing"
         );
     }
