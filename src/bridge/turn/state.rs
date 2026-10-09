@@ -8,7 +8,7 @@
 //! accumulator's own tests are the module's internal seam.
 
 use super::disposition::Disposition;
-use crate::backend::{MessageId, Part, SessionTranscript, TurnAnchor};
+use crate::backend::{MessageId, Part, SessionTranscript, ToolCall, TurnAnchor};
 use crate::bridge::chain::{CursorFrontier, CursorPartKind, RenderedCursor};
 use crate::bridge::handles::CardsHandle;
 use crate::feishu::card::first_n_chars_bytes;
@@ -1073,7 +1073,13 @@ pub(super) struct StreamAccumulator {
     /// through [`Self::reasoning`].
     reasoning: String,
     /// Tool panels keyed by call ID (current state; `timeline` keeps order).
-    pub(super) tools: IndexMap<String, ToolPanel>,
+    /// Private to this module: written by [`Self::push_tool_from`], the seeded
+    /// delivery [`Self::mark_delivered_part`] and the liveness attach
+    /// [`Self::set_tool_liveness`]; read through [`Self::tool_panel_current`],
+    /// [`Self::tool_settled`], [`Self::tool_count`],
+    /// [`Self::has_rendered_content`], [`Self::has_live_tool`],
+    /// [`Self::running_tool`], [`Self::live_task_children`] and the card build.
+    tools: IndexMap<String, ToolPanel>,
     /// Live (unfinished) Tool Panels keyed by call ID: the timeline key,
     /// server start time and element identity allocated when the call first
     /// appeared. A live panel renders in the card TAIL, so a split can never
@@ -1100,18 +1106,27 @@ pub(super) struct StreamAccumulator {
     /// whichever card the call landed on: once that card finalizes (a long
     /// turn splits into several), later updates land on an already-sent card
     /// and stay invisible. The tail rides the live card, so every flush shows
-    /// the current list. Each later call replaces it in place.
-    pub(super) todo_panel: Option<ToolPanel>,
+    /// the current list. Each later call replaces it in place. Private to this
+    /// module: set (with its clock) only by [`Self::set_todo_panel`] — the
+    /// renderer's and the seed's one write; read through
+    /// [`Self::tool_panel_current`], [`Self::has_live_tool`],
+    /// [`Self::has_rendered_content`] and the card tail render.
+    todo_panel: Option<ToolPanel>,
     /// The server start time of the todowrite call that last refreshed
     /// [`Self::todo_panel`] — its panel header shows when the list was last
-    /// written.
-    pub(super) todo_shown_at: Option<i64>,
+    /// written. Moves with the panel: private to this module, set only by
+    /// [`Self::set_todo_panel`]; read through [`Self::tool_panel_current`] and
+    /// the card tail render.
+    todo_shown_at: Option<i64>,
     /// The Background Task Ledger (ADR-0060): the Session's live Background
-    /// Tasks, rebuilt from each transcript read ([`Self::set_ledger`]) and
-    /// rendered as a card-TAIL section, so the list rides the newest (live)
+    /// Tasks, rebuilt from each transcript read ([`Self::set_ledger_from_read`])
+    /// and rendered as a card-TAIL section, so the list rides the newest (live)
     /// card. Empty renders nothing — V1 has no Background Task facts, so its
-    /// ledger is always empty.
-    pub(super) ledger: Vec<TaskLedgerRow>,
+    /// ledger is always empty. Private to this module: replaced by the one
+    /// read-writing site [`Self::set_ledger_change`] and cleared when the card
+    /// is collected ([`Self::collect_waiting`]); read through
+    /// [`Self::ledger_has_unconfirmed`] and the card tail render.
+    ledger: Vec<TaskLedgerRow>,
     /// Each live Background Task's last successfully gathered child liveness,
     /// keyed by the task's call id (spec #501): a read whose child gather
     /// failed (or never names the child) keeps rendering this fragment — the
@@ -1140,8 +1155,13 @@ pub(super) struct StreamAccumulator {
     ledger_clock: Vec<crate::feishu::card::ledger::LedgerRowClock>,
     /// Text, reasoning, tool and receipt entries ordered by their key (the
     /// server-side part start time) — the card is built from this, so message ↔
-    /// tool interleaving is preserved even when a part renders late.
-    pub(super) timeline: Vec<TimelineItem>,
+    /// tool interleaving is preserved even when a part renders late. Private to
+    /// this module (no external writer): maintained by [`Self::insert_item`],
+    /// [`Self::insert_kind_after`], [`Self::push_text_lead`],
+    /// [`Self::push_reasoning_lead`], [`Self::push_tool_from`] and
+    /// [`Self::drop_source_run`]; read through [`Self::has_receipt_prefix`] and
+    /// the card build.
+    timeline: Vec<TimelineItem>,
     /// Fallback key source for pushes without a server part time
     /// ([`Self::next_order`]).
     order_seq: i64,
@@ -1161,8 +1181,13 @@ pub(super) struct StreamAccumulator {
     /// Timeline index the CURRENT card starts rendering from. When a card fills
     /// up (Feishu component limit) it is finalized with a "to be continued"
     /// marker and `render_from` advances — a fresh continuation card renders the
-    /// remaining timeline from there.
-    pub(super) render_from: usize,
+    /// remaining timeline from there. Private to this module: advanced by the
+    /// builds ([`Self::build_card_with_info`] / [`Self::build_finalized_handoff`])
+    /// and the source prune [`Self::drop_source_run`] re-bases it; the failed-write
+    /// rewind goes through [`Self::restore_render_boundary`], the projection
+    /// arm's fenced retry through [`Self::rewind_render_boundary`]. Read through
+    /// [`Self::render_from`].
+    render_from: usize,
     /// Provider ID of the model answering this turn (e.g. "opencode-go").
     /// Private to this module: set by [`Self::apply_footer_model`] (a transcript
     /// read) and the `set_model` test seam; read only inside this module (the
@@ -1572,6 +1597,67 @@ impl StreamAccumulator {
     /// then the `todowrite` tail) lives in exactly one place.
     fn has_running_tool(&self) -> bool {
         self.running_tool().is_some()
+    }
+
+    /// Whether the current panel IS this tool call's rendered revision — the
+    /// render dedup rule: a `todowrite`'s card-tail panel and its write clock,
+    /// any other call's entry in the `tools` map. An unchanged poll then skips
+    /// the part; a revision (running → settled, late output, a rewritten list)
+    /// differs and re-renders.
+    pub(super) fn tool_panel_current(&self, call: &ToolCall) -> bool {
+        if call.identity.name == "todowrite" {
+            self.todo_panel.as_ref().is_some_and(|panel| panel.call() == call)
+                && self.todo_shown_at == call.started_at
+        } else {
+            self.tools
+                .get(&call.identity.call_id)
+                .is_some_and(|panel| panel.call() == call)
+        }
+    }
+
+    /// Whether the call's current panel has SETTLED (exists and is no longer
+    /// live) — the seeded-call reconciliation's retire test (spec #561): a
+    /// seeded identity that settled joins the timeline once and leaves the
+    /// seeded set.
+    pub(super) fn tool_settled(&self, call_id: &str) -> bool {
+        self.tools.get(call_id).is_some_and(|panel| !panel.is_live())
+    }
+
+    /// How many tool panels the current `tools` map holds — the final-render
+    /// log's tool count.
+    pub(super) fn tool_count(&self) -> usize {
+        self.tools.len()
+    }
+
+    /// Whether this accumulator has rendered any part — the external
+    /// renderer's "partial reply" probe before it finalizes on timeout: any
+    /// text/reasoning mark, a seeded delivery, a tool panel or the `todowrite`
+    /// tail.
+    pub(super) fn has_rendered_content(&self) -> bool {
+        !self.rendered_parts.is_empty()
+            || !self.seeded_delivered.is_empty()
+            || !self.tools.is_empty()
+            || self.todo_panel.is_some()
+    }
+
+    /// Whether any live Tool Panel the Turn owns is unfinished — a call whose
+    /// status is `running` or `pending` (both render `⏳`). The drain follow's
+    /// Done decision waits for these to settle (#284): the card must never read
+    /// `✅ 完成` over a `⏳` panel. A still-running **seeded** call (spec #561's
+    /// live set, ADR-0068's successor) is deliberately not one of the Turn's
+    /// own: it is display-only, so it must not extend the settle decision.
+    pub(super) fn has_live_tool(&self) -> bool {
+        self.tools
+            .iter()
+            .any(|(call_id, panel)| !self.seeded_calls.contains(call_id) && panel.is_live())
+            || self.todo_panel.as_ref().is_some_and(|panel| panel.is_live())
+    }
+
+    /// The current tool panels keyed by call ID — a test read of the tool
+    /// facts the render derivations maintain.
+    #[cfg(test)]
+    pub(super) fn tools(&self) -> &IndexMap<String, ToolPanel> {
+        &self.tools
     }
 
     /// The header phase for the current state: None when the turn finished,
@@ -3096,6 +3182,23 @@ impl StreamAccumulator {
         self.refresh_phase();
     }
 
+    /// Record the latest `todowrite` panel and its write clock — the single
+    /// production write of the card-tail list: the renderer's `render_part`
+    /// and the seed's [`Self::mark_delivered_part`] both go through it. Both
+    /// move together: the clock is always reassigned, so a payload without a
+    /// server time shows no clock rather than the previous call's (which would
+    /// read as a write time this list never had).
+    pub(super) fn set_todo_panel(&mut self, panel: ToolPanel, shown_at: Option<i64>) {
+        self.todo_panel = Some(panel);
+        self.todo_shown_at = shown_at;
+    }
+
+    /// The `todowrite` tail panel, if any — a test read of the card-tail list.
+    #[cfg(test)]
+    pub(super) fn todo_panel(&self) -> Option<&ToolPanel> {
+        self.todo_panel.as_ref()
+    }
+
     /// Seed a render from the chain's Rendered Cursor (spec #561, tickets
     /// #563/#564/#565): the resolved seed makes everything at or before its
     /// frontier count as delivered, its live set enters the identity
@@ -3132,8 +3235,7 @@ impl StreamAccumulator {
             }
             Part::Tool(call) => {
                 if call.identity.name == "todowrite" {
-                    self.todo_panel = Some(ToolPanel::new(call.clone()));
-                    self.todo_shown_at = call.started_at;
+                    self.set_todo_panel(ToolPanel::new(call.clone()), call.started_at);
                 } else {
                     self.tools
                         .insert(call.identity.call_id.clone(), ToolPanel::new(call.clone()));
@@ -3186,6 +3288,14 @@ impl StreamAccumulator {
         }
         panel.set_liveness(liveness);
         true
+    }
+
+    /// Whether the ledger still carries a row whose status is unconfirmed
+    /// (⚠️ 状态待确认) — the render's cleanup-button predicate and the click's
+    /// own claim guard read the same fact, so a card cannot offer a clearance
+    /// its pipeline would refuse.
+    pub(super) fn ledger_has_unconfirmed(&self) -> bool {
+        self.ledger.iter().any(|row| row.unconfirmed)
     }
 
     /// Replace the live Background Task ledger from a transcript read
@@ -3527,6 +3637,49 @@ impl StreamAccumulator {
             .collect()
     }
 
+    /// The timeline index the current card starts rendering from — the
+    /// projection arm's remaining-slice probe and the flush's failed-write
+    /// restore read it.
+    pub(super) fn render_from(&self) -> usize {
+        self.render_from
+    }
+
+    /// Rewind the render boundary to `from` when the build still left it at
+    /// `to` — the failed- and fenced-write restore (spec #561, review #569):
+    /// the slice the build already advanced past reached no card, so
+    /// re-rendering it from `from` is what keeps it from being silently
+    /// skipped. The equality check keeps a boundary moved elsewhere (defensive;
+    /// the card-write lock serializes flushes) from being rewound. Returns
+    /// whether the boundary moved. Production writers: the flush's finalized
+    /// fenced retry and its failed continuation create.
+    pub(super) fn restore_render_boundary(&mut self, from: usize, to: usize) -> bool {
+        if self.render_from != to {
+            return false;
+        }
+        self.rewind_render_boundary(from);
+        true
+    }
+
+    /// Rewind the render boundary to `to` unconditionally: the projection arm's
+    /// fenced retry re-renders its first body from scratch, so the boundary
+    /// goes back to it (spec #561, review #569). Production writer:
+    /// `fenced_projected_slice`.
+    pub(super) fn rewind_render_boundary(&mut self, to: usize) {
+        self.render_from = to;
+    }
+
+    /// Whether any timeline entry is an Interaction Receipt whose line starts
+    /// with `prefix` (ADR-0038, rule 4) — a test read for the sweep rig's
+    /// receipt probe. Test-gated because its only caller is the test seam
+    /// [`Turn::has_receipt_prefix`], which itself lives in the
+    /// `#[cfg(test)] impl Turn` block in `mod.rs`.
+    #[cfg(test)]
+    pub(super) fn has_receipt_prefix(&self, prefix: &str) -> bool {
+        self.timeline
+            .iter()
+            .any(|item| matches!(&item.kind, TimelineKind::Receipt(text) if text.starts_with(prefix)))
+    }
+
     /// Whether a still-running seeded call (spec #561's live set) is omitted
     /// from the card being built under `state`: it rides the tail only while a
     /// live renderer owns the card — once the card is settled (or yielded), no
@@ -3770,7 +3923,7 @@ impl StreamAccumulator {
             // rows the ledger renders. The click's handler re-derives the rows
             // from the transcript (the card's own list is only the affordance).
             if state == CardState::Waiting
-                && self.ledger.iter().any(|row| row.unconfirmed)
+                && self.ledger_has_unconfirmed()
                 && let Some(sid) = &self.session_id
             {
                 builder = builder.with_element(crate::feishu::card::ledger::cleanup_button(sid));

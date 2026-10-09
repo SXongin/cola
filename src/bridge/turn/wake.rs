@@ -995,7 +995,7 @@ impl Turn {
         }
         // The arm built the first slice already: the fenced retry re-renders
         // the SAME body, so its render boundary rewinds.
-        card.acc.render_from = 0;
+        card.acc.rewind_render_boundary(0);
         let built = card.acc.build_card_with_info();
         let cursor_stage = state::StagedCursorId {
             id: card

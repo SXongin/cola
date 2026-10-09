@@ -155,21 +155,14 @@ fn renders_part(acc: &StreamAccumulator, part: &Part) -> bool {
             // The current panel IS the call's rendered revision: an update
             // (running → completed, a late output, or a todowrite list
             // rewritten with same-length items) differs from it and
-            // re-renders; an unchanged poll skips. A todowrite's clock also
-            // participates: each re-sent list stamps `todo_shown_at`, exactly
-            // as the state-content signature used to.
+            // re-renders; an unchanged poll skips. The dedup rule — the
+            // `todowrite` tail with its clock, or the `tools` map — lives in
+            // the accumulator ([`StreamAccumulator::tool_panel_current`]).
             //
             // The comparison is against the typed call BEFORE the panel is
             // built: an unchanged poll (the common case) must not deep-copy
             // the call's raw payloads into a panel only to drop it.
-            if call.identity.name == "todowrite" {
-                !(acc.todo_panel.as_ref().is_some_and(|panel| panel.call() == call)
-                    && acc.todo_shown_at == call.started_at)
-            } else {
-                !acc.tools
-                    .get(&call.identity.call_id)
-                    .is_some_and(|panel| panel.call() == call)
-            }
+            !acc.tool_panel_current(call)
         }
         // Step boundaries, patches and part kinds this build does not model
         // render nothing — there is no content to add or dedupe.
@@ -245,8 +238,7 @@ fn render_part(acc: &mut StreamAccumulator, source: Option<PartSource>, part: &P
                 // always reassigned — a payload without a server time shows no
                 // clock rather than the previous call's, which would read as a
                 // write time this list never had.
-                acc.todo_panel = Some(panel);
-                acc.todo_shown_at = call.started_at;
+                acc.set_todo_panel(panel, call.started_at);
             } else {
                 acc.push_tool_from(call.started_at, &call.identity.call_id, panel, source);
             }
@@ -1334,7 +1326,7 @@ fn resolve_seeded_calls(acc: &mut StreamAccumulator, transcript: &SessionTranscr
         {
             rendered = true;
         }
-        if acc.tools.get(&call_id).is_some_and(|panel| !panel.is_live()) {
+        if acc.tool_settled(&call_id) {
             acc.seeded_calls.remove(&call_id);
         }
     }
@@ -2175,8 +2167,8 @@ mod tests {
         acc.set_card_state(CardState::Done);
 
         assert!(acc.reasoning().contains("The user is asking in Chinese."));
-        assert_eq!(acc.tools.len(), 1);
-        let tool = &acc.tools["call_1"];
+        assert_eq!(acc.tools().len(), 1);
+        let tool = &acc.tools()["call_1"];
         assert_eq!(tool.name(), "bash");
         assert_eq!(tool.status(), &ToolStatus::Completed);
         assert!(
@@ -2211,7 +2203,7 @@ mod tests {
         )];
         let mut acc = StreamAccumulator::new("test");
         render_parts(&mut acc, &parts);
-        assert_eq!(acc.tools["call_2"].output().as_deref(), Some("fn main() {}"));
+        assert_eq!(acc.tools()["call_2"].output().as_deref(), Some("fn main() {}"));
     }
 
     /// A tool part's `running` status marks the card Streaming; a completed one
@@ -2283,7 +2275,7 @@ Index: /x/src/main.rs
         let parts = vec![Part::Tool(call)];
         let mut acc = StreamAccumulator::new("test");
         render_parts(&mut acc, &parts);
-        let out = acc.tools["call_patch"].output().unwrap();
+        let out = acc.tools()["call_patch"].output().unwrap();
         assert!(out.contains("+let b = 3;"), "hunk shown: {out}");
         assert!(
             out.contains("LSP errors detected in src/main.rs"),
@@ -2329,7 +2321,7 @@ Index: /x/src/main.rs
 
         assert!(render_new_turn_parts(&mut acc, &transcript));
         assert!(acc.reasoning().contains("Let me think"));
-        assert_eq!(acc.tools.len(), 1);
+        assert_eq!(acc.tools().len(), 1);
         assert_eq!(acc.rendered_parts.len(), 1);
         assert!(!acc.text().contains("question"));
         assert!(!acc.reasoning().contains("old reasoning"));
@@ -2396,7 +2388,7 @@ Index: /x/src/main.rs
             acc.reasoning()
         );
         assert_eq!(
-            acc.tools["call_task"].status(),
+            acc.tools()["call_task"].status(),
             &ToolStatus::Running,
             "the running panel must render live, not only at finalization"
         );
@@ -2436,15 +2428,18 @@ Index: /x/src/main.rs
             &mut acc,
             &transcript(None, ToolStatus::Running, "")
         ));
-        assert_eq!(acc.tools["call_task"].status(), &ToolStatus::Running);
+        assert_eq!(acc.tools()["call_task"].status(), &ToolStatus::Running);
 
         // Completed AFTER the anchor: the settled panel still renders.
         assert!(render_new_turn_parts(
             &mut acc,
             &transcript(Some(2_500), ToolStatus::Completed, "research done")
         ));
-        assert_eq!(acc.tools["call_task"].status(), &ToolStatus::Completed);
-        assert_eq!(acc.tools["call_task"].output().as_deref(), Some("research done"));
+        assert_eq!(acc.tools()["call_task"].status(), &ToolStatus::Completed);
+        assert_eq!(
+            acc.tools()["call_task"].output().as_deref(),
+            Some("research done")
+        );
 
         // Re-fetching the same settled state must not duplicate.
         assert!(!render_new_turn_parts(
@@ -2497,7 +2492,7 @@ Index: /x/src/main.rs
             &mut acc,
             &transcript(ToolStatus::Running, None)
         ));
-        assert_eq!(acc.tools["call_sleep"].status(), &ToolStatus::Running);
+        assert_eq!(acc.tools()["call_sleep"].status(), &ToolStatus::Running);
         let (card, full) = acc.build_card_with_split();
         assert!(!full, "a live card with only a tail panel must not split");
         assert!(
@@ -2511,7 +2506,7 @@ Index: /x/src/main.rs
             &mut acc,
             &transcript(ToolStatus::Completed, Some("slept"))
         ));
-        assert_eq!(acc.tools["call_sleep"].status(), &ToolStatus::Completed);
+        assert_eq!(acc.tools()["call_sleep"].status(), &ToolStatus::Completed);
         let text = card_text(&acc.build_card_with_split().0);
         assert_eq!(text.matches("slept").count(), 1, "settled once: {text}");
         assert!(!render_new_turn_parts(
@@ -2564,7 +2559,7 @@ Index: /x/src/main.rs
             "the orphan's running call is the seed's live set"
         );
         render_new_turn_parts(&mut acc, &transcript(ToolStatus::Running, None));
-        assert_eq!(acc.tools["call_sleep"].status(), &ToolStatus::Running);
+        assert_eq!(acc.tools()["call_sleep"].status(), &ToolStatus::Running);
         let (card, full) = acc.build_card_with_split();
         assert!(!full, "a live card with only a tail panel must not split");
         assert!(
@@ -2591,7 +2586,7 @@ Index: /x/src/main.rs
             message("a_new", anchor + 1_000, vec![text_part("新回答")]),
         ]);
         assert!(render_new_turn_parts(&mut acc, &settled));
-        assert!(!acc.tools["call_sleep"].is_live());
+        assert!(!acc.tools()["call_sleep"].is_live());
         let text = card_text(&acc.build_card_with_split().0);
         assert_eq!(text.matches("slept").count(), 1, "settled once: {text}");
         assert!(
@@ -2651,7 +2646,7 @@ Index: /x/src/main.rs
         );
         // The first render resolves the seeded identity into the live tail.
         render_new_turn_parts(&mut acc, &transcript(ToolStatus::Pending, None));
-        assert_eq!(acc.tools["call_sleep"].status(), &ToolStatus::Pending);
+        assert_eq!(acc.tools()["call_sleep"].status(), &ToolStatus::Pending);
         let (card, full) = acc.build_card_with_split();
         assert!(!full, "a live card with only a tail panel must not split");
         assert!(
@@ -2676,7 +2671,7 @@ Index: /x/src/main.rs
             ),
         ]);
         assert!(render_new_turn_parts(&mut acc, &settled));
-        assert!(!acc.tools["call_sleep"].is_live());
+        assert!(!acc.tools()["call_sleep"].is_live());
         assert!(
             acc.seeded_calls.is_empty(),
             "a settled seeded call leaves the display-only live set"
@@ -2793,7 +2788,7 @@ Index: /x/src/main.rs
         for _ in 0..3 {
             render_new_turn_parts(&mut acc, &transcript(ToolStatus::Running, None));
             assert!(
-                acc.tools["call_sleep"].is_live(),
+                acc.tools()["call_sleep"].is_live(),
                 "a killed run's seeded call keeps the transcript's running status"
             );
         }
@@ -2808,7 +2803,7 @@ Index: /x/src/main.rs
             &mut acc,
             &transcript(ToolStatus::Error, Some("killed"))
         ));
-        assert!(!acc.tools["call_sleep"].is_live());
+        assert!(!acc.tools()["call_sleep"].is_live());
         let text = card_text(&acc.build_card_with_split().0);
         assert_eq!(text.matches("killed").count(), 1, "reconciled once: {text}");
     }
@@ -2864,7 +2859,7 @@ Index: /x/src/main.rs
             &anchorless(ToolStatus::Completed, Some("slept"))
         ));
         assert_eq!(acc.turn_anchor, None, "still no anchor to gate on");
-        assert!(!acc.tools["call_sleep"].is_live());
+        assert!(!acc.tools()["call_sleep"].is_live());
         let text = card_text(&acc.build_card_with_split().0);
         assert_eq!(text.matches("slept").count(), 1, "reconciled once: {text}");
 
@@ -2993,7 +2988,7 @@ Index: /x/src/main.rs
         );
         let mut acc = StreamAccumulator::new("proj");
         acc.seed_projection(&RenderedCursor::default(), seed);
-        assert!(acc.tools.is_empty() && acc.seeded_calls.is_empty());
+        assert!(acc.tools().is_empty() && acc.seeded_calls.is_empty());
     }
 
     /// A killed run's seeded call does not outlive the Turn (spec #561): while
@@ -4211,14 +4206,14 @@ Index: /x/src/main.rs
             &mut acc,
             &transcript(ToolStatus::Running, "")
         ));
-        assert_eq!(acc.tools["call_1"].status(), &ToolStatus::Running);
+        assert_eq!(acc.tools()["call_1"].status(), &ToolStatus::Running);
 
         // Same call, updated to completed — must re-render (upsert).
         assert!(render_new_turn_parts(
             &mut acc,
             &transcript(ToolStatus::Completed, "src\n")
         ));
-        assert_eq!(acc.tools["call_1"].status(), &ToolStatus::Completed);
+        assert_eq!(acc.tools()["call_1"].status(), &ToolStatus::Completed);
 
         // No change → nothing new.
         assert!(!render_new_turn_parts(
@@ -4259,9 +4254,9 @@ Index: /x/src/main.rs
         );
 
         assert!(
-            acc.tools.is_empty(),
+            acc.tools().is_empty(),
             "todowrite must not take a timeline row: {:?}",
-            acc.tools.keys().collect::<Vec<_>>()
+            acc.tools().keys().collect::<Vec<_>>()
         );
         let card = acc.build_card().to_string();
         assert_eq!(
@@ -4350,12 +4345,15 @@ Index: /x/src/main.rs
             "status": "pending",
         }])
         .to_string();
-        acc.todo_panel = Some(crate::feishu::card::tool_render::ToolPanel::for_test(
-            "todowrite",
-            ToolStatus::Completed,
+        acc.set_todo_panel(
+            crate::feishu::card::tool_render::ToolPanel::for_test(
+                "todowrite",
+                ToolStatus::Completed,
+                None,
+                Some(&output),
+            ),
             None,
-            Some(&output),
-        ));
+        );
         // Two max-size CJK text chunks (~18KB each): the first alone plus the
         // reserve is over the budget, so only the progress guarantee keeps the
         // chain moving.
@@ -4364,7 +4362,7 @@ Index: /x/src/main.rs
 
         let mut cards = 0;
         loop {
-            let before = acc.render_from;
+            let before = acc.render_from();
             let (card, full) = acc.build_card_with_split();
             let text = card.to_string();
             assert!(
@@ -4376,7 +4374,7 @@ Index: /x/src/main.rs
             if !full {
                 break;
             }
-            assert!(acc.render_from > before, "a full card must advance render_from");
+            assert!(acc.render_from() > before, "a full card must advance render_from");
         }
         let last = acc.build_card();
         assert!(
@@ -4417,7 +4415,7 @@ Index: /x/src/main.rs
             !card.contains("任务 A"),
             "the stale list must be replaced: {card}"
         );
-        assert!(acc.todo_panel.is_some(), "the tail holds the panel");
+        assert!(acc.todo_panel().is_some(), "the tail holds the panel");
 
         // The SAME call re-streams with new, equal-length content: the panel
         // must follow it, not dedupe on a length-only signature.
@@ -4595,7 +4593,7 @@ Index: /x/src/main.rs
         let transcript = SessionTranscript::new(vec![message("a1", 100, vec![Part::Tool(call)])]);
 
         assert!(render_new_turn_parts(&mut acc, &transcript));
-        let tool = acc.tools.get("call_edit").expect("tool rendered");
+        let tool = acc.tools().get("call_edit").expect("tool rendered");
         assert_eq!(tool.status(), &ToolStatus::Error);
         let out = tool.output().unwrap_or_default();
         assert!(
@@ -4636,7 +4634,7 @@ Index: /x/src/main.rs
         let transcript = SessionTranscript::new(vec![message("a1", 100, vec![Part::Tool(call)])]);
 
         assert!(render_new_turn_parts(&mut acc, &transcript));
-        let tool = acc.tools.get("call_edit").expect("tool rendered");
+        let tool = acc.tools().get("call_edit").expect("tool rendered");
         assert_eq!(tool.status(), &ToolStatus::Error);
         let out = tool.output().unwrap_or_default();
         assert!(
@@ -4690,7 +4688,7 @@ Index: /x/src/main.rs
                 None
             ))
         ));
-        let out = acc.tools["call_edit"].output().unwrap_or_default();
+        let out = acc.tools()["call_edit"].output().unwrap_or_default();
         assert!(out.contains("@@ -1 +1 @@"), "diff must be shown: {}", out);
         assert!(
             !out.contains("Edit applied successfully."),
@@ -4716,7 +4714,7 @@ Index: /x/src/main.rs
             &mut acc,
             &transcript(edit(ToolStatus::Error, None, true, Some("no such file")))
         ));
-        let out = acc.tools["call_edit"].output().unwrap_or_default();
+        let out = acc.tools()["call_edit"].output().unwrap_or_default();
         assert!(out.contains("no such file"), "error text must be shown: {}", out);
         assert!(!out.contains("@@"), "no diff on a failed edit: {}", out);
     }
@@ -4753,7 +4751,7 @@ Index: /x/src/main.rs
         assert!(!render_parts(&mut acc, &parts));
         assert_eq!(acc.text(), "The answer.");
         assert_eq!(acc.reasoning(), "Let me check");
-        assert_eq!(acc.tools["call_1"].output().as_deref(), Some("src"));
+        assert_eq!(acc.tools()["call_1"].output().as_deref(), Some("src"));
     }
 
     /// A header change alone must re-flush the card: the progress timer keeps

@@ -986,7 +986,7 @@ impl Turn {
                         .unwrap_or(0),
                     acc.text().len(),
                     acc.reasoning().len(),
-                    acc.tools.len(),
+                    acc.tool_count(),
                     acc.rendered_parts.len(),
                     acc.error().unwrap_or("none"),
                 );
@@ -3235,12 +3235,12 @@ impl Turn {
     /// Whether the session's card has rendered any part — the external
     /// renderer's "partial reply" probe before it finalizes on timeout.
     pub(crate) async fn has_rendered_content(cards: &CardsHandle, session_id: &str) -> bool {
-        cards.cards.lock().await.get(session_id).is_some_and(|c| {
-            !c.acc.rendered_parts.is_empty()
-                || !c.acc.seeded_delivered.is_empty()
-                || !c.acc.tools.is_empty()
-                || c.acc.todo_panel.is_some()
-        })
+        cards
+            .cards
+            .lock()
+            .await
+            .get(session_id)
+            .is_some_and(|c| c.acc.has_rendered_content())
     }
 
     /// The accumulator's observable-progress serial (#457): bumped by every
@@ -3270,16 +3270,12 @@ impl Turn {
     /// render has already left the seeded set, so today's guard applies to it
     /// as before.
     pub(crate) async fn has_live_tools(cards: &CardsHandle, session_id: &str) -> bool {
-        cards.cards.lock().await.get(session_id).is_some_and(|c| {
-            c.acc.tools.iter().any(|(call_id, panel)| {
-                !c.acc.seeded_calls.contains(call_id)
-                    && crate::feishu::card::tool_render::ToolPanel::is_live(panel)
-            }) || c
-                .acc
-                .todo_panel
-                .as_ref()
-                .is_some_and(crate::feishu::card::tool_render::ToolPanel::is_live)
-        })
+        cards
+            .cards
+            .lock()
+            .await
+            .get(session_id)
+            .is_some_and(|c| c.acc.has_live_tool())
     }
 
     /// Re-point the live card identity at a new message (ADR-0028: a re-adopt
@@ -3493,7 +3489,7 @@ impl Turn {
             || card.card_message_id.is_none()
             || !card.card_is_live
             || !card.pending_split.is_empty()
-            || !card.acc.ledger.iter().any(|row| row.unconfirmed)
+            || !card.acc.ledger_has_unconfirmed()
         {
             return false;
         }
@@ -4190,7 +4186,7 @@ impl Turn {
             .lock()
             .await
             .get(session_id)
-            .map(|c| c.acc.render_from)
+            .map(|c| c.acc.render_from())
     }
 
     /// Whether the card session is the growing live card.
@@ -4240,11 +4236,12 @@ impl Turn {
 
     /// Whether any card carries an Interaction Receipt starting with `prefix`.
     pub(crate) async fn has_receipt_prefix(cards: &CardsHandle, prefix: &str) -> bool {
-        cards.cards.lock().await.values().any(|c| {
-            c.acc.timeline.iter().any(
-                |item| matches!(&item.kind, state::TimelineKind::Receipt(text) if text.starts_with(prefix)),
-            )
-        })
+        cards
+            .cards
+            .lock()
+            .await
+            .values()
+            .any(|c| c.acc.has_receipt_prefix(prefix))
     }
 }
 
@@ -4319,7 +4316,7 @@ mod tests {
             "a replaced successor receives nothing"
         );
         assert!(live["ses_test"].acc.seeded_calls.is_empty());
-        assert!(live["ses_test"].acc.tools.is_empty());
+        assert!(live["ses_test"].acc.tools().is_empty());
     }
 
     /// The disposition-driven notice walks the table's classification: a
