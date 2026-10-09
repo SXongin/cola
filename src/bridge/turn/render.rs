@@ -213,7 +213,7 @@ fn render_part(acc: &mut StreamAccumulator, source: Option<PartSource>, part: &P
                 let (source, chunk) = source_chunk(acc, source, &text.text, None);
                 acc.push_text_from(text.started_at, source, &chunk);
             }
-            acc.card_state = crate::feishu::card::CardState::Streaming;
+            acc.mark_streaming();
         }
         Part::Reasoning(reasoning) => {
             acc.rendered_parts
@@ -232,7 +232,7 @@ fn render_part(acc: &mut StreamAccumulator, source: Option<PartSource>, part: &P
                 );
                 acc.push_reasoning_from(reasoning.started_at, source, &chunk);
             }
-            acc.card_state = crate::feishu::card::CardState::Reasoning;
+            acc.mark_reasoning();
         }
         Part::Tool(call) => {
             // The panel is a view over the typed call; the Platform assembles
@@ -251,7 +251,7 @@ fn render_part(acc: &mut StreamAccumulator, source: Option<PartSource>, part: &P
                 acc.push_tool_from(call.started_at, &call.identity.call_id, panel, source);
             }
             if call.status == ToolStatus::Running {
-                acc.card_state = crate::feishu::card::CardState::Streaming;
+                acc.mark_streaming();
             }
         }
         Part::StepStart(_) | Part::StepFinish(_) | Part::Patch(_) | Part::Other(_) => return false,
@@ -1120,10 +1120,10 @@ fn render_gap_part(
     };
     if is_text {
         acc.push_text_lead(started_at, Some(source), &suffix, lead);
-        acc.card_state = crate::feishu::card::CardState::Streaming;
+        acc.mark_streaming();
     } else {
         acc.push_reasoning_lead(started_at, Some(source), &suffix, lead);
-        acc.card_state = crate::feishu::card::CardState::Reasoning;
+        acc.mark_reasoning();
     }
     true
 }
@@ -1251,10 +1251,10 @@ fn render_seeded_part(
         acc.mark_delivered_part(&message_id, part);
         if is_text {
             acc.replace_text_run(&source, full, started_at);
-            acc.card_state = crate::feishu::card::CardState::Streaming;
+            acc.mark_streaming();
         } else {
             acc.replace_reasoning_run(&source, full, started_at);
-            acc.card_state = crate::feishu::card::CardState::Reasoning;
+            acc.mark_reasoning();
         }
         if let Some(seed) = acc.seed.as_mut()
             && let Some(frontier) = seed.frontier.as_mut()
@@ -1299,10 +1299,10 @@ fn render_seeded_part(
         };
         if is_text {
             acc.push_text_lead(started_at, Some(source), &suffix, lead);
-            acc.card_state = crate::feishu::card::CardState::Streaming;
+            acc.mark_streaming();
         } else {
             acc.push_reasoning_lead(started_at, Some(source), &suffix, lead);
-            acc.card_state = crate::feishu::card::CardState::Reasoning;
+            acc.mark_reasoning();
         }
     }
     if let Some(seed) = acc.seed.as_mut()
@@ -2187,7 +2187,7 @@ mod tests {
 
         let mut acc = StreamAccumulator::new("test");
         render_parts(&mut acc, &parts);
-        acc.card_state = CardState::Done;
+        acc.set_card_state(CardState::Done);
 
         assert!(acc.reasoning.contains("The user is asking in Chinese."));
         assert_eq!(acc.tools.len(), 1);
@@ -2243,11 +2243,11 @@ mod tests {
             None,
         )];
         let mut acc = StreamAccumulator::new("test");
-        acc.card_state = CardState::Done;
+        acc.set_card_state(CardState::Done);
         render_parts(&mut acc, &running);
         assert_eq!(
-            acc.card_state,
-            CardState::Streaming,
+            acc.card_state(),
+            &CardState::Streaming,
             "a running tool must keep the card Streaming"
         );
 
@@ -2260,11 +2260,11 @@ mod tests {
             Some("ok"),
         )];
         let mut acc = StreamAccumulator::new("test");
-        acc.card_state = CardState::Done;
+        acc.set_card_state(CardState::Done);
         render_parts(&mut acc, &completed);
         assert_eq!(
-            acc.card_state,
-            CardState::Done,
+            acc.card_state(),
+            &CardState::Done,
             "a completed tool must not flip the card state"
         );
     }
@@ -3059,14 +3059,14 @@ Index: /x/src/main.rs
 
         // The Turn ends with the call still running (the killed-run case): the
         // settled card omits the panel — the `⏳` never outlives the Turn.
-        acc.card_state = CardState::Done;
+        acc.set_card_state(CardState::Done);
         let text = card_text(&acc.build_card_with_split().0);
         assert!(
             !text.contains("⏳ shell"),
             "the settled card must not keep a permanent running panel: {text}"
         );
         // A yielded card has no renderer either: same rule.
-        acc.card_state = CardState::Waiting;
+        acc.set_card_state(CardState::Waiting);
         assert!(
             !card_text(&acc.build_card_with_split().0).contains("⏳ shell"),
             "a card no renderer owns never shows a still-running seeded panel"
@@ -3074,12 +3074,12 @@ Index: /x/src/main.rs
 
         // A completion that landed before the end is a timeline record and
         // still renders on the settled card, exactly once.
-        acc.card_state = CardState::Streaming;
+        acc.set_card_state(CardState::Streaming);
         assert!(render_new_turn_parts(
             &mut acc,
             &transcript(ToolStatus::Completed, Some("slept"))
         ));
-        acc.card_state = CardState::Done;
+        acc.set_card_state(CardState::Done);
         let text = card_text(&acc.build_card_with_split().0);
         assert_eq!(
             text.matches("slept").count(),
@@ -4357,7 +4357,7 @@ Index: /x/src/main.rs
     #[test]
     fn todo_reserve_never_wedges_the_card_chain() {
         let mut acc = StreamAccumulator::new("test");
-        acc.card_state = CardState::Done;
+        acc.set_card_state(CardState::Done);
         // A near-maximal todo panel: one item whose CJK content fills the
         // reserve's 3000-char output window (~9KB).
         let output = serde_json::json!([{
@@ -4621,7 +4621,7 @@ Index: /x/src/main.rs
 
         // The Done card header stays green — the failure is on the tool's own
         // panel, not the whole turn.
-        acc.card_state = crate::feishu::card::CardState::Done;
+        acc.set_card_state(crate::feishu::card::CardState::Done);
         let card = acc.build_card();
         let header = card["header"]["title"]["content"].as_str().unwrap();
         assert!(
@@ -5553,7 +5553,7 @@ Index: /x/src/main.rs
                 Some("done"),
             )],
         );
-        acc.card_state = CardState::Done;
+        acc.set_card_state(CardState::Done);
         let done = acc.build_card();
         let text = done.to_string();
         assert!(

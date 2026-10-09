@@ -655,8 +655,8 @@ pub(super) async fn flush_card_locked(
                 // other cause splits a live card and re-stamps
                 // unconditionally: its slice may not have reached Feishu yet
                 // (the loading-card window's deferred split).
-                let terminal = continues_an_ended_card && card.acc.card_state.is_terminal();
-                let state = terminal.then(|| card.acc.card_state.clone());
+                let terminal = continues_an_ended_card && card.acc.card_state().is_terminal();
+                let state = terminal.then(|| card.acc.card_state().clone());
                 let finalized = card.acc.build_finalized_handoff(state);
                 (finalized, !terminal || handover)
             } else {
@@ -1121,7 +1121,7 @@ mod tests {
     /// Feishu tag) and the in-flight guard.
     async fn seed_live_card(app: &Arc<App>, text: &str) {
         let mut acc = StreamAccumulator::new("回合");
-        acc.card_state = CardState::Streaming;
+        acc.set_card_state(CardState::Streaming);
         acc.push_text(text);
         acc.reply_to_message_id = Some("msg_1".into());
         app.cards
@@ -1195,7 +1195,7 @@ mod tests {
         let max = crate::feishu::card::MAX_CARD_TEXT_CHARS;
         let slice = |i: usize| format!("【S{i:02}】{}", "长".repeat(max - 5));
         let mut acc = StreamAccumulator::new("回合");
-        acc.card_state = CardState::Streaming;
+        acc.set_card_state(CardState::Streaming);
         acc.push_text(&slice(0));
         acc.push_text(&slice(1));
         acc.reply_to_message_id = Some("msg_1".into());
@@ -1288,7 +1288,11 @@ mod tests {
         let (app, platform) = app_with_live_card("回答 <number_tag> 里。").await;
         {
             let mut cards = app.cards.lock().await;
-            cards.get_mut("ses_test").unwrap().acc.card_state = CardState::Done;
+            cards
+                .get_mut("ses_test")
+                .unwrap()
+                .acc
+                .set_card_state(CardState::Done);
         }
         app.cards_handle().chains.track(
             "ses_test",
@@ -1581,7 +1585,7 @@ mod tests {
     async fn a_size_split_with_no_reachable_continuation_target_records_failed() {
         let (app, platform) = app_with_session().await;
         let mut acc = StreamAccumulator::new("回合");
-        acc.card_state = CardState::Streaming;
+        acc.set_card_state(CardState::Streaming);
         acc.push_text(&"很长的回答。".repeat(2000));
         // Deliberately no reply target and no fallback Chat: the continuation
         // cannot be attempted, so the terminal tail never lands.
@@ -1615,7 +1619,7 @@ mod tests {
     async fn a_size_split_chain_that_stops_mid_way_records_failed() {
         let (app, _platform) = app_with_session().await;
         let mut acc = StreamAccumulator::new("回合");
-        acc.card_state = CardState::Streaming;
+        acc.set_card_state(CardState::Streaming);
         // Far more content than one flush's MAX_CARD_CHAIN slices can carry.
         acc.push_text(&"很长的回答。".repeat(12000));
         acc.reply_to_message_id = Some("msg_1".into());
