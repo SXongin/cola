@@ -455,12 +455,12 @@ impl Turn {
         // The notice's clock travels on the card (ADR-0060): a quiet true end
         // is settled by Session Sync, which has no Turn to read `started_at`
         // from.
-        acc.turn_started_at = Some(started_at);
+        acc.set_turn_started_at(started_at);
         // The id this turn's user message carries, so a later retry reuses
         // it (ADR-0026) — the server deduplicates by id.
-        acc.cola_message_id = Some(cola_message_id.clone());
+        acc.set_cola_message_id(&cola_message_id);
         // Full original prompt, so the error-card "retry" can re-submit it.
-        acc.prompt = Some(text.clone());
+        acc.set_prompt(&text);
         acc.set_requester(requester_open_id.clone());
         acc.set_is_group(is_group);
         // An explicit retry carries the failed attempt's render baseline
@@ -490,7 +490,7 @@ impl Turn {
                 requester_open_id.as_deref(),
             )
             .await;
-        acc.turn_generation = Some(generation);
+        acc.set_turn_generation(generation);
         {
             let mut cards = handles.cards.cards.lock().await;
             cards.insert(
@@ -2027,7 +2027,7 @@ impl Turn {
             let live = cards.cards.lock().await;
             match live.get(session_id) {
                 Some(card) => (
-                    card.acc.cola_message_id.clone().map(MessageId::new).or_else(|| {
+                    card.acc.cola_message_id().map(MessageId::new).or_else(|| {
                         card.acc
                             .turn_anchor
                             .as_ref()
@@ -2120,7 +2120,7 @@ impl Turn {
             };
             let confirmed = card.acc.take_staged_cursor(card_message_id, expected);
             (
-                card.acc.cola_message_id.clone().map(MessageId::new).or_else(|| {
+                card.acc.cola_message_id().map(MessageId::new).or_else(|| {
                     card.acc
                         .turn_anchor
                         .as_ref()
@@ -2368,7 +2368,7 @@ impl Turn {
     async fn current_turn_message(handles: &TurnHandles, session_id: &str) -> Option<MessageId> {
         let live = handles.cards.cards.lock().await;
         live.get(session_id)
-            .and_then(|card| card.acc.cola_message_id.clone())
+            .and_then(|card| card.acc.cola_message_id().map(str::to_string))
             .map(MessageId::new)
     }
 
@@ -2931,7 +2931,7 @@ impl Turn {
             let notice_at = if card.acc.wake_continuation {
                 None
             } else {
-                card.acc.turn_started_at
+                card.acc.turn_started_at()
             };
             // The card the ending landed on (spec #602, review finding 6):
             // captured under the same lock as the stamp, so the caller's notice
@@ -3455,7 +3455,11 @@ impl Turn {
         card.card_message_id.as_ref()?;
         // An external turn's ending has no prompt to re-submit; the button
         // must not claim (there is nothing to recover).
-        let prompt = card.acc.prompt.clone().filter(|prompt| !prompt.is_empty())?;
+        let prompt = card
+            .acc
+            .prompt()
+            .filter(|prompt| !prompt.is_empty())
+            .map(str::to_string)?;
         card.acc.recovery_claimed = true;
         Some(TurnRecovery {
             session_id: session_id.to_string(),
@@ -3464,7 +3468,7 @@ impl Turn {
             subtitle: card.acc.title.clone(),
             requester_open_id: card.acc.requester_open_id().map(str::to_string),
             is_group: card.acc.is_group(),
-            cola_message_id: card.acc.cola_message_id.clone(),
+            cola_message_id: card.acc.cola_message_id().map(str::to_string),
         })
     }
 
@@ -4048,7 +4052,7 @@ impl Turn {
         if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
             card.acc.set_requester(Some(requester_open_id.to_string()));
             card.acc.set_is_group(is_group);
-            card.acc.turn_generation = Some(generation);
+            card.acc.set_turn_generation(generation);
         }
     }
 

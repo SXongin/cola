@@ -360,7 +360,7 @@ pub(super) fn capture_turn_anchor(acc: &mut StreamAccumulator, transcript: &Sess
     if acc.turn_anchor.is_some() {
         return;
     }
-    let Some(cola_message_id) = acc.cola_message_id.as_deref() else {
+    let Some(cola_message_id) = acc.cola_message_id() else {
         return;
     };
     // `anchor_of_user` keeps identity and server time together; a message with
@@ -2361,7 +2361,7 @@ Index: /x/src/main.rs
     #[test]
     fn an_in_flight_message_created_before_the_anchor_renders() {
         let mut acc = StreamAccumulator::new("proj");
-        acc.cola_message_id = Some("msg_cola_1".into());
+        acc.set_cola_message_id("msg_cola_1");
         let transcript = SessionTranscript::new(vec![
             // The new turn's own user message: the anchor.
             TranscriptMessage {
@@ -2507,7 +2507,7 @@ Index: /x/src/main.rs
         };
 
         let mut acc = StreamAccumulator::new("proj");
-        acc.cola_message_id = Some("msg_cola_new".into());
+        acc.set_cola_message_id("msg_cola_new");
         assert!(render_new_turn_parts(
             &mut acc,
             &transcript(ToolStatus::Running, None)
@@ -2571,7 +2571,7 @@ Index: /x/src/main.rs
         };
 
         let mut acc = StreamAccumulator::new("proj");
-        acc.cola_message_id = Some("msg_cola_new".into());
+        acc.set_cola_message_id("msg_cola_new");
         // The takeover seeds the orphan Turn's running calls before the prompt.
         assert_eq!(
             seed_live_calls(&mut acc, &transcript(ToolStatus::Running, None), &orphan),
@@ -2656,7 +2656,7 @@ Index: /x/src/main.rs
         };
 
         let mut acc = StreamAccumulator::new("proj");
-        acc.cola_message_id = Some("msg_cola_new".into());
+        acc.set_cola_message_id("msg_cola_new");
         // The takeover seeds the orphan Turn's pending call: `pending` is live,
         // so it is part of spec #561's live set.
         assert_eq!(
@@ -2801,7 +2801,7 @@ Index: /x/src/main.rs
         };
 
         let mut acc = StreamAccumulator::new("proj");
-        acc.cola_message_id = Some("msg_cola_new".into());
+        acc.set_cola_message_id("msg_cola_new");
         seed_live_calls(&mut acc, &transcript(ToolStatus::Running, None), &orphan);
         // Repeated reads while the transcript says running: the seeded panel
         // stays truthfully live and never invents an ending.
@@ -2864,7 +2864,7 @@ Index: /x/src/main.rs
         };
 
         let mut acc = StreamAccumulator::new("proj");
-        acc.cola_message_id = Some("msg_cola_new".into());
+        acc.set_cola_message_id("msg_cola_new");
         assert_eq!(
             seed_live_calls(&mut acc, &anchorless(ToolStatus::Running, None), &orphan),
             1
@@ -2961,7 +2961,7 @@ Index: /x/src/main.rs
         };
 
         let mut acc = StreamAccumulator::new("proj");
-        acc.cola_message_id = Some("msg_cola_new".into());
+        acc.set_cola_message_id("msg_cola_new");
         assert_eq!(
             seed_live_calls(&mut acc, &transcript(ToolStatus::Running, None), &orphan),
             1
@@ -3049,7 +3049,7 @@ Index: /x/src/main.rs
         };
 
         let mut acc = StreamAccumulator::new("proj");
-        acc.cola_message_id = Some("msg_cola_new".into());
+        acc.set_cola_message_id("msg_cola_new");
         seed_live_calls(&mut acc, &transcript(ToolStatus::Running, None), &orphan);
         render_new_turn_parts(&mut acc, &transcript(ToolStatus::Running, None));
         assert!(
@@ -3147,7 +3147,7 @@ Index: /x/src/main.rs
         };
 
         let mut acc = StreamAccumulator::new("proj");
-        acc.cola_message_id = Some("msg_cola_new".into());
+        acc.set_cola_message_id("msg_cola_new");
         // The takeover's seed: the frontier inside the orphan's answer, the
         // orphan's own Turn as the scope, no live calls.
         let cursor = projection_cursor_at(
@@ -3226,7 +3226,7 @@ Index: /x/src/main.rs
         ]);
 
         let mut acc = StreamAccumulator::new("proj");
-        acc.cola_message_id = Some("msg_cola_new".into());
+        acc.set_cola_message_id("msg_cola_new");
         let cursor = projection_cursor_at(
             "a_orphan",
             0,
@@ -3281,7 +3281,7 @@ Index: /x/src/main.rs
         ]);
 
         let mut acc = StreamAccumulator::new("proj");
-        acc.cola_message_id = Some("msg_cola_new".into());
+        acc.set_cola_message_id("msg_cola_new");
         let cursor = projection_cursor_at(
             "a_orphan",
             0,
@@ -4040,7 +4040,7 @@ Index: /x/src/main.rs
     #[test]
     fn turn_anchor_captures_the_user_message_identity_and_server_time() {
         let mut acc = StreamAccumulator::new("proj");
-        acc.cola_message_id = Some("msg_cola_1".into());
+        acc.set_cola_message_id("msg_cola_1");
         let transcript = SessionTranscript::new(vec![typed_message(
             "msg_cola_1",
             MessageRole::User,
@@ -4064,7 +4064,7 @@ Index: /x/src/main.rs
     #[test]
     fn nothing_renders_before_the_server_anchor_is_observed() {
         let mut acc = StreamAccumulator::new("proj");
-        acc.cola_message_id = Some("msg_cola_1".into());
+        acc.set_cola_message_id("msg_cola_1");
         let transcript = SessionTranscript::new(vec![message("a1", 100, vec![text_part("回答")])]);
 
         assert!(!render_new_turn_parts(&mut acc, &transcript));
@@ -4083,7 +4083,7 @@ Index: /x/src/main.rs
         let assistant = server_user + 250;
 
         let mut acc = StreamAccumulator::new("proj");
-        acc.cola_message_id = Some("msg_cola_1".into());
+        acc.set_cola_message_id("msg_cola_1");
         let transcript = SessionTranscript::new(vec![
             typed_message(
                 "msg_cola_1",
@@ -4125,7 +4125,7 @@ Index: /x/src/main.rs
         let assistant = server_user + 250;
 
         let mut acc = StreamAccumulator::new("proj");
-        acc.cola_message_id = Some("msg_cola_1".into());
+        acc.set_cola_message_id("msg_cola_1");
         let transcript = SessionTranscript::new(vec![
             message("a_old", previous_assistant, vec![text_part("旧回答")]),
             typed_message(
@@ -6031,7 +6031,7 @@ Index: /x/src/main.rs
         );
 
         let mut acc = StreamAccumulator::new("proj");
-        acc.cola_message_id = Some("msg_cola_new".into());
+        acc.set_cola_message_id("msg_cola_new");
         acc.seed_projection(&cursor, seed);
         assert!(render_new_turn_parts(&mut acc, &transcript));
         let text = card_text(&acc.build_card_with_split().0);

@@ -590,7 +590,7 @@ impl Turn {
             .lock()
             .await
             .get(session_id)
-            .and_then(|card| card.acc.cola_message_id.clone())
+            .and_then(|card| card.acc.cola_message_id().map(str::to_string))
     }
 
     /// Arm a FRESH Wake continuation card: the path with neither a chain in
@@ -695,7 +695,7 @@ impl Turn {
             .lock()
             .await
             .get(session_id)
-            .and_then(|card| card.acc.turn_started_at)
+            .and_then(|card| card.acc.turn_started_at())
     }
 
     /// Drop an armed continuation whose card never sent: the session must not
@@ -855,7 +855,7 @@ impl Turn {
         // crash could lose, leaving a refused target persisted).
         card.acc.set_reply_target(reply_to.map(str::to_string));
         let (message_id, created_ms, context_directory, reply_to) = (
-            card.acc.cola_message_id.clone().map(MessageId::new).or_else(|| {
+            card.acc.cola_message_id().map(MessageId::new).or_else(|| {
                 card.acc
                     .turn_anchor
                     .as_ref()
