@@ -774,11 +774,17 @@ impl CardDelivery {
         }
         // A delivery settles only the Completion Notices gated on THIS
         // write's own sequence (spec #602, ticket #607): the gated update has
-        // landed, so the notice may fire. A permanent refusal, a superseding
-        // failure or an eviction leaves the notices to drop — suppressed.
+        // landed, so the notice may fire. A permanent refusal settles that
+        // sequence too, but with the opposite outcome — the notice can never
+        // fire, so its callbacks are DROPPED here rather than lingering until
+        // eviction (review finding 2). A recoverable failure leaves them armed:
+        // the write is still owed.
         let notices = if result.is_ok() {
             Self::take_deferred_notices(entry, seq)
         } else {
+            if !recoverable {
+                Self::drop_settled_deferred_notices(entry, seq);
+            }
             Vec::new()
         };
         // The write just recorded is never this admission's own victim: the
@@ -817,6 +823,16 @@ impl CardDelivery {
         }
         entry.deferred_notices = kept;
         fired
+    }
+
+    /// Drop the Completion Notices a **permanent refusal** of `refused_seq`
+    /// settles: a notice gated on that seq (or an older, already-superseded
+    /// one) can never fire, so it leaves the entry now rather than lingering
+    /// until eviction (spec #602, review finding 2). A notice gated on a
+    /// still-owed LATER seq is kept — a later write may yet carry it. Mirrors
+    /// [`Self::take_deferred_notices`], which fires the settled seq instead.
+    fn drop_settled_deferred_notices(entry: &mut PendingEntry, refused_seq: u64) {
+        entry.deferred_notices.retain(|(seq, _)| *seq > refused_seq);
     }
 
     /// Add one proven-delivered sequence to a card's bounded set (spec #561,
@@ -1487,9 +1503,12 @@ impl CardDelivery {
             Err(e) => {
                 // A permanent refusal is settled too: the tombstone keeps
                 // an older slow failure from re-registering, and records
-                // that nothing was delivered (spec #561).
+                // that nothing was delivered (spec #561) — and the notice
+                // armed on this seq is dropped rather than retained (spec
+                // #602, review finding 2).
                 if let Some(current) = state.entries.get_mut(&message_id) {
                     current.card = None;
+                    Self::drop_settled_deferred_notices(current, seq);
                 }
                 tracing::warn!("pending card update for {message_id} dropped: {e}");
             }
@@ -2467,6 +2486,60 @@ mod tests {
             delivery.defer_notice_until_delivered("om_bad", bad_seq, Box::new(|| {})),
             NoticeGate::Never,
             "a permanently refused write suppresses the notice"
+        );
+    }
+
+    /// Finding 2 (spec #602 pre-push review): a permanent refusal settles the
+    /// entry's payload but must ALSO drop the Completion Notices armed on that
+    /// sequence — otherwise the callbacks (and their captured Arcs) are
+    /// retained until eviction although they can never fire. The refused seq's
+    /// notice leaves the entry; a still-owed later seq's notice stays.
+    #[tokio::test]
+    async fn a_permanent_refusal_drops_the_armed_notice() {
+        use crate::feishu::NoticeGate;
+        let inner = Arc::new(FakePlatform::new());
+        let delivery = CardDelivery::new(inner.clone());
+        let card = serde_json::json!({ "body": "terminal" });
+        let fired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        // A recoverable failure queues the terminal write; the notice arms on
+        // that exact sequence.
+        inner.fail_next(Fail::Transport);
+        assert!(delivery.update_message("om_1", &card).await.is_err());
+        let seq = delivery
+            .pending_card_write("om_1", &card)
+            .expect("the terminal write is owed");
+        let f = fired.clone();
+        assert_eq!(
+            delivery.defer_notice_until_delivered(
+                "om_1",
+                seq,
+                Box::new(move || {
+                    f.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }),
+            ),
+            NoticeGate::Armed,
+            "an owed update arms the notice"
+        );
+
+        // The retry is permanently refused: the notice can never fire, so it is
+        // dropped rather than retained until eviction.
+        inner.fail_next(Fail::Http(400));
+        delivery.drain_pending_card_updates(true).await;
+        assert_eq!(
+            fired.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a permanently refused write never fires its notice"
+        );
+        let state = delivery.state.lock().unwrap();
+        let entry = state
+            .entries
+            .get("om_1")
+            .expect("the refused write's settled tombstone remains");
+        assert!(
+            entry.deferred_notices.is_empty(),
+            "the refused sequence's notice is dropped, not retained: {} left",
+            entry.deferred_notices.len()
         );
     }
 
