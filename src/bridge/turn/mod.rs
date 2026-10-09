@@ -160,6 +160,18 @@ struct DrainTick {
     contact: bool,
 }
 
+/// What a settled drain's one fresh finalization read found (#604).
+enum SettledFinalRead {
+    /// The read showed nothing the card lacks: the rendered, quiescent snapshot
+    /// the ending is decided on.
+    Quiescent(Box<SessionTranscript>),
+    /// The read failed: fall back to the drain's last rendered snapshot.
+    Unreadable,
+    /// The read still carried content the card lacks — the run went live again.
+    /// The caller re-opens the drain instead of stamping an ending here.
+    Live,
+}
+
 /// Everything [`Turn::run`] needs for one turn. Built by `handle_prompt` for a
 /// fresh message and by the error-card "retry" action (which re-submits the
 /// original prompt under either the failed attempt's id or a fresh one, and
@@ -711,38 +723,56 @@ impl Turn {
     /// hand-off; the only ceilings are the lost-contact and stuck-panel graces,
     /// which end a run nobody can act on.
     async fn finish(&mut self, handles: &TurnHandles, prompt_resp: &crate::error::Result<()>) {
-        // Post-prompt drain + the pre-finalization re-check: a Supplement
-        // racing the drain's exit is drained here rather than dropped, and one
+        // Post-prompt drain + finalization, as ONE loop (#603, #604). The drain
+        // settles only on a rendered, quiescent read; finalization then makes
+        // ONE fresh confirmation read. Content that landed after the settle but
+        // before that read — the run went live again — is rendered and the drain
+        // is RE-OPENED, so the run is followed to its true end by the drain's own
+        // settle logic and its graces (no total budget). There is no path that
+        // stamps an ending on a read that still shows unrendered new content. A
+        // decided (grace) ending's disposition is already final: it reads at most
+        // once and stamps.
+        //
+        // The drain's exit is not the last word: the pre-finalization re-check
+        // drains a Supplement racing the exit rather than dropping it, and one
         // that lands after the release becomes a normal new Turn on the
         // handler's not-busy path.
-        let drain_outcome = self.drain_after_prompt(handles).await;
+        let (drain_outcome, final_transcript) = loop {
+            let drain_outcome = self.drain_after_prompt(handles).await;
 
-        // The accumulator vanished under the drain (a replacement or a collect
-        // took the card): the Turn owns nothing any more, so it ends silently —
-        // no ending is stamped and no notice is sent, exactly as the out-of-turn
-        // follow does when its render finds no accumulator (review, PR #595).
-        if drain_outcome == Some(DrainState::Vanished) {
-            tracing::info!("turn drain: card vanished on session {}", self.session_id);
-            self.release(handles).await;
-            return;
-        }
+            // The accumulator vanished under the drain (a replacement or a
+            // collect took the card): the Turn owns nothing any more, so it ends
+            // silently — no ending is stamped and no notice is sent, exactly as
+            // the out-of-turn follow does when its render finds no accumulator
+            // (review, PR #595).
+            if drain_outcome == Some(DrainState::Vanished) {
+                tracing::info!("turn drain: card vanished on session {}", self.session_id);
+                self.release(handles).await;
+                return;
+            }
 
-        // The turn's outcome is OBSERVED, not returned (ADR-0056): a rejected
-        // submit is the call's Err, and a submitted run's failure is recorded
-        // on its newest assistant message — the blocking response used to carry
-        // it inline, and the transcript now does.
-        //
-        // The read the ending is decided on (#604): the drain's own rendered,
-        // quiescent snapshot when it settled cleanly — never a later separate
-        // read that could disagree and finalize a stale one. Otherwise a fresh
-        // bounded read, repeated while it still carries content the card lacks:
-        // the same rendered-and-quiescent rule the drain applies, so the two
-        // paths cannot diverge. `None` here is NOT completion: the failure the
-        // drain last observed stands in, so a hiccup cannot stamp Done over a
-        // failed turn. Every read is bounded by the same per-read timeout as the
-        // drain (#603): a hung Backend must not freeze finalization after the
-        // drain already ended (a lost-contact run reaches here).
-        let final_transcript = self.final_transcript(handles, drain_outcome.is_none()).await;
+            // A decided ending — the waiting yield, the Unreceived ending, the
+            // two graces: its disposition is final, so finalization reads at most
+            // once (for any tail the grace's read carried) and stamps it.
+            if drain_outcome.is_some() {
+                break (drain_outcome, self.final_read_once(handles).await);
+            }
+
+            // A settled drain: one fresh read confirms it. Quiescent → decide on
+            // it. Still carrying content the card lacks → the run went live
+            // again: render it and re-open the drain, never stamping an ending
+            // on this non-quiescent read.
+            match self.settled_final_read(handles).await {
+                SettledFinalRead::Quiescent(transcript) => break (drain_outcome, Some(*transcript)),
+                SettledFinalRead::Unreadable => break (drain_outcome, self.last_transcript.clone()),
+                SettledFinalRead::Live => {
+                    tracing::info!(
+                        "turn drain: content still arriving after settle on session {}; re-opening the drain",
+                        self.session_id
+                    );
+                }
+            }
+        };
 
         // A deliberate `/stop` owns this turn's ending (#394): the abort the
         // server recorded is NOT a failure, its text must never reach the
@@ -1112,124 +1142,81 @@ impl Turn {
         handles.config.follow_read_timeout_ms()
     }
 
-    /// The transcript finalization decides the ending on (#604), obeying the
-    /// same rendered-and-quiescent rule as the drain: a FRESH bounded read that
-    /// is rendered, repeated while it still carries content the card lacks, so
-    /// the ending is never stamped over an unrendered tail. The drain's cached
-    /// `last_transcript` is NOT trusted blindly (spec #602, review finding 3):
-    /// a part can land after the settle read — between the settling tick's
-    /// transcript read and its status read, or between the settle and
-    /// finalization — and a later *transcript* read is exactly what must catch
-    /// it (it is a later *status* read that #604 forbids finalizing a stale
-    /// transcript). `None` when no read answers and the drain had no snapshot to
-    /// fall back on.
-    ///
-    /// The re-read is BOUNDED (spec #602 review, round 4): it catches a finite
-    /// tail, never a live stream. A settled drain re-reads only until the
-    /// follow grace is spent (returning its last read, so the decided
-    /// disposition is stamped); a grace ending reads exactly once and out. See
-    /// the loop below.
-    async fn final_transcript(
-        &self,
-        handles: &TurnHandles,
-        drain_settled: bool,
-    ) -> Option<SessionTranscript> {
-        // The re-read loop is BOUNDED (spec #602 review, round 4): it exists to
-        // catch a FINITE tail that landed after the drain's snapshot, never to
-        // chase a live stream. The budget is the same follow grace the drain's
-        // own ceilings use; once it is spent the loop returns the read it last
-        // saw, so the already-decided disposition is stamped instead of the
-        // guard being held forever. A grace ending (the drain did not settle
-        // cleanly) does not chase a live stream at all — one read is enough
-        // there, since the decided disposition is stamped regardless of what
-        // the read carries.
-        //
-        // The budget is not just checked between reads (spec #602 review, round
-        // 5): it BOUNDS each read. A read begun just before the deadline would
-        // otherwise run the full per-read timeout past it, holding the guard
-        // past the stated grace by up to one `follow_read_timeout_ms` — which
-        // can exceed the grace itself in small configs. The loop also refuses to
-        // START a further read once the budget is spent, returning the read it
-        // last saw.
-        let deadline =
-            tokio::time::Instant::now() + std::time::Duration::from_millis(handles.config.follow_grace_ms());
-        // The read last rendered, returned when the budget is spent so the
-        // already-decided disposition is stamped.
-        let mut last: Option<SessionTranscript> = None;
-        loop {
-            // Never START another read once the budget is spent: the read last
-            // seen is the rendered, quiescent snapshot to decide on. The first
-            // read is always attempted (a settled drain's own early return means
-            // there may be no `last` yet) — the bound below covers the case
-            // where no budget is left at all.
-            if drain_settled && last.is_some() && tokio::time::Instant::now() >= deadline {
-                return last;
-            }
-            // Bound THIS read by what is left of the budget: `min(follow_read_timeout_ms,
-            // remaining)`, floored to a small positive value so a read begun at
-            // the deadline still returns promptly rather than being skipped.
-            let read_timeout_ms = deadline
-                .saturating_duration_since(tokio::time::Instant::now())
-                .as_millis()
-                .min(u128::from(self.drain_read_timeout_ms(handles)))
-                .max(1) as u64;
-            let read = crate::bridge::bounded_call(
-                "turn final transcript",
-                read_timeout_ms,
-                handles.backend.transcript(&self.session_id),
-            )
-            .await
-            .and_then(std::result::Result::ok);
-            let Some(transcript) = read else {
-                // A failed fresh read. When the drain settled cleanly, its own
-                // rendered snapshot is the best available substitute — falling
-                // back to it keeps a transient hiccup from turning a settled
-                // ending into an unknown one. A drain that ended in a decided
-                // ending has no such snapshot, so a failed read stays `None`.
-                return if drain_settled {
-                    self.last_transcript.clone()
-                } else {
-                    None
-                };
-            };
-            // The settled-drain fast path: when this fresh read shows nothing
-            // the card lacks, it IS the rendered, quiescent snapshot to decide
-            // on — return it without rendering. A render here would re-spend
-            // the cycle's ledger reads and re-persist the chain record for a
-            // body that has not moved (the drain's own early-return makes the
-            // same call). A read that DOES carry new content — the tail that
-            // landed after the settle (finding 3) — falls through and is
-            // rendered, then re-read until quiescent.
-            if drain_settled && !self.drain_owes_render(handles, &transcript).await {
-                return Some(transcript);
-            }
-            // Render this read, then repeat only if it carried content the card
-            // lacked: the ending may only be stamped on a read that shows no
-            // new content. A vanished accumulator ends the loop with the read
-            // it last saw.
-            let Some(rendered) = render::render_and_flush(
-                &handles.cards,
-                &handles.sessions,
-                &handles.backend,
-                &handles.requests,
-                &self.session_id,
-                &transcript,
-            )
-            .await
-            else {
-                return Some(transcript);
-            };
-            if !rendered.stats.new_content {
-                return Some(transcript);
-            }
-            // A grace ending gets one read and out; a settled drain keeps
-            // catching a finite tail, but never past the grace budget — the
-            // read is remembered so the next iteration's top check can return
-            // it once the budget is spent.
-            if !drain_settled {
-                return Some(transcript);
-            }
-            last = Some(transcript);
+    /// The one bounded read finalization decides on (#603): like the drain's
+    /// own reads, it is bounded by the remaining grace budget
+    /// (`min(follow_read_timeout_ms, follow_grace_ms)`, floored to 1 ms), so a
+    /// read begun at the deadline still returns promptly and a hung Backend
+    /// cannot hold the inflight guard past the grace.
+    async fn finalization_read(&self, handles: &TurnHandles) -> Option<SessionTranscript> {
+        let read_timeout_ms = handles
+            .config
+            .follow_grace_ms()
+            .min(self.drain_read_timeout_ms(handles))
+            .max(1);
+        crate::bridge::bounded_call(
+            "turn final transcript",
+            read_timeout_ms,
+            handles.backend.transcript(&self.session_id),
+        )
+        .await
+        .and_then(std::result::Result::ok)
+    }
+
+    /// The read a DECIDED ending finalizes on (#603): its disposition is already
+    /// final, so one bounded read renders any tail the grace's read carried and
+    /// the read is returned for the final reconcile. `None` when the read fails
+    /// (the failure the drain last observed stands in).
+    async fn final_read_once(&self, handles: &TurnHandles) -> Option<SessionTranscript> {
+        let transcript = self.finalization_read(handles).await?;
+        let _ = render::render_and_flush(
+            &handles.cards,
+            &handles.sessions,
+            &handles.backend,
+            &handles.requests,
+            &self.session_id,
+            &transcript,
+        )
+        .await;
+        Some(transcript)
+    }
+
+    /// The settled drain's ONE fresh read (#604). When it shows nothing the card
+    /// lacks it IS the rendered, quiescent snapshot the ending is decided on. A
+    /// read that still carries content the card lacks means the run went live
+    /// again: the read is rendered and the caller RE-OPENS the drain, so the
+    /// ending is never stamped on a non-quiescent read. A failed read falls back
+    /// to the drain's last rendered snapshot (a transient hiccup must not turn a
+    /// settled ending into an unknown one).
+    async fn settled_final_read(&self, handles: &TurnHandles) -> SettledFinalRead {
+        let Some(transcript) = self.finalization_read(handles).await else {
+            return SettledFinalRead::Unreadable;
+        };
+        // A read the card already shows: the rendered, quiescent snapshot to
+        // decide on — no render needed (it would re-spend the cycle's ledger
+        // reads and re-persist the chain record for a body that has not moved;
+        // the drain's own early-return makes the same call).
+        if !self.drain_owes_render(handles, &transcript).await {
+            return SettledFinalRead::Quiescent(Box::new(transcript));
+        }
+        // The read carries content the card lacks: render it (the fresh RENDERED
+        // read), then report Live so the caller re-opens the drain. A vanished
+        // accumulator leaves the read as the snapshot it last saw.
+        let Some(rendered) = render::render_and_flush(
+            &handles.cards,
+            &handles.sessions,
+            &handles.backend,
+            &handles.requests,
+            &self.session_id,
+            &transcript,
+        )
+        .await
+        else {
+            return SettledFinalRead::Quiescent(Box::new(transcript));
+        };
+        if rendered.stats.new_content {
+            SettledFinalRead::Live
+        } else {
+            SettledFinalRead::Quiescent(Box::new(transcript))
         }
     }
 
