@@ -1068,6 +1068,14 @@ impl Turn {
             // reopens the drain, so the ending is never decided from a read a
             // later read contradicts (the same-snapshot rule's spirit). A
             // failed re-check read leaves the settled decision standing.
+            // The re-check only CORROBORATES the settled decision: `drain()`
+            // returns `None` (settled) solely from `Some(DrainState::Settled)
+            // if tick.contact` above — the ending already rests on a full read
+            // pair. So neither arm of this match needs its own `contact` check:
+            // `Some(Settled)` is the same verdict re-observed, `None` is a
+            // failed re-check read, and a failed re-check deliberately leaves
+            // the settled decision standing (spec #602 review, finding A: false
+            // positive).
             match self
                 .drain_tick(handles, self.drain_read_timeout_ms(handles))
                 .await
