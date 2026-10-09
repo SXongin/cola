@@ -2070,6 +2070,99 @@ async fn a_second_late_tail_does_not_post_a_second_neutral_card() {
     );
 }
 
+/// Finding 2 (spec #602 review, round 4): a later tail after the one neutral
+/// residual card that OVERFLOWS one Card must not be built unsplit — where a
+/// refused oversized PATCH would lose the remainder with nowhere to move it.
+/// The residual in-place flush splits on the size overflow (the one allowed
+/// mid-request continuation), so the overflow rides a continuation Card, and
+/// the split stays neutral: no 「已恢复执行」 receipt, no Wake 承接 line.
+#[tokio::test]
+async fn an_overflowing_late_tail_on_the_residual_card_splits_instead_of_dropping() {
+    let _wd = test_work_dir();
+    let done = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "第一条消息"),
+        assistant(2_000, "第一轮回答。"),
+    ])
+    .with_executions(vec![execution(2_500)]);
+    let (_dir, app, backend, platform) = scripted_app(vec![done], Some(SessionStatus::Idle)).await;
+    Turn::run(&app.turn_handles(), ctx("ses_test", "第一条消息"))
+        .await
+        .unwrap();
+    name_request_card(&app).await;
+    let posts_before = card_posts(&platform).await;
+
+    // The first late tail opens the one neutral residual card.
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(vec![
+                user("msg_cola_anchor", 1_000, "第一条消息"),
+                assistant(2_000, "第一轮回答。"),
+                assistant(3_100, "收尾时补上的一段。"),
+            ])
+            .with_executions(vec![execution(2_500), execution(4_000)]),
+        ],
+    )
+    .await;
+    spawn_sync(&app);
+    wait_for_card_update(&platform, "the neutral residual card", CardUpdates::Any, |card| {
+        card_text(card).contains(RESIDUAL_LEAD) && card_text(card).contains("收尾时补上的一段。")
+    })
+    .await;
+    assert_eq!(
+        card_posts(&platform).await,
+        posts_before + 1,
+        "the floor posts its one neutral card: {:?}",
+        platform.calls.lock().await
+    );
+
+    // A later tail overflows one Card: it must continue on a NEW card, never be
+    // built unsplit on the residual card.
+    let overflow = format!("{}【尾部标记】", "很长的回答。".repeat(1_200));
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(vec![
+                user("msg_cola_anchor", 1_000, "第一条消息"),
+                assistant(2_000, "第一轮回答。"),
+                assistant(3_100, "收尾时补上的一段。"),
+                assistant(5_000, &overflow),
+            ])
+            .with_executions(vec![execution(2_500), execution(4_000), execution(6_000)]),
+        ],
+    )
+    .await;
+    // The overflow's remainder must reach a card — the marker is the proof it
+    // was not built unsplit and dropped.
+    wait_for_any_card(&platform, "【尾部标记】").await;
+
+    // The overflow's remainder rides a continuation card POST — the only place
+    // a split's tail can go — instead of the unsplit residual card.
+    let calls = platform.calls.lock().await.clone();
+    let continuation = calls
+        .iter()
+        .find_map(|call| match call {
+            PlatformCall::ReplyCard { card, .. } | PlatformCall::SendCard { card, .. }
+                if card_text(card).contains("【尾部标记】") =>
+            {
+                Some(card)
+            }
+            _ => None,
+        })
+        .expect("an overflowing residual tail must split onto a continuation Card, never drop it");
+    assert!(
+        !card_text(continuation).contains(WAKE_LEAD),
+        "the size split stays neutral, never a 「已恢复执行」 resumption: {continuation}"
+    );
+    assert!(
+        !calls
+            .iter()
+            .filter_map(call_card)
+            .any(|card| card_text(card).contains(WAKE_LEAD)),
+        "a residual size split must never become a resumption Card: {calls:?}"
+    );
+}
+
 /// Acceptance 5a: a Wake on a Session whose newest user message is EXTERNAL
 /// stays unrendered — the external-message path is unchanged and the Wake
 /// never moves the Sync Watermark (which accounts user messages only).
