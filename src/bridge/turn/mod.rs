@@ -1186,7 +1186,19 @@ impl Turn {
             } else {
                 stuck_since = None;
                 match tick.state {
-                    Some(DrainState::Settled) => return None,
+                    // A Settled ending may only finalize on a FULL read pair
+                    // (spec #602, review): a settled state read out of an
+                    // unreadable status (`contact == false`) is not evidence the
+                    // run ended — the transcript's Complete alone cannot prove
+                    // the Session idle, and finalizing on it would stamp a
+                    // partial turn (a live `⏳` panel included) `✅` while
+                    // `session_status` never answered, skipping the lost-contact
+                    // grace below. Keep observing: the grace ends the card in
+                    // error, or a later readable tick settles it. The `/stop`
+                    // ending arrives with `contact == true`, so it still
+                    // finalizes promptly.
+                    Some(DrainState::Settled) if tick.contact => return None,
+                    Some(DrainState::Settled) => {}
                     // The card vanished (a replacement or a collect): the Turn
                     // owns nothing any more, so stop silently.
                     Some(DrainState::Vanished) => return Some(DrainState::Vanished),

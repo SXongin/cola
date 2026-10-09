@@ -1018,6 +1018,39 @@ async fn a_hung_backend_ends_the_drain_in_error() {
     assert_no_further_rendering(&backend, &platform).await;
 }
 
+/// Finding C (spec #602 review): a `Settled` ending derived from an unanswered
+/// status must not finalize. Here the TRANSCRIPT reads keep succeeding and carry
+/// a live `⏳` panel, but `session_status` never answers — so the tick is not a
+/// full read pair (`contact == false`). The Complete state comes only from the
+/// readable transcript, and the unreadable status must not be read as "the run
+/// ended": the card must NOT be stamped ✅ over the live panel; the lost-contact
+/// grace ends it in error instead. (The hung-backend test hangs the transcript
+/// too, so it never exercises this half.)
+#[tokio::test]
+async fn a_settled_read_over_an_unanswered_status_does_not_finalize_done() {
+    let _wd = test_work_dir();
+    let (_dir, app, backend, platform) = busy_supplement_app(50).await;
+    run_to_panel(&app, &platform).await;
+
+    // The transcript keeps reading (the live `⏳ bash` panel is still there) and
+    // the anchor turn reads Complete — a Settled state — but every status read
+    // now fails: the tick is not a full read pair, so the ending is not real.
+    backend.session_status_fails.store(true, Ordering::SeqCst);
+
+    wait_for_card_header(&platform, "出错").await;
+    wait_for_guard_release(&app).await;
+    let final_card = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        !card_header(&final_card).contains("完成"),
+        "a Settled ending over an unanswered status must never stamp Done: {final_card}"
+    );
+    assert!(
+        card_text(&final_card).contains("失去联系"),
+        "the lost-contact grace ends it: {final_card}"
+    );
+    assert_no_further_rendering(&backend, &platform).await;
+}
+
 /// A live `⏳` panel on a readable, idle session that never settles is an
 /// unreconcilable panel: the drain gives it the grace to settle, then ends
 /// Error — never Done over a `⏳`, never an eternal card (#386).

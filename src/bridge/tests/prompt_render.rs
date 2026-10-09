@@ -736,6 +736,14 @@ async fn retry_after_a_failed_status_read_submits_a_new_id() {
         "an unknown decision must submit a fresh id (click must have an effect)"
     );
 
+    // The unknown decision is spent. Lift the status failure so the FRESH turn
+    // is judged by a readable status: a Settled ending may only finalize on a
+    // full read pair (spec #602 review), so a permanently unreadable status
+    // would end the retried turn in the lost-contact Error at the grace.
+    backend
+        .session_status_fails
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+
     wait_for_card_update(&platform, "the retried Done card", CardUpdates::Latest, |card| {
         card_header(card) == "✅ 完成" && card_text(card).contains("当前目录有 src/ 和 Cargo.toml。")
     })
