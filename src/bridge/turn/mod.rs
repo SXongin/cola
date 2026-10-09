@@ -2560,6 +2560,75 @@ impl Turn {
             .accepted()
     }
 
+    /// Land a later Wake-less tail on the chain's ONE already-posted neutral
+    /// residual card (spec #602, ticket #606): the "content is never dropped"
+    /// half of the floor, after [`Self::wake_continuation`]'s
+    /// [`WakeContinuation::Residual`] posted the one card. The tail renders on
+    /// that same card in place — no second card, no receipt, no resumption —
+    /// and the ending the card already carries is restored over the render and
+    /// carried by the single flush, so a settled (terminal) card's recorded
+    /// ending is never rewritten (ADR-0074). Returns whether a write was
+    /// accepted (the caller's carrier signal); the content itself stays owed
+    /// through the delivery layer when the PATCH has to retry.
+    ///
+    /// One write-lock-held sequence, like the in-place resume: the admission
+    /// (the chain's residual card, with no live renderer owning it) is
+    /// re-checked under the write lock, the card renders the read WITHOUT its
+    /// own flush (the ending restore must ride the same write), and the flush
+    /// that carries the tail is the caller's carrier. [`SplitPolicy::Forbid`]:
+    /// the tail must never open a second card, so an over-budget slice stays on
+    /// the one card rather than splitting.
+    pub(crate) async fn render_residual_in_place(
+        cards: &CardsHandle,
+        sessions: &SessionsHandle,
+        backend: &Arc<dyn crate::backend::Backend>,
+        requests: &RequestsHandle,
+        session_id: &str,
+        transcript: &SessionTranscript,
+    ) -> bool {
+        let write_lock = cards.write_lock(session_id).await;
+        let _guard = write_lock.lock().await;
+        // The admission, re-checked under the write lock: only the chain's
+        // residual card (its ONE neutral card posted) that no live renderer
+        // owns admits. A card a new Turn replaced, or one a settle loop still
+        // owns, is left alone — that owning path renders the tail.
+        let Some((ending_state, ending_error)) = ({
+            let live = cards.cards.lock().await;
+            live.get(session_id)
+                .filter(|card| card.acc.residual_card_posted && !card.acc.card_state.is_render_owned())
+                .map(|card| (card.acc.card_state.clone(), card.acc.error.clone()))
+        }) else {
+            return false;
+        };
+        // Render the read into the card WITHOUT its own flush: rendering the
+        // new parts sets a live state, and the ending restore below must ride
+        // the same write as those parts, so the card never PATCHes a live
+        // header for content a settled run already finished.
+        if render::render_and_flush_settling(cards, sessions, backend, requests, session_id, transcript)
+            .await
+            .is_none()
+        {
+            return false;
+        }
+        // Restore the ending the card carried before the late tail: rendering
+        // the new parts set a live state, but a card past its wait keeps the
+        // ending it recorded (ADR-0074). The one flush below carries both.
+        {
+            let mut live = cards.cards.lock().await;
+            let Some(card) = live.get_mut(session_id) else {
+                return false;
+            };
+            card.acc.card_state = ending_state;
+            card.acc.error = ending_error;
+            card.acc.refresh_phase();
+        }
+        // `SplitPolicy::Forbid`: the tail lands on the one residual card and
+        // never opens a second.
+        flush::flush_card_locked(cards, session_id, flush::SplitPolicy::Forbid)
+            .await
+            .accepted()
+    }
+
     /// Refresh a yielded card's ledger from a Session Sync read, in place
     /// (ADR-0060): the freeze's carve-out, beside the Wake handover. A Waiting
     /// card has no render loop — its Turn yielded to its live Background Tasks
@@ -3880,6 +3949,17 @@ pub(crate) enum WakeContinuation {
     /// marker bounds it to one per request, and the same-snapshot ending rule
     /// (#604) makes the whole arm near-unreachable.
     Residual { line: ContinuationLine },
+    /// A card chain whose card is past its wait and has ALREADY posted its one
+    /// neutral residual card (spec #602, ticket #606): a later Wake-less tail
+    /// renders IN PLACE on that same neutral card — no second card, no receipt,
+    /// no resumption — keeping the ending the card already carries (ADR-0074:
+    /// a terminal card's recorded ending is never rewritten, but the content a
+    /// user is owed is never dropped either). The card may have settled to a
+    /// terminal state by the time the tail arrives; the tail still lands on it,
+    /// rendered against a freshly restored copy of that ending. This is the
+    /// "content is never dropped" half of #606, paired with [`Self::Residual`]'s
+    /// "at most one such card per request" half.
+    RenderResidualInPlace,
     /// No chain in this process and no durable record (a cola restart that
     /// left nothing behind): arm a fresh card, scoped at the newest Wake's own
     /// anchor so the lost card's content is never replayed.
@@ -4112,8 +4192,10 @@ impl Turn {
                 //    floor it renders honestly on ONE neutral continuation card,
                 //    never a 「已恢复执行」 receipt, and the content is never
                 //    dropped. The chain's own marker bounds it to one per
-                //    request — once the floor has fired, later late content can
-                //    no longer post a second neutral card.
+                //    request — once the floor has fired, later late content
+                //    renders IN PLACE on that one neutral card (a second neutral
+                //    card would break one-card-per-request; dropping the content
+                //    would break "never dropped").
                 if !card.acc.residual_card_posted {
                     return Some(WakeContinuation::Residual {
                         line: ContinuationLine {
@@ -4127,7 +4209,7 @@ impl Turn {
                         },
                     });
                 }
-                return None;
+                return Some(WakeContinuation::RenderResidualInPlace);
             }
         }
         // No chain in this process (a cola restart). The Fresh gate is the
