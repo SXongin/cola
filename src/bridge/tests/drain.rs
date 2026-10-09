@@ -3145,11 +3145,13 @@ async fn finalization_reads_are_bounded_by_the_remaining_grace_budget() {
     wait_for_guard_release(&app).await;
     let held = start.elapsed();
 
-    // Finalization is bounded by the remaining grace (~60 ms), never the full
-    // 600 ms read timeout: the guard releases comfortably under one full read
-    // timeout after the drain's own read. An unbounded read would add ~600 ms.
+    // `held` spans the drain's own (fixed 600 ms) read PLUS finalization. Fixed:
+    // ~600 ms + the ~60 ms remaining grace ≈ 660 ms. A regression that spent the
+    // FULL 600 ms read timeout in finalization would instead be ~1200 ms, so a
+    // threshold well under that (800 ms) distinguishes the two and fails a
+    // full-timeout read.
     assert!(
-        held < Duration::from_millis(900),
+        held < Duration::from_millis(800),
         "finalization held the guard {held:?} after the drain — a read must be bound by the remaining budget, not the full read timeout"
     );
 
