@@ -372,6 +372,16 @@ async fn a_non_live_advisory_read_starts_a_turn_with_an_ordinary_card() {
         let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
         seed_session(&app, "ses_test", "/work").await;
 
+        // The `unreadable` arm's status read fails for the whole turn, so a
+        // Settled ending keeps observing until the lost-contact grace (spec
+        // #602 review); bound it and the render poll (as the migrated lifecycle
+        // tests do) so the inline handler returns promptly. The card assertions
+        // are unchanged — the ordinary loading card still lands.
+        app.turn_render_poll_ms
+            .store(5, std::sync::atomic::Ordering::Relaxed);
+        app.turn_follow_grace_ms
+            .store(50, std::sync::atomic::Ordering::Relaxed);
+
         app.handle_message(incoming(
             "msg_1".into(),
             "chat_1".into(),
