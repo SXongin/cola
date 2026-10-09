@@ -1011,19 +1011,24 @@ pub(super) struct StagedWatermark {
     pub(super) id: u64,
 }
 
-/// Whether the write carrying a flush's **terminal slice** was accepted by
-/// delivery (spec #602, ticket #607): delivered now, or owed by the delivery
-/// layer's pending retry. A `bool` newtype so [`StreamAccumulator`] can keep
-/// deriving `Default` while this field defaults to `true` — before any flush
-/// there is no terminal write to doubt, and the Completion Notice gate must not
-/// suppress on that absence. A later flush overwrites it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct EndingWriteAccepted(pub(super) bool);
-
-impl Default for EndingWriteAccepted {
-    fn default() -> Self {
-        Self(true)
-    }
+/// The fate of the write carrying a flush's **terminal slice** (spec #602,
+/// ticket #607): whether delivery accepted it now, still owes it as a pending
+/// retry, or can never carry it. `Default` is [`Self::Delivered`] so a
+/// [`StreamAccumulator`] with no flush behind it does not suppress — before any
+/// terminal write there is nothing to doubt. A later flush overwrites it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum EndingWrite {
+    /// The terminal slice is on Feishu: a direct PATCH delivered, or a
+    /// size-split continuation create landed it on the new card.
+    #[default]
+    Delivered,
+    /// The terminal slice is still owed by the delivery layer's pending retry
+    /// as the keyless write at this exact sequence. The Completion Notice arms
+    /// against THIS sequence, never the card's current newest (spec #607).
+    Owed(u64),
+    /// The terminal slice can never reach Feishu: a permanently refused or
+    /// suspended ending PATCH, or a size-split continuation create that failed.
+    Failed,
 }
 
 /// Accumulates streaming state for one session.
@@ -1034,13 +1039,12 @@ pub(super) struct StreamAccumulator {
     /// `None` and is advanced by the flush when Feishu rejects a card it
     /// built. A fresh turn starts clean and re-tries the normal rendering.
     pub(super) card_fallback: CardFallback,
-    /// Whether the write carrying this card's flush's terminal slice was
-    /// accepted by delivery (spec #602, ticket #607): `true` when delivered now
-    /// or owed by the pending retry, `false` when permanently refused — a
-    /// size-split continuation create that failed, or a refused ending PATCH.
-    /// The Completion Notice gate reads it to suppress a notice over a tail
+    /// The fate of the write carrying this card's flush's **terminal slice**
+    /// (spec #602, ticket #607). The Completion Notice reads it: [`EndingWrite::Delivered`]
+    /// announces at once, [`EndingWrite::Owed`] arms against that exact
+    /// sequence, and [`EndingWrite::Failed`] suppresses a notice over a tail
     /// that never reached Feishu.
-    pub(super) ending_write_accepted: EndingWriteAccepted,
+    pub(super) ending_write: EndingWrite,
     pub(super) text: String,
     pub(super) reasoning: String,
     /// Tool panels keyed by call ID (current state; `timeline` keeps order).

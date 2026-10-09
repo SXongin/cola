@@ -66,7 +66,7 @@ use crate::bridge::handles::{
     CardsHandle, FlowHandles, NoticeRules, RequestsHandle, SessionsHandle, TurnHandles,
 };
 use crate::bridge::span;
-use crate::bridge::turn::state::StreamAccumulator;
+use crate::bridge::turn::state::{EndingWrite, StreamAccumulator};
 use crate::config::ThreadKey;
 use crate::feishu::client::ImageAttachment;
 use crate::opencode;
@@ -4743,21 +4743,19 @@ async fn release_inflight(handles: &TurnHandles, session_id: &str) {
     inflight.remove(session_id);
 }
 
-/// Send the Completion Notice gated on the terminal write being **accepted**
-/// (spec #602, ticket #607): the write must have been delivered now, or be
-/// owed by the delivery layer's retry. A direct PATCH to the current card and a
-/// size-split that continued on a new card both answer "accepted now" and
-/// announce at once; a failed ending PATCH queued as a Pending Card Update
-/// announces only when that update DRAINS, so the notice never lands before the
-/// terminal slice it announces. A permanently refused terminal write — and a
+/// Send the Completion Notice gated on the terminal write's own **fate** (spec
+/// #602, ticket #607): the write must have been delivered now, or be owed by the
+/// delivery layer's retry. A direct PATCH to the current card and a size-split
+/// that continued on a new card both read [`EndingWrite::Delivered`] and
+/// announce at once; a failed ending PATCH queued as a Pending Card Update reads
+/// [`EndingWrite::Owed`] and arms the notice against that **exact sequence**, so
+/// it fires only when that write DRAINS — never before, and never on an
+/// unrelated newer repaint. A permanently refused terminal write — and a
 /// size-split continuation create that failed, whose slice never reached Feishu
-/// — suppresses the notice through the accumulator's
-/// [`ending_write_accepted`](super::state::EndingWriteAccepted), read before the
-/// delivery-layer gate so the OLD card's delivered write can never answer for
-/// the failed continuation. A missing tracked card is likewise suppressed:
-/// without a card there is no write to gate on. The disposition's own
-/// classification and the opt-in rules are unchanged — this only fixes the
-/// timing/gate.
+/// — reads [`EndingWrite::Failed`] and suppresses the notice. A missing tracked
+/// card is likewise suppressed: without a card there is no write to gate on. The
+/// disposition's own classification and the opt-in rules are unchanged — this
+/// only fixes the timing/gate.
 ///
 /// The one entry point every ending takes (the in-Turn `finish`, the out-of-turn
 /// follow, the Wake in-place resume and Session Sync's quiet true end) — so all
@@ -4776,15 +4774,15 @@ pub(crate) async fn announce_completion(
     if disposition.notice_copy().is_none() {
         return;
     }
-    // The card carrying the terminal slice and whether that write was accepted
-    // by delivery (#607), read under one lock. `ending_write_accepted` is
-    // `false` when a size-split continuation create failed or an ending PATCH
-    // was permanently refused — the tail never reached Feishu.
-    let (card_id, ending_write_accepted) = {
+    // The card carrying the terminal slice and that write's own fate (#607),
+    // read under one lock. `Failed` when a size-split continuation create
+    // failed or an ending PATCH was permanently refused — the tail never
+    // reached Feishu; `Owed(seq)` when delivery still owes that exact write.
+    let (card_id, ending) = {
         let live = cards.cards.lock().await;
         match live.get(session_id) {
-            Some(card) => (card.card_message_id.clone(), card.acc.ending_write_accepted.0),
-            None => (None, true),
+            Some(card) => (card.card_message_id.clone(), card.acc.ending_write),
+            None => (None, EndingWrite::Failed),
         }
     };
     // No tracked card: there is no write to gate on, so the notice is
@@ -4795,38 +4793,58 @@ pub(crate) async fn announce_completion(
         tracing::warn!("completion notice suppressed: no tracked card for {session_id} to gate delivery on");
         return;
     };
-    // The terminal write's own carrier refused: the delivery layer would answer
-    // for the OLD card (whose earlier write delivered), so the notice would be
-    // announced over a terminal tail that never landed. Suppress instead.
-    if !ending_write_accepted {
-        tracing::warn!("completion notice suppressed: the terminal write for {session_id} was refused");
-        return;
-    }
-    // The deferred closure spawns the send on fire: the delivery layer calls it
-    // from a drain, and the notice's own lookup and reply must not run under
-    // the delivery layer's lock.
-    let notice: crate::feishu::DeferredNotice = {
-        let cards = cards.clone();
-        let platform = Arc::clone(platform);
-        let rules = rules.clone();
-        let session_id = session_id.to_string();
-        let disposition = disposition.clone();
-        Box::new(move || {
-            tokio::spawn(async move {
-                send_completion_notice(&cards, &platform, &rules, &session_id, started_at, &disposition)
-                    .await;
-            });
-        })
-    };
-    match platform.defer_notice_until_delivered(&card_id, notice) {
-        crate::feishu::NoticeGate::Armed => {}
-        crate::feishu::NoticeGate::Delivered => {
+    match ending {
+        // The terminal slice's own carrier refused: the delivery layer would
+        // answer for the OLD card (whose earlier write delivered), so the
+        // notice would be announced over a terminal tail that never landed.
+        // Suppress instead.
+        EndingWrite::Failed => {
+            tracing::warn!("completion notice suppressed: the terminal write for {session_id} was refused");
+        }
+        // The terminal slice is on Feishu: announce at once.
+        EndingWrite::Delivered => {
             send_completion_notice(cards, platform, rules, session_id, started_at, disposition).await;
         }
-        crate::feishu::NoticeGate::Never => {
-            tracing::warn!(
-                "completion notice suppressed: the terminal write for {session_id} will never land"
-            );
+        // The terminal slice is owed by the delivery layer's retry at THIS
+        // sequence. The gate arms the notice against that exact sequence (so an
+        // unrelated newer repaint can never answer for it); if the write
+        // already drained it announces now, and if it was superseded or evicted
+        // it is suppressed.
+        EndingWrite::Owed(seq) => {
+            // The deferred closure spawns the send on fire: the delivery layer
+            // calls it from a drain, and the notice's own lookup and reply must
+            // not run under the delivery layer's lock.
+            let notice: crate::feishu::DeferredNotice = {
+                let cards = cards.clone();
+                let platform = Arc::clone(platform);
+                let rules = rules.clone();
+                let session_id = session_id.to_string();
+                let disposition = disposition.clone();
+                Box::new(move || {
+                    tokio::spawn(async move {
+                        send_completion_notice(
+                            &cards,
+                            &platform,
+                            &rules,
+                            &session_id,
+                            started_at,
+                            &disposition,
+                        )
+                        .await;
+                    });
+                })
+            };
+            match platform.defer_notice_until_delivered(&card_id, seq, notice) {
+                crate::feishu::NoticeGate::Armed => {}
+                crate::feishu::NoticeGate::Delivered => {
+                    send_completion_notice(cards, platform, rules, session_id, started_at, disposition).await;
+                }
+                crate::feishu::NoticeGate::Never => {
+                    tracing::warn!(
+                        "completion notice suppressed: the terminal write for {session_id} will never land"
+                    );
+                }
+            }
         }
     }
 }
