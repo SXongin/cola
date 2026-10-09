@@ -2682,10 +2682,14 @@ impl Turn {
     /// through the delivery layer when the PATCH has to retry.
     ///
     /// One write-lock-held sequence, like the in-place resume: the admission
-    /// (the chain's residual card, with no live renderer owning it) is
-    /// re-checked under the write lock, the card renders the read WITHOUT its
-    /// own flush (the ending restore must ride the same write), and the flush
-    /// that carries the tail is the caller's carrier.
+    /// (the chain's card, with no live renderer owning it) is re-checked under
+    /// the write lock, the card renders the read WITHOUT its own flush (the
+    /// ending restore must ride the same write), and the flush that carries
+    /// the tail is the caller's carrier. The admission is broader than "the
+    /// residual card": when the residual has no reachable reply target to
+    /// split onto, the FIRST Wake-less tail on an existing card also lands here
+    /// in place — the "content is never dropped" floor (#606) — and the write
+    /// marks the floor fired, so later tails route to this same path.
     ///
     /// [`SplitPolicy::Allow`]: a tail that pushes the neutral card past
     /// Feishu's size limit is finalized and its remainder carried onto a new
@@ -2705,14 +2709,16 @@ impl Turn {
     ) -> bool {
         let write_lock = cards.write_lock(session_id).await;
         let _guard = write_lock.lock().await;
-        // The admission, re-checked under the write lock: only the chain's
-        // residual card (its ONE neutral card posted) that no live renderer
-        // owns admits. A card a new Turn replaced, or one a settle loop still
-        // owns, is left alone — that owning path renders the tail.
+        // The admission, re-checked under the write lock: the chain's
+        // non-render-owned card admits. That is the chain's residual card (its
+        // ONE neutral card posted, a later tail), and — when the residual has
+        // no reachable reply target to split onto — the first Wake-less tail on
+        // an existing card, which must never be dropped (#606). A card a live
+        // renderer owns, or one a new Turn replaced, is left alone.
         let Some((ending_state, ending_error)) = ({
             let live = cards.cards.lock().await;
             live.get(session_id)
-                .filter(|card| card.acc.residual_card_posted && !card.acc.card_state.is_render_owned())
+                .filter(|card| !card.acc.card_state.is_render_owned())
                 .map(|card| (card.acc.card_state.clone(), card.acc.error.clone()))
         }) else {
             return false;
@@ -2729,7 +2735,11 @@ impl Turn {
         }
         // Restore the ending the card carried before the late tail: rendering
         // the new parts set a live state, but a card past its wait keeps the
-        // ending it recorded (ADR-0074). The one flush below carries both.
+        // ending it recorded (ADR-0074). The one flush below carries both. The
+        // floor is marked fired in the same write, so a LATER Wake-less tail
+        // routes to this in-place path (`RenderResidualInPlace`) instead of
+        // re-deciding `Residual`; when the residual instead split onto its own
+        // neutral card, `push_queued_receipts` set the same marker at the send.
         {
             let mut live = cards.cards.lock().await;
             let Some(card) = live.get_mut(session_id) else {
@@ -2737,6 +2747,7 @@ impl Turn {
             };
             card.acc.card_state = ending_state;
             card.acc.error = ending_error;
+            card.acc.residual_card_posted = true;
             card.acc.refresh_phase();
         }
         // `SplitPolicy::Allow`: an over-budget tail finalizes this card and
