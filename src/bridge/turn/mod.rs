@@ -4823,11 +4823,11 @@ async fn release_inflight(handles: &TurnHandles, session_id: &str) {
 /// The one entry point every ending takes (the in-Turn `finish`, the out-of-turn
 /// follow, the Wake in-place resume and Session Sync's quiet true end) — so all
 /// carriers are covered by one rule. The recipient and copy are resolved ONCE
-/// here ([`resolve_completion_notice`]), against the card that carried the
-/// terminal write: a deferred notice therefore carries the ORIGINAL request's
-/// requester and re-checks the card's identity before sending
+/// here, from [`CapturedNotice`] — the card id, ending fate and request identity
+/// read in a SINGLE critical section. A deferred notice therefore carries the
+/// ORIGINAL request's requester and re-checks the card's identity before sending
 /// ([`deliver_deferred_notice`]), so a newer Turn's card is never announced over
-/// the old request's ending (review finding 1).
+/// the old request's ending (review findings 1 and 5).
 pub(crate) async fn announce_completion(
     cards: &CardsHandle,
     platform: &Arc<dyn crate::feishu::Platform>,
@@ -4841,32 +4841,44 @@ pub(crate) async fn announce_completion(
     if disposition.notice_copy().is_none() {
         return;
     }
-    // The card carrying the terminal slice and that write's own fate (#607),
-    // read under one lock. `Failed` when a size-split continuation create
-    // failed or an ending PATCH was permanently refused — the tail never
-    // reached Feishu; `Owed(seq)` when delivery still owes that exact write.
-    let (card_id, ending) = {
+    // The card carrying the terminal slice, that write's own fate (#607) AND
+    // the request's identity, read under ONE lock (spec #602, review finding
+    // 5): a newer Turn that replaces the card must never redirect the notice,
+    // so the recipient, chat kind and copy are resolved against the SAME card
+    // identity the terminal write was gated on. `Failed` when a size-split
+    // continuation create failed or an ending PATCH was permanently refused —
+    // the tail never reached Feishu; `Owed(seq)` when delivery still owes that
+    // exact write.
+    let captured = {
         let live = cards.cards.lock().await;
-        match live.get(session_id) {
-            Some(card) => (card.card_message_id.clone(), card.acc.ending_write),
-            None => (None, EndingWrite::Failed),
-        }
+        live.get(session_id).map(|card| CapturedNotice {
+            card_message_id: card.card_message_id.clone(),
+            ending: card.acc.ending_write,
+            requester: card.acc.requester_open_id.clone(),
+            reply_to: card.acc.reply_to_message_id.clone(),
+            is_group: card.acc.is_group,
+        })
     };
     // No tracked card: there is no write to gate on, so the notice is
     // suppressed rather than sent without a delivery verdict (spec #602,
     // review). A card collected before its ending has no terminal write that
     // could have reached Feishu.
-    let Some(card_id) = card_id else {
+    let Some(captured) = captured else {
         tracing::warn!("completion notice suppressed: no tracked card for {session_id} to gate delivery on");
         return;
     };
-    // Resolve the notice's recipient, chat kind and copy ONCE, against the card
-    // that carried the terminal write (spec #602, review finding 1). A deferred
-    // notice must send to THIS request's requester, never to a card a newer Turn
+    // No card id: same suppression — without one there is no write to gate on.
+    let Some(card_id) = captured.card_message_id.clone() else {
+        tracing::warn!("completion notice suppressed: no tracked card for {session_id} to gate delivery on");
+        return;
+    };
+    // Resolve the notice's recipient, chat kind and copy against the CAPTURED
+    // card — never a re-read (spec #602, review finding 5). A deferred notice
+    // must send to THIS request's requester, never to a card a newer Turn
     // replaced while the terminal write was still owed. `None` keeps it silent
     // (the disposition, the opt-ins or a missing requester/reply target).
-    let resolved = resolve_completion_notice(cards, rules, session_id, started_at, disposition).await;
-    match ending {
+    let resolved = captured.resolve(session_id, rules, started_at, disposition);
+    match captured.ending {
         // The terminal slice's own carrier refused: the delivery layer would
         // answer for the OLD card (whose earlier write delivered), so the
         // notice would be announced over a terminal tail that never landed.
@@ -4935,41 +4947,53 @@ struct ResolvedNotice {
     text: &'static str,
 }
 
-/// Resolve the Completion Notice against the session's current card, or `None`
-/// when the disposition, the opt-ins or a missing recipient keep it silent.
-/// Reading the card here (not at fire time) is what binds a deferred notice to
-/// the request that ended.
-async fn resolve_completion_notice(
-    cards: &CardsHandle,
-    rules: &NoticeRules,
-    session_id: &str,
-    started_at: std::time::Instant,
-    disposition: &Disposition,
-) -> Option<ResolvedNotice> {
-    let text = disposition.notice_copy()?;
-    if !(rules.group_completion_notice || rules.long_task_notice) {
-        return None;
+/// The card state `announce_completion` reads in ONE critical section (spec
+/// #602, review finding 5): the card carrying the terminal write plus the
+/// request's identity. Reading them together — never in a second lock — is what
+/// binds a deferred notice to the request that ended, even if a newer Turn
+/// replaces the card before the notice resolves.
+struct CapturedNotice {
+    card_message_id: Option<String>,
+    ending: EndingWrite,
+    requester: Option<String>,
+    reply_to: Option<String>,
+    is_group: bool,
+}
+
+impl CapturedNotice {
+    /// Resolve the Completion Notice against THIS captured card, or `None` when
+    /// the disposition, the opt-ins or a missing recipient keep it silent. It
+    /// never re-reads the session, so the notice names exactly the request that
+    /// ended.
+    fn resolve(
+        &self,
+        session_id: &str,
+        rules: &NoticeRules,
+        started_at: std::time::Instant,
+        disposition: &Disposition,
+    ) -> Option<ResolvedNotice> {
+        let text = disposition.notice_copy()?;
+        if !(rules.group_completion_notice || rules.long_task_notice) {
+            return None;
+        }
+        let card_message_id = self.card_message_id.clone()?;
+        let requester = self.requester.clone()?;
+        let reply_to = self.reply_to.clone()?;
+        let long_task = started_at.elapsed() >= std::time::Duration::from_millis(rules.long_task_notice_ms());
+        if !(self.is_group && rules.group_completion_notice
+            || !self.is_group && rules.long_task_notice && long_task)
+        {
+            return None;
+        }
+        Some(ResolvedNotice {
+            session_id: session_id.to_string(),
+            card_message_id,
+            reply_to,
+            requester,
+            is_group: self.is_group,
+            text,
+        })
     }
-    let live = cards.cards.lock().await;
-    let card = live.get(session_id)?;
-    let card_message_id = card.card_message_id.clone()?;
-    let acc = &card.acc;
-    let requester = acc.requester_open_id.clone()?;
-    let reply_to = acc.reply_to_message_id.clone()?;
-    let long_task = started_at.elapsed() >= std::time::Duration::from_millis(rules.long_task_notice_ms());
-    if !(acc.is_group && rules.group_completion_notice
-        || !acc.is_group && rules.long_task_notice && long_task)
-    {
-        return None;
-    }
-    Some(ResolvedNotice {
-        session_id: session_id.to_string(),
-        card_message_id,
-        reply_to,
-        requester,
-        is_group: acc.is_group,
-        text,
-    })
 }
 
 /// Send a resolved notice to its own recipient — the request that actually
@@ -5655,6 +5679,123 @@ mod tests {
             )),
             "a Done disposition notifies with the true end's copy: {:?}",
             platform.calls.lock().await
+        );
+    }
+
+    /// Finding (spec #602 pre-push review 5): `announce_completion` captured the
+    /// card carrying the terminal write under one lock, then resolved the
+    /// notice's recipient from a SEPARATE read of the session's current card. A
+    /// newer Turn that replaces the card between those two reads redirects a
+    /// DELIVERED notice to the replacement's requester.
+    ///
+    /// The map lock makes the race deterministic: the announce (spawned first)
+    /// takes the lock, captures the ORIGINAL card and releases; the replacement
+    /// (spawned second, already queued) swaps in a fully formed card before the
+    /// announce resolves. The notice must still land on the ORIGINAL request's
+    /// recipient, never the replacement's.
+    #[tokio::test]
+    async fn a_replace_between_captures_never_redirects_a_delivered_notice() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        let cards = app.cards_handle();
+        Turn::seed_card(&cards, "ses_test", Some("om_old")).await;
+        Turn::set_reply_target(&cards, "ses_test", "msg_old").await;
+        Turn::set_turn_identity(&cards, "ses_test", "ou_old", true, 1).await;
+
+        // Hold the map lock so the announce and the replacement queue on it in
+        // spawn order: the announce first, the newer Turn's replacement second.
+        let held = cards.cards.lock().await;
+        let (ready_tx, mut ready_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let announce = {
+            let cards = cards.clone();
+            let platform = app.feishu.clone();
+            let rules = app.turn_config().notice_rules();
+            let ready = ready_tx.clone();
+            tokio::spawn(async move {
+                ready.send(()).expect("the test is receiving");
+                announce_completion(
+                    &cards,
+                    &platform,
+                    &rules,
+                    "ses_test",
+                    std::time::Instant::now(),
+                    &Disposition::Done,
+                )
+                .await;
+            })
+        };
+        let replace = {
+            let cards = cards.clone();
+            let ready = ready_tx;
+            tokio::spawn(async move {
+                ready.send(()).expect("the test is receiving");
+                // A newer Turn's own insert — ONE critical section installing
+                // the replacement's card id, reply target and requester.
+                let mut card = state::CardSession::new(
+                    state::StreamAccumulator::new("turn"),
+                    Some("om_new".to_string()),
+                );
+                card.acc.reply_to_message_id = Some("msg_new".to_string());
+                card.acc.requester_open_id = Some("ou_new_requester".to_string());
+                card.acc.is_group = true;
+                cards.cards.lock().await.insert("ses_test".to_string(), card);
+            })
+        };
+        ready_rx.recv().await.expect("the announce queued");
+        ready_rx.recv().await.expect("the replacement queued");
+        drop(held);
+        announce.await.expect("the announce task");
+        replace.await.expect("the replacement task");
+
+        let notices = platform.completion_notices().await;
+        assert!(
+            notices
+                .iter()
+                .any(|(reply_to, open_id, _, _)| reply_to == "msg_old" && open_id == "ou_old"),
+            "the request that ended is still notified: {notices:?}"
+        );
+        assert!(
+            notices
+                .iter()
+                .all(|(reply_to, open_id, _, _)| reply_to != "msg_new" && open_id != "ou_new_requester"),
+            "the replacement request is never announced the old Turn's ending: {notices:?}"
+        );
+    }
+
+    /// The control for the race above: with no replacement, a delivered notice
+    /// still targets the request that ended.
+    #[tokio::test]
+    async fn a_delivered_notice_uses_the_original_recipient() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        let cards = app.cards_handle();
+        Turn::seed_card(&cards, "ses_test", Some("om_old")).await;
+        Turn::set_reply_target(&cards, "ses_test", "msg_old").await;
+        Turn::set_turn_identity(&cards, "ses_test", "ou_old", true, 1).await;
+
+        announce_completion(
+            &cards,
+            &app.feishu,
+            &app.turn_config().notice_rules(),
+            "ses_test",
+            std::time::Instant::now(),
+            &Disposition::Done,
+        )
+        .await;
+
+        assert_eq!(
+            platform.completion_notices().await,
+            vec![(
+                "msg_old".to_string(),
+                "ou_old".to_string(),
+                None,
+                "✅ 已完成。".to_string()
+            )],
+            "a delivered notice names the request that ended"
         );
     }
 
