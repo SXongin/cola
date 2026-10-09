@@ -3162,6 +3162,101 @@ async fn finalization_reads_are_bounded_by_the_remaining_grace_budget() {
         .unwrap();
 }
 
+/// Finding 1 (spec #602 review, round 5, #604): a settled drain whose transcript
+/// keeps GROWING after the settle must never give up and stamp an ending on a
+/// non-quiescent read. When finalization's fresh read still carries content the
+/// card lacks the run went live again, so the drain is RE-OPENED and the run is
+/// followed to its true end by the drain's own settle logic — no total budget,
+/// no give-up. Only when the growth stops does the tail land, once, on the one
+/// Card.
+///
+/// The old bounded finalization re-read spent the grace and then returned its
+/// last (contentful) snapshot, stamping ✅ over a read that still showed new
+/// content — exactly the #604 race. The ever-changing stream makes every read
+/// carry a fresh body, so "still growing" is deterministic.
+#[tokio::test]
+async fn a_settled_drain_whose_stream_keeps_growing_reopens_instead_of_stamping() {
+    let _wd = test_work_dir();
+    let tail_less = vec![
+        user("msg_cola_anchor", 1_000, "第一条消息"),
+        assistant(2_000, "第一段。"),
+    ];
+    let (_dir, app, backend, platform) = scripted_app(
+        vec![SessionTranscript::new(tail_less.clone())],
+        Some(SessionStatus::Busy),
+    )
+    .await;
+    // A grace the old bounded re-read would spend and then stamp on: it is the
+    // distinguishing budget. The per-read bound stays large so a parked read
+    // never times out (the drain's lost-contact grace must not fire while the
+    // test holds a read).
+    app.turn_follow_grace_ms.store(60, Ordering::Relaxed);
+    app.turn_follow_read_timeout_ms.store(60_000, Ordering::Relaxed);
+
+    let _turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
+    wait_for_card_text(&platform, "第一段。").await;
+    // Let the submit-window render poll stop: from here the drain is the only
+    // transcript reader, so the reads parked below are its own.
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    // Park the drain's settle read (gate-entered read #1). The hook turns the
+    // ever-changing stream ON for gate-entered read #3 — finalization's fresh
+    // confirmation read — so the drain settles on a quiescent read and the
+    // growth starts exactly on the read that must not be stamped on.
+    let gate = backend.hold_transcripts();
+    wait_for_parked_reads(&backend, 1).await;
+    {
+        let stream = Arc::clone(&backend);
+        let fired = std::sync::atomic::AtomicBool::new(false);
+        *backend.on_transcript_read.lock().unwrap() = Some(Box::new(move |entered| {
+            // Fire exactly once, at finalization's read: a later `false` from
+            // the test (growth stopped) must stick.
+            if entered >= 3 && !fired.swap(true, Ordering::SeqCst) {
+                stream.growing_transcript.store(true, Ordering::SeqCst);
+            }
+        }));
+    }
+    // Read #1 (the parked settle read) is served the quiescent, tail-less
+    // snapshot: the session is Idle, so the drain settles. Read #2 corroborates
+    // it; read #3 is finalization's own.
+    backend
+        .set_session_status("ses_test", Some(SessionStatus::Idle))
+        .await;
+    gate.add_permits(1);
+
+    // Well past the grace, with content still arriving, the turn must still be
+    // observing — an ending is never stamped on a read that keeps showing new
+    // content.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        app.inflight.lock().await.contains("ses_test"),
+        "a settled drain whose stream keeps growing must re-open, not stamp an ending on a live read"
+    );
+    assert_ne!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Done),
+        "no ending is stamped while content still arrives"
+    );
+
+    // The growth stops: the run reaches its true end and lands on the one Card.
+    backend.growing_transcript.store(false, Ordering::SeqCst);
+    wait_for_guard_release(&app).await;
+    let final_card = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_header(&final_card).contains("完成"),
+        "the turn ends on the Card once the growth stops: {final_card}"
+    );
+    assert!(
+        card_text(&final_card).contains("段。"),
+        "the growing stream's content kept landing on the Card: {final_card}"
+    );
+    assert!(
+        continuation_sends(&platform).await.is_empty(),
+        "one request, one Card — no continuation: {:?}",
+        platform.calls.lock().await
+    );
+}
+
 /// A Wake's content landing in the finalization window must not satisfy the
 /// Turn's completion check: its Execution has not reached a boundary yet, so
 /// the Turn keeps observing (the old "any terminal step since the anchor" rule

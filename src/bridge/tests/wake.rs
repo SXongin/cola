@@ -2163,6 +2163,92 @@ async fn an_overflowing_late_tail_on_the_residual_card_splits_instead_of_droppin
     );
 }
 
+/// Finding 2 (spec #602 review, round 5, #606): a top-level continuation — a
+/// restart Fresh card, which has NO reply target and only a fallback chat — ends,
+/// and then a Wake-less tail arrives. The residual split resolves a reply target
+/// and bailed when it found none, so the tail was dropped. The content must land
+/// IN PLACE on the existing card: never dropped, no 「已恢复执行」 receipt, and no
+/// second residual card.
+#[tokio::test]
+async fn a_top_level_cards_wake_less_tail_lands_in_place() {
+    let _wd = test_work_dir();
+    let resumed = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+        assistant(3_100, "CI 通过了。"),
+    ])
+    .with_executions(vec![execution(2_500), execution(4_000)])
+    .with_wakes(vec![shell_wake(2_900)]);
+    let (_dir, app, backend, platform) = scripted_app(vec![resumed], Some(SessionStatus::Idle)).await;
+    assert!(
+        !Turn::has_card(&app.cards_handle(), "ses_test").await,
+        "the restart fixture has no card chain"
+    );
+
+    spawn_sync(&app);
+    // The restart continuation is sent top-level (no reply target to recover)
+    // and ends ✅ at the Wake's Execution boundary.
+    wait_for_card_update(
+        &platform,
+        "the top-level continuation's done card",
+        CardUpdates::Latest,
+        |card| card_header(card).contains("✅") && card_text(card).contains("CI 通过了。"),
+    )
+    .await;
+    assert_eq!(
+        Turn::reply_target(&app.cards_handle(), "ses_test").await,
+        None,
+        "a top-level card has no reply target — the lobby case (#426)"
+    );
+    let posts_before = card_posts(&platform).await;
+
+    // A Wake-less tail arrives after the run already reported idle: no new Wake
+    // announced it, so this is the #606 residual floor.
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(vec![
+                user("msg_cola_anchor", 1_000, "跑一下 CI"),
+                assistant(2_000, "已经交给后台了。"),
+                assistant(3_100, "CI 通过了。"),
+                assistant(5_100, "收尾时补上的一段。"),
+            ])
+            .with_executions(vec![execution(2_500), execution(4_000), execution(6_000)])
+            .with_wakes(vec![shell_wake(2_900)]),
+        ],
+    )
+    .await;
+
+    // The tail lands in place on the EXISTING top-level card.
+    wait_for_card_update(&platform, "the late tail in place", CardUpdates::Latest, |card| {
+        card_text(card).contains("收尾时补上的一段。")
+    })
+    .await;
+
+    assert_eq!(
+        card_posts(&platform).await,
+        posts_before,
+        "a Wake-less tail with no reply target must not post a second card: {:?}",
+        platform.calls.lock().await
+    );
+    let last = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_text(&last).contains("收尾时补上的一段。"),
+        "the tail is never dropped: {last}"
+    );
+    // The card was opened by a genuine restart Wake, so it already carries that
+    // one 承接 line; the residual must add no SECOND resumption receipt.
+    assert_eq!(
+        card_text(&last).matches(WAKE_LEAD).count(),
+        1,
+        "the residual adds no second 「已恢复执行」 receipt: {last}"
+    );
+    assert!(
+        !card_text(&last).contains(RESIDUAL_LEAD),
+        "the in-place floor writes no residual receipt: {last}"
+    );
+}
+
 /// Acceptance 5a: a Wake on a Session whose newest user message is EXTERNAL
 /// stays unrendered — the external-message path is unchanged and the Wake
 /// never moves the Sync Watermark (which accounts user messages only).
