@@ -334,26 +334,6 @@ pub(super) fn render_parts(acc: &mut StreamAccumulator, parts: &[Part]) -> bool 
     rendered_any
 }
 
-/// Capture the Turn's anchor — the identity of the user message the server
-/// stored together with its server time, one fact — matched by the `msg_cola_`
-/// id cola chose (ADR-0026). External renders arm with the anchor directly;
-/// this fills it in for cola's own turns on the first poll that sees the
-/// message. It must run before any filtering: the anchor alone decides which
-/// messages are this turn's, and cola's clock cannot. Shared with the
-/// post-prompt drain (ADR-0043), whose Backend snapshot must capture the
-/// anchor before it can judge an unanswered supplement.
-pub(super) fn capture_turn_anchor(acc: &mut StreamAccumulator, transcript: &SessionTranscript) {
-    if acc.turn_anchor.is_some() {
-        return;
-    }
-    let Some(cola_message_id) = acc.cola_message_id() else {
-        return;
-    };
-    // `anchor_of_user` keeps identity and server time together; a message with
-    // no server time cannot anchor (and is retried on the next poll).
-    acc.turn_anchor = transcript.anchor_of_user(cola_message_id);
-}
-
 /// Capture one assistant message's model facts into the card footer: the
 /// answering model, and — when the decoder reports one — its variant. V2's
 /// message model ref carries the variant (the session's selection at the time
@@ -721,7 +701,7 @@ pub(super) fn apply_ledger_read(
 #[cfg(test)]
 pub(super) fn render_new_turn_parts(acc: &mut StreamAccumulator, transcript: &SessionTranscript) -> bool {
     let rendered = render_turn_parts(acc, transcript);
-    let plans = plan_ledger_entries(acc, transcript, acc.turn_anchor.as_ref());
+    let plans = plan_ledger_entries(acc, transcript, acc.turn_anchor());
     let entries = commit_planned_entries(acc, plans);
     rendered | refresh_ledger(acc, transcript, &std::collections::HashMap::new()).owes() | entries
 }
@@ -738,8 +718,8 @@ pub(super) fn plan_finalization_entries(
     acc: &mut StreamAccumulator,
     transcript: &SessionTranscript,
 ) -> Vec<PlannedEntry> {
-    capture_turn_anchor(acc, transcript);
-    plan_ledger_entries(acc, transcript, acc.turn_anchor.as_ref())
+    acc.capture_turn_anchor(transcript);
+    plan_ledger_entries(acc, transcript, acc.turn_anchor())
 }
 
 /// The finalization render, with the caller's already-planned (and already
@@ -785,7 +765,7 @@ pub(super) fn render_new_turn_parts_committing(
 /// turn began — while one that finished before the anchor stays the previous
 /// turn's and never bleeds in (#190).
 pub(super) fn render_turn_parts(acc: &mut StreamAccumulator, transcript: &SessionTranscript) -> bool {
-    capture_turn_anchor(acc, transcript);
+    acc.capture_turn_anchor(transcript);
     // The orphan gap this accumulator owes (spec #561, review #569) renders
     // first, on the first read that can place its cursor: the content was never
     // on a card, while the chain's Rendered Cursor has already advanced past
@@ -829,7 +809,7 @@ pub(super) fn render_turn_parts(acc: &mut StreamAccumulator, transcript: &Sessio
     if let Some(scope) = seed_scope(acc) {
         rendered_any |= render_seed_scope(acc, transcript, &scope, &message_positions, &mut seeded_messages);
     }
-    let Some(anchor) = acc.turn_anchor.clone() else {
+    let Some(anchor) = acc.turn_anchor().cloned() else {
         return rendered_any;
     };
     // A merged Wake's completion entry (spec #593) is planned and committed by
@@ -1115,7 +1095,7 @@ fn render_gap_part(
 fn seed_scope(acc: &StreamAccumulator) -> Option<TurnAnchor> {
     acc.seed()
         .and_then(|seed| seed.scope.clone())
-        .filter(|scope| acc.turn_anchor.as_ref() != Some(scope))
+        .filter(|scope| acc.turn_anchor() != Some(scope))
 }
 
 /// Render the seed's own Turn window ([`seed_scope`]) through the cursor cut:
@@ -1356,7 +1336,7 @@ fn refresh_ledger(
     transcript: &SessionTranscript,
     activities: &std::collections::HashMap<String, TaskLiveness>,
 ) -> super::state::LedgerChange {
-    if acc.turn_anchor.is_none() {
+    if !acc.has_turn_anchor() {
         return super::state::LedgerChange::default();
     }
     acc.set_ledger_from_read(
@@ -1530,12 +1510,12 @@ async fn render_and_flush_inner(
         // BEFORE planning the entries, so their output reads can run outside
         // this lock below. `render_turn_parts` re-runs the same idempotent
         // capture.
-        capture_turn_anchor(&mut card.acc, transcript);
+        card.acc.capture_turn_anchor(transcript);
         // The completion entries this read owes (spec #593): planned here
         // (pure), their output tails read below, committed before the flush —
         // the live path must render the retirement entry on the very read that
         // observed it.
-        let plans = plan_ledger_entries(&card.acc, transcript, card.acc.turn_anchor.as_ref());
+        let plans = plan_ledger_entries(&card.acc, transcript, card.acc.turn_anchor());
         let changed = render_turn_parts(&mut card.acc, transcript);
         if changed {
             // Mark the progress NOW: a later stage of this pass may be
@@ -1547,7 +1527,7 @@ async fn render_and_flush_inner(
         // The Turn anchor this render captured (or already carried) plus the
         // card it belongs to: the durable live-card record's anchor is written
         // below, outside the lock (ADR-0063).
-        let anchor = card.card_message_id.clone().zip(card.acc.turn_anchor.clone());
+        let anchor = card.card_message_id.clone().zip(card.acc.turn_anchor().cloned());
         // Re-flush when the header changed even without new content: the
         // progress timer keeps ticking, so an idle turn still proves it is
         // alive (ADR-0014). Whole-second timestamps bound this to at most one
@@ -2060,7 +2040,7 @@ mod tests {
         use crate::bridge::turn::state::HeaderPhase;
 
         let mut acc = StreamAccumulator::new("test");
-        acc.turn_anchor = Some(turn_anchor(0));
+        acc.repoint_turn_anchor(&turn_anchor(0));
         assert_eq!(acc.current_phase(), Some(&HeaderPhase::Loading));
 
         let transcript = SessionTranscript::new(vec![message(
@@ -2098,7 +2078,7 @@ mod tests {
             parts: Vec::new(),
         };
         let mut acc = StreamAccumulator::new("test");
-        acc.turn_anchor = Some(turn_anchor(0));
+        acc.repoint_turn_anchor(&turn_anchor(0));
 
         let transcript = SessionTranscript::new(vec![
             message(
@@ -2288,7 +2268,7 @@ Index: /x/src/main.rs
         // (3000) after.
         let anchor = 2000;
         let mut acc = StreamAccumulator::new("test");
-        acc.turn_anchor = Some(turn_anchor(anchor));
+        acc.repoint_turn_anchor(&turn_anchor(anchor));
 
         let transcript = SessionTranscript::new(vec![
             // Old turn assistant message (completed before the anchor) — skipped.
@@ -2369,8 +2349,8 @@ Index: /x/src/main.rs
 
         assert!(render_new_turn_parts(&mut acc, &transcript));
         assert_eq!(
-            acc.turn_anchor,
-            Some(TurnAnchor {
+            acc.turn_anchor(),
+            Some(&TurnAnchor {
                 message_id: MessageId::new("msg_cola_1"),
                 created_ms: 2000,
             }),
@@ -2400,7 +2380,7 @@ Index: /x/src/main.rs
     fn a_message_completed_after_the_anchor_keeps_rendering() {
         let anchor = 2000;
         let mut acc = StreamAccumulator::new("proj");
-        acc.turn_anchor = Some(turn_anchor(anchor));
+        acc.repoint_turn_anchor(&turn_anchor(anchor));
         let transcript = |completed: Option<i64>, status: ToolStatus, output: &str| {
             SessionTranscript::new(vec![message_in_flight(
                 "a_prev",
@@ -2843,7 +2823,7 @@ Index: /x/src/main.rs
             seed_live_calls(&mut acc, &anchorless(ToolStatus::Running, None), &orphan),
             1
         );
-        assert_eq!(acc.turn_anchor, None);
+        assert_eq!(acc.turn_anchor(), None);
 
         // The call completes while the fresh message is still absent: the
         // seeded identity reconciles anyway, joining the timeline at its
@@ -2852,7 +2832,7 @@ Index: /x/src/main.rs
             &mut acc,
             &anchorless(ToolStatus::Completed, Some("slept"))
         ));
-        assert_eq!(acc.turn_anchor, None, "still no anchor to gate on");
+        assert_eq!(acc.turn_anchor(), None, "still no anchor to gate on");
         assert!(!acc.tools()["call_sleep"].is_live());
         let text = card_text(&acc.build_card_with_split().0);
         assert_eq!(text.matches("slept").count(), 1, "reconciled once: {text}");
@@ -2885,8 +2865,8 @@ Index: /x/src/main.rs
         ]);
         assert!(render_new_turn_parts(&mut acc, &with_anchor));
         assert_eq!(
-            acc.turn_anchor,
-            Some(TurnAnchor {
+            acc.turn_anchor(),
+            Some(&TurnAnchor {
                 message_id: MessageId::new("msg_cola_new"),
                 created_ms: anchor,
             })
@@ -3139,7 +3119,7 @@ Index: /x/src/main.rs
         // Queued: the seed's own scope renders the tail with no anchor
         // observed.
         assert!(render_new_turn_parts(&mut acc, &queued(&full)));
-        assert_eq!(acc.turn_anchor, None, "the new message is still queued");
+        assert_eq!(acc.turn_anchor(), None, "the new message is still queued");
         let text = card_text(&acc.build_card_with_split().0);
         assert_eq!(
             text.matches(tail).count(),
@@ -3342,7 +3322,7 @@ Index: /x/src/main.rs
         };
 
         let mut acc = StreamAccumulator::new("proj");
-        acc.turn_anchor = Some(turn_anchor(1_000));
+        acc.repoint_turn_anchor(&turn_anchor(1_000));
         let cursor = projection_cursor("msg_a_2000", 0, CursorPartKind::Text, prefix, &[]);
         let seed = CursorSeed::resolve(&transcript(&full), &cursor).expect("the frontier resolves");
         acc.seed_projection(&cursor, seed);
@@ -3404,7 +3384,7 @@ Index: /x/src/main.rs
             ])
         };
         let mut acc = StreamAccumulator::new("t");
-        acc.turn_anchor = Some(turn_anchor(1_000));
+        acc.repoint_turn_anchor(&turn_anchor(1_000));
 
         assert!(render_new_turn_parts(&mut acc, &transcript("A")));
         let built = acc.build_card_with_info();
@@ -3471,7 +3451,7 @@ Index: /x/src/main.rs
             ])
         };
         let mut acc = StreamAccumulator::new("t");
-        acc.turn_anchor = Some(turn_anchor(1_000));
+        acc.repoint_turn_anchor(&turn_anchor(1_000));
 
         assert!(render_new_turn_parts(&mut acc, &transcript(&first)));
         let delivered = acc.build_card_with_info();
@@ -3521,7 +3501,7 @@ Index: /x/src/main.rs
         ]);
 
         let mut acc = StreamAccumulator::new("proj");
-        acc.turn_anchor = Some(turn_anchor(1_000));
+        acc.repoint_turn_anchor(&turn_anchor(1_000));
         let cursor = projection_cursor("msg_a_2000", 0, CursorPartKind::Text, prefix, &[]);
         let seed = CursorSeed::resolve(&transcript, &cursor).expect("the frontier resolves");
         acc.seed_projection(&cursor, seed);
@@ -3558,7 +3538,7 @@ Index: /x/src/main.rs
         ]);
 
         let mut acc = StreamAccumulator::new("proj");
-        acc.turn_anchor = Some(turn_anchor(1_000));
+        acc.repoint_turn_anchor(&turn_anchor(1_000));
         // The reasoning part delivered up to its first sentence.
         let cursor = projection_cursor_at(
             "msg_a_2000",
@@ -3611,7 +3591,7 @@ Index: /x/src/main.rs
 
         // The live render: the whole part is pushed, the card truncates it.
         let mut acc = StreamAccumulator::new("live");
-        acc.turn_anchor = Some(turn_anchor(1_000));
+        acc.repoint_turn_anchor(&turn_anchor(1_000));
         assert!(render_new_turn_parts(&mut acc, &transcript));
         let built = acc.build_card_with_info();
         let card = card_text(&built.card);
@@ -3634,7 +3614,7 @@ Index: /x/src/main.rs
         // The restart: the same read, a fresh accumulator, the seed from that
         // frontier. The undisclosed suffix renders as a continuation.
         let mut restarted = StreamAccumulator::new("proj");
-        restarted.turn_anchor = Some(turn_anchor(1_000));
+        restarted.repoint_turn_anchor(&turn_anchor(1_000));
         let seed = CursorSeed::resolve(&transcript, &built.cursor).expect("the frontier resolves");
         restarted.seed_projection(&built.cursor, seed);
         assert!(render_new_turn_parts(&mut restarted, &transcript));
@@ -3680,7 +3660,7 @@ Index: /x/src/main.rs
         // The live render: the first push is below the cap, the growth merges
         // into the same entry and crosses it.
         let mut acc = StreamAccumulator::new("live");
-        acc.turn_anchor = Some(turn_anchor(1_000));
+        acc.repoint_turn_anchor(&turn_anchor(1_000));
         assert!(render_new_turn_parts(&mut acc, &build(&first)));
         assert!(render_new_turn_parts(&mut acc, &build(&grown)));
         let built = acc.build_card_with_info();
@@ -3700,7 +3680,7 @@ Index: /x/src/main.rs
         // capped prefix) and renders only what is beyond it.
         let restarted_read = build(&grown);
         let mut recovered = StreamAccumulator::new("proj");
-        recovered.turn_anchor = Some(turn_anchor(1_000));
+        recovered.repoint_turn_anchor(&turn_anchor(1_000));
         let seed = CursorSeed::resolve(&restarted_read, &built.cursor).expect("the grown frontier resolves");
         recovered.seed_projection(&built.cursor, seed);
         assert!(render_new_turn_parts(&mut recovered, &restarted_read));
@@ -3739,13 +3719,13 @@ Index: /x/src/main.rs
             ])
         };
         let mut acc = StreamAccumulator::new("live");
-        acc.turn_anchor = Some(turn_anchor(1_000));
+        acc.repoint_turn_anchor(&turn_anchor(1_000));
         assert!(render_new_turn_parts(&mut acc, &build(&before)));
         let cursor = acc.build_card_with_info().cursor;
 
         let restarted = build(&after);
         let mut recovered = StreamAccumulator::new("proj");
-        recovered.turn_anchor = Some(turn_anchor(1_000));
+        recovered.repoint_turn_anchor(&turn_anchor(1_000));
         let seed = CursorSeed::resolve(&restarted, &cursor).expect("the frontier resolves");
         recovered.seed_projection(&cursor, seed);
         assert!(render_new_turn_parts(&mut recovered, &restarted));
@@ -3778,7 +3758,7 @@ Index: /x/src/main.rs
         ]);
 
         let mut acc = StreamAccumulator::new("proj");
-        acc.turn_anchor = Some(turn_anchor(1_000));
+        acc.repoint_turn_anchor(&turn_anchor(1_000));
         let cursor = projection_cursor("msg_a_2000", 0, CursorPartKind::Text, prefix, &[]);
         let seed = CursorSeed::resolve(&transcript, &cursor).expect("the frontier resolves");
         acc.seed_projection(&cursor, seed);
@@ -3827,7 +3807,7 @@ Index: /x/src/main.rs
         };
         let running = timeline(ToolStatus::Running, None);
         let mut acc = StreamAccumulator::new("proj");
-        acc.turn_anchor = Some(turn_anchor(1_000));
+        acc.repoint_turn_anchor(&turn_anchor(1_000));
         let cursor = projection_cursor("msg_a_2000", 0, CursorPartKind::Text, text, &["call_1"]);
         let seed = CursorSeed::resolve(&running, &cursor).expect("the frontier resolves");
         acc.seed_projection(&cursor, seed);
@@ -3898,7 +3878,7 @@ Index: /x/src/main.rs
         };
         let running = timeline(ToolStatus::Running, None);
         let mut acc = StreamAccumulator::new("proj");
-        acc.turn_anchor = Some(turn_anchor(1_000));
+        acc.repoint_turn_anchor(&turn_anchor(1_000));
         let cursor = projection_cursor("msg_a_2000", 0, CursorPartKind::Text, text, &["call_1"]);
         let seed = CursorSeed::resolve(&running, &cursor).expect("the frontier resolves");
         acc.seed_projection(&cursor, seed);
@@ -3939,7 +3919,7 @@ Index: /x/src/main.rs
             )],
         )]);
         let mut acc = StreamAccumulator::new("t");
-        acc.turn_anchor = Some(turn_anchor(50));
+        acc.repoint_turn_anchor(&turn_anchor(50));
         // The cursor named a settled tool in this slot, with no text before it.
         let cursor = RenderedCursor {
             frontier: Some(CursorFrontier {
@@ -3993,7 +3973,7 @@ Index: /x/src/main.rs
         ]);
 
         let mut acc = StreamAccumulator::new("proj");
-        acc.turn_anchor = Some(turn_anchor(1_000));
+        acc.repoint_turn_anchor(&turn_anchor(1_000));
         let cursor = projection_cursor("msg_a_2000", 0, CursorPartKind::Text, prefix, &[]);
         let seed = CursorSeed::resolve(&transcript, &cursor).expect("the frontier resolves");
         acc.seed_projection(&cursor, seed);
@@ -4024,8 +4004,8 @@ Index: /x/src/main.rs
 
         assert!(!render_new_turn_parts(&mut acc, &transcript));
         assert_eq!(
-            acc.turn_anchor,
-            Some(TurnAnchor {
+            acc.turn_anchor(),
+            Some(&TurnAnchor {
                 message_id: MessageId::new("msg_cola_1"),
                 created_ms: 1234,
             })
@@ -4042,7 +4022,7 @@ Index: /x/src/main.rs
         let transcript = SessionTranscript::new(vec![message("a1", 100, vec![text_part("回答")])]);
 
         assert!(!render_new_turn_parts(&mut acc, &transcript));
-        assert_eq!(acc.turn_anchor, None);
+        assert_eq!(acc.turn_anchor(), None);
         assert!(acc.text().is_empty());
     }
 
@@ -4074,8 +4054,8 @@ Index: /x/src/main.rs
 
         assert!(render_new_turn_parts(&mut acc, &transcript));
         assert_eq!(
-            acc.turn_anchor,
-            Some(TurnAnchor {
+            acc.turn_anchor(),
+            Some(&TurnAnchor {
                 message_id: MessageId::new("msg_cola_1"),
                 created_ms: server_user,
             })
@@ -4117,8 +4097,8 @@ Index: /x/src/main.rs
 
         assert!(render_new_turn_parts(&mut acc, &transcript));
         assert_eq!(
-            acc.turn_anchor,
-            Some(TurnAnchor {
+            acc.turn_anchor(),
+            Some(&TurnAnchor {
                 message_id: MessageId::new("msg_cola_1"),
                 created_ms: server_user,
             })
@@ -4178,7 +4158,7 @@ Index: /x/src/main.rs
     #[test]
     fn tool_part_update_re_renders_panel() {
         let mut acc = StreamAccumulator::new("test");
-        acc.turn_anchor = Some(turn_anchor(0));
+        acc.repoint_turn_anchor(&turn_anchor(0));
 
         let transcript = |status: ToolStatus, output: &str| {
             SessionTranscript::new(vec![message(
@@ -4506,7 +4486,7 @@ Index: /x/src/main.rs
     #[test]
     fn empty_then_updated_part_renders_once_with_content() {
         let mut acc = StreamAccumulator::new("test");
-        acc.turn_anchor = Some(turn_anchor(0));
+        acc.repoint_turn_anchor(&turn_anchor(0));
 
         let transcript = |reasoning: &str, text: &str| {
             SessionTranscript::new(vec![message(
@@ -4546,7 +4526,7 @@ Index: /x/src/main.rs
     #[test]
     fn text_without_id_is_not_rendered_twice() {
         let mut acc = StreamAccumulator::new("test");
-        acc.turn_anchor = Some(turn_anchor(0));
+        acc.repoint_turn_anchor(&turn_anchor(0));
 
         // Realistic: no part id, just typed text and reasoning.
         let transcript = || {
@@ -4573,7 +4553,7 @@ Index: /x/src/main.rs
     #[test]
     fn failed_tool_error_part_renders_output_and_error_state() {
         let mut acc = StreamAccumulator::new("test");
-        acc.turn_anchor = Some(turn_anchor(0));
+        acc.repoint_turn_anchor(&turn_anchor(0));
 
         let mut call = tool_call(
             "edit",
@@ -4614,7 +4594,7 @@ Index: /x/src/main.rs
     #[test]
     fn failed_tool_string_error_renders_on_panel() {
         let mut acc = StreamAccumulator::new("test");
-        acc.turn_anchor = Some(turn_anchor(0));
+        acc.repoint_turn_anchor(&turn_anchor(0));
 
         let mut call = tool_call(
             "edit",
@@ -4646,7 +4626,7 @@ Index: /x/src/main.rs
     #[test]
     fn edit_part_uses_metadata_diff_as_output() {
         let mut acc = StreamAccumulator::new("test");
-        acc.turn_anchor = Some(turn_anchor(0));
+        acc.repoint_turn_anchor(&turn_anchor(0));
 
         let diff = "Index: src/main.rs\n======\n--- src/main.rs\n+++ src/main.rs\n@@ -1 +1 @@\n-a\n+b\n";
         let edit = |status: ToolStatus, output: Option<&str>, with_diff: bool, error: Option<&str>| {
@@ -4703,7 +4683,7 @@ Index: /x/src/main.rs
 
         // A failure keeps its error text, not a diff.
         let mut acc = StreamAccumulator::new("test");
-        acc.turn_anchor = Some(turn_anchor(0));
+        acc.repoint_turn_anchor(&turn_anchor(0));
         assert!(render_new_turn_parts(
             &mut acc,
             &transcript(edit(ToolStatus::Error, None, true, Some("no such file")))
@@ -4721,7 +4701,7 @@ Index: /x/src/main.rs
     #[test]
     fn render_parts_fallback_does_not_double_already_rendered_text() {
         let mut acc = StreamAccumulator::new("test");
-        acc.turn_anchor = Some(turn_anchor(0));
+        acc.repoint_turn_anchor(&turn_anchor(0));
 
         let parts = vec![
             reasoning_part("Let me check"),
@@ -5500,7 +5480,7 @@ Index: /x/src/main.rs
         let tool_start = test_local_ms(2026, 9, 17, 0, 5);
 
         let mut acc = StreamAccumulator::new("proj");
-        acc.turn_anchor = Some(turn_anchor(turn_started));
+        acc.repoint_turn_anchor(&turn_anchor(turn_started));
         render_parts(
             &mut acc,
             &[
@@ -5573,7 +5553,7 @@ Index: /x/src/main.rs
     #[test]
     fn the_built_card_carries_the_delivered_frontier() {
         let mut acc = StreamAccumulator::new("test");
-        acc.turn_anchor = Some(turn_anchor(0));
+        acc.repoint_turn_anchor(&turn_anchor(0));
         let text = "第一段回答。";
         let transcript = SessionTranscript::new(vec![message(
             "msg_a_1",
@@ -5622,7 +5602,7 @@ Index: /x/src/main.rs
             ],
         )]);
         let mut acc = StreamAccumulator::new("test");
-        acc.turn_anchor = Some(turn_anchor(0));
+        acc.repoint_turn_anchor(&turn_anchor(0));
         assert!(render_new_turn_parts(&mut acc, &running));
 
         // The running call stays display-only: the frontier is the text, the
@@ -5685,7 +5665,7 @@ Index: /x/src/main.rs
     #[test]
     fn a_split_part_records_its_delivered_prefix_then_the_full_extent() {
         let mut acc = StreamAccumulator::new("test");
-        acc.turn_anchor = Some(turn_anchor(0));
+        acc.repoint_turn_anchor(&turn_anchor(0));
         let max = crate::feishu::card::MAX_CARD_TEXT_CHARS;
         let text: String = "长".repeat(max + 500);
         let transcript = SessionTranscript::new(vec![message("msg_a_1", 100, vec![text_at(&text, 100)])]);
@@ -5718,7 +5698,7 @@ Index: /x/src/main.rs
     #[test]
     fn the_built_card_carries_running_tool_ids_and_drops_settled_ones() {
         let mut acc = StreamAccumulator::new("test");
-        acc.turn_anchor = Some(turn_anchor(0));
+        acc.repoint_turn_anchor(&turn_anchor(0));
         let running = SessionTranscript::new(vec![message(
             "msg_a_1",
             100,
@@ -5780,7 +5760,7 @@ Index: /x/src/main.rs
     #[test]
     fn a_body_without_content_keeps_the_chains_frontier() {
         let mut acc = StreamAccumulator::new("test");
-        acc.turn_anchor = Some(turn_anchor(0));
+        acc.repoint_turn_anchor(&turn_anchor(0));
         let transcript =
             SessionTranscript::new(vec![message("msg_a_1", 100, vec![text_at("第一段。", 100)])]);
         assert!(render_new_turn_parts(&mut acc, &transcript));
@@ -5841,7 +5821,7 @@ Index: /x/src/main.rs
             "a replaced part is cut at 0, never skipped"
         );
         let mut acc = StreamAccumulator::new("proj");
-        acc.turn_anchor = Some(turn_anchor(1_000));
+        acc.repoint_turn_anchor(&turn_anchor(1_000));
         acc.seed_projection(&cursor, seed);
         assert!(render_new_turn_parts(&mut acc, &replaced));
         let text = card_text(&acc.build_card_with_info().card);
@@ -5930,7 +5910,7 @@ Index: /x/src/main.rs
         let seed = CursorSeed::resolve(&transcript, &cursor).expect("growth keeps the prefix");
 
         let mut acc = StreamAccumulator::new("proj");
-        acc.turn_anchor = Some(turn_anchor(1_000));
+        acc.repoint_turn_anchor(&turn_anchor(1_000));
         acc.seed_projection(&cursor, seed);
         assert!(render_new_turn_parts(&mut acc, &transcript));
         let text = card_text(&acc.build_card_with_info().card);
@@ -6045,7 +6025,7 @@ Index: /x/src/main.rs
             ])
         };
         let mut acc = StreamAccumulator::new("t");
-        acc.turn_anchor = Some(turn_anchor(1_000));
+        acc.repoint_turn_anchor(&turn_anchor(1_000));
         assert!(render_new_turn_parts(&mut acc, &transcript("ABC")));
         // The server rewrote the part in place.
         assert!(render_new_turn_parts(&mut acc, &transcript("XYZ")));

@@ -817,7 +817,7 @@ impl CardSession {
         if self.acc.card_state != CardState::Error {
             return None;
         }
-        let anchor = self.acc.turn_anchor.clone()?;
+        let anchor = self.acc.turn_anchor().cloned()?;
         let directory = self.rearm_common(directory);
         Some((Some(anchor), directory))
     }
@@ -840,7 +840,7 @@ impl CardSession {
         if self.acc.card_state != CardState::Unreceived {
             return None;
         }
-        let anchor = self.acc.turn_anchor.clone();
+        let anchor = self.acc.turn_anchor().cloned();
         let directory = self.rearm_common(directory);
         Some((anchor, directory))
     }
@@ -1502,14 +1502,21 @@ pub(super) struct StreamAccumulator {
     /// identity rule for the Wake Watermark's drain.
     watermark_stage_seq: u64,
     /// The Turn's anchor, captured as one fact: the identity of the user
-    /// message this turn answers together with that message's server time. An
-    /// external render arms with the external message's anchor directly; a
-    /// cola-sent turn captures it from the stored user message on the first
-    /// poll it appears in (matched by `cola_message_id`, ADR-0026). It is the
-    /// turn's single anchor: the header date, the turn filter and the renderer
-    /// replacement guard all read it, so cola's own clock is never compared
-    /// against the server's (#183, #190).
-    pub(super) turn_anchor: Option<TurnAnchor>,
+    /// message this turn answers together with that message's server time. It
+    /// is the turn's single anchor: the header date, the turn filter and the
+    /// renderer replacement guard all read it, so cola's own clock is never
+    /// compared against the server's (#183, #190). Starts unset at
+    /// [`Self::new`]; private to this module. Its production writers are the
+    /// capture-from-a-read [`Self::capture_turn_anchor`] (a cola-sent turn's
+    /// first poll that sees its stored user message, matched by
+    /// `cola_message_id`, ADR-0026) and the adopt-external
+    /// [`Self::adopt_turn_anchor`] (`Turn::arm_projected_card`,
+    /// `Turn::arm_external_render` and `Turn::arm_wake_continuation`, which
+    /// already hold the external message's anchor); the `#[cfg(test)]`
+    /// [`Self::repoint_turn_anchor`] seam serves `Turn::set_turn_anchor` and
+    /// the rendering fixtures. Read through [`Self::turn_anchor`] /
+    /// [`Self::has_turn_anchor`].
+    turn_anchor: Option<TurnAnchor>,
     /// Whether this card has already shown the neutral waiting line
     /// 「⏳ 等待当前运行接收…」 (ADR-0062): the unreceived watch pushes it
     /// exactly once while the Session reads live but the submitted message
@@ -2004,6 +2011,61 @@ impl StreamAccumulator {
     /// `Turn::start`; the rendering fixtures set it through this method too).
     pub(super) fn set_cola_message_id(&mut self, cola_message_id: &str) {
         self.cola_message_id = Some(cola_message_id.to_string());
+    }
+
+    /// This turn's anchor, if captured — the user message's identity together
+    /// with its server time, one fact (#183, #190). Private to this module:
+    /// filled by [`Self::capture_turn_anchor`] or [`Self::adopt_turn_anchor`].
+    pub(super) fn turn_anchor(&self) -> Option<&TurnAnchor> {
+        self.turn_anchor.as_ref()
+    }
+
+    /// Whether this turn's anchor has been captured — the render and ledger
+    /// gates that must not run before the server's own user message is
+    /// observed (an anchorless card renders nothing, and its reads place no
+    /// completion entry).
+    pub(super) fn has_turn_anchor(&self) -> bool {
+        self.turn_anchor.is_some()
+    }
+
+    /// Capture the Turn's anchor from a read: the identity of the user message
+    /// the server stored together with its server time, one fact — matched by
+    /// the `msg_cola_` id cola chose (ADR-0026). External renders adopt the
+    /// anchor directly ([`Self::adopt_turn_anchor`]); this fills it in for
+    /// cola's own turns on the first poll that sees the message. Idempotent: an
+    /// already-captured anchor is kept. It must run before any filtering — the
+    /// anchor alone decides which messages are this turn's, and cola's clock
+    /// cannot. Shared with the post-prompt drain (ADR-0043), whose Backend
+    /// snapshot must capture the anchor before it can judge an unanswered
+    /// supplement.
+    pub(super) fn capture_turn_anchor(&mut self, transcript: &SessionTranscript) {
+        if self.turn_anchor.is_some() {
+            return;
+        }
+        let Some(cola_message_id) = self.cola_message_id() else {
+            return;
+        };
+        // `anchor_of_user` keeps identity and server time together; a message
+        // with no server time cannot anchor (and is retried on the next poll).
+        self.turn_anchor = transcript.anchor_of_user(cola_message_id);
+    }
+
+    /// Adopt an anchor the caller already holds — an external message's
+    /// identity together with its server time — as this turn's anchor. The
+    /// arming paths (`Turn::arm_projected_card`, `Turn::arm_external_render`
+    /// and `Turn::arm_wake_continuation`) know the external message's anchor
+    /// before any read, so they adopt it rather than capture it.
+    pub(super) fn adopt_turn_anchor(&mut self, anchor: &TurnAnchor) {
+        self.turn_anchor = Some(anchor.clone());
+    }
+
+    /// Repoint this turn's anchor to one the caller holds — the `#[cfg(test)]`
+    /// seam: `Turn::set_turn_anchor` repoints a re-adopt and the rendering
+    /// fixtures seed one directly; production only ever captures or adopts an
+    /// anchor.
+    #[cfg(test)]
+    pub(super) fn repoint_turn_anchor(&mut self, anchor: &TurnAnchor) {
+        self.turn_anchor = Some(anchor.clone());
     }
 
     /// When the Turn that owns this chain started, if recorded — the Completion
@@ -3961,8 +4023,7 @@ impl StreamAccumulator {
         // so it can't disagree with the panels and stays stable across flushes.
         builder = builder.with_subtitle(&self.title);
         if let Some(date) = self
-            .turn_anchor
-            .as_ref()
+            .turn_anchor()
             .and_then(|anchor| crate::feishu::card::fmt_local_date(anchor.created_ms))
         {
             builder = builder.with_date(&date);

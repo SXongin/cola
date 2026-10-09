@@ -184,7 +184,7 @@ impl CardOwnership {
             claim,
             card_class: classify(card),
             card_message_id: card.card_message_id.clone(),
-            turn_anchor: card.acc.turn_anchor.clone(),
+            turn_anchor: card.acc.turn_anchor().cloned(),
             chain_id: Some(card.chain_id()),
         }
     }
@@ -384,7 +384,7 @@ impl Ticket {
         let chain = {
             let mut live = cards.cards.lock().await;
             match live.get_mut(session_id) {
-                Some(card) if self.matches(card.acc.turn_anchor.as_ref(), Some(card.chain_id())) => {
+                Some(card) if self.matches(card.acc.turn_anchor(), Some(card.chain_id())) => {
                     card.acc.apply_ending(disposition);
                     card.chain_id()
                 }

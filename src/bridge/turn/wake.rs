@@ -191,7 +191,7 @@ impl Turn {
             .lock()
             .await
             .get(session_id)
-            .and_then(|c| c.acc.turn_anchor.clone())
+            .and_then(|c| c.acc.turn_anchor().cloned())
     }
 
     /// Arm a projection's successor card (spec #561): a fresh accumulator
@@ -241,7 +241,7 @@ impl Turn {
         // read before the lock is taken (spec #593; the reads are network).
         let mut acc = StreamAccumulator::new(title);
         Self::seed_wake_floor(cards, session_id, &mut acc);
-        acc.turn_anchor = Some(anchor.clone());
+        acc.adopt_turn_anchor(anchor);
         acc.set_session(session_id);
         // The chain's reply target (issue #580) is the target the successor's
         // create actually lands on — the durable reply target, or the recorded
@@ -351,7 +351,7 @@ impl Turn {
         // turn's anchor: header date, turn filter and renderer replacement
         // guard all read it, and cola's clock is never part of the card
         // (#183, #190).
-        acc.turn_anchor = Some(anchor.clone());
+        acc.adopt_turn_anchor(anchor);
         acc.set_session(session_id);
         acc.set_reply_target(Some(card_id.to_string()));
         acc.attach_work_context(session_dir).await;
@@ -428,7 +428,7 @@ impl Turn {
                 // looped a fresh 承接 card each Sync tick (live 2026-09-30). A
                 // same-life card's anchor is the user message's, so the common
                 // path is unchanged.
-                let anchor = card.acc.turn_anchor.as_ref().unwrap_or(turn_anchor);
+                let anchor = card.acc.turn_anchor().unwrap_or(turn_anchor);
                 if !render::renders_new_content(&card.acc, transcript, anchor) {
                     return None;
                 }
@@ -616,7 +616,7 @@ impl Turn {
         }
         let mut acc = StreamAccumulator::new(facts.subtitle);
         Self::seed_wake_floor(cards, session_id, &mut acc);
-        acc.turn_anchor = Some(anchor.clone());
+        acc.adopt_turn_anchor(anchor);
         acc.set_session(session_id);
         acc.set_reply_target(facts.reply_to.map(str::to_string));
         acc.set_variant(facts.variant);
@@ -706,7 +706,7 @@ impl Turn {
         let mut live = cards.cards.lock().await;
         if live
             .get(session_id)
-            .is_some_and(|card| card.acc.turn_anchor.as_ref() == Some(anchor))
+            .is_some_and(|card| card.acc.turn_anchor() == Some(anchor))
         {
             live.remove(session_id);
         }
@@ -855,13 +855,11 @@ impl Turn {
         // crash could lose, leaving a refused target persisted).
         card.acc.set_reply_target(reply_to.map(str::to_string));
         let (message_id, created_ms, context_directory, reply_to) = (
-            card.acc.cola_message_id().map(MessageId::new).or_else(|| {
-                card.acc
-                    .turn_anchor
-                    .as_ref()
-                    .map(|anchor| anchor.message_id.clone())
-            }),
-            card.acc.turn_anchor.as_ref().map(|anchor| anchor.created_ms),
+            card.acc
+                .cola_message_id()
+                .map(MessageId::new)
+                .or_else(|| card.acc.turn_anchor().map(|anchor| anchor.message_id.clone())),
+            card.acc.turn_anchor().map(|anchor| anchor.created_ms),
             card.acc.directory().map(str::to_string),
             card.acc.reply_to_message_id().map(str::to_string),
         );
