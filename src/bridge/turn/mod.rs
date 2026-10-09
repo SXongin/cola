@@ -1123,11 +1123,28 @@ impl Turn {
     /// it (it is a later *status* read that #604 forbids finalizing a stale
     /// transcript). `None` when no read answers and the drain had no snapshot to
     /// fall back on.
+    ///
+    /// The re-read is BOUNDED (spec #602 review, round 4): it catches a finite
+    /// tail, never a live stream. A settled drain re-reads only until the
+    /// follow grace is spent (returning its last read, so the decided
+    /// disposition is stamped); a grace ending reads exactly once and out. See
+    /// the loop below.
     async fn final_transcript(
         &self,
         handles: &TurnHandles,
         drain_settled: bool,
     ) -> Option<SessionTranscript> {
+        // The re-read loop is BOUNDED (spec #602 review, round 4): it exists to
+        // catch a FINITE tail that landed after the drain's snapshot, never to
+        // chase a live stream. The budget is the same follow grace the drain's
+        // own ceilings use; once it is spent the loop returns the read it last
+        // saw, so the already-decided disposition is stamped instead of the
+        // guard being held forever. A grace ending (the drain did not settle
+        // cleanly) does not chase a live stream at all — one read is enough
+        // there, since the decided disposition is stamped regardless of what
+        // the read carries.
+        let deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_millis(handles.config.follow_grace_ms());
         loop {
             let read = crate::bridge::bounded_call(
                 "turn final transcript",
@@ -1176,6 +1193,11 @@ impl Turn {
                 return Some(transcript);
             };
             if !rendered.stats.new_content {
+                return Some(transcript);
+            }
+            // A grace ending gets one read and out; a settled drain keeps
+            // catching a finite tail, but never past the grace budget.
+            if !drain_settled || tokio::time::Instant::now() >= deadline {
                 return Some(transcript);
             }
         }

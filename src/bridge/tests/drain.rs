@@ -3058,6 +3058,56 @@ async fn a_tail_landing_after_the_drain_settled_still_lands_on_the_card() {
     );
 }
 
+/// Finding 1 (spec #602 review, round 4): finalization must never hold the
+/// inflight guard on a CONTINUING stream. A run whose `session_status` never
+/// answers but whose every transcript read succeeds WITH new content ends the
+/// drain in the lost-contact grace; the decided ending must be stamped at that
+/// grace instead of finalization re-reading the live stream forever. The mock's
+/// growing transcript makes every read carry a fresh body, so a "continuing
+/// stream" is available deterministically; the turn still has to finalize in
+/// error and release the guard within the bound (never hang).
+#[tokio::test]
+async fn a_continuing_stream_on_a_failed_status_read_still_finalizes_at_the_grace() {
+    let _wd = test_work_dir();
+    let timeline = vec![
+        user("msg_cola_anchor", 1_000, "第一条消息"),
+        assistant(2_000, "第一段。"),
+    ];
+    let (_dir, app, backend, platform) = scripted_app(vec![SessionTranscript::new(timeline)], None).await;
+    // The status leg never answers: the drain can only end through the
+    // lost-contact grace. The transcript leg keeps answering — with content the
+    // card has not seen, on every read (a deterministic continuing stream).
+    backend.session_status_fails.store(true, Ordering::SeqCst);
+    backend.growing_transcript.store(true, Ordering::SeqCst);
+    app.turn_follow_grace_ms.store(80, Ordering::Relaxed);
+    app.turn_follow_read_timeout_ms.store(200, Ordering::Relaxed);
+
+    let turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
+
+    // The grace decides the run's ending even while the stream keeps going: the
+    // turn must finalize and release the guard within the bound, never chase the
+    // stream forever.
+    let finalized = tokio::time::timeout(Duration::from_secs(2), async {
+        wait_for_card_header(&platform, "出错").await;
+        wait_for_guard_release(&app).await;
+    })
+    .await;
+    assert!(
+        finalized.is_ok(),
+        "the turn must finalize at the grace, not chase the continuing stream"
+    );
+    tokio::time::timeout(Duration::from_secs(2), turn)
+        .await
+        .expect("the turn task must end with the finalized card")
+        .unwrap()
+        .unwrap();
+    let final_card = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_text(&final_card).contains("失去联系"),
+        "a lost-contact run still ends in error at the grace: {final_card}"
+    );
+}
+
 /// A Wake's content landing in the finalization window must not satisfy the
 /// Turn's completion check: its Execution has not reached a boundary yet, so
 /// the Turn keeps observing (the old "any terminal step since the anchor" rule
