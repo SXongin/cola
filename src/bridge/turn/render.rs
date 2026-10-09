@@ -958,7 +958,7 @@ fn render_pending_gap_once(acc: &mut StreamAccumulator, transcript: &SessionTran
     acc.gap_rendered = true;
     tracing::info!(
         "orphan gap: session {} rendered its pending tail",
-        acc.session_id.as_deref().unwrap_or("")
+        acc.session_id().unwrap_or("")
     );
     true
 }
@@ -5371,8 +5371,8 @@ Index: /x/src/main.rs
         // Simulate an in-flight turn whose card was captured with the OLD
         // default subtitle before the server auto-titled the session.
         let mut acc = crate::bridge::turn::state::StreamAccumulator::new("test");
-        acc.reply_to_message_id = Some("msg_1".into());
-        acc.session_id = Some("ses_test".into());
+        acc.set_reply_target(Some("msg_1".into()));
+        acc.set_session("ses_test");
         {
             let mut cards = app.cards.lock().await;
             cards.insert(
@@ -5449,8 +5449,8 @@ Index: /x/src/main.rs
         // An in-flight turn whose card was captured with the OLD subtitle
         // (before the server auto-titled the session).
         let mut acc = crate::bridge::turn::state::StreamAccumulator::new("test");
-        acc.reply_to_message_id = Some("msg_1".into());
-        acc.session_id = Some("ses_test".into());
+        acc.set_reply_target(Some("msg_1".into()));
+        acc.set_session("ses_test");
         {
             let mut cards = app.cards.lock().await;
             cards.insert(

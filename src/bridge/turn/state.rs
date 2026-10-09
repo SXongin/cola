@@ -1206,10 +1206,15 @@ pub(super) struct StreamAccumulator {
     /// Read through [`Self::error`]; [`Self::set_error`] is the `#[cfg(test)]`
     /// seam.
     error: Option<String>,
-    pub(super) reply_to_message_id: Option<String>,
+    /// The message this card replies to — where a recovery click's
+    /// re-submission posts and a split continuation's replies land. Private to
+    /// this module: set by [`Self::set_reply_target`]; read through
+    /// [`Self::reply_to_message_id`].
+    reply_to_message_id: Option<String>,
     /// This turn's session id, carried on the error-card retry button so the
-    /// card callback can find the accumulator + card to reuse.
-    pub(super) session_id: Option<String>,
+    /// card callback can find the accumulator + card to reuse. Private to this
+    /// module: set by [`Self::set_session`]; read through [`Self::session_id`].
+    session_id: Option<String>,
     /// The full original prompt text of this turn, kept so the error-card
     /// "retry" button can re-submit it without the user retyping.
     pub(super) prompt: Option<String>,
@@ -1225,10 +1230,13 @@ pub(super) struct StreamAccumulator {
     /// later error-card retry reuses it and the server deduplicates by id.
     pub(super) cola_message_id: Option<String>,
     /// Who sent the prompt (Feishu open_id), so the group completion notice can
-    /// be replied to them / @-mention them.
-    pub(super) requester_open_id: Option<String>,
-    /// Whether the prompt came from a group chat (completion notice is group-only).
-    pub(super) is_group: bool,
+    /// be replied to them / @-mention them. Private to this module: set by
+    /// [`Self::set_requester`]; read through [`Self::requester_open_id`].
+    requester_open_id: Option<String>,
+    /// Whether the prompt came from a group chat (completion notice is
+    /// group-only). Private to this module: set by [`Self::set_is_group`]; read
+    /// through [`Self::is_group`].
+    is_group: bool,
     /// When the Turn that owns this card chain started (the same instant the
     /// Turn's own `started_at` records), for the Completion Notice's p2p
     /// long-task threshold. The quiet true end (ADR-0060) is settled by Session
@@ -1668,6 +1676,61 @@ impl StreamAccumulator {
     #[cfg(test)]
     pub(super) fn set_error(&mut self, error: Option<String>) {
         self.error = error;
+    }
+
+    /// The Session this card's Turn runs on, if recorded — the reply fixture
+    /// the recovery re-attach and the completion notice read. Private to this
+    /// module: set by [`Self::set_session`].
+    pub(super) fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
+    }
+
+    /// Set the Session this card's Turn runs on (ADR-0062): at `Turn::start`
+    /// and `Turn::recreate` (a 404), and on every armed successor's fresh
+    /// accumulator (`arm_projected_card`, `arm_external_render`,
+    /// `arm_wake_continuation`).
+    pub(super) fn set_session(&mut self, session_id: &str) {
+        self.session_id = Some(session_id.to_string());
+    }
+
+    /// The message this card replies to, if recorded — where a recovery click's
+    /// re-submission posts. Private to this module: set by
+    /// [`Self::set_reply_target`].
+    pub(super) fn reply_to_message_id(&self) -> Option<&str> {
+        self.reply_to_message_id.as_deref()
+    }
+
+    /// Set (or clear) the message this card replies to (ADR-0028, ADR-0062):
+    /// at `Turn::start`, on every armed successor (`arm_external_render`,
+    /// `arm_wake_continuation`, `attach_and_repoint`), by `flush_card_locked`
+    /// when a served pending-split continuation becomes the chain's newest
+    /// anchor, and by the `Turn::set_reply_target` test seam. `None` clears the
+    /// target — a refused rung falls back to the Chat's top level.
+    pub(super) fn set_reply_target(&mut self, reply_to_message_id: Option<String>) {
+        self.reply_to_message_id = reply_to_message_id;
+    }
+
+    /// Who sent this turn's prompt (a Feishu open_id), if recorded — the group
+    /// completion notice replies to them / @-mentions them. Private to this
+    /// module: set by [`Self::set_requester`].
+    pub(super) fn requester_open_id(&self) -> Option<&str> {
+        self.requester_open_id.as_deref()
+    }
+
+    /// Record who sent this turn's prompt (`None` when unknown).
+    pub(super) fn set_requester(&mut self, requester_open_id: Option<String>) {
+        self.requester_open_id = requester_open_id;
+    }
+
+    /// Whether this turn's prompt came from a group chat (the completion notice
+    /// is group-only). Private to this module: set by [`Self::set_is_group`].
+    pub(super) fn is_group(&self) -> bool {
+        self.is_group
+    }
+
+    /// Record whether this turn's prompt came from a group chat.
+    pub(super) fn set_is_group(&mut self, is_group: bool) {
+        self.is_group = is_group;
     }
 
     /// A waiting card's collect (ADR-0059, spec #405): the card yielded

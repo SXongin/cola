@@ -44,14 +44,14 @@ impl Turn {
         let live = cards.cards.lock().await;
         let card = live.get(session_id)?;
         let generation = card.acc.turn_generation?;
-        let requester_open_id = card.acc.requester_open_id.clone()?;
+        let requester_open_id = card.acc.requester_open_id().map(str::to_string)?;
         if requester_open_id.is_empty() {
             return None;
         }
         Some(TurnPinSource {
             generation,
             requester_open_id,
-            is_group: card.acc.is_group,
+            is_group: card.acc.is_group(),
         })
     }
 
