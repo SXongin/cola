@@ -1310,6 +1310,14 @@ pub struct MockBackend {
     /// (the retry's status leg, spec #391). Separate from
     /// [`Self::session_status_error`], which is fixed at construction.
     pub session_status_fails: Arc<std::sync::atomic::AtomicBool>,
+    /// When set, every `transcript` read rewrites its last assistant text part
+    /// with a fresh, numbered body (spec #602 review): a deterministic
+    /// ever-changing stream, so each read carries content the card has not
+    /// seen — without the text accumulating. Used to prove finalization cannot
+    /// chase a continuing stream forever.
+    pub growing_transcript: Arc<std::sync::atomic::AtomicBool>,
+    /// The number of `transcript` reads the growing stream has rewritten.
+    pub growing_transcript_reads: Arc<std::sync::atomic::AtomicUsize>,
     /// Scripts the ADR-0028 busy→idle race: the first `session_status` read
     /// returns Busy (and clears the flag), later reads serve the map.
     pub status_busy_once: std::sync::atomic::AtomicBool,
@@ -1430,6 +1438,8 @@ impl MockBackend {
             overlay: crate::backend::BackgroundTaskOverlay::default(),
             session_status_error: None,
             session_status_fails: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            growing_transcript: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            growing_transcript_reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             status_busy_once: std::sync::atomic::AtomicBool::new(false),
             prompt_scripts: Vec::new(),
             last_prompt_parts: std::sync::Mutex::new(None),
@@ -2320,6 +2330,29 @@ impl crate::backend::Backend for MockBackend {
             Some(transcript) => transcript,
             None => self.default_transcript(session_id),
         };
+        // The deterministic ever-changing stream (spec #602 review): rewrite the
+        // last assistant text in place, so each read carries a fresh body the
+        // card has not seen, while the served text stays bounded (the rewrite
+        // replaces the source's run rather than appending).
+        if self.growing_transcript.load(std::sync::atomic::Ordering::SeqCst) {
+            let n = self
+                .growing_transcript_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            if let Some(message) = transcript
+                .messages
+                .iter_mut()
+                .rev()
+                .find(|message| message.role == MessageRole::Assistant)
+            {
+                for part in message.parts.iter_mut() {
+                    if let Part::Text(text) = part {
+                        text.text = format!("第{n}段。");
+                        break;
+                    }
+                }
+            }
+        }
         // The Background Task overlay, applied exactly like the real adapter's
         // (issue #454, review #588): retirements leave the live list and
         // unconfirmed markers ride every read.
