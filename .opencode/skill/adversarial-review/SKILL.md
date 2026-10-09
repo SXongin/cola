@@ -24,13 +24,13 @@ Do not invent the checks. Read `.github/codex/prompts/review.md` and lift its `#
 
 Whatever the caller names for the **base**: a branch, a SHA, or a **ticket window** — the run of commits carrying one ticket's `Refs: #<n>` trailer, with the base at the commit before the run (the `foreman` window definition). Default the base to `main` when none is given. A caller may also scope the review to a **pathspec** (a subset of the touched files) — carry it through to both commands.
 
-Confirm the base resolves (`git rev-parse <base>`). Review with the gate's merge-base semantics: `BASE=$(git merge-base <base> HEAD)`, then `git diff "$BASE"` (add `-- <paths>` when scoped) — the scope of CI's `git diff <base>...HEAD`, extended to the working tree so committed, staged, and unstaged work are all in scope; the commit list is `git log <base>..HEAD --oneline` (add `-- <paths>` when scoped). Fail here when the diff is empty, never inside the sub-agent.
+Confirm the base resolves (`git rev-parse <base>`). Review with the gate's merge-base semantics: `BASE=$(git merge-base <base> HEAD)`, then `git diff "$BASE"` (add `-- <paths>` when scoped) — the scope of CI's `git diff <base>...HEAD`, extended to the working tree so committed, staged, and unstaged work are all in scope. That diff still omits **untracked** files, so list them with `git ls-files --others --exclude-standard` (add `-- <paths>` when scoped) and hand them to the reviewer as content. The commit list is `git log <base>..HEAD --oneline` (add `-- <paths>` when scoped). Fail here when the diff and the untracked list are both empty, never inside the sub-agent.
 
 ### 2. Spawn one reviewer sub-agent
 
 Dispatch a single `code-reviewer` sub-agent **from the orchestrating session** — a sub-agent cannot spawn it. The prompt carries:
 
-- the diff `git diff "$BASE"` (with `BASE` the merge-base, plus `-- <paths>` when scoped) and the commit list (`git log <base>..HEAD --oneline`, plus `-- <paths>` when scoped);
+- the diff `git diff "$BASE"` (with `BASE` the merge-base, plus `-- <paths>` when scoped), the untracked files from `git ls-files --others --exclude-standard` (not in the diff), and the commit list (`git log <base>..HEAD --oneline`, plus `-- <paths>` when scoped);
 - the `## The adversarial pass` and `## Rules` sections pasted in full (the sub-agent has no network; paste the rubric rather than pointing at it), minus the host-tree clause, with that omission stated in the prompt;
 - this brief:
   > You are reproducing the CI Codex gate's adversarial pass on this diff. The reference trees named in `AGENTS.md` exist on this host, so the host-tree exemption in the Rules does not apply. Report findings first and finish with the `CODEX_REVIEW_VERDICT` line the Rules prescribe.
