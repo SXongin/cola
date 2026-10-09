@@ -1039,7 +1039,16 @@ pub(super) enum EndingWrite {
 /// Accumulates streaming state for one session.
 #[derive(Default, Clone)]
 pub(super) struct StreamAccumulator {
-    pub(super) card_state: CardState,
+    /// The card's display state. Private to this module: it moves only through
+    /// intent methods — [`Self::apply_ending`] (an ending), the live-render
+    /// marks ([`Self::mark_streaming`] / [`Self::mark_reasoning`] / the adoption
+    /// promotion [`Self::mark_adopted_live`]), the recovery mark
+    /// ([`Self::mark_retried`]), the resume/collect/reset transitions
+    /// ([`Self::restore_live_state`], [`Self::set_resuming`],
+    /// [`Self::continue_on_new_card`], [`Self::collect_waiting`]) and the
+    /// residual restore ([`Self::restore_ending`]); [`Self::set_card_state`] is
+    /// the `#[cfg(test)]` seam. Read through [`Self::card_state`].
+    card_state: CardState,
     /// This turn's card-content fallback (see [`CardFallback`]): starts at
     /// `None` and is advanced by the flush when Feishu rejects a card it
     /// built. A fresh turn starts clean and re-tries the normal rendering.
@@ -1174,7 +1183,15 @@ pub(super) struct StreamAccumulator {
     /// The session/thread name; shown as the card subtitle so the header can
     /// stay focused on state (the question is already in the reply context).
     pub(super) title: String,
-    pub(super) error: Option<String>,
+    /// The failure line recorded on the card, if any. Private to this module:
+    /// it moves only through [`Self::apply_ending`] (a failure ending records
+    /// its line, a stop/unreceived ending clears one),
+    /// [`Self::restore_ending`] (an in-place residual re-stamps the ending it
+    /// carried) and [`Self::continue_on_new_card`] (a Wake continuation starts
+    /// clean); a recovery re-arm clears it through `CardSession::rearm_common`.
+    /// Read through [`Self::error`]; [`Self::set_error`] is the `#[cfg(test)]`
+    /// seam.
+    error: Option<String>,
     pub(super) reply_to_message_id: Option<String>,
     /// This turn's session id, carried on the error-card retry button so the
     /// card callback can find the accumulator + card to reuse.
@@ -1563,6 +1580,74 @@ impl StreamAccumulator {
         }
         self.card_state = state;
         self.refresh_phase();
+    }
+
+    /// The card's current display state — the header phase, the flush's
+    /// continuation decision, the ownership verdict and the recovery claim all
+    /// read it. The field is private; this is the only read.
+    pub(super) fn card_state(&self) -> &CardState {
+        &self.card_state
+    }
+
+    /// The failure line this card records, if any — the footer render and the
+    /// residual restore read it. The field is private; this is the only read.
+    pub(super) fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    /// Mark a live card Streaming: what a text part or a running tool renders
+    /// (ADR-0014). A pure state write — the render pass refreshes the header
+    /// phase itself once the part is in.
+    pub(super) fn mark_streaming(&mut self) {
+        self.card_state = CardState::Streaming;
+    }
+
+    /// Mark a live card Reasoning: what a reasoning part renders (ADR-0014).
+    /// A pure state write — the render pass refreshes the header phase itself.
+    pub(super) fn mark_reasoning(&mut self) {
+        self.card_state = CardState::Reasoning;
+    }
+
+    /// A live adoption is a working card from its first send (spec #561): a
+    /// successor that rendered nothing would otherwise show the initial
+    /// Loading 「思考中」 over a run already in flight, so promote it to
+    /// Streaming. A card past Loading is left exactly as it is.
+    pub(super) fn mark_adopted_live(&mut self) {
+        if self.card_state == CardState::Loading {
+            self.card_state = CardState::Streaming;
+        }
+    }
+
+    /// Mark the failed card Retried (spec #391): header 「↩️ 已重试」, the retry
+    /// button suppressed, the marker line appended, the failed content kept.
+    /// `Retried` is not an ending a [`Disposition`] can name, so it is its own
+    /// mark rather than an [`Self::apply_ending`] call.
+    pub(super) fn mark_retried(&mut self) {
+        self.card_state = CardState::Retried;
+    }
+
+    /// Restore the ending a card carried before rendering an in-place late tail
+    /// (ADR-0074): the render set a live state, but a card past its wait keeps
+    /// the ending it recorded. Stamps the saved state and failure together, in
+    /// one write; the caller refreshes the header phase.
+    pub(super) fn restore_ending(&mut self, state: CardState, error: Option<String>) {
+        self.card_state = state;
+        self.error = error;
+    }
+
+    /// Set the card's display state directly: a test seam standing in for the
+    /// production transition the fixture would otherwise drive. The field is
+    /// private; every production writer goes through an intent method.
+    #[cfg(test)]
+    pub(super) fn set_card_state(&mut self, state: CardState) {
+        self.card_state = state;
+    }
+
+    /// Record a failure line directly: a test seam standing in for a failure
+    /// ending, so a clearing ending is visible as a change.
+    #[cfg(test)]
+    pub(super) fn set_error(&mut self, error: Option<String>) {
+        self.error = error;
     }
 
     /// A waiting card's collect (ADR-0059, spec #405): the card yielded

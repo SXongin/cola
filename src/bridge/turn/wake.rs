@@ -289,9 +289,7 @@ impl Turn {
                 // A live adoption follows a run already in flight: the
                 // successor is a working card from its first send, never an
                 // initial 「思考中」.
-                if acc.card_state == crate::feishu::card::CardState::Loading {
-                    acc.card_state = crate::feishu::card::CardState::Streaming;
-                }
+                acc.mark_adopted_live();
             }
         }
         // The successor's body goes through the SAME splitter the flush uses

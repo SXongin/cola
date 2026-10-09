@@ -447,7 +447,7 @@ impl Ticket {
 /// The card class from one [`CardSession`]: the display state first, then the
 /// yielded card's write-readiness.
 fn classify(card: &CardSession) -> CardClass {
-    let state = &card.acc.card_state;
+    let state = card.acc.card_state();
     if *state == CardState::Waiting {
         CardClass::Yielded {
             live: card.card_is_live,
@@ -1017,14 +1017,14 @@ mod tests {
             .lock()
             .await
             .get(session_id)
-            .and_then(|card| card.acc.error.clone())
+            .and_then(|card| card.acc.error().map(str::to_string))
     }
 
     /// Seed a recorded failure on the live card, so an ending that clears it
     /// (Stopped) is visible as a change.
     async fn set_card_error(cards: &CardsHandle, session_id: &str, error: &str) {
         if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
-            card.acc.error = Some(error.to_string());
+            card.acc.set_error(Some(error.to_string()));
         }
     }
 

@@ -988,7 +988,7 @@ impl Turn {
                     acc.reasoning.len(),
                     acc.tools.len(),
                     acc.rendered_parts.len(),
-                    acc.error.as_deref().unwrap_or("none"),
+                    acc.error().unwrap_or("none"),
                 );
             }
         }
@@ -2560,7 +2560,7 @@ impl Turn {
         let mut plans = {
             let live = cards.cards.lock().await;
             match live.get(session_id) {
-                Some(card) if !card.acc.card_state.is_render_owned() => {
+                Some(card) if !card.acc.card_state().is_render_owned() => {
                     render::plan_ledger_entries(&card.acc, transcript, card.acc.turn_anchor.as_ref())
                 }
                 _ => return None,
@@ -2570,7 +2570,7 @@ impl Turn {
         let handover = {
             let mut live = cards.cards.lock().await;
             let card = live.get_mut(session_id)?;
-            if card.acc.card_state.is_render_owned() {
+            if card.acc.card_state().is_render_owned() {
                 return None;
             }
             // A card with no Turn anchor to scope the entries with owes no
@@ -2742,8 +2742,13 @@ impl Turn {
         let Some((ending_state, ending_error)) = ({
             let live = cards.cards.lock().await;
             live.get(session_id)
-                .filter(|card| !card.acc.card_state.is_render_owned())
-                .map(|card| (card.acc.card_state.clone(), card.acc.error.clone()))
+                .filter(|card| !card.acc.card_state().is_render_owned())
+                .map(|card| {
+                    (
+                        card.acc.card_state().clone(),
+                        card.acc.error().map(str::to_string),
+                    )
+                })
         }) else {
             return false;
         };
@@ -2779,8 +2784,7 @@ impl Turn {
             if !card.acc.residual_card_posted {
                 card.acc.push_receipt(SplitKind::Residual.receipt());
             }
-            card.acc.card_state = ending_state;
-            card.acc.error = ending_error;
+            card.acc.restore_ending(ending_state, ending_error);
             card.acc.residual_card_posted = true;
             card.acc.refresh_phase();
         }
@@ -3437,7 +3441,7 @@ impl Turn {
         }
         let mut live = cards.cards.lock().await;
         let card = live.get_mut(session_id)?;
-        if card.acc.card_state != from
+        if *card.acc.card_state() != from
             || card.acc.recovery_claimed
             // A Wake continuation carries no question to re-ask (ADR-0059):
             // its card never offers Retry, so no click may claim one either.
@@ -3480,7 +3484,7 @@ impl Turn {
         let Some(card) = live.get_mut(session_id) else {
             return false;
         };
-        if card.acc.card_state != crate::feishu::card::CardState::Waiting
+        if *card.acc.card_state() != crate::feishu::card::CardState::Waiting
             || card.acc.recovery_claimed
             || card.card_message_id.is_none()
             || !card.card_is_live
@@ -3629,7 +3633,7 @@ impl Turn {
     /// regardless.
     async fn mark_retried(cards: &CardsHandle, session_id: &str) {
         if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
-            card.acc.card_state = crate::feishu::card::CardState::Retried;
+            card.acc.mark_retried();
         }
         Self::flush_card(cards, session_id).await;
     }
@@ -3982,7 +3986,7 @@ impl Turn {
         state: crate::feishu::card::CardState,
     ) {
         if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
-            card.acc.card_state = state;
+            card.acc.set_card_state(state);
         }
     }
 
@@ -4113,7 +4117,7 @@ impl Turn {
             .lock()
             .await
             .get(session_id)
-            .map(|c| c.acc.card_state.clone())
+            .map(|c| c.acc.card_state().clone())
     }
 
     /// Whether the card's fallback reached the suspended state (the fenced
