@@ -40,6 +40,10 @@ pub fn build_help_card() -> serde_json::Value {
                 ("/autoaccept [on|off]", "查看或切换自动授权"),
                 ("/stop", "中断当前执行"),
                 ("/compact", "压缩上下文"),
+                (
+                    "/card",
+                    "把实时卡片拉回最新位置（命令回复把它埋下去后；无进行中的轮次时回复一条提示）",
+                ),
             ],
         ),
         (
@@ -49,6 +53,10 @@ pub fn build_help_card() -> serde_json::Value {
                 ("/restart", "重启 cola"),
                 ("/restart-opencode", "重启 OpenCode 服务器（仅 cola 启动的）"),
                 ("/update", "检查并应用自更新"),
+                (
+                    "/version",
+                    "显示 cola 版本与构建来源（release / crates.io / dev 构建）",
+                ),
             ],
         ),
     ];
@@ -93,10 +101,12 @@ mod tests {
             "/autoaccept",
             "/stop",
             "/compact",
+            "/card",
             "/help",
             "/restart",
             "/restart-opencode",
             "/update",
+            "/version",
         ] {
             assert!(text.contains(cmd), "missing command {cmd} in help card: {text}");
         }
