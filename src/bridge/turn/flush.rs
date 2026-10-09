@@ -507,14 +507,14 @@ pub(super) async fn flush_card_locked(
             // card is a finalized (full) slice. Remember the boundary: a
             // failed continuation send must restore it, or the slice it built
             // reaches no card and the retry silently starts after it.
-            let slice_from = card.acc.render_from;
+            let slice_from = card.acc.render_from();
             let built = match split_policy {
                 SplitPolicy::Allow => card.acc.build_card_with_info(),
                 // A ledger-only refresh never finalizes: the whole live slice
                 // renders on the tracked card, `render_from` unmoved.
                 SplitPolicy::Forbid => card.acc.build_card_unsplit(),
             };
-            let slice_to = card.acc.render_from;
+            let slice_to = card.acc.render_from();
             let rendered = built
                 .spans
                 .iter()
@@ -722,9 +722,8 @@ pub(super) async fn flush_card_locked(
                                 // losing it to a rejection that would repeat verbatim.
                                 let mut cards = cards.cards.lock().await;
                                 if let Some(card) = cards.get_mut(session_id)
-                                    && card.acc.render_from == slice_to
+                                    && card.acc.restore_render_boundary(slice_from, slice_to)
                                 {
-                                    card.acc.render_from = slice_from;
                                     card.card_is_live = true;
                                     card_is_live = true;
                                 }
@@ -939,9 +938,7 @@ pub(super) async fn flush_card_locked(
                     // slice never landed, so the notice must be suppressed
                     // (#607). A fenced retry overwrites this on its next send.
                     card.acc.set_ending_write(super::state::EndingWrite::Failed);
-                    if card.acc.render_from == slice_to {
-                        card.acc.render_from = slice_from;
-                    }
+                    card.acc.restore_render_boundary(slice_from, slice_to);
                 }
                 drop(cards);
                 if retry_fenced {
