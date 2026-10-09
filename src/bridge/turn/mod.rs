@@ -1143,12 +1143,39 @@ impl Turn {
         // cleanly) does not chase a live stream at all — one read is enough
         // there, since the decided disposition is stamped regardless of what
         // the read carries.
+        //
+        // The budget is not just checked between reads (spec #602 review, round
+        // 5): it BOUNDS each read. A read begun just before the deadline would
+        // otherwise run the full per-read timeout past it, holding the guard
+        // past the stated grace by up to one `follow_read_timeout_ms` — which
+        // can exceed the grace itself in small configs. The loop also refuses to
+        // START a further read once the budget is spent, returning the read it
+        // last saw.
         let deadline =
             tokio::time::Instant::now() + std::time::Duration::from_millis(handles.config.follow_grace_ms());
+        // The read last rendered, returned when the budget is spent so the
+        // already-decided disposition is stamped.
+        let mut last: Option<SessionTranscript> = None;
         loop {
+            // Never START another read once the budget is spent: the read last
+            // seen is the rendered, quiescent snapshot to decide on. The first
+            // read is always attempted (a settled drain's own early return means
+            // there may be no `last` yet) — the bound below covers the case
+            // where no budget is left at all.
+            if drain_settled && last.is_some() && tokio::time::Instant::now() >= deadline {
+                return last;
+            }
+            // Bound THIS read by what is left of the budget: `min(follow_read_timeout_ms,
+            // remaining)`, floored to a small positive value so a read begun at
+            // the deadline still returns promptly rather than being skipped.
+            let read_timeout_ms = deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .as_millis()
+                .min(u128::from(self.drain_read_timeout_ms(handles)))
+                .max(1) as u64;
             let read = crate::bridge::bounded_call(
                 "turn final transcript",
-                self.drain_read_timeout_ms(handles),
+                read_timeout_ms,
                 handles.backend.transcript(&self.session_id),
             )
             .await
@@ -1196,10 +1223,13 @@ impl Turn {
                 return Some(transcript);
             }
             // A grace ending gets one read and out; a settled drain keeps
-            // catching a finite tail, but never past the grace budget.
-            if !drain_settled || tokio::time::Instant::now() >= deadline {
+            // catching a finite tail, but never past the grace budget — the
+            // read is remembered so the next iteration's top check can return
+            // it once the budget is spent.
+            if !drain_settled {
                 return Some(transcript);
             }
+            last = Some(transcript);
         }
     }
 
