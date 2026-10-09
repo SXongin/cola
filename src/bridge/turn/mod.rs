@@ -1101,29 +1101,52 @@ impl Turn {
     }
 
     /// The transcript finalization decides the ending on (#604), obeying the
-    /// same rendered-and-quiescent rule as the drain. When the drain settled
-    /// cleanly (`drain_settled`) that is its own last rendered read — the
-    /// snapshot that was rendered and showed no new content — so the ending can
-    /// never be decided from a later read that disagrees with it. Otherwise a
-    /// fresh bounded read, repeated while it still carries content the card
-    /// lacks: each such read is rendered before the next, so the ending is
-    /// never stamped over an unrendered tail. `None` when no read answers.
+    /// same rendered-and-quiescent rule as the drain: a FRESH bounded read that
+    /// is rendered, repeated while it still carries content the card lacks, so
+    /// the ending is never stamped over an unrendered tail. The drain's cached
+    /// `last_transcript` is NOT trusted blindly (spec #602, review finding 3):
+    /// a part can land after the settle read — between the settling tick's
+    /// transcript read and its status read, or between the settle and
+    /// finalization — and a later *transcript* read is exactly what must catch
+    /// it (it is a later *status* read that #604 forbids finalizing a stale
+    /// transcript). `None` when no read answers and the drain had no snapshot to
+    /// fall back on.
     async fn final_transcript(
         &self,
         handles: &TurnHandles,
         drain_settled: bool,
     ) -> Option<SessionTranscript> {
-        if drain_settled && let Some(transcript) = &self.last_transcript {
-            return Some(transcript.clone());
-        }
         loop {
-            let transcript = crate::bridge::bounded_call(
+            let read = crate::bridge::bounded_call(
                 "turn final transcript",
                 self.drain_read_timeout_ms(handles),
                 handles.backend.transcript(&self.session_id),
             )
             .await
-            .and_then(std::result::Result::ok)?;
+            .and_then(std::result::Result::ok);
+            let Some(transcript) = read else {
+                // A failed fresh read. When the drain settled cleanly, its own
+                // rendered snapshot is the best available substitute — falling
+                // back to it keeps a transient hiccup from turning a settled
+                // ending into an unknown one. A drain that ended in a decided
+                // ending has no such snapshot, so a failed read stays `None`.
+                return if drain_settled {
+                    self.last_transcript.clone()
+                } else {
+                    None
+                };
+            };
+            // The settled-drain fast path: when this fresh read shows nothing
+            // the card lacks, it IS the rendered, quiescent snapshot to decide
+            // on — return it without rendering. A render here would re-spend
+            // the cycle's ledger reads and re-persist the chain record for a
+            // body that has not moved (the drain's own early-return makes the
+            // same call). A read that DOES carry new content — the tail that
+            // landed after the settle (finding 3) — falls through and is
+            // rendered, then re-read until quiescent.
+            if drain_settled && !self.drain_owes_render(handles, &transcript).await {
+                return Some(transcript);
+            }
             // Render this read, then repeat only if it carried content the card
             // lacked: the ending may only be stamped on a read that shows no
             // new content. A vanished accumulator ends the loop with the read
