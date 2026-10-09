@@ -1153,20 +1153,19 @@ impl Turn {
         handles.config.follow_read_timeout_ms()
     }
 
-    /// The one bounded read finalization decides on (#603): like the drain's
-    /// own reads, it is bounded by the remaining grace budget
-    /// (`min(follow_read_timeout_ms, follow_grace_ms)`, floored to 1 ms), so a
-    /// read begun at the deadline still returns promptly and a hung Backend
-    /// cannot hold the inflight guard past the grace.
+    /// One bounded read finalization decides on (#603/#604). It uses the FIXED
+    /// per-read timeout (spec #602 review, round 7): a grace-capped read
+    /// (`min(follow_read_timeout_ms, grace)`) would misread a reachable Backend
+    /// that answers within the read timeout but after a small grace as
+    /// "unreadable", finalizing on the earlier snapshot before a late tail
+    /// renders — the #604 race. The flow stays bounded because each read is
+    /// bounded by `follow_read_timeout_ms` and no read is started after the
+    /// drain's own graces have decided the ending; a read is never shortened to
+    /// fit the grace.
     async fn finalization_read(&self, handles: &TurnHandles) -> Option<SessionTranscript> {
-        let read_timeout_ms = handles
-            .config
-            .follow_grace_ms()
-            .min(self.drain_read_timeout_ms(handles))
-            .max(1);
         crate::bridge::bounded_call(
             "turn final transcript",
-            read_timeout_ms,
+            self.drain_read_timeout_ms(handles),
             handles.backend.transcript(&self.session_id),
         )
         .await
