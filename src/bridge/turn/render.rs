@@ -1575,8 +1575,8 @@ async fn render_and_flush_inner(
             changed,
             header_changed,
             card.acc.rendered_parts.len() - before,
-            card.acc.text.len(),
-            card.acc.reasoning.len(),
+            card.acc.text().len(),
+            card.acc.reasoning().len(),
             anchor,
             plans,
         )
@@ -2174,7 +2174,7 @@ mod tests {
         render_parts(&mut acc, &parts);
         acc.set_card_state(CardState::Done);
 
-        assert!(acc.reasoning.contains("The user is asking in Chinese."));
+        assert!(acc.reasoning().contains("The user is asking in Chinese."));
         assert_eq!(acc.tools.len(), 1);
         let tool = &acc.tools["call_1"];
         assert_eq!(tool.name(), "bash");
@@ -2328,11 +2328,11 @@ Index: /x/src/main.rs
         ]);
 
         assert!(render_new_turn_parts(&mut acc, &transcript));
-        assert!(acc.reasoning.contains("Let me think"));
+        assert!(acc.reasoning().contains("Let me think"));
         assert_eq!(acc.tools.len(), 1);
         assert_eq!(acc.rendered_parts.len(), 1);
-        assert!(!acc.text.contains("question"));
-        assert!(!acc.reasoning.contains("old reasoning"));
+        assert!(!acc.text().contains("question"));
+        assert!(!acc.reasoning().contains("old reasoning"));
 
         assert!(!render_new_turn_parts(&mut acc, &transcript));
     }
@@ -2391,9 +2391,9 @@ Index: /x/src/main.rs
             "the anchor is the message's identity together with its server time"
         );
         assert!(
-            acc.reasoning.contains("还在研究"),
+            acc.reasoning().contains("还在研究"),
             "the in-flight message's reasoning must render live: {:?}",
-            acc.reasoning
+            acc.reasoning()
         );
         assert_eq!(
             acc.tools["call_task"].status(),
@@ -4054,7 +4054,7 @@ Index: /x/src/main.rs
 
         assert!(!render_new_turn_parts(&mut acc, &transcript));
         assert_eq!(acc.turn_anchor, None);
-        assert!(acc.text.is_empty());
+        assert!(acc.text().is_empty());
     }
 
     /// #190: a server clock BEHIND cola's must not drop the new turn — every
@@ -4092,9 +4092,9 @@ Index: /x/src/main.rs
             })
         );
         assert!(
-            acc.text.contains("回答"),
+            acc.text().contains("回答"),
             "the turn's parts must render: {:?}",
-            acc.text
+            acc.text()
         );
     }
 
@@ -4135,14 +4135,14 @@ Index: /x/src/main.rs
             })
         );
         assert!(
-            acc.text.contains("新回答"),
+            acc.text().contains("新回答"),
             "the turn must render: {:?}",
-            acc.text
+            acc.text()
         );
         assert!(
-            !acc.text.contains("旧回答"),
+            !acc.text().contains("旧回答"),
             "the previous turn must not bleed in: {:?}",
-            acc.text
+            acc.text()
         );
     }
 
@@ -4527,24 +4527,24 @@ Index: /x/src/main.rs
         // Parts are written empty first, then updated with content. The empty
         // version must NOT be rendered (it would freeze the placeholder).
         assert!(!render_new_turn_parts(&mut acc, &transcript("", "")));
-        assert_eq!(acc.reasoning, "");
-        assert_eq!(acc.text, "");
+        assert_eq!(acc.reasoning(), "");
+        assert_eq!(acc.text(), "");
 
         // Once content lands (same message/parts), render it once.
         assert!(render_new_turn_parts(
             &mut acc,
             &transcript("Let me think", "Answer here")
         ));
-        assert!(acc.reasoning.contains("Let me think"));
-        assert!(acc.text.contains("Answer here"));
+        assert!(acc.reasoning().contains("Let me think"));
+        assert!(acc.text().contains("Answer here"));
 
         // Re-fetching the same content must not duplicate.
         assert!(!render_new_turn_parts(
             &mut acc,
             &transcript("Let me think", "Answer here")
         ));
-        assert_eq!(acc.reasoning, "Let me think");
-        assert_eq!(acc.text, "Answer here");
+        assert_eq!(acc.reasoning(), "Let me think");
+        assert_eq!(acc.text(), "Answer here");
     }
 
     /// Regression: real OpenCode part payloads carry NO `id` field (the DB id
@@ -4567,12 +4567,12 @@ Index: /x/src/main.rs
 
         // Poll loop renders the parts.
         assert!(render_new_turn_parts(&mut acc, &transcript()));
-        assert_eq!(acc.text, "你好！很高兴认识你。");
+        assert_eq!(acc.text(), "你好！很高兴认识你。");
 
         // Final render re-fetches the same messages — must NOT append again.
         assert!(!render_new_turn_parts(&mut acc, &transcript()));
-        assert_eq!(acc.text, "你好！很高兴认识你。");
-        assert_eq!(acc.reasoning, "thinking");
+        assert_eq!(acc.text(), "你好！很高兴认识你。");
+        assert_eq!(acc.reasoning(), "thinking");
     }
 
     /// Real OpenCode failed-tool calls use status `error` with the reason in
@@ -4751,8 +4751,8 @@ Index: /x/src/main.rs
         // Final reconcile: nothing new from the transcript → falls back to the
         // response parts (identical content). Must NOT append again.
         assert!(!render_parts(&mut acc, &parts));
-        assert_eq!(acc.text, "The answer.");
-        assert_eq!(acc.reasoning, "Let me check");
+        assert_eq!(acc.text(), "The answer.");
+        assert_eq!(acc.reasoning(), "Let me check");
         assert_eq!(acc.tools["call_1"].output().as_deref(), Some("src"));
     }
 

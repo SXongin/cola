@@ -116,7 +116,7 @@ fn flush_outcome(wrote: bool, refused: bool) -> FlushOutcome {
 async fn set_ending_write(cards: &CardsHandle, session_id: &str, ending: super::state::EndingWrite) {
     let mut live = cards.cards.lock().await;
     if let Some(card) = live.get_mut(session_id) {
-        card.acc.ending_write = ending;
+        card.acc.set_ending_write(ending);
     }
 }
 
@@ -173,20 +173,14 @@ pub(super) enum SplitPolicy {
 
 /// Advance the turn's [`CardFallback`] after Feishu rejected a card it built.
 async fn advance_card_fallback(cards: &CardsHandle, session_id: &str) -> FallbackAdvance {
-    use crate::bridge::turn::state::CardFallback;
     let mut live = cards.cards.lock().await;
     let Some(card) = live.get_mut(session_id) else {
         return FallbackAdvance::Stop;
     };
-    match card.acc.card_fallback {
-        CardFallback::None => {
-            card.acc.card_fallback = CardFallback::Fenced;
-            FallbackAdvance::RetryFenced
-        }
-        CardFallback::Fenced | CardFallback::Suspended => {
-            card.acc.card_fallback = CardFallback::Suspended;
-            FallbackAdvance::Stop
-        }
+    if card.acc.advance_card_fallback() {
+        FallbackAdvance::RetryFenced
+    } else {
+        FallbackAdvance::Stop
     }
 }
 
@@ -457,7 +451,7 @@ pub(super) async fn flush_card_locked(
         (
             card.pending_split.clone(),
             card.card_is_live,
-            card.acc.card_fallback == crate::bridge::turn::state::CardFallback::Suspended,
+            card.acc.card_fallback() == crate::bridge::turn::state::CardFallback::Suspended,
         )
     };
     if suspended {
@@ -875,11 +869,11 @@ pub(super) async fn flush_card_locked(
                         // The next slice's send overwrites this; if the flush
                         // stops here, `Failed` suppresses the notice over a tail
                         // that never landed (#607).
-                        card.acc.ending_write = if built.full {
+                        card.acc.set_ending_write(if built.full {
                             super::state::EndingWrite::Failed
                         } else {
                             super::state::EndingWrite::Delivered
-                        };
+                        });
                         card.card_message_id = Some(new_id.clone());
                         // A continuation that fits becomes the live card; one
                         // that is itself over the budget stays finalized and
@@ -944,7 +938,7 @@ pub(super) async fn flush_card_locked(
                     // The continuation create reached no card: the terminal
                     // slice never landed, so the notice must be suppressed
                     // (#607). A fenced retry overwrites this on its next send.
-                    card.acc.ending_write = super::state::EndingWrite::Failed;
+                    card.acc.set_ending_write(super::state::EndingWrite::Failed);
                     if card.acc.render_from == slice_to {
                         card.acc.render_from = slice_from;
                     }
@@ -1177,7 +1171,7 @@ mod tests {
         );
         let cards = app.cards.lock().await;
         assert_eq!(
-            cards.get("ses_test").unwrap().acc.card_fallback,
+            cards.get("ses_test").unwrap().acc.card_fallback(),
             CardFallback::Fenced,
             "the fallback is sticky for the turn"
         );
@@ -1272,7 +1266,13 @@ mod tests {
             cards[1]
         );
         assert_eq!(
-            app.cards.lock().await.get("ses_test").unwrap().acc.card_fallback,
+            app.cards
+                .lock()
+                .await
+                .get("ses_test")
+                .unwrap()
+                .acc
+                .card_fallback(),
             CardFallback::Fenced
         );
     }
@@ -1314,7 +1314,13 @@ mod tests {
             "the plain attempt and the fenced one only"
         );
         assert_eq!(
-            app.cards.lock().await.get("ses_test").unwrap().acc.card_fallback,
+            app.cards
+                .lock()
+                .await
+                .get("ses_test")
+                .unwrap()
+                .acc
+                .card_fallback(),
             CardFallback::Suspended
         );
         assert!(
@@ -1339,7 +1345,13 @@ mod tests {
             "the plain attempt and the fenced one only"
         );
         assert_eq!(
-            app.cards.lock().await.get("ses_test").unwrap().acc.card_fallback,
+            app.cards
+                .lock()
+                .await
+                .get("ses_test")
+                .unwrap()
+                .acc
+                .card_fallback(),
             CardFallback::Suspended
         );
 
@@ -1603,7 +1615,7 @@ mod tests {
         );
         // ...but the terminal tail never landed, so the ending write must not
         // read Delivered.
-        let ending = app.cards.lock().await.get("ses_test").unwrap().acc.ending_write;
+        let ending = app.cards.lock().await.get("ses_test").unwrap().acc.ending_write();
         assert_eq!(
             ending,
             EndingWrite::Failed,
@@ -1631,7 +1643,7 @@ mod tests {
 
         Turn::flush_card(&app.cards_handle(), "ses_test").await;
 
-        let ending = app.cards.lock().await.get("ses_test").unwrap().acc.ending_write;
+        let ending = app.cards.lock().await.get("ses_test").unwrap().acc.ending_write();
         assert_eq!(
             ending,
             EndingWrite::Failed,
