@@ -3777,3 +3777,58 @@ async fn a_failed_size_split_continuation_create_suppresses_the_notice() {
         platform.calls.lock().await
     );
 }
+
+/// Finding 1 (spec #602 pre-push review): a deferred Completion Notice belongs
+/// to the request that ENDED — the card that carried its terminal write — not
+/// to whatever card the session has when the owed write finally drains. A NEW
+/// Turn replaces the session's card (a fresh card id, a fresh requester) while
+/// the terminal write is still owed; when the delivery layer then drains that
+/// write, the notice must be SUPPRESSED, never redirected to the replacement
+/// request's requester.
+#[tokio::test]
+async fn a_deferred_notice_is_suppressed_when_a_new_turn_replaced_the_card() {
+    let _wd = test_work_dir();
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "你好"),
+        assistant(2_000, "最终答复。"),
+    ]);
+    let (_dir, app, _backend, platform) = scripted_app(vec![transcript], Some(SessionStatus::Idle)).await;
+    // Every content write fails at the transport: the terminal PATCH is owed
+    // and the notice is deferred until that exact write drains.
+    platform.fail_update_transport_count.store(100, Ordering::SeqCst);
+    let mut context = ctx("ses_test", "你好");
+    context.is_group = true;
+    context.requester_open_id = Some(TEST_HOST.to_string());
+
+    Turn::run(&app.turn_handles(), context).await.unwrap();
+    assert!(
+        !noticed(&platform).await,
+        "an owed terminal write must defer the notice: {:?}",
+        platform.calls.lock().await
+    );
+
+    // A NEW Turn replaces the session's card while the first write is still
+    // owed: the session now carries a different card and a different requester.
+    let cards = app.cards_handle();
+    Turn::seed_card(&cards, "ses_test", Some("om_new")).await;
+    Turn::set_reply_target(&cards, "ses_test", "msg_new").await;
+    Turn::set_turn_identity(&cards, "ses_test", "ou_new_requester", true, 2).await;
+
+    // The owed write drains — to the ORIGINAL card. The deferred notice must
+    // not follow it to the replacement card's request.
+    platform.fail_update_transport_count.store(0, Ordering::SeqCst);
+    app.core.feishu.drain_pending_card_updates(true).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let notices = platform.completion_notices().await;
+    assert!(
+        notices
+            .iter()
+            .all(|(reply_to, open_id, _, _)| reply_to != "msg_new" && open_id != "ou_new_requester"),
+        "the deferred notice must never target the replacement request: {notices:?}"
+    );
+    assert!(
+        notices.is_empty(),
+        "the original request's card is gone, so the notice is suppressed: {notices:?}"
+    );
+}
