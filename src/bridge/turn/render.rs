@@ -822,7 +822,7 @@ pub(super) fn render_turn_parts(acc: &mut StreamAccumulator, transcript: &Sessio
     // The seed (spec #561) resolves against THIS read: its at-or-before-the-
     // frontier rule uses the read's own message order. The positions map serves
     // both walks below — the seed's own scope and the accumulator's window.
-    let message_positions: std::collections::HashMap<&str, usize> = if acc.seed.is_some() {
+    let message_positions: std::collections::HashMap<&str, usize> = if acc.seed().is_some() {
         transcript
             .messages
             .iter()
@@ -851,7 +851,7 @@ pub(super) fn render_turn_parts(acc: &mut StreamAccumulator, transcript: &Sessio
     // [`commit_planned_entries`] — so its output read happens outside the cards
     // lock. The timeline keys the entry before the work it announces, so
     // committing it here or after the parts render is one card.
-    let seed = acc.seed.clone();
+    let seed = acc.seed().cloned();
     for message in transcript.turn_for_user(&anchor).messages {
         // A message the seed's own scope already walked is done: walking it
         // again would render its frontier part's suffix twice in one pass.
@@ -932,7 +932,7 @@ fn render_pending_gap_once(acc: &mut StreamAccumulator, transcript: &SessionTran
     // confirmed writes): `gap_rendered` is the one-shot render gate, so a
     // partial render still leaves the fact — and its remaining tail — visible
     // to the re-point that carries it on.
-    if acc.gap_rendered {
+    if acc.gap_rendered() {
         return false;
     }
     let Some(gap) = acc.pending_gap().cloned() else {
@@ -942,14 +942,14 @@ fn render_pending_gap_once(acc: &mut StreamAccumulator, transcript: &SessionTran
     // shows, but NEVER treat the gap as rendered through — its end may be
     // beyond the page cap, so nothing may mark it complete and the walk runs
     // again on the next read, until a complete one shows the end.
-    acc.gap_truncated = transcript.truncated;
+    acc.set_gap_truncated(transcript.truncated);
     if !render_pending_gap(acc, transcript, &gap) {
         return false;
     }
     if transcript.truncated {
         return true;
     }
-    acc.gap_rendered = true;
+    acc.mark_gap_rendered();
     tracing::info!(
         "orphan gap: session {} rendered its pending tail",
         acc.session_id().unwrap_or("")
@@ -1013,13 +1013,13 @@ fn render_pending_gap(
                     // content (spec #561, review #569): the chain cursor must
                     // never be built from these entries, while the gap's own
                     // progress is read from them.
-                    acc.gap_messages.insert(message.id.clone());
+                    acc.mark_gap_message(message.id.clone());
                     if render_gap_part(acc, message.id.clone(), index, part, delivered) {
                         rendered = true;
                     }
                 }
                 crate::bridge::turn::state::SeedCut::Undelivered => {
-                    acc.gap_messages.insert(message.id.clone());
+                    acc.mark_gap_message(message.id.clone());
                     // A seeded call the gap renders is an ordinary settled
                     // panel again: it leaves the display-only seeded set,
                     // exactly as in the accumulator's own window.
@@ -1127,8 +1127,7 @@ fn render_gap_part(
 /// its walk runs in addition to — and before — the accumulator's own window.
 /// The projection's seed has no scope (its Turn IS the accumulator's).
 fn seed_scope(acc: &StreamAccumulator) -> Option<TurnAnchor> {
-    acc.seed
-        .as_ref()
+    acc.seed()
         .and_then(|seed| seed.scope.clone())
         .filter(|scope| acc.turn_anchor.as_ref() != Some(scope))
 }
@@ -1147,7 +1146,7 @@ fn render_seed_scope(
     message_positions: &std::collections::HashMap<&str, usize>,
     walked: &mut std::collections::HashSet<MessageId>,
 ) -> bool {
-    let Some(seed) = acc.seed.clone() else {
+    let Some(seed) = acc.seed().cloned() else {
         return false;
     };
     if seed.frontier.is_none() {
@@ -1173,7 +1172,7 @@ fn render_seed_scope(
                 crate::bridge::turn::state::SeedCut::Delivered => acc.mark_delivered_part(&message.id, part),
                 crate::bridge::turn::state::SeedCut::Frontier(delivered) => {
                     if gap_scope {
-                        acc.gap_messages.insert(message.id.clone());
+                        acc.mark_gap_message(message.id.clone());
                     }
                     if render_seeded_part(acc, message.id.clone(), index, part, delivered) {
                         rendered = true;
@@ -1187,7 +1186,7 @@ fn render_seed_scope(
                         acc.seeded_calls.remove(&call.identity.call_id);
                     }
                     if gap_scope {
-                        acc.gap_messages.insert(message.id.clone());
+                        acc.mark_gap_message(message.id.clone());
                     }
                     let source = PartSource::at(message.id.clone(), index);
                     if render_part(acc, Some(source), part) {
@@ -1198,7 +1197,7 @@ fn render_seed_scope(
         }
     }
     if gap_scope && rendered {
-        acc.gap_rendered = true;
+        acc.mark_gap_rendered();
     }
     rendered
 }
@@ -1250,11 +1249,7 @@ fn render_seeded_part(
             acc.replace_reasoning_run(&source, full, started_at);
             acc.mark_reasoning();
         }
-        if let Some(seed) = acc.seed.as_mut()
-            && let Some(frontier) = seed.frontier.as_mut()
-        {
-            frontier.delivered_chars = full_len;
-        }
+        acc.record_seed_frontier_delivered(full_len);
         return !full.is_empty();
     }
     let (cut, before) = if held == 0 {
@@ -1299,11 +1294,7 @@ fn render_seeded_part(
             acc.mark_reasoning();
         }
     }
-    if let Some(seed) = acc.seed.as_mut()
-        && let Some(frontier) = seed.frontier.as_mut()
-    {
-        frontier.delivered_chars = full_len;
-    }
+    acc.record_seed_frontier_delivered(full_len);
     !suffix.is_empty()
 }
 

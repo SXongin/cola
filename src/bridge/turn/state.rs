@@ -1386,8 +1386,10 @@ pub(super) struct StreamAccumulator {
     /// the read being rendered, it makes everything at or before the cursor's
     /// frontier count as delivered — the frontier part renders only its
     /// undelivered suffix — while the live set resolves by identity against
-    /// the whole read. `None` on every ordinary accumulator.
-    pub(super) seed: Option<CursorSeed>,
+    /// the whole read. `None` on every ordinary accumulator. Private to this
+    /// module: seeded by [`Self::seed_projection`]; read through [`Self::seed`],
+    /// its frontier advanced through [`Self::record_seed_frontier_delivered`].
+    seed: Option<CursorSeed>,
     /// The orphan gap this accumulator owes (spec #561, review #569): the
     /// durable gap, rendered once by the first render read that can place it.
     /// The chain's Rendered Cursor keeps advancing past the delivered content
@@ -1398,18 +1400,22 @@ pub(super) struct StreamAccumulator {
     /// The messages whose parts the pending gap's own walk rendered (spec #561,
     /// review #569). Their content sits EARLIER in the read than the chain's
     /// confirmed frontier, so the chain cursor must never be built from their
-    /// entries — while they are exactly what the gap's progress reads.
-    pub(super) gap_messages: std::collections::HashSet<MessageId>,
+    /// entries — while they are exactly what the gap's progress reads. Private
+    /// to this module: grown by [`Self::mark_gap_message`]; read only inside
+    /// this module.
+    gap_messages: std::collections::HashSet<MessageId>,
     /// Whether this accumulator's timeline holds the pending gap's content
     /// (spec #561, review #569): the first confirmed write of a body that
     /// includes it clears the durable fact, so a crash before that write keeps
-    /// the gap recoverable.
-    pub(super) gap_rendered: bool,
+    /// the gap recoverable. Private to this module: set by
+    /// [`Self::mark_gap_rendered`]; read through [`Self::gap_rendered`].
+    gap_rendered: bool,
     /// Whether the gap's last render came from a TRUNCATED read (spec #561,
     /// review #569): the read is a prefix, so the gap's end may be beyond the
     /// page cap — its coverage can never be complete, and the gap stays owed
-    /// until a complete read shows its end.
-    pub(super) gap_truncated: bool,
+    /// until a complete read shows its end. Private to this module: set by
+    /// [`Self::set_gap_truncated`]; read only inside this module.
+    gap_truncated: bool,
     /// The chain's durable Wake Watermark as a floor (spec #561, review #569):
     /// every Wake at or below this `created_ms` was announced by an earlier
     /// card, so this accumulator's render neither re-inserts its completion
@@ -1958,6 +1964,48 @@ impl StreamAccumulator {
     /// Mark the neutral waiting line as shown (pushed exactly once).
     pub(super) fn mark_receive_hint_shown(&mut self) {
         self.receive_hint_shown = true;
+    }
+
+    /// The projection's render seed, if this accumulator carries one (spec #561,
+    /// ticket #563). Private to this module: seeded by [`Self::seed_projection`].
+    pub(super) fn seed(&self) -> Option<&CursorSeed> {
+        self.seed.as_ref()
+    }
+
+    /// Record how much of the seed's frontier part this render delivered
+    /// (spec #561, review #569): the seed's frontier part then renders only its
+    /// undelivered suffix on later reads. A no-op when the accumulator carries
+    /// no seed, or the seed no frontier.
+    pub(super) fn record_seed_frontier_delivered(&mut self, delivered_chars: usize) {
+        if let Some(seed) = self.seed.as_mut()
+            && let Some(frontier) = seed.frontier.as_mut()
+        {
+            frontier.delivered_chars = delivered_chars;
+        }
+    }
+
+    /// Record a message whose parts the pending gap's own walk rendered
+    /// (spec #561, review #569) — the chain cursor is never built from them.
+    pub(super) fn mark_gap_message(&mut self, message_id: MessageId) {
+        self.gap_messages.insert(message_id);
+    }
+
+    /// Whether this accumulator's timeline holds the pending gap's content
+    /// (spec #561, review #569). Private to this module: set by
+    /// [`Self::mark_gap_rendered`].
+    pub(super) fn gap_rendered(&self) -> bool {
+        self.gap_rendered
+    }
+
+    /// Mark the pending gap's content as rendered into this timeline.
+    pub(super) fn mark_gap_rendered(&mut self) {
+        self.gap_rendered = true;
+    }
+
+    /// Record whether the gap's last render came from a truncated read
+    /// (spec #561, review #569).
+    pub(super) fn set_gap_truncated(&mut self, truncated: bool) {
+        self.gap_truncated = truncated;
     }
 
     /// A waiting card's collect (ADR-0059, spec #405): the card yielded
