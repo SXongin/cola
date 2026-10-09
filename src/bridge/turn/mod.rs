@@ -1073,9 +1073,13 @@ impl Turn {
             // if tick.contact` above — the ending already rests on a full read
             // pair. So neither arm of this match needs its own `contact` check:
             // `Some(Settled)` is the same verdict re-observed, `None` is a
-            // failed re-check read, and a failed re-check deliberately leaves
-            // the settled decision standing (spec #602 review, finding A: false
-            // positive).
+            // failed re-check read (NOT an unreadable-status decision — that
+            // never returns `None` here), and a failed re-check deliberately
+            // leaves the settled decision standing. Adding a `contact` check to
+            // the `None` arm would let a transient read failure discard a valid
+            // Done and hand it to the lost-contact grace — a harmful behavior
+            // change, so the false positive is documented, not "fixed" (spec
+            // #602 review, finding A / pre-push finding 4).
             match self
                 .drain_tick(handles, self.drain_read_timeout_ms(handles))
                 .await
