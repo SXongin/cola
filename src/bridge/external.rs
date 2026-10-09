@@ -1107,9 +1107,31 @@ impl ExternalFlow {
         // The Feishu reply target: the Turn's own when the chain still knows it
         // (the user's message the exchange continues from), else an in-topic
         // anchor — the external path's fallback order. `None` means only a
-        // top-level send can reach the thread, which a split cannot do.
+        // top-level send could reach the thread, which a split cannot do.
         let reply_target = self.wake_reply_target(handles, sid, thread_key).await;
         let Some(reply_to) = reply_target else {
+            // The RESIDUAL floor must never drop content (#606): with no
+            // reachable target a split cannot open a card, so a Wake-less tail
+            // lands IN PLACE on the chain's existing card instead — no receipt,
+            // neutral labeling, the card's ending preserved. A genuine
+            // resumption Wake may still bail as today (a Fresh card without a
+            // chain has its own top-level path).
+            if residual
+                && Turn::render_residual_in_place(
+                    &handles.cards,
+                    &handles.sessions,
+                    &handles.backend,
+                    &handles.requests,
+                    sid,
+                    transcript,
+                )
+                .await
+            {
+                tracing::warn!(
+                    "wake continuation: session {sid} has no reachable reply target; its neutral residual tail lands in place"
+                );
+                return true;
+            }
             tracing::warn!(
                 "wake continuation: session {} has a chain but no reachable reply target",
                 sid
