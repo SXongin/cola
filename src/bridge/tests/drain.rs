@@ -700,41 +700,50 @@ async fn a_long_healthy_run_finishes_on_one_card() {
     // rendering the SAME card. A fixed total budget — the retired 10-minute
     // hand-off — would eventually split or 「出错」; the unbounded path never
     // does. The tiny cadence makes the tick count observable.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    //
+    // A fixed 10-minute budget cannot be waited out in a unit test, and the
+    // budget knob is gone (it no longer exists on the config surface), so the
+    // strongest portable guard is to SAMPLE the invariants at every tick across
+    // a stretch spanning many multiples of the grace: the guard is held for the
+    // WHOLE path (never released mid-run) and the run never posts a second Card,
+    // never opens a continuation, and never shows a hand-off header at ANY tick
+    // — not merely at the single end-of-stretch sample the old form took.
+    for sample in 0..15 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            app.inflight.lock().await.contains("ses_test"),
+            "sample {sample}: the guard must be held for the whole path, never released mid-run"
+        );
+        assert_eq!(
+            Turn::card_state(&app.cards_handle(), "ses_test").await,
+            Some(CardState::Streaming),
+            "sample {sample}: the card stays live while the session is readable and busy"
+        );
+        assert_eq!(
+            card_posts(&platform).await,
+            1,
+            "sample {sample}: exactly one Card may ever be posted: {:?}",
+            platform.calls.lock().await
+        );
+        assert!(
+            continuation_sends(&platform).await.is_empty(),
+            "sample {sample}: no continuation card may ever open: {:?}",
+            platform.calls.lock().await
+        );
+        assert!(
+            platform
+                .updated_cards()
+                .await
+                .iter()
+                .all(|c| !card_header(c).contains("部分完成") && !card_header(c).contains("出错")),
+            "sample {sample}: a long healthy run must show no hand-off artifact: {:?}",
+            platform.updated_cards().await
+        );
+    }
     let reads = backend.transcript_calls.lock().await.len();
     assert!(
         reads >= 20,
         "the drain must keep ticking while the session is readable (saw {reads} reads)"
-    );
-    assert_eq!(
-        Turn::card_state(&app.cards_handle(), "ses_test").await,
-        Some(CardState::Streaming),
-        "the card stays live while the session is readable and busy"
-    );
-    assert!(
-        app.inflight.lock().await.contains("ses_test"),
-        "the guard is held for the whole path"
-    );
-    // ONE card so far: the run was never handed off to a new card.
-    assert_eq!(
-        card_posts(&platform).await,
-        1,
-        "a long healthy run must stay on its one card: {:?}",
-        platform.calls.lock().await
-    );
-    assert!(
-        continuation_sends(&platform).await.is_empty(),
-        "no continuation card may open: {:?}",
-        platform.calls.lock().await
-    );
-    assert!(
-        platform
-            .updated_cards()
-            .await
-            .iter()
-            .all(|c| !card_header(c).contains("部分完成") && !card_header(c).contains("出错")),
-        "a long healthy run must show no hand-off artifact: {:?}",
-        platform.updated_cards().await
     );
 
     // It genuinely ends: the session goes idle and the merged drain finalizes Done.
