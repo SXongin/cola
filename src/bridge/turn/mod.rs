@@ -3438,7 +3438,7 @@ impl Turn {
         let mut live = cards.cards.lock().await;
         let card = live.get_mut(session_id)?;
         if *card.acc.card_state() != from
-            || card.acc.recovery_claimed
+            || card.acc.recovery_claimed()
             // A Wake continuation carries no question to re-ask (ADR-0059):
             // its card never offers Retry, so no click may claim one either.
             || card.acc.wake_continuation()
@@ -3456,7 +3456,7 @@ impl Turn {
             .prompt()
             .filter(|prompt| !prompt.is_empty())
             .map(str::to_string)?;
-        card.acc.recovery_claimed = true;
+        card.acc.take_recovery_claim();
         Some(TurnRecovery {
             session_id: session_id.to_string(),
             prompt,
@@ -3485,7 +3485,7 @@ impl Turn {
             return false;
         };
         if *card.acc.card_state() != crate::feishu::card::CardState::Waiting
-            || card.acc.recovery_claimed
+            || card.acc.recovery_claimed()
             || card.card_message_id.is_none()
             || !card.card_is_live
             || !card.pending_split.is_empty()
@@ -3493,7 +3493,7 @@ impl Turn {
         {
             return false;
         }
-        card.acc.recovery_claimed = true;
+        card.acc.take_recovery_claim();
         true
     }
 
@@ -4009,8 +4009,7 @@ impl Turn {
     /// live card's timer otherwise ticks the header once a second).
     pub(crate) async fn clear_phase(cards: &CardsHandle, session_id: &str) {
         if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
-            card.acc.current_phase = None;
-            card.acc.phase_started_at = None;
+            card.acc.reset_phase();
         }
     }
 
