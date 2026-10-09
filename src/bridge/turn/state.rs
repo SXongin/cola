@@ -785,7 +785,7 @@ impl CardSession {
     /// neither submitted nor re-attached leaves the terminal card's action
     /// working for a later click.
     pub(super) fn release_recovery_claim(&mut self) {
-        self.acc.recovery_claimed = false;
+        self.acc.release_recovery_claim();
     }
 
     /// The shared tail of a recovery re-arm (spec #391, #437): the ending's
@@ -1283,8 +1283,13 @@ pub(super) struct StreamAccumulator {
     /// click can arrive before the action's own marking lands; the claim is
     /// checked and set under the cards lock, so exactly one click runs the
     /// action — and the cleanup's pipeline releases it once done (a recovery
-    /// action keeps it, its card being terminal).
-    pub(super) recovery_claimed: bool,
+    /// action keeps it, its card being terminal). Private to this module: taken
+    /// by [`Self::take_recovery_claim`] (`Turn::claim_recovery` and
+    /// `Turn::claim_cleanup`) and released by [`Self::release_recovery_claim`]
+    /// (`CardSession::release_recovery_claim`, the `Turn::release_recovery_claim`
+    /// / `Turn::release_cleanup_claim` path, and [`Self::continue_on_new_card`]);
+    /// read through [`Self::recovery_claimed`].
+    recovery_claimed: bool,
     /// The id this turn's user message carries (`msg_cola_…`, ADR-0026), so a
     /// later error-card retry reuses it and the server deduplicates by id.
     /// Private to this module: set by [`Self::set_cola_message_id`]; read
@@ -1515,11 +1520,19 @@ pub(super) struct StreamAccumulator {
     receive_hint_shown: bool,
     /// ADR-0014: progress/liveness signals for the header.
     /// The active header phase; None when the turn is not actively working
-    /// (Done/Error/Continued show no timer).
-    pub(super) current_phase: Option<HeaderPhase>,
+    /// (Done/Error/Continued show no timer). Private to this module: starts at
+    /// [`Self::new`] (Loading), moved only by [`Self::refresh_phase`] (it sets
+    /// the phase on a change, clearing it to `None` when the active phase ends)
+    /// and cleared by [`Self::reset_phase`] (the Error-cleared restore and the
+    /// Wake continuation clear before refreshing, so the clock always restarts);
+    /// read inside this module by [`Self::refresh_phase`] and, as a
+    /// `#[cfg(test)]` read, through [`Self::current_phase`].
+    current_phase: Option<HeaderPhase>,
     /// When the current phase started (wall clock); the header timer counts up
-    /// from here.
-    pub(super) phase_started_at: Option<std::time::Instant>,
+    /// from here. Private to this module: starts at [`Self::new`], set by
+    /// [`Self::refresh_phase`], cleared by [`Self::reset_phase`]; read only by
+    /// [`Self::header_progress`] (no external reader).
+    phase_started_at: Option<std::time::Instant>,
 }
 
 impl StreamAccumulator {
@@ -1761,13 +1774,33 @@ impl StreamAccumulator {
     }
 
     /// Reset the phase timer whenever the active header phase changes.
-    /// Idempotent — safe to call after every mutation.
+    /// Idempotent — safe to call after every mutation. This and
+    /// [`Self::reset_phase`] are the only production movers of the phase timer.
     pub(super) fn refresh_phase(&mut self) {
         let new = self.active_phase();
         if new != self.current_phase {
             self.current_phase = new;
             self.phase_started_at = Some(std::time::Instant::now());
         }
+    }
+
+    /// Reset the phase timer to nothing — the reset half of the phase intent: a
+    /// caller about to start a fresh phase clears first so [`Self::refresh_phase`]
+    /// always restarts the clock (it resets only on a change). Private to this
+    /// module: production writers are [`Self::restore_live_state`] (an Error was
+    /// cleared while the run continued) and [`Self::continue_on_new_card`] (a
+    /// Wake continuation begins on a new card), both followed by
+    /// [`Self::refresh_phase`]; the `#[cfg(test)]` `Turn::clear_phase` fixture
+    /// (a frozen header) calls it alone.
+    pub(super) fn reset_phase(&mut self) {
+        self.current_phase = None;
+        self.phase_started_at = None;
+    }
+
+    /// The active header phase — a test read of the phase timer's phase.
+    #[cfg(test)]
+    pub(super) fn current_phase(&self) -> Option<&HeaderPhase> {
+        self.current_phase.as_ref()
     }
 
     /// Restore a live card after its Error was cleared (spec #391, ticket
@@ -1787,7 +1820,7 @@ impl StreamAccumulator {
         // The Error state held the active phase at None, but the phase could
         // still be Some from before the failure: clear first so the timer is
         // always restarted (`refresh_phase` only resets on a change).
-        self.current_phase = None;
+        self.reset_phase();
         self.refresh_phase();
     }
 
@@ -2140,6 +2173,32 @@ impl StreamAccumulator {
         self.receive_hint_shown = true;
     }
 
+    /// Whether this card's terminal recovery action — spec #391's Error retry,
+    /// #437's Unreceived 重新发起 — or its waiting-card cleanup (spec #588,
+    /// #590) has been claimed. Private to this module: taken by
+    /// [`Self::take_recovery_claim`], released by [`Self::release_recovery_claim`].
+    pub(super) fn recovery_claimed(&self) -> bool {
+        self.recovery_claimed
+    }
+
+    /// Take the recovery claim: exactly one click runs the action (spec #391,
+    /// #437, #588). Production writers: `Turn::claim_recovery` and
+    /// `Turn::claim_cleanup`, each after checking [`Self::recovery_claimed`]
+    /// under the cards lock so a double-click cannot claim twice.
+    pub(super) fn take_recovery_claim(&mut self) {
+        self.recovery_claimed = true;
+    }
+
+    /// Give an unused recovery claim back: a click that neither submitted nor
+    /// re-attached leaves the terminal card's action working for a later click
+    /// (spec #391, #437). Production writers:
+    /// `CardSession::release_recovery_claim` (the `Turn::release_recovery_claim`
+    /// / `Turn::release_cleanup_claim` path) and [`Self::continue_on_new_card`]
+    /// (a fresh card starts unclaimed).
+    pub(super) fn release_recovery_claim(&mut self) {
+        self.recovery_claimed = false;
+    }
+
     /// The projection's render seed, if this accumulator carries one (spec #561,
     /// ticket #563). Private to this module: seeded by [`Self::seed_projection`].
     pub(super) fn seed(&self) -> Option<&CursorSeed> {
@@ -2261,13 +2320,13 @@ impl StreamAccumulator {
     pub(super) fn continue_on_new_card(&mut self) {
         self.error = None;
         self.prompt = None;
-        self.recovery_claimed = false;
+        self.release_recovery_claim();
         self.mark_wake_continuation();
         self.card_fallback = CardFallback::None;
         self.card_state = CardState::Loading;
         // The previous phase ended with the card; `refresh_phase` only resets
         // on a change, so clear first for a fresh timer.
-        self.current_phase = None;
+        self.reset_phase();
         self.refresh_phase();
     }
 
@@ -6111,7 +6170,7 @@ mod tests {
         acc.card_state = CardState::Stopped;
         acc.refresh_phase();
         assert_eq!(acc.active_phase(), None);
-        assert_eq!(acc.current_phase, None);
+        assert_eq!(acc.current_phase(), None);
     }
 
     /// The one ending application (spec #538, #539): every disposition stamps

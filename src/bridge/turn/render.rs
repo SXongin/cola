@@ -2061,7 +2061,7 @@ mod tests {
 
         let mut acc = StreamAccumulator::new("test");
         acc.turn_anchor = Some(turn_anchor(0));
-        assert_eq!(acc.current_phase, Some(HeaderPhase::Loading));
+        assert_eq!(acc.current_phase(), Some(&HeaderPhase::Loading));
 
         let transcript = SessionTranscript::new(vec![message(
             "a1",
@@ -2070,7 +2070,7 @@ mod tests {
         )]);
 
         assert!(render_new_turn_parts(&mut acc, &transcript));
-        assert_eq!(acc.current_phase, Some(HeaderPhase::Streaming));
+        assert_eq!(acc.current_phase(), Some(&HeaderPhase::Streaming));
     }
 
     /// Every step is its own assistant message, and an in-flight step carries
