@@ -2668,9 +2668,16 @@ impl Turn {
     /// (the chain's residual card, with no live renderer owning it) is
     /// re-checked under the write lock, the card renders the read WITHOUT its
     /// own flush (the ending restore must ride the same write), and the flush
-    /// that carries the tail is the caller's carrier. [`SplitPolicy::Forbid`]:
-    /// the tail must never open a second card, so an over-budget slice stays on
-    /// the one card rather than splitting.
+    /// that carries the tail is the caller's carrier.
+    ///
+    /// [`SplitPolicy::Allow`]: a tail that pushes the neutral card past
+    /// Feishu's size limit is finalized and its remainder carried onto a new
+    /// Card (the one allowed mid-request continuation besides a genuine
+    /// resumption), so no content is ever built unsplit and lost to a refused
+    /// oversized PATCH. The split stays NEUTRAL: no 「🔔 已恢复执行」 receipt and
+    /// no Wake 承接 line (the residual has no Wake, so no `pending_split`
+    /// receipt is queued) — "at most one residual Card per request" bounds the
+    /// neutral RECEIPT card, not a size-split continuation.
     pub(crate) async fn render_residual_in_place(
         cards: &CardsHandle,
         sessions: &SessionsHandle,
@@ -2715,9 +2722,10 @@ impl Turn {
             card.acc.error = ending_error;
             card.acc.refresh_phase();
         }
-        // `SplitPolicy::Forbid`: the tail lands on the one residual card and
-        // never opens a second.
-        flush::flush_card_locked(cards, session_id, flush::SplitPolicy::Forbid)
+        // `SplitPolicy::Allow`: an over-budget tail finalizes this card and
+        // continues on a new one — the size split, not a resumption. With no
+        // queued split, no receipt is pushed, so the continuation stays neutral.
+        flush::flush_card_locked(cards, session_id, flush::SplitPolicy::Allow)
             .await
             .accepted()
     }
