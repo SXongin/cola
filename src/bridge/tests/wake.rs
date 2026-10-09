@@ -1968,10 +1968,13 @@ async fn content_a_finalized_card_missed_renders_on_a_neutral_card() {
 }
 
 /// Acceptance 2 of #606: the neutral residual floor fires AT MOST ONCE per
-/// request. Once the chain has posted its one neutral card, a later late tail
-/// cannot post a second — the chain's marker suppresses it. (The same-snapshot
-/// rule #604 keeps this whole path near-unreachable, so the floor's overflow
-/// is rare by construction.)
+/// request, and the content is never dropped. Once the chain has posted its one
+/// neutral card, a later late tail cannot post a second — it renders IN PLACE
+/// on that same neutral card instead, keeping the ending the card already
+/// carries (ADR-0074: a terminal Card's recorded ending is never rewritten, but
+/// the content a user is owed is never dropped either). (The same-snapshot rule
+/// #604 keeps this whole path near-unreachable, so the floor's overflow is rare
+/// by construction.)
 #[tokio::test]
 async fn a_second_late_tail_does_not_post_a_second_neutral_card() {
     let _wd = test_work_dir();
@@ -2018,8 +2021,8 @@ async fn a_second_late_tail_does_not_post_a_second_neutral_card() {
         platform.calls.lock().await
     );
 
-    // A later tail arrives after that neutral card settled: the marker must
-    // suppress a second neutral card.
+    // A later tail arrives after that neutral card settled: it must render IN
+    // PLACE on the one neutral card — never a second card, never dropped.
     script_transcript(
         &backend,
         vec![
@@ -2033,13 +2036,37 @@ async fn a_second_late_tail_does_not_post_a_second_neutral_card() {
         ],
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_card_update(
+        &platform,
+        "the later tail lands on the one neutral card",
+        CardUpdates::Latest,
+        |card| card_text(card).contains(RESIDUAL_LEAD) && card_text(card).contains("又晚来的一段。"),
+    )
+    .await;
 
     assert_eq!(
         card_posts(&platform).await,
         posts_before + 1,
         "the residual floor posts exactly one neutral card per request: {:?}",
         platform.calls.lock().await
+    );
+    // The one neutral card carries BOTH late tails: the second is rendered in
+    // place, never dropped and never moved onto a second card. It keeps the
+    // ending it already recorded (ADR-0074) — no resumption header, no rewrite.
+    let latest = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_text(&latest).contains(RESIDUAL_LEAD)
+            && card_text(&latest).contains("收尾时补上的一段。")
+            && card_text(&latest).contains("又晚来的一段。"),
+        "the second late tail lands on the same neutral card: {latest}"
+    );
+    assert!(
+        card_header(&latest).contains("✅"),
+        "the neutral card keeps its recorded ending: {latest}"
+    );
+    assert!(
+        !card_header(&latest).contains("恢复执行") && !card_header(&latest).contains("继续处理中"),
+        "a late tail must not re-open the card as a resumption: {latest}"
     );
 }
 

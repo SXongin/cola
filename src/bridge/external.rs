@@ -941,6 +941,29 @@ impl ExternalFlow {
                 )
                 .await
             }
+            WakeContinuation::RenderResidualInPlace => {
+                // The one neutral residual card already posted: a later
+                // Wake-less tail lands on it in place — no second card, no
+                // receipt, no resumption — keeping the ending the card carries.
+                // It is a card write, so it is this pass's carrier.
+                if Turn::render_residual_in_place(
+                    &handles.cards,
+                    &handles.sessions,
+                    &handles.backend,
+                    &handles.requests,
+                    sid,
+                    transcript,
+                )
+                .await
+                {
+                    tracing::info!(
+                        "wake continuation: session {sid} lands a late tail on its one neutral residual card"
+                    );
+                    true
+                } else {
+                    false
+                }
+            }
             WakeContinuation::Fresh { anchor } => {
                 // The Feishu reply target, the split path's own fallback order:
                 // a restart leaves no reply target behind, and only a top-level
