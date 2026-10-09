@@ -140,16 +140,11 @@ fn renders_part(acc: &StreamAccumulator, part: &Part) -> bool {
         // with the full content. Only render once they have content, otherwise
         // we'd freeze the placeholder version.
         Part::Text(text) => {
-            !text.text.is_empty()
-                && !acc
-                    .rendered_parts
-                    .contains(&RenderedPart::Text(text.text.clone()))
+            !text.text.is_empty() && !acc.has_rendered_part(&RenderedPart::Text(text.text.clone()))
         }
         Part::Reasoning(reasoning) => {
             !reasoning.text.is_empty()
-                && !acc
-                    .rendered_parts
-                    .contains(&RenderedPart::Reasoning(reasoning.text.clone()))
+                && !acc.has_rendered_part(&RenderedPart::Reasoning(reasoning.text.clone()))
         }
         Part::Tool(call) => {
             // The current panel IS the call's rendered revision: an update
@@ -193,7 +188,7 @@ fn render_part(acc: &mut StreamAccumulator, source: Option<PartSource>, part: &P
     }
     match part {
         Part::Text(text) => {
-            acc.rendered_parts.insert(RenderedPart::Text(text.text.clone()));
+            acc.mark_rendered(RenderedPart::Text(text.text.clone()));
             if let Some(rewritten) = source
                 .as_ref()
                 .filter(|source| acc.source_rewritten(source, &text.text))
@@ -209,8 +204,7 @@ fn render_part(acc: &mut StreamAccumulator, source: Option<PartSource>, part: &P
             acc.mark_streaming();
         }
         Part::Reasoning(reasoning) => {
-            acc.rendered_parts
-                .insert(RenderedPart::Reasoning(reasoning.text.clone()));
+            acc.mark_rendered(RenderedPart::Reasoning(reasoning.text.clone()));
             if let Some(rewritten) = source
                 .as_ref()
                 .filter(|source| acc.source_rewritten(source, &reasoning.text))
@@ -854,10 +848,10 @@ pub(super) fn render_turn_parts(acc: &mut StreamAccumulator, transcript: &Sessio
         // its messages stay suppressed, so the rebuilt card streams only the
         // new attempt instead of replaying the old window. Every message this
         // attempt examines is recorded, so a later retry can suppress it too.
-        if acc.baseline.suppressed.contains(message.id.as_str()) {
+        if acc.baseline_suppresses(message.id.as_str()) {
             continue;
         }
-        acc.baseline.observed.insert(message.id.as_str().to_string());
+        acc.observe_message(message.id.as_str());
         // Capture the answering model + token usage for the card footer.
         capture_footer_model(acc, message);
         // An in-flight step is its own assistant message and carries all-zero
@@ -895,7 +889,7 @@ pub(super) fn render_turn_parts(acc: &mut StreamAccumulator, transcript: &Sessio
                     // guard included) apply to it exactly as they did before
                     // the seed existed.
                     if let Part::Tool(call) = part {
-                        acc.seeded_calls.remove(&call.identity.call_id);
+                        acc.retire_seeded_call(&call.identity.call_id);
                     }
                     // The part's own position identifies it for the Rendered
                     // Cursor frontier (spec #561): parts carry no id (AGENTS.md
@@ -1016,7 +1010,7 @@ fn render_pending_gap(
                     // panel again: it leaves the display-only seeded set,
                     // exactly as in the accumulator's own window.
                     if let Part::Tool(call) = part {
-                        acc.seeded_calls.remove(&call.identity.call_id);
+                        acc.retire_seeded_call(&call.identity.call_id);
                     }
                     let source = PartSource::at(message.id.clone(), index);
                     if render_part(acc, Some(source), part) {
@@ -1175,7 +1169,7 @@ fn render_seed_scope(
                     // again: it leaves the display-only seeded set, exactly as
                     // in the accumulator's own window.
                     if let Part::Tool(call) = part {
-                        acc.seeded_calls.remove(&call.identity.call_id);
+                        acc.retire_seeded_call(&call.identity.call_id);
                     }
                     if gap_scope {
                         acc.mark_gap_message(message.id.clone());
@@ -1311,7 +1305,7 @@ fn render_seeded_part(
 /// settled card omits it, because no renderer will ever update that `⏳` again.
 fn resolve_seeded_calls(acc: &mut StreamAccumulator, transcript: &SessionTranscript) -> bool {
     let mut rendered = false;
-    let seeded: Vec<String> = acc.seeded_calls.iter().cloned().collect();
+    let seeded = acc.seeded_call_ids();
     for call_id in seeded {
         // The call's typed position — the seeded panel keeps it, so once it
         // settles its timeline entry can become the Rendered Cursor frontier
@@ -1327,7 +1321,7 @@ fn resolve_seeded_calls(acc: &mut StreamAccumulator, transcript: &SessionTranscr
             rendered = true;
         }
         if acc.tool_settled(&call_id) {
-            acc.seeded_calls.remove(&call_id);
+            acc.retire_seeded_call(&call_id);
         }
     }
     rendered
@@ -1391,7 +1385,7 @@ pub(super) fn renders_new_content(
     anchor: &TurnAnchor,
 ) -> bool {
     transcript.turn_for_user(anchor).messages.iter().any(|message| {
-        !acc.baseline.suppressed.contains(message.id.as_str())
+        !acc.baseline_suppresses(message.id.as_str())
             && message
                 .parts
                 .iter()
@@ -1530,7 +1524,7 @@ async fn render_and_flush_inner(
     let (changed, header_changed, new_parts, text_len, reasoning_len, anchor, mut plans) = {
         let mut live = cards.cards.lock().await;
         let card = live.get_mut(session_id)?;
-        let before = card.acc.rendered_parts.len();
+        let before = card.acc.rendered_part_count();
         // The anchor this read establishes (or already carries) is the scope
         // both the parts and the completion entries place against: capture it
         // BEFORE planning the entries, so their output reads can run outside
@@ -1566,7 +1560,7 @@ async fn render_and_flush_inner(
         (
             changed,
             header_changed,
-            card.acc.rendered_parts.len() - before,
+            card.acc.rendered_part_count() - before,
             card.acc.text().len(),
             card.acc.reasoning().len(),
             anchor,
@@ -2322,7 +2316,7 @@ Index: /x/src/main.rs
         assert!(render_new_turn_parts(&mut acc, &transcript));
         assert!(acc.reasoning().contains("Let me think"));
         assert_eq!(acc.tools().len(), 1);
-        assert_eq!(acc.rendered_parts.len(), 1);
+        assert_eq!(acc.rendered_part_count(), 1);
         assert!(!acc.text().contains("question"));
         assert!(!acc.reasoning().contains("old reasoning"));
 
@@ -2673,7 +2667,7 @@ Index: /x/src/main.rs
         assert!(render_new_turn_parts(&mut acc, &settled));
         assert!(!acc.tools()["call_sleep"].is_live());
         assert!(
-            acc.seeded_calls.is_empty(),
+            acc.seeded_calls().is_empty(),
             "a settled seeded call leaves the display-only live set"
         );
         let text = card_text(&acc.build_card_with_split().0);
@@ -2946,11 +2940,11 @@ Index: /x/src/main.rs
             seed_live_calls(&mut acc, &transcript(ToolStatus::Running, None), &orphan),
             1
         );
-        assert!(acc.seeded_calls.contains("call_sleep"));
+        assert!(acc.seeded_calls().contains("call_sleep"));
 
         render_new_turn_parts(&mut acc, &transcript(ToolStatus::Running, None));
         assert!(
-            acc.seeded_calls.is_empty(),
+            acc.seeded_calls().is_empty(),
             "the Turn's own window render owns the call now, not the seed"
         );
     }
@@ -2988,7 +2982,7 @@ Index: /x/src/main.rs
         );
         let mut acc = StreamAccumulator::new("proj");
         acc.seed_projection(&RenderedCursor::default(), seed);
-        assert!(acc.tools().is_empty() && acc.seeded_calls.is_empty());
+        assert!(acc.tools().is_empty() && acc.seeded_calls().is_empty());
     }
 
     /// A killed run's seeded call does not outlive the Turn (spec #561): while
@@ -3850,7 +3844,7 @@ Index: /x/src/main.rs
         let settled = timeline(ToolStatus::Completed, Some("done"));
         assert!(render_new_turn_parts(&mut acc, &settled));
         assert!(
-            acc.seeded_calls.is_empty(),
+            acc.seeded_calls().is_empty(),
             "a settled live-set call leaves the display-only carry"
         );
         let text_after = card_text(&acc.build_card_with_info().card);
@@ -3911,14 +3905,14 @@ Index: /x/src/main.rs
 
         assert!(render_new_turn_parts(&mut acc, &running));
         assert!(
-            acc.seeded_calls.contains("call_1"),
+            acc.seeded_calls().contains("call_1"),
             "the delivered running call stays in the identity carry even before the frontier"
         );
 
         // The call settles: the carry still resolves it, exactly once.
         let settled = timeline(ToolStatus::Completed, Some("done"));
         assert!(render_new_turn_parts(&mut acc, &settled));
-        assert!(acc.seeded_calls.is_empty(), "the settled call leaves the carry");
+        assert!(acc.seeded_calls().is_empty(), "the settled call leaves the carry");
         let text = card_text(&acc.build_card_with_info().card);
         assert_eq!(text.matches("done").count(), 1, "settled once: {text}");
         assert!(!render_new_turn_parts(&mut acc, &settled));

@@ -1099,8 +1099,14 @@ pub(super) struct StreamAccumulator {
     /// settled/end-of-turn card omits a still-running one, so no `⏳` outlives
     /// the Turn) and never counts as the Turn's own unfinished tools for the
     /// settle guard. In-memory only, never durable; empty for every card that
-    /// did not take over an orphan.
-    pub(super) seeded_calls: std::collections::HashSet<String>,
+    /// did not take over an orphan. Private to this module: seeded whole by
+    /// [`Self::seed_projection`] (a takeover's projection seed) and each id
+    /// retired by [`Self::retire_seeded_call`] (the renderer's own-window, gap
+    /// and scope walks and the reconciliation); read through
+    /// [`Self::seeded_call_ids`] and, inside this module, [`Self::has_live_tool`]
+    /// and [`Self::omitted_live_seeded`], with the `#[cfg(test)]`
+    /// [`Self::seeded_calls`] as the test read.
+    seeded_calls: std::collections::HashSet<String>,
     /// The latest `todowrite` panel of this turn, rendered as a card-TAIL
     /// status section instead of a timeline row. A timeline row would freeze on
     /// whichever card the call landed on: once that card finalizes (a long
@@ -1315,15 +1321,20 @@ pub(super) struct StreamAccumulator {
     /// once they have content. Tool panels are deduped separately: the current
     /// panel in `tools` / `todo_panel` IS the tool's rendered revision, so a
     /// re-render happens exactly when the typed call's visible content changed
-    /// (including a `todowrite` list rewritten with same-length items).
-    pub(super) rendered_parts: std::collections::HashSet<RenderedPart>,
+    /// (including a `todowrite` list rewritten with same-length items). Private
+    /// to this module: written only by [`Self::mark_rendered`] (the renderer's
+    /// `render_part`); read through [`Self::has_rendered_part`],
+    /// [`Self::rendered_part_count`] and [`Self::has_rendered_content`].
+    rendered_parts: std::collections::HashSet<RenderedPart>,
     /// Text/reasoning content a SEEDED earlier card already delivered, keyed by
     /// the message it appeared in (spec #561, review #569): the seed's
     /// at/before-frontier parts and the frontier part itself, marked by
     /// [`Self::mark_delivered_part`]. Message-scoped on purpose — the content
     /// in `rendered_parts` would swallow a NEW Turn's own part that happens to
-    /// have identical text, and the race must render the new answer.
-    pub(super) seeded_delivered: std::collections::HashSet<(crate::backend::MessageId, RenderedPart)>,
+    /// have identical text, and the race must render the new answer. Private to
+    /// this module: written only by [`Self::mark_delivered_part`]; read through
+    /// [`Self::part_seeded_delivered`] and [`Self::has_rendered_content`].
+    seeded_delivered: std::collections::HashSet<(crate::backend::MessageId, RenderedPart)>,
     /// Monotonic count of observable progress this accumulator has produced
     /// (#457): bumped by every render stage that changes content, a tool
     /// panel revision, a live fragment, ledger rows, or context tokens —
@@ -1337,8 +1348,12 @@ pub(super) struct StreamAccumulator {
     /// Assistant message ids this accumulator must NOT render and the ones it
     /// has observed — the retry render baseline (#387). Kept as one fact: the
     /// two sets are seeded and consumed together, and only this type's docs
-    /// carry the invariant.
-    pub(super) baseline: AttemptBaseline,
+    /// carry the invariant. Private to this module: `suppressed` is set by
+    /// [`Self::carry_attempt_baseline`] (a retry carries the prior attempt's
+    /// frontier) and `observed` is grown by [`Self::observe_message`] (each
+    /// render read records the message it examined); read through
+    /// [`Self::baseline_suppresses`].
+    baseline: AttemptBaseline,
     /// Whether this card continues its Turn after a Wake (ADR-0059): the
     /// chain moved on a new card after the previous one yielded or ended, so
     /// this card carries no question to re-ask — an Error ending never offers
@@ -1638,6 +1653,68 @@ impl StreamAccumulator {
             || !self.seeded_delivered.is_empty()
             || !self.tools.is_empty()
             || self.todo_panel.is_some()
+    }
+
+    /// Whether this part's content was already rendered into the card — the
+    /// content-keyed dedup read (`renders_part` in the renderer), so equal
+    /// content never renders twice (parts carry no id, AGENTS.md #9).
+    pub(super) fn has_rendered_part(&self, part: &RenderedPart) -> bool {
+        self.rendered_parts.contains(part)
+    }
+
+    /// Mark one text/reasoning part's content as rendered into the card — the
+    /// renderer's write, guarded by its `renders_part` dedup check (spec #298),
+    /// so a later poll carrying the same content dedupes instead of doubling
+    /// it. Production writer: `render_part` (text and reasoning parts).
+    pub(super) fn mark_rendered(&mut self, part: RenderedPart) {
+        self.rendered_parts.insert(part);
+    }
+
+    /// How many text/reasoning parts the card has rendered — the render pass's
+    /// new-part count and the final-render log's tally.
+    pub(super) fn rendered_part_count(&self) -> usize {
+        self.rendered_parts.len()
+    }
+
+    /// The seeded live-set ids, snapshotted for the reconciliation walk
+    /// (spec #561): the renderer resolves each id against the whole transcript
+    /// while it retires the settled ones, so it iterates a copy rather than the
+    /// set it mutates.
+    pub(super) fn seeded_call_ids(&self) -> Vec<String> {
+        self.seeded_calls.iter().cloned().collect()
+    }
+
+    /// Retire one id from the seeded live set (spec #561): the call settled, or
+    /// the Turn's own window rendered it, so it is an ordinary panel again and
+    /// the display-only omission no longer applies to it. Production writers:
+    /// the renderer's own-window, gap and scope walks (`render_turn_parts`,
+    /// `render_pending_gap`, `render_seed_scope`) and the reconciliation
+    /// (`resolve_seeded_calls`).
+    pub(super) fn retire_seeded_call(&mut self, call_id: &str) {
+        self.seeded_calls.remove(call_id);
+    }
+
+    /// The seeded live-set ids — a test read of the identity carry the
+    /// projection seed resolved.
+    #[cfg(test)]
+    pub(super) fn seeded_calls(&self) -> &std::collections::HashSet<String> {
+        &self.seeded_calls
+    }
+
+    /// Whether `message_id` belongs to an EARLIER attempt and must not render
+    /// (#387) — the retry baseline's suppression read, shared by the render
+    /// window (`render_turn_parts`) and the content-diff probe
+    /// (`renders_new_content`).
+    pub(super) fn baseline_suppresses(&self, message_id: &str) -> bool {
+        self.baseline.suppressed.contains(message_id)
+    }
+
+    /// Record that THIS attempt has examined `message_id` (#387): a later retry
+    /// unions the observed set into its suppressed frontier, so the rebuilt
+    /// card streams only the new attempt. The render window's one observation
+    /// write (`render_turn_parts`).
+    pub(super) fn observe_message(&mut self, message_id: &str) {
+        self.baseline.observed.insert(message_id.to_string());
     }
 
     /// Whether any live Tool Panel the Turn owns is unfinished — a call whose

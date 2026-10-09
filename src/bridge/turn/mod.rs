@@ -987,7 +987,7 @@ impl Turn {
                     acc.text().len(),
                     acc.reasoning().len(),
                     acc.tool_count(),
-                    acc.rendered_parts.len(),
+                    acc.rendered_part_count(),
                     acc.error().unwrap_or("none"),
                 );
             }
@@ -4300,7 +4300,7 @@ mod tests {
             Turn::apply_orphan_seed(&mut live, "ses_test", "om_successor", &cursor, seed.clone()),
             "the read's own successor is seeded"
         );
-        assert!(live["ses_test"].acc.seeded_calls.contains("call_sleep"));
+        assert!(live["ses_test"].acc.seeded_calls().contains("call_sleep"));
 
         // Another Turn replaced the card session during the read: nothing is
         // seeded into the newer accumulator.
@@ -4315,7 +4315,7 @@ mod tests {
             !Turn::apply_orphan_seed(&mut live, "ses_test", "om_successor", &cursor, seed),
             "a replaced successor receives nothing"
         );
-        assert!(live["ses_test"].acc.seeded_calls.is_empty());
+        assert!(live["ses_test"].acc.seeded_calls().is_empty());
         assert!(live["ses_test"].acc.tools().is_empty());
     }
 
