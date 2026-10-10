@@ -68,6 +68,17 @@ impl FileContent {
     pub fn record_line(&self) -> String {
         format!("📎 {} · {} · {}", self.name, self.mime, human_size(self.size))
     }
+
+    /// The record lines for `files`, newline-joined — the one body fragment
+    /// wherever a message's File Contents are shown (ADR-0076). An empty
+    /// string when there are none, so a caller may append it unconditionally.
+    pub fn record_lines<'a>(files: impl IntoIterator<Item = &'a FileContent>) -> String {
+        files
+            .into_iter()
+            .map(Self::record_line)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 /// A byte count as a human-readable size: exact bytes below 1 KiB, otherwise
@@ -178,5 +189,22 @@ mod tests {
             size: 1_258_291,
         };
         assert_eq!(large.record_line(), "📎 report.pdf · application/pdf · 1.2 MB");
+    }
+
+    /// The humanizer's 1 KiB switch: exactly the byte before stays exact bytes,
+    /// and 1024 B becomes `1.0 KB` in the binary unit (ADR-0076).
+    #[test]
+    fn the_size_humanizer_switches_at_the_kib_boundary() {
+        let line = |size: u64| {
+            FileContent {
+                uri: String::new(),
+                mime: "image/png".into(),
+                name: "shot.png".into(),
+                size,
+            }
+            .record_line()
+        };
+        assert_eq!(line(1023), "📎 shot.png · image/png · 1023 B");
+        assert_eq!(line(1024), "📎 shot.png · image/png · 1.0 KB");
     }
 }
