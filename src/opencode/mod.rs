@@ -34,7 +34,8 @@ mod wire;
 use std::sync::Arc;
 
 use crate::backend::{
-    Backend, BackendDirectory, ChildEvidence, DirectoryBackend, PromptSkill, SessionTranscript, TaskRuntime,
+    Backend, BackendDirectory, ChildEvidence, DirectoryBackend, PromptSkill, SessionTranscript, SkillInfo,
+    TaskRuntime,
 };
 use crate::error::Result;
 use async_trait::async_trait;
@@ -208,6 +209,10 @@ impl Backend for OpenCodeBackend {
 
     async fn list_agents(&self) -> Vec<AgentInfo> {
         OpenCodeBackend::list_agents(self).await
+    }
+
+    async fn list_skills(&self) -> Vec<SkillInfo> {
+        OpenCodeBackend::list_skills(self).await
     }
 
     async fn list_models(&self) -> Vec<ProviderModels> {

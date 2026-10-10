@@ -1211,6 +1211,12 @@ pub struct MockBackend {
     pub list_sessions_calls: Arc<std::sync::atomic::AtomicUsize>,
     /// Available agents served by `list_agents` (for the `/agent` card).
     pub agents: Vec<opencode::types::AgentInfo>,
+    /// Registered skills served by `list_skills` (for the `/skill` picker and
+    /// the `/skill <id>` resolution, spec #652, ticket #656).
+    pub skills: Vec<crate::backend::SkillInfo>,
+    /// Counts `list_skills` calls (a `/skill` dispatch must read the list
+    /// exactly once).
+    pub list_skills_calls: Arc<std::sync::atomic::AtomicUsize>,
     /// Available models grouped by provider, served by `list_models` (for the
     /// `/model` card).
     pub provider_models: Vec<opencode::types::ProviderModels>,
@@ -1449,6 +1455,8 @@ impl MockBackend {
             fail_title_patch: false,
             list_sessions_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             agents: Vec::new(),
+            skills: Vec::new(),
+            list_skills_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             provider_models: Vec::new(),
             default_model: None,
             context_window: Some(100_000),
@@ -1595,6 +1603,13 @@ impl MockBackend {
     /// Scenario: `list_agents` serves `agents`.
     pub(crate) fn with_agents(&mut self, agents: Vec<opencode::types::AgentInfo>) -> &mut Self {
         self.agents = agents;
+        self
+    }
+
+    /// Scenario: `list_skills` serves `skills` (the `/skill` picker and the
+    /// `/skill <id>` resolution, spec #652, ticket #656).
+    pub(crate) fn with_skills(&mut self, skills: Vec<crate::backend::SkillInfo>) -> &mut Self {
+        self.skills = skills;
         self
     }
 
@@ -2504,6 +2519,12 @@ impl crate::backend::Backend for MockBackend {
 
     async fn list_agents(&self) -> Vec<opencode::types::AgentInfo> {
         self.agents.clone()
+    }
+
+    async fn list_skills(&self) -> Vec<crate::backend::SkillInfo> {
+        self.list_skills_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.skills.clone()
     }
 
     async fn list_models(&self) -> Vec<opencode::types::ProviderModels> {
