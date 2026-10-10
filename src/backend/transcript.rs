@@ -443,6 +443,21 @@ impl SessionTranscript {
         }
     }
 
+    /// The skills the Turn `anchor` scopes attached, gathered from EVERY user
+    /// message that belongs to it (spec #652, ticket #655): the anchor's own
+    /// message AND any **Supplement** merged into the running turn. Membership
+    /// is the same [`belongs_to_turn`] rule the render and ledger use, so a
+    /// user message outside the Turn's span contributes nothing; the order is
+    /// transcript order (the anchor first, then its Supplements). Empty for a
+    /// generation whose user messages record no skill attachment (V1).
+    pub fn turn_user_skills(&self, anchor: &TurnAnchor) -> Vec<MessageSkill> {
+        self.messages
+            .iter()
+            .filter(|message| message.role == MessageRole::User && belongs_to_turn(message, anchor))
+            .flat_map(|message| message.skills.iter().cloned())
+            .collect()
+    }
+
     /// The single settle decision every Turn ending uses (ADR-0059, ADR-0062):
     /// the drain, the out-of-turn follow, the unreceived watch and the Wake
     /// continuation all read a Turn's ending from here.
