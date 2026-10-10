@@ -75,9 +75,11 @@ than adding a cola-side allow-list.
   `<skill_content>` envelope is unwrapped harmlessly, so the renderer is shared
   with the `skill` tool panel's shape). Each fold's body is capped at the `skill`
   tool panel's 3,000 characters, and the card's folds share one aggregate budget
-  — ≈8,000 CJK body characters, charged as 24 KB of structure, titles and bodies
-  — sized so an ordinary 1–3 skill dispatch shows every body in FULL while the
-  whole card stays comfortably under Feishu's 30 KB limit. Only a genuinely large
+  — 24 KB of structure, titles and bodies, charged by each body's ACTUAL
+  sanitized byte length, not a `chars × 3` estimate (ASCII bodies would
+  over-block; a `<` expands to `&#60;` (5 bytes) and would under-block) — sized
+  so an ordinary 1–3 skill dispatch shows every body in FULL while the whole card
+  stays comfortably under Feishu's 30 KB limit. Only a genuinely large
   dispatch degrades: past `SKILL_FOLD_MAX` folds the overflow collapses into one
   `🧩 已加载技能（等 N 个）` summary fold, and a fold past the aggregate keeps its
   title with an omission body (AGENTS.md #13). A **mixed dispatch** — some ids

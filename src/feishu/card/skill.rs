@@ -10,25 +10,21 @@ use crate::backend::SkillInfo;
 use serde_json::json;
 
 use super::picker::SKILL_ROW_LABEL_CHARS;
-use super::sanitize::CardMarkdown;
+use super::sanitize::{CardMarkdown, sanitize_markdown};
 use super::shell::{card_shell, collapsible_panel};
 use super::tool_render::{TOOL_OUTPUT_MAX_CHARS, parse_skill_envelope};
 use super::truncate_md;
 
 /// The bytes one loaded-skill card's folds may spend in total — every fold's
-/// JSON structure, its title AND its body (spec #652, ticket #655). Feishu
-/// rejects a card whose serialized JSON exceeds 30 KB (AGENTS.md pitfall #13),
-/// and the dedicated card carries ONE message's skills (usually 1–3), usually
-/// CJK (3 bytes per char), so the budget is sized to the card limit rather than
-/// the removed many-message tail's tight one: 24 KB (≈8,000 CJK body chars)
-/// leaves ~6 KB for the card shell, comfortably under 30 KB. It bounds the
-/// WORST CASE (a pathological dispatch of [`SKILL_FOLD_MAX`] long-named skills);
-/// an ordinary 1–3 skill dispatch is far below it and shows every body in full.
+/// JSON structure, its title AND its **sanitized** body (spec #652, ticket
+/// #655). Feishu rejects a card whose serialized JSON exceeds 30 KB (AGENTS.md
+/// pitfall #13), and the dedicated card carries ONE message's skills (usually
+/// 1–3), so the budget is sized to the card limit rather than the removed
+/// many-message tail's tight one: 24 KB leaves ~6 KB for the card shell,
+/// comfortably under 30 KB. It bounds the WORST CASE (a pathological dispatch
+/// of [`SKILL_FOLD_MAX`] long-named skills); an ordinary 1–3 skill dispatch is
+/// far below it and shows every body in full.
 pub(crate) const SKILL_FOLDS_TOTAL_BYTES: usize = 24_000;
-
-/// The bytes a CJK character costs — the upper bound the fold budget charges
-/// per body CHARACTER, so a body of `n` chars is charged at most `3 * n` bytes.
-const CJK_BYTES_PER_CHAR: usize = 3;
 
 /// The per-fold JSON structure the budget reserves (the `collapsible_panel` and
 /// nested markdown tags/keys/ids, not their text): conservative, so the
@@ -118,8 +114,11 @@ pub(crate) fn loaded_skill_folds(
 /// walk — the card folds AND the degraded text fallback both consume it, so the
 /// two can never disagree on how much of a body is shown (spec #652, ticket
 /// #655). Each fold is charged its [`FOLD_STRUCTURE_BYTES`] plus its (clipped)
-/// title's bytes plus its body at the CJK upper bound ([`CJK_BYTES_PER_CHAR`]
-/// per character), capped per fold at [`TOOL_OUTPUT_MAX_CHARS`], until
+/// title's bytes plus its body's **actual sanitized bytes** — the same
+/// [`sanitize_markdown`] path the card renders through, because a `char × 3`
+/// estimate is wrong in both directions (ASCII bodies charged as CJK over-blocks;
+/// a `<` expands to `&#60;` and under-charges) — capped per fold at
+/// [`TOOL_OUTPUT_MAX_CHARS`] characters BEFORE sanitizing, until
 /// [`SKILL_FOLDS_TOTAL_BYTES`] is spent — after which a fold keeps its title
 /// with an omission body.
 pub(crate) fn plan_skill_folds(skills: &[SkillInfo]) -> (Vec<usize>, usize) {
@@ -129,10 +128,20 @@ pub(crate) fn plan_skill_folds(skills: &[SkillInfo]) -> (Vec<usize>, usize) {
     for skill in &skills[..take] {
         let title_bytes = fold_title(&skill.name).len();
         bytes_left = bytes_left.saturating_sub(FOLD_STRUCTURE_BYTES + title_bytes);
-        let max_body_chars = (bytes_left / CJK_BYTES_PER_CHAR).min(TOOL_OUTPUT_MAX_CHARS);
-        let this = unwrapped_body(skill).chars().count().min(max_body_chars);
-        bytes_left = bytes_left.saturating_sub(this * CJK_BYTES_PER_CHAR);
-        allowed.push(this);
+        let body_chars = unwrapped_body(skill).chars().count();
+        if body_chars == 0 {
+            // The empty-content marker is constant and always rendered.
+            allowed.push(0);
+            continue;
+        }
+        let full = body_chars.min(TOOL_OUTPUT_MAX_CHARS);
+        let bytes = sanitize_markdown(&fold_body(skill, full)).len();
+        if bytes <= bytes_left {
+            bytes_left -= bytes;
+            allowed.push(full);
+        } else {
+            allowed.push(0);
+        }
     }
     (allowed, skills.len() - take)
 }
@@ -395,6 +404,60 @@ mod tests {
             .map(|f| f["elements"][0]["content"].as_str().unwrap().chars().count())
             .sum();
         assert_eq!(shown, 6_000, "three ordinary bodies show in full");
+    }
+
+    /// The budget charges real sanitized BYTES, not a `chars × 3` estimate
+    /// (spec #652, ticket #655): three 3,000-char ASCII bodies cost ~9 KB, far
+    /// under the aggregate, so ALL render in full — the fixed over-block.
+    #[test]
+    fn several_large_ascii_bodies_all_render_in_full() {
+        let body = "x".repeat(TOOL_OUTPUT_MAX_CHARS);
+        let skills = [
+            skill("a", Some(&body)),
+            skill("b", Some(&body)),
+            skill("c", Some(&body)),
+        ];
+        let (allowed, hidden) = plan_skill_folds(&skills);
+        assert_eq!(hidden, 0, "three bodies fit the aggregate");
+        assert_eq!(
+            allowed,
+            vec![TOOL_OUTPUT_MAX_CHARS; 3],
+            "every 3,000-char ASCII body is shown in full"
+        );
+
+        let card = build_loaded_skill_card(&skills, None);
+        let bodies: Vec<&str> = card["body"]["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["elements"][0]["content"].as_str().unwrap())
+            .collect();
+        assert!(
+            bodies.iter().all(|b| b.chars().count() == TOOL_OUTPUT_MAX_CHARS),
+            "no body is clipped: {:?}",
+            bodies.iter().map(|b| b.chars().count()).collect::<Vec<_>>()
+        );
+    }
+
+    /// The budget charges the SANITIZED bytes, so a `<`-heavy body (each `<`
+    /// expands to `&#60;`, 5 bytes) cannot defeat the cap (spec #652, ticket
+    /// #655): the card stays under Feishu's byte limit even though the
+    /// `chars × 3` estimate would have under-charged it.
+    #[test]
+    fn a_heavy_markup_body_set_stays_within_the_byte_limit() {
+        let body = "<".repeat(TOOL_OUTPUT_MAX_CHARS);
+        let skills: Vec<SkillInfo> = (0..10)
+            .map(|i| skill(&format!("skill-{i}"), Some(&body)))
+            .collect();
+        let card = build_loaded_skill_card(&skills, None);
+        let size = card.to_string().len();
+        assert!(
+            size <= crate::feishu::card::FEISHU_CARD_LIMIT_BYTES,
+            "the `<` expansion pushed the card to {size} bytes"
+        );
+        // The expansion is real: a thousand `<`s become five thousand bytes.
+        let sanitized = sanitize_markdown(&"<".repeat(1_000));
+        assert_eq!(sanitized.len(), 5_000, "each `<` is `&#60;`");
     }
 
     /// A pathological skill count — a `/skill a` token pasted 150 times — must
