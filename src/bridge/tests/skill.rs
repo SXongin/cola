@@ -1,15 +1,17 @@
-//! `/skill <id>` — loading OpenCode skills into the prompt (spec #652, tickets
-//! #654/#656). The Bridge parses the command, resolves the skill ids against a
-//! single generation-neutral list read, and submits the whole original message
-//! text verbatim with the neutral [`PromptSkill`] attachment. Which generation
-//! carries that attachment — V2's structured `skills` array or V1's text
-//! instruction — is the Generation Strategy's business (#653), so the Bridge is
-//! asserted here through the mock Backend's recorded prompt calls: identical on
-//! either generation.
+//! Skills — loading OpenCode skills into the prompt (spec #652, tickets
+//! #654/#656; the `#<id>` form, spec #662). The Bridge parses the invocation,
+//! resolves the skill ids against a single generation-neutral list read, and
+//! submits the whole original message text verbatim with the neutral
+//! [`PromptSkill`] attachment. Which generation carries that attachment — V2's
+//! structured `skills` array or V1's text instruction — is the Generation
+//! Strategy's business (#653), so the Bridge is asserted here through the mock
+//! Backend's recorded prompt calls: identical on either generation.
 //!
 //! A user who does not know an id is not stuck: a bare `/skill` (or a typed id
 //! that resolves to nothing) shows the picker card source-listed from the same
-//! read, and a tap on a row re-enters this same pipeline as `/skill <id>`.
+//! read, and a tap on a row re-enters this same pipeline as `#<id>`. The `#<id>`
+//! message form has no picker of its own: an id that resolves nothing is
+//! ordinary prose and the message just submits as a plain prompt.
 
 use crate::backend::{PromptSkill, SkillInfo};
 use crate::bridge::test_support::*;
@@ -335,6 +337,119 @@ async fn bare_skill_id_with_no_text_is_accepted() {
     assert_eq!(*fx.prompt_skills.lock().await, vec![vec![resolved("foreman")]]);
 }
 
+/// The `#<id>` form (spec #662): a message that does not lead with `/` still
+/// loads the named skill — the canonical entry, not the raw token — and the
+/// whole message is submitted verbatim.
+#[tokio::test]
+async fn hash_skill_token_loads_the_skill_and_keeps_the_message_text() {
+    let fx = SkillFixture::build().await;
+
+    fx.send("#implement-spec 644").await;
+
+    assert_eq!(
+        *fx.prompt_calls.lock().await,
+        vec!["#implement-spec 644".to_string()],
+        "the whole original message text is the prompt"
+    );
+    assert_eq!(
+        *fx.prompt_skills.lock().await,
+        vec![vec![resolved("implement-spec")]],
+        "the #<id> token attaches the canonical list entry"
+    );
+    // The same loaded-skill card a typed dispatch replies.
+    let card = loaded_skill_card(&fx).await;
+    assert_eq!(
+        collapsible_panels(&card)[0]["header"]["title"]["content"],
+        "🧩 已加载技能：Implement Spec"
+    );
+}
+
+/// Two `#<id>` tokens load both skills, in order, from one list read.
+#[tokio::test]
+async fn two_hash_tokens_load_both_skills() {
+    let fx = SkillFixture::build().await;
+
+    let text = "#implement-spec #foreman 644";
+    fx.send(text).await;
+
+    assert_eq!(*fx.prompt_calls.lock().await, vec![text.to_string()]);
+    assert_eq!(
+        *fx.prompt_skills.lock().await,
+        vec![vec![resolved("implement-spec"), resolved("foreman")]]
+    );
+    assert_eq!(
+        fx.list_skills_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "one list read resolves both ids"
+    );
+}
+
+/// The id run ends at a non-id character, so trailing punctuation (or CJK text
+/// run straight into the token) still names the skill — an adversarial-review
+/// finding (spec #662).
+#[tokio::test]
+async fn a_hash_token_with_trailing_punctuation_still_loads() {
+    let fx = SkillFixture::build().await;
+
+    fx.send("see #implement-spec, then 644").await;
+
+    assert_eq!(
+        *fx.prompt_calls.lock().await,
+        vec!["see #implement-spec, then 644".to_string()]
+    );
+    assert_eq!(
+        *fx.prompt_skills.lock().await,
+        vec![vec![resolved("implement-spec")]],
+        "the run stops at the comma; the skill still loads"
+    );
+}
+
+/// A `#<id>` message whose id resolves NOTHING is ordinary prose: the message
+/// still submits as a plain prompt — no attachment, and NO picker card (the `#`
+/// form owns no picker; `/skill` does).
+#[tokio::test]
+async fn an_unresolved_hash_token_is_a_plain_prompt() {
+    let fx = SkillFixture::build().await;
+
+    fx.send("#no-such-skill 644").await;
+
+    assert_eq!(
+        *fx.prompt_calls.lock().await,
+        vec!["#no-such-skill 644".to_string()],
+        "the message still reaches the model verbatim"
+    );
+    assert_eq!(
+        *fx.prompt_skills.lock().await,
+        vec![Vec::<PromptSkill>::new()],
+        "nothing resolved, nothing attached"
+    );
+    let cards = fx.platform.replied_cards().await;
+    assert!(
+        cards.iter().all(|card| !card.to_string().contains("选择技能")),
+        "an unresolved # token never opens the picker: {cards:?}"
+    );
+}
+
+/// A message with `#` but no `#<letter…>` token is an ordinary prompt — no
+/// skill path at all, so the skill list is never even read. This is what keeps
+/// `#644` (an issue reference) and markdown headings off the hot path.
+#[tokio::test]
+async fn prose_hash_tokens_never_read_the_skill_list() {
+    let fx = SkillFixture::build().await;
+
+    fx.send("fix #644 and # 标题").await;
+
+    assert_eq!(
+        *fx.prompt_calls.lock().await,
+        vec!["fix #644 and # 标题".to_string()]
+    );
+    assert_eq!(
+        fx.list_skills_calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "no #<letter…> token, so the skill list is never read"
+    );
+}
+
 /// A `/skill` dispatch reads the list from the CHAT/TOPIC's project
 /// directory — the location the eventual prompt runs in — so a session's own
 /// project skills are the ones listed and resolved, not the server default's.
@@ -441,7 +556,7 @@ async fn a_failed_picker_card_falls_back_to_a_text_list() {
     assert!(
         texts
             .iter()
-            .any(|t| t.contains("implement-spec") && t.contains("Hidden Tool") && t.contains("/skill <id>")),
+            .any(|t| t.contains("implement-spec") && t.contains("Hidden Tool") && t.contains("#<id>")),
         "a text listing is the fallback: {texts:?}"
     );
 }
@@ -463,9 +578,9 @@ async fn an_empty_skill_list_renders_a_no_skills_card() {
     assert!(fx.picker_buttons().await.is_empty(), "no rows without skills");
 }
 
-/// A tap on a picker row submits `/skill <id>` through the same pipeline a
-/// typed command takes: feed the row's OWN callback payload back in (the exact
-/// value Feishu echoes), and wait for the spawned submission off the ack.
+/// A tap on a picker row submits `#<id>` through the same pipeline a typed
+/// message takes: feed the row's OWN callback payload back in (the exact value
+/// Feishu echoes), and wait for the spawned submission off the ack.
 #[tokio::test]
 async fn a_picker_row_tap_submits_the_skill_command() {
     let fx = SkillFixture::build().await;
@@ -500,8 +615,8 @@ async fn a_picker_row_tap_submits_the_skill_command() {
     wait_for(&fx.prompt_calls, 1).await;
     assert_eq!(
         *fx.prompt_calls.lock().await,
-        vec!["/skill implement-spec".to_string()],
-        "a row sends `/skill <id>` with no text"
+        vec!["#implement-spec".to_string()],
+        "a row sends `#<id>` with no text"
     );
     assert_eq!(
         *fx.prompt_skills.lock().await,
@@ -814,8 +929,8 @@ async fn a_retried_skill_turn_still_submits_its_skills() {
 
 /// A picker row whose id contains whitespace still loads (spec #652, ticket
 /// #656): V1's id IS the skill name (`Implement Spec`), and the tap dispatches
-/// the callback's id DIRECTLY — round-tripping `/skill Implement Spec` through
-/// the command text parser would split it into two ids and resolve neither.
+/// the callback's id DIRECTLY — round-tripping `#Implement Spec` through the
+/// command text parser would split it into two ids and resolve neither.
 #[tokio::test]
 async fn a_picker_row_with_a_whitespace_id_still_loads() {
     let mut backend = MockBackend::new(realistic_parts());
@@ -843,7 +958,7 @@ async fn a_picker_row_with_a_whitespace_id_still_loads() {
     wait_for(&fx.prompt_calls, 1).await;
     assert_eq!(
         *fx.prompt_calls.lock().await,
-        vec!["/skill Implement Spec".to_string()],
+        vec!["#Implement Spec".to_string()],
         "the whitespace id reaches the prompt intact"
     );
     assert_eq!(
