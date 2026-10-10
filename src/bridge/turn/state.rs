@@ -491,8 +491,9 @@ pub(super) struct GapCoverage {
 
 /// Estimated serialized size (bytes) of one collapsible tool panel, mirroring
 /// [`StreamAccumulator::estimate_split_index`]'s accounting (element overhead
-/// plus the capped input and output the renderer keeps). Shared by the
-/// timeline's tool items and the todo tail reserve.
+/// plus the capped input and output the renderer keeps, plus the File Content
+/// tracking block the panel body appends — ADR-0076). Shared by the timeline's
+/// tool items and the todo tail reserve.
 fn panel_estimate(p: &ToolPanel) -> usize {
     let input = p
         .input()
@@ -503,7 +504,19 @@ fn panel_estimate(p: &ToolPanel) -> usize {
         .output()
         .map(|s| first_n_chars_bytes(&s, crate::feishu::card::tool_render::TOOL_OUTPUT_MAX_CHARS))
         .unwrap_or(0);
-    400 + input + output
+    400 + input + output + crate::feishu::card::tool_render::file_tracking_estimate(p)
+}
+
+/// The content hash of one panel's File Content at `index` (ADR-0076), or
+/// `None` when the panel no longer holds that position. The render path
+/// re-validates a resolved upload against it before attaching the key, so an
+/// upload that outlived the panel's revision cannot mark a different file.
+fn panel_file_hash(panel: &ToolPanel, index: usize) -> Option<u64> {
+    panel
+        .files()
+        .get(index)
+        .and_then(|file| file.content.bytes())
+        .map(|bytes| file_content_hash(&bytes))
 }
 
 /// A permission request surfaced inline on the streaming card (instead of a
@@ -1547,6 +1560,31 @@ pub(super) struct StreamAccumulator {
     /// [`Self::refresh_phase`], cleared by [`Self::reset_phase`]; read only by
     /// [`Self::header_progress`] (no external reader).
     phase_started_at: Option<std::time::Instant>,
+}
+
+/// One File Content whose card delivery the render path has not resolved yet
+/// (ADR-0076): the panel it belongs to (`call_id`), its position there
+/// (`index`), the content itself, and the content `hash` that keys the
+/// process-local upload cache. Named so the roles travel together instead of
+/// through a bare tuple, and so the resolver can re-validate the panel's file
+/// against the same identity it resolved ([`StreamAccumulator::set_file_image_key`]).
+#[derive(Debug, Clone)]
+pub(super) struct PendingFileDelivery {
+    pub(super) call_id: String,
+    pub(super) index: usize,
+    pub(super) content: FileContent,
+    pub(super) hash: u64,
+}
+
+/// A content hash for the process-local File Content image cache (ADR-0076):
+/// stable within the process, never persisted. It is also the identity a
+/// resolved upload attaches by, so a panel rebuilt while an upload was in
+/// flight cannot be marked with another file's key.
+pub(super) fn file_content_hash(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
 }
 
 impl StreamAccumulator {
@@ -3420,26 +3458,50 @@ impl StreamAccumulator {
     }
 
     /// The unresolved File Content deliveries across every tool panel
-    /// (ADR-0076): `(call_id, file index, content)` for each File Content whose
-    /// delivery the render path has not resolved yet. The render loop
-    /// pre-resolves these before the card JSON is built, so the panel can name
-    /// the file and embed the image.
-    pub(super) fn pending_file_deliveries(&self) -> Vec<(String, usize, FileContent)> {
+    /// (ADR-0076): one [`PendingFileDelivery`] per File Content whose delivery
+    /// the render path has not resolved yet — its owning call, position,
+    /// content and content hash. The render loop pre-resolves these before the
+    /// card JSON is built, so the panel can name the file and embed the image.
+    /// A content whose inline bytes cannot be decoded is skipped, exactly as
+    /// the render path's own hash step did.
+    pub(super) fn pending_file_deliveries(&self) -> Vec<PendingFileDelivery> {
         let mut pending = Vec::new();
         for (call_id, panel) in &self.tools {
             for (index, file) in panel.files().iter().enumerate() {
-                if file.delivery == FileDelivery::Unresolved {
-                    pending.push((call_id.clone(), index, file.content.clone()));
+                if file.delivery != FileDelivery::Unresolved {
+                    continue;
                 }
+                let Some(bytes) = file.content.bytes() else {
+                    continue;
+                };
+                pending.push(PendingFileDelivery {
+                    call_id: call_id.clone(),
+                    index,
+                    content: file.content.clone(),
+                    hash: file_content_hash(&bytes),
+                });
             }
         }
         pending
     }
 
-    /// Attach a resolved image key to one tool panel's File Content (ADR-0076).
-    /// A no-op for a call the accumulator no longer holds.
-    pub(super) fn set_file_image_key(&mut self, call_id: &str, index: usize, image_key: &str) {
+    /// Attach a resolved image key to one tool panel's File Content (ADR-0076),
+    /// keyed by the content `expected_hash` the resolver uploaded. A no-op when
+    /// the accumulator no longer holds the call, or when the panel's file at
+    /// `index` is no longer that content — a panel the transcript replaced
+    /// while the upload was in flight must not have a different file marked
+    /// embedded with the old key.
+    pub(super) fn set_file_image_key(
+        &mut self,
+        call_id: &str,
+        index: usize,
+        expected_hash: u64,
+        image_key: &str,
+    ) {
         if let Some(panel) = self.tools.get_mut(call_id) {
+            if panel_file_hash(panel, index) != Some(expected_hash) {
+                return;
+            }
             panel.set_file_delivery(
                 index,
                 FileDelivery::Embedded {
@@ -3451,10 +3513,14 @@ impl StreamAccumulator {
 
     /// Mark one tool panel's File Content considered with no card surface
     /// (ADR-0076) — a non-image or an image past Feishu's caps — so it is not
-    /// re-examined on every later poll. A no-op for a call the accumulator no
-    /// longer holds.
-    pub(super) fn set_file_no_surface(&mut self, call_id: &str, index: usize) {
+    /// re-examined on every later poll. Keyed by the content `expected_hash`,
+    /// like [`Self::set_file_image_key`], so a stale verdict cannot mark a
+    /// different file. A no-op for a call the accumulator no longer holds.
+    pub(super) fn set_file_no_surface(&mut self, call_id: &str, index: usize, expected_hash: u64) {
         if let Some(panel) = self.tools.get_mut(call_id) {
+            if panel_file_hash(panel, index) != Some(expected_hash) {
+                return;
+            }
             panel.set_file_delivery(index, FileDelivery::NoSurface);
         }
     }
@@ -3988,7 +4054,7 @@ impl StreamAccumulator {
             // ([`Self::omitted_live_seeded`]): the reserve must not charge for
             // what the build will not render.
             if let Some(panel) = &self.todo_panel {
-                comps += 1;
+                comps += 1 + panel.embedded_file_count();
                 size += panel_estimate(panel);
             }
             if !self.ledger.is_empty() {
@@ -4000,7 +4066,7 @@ impl StreamAccumulator {
                     continue;
                 }
                 if let Some(panel) = self.tools.get(call_id) {
-                    comps += 1;
+                    comps += 1 + panel.embedded_file_count();
                     size += panel_estimate(panel);
                 }
             }
@@ -4009,7 +4075,20 @@ impl StreamAccumulator {
             let (c, s, t) = match &item.kind {
                 TimelineKind::Reasoning(r) => (4, 300 + first_n_chars_bytes(r, 800), 0),
                 TimelineKind::Tool(call_id) => {
-                    (4, self.tools.get(call_id).map(panel_estimate).unwrap_or(400), 0)
+                    // The panel's own elements plus one `img` per embedded File
+                    // Content (`with_tool_at` pushes them after the panel,
+                    // ADR-0076); missing the images would let a near-budget
+                    // card be rejected by Feishu instead of splitting.
+                    let images = self
+                        .tools
+                        .get(call_id)
+                        .map(ToolPanel::embedded_file_count)
+                        .unwrap_or(0);
+                    (
+                        4 + images,
+                        self.tools.get(call_id).map(panel_estimate).unwrap_or(400),
+                        0,
+                    )
                 }
                 // Text is chunked to ≤ MAX_CARD_TEXT_CHARS per item, so a
                 // single item never exceeds the per-card budget; the budget
@@ -5196,6 +5275,96 @@ mod tests {
         assert!(
             rest.to_string().contains("最后的结论。"),
             "conclusion must appear on a continuation"
+        );
+    }
+
+    /// A tool panel that embeds File Contents contributes one extra `img`
+    /// element per embedded image (`with_tool_at`, ADR-0076). The split estimate
+    /// must charge them: otherwise a card whose real body crosses Feishu's
+    /// component limit is sent and rejected (ErrCode 11310), which the fenced
+    /// content fallback cannot fix.
+    #[test]
+    fn card_split_charges_embedded_image_components() {
+        let mut acc = StreamAccumulator::new("test");
+        acc.card_state = CardState::Done;
+        // 31 panels, each embedding ONE image: 31 × (4 + 1) = 155 components,
+        // over the 150 budget, while the panels alone (31 × 4 = 124) would fit.
+        // Only charging the images makes this split.
+        for i in 0..31 {
+            let mut panel = ToolPanel::for_test_with_files(&format!("tool{i}"), &[("shot.png", b"ABC")]);
+            panel.set_file_delivery(
+                0,
+                FileDelivery::Embedded {
+                    image_key: "img_x".into(),
+                },
+            );
+            acc.push_tool(&format!("call_{i}"), panel);
+        }
+
+        let (_card, full) = acc.build_card_with_split();
+        assert!(
+            full,
+            "the embedded images must push the card over the component budget"
+        );
+        assert!(acc.render_from > 0, "render_from must advance past the split");
+    }
+
+    /// The File Content tracking block is part of the panel body (ADR-0076), so
+    /// a panel whose tracking lines are large must be charged for them: a
+    /// near-budget card splits instead of being rejected by Feishu on the
+    /// JSON-size cap.
+    #[test]
+    fn card_split_charges_file_tracking_line_bytes() {
+        let mut acc = StreamAccumulator::new("test");
+        acc.card_state = CardState::Done;
+        // One panel whose file NAME alone is ~30KB: its record line pushes the
+        // panel's estimate past MAX_CARD_JSON_CHARS, which the 400-byte panel
+        // overhead alone would never do. A trailing item gives the splitter
+        // somewhere to split to (it must keep at least one item per card).
+        let long_name = "n".repeat(30_000);
+        acc.push_tool(
+            "call_read",
+            ToolPanel::for_test_with_files("read", &[(&long_name, b"ABC")]),
+        );
+        acc.push_text("最后的结论。");
+
+        let (_card, full) = acc.build_card_with_split();
+        assert!(
+            full,
+            "the tracking line's bytes must count toward the size budget"
+        );
+    }
+
+    /// A resolved upload attaches by content hash, not by position (ADR-0076):
+    /// a panel the transcript replaced while the upload was in flight must not
+    /// have a different file at that index marked embedded with the old key.
+    #[test]
+    fn stale_file_resolve_does_not_mark_a_different_file() {
+        let mut acc = StreamAccumulator::new("test");
+        acc.card_state = CardState::Done;
+        acc.push_tool(
+            "call_read",
+            ToolPanel::for_test_with_files("read", &[("shot.png", b"ABC")]),
+        );
+
+        // A resolve whose hash no longer matches the panel's file is ignored.
+        let stale_hash = file_content_hash(b"OTHER");
+        acc.set_file_image_key("call_read", 0, stale_hash, "img_stale");
+        acc.set_file_no_surface("call_read", 0, stale_hash);
+        assert_eq!(
+            acc.tools().get("call_read").unwrap().files()[0].delivery,
+            FileDelivery::Unresolved,
+            "a stale hash must not mark the panel's file"
+        );
+
+        // The matching hash attaches as before.
+        let live_hash = file_content_hash(b"ABC");
+        acc.set_file_image_key("call_read", 0, live_hash, "img_live");
+        assert_eq!(
+            acc.tools().get("call_read").unwrap().files()[0].delivery,
+            FileDelivery::Embedded {
+                image_key: "img_live".into()
+            }
         );
     }
 

@@ -213,11 +213,13 @@ pub struct SharedCore {
     /// per Session per interval across Session Sync and the live loops.
     pub runtime_reconcile: Arc<crate::bridge::runtime::RuntimeReconcile>,
     /// The process-local File Content image cache (ADR-0076): a content hash →
-    /// the resolved upload (`Some(image_key)` when embedded, `None` when the
-    /// content is not an embeddable image), so identical bytes upload once and
-    /// every later PATCH reuses the key. Never durable: an upload is cheap to
-    /// repeat after a restart, and a stale key would be worse.
-    pub file_images: Arc<Mutex<HashMap<u64, Option<String>>>>,
+    /// the single-flight resolution of that content (`Some(image_key)` when
+    /// embedded, `None` when the content is not an embeddable image), so
+    /// identical bytes upload once and every later PATCH reuses the key, and
+    /// concurrent resolves of one hash await one upload. Never durable: an
+    /// upload is cheap to repeat after a restart, and a stale key would be
+    /// worse.
+    pub file_images: crate::bridge::handles::FileImageCache,
 }
 
 impl SharedCore {

@@ -11,13 +11,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::Instrument;
 
 use crate::backend::{
-    MessageId, Part, SessionTranscript, TaskRetirementEnding, ToolStatus, TurnAnchor, Wake, WakeSource,
+    FileContent, MessageId, Part, SessionTranscript, TaskRetirementEnding, ToolStatus, TurnAnchor, Wake,
+    WakeSource,
 };
 use crate::bridge::core::SESSION_INFO_TIMEOUT;
 use crate::bridge::handles::{CardsHandle, RequestsHandle, SessionsHandle, TurnHandles};
 use crate::bridge::span;
 use crate::bridge::turn::state;
-use crate::bridge::turn::state::{LedgerCadence, PartSource, RenderedPart, StreamAccumulator};
+use crate::bridge::turn::state::{
+    LedgerCadence, PartSource, PendingFileDelivery, RenderedPart, StreamAccumulator,
+};
 use crate::config::ThreadKey;
 use crate::feishu::card::ledger::{TaskCompletionEntry, TaskEnding, TaskKind, TaskOutput};
 use crate::feishu::card::tool_render::{ChildActivity, TaskLiveness};
@@ -632,6 +635,15 @@ pub(super) async fn read_planned_outputs(
     }
 }
 
+/// One content hash's in-flight upload (ADR-0076): the process-local cell that
+/// carries the shared resolution, plus the content to upload if this resolver
+/// wins the race to initialize it.
+struct InFlightUpload {
+    hash: u64,
+    cell: Arc<tokio::sync::OnceCell<Option<String>>>,
+    content: FileContent,
+}
+
 /// Pre-resolve each newly rendered File Content's card delivery before the card
 /// JSON is built (ADR-0076). An image within Feishu's caps is uploaded once —
 /// cached process-locally by content hash, so identical bytes upload once and
@@ -644,66 +656,79 @@ pub(super) async fn read_planned_outputs(
 async fn resolve_file_deliveries(cards: &CardsHandle, session_id: &str) -> bool {
     // 1. Collect the unresolved File Contents under a brief lock, with their
     //    content hashes. No cache access here, so no nested lock.
-    let pending: Vec<(String, usize, crate::backend::FileContent, u64)> = {
+    let pending: Vec<PendingFileDelivery> = {
         let live = cards.cards.lock().await;
         let Some(card) = live.get(session_id) else {
             return false;
         };
-        card.acc
-            .pending_file_deliveries()
-            .into_iter()
-            .filter_map(|(call_id, index, content)| {
-                let bytes = content.bytes()?;
-                Some((call_id, index, content, file_content_hash(&bytes)))
-            })
-            .collect()
+        card.acc.pending_file_deliveries()
     };
     if pending.is_empty() {
         return false;
     }
-    // 2. A cache hit is a resolved delivery at once; a miss uploads, once per
-    //    distinct content hash, outside the cards lock. The Platform owns the
-    //    embeddability caps and answers `Ok(None)` for a content it will not
-    //    embed — that verdict is cached too.
-    let mut resolved: std::collections::HashMap<u64, Option<String>> = std::collections::HashMap::new();
-    let mut to_upload: Vec<(u64, crate::backend::FileContent)> = Vec::new();
+    // 2. One in-flight guard per distinct content hash, taken under a brief
+    //    lock: the cache's `OnceCell` is shared, so concurrent resolvers of the
+    //    same bytes await ONE upload instead of each missing the cache and
+    //    uploading twice. The Platform owns the embeddability caps and answers
+    //    `Ok(None)` for a content it will not embed — that verdict is cached
+    //    too; a failed upload leaves the cell uninitialized, so a later poll
+    //    retries.
+    let mut to_resolve: Vec<InFlightUpload> = Vec::new();
     let mut decided: std::collections::HashSet<u64> = std::collections::HashSet::new();
-    for (_, _, content, hash) in &pending {
-        if !decided.insert(*hash) {
+    for delivery in &pending {
+        if !decided.insert(delivery.hash) {
             continue;
         }
-        match cards.file_images.lock().await.get(hash).cloned() {
-            Some(delivery) => {
-                resolved.insert(*hash, delivery);
-            }
-            None => to_upload.push((*hash, content.clone())),
-        }
+        let cell = {
+            let mut cache = cards.file_images.lock().await;
+            Arc::clone(
+                cache
+                    .entry(delivery.hash)
+                    .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new())),
+            )
+        };
+        to_resolve.push(InFlightUpload {
+            hash: delivery.hash,
+            cell,
+            content: delivery.content.clone(),
+        });
     }
-    for (hash, content) in to_upload {
-        match cards.feishu.upload_image(&content).await {
+    let mut resolved: std::collections::HashMap<u64, Option<String>> = std::collections::HashMap::new();
+    for upload in to_resolve {
+        let attempt = upload
+            .cell
+            .get_or_try_init(|| async { cards.feishu.upload_image(&upload.content).await })
+            .await;
+        match attempt {
             Ok(delivery) => {
-                cards.file_images.lock().await.insert(hash, delivery.clone());
-                resolved.insert(hash, delivery);
+                resolved.insert(upload.hash, delivery.clone());
             }
             // Never cached: a later poll retries. The card is untouched.
-            Err(error) => tracing::warn!("file content {:?} upload failed: {error}", content.name),
+            Err(error) => {
+                tracing::warn!("file content {:?} upload failed: {error}", upload.content.name)
+            }
         }
     }
-    // 3. Attach the keys (and mark the non-embeddable contents considered) under
-    //    a short lock. A content whose upload failed is left unresolved, so a
-    //    later poll retries it.
+    // 3. Attach the keys (and mark the non-embeddable contents considered)
+    //    under a short lock, keyed by content hash so a panel the transcript
+    //    replaced mid-upload cannot be marked with another file's key. A
+    //    content whose upload failed is left unresolved, so a later poll
+    //    retries it.
     let mut live = cards.cards.lock().await;
     let Some(card) = live.get_mut(session_id) else {
         return false;
     };
     let mut changed = false;
-    for (call_id, index, _, hash) in pending {
-        match resolved.get(&hash) {
+    for delivery in pending {
+        match resolved.get(&delivery.hash) {
             Some(Some(key)) => {
-                card.acc.set_file_image_key(&call_id, index, key);
+                card.acc
+                    .set_file_image_key(&delivery.call_id, delivery.index, delivery.hash, key);
                 changed = true;
             }
-            Some(None) => card.acc.set_file_no_surface(&call_id, index),
+            Some(None) => card
+                .acc
+                .set_file_no_surface(&delivery.call_id, delivery.index, delivery.hash),
             None => {}
         }
     }
@@ -713,15 +738,6 @@ async fn resolve_file_deliveries(cards: &CardsHandle, session_id: &str) -> bool 
         card.acc.bump_progress_mark();
     }
     changed
-}
-
-/// A content hash for the process-local File Content image cache (ADR-0076):
-/// stable within the process, never persisted.
-fn file_content_hash(bytes: &[u8]) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    hasher.finish()
 }
 
 /// Commit a planned read (spec #593): announce each entry and insert it, under
@@ -5182,6 +5198,86 @@ Index: /x/src/main.rs
             .collect();
         assert_eq!(images.len(), 2, "both reads show their image: {card}");
         assert!(images.iter().all(|img| img["img_key"] == "img_v2_same"));
+    }
+
+    /// Two resolves of the SAME bytes racing on one content hash await ONE
+    /// upload (ADR-0076): the cache's in-flight guard is single-flight, so a
+    /// resolver that arrives while the first is still uploading blocks on the
+    /// shared cell instead of missing the cache and uploading the bytes again.
+    #[tokio::test]
+    async fn concurrent_resolves_of_the_same_bytes_upload_once() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        platform.given_image_key("img_v2_single_flight");
+        let sid = "ses_embed_single_flight";
+        let cards = app.core.cards_handle();
+        Turn::seed_card(&cards, sid, Some("om_single_flight")).await;
+        Turn::set_turn_anchor(&cards, sid, &turn_anchor(0)).await;
+
+        let transcript = SessionTranscript::new(vec![message(
+            "a1",
+            1_000,
+            vec![read_file_part("call_read", "shot.png", "image/png", b"ABC")],
+        )]);
+
+        // Park the first upload so the render's resolve is still in flight when
+        // a second resolve of the same bytes arrives.
+        let (entered, release) = platform.pause("upload_image", "");
+        let first = {
+            let app = Arc::clone(&app);
+            let sid = sid.to_string();
+            let transcript = transcript.clone();
+            tokio::spawn(async move {
+                let cards = app.core.cards_handle();
+                render(&app, &cards, &sid, &transcript).await;
+            })
+        };
+        entered.notified().await;
+
+        // The second resolver races the parked upload for the SAME content hash.
+        let second = {
+            let app = Arc::clone(&app);
+            let sid = sid.to_string();
+            tokio::spawn(async move {
+                let cards = app.core.cards_handle();
+                resolve_file_deliveries(&cards, &sid).await
+            })
+        };
+        // Let the second task run: single-flight leaves it blocked on the
+        // in-flight cell (not finished), having made no second upload call.
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !second.is_finished(),
+            "the second resolver must await the in-flight upload, not finish"
+        );
+        assert_eq!(
+            platform
+                .upload_image_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the second resolver must not start a second upload"
+        );
+
+        release.notify_one();
+        first.await.unwrap();
+        second.await.unwrap();
+
+        assert_eq!(
+            platform
+                .upload_image_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one upload for two concurrent resolves of identical bytes"
+        );
+        assert_eq!(
+            uploaded_images(&platform).await.len(),
+            1,
+            "exactly one UploadImage platform call"
+        );
     }
 
     /// A File Content that is not an embeddable image (a PDF) is not uploaded
