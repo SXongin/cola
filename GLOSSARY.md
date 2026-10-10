@@ -386,6 +386,14 @@ _Avoid_: Quote, reference, reply context
 A platform image (a standalone image message, an image inside a rich-text message, or a quoted image) downloaded by the platform and attached to a prompt as a vision file part. Requires a vision-capable model; unsupported models surface an error.
 _Avoid_: Picture, media, attachment file
 
+**File Content**:
+A file payload a transcript part carries instead of text — the Backend's `file` block (a `data:` URI with its mime and name) that a Built-in Tool such as `read` returns for an image or PDF, or that a user message's `files` list carries — decoded neutrally on both Generations. A File Content is what cola may render back to the user; contrast an **Image Attachment**, an inbound platform image attached to a prompt.
+_Avoid_: Attachment, media, file part, Tool File Content (too narrow — a user message carries File Content too)
+
+**File Message**:
+The separate Feishu image/file message cola posts for a **File Content** it cannot embed in the card — a non-image file (a PDF) or an image past the embedding caps — uploaded once (Feishu `im:resource`) and sent once per File Content. It is not a **Card**: it rides the topic beside the **Card Chain** (replied in-thread under the live card) and is tracked by its placeholder line in the **Tool Panel**. A File Content past Feishu's 30MB message cap, or one whose send fails, has no File Message (placeholder only); an image within the caps is embedded in the card instead, never sent as a File Message.
+_Avoid_: Attachment message, media message, upload
+
 **Turn Footer**:
 The Card footer line summarizing what a turn ran on: working directory (project basename), git branch and dirty state, the answering model, and context-window usage. The model line renders the full identity `provider/model@variant` (provider is part of model identity, not decoration). The directory/branch half is captured when the turn starts (so a wrong-branch run is visible from the first card) and refreshed when the turn ends (so the completed card shows where the turn landed); the model line and the context-window segment appear on every card — including a split "部分完成" one — as soon as their data exists. Context usage advances with the turn (each completed step), rendered as `used/window (percent)`, or as the used tokens alone when the window size is unknown. Only a streaming-card chain carries the Turn Footer; standalone Permission/Question cards and session snapshot cards never do (ADR-0019, ADR-0044).
 _Avoid_: Tail, footer bar, status line
@@ -467,6 +475,7 @@ _Avoid_: Notification, message, signal
 - One **Runtime Reconciliation** step corroborates every **Session**'s live **Background Tasks** — Session Sync, the Turn's drain and the follow/settle loop share it, one verdict per Session per 30 s — and the residue no positive evidence can conclude is ended by the user's **Cleanup** (ADR-0065, ADR-0073)
 - An **Instant Reminder** pins the conversation while a **Permission**/**Question** is pending, and clears when the wait resolves; a **Completion Notice** announces a long p2p **Turn**'s end — after any 等待后台任务 yields, including a waiting card's settle-in-place and an in-place resumed run's true end (a new message, not a pin; ADR-0059, ADR-0060, ADR-0066)
 - A **Turn** renders one **Tool Panel** per tool call; an unfinished panel rides the newest card of its **Card Chain** as a tail section and joins the card timeline when the tool settles; only **Built-in Tool**s (and tools cola itself injects) may get tailored rendering — every other tool's payload stays opaque
+- A **File Content** is a file payload a transcript part carries; within Feishu's caps an image is embedded in its **Tool Panel**, anything else becomes a **File Message** (or a placeholder when it cannot be sent), and a user message's File Content is recorded but never re-delivered
 - A **Session** receives many **Permissions** and **Questions**
 - A **Session Snapshot** reports the state of one **Session** (its last **Turn**'s completion, pending **Permissions**/**Questions**, recent messages) to the **Chat**/**Topic** that activated it
 - The **Bridge** reads the **Session Transcript** from a **Backend** and renders **Card** updates on the **Platform**
