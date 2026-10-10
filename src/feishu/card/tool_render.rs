@@ -109,6 +109,16 @@ impl ToolPanel {
         &self.files
     }
 
+    /// How many File Contents this panel embeds (ADR-0076) — the extra `img`
+    /// elements its render pushes after the panel, so a card-size estimate can
+    /// charge them.
+    pub(crate) fn embedded_file_count(&self) -> usize {
+        self.files
+            .iter()
+            .filter(|file| file.delivery.as_embedded_key().is_some())
+            .count()
+    }
+
     /// Attach the resolved delivery for the file at `index` (the render path's
     /// pre-resolve step). A no-op for an out-of-range index — the panel's files
     /// and its call's blocks can never disagree, but a caller cannot panic here.
@@ -525,6 +535,31 @@ impl ToolPanel {
             },
         })
     }
+
+    /// A panel carrying one unresolved File Content per `(name, bytes)` pair,
+    /// each a PNG `data:` URI (ADR-0076) — the shape the split-estimate and the
+    /// attach-guard tests build their panels from.
+    pub(crate) fn for_test_with_files(name: &str, files: &[(&str, &[u8])]) -> Self {
+        use base64::Engine as _;
+        let mut panel = Self::for_test(name, ToolStatus::Completed, None, None);
+        panel.files = files
+            .iter()
+            .map(|(file_name, bytes)| {
+                let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+                let content = crate::backend::FileContent::decode(
+                    &format!("data:image/png;base64,{encoded}"),
+                    Some("image/png"),
+                    Some(file_name),
+                )
+                .expect("an inline payload is a File Content");
+                ToolFile {
+                    content,
+                    delivery: FileDelivery::Unresolved,
+                }
+            })
+            .collect();
+        panel
+    }
 }
 
 /// How a Tool Panel's output body renders. The renderer for a tool knows its
@@ -562,6 +597,15 @@ fn file_tracking_block(tool: &ToolPanel) -> Option<String> {
             .collect::<Vec<_>>()
             .join("\n"),
     )
+}
+
+/// The byte length of the tracking block [`file_tracking_block`] appends to a
+/// panel body (ADR-0076), for a card-size estimate that must charge the same
+/// bytes the renderer writes — the record line plus the `· 已内嵌` suffix an
+/// embedded content adds. `0` when the panel carries no File Content. Kept
+/// beside the render so the two cannot drift.
+pub(crate) fn file_tracking_estimate(tool: &ToolPanel) -> usize {
+    file_tracking_block(tool).map(|block| block.len()).unwrap_or(0)
 }
 
 /// The `img` elements this panel renders (ADR-0076): one per embedded File

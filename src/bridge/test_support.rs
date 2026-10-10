@@ -1026,6 +1026,11 @@ impl feishu::Platform for RecordingPlatform {
                 "simulated upload_image failure".into(),
             ));
         }
+        // A test may park the upload (single-flight tests): signal entry, then
+        // hold until released, so a concurrent resolver is forced to await it.
+        if let Some(gate) = self.take_gate("upload_image", "") {
+            wait_gate(gate).await;
+        }
         self.calls.lock().await.push(PlatformCall::UploadImage {
             mime: content.mime.clone(),
             size: content.size,
