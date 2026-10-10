@@ -604,8 +604,29 @@ fn file_tracking_block(tool: &ToolPanel) -> Option<String> {
 /// bytes the renderer writes — the record line plus the `· 已内嵌` suffix an
 /// embedded content adds. `0` when the panel carries no File Content. Kept
 /// beside the render so the two cannot drift.
+///
+/// The block is charged at its **serialized** size, not its raw UTF-8 length:
+/// it is markdown-sanitized by the card's own [`CardMarkdown::element`] (which
+/// escapes `<` and downgrades images) and then embedded in the card's JSON
+/// `content` string, where a `"` or `\` doubles to two bytes and a control
+/// character to six. A raw-length estimate under-counts a filename full of
+/// quotes (or `<`) by half, letting a panel pass the split check while the
+/// serialized card still exceeds Feishu's size cap — which the fenced content
+/// fallback cannot repair.
 pub(crate) fn file_tracking_estimate(tool: &ToolPanel) -> usize {
-    file_tracking_block(tool).map(|block| block.len()).unwrap_or(0)
+    file_tracking_block(tool)
+        .map(|block| json_escaped_len(&CardMarkdown::new().element(&block)))
+        .unwrap_or(0)
+}
+
+/// The byte length `text` contributes to a JSON string: its JSON-escaped form
+/// without the surrounding quotes. `serde_json::to_string` on a `&str` cannot
+/// fail, so the raw-length fallback is unreachable; it only keeps the estimate
+/// finite if it ever were.
+fn json_escaped_len(text: &str) -> usize {
+    serde_json::to_string(text)
+        .map(|quoted| quoted.len().saturating_sub(2))
+        .unwrap_or(text.len())
 }
 
 /// The `img` elements this panel renders (ADR-0076): one per embedded File
@@ -1765,6 +1786,49 @@ mod tests {
         let body = elements[0]["elements"][0]["content"].as_str().unwrap();
         assert!(body.contains("📎 doc.pdf · application/pdf · 4 B"), "{body}");
         assert!(!body.contains("已内嵌"), "{body}");
+    }
+
+    /// The tracking-line size estimate must charge the block's JSON-ESCAPED
+    /// bytes, not its raw UTF-8 length: the panel body is embedded in the card's
+    /// JSON `content` string, where every `"` becomes `\"` (and a `\` becomes
+    /// `\\`, a control char six bytes). A raw-length estimate under-counts a
+    /// pathological filename by half, letting a card pass the split check and
+    /// still be rejected by Feishu on size — which the fenced content fallback
+    /// cannot repair. 16,000 quotes are ~16KB raw but ~32KB escaped.
+    #[test]
+    fn file_tracking_estimate_charges_json_escaping() {
+        let quotes = "\"".repeat(16_000);
+        let panel = read_panel(&quotes, "image/png", b"ABC", FileDelivery::NoSurface);
+        let raw = file_tracking_block(&panel).expect("the panel carries a tracking block");
+        let estimate = file_tracking_estimate(&panel);
+
+        assert_eq!(
+            estimate,
+            raw.len() + quotes.len(),
+            "each `\"` must cost its escaped `\\\"` — one extra byte"
+        );
+        assert!(
+            estimate > raw.len(),
+            "the estimate must not be the raw UTF-8 length"
+        );
+    }
+
+    /// The same estimate must also charge the card's MARKDOWN sanitization: the
+    /// block runs through `CardMarkdown::element` before it reaches the JSON, so
+    /// every `<` a filename carries is escaped to the five-byte `&#60;`. A raw
+    /// estimate would charge one byte for each and under-count by 4x.
+    #[test]
+    fn file_tracking_estimate_charges_markdown_escaping() {
+        let angles = "<".repeat(1_000);
+        let panel = read_panel(&angles, "image/png", b"ABC", FileDelivery::NoSurface);
+        let raw = file_tracking_block(&panel).expect("the panel carries a tracking block");
+        let estimate = file_tracking_estimate(&panel);
+
+        assert_eq!(
+            estimate,
+            raw.len() + angles.len() * 4,
+            "each `<` must cost its five-byte `&#60;` — four extra bytes"
+        );
     }
 
     /// The whole-card content-rejection fallback fences every markdown element
