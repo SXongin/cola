@@ -787,6 +787,15 @@ async fn prompt_skills_ride_the_generation_and_an_empty_attachment_changes_nothi
                     text.contains(fixture.skill_name),
                     "{generation}: V1 must name the skill (its identity is the name) in the prompt text: {text:?}"
                 );
+                // The fallback must DIRECT the model to load the named skill
+                // with its `skill` tool — the whole point of the text fallback.
+                // Naming the skill alone is not enough: a test that checked only
+                // the name would pass with the directive removed (spec #652).
+                let directive = format!("Use the `skill` tool to load `{}`", fixture.skill_name);
+                assert!(
+                    text.contains(&directive),
+                    "{generation}: V1's text fallback must instruct the model to load the skill with its `skill` tool: {text:?}"
+                );
                 assert!(
                     !text.contains(fixture.skill_id),
                     "{generation}: V1's text fallback names the skill, not the V2 id: {text:?}"
