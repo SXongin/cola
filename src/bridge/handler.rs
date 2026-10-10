@@ -197,6 +197,37 @@ fn reject_nested_topic(thread_key: &ThreadKey) -> Option<CardActionResult> {
     })
 }
 
+/// One unknown skill id's clip in the `/skill` error line (spec #652, ticket
+/// #655): a single pathological id cannot dominate the line. Matches the
+/// picker's row-label budget.
+const UNKNOWN_ID_CHARS: usize = 60;
+
+/// The whole `⚠️ 未找到技能：…` line's clip. The line is passed into the picker
+/// card and the dedicated loaded-skill card OUTSIDE the fold budget, so a
+/// dispatch naming many or very long unknown ids must still be bounded well
+/// under Feishu's 30 KB card limit (AGENTS.md #13).
+const UNKNOWN_IDS_LINE_CHARS: usize = 500;
+
+/// The `⚠️ 未找到技能：<id>、…` line a `/skill` dispatch with unresolvable ids
+/// shows — on the picker card when NOTHING resolved, and on the dedicated
+/// loaded-skill card when some did (Q19). `None` when every typed id resolved
+/// (the bare `/skill` case included). Bounded here (each id and the whole line)
+/// because the card renderers do not budget this leading line.
+fn unknown_skill_error(unknown: &[String]) -> Option<String> {
+    if unknown.is_empty() {
+        return None;
+    }
+    let named = unknown
+        .iter()
+        .map(|id| format!("`{}`", crate::feishu::card::truncate_md(id, UNKNOWN_ID_CHARS)))
+        .collect::<Vec<_>>()
+        .join("、");
+    Some(crate::feishu::card::truncate_md(
+        &format!("⚠️ 未找到技能：{named}"),
+        UNKNOWN_IDS_LINE_CHARS,
+    ))
+}
+
 /// The user-facing refusal for a denied action (ADR-0035), shared by the
 /// message gate and the card-click gate so their copy cannot drift.
 fn denial_text(reason: &DenyReason) -> &'static str {
@@ -536,15 +567,9 @@ impl App {
         // `/skill` supplies none, a dispatch with unresolvable ids leads with
         // one — on the picker when NOTHING resolved, and on the dedicated
         // loaded-skill card when SOME did (Q19: partial submit, the unknowns
-        // surfaced, nothing dropped silently).
-        let unknown_error = (!unknown.is_empty()).then(|| {
-            let named = unknown
-                .iter()
-                .map(|id| format!("`{id}`"))
-                .collect::<Vec<_>>()
-                .join("、");
-            format!("⚠️ 未找到技能：{named}")
-        });
+        // surfaced, nothing dropped silently). Bounded; see
+        // [`unknown_skill_error`].
+        let unknown_error = unknown_skill_error(&unknown);
         // Nothing resolved (a bare `/skill`, or every id unknown): the picker
         // card, leading with the error line when there were ids, and no prompt.
         if ids.is_empty() || resolved.is_empty() {
@@ -2082,8 +2107,9 @@ impl App {
     /// two ids and resolve neither. The click must ack within 3s while a turn
     /// runs for the length of a model reply, so the submission is spawned off
     /// the ack; the picker card stays put (the dedicated loaded-skill card
-    /// replies under it, spec #655), and the agent/autoaccept toasts already
-    /// established that a picker does not replace itself.
+    /// replies under the ORIGINAL user message, spec #655), and the
+    /// agent/autoaccept toasts already established that a picker does not
+    /// replace itself.
     async fn handle_skill_card_action(
         self: &Arc<Self>,
         value: &serde_json::Value,
@@ -2118,14 +2144,26 @@ impl App {
                 .get("operator_open_id")
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
-            // The picker card's own message is the reply anchor, so the turn's
-            // card lands below the row the user tapped.
+            // The loaded-skill card (and the turn's card) must reply under the
+            // ORIGINAL user message the picker was sent under, exactly like a
+            // typed dispatch — not under the picker card. The picker's buttons
+            // carry that id (`reply_message_id`, see `build_skill_cards`); a card
+            // built before that field existed falls back to the picker's own
+            // message.
+            let reply_to = {
+                let carried = string("reply_message_id");
+                if carried.is_empty() {
+                    string("open_message_id")
+                } else {
+                    carried
+                }
+            };
             let kind = ConversationKind::classify(&chat_type, thread_id.as_deref());
             let thread_key = kind.thread_key(&chat_id, thread_id.as_deref());
             app.handle_skill_command(
                 thread_key,
                 crate::bridge::IncomingMessage {
-                    message_id: string("open_message_id"),
+                    message_id: reply_to,
                     chat_id,
                     chat_type,
                     thread_id,

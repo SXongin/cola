@@ -138,6 +138,21 @@ fn unwrapped_body(skill: &SkillInfo) -> String {
         .to_string()
 }
 
+/// The plain-text body one skill contributes to the degraded text fallback
+/// (spec #652, ticket #655): the same unwrapped markdown a fold shows, clipped
+/// to `allowed` characters — or empty when the skill carries no content or the
+/// shared budget is spent. Shared so the fallback and the folds unwrap the same
+/// way, and the fallback keeps the fold body the acceptance promises instead of
+/// degrading to a title-only list.
+pub(crate) fn fallback_body(skill: &SkillInfo, allowed: usize) -> String {
+    let body = unwrapped_body(skill);
+    if body.is_empty() || allowed == 0 {
+        String::new()
+    } else {
+        truncate_md(&body, allowed)
+    }
+}
+
 /// One fold's panel: the title `🧩 已加载技能：<name>`, the body the skill's
 /// markdown (sanitized, capped at `allowed` characters) with any server
 /// `<skill_content>` envelope and sampled `<skill_files>` list stripped — the
