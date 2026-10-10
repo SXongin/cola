@@ -567,12 +567,7 @@ fn skill_list_text(skills: &[crate::backend::SkillInfo], error: Option<&str>) ->
     } else {
         text.push_str("🧩 可用技能：\n");
         for skill in skills {
-            let description = skill
-                .description
-                .as_deref()
-                .map(str::trim)
-                .filter(|d| !d.is_empty())
-                .map(|d| d.lines().next().unwrap_or("").trim());
+            let description = super::picker::skill_description_line(skill);
             match description {
                 Some(description) => {
                     text.push_str(&format!("- `{}` {} — {}\n", skill.id, skill.name, description))

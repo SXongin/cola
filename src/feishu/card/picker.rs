@@ -25,7 +25,7 @@ fn option_picker_card(
 /// alongside `chat_id`/`thread_id`, so a tap reconstructs the exact
 /// [`ConversationKind`](crate::config::ConversationKind) the picker was sent in.
 /// Every other picker passes `None`.
-fn with_extra(mut payload: serde_json::Value, extra: Option<(&str, &str)>) -> serde_json::Value {
+fn with_callback_field(mut payload: serde_json::Value, extra: Option<(&str, &str)>) -> serde_json::Value {
     if let Some((key, value)) = extra {
         payload[key] = serde_json::Value::String(value.to_string());
     }
@@ -87,7 +87,7 @@ fn picker_card(
             "text": { "tag": "plain_text", "content": "← 返回全部 provider" },
             "type": "default",
             "width": "fill",
-            "value": with_extra(json!({
+            "value": with_callback_field(json!({
                 "action": action,
                 "chat_id": thread_key.chat_id,
                 "thread_id": thread_key.thread_id,
@@ -102,7 +102,7 @@ fn picker_card(
             "text": { "tag": "plain_text", "content": label },
             "type": "default",
             "width": "fill",
-            "value": with_extra(json!({
+            "value": with_callback_field(json!({
                 "action": clear_action,
                 "chat_id": thread_key.chat_id,
                 "thread_id": thread_key.thread_id,
@@ -125,7 +125,7 @@ fn picker_card(
             "text": { "tag": "plain_text", "content": label },
             "type": "default",
             "width": "fill",
-            "value": with_extra(payload, extra),
+            "value": with_callback_field(payload, extra),
         }));
     }
     card_shell(header, "blue", elements)
@@ -406,6 +406,21 @@ pub fn build_think_card(
 /// "…" rather than bloating the card; the skill's `name` always leads.
 const SKILL_ROW_LABEL_CHARS: usize = 60;
 
+/// The one-line skill description both the picker row and its text fallback
+/// show (spec #652, ticket #656): the skill's `description` trimmed, an
+/// empty/whitespace-only value dropped, and a folded/multi-line frontmatter
+/// value clipped to its first line (trimmed again). `None` when the skill
+/// declares no usable description, so both sites render the name alone — one
+/// helper, so the row and the fallback cannot drift.
+pub(crate) fn skill_description_line(skill: &crate::backend::SkillInfo) -> Option<&str> {
+    skill
+        .description
+        .as_deref()
+        .map(str::trim)
+        .filter(|description| !description.is_empty())
+        .map(|description| description.lines().next().unwrap_or("").trim())
+}
+
 /// The `/skill` picker (spec #652, ticket #656): one button per registered
 /// skill — its `name`, plus its `description` when it declares one — so a user
 /// who does not know an id can pick one. The callback value is the skill's
@@ -441,18 +456,15 @@ pub(crate) fn build_skill_cards(
     let options: Vec<(String, String)> = skills
         .iter()
         .map(|skill| {
-            let label = match skill
-                .description
-                .as_deref()
-                .map(str::trim)
-                .filter(|d| !d.is_empty())
-            {
+            let label = match skill_description_line(skill) {
                 Some(description) => {
-                    // A button is one line: a folded/multi-line frontmatter
-                    // description is clipped to its first line, then to the row
-                    // budget, so a newline never reaches Feishu's `plain_text`.
-                    let one_line = description.lines().next().unwrap_or("").trim();
-                    truncate_md(&format!("{} — {}", skill.name, one_line), SKILL_ROW_LABEL_CHARS)
+                    // A button is one line: the description is already clipped
+                    // to its first line, then the whole label to the row budget,
+                    // so a newline never reaches Feishu's `plain_text`.
+                    truncate_md(
+                        &format!("{} — {}", skill.name, description),
+                        SKILL_ROW_LABEL_CHARS,
+                    )
                 }
                 // Clip the bare name too: an unbounded label could alone exceed
                 // the card budget, and `chunk_picker_cards` cannot split a
@@ -789,6 +801,30 @@ mod tests {
                 .count(),
             1,
             "the list follows the error"
+        );
+    }
+
+    /// The one shared description normalizer both the picker row and the text
+    /// fallback call (spec #652, ticket #656): a missing, empty or
+    /// whitespace-only description is `None`; a multi-line (folded frontmatter)
+    /// value is clipped to its first line; surrounding whitespace is trimmed.
+    #[test]
+    fn skill_description_line_trims_drops_empty_and_takes_the_first_line() {
+        let skill = |description: Option<&str>| crate::backend::SkillInfo {
+            id: "s".into(),
+            name: "S".into(),
+            description: description.map(str::to_string),
+        };
+        assert_eq!(skill_description_line(&skill(None)), None);
+        assert_eq!(skill_description_line(&skill(Some(""))), None);
+        assert_eq!(skill_description_line(&skill(Some("   \n  "))), None);
+        assert_eq!(
+            skill_description_line(&skill(Some("  first line\nsecond line  "))),
+            Some("first line")
+        );
+        assert_eq!(
+            skill_description_line(&skill(Some("only line"))),
+            Some("only line")
         );
     }
 
