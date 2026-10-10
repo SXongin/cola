@@ -39,25 +39,39 @@ way a turn's several images stay tied to the call that read each one.
 
 ## Decision
 
-- **Embed an image within the caps.** An image whose mime is in Feishu's set and
-  whose bytes are ≤10MB is uploaded once and embedded as a **standalone `img`
-  element immediately after its Tool Panel** in the card body, title
-  `📎 <name>`. It is not nested in the panel (the panel is folded by default), so
-  the image is visible and its adjacency to the panel gives the correspondence.
+- **One typed File Content over the neutral model.** The decoded file payload is
+  exposed as a typed view — uri, mime, name, and a size derived from the inline
+  bytes — uniform across Generations and across a tool's `file` block and a user
+  message's `files` entry, with sane defaults for a missing name or mime. The
+  renderer never re-parses the raw block, and the model's existing raw-block
+  preservation is unchanged.
+- **Embed an image within the caps.** An image whose mime is in Feishu's set,
+  whose bytes are ≤10MB, and whose dimensions are within Feishu's limits (GIF
+  ≤2000×2000, others ≤12000×12000) is uploaded once and embedded as a
+  **standalone `img` element immediately after its Tool Panel** in the card body,
+  title `📎 <name>`, `preview` enabled so a click enlarges it. It is not nested in
+  the panel (the panel is folded by default), so the image is visible and its
+  adjacency to the panel gives the correspondence. A format or dimension Feishu
+  rejects is not embeddable and falls through to the File Message path.
 - **Send everything else as a File Message.** A non-image file, or an image past
   the caps (still ≤30MB), is uploaded once and posted as a separate Feishu
   message (`msg_type:"file"`), **replied in-thread under the live card**, sent
   **once on the first poll that shows the block**, guarded by a process-local
   once-guard (a cola restart may resend it).
-- **The panel's tracking line has three states.** Every File Content gets one
+- **One shared Feishu capability, not a file-only path.** The client gains image
+  and file upload and a generic message send carrying an arbitrary `msg_type` +
+  content with thread-reply support, so the delivery is one reusable step shared
+  by the image-embed and File Message surfaces.
+- **The tracking line has three states.** A tool-output File Content gets one
   line in its Tool Panel: `📎 name · mime · size · 已内嵌` when the image is
   embedded in the card; `📎 name · mime · size · 已发送为文件消息` when it was
   delivered as a File Message; `📎 name · mime · size · 未发送` when it could not
   be delivered — over Feishu's hard 30MB message cap, or the send failed. An
-  embedded image is never marked `未发送`: it was shown on the card, not sent as
-  a message, and its own state says so. The fallback ladder when the preferred
-  surface fails: embed upload fails → degrade to a File Message → that fails →
-  `未发送`.
+  embedded image is never marked `未发送`: it was shown on the card, not sent as a
+  message, and its own state says so. A user-message File Content is recorded
+  elsewhere (below) and never gets a File Message. The fallback ladder when the
+  preferred surface fails: embed upload fails → degrade to a File Message → that
+  fails → `未发送`.
 - **Upload is pre-resolved in the render loop**, cached in memory **by content
   hash**, so an identical file is uploaded once and every PATCH reuses the key.
 - **A user message's File Content is record-only.** It shows
