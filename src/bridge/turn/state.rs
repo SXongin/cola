@@ -5335,6 +5335,32 @@ mod tests {
         );
     }
 
+    /// The tracking-line estimate must charge the JSON-ESCAPED bytes, not the
+    /// raw UTF-8 length: the panel body is embedded in the card's JSON `content`
+    /// string, where each `"` becomes `\"`. A 16,000-quote filename is ~16KB raw
+    /// (under the 25KB budget, so a raw estimate would not split) but ~32KB
+    /// escaped (over it), so only an escaping-aware estimate splits the card
+    /// before Feishu rejects it on size — which the fenced content fallback
+    /// cannot repair.
+    #[test]
+    fn card_split_charges_escaped_tracking_line_bytes() {
+        let mut acc = StreamAccumulator::new("test");
+        acc.card_state = CardState::Done;
+        let quotes = "\"".repeat(16_000);
+        acc.push_tool(
+            "call_read",
+            ToolPanel::for_test_with_files("read", &[(&quotes, b"ABC")]),
+        );
+        acc.push_text("最后的结论。");
+
+        let (_card, full) = acc.build_card_with_split();
+        assert!(
+            full,
+            "the tracking line's ESCAPED bytes must count toward the size budget"
+        );
+        assert!(acc.render_from > 0, "render_from must advance past the split");
+    }
+
     /// A resolved upload attaches by content hash, not by position (ADR-0076):
     /// a panel the transcript replaced while the upload was in flight must not
     /// have a different file at that index marked embedded with the old key.
