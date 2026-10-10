@@ -730,14 +730,19 @@ impl WireQuestion {
 /// Fold the caller's skill attachment ([`PromptSkill`]) into V1's prompt text.
 /// V1 has neither a structured `skills` field nor a skill prompt part, so the
 /// only way to load a skill is to name it and tell the model to load it with
-/// its `skill` tool. An empty attachment returns the text untouched — a bare
-/// prompt stays byte-for-byte what it was (spec #652). Used by `prompt`.
+/// its `skill` tool. V1's `skill` tool takes the skill's **name** (its `Info`
+/// carries no id; skills are keyed by their frontmatter name), and V1's identity
+/// *is* the name — so this fold uses [`PromptSkill::name`] and never `id`, which
+/// only V2's structured `skills` path consumes. An empty attachment returns the
+/// text untouched — a bare prompt stays byte-for-byte what it was (spec #652).
+/// Used by `prompt`.
 fn fold_skills(text: &str, skills: &[PromptSkill]) -> String {
     if skills.is_empty() {
         return text.to_string();
     }
     let names = skills
         .iter()
+        // V1's `skill` tool loads by name; `id` is V2's key and never appears here.
         .map(|skill| format!("`{}`", skill.name))
         .collect::<Vec<_>>()
         .join(", ");
