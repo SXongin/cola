@@ -18,15 +18,18 @@ fn option_picker_card(
     picker_card(header, intro, thread_key, action, None, false, None, options, &[])
 }
 
-/// Add the extra routing pairs to a button's callback payload (spec #652,
-/// ticket #656): the `/skill` picker carries the conversation's `chat_type`
+/// Add the callback fields to a button's callback payload (spec #652,
+/// ticket #656): the `/skill` picker carries the Chat/Topic's `chat_type`
 /// alongside `chat_id`/`thread_id` (so a tap reconstructs the exact
 /// [`ConversationKind`](crate::config::ConversationKind) the picker was sent in)
 /// AND the original user message id the picker replied under, so a tap's own
 /// reply (the loaded-skill card) lands under that message rather than the picker
 /// card. Every other picker passes an empty slice.
-fn with_callback_field(mut payload: serde_json::Value, extra: &[(&str, &str)]) -> serde_json::Value {
-    for (key, value) in extra {
+fn with_callback_field(
+    mut payload: serde_json::Value,
+    callback_fields: &[(&str, &str)],
+) -> serde_json::Value {
+    for (key, value) in callback_fields {
         payload[*key] = serde_json::Value::String((*value).to_string());
     }
     payload
@@ -60,7 +63,7 @@ impl PickerLevel {
 /// A picker card whose buttons carry an optional `level` (two-step navigation
 /// for the `/model` provider → model flow) and an optional leading "back"
 /// button. Each button's callback payload is `{action, chat_id, thread_id,
-/// [level], value}` plus every `extra` pair. An optional leading clear button
+/// [level], value}` plus every `callback_fields` pair. An optional leading clear button
 /// (`clear = Some((label, action))`) carries its OWN action tag: "clear/reset"
 /// never shares the value namespace with the options, so an option literally
 /// named like a clear verb stays selectable (ADR-0020's `--reset` decoupling —
@@ -75,7 +78,7 @@ fn picker_card(
     back: bool,
     clear: Option<(&str, &str)>,
     options: &[(String, String)],
-    extra: &[(&str, &str)],
+    callback_fields: &[(&str, &str)],
 ) -> serde_json::Value {
     let mut elements: Vec<serde_json::Value> = vec![json!({
         "tag": "markdown",
@@ -93,7 +96,7 @@ fn picker_card(
                 "thread_id": thread_key.thread_id,
                 "level": PickerLevel::Provider.as_str(),
                 "value": PICKER_BACK_TO_PROVIDERS,
-            }), extra),
+            }), callback_fields),
         }));
     }
     if let Some((label, clear_action)) = clear {
@@ -107,7 +110,7 @@ fn picker_card(
                 "chat_id": thread_key.chat_id,
                 "thread_id": thread_key.thread_id,
                 "value": "",
-            }), extra),
+            }), callback_fields),
         }));
     }
     for (label, value) in options {
@@ -125,7 +128,7 @@ fn picker_card(
             "text": { "tag": "plain_text", "content": label },
             "type": "default",
             "width": "fill",
-            "value": with_callback_field(payload, extra),
+            "value": with_callback_field(payload, callback_fields),
         }));
     }
     card_shell(header, "blue", elements)
@@ -307,22 +310,27 @@ fn chunk_picker_cards(
     back: bool,
     clear: Option<(&str, &str)>,
     options: &[(String, String)],
-    extra: &[(&str, &str)],
+    callback_fields: &[(&str, &str)],
 ) -> Vec<serde_json::Value> {
     let mut pages: Vec<&[(String, String)]> = Vec::new();
     let mut start = 0usize;
+    // One button's estimated serialized bytes: ~200 of structure (tags, the
+    // routing callback fields) + the label's UTF-8 (shown twice in the button
+    // JSON) + the callback VALUE, which for a `/skill` row is the skill's exact
+    // id — an unbudgeted id would let the card exceed Feishu's limit (spec #652,
+    // ticket #655).
+    let button_bytes = |option: &(String, String)| 200 + option.0.len() * 2 + option.1.len();
     while start < options.len() {
-        // Estimate JSON bytes like the streaming splitter (a button is ~200
-        // bytes + the label's UTF-8); bound the button COUNT by the picker
-        // budget, not the streaming 150-component constant — buttons cost ~2
-        // elements each against Feishu's 200-element ceiling.
+        // Estimate JSON bytes like the streaming splitter; bound the button
+        // COUNT by the picker budget, not the streaming 150-component constant —
+        // buttons cost ~2 elements each against Feishu's 200-element ceiling.
         let mut bytes = intro.len() + 64;
         let mut end = start;
         while end < options.len()
             && end - start < MAX_PICKER_BUTTONS_PER_CARD
-            && bytes + 200 + options[end].0.len() * 2 <= MAX_CARD_JSON_CHARS
+            && bytes + button_bytes(&options[end]) <= MAX_CARD_JSON_CHARS
         {
-            bytes += 200 + options[end].0.len() * 2;
+            bytes += button_bytes(&options[end]);
             end += 1;
         }
         if end == start {
@@ -347,7 +355,7 @@ fn chunk_picker_cards(
             back,
             clear,
             page,
-            extra,
+            callback_fields,
         ));
     }
     cards
@@ -443,7 +451,7 @@ pub(crate) fn build_skill_cards(
     message_id: &str,
     error: Option<&str>,
 ) -> Vec<serde_json::Value> {
-    let extra = [("chat_type", chat_type), ("reply_message_id", message_id)];
+    let callback_fields = [("chat_type", chat_type), ("reply_message_id", message_id)];
     let mut intro = error.map(|e| format!("{e}\n")).unwrap_or_default();
     if skills.is_empty() {
         intro.push_str("_(没有可用技能)_");
@@ -456,7 +464,7 @@ pub(crate) fn build_skill_cards(
             false,
             None,
             &[],
-            &extra,
+            &callback_fields,
         )];
     }
     intro.push_str("**选择技能**（点击后以 `/skill <id>` 发送）：");
@@ -491,7 +499,7 @@ pub(crate) fn build_skill_cards(
         false,
         None,
         &options,
-        &extra,
+        &callback_fields,
     )
 }
 
@@ -727,7 +735,7 @@ mod tests {
     /// (`disable-model-invocation`) and a description-less one included — one
     /// row each under the `skill` action. The row label carries the name and,
     /// when present, the description; the callback value is the skill identity,
-    /// and the conversation's `chat_type` rides every button for the tap.
+    /// and the Chat/Topic's `chat_type` rides every button for the tap.
     #[test]
     fn skill_cards_list_every_entry_with_descriptions_and_routing() {
         let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
@@ -879,5 +887,49 @@ mod tests {
             label.chars().count()
         );
         assert!(label.ends_with('…'), "clipped label keeps its ellipsis: {label}");
+    }
+
+    /// A registered skill with a very long CALLBACK VALUE (its exact `id`) must
+    /// still produce cards under Feishu's byte ceiling (spec #652, ticket #655):
+    /// the chunker budgets the button's callback value, not just its label, so a
+    /// long id paginates instead of building an oversized card. The full id
+    /// stays in the callback so the skill remains selectable.
+    #[test]
+    fn skill_card_accounts_for_an_overlong_id_and_stays_within_budget() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let id = "i".repeat(20_000);
+        let skills: Vec<crate::backend::SkillInfo> = (0..3)
+            .map(|n| crate::backend::SkillInfo {
+                id: format!("{n}-{id}"),
+                name: format!("skill-{n}"),
+                description: None,
+                content: None,
+            })
+            .collect();
+        let cards = build_skill_cards(&key, &skills, "p2p", "msg_src", None);
+        assert!(!cards.is_empty(), "the picker must still list the skills");
+        for card in &cards {
+            assert!(
+                card.to_string().len() <= FEISHU_CARD_LIMIT_BYTES,
+                "a long callback value pushed a card to {} bytes",
+                card.to_string().len()
+            );
+        }
+        // Every skill's exact id survives in some card's callback.
+        let values: Vec<String> = cards
+            .iter()
+            .flat_map(|card| {
+                card["body"]["elements"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|e| e["tag"] == "button")
+                    .filter_map(|e| e["value"]["value"].as_str().map(str::to_string))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        for skill in &skills {
+            assert!(values.contains(&skill.id), "the exact id must remain selectable");
+        }
     }
 }

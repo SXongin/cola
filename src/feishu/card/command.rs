@@ -523,7 +523,7 @@ pub(crate) async fn send_help_card(handles: &CommandHandles, message_id: &str) -
 /// dispatch reads the skills exactly ONCE. `error`, when set, leads the card so
 /// an unknown-id dispatch shows the same list behind an error line. `chat_type`
 /// rides the buttons so a tap re-enters the message pipeline in the
-/// conversation kind the picker was sent in. The read behind `skills` is
+/// Chat/Topic kind the picker was sent in. The read behind `skills` is
 /// generation-neutral and unfiltered, so a hidden or description-less skill is
 /// listed too; an empty list opens the no-skills state.
 ///

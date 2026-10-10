@@ -335,11 +335,11 @@ async fn bare_skill_id_with_no_text_is_accepted() {
     assert_eq!(*fx.prompt_skills.lock().await, vec![vec![resolved("foreman")]]);
 }
 
-/// A `/skill` dispatch reads the list from the CONVERSATION's project
+/// A `/skill` dispatch reads the list from the CHAT/TOPIC's project
 /// directory — the location the eventual prompt runs in — so a session's own
 /// project skills are the ones listed and resolved, not the server default's.
 #[tokio::test]
-async fn a_skill_read_is_scoped_to_the_conversations_directory() {
+async fn a_skill_read_is_scoped_to_the_chat_or_topics_directory() {
     let fx = SkillFixture::build().await;
     seed_session(&fx.app, "ses_test", "/work/custom").await;
 
