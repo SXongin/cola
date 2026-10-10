@@ -299,6 +299,14 @@ impl CardBuilder {
         self
     }
 
+    /// This card's markdown hygiene state, for a caller that builds a body
+    /// element through it instead of [`Self::with_element`]'s ready-made JSON —
+    /// the loaded-skill folds (spec #652, ticket #655) share the card's table
+    /// budget and fenced fallback with every other element.
+    pub(crate) fn markdown_mut(&mut self) -> &mut CardMarkdown {
+        &mut self.markdown
+    }
+
     /// How many body elements have been pushed so far — the streaming card
     /// records each interaction block's element range with it (ADR-0038, rule
     /// 2), so a cached card can be edited in place later.

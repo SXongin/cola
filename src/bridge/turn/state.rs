@@ -4096,7 +4096,12 @@ impl StreamAccumulator {
         // exactly as before; the folds share one card-wide size and count
         // budget, mirroring the splitter's reserve.
         if include_tail {
-            for panel in crate::feishu::card::skill::loaded_skill_folds(&self.loaded_skills, "skill_") {
+            let panels = crate::feishu::card::skill::loaded_skill_folds(
+                &self.loaded_skills,
+                "skill_",
+                builder.markdown_mut(),
+            );
+            for panel in panels {
                 builder = builder.with_element(panel);
             }
         }

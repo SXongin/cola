@@ -1,7 +1,7 @@
 use serde_json::json;
 
 use super::clean_session_label;
-use super::sanitize::sanitize_markdown;
+use super::sanitize::{CardMarkdown, sanitize_markdown};
 use super::shell::card_shell;
 use super::skill::loaded_skill_folds;
 use crate::backend::MessageSkill;
@@ -23,9 +23,13 @@ pub fn build_external_message_card(
         content.push_str(&format!("**{}**\n", session_name));
     }
     content.push_str(preview);
-    let content = sanitize_markdown(&content);
+    // One card-wide markdown state: the preview and the loaded-skill folds
+    // share its table budget and fenced fallback, so their tables together can
+    // never exceed Feishu's per-card limit (spec #652, ticket #655).
+    let mut md = CardMarkdown::new();
+    let content = md.clean(&content);
     let mut elements = vec![json!({ "tag": "markdown", "content": content })];
-    elements.extend(loaded_skill_folds(skills, "ext_skill_"));
+    elements.extend(loaded_skill_folds(skills, "ext_skill_", &mut md));
     card_shell("💬 有新消息", "blue", elements)
 }
 
@@ -121,6 +125,34 @@ mod tests {
         assert!(
             size <= crate::feishu::card::FEISHU_CARD_LIMIT_BYTES,
             "the folds pushed the notification to {size} bytes"
+        );
+    }
+
+    /// The external-message preview AND its loaded-skill folds share ONE
+    /// card-wide table budget (spec #652, ticket #655): the preview's tables
+    /// count against the same five the folds draw from, so a 6th anywhere on the
+    /// card renders as code.
+    #[test]
+    fn the_external_preview_and_folds_share_one_table_budget() {
+        use crate::feishu::card::sanitize::MAX_CARD_TABLES;
+
+        let table = "| a | b |\n|---|---|\n| 1 | 2 |";
+        let body = format!("{table}\n\n{table}\n\n{table}");
+        let skills: Vec<MessageSkill> = (0..2)
+            .map(|i| MessageSkill {
+                id: format!("s{i}"),
+                name: format!("skill-{i}"),
+                instructions: Some(body.clone()),
+            })
+            .collect();
+        let card = build_external_message_card("proj", &body, &skills);
+        let s = card.to_string();
+
+        assert_eq!(s.matches("|---|---|").count(), 9, "nine tables present: {s}");
+        assert_eq!(
+            s.matches("```").count() / 2,
+            9 - MAX_CARD_TABLES,
+            "tables past the card-wide budget render as code: {s}"
         );
     }
 }
