@@ -470,6 +470,9 @@ impl Turn {
         acc.set_cola_message_id(&cola_message_id);
         // Full original prompt, so the error-card "retry" can re-submit it.
         acc.set_prompt(&text);
+        // The skills ride with it: a retry re-submits the prompt WITH its skills
+        // (spec #652, ticket #654).
+        acc.set_skills(&skills);
         acc.set_requester(requester_open_id.clone());
         acc.set_is_group(is_group);
         // An explicit retry carries the failed attempt's render baseline
@@ -3038,6 +3041,9 @@ pub(crate) struct TurnRecovery {
     /// The failed/unreceived turn's session.
     pub(crate) session_id: String,
     pub(crate) prompt: String,
+    /// The skills the failed turn loaded (spec #652, ticket #654), re-attached
+    /// by the retry. Empty for an ordinary prompt.
+    pub(crate) skills: Vec<PromptSkill>,
     pub(crate) reply_to: String,
     pub(crate) subtitle: String,
     pub(crate) requester_open_id: Option<String>,
@@ -3048,9 +3054,10 @@ pub(crate) struct TurnRecovery {
 impl TurnRecovery {
     /// This recovery as the new attempt's [`PromptContext`]: the same facts
     /// under the context's names, with the id policy the caller chose (`None`
-    /// = a fresh `msg_cola_` id, `Some` = the previous attempt's). Images and
-    /// skills are not re-sent on a recovery (#391, out of scope): the recovery
-    /// fixture carries neither.
+    /// = a fresh `msg_cola_` id, `Some` = the previous attempt's). The skills
+    /// are carried (already-resolved small tokens, the retry's whole point);
+    /// images are not re-sent on a recovery (#391, re-upload cost, out of
+    /// scope).
     pub(crate) fn into_context(
         self,
         thread_key: ThreadKey,
@@ -3067,7 +3074,7 @@ impl TurnRecovery {
             is_group: self.is_group,
             cola_message_id,
             images: Vec::new(),
-            skills: Vec::new(),
+            skills: self.skills,
             // A recovery never routes through the advisory read (its own
             // decision already judged the run): an ordinary card.
             advisory_live: false,
@@ -3467,6 +3474,7 @@ impl Turn {
         Some(TurnRecovery {
             session_id: session_id.to_string(),
             prompt,
+            skills: card.acc.skills().to_vec(),
             reply_to: card.acc.reply_to_message_id().unwrap_or_default().to_string(),
             subtitle: card.acc.title().to_string(),
             requester_open_id: card.acc.requester_open_id().map(str::to_string),
