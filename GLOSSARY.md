@@ -391,7 +391,7 @@ A file payload a transcript part carries instead of text — the Backend's `file
 _Avoid_: Attachment, media, file part, Tool File Content (too narrow — a user message carries File Content too)
 
 **File Message**:
-The separate Feishu image/file message cola posts for a **File Content** it cannot embed in the card — a non-image file (a PDF) or an image past the embedding caps — uploaded once (Feishu `im:resource`) and sent once per File Content. It is not a **Card**: it rides the topic beside the **Card Chain** (replied in-thread under the live card) and is tracked by its placeholder line in the **Tool Panel**. A File Content past Feishu's 30MB message cap, or one whose send fails, has no File Message (placeholder only); an image within the caps is embedded in the card instead, never sent as a File Message.
+The separate Feishu file message cola posts for a **File Content** it cannot embed in the card — a non-image file (a PDF) or an image past the embedding caps — uploaded once (Feishu `im:resource`) and sent once per File Content. It is not a **Card**: it rides the topic beside the **Card Chain** (replied in-thread under the live card) and is tracked by its placeholder line in the **Tool Panel**. A File Content past Feishu's 30MB message cap, or one whose send fails, has no File Message (placeholder only); an image within the caps is embedded in the card instead, never sent as a File Message.
 _Avoid_: Attachment message, media message, upload
 
 **Turn Footer**:

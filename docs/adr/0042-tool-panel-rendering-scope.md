@@ -129,3 +129,14 @@ arms now match it by the same rule — exact built-in id, shape-gated:
 
 Nothing above changes the boundary: only ids OpenCode ships get arms, each arm
 stays shape-gated, and every other payload stays raw.
+
+## Amendment (2026-10-10): a `file` content block is protocol, not tool payload
+
+ADR-0076 renders the `file` variant of `Tool.Content` (OpenCode's protocol
+content union, `text` | `file`) as a File Content — for `read`, an MCP tool, or
+any other tool alike. This does not breach the boundary above: that boundary
+keeps a tool's `input`/`output` *payload* opaque because its shape is the tool's
+own contract, whereas a `file` content block is a protocol-level content variant
+the server defines for every tool, decoded neutrally before any tool id is
+consulted. Rendering it is reading the protocol, not sniffing a third-party
+shape, and the renderer never inspects the tool id to do so.

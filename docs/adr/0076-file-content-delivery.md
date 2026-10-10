@@ -99,8 +99,13 @@ way a turn's several images stay tied to the call that read each one.
 - **A separate message is the only path to a PDF**, and Feishu's own upload
   limits (10MB image / 30MB file) set the boundary between the two surfaces.
 - **One shared step, not per-tool renderers.** File Content is content-shaped,
-  not tool-shaped, so `read`, an MCP resource, and a user message all ride one
-  "File Content → card/message" path — consistent with ADR-0042's boundary.
+  not tool-shaped: the `file` block is a protocol-level variant of
+  `Tool.Content`, defined for every tool, so `read`, an MCP resource, and a user
+  message all ride one "File Content → card/message" path. This is not
+  ADR-0042's forbidden shape-sniffing — that boundary keeps a tool's own
+  `input`/`output` payload opaque, whereas a `file` content block is decoded
+  neutrally before any tool id is consulted; ADR-0042 carries an amendment
+  recording the distinction.
 
 ## Alternatives considered
 
@@ -134,6 +139,8 @@ and **File Message** (the separate message cola posts for one it cannot embed).
 The implementation batch (spec #644, tickets #646–#649) adds the tests at the
 three existing seams: the Feishu wire client (the upload multipart fields, the
 bearer/token flow, the `msg_type:"file"` content, `reply_in_thread`, and
-business-error mapping), the pure card builder (the `img` element, the three tracking-line
-states, the content-rejection fenced fallback), and the bridge mock Platform
-(the pre-resolve, the content-hash dedup, the fallback ladder, the once-guard).
+business-error mapping), the pure card builder (the `img` element's position
+immediately after its panel and its `title`/`preview`, the three tracking-line
+states, the user-record line, the content-rejection fenced fallback), and the
+bridge mock Platform (the pre-resolve, the content-hash dedup, the fallback
+ladder, the once-guard, the in-thread placement, best-effort on failure).
