@@ -1284,9 +1284,10 @@ pub(super) struct StreamAccumulator {
     /// cost) carrying them costs nothing. Private to this module: set by
     /// [`Self::set_skills`] (at `Turn::start`); read through [`Self::skills`].
     skills: Vec<PromptSkill>,
-    /// The skills this turn's USER MESSAGE attached (spec #652, ticket #655),
-    /// captured from the neutral transcript's anchor message on the first
-    /// render read and rendered as the live card's `🧩 已加载技能` folds. Distinct
+    /// The skills this turn's USER MESSAGES attached (spec #652, ticket #655),
+    /// captured from the neutral transcript's user messages within the Turn's
+    /// span — the anchor AND any Supplement merged into it — on the first render
+    /// read and rendered as the live card's `🧩 已加载技能` folds. Distinct
     /// from [`Self::skills`] (the `{ id, name }` prompt axis #654 keeps for a
     /// retry): this carries the skill's own body the fold shows, and is empty on
     /// a generation whose user messages record none (V1). Set by
@@ -2029,25 +2030,26 @@ impl StreamAccumulator {
         self.skills = skills.to_vec();
     }
 
-    /// Capture the anchor user message's attached skills from a read (spec #652,
-    /// ticket #655). The turn's user message IS the anchor ([`Self::turn_anchor`]
-    /// names it by identity), so once the anchor is known one read of the same
-    /// transcript yields the skills the loaded-skill folds render. The capture
-    /// is positive-only: a read that cannot find the message (or finds one with
-    /// no skills, as V1 always does) leaves what it has, so a later read cannot
-    /// clear a capture the message's own payload will keep carrying anyway.
+    /// Capture the skills the Turn's user messages attached from a read (spec
+    /// #652, ticket #655): the anchor user message AND any Supplement merged
+    /// into the running turn. The turn's user message IS the anchor
+    /// ([`Self::turn_anchor`] names it by identity), and a Supplement is
+    /// another user message within the same Turn span, so one read of the same
+    /// transcript yields every skill the loaded-skill folds render via
+    /// [`SessionTranscript::turn_user_skills`]. The capture is positive-only: a
+    /// read that finds no skill for the turn (the messages are gone —
+    /// compaction — or the generation records none, as V1 always does) leaves
+    /// what it has, so a later read cannot clear a capture the messages' own
+    /// payloads keep carrying anyway.
     pub(super) fn capture_loaded_skills(&mut self, transcript: &SessionTranscript) {
         let Some(anchor) = self.turn_anchor.as_ref() else {
             return;
         };
-        let Some(message) = transcript
-            .messages
-            .iter()
-            .find(|message| message.id.as_str() == anchor.message_id.as_str())
-        else {
+        let skills = transcript.turn_user_skills(anchor);
+        if skills.is_empty() {
             return;
-        };
-        self.loaded_skills = message.skills.clone();
+        }
+        self.loaded_skills = skills;
     }
 
     /// The `msg_cola_…` id this turn's user message carries (ADR-0026), if

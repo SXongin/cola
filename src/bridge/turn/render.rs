@@ -766,10 +766,11 @@ pub(super) fn render_new_turn_parts_committing(
 /// turn's and never bleeds in (#190).
 pub(super) fn render_turn_parts(acc: &mut StreamAccumulator, transcript: &SessionTranscript) -> bool {
     acc.capture_turn_anchor(transcript);
-    // The anchor user message's attached skills (spec #652, ticket #655): once
-    // the anchor is known, the same read yields the skills the live card's fold
-    // renders. Captured here, before any filtering, so a card whose anchor this
-    // read is the first to establish still shows them.
+    // The skills this Turn's user messages attached (spec #652, ticket #655):
+    // the anchor AND any Supplement merged into the running turn, gathered over
+    // the same Turn span the render below uses. Captured here, before any
+    // filtering, so a card whose anchor this read is the first to establish
+    // still shows them.
     acc.capture_loaded_skills(transcript);
     // The orphan gap this accumulator owes (spec #561, review #569) renders
     // first, on the first read that can place its cursor: the content was never
@@ -2389,6 +2390,48 @@ Index: /x/src/main.rs
 
         assert!(render_new_turn_parts(&mut acc, &transcript));
         assert!(!acc.build_card().to_string().contains("已加载技能"));
+    }
+
+    /// A Supplement — a `/skill …` sent while a Turn is already live — loads its
+    /// skill into the prompt, but attaches it to a SECOND user message, not the
+    /// anchor. The live card's folds must read every user message that belongs
+    /// to the running turn, the anchor AND its Supplements; reading the anchor
+    /// alone would load the skill into the prompt with no fold ever appearing
+    /// (spec #652, ticket #655).
+    #[test]
+    fn a_supplements_skill_renders_its_fold_on_the_live_card() {
+        let mut acc = StreamAccumulator::new("test");
+        acc.set_cola_message_id("msg_cola_1");
+        let transcript = SessionTranscript::new(vec![
+            // The anchor: no skills of its own.
+            typed_message(
+                "msg_cola_1",
+                MessageRole::User,
+                Some(2000),
+                vec![text_part("start")],
+            ),
+            message("a1", 2500, vec![text_part("working")]),
+            // A Supplement merged into the running turn, carrying a skill.
+            user_message_with_skills(
+                "msg_cola_2",
+                3000,
+                "/skill implement-spec",
+                vec![message_skill(
+                    "implement-spec",
+                    "implement-spec",
+                    Some("Do the thing."),
+                )],
+            ),
+            message("a2", 3500, vec![text_part("done")]),
+        ]);
+
+        assert!(render_new_turn_parts(&mut acc, &transcript));
+        assert!(
+            acc.build_card()
+                .to_string()
+                .contains("🧩 已加载技能：implement-spec"),
+            "a Supplement's skill must render its fold on the live card"
+        );
     }
 
     /// Several large CJK skills attached to one turn must not push the live
