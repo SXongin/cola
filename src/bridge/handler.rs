@@ -465,12 +465,28 @@ impl App {
     /// dispatch that resolves at least one id keeps those and submits — the ids
     /// that resolve ride the prompt, exactly as the spec's "keeps the ids that
     /// resolve" states.
+    ///
+    /// Unlike every other command, this one runs Lazy Start first
+    /// ([`Self::ensure_server_for`]): the skill list comes from the server, so a
+    /// serverless cola must attach or spawn before the read — otherwise every id
+    /// reads as unknown and the picker is empty. See the comment in the body.
     async fn handle_skill_command(
         self: &Arc<Self>,
         thread_key: ThreadKey,
         msg: crate::bridge::IncomingMessage,
         ids: Vec<String>,
     ) {
+        // `/skill` is the prompt-like exception to "commands never trigger Lazy
+        // Start": both forms depend on the server's skill list — the dispatch
+        // resolves typed ids against it (then submits a prompt), and the bare
+        // form's picker lists it — so ensure the server BEFORE the list read.
+        // A serverless cola otherwise reads an empty list: a typed id reads as
+        // unknown, the picker shows nothing, and the path never reaches the
+        // prompt that would have started the server. The user gets the same
+        // NoServer / start-failure message a prompt does.
+        if !self.ensure_server_for(&msg.message_id).await {
+            return;
+        }
         let kind = ConversationKind::classify(&msg.chat_type, msg.thread_id.as_deref());
         let handles = self.command_handles();
         // Read from the conversation's own project directory (the location the
@@ -650,6 +666,38 @@ impl App {
         PromptRoute::NewTurn { advisory_live }
     }
 
+    /// Lazy Start (ADR-0013) for a path about to need the server: attach to an
+    /// existing default-store server, or spawn an Owned Server when none exists
+    /// (unless `start_server = "never"`). On failure the user is told — the same
+    /// NoServer / start-failure message every prompt shows — and the caller must
+    /// stop. Returns whether a server is ready. Shared by [`Self::handle_prompt`]
+    /// and [`Self::handle_skill_command`], so `/skill` reports the serverless
+    /// state exactly like a prompt.
+    async fn ensure_server_for(&self, message_id: &str) -> bool {
+        match crate::bridge::pollers::ensure_server(&self.poll_handles()).await {
+            Ok(true) => true,
+            Ok(false) => {
+                let _ = self
+                    .feishu
+                    .reply_text(
+                        message_id,
+                        "⚠️ 当前没有可用的 OpenCode server，且 `start_server = \"never\"`。\
+                          \n请启动 OpenChamber（或手动 `opencode serve`），或把配置改为 `start_server = \"auto\"`。",
+                    )
+                    .await;
+                false
+            }
+            Err(e) => {
+                tracing::warn!("ensure server failed: {}", e);
+                let _ = self
+                    .feishu
+                    .reply_text(message_id, &format!("⚠️ 启动 OpenCode server 失败：{e}"))
+                    .await;
+                false
+            }
+        }
+    }
+
     pub(crate) async fn handle_prompt(
         self: &Arc<Self>,
         thread_key: ThreadKey,
@@ -671,28 +719,11 @@ impl App {
         // when none exists (unless `start_server = "never"`). Serverless means
         // the bot has no OpenCode to answer with — tell the user instead of
         // failing silently inside the prompt flow. Commands never trigger this
-        // (so `/restart-opencode` still reports NoServer/NotOwned properly).
-        match crate::bridge::pollers::ensure_server(&self.poll_handles()).await {
-            Ok(true) => {}
-            Ok(false) => {
-                let _ = self
-                    .feishu
-                    .reply_text(
-                        &message_id,
-                        "⚠️ 当前没有可用的 OpenCode server，且 `start_server = \"never\"`。\
-                          \n请启动 OpenChamber（或手动 `opencode serve`），或把配置改为 `start_server = \"auto\"`。",
-                    )
-                    .await;
-                return Ok(());
-            }
-            Err(e) => {
-                tracing::warn!("ensure server failed: {}", e);
-                let _ = self
-                    .feishu
-                    .reply_text(&message_id, &format!("⚠️ 启动 OpenCode server 失败：{e}"))
-                    .await;
-                return Ok(());
-            }
+        // (so `/restart-opencode` still reports NoServer/NotOwned properly),
+        // with `/skill` the one prompt-like exception (see
+        // [`Self::handle_skill_command`]).
+        if !self.ensure_server_for(&message_id).await {
+            return Ok(());
         }
         let is_group = chat_type == "group";
         let mut text = text;
@@ -1998,13 +2029,16 @@ impl App {
         }
     }
 
-    /// Handle a `/skill` picker row tap (spec #652, ticket #656): a row sends
-    /// `/skill <id>` — the same path a typed command takes — so the tap
-    /// re-enters the message coordinator rather than growing a parallel submit.
-    /// The click must ack within 3s while a turn runs for the length of a model
-    /// reply, so the submission is spawned off the ack; the picker card stays
-    /// put, and the agent/autoaccept toasts already established that a picker
-    /// does not replace itself.
+    /// Handle a `/skill` picker row tap (spec #652, ticket #656): a row carries
+    /// the skill's exact id, and the tap dispatches it straight to
+    /// [`Self::handle_skill_command`] — the same submit path a typed command
+    /// takes, minus the text parse. The id is NOT round-tripped as
+    /// `/skill <id>` text: V1's id IS the skill name, which can contain
+    /// whitespace (`Implement Spec`), and `/skill Implement Spec` would parse as
+    /// two ids and resolve neither. The click must ack within 3s while a turn
+    /// runs for the length of a model reply, so the submission is spawned off
+    /// the ack; the picker card stays put, and the agent/autoaccept toasts
+    /// already established that a picker does not replace itself.
     async fn handle_skill_card_action(
         self: &Arc<Self>,
         value: &serde_json::Value,
@@ -2015,7 +2049,8 @@ impl App {
         }
         let app = Arc::clone(self);
         let value = value.clone();
-        let text = format!("/skill {id}");
+        let toast = format!("正在加载技能 {id}…");
+        let id = id.to_string();
         tokio::spawn(async move {
             // The conversation kind the picker was sent in: every button carries
             // it next to chat_id/thread_id, since a click has no chat_type of
@@ -2040,21 +2075,27 @@ impl App {
                 .map(str::to_string);
             // The picker card's own message is the reply anchor, so the turn's
             // card lands below the row the user tapped.
-            app.handle_message(crate::bridge::IncomingMessage {
-                message_id: string("open_message_id"),
-                chat_id,
-                chat_type,
-                thread_id,
-                parent_id: None,
-                text,
-                images: vec![],
-                requester_open_id: requester,
-            })
+            let kind = ConversationKind::classify(&chat_type, thread_id.as_deref());
+            let thread_key = kind.thread_key(&chat_id, thread_id.as_deref());
+            app.handle_skill_command(
+                thread_key,
+                crate::bridge::IncomingMessage {
+                    message_id: string("open_message_id"),
+                    chat_id,
+                    chat_type,
+                    thread_id,
+                    parent_id: None,
+                    text: format!("/skill {id}"),
+                    images: vec![],
+                    requester_open_id: requester,
+                },
+                vec![id],
+            )
             .await;
         });
         Some(CardActionResult {
             card: None,
-            toast: Some(format!("正在加载技能 {id}…")),
+            toast: Some(toast),
         })
     }
 

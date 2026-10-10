@@ -1220,6 +1220,11 @@ pub struct MockBackend {
     /// Records the directory each `list_skills` call was scoped to, in call
     /// order — the location a session's skill read must carry.
     pub list_skills_directories: Arc<tokio::sync::Mutex<Vec<Option<String>>>>,
+    /// Simulate a real adapter BEFORE Lazy Start: serverless (an empty
+    /// `base_url`, so a read against it yields nothing) but able to spawn its
+    /// own server. Lets a test drive the Lazy Start / NoServer path that the
+    /// default mock (attached, `can_self_start_server = false`) never reaches.
+    pub serverless: bool,
     /// Available models grouped by provider, served by `list_models` (for the
     /// `/model` card).
     pub provider_models: Vec<opencode::types::ProviderModels>,
@@ -1461,6 +1466,7 @@ impl MockBackend {
             skills: Vec::new(),
             list_skills_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             list_skills_directories: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            serverless: false,
             provider_models: Vec::new(),
             default_model: None,
             context_window: Some(100_000),
@@ -2881,7 +2887,18 @@ impl crate::backend::Backend for MockBackend {
         Ok(())
     }
     fn base_url(&self) -> String {
-        "http://mock".into()
+        if self.serverless {
+            String::new()
+        } else {
+            "http://mock".into()
+        }
+    }
+
+    /// A serverless mock simulates the real adapter before Lazy Start: it can
+    /// spawn its own server. An attached mock (the default) cannot, so
+    /// `ensure_server` is a no-op for it.
+    fn can_self_start_server(&self) -> bool {
+        self.serverless
     }
 
     fn for_directory(self: Arc<Self>, directory: &str) -> Arc<dyn crate::backend::DirectoryBackend> {

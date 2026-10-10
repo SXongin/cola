@@ -78,9 +78,16 @@ impl SkillFixture {
     }
 
     async fn with(backend: MockBackend) -> Self {
+        Self::with_policy(backend, crate::config::ServerStartPolicy::Auto).await
+    }
+
+    /// [`Self::with`] under an explicit `start_server` policy — the serverless
+    /// (`never`) path's fixture.
+    async fn with_policy(backend: MockBackend, policy: crate::config::ServerStartPolicy) -> Self {
         let work_dir = test_work_dir();
         let config_dir = tempfile::tempdir().unwrap();
-        let cfg = test_config(&config_dir.path().join("sessions.json"));
+        let mut cfg = test_config(&config_dir.path().join("sessions.json"));
+        cfg.opencode.start_server = policy;
         let prompt_calls = backend.prompt_calls.clone();
         let prompt_skills = backend.prompt_skills.clone();
         let list_skills_calls = backend.list_skills_calls.clone();
@@ -454,6 +461,49 @@ async fn a_retried_skill_turn_still_submits_its_skills() {
     );
 }
 
+/// A picker row whose id contains whitespace still loads (spec #652, ticket
+/// #656): V1's id IS the skill name (`Implement Spec`), and the tap dispatches
+/// the callback's id DIRECTLY — round-tripping `/skill Implement Spec` through
+/// the command text parser would split it into two ids and resolve neither.
+#[tokio::test]
+async fn a_picker_row_with_a_whitespace_id_still_loads() {
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_skills(vec![SkillInfo {
+        id: "Implement Spec".into(),
+        name: "Implement Spec".into(),
+        description: None,
+    }]);
+    let fx = SkillFixture::with(backend).await;
+    fx.send("/skill").await;
+
+    let cards = fx.platform.replied_cards().await;
+    let value = cards[0]["body"]["elements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|element| element["tag"] == "button")
+        .expect("a picker row")["value"]
+        .clone();
+
+    let result = fx.app.host_action(value).await;
+    assert!(result.is_some(), "the tap must ack");
+
+    wait_for(&fx.prompt_calls, 1).await;
+    assert_eq!(
+        *fx.prompt_calls.lock().await,
+        vec!["/skill Implement Spec".to_string()],
+        "the whitespace id reaches the prompt intact"
+    );
+    assert_eq!(
+        *fx.prompt_skills.lock().await,
+        vec![vec![PromptSkill {
+            id: "Implement Spec".into(),
+            name: "Implement Spec".into()
+        }]],
+        "the row's exact id resolves, not the split tokens"
+    );
+}
+
 /// A `/skill` message received while a turn is already live takes the Supplement
 /// (steer) route, and its skills ride that submit too (spec #652, ticket #654).
 /// The live turn is seeded exactly as the ownership read sees it — the inflight
@@ -476,5 +526,42 @@ async fn a_skill_command_during_a_live_turn_carries_its_skills_to_the_supplement
         *fx.prompt_skills.lock().await,
         vec![vec![resolved("implement-spec")]],
         "the supplement submit must carry the requested skill"
+    );
+}
+
+/// `/skill <id>` on a serverless cola runs Lazy Start BEFORE the skill-list read
+/// (spec #652): with no server and `start_server = "never"`, the user gets the
+/// SAME NoServer message a prompt does, and the list is never read — so a typed
+/// id is never falsely reported as unknown against an empty serverless list
+/// (the bug this guards). The backend must be able to self-start for the check
+/// to be reached at all (the default attached mock makes `ensure_server` a
+/// no-op).
+#[tokio::test]
+async fn a_skill_command_on_a_serverless_cola_ensures_the_server_first() {
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_skills(fixture_skills());
+    backend.serverless = true;
+    let fx = SkillFixture::with_policy(backend, crate::config::ServerStartPolicy::Never).await;
+
+    fx.send("/skill implement-spec").await;
+
+    assert!(
+        fx.prompt_calls.lock().await.is_empty(),
+        "a serverless /skill must not submit a prompt"
+    );
+    assert_eq!(
+        fx.list_skills_calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the list read must not run before Lazy Start: a serverless read is empty, \
+         so a typed id would read as unknown and never reach the prompt"
+    );
+    let texts = fx.platform.texts().await;
+    assert!(
+        texts.iter().any(|t| t.contains("没有可用的 OpenCode server")),
+        "the same NoServer message a prompt shows: {texts:?}"
+    );
+    assert!(
+        fx.platform.replied_cards().await.is_empty(),
+        "no picker on a serverless cola: {texts:?}"
     );
 }
