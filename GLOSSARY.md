@@ -259,6 +259,15 @@ _Avoid_: Recently opened folders, folder history, recent projects
 A model-declared reasoning-effort setting (e.g. "low"/"high"/"minimal"), selectable per session via the `/think` command. Each model declares its own variant set — there is no universal scale across models — and "unset" means the server's default for that model. Selecting a model that doesn't declare the current session's variant clears it. How it reaches the backend is generation-specific: V1 sends `PromptInput.variant` per prompt, while V2 carries it inside the session's durable model ref (a session switch, not a prompt field). The user-facing label on cards is "思考等级"/thinking; "variant" is the backend protocol term, never a command name.
 _Avoid_: Thinking level as the domain term (it's the presentation label); calling the command `/variant`
 
+**Skill**:
+A named instruction set the OpenCode Backend registers (a `SKILL.md` under a skills root) that a user attaches to one prompt so its instructions are injected for that turn. cola reaches them from Feishu with the `/skill <id>…` **Command**: dispatch reads the Backend's skill list once, scoped to the conversation's current **Project** directory, resolves each typed id to its canonical `{ id, name }`, and submits the turn with the rest of the message as the prompt — ids that do not resolve are dropped, and a dispatch that resolves none (or a bare `/skill`) answers with the skill picker instead. The attachment is a per-prompt fact, not session state, and how it reaches the model is generation-specific: V2 sends the prompt body's structured `skills` array, while V1 — which has no such field — folds a "load the skill by name with your `skill` tool" instruction into the text (ADR-0077). The Backend's list read is generation-neutral (`{ id, name, description? }`); a read failure yields an empty list and the picker degrades to its no-skills state.
+_Avoid_: Prompt (the send action, not the instructions), template, plugin (a plugin is an injected tool, not instructions), agent (an agent is a selection, not an instruction set)
+
+**Loaded Skill** (已加载技能):
+A **Skill** a user message attached, surfaced in Feishu as a folded collapsible panel titled `🧩 已加载技能：<name>` whose body is the skill's own instructions, unwrapped from the server's `<skill_content>` envelope with the sampled `<skill_files>` list dropped. One shared renderer feeds all three sites — the live **Turn** card's newest card, the **Session Snapshot**'s 最近对话 tail, and the **External Message** preview — so a skill another client attached is visible in Feishu too, and every fold on one card draws from one shared size budget (spec #652, ADR-0077). A **Turn**'s live card shows the folds for every user message in the turn's span — the anchor AND any **Supplement** merged into the running turn.
+_UI label_: 🧩 已加载技能 — the fold title.
+_Avoid_: Skill panel, instruction fold
+
 **Permission**:
 A request from the AI backend to perform an action on a resource. Presented to the user as an interactive card with Allow/Deny/Always options.
 _Avoid_: Approval, authorization, consent
