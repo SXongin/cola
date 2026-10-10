@@ -30,6 +30,18 @@ use crate::opencode::types::{
     QuestionRequest, Session, SessionInfo, SessionListInfo, SessionSelection, SessionStatus,
 };
 
+/// One skill a caller attaches to a prompt (spec #652): a small generation-neutral
+/// `{ id, name }` pair. `id` is the skill's identity in the attached generation's
+/// own space — V2's `Skill.ID`, the only field its structured prompt `skills`
+/// request carries — while `name` is the human-facing name. V1 has neither the
+/// field nor a skill prompt part, so its strategy folds `name` into the prompt
+/// text; the loaded-skill fold renders `name` too.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptSkill {
+    pub id: String,
+    pub name: String,
+}
+
 /// A directory-scoped handle to the backend. Instance routing lives here: the
 /// handle carries the directory, so a caller cannot silently omit `?directory=`
 /// and scope a request to the wrong server instance (ADR-0010). Directory-scoped
@@ -150,18 +162,27 @@ pub trait Backend: Send + Sync {
     /// `images` are attached as data-URL `file` parts; requires a vision-capable
     /// model (unsupported models surface an error).
     ///
+    /// `skills` asks the server to load those skills with this prompt. The
+    /// attachment is generation-neutral ([`PromptSkill`]); each generation's
+    /// strategy owns the wire: V2 emits the prompt body's structured `skills`
+    /// array (the server injects each skill's body deterministically), while V1
+    /// — which has no field for it — folds the request into the prompt text as
+    /// an instruction naming the skill, so the model loads it with its `skill`
+    /// tool. An empty slice leaves the prompt untouched on both generations.
+    ///
     /// `message_id` is the id cola chose for the user message this prompt will
     /// create (ADR-0026: `msg_cola_` self-identifies cola-authored messages).
     /// A re-post is idempotent either way, but only on a generation where
     /// [`Self::reuse_continues_an_admitted_turn`] is true does it continue the
     /// admitted turn (V1); on V2 the admitted id makes the re-post a no-op.
     /// None falls back to a server-generated id.
-    #[allow(clippy::too_many_arguments)] // prompt axes: session/text/images + model/variant/agent/message-id
+    #[allow(clippy::too_many_arguments)] // prompt axes: session/text/images/skills + model/variant/agent/message-id
     async fn prompt(
         &self,
         session_id: &str,
         text: &str,
         images: &[ImageInput],
+        skills: &[PromptSkill],
         model: Option<&ModelInfo>,
         variant: Option<&str>,
         agent: Option<&str>,

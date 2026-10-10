@@ -327,6 +327,7 @@ async fn prompt_posts_the_native_fire_and_forget_route_with_parts_model_variant_
             "ses_1",
             "hello",
             &images,
+            &[],
             Some(&model),
             Some("high"),
             Some("build"),
@@ -365,16 +366,25 @@ async fn prompt_model_prefers_the_override_then_the_configured_default_then_the_
     let override_model = parse_model("other/override-model").unwrap();
 
     client
-        .prompt("ses_override", "a", &[], Some(&override_model), None, None, None)
+        .prompt(
+            "ses_override",
+            "a",
+            &[],
+            &[],
+            Some(&override_model),
+            None,
+            None,
+            None,
+        )
         .await
         .unwrap();
     client
-        .prompt("ses_default", "b", &[], None, None, None, None)
+        .prompt("ses_default", "b", &[], &[], None, None, None, None)
         .await
         .unwrap();
     let client_without_default = v1_wire_client(&server, None);
     client_without_default
-        .prompt("ses_server", "c", &[], None, None, None, None)
+        .prompt("ses_server", "c", &[], &[], None, None, None, None)
         .await
         .unwrap();
 
@@ -397,7 +407,7 @@ async fn prompt_maps_404_to_session_not_found() {
     let client = v1_wire_client(&server, None);
 
     let err = client
-        .prompt("ses_gone", "hi", &[], None, None, None, None)
+        .prompt("ses_gone", "hi", &[], &[], None, None, None, None)
         .await
         .unwrap_err();
 
@@ -416,7 +426,7 @@ async fn prompt_maps_a_failed_status_to_a_diagnostic_opencode_error() {
 
     let message = opencode_error(
         client
-            .prompt("ses_1", "hi", &[], None, None, None, None)
+            .prompt("ses_1", "hi", &[], &[], None, None, None, None)
             .await
             .unwrap_err(),
     );

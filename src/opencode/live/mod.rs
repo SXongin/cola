@@ -137,7 +137,16 @@ async fn live_v1_scripted_capability_chain() {
     // message is durable and a run is forked, so the permission poll below runs
     // concurrently with the live turn — exactly the shape the Bridge's Turn is
     // built around (ADR-0056).
-    let prompt = backend.prompt(&session.id, PROMPT_TEXT, &[], None, None, None, Some(&message_id));
+    let prompt = backend.prompt(
+        &session.id,
+        PROMPT_TEXT,
+        &[],
+        &[],
+        None,
+        None,
+        None,
+        Some(&message_id),
+    );
     let answer = answer_permission(&backend, &work_dir, &session.id, &server);
 
     let (prompt_result, permission) = tokio::join!(prompt, answer);
@@ -189,7 +198,16 @@ async fn live_v1_scripted_capability_chain() {
         .count();
     let completions_before = provider_turn_completions(&provider);
     backend
-        .prompt(&session.id, PROMPT_TEXT, &[], None, None, None, Some(&message_id))
+        .prompt(
+            &session.id,
+            PROMPT_TEXT,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            Some(&message_id),
+        )
         .await
         .unwrap_or_else(|error| panic!("retry submit failed: {error}\n{}", server.stderr()));
     wait_for_idle(&backend, &session.id, &work_dir, &server).await;
@@ -258,7 +276,16 @@ async fn live_v1_scripted_failure_and_retry_chain() {
 
     let message_id = cola_message_id();
     backend
-        .prompt(&session.id, PROMPT_TEXT, &[], None, None, None, Some(&message_id))
+        .prompt(
+            &session.id,
+            PROMPT_TEXT,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            Some(&message_id),
+        )
         .await
         .unwrap_or_else(|error| panic!("prompt submit failed: {error}\n{}", server.stderr()));
 
@@ -285,7 +312,16 @@ async fn live_v1_scripted_failure_and_retry_chain() {
     // runs a new step. The retried step calls the scripted tool, so answer its
     // ask; the turn then completes cleanly.
     backend
-        .prompt(&session.id, PROMPT_TEXT, &[], None, None, None, Some(&message_id))
+        .prompt(
+            &session.id,
+            PROMPT_TEXT,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            Some(&message_id),
+        )
         .await
         .unwrap_or_else(|error| panic!("retry submit failed: {error}\n{}", server.stderr()));
     answer_permission(&backend, &work_dir, &session.id, &server).await;
@@ -372,7 +408,16 @@ async fn live_v2_scripted_transcript_read() {
     // The V2 submit is admit-then-return: it comes back as soon as the message
     // is durable, so the in-flight read below sees the live turn (ADR-0056).
     backend
-        .prompt(&session.id, PROMPT_TEXT, &[], None, None, None, Some(&message_id))
+        .prompt(
+            &session.id,
+            PROMPT_TEXT,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            Some(&message_id),
+        )
         .await
         .unwrap_or_else(|error| panic!("prompt submit failed: {error}\n{}", server.stderr()));
 
@@ -519,7 +564,16 @@ async fn live_v2_scripted_write_chain() {
     let message_id = cola_message_id();
     let supplement_id = cola_message_id();
     backend
-        .prompt(&session.id, PROMPT_TEXT, &[], None, None, None, Some(&message_id))
+        .prompt(
+            &session.id,
+            PROMPT_TEXT,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            Some(&message_id),
+        )
         .await
         .unwrap_or_else(|error| panic!("prompt submit failed: {error}\n{}", server.stderr()));
     poll_until(
@@ -536,6 +590,7 @@ async fn live_v2_scripted_write_chain() {
         .prompt(
             &session.id,
             SUPPLEMENT_TEXT,
+            &[],
             &[],
             None,
             None,
@@ -611,7 +666,16 @@ async fn live_v2_scripted_write_chain() {
         .count();
     let completions_before = provider_completions(&provider);
     backend
-        .prompt(&session.id, PROMPT_TEXT, &[], None, None, None, Some(&message_id))
+        .prompt(
+            &session.id,
+            PROMPT_TEXT,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            Some(&message_id),
+        )
         .await
         .unwrap_or_else(|error| panic!("retry failed: {error}\n{}", server.stderr()));
     // Let the reconcile settle before counting, as the retired blocking retry
@@ -668,6 +732,7 @@ async fn live_v2_scripted_write_chain() {
         .prompt(
             &interrupt_session.id,
             PROMPT_TEXT,
+            &[],
             &[],
             None,
             None,
@@ -805,7 +870,16 @@ async fn live_v2_scripted_selection_chain() {
     // fields — so this is what "the session's selection applies" means).
     let message_id = cola_message_id();
     backend
-        .prompt(&session.id, PROMPT_TEXT, &[], None, None, None, Some(&message_id))
+        .prompt(
+            &session.id,
+            PROMPT_TEXT,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            Some(&message_id),
+        )
         .await
         .unwrap_or_else(|error| panic!("prompt submit failed: {error}\n{}", server.stderr()));
     let transcript = wait_for_turn(&backend, &session.id, &message_id, &server).await;
@@ -1000,7 +1074,16 @@ async fn live_v2_scripted_permission_chain() {
     // ask, which the location-scoped pending list must surface (one call per
     // directory, never per session).
     backend
-        .prompt(&session.id, PROMPT_TEXT, &[], None, None, None, Some(&message_id))
+        .prompt(
+            &session.id,
+            PROMPT_TEXT,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            Some(&message_id),
+        )
         .await
         .unwrap_or_else(|error| panic!("prompt submit failed: {error}\n{}", server.stderr()));
     let permission = poll_until(
@@ -1067,7 +1150,16 @@ async fn live_v2_scripted_permission_chain() {
             });
         let message_id = cola_message_id();
         backend
-            .prompt(&session.id, PROMPT_TEXT, &[], None, None, None, Some(&message_id))
+            .prompt(
+                &session.id,
+                PROMPT_TEXT,
+                &[],
+                &[],
+                None,
+                None,
+                None,
+                Some(&message_id),
+            )
             .await
             .unwrap_or_else(|error| panic!("{decision}: prompt submit failed: {error}\n{}", server.stderr()));
         let permission = poll_until(
@@ -1151,7 +1243,16 @@ async fn live_v2_scripted_form_chain() {
     // The admit-then-return submit schedules the turn; it blocks on the typed
     // form the location-scoped list must surface.
     backend
-        .prompt(&session.id, PROMPT_TEXT, &[], None, None, None, Some(&message_id))
+        .prompt(
+            &session.id,
+            PROMPT_TEXT,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            Some(&message_id),
+        )
         .await
         .unwrap_or_else(|error| panic!("prompt submit failed: {error}\n{}", server.stderr()));
 
@@ -1225,6 +1326,7 @@ async fn live_v2_scripted_form_chain() {
         .prompt(
             &cancel_session.id,
             PROMPT_TEXT,
+            &[],
             &[],
             None,
             None,
@@ -1669,7 +1771,16 @@ async fn start_turn(backend: &OpenCodeBackend, server: &LiveServer, session_id: 
 /// Submit `message_id` through the production adapter and assert acceptance.
 async fn submit_prompt(backend: &OpenCodeBackend, server: &LiveServer, session_id: &str, message_id: &str) {
     backend
-        .prompt(session_id, PROMPT_TEXT, &[], None, None, None, Some(message_id))
+        .prompt(
+            session_id,
+            PROMPT_TEXT,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            Some(message_id),
+        )
         .await
         .unwrap_or_else(|error| {
             panic!(
