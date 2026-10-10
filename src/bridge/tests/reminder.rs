@@ -425,6 +425,7 @@ fn turn_ctx(session_id: &str) -> PromptContext {
         is_group: false,
         cola_message_id: None,
         images: Vec::new(),
+        skills: Vec::new(),
         advisory_live: false,
     }
 }
