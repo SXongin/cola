@@ -435,7 +435,7 @@ pub(crate) fn skill_description_line(skill: &crate::backend::SkillInfo) -> Optio
 /// skill — its `name`, plus its `description` when it declares one — so a user
 /// who does not know an id can pick one. The callback value is the skill's
 /// generation identity (`id`); a tap re-enters the message pipeline as
-/// `/skill <id>`. `chat_type` rides each button so the tap reconstructs the
+/// `#<id>`. `chat_type` rides each button so the tap reconstructs the
 /// [`ConversationKind`](crate::config::ConversationKind) the picker was sent in
 /// (the same routing payload every card button carries, next to `chat_id` /
 /// `thread_id`), and `message_id` — the original user message the picker
@@ -467,7 +467,7 @@ pub(crate) fn build_skill_cards(
             &callback_fields,
         )];
     }
-    intro.push_str("**选择技能**（点击后以 `/skill <id>` 发送）：");
+    intro.push_str("**选择技能**（点击后以 `#<id>` 发送）：");
     let options: Vec<(String, String)> = skills
         .iter()
         .map(|skill| {

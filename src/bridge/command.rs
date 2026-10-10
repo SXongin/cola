@@ -70,17 +70,32 @@ pub enum Command {
     Version,
     /// Show available commands, or help for one command (`/help <cmd>`).
     Help(Option<String>),
-    /// `/skill <id> [text…]` — load one or more OpenCode skills into the prompt
-    /// (spec #652, tickets #654/#656). Each `/skill <id>` token contributes one
-    /// id, collected in order (`/skill a /skill b text`); the whole original
-    /// message text is the prompt, tokens and all (it mirrors the composer's
-    /// `@skill-id`). The coordinator routes this into the prompt pipeline itself
+    /// Load one or more OpenCode skills into the prompt (spec #652, tickets
+    /// #654/#656; the `#<id>` syntax, spec #662). The whole original message
+    /// text is the prompt, tokens and all — it mirrors the composer's
+    /// `@skill-id`. The coordinator routes this into the prompt pipeline itself
     /// — the same path as [`Command::Forward`] — because the prompt pipeline,
-    /// not the command dispatcher, owns submission; a bare `/skill` (no id) or
-    /// an unknown id instead answers with the skill picker (#656).
-    Skill(Vec<String>),
+    /// not the command dispatcher, owns submission. See [`SkillInvocation`] for
+    /// the two forms.
+    Skill(SkillInvocation),
     /// Forward unrecognized slash command to OpenCode as prompt text
     Forward(String),
+}
+
+/// One skill-invocation request (spec #662): the ids a message named, and which
+/// form named them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SkillInvocation {
+    /// The ids the message named, in first-occurrence order. `/skill <id>`
+    /// contributes the token after each `/skill`; a plain message contributes
+    /// each `#<id>` whose id starts with an ASCII letter.
+    pub ids: Vec<String>,
+    /// Whether a dispatch that resolves NO id still owes a picker: `/skill` —
+    /// the list-entry command — answers the skill picker (a bare `/skill`, or
+    /// ids that all fail to resolve). `false` for a `#<id>` message, whose
+    /// unresolvable ids are ordinary prose: the message submits as a plain
+    /// prompt, no card.
+    pub picker_on_empty: bool,
 }
 
 impl Command {
@@ -184,12 +199,26 @@ pub enum AutoAcceptAction {
     Set(bool),
 }
 
-/// Parse a slash command from message text. Returns `None` if the message
-/// is not a command (plain text).
+/// Parse a command from message text. A `/`-leading message is a slash command;
+/// a message that leads with anything else is a plain prompt unless it carries
+/// `#<id>` skill tokens (spec #662), in which case it parses as
+/// [`Command::Skill`] with [`SkillInvocation::picker_on_empty`] `false`. Returns
+/// `None` for a plain message with no skill tokens.
 pub fn parse_command(text: &str) -> Option<Command> {
     let trimmed = text.trim();
     if !trimmed.starts_with('/') {
-        return None;
+        // A plain message can still load skills via `#<id>` tokens (spec #662).
+        // The id after `#` must start with an ASCII letter, so prose like `#644`
+        // (an issue reference) or a markdown heading (`# 标题`) never enters the
+        // skill path — those messages stay plain prompts and cost no list read.
+        let ids = parse_hash_skill_ids(trimmed);
+        if ids.is_empty() {
+            return None;
+        }
+        return Some(Command::Skill(SkillInvocation {
+            ids,
+            picker_on_empty: false,
+        }));
     }
 
     let parts: Vec<&str> = trimmed.splitn(2, ' ').collect();
@@ -353,8 +382,13 @@ pub fn parse_command(text: &str) -> Option<Command> {
         // `/skill <id> [/skill <id> …] [text]` — load the named skills into the
         // prompt (spec #652). Each `/skill` token takes the token that follows
         // it as an id; every other token stays in the message text, which is
-        // submitted verbatim. A bare `/skill` carries no id.
-        "/skill" => Some(Command::Skill(parse_skill_ids(trimmed))),
+        // submitted verbatim. A bare `/skill` carries no id and opens the
+        // picker. (The `#<id>` form is parsed above, for messages that do not
+        // lead with `/`; spec #662.)
+        "/skill" => Some(Command::Skill(SkillInvocation {
+            ids: parse_skill_ids(trimmed),
+            picker_on_empty: true,
+        })),
         // `/init`, `/review`, or any unknown /command — forward to OpenCode
         _ => Some(Command::Forward(trimmed.to_string())),
     }
@@ -374,6 +408,44 @@ fn parse_skill_ids(text: &str) -> Vec<String> {
         {
             ids.push(id.to_string());
         }
+    }
+    ids
+}
+
+/// Collect the ids of every `#<id>` in `text`, in order (spec #662). An id is
+/// the run of id characters (`[A-Za-z0-9-]`) directly after a `#`, and it counts
+/// only when that run starts with an ASCII letter — skill ids are lowercase
+/// kebab-case — so `#644` (an issue reference) and a bare `#` or `# 标题` never
+/// enter the skill path. The run ends at any other character, so trailing
+/// punctuation and CJK text run straight into the token without a space
+/// (`#implement-spec,` and `用#caveman试试` still name `implement-spec` /
+/// `caveman`). An id is kept exactly as typed; one that matches no registered
+/// skill stays in the prompt text verbatim (the dispatch's resolve step decides).
+fn parse_hash_skill_ids(text: &str) -> Vec<String> {
+    fn is_id_char(c: char) -> bool {
+        c.is_ascii_alphanumeric() || c == '-'
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut ids = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '#' {
+            i += 1;
+            continue;
+        }
+        // The id run starts right after the `#`; it must be non-empty and lead
+        // with a letter, else this `#` is prose (or a markdown heading).
+        let start = i + 1;
+        let mut end = start;
+        while end < chars.len() && is_id_char(chars[end]) {
+            end += 1;
+        }
+        if end > start && chars[start].is_ascii_alphabetic() {
+            ids.push(chars[start..end].iter().collect());
+        }
+        // Skip past the run (or just the `#` when there is none) — no id here
+        // can start inside it.
+        i = end.max(start);
     }
     ids
 }
@@ -399,7 +471,8 @@ pub fn help_text() -> String {
 `/agent <name>` · Switch agent (takes effect next message)
 `/model <p/m>` · Switch model (takes effect next message)
 `/think [等级]` · Set/clear thinking level (per model; takes effect next message)
-`/skill <id> [/skill <id> …] [text]` · Load one or more OpenCode skills into this message's prompt; text after the tokens is submitted verbatim (a bare `/skill` opens the skill picker)
+`#<id> [#<id> …] [text]` · Load OpenCode skills into this message's prompt (e.g. `#implement-spec 644`); the whole message is submitted verbatim, and an id that matches no skill stays as plain text
+`/skill` · Skill picker: list every registered skill (also `/skill <id>`)
 `/autoaccept` · Show auto-approve status; `/autoaccept on|off` switches
 `/restart` · Restart cola (keeps startup args + log redirect)
 `/restart-opencode` · Restart the OpenCode server (only when cola started it)
@@ -461,7 +534,7 @@ pub fn command_help(name: &str) -> Option<String> {
             "/autoaccept [on|off]\nShow or switch auto-allowing permission requests for this session (no permission cards). On a Pending Session (`/new`/`/dir`/`/topic` before its first message) the flag is recorded on the pending and applies to the session the first message creates.\nNo arg: show current state. `/autoaccept on` / `/autoaccept off` switch it.\nExample: `/autoaccept`"
         }
         "skill" => {
-            "/skill <id> [/skill <id> …] [text]\nLoad one or more OpenCode skills into this message's prompt. Each `/skill <id>` token takes the id that follows it, collected in order (`/skill a /skill b`), and the whole message text — tokens included — is submitted verbatim, so trailing text becomes the skill's argument (`/skill implement-spec 644`). A bare `/skill`, or a dispatch whose ids all fail to resolve, replies with the skill picker: every registered skill, hidden ones included. On V2 the ids ride the prompt's structured `skills` field (deterministic injection); on V1, which has no such field, cola folds an instruction to load the skill by name with its `skill` tool into the prompt text.\nExample: `/skill implement-spec 644`"
+            "#<id> [#<id> …] [text]\nLoad one or more OpenCode skills into this message's prompt. Each `#<id>` token names one skill, collected in order (`#implement-spec #foreman 644`), and the whole message text — tokens included — is submitted verbatim, so trailing text becomes the skill's argument (`#implement-spec 644`). An id that matches no registered skill is left as plain text (so `#644` stays an issue reference), and a bare `#` does nothing.\n`/skill` opens the skill picker: every registered skill, hidden ones included. `/skill <id>` is an alias for `#<id>`.\nOn V2 the ids ride the prompt's structured `skills` field (deterministic injection); on V1, which has no such field, cola folds an instruction to load the skill by name with its `skill` tool into the prompt text.\nExample: `#implement-spec 644`"
         }
         "restart" => {
             "/restart\nRestart cola itself, keeping startup args and the log redirect. The new process takes over the singleton lock (passes --replace). Under a systemd unit cola exits and lets `Restart=on-failure` bring it back; elsewhere it re-execs. cola announces in this chat when it's back."
@@ -2578,11 +2651,11 @@ mod tests {
         );
         let skill = command_help("skill").expect("skill has a help topic");
         assert!(
-            skill.contains("/skill <id>"),
-            "the skill help shows the syntax: {skill}"
+            skill.contains("#<id>"),
+            "the skill help shows the # syntax: {skill}"
         );
         assert!(
-            skill.contains("/skill a /skill b"),
+            skill.contains("#implement-spec #foreman"),
             "the skill help documents the repeated-token form: {skill}"
         );
         assert_eq!(command_help("nonexistent"), None);
@@ -2590,13 +2663,15 @@ mod tests {
         assert_eq!(command_help("list"), None);
     }
 
-    /// `/skill` is discoverable in every help surface (spec #652, ticket #657):
-    /// the plain-text fallback the `/help` card degrades to must list it with
-    /// its syntax, exactly like the card and the per-command topic do.
+    /// The skill signatures are discoverable in every help surface (spec #652,
+    /// ticket #657; the `#<id>` form added in spec #662): the plain-text
+    /// fallback the `/help` card degrades to must list them with their syntax,
+    /// exactly like the card and the per-command topic do.
     #[test]
     fn help_text_lists_the_skill_command() {
         let text = help_text();
-        assert!(text.contains("`/skill <id>"), "help text lists /skill: {text}");
+        assert!(text.contains("`#<id>"), "help text lists the # form: {text}");
+        assert!(text.contains("`/skill`"), "help text lists /skill: {text}");
     }
 
     #[test]
@@ -2610,29 +2685,108 @@ mod tests {
 
     /// `/skill <id>` is its own command, not forwarded text (spec #652, ticket
     /// #654): each `/skill` token contributes the token after it, in order, and
-    /// a trailing argument that follows no `/skill` token stays prompt text.
+    /// a trailing argument that follows no `/skill` token stays prompt text. Its
+    /// dispatch owns the picker (`picker_on_empty: true`).
     #[test]
     fn skill_command_collects_ids_in_order() {
         assert_eq!(
             parse_command("/skill implement-spec 644"),
-            Some(Command::Skill(vec!["implement-spec".into()]))
+            Some(Command::Skill(SkillInvocation {
+                ids: vec!["implement-spec".into()],
+                picker_on_empty: true,
+            }))
         );
         assert_eq!(
             parse_command("/skill implement-spec /skill foreman 644"),
-            Some(Command::Skill(vec!["implement-spec".into(), "foreman".into()]))
+            Some(Command::Skill(SkillInvocation {
+                ids: vec!["implement-spec".into(), "foreman".into()],
+                picker_on_empty: true,
+            }))
         );
         // Case-insensitive command token, like every other command.
         assert_eq!(
             parse_command("/SKILL implement-spec"),
-            Some(Command::Skill(vec!["implement-spec".into()]))
+            Some(Command::Skill(SkillInvocation {
+                ids: vec!["implement-spec".into()],
+                picker_on_empty: true,
+            }))
         );
         // A bare `/skill` names no skill.
-        assert_eq!(parse_command("/skill"), Some(Command::Skill(vec![])));
+        assert_eq!(
+            parse_command("/skill"),
+            Some(Command::Skill(SkillInvocation {
+                ids: vec![],
+                picker_on_empty: true,
+            }))
+        );
         // `/skill` is the command only when it LEADS the message; anywhere else
         // the message is ordinary text (or a different command).
         assert_eq!(
             parse_command("/init /skill foo"),
             Some(Command::Forward("/init /skill foo".into()))
+        );
+        // Inside a `/`-leading message the slash grammar owns the parse — a `#`
+        // token there is not collected.
+        assert_eq!(
+            parse_command("/skill a #b"),
+            Some(Command::Skill(SkillInvocation {
+                ids: vec!["a".into()],
+                picker_on_empty: true,
+            }))
+        );
+    }
+
+    /// A message that does not lead with `/` still loads skills with `#<id>`
+    /// tokens (spec #662): the ids are collected in order, `picker_on_empty` is
+    /// false (a `#` dispatch owns no picker), and the whole message stays the
+    /// prompt. Only a `#` immediately followed by an ASCII letter counts, so
+    /// prose with `#644` or a markdown heading is an ordinary prompt — no skill
+    /// work.
+    #[test]
+    fn hash_skill_invocation_collects_letter_ids() {
+        assert_eq!(
+            parse_command("#implement-spec 644"),
+            Some(Command::Skill(SkillInvocation {
+                ids: vec!["implement-spec".into()],
+                picker_on_empty: false,
+            }))
+        );
+        assert_eq!(
+            parse_command("#implement-spec #foreman 644"),
+            Some(Command::Skill(SkillInvocation {
+                ids: vec!["implement-spec".into(), "foreman".into()],
+                picker_on_empty: false,
+            }))
+        );
+        // A mid-message token counts too; the whole text stays the prompt.
+        assert_eq!(
+            parse_command("用 #caveman 再 #implement-spec 644"),
+            Some(Command::Skill(SkillInvocation {
+                ids: vec!["caveman".into(), "implement-spec".into()],
+                picker_on_empty: false,
+            }))
+        );
+        // No `#<letter…>` token: an ordinary prompt, no skill-list read.
+        assert_eq!(parse_command("fix #644 please"), None);
+        assert_eq!(parse_command("# 标题\n正文"), None);
+        assert_eq!(parse_command("bare # trailing"), None);
+        assert_eq!(parse_command("## not a skill"), None);
+        assert_eq!(parse_command("#1abc not a skill"), None);
+        // The id run ends at a non-id character: trailing punctuation and CJK
+        // text run straight into the token still name the skill.
+        assert_eq!(
+            parse_command("see #implement-spec, then"),
+            Some(Command::Skill(SkillInvocation {
+                ids: vec!["implement-spec".into()],
+                picker_on_empty: false,
+            }))
+        );
+        assert_eq!(
+            parse_command("用#caveman试试"),
+            Some(Command::Skill(SkillInvocation {
+                ids: vec!["caveman".into()],
+                picker_on_empty: false,
+            }))
         );
     }
 

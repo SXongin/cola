@@ -1,5 +1,12 @@
 # The `/skill` command: structured prompt skills from Feishu, with a V1 text fallback
 
+> **Amended 2026-10-11 (#662)**: the invocation sigil is `#<id>` — one `#` per
+> skill (`#implement-spec #foreman 644`) — measured to pass through Feishu
+> byte-for-byte. `/skill` stays as the picker (the list entry) and `/skill <id>`
+> as an alias. Every `/skill <id>` spelling below describes the earlier form and
+> is superseded on the sigil alone; the mechanism is unchanged. See the
+> Amendment at the end.
+
 Feishu gets its own way to load an OpenCode **skill**: the slash command
 `/skill <id>`, repeated once per skill, with the whole message text kept as the
 prompt. It cannot be `@` — that sigil belongs to Feishu's person mentions — so
@@ -136,3 +143,37 @@ than adding a cola-side allow-list.
   the repeated-token form) is recorded in `AGENTS.md`.
 
 Related: #652, #651, ADR-0055, ADR-0056.
+
+## Amendment (2026-10-11, #662): the skill sigil is `#<id>`
+
+The invocation sigil moved from `/skill <id>` to `#<id>`, one `#` per skill
+(`#implement-spec #foreman 644`). Feishu was **measured** to pass `#` through
+byte-for-byte (2026-10-11: `#probe-test 井号 #644 忽略本条` reached cola's log
+intact — no entity-ization, no rewrite, no zero-width characters), so `#` is the
+sibling of the composer's `@` that `@` itself cannot be (Context above). `/skill`
+stays as the picker — the list-entry command — and `/skill <id>` as an alias.
+
+- **`#<id>` is resolve-gated and silent on failure.** A `#<id>` token attaches a
+  skill only when it resolves against the skill list; one that resolves nothing
+  is ordinary prose (`#644`, a heading) and stays in the prompt text verbatim —
+  the `#` form never opens the picker. That is the only behavioural difference
+  from `/skill <id>`, whose dispatch shows the error-plus-picker card when
+  nothing resolves: the source rides `SkillInvocation::picker_on_empty`.
+- **Only `#` + an id run starting with a letter enters the skill path.**
+  `parse_command` takes, after a `#`, the run of `[A-Za-z0-9-]` that starts with
+  an ASCII letter (ids are kebab-case). A message carrying `#644` or `# 标题` is a
+  plain prompt and costs **no** skill-list read — the ubiquitous issue reference
+  stays off the hot path. The run ends at any other character, so trailing
+  punctuation and CJK text run straight into the token (`#implement-spec,`,
+  `用#caveman试试`) still name the skill. A `#word`-shaped token does trigger the
+  read (and Lazy Start), exactly like `/skill`.
+- **A picker-row tap re-enters as `#<id>`.** The synthesized message text (and so
+  the prompt the model sees) is now `#<id>`, not `/skill <id>`.
+
+Unchanged: the structured V2 `skills: [{ id }]` injection and V1's text fallback,
+the single generation-neutral list read, resolution to the canonical `{id, name}`,
+dedupe, the dedicated loaded-skill card, the accepted permission gap, and the
+whole-message-verbatim rule (ids ride the attachment; the `#` tokens stay in the
+text). Everything above describes the earlier `/skill <id>` spelling.
+
+Related: #651, #652.

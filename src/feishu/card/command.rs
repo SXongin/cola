@@ -608,7 +608,7 @@ fn skill_list_text(skills: &[crate::backend::SkillInfo], error: Option<&str>) ->
             text.push_str(&format!("…（共 {} 个技能，已截断）\n", skills.len()));
         }
     }
-    text.push_str("用法：`/skill <id>`");
+    text.push_str("用法：`#<id>`");
     super::truncate_md(&text, super::skill::FALLBACK_TEXT_CHARS)
 }
 

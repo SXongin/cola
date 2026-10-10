@@ -456,14 +456,14 @@ impl App {
                 }
                 return;
             }
-            // `/skill <id> …` loads skills into the prompt (spec #652, tickets
-            // #654/#656). Like Forward, it is routed here rather than through
-            // the command dispatcher: the skills ride the prompt axis, and the
-            // whole original message text is the prompt. Dispatch resolves each
-            // typed id against the skill list — see
-            // [`Self::handle_skill_command`].
-            if let command::Command::Skill(ids) = cmd {
-                self.handle_skill_command(thread_key, msg, ids).await;
+            // `/skill <id> …` and `#<id> …` load skills into the prompt (spec
+            // #652, tickets #654/#656; `#` form spec #662). Like Forward, this is
+            // routed here rather than through the command dispatcher: the skills
+            // ride the prompt axis, and the whole original message text is the
+            // prompt. Dispatch resolves each typed id against the skill list —
+            // see [`Self::handle_skill_command`].
+            if let command::Command::Skill(invocation) = cmd {
+                self.handle_skill_command(thread_key, msg, invocation).await;
                 return;
             }
             if let Err(e) =
@@ -478,15 +478,15 @@ impl App {
         }
     }
 
-    /// Dispatch a `/skill` command (spec #652, tickets #654/#656): the Bridge
-    /// reads the skill list ONCE — scoped to the Chat/Topic's current project
-    /// directory, the same location the eventual prompt runs in — resolves each
-    /// typed id to its canonical `{ id, name }` list entry (so the attached
-    /// skill is not just the raw token — V1's text fallback then names the
-    /// skill correctly), and submits the whole original message text verbatim
-    /// with the resolved attachment. Ids are deduped by id, first-occurrence
-    /// order preserved. The read is generation-neutral, so the command behaves
-    /// identically on V1 and V2.
+    /// Dispatch a skill invocation (spec #652, tickets #654/#656; the `#<id>`
+    /// form, spec #662): the Bridge reads the skill list ONCE — scoped to the
+    /// Chat/Topic's current project directory, the same location the eventual
+    /// prompt runs in — resolves each typed id to its canonical `{ id, name }`
+    /// list entry (so the attached skill is not just the raw token — V1's text
+    /// fallback then names the skill correctly), and submits the whole original
+    /// message text verbatim with the resolved attachment. Ids are deduped by
+    /// id, first-occurrence order preserved. The read is generation-neutral, so
+    /// the invocation behaves identically on V1 and V2.
     ///
     /// A resolved dispatch also replies the dedicated loaded-skill card under
     /// the user's message ([`crate::feishu::card::command::send_loaded_skill_card`]),
@@ -497,12 +497,15 @@ impl App {
     /// submits the resolved ones and leads the card with a `⚠️ 未找到技能：…`
     /// line naming the rest, so nothing is dropped silently (Q19).
     ///
-    /// Two recovery cases never reach the model — a bare `/skill` (no id) and a
-    /// dispatch whose ids ALL fail to resolve. Both answer with the SAME picker
-    /// card from the list just read; only the second leads with an error line. A
-    /// dispatch that resolves at least one id keeps those and submits — the ids
-    /// that resolve ride the prompt, exactly as the spec's "keeps the ids that
-    /// resolve" states.
+    /// A dispatch that resolves NO id branches on the source
+    /// ([`command::SkillInvocation::picker_on_empty`]): `/skill` — the list-entry
+    /// command — answers the picker card from the list just read (a bare
+    /// `/skill` carries no id; an unknown one leads with the error line). A
+    /// `#<id>` message instead submits as a plain prompt with no card: its
+    /// unresolvable tokens are ordinary prose (`#644`, a heading) and the message
+    /// text is already the prompt. A dispatch that resolves at least one id keeps
+    /// those and submits — the ids that resolve ride the prompt, exactly as the
+    /// spec's "keeps the ids that resolve" states.
     ///
     /// Unlike every other command, this one runs Lazy Start first
     /// ([`Self::ensure_server_for`]): the skill list comes from the server, so a
@@ -512,8 +515,9 @@ impl App {
         self: &Arc<Self>,
         thread_key: ThreadKey,
         msg: crate::bridge::IncomingMessage,
-        ids: Vec<String>,
+        invocation: command::SkillInvocation,
     ) {
+        let command::SkillInvocation { ids, picker_on_empty } = invocation;
         // `/skill` is the prompt-like exception to "commands never trigger Lazy
         // Start": both forms depend on the server's skill list — the dispatch
         // resolves typed ids against it (then submits a prompt), and the bare
@@ -564,18 +568,30 @@ impl App {
         // surfaced, nothing dropped silently). Bounded; see
         // [`unknown_skill_error`].
         let unknown_error = unknown_skill_error(&unknown);
-        // Nothing resolved (a bare `/skill`, or every id unknown): the picker
-        // card, leading with the error line when there were ids, and no prompt.
-        if ids.is_empty() || selected.is_empty() {
-            let _ = crate::feishu::card::command::send_skill_card(
-                &handles,
-                &thread_key,
-                &msg.chat_type,
-                &msg.message_id,
-                &skills,
-                unknown_error.as_deref(),
-            )
-            .await;
+        // No id resolved.
+        if selected.is_empty() {
+            // `/skill` — the list-entry command. A bare `/skill` or ids that all
+            // fail to resolve answer the picker card from the list just read,
+            // leading with the error line when ids were given. No prompt.
+            if picker_on_empty {
+                let _ = crate::feishu::card::command::send_skill_card(
+                    &handles,
+                    &thread_key,
+                    &msg.chat_type,
+                    &msg.message_id,
+                    &skills,
+                    unknown_error.as_deref(),
+                )
+                .await;
+                return;
+            }
+            // A `#<id>` dispatch whose ids all fail to resolve: the tokens are
+            // ordinary prose (`#644`, a heading), so the message is just a plain
+            // prompt — no card, no attachment. The whole text is submitted
+            // verbatim, which is where those tokens already live.
+            if let Err(e) = self.handle_prompt(thread_key, msg, kind, Vec::new()).await {
+                tracing::error!("Prompt: {}", e);
+            }
             return;
         }
         // A mixed dispatch submits the ids that resolved AND names the unknown
@@ -2171,11 +2187,14 @@ impl App {
                     chat_type,
                     thread_id,
                     parent_id: None,
-                    text: format!("/skill {id}"),
+                    text: format!("#{id}"),
                     images: vec![],
                     requester_open_id: requester,
                 },
-                vec![id],
+                crate::bridge::command::SkillInvocation {
+                    ids: vec![id],
+                    picker_on_empty: true,
+                },
             )
             .await;
         });
