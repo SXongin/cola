@@ -49,11 +49,15 @@ way a turn's several images stay tied to the call that read each one.
   message (`msg_type:"file"`), **replied in-thread under the live card**, sent
   **once on the first poll that shows the block**, guarded by a process-local
   once-guard (a cola restart may resend it).
-- **Past 30MB, or on failure, a placeholder line only.** Feishu's 30MB message
-  cap is hard; a File Content over it has no File Message. The tracking line in
-  the panel reads `📎 name · mime · size · 已发送为文件消息`, or
-  `📎 name · mime · size（未发送）` when no File Message was sent. The fallback
-  ladder is: embed upload fails → degrade to a File Message → fails → placeholder.
+- **The panel's tracking line has three states.** Every File Content gets one
+  line in its Tool Panel: `📎 name · mime · size · 已内嵌` when the image is
+  embedded in the card; `📎 name · mime · size · 已发送为文件消息` when it was
+  delivered as a File Message; `📎 name · mime · size · 未发送` when it could not
+  be delivered — over Feishu's hard 30MB message cap, or the send failed. An
+  embedded image is never marked `未发送`: it was shown on the card, not sent as
+  a message, and its own state says so. The fallback ladder when the preferred
+  surface fails: embed upload fails → degrade to a File Message → that fails →
+  `未发送`.
 - **Upload is pre-resolved in the render loop**, cached in memory **by content
   hash**, so an identical file is uploaded once and every PATCH reuses the key.
 - **A user message's File Content is record-only.** It shows
@@ -93,7 +97,7 @@ way a turn's several images stay tied to the call that read each one.
 ## Consequences
 
 - Deployments must add the `im:resource` scope; an app without it degrades to
-  placeholder lines (the path is best-effort and never blocks a card).
+  `未发送` tracking lines (the path is best-effort and never blocks a card).
 - Feishu's 30MB message cap is a permanent ceiling: a File Content over it is
   never deliverable through this path.
 - cola gains an outbound surface beyond cards and text: it uploads to Feishu and
@@ -105,3 +109,11 @@ way a turn's several images stay tied to the call that read each one.
 
 The concepts enter the glossary as **File Content** (the payload a part carries)
 and **File Message** (the separate message cola posts for one it cannot embed).
+
+## Tests (implementation batch)
+
+The implementation batch (spec #644, tickets #646–#649) adds the tests at the
+three existing seams: the Feishu wire client (the new upload/send request
+bodies), the pure card builder (the `img` element, the three tracking-line
+states, the content-rejection fenced fallback), and the bridge mock Platform
+(the pre-resolve, the content-hash dedup, the fallback ladder, the once-guard).
