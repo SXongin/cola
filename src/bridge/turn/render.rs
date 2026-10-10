@@ -632,6 +632,98 @@ pub(super) async fn read_planned_outputs(
     }
 }
 
+/// Pre-resolve each newly rendered File Content's card delivery before the card
+/// JSON is built (ADR-0076). An image within Feishu's caps is uploaded once —
+/// cached process-locally by content hash, so identical bytes upload once and
+/// every later PATCH reuses the key — and embedded as an `img` immediately
+/// after its Tool Panel; a file this build cannot embed is left for the File
+/// Message path (#649). Best-effort: a failed upload leaves the panel's
+/// tracking line and never fails the Turn. Runs OUTSIDE the cards lock for the
+/// upload (it is a network call), like the planned-entry output reads. Returns
+/// whether any delivery was attached — a change that owes its card PATCH.
+async fn resolve_file_deliveries(cards: &CardsHandle, session_id: &str) -> bool {
+    // 1. Collect the unresolved File Contents under a brief lock, with their
+    //    content hashes. No cache access here, so no nested lock.
+    let pending: Vec<(String, usize, crate::backend::FileContent, u64)> = {
+        let live = cards.cards.lock().await;
+        let Some(card) = live.get(session_id) else {
+            return false;
+        };
+        card.acc
+            .pending_file_deliveries()
+            .into_iter()
+            .filter_map(|(call_id, index, content)| {
+                let bytes = content.bytes()?;
+                Some((call_id, index, content, file_content_hash(&bytes)))
+            })
+            .collect()
+    };
+    if pending.is_empty() {
+        return false;
+    }
+    // 2. A cache hit is a resolved delivery at once; a miss uploads, once per
+    //    distinct content hash, outside the cards lock. The Platform owns the
+    //    embeddability caps and answers `Ok(None)` for a content it will not
+    //    embed — that verdict is cached too.
+    let mut resolved: std::collections::HashMap<u64, Option<String>> = std::collections::HashMap::new();
+    let mut to_upload: Vec<(u64, crate::backend::FileContent)> = Vec::new();
+    let mut decided: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    for (_, _, content, hash) in &pending {
+        if !decided.insert(*hash) {
+            continue;
+        }
+        match cards.file_images.lock().await.get(hash).cloned() {
+            Some(delivery) => {
+                resolved.insert(*hash, delivery);
+            }
+            None => to_upload.push((*hash, content.clone())),
+        }
+    }
+    for (hash, content) in to_upload {
+        match cards.feishu.upload_image(&content).await {
+            Ok(delivery) => {
+                cards.file_images.lock().await.insert(hash, delivery.clone());
+                resolved.insert(hash, delivery);
+            }
+            // Never cached: a later poll retries. The card is untouched.
+            Err(error) => tracing::warn!("file content {:?} upload failed: {error}", content.name),
+        }
+    }
+    // 3. Attach the keys (and mark the non-embeddable contents considered) under
+    //    a short lock. A content whose upload failed is left unresolved, so a
+    //    later poll retries it.
+    let mut live = cards.cards.lock().await;
+    let Some(card) = live.get_mut(session_id) else {
+        return false;
+    };
+    let mut changed = false;
+    for (call_id, index, _, hash) in pending {
+        match resolved.get(&hash) {
+            Some(Some(key)) => {
+                card.acc.set_file_image_key(&call_id, index, key);
+                changed = true;
+            }
+            Some(None) => card.acc.set_file_no_surface(&call_id, index),
+            None => {}
+        }
+    }
+    if changed {
+        // An attached image is rendered content, not clock churn: it owes its
+        // flush and counts as progress, like a part.
+        card.acc.bump_progress_mark();
+    }
+    changed
+}
+
+/// A content hash for the process-local File Content image cache (ADR-0076):
+/// stable within the process, never persisted.
+fn file_content_hash(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// Commit a planned read (spec #593): announce each entry and insert it, under
 /// the cards lock. The announce is the exactly-once gate, so a plan a racing
 /// render already committed is skipped — the entry renders once, wherever the
@@ -1549,6 +1641,11 @@ async fn render_and_flush_inner(
             plans,
         )
     };
+    // Resolve every newly rendered File Content's card delivery (ADR-0076)
+    // before the flush builds the card JSON: one upload per content, outside
+    // the cards lock. Best-effort — a failure leaves the tracking line. An
+    // attached delivery is a rendered change and owes its PATCH.
+    let file_changed = resolve_file_deliveries(cards, session_id).await;
     // One output read per planned entry, OUTSIDE the cards lock (the reads are
     // network), then one short lock to announce and insert them (spec #593).
     read_planned_outputs(backend, &mut plans).await;
@@ -1639,6 +1736,7 @@ async fn render_and_flush_inner(
         FlushOutcome::Unwritten
     } else if changed
         || entries_changed
+        || file_changed
         || header_changed
         || context_changed
         || ledger.owes()
@@ -1928,7 +2026,7 @@ mod tests {
     use crate::bridge::App;
     use crate::bridge::chain::{CursorFrontier, CursorPartKind, RenderedCursor, cursor_prefix_digest};
     use crate::bridge::test_support::{
-        MockBackend, PlatformCall, RecordingPlatform, build_app, card_text, realistic_parts,
+        MockBackend, PlatformCall, RecordingPlatform, build_app, card_text, final_card, realistic_parts,
         seed_cover_title, seed_entry, test_config, test_work_dir, text_part, turn_anchor, typed_message,
     };
     use crate::bridge::turn::state::{CursorSeed, StreamAccumulator};
@@ -4918,6 +5016,285 @@ Index: /x/src/main.rs
             updates.last().unwrap().to_string().contains("第二段"),
             "the flushed card carries the new text: {}",
             updates.last().unwrap()
+        );
+    }
+
+    /// A `read` tool call whose decoded output carries the text header plus one
+    /// File Content (ADR-0076), the shape `read` returns for an image.
+    fn read_file_part(call_id: &str, name: &str, mime: &str, bytes: &[u8]) -> Part {
+        use base64::Engine as _;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let content = crate::backend::FileContent::decode(
+            &format!("data:{mime};base64,{encoded}"),
+            Some(mime),
+            Some(name),
+        )
+        .expect("an inline payload is a File Content");
+        Part::Tool(tool_call(
+            "read",
+            call_id,
+            ToolStatus::Completed,
+            Some(1_000),
+            None,
+            vec![
+                crate::backend::ContentBlock::Text("Image read successfully".into()),
+                crate::backend::ContentBlock::File(content),
+            ],
+        ))
+    }
+
+    /// Drive one render pass for `sid` with `transcript` and return it.
+    async fn render(
+        app: &Arc<App>,
+        cards: &CardsHandle,
+        sid: &str,
+        transcript: &SessionTranscript,
+    ) -> Option<RenderPass> {
+        render_and_flush(
+            cards,
+            &app.sessions_handle(),
+            &app.opencode,
+            &app.requests_handle(),
+            sid,
+            transcript,
+        )
+        .await
+    }
+
+    /// The `(mime, size)` of every image upload the mock recorded, in order.
+    async fn uploaded_images(platform: &RecordingPlatform) -> Vec<(String, u64)> {
+        platform
+            .calls
+            .lock()
+            .await
+            .iter()
+            .filter_map(|call| match call {
+                PlatformCall::UploadImage { mime, size } => Some((mime.clone(), *size)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A tool-read image renders on the card (ADR-0076): uploaded once, embedded
+    /// as an `img` immediately after its panel with `title` `📎 <name>` and
+    /// `preview` on, and the panel carries the `· 已内嵌` tracking line.
+    #[tokio::test]
+    async fn a_tool_read_image_is_uploaded_and_embedded_after_its_panel() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        platform.given_image_key("img_v2_shot");
+        let sid = "ses_embed_image";
+        let cards = app.core.cards_handle();
+        Turn::seed_card(&cards, sid, Some("om_embed")).await;
+        Turn::set_turn_anchor(&cards, sid, &turn_anchor(0)).await;
+
+        let pass = render(
+            &app,
+            &cards,
+            sid,
+            &SessionTranscript::new(vec![message(
+                "a1",
+                1_000,
+                vec![read_file_part("call_read", "shot.png", "image/png", b"ABC")],
+            )]),
+        )
+        .await;
+        assert!(pass.is_some(), "the render pass must not vanish");
+
+        assert_eq!(
+            uploaded_images(&platform).await,
+            vec![("image/png".to_string(), 3)],
+            "exactly one upload, with the decoded size"
+        );
+        let card = final_card(&platform).await;
+        let elements = card["body"]["elements"].as_array().unwrap();
+        let panel_at = elements
+            .iter()
+            .position(|e| e["tag"] == "collapsible_panel")
+            .expect("the read panel is on the card");
+        let image = &elements[panel_at + 1];
+        assert_eq!(image["tag"], "img", "the image follows the panel: {card}");
+        assert_eq!(image["img_key"], "img_v2_shot");
+        assert_eq!(image["title"]["content"], "📎 shot.png");
+        assert_eq!(image["preview"], true);
+        let body = elements[panel_at]["elements"][0]["content"].as_str().unwrap();
+        assert!(body.contains("已内嵌"), "the panel marks the embed: {body}");
+        assert!(body.contains("📎 shot.png · image/png · 3 B"), "{body}");
+    }
+
+    /// The same bytes read twice in one Session upload once: the second render
+    /// resolves the content from the process-local cache and every later PATCH
+    /// reuses the key (ADR-0076).
+    #[tokio::test]
+    async fn reading_the_same_image_twice_uploads_once_and_reuses_the_key() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        platform.given_image_key("img_v2_same");
+        let sid = "ses_embed_dedup";
+        let cards = app.core.cards_handle();
+        Turn::seed_card(&cards, sid, Some("om_dedup")).await;
+        Turn::set_turn_anchor(&cards, sid, &turn_anchor(0)).await;
+
+        let first = SessionTranscript::new(vec![message(
+            "a1",
+            1_000,
+            vec![read_file_part("call_read", "shot.png", "image/png", b"ABC")],
+        )]);
+        render(&app, &cards, sid, &first).await;
+
+        // A second call reads the SAME bytes into the same Session.
+        let second = SessionTranscript::new(vec![
+            message(
+                "a1",
+                1_000,
+                vec![read_file_part("call_read", "shot.png", "image/png", b"ABC")],
+            ),
+            message(
+                "a2",
+                2_000,
+                vec![read_file_part("call_read_2", "shot.png", "image/png", b"ABC")],
+            ),
+        ]);
+        render(&app, &cards, sid, &second).await;
+
+        assert_eq!(
+            uploaded_images(&platform).await.len(),
+            1,
+            "identical bytes upload once"
+        );
+        assert_eq!(
+            platform
+                .upload_image_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the second read is a cache hit, not a second platform call"
+        );
+        let card = final_card(&platform).await;
+        let images: Vec<_> = card["body"]["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["tag"] == "img")
+            .collect();
+        assert_eq!(images.len(), 2, "both reads show their image: {card}");
+        assert!(images.iter().all(|img| img["img_key"] == "img_v2_same"));
+    }
+
+    /// A File Content that is not an embeddable image (a PDF) is not uploaded
+    /// and renders no `img`; its panel still names the file. File Messages are
+    /// ticket #649's, deliberately not built here.
+    #[tokio::test]
+    async fn a_non_image_file_content_is_not_uploaded_and_renders_no_image() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        let sid = "ses_embed_pdf";
+        let cards = app.core.cards_handle();
+        Turn::seed_card(&cards, sid, Some("om_pdf")).await;
+        Turn::set_turn_anchor(&cards, sid, &turn_anchor(0)).await;
+
+        let transcript = SessionTranscript::new(vec![message(
+            "a1",
+            1_000,
+            vec![read_file_part("call_read", "doc.pdf", "application/pdf", b"%PDF")],
+        )]);
+        render(&app, &cards, sid, &transcript).await;
+        // A later poll must not re-ask: the platform already decided.
+        render(&app, &cards, sid, &transcript).await;
+
+        assert!(
+            uploaded_images(&platform).await.is_empty(),
+            "a PDF is not uploaded"
+        );
+        assert_eq!(
+            platform
+                .upload_image_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the platform decides once; a later poll does not re-ask"
+        );
+        let card = final_card(&platform).await;
+        assert!(
+            card["body"]["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|e| e["tag"] != "img"),
+            "no image element: {card}"
+        );
+        let body = card["body"]["elements"][0]["elements"][0]["content"]
+            .as_str()
+            .unwrap();
+        assert!(body.contains("📎 doc.pdf · application/pdf · 4 B"), "{body}");
+        assert!(!body.contains("已内嵌"), "{body}");
+    }
+
+    /// A failed upload is best-effort: the card is built intact with the file's
+    /// tracking line, the Turn is not failed, and a later poll retries (the
+    /// failure is never cached) so the image lands once the platform recovers.
+    #[tokio::test]
+    async fn a_failed_upload_keeps_the_card_intact_and_is_retried() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        platform.given_image_key("img_v2_retry");
+        platform
+            .fail_upload_image_count
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        let sid = "ses_embed_fail";
+        let cards = app.core.cards_handle();
+        Turn::seed_card(&cards, sid, Some("om_fail")).await;
+        Turn::set_turn_anchor(&cards, sid, &turn_anchor(0)).await;
+        let transcript = SessionTranscript::new(vec![message(
+            "a1",
+            1_000,
+            vec![read_file_part("call_read", "shot.png", "image/png", b"ABC")],
+        )]);
+
+        let pass = render(&app, &cards, sid, &transcript).await;
+        assert!(pass.is_some(), "a failed upload never fails the Turn");
+        assert!(
+            uploaded_images(&platform).await.is_empty(),
+            "the failed upload records nothing"
+        );
+        let card = final_card(&platform).await;
+        assert!(
+            card["body"]["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|e| e["tag"] != "img"),
+            "no image without a key: {card}"
+        );
+        let body = card["body"]["elements"][0]["elements"][0]["content"]
+            .as_str()
+            .unwrap();
+        assert!(
+            body.contains("📎 shot.png · image/png · 3 B"),
+            "the line survives: {body}"
+        );
+
+        // The next poll retries: the failure was not cached.
+        render(&app, &cards, sid, &transcript).await;
+        assert_eq!(
+            uploaded_images(&platform).await,
+            vec![("image/png".to_string(), 3)],
+            "a later poll uploads the image"
+        );
+        let card = final_card(&platform).await;
+        assert!(
+            card["body"]["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["tag"] == "img" && e["img_key"] == "img_v2_retry"),
+            "the retried upload lands on the card: {card}"
         );
     }
 

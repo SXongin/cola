@@ -2,11 +2,13 @@ pub mod card;
 pub mod client;
 pub(crate) mod delivery;
 pub mod event;
+pub(crate) mod image;
 pub(crate) mod message;
 pub(crate) mod pbbp2;
 pub mod snapshot_card;
 pub mod ws;
 
+use crate::backend::FileContent;
 use crate::error::Result;
 use async_trait::async_trait;
 use client::Client;
@@ -186,6 +188,15 @@ pub trait Platform: Send + Sync {
     /// callers degrade to the bare ending on any error.
     async fn get_card_view(&self, message_id: &str) -> Result<Value>;
 
+    /// Upload a File Content as a Feishu image and return the reusable
+    /// `image_key` a card's `img` element references (`POST
+    /// /open-apis/im/v1/images`, `image_type=message`, scope `im:resource`;
+    /// ADR-0076). `Ok(None)` when `content` is not an embeddable image — a mime
+    /// outside Feishu's set, or bytes/dimensions past its caps — so the caller
+    /// leaves it to the File Message path (#649). Best-effort at the call site:
+    /// any `Err` leaves the card intact and never fails the Turn.
+    async fn upload_image(&self, content: &FileContent) -> Result<Option<String>>;
+
     /// Download an image embedded in a message (`GET /im/v1/messages/{id}/resources/{key}?type=image`),
     /// used to attach Image Attachments to a prompt. Requires the `im:message`
     /// permission (already held); callers degrade to a `[图片]` placeholder on
@@ -363,6 +374,16 @@ impl Platform for Client {
 
     async fn get_card_view(&self, message_id: &str) -> Result<Value> {
         Client::get_card_view(self, message_id).await
+    }
+
+    async fn upload_image(&self, content: &FileContent) -> Result<Option<String>> {
+        if !image::embeddable_image(content) {
+            return Ok(None);
+        }
+        let Some(bytes) = content.bytes() else {
+            return Ok(None);
+        };
+        Client::upload_image(self, &bytes, &content.mime).await.map(Some)
     }
 
     async fn download_image(&self, message_id: &str, image_key: &str) -> Result<client::ImageAttachment> {

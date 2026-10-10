@@ -269,6 +269,12 @@ pub enum PlatformCall {
         message_id: String,
         on: bool,
     },
+    /// An image upload (ADR-0076): the File Content's mime and decoded length,
+    /// recorded so a test can assert how many uploads a turn made.
+    UploadImage {
+        mime: String,
+        size: u64,
+    },
 }
 
 /// A one-shot gate on one platform call, so a test can freeze a card write
@@ -378,6 +384,16 @@ pub struct RecordingPlatform {
     /// review): production's delivery bound by default, shortened by a test
     /// that parks a keyed write and must watch a caller give up on it.
     pub keyed_ticket_await: std::sync::Mutex<std::time::Duration>,
+    /// The `image_key` `upload_image` returns (ADR-0076).
+    pub image_key: std::sync::Mutex<String>,
+    /// The next N `upload_image` calls fail with a Feishu error after recording
+    /// nothing (tests the best-effort path: a failed upload leaves the card
+    /// intact and never fails the Turn).
+    pub fail_upload_image_count: std::sync::atomic::AtomicUsize,
+    /// Every `upload_image` entry — including a non-embeddable content the mock
+    /// answers `Ok(None)` for — so a test can assert the bridge asks the
+    /// platform at most once for a content it has already decided.
+    pub upload_image_calls: std::sync::atomic::AtomicUsize,
 }
 
 impl RecordingPlatform {
@@ -404,6 +420,9 @@ impl RecordingPlatform {
             pause_call: std::sync::Mutex::new(None),
             reply_ids: std::sync::Mutex::new(std::collections::VecDeque::new()),
             keyed_ticket_await: std::sync::Mutex::new(crate::feishu::delivery::KEYED_TICKET_AWAIT),
+            image_key: std::sync::Mutex::new("img_test".into()),
+            fail_upload_image_count: std::sync::atomic::AtomicUsize::new(0),
+            upload_image_calls: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -418,6 +437,11 @@ impl RecordingPlatform {
     /// with none queued keeps the mock's default `msg_reply`.
     pub fn given_reply_id(&self, id: &str) {
         self.reply_ids.lock().unwrap().push_back(id.to_string());
+    }
+
+    /// Set the `image_key` every `upload_image` returns (ADR-0076).
+    pub fn given_image_key(&self, key: &str) {
+        *self.image_key.lock().unwrap() = key.to_string();
     }
 
     /// Queue the next `reply_card` call's outcome; a failed send is not
@@ -977,6 +1001,36 @@ impl feishu::Platform for RecordingPlatform {
             mime: "image/png".into(),
             data: vec![1, 2, 3, 4],
         })
+    }
+
+    async fn upload_image(
+        &self,
+        content: &crate::backend::FileContent,
+    ) -> crate::error::Result<Option<String>> {
+        self.upload_image_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // Embeddability is the same production caps check the real platform
+        // applies, so a bridge test's routing (an image embeds, a PDF does not)
+        // is the real decision, not a mock's shortcut.
+        if !crate::feishu::image::embeddable_image(content) {
+            return Ok(None);
+        }
+        if self
+            .fail_upload_image_count
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0
+        {
+            self.fail_upload_image_count
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            return Err(crate::error::BridgeError::Feishu(
+                "simulated upload_image failure".into(),
+            ));
+        }
+        self.calls.lock().await.push(PlatformCall::UploadImage {
+            mime: content.mime.clone(),
+            size: content.size,
+        });
+        Ok(Some(self.image_key.lock().unwrap().clone()))
     }
 }
 
