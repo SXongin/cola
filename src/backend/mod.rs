@@ -42,14 +42,17 @@ pub struct PromptSkill {
     pub name: String,
 }
 
-/// One registered skill as the skill-list read exposes it (spec #652, ticket
-/// #656): a small generation-neutral `{ id, name, description? }`. `id` is the
-/// skill's identity in the attached generation's own space — V2's `Skill.ID`
-/// (what the structured prompt `skills` request carries and what the picker
-/// sends back), while on V1, whose `Skill.Info` has no id, `id` IS `name` (V1
-/// keys skills by name and its `skill` tool loads by name). `name` is the
-/// human-facing name; `description` is the frontmatter description when the
-/// skill declares one. The read is deliberately unfiltered: a hidden
+/// One registered skill as the skill-list read exposes it (spec #652, tickets
+/// #656/#655): a small generation-neutral `{ id, name, description?, content? }`.
+/// `id` is the skill's identity in the attached generation's own space — V2's
+/// `Skill.ID` (what the structured prompt `skills` request carries and what the
+/// picker sends back), while on V1, whose `Skill.Info` has no id, `id` IS
+/// `name` (V1 keys skills by name and its `skill` tool loads by name). `name`
+/// is the human-facing name; `description` is the frontmatter description when
+/// the skill declares one. `content` is the skill's own markdown as the list
+/// route reports it — the body the dedicated loaded-skill card's fold shows
+/// (raw, with no `<skill_content>` envelope to unwrap) — and `None` when the
+/// route carried none. The read is deliberately unfiltered: a hidden
 /// (`disable-model-invocation`) or description-less skill is listed too, since
 /// the whole point of the picker is to reach exactly the skills the model never
 /// advertises.
@@ -58,6 +61,7 @@ pub struct SkillInfo {
     pub id: String,
     pub name: String,
     pub description: Option<String>,
+    pub content: Option<String>,
 }
 
 /// A directory-scoped handle to the backend. Instance routing lives here: the

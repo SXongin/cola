@@ -48,17 +48,17 @@ fn mount_skills(server: &TestHttpServer, fixture: &SkillListFixture) {
                 "name": fixture.visible_name,
                 "description": fixture.visible_description,
                 "location": "/work/skills/implement-spec/SKILL.md",
-                "content": "body",
+                "content": fixture.visible_content,
             },
             {
                 "name": fixture.bare_name,
                 "location": "/work/skills/description-less/SKILL.md",
-                "content": "body",
+                "content": fixture.visible_content,
             },
             {
                 "name": fixture.hidden_name,
                 "location": "/work/skills/hidden-tool/SKILL.md",
-                "content": "body",
+                "content": fixture.visible_content,
             },
         ])
         .to_string(),

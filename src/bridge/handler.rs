@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use tracing::Instrument;
 
-use crate::backend::PromptSkill;
+use crate::backend::{PromptSkill, SkillInfo};
 use crate::bridge::access::{Access, Decision, DenyReason};
 use crate::bridge::command;
 use crate::bridge::core::SharedCore;
@@ -456,8 +456,16 @@ impl App {
     /// typed id to its canonical `{ id, name }` list entry (so the attached
     /// skill is not just the raw token — V1's text fallback then names the
     /// skill correctly), and submits the whole original message text verbatim
-    /// with the resolved attachment. The read is generation-neutral, so the
-    /// command behaves identically on V1 and V2.
+    /// with the resolved attachment. Ids are deduped by id, first-occurrence
+    /// order preserved. The read is generation-neutral, so the command behaves
+    /// identically on V1 and V2.
+    ///
+    /// A resolved dispatch also replies the dedicated loaded-skill card under
+    /// the user's message ([`crate::feishu::card::command::send_loaded_skill_card`]),
+    /// one `🧩 已加载技能：<name>` fold per distinct skill — the ONLY place a
+    /// skill fold renders (the live Turn card, the Session Snapshot tail and
+    /// the External Message preview are text-only; ADR-0077's acceptance
+    /// reversal).
     ///
     /// Two recovery cases never reach the model — a bare `/skill` (no id) and a
     /// dispatch whose ids ALL fail to resolve. Both answer with the SAME picker
@@ -498,13 +506,27 @@ impl App {
             .list_skills((!directory.is_empty()).then_some(directory.as_str()))
             .await;
         let mut resolved: Vec<PromptSkill> = Vec::new();
+        // The distinct resolved skills, in first-occurrence order, for the
+        // dedicated loaded-skill card's folds (spec #652, ticket #655): the
+        // card carries the list read's own `content`, so it needs the neutral
+        // `SkillInfo`, not just the `{ id, name }` prompt attachment.
+        let mut loaded: Vec<SkillInfo> = Vec::new();
         let mut unknown: Vec<String> = Vec::new();
+        // Dedupe by id, preserving first-occurrence order: the server also
+        // dedupes injection within one prompt, but cola must not attach (or
+        // fold) the same skill twice for `/skill a /skill a`.
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for id in &ids {
             match skills.iter().find(|skill| skill.id == *id) {
-                Some(entry) => resolved.push(PromptSkill {
-                    id: entry.id.clone(),
-                    name: entry.name.clone(),
-                }),
+                Some(entry) => {
+                    if seen.insert(entry.id.clone()) {
+                        resolved.push(PromptSkill {
+                            id: entry.id.clone(),
+                            name: entry.name.clone(),
+                        });
+                        loaded.push(entry.clone());
+                    }
+                }
                 None => unknown.push(id.clone()),
             }
         }
@@ -529,6 +551,15 @@ impl App {
             )
             .await;
             return;
+        }
+        // The dedicated loaded-skill card replies under the user's message —
+        // the same feedback for a typed command and a picker-row tap. A failed
+        // card is logged (and degrades to text inside the helper); it never
+        // blocks the submit, which is the command's whole point.
+        if let Err(e) =
+            crate::feishu::card::command::send_loaded_skill_card(&handles, &msg.message_id, &loaded).await
+        {
+            tracing::warn!("loaded-skill card: {e}");
         }
         if let Err(e) = self.handle_prompt(thread_key, msg, kind, resolved).await {
             tracing::error!("Prompt: {}", e);
@@ -2037,8 +2068,9 @@ impl App {
     /// whitespace (`Implement Spec`), and `/skill Implement Spec` would parse as
     /// two ids and resolve neither. The click must ack within 3s while a turn
     /// runs for the length of a model reply, so the submission is spawned off
-    /// the ack; the picker card stays put, and the agent/autoaccept toasts
-    /// already established that a picker does not replace itself.
+    /// the ack; the picker card stays put (the dedicated loaded-skill card
+    /// replies under it, spec #655), and the agent/autoaccept toasts already
+    /// established that a picker does not replace itself.
     async fn handle_skill_card_action(
         self: &Arc<Self>,
         value: &serde_json::Value,

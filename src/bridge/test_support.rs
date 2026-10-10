@@ -9,9 +9,8 @@ pub(crate) use crate::opencode;
 
 use crate::backend::{
     BackgroundTask, ChildEvidence, ContentBlock, Execution, ExecutionOutcome, FinishReason, MessageId,
-    MessageRole, MessageSkill, MessageTime, Part, ReasoningPart, SessionTranscript, StepFinish, StepStart,
-    TextPart, ToolCall, ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage, TurnAnchor, Wake,
-    WakeSource,
+    MessageRole, MessageTime, Part, ReasoningPart, SessionTranscript, StepFinish, StepStart, TextPart,
+    ToolCall, ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage, TurnAnchor, Wake, WakeSource,
 };
 
 /// One typed transcript message for view-shaped fixtures (spec #332): identity,
@@ -35,31 +34,7 @@ pub(crate) fn typed_message(
         model: None,
         tokens: None,
         error: None,
-        skills: Vec::new(),
         parts,
-    }
-}
-
-/// [`typed_message`] carrying the given attached skills (spec #652, ticket
-/// #655): a user message another client loaded skills into, the shape the
-/// loaded-skill fold renders.
-pub(crate) fn user_message_with_skills(
-    id: &str,
-    created: i64,
-    text: &str,
-    skills: Vec<MessageSkill>,
-) -> TranscriptMessage {
-    let mut message = typed_message(id, MessageRole::User, Some(created), vec![text_part(text)]);
-    message.skills = skills;
-    message
-}
-
-/// One neutral attached-skill fact (spec #652, ticket #655) for a fixture.
-pub(crate) fn message_skill(id: &str, name: &str, instructions: Option<&str>) -> MessageSkill {
-    MessageSkill {
-        id: id.to_string(),
-        name: name.to_string(),
-        instructions: instructions.map(str::to_string),
     }
 }
 

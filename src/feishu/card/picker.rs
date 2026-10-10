@@ -729,16 +729,19 @@ mod tests {
                 id: "implement-spec".into(),
                 name: "Implement Spec".into(),
                 description: Some("Drive a spec to shipped code.".into()),
+                content: None,
             },
             crate::backend::SkillInfo {
                 id: "bare".into(),
                 name: "Bare".into(),
                 description: None,
+                content: None,
             },
             crate::backend::SkillInfo {
                 id: "hidden-tool".into(),
                 name: "Hidden Tool".into(),
                 description: Some("Never advertised to the model.".into()),
+                content: None,
             },
         ];
         let cards = build_skill_cards(&key, &skills, "p2p", None);
@@ -786,6 +789,7 @@ mod tests {
             id: "implement-spec".into(),
             name: "Implement Spec".into(),
             description: None,
+            content: None,
         }];
         let with_error = build_skill_cards(&key, &skills, "group", Some("⚠️ 未找到技能：`nope`"));
         let text = with_error[0].to_string();
@@ -814,6 +818,7 @@ mod tests {
             id: "s".into(),
             name: "S".into(),
             description: description.map(str::to_string),
+            content: None,
         };
         assert_eq!(skill_description_line(&skill(None)), None);
         assert_eq!(skill_description_line(&skill(Some(""))), None);
@@ -838,6 +843,7 @@ mod tests {
             id: "long".into(),
             name: "名".repeat(500),
             description: None,
+            content: None,
         }];
         let cards = build_skill_cards(&key, &skills, "p2p", None);
         assert_eq!(cards.len(), 1, "one bounded row");

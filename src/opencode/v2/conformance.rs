@@ -50,13 +50,13 @@ fn mount_skills(server: &TestHttpServer, fixture: &SkillListFixture) {
                     "description": fixture.visible_description,
                     "autoinvoke": true,
                     "path": "/work/skills/implement-spec/SKILL.md",
-                    "content": "body",
+                    "content": fixture.visible_content,
                 },
                 {
                     "id": fixture.bare_name,
                     "name": fixture.bare_name,
                     "path": "/work/skills/description-less/SKILL.md",
-                    "content": "body",
+                    "content": fixture.visible_content,
                 },
                 {
                     "id": fixture.hidden_id,
@@ -64,7 +64,7 @@ fn mount_skills(server: &TestHttpServer, fixture: &SkillListFixture) {
                     "description": "Hidden from the model.",
                     "autoinvoke": false,
                     "path": "/work/skills/hidden-tool/SKILL.md",
-                    "content": "body",
+                    "content": fixture.visible_content,
                 },
             ],
         })

@@ -30,9 +30,9 @@ use serde_json::Value;
 
 use crate::backend::{
     BackgroundLaunch, BackgroundTask, ChildEvidence, ContentBlock, Execution, ExecutionOutcome, FinishReason,
-    MessageId, MessageRole, MessageSkill, MessageTime, ModelIdentity, OtherPart, Part, ReasoningPart,
-    SessionTranscript, ShellEnd, ShellRuntime, SkillInfo, StepFinish, TextPart, TokenUsage, ToolCall,
-    ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage, Wake, WakeSource,
+    MessageId, MessageRole, MessageTime, ModelIdentity, OtherPart, Part, ReasoningPart, SessionTranscript,
+    ShellEnd, ShellRuntime, SkillInfo, StepFinish, TextPart, TokenUsage, ToolCall, ToolIdentity, ToolOutput,
+    ToolStatus, TranscriptMessage, Wake, WakeSource,
 };
 use crate::opencode::types::{
     AgentInfo, FormFieldKind, ModelInfo, ModelOption, PermissionRequest, QuestionInfo, QuestionOption,
@@ -199,18 +199,21 @@ impl RawAgentInfo {
     }
 }
 
-/// `GET /api/skill` — one `Skill.Info` (spec #652, ticket #656). `id` is the
-/// wire identity the structured prompt `skills` request carries and the picker
-/// sends back; `name` is the human-facing name. `description` is optional (a
-/// description-less skill must still list). `path`/`content`/`autoinvoke` are
-/// ignored: the list only needs what the picker shows and the prompt
-/// resolution attaches, and the read is deliberately unfiltered.
+/// `GET /api/skill` — one `Skill.Info` (spec #652, tickets #656/#655). `id` is
+/// the wire identity the structured prompt `skills` request carries and the
+/// picker sends back; `name` is the human-facing name. `description` and
+/// `content` are optional (a description-less skill must still list; a skill's
+/// own markdown is the loaded-skill card's fold body). `path`/`autoinvoke` are
+/// ignored: the list only needs what the picker shows, the prompt resolution
+/// attaches, and the fold renders, and the read is deliberately unfiltered.
 #[derive(Debug, Deserialize)]
 pub(super) struct RawSkillInfo {
     pub(super) id: String,
     pub(super) name: String,
     #[serde(default)]
     pub(super) description: Option<String>,
+    #[serde(default)]
+    pub(super) content: Option<String>,
 }
 
 impl RawSkillInfo {
@@ -219,6 +222,7 @@ impl RawSkillInfo {
             id: self.id,
             name: self.name,
             description: self.description,
+            content: self.content,
         }
     }
 }
@@ -913,13 +917,6 @@ impl ToolCall {
 fn decode_message(message: &Value) -> TranscriptMessage {
     let kind = message.get("type").and_then(Value::as_str);
     let (role, parts) = decode_body(kind, message);
-    // A user message's attached skills (spec #652, ticket #655): V2 carries
-    // them on the message itself; every other kind carries none.
-    let skills = if kind == Some("user") {
-        decode_attached_skills(message.get("skills"))
-    } else {
-        Vec::new()
-    };
     TranscriptMessage {
         id: message_id(message),
         role,
@@ -927,33 +924,8 @@ fn decode_message(message: &Value) -> TranscriptMessage {
         model: decode_model(message.get("model")),
         tokens: decode_tokens(message.get("tokens")),
         error: message.get("error").and_then(decode_error),
-        skills,
         parts,
     }
-}
-
-/// The skills a user message attached (spec #652, ticket #655): each
-/// attachment's `id` and `name`, with its optional prepared body (`text`, the
-/// `<skill_content>` envelope the fold unwraps). An attachment without an `id`
-/// names no skill and is skipped; a missing `name` falls back to the `id`.
-fn decode_attached_skills(skills: Option<&Value>) -> Vec<MessageSkill> {
-    skills
-        .and_then(Value::as_array)
-        .map(|skills| {
-            skills
-                .iter()
-                .filter_map(|skill| {
-                    let id = skill.get("id").and_then(Value::as_str)?;
-                    let name = skill.get("name").and_then(Value::as_str).unwrap_or(id);
-                    Some(MessageSkill {
-                        id: id.to_string(),
-                        name: name.to_string(),
-                        instructions: skill.get("text").and_then(Value::as_str).map(str::to_string),
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// A message's identity: the server's own id, or empty when the payload lost
@@ -1683,52 +1655,6 @@ mod tests {
             assert_eq!(raw.kind, kind);
             assert_eq!(raw.raw.get("type").and_then(Value::as_str), Some(kind));
         }
-    }
-
-    /// A V2 user message's attached skills decode to the neutral facts (spec
-    /// #652, ticket #655): each attachment's `id`, `name` and optional prepared
-    /// body (`text`); an attachment without an id names no skill and is
-    /// skipped. No other message kind carries skills.
-    #[test]
-    fn a_user_messages_attached_skills_decode_to_the_neutral_facts() {
-        let transcript = decode_messages(&[serde_json::json!({
-            "id": "msg_u",
-            "type": "user",
-            "text": "/skill implement-spec 644",
-            "time": {"created": 10},
-            "skills": [
-                {
-                    "id": "implement-spec",
-                    "name": "implement-spec",
-                    "text": "<skill_content name=\"implement-spec\">\nbody\n</skill_content>"
-                },
-                {"id": "foreman", "name": "foreman"},
-                {"name": "no-id-is-not-a-skill"}
-            ]
-        })]);
-        let skills = &transcript.messages[0].skills;
-        assert_eq!(skills.len(), 2, "the id-less attachment is skipped: {skills:?}");
-        assert_eq!(skills[0].id, "implement-spec");
-        assert_eq!(skills[0].name, "implement-spec");
-        assert!(
-            skills[0]
-                .instructions
-                .as_deref()
-                .is_some_and(|text| text.contains("body")),
-            "{skills:?}"
-        );
-        assert_eq!(skills[1].name, "foreman");
-        assert!(skills[1].instructions.is_none(), "no prepared body: {skills:?}");
-
-        // An assistant message carries none, even when the payload names one.
-        let assistant = decode_messages(&[serde_json::json!({
-            "id": "msg_a",
-            "type": "assistant",
-            "content": [],
-            "time": {"created": 11},
-            "skills": [{"id": "x", "name": "x"}]
-        })]);
-        assert!(assistant.messages[0].skills.is_empty());
     }
 
     /// The message id survives verbatim (V2's `msg_` rule is tighter than V1's

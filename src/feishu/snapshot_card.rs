@@ -105,9 +105,9 @@ pub type SnapshotQuestionState = std::collections::HashMap<String, QuestionBlock
 /// The 最近对话 panel: the last-four tail entries, each role-marked and shown
 /// folded — its header previews the entry briefly and expanding reveals the
 /// full verbatim text (chunked to cola's per-element budget). No tail → no panel.
-/// `md` is the card's markdown state: the entry texts AND their loaded-skill
-/// folds share its one table budget and fenced fallback (spec #652, ticket
-/// #655), so the tail cannot put a 6th table on the card.
+/// `md` is the card's markdown state: the entry texts share its one table budget
+/// and fenced fallback. A tail entry's attached skills are NOT rendered here
+/// (spec #652, ticket #655, acceptance reversal): the snapshot tail is text only.
 fn tail_panels(
     tail: &[TailEntry],
     md: &mut crate::feishu::card::sanitize::CardMarkdown,
@@ -117,10 +117,6 @@ fn tail_panels(
         return panels;
     }
     panels.push(json!({ "tag": "markdown", "content": "**最近对话**" }));
-    // The loaded-skill folds share ONE card-wide budget across every entry
-    // (spec #652, ticket #655), so several messages' large skills cannot push
-    // the one-shot snapshot past Feishu's total limit.
-    let mut folds = crate::feishu::card::skill::SkillFolds::new();
     for (i, entry) in tail.iter().enumerate() {
         let (role, preview) = tail_preview(entry);
         let title = if preview.is_empty() {
@@ -144,15 +140,6 @@ fn tail_panels(
             &chunks,
             Some(&format!("snap_{i}")),
         ));
-        // The message's attached skills (spec #652, ticket #655) ride beside
-        // its text, so a skill loaded by another client is visible in Feishu.
-        panels.extend(folds.render(&entry.skills, &format!("snap_{i}_skill_"), md));
-    }
-    // The card-wide overflow summary (spec #652, ticket #655): ONE fold naming
-    // every skill past the component-safe bound across ALL entries, so a
-    // pathological tail cannot build a card Feishu rejects.
-    if let Some(summary) = folds.summary("snap_skill_summary", md) {
-        panels.push(summary);
     }
     panels
 }
@@ -300,7 +287,6 @@ pub fn build_switched_state_card(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::MessageSkill;
     use crate::bridge::request::kind::PendingRequest;
     use crate::bridge::snapshot::SnapshotData;
     use crate::opencode::types::{PermissionRequest, QuestionInfo, QuestionOption, QuestionRequest};
@@ -366,7 +352,6 @@ mod tests {
             role,
             created_ms,
             text: text.into(),
-            skills: Vec::new(),
         }
     }
 
@@ -667,173 +652,20 @@ mod tests {
         assert!(panels.iter().all(|p| !p["expanded"].as_bool().unwrap()));
     }
 
-    /// A tail entry's attached skills render as the loaded-skill fold beside
-    /// its text (spec #652, ticket #655), so a skill another client loaded is
-    /// visible in the snapshot. A message with no skills renders no fold.
+    /// A tail entry's text is rendered alone (spec #652, ticket #655, acceptance
+    /// reversal): the Session Snapshot tail carries NO loaded-skill fold, even
+    /// for a `/skill` message.
     #[test]
-    fn a_tail_entrys_attached_skills_render_the_fold_beside_its_text() {
-        let mut with_skill = tail(MessageRole::User, 1000, "/skill implement-spec 644");
-        with_skill.skills = vec![MessageSkill {
-            id: "implement-spec".into(),
-            name: "implement-spec".into(),
-            instructions: Some(
-                "<skill_content name=\"implement-spec\">\nDo the thing.\n\
-                 <skill_files>\n<file>/a.md</file>\n</skill_files>\n</skill_content>"
-                    .into(),
-            ),
-        }];
+    fn a_tail_entry_renders_no_skill_fold() {
         let d = data(
-            Some(opencode::types::SessionStatus::Idle),
-            vec![],
-            vec![with_skill],
-        );
-        let card = build_snapshot_card("接管", "t", &d, None);
-        let s = card.to_string();
-        assert!(s.contains("🧩 已加载技能：implement-spec"), "{s}");
-        assert!(s.contains("Do the thing."), "{s}");
-        assert!(!s.contains("skill_files"), "{s}");
-        // The message panel still comes first; the fold rides beside it.
-        let panels: Vec<&serde_json::Value> = elements(&card)
-            .iter()
-            .filter(|e| e["tag"] == "collapsible_panel")
-            .collect();
-        assert_eq!(panels.len(), 2, "message panel + skill fold: {card}");
-        assert_eq!(
-            panels[1]["header"]["title"]["content"],
-            "🧩 已加载技能：implement-spec"
-        );
-
-        // No skills → exactly the message panel, as today.
-        let plain = data(
             Some(opencode::types::SessionStatus::Idle),
             vec![],
             vec![tail(MessageRole::User, 1000, "/skill implement-spec 644")],
         );
-        let plain = build_snapshot_card("接管", "t", &plain, None);
-        assert!(!plain.to_string().contains("已加载技能"), "{plain}");
-    }
-
-    /// Several large CJK skills attached to one message must not push the
-    /// one-shot snapshot past Feishu's total card limit: the folds share one
-    /// card-wide body budget (spec #652, ticket #655). Every skill still gets
-    /// its own titled fold; only bodies past the budget are omitted. Without the
-    /// shared budget, even four 3,000-char CJK bodies alone are 36 KB — the card
-    /// is rejected.
-    #[test]
-    fn several_large_skills_stay_within_the_snapshot_budget() {
-        let huge = "很长的技能说明。".repeat(1_000); // 8,000 CJK chars (24 KB) each
-        let mut entry = tail(MessageRole::User, 1000, "/skill implement-spec");
-        entry.skills = (0..10)
-            .map(|i| MessageSkill {
-                id: format!("s{i}"),
-                name: format!("skill-{i}"),
-                instructions: Some(huge.clone()),
-            })
-            .collect();
-        let d = data(Some(opencode::types::SessionStatus::Idle), vec![], vec![entry]);
         let card = build_snapshot_card("接管", "t", &d, None);
         let s = card.to_string();
-        assert!(s.contains("🧩 已加载技能：skill-0"), "{s}");
-        assert!(
-            s.contains("🧩 已加载技能：skill-9"),
-            "every skill keeps its own fold: {s}"
-        );
-        let size = s.len();
-        assert!(
-            size <= crate::feishu::card::FEISHU_CARD_LIMIT_BYTES,
-            "the folds pushed the snapshot to {size} bytes"
-        );
-    }
-
-    /// A pathological skill count on the snapshot path — several tail messages
-    /// each attaching more skills than a card may hold — cannot build a card
-    /// Feishu rejects on component count: the fold budget is CARD-WIDE, so at
-    /// most `SKILL_FOLD_MAX` individual folds render across EVERY entry and the
-    /// rest collapse into ONE summary fold (spec #652, ticket #655).
-    #[test]
-    fn a_pathological_skill_count_is_bounded_card_wide_in_the_snapshot() {
-        use crate::feishu::card::skill::SKILL_FOLD_MAX;
-
-        let entry = |created_ms: i64| {
-            let mut entry = tail(MessageRole::User, created_ms, "/skill a");
-            entry.skills = (0..150)
-                .map(|i| MessageSkill {
-                    id: format!("s{i}"),
-                    name: format!("skill-{i}"),
-                    instructions: Some("body".into()),
-                })
-                .collect();
-            entry
-        };
-        let d = data(
-            Some(opencode::types::SessionStatus::Idle),
-            vec![],
-            vec![entry(1000), entry(2000)],
-        );
-        let card = build_snapshot_card("接管", "t", &d, None);
-
-        let skill_panels: Vec<&serde_json::Value> = elements(&card)
-            .iter()
-            .filter(|e| {
-                e["header"]["title"]["content"]
-                    .as_str()
-                    .is_some_and(|title| title.contains("已加载技能"))
-            })
-            .collect();
-        assert_eq!(
-            skill_panels.len(),
-            SKILL_FOLD_MAX + 1,
-            "capped across entries, one summary: {card}"
-        );
-        assert_eq!(
-            skill_panels.last().unwrap()["header"]["title"]["content"],
-            "🧩 已加载技能（等 250 个）",
-            "the one summary names every hidden skill: {card}"
-        );
-
-        // Count every top-level element plus the markdown nested in each panel:
-        // the snapshot has no splitter, so the builder itself must stay under
-        // Feishu's ceiling.
-        let components: usize = elements(&card)
-            .iter()
-            .map(|e| 1 + e["elements"].as_array().map_or(0, |nested| nested.len()))
-            .sum();
-        assert!(components <= 200, "the snapshot spent {components} components");
-    }
-
-    /// The snapshot's tail text AND its loaded-skill folds share ONE card-wide
-    /// table budget (spec #652, ticket #655): a message whose text carries three
-    /// tables and whose two skills carry three each is nine tables, and Feishu
-    /// rejects a 6th. Threading one [`CardMarkdown`] through the tail and the
-    /// folds leaves only the first five native; the rest render as code.
-    #[test]
-    fn the_snapshot_tail_and_folds_share_one_table_budget() {
-        use crate::feishu::card::sanitize::MAX_CARD_TABLES;
-
-        let table = "| a | b |\n|---|---|\n| 1 | 2 |";
-        // A prefix longer than the 40-char preview keeps the delimiter out of
-        // the panel's plain-text header, so the count below is body tables only.
-        let prefix = "前置说明文字。".repeat(8);
-        let body = format!("{prefix}\n\n{table}\n\n{table}\n\n{table}");
-        let mut entry = tail(MessageRole::User, 1000, &body);
-        entry.skills = (0..2)
-            .map(|i| MessageSkill {
-                id: format!("s{i}"),
-                name: format!("skill-{i}"),
-                instructions: Some(format!("{table}\n\n{table}\n\n{table}")),
-            })
-            .collect();
-        let d = data(Some(opencode::types::SessionStatus::Idle), vec![], vec![entry]);
-        let card = build_snapshot_card("接管", "t", &d, None);
-        let s = card.to_string();
-
-        // 9 tables, 5 native, 4 fenced: each fenced table is one ``` pair.
-        assert_eq!(s.matches("|---|---|").count(), 9, "nine tables present: {s}");
-        assert_eq!(
-            s.matches("```").count() / 2,
-            9 - MAX_CARD_TABLES,
-            "tables past the card-wide budget render as code: {s}"
-        );
+        assert!(s.contains("/skill implement-spec 644"), "{s}");
+        assert!(!s.contains("已加载技能"), "the tail renders no fold: {s}");
     }
 
     /// Worst-case input (4-message tail + 2 pending blocks) must stay within

@@ -1,30 +1,30 @@
-//! The loaded-skill fold (spec #652, ticket #655): one skill a Turn loaded into
-//! its user message, rendered as a folded `🧩 已加载技能：<name>` panel whose body
-//! is the skill's own instructions. One shared renderer feeds all three sites —
-//! the live Turn card, the Session Snapshot's 「最近对话」 tail and the External
-//! Message preview — so the `🧩` vocabulary keeps one shape and one size budget.
+//! The loaded-skill fold (spec #652, ticket #655): one skill a `/skill <id>`
+//! dispatch loaded into the prompt, rendered as a folded
+//! `🧩 已加载技能：<name>` panel whose body is the skill's own markdown from the
+//! skill-list read's `content`. Its ONLY caller is the dedicated loaded-skill
+//! card that replies under the user's `/skill` message — the live Turn card,
+//! the Session Snapshot's 「最近对话」 tail and the External Message preview
+//! render no skill fold (the acceptance reversal recorded in ADR-0077).
 
-use crate::backend::MessageSkill;
+use crate::backend::SkillInfo;
 
 use super::sanitize::CardMarkdown;
-use super::shell::collapsible_panel;
+use super::shell::{card_shell, collapsible_panel};
 use super::tool_render::{TOOL_OUTPUT_MAX_CHARS, parse_skill_envelope};
 use super::truncate_md;
 
 /// The body characters one card's loaded-skill folds may spend in total
 /// (spec #652, ticket #655). Feishu rejects a card whose serialized JSON
-/// exceeds 30 KB (AGENTS.md pitfall #13), and a message can attach several
-/// skills whose bodies are CJK (3 bytes per char), so the per-fold
-/// [`TOOL_OUTPUT_MAX_CHARS`] cap alone cannot bound a one-shot snapshot or
-/// notification card, which has no size splitter. 4,000 chars is at most
-/// 12 KB of CJK body text, leaving room for the rest of the card.
+/// exceeds 30 KB (AGENTS.md pitfall #13), and one `/skill` dispatch can load
+/// several skills whose bodies are CJK (3 bytes per char), so the per-fold
+/// [`TOOL_OUTPUT_MAX_CHARS`] cap alone cannot bound the one-shot loaded-skill
+/// card, which has no size splitter. 4,000 chars is at most 12 KB of CJK body
+/// text, leaving room for the rest of the card.
 pub(crate) const SKILL_FOLDS_TOTAL_CHARS: usize = 4_000;
 
 /// Feishu's hard platform ceiling for a card's element/component count: a card
-/// past it is rejected (`ErrCode 11310`). The live card's own splitter budget
-/// ([`super::MAX_CARD_COMPONENTS`], 150) is lower, but a one-shot Session
-/// Snapshot or External Message card has no splitter and must still stay under
-/// this ceiling.
+/// past it is rejected (`ErrCode 11310`). The loaded-skill card has no
+/// splitter and must stay under this ceiling.
 const FEISHU_MAX_COMPONENTS: usize = 200;
 
 /// Components one loaded-skill fold spends: its `collapsible_panel` plus the
@@ -41,10 +41,10 @@ const FOLD_COMPONENTS: usize = 2;
 /// it and still renders one fold per skill, with its body.
 pub(crate) const SKILL_FOLD_MAX: usize = FEISHU_MAX_COMPONENTS / (2 * FOLD_COMPONENTS);
 
-/// The body an attached skill with no instructions renders (its payload named
-/// the skill but carried no prepared body, or a body that unwraps to nothing).
-/// A collapsible panel needs a non-empty markdown element, so the titled fold
-/// still opens rather than vanishing or failing Feishu's content check.
+/// The body an attached skill with no instructions renders (the list route
+/// carried no `content`, or one that unwraps to nothing). A collapsible panel
+/// needs a non-empty markdown element, so the titled fold still opens rather
+/// than vanishing or failing Feishu's content check.
 const EMPTY_BODY: &str = "（无说明）";
 
 /// The body a fold renders once the card's shared character budget is spent:
@@ -58,12 +58,10 @@ const SUMMARY_BODY: &str = "（技能过多，其余已省略）";
 
 /// A card's loaded-skill fold budget: the body characters its folds may still
 /// spend AND the individual folds it may still render. Every fold on one card
-/// draws from one budget, so a message attaching several large skills cannot
-/// push a one-shot snapshot or notification card past Feishu's total limit
-/// (AGENTS.md #13), and a pathological skill count cannot push it past the
-/// component ceiling ([`SKILL_FOLD_MAX`]). The live Turn card's splitter
-/// reserves the same walk through [`loaded_skill_folds_estimate`], so the
-/// render and the estimate cannot drift.
+/// draws from one budget, so a dispatch loading several large skills cannot
+/// push the one-shot loaded-skill card past Feishu's total limit (AGENTS.md
+/// #13), and a pathological skill count cannot push it past the component
+/// ceiling ([`SKILL_FOLD_MAX`]).
 pub(crate) struct SkillFolds {
     chars_left: usize,
     /// Individual folds this card may still render; once spent, further skills
@@ -71,7 +69,7 @@ pub(crate) struct SkillFolds {
     folds_left: usize,
     /// Skills past [`SKILL_FOLD_MAX`] this card has seen — the count its summary
     /// fold names. Accumulates across [`Self::render`] calls, so a card renders
-    /// ONE summary however many messages contributed.
+    /// ONE summary however many calls contributed.
     hidden: usize,
 }
 
@@ -79,7 +77,7 @@ pub(crate) struct SkillFolds {
 /// characters its fold may spend (`0` once the budget is spent, so the fold
 /// renders its title with the omission body).
 struct FoldPlan<'a> {
-    skill: &'a MessageSkill,
+    skill: &'a SkillInfo,
     allowed: usize,
 }
 
@@ -95,10 +93,10 @@ impl SkillFolds {
 
     /// Plan this call's folds, spending the card's remaining budget: at most
     /// [`Self::folds_left`] individual folds (in order), with every skill past
-    /// that counted in `hidden` for the summary. The render and the splitter's
-    /// estimate both consume this ONE traversal, so which folds carry a body
-    /// and which omit it cannot diverge.
-    fn plan<'a>(&mut self, skills: &'a [MessageSkill]) -> Vec<FoldPlan<'a>> {
+    /// that counted in `hidden` for the summary. The render and the summary
+    /// both consume this ONE traversal, so which folds carry a body and which
+    /// omit it cannot diverge.
+    fn plan<'a>(&mut self, skills: &'a [SkillInfo]) -> Vec<FoldPlan<'a>> {
         let take = skills.len().min(self.folds_left);
         let plans = skills
             .iter()
@@ -123,13 +121,11 @@ impl SkillFolds {
     /// like every other panel's `element_id`. `md` is the CARD's markdown state:
     /// every fold draws from its one table budget and honors its fenced
     /// fallback, so a 6th table anywhere on the card — a fold included —
-    /// renders as code. Call once per message on a card, the same budget each
-    /// time, so several messages' skills share one allowance. The overflow past
-    /// [`SKILL_FOLD_MAX`] is NOT rendered here — call [`Self::summary`] once
-    /// after the last message.
+    /// renders as code. The overflow past [`SKILL_FOLD_MAX`] is NOT rendered
+    /// here — call [`Self::summary`] once after the last call.
     pub(crate) fn render(
         &mut self,
-        skills: &[MessageSkill],
+        skills: &[SkillInfo],
         prefix: &str,
         md: &mut CardMarkdown,
     ) -> Vec<serde_json::Value> {
@@ -143,19 +139,18 @@ impl SkillFolds {
     /// The single overflow fold this card owes, if any skills were hidden past
     /// [`SKILL_FOLD_MAX`]: one bounded `🧩 已加载技能（等 N 个）` panel naming how
     /// many were collapsed. `None` when every skill got its own fold. Call ONCE
-    /// per card, after the last [`Self::render`] — a card renders one summary
-    /// however many messages contributed.
+    /// per card, after the last [`Self::render`].
     pub(crate) fn summary(&mut self, element_id: &str, md: &mut CardMarkdown) -> Option<serde_json::Value> {
         (self.hidden > 0).then(|| summary_fold(self.hidden, element_id, md))
     }
 }
 
 /// [`SkillFolds::render`] followed by [`SkillFolds::summary`] for a card whose
-/// folds all belong to one call — the live Turn card's own skills, and the
-/// External Message preview. `md` is that card's markdown state, so the folds
-/// share its table budget and fenced fallback with the card's other elements.
+/// folds all belong to one call — the loaded-skill card's own skills. `md` is
+/// that card's markdown state, so the folds share its table budget and fenced
+/// fallback with the card's other elements.
 pub(crate) fn loaded_skill_folds(
-    skills: &[MessageSkill],
+    skills: &[SkillInfo],
     prefix: &str,
     md: &mut CardMarkdown,
 ) -> Vec<serde_json::Value> {
@@ -167,11 +162,26 @@ pub(crate) fn loaded_skill_folds(
     panels
 }
 
-/// The skill's own instructions with the server's `<skill_content>` envelope and
-/// sampled `<skill_files>` list stripped, trimmed — the body a fold shows.
-fn unwrapped_body(skill: &MessageSkill) -> String {
+/// The dedicated loaded-skill card (spec #652, ticket #655, acceptance
+/// reversal): the small card that replies under a resolved `/skill <id>`
+/// message, carrying one `🧩 已加载技能：<name>` fold per distinct loaded skill.
+/// The fold body is the skill's own markdown from the skill-list read's
+/// `content` (no `<skill_content>` envelope to strip — the unwrap is harmless
+/// on raw content). One card-wide budget bounds the folds, so a dispatch
+/// loading several large skills cannot build a card Feishu rejects.
+pub(crate) fn build_loaded_skill_card(skills: &[SkillInfo]) -> serde_json::Value {
+    let mut md = CardMarkdown::new();
+    let elements = loaded_skill_folds(skills, "loaded_skill_", &mut md);
+    card_shell("🧩 已加载技能", "green", elements)
+}
+
+/// The skill's own markdown, with any server `<skill_content>` envelope and
+/// sampled `<skill_files>` list stripped, trimmed — the body a fold shows. The
+/// list route serves raw markdown, so the unwrap is usually a no-op; keeping it
+/// keeps the fold identical for a payload that does carry the envelope.
+fn unwrapped_body(skill: &SkillInfo) -> String {
     skill
-        .instructions
+        .content
         .as_deref()
         .map(|text| parse_skill_envelope(text).unwrap_or_else(|| text.to_string()))
         .unwrap_or_default()
@@ -179,32 +189,8 @@ fn unwrapped_body(skill: &MessageSkill) -> String {
         .to_string()
 }
 
-/// The serialized size (bytes) and component count a fresh card-wide budget
-/// will spend rendering `skills`' folds: the splitter's reserve, consuming the
-/// same [`SkillFolds::plan`] walk as [`loaded_skill_folds`]. Each fold — the
-/// summary included — is [`FOLD_COMPONENTS`] components, never one, so the
-/// reserve cannot under-charge its card. The byte figure is a CJK upper bound
-/// (3 bytes per spent character) plus the panel overhead, so the reserve never
-/// under-charges its card.
-pub(crate) fn loaded_skill_folds_estimate(skills: &[MessageSkill]) -> (usize, usize) {
-    let mut budget = SkillFolds::new();
-    let plans = budget.plan(skills);
-    let summary = budget.hidden > 0;
-    let comps = (plans.len() + usize::from(summary)) * FOLD_COMPONENTS;
-    let size = plans
-        .iter()
-        .map(|fold| 400 + fold.skill.name.len() + fold.allowed * 3)
-        .sum::<usize>()
-        + if summary {
-            summary_fold_size(budget.hidden)
-        } else {
-            0
-        };
-    (size, comps)
-}
-
 /// One fold's panel: the title `🧩 已加载技能：<name>`, the body the skill's
-/// instructions (sanitized, capped at `allowed` characters) with the server's
+/// markdown (sanitized, capped at `allowed` characters) with any server
 /// `<skill_content>` envelope and sampled `<skill_files>` list stripped — the
 /// same unwrapping the `skill` tool panel uses (spec #652, ticket #655). An
 /// empty body renders its titled fold with a marker instead of an empty panel;
@@ -218,7 +204,7 @@ pub(crate) fn loaded_skill_folds_estimate(skills: &[MessageSkill]) -> (usize, us
 /// fence — clipping the fenced result could cut the closing fence (the `skill`
 /// tool panel clips first for the same reason).
 fn build_fold(
-    skill: &MessageSkill,
+    skill: &SkillInfo,
     allowed: usize,
     element_id: &str,
     md: &mut CardMarkdown,
@@ -246,50 +232,40 @@ fn summary_fold(hidden: usize, element_id: &str, md: &mut CardMarkdown) -> serde
     )
 }
 
-/// The summary fold's title, shared by its render and its size estimate so the
-/// two cannot drift.
+/// The summary fold's title, so its render and the tests name the same shape.
 fn summary_title(hidden: usize) -> String {
     format!("🧩 已加载技能（等 {hidden} 个）")
-}
-
-/// The summary fold's byte estimate, mirroring [`build_fold`]'s 400-byte panel
-/// overhead plus its title.
-fn summary_fold_size(hidden: usize) -> usize {
-    400 + summary_title(hidden).len()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// One prepared skill body: a `<skill_content>` envelope around the skill's
-    /// own markdown.
-    fn prepared(name: &str, body: &str) -> MessageSkill {
-        MessageSkill {
+    /// One skill as the list route serves it: a name and its own markdown body.
+    fn skill(name: &str, content: Option<&str>) -> SkillInfo {
+        SkillInfo {
             id: name.into(),
             name: name.into(),
-            instructions: Some(format!(
-                "<skill_content name=\"{name}\">\n{body}\n\
-                 <skill_files>\n<file>/root/skills/a.md</file>\n</skill_files>\n</skill_content>"
-            )),
+            description: None,
+            content: content.map(str::to_string),
         }
-    }
-
-    /// `loaded_skill_folds` with a fresh card markdown state — the ordinary
-    /// single-call case. Tests that exercise the shared table budget pass their
-    /// own [`CardMarkdown`].
-    fn folds(skills: &[MessageSkill], prefix: &str) -> Vec<serde_json::Value> {
-        loaded_skill_folds(skills, prefix, &mut CardMarkdown::new())
     }
 
     /// The server's prepared skill body is a `<skill_content>` envelope around
     /// the skill's own markdown: the fold shows the markdown alone, dropping
     /// the wrapper and the sampled `<skill_files>` inventory (spec #652,
-    /// ticket #655).
+    /// ticket #655). The list route usually serves raw markdown, so the same
+    /// unwrap is a harmless no-op there.
     #[test]
     fn a_loaded_skill_folds_the_unwrapped_body_under_its_title() {
-        let skill = prepared("implement-spec", "# Skill: implement-spec\n\nDo the thing.");
-        let panels = folds(&[skill], "skill_");
+        let enveloped = skill(
+            "implement-spec",
+            Some(
+                "<skill_content name=\"implement-spec\">\n# Skill: implement-spec\n\nDo the thing.\n\
+                 <skill_files>\n<file>/root/skills/a.md</file>\n</skill_files>\n</skill_content>",
+            ),
+        );
+        let panels = loaded_skill_folds(&[enveloped], "skill_", &mut CardMarkdown::new());
 
         assert_eq!(panels.len(), 1);
         let panel = &panels[0];
@@ -308,35 +284,40 @@ mod tests {
             !body.contains("/root/skills/a.md"),
             "sampled file dropped: {body}"
         );
+
+        // Raw content (the list route's own shape) passes through unchanged.
+        let raw = skill("foreman", Some("# Foreman\n\nRun the batch."));
+        let panels = loaded_skill_folds(&[raw], "skill_", &mut CardMarkdown::new());
+        let body = panels[0]["elements"][0]["content"].as_str().unwrap();
+        assert!(body.contains("Run the batch."), "{body}");
     }
 
-    /// A skill the payload attached by identity alone (no prepared body), or
-    /// one whose body unwraps to nothing, still renders its titled fold — never
-    /// an empty panel Feishu would reject.
+    /// A skill the list read carried no `content` for (or one whose body
+    /// unwraps to nothing) still renders its titled fold — never an empty panel
+    /// Feishu would reject.
     #[test]
     fn an_empty_instruction_body_still_renders_a_titled_fold() {
-        for instructions in [None, Some(String::new())] {
-            let skill = MessageSkill {
-                id: "foreman".into(),
-                name: "foreman".into(),
-                instructions,
-            };
-            let panels = folds(&[skill], "skill_");
+        for content in [None, Some("")] {
+            let panels = loaded_skill_folds(&[skill("foreman", content)], "skill_", &mut CardMarkdown::new());
             assert_eq!(panels[0]["header"]["title"]["content"], "🧩 已加载技能：foreman");
             assert_eq!(panels[0]["elements"][0]["content"], "（无说明）");
         }
     }
 
-    /// The element ids keep the caller's prefix, so each site's fold state is
-    /// stable across a re-render.
+    /// The element ids keep the caller's prefix, so the fold state is stable
+    /// across a re-render.
     #[test]
     fn the_fold_ids_carry_the_callers_prefix() {
-        let panels = folds(&[prepared("a", "x"), prepared("b", "y")], "snap_0_skill_");
-        assert_eq!(panels[0]["element_id"], "snap_0_skill_0");
-        assert_eq!(panels[1]["element_id"], "snap_0_skill_1");
+        let panels = loaded_skill_folds(
+            &[skill("a", Some("x")), skill("b", Some("y"))],
+            "loaded_skill_",
+            &mut CardMarkdown::new(),
+        );
+        assert_eq!(panels[0]["element_id"], "loaded_skill_0");
+        assert_eq!(panels[1]["element_id"], "loaded_skill_1");
     }
 
-    /// The card's shared budget bounds the folds even when a message attaches
+    /// The card's shared budget bounds the folds even when a dispatch loads
     /// several large CJK skills whose per-fold caps would sum far past Feishu's
     /// total card limit (AGENTS.md #13). Every skill still gets its OWN titled
     /// fold below the component cap — the character budget is the size guard —
@@ -346,9 +327,11 @@ mod tests {
     fn the_folds_share_one_body_budget_across_the_card() {
         // 8,000 CJK chars per skill — ten of them are 80,000 raw chars.
         let huge = "很长的技能说明。".repeat(1_000);
-        let skills: Vec<MessageSkill> = (0..10).map(|i| prepared(&format!("skill-{i}"), &huge)).collect();
+        let skills: Vec<SkillInfo> = (0..10)
+            .map(|i| skill(&format!("skill-{i}"), Some(&huge)))
+            .collect();
 
-        let panels = folds(&skills, "f_");
+        let panels = loaded_skill_folds(&skills, "f_", &mut CardMarkdown::new());
         assert_eq!(panels.len(), 10, "one fold per skill, below the component cap");
         for (i, panel) in panels.iter().enumerate() {
             let expected = format!("🧩 已加载技能：skill-{i}");
@@ -377,15 +360,14 @@ mod tests {
     /// not build a card Feishu rejects on component count: the first
     /// [`SKILL_FOLD_MAX`] skills keep their own fold and the rest collapse into
     /// ONE bounded summary fold naming how many were hidden (spec #652, ticket
-    /// #655). The estimate charges the same 2-components-per-fold walk, so the
-    /// live-card splitter reserves the truth rather than half of it.
+    /// #655).
     #[test]
     fn a_pathological_skill_count_collapses_into_one_summary_fold() {
-        let skills: Vec<MessageSkill> = (0..150)
-            .map(|i| prepared(&format!("skill-{i}"), "body"))
+        let skills: Vec<SkillInfo> = (0..150)
+            .map(|i| skill(&format!("skill-{i}"), Some("body")))
             .collect();
 
-        let panels = folds(&skills, "f_");
+        let panels = loaded_skill_folds(&skills, "f_", &mut CardMarkdown::new());
         assert_eq!(panels.len(), SKILL_FOLD_MAX + 1, "the cap plus one summary");
         assert!(
             panels[..SKILL_FOLD_MAX]
@@ -411,14 +393,9 @@ mod tests {
             "the folds spent {components} components, past Feishu's ceiling"
         );
 
-        // The splitter's estimate charges the same components, never one per
-        // fold (which is what let 101 skills build a 202-component card).
-        let (_, comps) = loaded_skill_folds_estimate(&skills);
-        assert_eq!(comps, components);
-
         // An ordinary message is far below the cap: one fold per skill, no
         // summary.
-        let few = folds(&skills[..5], "f_");
+        let few = loaded_skill_folds(&skills[..5], "f_", &mut CardMarkdown::new());
         assert_eq!(few.len(), 5);
         assert!(few.iter().all(|panel| panel["tag"] == "collapsible_panel"));
     }
@@ -432,7 +409,7 @@ mod tests {
     fn the_folds_share_one_table_budget_across_the_card() {
         let table = "| a | b |\n|---|---|\n| 1 | 2 |";
         let body = format!("{table}\n\n{table}\n\n{table}");
-        let skills = [prepared("one", &body), prepared("two", &body)];
+        let skills = [skill("one", Some(&body)), skill("two", Some(&body))];
 
         let mut md = CardMarkdown::new();
         let panels = loaded_skill_folds(&skills, "f_", &mut md);
@@ -462,10 +439,42 @@ mod tests {
     #[test]
     fn the_fenced_fallback_fences_a_folds_body() {
         let mut md = CardMarkdown::fenced();
-        let panels = loaded_skill_folds(&[prepared("a", "Do the thing.")], "f_", &mut md);
+        let panels = loaded_skill_folds(&[skill("a", Some("Do the thing."))], "f_", &mut md);
         let body = panels[0]["elements"][0]["content"].as_str().unwrap();
         assert!(body.starts_with("```"), "the fold body is fenced: {body}");
         assert!(body.ends_with("```"), "the fence closes: {body}");
         assert!(body.contains("Do the thing."), "{body}");
+    }
+
+    /// The dedicated card (spec #652, ticket #655): one fold per distinct
+    /// loaded skill, titled, with the body from the list `content`. An empty
+    /// body still renders a titled fold.
+    #[test]
+    fn the_loaded_skill_card_lists_one_titled_fold_per_skill() {
+        let card = build_loaded_skill_card(&[
+            skill("implement-spec", Some("# Implement Spec\n\nDrive it.")),
+            skill("foreman", None),
+        ]);
+        assert_eq!(card["header"]["title"]["content"], "🧩 已加载技能");
+        let panels: Vec<&serde_json::Value> = card["body"]["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["tag"] == "collapsible_panel")
+            .collect();
+        assert_eq!(panels.len(), 2, "{card}");
+        assert_eq!(
+            panels[0]["header"]["title"]["content"],
+            "🧩 已加载技能：implement-spec"
+        );
+        assert!(
+            panels[0]["elements"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("Drive it."),
+            "{card}"
+        );
+        assert_eq!(panels[1]["header"]["title"]["content"], "🧩 已加载技能：foreman");
+        assert_eq!(panels[1]["elements"][0]["content"], "（无说明）");
     }
 }

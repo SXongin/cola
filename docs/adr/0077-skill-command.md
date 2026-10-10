@@ -54,22 +54,29 @@ than adding a cola-side allow-list.
   description-less skills are listed too, since reaching exactly the
   user-invoked skills the model never advertises is the point.
 - **One generation-neutral skill-list read.** The Backend contract grows
-  `list_skills(directory)` returning `{ id, name, description? }`. V2 reads
-  `GET /api/skill`; V1 reads its own `GET /skill`, whose identity IS the name
-  (V1's `Skill.Info` has no id, so V1's `id` is the name). A read failure
+  `list_skills(directory)` returning `{ id, name, description?, content? }`. V2
+  reads `GET /api/skill`; V1 reads its own `GET /skill`, whose identity IS the
+  name (V1's `Skill.Info` has no id, so V1's `id` is the name). `content` is the
+  skill's own markdown — the loaded-skill card's fold body. A read failure
   returns an empty list, and the picker degrades to a no-skills state.
 - **The prompt attachment is one neutral field.** `prompt` gains a
-  `skills: &[PromptSkill]` axis (`{ id, name }`). V2 emits the body's structured
-  `skills` array carrying only the id; V1, which has neither the field nor a
-  skill prompt part, folds the request into the prompt text as an instruction to
-  load the skill by name with the `skill` tool. An empty slice leaves the prompt
-  byte-for-byte untouched on both generations.
-- **The loaded-skill fold is one shared renderer.** A loaded skill renders as a
-  folded collapsible panel titled `🧩 已加载技能：<name>` whose body is the
-  skill's own instructions, unwrapped from the server's `<skill_content>`
-  envelope with the sampled `<skill_files>` list dropped. The live Turn card,
-  the Session Snapshot's 「最近对话」 tail and the External Message preview all
-  call it, so a skill attached by another client is visible in Feishu too.
+  `skills: &[PromptSkill]` axis (`{ id, name }`). Ids are **deduped by id**
+  (first-occurrence order preserved) before the attachment is built: the server
+  already dedupes injection within one prompt, but cola dedupes too. V2 emits
+  the body's structured `skills` array carrying only the id; V1, which has
+  neither the field nor a skill prompt part, folds the request into the prompt
+  text as an instruction to load the skill by name with the `skill` tool. An
+  empty slice leaves the prompt byte-for-byte untouched on both generations.
+- **The loaded-skill fold is one renderer on a dedicated card** (acceptance
+  reversal, 2026-10-10). A resolved `/skill <id>` — typed, or a picker-row tap —
+  replies a small card under the user's message carrying one folded collapsible
+  panel titled `🧩 已加载技能：<name>` per **distinct** loaded skill, its body the
+  skill's own markdown from the skill-list read's `content` (raw; any server
+  `<skill_content>` envelope is unwrapped harmlessly, so the renderer is shared
+  with the `skill` tool panel's shape). The live Turn card, the Session
+  Snapshot's 「最近对话」 tail and the External Message preview do **not** render
+  skill folds: those sites stay text-only, and non-text user-message structures
+  from other clients are deferred (#660).
 - **Accepted permission gap.** The V2 prompt route does not enforce the
   `skill` permission: the server injects any existing skill id, even one the
   agent's config `deny`s, and only the server-side `skill` tool runs the
@@ -100,6 +107,11 @@ than adding a cola-side allow-list.
 
 - Loading a skill is **strictly explicit**: no skill is ever auto-loaded, and
   the user-invoked workflow skills become reachable from Feishu.
+- The loaded-skill feedback is a **dedicated small card** replying under the
+  user's `/skill` message; the live Turn card, the Session Snapshot's
+  「最近对话」 tail and the External Message preview render **no** skill fold
+  (acceptance reversal, 2026-10-10). Non-text user-message structures from other
+  clients or adopted snapshots (skill / file / …) are deferred to #660.
 - A denied skill id still injects through `/skill` on V2; only the `skill` tool
   enforces the permission. Recorded, not silent.
 - V1 retirement stays a deletion: the text fallback lives in the V1 generation

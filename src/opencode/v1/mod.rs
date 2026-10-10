@@ -657,15 +657,17 @@ impl GenerationStrategy for V1Strategy {
     }
 }
 
-/// One registered skill (`Skill.Info`) — V1's shape (spec #652, ticket #656).
-/// There is no id: the name is the identity, so it becomes the neutral `id`
-/// too. `location`/`content` are ignored — the list only needs what the picker
-/// shows and the prompt resolution attaches.
+/// One registered skill (`Skill.Info`) — V1's shape (spec #652, tickets
+/// #656/#655). There is no id: the name is the identity, so it becomes the
+/// neutral `id` too. `location` is ignored; `content` is the skill's own
+/// markdown, the dedicated loaded-skill card's fold body.
 #[derive(Debug, serde::Deserialize)]
 struct WireSkill {
     name: String,
     #[serde(default)]
     description: Option<String>,
+    #[serde(default)]
+    content: Option<String>,
 }
 
 impl WireSkill {
@@ -674,6 +676,7 @@ impl WireSkill {
             id: self.name.clone(),
             name: self.name,
             description: self.description,
+            content: self.content,
         }
     }
 }
