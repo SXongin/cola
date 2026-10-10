@@ -1922,8 +1922,8 @@ impl RenderPoll {
 mod tests {
     use super::*;
     use crate::backend::{
-        BackgroundTask, MessageId, MessageRole, MessageTime, ReasoningPart, StepFinish, StepStart, ToolCall,
-        ToolIdentity, ToolOutput, TranscriptMessage, TurnAnchor, TurnSettle,
+        BackgroundTask, FileContent, MessageId, MessageRole, MessageTime, ReasoningPart, StepFinish,
+        StepStart, ToolCall, ToolIdentity, ToolOutput, TranscriptMessage, TurnAnchor, TurnSettle,
     };
     use crate::bridge::App;
     use crate::bridge::chain::{CursorFrontier, CursorPartKind, RenderedCursor, cursor_prefix_digest};
@@ -2335,6 +2335,56 @@ Index: /x/src/main.rs
         assert!(
             !acc.build_card().to_string().contains("已加载技能"),
             "the live Turn card must not carry the skill fold"
+        );
+    }
+
+    /// A user message's File Content never reaches the live card (ADR-0076):
+    /// the part kind is a renderer no-op (`renders_part`), so a turn whose user
+    /// message carries an attachment renders only its assistant reply — no
+    /// `img` element, no name/mime/payload line. The record line and the
+    /// delivery are the Snapshot/Platform surfaces' (tickets #647/#649); this
+    /// pins that neither leaks onto the live card.
+    #[test]
+    fn a_user_file_part_renders_nothing_on_the_live_card() {
+        let content = FileContent::decode("data:image/png;base64,QUJD", Some("image/png"), Some("shot.png"))
+            .expect("an inline payload is a File Content");
+
+        let mut acc = StreamAccumulator::new("test");
+        acc.repoint_turn_anchor(&turn_anchor(0));
+
+        // The turn: the user message that anchors it — its text beside the
+        // attachment — and the assistant reply, the only part that renders.
+        let transcript = SessionTranscript::new(vec![
+            typed_message(
+                "u1",
+                MessageRole::User,
+                Some(0),
+                vec![text_part("看看这个"), Part::File(content.clone())],
+            ),
+            message("a1", 100, vec![text_part("看到了")]),
+        ]);
+        assert!(render_new_turn_parts(&mut acc, &transcript));
+        // The render loop's own arm, walked directly for the File part: the
+        // part adds nothing, exactly as it does from the transcript read.
+        assert!(!render_parts(&mut acc, &[Part::File(content)]));
+
+        let rendered = acc.build_card().to_string();
+        assert!(rendered.contains("看到了"), "the turn's reply still renders");
+        assert!(
+            !rendered.contains(r#""img""#),
+            "a user attachment must add no image element"
+        );
+        assert!(
+            !rendered.contains("shot.png"),
+            "the file's name must stay off the live card"
+        );
+        assert!(
+            !rendered.contains("image/png"),
+            "the file's mime must stay off the live card"
+        );
+        assert!(
+            !rendered.contains("QUJD"),
+            "the inline payload must stay off the live card"
         );
     }
 
