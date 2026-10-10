@@ -39,7 +39,7 @@ than adding a cola-side allow-list.
   the `@skill-id` reference in the text, so no separate "arguments" concept is
   invented.
 - **Dispatch resolves before submitting.** On dispatch the Bridge reads the
-  skill list **once**, scoped to the conversation's current project directory
+  skill list **once**, scoped to the Chat/Topic's current project directory
   (the location the eventual prompt runs in), resolves each typed id to its
   canonical `{ id, name }`, keeps the ids that resolve, and submits the turn on
   the existing prompt pipeline (the `Forward` route, not the command

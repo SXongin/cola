@@ -197,11 +197,6 @@ fn reject_nested_topic(thread_key: &ThreadKey) -> Option<CardActionResult> {
     })
 }
 
-/// One unknown skill id's clip in the `/skill` error line (spec #652, ticket
-/// #655): a single pathological id cannot dominate the line. Matches the
-/// picker's row-label budget.
-const UNKNOWN_ID_CHARS: usize = 60;
-
 /// The whole `⚠️ 未找到技能：…` line's clip. The line is passed into the picker
 /// card and the dedicated loaded-skill card OUTSIDE the fold budget, so a
 /// dispatch naming many or very long unknown ids must still be bounded well
@@ -212,14 +207,16 @@ const UNKNOWN_IDS_LINE_CHARS: usize = 500;
 /// shows — on the picker card when NOTHING resolved, and on the dedicated
 /// loaded-skill card when some did (Q19). `None` when every typed id resolved
 /// (the bare `/skill` case included). Bounded here (each id and the whole line)
-/// because the card renderers do not budget this leading line.
+/// because the card renderers do not budget this leading line; each id reuses
+/// the picker's own row-label clip so the two cannot drift.
 fn unknown_skill_error(unknown: &[String]) -> Option<String> {
     if unknown.is_empty() {
         return None;
     }
+    let clip = crate::feishu::card::picker::SKILL_ROW_LABEL_CHARS;
     let named = unknown
         .iter()
-        .map(|id| format!("`{}`", crate::feishu::card::truncate_md(id, UNKNOWN_ID_CHARS)))
+        .map(|id| format!("`{}`", crate::feishu::card::truncate_md(id, clip)))
         .collect::<Vec<_>>()
         .join("、");
     Some(crate::feishu::card::truncate_md(
@@ -482,7 +479,7 @@ impl App {
     }
 
     /// Dispatch a `/skill` command (spec #652, tickets #654/#656): the Bridge
-    /// reads the skill list ONCE — scoped to the conversation's current project
+    /// reads the skill list ONCE — scoped to the Chat/Topic's current project
     /// directory, the same location the eventual prompt runs in — resolves each
     /// typed id to its canonical `{ id, name }` list entry (so the attached
     /// skill is not just the raw token — V1's text fallback then names the
@@ -530,7 +527,7 @@ impl App {
         }
         let kind = ConversationKind::classify(&msg.chat_type, msg.thread_id.as_deref());
         let handles = self.command_handles();
-        // Read from the conversation's own project directory (the location the
+        // Read from the Chat/Topic's own project directory (the location the
         // prompt will run in), so resolution and injection cannot disagree; an
         // empty/unknown directory keeps the server's default location.
         let directory = handles.current_project_directory(&thread_key).await;
@@ -538,12 +535,13 @@ impl App {
             .opencode
             .list_skills((!directory.is_empty()).then_some(directory.as_str()))
             .await;
-        let mut resolved: Vec<PromptSkill> = Vec::new();
-        // The distinct resolved skills, in first-occurrence order, for the
-        // dedicated loaded-skill card's folds (spec #652, ticket #655): the
-        // card carries the list read's own `content`, so it needs the neutral
-        // `SkillInfo`, not just the `{ id, name }` prompt attachment.
-        let mut loaded: Vec<SkillInfo> = Vec::new();
+        // The distinct resolved skills, in first-occurrence order: ONE
+        // collection holds both the prompt attachment and the dedicated
+        // loaded-skill card's folds (spec #652, ticket #655), so the two views
+        // cannot get out of sync. The card folds need the neutral `SkillInfo`
+        // (for the list read's own `content`); the prompt skills are derived
+        // from it at submit time.
+        let mut selected: Vec<SkillInfo> = Vec::new();
         let mut unknown: Vec<String> = Vec::new();
         // Dedupe by id, preserving first-occurrence order: the server also
         // dedupes injection within one prompt, but cola must not attach (or
@@ -553,11 +551,7 @@ impl App {
             match skills.iter().find(|skill| skill.id == *id) {
                 Some(entry) => {
                     if seen.insert(entry.id.clone()) {
-                        resolved.push(PromptSkill {
-                            id: entry.id.clone(),
-                            name: entry.name.clone(),
-                        });
-                        loaded.push(entry.clone());
+                        selected.push(entry.clone());
                     }
                 }
                 None => unknown.push(id.clone()),
@@ -572,7 +566,7 @@ impl App {
         let unknown_error = unknown_skill_error(&unknown);
         // Nothing resolved (a bare `/skill`, or every id unknown): the picker
         // card, leading with the error line when there were ids, and no prompt.
-        if ids.is_empty() || resolved.is_empty() {
+        if ids.is_empty() || selected.is_empty() {
             let _ = crate::feishu::card::command::send_skill_card(
                 &handles,
                 &thread_key,
@@ -592,13 +586,21 @@ impl App {
         if let Err(e) = crate::feishu::card::command::send_loaded_skill_card(
             &handles,
             &msg.message_id,
-            &loaded,
+            &selected,
             unknown_error.as_deref(),
         )
         .await
         {
             tracing::warn!("loaded-skill card: {e}");
         }
+        // The prompt attachment derived from the one selected collection.
+        let resolved: Vec<PromptSkill> = selected
+            .iter()
+            .map(|skill| PromptSkill {
+                id: skill.id.clone(),
+                name: skill.name.clone(),
+            })
+            .collect();
         if let Err(e) = self.handle_prompt(thread_key, msg, kind, resolved).await {
             tracing::error!("Prompt: {}", e);
         }
@@ -2123,11 +2125,12 @@ impl App {
         let toast = format!("正在加载技能 {id}…");
         let id = id.to_string();
         tokio::spawn(async move {
-            // The conversation kind the picker was sent in: every button carries
+            // The Chat/Topic kind the picker was sent in: every button carries
             // it next to chat_id/thread_id, since a click has no chat_type of
             // its own (see `build_skill_cards`).
-            let string = |key: &str| value.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let chat_id = string("chat_id");
+            let callback_string =
+                |key: &str| value.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let chat_id = callback_string("chat_id");
             // A non-topic key's `thread_id` IS its `chat_id` (ThreadKey), so
             // drop it: re-classifying must not mistake the top level for a
             // topic. A real topic's `thread_id` differs and is kept.
@@ -2137,7 +2140,7 @@ impl App {
                 .filter(|id| *id != chat_id)
                 .map(str::to_string);
             let chat_type = {
-                let t = string("chat_type");
+                let t = callback_string("chat_type");
                 if t.is_empty() { "group".to_string() } else { t }
             };
             let requester = value
@@ -2151,9 +2154,9 @@ impl App {
             // built before that field existed falls back to the picker's own
             // message.
             let reply_to = {
-                let carried = string("reply_message_id");
+                let carried = callback_string("reply_message_id");
                 if carried.is_empty() {
-                    string("open_message_id")
+                    callback_string("open_message_id")
                 } else {
                     carried
                 }
