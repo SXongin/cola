@@ -85,6 +85,7 @@ fn orphaned_in_flight_message(
     error: Option<&str>,
 ) -> TranscriptMessage {
     TranscriptMessage {
+        skills: Vec::new(),
         id: MessageId::new("msg_zombie"),
         role: MessageRole::Assistant,
         time: Some(MessageTime {
@@ -2598,6 +2599,7 @@ async fn render_poll_shows_live_context_and_memoizes_the_window() {
     // A typed assistant step: the answering model and its usage, plus text.
     let transcript = |total: i64| {
         SessionTranscript::new(vec![TranscriptMessage {
+            skills: Vec::new(),
             id: MessageId::new("a1"),
             role: MessageRole::Assistant,
             time: Some(MessageTime {
@@ -2693,6 +2695,7 @@ async fn an_in_flight_step_before_the_anchor_renders_live() {
     // The step the previous run left streaming: created BEFORE the new turn's
     // anchor, no completion stamp, a `task` still running.
     let in_flight = |completed: Option<i64>, status: ToolStatus, output: &str| TranscriptMessage {
+        skills: Vec::new(),
         id: MessageId::new("msg_prev"),
         role: MessageRole::Assistant,
         time: Some(MessageTime {
@@ -2783,6 +2786,7 @@ async fn an_orphaned_in_flight_message_does_not_render_on_a_later_turn() {
     let gate = backend.hold_prompts();
     // The new Turn's own in-flight reply, created after the anchor.
     let live = TranscriptMessage {
+        skills: Vec::new(),
         id: MessageId::new("msg_live"),
         role: MessageRole::Assistant,
         time: Some(MessageTime {

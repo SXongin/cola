@@ -122,6 +122,10 @@ fn decode_message(message: &WireSessionMessage) -> TranscriptMessage {
         }),
         tokens: info.tokens.as_ref().map(decode_tokens),
         error: info.error.as_ref().and_then(decode_message_error),
+        // V1's message envelope has no skill attachment (spec #652, ticket
+        // #655): its prompt `skills` fold into the text, so a V1 user message
+        // always carries none.
+        skills: Vec::new(),
         parts: decode_parts(&message.parts),
     }
 }
@@ -290,6 +294,34 @@ mod tests {
             panic!("expected a tool part: {:?}", transcript.messages[0].parts[0]);
         };
         call.clone()
+    }
+
+    /// V1's message envelope carries no skill attachment (spec #652, ticket
+    /// #655): a user message decodes with an empty skill list, even when its
+    /// text names the command.
+    #[test]
+    fn a_v1_user_message_carries_no_attached_skills() {
+        let message = WireSessionMessage {
+            info: WireMessageInfo {
+                id: "msg_u1".into(),
+                role: Some("user".into()),
+                time: Some(WireMessageTime {
+                    created: 1_000,
+                    completed: None,
+                }),
+                model_id: None,
+                provider_id: None,
+                tokens: None,
+                error: None,
+            },
+            parts: serde_json::json!([{"type": "text", "text": "/skill implement-spec 644"}]),
+        };
+        let transcript = decode(&[message]);
+        assert!(
+            transcript.messages[0].skills.is_empty(),
+            "V1 records no skill attachment: {:?}",
+            transcript.messages[0].skills
+        );
     }
 
     /// A string `output` is authoritative: the `content`/`result` sources are

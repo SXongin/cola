@@ -541,6 +541,7 @@ impl SessionTranscript {
                     role: message.role.clone(),
                     created_ms: message.time?.created,
                     text,
+                    skills: message.skills.clone(),
                 })
             })
             .collect();
@@ -602,7 +603,25 @@ pub struct TranscriptMessage {
     /// (a model error, an abort, a context overflow). The async-native Turn
     /// reads a turn's failure from here instead of a blocking prompt response.
     pub error: Option<String>,
+    /// The skills this message attached (spec #652, ticket #655): the neutral
+    /// `{ id, name, instructions }` facts a user message's skill payload
+    /// carries, so the loaded-skill fold can render them. Empty for every
+    /// assistant message and on a generation that records none (V1).
+    pub skills: Vec<MessageSkill>,
     pub parts: Vec<Part>,
+}
+
+/// One skill a message attached (spec #652, ticket #655): the neutral
+/// `{ id, name, instructions }` facts decoded from the generation's own skill
+/// payload. `instructions` is the skill's prepared body as the server injected
+/// it (V2's `<skill_content>` envelope text); `None` when the payload attached
+/// the skill by identity alone, and empty for V1, whose message envelope
+/// carries no skill attachment at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageSkill {
+    pub id: String,
+    pub name: String,
+    pub instructions: Option<String>,
 }
 
 impl TranscriptMessage {
@@ -1274,6 +1293,10 @@ pub struct TailEntry {
     pub role: MessageRole,
     pub created_ms: i64,
     pub text: String,
+    /// The skills the message attached (spec #652, ticket #655), rendered as
+    /// the `🧩 已加载技能` folds beside the text. Empty for assistant messages
+    /// and on a generation that records none (V1).
+    pub skills: Vec<MessageSkill>,
 }
 
 /// A message part, typed. Unknown kinds decode into [`Part::Other`] with their
@@ -1475,6 +1498,7 @@ mod tests {
             model: None,
             tokens: None,
             error: None,
+            skills: Vec::new(),
             parts,
         }
     }

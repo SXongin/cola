@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::Instrument;
 
-use crate::backend::{MessageRole, Part, SessionTranscript, TurnAnchor, TurnSettle};
+use crate::backend::{MessageRole, MessageSkill, Part, SessionTranscript, TurnAnchor, TurnSettle};
 use crate::bridge::handles::{CardsHandle, FlowHandles, NoticeRules};
 use crate::bridge::turn::{
     CardClass, CardOwnership, ContinuationFacts, ContinuationLine, Disposition, SettleTiming, Turn,
@@ -470,6 +470,7 @@ impl ExternalFlow {
         if turn_anchor.created_ms > prev {
             map.insert(sid.to_string(), turn_anchor.created_ms);
             let preview = message_preview(&transcript, &turn_anchor);
+            let skills = message_skills(&transcript, &turn_anchor);
             drop(map);
             tracing::info!("External message on session {}: {}", sid, preview);
             // The card title is the server's session title (ADR-0007)
@@ -485,7 +486,7 @@ impl ExternalFlow {
             .and_then(|r| r.ok())
             .and_then(|i| i.title)
             .unwrap_or_default();
-            let card = crate::feishu::card::notify::build_external_message_card(&title, &preview);
+            let card = crate::feishu::card::notify::build_external_message_card(&title, &preview, &skills);
             // A topic session must be reached by replying to a
             // message INSIDE the topic (the create API rejects
             // `receive_id_type=thread_id`). Resolve an in-topic
@@ -1698,14 +1699,61 @@ fn message_preview(transcript: &SessionTranscript, anchor: &TurnAnchor) -> Strin
         .collect()
 }
 
+/// The skills the External Message's user messages attached (spec #652, ticket
+/// #655), in read order, so the notification card can render the loaded-skill
+/// fold beside the preview. The same same-epoch selection [`message_preview`]
+/// folds, so the two views of one message cannot drift apart.
+fn message_skills(transcript: &SessionTranscript, anchor: &TurnAnchor) -> Vec<MessageSkill> {
+    transcript
+        .messages
+        .iter()
+        .filter(|message| message.role == MessageRole::User)
+        .filter(|message| message.time.is_some_and(|time| time.created == anchor.created_ms))
+        .flat_map(|message| message.skills.iter().cloned())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::backend::{MessageRole, Part, ReasoningPart, SessionTranscript, TranscriptMessage};
-    use crate::bridge::test_support::{text_part, turn_anchor, typed_message};
+    use crate::bridge::test_support::{
+        message_skill, text_part, turn_anchor, typed_message, user_message_with_skills,
+    };
 
     fn user(id: &str, created: i64, parts: Vec<Part>) -> TranscriptMessage {
         typed_message(id, MessageRole::User, Some(created), parts)
+    }
+
+    /// The external preview's skills are the same-epoch user messages'
+    /// attachments (spec #652, ticket #655): a skill another client loaded
+    /// rides the notification card; a different turn's message contributes
+    /// nothing.
+    #[test]
+    fn message_skills_gathers_the_anchors_attachments_only() {
+        let anchor = turn_anchor(1_000);
+        let transcript = SessionTranscript::new(vec![
+            user_message_with_skills(
+                "msg_u1",
+                1_000,
+                "看一下",
+                vec![message_skill("implement-spec", "implement-spec", Some("body"))],
+            ),
+            user_message_with_skills(
+                "msg_other",
+                2_000,
+                "别的回合",
+                vec![message_skill("foreman", "foreman", None)],
+            ),
+        ]);
+        let skills = message_skills(&transcript, &anchor);
+        assert_eq!(skills.len(), 1, "{skills:?}");
+        assert_eq!(skills[0].id, "implement-spec");
+        assert_eq!(skills[0].instructions.as_deref(), Some("body"));
+
+        // No attachments → no folds.
+        let plain = SessionTranscript::new(vec![user("msg_u1", 1_000, vec![text_part("看一下")])]);
+        assert!(message_skills(&plain, &anchor).is_empty());
     }
 
     #[test]

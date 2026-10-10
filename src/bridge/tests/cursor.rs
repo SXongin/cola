@@ -744,6 +744,7 @@ async fn a_delivered_cursor_survives_a_newer_stage_that_replaces_it() {
         vec![SessionTranscript::new(vec![
             user("msg_cola_anchor", 1_000, "你好"),
             TranscriptMessage {
+                skills: Vec::new(),
                 id: MessageId::new("msg_a_2000"),
                 role: MessageRole::Assistant,
                 time: Some(MessageTime {
