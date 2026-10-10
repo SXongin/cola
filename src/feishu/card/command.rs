@@ -517,6 +517,29 @@ pub(crate) async fn send_help_card(handles: &CommandHandles, message_id: &str) -
     }
 }
 
+/// Send the `/skill` picker card (spec #652, ticket #656): every registered
+/// skill, one row each — the source of truth for a user who does not know an
+/// id. The caller passes the list it already read for the dispatch, so a
+/// dispatch reads the skills exactly ONCE. `error`, when set, leads the card so
+/// an unknown-id dispatch shows the same list behind an error line. `chat_type`
+/// rides the buttons so a tap re-enters the message pipeline in the
+/// conversation kind the picker was sent in. The read behind `skills` is
+/// generation-neutral and unfiltered, so a hidden or description-less skill is
+/// listed too; an empty list opens the no-skills state.
+pub(crate) async fn send_skill_card(
+    handles: &CommandHandles,
+    thread_key: &ThreadKey,
+    chat_type: &str,
+    message_id: &str,
+    skills: &[crate::backend::SkillInfo],
+    error: Option<&str>,
+) -> Result<()> {
+    for card in super::picker::build_skill_cards(thread_key, skills, chat_type, error) {
+        handles.flow.platform.reply_card(message_id, &card).await?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

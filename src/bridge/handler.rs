@@ -428,38 +428,14 @@ impl App {
                 }
                 return;
             }
-            // `/skill <id> …` loads skills into the prompt (spec #652, ticket
-            // #654). Like Forward, it is routed here rather than through the
-            // command dispatcher: the skills ride the prompt axis, and the whole
-            // original message text is the prompt. Each command token contributes
-            // one id, in order.
+            // `/skill <id> …` loads skills into the prompt (spec #652, tickets
+            // #654/#656). Like Forward, it is routed here rather than through
+            // the command dispatcher: the skills ride the prompt axis, and the
+            // whole original message text is the prompt. Dispatch resolves each
+            // typed id against the skill list — see
+            // [`Self::handle_skill_command`].
             if let command::Command::Skill(ids) = cmd {
-                if ids.is_empty() {
-                    // A bare `/skill` names nothing to load: the picker card
-                    // supersedes this reply (ticket #656), and until then the
-                    // recognised command answers with its syntax — never a
-                    // prompt carrying the literal `/skill`.
-                    let _ = self
-                        .feishu
-                        .reply_text(&msg.message_id, command::SKILL_USAGE)
-                        .await;
-                    return;
-                }
-                // The typed token stands in as BOTH identity and name, and is
-                // right on either generation: on V2 it is the skill's `id` (the
-                // structured `skills` request carries it), and on V1 the skill
-                // identity IS its name — V1's `Skill.Info` has no `id` and the
-                // pinned `skill` tool loads by name (`skill.require(name)`), so
-                // the token a V1 user types IS the name V1 needs. No skill-list
-                // read exists yet; ticket #656 replaces this placeholder with
-                // the canonical `{id, name}` resolved from the list read.
-                let skills = ids
-                    .into_iter()
-                    .map(|id| PromptSkill { name: id.clone(), id })
-                    .collect();
-                if let Err(e) = self.handle_prompt(thread_key, msg, kind, skills).await {
-                    tracing::error!("Prompt: {}", e);
-                }
+                self.handle_skill_command(thread_key, msg, ids).await;
                 return;
             }
             if let Err(e) =
@@ -470,6 +446,75 @@ impl App {
             return;
         }
         if let Err(e) = self.handle_prompt(thread_key, msg, kind, Vec::new()).await {
+            tracing::error!("Prompt: {}", e);
+        }
+    }
+
+    /// Dispatch a `/skill` command (spec #652, tickets #654/#656): the Bridge
+    /// reads the skill list ONCE, resolves each typed id to its canonical
+    /// `{ id, name }` list entry (so the attached skill is not just the raw
+    /// token — V1's text fallback then names the skill correctly), and submits
+    /// the whole original message text verbatim with the resolved attachment.
+    /// The read is generation-neutral, so the command behaves identically on V1
+    /// and V2.
+    ///
+    /// Two recovery cases never reach the model: a bare `/skill` (no id) shows
+    /// the picker card, and a dispatch whose ids ALL fail to resolve shows the
+    /// same card behind an error line. A dispatch that resolves at least one id
+    /// keeps those and submits — the ids that resolve ride the prompt, exactly
+    /// as the spec's "keeps the ids that resolve" states.
+    async fn handle_skill_command(
+        self: &Arc<Self>,
+        thread_key: ThreadKey,
+        msg: crate::bridge::IncomingMessage,
+        ids: Vec<String>,
+    ) {
+        let kind = ConversationKind::classify(&msg.chat_type, msg.thread_id.as_deref());
+        let skills = self.opencode.list_skills().await;
+        let mut resolved: Vec<PromptSkill> = Vec::new();
+        let mut unknown: Vec<String> = Vec::new();
+        for id in &ids {
+            match skills.iter().find(|skill| skill.id == *id) {
+                Some(entry) => resolved.push(PromptSkill {
+                    id: entry.id.clone(),
+                    name: entry.name.clone(),
+                }),
+                None => unknown.push(id.clone()),
+            }
+        }
+        if !unknown.is_empty() && resolved.is_empty() {
+            let named = unknown
+                .iter()
+                .map(|id| format!("`{id}`"))
+                .collect::<Vec<_>>()
+                .join("、");
+            let error = format!("⚠️ 未找到技能：{named}");
+            let _ = crate::feishu::card::command::send_skill_card(
+                &self.command_handles(),
+                &thread_key,
+                &msg.chat_type,
+                &msg.message_id,
+                &skills,
+                Some(&error),
+            )
+            .await;
+            return;
+        }
+        if ids.is_empty() {
+            // A bare `/skill` names nothing to load: show the picker (never a
+            // prompt carrying the literal `/skill`).
+            let _ = crate::feishu::card::command::send_skill_card(
+                &self.command_handles(),
+                &thread_key,
+                &msg.chat_type,
+                &msg.message_id,
+                &skills,
+                None,
+            )
+            .await;
+            return;
+        }
+        if let Err(e) = self.handle_prompt(thread_key, msg, kind, resolved).await {
             tracing::error!("Prompt: {}", e);
         }
     }
@@ -1046,6 +1091,7 @@ impl App {
                 "think" => self.handle_think_card_action(&self.core, &value, false).await,
                 "think_clear" => self.handle_think_card_action(&self.core, &value, true).await,
                 "autoaccept" => self.handle_autoaccept_card_action(&self.core, &value).await,
+                "skill" => self.handle_skill_card_action(&value).await,
                 _ => None,
             }
         };
@@ -1950,6 +1996,66 @@ impl App {
             card: first.cloned(),
             toast: None,
         }
+    }
+
+    /// Handle a `/skill` picker row tap (spec #652, ticket #656): a row sends
+    /// `/skill <id>` — the same path a typed command takes — so the tap
+    /// re-enters the message coordinator rather than growing a parallel submit.
+    /// The click must ack within 3s while a turn runs for the length of a model
+    /// reply, so the submission is spawned off the ack; the picker card stays
+    /// put, and the agent/autoaccept toasts already established that a picker
+    /// does not replace itself.
+    async fn handle_skill_card_action(
+        self: &Arc<Self>,
+        value: &serde_json::Value,
+    ) -> Option<CardActionResult> {
+        let id = value.get("value").and_then(|v| v.as_str()).unwrap_or("");
+        if id.is_empty() {
+            return None;
+        }
+        let app = Arc::clone(self);
+        let value = value.clone();
+        let text = format!("/skill {id}");
+        tokio::spawn(async move {
+            // The conversation kind the picker was sent in: every button carries
+            // it next to chat_id/thread_id, since a click has no chat_type of
+            // its own (see `build_skill_cards`).
+            let string = |key: &str| value.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let chat_id = string("chat_id");
+            // A non-topic key's `thread_id` IS its `chat_id` (ThreadKey), so
+            // drop it: re-classifying must not mistake the top level for a
+            // topic. A real topic's `thread_id` differs and is kept.
+            let thread_id = value
+                .get("thread_id")
+                .and_then(|v| v.as_str())
+                .filter(|id| *id != chat_id)
+                .map(str::to_string);
+            let chat_type = {
+                let t = string("chat_type");
+                if t.is_empty() { "group".to_string() } else { t }
+            };
+            let requester = value
+                .get("operator_open_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            // The picker card's own message is the reply anchor, so the turn's
+            // card lands below the row the user tapped.
+            app.handle_message(crate::bridge::IncomingMessage {
+                message_id: string("open_message_id"),
+                chat_id,
+                chat_type,
+                thread_id,
+                parent_id: None,
+                text,
+                images: vec![],
+                requester_open_id: requester,
+            })
+            .await;
+        });
+        Some(CardActionResult {
+            card: None,
+            toast: Some(format!("正在加载技能 {id}…")),
+        })
     }
 
     /// Handle an `/autoaccept` toggle-card button: switch the flag and refresh

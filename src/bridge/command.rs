@@ -71,22 +71,17 @@ pub enum Command {
     /// Show available commands, or help for one command (`/help <cmd>`).
     Help(Option<String>),
     /// `/skill <id> [text…]` — load one or more OpenCode skills into the prompt
-    /// (spec #652, ticket #654). Each `/skill <id>` token contributes one id,
-    /// collected in order (`/skill a /skill b text`); the whole original message
-    /// text is the prompt, tokens and all (it mirrors the composer's
-    /// `@skill-id`). A bare `/skill` carries no id. The coordinator routes this
-    /// into the prompt pipeline itself — the same path as [`Command::Forward`] —
-    /// because the prompt pipeline, not the command dispatcher, owns submission.
+    /// (spec #652, tickets #654/#656). Each `/skill <id>` token contributes one
+    /// id, collected in order (`/skill a /skill b text`); the whole original
+    /// message text is the prompt, tokens and all (it mirrors the composer's
+    /// `@skill-id`). The coordinator routes this into the prompt pipeline itself
+    /// — the same path as [`Command::Forward`] — because the prompt pipeline,
+    /// not the command dispatcher, owns submission; a bare `/skill` (no id) or
+    /// an unknown id instead answers with the skill picker (#656).
     Skill(Vec<String>),
     /// Forward unrecognized slash command to OpenCode as prompt text
     Forward(String),
 }
-
-/// Shown for a bare `/skill` (no id): the command is recognised (never
-/// forwarded to the model as text), but with no skill named there is nothing to
-/// load. The skill picker card supersedes this reply (ticket #656).
-pub(crate) const SKILL_USAGE: &str =
-    "用法：`/skill <id> [/skill <id> …] [文本]`，例如 `/skill implement-spec 644`。";
 
 impl Command {
     /// The single source of truth for the "commands restricted inside a topic"
