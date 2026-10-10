@@ -701,14 +701,15 @@ mod tests {
 
     /// Several large CJK skills attached to one message must not push the
     /// one-shot snapshot past Feishu's total card limit: the folds share one
-    /// card-wide body budget (spec #652, ticket #655). Without the shared
-    /// budget, four 3,000-char CJK bodies alone are 36 KB — the card is
-    /// rejected.
+    /// card-wide body budget (spec #652, ticket #655). Every skill still gets
+    /// its own titled fold; only bodies past the budget are omitted. Without the
+    /// shared budget, even four 3,000-char CJK bodies alone are 36 KB — the card
+    /// is rejected.
     #[test]
     fn several_large_skills_stay_within_the_snapshot_budget() {
         let huge = "很长的技能说明。".repeat(1_000); // 8,000 CJK chars (24 KB) each
         let mut entry = tail(MessageRole::User, 1000, "/skill implement-spec");
-        entry.skills = (0..4)
+        entry.skills = (0..10)
             .map(|i| MessageSkill {
                 id: format!("s{i}"),
                 name: format!("skill-{i}"),
@@ -719,6 +720,10 @@ mod tests {
         let card = build_snapshot_card("接管", "t", &d, None);
         let s = card.to_string();
         assert!(s.contains("🧩 已加载技能：skill-0"), "{s}");
+        assert!(
+            s.contains("🧩 已加载技能：skill-9"),
+            "every skill keeps its own fold: {s}"
+        );
         let size = s.len();
         assert!(
             size <= crate::feishu::card::FEISHU_CARD_LIMIT_BYTES,

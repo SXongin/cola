@@ -99,11 +99,11 @@ mod tests {
 
     /// Several large CJK skills must not push the one-shot notification card
     /// past Feishu's total limit: the folds share one card-wide body budget
-    /// (spec #652, ticket #655).
+    /// (spec #652, ticket #655). Every skill still gets its own titled fold.
     #[test]
     fn several_large_skills_stay_within_the_message_card_budget() {
         let huge = "很长的技能说明。".repeat(1_000); // 8,000 CJK chars (24 KB) each
-        let skills: Vec<MessageSkill> = (0..4)
+        let skills: Vec<MessageSkill> = (0..10)
             .map(|i| MessageSkill {
                 id: format!("s{i}"),
                 name: format!("skill-{i}"),
@@ -113,6 +113,10 @@ mod tests {
         let card = build_external_message_card("proj", "看一下这个", &skills);
         let s = card.to_string();
         assert!(s.contains("🧩 已加载技能：skill-0"), "{s}");
+        assert!(
+            s.contains("🧩 已加载技能：skill-9"),
+            "every skill keeps its own fold: {s}"
+        );
         let size = s.len();
         assert!(
             size <= crate::feishu::card::FEISHU_CARD_LIMIT_BYTES,
