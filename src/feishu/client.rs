@@ -1845,6 +1845,29 @@ mod tests {
         assert!(body.ends_with("--\r\n"), "the body closes the multipart: {body}");
     }
 
+    /// A stalled upload must be bounded by the client's 10s request timeout,
+    /// like the client's other byte-carrying call (`download_image`): otherwise
+    /// the render pass and the poll loop that await it hang indefinitely on a
+    /// wedged Feishu (ADR-0076). The mock server hangs for 60s under a paused
+    /// clock, so the 10s timeout fires first with no wall-clock wait.
+    #[tokio::test(start_paused = true)]
+    async fn upload_image_gives_up_on_a_hung_server() {
+        let (server, client) = wire_client().await;
+        server.route_delayed(
+            "POST",
+            "/open-apis/im/v1/images",
+            200,
+            r#"{"code":0,"msg":"ok","data":{"image_key":"img_v2_abc"}}"#,
+            std::time::Duration::from_secs(60),
+        );
+
+        let err = client.upload_image(b"PNGDATA", "image/png").await.unwrap_err();
+        assert!(
+            matches!(err, crate::error::BridgeError::Http(ref e) if e.is_timeout()),
+            "the upload must time out, not hang: {err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn upload_image_maps_a_business_error() {
         let (server, client) = wire_client().await;
