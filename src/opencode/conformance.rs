@@ -217,7 +217,11 @@ pub(crate) struct PromptFixture {
     pub(crate) answer_id: &'static str,
     pub(crate) answer_text: &'static str,
     /// The id and name of the skill the prompt-skills conformance scenario
-    /// attaches. V1 has no ids, so its identity is the name — one shared value.
+    /// attaches. They are deliberately distinct, mirroring a real V2 skill
+    /// (id from the file/directory, name from the frontmatter): V2's structured
+    /// attachment carries `id`, while V1 has no id — its identity is the name
+    /// and its `skill` tool loads by name — so a differing pair proves each
+    /// generation consumes the field it must, not merely the shared value.
     pub(crate) skill_id: &'static str,
     pub(crate) skill_name: &'static str,
 }
@@ -231,7 +235,7 @@ impl Default for PromptFixture {
             answer_id: "msg_prompt_answer",
             answer_text: "干完了",
             skill_id: "implement-spec",
-            skill_name: "implement-spec",
+            skill_name: "Implement Spec",
         }
     }
 }
@@ -725,11 +729,17 @@ async fn prompt_skills_ride_the_generation_and_an_empty_attachment_changes_nothi
 
         let body = last_prompt_body(&server);
         match case.generation {
-            Generation::V2 => assert_eq!(
-                body["skills"],
-                serde_json::json!([{ "id": fixture.skill_id }]),
-                "{generation}: V2 must send the server's structured skills array: {body}"
-            ),
+            Generation::V2 => {
+                assert_eq!(
+                    body["skills"],
+                    serde_json::json!([{ "id": fixture.skill_id }]),
+                    "{generation}: V2 must send the server's structured skills array: {body}"
+                );
+                assert!(
+                    !body.to_string().contains(fixture.skill_name),
+                    "{generation}: V2's wire carries the id, never the name: {body}"
+                );
+            }
             Generation::V1 => {
                 assert!(
                     body.get("skills").is_none(),
@@ -738,7 +748,11 @@ async fn prompt_skills_ride_the_generation_and_an_empty_attachment_changes_nothi
                 let text = body["parts"][0]["text"].as_str().unwrap_or_default();
                 assert!(
                     text.contains(fixture.skill_name),
-                    "{generation}: V1 must name the skill in the prompt text: {text:?}"
+                    "{generation}: V1 must name the skill (its identity is the name) in the prompt text: {text:?}"
+                );
+                assert!(
+                    !text.contains(fixture.skill_id),
+                    "{generation}: V1's text fallback names the skill, not the V2 id: {text:?}"
                 );
             }
         }
