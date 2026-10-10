@@ -555,7 +555,10 @@ pub(crate) async fn send_skill_card(
 /// The plain-text fallback for [`send_skill_card`]: the same skills one line
 /// each (`id`, name, description where present) plus the command syntax, with
 /// the same leading error line an unknown id would show. Mirrors
-/// [`crate::bridge::command::help_text`]'s role for the `/help` card.
+/// [`crate::bridge::command::help_text`]'s role for the `/help` card. Bounded as
+/// a whole (spec #652, ticket #655): each field is clipped to the picker's
+/// row-label budget, at most [`super::skill::MAX_FALLBACK_SKILLS`] rows are
+/// listed (with an elision count), and the whole text is capped.
 fn skill_list_text(skills: &[crate::backend::SkillInfo], error: Option<&str>) -> String {
     let mut text = String::new();
     if let Some(error) = error {
@@ -566,18 +569,24 @@ fn skill_list_text(skills: &[crate::backend::SkillInfo], error: Option<&str>) ->
         text.push_str("（没有可用技能）\n");
     } else {
         text.push_str("🧩 可用技能：\n");
-        for skill in skills {
-            let description = super::picker::skill_description_line(skill);
-            match description {
+        let shown = skills.len().min(super::skill::MAX_FALLBACK_SKILLS);
+        for skill in &skills[..shown] {
+            let id = super::truncate_md(&skill.id, super::picker::SKILL_ROW_LABEL_CHARS);
+            let name = super::truncate_md(&skill.name, super::picker::SKILL_ROW_LABEL_CHARS);
+            match super::picker::skill_description_line(skill) {
                 Some(description) => {
-                    text.push_str(&format!("- `{}` {} — {}\n", skill.id, skill.name, description))
+                    let description = super::truncate_md(description, super::picker::SKILL_ROW_LABEL_CHARS);
+                    text.push_str(&format!("- `{id}` {name} — {description}\n"));
                 }
-                None => text.push_str(&format!("- `{}` {}\n", skill.id, skill.name)),
+                None => text.push_str(&format!("- `{id}` {name}\n")),
             }
+        }
+        if skills.len() > shown {
+            text.push_str(&format!("…（共 {} 个技能，已截断）\n", skills.len()));
         }
     }
     text.push_str("用法：`/skill <id>`");
-    text
+    super::truncate_md(&text, super::skill::FALLBACK_TEXT_CHARS)
 }
 
 /// Reply the dedicated loaded-skill card (spec #652, ticket #655, acceptance
@@ -611,28 +620,29 @@ pub(crate) async fn send_loaded_skill_card(
 
 /// The plain-text fallback for [`send_loaded_skill_card`]: the same leading error
 /// line the card would show, then one section per loaded skill — the
-/// `🧩 已加载技能：<name>` title AND its (clipped) markdown body, the fold body the
-/// acceptance promises. The bodies share the folds' card-wide character budget,
-/// so the degraded text stays bounded; the name is clipped to the picker's
-/// row-label budget.
+/// `🧩 已加载技能：<name>` title AND its body, exactly what the card fold shows
+/// (both consume [`super::skill::plan_skill_folds`] and
+/// [`super::skill::fold_body`], so they never disagree on the extent). The
+/// overflow past [`super::skill::SKILL_FOLD_MAX`] is named in one elision line,
+/// mirroring the card's summary fold, so the degraded text is bounded as a
+/// whole.
 fn loaded_skill_text(skills: &[crate::backend::SkillInfo], error: Option<&str>) -> String {
     let mut text = String::new();
     if let Some(error) = error {
         text.push_str(error);
         text.push('\n');
     }
-    let mut chars_left = super::skill::SKILL_FOLDS_TOTAL_CHARS;
-    for skill in skills {
+    let (allowed, hidden) = super::skill::plan_skill_folds(skills);
+    for (skill, allowed) in skills.iter().zip(&allowed) {
         let name = super::truncate_md(&skill.name, super::picker::SKILL_ROW_LABEL_CHARS);
-        let body = super::skill::fallback_body(skill, chars_left);
-        chars_left = chars_left.saturating_sub(body.chars().count());
         text.push_str(&format!("🧩 已加载技能：{name}\n"));
-        if !body.is_empty() {
-            text.push_str(&body);
-            text.push('\n');
-        }
+        text.push_str(&super::skill::fold_body(skill, *allowed));
+        text.push('\n');
     }
-    text.trim_end().to_string()
+    if hidden > 0 {
+        text.push_str(&format!("…等 {hidden} 个技能未列出\n"));
+    }
+    super::truncate_md(text.trim_end(), super::skill::FALLBACK_TEXT_CHARS)
 }
 
 #[cfg(test)]

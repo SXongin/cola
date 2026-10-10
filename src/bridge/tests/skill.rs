@@ -618,6 +618,111 @@ async fn a_rejected_loaded_skill_card_falls_back_to_text_with_the_body() {
     );
 }
 
+/// The degraded text fallback shows the SAME body extent the card fold would
+/// (spec #652, ticket #655): both consume the one budget walk, so a body past
+/// the per-fold cap is clipped to the same point in each.
+#[tokio::test]
+async fn a_rejected_card_fallback_shows_the_same_body_extent_as_the_card() {
+    let long_body = "A".repeat(5_000);
+    let fixture_skill = || SkillInfo {
+        id: "long".into(),
+        name: "Long Skill".into(),
+        description: None,
+        content: Some(long_body.clone()),
+    };
+
+    // The card fold clips the body to the per-fold cap.
+    let card = crate::feishu::card::skill::build_loaded_skill_card(&[fixture_skill()], None);
+    let card_body = card["body"]["elements"][0]["elements"][0]["content"]
+        .as_str()
+        .unwrap();
+    let card_a = card_body.chars().filter(|c| *c == 'A').count();
+
+    // The fallback (card rejected) shows the same number of body chars.
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_skills(vec![fixture_skill()]);
+    let fx = SkillFixture::with(backend).await;
+    fx.platform
+        .fail_reply_card_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    fx.send("/skill long").await;
+    let texts = fx.platform.texts().await;
+    let fallback = texts
+        .iter()
+        .find(|t| t.contains("已加载技能"))
+        .expect("a text fallback is sent");
+    let fallback_a = fallback.chars().filter(|c| *c == 'A').count();
+
+    assert_eq!(
+        fallback_a, card_a,
+        "the card fold and the fallback must show the same body extent"
+    );
+    assert_eq!(
+        card_a,
+        crate::feishu::card::tool_render::TOOL_OUTPUT_MAX_CHARS,
+        "a body past the per-fold cap is clipped to it"
+    );
+}
+
+/// The picker fallback is bounded as a whole (spec #652, ticket #655): a server
+/// listing hundreds of skills with long names/descriptions degrades to a
+/// clipped, capped listing, never an unbounded message.
+#[tokio::test]
+async fn a_large_picker_fallback_stays_bounded() {
+    let many: Vec<SkillInfo> = (0..300)
+        .map(|i| SkillInfo {
+            id: format!("skill-{i}-{}", "i".repeat(200)),
+            name: "名".repeat(500),
+            description: Some("描".repeat(500)),
+            content: Some("body".into()),
+        })
+        .collect();
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_skills(many);
+    let fx = SkillFixture::with(backend).await;
+    // Fail the first picker card so the bare `/skill` degrades to text.
+    fx.platform
+        .fail_reply_card_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+
+    fx.send("/skill").await;
+
+    let texts = fx.platform.texts().await;
+    let fallback = texts
+        .iter()
+        .find(|t| t.contains("可用技能"))
+        .expect("a text fallback is sent");
+    assert!(
+        fallback.chars().count() <= crate::feishu::card::skill::FALLBACK_TEXT_CHARS + 1,
+        "the picker fallback is bounded: {} chars",
+        fallback.chars().count()
+    );
+}
+
+/// A long unknown id degrades to a bounded picker fallback too (spec #652,
+/// ticket #655): the error line is clipped and the whole message is capped.
+#[tokio::test]
+async fn a_long_unknown_id_picker_fallback_is_bounded() {
+    let fx = SkillFixture::build().await;
+    fx.platform
+        .fail_reply_card_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+
+    let long = "z".repeat(20_000);
+    fx.send(&format!("/skill {long}")).await;
+
+    let texts = fx.platform.texts().await;
+    let fallback = texts
+        .iter()
+        .find(|t| t.contains("未找到技能"))
+        .expect("a text fallback is sent");
+    assert!(
+        fallback.chars().count() <= crate::feishu::card::skill::FALLBACK_TEXT_CHARS + 1,
+        "the picker fallback is bounded: {} chars",
+        fallback.chars().count()
+    );
+}
+
 /// A skill with an over-long name is clipped in its fold title (spec #652,
 /// ticket #655): the body budget never bounds the title, so an unbounded name
 /// could alone push the card past Feishu's 30 KB limit. The clip matches the

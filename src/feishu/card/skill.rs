@@ -15,14 +15,37 @@ use super::shell::{card_shell, collapsible_panel};
 use super::tool_render::{TOOL_OUTPUT_MAX_CHARS, parse_skill_envelope};
 use super::truncate_md;
 
-/// The body characters one card's loaded-skill folds may spend in total
-/// (spec #652, ticket #655). Feishu rejects a card whose serialized JSON
-/// exceeds 30 KB (AGENTS.md pitfall #13), and one `/skill` dispatch can load
-/// several skills whose bodies are CJK (3 bytes per char), so the per-fold
-/// [`TOOL_OUTPUT_MAX_CHARS`] cap alone cannot bound the one-shot loaded-skill
-/// card, which has no size splitter. 4,000 chars is at most 12 KB of CJK body
-/// text, leaving room for the rest of the card.
-pub(crate) const SKILL_FOLDS_TOTAL_CHARS: usize = 4_000;
+/// The bytes one loaded-skill card's folds may spend in total — every fold's
+/// JSON structure, its title AND its body (spec #652, ticket #655). Feishu
+/// rejects a card whose serialized JSON exceeds 30 KB (AGENTS.md pitfall #13),
+/// and the dedicated card carries ONE message's skills (usually 1–3), usually
+/// CJK (3 bytes per char), so the budget is sized to the card limit rather than
+/// the removed many-message tail's tight one: 24 KB (≈8,000 CJK body chars)
+/// leaves ~6 KB for the card shell, comfortably under 30 KB. It bounds the
+/// WORST CASE (a pathological dispatch of [`SKILL_FOLD_MAX`] long-named skills);
+/// an ordinary 1–3 skill dispatch is far below it and shows every body in full.
+pub(crate) const SKILL_FOLDS_TOTAL_BYTES: usize = 24_000;
+
+/// The bytes a CJK character costs — the upper bound the fold budget charges
+/// per body CHARACTER, so a body of `n` chars is charged at most `3 * n` bytes.
+const CJK_BYTES_PER_CHAR: usize = 3;
+
+/// The per-fold JSON structure the budget reserves (the `collapsible_panel` and
+/// nested markdown tags/keys/ids, not their text): conservative, so the
+/// aggregate stays a genuine card-size upper bound however many folds carry.
+const FOLD_STRUCTURE_BYTES: usize = 320;
+
+/// The most fallback rows either text fallback lists before it says how many
+/// were elided (spec #652, ticket #655): the card paginates or collapses
+/// overflow, and the degraded plain-text message must be bounded too.
+pub(crate) const MAX_FALLBACK_SKILLS: usize = 50;
+
+/// The whole-text cap each degraded plain-text fallback applies (spec #652,
+/// ticket #655): a final guard after the per-field clips and the row cap, so a
+/// pathological list cannot produce an unbounded message. ≥ the loaded-skill
+/// plan's own output, so it never cuts a fold the card would show; ≤27 KB of
+/// CJK.
+pub(crate) const FALLBACK_TEXT_CHARS: usize = 9_000;
 
 /// Feishu's hard platform ceiling for a card's element/component count: a card
 /// past it is rejected (`ErrCode 11310`). The loaded-skill card has no
@@ -49,7 +72,7 @@ pub(crate) const SKILL_FOLD_MAX: usize = FEISHU_MAX_COMPONENTS / (2 * FOLD_COMPO
 /// than vanishing or failing Feishu's content check.
 const EMPTY_BODY: &str = "（无说明）";
 
-/// The body a fold renders once the card's shared character budget is spent:
+/// The body a fold renders once the card's shared byte budget is spent:
 /// its title still names the skill, without an oversized body. A fold within
 /// the count budget keeps its title; only the body is dropped.
 const OMITTED_BODY: &str = "（内容过长，已省略）";
@@ -59,42 +82,59 @@ const OMITTED_BODY: &str = "（内容过长，已省略）";
 const SUMMARY_BODY: &str = "（技能过多，其余已省略）";
 
 /// One card's loaded-skill folds: one folded `🧩 已加载技能：<name>` panel per
-/// distinct skill, in order, under the card's SHARED budget — the body
-/// characters its folds may spend AND the individual folds it may render. Every
-/// fold on the card draws from that one budget, so a dispatch loading several
-/// large skills cannot push the one-shot loaded-skill card past Feishu's total
-/// limit (AGENTS.md #13), and a pathological skill count cannot push it past the
-/// component ceiling ([`SKILL_FOLD_MAX`]). `prefix` names each panel for the
-/// reader's fold state (`{prefix}{index}`), like every other panel's
-/// `element_id`; `md` is the CARD's markdown state, so the folds share its one
-/// table budget and fenced fallback with the card's other elements. The overflow
-/// past [`SKILL_FOLD_MAX`] is collapsed into ONE bounded summary fold naming the
-/// count; a fold past the character budget keeps its title with an omission body.
+/// distinct skill, in order, under the card's SHARED budget — the structure,
+/// title and body bytes its folds may spend AND the individual folds it may
+/// render. Every fold on the card draws from that one budget, so a dispatch
+/// loading several large skills cannot push the one-shot loaded-skill card past
+/// Feishu's total limit (AGENTS.md #13), and a pathological skill count cannot
+/// push it past the component ceiling ([`SKILL_FOLD_MAX`]). `prefix` names each
+/// panel for the reader's fold state (`{prefix}{index}`), like every other
+/// panel's `element_id`; `md` is the CARD's markdown state, so the folds share
+/// its one table budget and fenced fallback with the card's other elements. The
+/// overflow past [`SKILL_FOLD_MAX`] is collapsed into ONE bounded summary fold
+/// naming the count; a fold past the byte budget keeps its title with an
+/// omission body.
 pub(crate) fn loaded_skill_folds(
     skills: &[SkillInfo],
     prefix: &str,
     md: &mut CardMarkdown,
 ) -> Vec<serde_json::Value> {
-    let take = skills.len().min(SKILL_FOLD_MAX);
-    let mut chars_left = SKILL_FOLDS_TOTAL_CHARS;
-    let mut panels: Vec<serde_json::Value> = skills[..take]
+    let (allowed, hidden) = plan_skill_folds(skills);
+    let mut panels: Vec<serde_json::Value> = skills
         .iter()
+        .zip(&allowed)
         .enumerate()
-        .map(|(i, skill)| {
-            let allowed = unwrapped_body(skill)
-                .chars()
-                .count()
-                .min(TOOL_OUTPUT_MAX_CHARS)
-                .min(chars_left);
-            chars_left -= allowed;
-            build_fold(skill, allowed, &format!("{prefix}{i}"), md)
-        })
+        .map(|(i, (skill, allowed))| build_fold(skill, *allowed, &format!("{prefix}{i}"), md))
         .collect();
-    let hidden = skills.len() - take;
     if hidden > 0 {
         panels.push(summary_fold(hidden, &format!("{prefix}summary"), md));
     }
     panels
+}
+
+/// Walk `skills` under the card's SHARED fold-text budget, returning each
+/// fold's allowed body length (in characters, in order) and the count that
+/// overflowed past [`SKILL_FOLD_MAX`] into the summary fold. This is THE budget
+/// walk — the card folds AND the degraded text fallback both consume it, so the
+/// two can never disagree on how much of a body is shown (spec #652, ticket
+/// #655). Each fold is charged its [`FOLD_STRUCTURE_BYTES`] plus its (clipped)
+/// title's bytes plus its body at the CJK upper bound ([`CJK_BYTES_PER_CHAR`]
+/// per character), capped per fold at [`TOOL_OUTPUT_MAX_CHARS`], until
+/// [`SKILL_FOLDS_TOTAL_BYTES`] is spent — after which a fold keeps its title
+/// with an omission body.
+pub(crate) fn plan_skill_folds(skills: &[SkillInfo]) -> (Vec<usize>, usize) {
+    let take = skills.len().min(SKILL_FOLD_MAX);
+    let mut bytes_left = SKILL_FOLDS_TOTAL_BYTES;
+    let mut allowed = Vec::with_capacity(take);
+    for skill in &skills[..take] {
+        let title_bytes = fold_title(&skill.name).len();
+        bytes_left = bytes_left.saturating_sub(FOLD_STRUCTURE_BYTES + title_bytes);
+        let max_body_chars = (bytes_left / CJK_BYTES_PER_CHAR).min(TOOL_OUTPUT_MAX_CHARS);
+        let this = unwrapped_body(skill).chars().count().min(max_body_chars);
+        bytes_left = bytes_left.saturating_sub(this * CJK_BYTES_PER_CHAR);
+        allowed.push(this);
+    }
+    (allowed, skills.len() - take)
 }
 
 /// The dedicated loaded-skill card (spec #652, ticket #655, acceptance
@@ -138,50 +178,43 @@ fn unwrapped_body(skill: &SkillInfo) -> String {
         .to_string()
 }
 
-/// The plain-text body one skill contributes to the degraded text fallback
-/// (spec #652, ticket #655): the same unwrapped markdown a fold shows, clipped
-/// to `allowed` characters — or empty when the skill carries no content or the
-/// shared budget is spent. Shared so the fallback and the folds unwrap the same
-/// way, and the fallback keeps the fold body the acceptance promises instead of
-/// degrading to a title-only list.
-pub(crate) fn fallback_body(skill: &SkillInfo, allowed: usize) -> String {
+/// The body text one fold shows for `skill` under `allowed` body characters:
+/// the skill's unwrapped markdown clipped to `allowed`, or the empty marker when
+/// it carries none, or the omission marker when the shared budget was spent.
+/// Shared by the card fold and the degraded text fallback, so the two can never
+/// disagree on how much of a body is shown (spec #652, ticket #655).
+pub(crate) fn fold_body(skill: &SkillInfo, allowed: usize) -> String {
     let body = unwrapped_body(skill);
-    if body.is_empty() || allowed == 0 {
-        String::new()
+    if body.is_empty() {
+        EMPTY_BODY.to_string()
+    } else if allowed == 0 {
+        OMITTED_BODY.to_string()
     } else {
         truncate_md(&body, allowed)
     }
 }
 
-/// One fold's panel: the title `🧩 已加载技能：<name>`, the body the skill's
-/// markdown (sanitized, capped at `allowed` characters) with any server
-/// `<skill_content>` envelope and sampled `<skill_files>` list stripped — the
+/// One fold's panel: the title `🧩 已加载技能：<name>`, its body from
+/// [`fold_body`] (sanitized) — the skill's markdown with any server
+/// `<skill_content>` envelope and sampled `<skill_files>` list stripped, the
 /// same unwrapping the `skill` tool panel uses (spec #652, ticket #655). An
 /// empty body renders its titled fold with a marker instead of an empty panel;
-/// a fold whose body is past the budget renders the omission marker.
+/// a fold whose body is past the shared budget renders the omission marker.
 ///
 /// `md` is the CARD's markdown state, threaded in rather than a fresh
 /// one-shot: the fold draws from the card's single table budget, so a 6th table
 /// anywhere on the card — this fold included — renders as code, exactly like
 /// every other element ([`CardMarkdown`]'s own warning). The raw body is clipped
-/// BEFORE `md.element` because that call may wrap an over-budget table in a
-/// fence — clipping the fenced result could cut the closing fence (the `skill`
-/// tool panel clips first for the same reason).
+/// BEFORE `md.element` (inside [`fold_body`]) because that call may wrap an
+/// over-budget table in a fence — clipping the fenced result could cut the
+/// closing fence (the `skill` tool panel clips first for the same reason).
 fn build_fold(
     skill: &SkillInfo,
     allowed: usize,
     element_id: &str,
     md: &mut CardMarkdown,
 ) -> serde_json::Value {
-    let body = unwrapped_body(skill);
-    let body = if body.is_empty() {
-        EMPTY_BODY.to_string()
-    } else if allowed == 0 {
-        OMITTED_BODY.to_string()
-    } else {
-        truncate_md(&body, allowed)
-    };
-    let body = md.element(&body);
+    let body = md.element(&fold_body(skill, allowed));
     collapsible_panel(&fold_title(&skill.name), &body, Some(element_id))
 }
 
@@ -284,9 +317,9 @@ mod tests {
     /// The card's shared budget bounds the folds even when a dispatch loads
     /// several large CJK skills whose per-fold caps would sum far past Feishu's
     /// total card limit (AGENTS.md #13). Every skill still gets its OWN titled
-    /// fold below the component cap — the character budget is the size guard —
-    /// and a fold past the budget renders its title with the omission body
-    /// rather than an oversized body.
+    /// fold below the component cap — the budget is the size guard — and a fold
+    /// past the budget renders its title with the omission body rather than an
+    /// oversized body. The whole card stays under Feishu's limit.
     #[test]
     fn the_folds_share_one_body_budget_across_the_card() {
         // 8,000 CJK chars per skill — ten of them are 80,000 raw chars.
@@ -310,14 +343,58 @@ mod tests {
             .map(|panel| panel["elements"][0]["content"].as_str().unwrap().chars().count())
             .sum();
         assert!(
-            body_chars < 5_000,
+            body_chars <= 8_000,
             "the folds spent {body_chars} chars, not the raw 80,000"
         );
 
-        // The first folds carry a (capped) body; once the 4,000-char budget is
-        // spent the rest keep their titles with the omission body.
+        // The first folds carry a (capped) body; once the budget is spent the
+        // rest keep their titles with the omission body.
         assert_ne!(panels[0]["elements"][0]["content"], OMITTED_BODY);
-        assert_eq!(panels[2]["elements"][0]["content"], OMITTED_BODY);
+        assert_eq!(panels[3]["elements"][0]["content"], OMITTED_BODY);
+
+        // The aggregate includes per-fold structure, so the whole card stays
+        // under Feishu's serialized-size limit.
+        let card = build_loaded_skill_card(&skills, None);
+        assert!(
+            card.to_string().len() <= crate::feishu::card::FEISHU_CARD_LIMIT_BYTES,
+            "the folds pushed the card to {} bytes",
+            card.to_string().len()
+        );
+    }
+
+    /// An ordinary dispatch — one skill with a body under the per-fold cap —
+    /// shows the body in FULL (spec #652, ticket #655): the budget is sized for
+    /// the dedicated card, not the removed many-message tail.
+    #[test]
+    fn an_ordinary_skill_shows_its_full_body() {
+        let body = "x".repeat(TOOL_OUTPUT_MAX_CHARS);
+        let card = build_loaded_skill_card(&[skill("implement-spec", Some(&body))], None);
+        let fold = &card["body"]["elements"][0];
+        let shown = fold["elements"][0]["content"].as_str().unwrap();
+        assert_eq!(
+            shown.chars().count(),
+            TOOL_OUTPUT_MAX_CHARS,
+            "the whole body is shown, not clipped"
+        );
+        assert!(!shown.ends_with('…'), "no truncation marker: {}", shown.len());
+
+        // Three ordinary (2,000-char) bodies all show in full.
+        let ordinary = "y".repeat(2_000);
+        let card = build_loaded_skill_card(
+            &[
+                skill("a", Some(&ordinary)),
+                skill("b", Some(&ordinary)),
+                skill("c", Some(&ordinary)),
+            ],
+            None,
+        );
+        let shown: usize = card["body"]["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["elements"][0]["content"].as_str().unwrap().chars().count())
+            .sum();
+        assert_eq!(shown, 6_000, "three ordinary bodies show in full");
     }
 
     /// A pathological skill count — a `/skill a` token pasted 150 times — must
