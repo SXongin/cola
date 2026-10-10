@@ -445,9 +445,14 @@ impl App {
                         .await;
                     return;
                 }
-                // The typed id is both identity and name here: no skill-list
-                // read exists yet (the picker's read, ticket #656, resolves the
-                // human-facing name).
+                // The typed token stands in as BOTH identity and name, and is
+                // right on either generation: on V2 it is the skill's `id` (the
+                // structured `skills` request carries it), and on V1 the skill
+                // identity IS its name — V1's `Skill.Info` has no `id` and the
+                // pinned `skill` tool loads by name (`skill.require(name)`), so
+                // the token a V1 user types IS the name V1 needs. No skill-list
+                // read exists yet; ticket #656 replaces this placeholder with
+                // the canonical `{id, name}` resolved from the list read.
                 let skills = ids
                     .into_iter()
                     .map(|id| PromptSkill { name: id.clone(), id })
