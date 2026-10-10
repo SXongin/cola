@@ -61,6 +61,30 @@ impl FileContent {
     pub fn bytes(&self) -> Option<Vec<u8>> {
         inline_payload(&self.uri)
     }
+
+    /// The one line a File Content is recorded with where a message's body is
+    /// shown (ADR-0076): `📎 <name> · <mime> · <size>`. The line names the
+    /// payload; it never carries its bytes.
+    pub fn record_line(&self) -> String {
+        format!("📎 {} · {} · {}", self.name, self.mime, human_size(self.size))
+    }
+}
+
+/// A byte count as a human-readable size: exact bytes below 1 KiB, otherwise
+/// one decimal in the largest binary unit that fits (`512 B`, `1.2 MB`).
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 
 /// The decoded payload of an inline base64 `data:` URI, or `None` when `uri` is
@@ -132,5 +156,27 @@ mod tests {
         assert!(FileContent::decode("data:text/plain,hello", Some("text/plain"), None).is_none());
         assert!(FileContent::decode("data:image/png;base64,!!!", Some("image/png"), None).is_none());
         assert!(FileContent::decode("data:image/png;base64", Some("image/png"), None).is_none());
+    }
+
+    /// A record line names the file — `📎 name · mime · size` — with the size
+    /// humanized: exact bytes below 1 KiB, one decimal in the largest binary
+    /// unit that fits above it (ADR-0076).
+    #[test]
+    fn a_record_line_names_the_file_and_humanizes_its_size() {
+        let small = FileContent {
+            uri: String::new(),
+            mime: "image/png".into(),
+            name: "shot.png".into(),
+            size: 512,
+        };
+        assert_eq!(small.record_line(), "📎 shot.png · image/png · 512 B");
+
+        let large = FileContent {
+            uri: String::new(),
+            mime: "application/pdf".into(),
+            name: "report.pdf".into(),
+            size: 1_258_291,
+        };
+        assert_eq!(large.record_line(), "📎 report.pdf · application/pdf · 1.2 MB");
     }
 }
