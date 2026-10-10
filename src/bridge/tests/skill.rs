@@ -62,6 +62,7 @@ struct SkillFixture {
     prompt_calls: Arc<tokio::sync::Mutex<Vec<String>>>,
     prompt_skills: Arc<tokio::sync::Mutex<Vec<Vec<PromptSkill>>>>,
     list_skills_calls: Arc<std::sync::atomic::AtomicUsize>,
+    list_skills_directories: Arc<tokio::sync::Mutex<Vec<Option<String>>>>,
 }
 
 impl SkillFixture {
@@ -83,6 +84,7 @@ impl SkillFixture {
         let prompt_calls = backend.prompt_calls.clone();
         let prompt_skills = backend.prompt_skills.clone();
         let list_skills_calls = backend.list_skills_calls.clone();
+        let list_skills_directories = backend.list_skills_directories.clone();
         let platform = Arc::new(RecordingPlatform::new());
         let app = Arc::new(App::new(cfg, Arc::new(backend), platform.clone()).unwrap());
         Self {
@@ -93,6 +95,7 @@ impl SkillFixture {
             prompt_calls,
             prompt_skills,
             list_skills_calls,
+            list_skills_directories,
         }
     }
 
@@ -211,6 +214,34 @@ async fn bare_skill_id_with_no_text_is_accepted() {
 
     assert_eq!(*fx.prompt_calls.lock().await, vec!["/skill foreman".to_string()]);
     assert_eq!(*fx.prompt_skills.lock().await, vec![vec![resolved("foreman")]]);
+}
+
+/// A `/skill` dispatch reads the list from the CONVERSATION's project
+/// directory — the location the eventual prompt runs in — so a session's own
+/// project skills are the ones listed and resolved, not the server default's.
+#[tokio::test]
+async fn a_skill_read_is_scoped_to_the_conversations_directory() {
+    let fx = SkillFixture::build().await;
+    seed_session(&fx.app, "ses_test", "/work/custom").await;
+
+    // A bare `/skill` lists that directory's skills.
+    fx.send("/skill").await;
+    assert_eq!(
+        fx.picker_buttons().await.len(),
+        3,
+        "the picker lists the directory's skills"
+    );
+    // Resolving a typed id reads the same directory.
+    fx.send("/skill implement-spec").await;
+    assert_eq!(
+        *fx.list_skills_directories.lock().await,
+        vec![Some("/work/custom".to_string()), Some("/work/custom".to_string())],
+        "every skill read must be scoped to the session's directory"
+    );
+    assert_eq!(
+        *fx.prompt_skills.lock().await,
+        vec![vec![resolved("implement-spec")]]
+    );
 }
 
 /// A bare `/skill` (no id) names nothing to load: it shows the picker card

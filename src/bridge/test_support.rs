@@ -1217,6 +1217,9 @@ pub struct MockBackend {
     /// Counts `list_skills` calls (a `/skill` dispatch must read the list
     /// exactly once).
     pub list_skills_calls: Arc<std::sync::atomic::AtomicUsize>,
+    /// Records the directory each `list_skills` call was scoped to, in call
+    /// order — the location a session's skill read must carry.
+    pub list_skills_directories: Arc<tokio::sync::Mutex<Vec<Option<String>>>>,
     /// Available models grouped by provider, served by `list_models` (for the
     /// `/model` card).
     pub provider_models: Vec<opencode::types::ProviderModels>,
@@ -1457,6 +1460,7 @@ impl MockBackend {
             agents: Vec::new(),
             skills: Vec::new(),
             list_skills_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            list_skills_directories: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             provider_models: Vec::new(),
             default_model: None,
             context_window: Some(100_000),
@@ -2521,9 +2525,13 @@ impl crate::backend::Backend for MockBackend {
         self.agents.clone()
     }
 
-    async fn list_skills(&self) -> Vec<crate::backend::SkillInfo> {
+    async fn list_skills(&self, directory: Option<&str>) -> Vec<crate::backend::SkillInfo> {
         self.list_skills_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.list_skills_directories
+            .lock()
+            .await
+            .push(directory.map(str::to_string));
         self.skills.clone()
     }
 

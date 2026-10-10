@@ -451,18 +451,20 @@ impl App {
     }
 
     /// Dispatch a `/skill` command (spec #652, tickets #654/#656): the Bridge
-    /// reads the skill list ONCE, resolves each typed id to its canonical
-    /// `{ id, name }` list entry (so the attached skill is not just the raw
-    /// token — V1's text fallback then names the skill correctly), and submits
-    /// the whole original message text verbatim with the resolved attachment.
-    /// The read is generation-neutral, so the command behaves identically on V1
-    /// and V2.
+    /// reads the skill list ONCE — scoped to the conversation's current project
+    /// directory, the same location the eventual prompt runs in — resolves each
+    /// typed id to its canonical `{ id, name }` list entry (so the attached
+    /// skill is not just the raw token — V1's text fallback then names the
+    /// skill correctly), and submits the whole original message text verbatim
+    /// with the resolved attachment. The read is generation-neutral, so the
+    /// command behaves identically on V1 and V2.
     ///
-    /// Two recovery cases never reach the model: a bare `/skill` (no id) shows
-    /// the picker card, and a dispatch whose ids ALL fail to resolve shows the
-    /// same card behind an error line. A dispatch that resolves at least one id
-    /// keeps those and submits — the ids that resolve ride the prompt, exactly
-    /// as the spec's "keeps the ids that resolve" states.
+    /// Two recovery cases never reach the model — a bare `/skill` (no id) and a
+    /// dispatch whose ids ALL fail to resolve. Both answer with the SAME picker
+    /// card from the list just read; only the second leads with an error line. A
+    /// dispatch that resolves at least one id keeps those and submits — the ids
+    /// that resolve ride the prompt, exactly as the spec's "keeps the ids that
+    /// resolve" states.
     async fn handle_skill_command(
         self: &Arc<Self>,
         thread_key: ThreadKey,
@@ -470,7 +472,15 @@ impl App {
         ids: Vec<String>,
     ) {
         let kind = ConversationKind::classify(&msg.chat_type, msg.thread_id.as_deref());
-        let skills = self.opencode.list_skills().await;
+        let handles = self.command_handles();
+        // Read from the conversation's own project directory (the location the
+        // prompt will run in), so resolution and injection cannot disagree; an
+        // empty/unknown directory keeps the server's default location.
+        let directory = handles.current_project_directory(&thread_key).await;
+        let skills = self
+            .opencode
+            .list_skills((!directory.is_empty()).then_some(directory.as_str()))
+            .await;
         let mut resolved: Vec<PromptSkill> = Vec::new();
         let mut unknown: Vec<String> = Vec::new();
         for id in &ids {
@@ -482,34 +492,24 @@ impl App {
                 None => unknown.push(id.clone()),
             }
         }
-        if !unknown.is_empty() && resolved.is_empty() {
-            let named = unknown
-                .iter()
-                .map(|id| format!("`{id}`"))
-                .collect::<Vec<_>>()
-                .join("、");
-            let error = format!("⚠️ 未找到技能：{named}");
+        // The one card-send path both recovery cases share: a bare `/skill`
+        // supplies no error, an unresolvable dispatch leads with one.
+        if ids.is_empty() || resolved.is_empty() {
+            let error = (!unknown.is_empty()).then(|| {
+                let named = unknown
+                    .iter()
+                    .map(|id| format!("`{id}`"))
+                    .collect::<Vec<_>>()
+                    .join("、");
+                format!("⚠️ 未找到技能：{named}")
+            });
             let _ = crate::feishu::card::command::send_skill_card(
-                &self.command_handles(),
+                &handles,
                 &thread_key,
                 &msg.chat_type,
                 &msg.message_id,
                 &skills,
-                Some(&error),
-            )
-            .await;
-            return;
-        }
-        if ids.is_empty() {
-            // A bare `/skill` names nothing to load: show the picker (never a
-            // prompt carrying the literal `/skill`).
-            let _ = crate::feishu::card::command::send_skill_card(
-                &self.command_handles(),
-                &thread_key,
-                &msg.chat_type,
-                &msg.message_id,
-                &skills,
-                None,
+                error.as_deref(),
             )
             .await;
             return;

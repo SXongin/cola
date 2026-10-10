@@ -222,11 +222,14 @@ pub(crate) trait GenerationStrategy: Send + Sync {
     async fn list_agents(&self, http: &Transport) -> Vec<AgentInfo>;
 
     /// The registered skills (V2's `GET /api/skill`, V1's `GET /skill`), each
-    /// as a neutral `{ id, name, description? }`. Best-effort: an unreadable
-    /// failure returns an empty list, so the picker degrades to its no-skills
-    /// state. The read is deliberately unfiltered — hidden and description-less
-    /// skills are listed too (spec #652, ticket #656).
-    async fn list_skills(&self, http: &Transport) -> Vec<SkillInfo>;
+    /// as a neutral `{ id, name, description? }`. `directory` selects the
+    /// location the read is scoped to — V2's `location[directory]=…` deepObject
+    /// query, V1's flat `directory=`; `None` keeps the server's default
+    /// location. Best-effort: an unreadable failure returns an empty list, so
+    /// the picker degrades to its no-skills state. The read is deliberately
+    /// unfiltered — hidden and description-less skills are listed too (spec
+    /// #652, ticket #656).
+    async fn list_skills(&self, http: &Transport, directory: Option<&str>) -> Vec<SkillInfo>;
 
     async fn list_models(&self, http: &Transport) -> Vec<ProviderModels>;
 

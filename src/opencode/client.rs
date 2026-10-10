@@ -482,9 +482,11 @@ impl OpenCodeBackend {
 
     /// The registered skills (`GET /api/skill` on V2, `GET /skill` on V1), for
     /// the `/skill` picker and the `/skill <id>` resolution (spec #652, ticket
-    /// #656). Best-effort: an unreadable failure yields an empty list.
-    pub async fn list_skills(&self) -> Vec<SkillInfo> {
-        self.strategy().list_skills(&self.transport).await
+    /// #656). `directory` scopes the read to the session's location; `None`
+    /// keeps the server default. Best-effort: an unreadable failure yields an
+    /// empty list.
+    pub async fn list_skills(&self, directory: Option<&str>) -> Vec<SkillInfo> {
+        self.strategy().list_skills(&self.transport, directory).await
     }
 
     pub async fn list_models(&self) -> Vec<ProviderModels> {
