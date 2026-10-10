@@ -73,18 +73,23 @@ than adding a cola-side allow-list.
   panel titled `🧩 已加载技能：<name>` per **distinct** loaded skill, its body the
   skill's own markdown from the skill-list read's `content` (raw; any server
   `<skill_content>` envelope is unwrapped harmlessly, so the renderer is shared
-  with the `skill` tool panel's shape). The platform-limit guard bounds "one fold
-  per skill": past `SKILL_FOLD_MAX` folds the overflow collapses into one
-  `🧩 已加载技能（等 N 个）` summary fold, and a fold past the card's shared
-  character budget keeps its title with an omission body — both are necessary to
-  stay under Feishu's component and byte ceilings (AGENTS.md #13). A **mixed
-  dispatch** — some ids resolve, some do not — still submits the resolved ones
-  and leads the card with a `⚠️ 未找到技能：…` line naming the rest, so an unknown
-  id is never dropped silently (Q19); a dispatch whose ids ALL fail to resolve
-  keeps the error-plus-picker card and submits no prompt. The live Turn card,
-  the Session Snapshot's 「最近对话」 tail and the External Message preview do
-  **not** render skill folds: those sites stay text-only, and non-text
-  user-message structures from other clients are deferred (#660).
+  with the `skill` tool panel's shape). Each fold's body is capped at the `skill`
+  tool panel's 3,000 characters, and the card's folds share one aggregate budget
+  — ≈8,000 CJK body characters, charged as 24 KB of structure, titles and bodies
+  — sized so an ordinary 1–3 skill dispatch shows every body in FULL while the
+  whole card stays comfortably under Feishu's 30 KB limit. Only a genuinely large
+  dispatch degrades: past `SKILL_FOLD_MAX` folds the overflow collapses into one
+  `🧩 已加载技能（等 N 个）` summary fold, and a fold past the aggregate keeps its
+  title with an omission body (AGENTS.md #13). A **mixed dispatch** — some ids
+  resolve, some do not — still submits the resolved ones and leads the card with
+  a `⚠️ 未找到技能：…` line naming the rest, so an unknown id is never dropped
+  silently (Q19); a dispatch whose ids ALL fail to resolve keeps the
+  error-plus-picker card and submits no prompt. A rejected card degrades to a
+  plain-text message that consumes the SAME budget walk and shows the SAME body
+  extent as the folds. The live Turn card, the Session Snapshot's 「最近对话」
+  tail and the External Message preview do **not** render skill folds: those
+  sites stay text-only, and non-text user-message structures from other clients
+  are deferred (#660).
 - **Accepted permission gap.** The V2 prompt route does not enforce the
   `skill` permission: the server injects any existing skill id, even one the
   agent's config `deny`s, and only the server-side `skill` tool runs the
