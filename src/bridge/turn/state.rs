@@ -506,6 +506,20 @@ fn panel_estimate(p: &ToolPanel) -> usize {
     400 + input + output
 }
 
+/// Estimated serialized size (bytes) of one loaded-skill fold (spec #652,
+/// ticket #655), mirroring [`StreamAccumulator::estimate_split_index`]'s
+/// accounting: element overhead plus the title and the body the renderer keeps
+/// (capped at the tool-output budget). Shared with the tail reserve, so the
+/// card and its skills stay together under the cap.
+fn skill_estimate(skill: &crate::backend::MessageSkill) -> usize {
+    let instructions = skill
+        .instructions
+        .as_deref()
+        .map(|text| first_n_chars_bytes(text, crate::feishu::card::tool_render::TOOL_OUTPUT_MAX_CHARS))
+        .unwrap_or(0);
+    400 + skill.name.len() + instructions
+}
+
 /// A permission request surfaced inline on the streaming card (instead of a
 /// separate card), so the whole turn lives on ONE card.
 #[derive(Debug, Clone)]
@@ -1284,6 +1298,15 @@ pub(super) struct StreamAccumulator {
     /// cost) carrying them costs nothing. Private to this module: set by
     /// [`Self::set_skills`] (at `Turn::start`); read through [`Self::skills`].
     skills: Vec<PromptSkill>,
+    /// The skills this turn's USER MESSAGE attached (spec #652, ticket #655),
+    /// captured from the neutral transcript's anchor message on the first
+    /// render read and rendered as the live card's `🧩 已加载技能` folds. Distinct
+    /// from [`Self::skills`] (the `{ id, name }` prompt axis #654 keeps for a
+    /// retry): this carries the skill's own body the fold shows, and is empty on
+    /// a generation whose user messages record none (V1). Set by
+    /// [`Self::capture_loaded_skills`]; read directly by the card builder and
+    /// its tail reserve.
+    loaded_skills: Vec<crate::backend::MessageSkill>,
     /// Whether this card's terminal recovery action — spec #391's Error retry,
     /// #437's Unreceived 重新发起 — or its waiting-card cleanup (spec #588,
     /// #590) has been claimed. The click is acked immediately, so a second
@@ -2018,6 +2041,27 @@ impl StreamAccumulator {
     /// [`Self::set_prompt`]).
     pub(super) fn set_skills(&mut self, skills: &[PromptSkill]) {
         self.skills = skills.to_vec();
+    }
+
+    /// Capture the anchor user message's attached skills from a read (spec #652,
+    /// ticket #655). The turn's user message IS the anchor ([`Self::turn_anchor`]
+    /// names it by identity), so once the anchor is known one read of the same
+    /// transcript yields the skills the loaded-skill folds render. The capture
+    /// is positive-only: a read that cannot find the message (or finds one with
+    /// no skills, as V1 always does) leaves what it has, so a later read cannot
+    /// clear a capture the message's own payload will keep carrying anyway.
+    pub(super) fn capture_loaded_skills(&mut self, transcript: &SessionTranscript) {
+        let Some(anchor) = self.turn_anchor.as_ref() else {
+            return;
+        };
+        let Some(message) = transcript
+            .messages
+            .iter()
+            .find(|message| message.id.as_str() == anchor.message_id.as_str())
+        else {
+            return;
+        };
+        self.loaded_skills = message.skills.clone();
     }
 
     /// The `msg_cola_…` id this turn's user message carries (ADR-0026), if
@@ -3940,13 +3984,17 @@ impl StreamAccumulator {
         let mut card_text = 0usize;
         if reserve_tail {
             // The tail rides only the live card, but it counts against that
-            // card's budget: the todo list, the Background Task Ledger, then
-            // every running tool's panel (ADR-0045). When they don't fit, the
-            // card finalizes without the tail and the continuation carries it.
-            // A still-running seeded panel is excluded on a card no live
-            // renderer owns, exactly as `build_card_inner` omits it
-            // ([`Self::omitted_live_seeded`]): the reserve must not charge for
-            // what the build will not render.
+            // card's budget: the loaded-skill folds, the todo list, the
+            // Background Task Ledger, then every running tool's panel
+            // (ADR-0045). When they don't fit, the card finalizes without the
+            // tail and the continuation carries it. A still-running seeded panel
+            // is excluded on a card no live renderer owns, exactly as
+            // `build_card_inner` omits it ([`Self::omitted_live_seeded`]): the
+            // reserve must not charge for what the build will not render.
+            for skill in &self.loaded_skills {
+                comps += 1;
+                size += skill_estimate(skill);
+            }
             if let Some(panel) = &self.todo_panel {
                 comps += 1;
                 size += panel_estimate(panel);
@@ -4049,6 +4097,22 @@ impl StreamAccumulator {
             .and_then(|anchor| crate::feishu::card::fmt_local_date(anchor.created_ms))
         {
             builder = builder.with_date(&date);
+        }
+
+        // The skills this turn's user message attached (spec #652, ticket
+        // #655): folded `🧩 已加载技能` panels near the top of the LIVE card. They
+        // ride `include_tail` exactly like the Todo Panel and Background Task
+        // Ledger (ADR-0045/0060), so they always land on the newest card of the
+        // chain — re-rendered on every flush rather than frozen into a timeline
+        // row. A message with no skills (and every V1 message) renders nothing,
+        // exactly as before; a stable id keeps the reader's fold state.
+        if include_tail {
+            for (i, skill) in self.loaded_skills.iter().enumerate() {
+                builder = builder.with_element(crate::feishu::card::skill::loaded_skill_panel(
+                    skill,
+                    Some(&format!("skill_{i}")),
+                ));
+            }
         }
 
         // Render text, reasoning, tool panels and receipts in the timeline's
@@ -6478,6 +6542,7 @@ mod tests {
         // The frontier resolves against the read: part one stays delivered and
         // the second part renders only past its own cut.
         let transcript = SessionTranscript::new(vec![crate::backend::TranscriptMessage {
+            skills: Vec::new(),
             id: message.clone(),
             role: crate::backend::MessageRole::Assistant,
             time: Some(crate::backend::MessageTime {

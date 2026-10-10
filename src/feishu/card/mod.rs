@@ -7,6 +7,7 @@ pub(crate) mod question;
 pub(crate) mod sanitize;
 pub(crate) mod session;
 pub(crate) mod shell;
+pub(crate) mod skill;
 pub(crate) mod tool_render;
 
 /// Card state for Feishu interactive message cards.
@@ -644,7 +645,8 @@ mod tests {
         assert_eq!(clean_session_label("@_user_1 你好"), "你好");
         assert_eq!(clean_session_label("frontend-refactor"), "frontend-refactor");
         // A notification card shows the cleaned label, not the raw name.
-        let card = notify::build_external_message_card("sess-7a025fa5-74a1-44e0-b5c5-80b9a21f71bc", "hi");
+        let card =
+            notify::build_external_message_card("sess-7a025fa5-74a1-44e0-b5c5-80b9a21f71bc", "hi", &[]);
         let text = card.to_string();
         assert!(!text.contains("sess-"), "raw sess-uuid must not leak: {}", text);
     }

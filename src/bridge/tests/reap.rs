@@ -1614,6 +1614,7 @@ fn in_flight_shell(
     output: &str,
 ) -> TranscriptMessage {
     TranscriptMessage {
+        skills: Vec::new(),
         id: MessageId::new(id),
         role: MessageRole::Assistant,
         time: Some(MessageTime {
@@ -7310,6 +7311,7 @@ fn race_transcript(
     let mut messages = vec![
         user("msg_cola_anchor", orphan_anchor, "跑个长命令"),
         TranscriptMessage {
+            skills: Vec::new(),
             id: MessageId::new("msg_a_orphan"),
             role: MessageRole::Assistant,
             time: Some(MessageTime {
@@ -7795,6 +7797,7 @@ async fn a_turn_winning_the_create_window_keeps_the_chain_when_the_run_ended_whi
         let mut messages = vec![
             user("msg_cola_anchor", orphan_anchor, "问题"),
             TranscriptMessage {
+                skills: Vec::new(),
                 id: MessageId::new("msg_a_orphan"),
                 role: MessageRole::Assistant,
                 time: Some(MessageTime {
@@ -7954,6 +7957,7 @@ fn text_and_tool(text: &str, status: ToolStatus, output: &str) -> SessionTranscr
     SessionTranscript::new(vec![
         user("msg_cola_anchor", 1_000, "跑个长命令"),
         TranscriptMessage {
+            skills: Vec::new(),
             id: MessageId::new("msg_a_2000"),
             role: MessageRole::Assistant,
             time: Some(MessageTime {
@@ -8937,6 +8941,7 @@ async fn a_turn_winning_the_collect_window_never_re_renders_the_delivered_tail()
                 SessionTranscript::new(vec![
                     user("msg_cola_anchor", orphan_anchor, "问题"),
                     TranscriptMessage {
+                        skills: Vec::new(),
                         id: MessageId::new(format!("msg_a_{}", orphan_anchor + 500)),
                         role: MessageRole::Assistant,
                         time: Some(MessageTime {
@@ -9203,6 +9208,7 @@ async fn a_failed_seed_read_keeps_a_cursor_bearing_tail_pending() {
     let phase_b = SessionTranscript::new(vec![
         user("msg_cola_anchor", orphan_anchor, "跑个长命令"),
         TranscriptMessage {
+            skills: Vec::new(),
             id: MessageId::new("msg_a_orphan"),
             role: MessageRole::Assistant,
             time: Some(MessageTime {
@@ -9480,6 +9486,7 @@ async fn an_identical_new_answer_renders_after_the_seeded_takeover() {
     let live = SessionTranscript::new(vec![
         user("msg_cola_anchor", orphan_anchor, "跑个长命令"),
         TranscriptMessage {
+            skills: Vec::new(),
             id: MessageId::new("msg_a_orphan"),
             role: MessageRole::Assistant,
             time: Some(MessageTime {
@@ -9777,6 +9784,7 @@ async fn a_restart_while_the_gap_is_pending_renders_only_the_gap() {
     let life2 = SessionTranscript::new(vec![
         user("msg_cola_anchor", orphan_anchor, "跑个长命令"),
         TranscriptMessage {
+            skills: Vec::new(),
             id: MessageId::new("msg_a_orphan"),
             role: MessageRole::Assistant,
             time: Some(MessageTime {
@@ -9996,6 +10004,7 @@ async fn a_split_gap_resumes_from_its_confirmed_head_after_a_restart() {
         SessionTranscript::new(vec![
             user("msg_cola_anchor", orphan_anchor, "跑个长命令"),
             TranscriptMessage {
+                skills: Vec::new(),
                 id: MessageId::new(format!("msg_a_{}", orphan_anchor + 500)),
                 role: MessageRole::Assistant,
                 time: Some(MessageTime {
@@ -10190,6 +10199,7 @@ async fn a_crash_after_a_resolved_seed_still_lands_the_orphan_tail() {
         SessionTranscript::new(vec![
             user("msg_cola_anchor", orphan_anchor, "跑个长命令"),
             TranscriptMessage {
+                skills: Vec::new(),
                 id: MessageId::new(format!("msg_a_{}", orphan_anchor + 500)),
                 role: MessageRole::Assistant,
                 time: Some(MessageTime {
@@ -10300,6 +10310,7 @@ async fn one_confirmed_write_advances_cursor_and_gap_together() {
     let transcript = SessionTranscript::new(vec![
         user("msg_cola_anchor", orphan_anchor, "跑个长命令"),
         TranscriptMessage {
+            skills: Vec::new(),
             id: MessageId::new(format!("msg_a_{}", orphan_anchor + 500)),
             role: MessageRole::Assistant,
             time: Some(MessageTime {
@@ -10529,6 +10540,7 @@ async fn a_truncated_takeover_keeps_the_gap_until_a_complete_read() {
         &[],
     );
     let orphan_text = |tail: &str| TranscriptMessage {
+        skills: Vec::new(),
         id: MessageId::new(format!("msg_a_{}", orphan_anchor + 500)),
         role: MessageRole::Assistant,
         time: Some(MessageTime {
@@ -10559,6 +10571,7 @@ async fn a_truncated_takeover_keeps_the_gap_until_a_complete_read() {
             user("msg_cola_anchor", orphan_anchor, "跑个长命令"),
             orphan_text(visible),
             TranscriptMessage {
+                skills: Vec::new(),
                 id: MessageId::new(format!("msg_a_{}", orphan_anchor + 900)),
                 role: MessageRole::Assistant,
                 time: Some(MessageTime {
@@ -10658,6 +10671,7 @@ async fn a_takeover_records_the_gap_before_its_read_completes() {
         SessionTranscript::new(vec![
             user("msg_cola_anchor", orphan_anchor, "跑个长命令"),
             TranscriptMessage {
+                skills: Vec::new(),
                 id: MessageId::new(format!("msg_a_{}", orphan_anchor + 500)),
                 role: MessageRole::Assistant,
                 time: Some(MessageTime {
@@ -10785,6 +10799,7 @@ async fn a_takeover_keeps_an_unresolved_projection_intent() {
         SessionTranscript::new(vec![
             user("msg_cola_anchor", orphan_anchor, "跑个长命令"),
             TranscriptMessage {
+                skills: Vec::new(),
                 id: MessageId::new(format!("msg_a_{}", orphan_anchor + 500)),
                 role: MessageRole::Assistant,
                 time: Some(MessageTime {

@@ -3,11 +3,20 @@ use serde_json::json;
 use super::clean_session_label;
 use super::sanitize::sanitize_markdown;
 use super::shell::card_shell;
+use super::skill::loaded_skill_panel;
+use crate::backend::MessageSkill;
 
 /// A notification card telling the Feishu side that OpenChamber (or another
 /// client on the same store) has posted a new user message to a session.
 /// Kept deliberately small and link-free — cola doesn't couple to OpenChamber.
-pub fn build_external_message_card(session_name: &str, preview: &str) -> serde_json::Value {
+/// The message's attached skills ride the same card as the loaded-skill fold
+/// (spec #652, ticket #655), beside the preview text, so a skill loaded from
+/// another client is visible in Feishu too.
+pub fn build_external_message_card(
+    session_name: &str,
+    preview: &str,
+    skills: &[MessageSkill],
+) -> serde_json::Value {
     let session_name = clean_session_label(session_name);
     let mut content = String::new();
     if !session_name.is_empty() {
@@ -15,11 +24,11 @@ pub fn build_external_message_card(session_name: &str, preview: &str) -> serde_j
     }
     content.push_str(preview);
     let content = sanitize_markdown(&content);
-    card_shell(
-        "💬 有新消息",
-        "blue",
-        vec![json!({ "tag": "markdown", "content": content })],
-    )
+    let mut elements = vec![json!({ "tag": "markdown", "content": content })];
+    for (i, skill) in skills.iter().enumerate() {
+        elements.push(loaded_skill_panel(skill, Some(&format!("ext_skill_{i}"))));
+    }
+    card_shell("💬 有新消息", "blue", elements)
 }
 
 /// Replacement for a permission/question card whose request was already resolved
@@ -53,4 +62,40 @@ pub fn build_interrupted_card(kind: &str, detail: &str) -> serde_json::Value {
         "orange",
         vec![json!({ "tag": "markdown", "content": body })],
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An External Message whose user message attached a skill renders the
+    /// loaded-skill fold beside the preview (spec #652, ticket #655), so a
+    /// skill loaded from another client is visible in Feishu.
+    #[test]
+    fn an_external_message_with_a_skill_renders_the_fold_beside_the_preview() {
+        let skills = vec![MessageSkill {
+            id: "implement-spec".into(),
+            name: "implement-spec".into(),
+            instructions: Some(
+                "<skill_content name=\"implement-spec\">\nDo the thing.\n\
+                 <skill_files>\n<file>/a.md</file>\n</skill_files>\n</skill_content>"
+                    .into(),
+            ),
+        }];
+        let card = build_external_message_card("proj", "看一下这个", &skills);
+        let s = card.to_string();
+        assert!(s.contains("看一下这个"), "{s}");
+        assert!(s.contains("🧩 已加载技能：implement-spec"), "{s}");
+        assert!(s.contains("Do the thing."), "{s}");
+        assert!(!s.contains("skill_files"), "file list stripped: {s}");
+    }
+
+    /// A message with no skills renders exactly the preview card as before.
+    #[test]
+    fn an_external_message_without_skills_renders_only_the_preview() {
+        let card = build_external_message_card("proj", "看一下这个", &[]);
+        let s = card.to_string();
+        assert!(s.contains("看一下这个"), "{s}");
+        assert!(!s.contains("已加载技能"), "{s}");
+    }
 }

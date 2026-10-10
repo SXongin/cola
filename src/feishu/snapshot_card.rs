@@ -137,6 +137,14 @@ fn tail_panels(tail: &[TailEntry]) -> Vec<serde_json::Value> {
             &chunks,
             Some(&format!("snap_{i}")),
         ));
+        // The message's attached skills (spec #652, ticket #655) ride beside
+        // its text, so a skill loaded by another client is visible in Feishu.
+        for (s, skill) in entry.skills.iter().enumerate() {
+            panels.push(crate::feishu::card::skill::loaded_skill_panel(
+                skill,
+                Some(&format!("snap_{i}_skill_{s}")),
+            ));
+        }
     }
     panels
 }
@@ -279,6 +287,7 @@ pub fn build_switched_state_card(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::MessageSkill;
     use crate::bridge::request::kind::PendingRequest;
     use crate::bridge::snapshot::SnapshotData;
     use crate::opencode::types::{PermissionRequest, QuestionInfo, QuestionOption, QuestionRequest};
@@ -344,6 +353,7 @@ mod tests {
             role,
             created_ms,
             text: text.into(),
+            skills: Vec::new(),
         }
     }
 
@@ -642,6 +652,52 @@ mod tests {
         assert!(s.contains("🤖"), "assistant role marked: {s}");
         assert!(s.contains("回答二"), "full text present: {s}");
         assert!(panels.iter().all(|p| !p["expanded"].as_bool().unwrap()));
+    }
+
+    /// A tail entry's attached skills render as the loaded-skill fold beside
+    /// its text (spec #652, ticket #655), so a skill another client loaded is
+    /// visible in the snapshot. A message with no skills renders no fold.
+    #[test]
+    fn a_tail_entrys_attached_skills_render_the_fold_beside_its_text() {
+        let mut with_skill = tail(MessageRole::User, 1000, "/skill implement-spec 644");
+        with_skill.skills = vec![MessageSkill {
+            id: "implement-spec".into(),
+            name: "implement-spec".into(),
+            instructions: Some(
+                "<skill_content name=\"implement-spec\">\nDo the thing.\n\
+                 <skill_files>\n<file>/a.md</file>\n</skill_files>\n</skill_content>"
+                    .into(),
+            ),
+        }];
+        let d = data(
+            Some(opencode::types::SessionStatus::Idle),
+            vec![],
+            vec![with_skill],
+        );
+        let card = build_snapshot_card("接管", "t", &d, None);
+        let s = card.to_string();
+        assert!(s.contains("🧩 已加载技能：implement-spec"), "{s}");
+        assert!(s.contains("Do the thing."), "{s}");
+        assert!(!s.contains("skill_files"), "{s}");
+        // The message panel still comes first; the fold rides beside it.
+        let panels: Vec<&serde_json::Value> = elements(&card)
+            .iter()
+            .filter(|e| e["tag"] == "collapsible_panel")
+            .collect();
+        assert_eq!(panels.len(), 2, "message panel + skill fold: {card}");
+        assert_eq!(
+            panels[1]["header"]["title"]["content"],
+            "🧩 已加载技能：implement-spec"
+        );
+
+        // No skills → exactly the message panel, as today.
+        let plain = data(
+            Some(opencode::types::SessionStatus::Idle),
+            vec![],
+            vec![tail(MessageRole::User, 1000, "/skill implement-spec 644")],
+        );
+        let plain = build_snapshot_card("接管", "t", &plain, None);
+        assert!(!plain.to_string().contains("已加载技能"), "{plain}");
     }
 
     /// Worst-case input (4-message tail + 2 pending blocks) must stay within

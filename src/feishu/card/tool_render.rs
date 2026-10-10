@@ -1085,8 +1085,10 @@ fn parse_subagent_envelope(output: &str) -> Option<String> {
 /// Strip a `skill` tool's XML envelope: `<skill_content name=…>` around the
 /// skill's own markdown, dropping the sampled `<skill_files>` inventory (a
 /// file list the reader can't use). `None` when the wrapper isn't there, so the
-/// caller shows the output unchanged.
-fn parse_skill_envelope(output: &str) -> Option<String> {
+/// caller shows the output unchanged. Shared with the loaded-skill fold (spec
+/// #652, ticket #655), which unwraps the same envelope from a user message's
+/// attached skill.
+pub(super) fn parse_skill_envelope(output: &str) -> Option<String> {
     let mut body = String::new();
     let mut in_files = false;
     for line in envelope_lines(output, "<skill_content ", "</skill_content>")? {
