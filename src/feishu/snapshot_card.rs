@@ -212,8 +212,9 @@ pub fn build_snapshot_card_with_state(
     let title = display_title(title, &data.session_id);
 
     // The card's markdown state (one table budget, one fenced fallback) for the
-    // sections that build model-authored text — the 最近对话 tail's entry texts
-    // and their loaded-skill folds (spec #652, ticket #655).
+    // section that builds model-authored text — the 最近对话 tail's entry texts.
+    // Hoisted here, not built inside `tail_panels`, so every entry's chunks draw
+    // from the ONE card-wide table budget rather than a fresh one per entry.
     let mut md = crate::feishu::card::sanitize::CardMarkdown::new();
 
     // Only the adopted session's OWN pendings belong on the snapshot — never a
