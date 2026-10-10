@@ -145,6 +145,12 @@ fn tail_panels(tail: &[TailEntry]) -> Vec<serde_json::Value> {
         // its text, so a skill loaded by another client is visible in Feishu.
         panels.extend(folds.render(&entry.skills, &format!("snap_{i}_skill_")));
     }
+    // The card-wide overflow summary (spec #652, ticket #655): ONE fold naming
+    // every skill past the component-safe bound across ALL entries, so a
+    // pathological tail cannot build a card Feishu rejects.
+    if let Some(summary) = folds.summary("snap_skill_summary") {
+        panels.push(summary);
+    }
     panels
 }
 
@@ -729,6 +735,62 @@ mod tests {
             size <= crate::feishu::card::FEISHU_CARD_LIMIT_BYTES,
             "the folds pushed the snapshot to {size} bytes"
         );
+    }
+
+    /// A pathological skill count on the snapshot path — several tail messages
+    /// each attaching more skills than a card may hold — cannot build a card
+    /// Feishu rejects on component count: the fold budget is CARD-WIDE, so at
+    /// most `SKILL_FOLD_MAX` individual folds render across EVERY entry and the
+    /// rest collapse into ONE summary fold (spec #652, ticket #655).
+    #[test]
+    fn a_pathological_skill_count_is_bounded_card_wide_in_the_snapshot() {
+        use crate::feishu::card::skill::SKILL_FOLD_MAX;
+
+        let entry = |created_ms: i64| {
+            let mut entry = tail(MessageRole::User, created_ms, "/skill a");
+            entry.skills = (0..150)
+                .map(|i| MessageSkill {
+                    id: format!("s{i}"),
+                    name: format!("skill-{i}"),
+                    instructions: Some("body".into()),
+                })
+                .collect();
+            entry
+        };
+        let d = data(
+            Some(opencode::types::SessionStatus::Idle),
+            vec![],
+            vec![entry(1000), entry(2000)],
+        );
+        let card = build_snapshot_card("接管", "t", &d, None);
+
+        let skill_panels: Vec<&serde_json::Value> = elements(&card)
+            .iter()
+            .filter(|e| {
+                e["header"]["title"]["content"]
+                    .as_str()
+                    .is_some_and(|title| title.contains("已加载技能"))
+            })
+            .collect();
+        assert_eq!(
+            skill_panels.len(),
+            SKILL_FOLD_MAX + 1,
+            "capped across entries, one summary: {card}"
+        );
+        assert_eq!(
+            skill_panels.last().unwrap()["header"]["title"]["content"],
+            "🧩 已加载技能（等 250 个）",
+            "the one summary names every hidden skill: {card}"
+        );
+
+        // Count every top-level element plus the markdown nested in each panel:
+        // the snapshot has no splitter, so the builder itself must stay under
+        // Feishu's ceiling.
+        let components: usize = elements(&card)
+            .iter()
+            .map(|e| 1 + e["elements"].as_array().map_or(0, |nested| nested.len()))
+            .sum();
+        assert!(components <= 200, "the snapshot spent {components} components");
     }
 
     /// Worst-case input (4-message tail + 2 pending blocks) must stay within
