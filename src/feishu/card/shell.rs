@@ -6,7 +6,7 @@ use super::ledger::{
     task_ledger_text, task_ledger_title,
 };
 use super::sanitize::CardMarkdown;
-use super::tool_render::{ToolPanel, tool_panel_element};
+use super::tool_render::{ToolPanel, file_image_elements, tool_panel_element};
 use super::{
     CardActionButton, CardState, HeaderProgress, chunk_text, fenced_code, fmt_local_time, truncate_md,
 };
@@ -234,6 +234,12 @@ impl CardBuilder {
         // cards when the component estimate exceeds the Feishu limit.
         self.body
             .push(tool_panel_element(&panel, at_ms, element_id, &mut self.markdown));
+        // An embedded File Content shows immediately AFTER its panel (ADR-0076):
+        // a standalone `img` element, never folded into the panel (which starts
+        // collapsed), so the image is visible and its adjacency gives the
+        // correspondence to the call that read it. Pushed raw, so the
+        // whole-card content-rejection fallback never fences it.
+        self.body.extend(file_image_elements(&panel));
         self
     }
 

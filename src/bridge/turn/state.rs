@@ -8,13 +8,13 @@
 //! accumulator's own tests are the module's internal seam.
 
 use super::disposition::Disposition;
-use crate::backend::{MessageId, Part, PromptSkill, SessionTranscript, ToolCall, TurnAnchor};
+use crate::backend::{FileContent, MessageId, Part, PromptSkill, SessionTranscript, ToolCall, TurnAnchor};
 use crate::bridge::chain::{CursorFrontier, CursorPartKind, RenderedCursor};
 use crate::bridge::handles::CardsHandle;
 use crate::feishu::card::first_n_chars_bytes;
 use crate::feishu::card::ledger::{TaskCompletionEntry, TaskKind, TaskLedgerRow};
 use crate::feishu::card::shell::CardBuilder;
-use crate::feishu::card::tool_render::{TaskLiveness, ToolPanel, is_task_tool};
+use crate::feishu::card::tool_render::{FileDelivery, TaskLiveness, ToolPanel, is_task_tool};
 use crate::feishu::card::{AwaitingAction, CardState};
 use indexmap::IndexMap;
 use std::collections::HashMap;
@@ -3417,6 +3417,46 @@ impl StreamAccumulator {
     #[cfg(test)]
     pub(super) fn todo_panel(&self) -> Option<&ToolPanel> {
         self.todo_panel.as_ref()
+    }
+
+    /// The unresolved File Content deliveries across every tool panel
+    /// (ADR-0076): `(call_id, file index, content)` for each File Content whose
+    /// delivery the render path has not resolved yet. The render loop
+    /// pre-resolves these before the card JSON is built, so the panel can name
+    /// the file and embed the image.
+    pub(super) fn pending_file_deliveries(&self) -> Vec<(String, usize, FileContent)> {
+        let mut pending = Vec::new();
+        for (call_id, panel) in &self.tools {
+            for (index, file) in panel.files().iter().enumerate() {
+                if file.delivery == FileDelivery::Unresolved {
+                    pending.push((call_id.clone(), index, file.content.clone()));
+                }
+            }
+        }
+        pending
+    }
+
+    /// Attach a resolved image key to one tool panel's File Content (ADR-0076).
+    /// A no-op for a call the accumulator no longer holds.
+    pub(super) fn set_file_image_key(&mut self, call_id: &str, index: usize, image_key: &str) {
+        if let Some(panel) = self.tools.get_mut(call_id) {
+            panel.set_file_delivery(
+                index,
+                FileDelivery::Embedded {
+                    image_key: image_key.to_string(),
+                },
+            );
+        }
+    }
+
+    /// Mark one tool panel's File Content considered with no card surface
+    /// (ADR-0076) — a non-image or an image past Feishu's caps — so it is not
+    /// re-examined on every later poll. A no-op for a call the accumulator no
+    /// longer holds.
+    pub(super) fn set_file_no_surface(&mut self, call_id: &str, index: usize) {
+        if let Some(panel) = self.tools.get_mut(call_id) {
+            panel.set_file_delivery(index, FileDelivery::NoSurface);
+        }
     }
 
     /// Seed a render from the chain's Rendered Cursor (spec #561, tickets
