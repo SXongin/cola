@@ -580,6 +580,42 @@ fn skill_list_text(skills: &[crate::backend::SkillInfo], error: Option<&str>) ->
     text
 }
 
+/// Reply the dedicated loaded-skill card (spec #652, ticket #655, acceptance
+/// reversal) under the user's `/skill` message: one folded
+/// `🧩 已加载技能：<name>` panel per distinct loaded skill, the body the skill's
+/// own markdown from the skill-list read's `content`. Both the typed command
+/// and a picker-row tap go through here, so the feedback is identical. A
+/// rejected card must not leave the command dead, so — like
+/// [`send_skill_card`] — the failure degrades to a plain-text listing of the
+/// same skills.
+pub(crate) async fn send_loaded_skill_card(
+    handles: &CommandHandles,
+    message_id: &str,
+    skills: &[crate::backend::SkillInfo],
+) -> Result<()> {
+    let card = super::skill::build_loaded_skill_card(skills);
+    if let Err(e) = handles.flow.platform.reply_card(message_id, &card).await {
+        tracing::warn!("loaded-skill card failed ({}), falling back to text", e);
+        return handles
+            .flow
+            .platform
+            .reply_text(message_id, &loaded_skill_text(skills))
+            .await
+            .map(|_| ());
+    }
+    Ok(())
+}
+
+/// The plain-text fallback for [`send_loaded_skill_card`]: one line per loaded
+/// skill, the same `🧩 已加载技能：<name>` title the folds carry.
+fn loaded_skill_text(skills: &[crate::backend::SkillInfo]) -> String {
+    let mut text = String::new();
+    for skill in skills {
+        text.push_str(&format!("🧩 已加载技能：{}\n", skill.name));
+    }
+    text.trim_end().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

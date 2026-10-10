@@ -443,21 +443,6 @@ impl SessionTranscript {
         }
     }
 
-    /// The skills the Turn `anchor` scopes attached, gathered from EVERY user
-    /// message that belongs to it (spec #652, ticket #655): the anchor's own
-    /// message AND any **Supplement** merged into the running turn. Membership
-    /// is the same [`belongs_to_turn`] rule the render and ledger use, so a
-    /// user message outside the Turn's span contributes nothing; the order is
-    /// transcript order (the anchor first, then its Supplements). Empty for a
-    /// generation whose user messages record no skill attachment (V1).
-    pub fn turn_user_skills(&self, anchor: &TurnAnchor) -> Vec<MessageSkill> {
-        self.messages
-            .iter()
-            .filter(|message| message.role == MessageRole::User && belongs_to_turn(message, anchor))
-            .flat_map(|message| message.skills.iter().cloned())
-            .collect()
-    }
-
     /// The single settle decision every Turn ending uses (ADR-0059, ADR-0062):
     /// the drain, the out-of-turn follow, the unreceived watch and the Wake
     /// continuation all read a Turn's ending from here.
@@ -556,7 +541,6 @@ impl SessionTranscript {
                     role: message.role.clone(),
                     created_ms: message.time?.created,
                     text,
-                    skills: message.skills.clone(),
                 })
             })
             .collect();
@@ -618,25 +602,7 @@ pub struct TranscriptMessage {
     /// (a model error, an abort, a context overflow). The async-native Turn
     /// reads a turn's failure from here instead of a blocking prompt response.
     pub error: Option<String>,
-    /// The skills this message attached (spec #652, ticket #655): the neutral
-    /// `{ id, name, instructions }` facts a user message's skill payload
-    /// carries, so the loaded-skill fold can render them. Empty for every
-    /// assistant message and on a generation that records none (V1).
-    pub skills: Vec<MessageSkill>,
     pub parts: Vec<Part>,
-}
-
-/// One skill a message attached (spec #652, ticket #655): the neutral
-/// `{ id, name, instructions }` facts decoded from the generation's own skill
-/// payload. `instructions` is the skill's prepared body as the server injected
-/// it (V2's `<skill_content>` envelope text); `None` when the payload attached
-/// the skill by identity alone, and empty for V1, whose message envelope
-/// carries no skill attachment at all.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MessageSkill {
-    pub id: String,
-    pub name: String,
-    pub instructions: Option<String>,
 }
 
 impl TranscriptMessage {
@@ -1308,10 +1274,6 @@ pub struct TailEntry {
     pub role: MessageRole,
     pub created_ms: i64,
     pub text: String,
-    /// The skills the message attached (spec #652, ticket #655), rendered as
-    /// the `🧩 已加载技能` folds beside the text. Empty for assistant messages
-    /// and on a generation that records none (V1).
-    pub skills: Vec<MessageSkill>,
 }
 
 /// A message part, typed. Unknown kinds decode into [`Part::Other`] with their
@@ -1513,7 +1475,6 @@ mod tests {
             model: None,
             tokens: None,
             error: None,
-            skills: Vec::new(),
             parts,
         }
     }
@@ -2649,45 +2610,6 @@ mod tests {
         assert_eq!(roles, vec![MessageRole::User, MessageRole::Assistant]);
         assert_eq!(tail[0].text, "第一段\n第二段");
         assert_eq!(tail[1].text, "回答");
-    }
-
-    /// The tail copies each message's attached skills into its entry (spec #652,
-    /// ticket #655), so the snapshot's loaded-skill fold reads them through this
-    /// public projection — not a hand-built entry. An assistant message carries
-    /// none.
-    #[test]
-    fn tail_copies_each_messages_attached_skills() {
-        let mut with_skills = message(
-            "u1",
-            MessageRole::User,
-            Some(MessageTime {
-                created: 1_000,
-                completed: Some(1_000),
-            }),
-            vec![text_part("看一下")],
-        );
-        with_skills.skills = vec![MessageSkill {
-            id: "implement-spec".into(),
-            name: "implement-spec".into(),
-            instructions: Some("body".into()),
-        }];
-        let assistant = message(
-            "a1",
-            MessageRole::Assistant,
-            Some(MessageTime {
-                created: 2_000,
-                completed: Some(2_000),
-            }),
-            vec![text_part("回答")],
-        );
-
-        let tail = SessionTranscript::new(vec![with_skills, assistant]).transcript_tail();
-        assert_eq!(tail.len(), 2);
-        assert_eq!(tail[0].skills.len(), 1, "{:?}", tail[0].skills);
-        assert_eq!(tail[0].skills[0].id, "implement-spec");
-        assert_eq!(tail[0].skills[0].name, "implement-spec");
-        assert_eq!(tail[0].skills[0].instructions.as_deref(), Some("body"));
-        assert!(tail[1].skills.is_empty(), "an assistant message carries none");
     }
 
     #[test]

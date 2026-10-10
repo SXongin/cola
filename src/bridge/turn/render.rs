@@ -766,12 +766,6 @@ pub(super) fn render_new_turn_parts_committing(
 /// turn's and never bleeds in (#190).
 pub(super) fn render_turn_parts(acc: &mut StreamAccumulator, transcript: &SessionTranscript) -> bool {
     acc.capture_turn_anchor(transcript);
-    // The skills this Turn's user messages attached (spec #652, ticket #655):
-    // the anchor AND any Supplement merged into the running turn, gathered over
-    // the same Turn span the render below uses. Captured here, before any
-    // filtering, so a card whose anchor this read is the first to establish
-    // still shows them.
-    acc.capture_loaded_skills(transcript);
     // The orphan gap this accumulator owes (spec #561, review #569) renders
     // first, on the first read that can place its cursor: the content was never
     // on a card, while the chain's Rendered Cursor has already advanced past
@@ -1928,9 +1922,8 @@ mod tests {
     use crate::bridge::App;
     use crate::bridge::chain::{CursorFrontier, CursorPartKind, RenderedCursor, cursor_prefix_digest};
     use crate::bridge::test_support::{
-        MockBackend, PlatformCall, RecordingPlatform, build_app, card_text, message_skill, realistic_parts,
+        MockBackend, PlatformCall, RecordingPlatform, build_app, card_text, realistic_parts,
         seed_cover_title, seed_entry, test_config, test_work_dir, text_part, turn_anchor, typed_message,
-        user_message_with_skills,
     };
     use crate::bridge::turn::state::{CursorSeed, StreamAccumulator};
     use crate::feishu::card::CardState;
@@ -1951,7 +1944,6 @@ mod tests {
         parts: Vec<Part>,
     ) -> TranscriptMessage {
         TranscriptMessage {
-            skills: Vec::new(),
             id: MessageId::new(id),
             role: MessageRole::Assistant,
             time: Some(MessageTime { created, completed }),
@@ -2070,7 +2062,6 @@ mod tests {
         use crate::backend::{ModelIdentity, TokenUsage};
 
         let message = |id: &str, created: i64, tokens: TokenUsage| TranscriptMessage {
-            skills: Vec::new(),
             id: MessageId::new(id),
             role: MessageRole::Assistant,
             time: Some(MessageTime {
@@ -2312,157 +2303,32 @@ Index: /x/src/main.rs
         assert!(!render_new_turn_parts(&mut acc, &transcript));
     }
 
-    /// A turn's user message whose skills were attached renders them as the
-    /// live card's `🧩 已加载技能` folds — the first body element, so the fold
-    /// sits near the top, and the card's own tail makes it newest-card-only
-    /// (spec #652, ticket #655). The envelope is unwrapped and the sampled file
-    /// list dropped, exactly like the `skill` tool panel.
+    /// The live Turn card does NOT render a skill fold (spec #652, ticket #655,
+    /// acceptance reversal): a `/skill` turn's card carries its text/reasoning/
+    /// tool panels only — the loaded-skill fold lives on the dedicated small
+    /// card, never here.
     #[test]
-    fn a_rendered_turn_shows_its_attached_skills_as_folds_on_the_live_card() {
+    fn a_skill_turn_renders_no_fold_on_the_live_card() {
         let mut acc = StreamAccumulator::new("test");
         acc.set_cola_message_id("msg_cola_1");
+        acc.set_skills(&[crate::backend::PromptSkill {
+            id: "implement-spec".into(),
+            name: "Implement Spec".into(),
+        }]);
         let transcript = SessionTranscript::new(vec![
-            user_message_with_skills(
-                "msg_cola_1",
-                2000,
-                "/skill implement-spec 644",
-                vec![message_skill(
-                    "implement-spec",
-                    "implement-spec",
-                    Some(
-                        "<skill_content name=\"implement-spec\">\nDo the thing.\n\
-                         <skill_files>\n<file>/a.md</file>\n</skill_files>\n</skill_content>",
-                    ),
-                )],
-            ),
-            message("a1", 3000, vec![text_part("done")]),
-        ]);
-
-        assert!(render_new_turn_parts(&mut acc, &transcript));
-        let card = acc.build_card();
-        let elements = card["body"]["elements"].as_array().unwrap();
-        let fold = &elements[0];
-        assert_eq!(fold["tag"], "collapsible_panel");
-        assert_eq!(
-            fold["header"]["title"]["content"],
-            "🧩 已加载技能：implement-spec"
-        );
-        let body = fold["elements"][0]["content"].as_str().unwrap();
-        assert!(body.contains("Do the thing."), "{body}");
-        assert!(!card.to_string().contains("skill_files"), "{card}");
-    }
-
-    /// A skill another client attached (an `@skill` from OpenChamber) renders
-    /// the same way: the fold reads the neutral transcript's user message, not
-    /// cola's own prompt record.
-    #[test]
-    fn a_skill_another_client_attached_renders_on_the_card() {
-        let mut acc = StreamAccumulator::new("test");
-        acc.adopt_turn_anchor(&turn_anchor(2000));
-        let transcript = SessionTranscript::new(vec![
-            user_message_with_skills(
-                "msg_anchor_2000",
-                2000,
-                "@implement-spec 644",
-                vec![message_skill("implement-spec", "implement-spec", Some("body"))],
-            ),
-            message("a1", 3000, vec![text_part("done")]),
-        ]);
-
-        assert!(render_new_turn_parts(&mut acc, &transcript));
-        assert!(
-            acc.build_card()
-                .to_string()
-                .contains("🧩 已加载技能：implement-spec"),
-            "an externally attached skill must render"
-        );
-    }
-
-    /// A message with no attached skills renders exactly as today: no fold.
-    #[test]
-    fn a_turn_without_attached_skills_renders_no_fold() {
-        let mut acc = StreamAccumulator::new("test");
-        acc.set_cola_message_id("msg_cola_1");
-        let transcript = SessionTranscript::new(vec![
-            typed_message("msg_cola_1", MessageRole::User, Some(2000), vec![text_part("hi")]),
-            message("a1", 3000, vec![text_part("done")]),
-        ]);
-
-        assert!(render_new_turn_parts(&mut acc, &transcript));
-        assert!(!acc.build_card().to_string().contains("已加载技能"));
-    }
-
-    /// A Supplement — a `/skill …` sent while a Turn is already live — loads its
-    /// skill into the prompt, but attaches it to a SECOND user message, not the
-    /// anchor. The live card's folds must read every user message that belongs
-    /// to the running turn, the anchor AND its Supplements; reading the anchor
-    /// alone would load the skill into the prompt with no fold ever appearing
-    /// (spec #652, ticket #655).
-    #[test]
-    fn a_supplements_skill_renders_its_fold_on_the_live_card() {
-        let mut acc = StreamAccumulator::new("test");
-        acc.set_cola_message_id("msg_cola_1");
-        let transcript = SessionTranscript::new(vec![
-            // The anchor: no skills of its own.
             typed_message(
                 "msg_cola_1",
                 MessageRole::User,
                 Some(2000),
-                vec![text_part("start")],
+                vec![text_part("/skill implement-spec 644")],
             ),
-            message("a1", 2500, vec![text_part("working")]),
-            // A Supplement merged into the running turn, carrying a skill.
-            user_message_with_skills(
-                "msg_cola_2",
-                3000,
-                "/skill implement-spec",
-                vec![message_skill(
-                    "implement-spec",
-                    "implement-spec",
-                    Some("Do the thing."),
-                )],
-            ),
-            message("a2", 3500, vec![text_part("done")]),
-        ]);
-
-        assert!(render_new_turn_parts(&mut acc, &transcript));
-        assert!(
-            acc.build_card()
-                .to_string()
-                .contains("🧩 已加载技能：implement-spec"),
-            "a Supplement's skill must render its fold on the live card"
-        );
-    }
-
-    /// Several large CJK skills attached to one turn must not push the live
-    /// card past the card budget either: every skill keeps its own titled fold
-    /// and the bodies share one card-wide budget (spec #652, ticket #655), the
-    /// same walk the splitter reserves.
-    #[test]
-    fn several_large_skills_stay_within_the_live_card_budget() {
-        let mut acc = StreamAccumulator::new("test");
-        acc.set_cola_message_id("msg_cola_1");
-        let huge = "很长的技能说明。".repeat(1_000); // 8,000 CJK chars (24 KB) each
-        let skills: Vec<crate::backend::MessageSkill> = (0..10)
-            .map(|i| message_skill(&format!("s{i}"), &format!("skill-{i}"), Some(&huge)))
-            .collect();
-        let transcript = SessionTranscript::new(vec![
-            user_message_with_skills("msg_cola_1", 2000, "/skill a", skills),
             message("a1", 3000, vec![text_part("done")]),
         ]);
 
         assert!(render_new_turn_parts(&mut acc, &transcript));
-        let card = acc.build_card();
-        let s = card.to_string();
-        assert!(s.contains("🧩 已加载技能：skill-0"), "{s}");
         assert!(
-            s.contains("🧩 已加载技能：skill-9"),
-            "every skill keeps a fold: {s}"
-        );
-        assert!(
-            s.len() <= crate::feishu::card::MAX_CARD_JSON_CHARS,
-            "the folds pushed the live card to {} bytes",
-            s.len()
+            !acc.build_card().to_string().contains("已加载技能"),
+            "the live Turn card must not carry the skill fold"
         );
     }
 
@@ -2479,7 +2345,6 @@ Index: /x/src/main.rs
         let transcript = SessionTranscript::new(vec![
             // The new turn's own user message: the anchor.
             TranscriptMessage {
-                skills: Vec::new(),
                 id: MessageId::new("msg_cola_1"),
                 role: MessageRole::User,
                 time: Some(MessageTime {

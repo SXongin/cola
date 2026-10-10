@@ -1,36 +1,28 @@
 use serde_json::json;
 
 use super::clean_session_label;
-use super::sanitize::{CardMarkdown, sanitize_markdown};
+use super::sanitize::sanitize_markdown;
 use super::shell::card_shell;
-use super::skill::loaded_skill_folds;
-use crate::backend::MessageSkill;
 
 /// A notification card telling the Feishu side that OpenChamber (or another
 /// client on the same store) has posted a new user message to a session.
 /// Kept deliberately small and link-free — cola doesn't couple to OpenChamber.
-/// The message's attached skills ride the same card as the loaded-skill fold
-/// (spec #652, ticket #655), beside the preview text, so a skill loaded from
-/// another client is visible in Feishu too.
-pub fn build_external_message_card(
-    session_name: &str,
-    preview: &str,
-    skills: &[MessageSkill],
-) -> serde_json::Value {
+/// The preview is text only: a skill attached from another client is NOT
+/// rendered here (the loaded-skill fold lives only on the dedicated
+/// `/skill` card, ADR-0077's acceptance reversal).
+pub fn build_external_message_card(session_name: &str, preview: &str) -> serde_json::Value {
     let session_name = clean_session_label(session_name);
     let mut content = String::new();
     if !session_name.is_empty() {
         content.push_str(&format!("**{}**\n", session_name));
     }
     content.push_str(preview);
-    // One card-wide markdown state: the preview and the loaded-skill folds
-    // share its table budget and fenced fallback, so their tables together can
-    // never exceed Feishu's per-card limit (spec #652, ticket #655).
-    let mut md = CardMarkdown::new();
-    let content = md.clean(&content);
-    let mut elements = vec![json!({ "tag": "markdown", "content": content })];
-    elements.extend(loaded_skill_folds(skills, "ext_skill_", &mut md));
-    card_shell("💬 有新消息", "blue", elements)
+    let content = sanitize_markdown(&content);
+    card_shell(
+        "💬 有新消息",
+        "blue",
+        vec![json!({ "tag": "markdown", "content": content })],
+    )
 }
 
 /// Replacement for a permission/question card whose request was already resolved
@@ -70,89 +62,14 @@ pub fn build_interrupted_card(kind: &str, detail: &str) -> serde_json::Value {
 mod tests {
     use super::*;
 
-    /// An External Message whose user message attached a skill renders the
-    /// loaded-skill fold beside the preview (spec #652, ticket #655), so a
-    /// skill loaded from another client is visible in Feishu.
+    /// An External Message renders the preview text only (spec #652, ticket
+    /// #655, acceptance reversal): a skill attached from another client is NOT
+    /// rendered here — no loaded-skill fold.
     #[test]
-    fn an_external_message_with_a_skill_renders_the_fold_beside_the_preview() {
-        let skills = vec![MessageSkill {
-            id: "implement-spec".into(),
-            name: "implement-spec".into(),
-            instructions: Some(
-                "<skill_content name=\"implement-spec\">\nDo the thing.\n\
-                 <skill_files>\n<file>/a.md</file>\n</skill_files>\n</skill_content>"
-                    .into(),
-            ),
-        }];
-        let card = build_external_message_card("proj", "看一下这个", &skills);
+    fn an_external_message_renders_only_the_preview() {
+        let card = build_external_message_card("proj", "看一下这个");
         let s = card.to_string();
         assert!(s.contains("看一下这个"), "{s}");
-        assert!(s.contains("🧩 已加载技能：implement-spec"), "{s}");
-        assert!(s.contains("Do the thing."), "{s}");
-        assert!(!s.contains("skill_files"), "file list stripped: {s}");
-    }
-
-    /// A message with no skills renders exactly the preview card as before.
-    #[test]
-    fn an_external_message_without_skills_renders_only_the_preview() {
-        let card = build_external_message_card("proj", "看一下这个", &[]);
-        let s = card.to_string();
-        assert!(s.contains("看一下这个"), "{s}");
-        assert!(!s.contains("已加载技能"), "{s}");
-    }
-
-    /// Several large CJK skills must not push the one-shot notification card
-    /// past Feishu's total limit: the folds share one card-wide body budget
-    /// (spec #652, ticket #655). Every skill still gets its own titled fold.
-    #[test]
-    fn several_large_skills_stay_within_the_message_card_budget() {
-        let huge = "很长的技能说明。".repeat(1_000); // 8,000 CJK chars (24 KB) each
-        let skills: Vec<MessageSkill> = (0..10)
-            .map(|i| MessageSkill {
-                id: format!("s{i}"),
-                name: format!("skill-{i}"),
-                instructions: Some(huge.clone()),
-            })
-            .collect();
-        let card = build_external_message_card("proj", "看一下这个", &skills);
-        let s = card.to_string();
-        assert!(s.contains("🧩 已加载技能：skill-0"), "{s}");
-        assert!(
-            s.contains("🧩 已加载技能：skill-9"),
-            "every skill keeps its own fold: {s}"
-        );
-        let size = s.len();
-        assert!(
-            size <= crate::feishu::card::FEISHU_CARD_LIMIT_BYTES,
-            "the folds pushed the notification to {size} bytes"
-        );
-    }
-
-    /// The external-message preview AND its loaded-skill folds share ONE
-    /// card-wide table budget (spec #652, ticket #655): the preview's tables
-    /// count against the same five the folds draw from, so a 6th anywhere on the
-    /// card renders as code.
-    #[test]
-    fn the_external_preview_and_folds_share_one_table_budget() {
-        use crate::feishu::card::sanitize::MAX_CARD_TABLES;
-
-        let table = "| a | b |\n|---|---|\n| 1 | 2 |";
-        let body = format!("{table}\n\n{table}\n\n{table}");
-        let skills: Vec<MessageSkill> = (0..2)
-            .map(|i| MessageSkill {
-                id: format!("s{i}"),
-                name: format!("skill-{i}"),
-                instructions: Some(body.clone()),
-            })
-            .collect();
-        let card = build_external_message_card("proj", &body, &skills);
-        let s = card.to_string();
-
-        assert_eq!(s.matches("|---|---|").count(), 9, "nine tables present: {s}");
-        assert_eq!(
-            s.matches("```").count() / 2,
-            9 - MAX_CARD_TABLES,
-            "tables past the card-wide budget render as code: {s}"
-        );
+        assert!(!s.contains("已加载技能"), "no skill fold on the preview: {s}");
     }
 }

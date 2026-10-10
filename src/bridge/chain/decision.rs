@@ -832,7 +832,6 @@ mod tests {
         let failed = SessionTranscript::new(vec![
             user("msg_cola_anchor", 1_000, "问题"),
             TranscriptMessage {
-                skills: Vec::new(),
                 error: Some("503".into()),
                 ..assistant(2_000, "")
             },
@@ -948,7 +947,6 @@ mod tests {
         let failed = SessionTranscript::new(vec![
             user("msg_cola_anchor", 1_000, "问题"),
             TranscriptMessage {
-                skills: Vec::new(),
                 error: Some("503".into()),
                 ..assistant(2_000, "答复。")
             },

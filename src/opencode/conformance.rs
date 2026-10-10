@@ -297,6 +297,9 @@ pub(crate) struct SkillListFixture {
     pub(crate) visible_id: &'static str,
     pub(crate) visible_name: &'static str,
     pub(crate) visible_description: &'static str,
+    /// The skill's own markdown as the list route reports it — the body the
+    /// dedicated loaded-skill card's fold renders (spec #652, ticket #655).
+    pub(crate) visible_content: &'static str,
     pub(crate) bare_name: &'static str,
     pub(crate) hidden_id: &'static str,
     pub(crate) hidden_name: &'static str,
@@ -309,6 +312,7 @@ impl Default for SkillListFixture {
             visible_id: "implement-spec",
             visible_name: "Implement Spec",
             visible_description: "Drive a spec to shipped code.",
+            visible_content: "# Implement Spec\n\nDrive it.",
             bare_name: "description-less",
             hidden_id: "hidden-tool",
             hidden_name: "Hidden Tool",
@@ -1122,6 +1126,11 @@ async fn list_skills_yields_the_same_unfiltered_neutral_view_on_every_generation
             .find(|s| s.name == fixture.bare_name)
             .expect("a description-less skill is listed");
         assert_eq!(bare.description, None, "{generation}: no invented description");
+        assert_eq!(
+            skills[0].content.as_deref(),
+            Some(fixture.visible_content),
+            "{generation}: the skill's own markdown is exposed for the loaded-skill card"
+        );
         // V2 keys a skill by its wire id; V1 has no id, so the name is the id.
         if case.generation == Generation::V2 {
             assert_eq!(

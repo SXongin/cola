@@ -25,16 +25,19 @@ fn fixture_skills() -> Vec<SkillInfo> {
             id: "implement-spec".into(),
             name: "Implement Spec".into(),
             description: Some("Drive a spec to shipped code.".into()),
+            content: Some("# Implement Spec\n\nDrive it.".into()),
         },
         SkillInfo {
             id: "foreman".into(),
             name: "Foreman".into(),
             description: None,
+            content: Some("# Foreman\n\nRun the batch.".into()),
         },
         SkillInfo {
             id: "hidden-tool".into(),
             name: "Hidden Tool".into(),
             description: Some("Never advertised to the model.".into()),
+            content: None,
         },
     ]
 }
@@ -157,6 +160,27 @@ fn card_buttons(card: &serde_json::Value) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The dedicated loaded-skill card among the replied cards (spec #652, ticket
+/// #655): the one whose own title is `🧩 已加载技能`.
+async fn loaded_skill_card(fx: &SkillFixture) -> serde_json::Value {
+    fx.platform
+        .replied_cards()
+        .await
+        .into_iter()
+        .find(|card| card["header"]["title"]["content"] == "🧩 已加载技能")
+        .expect("the loaded-skill card must reply under the user's message")
+}
+
+/// Every collapsible panel of a card, in order.
+fn collapsible_panels(card: &serde_json::Value) -> Vec<&serde_json::Value> {
+    card["body"]["elements"]
+        .as_array()
+        .expect("card body elements")
+        .iter()
+        .filter(|element| element["tag"] == "collapsible_panel")
+        .collect()
+}
+
 /// Wait until `recorder` holds at least `n` entries (a submission off the ack
 /// path runs on a spawned task), or fail loudly.
 async fn wait_for<T>(recorder: &Arc<tokio::sync::Mutex<Vec<T>>>, n: usize) {
@@ -209,6 +233,88 @@ async fn repeated_skill_tokens_load_every_skill_in_order() {
         *fx.prompt_skills.lock().await,
         vec![vec![resolved("implement-spec"), resolved("foreman")]]
     );
+}
+
+/// A resolved `/skill <id>` replies the dedicated loaded-skill card under the
+/// user's message (spec #652, ticket #655, acceptance reversal): a
+/// `🧩 已加载技能：<name>` fold whose body is the skill-list read's `content`.
+/// The card is NOT the live Turn card; it is its own small card.
+#[tokio::test]
+async fn a_resolved_skill_replies_the_loaded_skill_card_with_the_content_body() {
+    let fx = SkillFixture::build().await;
+
+    fx.send("/skill implement-spec 644").await;
+
+    let card = loaded_skill_card(&fx).await;
+    assert_eq!(
+        card["header"]["title"]["content"], "🧩 已加载技能",
+        "the dedicated card's own title: {card}"
+    );
+    let panel = collapsible_panels(&card)[0];
+    assert_eq!(
+        panel["header"]["title"]["content"], "🧩 已加载技能：Implement Spec",
+        "the fold names the canonical skill: {card}"
+    );
+    let body = panel["elements"][0]["content"].as_str().unwrap();
+    assert!(body.contains("Drive it."), "the body is the list content: {body}");
+}
+
+/// Repeated ids dedupe by id, first-occurrence order preserved: `/skill a
+/// /skill a` attaches the skill once and the loaded-skill card shows ONE fold,
+/// not two (spec #652, ticket #655).
+#[tokio::test]
+async fn repeated_tokens_dedupe_to_one_fold_and_one_attachment() {
+    let fx = SkillFixture::build().await;
+
+    fx.send("/skill implement-spec /skill implement-spec").await;
+
+    assert_eq!(
+        *fx.prompt_skills.lock().await,
+        vec![vec![resolved("implement-spec")]],
+        "the server dedupes injection; cola must dedupe the attachment too"
+    );
+    let card = loaded_skill_card(&fx).await;
+    assert_eq!(
+        collapsible_panels(&card).len(),
+        1,
+        "one fold per distinct skill: {card}"
+    );
+}
+
+/// A multi-skill dispatch folds every DISTINCT loaded skill, one panel each,
+/// in first-occurrence order.
+#[tokio::test]
+async fn a_multi_skill_dispatch_folds_one_panel_per_distinct_skill() {
+    let fx = SkillFixture::build().await;
+
+    fx.send("/skill foreman /skill implement-spec /skill foreman")
+        .await;
+
+    let card = loaded_skill_card(&fx).await;
+    let titles: Vec<&str> = collapsible_panels(&card)
+        .iter()
+        .map(|p| p["header"]["title"]["content"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        titles,
+        ["🧩 已加载技能：Foreman", "🧩 已加载技能：Implement Spec"],
+        "distinct skills, first-occurrence order: {card}"
+    );
+}
+
+/// A skill the list read carried no `content` for still renders its titled
+/// fold (spec #652, ticket #655): the empty body degrades to a marker, never an
+/// empty panel.
+#[tokio::test]
+async fn an_empty_content_skill_still_renders_a_titled_fold() {
+    let fx = SkillFixture::build().await;
+
+    fx.send("/skill hidden-tool").await;
+
+    let card = loaded_skill_card(&fx).await;
+    let panel = collapsible_panels(&card)[0];
+    assert_eq!(panel["header"]["title"]["content"], "🧩 已加载技能：Hidden Tool");
+    assert_eq!(panel["elements"][0]["content"], "（无说明）");
 }
 
 /// A bare `/skill <id>` — no text after the token — is accepted and still loads
@@ -370,7 +476,12 @@ async fn a_picker_row_tap_submits_the_skill_command() {
         .clone();
 
     let result = fx.app.host_action(value).await;
-    assert!(result.is_some(), "the tap must ack");
+    let result = result.expect("the tap must ack");
+    assert_eq!(
+        result.toast.as_deref(),
+        Some("正在加载技能 implement-spec…"),
+        "the tap toasts"
+    );
 
     wait_for(&fx.prompt_calls, 1).await;
     assert_eq!(
@@ -381,6 +492,13 @@ async fn a_picker_row_tap_submits_the_skill_command() {
     assert_eq!(
         *fx.prompt_skills.lock().await,
         vec![vec![resolved("implement-spec")]]
+    );
+    // The tap path replies the same dedicated loaded-skill card a typed
+    // command does (spec #652, ticket #655).
+    let card = loaded_skill_card(&fx).await;
+    assert_eq!(
+        collapsible_panels(&card)[0]["header"]["title"]["content"],
+        "🧩 已加载技能：Implement Spec"
     );
 }
 
@@ -472,6 +590,7 @@ async fn a_picker_row_with_a_whitespace_id_still_loads() {
         id: "Implement Spec".into(),
         name: "Implement Spec".into(),
         description: None,
+        content: None,
     }]);
     let fx = SkillFixture::with(backend).await;
     fx.send("/skill").await;
