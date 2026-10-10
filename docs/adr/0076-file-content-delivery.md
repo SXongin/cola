@@ -28,7 +28,7 @@ way a turn's several images stay tied to the call that read each one.
     jpg), GIF ≤2000×2000 and others ≤12000×12000, returning a reusable
     `image_key`.
   - `POST /open-apis/im/v1/files` (scope `im:resource`) uploads a file ≤30MB,
-    returning a `file_key`; `msg_type:"file"` (or `"image"`) sends it.
+    returning a `file_key`; `msg_type:"file"` sends it.
   - An uploaded key is stable and reusable: **one upload serves every later
     PATCH**, so a card rebuild never re-uploads.
   - An inline `data:` URI cannot be embedded directly: the base64 payload blows
@@ -132,7 +132,8 @@ and **File Message** (the separate message cola posts for one it cannot embed).
 ## Tests (implementation batch)
 
 The implementation batch (spec #644, tickets #646–#649) adds the tests at the
-three existing seams: the Feishu wire client (the new upload/send request
-bodies), the pure card builder (the `img` element, the three tracking-line
+three existing seams: the Feishu wire client (the upload multipart fields, the
+bearer/token flow, the `msg_type:"file"` content, `reply_in_thread`, and
+business-error mapping), the pure card builder (the `img` element, the three tracking-line
 states, the content-rejection fenced fallback), and the bridge mock Platform
 (the pre-resolve, the content-hash dedup, the fallback ladder, the once-guard).
