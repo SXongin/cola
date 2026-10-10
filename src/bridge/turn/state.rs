@@ -506,20 +506,6 @@ fn panel_estimate(p: &ToolPanel) -> usize {
     400 + input + output
 }
 
-/// Estimated serialized size (bytes) of one loaded-skill fold (spec #652,
-/// ticket #655), mirroring [`StreamAccumulator::estimate_split_index`]'s
-/// accounting: element overhead plus the title and the body the renderer keeps
-/// (capped at the tool-output budget). Shared with the tail reserve, so the
-/// card and its skills stay together under the cap.
-fn skill_estimate(skill: &crate::backend::MessageSkill) -> usize {
-    let instructions = skill
-        .instructions
-        .as_deref()
-        .map(|text| first_n_chars_bytes(text, crate::feishu::card::tool_render::TOOL_OUTPUT_MAX_CHARS))
-        .unwrap_or(0);
-    400 + skill.name.len() + instructions
-}
-
 /// A permission request surfaced inline on the streaming card (instead of a
 /// separate card), so the whole turn lives on ONE card.
 #[derive(Debug, Clone)]
@@ -3991,10 +3977,10 @@ impl StreamAccumulator {
             // is excluded on a card no live renderer owns, exactly as
             // `build_card_inner` omits it ([`Self::omitted_live_seeded`]): the
             // reserve must not charge for what the build will not render.
-            for skill in &self.loaded_skills {
-                comps += 1;
-                size += skill_estimate(skill);
-            }
+            let (skill_size, skill_comps) =
+                crate::feishu::card::skill::loaded_skill_folds_estimate(&self.loaded_skills);
+            comps += skill_comps;
+            size += skill_size;
             if let Some(panel) = &self.todo_panel {
                 comps += 1;
                 size += panel_estimate(panel);
@@ -4105,13 +4091,11 @@ impl StreamAccumulator {
         // Ledger (ADR-0045/0060), so they always land on the newest card of the
         // chain — re-rendered on every flush rather than frozen into a timeline
         // row. A message with no skills (and every V1 message) renders nothing,
-        // exactly as before; a stable id keeps the reader's fold state.
+        // exactly as before; the folds share one card-wide size and count
+        // budget, mirroring the splitter's reserve.
         if include_tail {
-            for (i, skill) in self.loaded_skills.iter().enumerate() {
-                builder = builder.with_element(crate::feishu::card::skill::loaded_skill_panel(
-                    skill,
-                    Some(&format!("skill_{i}")),
-                ));
+            for panel in crate::feishu::card::skill::loaded_skill_folds(&self.loaded_skills, "skill_") {
+                builder = builder.with_element(panel);
             }
         }
 

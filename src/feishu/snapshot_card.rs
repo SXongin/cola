@@ -111,6 +111,10 @@ fn tail_panels(tail: &[TailEntry]) -> Vec<serde_json::Value> {
         return panels;
     }
     panels.push(json!({ "tag": "markdown", "content": "**最近对话**" }));
+    // The loaded-skill folds share ONE card-wide budget across every entry
+    // (spec #652, ticket #655), so several messages' large skills cannot push
+    // the one-shot snapshot past Feishu's total limit.
+    let mut folds = crate::feishu::card::skill::SkillFolds::new();
     // Transcript text is model/user-authored: sanitize it for the card dialect
     // (one budget for the card's tail).
     let mut md = crate::feishu::card::sanitize::CardMarkdown::new();
@@ -139,12 +143,7 @@ fn tail_panels(tail: &[TailEntry]) -> Vec<serde_json::Value> {
         ));
         // The message's attached skills (spec #652, ticket #655) ride beside
         // its text, so a skill loaded by another client is visible in Feishu.
-        for (s, skill) in entry.skills.iter().enumerate() {
-            panels.push(crate::feishu::card::skill::loaded_skill_panel(
-                skill,
-                Some(&format!("snap_{i}_skill_{s}")),
-            ));
-        }
+        panels.extend(folds.render(&entry.skills, &format!("snap_{i}_skill_")));
     }
     panels
 }
@@ -698,6 +697,33 @@ mod tests {
         );
         let plain = build_snapshot_card("接管", "t", &plain, None);
         assert!(!plain.to_string().contains("已加载技能"), "{plain}");
+    }
+
+    /// Several large CJK skills attached to one message must not push the
+    /// one-shot snapshot past Feishu's total card limit: the folds share one
+    /// card-wide body budget (spec #652, ticket #655). Without the shared
+    /// budget, four 3,000-char CJK bodies alone are 36 KB — the card is
+    /// rejected.
+    #[test]
+    fn several_large_skills_stay_within_the_snapshot_budget() {
+        let huge = "很长的技能说明。".repeat(1_000); // 8,000 CJK chars (24 KB) each
+        let mut entry = tail(MessageRole::User, 1000, "/skill implement-spec");
+        entry.skills = (0..4)
+            .map(|i| MessageSkill {
+                id: format!("s{i}"),
+                name: format!("skill-{i}"),
+                instructions: Some(huge.clone()),
+            })
+            .collect();
+        let d = data(Some(opencode::types::SessionStatus::Idle), vec![], vec![entry]);
+        let card = build_snapshot_card("接管", "t", &d, None);
+        let s = card.to_string();
+        assert!(s.contains("🧩 已加载技能：skill-0"), "{s}");
+        let size = s.len();
+        assert!(
+            size <= crate::feishu::card::FEISHU_CARD_LIMIT_BYTES,
+            "the folds pushed the snapshot to {size} bytes"
+        );
     }
 
     /// Worst-case input (4-message tail + 2 pending blocks) must stay within

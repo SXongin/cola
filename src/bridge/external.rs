@@ -3,7 +3,9 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::Instrument;
 
-use crate::backend::{MessageRole, MessageSkill, Part, SessionTranscript, TurnAnchor, TurnSettle};
+use crate::backend::{
+    MessageRole, MessageSkill, Part, SessionTranscript, TranscriptMessage, TurnAnchor, TurnSettle,
+};
 use crate::bridge::handles::{CardsHandle, FlowHandles, NoticeRules};
 use crate::bridge::turn::{
     CardClass, CardOwnership, ContinuationFacts, ContinuationLine, Disposition, SettleTiming, Turn,
@@ -1671,6 +1673,20 @@ async fn idle_bound_reached(handles: &FlowHandles, session_id: &str, anchor: &Tu
     }
 }
 
+/// The user messages the External Message names: those created at the anchor's
+/// server time (typically one). Both the preview text and the attached skills
+/// read this ONE selection, so the two views of the message cannot drift apart.
+fn anchor_user_messages<'a>(
+    transcript: &'a SessionTranscript,
+    anchor: &'a TurnAnchor,
+) -> impl Iterator<Item = &'a TranscriptMessage> {
+    transcript
+        .messages
+        .iter()
+        .filter(|message| message.role == MessageRole::User)
+        .filter(|message| message.time.is_some_and(|time| time.created == anchor.created_ms))
+}
+
 /// Preview of the External Message for the notification card: every user
 /// message the backend reported at the anchor's server time (typically one),
 /// its text and reasoning parts concatenated verbatim with no separator, then
@@ -1682,11 +1698,7 @@ async fn idle_bound_reached(handles: &FlowHandles, session_id: &str, anchor: &Tu
 /// prevent. Such a part carrying top-level `text` does not occur in user
 /// messages in practice.
 fn message_preview(transcript: &SessionTranscript, anchor: &TurnAnchor) -> String {
-    transcript
-        .messages
-        .iter()
-        .filter(|message| message.role == MessageRole::User)
-        .filter(|message| message.time.is_some_and(|time| time.created == anchor.created_ms))
+    anchor_user_messages(transcript, anchor)
         .flat_map(|message| message.parts.iter())
         .filter_map(|part| match part {
             Part::Text(text) => Some(text.text.as_str()),
@@ -1701,14 +1713,10 @@ fn message_preview(transcript: &SessionTranscript, anchor: &TurnAnchor) -> Strin
 
 /// The skills the External Message's user messages attached (spec #652, ticket
 /// #655), in read order, so the notification card can render the loaded-skill
-/// fold beside the preview. The same same-epoch selection [`message_preview`]
-/// folds, so the two views of one message cannot drift apart.
+/// fold beside the preview. Reads the same [`anchor_user_messages`] selection
+/// the preview does.
 fn message_skills(transcript: &SessionTranscript, anchor: &TurnAnchor) -> Vec<MessageSkill> {
-    transcript
-        .messages
-        .iter()
-        .filter(|message| message.role == MessageRole::User)
-        .filter(|message| message.time.is_some_and(|time| time.created == anchor.created_ms))
+    anchor_user_messages(transcript, anchor)
         .flat_map(|message| message.skills.iter().cloned())
         .collect()
 }

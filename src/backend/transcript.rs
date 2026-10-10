@@ -2636,6 +2636,45 @@ mod tests {
         assert_eq!(tail[1].text, "回答");
     }
 
+    /// The tail copies each message's attached skills into its entry (spec #652,
+    /// ticket #655), so the snapshot's loaded-skill fold reads them through this
+    /// public projection — not a hand-built entry. An assistant message carries
+    /// none.
+    #[test]
+    fn tail_copies_each_messages_attached_skills() {
+        let mut with_skills = message(
+            "u1",
+            MessageRole::User,
+            Some(MessageTime {
+                created: 1_000,
+                completed: Some(1_000),
+            }),
+            vec![text_part("看一下")],
+        );
+        with_skills.skills = vec![MessageSkill {
+            id: "implement-spec".into(),
+            name: "implement-spec".into(),
+            instructions: Some("body".into()),
+        }];
+        let assistant = message(
+            "a1",
+            MessageRole::Assistant,
+            Some(MessageTime {
+                created: 2_000,
+                completed: Some(2_000),
+            }),
+            vec![text_part("回答")],
+        );
+
+        let tail = SessionTranscript::new(vec![with_skills, assistant]).transcript_tail();
+        assert_eq!(tail.len(), 2);
+        assert_eq!(tail[0].skills.len(), 1, "{:?}", tail[0].skills);
+        assert_eq!(tail[0].skills[0].id, "implement-spec");
+        assert_eq!(tail[0].skills[0].name, "implement-spec");
+        assert_eq!(tail[0].skills[0].instructions.as_deref(), Some("body"));
+        assert!(tail[1].skills.is_empty(), "an assistant message carries none");
+    }
+
     #[test]
     fn a_message_without_time_has_no_anchor() {
         let timeless = message("msg_x", MessageRole::User, None, vec![text_part("你好")]);

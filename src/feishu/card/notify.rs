@@ -3,7 +3,7 @@ use serde_json::json;
 use super::clean_session_label;
 use super::sanitize::sanitize_markdown;
 use super::shell::card_shell;
-use super::skill::loaded_skill_panel;
+use super::skill::loaded_skill_folds;
 use crate::backend::MessageSkill;
 
 /// A notification card telling the Feishu side that OpenChamber (or another
@@ -25,9 +25,7 @@ pub fn build_external_message_card(
     content.push_str(preview);
     let content = sanitize_markdown(&content);
     let mut elements = vec![json!({ "tag": "markdown", "content": content })];
-    for (i, skill) in skills.iter().enumerate() {
-        elements.push(loaded_skill_panel(skill, Some(&format!("ext_skill_{i}"))));
-    }
+    elements.extend(loaded_skill_folds(skills, "ext_skill_"));
     card_shell("💬 有新消息", "blue", elements)
 }
 
@@ -97,5 +95,28 @@ mod tests {
         let s = card.to_string();
         assert!(s.contains("看一下这个"), "{s}");
         assert!(!s.contains("已加载技能"), "{s}");
+    }
+
+    /// Several large CJK skills must not push the one-shot notification card
+    /// past Feishu's total limit: the folds share one card-wide body budget
+    /// (spec #652, ticket #655).
+    #[test]
+    fn several_large_skills_stay_within_the_message_card_budget() {
+        let huge = "很长的技能说明。".repeat(1_000); // 8,000 CJK chars (24 KB) each
+        let skills: Vec<MessageSkill> = (0..4)
+            .map(|i| MessageSkill {
+                id: format!("s{i}"),
+                name: format!("skill-{i}"),
+                instructions: Some(huge.clone()),
+            })
+            .collect();
+        let card = build_external_message_card("proj", "看一下这个", &skills);
+        let s = card.to_string();
+        assert!(s.contains("🧩 已加载技能：skill-0"), "{s}");
+        let size = s.len();
+        assert!(
+            size <= crate::feishu::card::FEISHU_CARD_LIMIT_BYTES,
+            "the folds pushed the notification to {size} bytes"
+        );
     }
 }
