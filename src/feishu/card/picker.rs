@@ -2,6 +2,7 @@ use serde_json::json;
 
 use super::MAX_CARD_JSON_CHARS;
 use super::shell::card_shell;
+use super::truncate_md;
 
 /// A generic option-picker card: one button per option. Shared by the
 /// `/agent`, `/model` and `/autoaccept` dual-form cards. Each button carries
@@ -14,7 +15,21 @@ fn option_picker_card(
     action: &str,
     options: &[(String, String)],
 ) -> serde_json::Value {
-    picker_card(header, intro, thread_key, action, None, false, None, options)
+    picker_card(
+        header, intro, thread_key, action, None, false, None, options, None,
+    )
+}
+
+/// Add one extra routing pair to a button's callback payload (spec #652,
+/// ticket #656): the `/skill` picker carries the conversation's `chat_type`
+/// alongside `chat_id`/`thread_id`, so a tap reconstructs the exact
+/// [`ConversationKind`](crate::config::ConversationKind) the picker was sent in.
+/// Every other picker passes `None`.
+fn with_extra(mut payload: serde_json::Value, extra: Option<(&str, &str)>) -> serde_json::Value {
+    if let Some((key, value)) = extra {
+        payload[key] = serde_json::Value::String(value.to_string());
+    }
+    payload
 }
 
 /// The `/model` picker-card back button's value: clicking it returns from a
@@ -60,6 +75,7 @@ fn picker_card(
     back: bool,
     clear: Option<(&str, &str)>,
     options: &[(String, String)],
+    extra: Option<(&str, &str)>,
 ) -> serde_json::Value {
     let mut elements: Vec<serde_json::Value> = vec![json!({
         "tag": "markdown",
@@ -71,13 +87,13 @@ fn picker_card(
             "text": { "tag": "plain_text", "content": "← 返回全部 provider" },
             "type": "default",
             "width": "fill",
-            "value": {
+            "value": with_extra(json!({
                 "action": action,
                 "chat_id": thread_key.chat_id,
                 "thread_id": thread_key.thread_id,
                 "level": PickerLevel::Provider.as_str(),
                 "value": PICKER_BACK_TO_PROVIDERS,
-            },
+            }), extra),
         }));
     }
     if let Some((label, clear_action)) = clear {
@@ -86,12 +102,12 @@ fn picker_card(
             "text": { "tag": "plain_text", "content": label },
             "type": "default",
             "width": "fill",
-            "value": {
+            "value": with_extra(json!({
                 "action": clear_action,
                 "chat_id": thread_key.chat_id,
                 "thread_id": thread_key.thread_id,
                 "value": "",
-            },
+            }), extra),
         }));
     }
     for (label, value) in options {
@@ -109,7 +125,7 @@ fn picker_card(
             "text": { "tag": "plain_text", "content": label },
             "type": "default",
             "width": "fill",
-            "value": payload,
+            "value": with_extra(payload, extra),
         }));
     }
     card_shell(header, "blue", elements)
@@ -162,6 +178,7 @@ pub fn build_agent_card(
             Some(("默认（清除）", "agent_clear"))
         },
         &options,
+        None,
     )
 }
 
@@ -198,6 +215,7 @@ pub fn build_model_provider_cards(
             false,
             None,
             &[],
+            None,
         )];
     }
     chunk_picker_cards(
@@ -213,6 +231,7 @@ pub fn build_model_provider_cards(
         false,
         None,
         &options,
+        None,
     )
 }
 
@@ -252,6 +271,7 @@ pub fn build_model_picker_cards(
             true,
             None,
             &[],
+            None,
         )];
     }
     chunk_picker_cards(
@@ -263,6 +283,7 @@ pub fn build_model_picker_cards(
         true,
         None,
         &options,
+        None,
     )
 }
 
@@ -286,6 +307,7 @@ fn chunk_picker_cards(
     back: bool,
     clear: Option<(&str, &str)>,
     options: &[(String, String)],
+    extra: Option<(&str, &str)>,
 ) -> Vec<serde_json::Value> {
     let mut pages: Vec<&[(String, String)]> = Vec::new();
     let mut start = 0usize;
@@ -325,6 +347,7 @@ fn chunk_picker_cards(
             back,
             clear,
             page,
+            extra,
         ));
     }
     cards
@@ -374,6 +397,78 @@ pub fn build_think_card(
         false,
         Some(("默认（清除）", "think_clear")),
         &options,
+        None,
+    )
+}
+
+/// How many characters a skill row's button label shows before clipping. A
+/// button is a single line, so a long frontmatter description is clipped with a
+/// "…" rather than bloating the card; the skill's `name` always leads.
+const SKILL_ROW_LABEL_CHARS: usize = 60;
+
+/// The `/skill` picker (spec #652, ticket #656): one button per registered
+/// skill — its `name`, plus its `description` when it declares one — so a user
+/// who does not know an id can pick one. The callback value is the skill's
+/// generation identity (`id`); a tap re-enters the message pipeline as
+/// `/skill <id>`. `chat_type` rides each button so the tap reconstructs the
+/// [`ConversationKind`](crate::config::ConversationKind) the picker was sent in
+/// (the same routing payload every card button carries, next to `chat_id` /
+/// `thread_id`). `error`, when set, leads the intro so the SAME card answers
+/// both a bare `/skill` and an unknown id. An empty list opens the no-skills
+/// state.
+pub(crate) fn build_skill_cards(
+    thread_key: &crate::config::ThreadKey,
+    skills: &[crate::backend::SkillInfo],
+    chat_type: &str,
+    error: Option<&str>,
+) -> Vec<serde_json::Value> {
+    let mut intro = error.map(|e| format!("{e}\n")).unwrap_or_default();
+    if skills.is_empty() {
+        intro.push_str("_(没有可用技能)_");
+        return vec![picker_card(
+            "🧩 选择技能",
+            &intro,
+            thread_key,
+            "skill",
+            None,
+            false,
+            None,
+            &[],
+            Some(("chat_type", chat_type)),
+        )];
+    }
+    intro.push_str("**选择技能**（点击后以 `/skill <id>` 发送）：");
+    let options: Vec<(String, String)> = skills
+        .iter()
+        .map(|skill| {
+            let label = match skill
+                .description
+                .as_deref()
+                .map(str::trim)
+                .filter(|d| !d.is_empty())
+            {
+                Some(description) => {
+                    // A button is one line: a folded/multi-line frontmatter
+                    // description is clipped to its first line, then to the row
+                    // budget, so a newline never reaches Feishu's `plain_text`.
+                    let one_line = description.lines().next().unwrap_or("").trim();
+                    truncate_md(&format!("{} — {}", skill.name, one_line), SKILL_ROW_LABEL_CHARS)
+                }
+                None => skill.name.clone(),
+            };
+            (label, skill.id.clone())
+        })
+        .collect();
+    chunk_picker_cards(
+        "🧩 选择技能",
+        &intro,
+        thread_key,
+        "skill",
+        None,
+        false,
+        None,
+        &options,
+        Some(("chat_type", chat_type)),
     )
 }
 
@@ -381,7 +476,6 @@ pub fn build_think_card(
 mod tests {
     use super::*;
     use crate::feishu::card::FEISHU_CARD_LIMIT_BYTES;
-
     /// A provider list of any size must never build a card over Feishu's
     /// ceilings: the `/model` picker chunks into pages under the byte budget.
     #[test]
@@ -603,6 +697,94 @@ mod tests {
         assert!(
             !text.contains("\"value\":\"explore\""),
             "no filtered agent leaks into options: {text}"
+        );
+    }
+
+    /// The `/skill` picker lists EVERY registered skill — a hidden
+    /// (`disable-model-invocation`) and a description-less one included — one
+    /// row each under the `skill` action. The row label carries the name and,
+    /// when present, the description; the callback value is the skill identity,
+    /// and the conversation's `chat_type` rides every button for the tap.
+    #[test]
+    fn skill_cards_list_every_entry_with_descriptions_and_routing() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let skills = [
+            crate::backend::SkillInfo {
+                id: "implement-spec".into(),
+                name: "Implement Spec".into(),
+                description: Some("Drive a spec to shipped code.".into()),
+            },
+            crate::backend::SkillInfo {
+                id: "bare".into(),
+                name: "Bare".into(),
+                description: None,
+            },
+            crate::backend::SkillInfo {
+                id: "hidden-tool".into(),
+                name: "Hidden Tool".into(),
+                description: Some("Never advertised to the model.".into()),
+            },
+        ];
+        let cards = build_skill_cards(&key, &skills, "p2p", None);
+        assert_eq!(cards.len(), 1, "three skills fit one card");
+        let text = cards[0].to_string();
+        assert!(text.contains("选择技能"), "header: {text}");
+        for skill in &skills {
+            assert!(text.contains(&skill.name), "row for {}: {text}", skill.name);
+        }
+        assert!(
+            text.contains("Drive a spec to shipped code."),
+            "description shown: {text}"
+        );
+        let buttons = cards[0]["body"]["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["tag"] == "button")
+            .collect::<Vec<_>>();
+        assert_eq!(buttons.len(), 3, "one row per skill");
+        assert_eq!(buttons[0]["value"]["action"].as_str(), Some("skill"));
+        assert_eq!(buttons[0]["value"]["value"].as_str(), Some("implement-spec"));
+        assert_eq!(buttons[0]["value"]["chat_type"].as_str(), Some("p2p"));
+        assert!(
+            !buttons[1]["text"]["content"].as_str().unwrap().contains("Bare —"),
+            "a description-less skill shows only its name: {text}"
+        );
+        assert_eq!(
+            buttons[2]["value"]["value"].as_str(),
+            Some("hidden-tool"),
+            "the hidden skill is selectable"
+        );
+    }
+
+    /// An empty skill list renders the no-skills state (one card, no buttons),
+    /// and an `error` prefix leads the SAME list on an unknown id.
+    #[test]
+    fn skill_cards_render_empty_and_error_states() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let empty = build_skill_cards(&key, &[], "group", None);
+        assert_eq!(empty.len(), 1);
+        assert!(empty[0].to_string().contains("没有可用技能"), "no-skills state");
+
+        let skills = [crate::backend::SkillInfo {
+            id: "implement-spec".into(),
+            name: "Implement Spec".into(),
+            description: None,
+        }];
+        let with_error = build_skill_cards(&key, &skills, "group", Some("⚠️ 未找到技能：`nope`"));
+        let text = with_error[0].to_string();
+        assert!(text.contains("未找到技能"), "error line: {text}");
+        assert!(text.contains("nope"), "error names the id: {text}");
+        assert!(text.contains("Implement Spec"), "the list still follows: {text}");
+        assert_eq!(
+            with_error[0]["body"]["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|e| e["tag"] == "button")
+                .count(),
+            1,
+            "the list follows the error"
         );
     }
 }
