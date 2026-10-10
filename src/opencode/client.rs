@@ -10,7 +10,9 @@
 
 use std::sync::{Arc, RwLock};
 
-use crate::backend::{BackgroundTaskOverlay, ChildEvidence, PromptSkill, SessionTranscript, TaskRuntime};
+use crate::backend::{
+    BackgroundTaskOverlay, ChildEvidence, PromptSkill, SessionTranscript, SkillInfo, TaskRuntime,
+};
 
 use super::parsing::parse_model;
 use super::strategy::{Generation, GenerationStrategy};
@@ -476,6 +478,13 @@ impl OpenCodeBackend {
 
     pub async fn list_agents(&self) -> Vec<AgentInfo> {
         self.strategy().list_agents(&self.transport).await
+    }
+
+    /// The registered skills (`GET /api/skill` on V2, `GET /skill` on V1), for
+    /// the `/skill` picker and the `/skill <id>` resolution (spec #652, ticket
+    /// #656). Best-effort: an unreadable failure yields an empty list.
+    pub async fn list_skills(&self) -> Vec<SkillInfo> {
+        self.strategy().list_skills(&self.transport).await
     }
 
     pub async fn list_models(&self) -> Vec<ProviderModels> {

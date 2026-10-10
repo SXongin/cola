@@ -64,6 +64,11 @@ pub(crate) struct SessionCase {
     /// switch is observable in the following read; V1 mounts nothing (its
     /// switches are no-ops).
     pub(crate) mount_selection: fn(&TestHttpServer, &SessionReadFixture),
+    /// Mount the generation's skill-list read, publishing the shared
+    /// [`SkillListFixture`] values in that generation's shape (V2's `{data}`
+    /// envelope of `Skill.Info`; V1's bare array, where the name is the
+    /// identity).
+    pub(crate) mount_skills: fn(&TestHttpServer, &SkillListFixture),
 }
 
 /// The neutral values both generations' session-read payloads publish. One
@@ -275,6 +280,35 @@ impl Default for RequestFixture {
             field_question: "选哪个目录？",
             option_value: "/a",
             option_label: "目录 A",
+        }
+    }
+}
+
+/// The neutral values both generations' skill-list payloads publish (spec #652,
+/// ticket #656): a visible skill with a description, a description-less skill,
+/// and a hidden (`autoinvoke: false`) one. The read must surface ALL THREE —
+/// including-hidden is the point of the picker — and the generation owns the
+/// spelling: V2 carries `{id, name, description?}` (its `Skill.Info`), while V1
+/// has no id, so its identity (and the neutral `id`) IS the name.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SkillListFixture {
+    pub(crate) visible_id: &'static str,
+    pub(crate) visible_name: &'static str,
+    pub(crate) visible_description: &'static str,
+    pub(crate) bare_name: &'static str,
+    pub(crate) hidden_id: &'static str,
+    pub(crate) hidden_name: &'static str,
+}
+
+impl Default for SkillListFixture {
+    fn default() -> Self {
+        Self {
+            visible_id: "implement-spec",
+            visible_name: "Implement Spec",
+            visible_description: "Drive a spec to shipped code.",
+            bare_name: "description-less",
+            hidden_id: "hidden-tool",
+            hidden_name: "Hidden Tool",
         }
     }
 }
@@ -1039,5 +1073,54 @@ async fn resume_support_matches_the_generation() {
             "{generation}: the capability must answer without a wire read: {:?}",
             server.requests()
         );
+    }
+}
+
+/// The skill-list read has the same neutral outcome on both generations: the
+/// unfiltered `{ id, name, description? }` list the `/skill` picker and the
+/// `/skill <id>` resolution consume (spec #652, ticket #656). V2 carries the
+/// wire `id`; V1 has no id, so its name IS the neutral id. A hidden skill and a
+/// description-less one both survive the read.
+#[tokio::test]
+async fn list_skills_yields_the_same_unfiltered_neutral_view_on_every_generation() {
+    for case in cases() {
+        let generation = case.generation.as_str();
+        let fixture = SkillListFixture::default();
+        let server = TestHttpServer::start().await;
+        (case.mount_skills)(&server, &fixture);
+        let backend = case.backend(&server);
+
+        let skills = backend.list_skills().await;
+        assert_eq!(skills.len(), 3, "{generation}: every registered skill is listed");
+        assert_eq!(
+            skills[0].name, fixture.visible_name,
+            "{generation}: the human-facing name is kept"
+        );
+        assert_eq!(
+            skills[0].description.as_deref(),
+            Some(fixture.visible_description),
+            "{generation}: a declared description is exposed"
+        );
+        assert!(
+            skills.iter().any(|s| s.name == fixture.hidden_name),
+            "{generation}: a hidden skill must still be listed: {skills:?}"
+        );
+        let bare = skills
+            .iter()
+            .find(|s| s.name == fixture.bare_name)
+            .expect("a description-less skill is listed");
+        assert_eq!(bare.description, None, "{generation}: no invented description");
+        // V2 keys a skill by its wire id; V1 has no id, so the name is the id.
+        if case.generation == Generation::V2 {
+            assert_eq!(
+                skills[0].id, fixture.visible_id,
+                "{generation}: the wire id is the identity"
+            );
+        } else {
+            assert_eq!(
+                skills[0].id, fixture.visible_name,
+                "{generation}: V1's name is its identity"
+            );
+        }
     }
 }

@@ -7,7 +7,7 @@
 use serde_json::{Map, Value, json};
 
 use crate::opencode::conformance::{
-    PromptFixture, RequestFixture, SessionCase, SessionReadFixture, TranscriptFixture,
+    PromptFixture, RequestFixture, SessionCase, SessionReadFixture, SkillListFixture, TranscriptFixture,
 };
 use crate::opencode::strategy::Generation;
 use crate::test_http::{MockResponse, TestHttpServer};
@@ -27,12 +27,43 @@ pub(crate) fn case() -> SessionCase {
         mount_prompt,
         mount_requests,
         mount_selection,
+        mount_skills,
     }
 }
 
 /// V1 mounts nothing: it has no session switch routes, so the conformance
 /// scenario's switches are no-ops and must stay off the wire.
 fn mount_selection(_server: &TestHttpServer, _fixture: &SessionReadFixture) {}
+
+/// The V1 skill read: `GET /skill`, a bare `Skill.Info` array (no envelope).
+/// V1 keys skills by name — there is no id — so each entry carries only
+/// `name` + optional `description` (+ `location`/`content`, ignored).
+fn mount_skills(server: &TestHttpServer, fixture: &SkillListFixture) {
+    server.route(
+        "GET",
+        "/skill",
+        200,
+        json!([
+            {
+                "name": fixture.visible_name,
+                "description": fixture.visible_description,
+                "location": "/work/skills/implement-spec/SKILL.md",
+                "content": "body",
+            },
+            {
+                "name": fixture.bare_name,
+                "location": "/work/skills/description-less/SKILL.md",
+                "content": "body",
+            },
+            {
+                "name": fixture.hidden_name,
+                "location": "/work/skills/hidden-tool/SKILL.md",
+                "content": "body",
+            },
+        ])
+        .to_string(),
+    );
+}
 
 fn mount(server: &TestHttpServer, fixture: &SessionReadFixture) {
     // Two pages, most recently updated first, with the cursor in the header —

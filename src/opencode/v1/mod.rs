@@ -21,7 +21,7 @@ mod tests;
 
 use async_trait::async_trait;
 
-use crate::backend::{ChildEvidence, PromptSkill, SessionTranscript, TaskRuntime};
+use crate::backend::{ChildEvidence, PromptSkill, SessionTranscript, SkillInfo, TaskRuntime};
 use crate::error::Result;
 
 use super::strategy::GenerationStrategy;
@@ -57,6 +57,9 @@ const QUESTION: &str = "/question";
 const PROVIDER: &str = "/provider";
 /// The agent catalog.
 const AGENT: &str = "/agent";
+/// The skill catalog (spec #652, ticket #656). V1's `Skill.Info` carries no id
+/// — its identity is the name — so the neutral read uses the name as the id.
+const SKILL: &str = "/skill";
 
 /// The strategy that speaks the V1 generation.
 pub(crate) struct V1Strategy;
@@ -556,6 +559,25 @@ impl GenerationStrategy for V1Strategy {
         serde_json::from_str::<Vec<AgentInfo>>(&text).unwrap_or_default()
     }
 
+    /// The registered skills (`GET /skill`), each as a neutral
+    /// `{ id, name, description? }`. V1's `Skill.Info` has no id, so the name
+    /// IS the identity (V1 keys skills by name and its `skill` tool loads by
+    /// name). Best-effort: an unreadable/cached failure returns an empty list
+    /// so the `/skill` picker can degrade to its no-skills state.
+    async fn list_skills(&self, http: &Transport) -> Vec<SkillInfo> {
+        let Ok(resp) = http.client().get(http.url(SKILL)).send().await else {
+            return Vec::new();
+        };
+        let Ok(text) = resp.text().await else {
+            return Vec::new();
+        };
+        serde_json::from_str::<Vec<WireSkill>>(&text)
+            .unwrap_or_default()
+            .into_iter()
+            .map(WireSkill::into_neutral)
+            .collect()
+    }
+
     /// Available models (`GET /provider`), grouped as `provider → models`,
     /// each with its declared variants. Best-effort: an unreadable/cached
     /// failure returns an empty map so the `/model` card can degrade to a
@@ -624,6 +646,27 @@ impl GenerationStrategy for V1Strategy {
             .await?
             .error_for_status()?;
         Ok(())
+    }
+}
+
+/// One registered skill (`Skill.Info`) — V1's shape (spec #652, ticket #656).
+/// There is no id: the name is the identity, so it becomes the neutral `id`
+/// too. `location`/`content` are ignored — the list only needs what the picker
+/// shows and the prompt resolution attaches.
+#[derive(Debug, serde::Deserialize)]
+struct WireSkill {
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+impl WireSkill {
+    fn into_neutral(self) -> SkillInfo {
+        SkillInfo {
+            id: self.name.clone(),
+            name: self.name,
+            description: self.description,
+        }
     }
 }
 

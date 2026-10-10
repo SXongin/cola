@@ -38,7 +38,7 @@ mod tests;
 use async_trait::async_trait;
 
 use crate::backend::{
-    ChildEvidence, ChildRuntime, PromptSkill, SessionTranscript, ShellRuntime, TaskRuntime,
+    ChildEvidence, ChildRuntime, PromptSkill, SessionTranscript, ShellRuntime, SkillInfo, TaskRuntime,
 };
 use crate::error::Result;
 
@@ -98,6 +98,10 @@ const PERMISSION_REQUEST: &str = "/api/permission/request";
 const FORM: &str = "/api/form";
 /// The agent catalog (`GET /api/agent`) the `/agent` picker reads.
 const AGENT: &str = "/api/agent";
+/// The skill catalog (`GET /api/skill`) the `/skill` picker and the
+/// `/skill <id>` resolution read (spec #652, ticket #656). Unfiltered: the
+/// server lists every registered skill, hidden ones included.
+const SKILL: &str = "/api/skill";
 /// The model catalog (`GET /api/model`) the `/model` picker and the footer's
 /// context-window lookup read. It serves the enabled models only, so the
 /// picker needs no credential/`connected` filter like V1's `GET /provider`.
@@ -756,6 +760,25 @@ impl GenerationStrategy for V2Strategy {
         page.data
             .into_iter()
             .map(wire::RawAgentInfo::into_neutral)
+            .collect()
+    }
+
+    /// The registered skills (`GET /api/skill`), each as a neutral
+    /// `{ id, name, description? }`. The read is unfiltered — hidden
+    /// (`autoinvoke: false`) and description-less skills are listed too, the
+    /// point of the picker (spec #652, ticket #656). Best-effort: an unreadable
+    /// failure returns an empty list so the picker degrades to its no-skills
+    /// state.
+    async fn list_skills(&self, http: &Transport) -> Vec<SkillInfo> {
+        let Ok(resp) = http.client().get(http.url(SKILL)).send().await else {
+            return Vec::new();
+        };
+        let Ok(page) = resp.json::<wire::DataEnvelope<Vec<wire::RawSkillInfo>>>().await else {
+            return Vec::new();
+        };
+        page.data
+            .into_iter()
+            .map(wire::RawSkillInfo::into_neutral)
             .collect()
     }
 

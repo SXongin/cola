@@ -8,7 +8,7 @@
 use serde_json::{Map, json};
 
 use crate::opencode::conformance::{
-    PromptFixture, RequestFixture, SessionCase, SessionReadFixture, TranscriptFixture,
+    PromptFixture, RequestFixture, SessionCase, SessionReadFixture, SkillListFixture, TranscriptFixture,
 };
 use crate::opencode::strategy::Generation;
 use crate::test_http::{DynamicResponse, MockResponse, TestHttpServer};
@@ -28,7 +28,48 @@ pub(crate) fn case() -> SessionCase {
         mount_prompt,
         mount_requests,
         mount_selection,
+        mount_skills,
     }
+}
+
+/// The V2 skill read: `GET /api/skill`, a `{location, data}` envelope of
+/// `Skill.Info`. The wire `id` is the picker's callback value and the
+/// structured prompt attach; `description` is optional; `autoinvoke: false`
+/// marks a hidden skill, which the unfiltered list still returns.
+fn mount_skills(server: &TestHttpServer, fixture: &SkillListFixture) {
+    server.route(
+        "GET",
+        "/api/skill",
+        200,
+        json!({
+            "location": {"directory": "/work/cola"},
+            "data": [
+                {
+                    "id": fixture.visible_id,
+                    "name": fixture.visible_name,
+                    "description": fixture.visible_description,
+                    "autoinvoke": true,
+                    "path": "/work/skills/implement-spec/SKILL.md",
+                    "content": "body",
+                },
+                {
+                    "id": fixture.bare_name,
+                    "name": fixture.bare_name,
+                    "path": "/work/skills/description-less/SKILL.md",
+                    "content": "body",
+                },
+                {
+                    "id": fixture.hidden_id,
+                    "name": fixture.hidden_name,
+                    "description": "Hidden from the model.",
+                    "autoinvoke": false,
+                    "path": "/work/skills/hidden-tool/SKILL.md",
+                    "content": "body",
+                },
+            ],
+        })
+        .to_string(),
+    );
 }
 
 /// Mount a stateful durable selection: `GET /api/session/{id}` serves the

@@ -42,6 +42,24 @@ pub struct PromptSkill {
     pub name: String,
 }
 
+/// One registered skill as the skill-list read exposes it (spec #652, ticket
+/// #656): a small generation-neutral `{ id, name, description? }`. `id` is the
+/// skill's identity in the attached generation's own space — V2's `Skill.ID`
+/// (what the structured prompt `skills` request carries and what the picker
+/// sends back), while on V1, whose `Skill.Info` has no id, `id` IS `name` (V1
+/// keys skills by name and its `skill` tool loads by name). `name` is the
+/// human-facing name; `description` is the frontmatter description when the
+/// skill declares one. The read is deliberately unfiltered: a hidden
+/// (`disable-model-invocation`) or description-less skill is listed too, since
+/// the whole point of the picker is to reach exactly the skills the model never
+/// advertises.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillInfo {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+}
+
 /// A directory-scoped handle to the backend. Instance routing lives here: the
 /// handle carries the directory, so a caller cannot silently omit `?directory=`
 /// and scope a request to the wrong server instance (ADR-0010). Directory-scoped
@@ -407,6 +425,13 @@ pub trait Backend: Send + Sync {
     /// Available agents (`GET /agent`), for the `/agent` card picker. Empty on
     /// failure (the card degrades to a text prompt).
     async fn list_agents(&self) -> Vec<AgentInfo>;
+
+    /// The registered skills, for the `/skill` picker and the `/skill <id>`
+    /// resolution (spec #652, ticket #656). V2 reads `GET /api/skill`
+    /// (`Skill.Info[]`); V1 reads its own `GET /skill`, whose identity IS the
+    /// name (V1's `Skill.Info` has no id). Best-effort: an unreadable failure
+    /// returns an empty list, so the picker degrades to its no-skills state.
+    async fn list_skills(&self) -> Vec<SkillInfo>;
 
     /// Available models grouped by provider (`GET /provider`), for the `/model`
     /// card picker. Empty on failure (the card degrades to a text prompt).

@@ -31,8 +31,8 @@ use serde_json::Value;
 use crate::backend::{
     BackgroundLaunch, BackgroundTask, ChildEvidence, ContentBlock, Execution, ExecutionOutcome, FinishReason,
     MessageId, MessageRole, MessageSkill, MessageTime, ModelIdentity, OtherPart, Part, ReasoningPart,
-    SessionTranscript, ShellEnd, ShellRuntime, StepFinish, TextPart, TokenUsage, ToolCall, ToolIdentity,
-    ToolOutput, ToolStatus, TranscriptMessage, Wake, WakeSource,
+    SessionTranscript, ShellEnd, ShellRuntime, SkillInfo, StepFinish, TextPart, TokenUsage, ToolCall,
+    ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage, Wake, WakeSource,
 };
 use crate::opencode::types::{
     AgentInfo, FormFieldKind, ModelInfo, ModelOption, PermissionRequest, QuestionInfo, QuestionOption,
@@ -195,6 +195,30 @@ impl RawAgentInfo {
             description: self.description,
             mode: self.mode,
             hidden: self.hidden,
+        }
+    }
+}
+
+/// `GET /api/skill` — one `Skill.Info` (spec #652, ticket #656). `id` is the
+/// wire identity the structured prompt `skills` request carries and the picker
+/// sends back; `name` is the human-facing name. `description` is optional (a
+/// description-less skill must still list). `path`/`content`/`autoinvoke` are
+/// ignored: the list only needs what the picker shows and the prompt
+/// resolution attaches, and the read is deliberately unfiltered.
+#[derive(Debug, Deserialize)]
+pub(super) struct RawSkillInfo {
+    pub(super) id: String,
+    pub(super) name: String,
+    #[serde(default)]
+    pub(super) description: Option<String>,
+}
+
+impl RawSkillInfo {
+    pub(super) fn into_neutral(self) -> SkillInfo {
+        SkillInfo {
+            id: self.id,
+            name: self.name,
+            description: self.description,
         }
     }
 }
