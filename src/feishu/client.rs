@@ -811,6 +811,67 @@ impl Client {
             data: bytes.to_vec(),
         })
     }
+
+    /// Upload an image to Feishu (`POST /open-apis/im/v1/images`, multipart
+    /// `image_type=message`, scope `im:resource`), returning the reusable
+    /// `image_key` a card's `img` element references (ADR-0076). The multipart
+    /// body is hand-built: cola's reqwest is compiled without its `multipart`
+    /// feature, and the one shape needed is two parts, so a new dependency
+    /// (`mime_guess`/`multer`) is not worth it.
+    pub async fn upload_image(&self, bytes: &[u8], mime: &str) -> crate::error::Result<String> {
+        let token = self.get_access_token().await?;
+        let body = image_upload_body(IMAGE_UPLOAD_BOUNDARY, mime, bytes);
+        let text = read_body_with_diag(
+            self.http
+                .post(self.endpoint("/open-apis/im/v1/images"))
+                .bearer_auth(&token)
+                .header(
+                    reqwest::header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={IMAGE_UPLOAD_BOUNDARY}"),
+                )
+                .body(body)
+                .send()
+                .await?,
+            "upload image",
+        )
+        .await?;
+        let resp: ImageUploadResponse = parse_json(&text, "upload image response")?;
+
+        if resp.code != 0 {
+            return Err(api_error(
+                &format!("upload image error {}", resp.code),
+                i64::from(resp.code),
+                &resp.msg,
+            ));
+        }
+        resp.data.image_key.filter(|key| !key.is_empty()).ok_or_else(|| {
+            crate::error::BridgeError::Feishu(format!("upload image missing image_key — body: {text}"))
+        })
+    }
+}
+
+/// The boundary token for the hand-built image-upload body (see
+/// [`Client::upload_image`]).
+const IMAGE_UPLOAD_BOUNDARY: &str = "----colaImageBoundary";
+
+/// The `multipart/form-data` body Feishu's image upload expects: the
+/// `image_type` part (`message`) and the image part carrying `bytes` with its
+/// mime. `\r\n` line endings and the closing `--boundary--` are per RFC 7578.
+fn image_upload_body(boundary: &str, mime: &str, bytes: &[u8]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(bytes.len() + 256);
+    body.extend_from_slice(
+        format!("--{boundary}\r\nContent-Disposition: form-data; name=\"image_type\"\r\n\r\nmessage\r\n")
+            .as_bytes(),
+    );
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"image\"\r\nContent-Type: {mime}\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(bytes);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    body
 }
 
 /// A minimal interactive card carrying one markdown element — the shape
@@ -869,6 +930,22 @@ struct MessageData {
     /// id of the topic created around the seed message.
     #[serde(default)]
     thread_id: Option<String>,
+}
+
+/// Feishu's image-upload answer (`POST /open-apis/im/v1/images`): the reusable
+/// `image_key` under `data`.
+#[derive(Debug, Deserialize)]
+struct ImageUploadResponse {
+    code: i32,
+    msg: String,
+    #[serde(default)]
+    data: ImageUploadData,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ImageUploadData {
+    #[serde(default)]
+    image_key: Option<String>,
 }
 
 /// A message returned by `list_messages` — the newest-first page
@@ -1718,6 +1795,83 @@ mod tests {
         let message = feishu_error(client.get_card_view("om_text").await.unwrap_err());
         assert!(
             message.contains("parse get_card_view content"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_image_posts_the_multipart_fields_and_returns_the_key() {
+        let (server, client) = wire_client().await;
+        server.route(
+            "POST",
+            "/open-apis/im/v1/images",
+            200,
+            r#"{"code":0,"msg":"ok","data":{"image_key":"img_v2_abc"}}"#,
+        );
+
+        assert_eq!(
+            client.upload_image(b"PNGDATA", "image/png").await.unwrap(),
+            "img_v2_abc"
+        );
+
+        let request = last_request(&server);
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/open-apis/im/v1/images");
+        assert_eq!(request.header("authorization"), Some("Bearer t-abc"));
+        let content_type = request.header("content-type").unwrap_or_default();
+        assert!(
+            content_type.starts_with("multipart/form-data; boundary="),
+            "the body must be multipart: {content_type}"
+        );
+        let body = &request.body;
+        assert!(
+            body.contains("name=\"image_type\""),
+            "the image_type part is present: {body}"
+        );
+        assert!(body.contains("\r\n\r\nmessage\r\n"), "image_type=message: {body}");
+        assert!(
+            body.contains("name=\"image\""),
+            "the image part is present: {body}"
+        );
+        assert!(
+            body.contains("Content-Type: image/png"),
+            "the part carries the mime: {body}"
+        );
+        assert!(body.contains("PNGDATA"), "the part carries the bytes: {body}");
+        assert!(body.ends_with("--\r\n"), "the body closes the multipart: {body}");
+    }
+
+    #[tokio::test]
+    async fn upload_image_maps_a_business_error() {
+        let (server, client) = wire_client().await;
+        server.route(
+            "POST",
+            "/open-apis/im/v1/images",
+            200,
+            r#"{"code":40003,"msg":"invalid image"}"#,
+        );
+
+        let message = feishu_error(client.upload_image(b"junk", "image/png").await.unwrap_err());
+        assert!(
+            message.contains("upload image error 40003"),
+            "unexpected error: {message}"
+        );
+        assert!(message.contains("invalid image"), "unexpected error: {message}");
+    }
+
+    #[tokio::test]
+    async fn upload_image_reports_a_missing_key() {
+        let (server, client) = wire_client().await;
+        server.route(
+            "POST",
+            "/open-apis/im/v1/images",
+            200,
+            r#"{"code":0,"msg":"ok","data":{}}"#,
+        );
+
+        let message = feishu_error(client.upload_image(b"PNGDATA", "image/png").await.unwrap_err());
+        assert!(
+            message.contains("missing image_key"),
             "unexpected error: {message}"
         );
     }

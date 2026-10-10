@@ -836,9 +836,15 @@ pub(crate) struct CardsHandle {
     /// must never await unboundedly. The Session Sync pass's own request bound
     /// by default; a test may shorten it through the handle.
     pub(crate) preserved_view_timeout_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// The process-local File Content image cache (ADR-0076): `content hash →
+    /// Some(image_key)` embedded / `None` not an embeddable image. Shared with
+    /// the whole process so identical bytes upload once, whichever Session or
+    /// card renders them.
+    pub(crate) file_images: Arc<Mutex<HashMap<u64, Option<String>>>>,
 }
 
 impl CardsHandle {
+    #[allow(clippy::too_many_arguments)] // the card handle's wiring list is flat
     pub(crate) fn new(
         cards: Arc<Mutex<HashMap<String, CardSession>>>,
         card_handles: Arc<Mutex<CardHandles>>,
@@ -847,6 +853,7 @@ impl CardsHandle {
         chains: Arc<crate::bridge::chain::ChainRecords>,
         write_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
         preserved_view_timeout_ms: Arc<std::sync::atomic::AtomicU64>,
+        file_images: Arc<Mutex<HashMap<u64, Option<String>>>>,
     ) -> Self {
         Self {
             cards,
@@ -856,6 +863,7 @@ impl CardsHandle {
             chains,
             write_locks,
             preserved_view_timeout_ms,
+            file_images,
         }
     }
 
