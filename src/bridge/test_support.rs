@@ -1126,6 +1126,10 @@ pub struct MockBackend {
     pub prompt_calls: Arc<tokio::sync::Mutex<Vec<String>>>,
     /// Records the number of images attached to each `prompt` call.
     pub prompt_images: Arc<tokio::sync::Mutex<Vec<usize>>>,
+    /// Records every `prompt` call's attached skills (spec #652, ticket #654):
+    /// the neutral `{ id, name }` list, so a `/skill` submit is asserted
+    /// through the mock.
+    pub prompt_skills: Arc<tokio::sync::Mutex<Vec<Vec<crate::backend::PromptSkill>>>>,
     /// Records the model passed to each `prompt` call ("provider/model").
     pub prompt_models: Arc<tokio::sync::Mutex<Vec<Option<String>>>>,
     /// Records the variant passed to each `prompt` call (the `/think` override).
@@ -1401,6 +1405,7 @@ impl MockBackend {
             fail_interrupt_message: None,
             prompt_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             prompt_images: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            prompt_skills: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             prompt_models: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             prompt_variants: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             prompt_agents: Arc::new(tokio::sync::Mutex::new(Vec::new())),
@@ -2226,7 +2231,7 @@ impl crate::backend::Backend for MockBackend {
         session_id: &str,
         text: &str,
         images: &[opencode::types::ImageInput],
-        _skills: &[crate::backend::PromptSkill],
+        skills: &[crate::backend::PromptSkill],
         _model: Option<&opencode::types::ModelInfo>,
         variant: Option<&str>,
         agent: Option<&str>,
@@ -2234,6 +2239,7 @@ impl crate::backend::Backend for MockBackend {
     ) -> crate::error::Result<()> {
         self.prompt_calls.lock().await.push(text.to_string());
         self.prompt_images.lock().await.push(images.len());
+        self.prompt_skills.lock().await.push(skills.to_vec());
         self.prompt_message_ids
             .lock()
             .await

@@ -78,7 +78,7 @@ use std::sync::Arc;
 
 use tracing::Instrument;
 
-use crate::backend::{MessageId, MessageRole, SessionTranscript, TurnAnchor, TurnSettle};
+use crate::backend::{MessageId, MessageRole, PromptSkill, SessionTranscript, TurnAnchor, TurnSettle};
 use crate::bridge::chain::{ChainRecord, RenderedCursor};
 use crate::bridge::handler::image_inputs;
 use crate::bridge::handles::{CardsHandle, NoticeRules, RequestsHandle, SessionsHandle, TurnHandles};
@@ -213,6 +213,11 @@ pub(crate) struct PromptContext {
     pub(crate) cola_message_id: Option<String>,
     /// Downloaded images attached to this turn (Image Attachments).
     pub(crate) images: Vec<ImageAttachment>,
+    /// The skills this turn loads into the prompt (spec #652, ticket #654): the
+    /// generation-neutral attachment parsed from a `/skill <id>` command. Empty
+    /// for an ordinary message. Like `images`, deliberately not carried across a
+    /// recovery (see [`TurnRecovery::into_context`]).
+    pub(crate) skills: Vec<PromptSkill>,
     /// The Backend's ADVISORY status read reported a live Execution while cola
     /// owned no live card chain (ADR-0062): the new Turn's card opens with
     /// [`MERGE_OPENING`], and its prompt still carries the merge delivery (the
@@ -239,6 +244,9 @@ pub(crate) struct Turn {
     text: String,
     cola_message_id: String,
     images: Vec<ImageAttachment>,
+    /// The skills this turn loads into the prompt (spec #652, ticket #654),
+    /// captured at turn start — passed to every attempt's submit.
+    skills: Vec<PromptSkill>,
     /// The session's working directory, captured at turn start — the routing
     /// key for the drain's `session_status` read (ADR-0010).
     directory: String,
@@ -366,6 +374,7 @@ impl Turn {
             is_group,
             cola_message_id,
             images,
+            skills,
             advisory_live,
         } = ctx;
         // This logical user message keeps ONE id across every attempt of this
@@ -600,6 +609,7 @@ impl Turn {
             text,
             cola_message_id,
             images,
+            skills,
             directory: session_dir,
             turn_variant: None,
             started_at,
@@ -641,7 +651,7 @@ impl Turn {
                 &self.session_id,
                 &self.text,
                 &image_inputs(&self.images),
-                &[],
+                &self.skills,
                 model.as_ref(),
                 self.turn_variant.as_deref(),
                 agent.as_deref(),
@@ -3038,8 +3048,9 @@ pub(crate) struct TurnRecovery {
 impl TurnRecovery {
     /// This recovery as the new attempt's [`PromptContext`]: the same facts
     /// under the context's names, with the id policy the caller chose (`None`
-    /// = a fresh `msg_cola_` id, `Some` = the previous attempt's). Images are
-    /// not re-sent on a recovery (#391, out of scope).
+    /// = a fresh `msg_cola_` id, `Some` = the previous attempt's). Images and
+    /// skills are not re-sent on a recovery (#391, out of scope): the recovery
+    /// fixture carries neither.
     pub(crate) fn into_context(
         self,
         thread_key: ThreadKey,
@@ -3056,6 +3067,7 @@ impl TurnRecovery {
             is_group: self.is_group,
             cola_message_id,
             images: Vec::new(),
+            skills: Vec::new(),
             // A recovery never routes through the advisory read (its own
             // decision already judged the run): an ordinary card.
             advisory_live: false,
@@ -4260,6 +4272,7 @@ mod tests {
             is_group: false,
             cola_message_id: None,
             images: Vec::new(),
+            skills: Vec::new(),
             advisory_live: false,
         }
     }

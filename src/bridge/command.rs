@@ -70,9 +70,23 @@ pub enum Command {
     Version,
     /// Show available commands, or help for one command (`/help <cmd>`).
     Help(Option<String>),
+    /// `/skill <id> [text…]` — load one or more OpenCode skills into the prompt
+    /// (spec #652, ticket #654). Each `/skill <id>` token contributes one id,
+    /// collected in order (`/skill a /skill b text`); the whole original message
+    /// text is the prompt, tokens and all (it mirrors the composer's
+    /// `@skill-id`). A bare `/skill` carries no id. The coordinator routes this
+    /// into the prompt pipeline itself — the same path as [`Command::Forward`] —
+    /// because the prompt pipeline, not the command dispatcher, owns submission.
+    Skill(Vec<String>),
     /// Forward unrecognized slash command to OpenCode as prompt text
     Forward(String),
 }
+
+/// Shown for a bare `/skill` (no id): the command is recognised (never
+/// forwarded to the model as text), but with no skill named there is nothing to
+/// load. The skill picker card supersedes this reply (ticket #656).
+pub(crate) const SKILL_USAGE: &str =
+    "用法：`/skill <id> [/skill <id> …] [文本]`，例如 `/skill implement-spec 644`。";
 
 impl Command {
     /// The single source of truth for the "commands restricted inside a topic"
@@ -341,9 +355,32 @@ pub fn parse_command(text: &str) -> Option<Command> {
         "/update" => Some(Command::Update),
         "/version" => Some(Command::Version),
         "/help" => Some(Command::Help(arg.map(|s| s.to_lowercase()))),
+        // `/skill <id> [/skill <id> …] [text]` — load the named skills into the
+        // prompt (spec #652). Each `/skill` token takes the token that follows
+        // it as an id; every other token stays in the message text, which is
+        // submitted verbatim. A bare `/skill` carries no id.
+        "/skill" => Some(Command::Skill(parse_skill_ids(trimmed))),
         // `/init`, `/review`, or any unknown /command — forward to OpenCode
         _ => Some(Command::Forward(trimmed.to_string())),
     }
+}
+
+/// Collect the ids of every `/skill <id>` token in `text`, in order (spec #652,
+/// ticket #654). Each `/skill` token contributes the whitespace-separated token
+/// that follows it; an id is kept exactly as typed. The command token is
+/// matched case-insensitively like the other commands, and a `/skill` with no
+/// token after it contributes nothing.
+fn parse_skill_ids(text: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    let mut tokens = text.split_whitespace();
+    while let Some(token) = tokens.next() {
+        if token.eq_ignore_ascii_case("/skill")
+            && let Some(id) = tokens.next()
+        {
+            ids.push(id.to_string());
+        }
+    }
+    ids
 }
 
 /// Help text shown for the `/help` command.
@@ -1259,6 +1296,11 @@ pub(crate) async fn handle_command(
             // Unreachable: the message coordinator intercepts `Command::Forward`
             // and routes it into the prompt pipeline itself (that pipeline is the
             // coordinator's job, and command dispatch must not depend on it).
+        }
+        Command::Skill(_) => {
+            // Unreachable: like `Forward`, the message coordinator intercepts
+            // `Command::Skill` and routes it into the prompt pipeline itself
+            // (the skills must ride the prompt axis, which the coordinator owns).
         }
     }
     Ok(())
@@ -2547,6 +2589,34 @@ mod tests {
 
         let cmd2 = parse_command("/some-unknown-command arg1");
         assert_eq!(cmd2, Some(Command::Forward("/some-unknown-command arg1".into())));
+    }
+
+    /// `/skill <id>` is its own command, not forwarded text (spec #652, ticket
+    /// #654): each `/skill` token contributes the token after it, in order, and
+    /// a trailing argument that follows no `/skill` token stays prompt text.
+    #[test]
+    fn skill_command_collects_ids_in_order() {
+        assert_eq!(
+            parse_command("/skill implement-spec 644"),
+            Some(Command::Skill(vec!["implement-spec".into()]))
+        );
+        assert_eq!(
+            parse_command("/skill implement-spec /skill foreman 644"),
+            Some(Command::Skill(vec!["implement-spec".into(), "foreman".into()]))
+        );
+        // Case-insensitive command token, like every other command.
+        assert_eq!(
+            parse_command("/SKILL implement-spec"),
+            Some(Command::Skill(vec!["implement-spec".into()]))
+        );
+        // A bare `/skill` names no skill.
+        assert_eq!(parse_command("/skill"), Some(Command::Skill(vec![])));
+        // `/skill` is the command only when it LEADS the message; anywhere else
+        // the message is ordinary text (or a different command).
+        assert_eq!(
+            parse_command("/init /skill foo"),
+            Some(Command::Forward("/init /skill foo".into()))
+        );
     }
 
     #[test]

@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use tracing::Instrument;
 
+use crate::backend::PromptSkill;
 use crate::bridge::access::{Access, Decision, DenyReason};
 use crate::bridge::command;
 use crate::bridge::core::SharedCore;
@@ -422,7 +423,36 @@ impl App {
                     images: vec![],
                     requester_open_id: None,
                 };
-                if let Err(e) = self.handle_prompt(thread_key, forward, kind).await {
+                if let Err(e) = self.handle_prompt(thread_key, forward, kind, Vec::new()).await {
+                    tracing::error!("Prompt: {}", e);
+                }
+                return;
+            }
+            // `/skill <id> …` loads skills into the prompt (spec #652, ticket
+            // #654). Like Forward, it is routed here rather than through the
+            // command dispatcher: the skills ride the prompt axis, and the whole
+            // original message text is the prompt. Each command token contributes
+            // one id, in order.
+            if let command::Command::Skill(ids) = cmd {
+                if ids.is_empty() {
+                    // A bare `/skill` names nothing to load: the picker card
+                    // supersedes this reply (ticket #656), and until then the
+                    // recognised command answers with its syntax — never a
+                    // prompt carrying the literal `/skill`.
+                    let _ = self
+                        .feishu
+                        .reply_text(&msg.message_id, command::SKILL_USAGE)
+                        .await;
+                    return;
+                }
+                // The typed id is both identity and name here: no skill-list
+                // read exists yet (the picker's read, ticket #656, resolves the
+                // human-facing name).
+                let skills = ids
+                    .into_iter()
+                    .map(|id| PromptSkill { name: id.clone(), id })
+                    .collect();
+                if let Err(e) = self.handle_prompt(thread_key, msg, kind, skills).await {
                     tracing::error!("Prompt: {}", e);
                 }
                 return;
@@ -434,7 +464,7 @@ impl App {
             }
             return;
         }
-        if let Err(e) = self.handle_prompt(thread_key, msg, kind).await {
+        if let Err(e) = self.handle_prompt(thread_key, msg, kind, Vec::new()).await {
             tracing::error!("Prompt: {}", e);
         }
     }
@@ -575,6 +605,7 @@ impl App {
         thread_key: ThreadKey,
         msg: crate::bridge::IncomingMessage,
         kind: ConversationKind,
+        skills: Vec<PromptSkill>,
     ) -> crate::error::Result<()> {
         let crate::bridge::IncomingMessage {
             message_id,
@@ -701,6 +732,7 @@ impl App {
                     is_group,
                     cola_message_id: None,
                     images,
+                    skills,
                     advisory_live,
                 })
                 .await
@@ -732,7 +764,7 @@ impl App {
                         &session_id,
                         &text,
                         &image_inputs,
-                        &[],
+                        &skills,
                         self.session_model_override(&session_id).await.as_ref(),
                         self.session_variant_override(&session_id).await.as_deref(),
                         self.session_agent_override(&session_id).await.as_deref(),
