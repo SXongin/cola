@@ -301,6 +301,32 @@ async fn an_unknown_skill_id_shows_an_error_and_the_list_without_reaching_the_mo
     assert_eq!(buttons.len(), 3, "the same list follows the error: {buttons:?}");
 }
 
+/// A rejected picker card must not leave the command dead: the send degrades
+/// to a plain-text listing of the same skills (mirroring `send_help_card`'s
+/// `help_text()` fallback), and still never reaches the model.
+#[tokio::test]
+async fn a_failed_picker_card_falls_back_to_a_text_list() {
+    let fx = SkillFixture::build().await;
+    fx.platform
+        .fail_reply_card_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+
+    fx.send("/skill").await;
+
+    assert!(fx.prompt_calls.lock().await.is_empty());
+    assert!(
+        fx.platform.replied_cards().await.is_empty(),
+        "the failed card must not have landed"
+    );
+    let texts = fx.platform.texts().await;
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.contains("implement-spec") && t.contains("Hidden Tool") && t.contains("/skill <id>")),
+        "a text listing is the fallback: {texts:?}"
+    );
+}
+
 /// An empty skill list renders a clear "no skills" card — the picker's
 /// degraded state — and still never reaches the model.
 #[tokio::test]

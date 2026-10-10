@@ -526,6 +526,10 @@ pub(crate) async fn send_help_card(handles: &CommandHandles, message_id: &str) -
 /// conversation kind the picker was sent in. The read behind `skills` is
 /// generation-neutral and unfiltered, so a hidden or description-less skill is
 /// listed too; an empty list opens the no-skills state.
+///
+/// A rejected card (Feishu refuses the schema/size) must not leave the command
+/// dead, so — like [`send_help_card`]'s `help_text()` fallback — the failure
+/// degrades to a plain-text listing of the same skills.
 pub(crate) async fn send_skill_card(
     handles: &CommandHandles,
     thread_key: &ThreadKey,
@@ -535,9 +539,50 @@ pub(crate) async fn send_skill_card(
     error: Option<&str>,
 ) -> Result<()> {
     for card in super::picker::build_skill_cards(thread_key, skills, chat_type, error) {
-        handles.flow.platform.reply_card(message_id, &card).await?;
+        if let Err(e) = handles.flow.platform.reply_card(message_id, &card).await {
+            tracing::warn!("skill card failed ({}), falling back to text", e);
+            return handles
+                .flow
+                .platform
+                .reply_text(message_id, &skill_list_text(skills, error))
+                .await
+                .map(|_| ());
+        }
     }
     Ok(())
+}
+
+/// The plain-text fallback for [`send_skill_card`]: the same skills one line
+/// each (`id`, name, description where present) plus the command syntax, with
+/// the same leading error line an unknown id would show. Mirrors
+/// [`crate::bridge::command::help_text`]'s role for the `/help` card.
+fn skill_list_text(skills: &[crate::backend::SkillInfo], error: Option<&str>) -> String {
+    let mut text = String::new();
+    if let Some(error) = error {
+        text.push_str(error);
+        text.push('\n');
+    }
+    if skills.is_empty() {
+        text.push_str("（没有可用技能）\n");
+    } else {
+        text.push_str("🧩 可用技能：\n");
+        for skill in skills {
+            let description = skill
+                .description
+                .as_deref()
+                .map(str::trim)
+                .filter(|d| !d.is_empty())
+                .map(|d| d.lines().next().unwrap_or("").trim());
+            match description {
+                Some(description) => {
+                    text.push_str(&format!("- `{}` {} — {}\n", skill.id, skill.name, description))
+                }
+                None => text.push_str(&format!("- `{}` {}\n", skill.id, skill.name)),
+            }
+        }
+    }
+    text.push_str("用法：`/skill <id>`");
+    text
 }
 
 #[cfg(test)]
