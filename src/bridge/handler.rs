@@ -732,6 +732,7 @@ impl App {
                         &session_id,
                         &text,
                         &image_inputs,
+                        &[],
                         self.session_model_override(&session_id).await.as_ref(),
                         self.session_variant_override(&session_id).await.as_deref(),
                         self.session_agent_override(&session_id).await.as_deref(),

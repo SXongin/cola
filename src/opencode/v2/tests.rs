@@ -1305,6 +1305,7 @@ async fn prompt_admits_the_text_files_and_id_then_returns_without_waiting() {
                 mime: "image/png".into(),
                 data_base64: "AAAA".into(),
             }],
+            &[],
             None,
             None,
             None,
@@ -1342,7 +1343,7 @@ async fn prompt_omits_empty_files_and_an_absent_message_id() {
     let client = v2_wire_client(&server);
 
     client
-        .prompt("ses_1", "hi", &[], None, None, None, None)
+        .prompt("ses_1", "hi", &[], &[], None, None, None, None)
         .await
         .unwrap();
 
@@ -1366,7 +1367,7 @@ async fn prompt_maps_only_a_tagged_session_not_found() {
     );
     let client = v2_wire_client(&tagged);
     let error = client
-        .prompt("ses_gone", "hi", &[], None, None, None, None)
+        .prompt("ses_gone", "hi", &[], &[], None, None, None, None)
         .await
         .unwrap_err();
     assert!(
@@ -1383,7 +1384,7 @@ async fn prompt_maps_only_a_tagged_session_not_found() {
     );
     let client = v2_wire_client(&untagged);
     let error = client
-        .prompt("ses_1", "hi", &[], None, None, None, None)
+        .prompt("ses_1", "hi", &[], &[], None, None, None, None)
         .await
         .unwrap_err();
     assert!(

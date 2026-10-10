@@ -2226,6 +2226,7 @@ impl crate::backend::Backend for MockBackend {
         session_id: &str,
         text: &str,
         images: &[opencode::types::ImageInput],
+        _skills: &[crate::backend::PromptSkill],
         _model: Option<&opencode::types::ModelInfo>,
         variant: Option<&str>,
         agent: Option<&str>,

@@ -21,7 +21,7 @@ mod tests;
 
 use async_trait::async_trait;
 
-use crate::backend::{ChildEvidence, SessionTranscript, TaskRuntime};
+use crate::backend::{ChildEvidence, PromptSkill, SessionTranscript, TaskRuntime};
 use crate::error::Result;
 
 use super::strategy::GenerationStrategy;
@@ -176,20 +176,21 @@ impl GenerationStrategy for V1Strategy {
     /// create (ADR-0026). The server persists it, and a retry that reuses it is
     /// idempotent — never a duplicate user message. None falls back to a
     /// server-generated id (used only by tests/other clients).
-    #[allow(clippy::too_many_arguments)] // prompt axes: session/text/images + model/variant/agent/message-id
+    #[allow(clippy::too_many_arguments)] // prompt axes: session/text/images/skills + model/variant/agent/message-id
     async fn prompt(
         &self,
         http: &Transport,
         session_id: &str,
         text: &str,
         images: &[ImageInput],
+        skills: &[PromptSkill],
         model: Option<&ModelInfo>,
         variant: Option<&str>,
         agent: Option<&str>,
         message_id: Option<&str>,
     ) -> Result<()> {
         let mut body = serde_json::json!({
-            "parts": build_parts(text, images),
+            "parts": build_parts(&fold_skills(text, skills), images),
         });
         inject_message_id(&mut body, message_id);
         inject_model(&mut body, model, variant);
@@ -724,6 +725,23 @@ impl WireQuestion {
                 .collect(),
         }
     }
+}
+
+/// Fold the caller's skill attachment ([`PromptSkill`]) into V1's prompt text.
+/// V1 has neither a structured `skills` field nor a skill prompt part, so the
+/// only way to load a skill is to name it and tell the model to load it with
+/// its `skill` tool. An empty attachment returns the text untouched — a bare
+/// prompt stays byte-for-byte what it was (spec #652). Used by `prompt`.
+fn fold_skills(text: &str, skills: &[PromptSkill]) -> String {
+    if skills.is_empty() {
+        return text.to_string();
+    }
+    let names = skills
+        .iter()
+        .map(|skill| format!("`{}`", skill.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("Use the `skill` tool to load {names}, then continue with the request below.\n\n{text}")
 }
 
 /// The prompt `parts` array: a text part followed by one data-URL `file` part

@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::backend::{ChildEvidence, SessionTranscript, TaskRuntime};
+use crate::backend::{ChildEvidence, PromptSkill, SessionTranscript, TaskRuntime};
 use crate::error::Result;
 
 use super::transport::Transport;
@@ -51,13 +51,18 @@ pub(crate) trait GenerationStrategy: Send + Sync {
     /// The Turn observes completion from the transcript and run state
     /// (ADR-0056's submit+observe end state); `model` is already the effective
     /// model (the adapter resolved the configured default before dispatch).
-    #[allow(clippy::too_many_arguments)] // prompt axes: session/text/images + model/variant/agent/message-id
+    ///
+    /// `skills` is the generation-neutral attachment ([`PromptSkill`]); the
+    /// strategy owns how its generation carries it — V2's structured `skills`
+    /// body array, or V1's text instruction.
+    #[allow(clippy::too_many_arguments)] // prompt axes: session/text/images/skills + model/variant/agent/message-id
     async fn prompt(
         &self,
         http: &Transport,
         session_id: &str,
         text: &str,
         images: &[ImageInput],
+        skills: &[PromptSkill],
         model: Option<&ModelInfo>,
         variant: Option<&str>,
         agent: Option<&str>,

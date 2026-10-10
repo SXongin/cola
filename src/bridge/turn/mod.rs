@@ -641,6 +641,7 @@ impl Turn {
                 &self.session_id,
                 &self.text,
                 &image_inputs(&self.images),
+                &[],
                 model.as_ref(),
                 self.turn_variant.as_deref(),
                 agent.as_deref(),

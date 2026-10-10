@@ -34,7 +34,7 @@ mod wire;
 use std::sync::Arc;
 
 use crate::backend::{
-    Backend, BackendDirectory, ChildEvidence, DirectoryBackend, SessionTranscript, TaskRuntime,
+    Backend, BackendDirectory, ChildEvidence, DirectoryBackend, PromptSkill, SessionTranscript, TaskRuntime,
 };
 use crate::error::Result;
 use async_trait::async_trait;
@@ -71,12 +71,16 @@ impl Backend for OpenCodeBackend {
         session_id: &str,
         text: &str,
         images: &[ImageInput],
+        skills: &[PromptSkill],
         model: Option<&ModelInfo>,
         variant: Option<&str>,
         agent: Option<&str>,
         message_id: Option<&str>,
     ) -> Result<()> {
-        OpenCodeBackend::prompt(self, session_id, text, images, model, variant, agent, message_id).await
+        OpenCodeBackend::prompt(
+            self, session_id, text, images, skills, model, variant, agent, message_id,
+        )
+        .await
     }
 
     async fn reply_permission(

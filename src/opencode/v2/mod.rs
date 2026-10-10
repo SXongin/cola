@@ -37,7 +37,9 @@ mod tests;
 
 use async_trait::async_trait;
 
-use crate::backend::{ChildEvidence, ChildRuntime, SessionTranscript, ShellRuntime, TaskRuntime};
+use crate::backend::{
+    ChildEvidence, ChildRuntime, PromptSkill, SessionTranscript, ShellRuntime, TaskRuntime,
+};
 use crate::error::Result;
 
 use super::strategy::GenerationStrategy;
@@ -311,6 +313,7 @@ impl GenerationStrategy for V2Strategy {
         session_id: &str,
         text: &str,
         images: &[ImageInput],
+        skills: &[PromptSkill],
         model: Option<&ModelInfo>,
         variant: Option<&str>,
         agent: Option<&str>,
@@ -322,7 +325,9 @@ impl GenerationStrategy for V2Strategy {
                  not the per-prompt model/variant/agent"
             );
         }
-        let admitted = self.dispatch(http, session_id, text, images, message_id).await?;
+        let admitted = self
+            .dispatch(http, session_id, text, images, skills, message_id)
+            .await?;
         tracing::info!("prompt sent to session {session_id} (V2 admitted {admitted})");
         Ok(())
     }
@@ -934,6 +939,7 @@ impl V2Strategy {
         session_id: &str,
         text: &str,
         images: &[ImageInput],
+        skills: &[PromptSkill],
         message_id: Option<&str>,
     ) -> Result<String> {
         let mut body = serde_json::json!({ "text": text });
@@ -949,6 +955,19 @@ impl V2Strategy {
                             "uri": format!("data:{};base64,{}", image.mime, image.data_base64)
                         })
                     })
+                    .collect(),
+            );
+        }
+        if !skills.is_empty() {
+            // V2's structured skill attachment: the prompt body's `skills`
+            // array (the server's `PromptInput.SkillAttachment`, `{ id,
+            // mention? }`), which the server resolves and injects
+            // deterministically. Only the id rides the wire; `name` is a
+            // neutral-view fact (V1's text fallback, the loaded-skill fold).
+            body["skills"] = serde_json::Value::Array(
+                skills
+                    .iter()
+                    .map(|skill| serde_json::json!({ "id": skill.id }))
                     .collect(),
             );
         }

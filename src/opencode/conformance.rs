@@ -216,6 +216,10 @@ pub(crate) struct PromptFixture {
     pub(crate) text: &'static str,
     pub(crate) answer_id: &'static str,
     pub(crate) answer_text: &'static str,
+    /// The id and name of the skill the prompt-skills conformance scenario
+    /// attaches. V1 has no ids, so its identity is the name — one shared value.
+    pub(crate) skill_id: &'static str,
+    pub(crate) skill_name: &'static str,
 }
 
 impl Default for PromptFixture {
@@ -226,6 +230,8 @@ impl Default for PromptFixture {
             text: "开始干活",
             answer_id: "msg_prompt_answer",
             answer_text: "干完了",
+            skill_id: "implement-spec",
+            skill_name: "implement-spec",
         }
     }
 }
@@ -639,6 +645,7 @@ async fn prompt_submits_and_the_turn_is_observable_on_every_generation() {
                 fixture.session,
                 fixture.text,
                 &[],
+                &[],
                 None,
                 None,
                 None,
@@ -677,6 +684,107 @@ async fn prompt_submits_and_the_turn_is_observable_on_every_generation() {
             .collect();
         assert_eq!(texts, [fixture.answer_text], "{generation}: reply text");
     }
+}
+
+/// A prompt can carry a generation-neutral skill attachment, and each
+/// generation carries it its own way: V2 sends the server's structured `skills`
+/// array (`PromptInput.SkillAttachment`, `{ id }`), which the server resolves
+/// and injects deterministically; V1 has neither the field nor a skill part, so
+/// it folds the request into the prompt text as an instruction naming the skill
+/// for the model to load with its `skill` tool. An empty attachment changes
+/// nothing on either generation (spec #652).
+#[tokio::test]
+async fn prompt_skills_ride_the_generation_and_an_empty_attachment_changes_nothing() {
+    use crate::backend::PromptSkill;
+
+    for case in cases() {
+        let generation = case.generation.as_str();
+        let fixture = PromptFixture::default();
+        let skills = [PromptSkill {
+            id: fixture.skill_id.to_string(),
+            name: fixture.skill_name.to_string(),
+        }];
+
+        // A prompt carrying one skill reaches the generation's wire shape.
+        let server = TestHttpServer::start().await;
+        (case.mount_prompt)(&server, &fixture);
+        let backend = case.backend(&server);
+        backend
+            .prompt(
+                fixture.session,
+                fixture.text,
+                &[],
+                &skills,
+                None,
+                None,
+                None,
+                Some(fixture.message_id),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{generation}: skills prompt submit failed: {e}"));
+
+        let body = last_prompt_body(&server);
+        match case.generation {
+            Generation::V2 => assert_eq!(
+                body["skills"],
+                serde_json::json!([{ "id": fixture.skill_id }]),
+                "{generation}: V2 must send the server's structured skills array: {body}"
+            ),
+            Generation::V1 => {
+                assert!(
+                    body.get("skills").is_none(),
+                    "{generation}: V1 has no skills field: {body}"
+                );
+                let text = body["parts"][0]["text"].as_str().unwrap_or_default();
+                assert!(
+                    text.contains(fixture.skill_name),
+                    "{generation}: V1 must name the skill in the prompt text: {text:?}"
+                );
+            }
+        }
+
+        // An empty attachment is a no-op: no `skills` field, and on V1 the text
+        // is byte-for-byte the caller's own.
+        let server = TestHttpServer::start().await;
+        (case.mount_prompt)(&server, &fixture);
+        let backend = case.backend(&server);
+        backend
+            .prompt(
+                fixture.session,
+                fixture.text,
+                &[],
+                &[],
+                None,
+                None,
+                None,
+                Some(fixture.message_id),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{generation}: bare prompt submit failed: {e}"));
+
+        let body = last_prompt_body(&server);
+        assert!(
+            body.get("skills").is_none(),
+            "{generation}: an empty attachment must not add a skills field: {body}"
+        );
+        if case.generation == Generation::V1 {
+            assert_eq!(
+                body["parts"][0]["text"], fixture.text,
+                "{generation}: an empty attachment must leave the prompt text untouched"
+            );
+        }
+    }
+}
+
+/// The JSON body of the newest recorded prompt request. The prompt mount
+/// registers its routes but answers only once a prompt is submitted, so the
+/// newest request is the submit itself.
+fn last_prompt_body(server: &TestHttpServer) -> serde_json::Value {
+    let request = server
+        .requests()
+        .pop()
+        .expect("the prompt submit must have sent a request");
+    serde_json::from_str(&request.body).expect("the prompt body is JSON")
 }
 
 /// The pending-permission read and reply have the same neutral outcome on both

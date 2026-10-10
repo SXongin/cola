@@ -10,7 +10,7 @@
 
 use std::sync::{Arc, RwLock};
 
-use crate::backend::{BackgroundTaskOverlay, ChildEvidence, SessionTranscript, TaskRuntime};
+use crate::backend::{BackgroundTaskOverlay, ChildEvidence, PromptSkill, SessionTranscript, TaskRuntime};
 
 use super::parsing::parse_model;
 use super::strategy::{Generation, GenerationStrategy};
@@ -252,12 +252,13 @@ impl OpenCodeBackend {
     /// Submit a prompt through the attached generation's strategy (ADR-0056's
     /// submit+observe contract: the call returns once the message is durable,
     /// and the Turn observes completion from the transcript + run state).
-    #[allow(clippy::too_many_arguments)] // prompt axes: session/text/images + model/variant/agent/message-id
+    #[allow(clippy::too_many_arguments)] // prompt axes: session/text/images/skills + model/variant/agent/message-id
     pub async fn prompt(
         &self,
         session_id: &str,
         text: &str,
         images: &[ImageInput],
+        skills: &[PromptSkill],
         model: Option<&ModelInfo>,
         variant: Option<&str>,
         agent: Option<&str>,
@@ -273,6 +274,7 @@ impl OpenCodeBackend {
                 session_id,
                 text,
                 images,
+                skills,
                 model,
                 variant,
                 agent,
