@@ -199,3 +199,28 @@ async fn a_retried_skill_turn_still_submits_its_skills() {
         "the retry must re-attach the requested skill"
     );
 }
+
+/// A `/skill` message received while a turn is already live takes the Supplement
+/// (steer) route, and its skills ride that submit too (spec #652, ticket #654).
+/// The live turn is seeded exactly as the ownership read sees it — the inflight
+/// guard held plus a live card — so the second message merges instead of
+/// starting a Turn.
+#[tokio::test]
+async fn a_skill_command_during_a_live_turn_carries_its_skills_to_the_supplement() {
+    let fx = SkillFixture::build().await;
+    seed_session(&fx.app, "ses_test", "/work").await;
+    fx.app.inflight.lock().await.insert("ses_test".to_string());
+    Turn::seed_card(&fx.app.cards_handle(), "ses_test", None).await;
+
+    fx.send("/skill implement-spec 644").await;
+
+    assert_eq!(
+        *fx.prompt_calls.lock().await,
+        vec!["/skill implement-spec 644".to_string()]
+    );
+    assert_eq!(
+        *fx.prompt_skills.lock().await,
+        vec![vec![typed("implement-spec")]],
+        "the supplement submit must carry the requested skill"
+    );
+}
