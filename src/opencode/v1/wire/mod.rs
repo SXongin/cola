@@ -169,6 +169,10 @@ fn error_suppresses_fallback(status: &ToolStatus, error: Option<&str>) -> bool {
 /// inlines its payload — the `file` block `read` returns for an image or PDF,
 /// the same shape an MCP resource part carries — and the raw item otherwise, so
 /// a `file://`/`https://` reference is preserved rather than decoded.
+///
+/// Deliberately a V1-local copy of the block V2's decoder carries, not a
+/// shared helper: each generation's decoder owns its own payload field names
+/// (ADR-0055), the same split `non_null`/`has_payload` already keep.
 fn content_block(item: &Value) -> ContentBlock {
     if item.get("type").and_then(Value::as_str) == Some("file")
         && let Some(uri) = non_null(item.get("uri")).and_then(Value::as_str)
