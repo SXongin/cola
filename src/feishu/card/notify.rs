@@ -62,14 +62,22 @@ pub fn build_interrupted_card(kind: &str, detail: &str) -> serde_json::Value {
 mod tests {
     use super::*;
 
-    /// An External Message renders the preview text only (spec #652, ticket
-    /// #655, acceptance reversal): a skill attached from another client is NOT
-    /// rendered here — no loaded-skill fold.
+    /// An External Message (spec #652, ticket #655, acceptance reversal): the
+    /// preview text renders, and a File Content's record line — the whole
+    /// preview for a files-only message (ADR-0076, ticket #648) — reaches the
+    /// card verbatim.
     #[test]
     fn an_external_message_renders_only_the_preview() {
         let card = build_external_message_card("proj", "看一下这个");
         let s = card.to_string();
         assert!(s.contains("看一下这个"), "{s}");
         assert!(!s.contains("已加载技能"), "no skill fold on the preview: {s}");
+
+        let files_only = build_external_message_card("proj", "📎 shot.png · image/png · 3 B");
+        let s = files_only.to_string();
+        assert!(
+            s.contains("📎 shot.png · image/png · 3 B"),
+            "the record line renders: {s}"
+        );
     }
 }

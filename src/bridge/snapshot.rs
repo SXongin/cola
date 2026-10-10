@@ -46,9 +46,9 @@ pub struct SnapshotData {
     /// `None` when there were none. The status chip points at that card
     /// instead of falling back to the server run state; see [`ElsewherePending`].
     pub pending_elsewhere: Option<ElsewherePending>,
-    /// The 最近对话 tail: the last text-bearing user/assistant messages,
+    /// The 最近对话 tail: the last conversation user/assistant messages,
     /// newest last — the Session Transcript's shared `transcript_tail`
-    /// projection.
+    /// projection (a files-only user message is included, for its record line).
     pub tail: Vec<TailEntry>,
     /// The newest user message's anchor — its identity together with its
     /// server time — from the Session Transcript's `newest_user` projection.
@@ -420,11 +420,15 @@ mod tests {
         }
     }
 
+    /// A file part that inlines no payload is not a File Content: it stays a raw
+    /// `Other`, carries no conversation text, and is dropped from the tail
+    /// (ADR-0076: a real `Part::File` message is kept — the typed tail test
+    /// covers that).
     #[tokio::test]
     async fn tail_is_newest_last_text_bearing_only() {
         // A turn with reasoning + tool (no conversation text) — must NOT appear
-        // in the tail, and an image-only user message (file parts, no text)
-        // likewise.
+        // in the tail, and a file part that inlines no payload (a raw `Other`,
+        // not a File Content) likewise.
         let reasoning_only = typed_message(
             "b",
             MessageRole::Assistant,
