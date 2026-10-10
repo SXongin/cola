@@ -65,6 +65,21 @@ fn mount_skills(server: &TestHttpServer, fixture: &SkillListFixture) {
     );
 }
 
+/// V1's skill read is best-effort (spec #652, tickets #655/#656): a body that
+/// is not the expected array (a malformed/unreadable read) yields an EMPTY
+/// list, never a guessed or partial one — the picker degrades to its no-skills
+/// state.
+#[tokio::test]
+async fn a_malformed_skill_body_yields_an_empty_list() {
+    let server = TestHttpServer::start().await;
+    server.route("GET", "/skill", 200, "{}");
+    let backend = case().backend(&server);
+    assert!(
+        backend.list_skills(Some("/work/cola")).await.is_empty(),
+        "a non-array body must read as no skills"
+    );
+}
+
 fn mount(server: &TestHttpServer, fixture: &SessionReadFixture) {
     // Two pages, most recently updated first, with the cursor in the header —
     // the second page carries no header (the end).

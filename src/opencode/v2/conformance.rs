@@ -72,6 +72,21 @@ fn mount_skills(server: &TestHttpServer, fixture: &SkillListFixture) {
     );
 }
 
+/// V2's skill read is best-effort (spec #652, tickets #655/#656): a body that
+/// is not the `{data: Skill.Info[]}` envelope (a malformed/unreadable read)
+/// yields an EMPTY list, never a guessed or partial one — the picker degrades to
+/// its no-skills state.
+#[tokio::test]
+async fn a_malformed_skill_body_yields_an_empty_list() {
+    let server = TestHttpServer::start().await;
+    server.route("GET", "/api/skill", 200, "{}");
+    let backend = case().backend(&server);
+    assert!(
+        backend.list_skills(Some("/work/cola")).await.is_empty(),
+        "an envelope without `data` must read as no skills"
+    );
+}
+
 /// Mount a stateful durable selection: `GET /api/session/{id}` serves the
 /// stored `Session.Info` and the two switch routes mutate it, so a switch is
 /// observable in the following selection read — V2's native semantics.
