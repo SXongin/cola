@@ -14,8 +14,8 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::backend::{
-    ContentBlock, MessageId, MessageRole, MessageTime, ModelIdentity, OtherPart, Part, Patch, ReasoningPart,
-    SessionTranscript, StepFinish, StepStart, TokenUsage, ToolCall, ToolOutput, ToolStatus,
+    ContentBlock, FileContent, MessageId, MessageRole, MessageTime, ModelIdentity, OtherPart, Part, Patch,
+    ReasoningPart, SessionTranscript, StepFinish, StepStart, TokenUsage, ToolCall, ToolOutput, ToolStatus,
     TranscriptMessage,
 };
 use crate::error::Result;
@@ -183,6 +183,13 @@ fn decode_part(part: &Value) -> Part {
             hash: part.get("hash").and_then(Value::as_str).map(str::to_string),
             files: string_list(part.get("files")),
         }),
+        Some("file") => match decode_file_part(part) {
+            Some(content) => Part::File(content),
+            None => Part::Other(OtherPart {
+                kind: "file".to_string(),
+                raw: part.clone(),
+            }),
+        },
         Some(other) => Part::Other(OtherPart {
             kind: other.to_string(),
             raw: part.clone(),
@@ -192,6 +199,18 @@ fn decode_part(part: &Value) -> Part {
             raw: part.clone(),
         }),
     }
+}
+
+/// A V1 `file` part: its `url` is the payload URI (cola attaches images as
+/// inline `data:` URIs) and its `filename` the display name. A part that only
+/// references a file inlines no payload, so it is not a File Content and stays
+/// raw (the caller's fallthrough).
+fn decode_file_part(part: &Value) -> Option<FileContent> {
+    FileContent::decode(
+        part.get("url").and_then(Value::as_str)?,
+        part.get("mime").and_then(Value::as_str),
+        part.get("filename").and_then(Value::as_str),
+    )
 }
 
 fn decode_tool(part: &Value) -> ToolCall {
@@ -448,7 +467,7 @@ mod tests {
 
     /// Any content item with a string `text` contributes — the kind is not
     /// checked (the renderer reads `text` off any item); an item without one
-    /// stays raw.
+    /// stays raw unless it is an inline `file` block (below).
     #[test]
     fn any_content_item_with_string_text_contributes_its_text() {
         let call = tool(serde_json::json!({
@@ -466,6 +485,95 @@ mod tests {
                 ContentBlock::Text("file that carries textuntyped text".into()),
                 ContentBlock::Other(serde_json::json!({"type": "file", "uri": "file:///a"})),
             ]
+        );
+    }
+
+    /// A tool `file` content block that inlines its payload decodes into the
+    /// neutral File Content view on V1 exactly as on V2 — the image/PDF `read`
+    /// returns — while the output payload is preserved verbatim beside it.
+    #[test]
+    fn an_inline_tool_file_block_decodes_into_the_file_content_view() {
+        let file = serde_json::json!({
+            "type": "file",
+            "uri": "data:image/png;base64,QUJD",
+            "mime": "image/png",
+            "name": "shot.png"
+        });
+        let call = tool(serde_json::json!({
+            "status": "completed",
+            "content": [
+                {"type": "text", "text": "Image read successfully"},
+                file.clone()
+            ]
+        }));
+
+        assert_eq!(
+            call.output.blocks,
+            vec![
+                ContentBlock::Text("Image read successfully".into()),
+                ContentBlock::File(FileContent {
+                    uri: "data:image/png;base64,QUJD".into(),
+                    mime: "image/png".into(),
+                    name: "shot.png".into(),
+                    size: 3,
+                }),
+            ]
+        );
+        assert_eq!(
+            call.output.raw,
+            Some(serde_json::json!([
+                {"type": "text", "text": "Image read successfully"},
+                file
+            ])),
+            "the raw payload is preserved verbatim"
+        );
+    }
+
+    /// A V1 user message's `file` part decodes into the same typed view: its
+    /// `url` is the payload URI and its `filename` the display name (with the
+    /// sane default when the part carries none).
+    #[test]
+    fn an_inline_file_part_decodes_into_the_file_content_view() {
+        let message = decoded_message(serde_json::json!([
+            {"type": "file", "mime": "image/png", "filename": "shot.png",
+             "url": "data:image/png;base64,QUJD"},
+            {"type": "file", "mime": "application/pdf", "url": "data:application/pdf;base64,QUJD"}
+        ]));
+
+        assert_eq!(
+            message.parts[0],
+            Part::File(FileContent {
+                uri: "data:image/png;base64,QUJD".into(),
+                mime: "image/png".into(),
+                name: "shot.png".into(),
+                size: 3,
+            })
+        );
+        assert_eq!(
+            message.parts[1],
+            Part::File(FileContent {
+                uri: "data:application/pdf;base64,QUJD".into(),
+                mime: "application/pdf".into(),
+                name: "file".into(),
+                size: 3,
+            }),
+            "a part without a filename reads the sane default"
+        );
+    }
+
+    /// A `file` part that only references a file (no inline payload) is not a
+    /// File Content: it keeps its raw payload, exactly as before.
+    #[test]
+    fn a_file_part_without_an_inline_payload_stays_raw() {
+        let part = serde_json::json!({"type": "file", "mime": "image/png", "url": "file:///a.png"});
+        let message = decoded_message(serde_json::json!([part.clone()]));
+
+        assert_eq!(
+            message.parts,
+            vec![Part::Other(OtherPart {
+                kind: "file".into(),
+                raw: part
+            })]
         );
     }
 

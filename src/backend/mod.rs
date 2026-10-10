@@ -14,10 +14,12 @@
 //! HTTP adapter ([`crate::opencode::client::OpenCodeBackend`]) and the test mock
 //! implement them.
 
+pub mod file_content;
 pub mod transcript;
 
 // The neutral views are re-exported at the contract root: consumers import
 // them from here, never from the decoder's module path.
+pub use file_content::*;
 pub use transcript::*;
 
 use std::sync::Arc;
