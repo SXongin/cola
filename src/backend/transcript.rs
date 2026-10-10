@@ -18,6 +18,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::file_content::FileContent;
+
 /// One Session's normalized read: every message the backend reports, decoded
 /// into typed views, in the order the backend returned them, plus the current
 /// generation's interaction facts.
@@ -1286,6 +1288,10 @@ pub enum Part {
     StepStart(StepStart),
     StepFinish(StepFinish),
     Patch(Patch),
+    /// A user message's file attachment, decoded into the typed
+    /// [`FileContent`] view (ADR-0076). A `file` part that inlines no payload
+    /// is not a File Content and stays [`Part::Other`].
+    File(FileContent),
     /// A part kind this build does not model, kept raw.
     Other(OtherPart),
 }
@@ -1300,7 +1306,9 @@ impl Part {
             Part::Text(text) => text.started_at,
             Part::Reasoning(reasoning) => reasoning.started_at,
             Part::Tool(call) => call.started_at,
-            Part::StepStart(_) | Part::StepFinish(_) | Part::Patch(_) | Part::Other(_) => None,
+            Part::StepStart(_) | Part::StepFinish(_) | Part::Patch(_) | Part::File(_) | Part::Other(_) => {
+                None
+            }
         }
     }
 }
@@ -1439,7 +1447,8 @@ pub struct ToolOutput {
     /// `None` when the state carried no output.
     pub raw: Option<Value>,
     /// The output's content blocks: one text block with the output text the
-    /// Bridge has always rendered, followed by any non-text blocks kept raw.
+    /// Bridge has always rendered, any `file` block that inlines its payload as
+    /// the typed [`FileContent`], and any other non-text blocks kept raw.
     /// The decoder owns the source precedence, so a payload that carries more
     /// than one text source never renders twice.
     pub blocks: Vec<ContentBlock>,
@@ -1449,11 +1458,14 @@ pub struct ToolOutput {
     pub error: Option<String>,
 }
 
-/// One output content block. Text blocks carry their text; any other kind
-/// stays raw.
+/// One output content block. Text blocks carry their text; a `file` block that
+/// inlines its payload is decoded into the typed [`FileContent`] view; any
+/// other kind stays raw.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ContentBlock {
     Text(String),
+    /// A `file` content block's inline payload (ADR-0076).
+    File(FileContent),
     /// A content block kind this build does not model, kept raw.
     Other(Value),
 }
@@ -2506,6 +2518,28 @@ mod tests {
         let tail = transcript.transcript_tail();
         assert_eq!(tail.len(), 1);
         assert_eq!(tail[0].text, "问题");
+    }
+
+    /// A user message's file part is payload, not conversation: it joins no
+    /// text and carries no server start, so it neither anchors a Turn nor
+    /// enters the recent-conversation tail on its own (ADR-0076; the record
+    /// line and delivery are the Platform's, tickets #647/#648).
+    #[test]
+    fn a_file_part_joins_no_text_and_has_no_start() {
+        let content = FileContent::decode("data:image/png;base64,QUJD", Some("image/png"), Some("shot.png"))
+            .expect("an inline payload is a File Content");
+        let message = message(
+            "u1",
+            MessageRole::User,
+            Some(MessageTime {
+                created: 1_000,
+                completed: Some(1_000),
+            }),
+            vec![text_part("看看"), Part::File(content)],
+        );
+
+        assert_eq!(message.text(), "看看");
+        assert!(message.parts[1].started_at().is_none());
     }
 
     #[test]

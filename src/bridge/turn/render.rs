@@ -159,9 +159,9 @@ fn renders_part(acc: &StreamAccumulator, part: &Part) -> bool {
             // the call's raw payloads into a panel only to drop it.
             !acc.tool_panel_current(call)
         }
-        // Step boundaries, patches and part kinds this build does not model
-        // render nothing — there is no content to add or dedupe.
-        Part::StepStart(_) | Part::StepFinish(_) | Part::Patch(_) | Part::Other(_) => false,
+        // Step boundaries, patches, file attachments and part kinds this build
+        // does not model render nothing — there is no content to add or dedupe.
+        Part::StepStart(_) | Part::StepFinish(_) | Part::Patch(_) | Part::File(_) | Part::Other(_) => false,
     }
 }
 
@@ -240,7 +240,9 @@ fn render_part(acc: &mut StreamAccumulator, source: Option<PartSource>, part: &P
                 acc.mark_streaming();
             }
         }
-        Part::StepStart(_) | Part::StepFinish(_) | Part::Patch(_) | Part::Other(_) => return false,
+        Part::StepStart(_) | Part::StepFinish(_) | Part::Patch(_) | Part::File(_) | Part::Other(_) => {
+            return false;
+        }
     }
     // card_state / running-tool changes reset the header phase timer.
     acc.refresh_phase();
@@ -1692,7 +1694,11 @@ fn child_liveness(transcript: &SessionTranscript) -> Option<TaskLiveness> {
                     }
                 }
                 Part::Text(_) | Part::Reasoning(_) => observe(part.started_at()),
-                Part::StepStart(_) | Part::StepFinish(_) | Part::Patch(_) | Part::Other(_) => {}
+                Part::StepStart(_)
+                | Part::StepFinish(_)
+                | Part::Patch(_)
+                | Part::File(_)
+                | Part::Other(_) => {}
             }
         }
     }

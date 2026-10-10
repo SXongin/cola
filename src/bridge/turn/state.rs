@@ -3461,7 +3461,7 @@ impl StreamAccumulator {
                         .insert(call.identity.call_id.clone(), ToolPanel::new(call.clone()));
                 }
             }
-            Part::StepStart(_) | Part::StepFinish(_) | Part::Patch(_) | Part::Other(_) => {}
+            Part::StepStart(_) | Part::StepFinish(_) | Part::Patch(_) | Part::File(_) | Part::Other(_) => {}
         }
     }
 
