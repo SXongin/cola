@@ -454,7 +454,11 @@ pub(crate) fn build_skill_cards(
                     let one_line = description.lines().next().unwrap_or("").trim();
                     truncate_md(&format!("{} — {}", skill.name, one_line), SKILL_ROW_LABEL_CHARS)
                 }
-                None => skill.name.clone(),
+                // Clip the bare name too: an unbounded label could alone exceed
+                // the card budget, and `chunk_picker_cards` cannot split a
+                // single oversized option. Every skill row is bounded, so that
+                // fallback is unreachable here.
+                None => truncate_md(&skill.name, SKILL_ROW_LABEL_CHARS),
             };
             (label, skill.id.clone())
         })
@@ -786,5 +790,40 @@ mod tests {
             1,
             "the list follows the error"
         );
+    }
+
+    /// An over-long description-less skill name is clipped to the row budget, so
+    /// the built card stays under Feishu's byte ceiling — `chunk_picker_cards`
+    /// cannot split one oversized option, so the label itself must be bounded.
+    #[test]
+    fn skill_card_clips_an_overlong_name_and_stays_within_budget() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let skills = [crate::backend::SkillInfo {
+            id: "long".into(),
+            name: "名".repeat(500),
+            description: None,
+        }];
+        let cards = build_skill_cards(&key, &skills, "p2p", None);
+        assert_eq!(cards.len(), 1, "one bounded row");
+        assert!(
+            cards[0].to_string().len() <= FEISHU_CARD_LIMIT_BYTES,
+            "card over Feishu's byte ceiling: {}",
+            cards[0].to_string().len()
+        );
+        let label = cards[0]["body"]["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["tag"] == "button")
+            .unwrap()["text"]["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            label.chars().count() <= SKILL_ROW_LABEL_CHARS + 1,
+            "label must be clipped to the row budget: {} chars",
+            label.chars().count()
+        );
+        assert!(label.ends_with('…'), "clipped label keeps its ellipsis: {label}");
     }
 }
