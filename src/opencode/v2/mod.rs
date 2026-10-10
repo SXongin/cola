@@ -764,13 +764,18 @@ impl GenerationStrategy for V2Strategy {
     }
 
     /// The registered skills (`GET /api/skill`), each as a neutral
-    /// `{ id, name, description? }`. The read is unfiltered — hidden
+    /// `{ id, name, description? }`. The read is location-scoped: `directory`
+    /// rides the `location[directory]` deepObject query, so a session's own
+    /// project skills are listed. The read is unfiltered — hidden
     /// (`autoinvoke: false`) and description-less skills are listed too, the
     /// point of the picker (spec #652, ticket #656). Best-effort: an unreadable
     /// failure returns an empty list so the picker degrades to its no-skills
     /// state.
-    async fn list_skills(&self, http: &Transport) -> Vec<SkillInfo> {
-        let Ok(resp) = http.client().get(http.url(SKILL)).send().await else {
+    async fn list_skills(&self, http: &Transport, directory: Option<&str>) -> Vec<SkillInfo> {
+        let Ok(url) = location_url(&http.url(SKILL), directory) else {
+            return Vec::new();
+        };
+        let Ok(resp) = http.client().get(url).send().await else {
             return Vec::new();
         };
         let Ok(page) = resp.json::<wire::DataEnvelope<Vec<wire::RawSkillInfo>>>().await else {

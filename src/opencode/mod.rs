@@ -211,8 +211,8 @@ impl Backend for OpenCodeBackend {
         OpenCodeBackend::list_agents(self).await
     }
 
-    async fn list_skills(&self) -> Vec<SkillInfo> {
-        OpenCodeBackend::list_skills(self).await
+    async fn list_skills(&self, directory: Option<&str>) -> Vec<SkillInfo> {
+        OpenCodeBackend::list_skills(self, directory).await
     }
 
     async fn list_models(&self) -> Vec<ProviderModels> {

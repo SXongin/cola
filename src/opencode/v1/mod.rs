@@ -562,10 +562,18 @@ impl GenerationStrategy for V1Strategy {
     /// The registered skills (`GET /skill`), each as a neutral
     /// `{ id, name, description? }`. V1's `Skill.Info` has no id, so the name
     /// IS the identity (V1 keys skills by name and its `skill` tool loads by
-    /// name). Best-effort: an unreadable/cached failure returns an empty list
-    /// so the `/skill` picker can degrade to its no-skills state.
-    async fn list_skills(&self, http: &Transport) -> Vec<SkillInfo> {
-        let Ok(resp) = http.client().get(http.url(SKILL)).send().await else {
+    /// name). `directory` scopes the read to a project location (`directory=`
+    /// on the instance route); `None` keeps the server's cwd instance.
+    /// Best-effort: an unreadable/cached failure returns an empty list so the
+    /// `/skill` picker can degrade to its no-skills state.
+    async fn list_skills(&self, http: &Transport, directory: Option<&str>) -> Vec<SkillInfo> {
+        let Ok(mut url) = reqwest::Url::parse(&http.url(SKILL)) else {
+            return Vec::new();
+        };
+        if let Some(d) = directory {
+            url.query_pairs_mut().append_pair("directory", d);
+        }
+        let Ok(resp) = http.client().get(url).send().await else {
             return Vec::new();
         };
         let Ok(text) = resp.text().await else {

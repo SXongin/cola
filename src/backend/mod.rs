@@ -429,9 +429,12 @@ pub trait Backend: Send + Sync {
     /// The registered skills, for the `/skill` picker and the `/skill <id>`
     /// resolution (spec #652, ticket #656). V2 reads `GET /api/skill`
     /// (`Skill.Info[]`); V1 reads its own `GET /skill`, whose identity IS the
-    /// name (V1's `Skill.Info` has no id). Best-effort: an unreadable failure
+    /// name (V1's `Skill.Info` has no id). `directory` selects the location the
+    /// read is scoped to — project skills live under `<directory>/.opencode`,
+    /// so a session's own directory is what the eventual prompt runs in; `None`
+    /// keeps the server's default location. Best-effort: an unreadable failure
     /// returns an empty list, so the picker degrades to its no-skills state.
-    async fn list_skills(&self) -> Vec<SkillInfo>;
+    async fn list_skills(&self, directory: Option<&str>) -> Vec<SkillInfo>;
 
     /// Available models grouped by provider (`GET /provider`), for the `/model`
     /// card picker. Empty on failure (the card degrades to a text prompt).

@@ -292,6 +292,8 @@ impl Default for RequestFixture {
 /// has no id, so its identity (and the neutral `id`) IS the name.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SkillListFixture {
+    /// The location the read is scoped to (the session's project directory).
+    pub(crate) directory: &'static str,
     pub(crate) visible_id: &'static str,
     pub(crate) visible_name: &'static str,
     pub(crate) visible_description: &'static str,
@@ -303,6 +305,7 @@ pub(crate) struct SkillListFixture {
 impl Default for SkillListFixture {
     fn default() -> Self {
         Self {
+            directory: "/work/cola",
             visible_id: "implement-spec",
             visible_name: "Implement Spec",
             visible_description: "Drive a spec to shipped code.",
@@ -1090,7 +1093,7 @@ async fn list_skills_yields_the_same_unfiltered_neutral_view_on_every_generation
         (case.mount_skills)(&server, &fixture);
         let backend = case.backend(&server);
 
-        let skills = backend.list_skills().await;
+        let skills = backend.list_skills(Some(fixture.directory)).await;
         assert_eq!(skills.len(), 3, "{generation}: every registered skill is listed");
         assert_eq!(
             skills[0].name, fixture.visible_name,
@@ -1122,5 +1125,35 @@ async fn list_skills_yields_the_same_unfiltered_neutral_view_on_every_generation
                 "{generation}: V1's name is its identity"
             );
         }
+        // The read must carry the caller's location: V2's deepObject
+        // `location[directory]`, V1's flat `directory=`. Without it the server
+        // answers its default location and a session's own project skills are
+        // missed.
+        let pairs = skill_request_query_pairs(&server);
+        let expected = if case.generation == Generation::V2 {
+            "location[directory]"
+        } else {
+            "directory"
+        };
+        assert!(
+            pairs.contains(&(expected.to_string(), fixture.directory.to_string())),
+            "{generation}: the skill read must be location-scoped with `{expected}`: {pairs:?}"
+        );
     }
+}
+
+/// The (decoded) query pairs of the newest recorded skill-list request — the
+/// location a read carried. Selected by path so a concurrent reader request
+/// (V2's progress stream) cannot be mistaken for it.
+fn skill_request_query_pairs(server: &TestHttpServer) -> Vec<(String, String)> {
+    let request = server
+        .requests()
+        .into_iter()
+        .rev()
+        .find(|request| request.path == "/skill" || request.path.ends_with("/skill"))
+        .expect("the skill read must have sent a request");
+    let url = reqwest::Url::parse(&format!("http://test/?{}", request.query)).expect("query parses");
+    url.query_pairs()
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect()
 }
