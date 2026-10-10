@@ -2392,14 +2392,15 @@ Index: /x/src/main.rs
     }
 
     /// Several large CJK skills attached to one turn must not push the live
-    /// card past the card budget either: the folds share one card-wide body
-    /// budget (spec #652, ticket #655), the same walk the splitter reserves.
+    /// card past the card budget either: every skill keeps its own titled fold
+    /// and the bodies share one card-wide budget (spec #652, ticket #655), the
+    /// same walk the splitter reserves.
     #[test]
     fn several_large_skills_stay_within_the_live_card_budget() {
         let mut acc = StreamAccumulator::new("test");
         acc.set_cola_message_id("msg_cola_1");
         let huge = "很长的技能说明。".repeat(1_000); // 8,000 CJK chars (24 KB) each
-        let skills: Vec<crate::backend::MessageSkill> = (0..6)
+        let skills: Vec<crate::backend::MessageSkill> = (0..10)
             .map(|i| message_skill(&format!("s{i}"), &format!("skill-{i}"), Some(&huge)))
             .collect();
         let transcript = SessionTranscript::new(vec![
@@ -2408,10 +2409,17 @@ Index: /x/src/main.rs
         ]);
 
         assert!(render_new_turn_parts(&mut acc, &transcript));
-        let size = acc.build_card().to_string().len();
+        let card = acc.build_card();
+        let s = card.to_string();
+        assert!(s.contains("🧩 已加载技能：skill-0"), "{s}");
         assert!(
-            size <= crate::feishu::card::MAX_CARD_JSON_CHARS,
-            "the folds pushed the live card to {size} bytes"
+            s.contains("🧩 已加载技能：skill-9"),
+            "every skill keeps a fold: {s}"
+        );
+        assert!(
+            s.len() <= crate::feishu::card::MAX_CARD_JSON_CHARS,
+            "the folds pushed the live card to {} bytes",
+            s.len()
         );
     }
 
