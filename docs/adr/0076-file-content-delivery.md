@@ -52,16 +52,21 @@ way a turn's several images stay tied to the call that read each one.
   title `📎 <name>`, `preview` enabled so a click enlarges it. It is not nested in
   the panel (the panel is folded by default), so the image is visible and its
   adjacency to the panel gives the correspondence. A format or dimension Feishu
-  rejects is not embeddable and falls through to the File Message path.
+  rejects is not embeddable and falls through to the File Message path. The
+  card's whole-card content-rejection fallback (which otherwise fences every
+  element as code) must preserve `img` elements.
 - **Send everything else as a File Message.** A non-image file, or an image past
   the caps (still ≤30MB), is uploaded once and posted as a separate Feishu
   message (`msg_type:"file"`), **replied in-thread under the live card**, sent
   **once on the first poll that shows the block**, guarded by a process-local
   once-guard (a cola restart may resend it).
-- **One shared Feishu capability, not a file-only path.** The client gains image
-  and file upload and a generic message send carrying an arbitrary `msg_type` +
-  content with thread-reply support, so the delivery is one reusable step shared
-  by the image-embed and File Message surfaces.
+- **One shared Feishu capability, on the Platform boundary.** Image and file
+  upload, and a generic message send (an arbitrary `msg_type` + content, with
+  thread-reply support), are Platform methods, so the Bridge stays
+  platform-agnostic and the fake Platform records uploads and sends. An image
+  uploads as `image_type=message`; a file upload carries `file_type` (from the
+  mime/name) and `file_name`. The delivery is one reusable step shared by the
+  image-embed and File Message surfaces.
 - **The tracking line has three states.** A tool-output File Content gets one
   line in its Tool Panel: `📎 name · mime · size · 已内嵌` when the image is
   embedded in the card; `📎 name · mime · size · 已发送为文件消息` when it was
