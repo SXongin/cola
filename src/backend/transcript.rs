@@ -1306,12 +1306,12 @@ impl TailEntry {
         if self.files.is_empty() {
             return self.text.clone();
         }
-        let mut lines = Vec::with_capacity(self.files.len() + 1);
-        if !self.text.is_empty() {
-            lines.push(self.text.clone());
+        let records = FileContent::record_lines(&self.files);
+        if self.text.is_empty() {
+            records
+        } else {
+            format!("{}\n{}", self.text, records)
         }
-        lines.extend(self.files.iter().map(FileContent::record_line));
-        lines.join("\n")
     }
 }
 

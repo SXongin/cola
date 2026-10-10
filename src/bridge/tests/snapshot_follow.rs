@@ -1,5 +1,7 @@
 use super::drain::spawn_sync;
-use crate::backend::{FinishReason, MessageRole, Part, SessionTranscript, StepFinish, TranscriptMessage};
+use crate::backend::{
+    FileContent, FinishReason, MessageRole, Part, SessionTranscript, StepFinish, TranscriptMessage,
+};
 use crate::bridge::test_support::*;
 
 /// A lobby adopt of a session that carries a pending permission ends in ONE
@@ -1220,5 +1222,87 @@ async fn waiting_adopt_cola_authored_turn_stays_static() {
     assert!(
         !Turn::has_card(&app.cards_handle(), "ses_alpha01").await,
         "cola's own turn is never followed"
+    );
+}
+
+/// ADR-0076 (ticket #648): the busy-adopt follow's static 最近对话 text carries
+/// the message's `body_text()` — its verbatim text plus one `📎 name · mime ·
+/// size` record line per File Content — so a file-bearing tail renders its
+/// record line on the FOLLOW card, not only on the one-shot snapshot. A revert
+/// to the bare `entry.text` would drop the file line here.
+#[tokio::test]
+async fn busy_follow_static_tail_records_a_file_line() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let content = FileContent::decode("data:image/png;base64,QUJD", Some("image/png"), Some("shot.png"))
+        .expect("an inline payload is a File Content");
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_sessions(vec![list_session(
+        "ses_alpha01",
+        "唯一外部标题",
+        "/work/ext",
+        100,
+    )]);
+    backend.with_session_status("ses_alpha01", Some(opencode::types::SessionStatus::Busy));
+    // The newest user message carries text AND a File Content; its turn is
+    // already complete, so the follow finalizes the snapshot card Done.
+    backend.given_transcript(
+        "ses_alpha01",
+        vec![SessionTranscript::new(vec![
+            typed_message(
+                "msg_user",
+                MessageRole::User,
+                Some(1_000),
+                vec![text_part("看看这个"), Part::File(content)],
+            ),
+            typed_message(
+                "msg_assist",
+                MessageRole::Assistant,
+                Some(2_000),
+                vec![Part::StepFinish(StepFinish {
+                    reason: FinishReason::Stop,
+                })],
+            ),
+        ])],
+    );
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    app.core
+        .external
+        .render_poll_ms
+        .store(20, std::sync::atomic::Ordering::Relaxed);
+
+    send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
+
+    // The follow re-renders the snapshot card and finalizes it Done.
+    wait_for_card_update(&platform, "the follow card", CardUpdates::Latest, |card| {
+        card_header(card).contains("✅")
+    })
+    .await;
+
+    let calls = platform.calls.lock().await.clone();
+    let follow_card = calls
+        .iter()
+        .filter_map(|c| match c {
+            PlatformCall::UpdateMessage { message_id, card } if message_id == "msg_reply" => {
+                Some(card.to_string())
+            }
+            _ => None,
+        })
+        .next_back()
+        .expect("the busy-adopt follow re-renders the snapshot card in place");
+    assert!(
+        follow_card.contains("**最近对话**"),
+        "the follow's static text keeps the tail: {follow_card}"
+    );
+    assert!(
+        follow_card.contains("看看这个"),
+        "the follow's static tail keeps the verbatim text: {follow_card}"
+    );
+    assert!(
+        follow_card.contains("📎 shot.png · image/png · 3 B"),
+        "the follow's static tail records the file line: {follow_card}"
     );
 }

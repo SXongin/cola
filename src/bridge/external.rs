@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::Instrument;
 
-use crate::backend::{MessageRole, Part, SessionTranscript, TurnAnchor, TurnSettle};
+use crate::backend::{FileContent, MessageRole, Part, SessionTranscript, TurnAnchor, TurnSettle};
 use crate::bridge::handles::{CardsHandle, FlowHandles, NoticeRules};
 use crate::bridge::turn::{
     CardClass, CardOwnership, ContinuationFacts, ContinuationLine, Disposition, SettleTiming, Turn,
@@ -1686,7 +1686,7 @@ async fn idle_bound_reached(handles: &FlowHandles, session_id: &str, anchor: &Tu
 /// messages in practice.
 fn message_preview(transcript: &SessionTranscript, anchor: &TurnAnchor) -> String {
     let mut text = String::new();
-    let mut files: Vec<String> = Vec::new();
+    let mut files: Vec<&FileContent> = Vec::new();
     for message in transcript
         .messages
         .iter()
@@ -1699,7 +1699,7 @@ fn message_preview(transcript: &SessionTranscript, anchor: &TurnAnchor) -> Strin
                 Part::Reasoning(reasoning) => text.push_str(&reasoning.text),
                 // A File Content is recorded as a line of its own (ADR-0076):
                 // its bytes are never re-delivered on the External Message path.
-                Part::File(content) => files.push(content.record_line()),
+                Part::File(content) => files.push(content),
                 _ => {}
             }
         }
@@ -1707,12 +1707,13 @@ fn message_preview(transcript: &SessionTranscript, anchor: &TurnAnchor) -> Strin
     // The text keeps the preview's 80-char cap; each File Content's record line
     // is short and always survives, so a long text never hides the attachment.
     let text: String = text.chars().take(80).collect();
-    if files.is_empty() {
+    let records = FileContent::record_lines(files);
+    if records.is_empty() {
         text
     } else if text.is_empty() {
-        files.join("\n")
+        records
     } else {
-        format!("{text}\n{}", files.join("\n"))
+        format!("{text}\n{records}")
     }
 }
 
