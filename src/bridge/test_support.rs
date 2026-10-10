@@ -474,6 +474,20 @@ impl RecordingPlatform {
         .await
     }
 
+    /// Every replied card paired with the message id it replied under, in call
+    /// order (asserts a reply lands under the right message).
+    pub(crate) async fn replied_cards_with_targets(&self) -> Vec<(String, serde_json::Value)> {
+        self.calls
+            .lock()
+            .await
+            .iter()
+            .filter_map(|c| match c {
+                PlatformCall::ReplyCard { reply_to, card } => Some((reply_to.clone(), card.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Every card the app sent to a chat.
     pub(crate) async fn sent_cards(&self) -> Vec<serde_json::Value> {
         self.cards_of(|c| match c {

@@ -161,14 +161,20 @@ fn card_buttons(card: &serde_json::Value) -> Vec<(String, String)> {
 }
 
 /// The dedicated loaded-skill card among the replied cards (spec #652, ticket
-/// #655): the one whose own title is `🧩 已加载技能`.
-async fn loaded_skill_card(fx: &SkillFixture) -> serde_json::Value {
+/// #655): the one whose own title is `🧩 已加载技能`, paired with the message id
+/// it replied under.
+async fn loaded_skill_card_with_target(fx: &SkillFixture) -> (String, serde_json::Value) {
     fx.platform
-        .replied_cards()
+        .replied_cards_with_targets()
         .await
         .into_iter()
-        .find(|card| card["header"]["title"]["content"] == "🧩 已加载技能")
+        .find(|(_, card)| card["header"]["title"]["content"] == "🧩 已加载技能")
         .expect("the loaded-skill card must reply under the user's message")
+}
+
+/// The dedicated loaded-skill card alone.
+async fn loaded_skill_card(fx: &SkillFixture) -> serde_json::Value {
+    loaded_skill_card_with_target(fx).await.1
 }
 
 /// Every collapsible panel of a card, in order.
@@ -474,6 +480,14 @@ async fn a_picker_row_tap_submits_the_skill_command() {
         .find(|element| element["tag"] == "button")
         .expect("a picker row")["value"]
         .clone();
+    // The picker row carries the ORIGINAL user message the picker was sent
+    // under (`msg_skill`, the `send` fixture's id) — not the picker card — so a
+    // tap's reply lands under it, exactly like a typed dispatch (spec #652).
+    assert_eq!(
+        value["reply_message_id"].as_str(),
+        Some("msg_skill"),
+        "the row carries the original user message id: {value}"
+    );
 
     let result = fx.app.host_action(value).await;
     let result = result.expect("the tap must ack");
@@ -493,9 +507,13 @@ async fn a_picker_row_tap_submits_the_skill_command() {
         *fx.prompt_skills.lock().await,
         vec![vec![resolved("implement-spec")]]
     );
-    // The tap path replies the same dedicated loaded-skill card a typed
-    // command does (spec #652, ticket #655).
-    let card = loaded_skill_card(&fx).await;
+    // The tap path replies the same dedicated loaded-skill card a typed command
+    // does (spec #652, ticket #655), under the ORIGINAL user message.
+    let (target, card) = loaded_skill_card_with_target(&fx).await;
+    assert_eq!(
+        target, "msg_skill",
+        "the loaded-skill card replies under the user's message, not the picker card"
+    );
     assert_eq!(
         collapsible_panels(&card)[0]["header"]["title"]["content"],
         "🧩 已加载技能：Implement Spec"
@@ -537,6 +555,66 @@ async fn a_partly_unknown_dispatch_submits_the_resolved_skills() {
         collapsible_panels(&card).len(),
         1,
         "only the resolved skill folds: {card}"
+    );
+}
+
+/// A mixed dispatch with a very long unknown id must not bloat the card: the
+/// leading `⚠️ 未找到技能：…` line is passed in OUTSIDE the fold budget, so it
+/// is bounded by itself (spec #652, ticket #655). The card stays under Feishu's
+/// byte ceiling.
+#[tokio::test]
+async fn a_mixed_dispatch_bounds_the_unknown_id_error_line() {
+    let fx = SkillFixture::build().await;
+
+    let long = "x".repeat(20_000);
+    fx.send(&format!("/skill implement-spec /skill {long}")).await;
+
+    assert_eq!(
+        *fx.prompt_skills.lock().await,
+        vec![vec![resolved("implement-spec")]],
+        "the resolvable id still submits"
+    );
+    let card = loaded_skill_card(&fx).await;
+    let intro = card["body"]["elements"][0]["content"].as_str().unwrap();
+    assert!(intro.contains("未找到技能"), "{intro}");
+    assert!(
+        intro.chars().count() <= 520,
+        "the error line is bounded, not 20k chars: {} chars",
+        intro.chars().count()
+    );
+    assert!(
+        card.to_string().len() <= crate::feishu::card::FEISHU_CARD_LIMIT_BYTES,
+        "the card stays under Feishu's byte ceiling: {} bytes",
+        card.to_string().len()
+    );
+}
+
+/// A rejected loaded-skill card degrades to a text message that still carries
+/// each skill's (clipped) body — the fold body the acceptance promises — not a
+/// title-only list (spec #652, ticket #655).
+#[tokio::test]
+async fn a_rejected_loaded_skill_card_falls_back_to_text_with_the_body() {
+    let fx = SkillFixture::build().await;
+    // The FIRST reply is the loaded-skill card; failing it forces the text
+    // fallback (the Turn's own card is a later reply and is unaffected).
+    fx.platform
+        .fail_reply_card_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+
+    fx.send("/skill implement-spec").await;
+
+    let texts = fx.platform.texts().await;
+    let fallback = texts
+        .iter()
+        .find(|t| t.contains("已加载技能"))
+        .expect("a text fallback is sent");
+    assert!(
+        fallback.contains("🧩 已加载技能：Implement Spec"),
+        "the title is shown: {fallback}"
+    );
+    assert!(
+        fallback.contains("Drive it."),
+        "the fold body is present in the fallback: {fallback}"
     );
 }
 

@@ -538,7 +538,7 @@ pub(crate) async fn send_skill_card(
     skills: &[crate::backend::SkillInfo],
     error: Option<&str>,
 ) -> Result<()> {
-    for card in super::picker::build_skill_cards(thread_key, skills, chat_type, error) {
+    for card in super::picker::build_skill_cards(thread_key, skills, chat_type, message_id, error) {
         if let Err(e) = handles.flow.platform.reply_card(message_id, &card).await {
             tracing::warn!("skill card failed ({}), falling back to text", e);
             return handles
@@ -610,18 +610,27 @@ pub(crate) async fn send_loaded_skill_card(
 }
 
 /// The plain-text fallback for [`send_loaded_skill_card`]: the same leading error
-/// line the card would show, then one line per loaded skill with the same
-/// `🧩 已加载技能：<name>` title the folds carry. The name is clipped to the
-/// picker's row-label budget, so an unbounded name cannot bloat the message.
+/// line the card would show, then one section per loaded skill — the
+/// `🧩 已加载技能：<name>` title AND its (clipped) markdown body, the fold body the
+/// acceptance promises. The bodies share the folds' card-wide character budget,
+/// so the degraded text stays bounded; the name is clipped to the picker's
+/// row-label budget.
 fn loaded_skill_text(skills: &[crate::backend::SkillInfo], error: Option<&str>) -> String {
     let mut text = String::new();
     if let Some(error) = error {
         text.push_str(error);
         text.push('\n');
     }
+    let mut chars_left = super::skill::SKILL_FOLDS_TOTAL_CHARS;
     for skill in skills {
         let name = super::truncate_md(&skill.name, super::picker::SKILL_ROW_LABEL_CHARS);
+        let body = super::skill::fallback_body(skill, chars_left);
+        chars_left = chars_left.saturating_sub(body.chars().count());
         text.push_str(&format!("🧩 已加载技能：{name}\n"));
+        if !body.is_empty() {
+            text.push_str(&body);
+            text.push('\n');
+        }
     }
     text.trim_end().to_string()
 }

@@ -15,19 +15,19 @@ fn option_picker_card(
     action: &str,
     options: &[(String, String)],
 ) -> serde_json::Value {
-    picker_card(
-        header, intro, thread_key, action, None, false, None, options, None,
-    )
+    picker_card(header, intro, thread_key, action, None, false, None, options, &[])
 }
 
-/// Add one extra routing pair to a button's callback payload (spec #652,
+/// Add the extra routing pairs to a button's callback payload (spec #652,
 /// ticket #656): the `/skill` picker carries the conversation's `chat_type`
-/// alongside `chat_id`/`thread_id`, so a tap reconstructs the exact
-/// [`ConversationKind`](crate::config::ConversationKind) the picker was sent in.
-/// Every other picker passes `None`.
-fn with_callback_field(mut payload: serde_json::Value, extra: Option<(&str, &str)>) -> serde_json::Value {
-    if let Some((key, value)) = extra {
-        payload[key] = serde_json::Value::String(value.to_string());
+/// alongside `chat_id`/`thread_id` (so a tap reconstructs the exact
+/// [`ConversationKind`](crate::config::ConversationKind) the picker was sent in)
+/// AND the original user message id the picker replied under, so a tap's own
+/// reply (the loaded-skill card) lands under that message rather than the picker
+/// card. Every other picker passes an empty slice.
+fn with_callback_field(mut payload: serde_json::Value, extra: &[(&str, &str)]) -> serde_json::Value {
+    for (key, value) in extra {
+        payload[*key] = serde_json::Value::String((*value).to_string());
     }
     payload
 }
@@ -60,11 +60,11 @@ impl PickerLevel {
 /// A picker card whose buttons carry an optional `level` (two-step navigation
 /// for the `/model` provider → model flow) and an optional leading "back"
 /// button. Each button's callback payload is `{action, chat_id, thread_id,
-/// [level], value}`. An optional leading clear button (`clear = Some((label,
-/// action))`) carries its OWN action tag: "clear/reset" never shares the value
-/// namespace with the options, so an option literally named like a clear verb
-/// stays selectable (ADR-0020's `--reset` decoupling — clearing is a mechanism,
-/// not a value).
+/// [level], value}` plus every `extra` pair. An optional leading clear button
+/// (`clear = Some((label, action))`) carries its OWN action tag: "clear/reset"
+/// never shares the value namespace with the options, so an option literally
+/// named like a clear verb stays selectable (ADR-0020's `--reset` decoupling —
+/// clearing is a mechanism, not a value).
 #[allow(clippy::too_many_arguments)] // picker builder: every knob is a first-class card axis
 fn picker_card(
     header: &str,
@@ -75,7 +75,7 @@ fn picker_card(
     back: bool,
     clear: Option<(&str, &str)>,
     options: &[(String, String)],
-    extra: Option<(&str, &str)>,
+    extra: &[(&str, &str)],
 ) -> serde_json::Value {
     let mut elements: Vec<serde_json::Value> = vec![json!({
         "tag": "markdown",
@@ -178,7 +178,7 @@ pub fn build_agent_card(
             Some(("默认（清除）", "agent_clear"))
         },
         &options,
-        None,
+        &[],
     )
 }
 
@@ -215,7 +215,7 @@ pub fn build_model_provider_cards(
             false,
             None,
             &[],
-            None,
+            &[],
         )];
     }
     chunk_picker_cards(
@@ -231,7 +231,7 @@ pub fn build_model_provider_cards(
         false,
         None,
         &options,
-        None,
+        &[],
     )
 }
 
@@ -271,7 +271,7 @@ pub fn build_model_picker_cards(
             true,
             None,
             &[],
-            None,
+            &[],
         )];
     }
     chunk_picker_cards(
@@ -283,7 +283,7 @@ pub fn build_model_picker_cards(
         true,
         None,
         &options,
-        None,
+        &[],
     )
 }
 
@@ -307,7 +307,7 @@ fn chunk_picker_cards(
     back: bool,
     clear: Option<(&str, &str)>,
     options: &[(String, String)],
-    extra: Option<(&str, &str)>,
+    extra: &[(&str, &str)],
 ) -> Vec<serde_json::Value> {
     let mut pages: Vec<&[(String, String)]> = Vec::new();
     let mut start = 0usize;
@@ -397,7 +397,7 @@ pub fn build_think_card(
         false,
         Some(("默认（清除）", "think_clear")),
         &options,
-        None,
+        &[],
     )
 }
 
@@ -430,15 +430,20 @@ pub(crate) fn skill_description_line(skill: &crate::backend::SkillInfo) -> Optio
 /// `/skill <id>`. `chat_type` rides each button so the tap reconstructs the
 /// [`ConversationKind`](crate::config::ConversationKind) the picker was sent in
 /// (the same routing payload every card button carries, next to `chat_id` /
-/// `thread_id`). `error`, when set, leads the intro so the SAME card answers
+/// `thread_id`), and `message_id` — the original user message the picker
+/// replied under — rides it too, so the tap's own reply (the loaded-skill card)
+/// lands under THAT message, exactly like a typed dispatch, rather than under
+/// the picker card. `error`, when set, leads the intro so the SAME card answers
 /// both a bare `/skill` and an unknown id. An empty list opens the no-skills
 /// state.
 pub(crate) fn build_skill_cards(
     thread_key: &crate::config::ThreadKey,
     skills: &[crate::backend::SkillInfo],
     chat_type: &str,
+    message_id: &str,
     error: Option<&str>,
 ) -> Vec<serde_json::Value> {
+    let extra = [("chat_type", chat_type), ("reply_message_id", message_id)];
     let mut intro = error.map(|e| format!("{e}\n")).unwrap_or_default();
     if skills.is_empty() {
         intro.push_str("_(没有可用技能)_");
@@ -451,7 +456,7 @@ pub(crate) fn build_skill_cards(
             false,
             None,
             &[],
-            Some(("chat_type", chat_type)),
+            &extra,
         )];
     }
     intro.push_str("**选择技能**（点击后以 `/skill <id>` 发送）：");
@@ -486,7 +491,7 @@ pub(crate) fn build_skill_cards(
         false,
         None,
         &options,
-        Some(("chat_type", chat_type)),
+        &extra,
     )
 }
 
@@ -746,7 +751,7 @@ mod tests {
                 content: None,
             },
         ];
-        let cards = build_skill_cards(&key, &skills, "p2p", None);
+        let cards = build_skill_cards(&key, &skills, "p2p", "msg_src", None);
         assert_eq!(cards.len(), 1, "three skills fit one card");
         let text = cards[0].to_string();
         assert!(text.contains("选择技能"), "header: {text}");
@@ -767,6 +772,11 @@ mod tests {
         assert_eq!(buttons[0]["value"]["action"].as_str(), Some("skill"));
         assert_eq!(buttons[0]["value"]["value"].as_str(), Some("implement-spec"));
         assert_eq!(buttons[0]["value"]["chat_type"].as_str(), Some("p2p"));
+        assert_eq!(
+            buttons[0]["value"]["reply_message_id"].as_str(),
+            Some("msg_src"),
+            "the row carries the original user message for the tap's own reply"
+        );
         assert!(
             !buttons[1]["text"]["content"].as_str().unwrap().contains("Bare —"),
             "a description-less skill shows only its name: {text}"
@@ -783,7 +793,7 @@ mod tests {
     #[test]
     fn skill_cards_render_empty_and_error_states() {
         let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-        let empty = build_skill_cards(&key, &[], "group", None);
+        let empty = build_skill_cards(&key, &[], "group", "msg_src", None);
         assert_eq!(empty.len(), 1);
         assert!(empty[0].to_string().contains("没有可用技能"), "no-skills state");
 
@@ -793,7 +803,7 @@ mod tests {
             description: None,
             content: None,
         }];
-        let with_error = build_skill_cards(&key, &skills, "group", Some("⚠️ 未找到技能：`nope`"));
+        let with_error = build_skill_cards(&key, &skills, "group", "msg_src", Some("⚠️ 未找到技能：`nope`"));
         let text = with_error[0].to_string();
         assert!(text.contains("未找到技能"), "error line: {text}");
         assert!(text.contains("nope"), "error names the id: {text}");
@@ -847,7 +857,7 @@ mod tests {
             description: None,
             content: None,
         }];
-        let cards = build_skill_cards(&key, &skills, "p2p", None);
+        let cards = build_skill_cards(&key, &skills, "p2p", "msg_src", None);
         assert_eq!(cards.len(), 1, "one bounded row");
         assert!(
             cards[0].to_string().len() <= FEISHU_CARD_LIMIT_BYTES,
