@@ -8,7 +8,7 @@
 //! accumulator's own tests are the module's internal seam.
 
 use super::disposition::Disposition;
-use crate::backend::{MessageId, Part, SessionTranscript, ToolCall, TurnAnchor};
+use crate::backend::{MessageId, Part, PromptSkill, SessionTranscript, ToolCall, TurnAnchor};
 use crate::bridge::chain::{CursorFrontier, CursorPartKind, RenderedCursor};
 use crate::bridge::handles::CardsHandle;
 use crate::feishu::card::first_n_chars_bytes;
@@ -1277,6 +1277,13 @@ pub(super) struct StreamAccumulator {
     /// [`Self::continue_on_new_card`] (a Wake continuation carries no question
     /// to re-ask); read through [`Self::prompt`].
     prompt: Option<String>,
+    /// The skills this turn loaded into the prompt (spec #652, ticket #654),
+    /// kept alongside [`Self::prompt`] so the error-card "retry" re-submits the
+    /// prompt WITH its skills. Already-resolved small tokens (one id + name per
+    /// skill), so unlike the image bytes (#391 excludes those for re-upload
+    /// cost) carrying them costs nothing. Private to this module: set by
+    /// [`Self::set_skills`] (at `Turn::start`); read through [`Self::skills`].
+    skills: Vec<PromptSkill>,
     /// Whether this card's terminal recovery action — spec #391's Error retry,
     /// #437's Unreceived 重新发起 — or its waiting-card cleanup (spec #588,
     /// #590) has been claimed. The click is acked immediately, so a second
@@ -2000,6 +2007,19 @@ impl StreamAccumulator {
         self.prompt = Some(prompt.to_string());
     }
 
+    /// The skills this turn loaded into the prompt, if recorded — the
+    /// error-card "retry" re-submits the prompt WITH these (spec #652, ticket
+    /// #654). Private to this module: set by [`Self::set_skills`].
+    pub(super) fn skills(&self) -> &[PromptSkill] {
+        &self.skills
+    }
+
+    /// Record this turn's skills (set once, at `Turn::start`, beside
+    /// [`Self::set_prompt`]).
+    pub(super) fn set_skills(&mut self, skills: &[PromptSkill]) {
+        self.skills = skills.to_vec();
+    }
+
     /// The `msg_cola_…` id this turn's user message carries (ADR-0026), if
     /// recorded — the Chain Record's message id and the retry's dedup key.
     /// Private to this module: set by [`Self::set_cola_message_id`].
@@ -2382,6 +2402,8 @@ impl StreamAccumulator {
     pub(super) fn continue_on_new_card(&mut self) {
         self.error = None;
         self.prompt = None;
+        // No question to re-ask, so no attachment to re-attach either.
+        self.skills = Vec::new();
         self.release_recovery_claim();
         self.mark_wake_continuation();
         self.card_fallback = CardFallback::None;
