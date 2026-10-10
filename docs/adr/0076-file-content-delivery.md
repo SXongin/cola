@@ -6,7 +6,9 @@ message's `files` list carries — and `tool_output` drops it, so the panel show
 just 「Image read successfully」. cola renders a File Content back to the user by
 a **hybrid** of the two Feishu surfaces: an image within Feishu's caps is
 uploaded once and embedded in the card right after its **Tool Panel**; anything
-else is uploaded once and posted as a separate **File Message**. Feishu can show
+else within Feishu's 30MB message cap is uploaded once and posted as a separate
+**File Message**, while a File Content past that cap, or one whose send fails,
+leaves only a tracking line. Feishu can show
 a PDF in no other way (a card has no file component), and embedding is the only
 way a turn's several images stay tied to the call that read each one.
 
