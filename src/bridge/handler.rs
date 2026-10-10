@@ -465,7 +465,9 @@ impl App {
     /// one `🧩 已加载技能：<name>` fold per distinct skill — the ONLY place a
     /// skill fold renders (the live Turn card, the Session Snapshot tail and
     /// the External Message preview are text-only; ADR-0077's acceptance
-    /// reversal).
+    /// reversal). A dispatch that resolves SOME ids but not others still
+    /// submits the resolved ones and leads the card with a `⚠️ 未找到技能：…`
+    /// line naming the rest, so nothing is dropped silently (Q19).
     ///
     /// Two recovery cases never reach the model — a bare `/skill` (no id) and a
     /// dispatch whose ids ALL fail to resolve. Both answer with the SAME picker
@@ -530,34 +532,45 @@ impl App {
                 None => unknown.push(id.clone()),
             }
         }
-        // The one card-send path both recovery cases share: a bare `/skill`
-        // supplies no error, an unresolvable dispatch leads with one.
+        // The unknown-id error line, shared by the two card paths: a bare
+        // `/skill` supplies none, a dispatch with unresolvable ids leads with
+        // one — on the picker when NOTHING resolved, and on the dedicated
+        // loaded-skill card when SOME did (Q19: partial submit, the unknowns
+        // surfaced, nothing dropped silently).
+        let unknown_error = (!unknown.is_empty()).then(|| {
+            let named = unknown
+                .iter()
+                .map(|id| format!("`{id}`"))
+                .collect::<Vec<_>>()
+                .join("、");
+            format!("⚠️ 未找到技能：{named}")
+        });
+        // Nothing resolved (a bare `/skill`, or every id unknown): the picker
+        // card, leading with the error line when there were ids, and no prompt.
         if ids.is_empty() || resolved.is_empty() {
-            let error = (!unknown.is_empty()).then(|| {
-                let named = unknown
-                    .iter()
-                    .map(|id| format!("`{id}`"))
-                    .collect::<Vec<_>>()
-                    .join("、");
-                format!("⚠️ 未找到技能：{named}")
-            });
             let _ = crate::feishu::card::command::send_skill_card(
                 &handles,
                 &thread_key,
                 &msg.chat_type,
                 &msg.message_id,
                 &skills,
-                error.as_deref(),
+                unknown_error.as_deref(),
             )
             .await;
             return;
         }
-        // The dedicated loaded-skill card replies under the user's message —
-        // the same feedback for a typed command and a picker-row tap. A failed
-        // card is logged (and degrades to text inside the helper); it never
-        // blocks the submit, which is the command's whole point.
-        if let Err(e) =
-            crate::feishu::card::command::send_loaded_skill_card(&handles, &msg.message_id, &loaded).await
+        // A mixed dispatch submits the ids that resolved AND names the unknown
+        // ones on the dedicated loaded-skill card (Q19). The card replies under
+        // the user's message — the same feedback for a typed command and a
+        // picker-row tap. A failed card is logged (and degrades to text inside
+        // the helper); it never blocks the submit, which is the command's point.
+        if let Err(e) = crate::feishu::card::command::send_loaded_skill_card(
+            &handles,
+            &msg.message_id,
+            &loaded,
+            unknown_error.as_deref(),
+        )
+        .await
         {
             tracing::warn!("loaded-skill card: {e}");
         }

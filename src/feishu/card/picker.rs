@@ -403,8 +403,10 @@ pub fn build_think_card(
 
 /// How many characters a skill row's button label shows before clipping. A
 /// button is a single line, so a long frontmatter description is clipped with a
-/// "…" rather than bloating the card; the skill's `name` always leads.
-const SKILL_ROW_LABEL_CHARS: usize = 60;
+/// "…" rather than bloating the card; the skill's `name` always leads. The
+/// loaded-skill fold reuses it to bound the `name` in its panel title (spec
+/// #652, ticket #655).
+pub(crate) const SKILL_ROW_LABEL_CHARS: usize = 60;
 
 /// The one-line skill description both the picker row and its text fallback
 /// show (spec #652, ticket #656): the skill's `description` trimmed, an

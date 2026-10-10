@@ -504,8 +504,10 @@ async fn a_picker_row_tap_submits_the_skill_command() {
 
 /// A dispatch that resolves at least one id keeps the ids that resolve and
 /// submits — the spec's "keeps the ids that resolve" — so a typo alongside a
-/// valid id does not block the load. Only a dispatch that resolves NOTHING
-/// (a lone unknown id included) shows the error card.
+/// valid id does not block the load. The dedicated card leads with a
+/// `⚠️ 未找到技能：…` line naming the unknown ids (Q19): nothing is dropped
+/// silently. Only a dispatch that resolves NOTHING (a lone unknown id included)
+/// shows the error-plus-picker card.
 #[tokio::test]
 async fn a_partly_unknown_dispatch_submits_the_resolved_skills() {
     let fx = SkillFixture::build().await;
@@ -517,12 +519,60 @@ async fn a_partly_unknown_dispatch_submits_the_resolved_skills() {
     assert_eq!(
         *fx.prompt_skills.lock().await,
         vec![vec![resolved("implement-spec")]],
-        "the unknown id is dropped, the resolved one is attached"
+        "the unknown id is dropped from the prompt, the resolved one is attached"
     );
     let cards = fx.platform.replied_cards().await;
     assert!(
         cards.iter().all(|card| !card.to_string().contains("选择技能")),
         "a partly-resolved dispatch submits, it does not show the picker"
+    );
+    // The unknown id is surfaced on the dedicated card, not dropped silently.
+    let card = loaded_skill_card(&fx).await;
+    let intro = card["body"]["elements"][0]["content"].as_str().unwrap();
+    assert!(
+        intro.contains("未找到技能") && intro.contains("nope"),
+        "the card names the unknown id: {intro:?}"
+    );
+    assert_eq!(
+        collapsible_panels(&card).len(),
+        1,
+        "only the resolved skill folds: {card}"
+    );
+}
+
+/// A skill with an over-long name is clipped in its fold title (spec #652,
+/// ticket #655): the body budget never bounds the title, so an unbounded name
+/// could alone push the card past Feishu's 30 KB limit. The clip matches the
+/// picker's row-label budget.
+#[tokio::test]
+async fn an_overlong_skill_name_is_clipped_in_the_fold_title() {
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_skills(vec![SkillInfo {
+        id: "long".into(),
+        name: "名".repeat(500),
+        description: None,
+        content: Some("body".into()),
+    }]);
+    let fx = SkillFixture::with(backend).await;
+
+    fx.send("/skill long").await;
+
+    let card = loaded_skill_card(&fx).await;
+    let title = collapsible_panels(&card)[0]["header"]["title"]["content"]
+        .as_str()
+        .unwrap();
+    assert!(
+        title.chars().count() <= 80,
+        "the fold title is bounded, not 500 chars: {} chars",
+        title.chars().count()
+    );
+    assert!(
+        title.ends_with('…'),
+        "a clipped title carries the marker: {title}"
+    );
+    assert!(
+        card.to_string().len() <= crate::feishu::card::FEISHU_CARD_LIMIT_BYTES,
+        "the card stays under Feishu's byte ceiling"
     );
 }
 

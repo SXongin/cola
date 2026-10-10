@@ -583,7 +583,9 @@ fn skill_list_text(skills: &[crate::backend::SkillInfo], error: Option<&str>) ->
 /// Reply the dedicated loaded-skill card (spec #652, ticket #655, acceptance
 /// reversal) under the user's `/skill` message: one folded
 /// `🧩 已加载技能：<name>` panel per distinct loaded skill, the body the skill's
-/// own markdown from the skill-list read's `content`. Both the typed command
+/// own markdown from the skill-list read's `content`. `error`, when set, leads
+/// the card — a mixed dispatch that resolved SOME ids but not others names the
+/// unknown ones here, so nothing is dropped silently. Both the typed command
 /// and a picker-row tap go through here, so the feedback is identical. A
 /// rejected card must not leave the command dead, so — like
 /// [`send_skill_card`] — the failure degrades to a plain-text listing of the
@@ -592,26 +594,34 @@ pub(crate) async fn send_loaded_skill_card(
     handles: &CommandHandles,
     message_id: &str,
     skills: &[crate::backend::SkillInfo],
+    error: Option<&str>,
 ) -> Result<()> {
-    let card = super::skill::build_loaded_skill_card(skills);
+    let card = super::skill::build_loaded_skill_card(skills, error);
     if let Err(e) = handles.flow.platform.reply_card(message_id, &card).await {
         tracing::warn!("loaded-skill card failed ({}), falling back to text", e);
         return handles
             .flow
             .platform
-            .reply_text(message_id, &loaded_skill_text(skills))
+            .reply_text(message_id, &loaded_skill_text(skills, error))
             .await
             .map(|_| ());
     }
     Ok(())
 }
 
-/// The plain-text fallback for [`send_loaded_skill_card`]: one line per loaded
-/// skill, the same `🧩 已加载技能：<name>` title the folds carry.
-fn loaded_skill_text(skills: &[crate::backend::SkillInfo]) -> String {
+/// The plain-text fallback for [`send_loaded_skill_card`]: the same leading error
+/// line the card would show, then one line per loaded skill with the same
+/// `🧩 已加载技能：<name>` title the folds carry. The name is clipped to the
+/// picker's row-label budget, so an unbounded name cannot bloat the message.
+fn loaded_skill_text(skills: &[crate::backend::SkillInfo], error: Option<&str>) -> String {
     let mut text = String::new();
+    if let Some(error) = error {
+        text.push_str(error);
+        text.push('\n');
+    }
     for skill in skills {
-        text.push_str(&format!("🧩 已加载技能：{}\n", skill.name));
+        let name = super::truncate_md(&skill.name, super::picker::SKILL_ROW_LABEL_CHARS);
+        text.push_str(&format!("🧩 已加载技能：{name}\n"));
     }
     text.trim_end().to_string()
 }
