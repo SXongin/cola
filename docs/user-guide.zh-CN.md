@@ -323,6 +323,7 @@ cola 总是追加写入日志文件——默认 `~/.cola/cola.log`（不含 ANSI
 | `/agent <name>` | 切换 agent（下一条消息生效；持久化；`--reset` 清除为服务器默认） |
 | `/model <p/m>` | 切换模型（下一条消息生效；持久化） |
 | `/think [level]` | 设置/清除思考等级，按模型生效（下一条消息生效） |
+| `/skill <id> [/skill <id> …] [text]` | 把一个或多个 OpenCode 技能加载进本条消息的提示词；技能 token 之后的文本原样提交（裸 `/skill` 打开技能选择卡片） |
 | `/autoaccept [on\|off]` | 查看/切换本会话是否自动放行工具权限请求 |
 | `/restart` | 重启 cola（保留启动参数与日志重定向） |
 | `/restart-opencode` | 重启 OpenCode 服务器（仅限 cola 自己启动的那个） |

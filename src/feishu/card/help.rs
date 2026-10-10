@@ -37,6 +37,10 @@ pub fn build_help_card() -> serde_json::Value {
                 ("/agent <名字>", "切换 agent（下条消息生效）"),
                 ("/model <提供方/模型>", "切换模型（下条消息生效）"),
                 ("/think [等级]", "设置/清除思考等级（下条消息生效）"),
+                (
+                    "/skill <技能ID>",
+                    "加载一个 OpenCode 技能进本条消息的提示词（可重复本命令加载多个）",
+                ),
                 ("/autoaccept [on|off]", "查看或切换自动授权"),
                 ("/stop", "中断当前执行"),
                 ("/compact", "压缩上下文"),
@@ -98,6 +102,7 @@ mod tests {
             "/name",
             "/agent",
             "/model",
+            "/skill",
             "/autoaccept",
             "/stop",
             "/compact",

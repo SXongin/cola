@@ -399,6 +399,7 @@ pub fn help_text() -> String {
 `/agent <name>` · Switch agent (takes effect next message)
 `/model <p/m>` · Switch model (takes effect next message)
 `/think [等级]` · Set/clear thinking level (per model; takes effect next message)
+`/skill <id> [/skill <id> …] [text]` · Load one or more OpenCode skills into this message's prompt; text after the tokens is submitted verbatim (a bare `/skill` opens the skill picker)
 `/autoaccept` · Show auto-approve status; `/autoaccept on|off` switches
 `/restart` · Restart cola (keeps startup args + log redirect)
 `/restart-opencode` · Restart the OpenCode server (only when cola started it)
@@ -458,6 +459,9 @@ pub fn command_help(name: &str) -> Option<String> {
         }
         "autoaccept" => {
             "/autoaccept [on|off]\nShow or switch auto-allowing permission requests for this session (no permission cards). On a Pending Session (`/new`/`/dir`/`/topic` before its first message) the flag is recorded on the pending and applies to the session the first message creates.\nNo arg: show current state. `/autoaccept on` / `/autoaccept off` switch it.\nExample: `/autoaccept`"
+        }
+        "skill" => {
+            "/skill <id> [/skill <id> …] [text]\nLoad one or more OpenCode skills into this message's prompt. Each `/skill <id>` token takes the id that follows it, collected in order (`/skill a /skill b`), and the whole message text — tokens included — is submitted verbatim, so trailing text becomes the skill's argument (`/skill implement-spec 644`). A bare `/skill`, or a dispatch whose ids all fail to resolve, replies with the skill picker: every registered skill, hidden ones included. On V2 the ids ride the prompt's structured `skills` field (deterministic injection); on V1, which has no such field, cola folds an instruction to load the skill by name with its `skill` tool into the prompt text.\nExample: `/skill implement-spec 644`"
         }
         "restart" => {
             "/restart\nRestart cola itself, keeping startup args and the log redirect. The new process takes over the singleton lock (passes --replace). Under a systemd unit cola exits and lets `Restart=on-failure` bring it back; elsewhere it re-execs. cola announces in this chat when it's back."
@@ -2572,9 +2576,27 @@ mod tests {
             command_help("sub").unwrap().contains("/sub attach"),
             "the sub help documents the takeover form"
         );
+        let skill = command_help("skill").expect("skill has a help topic");
+        assert!(
+            skill.contains("/skill <id>"),
+            "the skill help shows the syntax: {skill}"
+        );
+        assert!(
+            skill.contains("/skill a /skill b"),
+            "the skill help documents the repeated-token form: {skill}"
+        );
         assert_eq!(command_help("nonexistent"), None);
         // The retired text-list form has no help topic of its own.
         assert_eq!(command_help("list"), None);
+    }
+
+    /// `/skill` is discoverable in every help surface (spec #652, ticket #657):
+    /// the plain-text fallback the `/help` card degrades to must list it with
+    /// its syntax, exactly like the card and the per-command topic do.
+    #[test]
+    fn help_text_lists_the_skill_command() {
+        let text = help_text();
+        assert!(text.contains("`/skill <id>"), "help text lists /skill: {text}");
     }
 
     #[test]
