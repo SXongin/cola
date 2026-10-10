@@ -47,11 +47,12 @@ than adding a cola-side allow-list.
   do not resolve are dropped.
 - **The picker is the recovery path.** A bare `/skill` (no id) and a dispatch
   whose ids **all** fail to resolve both answer with the same picker card — one
-  row per registered skill, its name plus its description — built from the list
-  just read; the second leads with an unknown-id error line. The list read is
-  deliberately **unfiltered**: hidden (`disable-model-invocation`) and
-  description-less skills are listed too, since reaching exactly the user-invoked
-  skills the model never advertises is the point.
+  row per registered skill, its name, plus its description when the skill
+  declares one (a description-less skill shows its name alone) — built from the
+  list just read; the second leads with an unknown-id error line. The list read
+  is deliberately **unfiltered**: hidden (`disable-model-invocation`) and
+  description-less skills are listed too, since reaching exactly the
+  user-invoked skills the model never advertises is the point.
 - **One generation-neutral skill-list read.** The Backend contract grows
   `list_skills(directory)` returning `{ id, name, description? }`. V2 reads
   `GET /api/skill`; V1 reads its own `GET /skill`, whose identity IS the name
