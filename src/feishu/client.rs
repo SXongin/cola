@@ -830,6 +830,10 @@ impl Client {
                     format!("multipart/form-data; boundary={IMAGE_UPLOAD_BOUNDARY}"),
                 )
                 .body(body)
+                // Bound the transfer like the client's other byte-carrying call
+                // (`download_image`, 10s): a stalled upload must never hold up
+                // the render pass or the poll loop that awaits it (ADR-0076).
+                .timeout(std::time::Duration::from_secs(10))
                 .send()
                 .await?,
             "upload image",

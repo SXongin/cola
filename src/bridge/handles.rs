@@ -786,6 +786,16 @@ impl SessionsHandle {
     }
 }
 
+/// The process-local File Content image cache (ADR-0076): a content hash maps to
+/// the single-flight resolution of that content. The inner cell holds
+/// `Some(image_key)` for an embedded image or `None` for a content the Platform
+/// will not embed, and its `get_or_try_init` is the in-flight guard: concurrent
+/// resolvers of one hash await ONE upload instead of each missing the cache and
+/// uploading the same bytes twice. A failed upload leaves the cell
+/// uninitialized, so a later poll retries. Shared process-wide, so identical
+/// bytes upload once whichever Session or card renders them.
+pub(crate) type FileImageCache = Arc<Mutex<HashMap<u64, Arc<tokio::sync::OnceCell<Option<String>>>>>>;
+
 /// The live cards, the card-handle registry, the per-session card-write locks,
 /// the topic cover records, and the platform that sends them.
 ///
@@ -837,10 +847,10 @@ pub(crate) struct CardsHandle {
     /// by default; a test may shorten it through the handle.
     pub(crate) preserved_view_timeout_ms: Arc<std::sync::atomic::AtomicU64>,
     /// The process-local File Content image cache (ADR-0076): `content hash →
-    /// Some(image_key)` embedded / `None` not an embeddable image. Shared with
-    /// the whole process so identical bytes upload once, whichever Session or
-    /// card renders them.
-    pub(crate) file_images: Arc<Mutex<HashMap<u64, Option<String>>>>,
+    /// the single-flight resolution` — an `OnceCell` holding `Some(image_key)`
+    /// embedded / `None` not an embeddable image. Shared with the whole process
+    /// so identical bytes upload once, whichever Session or card renders them.
+    pub(crate) file_images: FileImageCache,
 }
 
 impl CardsHandle {
@@ -853,7 +863,7 @@ impl CardsHandle {
         chains: Arc<crate::bridge::chain::ChainRecords>,
         write_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
         preserved_view_timeout_ms: Arc<std::sync::atomic::AtomicU64>,
-        file_images: Arc<Mutex<HashMap<u64, Option<String>>>>,
+        file_images: FileImageCache,
     ) -> Self {
         Self {
             cards,

@@ -186,6 +186,22 @@ mod tests {
         bytes
     }
 
+    /// A BMP `BM` file header (14 bytes) plus a BITMAPINFOHEADER declaring
+    /// `width`×`height` (a negative height is a top-down bitmap, read by
+    /// magnitude). The header is real (the parser must read the signature and
+    /// the DIB header), the pixel data is absent — the parser never reads it.
+    fn bmp(width: i32, height: i32) -> Vec<u8> {
+        let mut bytes = b"BM".to_vec();
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // file size (unread)
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // reserved
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // reserved
+        bytes.extend_from_slice(&54u32.to_le_bytes()); // pixel-data offset (unread)
+        bytes.extend_from_slice(&40u32.to_le_bytes()); // BITMAPINFOHEADER size
+        bytes.extend_from_slice(&width.to_le_bytes());
+        bytes.extend_from_slice(&height.to_le_bytes());
+        bytes
+    }
+
     #[test]
     fn a_mime_outside_feishus_set_is_not_embeddable() {
         assert!(!embeddable_image(&content(b"%PDF-1.7", "application/pdf")));
@@ -233,9 +249,15 @@ mod tests {
             0xff, 0xd9, // EOI
         ];
         assert_eq!(jpeg_dimensions(&jpeg), Some((9, 7)));
+        // BMP is read through the mime dispatch (`image/bmp`), so dropping that
+        // arm — not just the parser — fails here. A top-down bitmap's negative
+        // height reads by magnitude.
+        assert_eq!(image_dimensions(&bmp(11, 12), "image/bmp"), Some((11, 12)));
+        assert_eq!(image_dimensions(&bmp(11, -12), "image/bmp"), Some((11, 12)));
         // Truncated/malformed input yields no dimensions, never a panic.
         assert_eq!(png_dimensions(&[0x89, b'P']), None);
         assert_eq!(gif_dimensions(b"GIF89a"), None);
+        assert_eq!(bmp_dimensions(b"BM"), None);
         assert_eq!(jpeg_dimensions(&[0xff, 0xd8, 0xff]), None);
         assert_eq!(image_dimensions(b"x", "image/webp"), None);
     }
