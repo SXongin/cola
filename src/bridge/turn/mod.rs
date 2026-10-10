@@ -215,8 +215,10 @@ pub(crate) struct PromptContext {
     pub(crate) images: Vec<ImageAttachment>,
     /// The skills this turn loads into the prompt (spec #652, ticket #654): the
     /// generation-neutral attachment parsed from a `/skill <id>` command. Empty
-    /// for an ordinary message. Like `images`, deliberately not carried across a
-    /// recovery (see [`TurnRecovery::into_context`]).
+    /// for an ordinary message. Carried across a recovery, unlike `images` (see
+    /// [`TurnRecovery::into_context`]): skills are already-resolved small tokens
+    /// re-attached to the retry's prompt, while #391 excludes image bytes for
+    /// their re-upload cost.
     pub(crate) skills: Vec<PromptSkill>,
     /// The Backend's ADVISORY status read reported a live Execution while cola
     /// owned no live card chain (ADR-0062): the new Turn's card opens with
