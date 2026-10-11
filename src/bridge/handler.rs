@@ -13,6 +13,7 @@ use crate::bridge::span;
 use crate::bridge::turn::PromptContext;
 use crate::config::{Config, ConversationKind, ThreadKey};
 use crate::feishu;
+use crate::feishu::card::session::BrowseView;
 use crate::opencode;
 use crate::opencode::types::SessionStatus;
 
@@ -195,6 +196,237 @@ fn reject_nested_topic(thread_key: &ThreadKey) -> Option<CardActionResult> {
         card: None,
         toast: Some(NESTED_TOPIC_REJECTION.to_string()),
     })
+}
+
+/// The read model of one `/dir` browse card render (ADR-0078): the directory
+/// actually browsed (after resolution and any ancestor fallback), its child
+/// directories (filtered + sorted), whether the filter control shows, and any
+/// fallback explanation.
+struct BrowseState {
+    dir: String,
+    children: Vec<crate::feishu::card::session::BrowseChild>,
+    show_filter: bool,
+    notice: Option<String>,
+}
+
+/// How many directory entries one browse render will `stat`. A pathological
+/// directory (tens of thousands of children on a slow filesystem) must not
+/// outrun the card callback's budget — the WS layer drops a late card result
+/// entirely — so the scan stops here and the card says it was truncated
+/// (#670 review).
+pub(crate) const BROWSE_SCAN_CAP: usize = 2000;
+/// Read + shape the browse card's data for a requested directory (ADR-0078):
+/// resolve the target (symlinks followed, see [`resolve_browse_path`]), fall back
+/// to the nearest existing ancestor when the directory is gone, then list its
+/// child directories — directories only, dot-directories behind the hidden
+/// toggle, token-AND filtered by `keyword`, repos first then case-insensitive
+/// alphabetical. All local `stat`/`read_dir`: the card callback runs inside
+/// Feishu's 3 s, no-retry budget.
+fn browse_dir_state(view: BrowseView<'_>) -> BrowseState {
+    let keyword = view.keyword;
+    let show_hidden = view.show_hidden;
+    let Some(mut dir) = resolve_browse_path(view.dir) else {
+        return BrowseState {
+            dir: String::new(),
+            children: Vec::new(),
+            show_filter: false,
+            notice: Some("目录不可用".to_string()),
+        };
+    };
+    let mut notice = None;
+    if !dir.is_dir() {
+        match nearest_existing_dir(&dir) {
+            Some(ancestor) => {
+                notice = Some(format!("目录不存在，已回退到 `{}`", ancestor.display()));
+                dir = ancestor;
+            }
+            None => {
+                return BrowseState {
+                    dir: dir.to_string_lossy().to_string(),
+                    children: Vec::new(),
+                    show_filter: false,
+                    notice: Some("目录不存在".to_string()),
+                };
+            }
+        }
+    }
+    let lower_keyword = keyword.to_lowercase();
+    let mut children = Vec::new();
+    let mut visible = 0usize;
+    let mut scanned = 0usize;
+    let mut truncated = false;
+    let mut read_error = false;
+    match std::fs::read_dir(&dir) {
+        Ok(entries) => {
+            for entry in entries {
+                // Count EVERY attempt, errors included: a persistently failing
+                // iterator must not loop without advancing the bound.
+                if scanned == BROWSE_SCAN_CAP {
+                    truncated = true;
+                    break;
+                }
+                scanned += 1;
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(_) => {
+                        read_error = true;
+                        continue;
+                    }
+                };
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().to_string();
+                // `is_dir()` follows a symlink, so a linked directory is a
+                // legitimate browsing target.
+                if !path.is_dir() || (!show_hidden && name.starts_with('.')) {
+                    continue;
+                }
+                visible += 1;
+                if !lower_keyword.is_empty()
+                    && !crate::bridge::command::token_and_match(&name.to_lowercase(), &lower_keyword)
+                {
+                    continue;
+                }
+                children.push(crate::feishu::card::session::BrowseChild {
+                    name,
+                    path: path.to_string_lossy().to_string(),
+                    is_repo: path.join(".git").exists(),
+                });
+            }
+        }
+        Err(e) => notice = Some(format!("无法读取该目录：{e}")),
+    }
+    if notice.is_none() {
+        // A hard read failure outranks a partial read, which outranks truncation.
+        if read_error {
+            notice = Some("部分目录项读取失败，列表可能不完整".to_string());
+        } else if truncated {
+            notice = Some(format!("目录条目过多，仅扫描了前 {BROWSE_SCAN_CAP} 项"));
+        }
+    }
+    children.sort_by(|a, b| {
+        b.is_repo
+            .cmp(&a.is_repo)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    let show_filter = visible > crate::feishu::card::session::CARD_PAGE_SIZE || !keyword.is_empty();
+    BrowseState {
+        dir: dir.to_string_lossy().to_string(),
+        children,
+        show_filter,
+        notice,
+    }
+}
+
+/// Resolve a browse target to the real directory it denotes, following
+/// symlinks: the longest existing prefix is canonicalized (the OS resolves
+/// symlinks and `..` truly) and any remaining components are applied to that
+/// symlink-free base lexically — the one path the browser both renders and
+/// reads, so a display spelling can never disagree with the read. `None` only
+/// when nothing on the path exists.
+fn resolve_browse_path(input: &str) -> Option<std::path::PathBuf> {
+    let expanded = crate::bridge::command::expand_directory(input);
+    if let Ok(canonical) = std::fs::canonicalize(&expanded) {
+        return Some(canonical);
+    }
+    let ancestor = nearest_existing_dir(&expanded)?;
+    let resolved = std::fs::canonicalize(&ancestor).ok()?;
+    let tail = expanded.strip_prefix(&ancestor).ok()?;
+    Some(crate::bridge::command::lexical_normalize(&resolved.join(tail)))
+}
+
+/// Resolve a browse target into the canonical absolute directory a Pending
+/// Session may be declared in (ADR-0078); `None` when it is not a directory.
+fn resolve_browse_dir(target: &str) -> Option<String> {
+    let dir = resolve_browse_path(target)?;
+    dir.is_dir().then(|| dir.to_string_lossy().to_string())
+}
+
+/// Walk up from `dir` to the first ancestor that exists as a directory.
+fn nearest_existing_dir(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut current = Some(dir);
+    while let Some(path) = current {
+        if path.is_dir() {
+            return Some(path.to_path_buf());
+        }
+        current = path.parent();
+    }
+    None
+}
+
+/// The browse card's dot-toggle rides as a JSON bool on regular buttons but as
+/// the string `"true"`/`"false"` on the shared pager (whose callback fields are
+/// strings only) — read both, defaulting to hidden.
+fn parse_show_hidden(value: &serde_json::Value) -> bool {
+    match value.get("show_hidden") {
+        Some(serde_json::Value::Bool(b)) => *b,
+        Some(serde_json::Value::String(s)) => s == "true",
+        _ => false,
+    }
+}
+
+/// Declare (or replace) the conversation's Pending Session at `directory` — the
+/// shared tail of the Recent Directories and browse cards' pick/选择 (Lazy
+/// Session Creation, ADR-0041). A persist failure is logged and the caller still
+/// toasts success, parity with the switch card's 新建.
+async fn declare_pending_dir(core: &Arc<SharedCore>, thread_key: &ThreadKey, directory: &str) {
+    if let Err(e) = core
+        .declare_pending(thread_key, directory.to_string(), None)
+        .await
+    {
+        tracing::warn!("dir card pick: persist failed: {}", e);
+    }
+}
+
+/// Open a NEW topic for `directory`, anchored on the card's own message
+/// (`open_message_id`) — the shared body of the `/dir` and browse cards' 建话题
+/// (ADR-0016, ADR-0025). `Ok(display)` carries the directory basename for the
+/// success toast; `Err(result)` is the exact refusal to return as-is.
+async fn open_topic_from_card(
+    core: &Arc<SharedCore>,
+    thread_key: &ThreadKey,
+    open_message_id: Option<&str>,
+    directory: String,
+) -> std::result::Result<String, CardActionResult> {
+    if let Some(rejection) = reject_nested_topic(thread_key) {
+        return Err(rejection);
+    }
+    let Some(open_message_id) = open_message_id else {
+        return Err(CardActionResult {
+            card: None,
+            toast: Some("无法创建话题（缺少卡片消息引用）".to_string()),
+        });
+    };
+    // Creation title policy (ADR-0007): unnamed, like `/topic <dir>`; the cover
+    // shows the directory basename until the server auto-generates a title.
+    let display = crate::bridge::display::dir_basename(&directory);
+    match crate::bridge::topic::open_topic(
+        &core.topic_handles(),
+        &thread_key.chat_id,
+        open_message_id,
+        crate::bridge::topic::TopicOpening::Fresh {
+            directory,
+            name: None,
+        },
+    )
+    .await
+    {
+        Ok(_opened) => Ok(display),
+        Err(crate::bridge::topic::OpenTopicError::NoThreadId) => Err(CardActionResult {
+            card: None,
+            toast: Some(
+                "当前会话不支持创建话题（未返回 thread_id）。请改用 `/dir <目录>` 或在飞书里手动创建话题。"
+                    .to_string(),
+            ),
+        }),
+        Err(crate::bridge::topic::OpenTopicError::Failed(e)) => {
+            tracing::warn!("dir card topic: create topic failed: {}", e);
+            Err(CardActionResult {
+                card: None,
+                toast: Some("创建话题失败".to_string()),
+            })
+        }
+    }
 }
 
 /// The whole `⚠️ 未找到技能：…` line's clip. The line is passed into the picker
@@ -1812,6 +2044,11 @@ impl App {
         core: &Arc<SharedCore>,
         value: &serde_json::Value,
     ) -> Option<CardActionResult> {
+        // ADR-0078: the browse card multiplexes through the same `dir` action,
+        // distinguished by `view: "browse"`, so one dispatch arm serves both.
+        if value.get("view").and_then(|v| v.as_str()) == Some("browse") {
+            return self.handle_dir_browse_action(core, value).await;
+        }
         let op = value.get("op").and_then(|v| v.as_str()).unwrap_or("");
         let thread_key = thread_key_from_value(value);
         // The card's stateless filter (ADR-0052): the active keyword and page
@@ -1839,6 +2076,21 @@ impl App {
                 toast: None,
             });
         }
+        // ADR-0078: the Recent Directories card's 浏览目录 button opens the
+        // filesystem browse card in place.
+        if op == "browse" {
+            return Some(CardActionResult {
+                card: Some(self.build_dir_browse_for_start(core, &thread_key).await),
+                toast: None,
+            });
+        }
+        // ADR-0078: ← 最近目录 on the browse card swaps back in place.
+        if op == "recent" {
+            return Some(CardActionResult {
+                card: Some(self.build_dir_card_for(core, &thread_key, "", 1).await),
+                toast: None,
+            });
+        }
         let directory = value
             .get("directory")
             .and_then(|v| v.as_str())
@@ -1853,22 +2105,17 @@ impl App {
         match op {
             "pick" => {
                 // Pending-first (ADR-0041): 当前 is the pending's directory
-                // when one exists, else the active session's.
+                // when one exists, else the active session's. The equality rule
+                // is the browse card's own ✅ 当前 rule (`command::same_dir`), so
+                // the two pick surfaces agree on what "current" means.
                 let current_dir = core.sessions.lock().await.current_directory(&thread_key);
-                if current_dir.as_deref() == Some(directory.as_str()) {
+                if current_dir.is_some_and(|current| crate::bridge::command::same_dir(&current, &directory)) {
                     return Some(CardActionResult {
                         card: Some(self.build_dir_card_for(core, &thread_key, &keyword, page).await),
                         toast: Some("已在当前目录".to_string()),
                     });
                 }
-                // Lazy Session Creation (ADR-0041): the card form of
-                // `/dir <path>` — declare a Pending Session; the first
-                // non-command message materialises it. A persist failure is
-                // logged and still toasts success, parity with the switch
-                // card's 新建.
-                if let Err(e) = core.declare_pending(&thread_key, directory.clone(), None).await {
-                    tracing::warn!("dir card pick: persist failed: {}", e);
-                }
+                declare_pending_dir(core, &thread_key, &directory).await;
                 Some(CardActionResult {
                     card: Some(self.build_dir_card_for(core, &thread_key, &keyword, page).await),
                     toast: Some(format!("下一条消息将在目录 `{directory}` 创建会话")),
@@ -1880,53 +2127,17 @@ impl App {
                 // never-bound topic — which may legally bind its single
                 // session via `pick` — must not nest another topic. The guard
                 // is location-based, so it also covers a topic that bound
-                // itself via the row's left button on this same card.
-                if let Some(rejection) = reject_nested_topic(&thread_key) {
-                    return Some(rejection);
-                }
-                // The topic anchors on the card's own message (`open_message_id`,
+                // itself via the row's left button on this same card. The
+                // topic anchors on the card's own message (`open_message_id`,
                 // threaded by `extract_card_action_value`), so fallback cards
-                // can reply inside it — same contract as the switch card's
-                // topic op (ADR-0016).
-                let Some(open_message_id) = value.get("open_message_id").and_then(|v| v.as_str()) else {
-                    return Some(CardActionResult {
-                        card: None,
-                        toast: Some("无法创建话题（缺少卡片消息引用）".to_string()),
-                    });
-                };
-                // Creation title policy (ADR-0007): unnamed, like `/topic
-                // <dir>`; the cover shows the directory basename until the
-                // server auto-generates a title after the first exchange.
-                let display = crate::bridge::display::dir_basename(&directory);
-                match crate::bridge::topic::open_topic(
-                    &core.topic_handles(),
-                    &thread_key.chat_id,
-                    open_message_id,
-                    crate::bridge::topic::TopicOpening::Fresh {
-                        directory,
-                        name: None,
-                    },
-                )
-                .await
-                {
-                    Ok(_opened) => Some(CardActionResult {
+                // can reply inside it (ADR-0016).
+                let open_message_id = value.get("open_message_id").and_then(|v| v.as_str());
+                match open_topic_from_card(core, &thread_key, open_message_id, directory).await {
+                    Ok(display) => Some(CardActionResult {
                         card: Some(self.build_dir_card_for(core, &thread_key, &keyword, page).await),
                         toast: Some(format!("已建话题（{display}）——下一条消息创建会话")),
                     }),
-                    Err(crate::bridge::topic::OpenTopicError::NoThreadId) => Some(CardActionResult {
-                        card: None,
-                        toast: Some(
-                            "当前会话不支持创建话题（未返回 thread_id）。请改用 `/dir <目录>` 或在飞书里手动创建话题。"
-                                .to_string(),
-                        ),
-                    }),
-                    Err(crate::bridge::topic::OpenTopicError::Failed(e)) => {
-                        tracing::warn!("dir card topic: create topic failed: {}", e);
-                        Some(CardActionResult {
-                            card: None,
-                            toast: Some("创建话题失败".to_string()),
-                        })
-                    }
+                    Err(rejection) => Some(rejection),
                 }
             }
             _ => Some(CardActionResult {
@@ -1934,6 +2145,217 @@ impl App {
                 toast: Some("无效操作".to_string()),
             }),
         }
+    }
+
+    /// Open the `/dir` browse card (ADR-0078) at the conversation's current
+    /// project directory.
+    async fn build_dir_browse_for_start(
+        self: &Arc<Self>,
+        core: &Arc<SharedCore>,
+        thread_key: &ThreadKey,
+    ) -> serde_json::Value {
+        let start = core.command_handles().current_project_directory(thread_key).await;
+        self.build_dir_browse_for(
+            core,
+            thread_key,
+            BrowseView {
+                dir: &start,
+                show_hidden: false,
+                keyword: "",
+                page: 1,
+            },
+        )
+        .await
+    }
+
+    /// Rebuild the `/dir` browse card (ADR-0078) for `view.dir`, clamping a
+    /// vanished path to its nearest existing ancestor and marking the
+    /// conversation's current directory.
+    async fn build_dir_browse_for(
+        self: &Arc<Self>,
+        core: &Arc<SharedCore>,
+        thread_key: &ThreadKey,
+        view: BrowseView<'_>,
+    ) -> serde_json::Value {
+        let state = browse_dir_state(view);
+        let current_dir = core.sessions.lock().await.current_directory(thread_key);
+        // The card renders the RESOLVED directory (post-resolution/ancestor
+        // fallback), not the requested one.
+        let resolved = BrowseView {
+            dir: &state.dir,
+            ..view
+        };
+        crate::feishu::card::session::build_dir_browse_card(
+            thread_key,
+            &state.children,
+            current_dir.as_deref(),
+            resolved,
+            state.show_filter,
+            state.notice.as_deref(),
+        )
+    }
+
+    /// Handle a `/dir` browse-card click (ADR-0078). `go` drills down (a child
+    /// row, a breadcrumb hop, or the form's typed path); `pick`/`topic` act on
+    /// the directory you stand in (or the typed path), mirroring the Recent
+    /// Directories card's two ops; `filter`/`page`/`show_hidden` rebuild the
+    /// view; `recent` swaps back to the Recent Directories card. A typed path
+    /// wins over the payload's `dir`, and the current project is the fallback
+    /// when a name-only form submit lost the dir.
+    async fn handle_dir_browse_action(
+        self: &Arc<Self>,
+        core: &Arc<SharedCore>,
+        value: &serde_json::Value,
+    ) -> Option<CardActionResult> {
+        let op = value.get("op").and_then(|v| v.as_str()).unwrap_or("");
+        let thread_key = thread_key_from_value(value);
+        let show_hidden = parse_show_hidden(value);
+        let keyword = value
+            .get("keyword")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let page = value.get("page").and_then(|v| v.as_u64()).unwrap_or(1).max(1) as usize;
+        let dir = value
+            .get("dir")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let path = value
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        // The typed path wins over the payload's dir on 前往/选择; a name-only
+        // submit of 过滤 lost both, so it falls back to the current project.
+        let target = if !path.is_empty() {
+            path
+        } else if !dir.is_empty() {
+            dir
+        } else {
+            core.command_handles()
+                .current_project_directory(&thread_key)
+                .await
+        };
+        let base = BrowseView {
+            dir: &target,
+            show_hidden,
+            keyword: &keyword,
+            page,
+        };
+        match op {
+            "go" => Some(CardActionResult {
+                card: Some(
+                    self.build_dir_browse_for(
+                        core,
+                        &thread_key,
+                        BrowseView {
+                            keyword: "",
+                            page: 1,
+                            ..base
+                        },
+                    )
+                    .await,
+                ),
+                toast: None,
+            }),
+            "filter" => Some(CardActionResult {
+                card: Some(
+                    self.build_dir_browse_for(core, &thread_key, BrowseView { page: 1, ..base })
+                        .await,
+                ),
+                toast: None,
+            }),
+            "page" => Some(CardActionResult {
+                card: Some(self.build_dir_browse_for(core, &thread_key, base).await),
+                toast: None,
+            }),
+            "show_hidden" => Some(CardActionResult {
+                card: Some(
+                    self.build_dir_browse_for(
+                        core,
+                        &thread_key,
+                        BrowseView {
+                            show_hidden: !base.show_hidden,
+                            page: 1,
+                            ..base
+                        },
+                    )
+                    .await,
+                ),
+                toast: None,
+            }),
+            "pick" => self.browse_pick(core, &thread_key, base).await,
+            "topic" => {
+                let Some(directory) = resolve_browse_dir(&target) else {
+                    return Some(CardActionResult {
+                        card: None,
+                        toast: Some(format!("目录不存在：{target}")),
+                    });
+                };
+                let open_message_id = value.get("open_message_id").and_then(|v| v.as_str());
+                match open_topic_from_card(core, &thread_key, open_message_id, directory.clone()).await {
+                    Ok(display) => Some(CardActionResult {
+                        card: Some(
+                            self.build_dir_browse_for(
+                                core,
+                                &thread_key,
+                                BrowseView {
+                                    dir: &directory,
+                                    ..base
+                                },
+                            )
+                            .await,
+                        ),
+                        toast: Some(format!("已建话题（{display}）——下一条消息创建会话")),
+                    }),
+                    Err(rejection) => Some(rejection),
+                }
+            }
+            _ => Some(CardActionResult {
+                card: None,
+                toast: Some("无效操作".to_string()),
+            }),
+        }
+    }
+
+    /// The browse card's 选择: declare a Pending Session in `view.dir` (Lazy
+    /// Session Creation, ADR-0041) — the card form of `/dir <path>`. A target
+    /// that is not a directory is refused with a toast instead.
+    async fn browse_pick(
+        self: &Arc<Self>,
+        core: &Arc<SharedCore>,
+        thread_key: &ThreadKey,
+        view: BrowseView<'_>,
+    ) -> Option<CardActionResult> {
+        let Some(directory) = resolve_browse_dir(view.dir) else {
+            return Some(CardActionResult {
+                card: None,
+                toast: Some(format!("目录不存在：{}", view.dir)),
+            });
+        };
+        // Pending-first (ADR-0041): 当前 is the pending's directory when one
+        // exists, else the active session's. The comparison is the SAME one the
+        // card's ✅ 当前 mark uses (`command::same_dir`), so a directory the card
+        // marks current is never re-declared by a click.
+        let current_dir = core.sessions.lock().await.current_directory(thread_key);
+        let settled = BrowseView {
+            dir: &directory,
+            ..view
+        };
+        if current_dir.is_some_and(|current| crate::bridge::command::same_dir(&current, &directory)) {
+            return Some(CardActionResult {
+                card: Some(self.build_dir_browse_for(core, thread_key, settled).await),
+                toast: Some("已在当前目录".to_string()),
+            });
+        }
+        declare_pending_dir(core, thread_key, &directory).await;
+        Some(CardActionResult {
+            card: Some(self.build_dir_browse_for(core, thread_key, settled).await),
+            toast: Some(format!("下一条消息将在目录 `{directory}` 创建会话")),
+        })
     }
 
     /// Handle an `/agent` picker-card button: record the per-session override

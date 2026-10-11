@@ -955,3 +955,436 @@ fn pager_button<'a>(card: &'a serde_json::Value, label: &str) -> &'a serde_json:
         .find(|b| b["value"]["op"] == "page" && b["text"]["content"] == label)
         .unwrap_or_else(|| panic!("pager button `{label}` not found"))
 }
+
+// ---- ADR-0078: the /dir browse card ----
+
+/// A project directory with `alpha/`, `beta/`, `.hidden/` and a `repo/` that
+/// holds a `.git/` entry (a repo, floated first and 📦-marked).
+fn browse_project() -> tempfile::TempDir {
+    let proj = tempfile::tempdir().unwrap();
+    for name in ["alpha", "beta", ".hidden"] {
+        std::fs::create_dir(proj.path().join(name)).unwrap();
+    }
+    std::fs::create_dir_all(proj.path().join("repo").join(".git")).unwrap();
+    proj
+}
+
+/// A seeded active SessionEntry rooted at `directory`.
+fn seeded_entry(key: &crate::config::ThreadKey, directory: &str) -> crate::config::SessionEntry {
+    crate::config::SessionEntry {
+        thread_key: key.clone(),
+        session_id: "ses_seed".into(),
+        directory: directory.to_string(),
+        agent: None,
+        model: None,
+        auto_accept: false,
+        topic_anchor: None,
+        topic_root: None,
+        variant: None,
+    }
+}
+
+fn browse_action(op: &str, dir: &str) -> serde_json::Value {
+    serde_json::json!({
+        "action": "dir",
+        "view": "browse",
+        "op": op,
+        "chat_id": "chat_1",
+        "thread_id": "chat_1",
+        "dir": dir,
+    })
+}
+
+/// The Recent Directories card's 浏览目录 button (op `browse`) opens the browse
+/// card in place (ADR-0078).
+#[tokio::test]
+async fn dir_card_browse_op_opens_the_browse_card() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+
+    let result = app
+        .host_action(serde_json::json!({
+            "action": "dir",
+            "op": "browse",
+            "chat_id": "chat_1",
+            "thread_id": "chat_1",
+        }))
+        .await
+        .expect("browse op returns a result");
+    let card = result.card.expect("a browse card");
+    let text = card_text(&card);
+    assert!(text.contains("浏览目录"), "browse header: {text}");
+    assert!(text.contains("← 最近目录"), "back control: {text}");
+    assert!(
+        card.to_string().contains("\"name\":\"dir_browse\""),
+        "browse form"
+    );
+}
+
+/// The browse card lists a directory's children: directories only, dot
+/// directories hidden by default, and repos floated to the front (ADR-0078).
+#[tokio::test]
+async fn dir_browse_lists_children_repo_first_and_hides_dot_dirs() {
+    let _wd = test_work_dir();
+    let proj = browse_project();
+    let proj_dir = proj.path().to_string_lossy().to_string();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    seed_entry(&app, seeded_entry(&key, &proj_dir)).await;
+
+    let result = app.host_action(browse_action("go", &proj_dir)).await.expect("go");
+    let card = result.card.expect("a card");
+    let text = card_text(&card);
+
+    assert!(text.contains("📦 repo"), "repo listed + marked: {text}");
+    assert!(
+        text.contains("📁 alpha") && text.contains("📁 beta"),
+        "dirs listed: {text}"
+    );
+    assert!(!text.contains(".hidden"), "dot dir hidden by default: {text}");
+    let repo_at = text.find("📦 repo").expect("repo row");
+    let alpha_at = text.find("📁 alpha").expect("alpha row");
+    assert!(repo_at < alpha_at, "repo floats first: {text}");
+}
+
+/// The hidden toggle shows dot directories; the filter narrows the children
+/// (ADR-0078, the stateless payload carrying both).
+#[tokio::test]
+async fn dir_browse_hidden_toggle_and_filter_narrow_the_children() {
+    let _wd = test_work_dir();
+    let proj = browse_project();
+    let proj_dir = proj.path().to_string_lossy().to_string();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    seed_entry(&app, seeded_entry(&key, &proj_dir)).await;
+
+    let mut hidden_op = browse_action("show_hidden", &proj_dir);
+    hidden_op["show_hidden"] = serde_json::json!(false);
+    let card = app.host_action(hidden_op).await.unwrap().card.expect("card");
+    assert!(
+        card_text(&card).contains("📁 .hidden"),
+        "hidden toggle reveals dot dirs: {}",
+        card_text(&card)
+    );
+
+    let mut filter_op = browse_action("filter", &proj_dir);
+    filter_op["keyword"] = serde_json::json!("alph");
+    let card = app.host_action(filter_op).await.unwrap().card.expect("card");
+    let text = card_text(&card);
+    assert!(text.contains("📁 alpha"), "filter keeps the match: {text}");
+    assert!(!text.contains("📁 beta"), "filter drops the rest: {text}");
+}
+
+/// 选择 on the browse card declares a Pending Session in the target (the card
+/// form of `/dir <path>`), creating no server session (ADR-0041/ADR-0078).
+#[tokio::test]
+async fn dir_browse_pick_declares_a_pending_in_the_child() {
+    let _wd = test_work_dir();
+    let proj = browse_project();
+    let proj_dir = proj.path().to_string_lossy().to_string();
+    let child = proj.path().join("alpha");
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let created = MockBackend::new(realistic_parts());
+    let created_dirs = created.created_session_dirs.clone();
+    let (app, _platform) = build_app(cfg, created).await;
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    seed_entry(&app, seeded_entry(&key, &proj_dir)).await;
+
+    let result = app
+        .host_action(browse_action("pick", &child.to_string_lossy()))
+        .await
+        .expect("pick");
+    assert!(result.card.is_some(), "pick refreshes the browse card");
+    let toast = result.toast.unwrap_or_default();
+    assert!(toast.contains("下一条消息"), "pick toasts the pending: {toast}");
+    let canonical = std::fs::canonicalize(&child).unwrap();
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .pending_for(&key)
+            .map(|p| p.directory.clone()),
+        Some(canonical.to_string_lossy().to_string()),
+        "pending rooted at the canonical child"
+    );
+    assert!(created_dirs.lock().await.is_empty(), "no server session created");
+}
+
+/// The 前往 submit navigates to the typed path; an invalid one clamps to the
+/// nearest existing ancestor with a notice (ADR-0078).
+#[tokio::test]
+async fn dir_browse_go_navigates_and_clamps_a_vanished_path() {
+    let _wd = test_work_dir();
+    let proj = browse_project();
+    let proj_dir = proj.path().to_string_lossy().to_string();
+    let child = proj.path().join("alpha");
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    seed_entry(&app, seeded_entry(&key, &proj_dir)).await;
+
+    let mut nav = browse_action("go", "");
+    nav["path"] = serde_json::json!(child.to_string_lossy());
+    let card = app.host_action(nav).await.unwrap().card.expect("card");
+    let text = card_text(&card);
+    assert!(text.contains("alpha"), "navigated to the typed path: {text}");
+    assert!(text.contains("没有子目录"), "alpha is empty: {text}");
+
+    let ghost = proj.path().join("ghost");
+    let card = app
+        .host_action(browse_action("go", &ghost.to_string_lossy()))
+        .await
+        .unwrap()
+        .card
+        .expect("card");
+    let text = card_text(&card);
+    assert!(text.contains("不存在"), "clamp notice: {text}");
+    assert!(text.contains("📁 alpha"), "clamped back into the parent: {text}");
+}
+
+/// ← 最近目录 swaps the browse card back for the Recent Directories card in
+/// place (ADR-0078).
+#[tokio::test]
+async fn dir_browse_recent_swaps_back_in_place() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+
+    // The real ← 最近目录 button carries no `view`, so it lands on the recent
+    // handler's `recent` op (the browse card's own view routing would send a
+    // view-carrying payload to the browse handler instead).
+    let card = app
+        .host_action(serde_json::json!({
+            "action": "dir",
+            "op": "recent",
+            "chat_id": "chat_1",
+            "thread_id": "chat_1",
+        }))
+        .await
+        .unwrap()
+        .card
+        .expect("card");
+    let text = card_text(&card);
+    assert!(text.contains("最近目录"), "the recent card: {text}");
+    assert!(
+        !text.contains("← 最近目录"),
+        "no browse back control on the recent card"
+    );
+    assert!(
+        card.to_string().contains("\"op\":\"browse\""),
+        "the browse entry is back"
+    );
+}
+
+/// 建话题 on the browse card reaches the shared topic helper — without a card
+/// message reference it degrades to the guidance toast (the same contract as
+/// the Recent Directories card).
+#[tokio::test]
+async fn dir_browse_topic_without_message_reference_degrades() {
+    let _wd = test_work_dir();
+    let proj = browse_project();
+    let proj_dir = proj.path().to_string_lossy().to_string();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    seed_entry(&app, seeded_entry(&key, &proj_dir)).await;
+
+    let result = app
+        .host_action(browse_action("topic", &proj_dir))
+        .await
+        .expect("topic");
+    assert!(
+        result.toast.unwrap_or_default().contains("无法创建话题"),
+        "missing message reference degrades"
+    );
+}
+
+/// 选择 uses the same directory-equality rule as the card's ✅ 当前 mark, so a
+/// target spelled differently from the conversation's directory (here a
+/// trailing `/.`) is recognised as current and never re-declared (ADR-0078).
+#[tokio::test]
+async fn dir_browse_pick_recognises_an_equivalent_current_path() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    // The store holds the canonical directory; the click names the same
+    // directory with a trailing `.`. Append it to the RAW path, not the
+    // canonical one: on Windows the canonical form carries a `\\?\` verbatim
+    // prefix, which does NOT resolve `.` (the path would not be a directory).
+    let canonical = std::fs::canonicalize(proj.path()).unwrap();
+    seed_entry(&app, seeded_entry(&key, &canonical.to_string_lossy())).await;
+    let equivalent = proj.path().join(".");
+
+    let result = app
+        .host_action(browse_action("pick", &equivalent.to_string_lossy()))
+        .await
+        .expect("pick");
+    assert_eq!(
+        result.toast.as_deref(),
+        Some("已在当前目录"),
+        "an equivalent spelling is recognised as current"
+    );
+    assert!(
+        app.sessions.lock().await.pending_for(&key).is_none(),
+        "no pending declared for the already-current directory"
+    );
+}
+
+/// The browse card's pager routes: replaying a 下一页 button's payload flips the
+/// page (it must reach the browse handler, not answer 无效操作) — and the flag
+/// it carries as a string is read back (ADR-0078).
+#[tokio::test]
+async fn dir_browse_pager_flips_the_page() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    for i in 1..=13 {
+        std::fs::create_dir(proj.path().join(format!("p{i:02}"))).unwrap();
+    }
+    let proj_dir = proj.path().to_string_lossy().to_string();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    seed_entry(&app, seeded_entry(&key, &proj_dir)).await;
+
+    let card = app
+        .host_action(browse_action("go", &proj_dir))
+        .await
+        .unwrap()
+        .card
+        .expect("card");
+    assert_eq!(
+        dir_pager_label(&card).as_deref(),
+        Some("第 1/3 页 · 共 13 个"),
+        "page 1 of 3: {}",
+        card_text(&card)
+    );
+
+    let next = pager_button(&card, "下一页")["value"].clone();
+    let card = app.host_action(next).await.unwrap().card.expect("card");
+    assert_eq!(
+        dir_pager_label(&card).as_deref(),
+        Some("第 2/3 页 · 共 13 个"),
+        "the pager click flipped the page: {}",
+        card_text(&card)
+    );
+}
+
+/// The pager carries `show_hidden` as a STRING (`"true"`) because the shared
+/// pager only holds string callback fields; replaying it must read back as true,
+/// so a dot-directory child stays visible (#670 review).
+#[tokio::test]
+async fn dir_browse_pager_reads_the_string_flag_back() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    for i in 1..=13 {
+        std::fs::create_dir(proj.path().join(format!("p{i:02}"))).unwrap();
+    }
+    std::fs::create_dir(proj.path().join(".dotdir")).unwrap();
+    let proj_dir = proj.path().to_string_lossy().to_string();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    seed_entry(&app, seeded_entry(&key, &proj_dir)).await;
+
+    // Page 2 with the toggle on: the pager's 上一页 carries the flag as a string.
+    let card = app
+        .host_action(serde_json::json!({
+            "action": "dir",
+            "view": "browse",
+            "op": "page",
+            "chat_id": "chat_1",
+            "thread_id": "chat_1",
+            "dir": proj_dir,
+            "show_hidden": true,
+            "keyword": "",
+            "page": 2,
+        }))
+        .await
+        .unwrap()
+        .card
+        .expect("card");
+    let prev = pager_button(&card, "上一页")["value"].clone();
+    assert_eq!(prev["show_hidden"], "true", "the pager flags it as a string");
+
+    let card = app.host_action(prev).await.unwrap().card.expect("card");
+    assert!(
+        card_text(&card).contains(".dotdir"),
+        "the string flag was read back as true: {}",
+        card_text(&card)
+    );
+}
+
+/// 选择 on a regular FILE toasts and declares nothing — only directories can be
+/// selected (ADR-0078), guarding the non-directory branch (#670 review).
+#[tokio::test]
+async fn dir_browse_pick_on_a_file_refuses() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let file = proj.path().join("notes.txt");
+    std::fs::write(&file, "x").unwrap();
+    let proj_dir = proj.path().to_string_lossy().to_string();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    seed_entry(&app, seeded_entry(&key, &proj_dir)).await;
+
+    let result = app
+        .host_action(browse_action("pick", &file.to_string_lossy()))
+        .await
+        .expect("pick");
+    assert!(
+        result.toast.unwrap_or_default().contains("目录不存在"),
+        "a file pick is refused with a toast"
+    );
+    assert!(
+        app.sessions.lock().await.pending_for(&key).is_none(),
+        "no Pending Session from a file pick"
+    );
+}
+
+/// A directory larger than `BROWSE_SCAN_CAP` is scanned only up to the cap and
+/// says so — the render cannot outrun the card callback budget (#670 review).
+#[tokio::test]
+async fn dir_browse_caps_a_huge_directory_scan() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let cap = crate::bridge::handler::BROWSE_SCAN_CAP;
+    for i in 0..=cap {
+        std::fs::create_dir(proj.path().join(format!("d{i:05}"))).unwrap();
+    }
+    let proj_dir = proj.path().to_string_lossy().to_string();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    seed_entry(&app, seeded_entry(&key, &proj_dir)).await;
+
+    let card = app
+        .host_action(browse_action("go", &proj_dir))
+        .await
+        .unwrap()
+        .card
+        .expect("card");
+    let text = card_text(&card);
+    assert!(text.contains("仅扫描了前"), "truncation is announced: {text}");
+    assert!(
+        text.contains(&format!("共 {cap} 个")),
+        "exactly the cap was scanned, not the extra entry: {text}"
+    );
+}
