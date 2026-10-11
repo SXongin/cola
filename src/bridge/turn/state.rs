@@ -5412,9 +5412,9 @@ mod tests {
     }
 
     /// A panel's embedded images emit one `img` element each (ADR-0076), and
-    /// each element carries the file NAME in its `title` — serialized into
+    /// each element carries a short file-name `title` — serialized into
     /// the card's JSON. The split estimate must charge those bytes: a panel of
-    /// long-named embedded images whose images the estimate ignores can cross
+    /// many embedded images whose images the estimate ignores can cross
     /// Feishu's JSON-size cap while staying under the component budget, and
     /// Feishu rejects the card instead of the renderer splitting it (the fenced
     /// content fallback cannot repair a size rejection).
@@ -5422,13 +5422,14 @@ mod tests {
     fn card_split_charges_embedded_image_bytes() {
         let mut acc = StreamAccumulator::new("test");
         acc.card_state = CardState::Done;
-        // ONE panel embedding 60 images with ~150-char names: the `img` elements
-        // alone serialize to well past MAX_CARD_JSON_CHARS, while the component
-        // count (1 panel + 60 images = 61) stays under the 150 budget — so only
-        // charging the image bytes makes this split. The tracking lines share
-        // the names but stay well under the budget on their own, so the assert
-        // below pins the images as the decisive charge.
-        let names: Vec<String> = (0..60).map(|i| format!("{i:0>3}_{}", "n".repeat(150))).collect();
+        // ONE panel embedding 80 images with ~150-char names: the `img` elements
+        // serialize to ~13 KB, and together with the tracking lines the panel
+        // crosses MAX_CARD_JSON_CHARS, while the component count (1 panel + 80
+        // images = 81) stays under the 150 budget — so charging the image bytes
+        // is what makes this split. The tracking lines share the names but stay
+        // well under the budget on their own, so the assert below pins the
+        // images as the decisive charge.
+        let names: Vec<String> = (0..80).map(|i| format!("{i:0>3}_{}", "n".repeat(150))).collect();
         let files: Vec<(&str, &[u8])> = names.iter().map(|n| (n.as_str(), &b"ABC"[..])).collect();
         let mut panel = ToolPanel::for_test_with_files("read", &files);
         for i in 0..names.len() {
