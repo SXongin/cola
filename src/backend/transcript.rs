@@ -18,6 +18,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::file_content::FileContent;
+
 /// One Session's normalized read: every message the backend reports, decoded
 /// into typed views, in the order the backend returned them, plus the current
 /// generation's interaction facts.
@@ -521,11 +523,13 @@ impl SessionTranscript {
             .is_some_and(|boundary| boundary >= newest_wake)
     }
 
-    /// The recent-conversation tail: the last (at most four) text-bearing
-    /// user/assistant messages, newest last. A message is text-bearing when it
-    /// carries at least one non-empty text part; reasoning/tool/step parts are
-    /// inner monologue, not conversation, and are excluded. Messages without a
-    /// created time cannot be ordered and are dropped.
+    /// The recent-conversation tail: the last (at most four) conversation
+    /// messages, newest last. A message is conversation when it carries at
+    /// least one non-empty text part OR a File Content — a files-only user
+    /// message is kept so its record line reaches wherever the message's body
+    /// is shown (ADR-0076). Reasoning/tool/step parts are inner monologue, not
+    /// conversation, and are excluded. Messages without a created time cannot
+    /// be ordered and are dropped.
     pub fn transcript_tail(&self) -> Vec<TailEntry> {
         const TAIL_LIMIT: usize = 4;
         let mut out: Vec<TailEntry> = self
@@ -534,13 +538,15 @@ impl SessionTranscript {
             .filter(|message| matches!(message.role, MessageRole::User | MessageRole::Assistant))
             .filter_map(|message| {
                 let text = message.text();
-                if text.trim().is_empty() {
+                let files = message.files();
+                if text.trim().is_empty() && files.is_empty() {
                     return None;
                 }
                 Some(TailEntry {
                     role: message.role.clone(),
                     created_ms: message.time?.created,
                     text,
+                    files,
                 })
             })
             .collect();
@@ -626,6 +632,18 @@ impl TranscriptMessage {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// The File Contents the message carries, in part order (a user message's
+    /// file attachments; ADR-0076). Empty when it carries none.
+    pub fn files(&self) -> Vec<FileContent> {
+        self.parts
+            .iter()
+            .filter_map(|part| match part {
+                Part::File(content) => Some(content.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     /// The newest server activity this message reports: its creation time and
@@ -1267,13 +1285,34 @@ impl BackgroundTaskOverlay {
     }
 }
 
-/// One recent-conversation tail entry: a text-bearing user/assistant message's
-/// role, created time and verbatim text.
+/// One recent-conversation tail entry: a conversation message's role, created
+/// time, verbatim text, and the File Contents it carries (a files-only message
+/// has an empty `text` and at least one file; ADR-0076).
 #[derive(Debug, Clone, PartialEq)]
 pub struct TailEntry {
     pub role: MessageRole,
     pub created_ms: i64,
     pub text: String,
+    /// The message's File Contents, in part order — recorded as lines wherever
+    /// the message's body is shown, never re-delivered as a File Message.
+    pub files: Vec<FileContent>,
+}
+
+impl TailEntry {
+    /// The entry's body as it is shown where the message's body is shown: its
+    /// verbatim text, then one record line per File Content (`📎 name · mime ·
+    /// size`) newline-joined. A text-only entry is byte-for-byte its own text.
+    pub fn body_text(&self) -> String {
+        if self.files.is_empty() {
+            return self.text.clone();
+        }
+        let records = FileContent::record_lines(&self.files);
+        if self.text.is_empty() {
+            records
+        } else {
+            format!("{}\n{}", self.text, records)
+        }
+    }
 }
 
 /// A message part, typed. Unknown kinds decode into [`Part::Other`] with their
@@ -1286,6 +1325,10 @@ pub enum Part {
     StepStart(StepStart),
     StepFinish(StepFinish),
     Patch(Patch),
+    /// A user message's file attachment, decoded into the typed
+    /// [`FileContent`] view (ADR-0076). A `file` part that inlines no payload
+    /// is not a File Content and stays [`Part::Other`].
+    File(FileContent),
     /// A part kind this build does not model, kept raw.
     Other(OtherPart),
 }
@@ -1300,7 +1343,9 @@ impl Part {
             Part::Text(text) => text.started_at,
             Part::Reasoning(reasoning) => reasoning.started_at,
             Part::Tool(call) => call.started_at,
-            Part::StepStart(_) | Part::StepFinish(_) | Part::Patch(_) | Part::Other(_) => None,
+            Part::StepStart(_) | Part::StepFinish(_) | Part::Patch(_) | Part::File(_) | Part::Other(_) => {
+                None
+            }
         }
     }
 }
@@ -1439,7 +1484,8 @@ pub struct ToolOutput {
     /// `None` when the state carried no output.
     pub raw: Option<Value>,
     /// The output's content blocks: one text block with the output text the
-    /// Bridge has always rendered, followed by any non-text blocks kept raw.
+    /// Bridge has always rendered, any `file` block that inlines its payload as
+    /// the typed [`FileContent`], and any other non-text blocks kept raw.
     /// The decoder owns the source precedence, so a payload that carries more
     /// than one text source never renders twice.
     pub blocks: Vec<ContentBlock>,
@@ -1449,11 +1495,14 @@ pub struct ToolOutput {
     pub error: Option<String>,
 }
 
-/// One output content block. Text blocks carry their text; any other kind
-/// stays raw.
+/// One output content block. Text blocks carry their text; a `file` block that
+/// inlines its payload is decoded into the typed [`FileContent`] view; any
+/// other kind stays raw.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ContentBlock {
     Text(String),
+    /// A `file` content block's inline payload (ADR-0076).
+    File(FileContent),
     /// A content block kind this build does not model, kept raw.
     Other(Value),
 }
@@ -2508,6 +2557,83 @@ mod tests {
         assert_eq!(tail[0].text, "问题");
     }
 
+    /// A user message's file part is payload, not conversation: it joins no
+    /// text and carries no server start, so it neither anchors a Turn on its
+    /// own (ADR-0076; the record line and delivery are the Platform's, tickets
+    /// #647/#648) — but a file-bearing message IS kept in the tail (below).
+    #[test]
+    fn a_file_part_joins_no_text_and_has_no_start() {
+        let content = FileContent::decode("data:image/png;base64,QUJD", Some("image/png"), Some("shot.png"))
+            .expect("an inline payload is a File Content");
+        let message = message(
+            "u1",
+            MessageRole::User,
+            Some(MessageTime {
+                created: 1_000,
+                completed: Some(1_000),
+            }),
+            vec![text_part("看看"), Part::File(content)],
+        );
+
+        assert_eq!(message.text(), "看看");
+        assert!(message.parts[1].started_at().is_none());
+    }
+
+    /// A message that carries a File Content is kept in the tail even with no
+    /// text of its own — its file must be recorded where the message's body is
+    /// shown — and its files travel with the entry, in part order (ADR-0076).
+    /// A text-bearing entry keeps its text and gains its files; a message with
+    /// neither text nor files is still dropped.
+    #[test]
+    fn tail_keeps_a_file_bearing_message_and_carries_its_files() {
+        let file = |name: &str| {
+            Part::File(
+                FileContent::decode("data:image/png;base64,QUJD", Some("image/png"), Some(name))
+                    .expect("an inline payload is a File Content"),
+            )
+        };
+        let timed = |created: i64| MessageTime {
+            created,
+            completed: Some(created),
+        };
+        let transcript = SessionTranscript::new(vec![
+            message(
+                "u1",
+                MessageRole::User,
+                Some(timed(1_000)),
+                vec![file("only.png")],
+            ),
+            message(
+                "u2",
+                MessageRole::User,
+                Some(timed(2_000)),
+                vec![text_part("看看"), file("and.png")],
+            ),
+            message(
+                "a1",
+                MessageRole::Assistant,
+                Some(timed(3_000)),
+                vec![Part::Reasoning(ReasoningPart {
+                    text: "想想".into(),
+                    started_at: None,
+                })],
+            ),
+        ]);
+
+        let tail = transcript.transcript_tail();
+        assert_eq!(
+            tail.len(),
+            2,
+            "file-bearing and text-bearing entries survive, reasoning-only does not"
+        );
+        assert_eq!(tail[0].text, "", "a files-only message has no text");
+        assert_eq!(tail[0].files.len(), 1);
+        assert_eq!(tail[0].files[0].name, "only.png");
+        assert_eq!(tail[1].text, "看看");
+        assert_eq!(tail[1].files.len(), 1);
+        assert_eq!(tail[1].files[0].name, "and.png");
+    }
+
     #[test]
     fn tail_is_newest_last_text_bearing_only_and_caps_at_four() {
         let user = |id: &str, created: i64, text: &str| {
@@ -2536,7 +2662,8 @@ mod tests {
                     started_at: None,
                 })],
             ),
-            // Image-only user message (no text part): excluded.
+            // A file part that inlines no payload is not a File Content (it
+            // stays raw Other): still excluded.
             message(
                 "u2",
                 MessageRole::User,
@@ -2610,6 +2737,8 @@ mod tests {
         assert_eq!(roles, vec![MessageRole::User, MessageRole::Assistant]);
         assert_eq!(tail[0].text, "第一段\n第二段");
         assert_eq!(tail[1].text, "回答");
+        assert!(tail[0].files.is_empty(), "a text-only entry carries no files");
+        assert!(tail[1].files.is_empty(), "a text-only entry carries no files");
     }
 
     #[test]

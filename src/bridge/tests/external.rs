@@ -1,7 +1,7 @@
 use super::drain::{noticed, spawn_sync};
 use crate::backend::{
-    ContentBlock, FinishReason, MessageId, MessageRole, Part, ReasoningPart, SessionTranscript, StepFinish,
-    StepStart, ToolCall, ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage, TurnAnchor,
+    ContentBlock, FileContent, FinishReason, MessageId, MessageRole, Part, ReasoningPart, SessionTranscript,
+    StepFinish, StepStart, ToolCall, ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage, TurnAnchor,
 };
 use crate::bridge::chain::AdoptedFollow;
 use crate::bridge::test_support::*;
@@ -167,6 +167,95 @@ async fn external_message_from_shared_store_notifies_feishu() {
         card_text(&notify).contains("OpenChamber 里发的消息"),
         "notification should preview the message: {}",
         notify
+    );
+}
+
+/// ADR-0076 (ticket #648): a user message carrying a File Content is notified
+/// with its record line — `📎 name · mime · size` — and the bytes are never
+/// re-delivered: the notification card is the only thing cola sends for it, no
+/// File Message.
+#[tokio::test]
+async fn external_file_message_notifies_with_the_record_line() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let content = FileContent::decode("data:image/png;base64,QUJD", Some("image/png"), Some("shot.png"))
+        .expect("an inline payload is a File Content");
+    let mut mock = MockBackend::new(realistic_parts());
+    // A files-only user message: no text, one record line to preview.
+    mock.given_transcript(
+        "ses_ext",
+        vec![SessionTranscript::new(vec![typed_message(
+            "msg_ext_user",
+            MessageRole::User,
+            Some(now_ms()),
+            vec![Part::File(content)],
+        )])],
+    );
+    let (app, platform) = build_app(cfg, mock).await;
+
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
+            session_id: "ses_ext".into(),
+            directory: "/tmp/ext".into(),
+            agent: None,
+            model: None,
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        },
+    )
+    .await;
+    let watermark = chrono::Utc::now().timestamp_millis() - 60_000;
+    app.external
+        .last_user_msg_epoch
+        .lock()
+        .await
+        .insert("ses_ext".into(), watermark);
+
+    app.external
+        .poll_interval_ms
+        .store(50, std::sync::atomic::Ordering::Relaxed);
+    tokio::spawn({
+        let app = app.clone();
+        async move {
+            let _ = app.external.poll_loop(&app.flow_handles()).await;
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let calls = platform.calls.lock().await.clone();
+    let notify = calls
+        .iter()
+        .find_map(|c| match c {
+            PlatformCall::SendCard { card, .. } if card_text(card).contains("有新消息") => {
+                Some(card.clone())
+            }
+            _ => None,
+        })
+        .expect("external file message should produce a notification card");
+    assert!(
+        card_text(&notify).contains("📎 shot.png · image/png · 3 B"),
+        "notification should record the file line: {notify}"
+    );
+    // No File Message: the record line is a preview on the one notification the
+    // poll sends, never a second message for the bytes.
+    let sends = calls
+        .iter()
+        .filter(|c| matches!(c, PlatformCall::SendCard { .. }))
+        .count();
+    assert_eq!(
+        sends, 1,
+        "exactly one card is sent, no separate File Message: {calls:?}"
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|c| matches!(c, PlatformCall::SendMessageInThread { .. })),
+        "a user file is never delivered as a File Message: {calls:?}"
     );
 }
 

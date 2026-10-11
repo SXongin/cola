@@ -104,7 +104,9 @@ pub type SnapshotQuestionState = std::collections::HashMap<String, QuestionBlock
 
 /// The 最近对话 panel: the last-four tail entries, each role-marked and shown
 /// folded — its header previews the entry briefly and expanding reveals the
-/// full verbatim text (chunked to cola's per-element budget). No tail → no panel.
+/// full verbatim text (chunked to cola's per-element budget) together with one
+/// `📎 name · mime · size` record line per File Content the message carried
+/// (ADR-0076). No tail → no panel.
 /// `md` is the card's markdown state: the entry texts share its one table budget
 /// and fenced fallback. A tail entry's attached skills are NOT rendered here
 /// (spec #652, ticket #655, acceptance reversal): the snapshot tail is text only.
@@ -124,8 +126,8 @@ fn tail_panels(
         } else {
             format!("{role} {preview}…")
         };
-        let chunks =
-            crate::feishu::card::chunk_text(&entry.text, crate::feishu::card::MAX_ELEMENT_TEXT_CHARS);
+        let body = entry.body_text();
+        let chunks = crate::feishu::card::chunk_text(&body, crate::feishu::card::MAX_ELEMENT_TEXT_CHARS);
         let chunks = if chunks.is_empty() {
             vec!["（空消息）".to_string()]
         } else {
@@ -157,9 +159,15 @@ pub(crate) fn role_marker(role: &MessageRole) -> &'static str {
 
 /// One tail entry's role marker + short preview, shared by the static
 /// snapshot's collapsible panels and the busy-adopt follow's static text
-/// (ADR-0028).
+/// (ADR-0028). A files-only entry previews its record line so the folded panel
+/// names the file (ADR-0076); a text-bearing entry previews its text, unchanged.
 pub(crate) fn tail_preview(entry: &TailEntry) -> (&'static str, String) {
-    let preview: String = entry.text.chars().take(40).collect::<String>().trim().to_string();
+    let source = if entry.text.trim().is_empty() && !entry.files.is_empty() {
+        entry.body_text()
+    } else {
+        entry.text.clone()
+    };
+    let preview: String = source.chars().take(40).collect::<String>().trim().to_string();
     (role_marker(&entry.role), preview)
 }
 
@@ -353,7 +361,13 @@ mod tests {
             role,
             created_ms,
             text: text.into(),
+            files: Vec::new(),
         }
+    }
+
+    fn file(name: &str) -> crate::backend::FileContent {
+        crate::backend::FileContent::decode("data:image/png;base64,QUJD", Some("image/png"), Some(name))
+            .expect("an inline payload is a File Content")
     }
 
     fn elements(card: &serde_json::Value) -> &[serde_json::Value] {
@@ -651,6 +665,56 @@ mod tests {
         assert!(s.contains("🤖"), "assistant role marked: {s}");
         assert!(s.contains("回答二"), "full text present: {s}");
         assert!(panels.iter().all(|p| !p["expanded"].as_bool().unwrap()));
+    }
+
+    /// A tail entry that carries a File Content records it as a line
+    /// (`📎 name · mime · size`, ADR-0076): the folded panel's body carries the
+    /// full record line, and a files-only entry is not reported as an empty
+    /// message. A text-bearing entry keeps its text preview (below).
+    #[test]
+    fn a_file_bearing_tail_entry_records_the_file_line() {
+        let d = data(
+            Some(opencode::types::SessionStatus::Idle),
+            vec![],
+            vec![
+                TailEntry {
+                    role: MessageRole::User,
+                    created_ms: 1_000,
+                    text: String::new(),
+                    files: vec![file("only.png")],
+                },
+                TailEntry {
+                    role: MessageRole::User,
+                    created_ms: 2_000,
+                    text: "看看这个".into(),
+                    files: vec![file("and.png")],
+                },
+            ],
+        );
+        let card = build_snapshot_card("接管", "t", &d, None);
+        let s = card.to_string();
+        assert!(
+            s.contains("📎 only.png · image/png · 3 B"),
+            "the record line renders: {s}"
+        );
+        assert!(
+            s.contains("📎 and.png · image/png · 3 B"),
+            "each file records its own line: {s}"
+        );
+        assert!(
+            !s.contains("（空消息）"),
+            "a files-only entry is not an empty message: {s}"
+        );
+        // The text-bearing entry's preview stays its text (ADR-0076: semantics
+        // of text-bearing entries unchanged).
+        assert!(s.contains("👤 看看这个…"), "text preview unchanged: {s}");
+    }
+
+    /// A tail entry without files renders its text alone — the record-line
+    /// change leaves a file-free snapshot byte-for-byte unchanged (ADR-0076).
+    #[test]
+    fn a_tail_entry_without_files_renders_its_text_alone() {
+        assert_eq!(tail(MessageRole::User, 1_000, "问题一").body_text(), "问题一");
     }
 
     /// A tail entry's text is rendered alone (spec #652, ticket #655, acceptance

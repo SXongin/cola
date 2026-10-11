@@ -1,4 +1,4 @@
-use crate::backend::{ContentBlock, ToolCall, ToolStatus};
+use crate::backend::{ContentBlock, FileContent, ToolCall, ToolStatus};
 
 use super::sanitize::CardMarkdown;
 use super::shell::{collapsible_panel, fmt_elapsed, panel_time_suffix};
@@ -26,6 +26,56 @@ pub struct ToolPanel {
     /// rendering only shows it while the call is live. `None` for every
     /// non-task panel and until the child state has been read.
     liveness: Option<TaskLiveness>,
+    /// The File Contents this call's output carries, with the card delivery the
+    /// render path resolved for each (ADR-0076). Empty for the common case; a
+    /// `read` of an image is the shape that fills it.
+    files: Vec<ToolFile>,
+}
+
+/// One File Content a tool call carries, plus the card delivery the render path
+/// resolved for it (ADR-0076). The card build renders the tracking line from
+/// `content` and, for a [`FileDelivery::Embedded`] entry, the `img` element
+/// after the panel.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolFile {
+    pub content: FileContent,
+    /// The resolved delivery. Starts [`FileDelivery::Unresolved`] and is set by
+    /// the render path's pre-resolve step, so a `None`-free enum keeps "not
+    /// considered yet" distinct from "considered, nothing to render".
+    pub delivery: FileDelivery,
+}
+
+/// A File Content's card delivery (ADR-0076). Exactly one per File Content; the
+/// card build renders the line and image from it instead of re-deriving
+/// anything. A content that cannot be embedded is delivered as a File Message
+/// (#649): `SentAsFile` when the message went out, `Undelivered` when it could
+/// not be — over Feishu's 30MB cap, or a failed upload/send.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileDelivery {
+    /// The render path has not resolved this content yet. A card built before
+    /// the pre-resolve runs (a unit fixture) shows just the tracking line.
+    Unresolved,
+    /// An image within Feishu's caps, uploaded once and embedded in the card
+    /// immediately after its Tool Panel: the reusable `image_key` the `img`
+    /// element references. The panel line reads `· 已内嵌`.
+    Embedded { image_key: String },
+    /// A File Content uploaded once and posted as exactly one File Message
+    /// replied in-thread under the live card (#649). The panel line reads
+    /// `· 已发送为文件消息`.
+    SentAsFile,
+    /// A File Content that could not be delivered: over Feishu's 30MB message
+    /// cap, or a failed upload/send. The panel line reads `· 未发送`.
+    Undelivered,
+}
+
+impl FileDelivery {
+    /// The reusable `image_key` when this content is embedded in the card.
+    fn as_embedded_key(&self) -> Option<&str> {
+        match self {
+            FileDelivery::Embedded { image_key } => Some(image_key),
+            FileDelivery::Unresolved | FileDelivery::SentAsFile | FileDelivery::Undelivered => None,
+        }
+    }
 }
 
 /// The status marker a backgrounded call's panel shows instead of ✅
@@ -37,7 +87,49 @@ pub(crate) const BACKGROUNDED_MARKER: &str = "🌙";
 
 impl ToolPanel {
     pub fn new(call: ToolCall) -> Self {
-        Self { call, liveness: None }
+        // The call's file blocks become the panel's File Content carriers, so
+        // the card build reads them without re-parsing any tool output.
+        let files = call
+            .output
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::File(content) => Some(ToolFile {
+                    content: content.clone(),
+                    delivery: FileDelivery::Unresolved,
+                }),
+                _ => None,
+            })
+            .collect();
+        Self {
+            call,
+            liveness: None,
+            files,
+        }
+    }
+
+    /// The File Contents this panel carries (ADR-0076), in decoder order.
+    pub(crate) fn files(&self) -> &[ToolFile] {
+        &self.files
+    }
+
+    /// How many File Contents this panel embeds (ADR-0076) — the extra `img`
+    /// elements its render pushes after the panel, so a card-size estimate can
+    /// charge them.
+    pub(crate) fn embedded_file_count(&self) -> usize {
+        self.files
+            .iter()
+            .filter(|file| file.delivery.as_embedded_key().is_some())
+            .count()
+    }
+
+    /// Attach the resolved delivery for the file at `index` (the render path's
+    /// pre-resolve step). A no-op for an out-of-range index — the panel's files
+    /// and its call's blocks can never disagree, but a caller cannot panic here.
+    pub(crate) fn set_file_delivery(&mut self, index: usize, delivery: FileDelivery) {
+        if let Some(file) = self.files.get_mut(index) {
+            file.delivery = delivery;
+        }
     }
 
     /// The typed call this panel renders. The accumulator compares it against
@@ -447,6 +539,31 @@ impl ToolPanel {
             },
         })
     }
+
+    /// A panel carrying one unresolved File Content per `(name, bytes)` pair,
+    /// each a PNG `data:` URI (ADR-0076) — the shape the split-estimate and the
+    /// attach-guard tests build their panels from.
+    pub(crate) fn for_test_with_files(name: &str, files: &[(&str, &[u8])]) -> Self {
+        use base64::Engine as _;
+        let mut panel = Self::for_test(name, ToolStatus::Completed, None, None);
+        panel.files = files
+            .iter()
+            .map(|(file_name, bytes)| {
+                let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+                let content = crate::backend::FileContent::decode(
+                    &format!("data:image/png;base64,{encoded}"),
+                    Some("image/png"),
+                    Some(file_name),
+                )
+                .expect("an inline payload is a File Content");
+                ToolFile {
+                    content,
+                    delivery: FileDelivery::Unresolved,
+                }
+            })
+            .collect();
+        panel
+    }
 }
 
 /// How a Tool Panel's output body renders. The renderer for a tool knows its
@@ -463,6 +580,82 @@ enum BodyStyle {
     /// Markdown by construction (a generated list): never fenced, even when a
     /// line is long — fencing would show the literal list syntax.
     Markdown,
+}
+
+/// The tracking block a Tool Panel appends for its File Contents (ADR-0076):
+/// one line per file — `content.record_line()` plus the resolved delivery's
+/// state — so a file the panel read stops being invisible. `None` when the call
+/// carries no File Content: `· 已内嵌` for an embedded image, `· 已发送为文件消息`
+/// for one delivered as a File Message, `· 未发送` for one that could not be.
+fn file_tracking_block(tool: &ToolPanel) -> Option<String> {
+    if tool.files().is_empty() {
+        return None;
+    }
+    Some(
+        tool.files()
+            .iter()
+            .map(|file| match &file.delivery {
+                FileDelivery::Embedded { .. } => format!("{} · 已内嵌", file.content.record_line()),
+                FileDelivery::SentAsFile => format!("{} · 已发送为文件消息", file.content.record_line()),
+                FileDelivery::Undelivered => format!("{} · 未发送", file.content.record_line()),
+                FileDelivery::Unresolved => file.content.record_line(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+/// The byte length of the tracking block [`file_tracking_block`] appends to a
+/// panel body (ADR-0076), for a card-size estimate that must charge the same
+/// bytes the renderer writes — the record line plus the `· 已内嵌` /
+/// `· 已发送为文件消息` / `· 未发送` suffix the resolved delivery adds. `0` when
+/// the panel carries no File Content. Kept beside the render so the two cannot
+/// drift.
+///
+/// The block is charged at its **serialized** size, not its raw UTF-8 length:
+/// it is markdown-sanitized by the card's own [`CardMarkdown::element`] (which
+/// escapes `<` and downgrades images) and then embedded in the card's JSON
+/// `content` string, where a `"` or `\` doubles to two bytes and a control
+/// character to six. A raw-length estimate under-counts a filename full of
+/// quotes (or `<`) by half, letting a panel pass the split check while the
+/// serialized card still exceeds Feishu's size cap — which the fenced content
+/// fallback cannot repair.
+pub(crate) fn file_tracking_estimate(tool: &ToolPanel) -> usize {
+    file_tracking_block(tool)
+        .map(|block| json_escaped_len(&CardMarkdown::new().element(&block)))
+        .unwrap_or(0)
+}
+
+/// The byte length `text` contributes to a JSON string: its JSON-escaped form
+/// without the surrounding quotes. `serde_json::to_string` on a `&str` cannot
+/// fail, so the raw-length fallback is unreachable; it only keeps the estimate
+/// finite if it ever were.
+fn json_escaped_len(text: &str) -> usize {
+    serde_json::to_string(text)
+        .map(|quoted| quoted.len().saturating_sub(2))
+        .unwrap_or(text.len())
+}
+
+/// The `img` elements this panel renders (ADR-0076): one per embedded File
+/// Content, all pushed immediately AFTER the panel so the image is visible and
+/// its adjacency to the panel gives the correspondence. `title` is
+/// `📎 <name>`; `preview` is on so a click enlarges it. A content with no
+/// embed renders nothing here.
+pub(super) fn file_image_elements(tool: &ToolPanel) -> Vec<serde_json::Value> {
+    tool.files()
+        .iter()
+        .filter_map(|file| {
+            file.delivery.as_embedded_key().map(|image_key| {
+                serde_json::json!({
+                    "tag": "img",
+                    "img_key": image_key,
+                    "alt": { "tag": "plain_text", "content": file.content.name },
+                    "title": { "tag": "plain_text", "content": format!("📎 {}", file.content.name) },
+                    "preview": true,
+                })
+            })
+        })
+        .collect()
 }
 
 /// One tool panel as a folded collapsible element. `at_ms` is the part's
@@ -559,6 +752,15 @@ pub(super) fn tool_panel_element(
                 BodyStyle::Auto => content.push_str(&body),
             }
         }
+    }
+    // The File Contents' tracking lines (ADR-0076) close the panel body: the
+    // file's own line plus its delivery state, so a Tool Panel that read a file
+    // names it instead of dropping it.
+    if let Some(files) = file_tracking_block(tool) {
+        if !content.is_empty() {
+            content.push_str("\n\n");
+        }
+        content.push_str(&files);
     }
     if content.is_empty() {
         content = "_(no details)_".to_string();
@@ -1512,6 +1714,201 @@ mod tests {
     use crate::feishu::card::CardState;
     use crate::feishu::card::shell::CardBuilder;
     use serde_json::json;
+
+    /// A `read` panel whose one output block is a File Content, with the given
+    /// resolved delivery (ADR-0076).
+    fn read_panel(name: &str, mime: &str, bytes: &[u8], delivery: FileDelivery) -> ToolPanel {
+        use base64::Engine as _;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let content = FileContent::decode(&format!("data:{mime};base64,{encoded}"), Some(mime), Some(name))
+            .expect("an inline payload is a File Content");
+        let call = ToolCall {
+            identity: ToolIdentity {
+                name: "read".into(),
+                call_id: "call_read".into(),
+            },
+            status: ToolStatus::Completed,
+            started_at: None,
+            input: None,
+            metadata: None,
+            output: ToolOutput {
+                raw: None,
+                blocks: vec![ContentBlock::File(content)],
+                error: None,
+            },
+        };
+        let mut panel = ToolPanel::new(call);
+        panel.set_file_delivery(0, delivery);
+        panel
+    }
+
+    /// An embedded File Content (ADR-0076): the panel carries its tracking line
+    /// with `· 已内嵌`, and the `img` element sits IMMEDIATELY after the panel
+    /// (not inside it — the panel is collapsed by default), `title`
+    /// `📎 <name>`, `preview` on.
+    #[test]
+    fn an_embedded_file_content_renders_its_tracking_line_and_image_after_the_panel() {
+        let panel = read_panel(
+            "shot.png",
+            "image/png",
+            b"ABC",
+            FileDelivery::Embedded {
+                image_key: "img_v2_x".into(),
+            },
+        );
+        let card = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_tool(panel)
+            .with_text("after")
+            .build();
+        let elements = card["body"]["elements"].as_array().unwrap();
+        assert_eq!(elements[0]["tag"], "collapsible_panel", "{card}");
+        assert_eq!(elements[1]["tag"], "img", "the image follows its panel: {card}");
+        assert_eq!(elements[1]["img_key"], "img_v2_x");
+        assert_eq!(elements[1]["title"]["content"], "📎 shot.png");
+        assert_eq!(elements[1]["alt"]["content"], "shot.png");
+        assert_eq!(elements[1]["preview"], true, "the image is clickable to enlarge");
+        assert_eq!(
+            elements[2]["content"], "after",
+            "later content still follows: {card}"
+        );
+        let body = elements[0]["elements"][0]["content"].as_str().unwrap();
+        assert!(
+            body.contains("📎 shot.png · image/png · 3 B · 已内嵌"),
+            "the panel carries the tracking line: {body}"
+        );
+    }
+
+    /// A File Content with no embed — a non-image, or an image the upload could
+    /// not embed — keeps the bare record line with the `· 未发送` state and
+    /// emits NO `img` element.
+    #[test]
+    fn an_undelivered_file_content_renders_only_its_unsent_line() {
+        let panel = read_panel("doc.pdf", "application/pdf", b"%PDF", FileDelivery::Undelivered);
+        let card = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_tool(panel)
+            .build();
+        let elements = card["body"]["elements"].as_array().unwrap();
+        assert_eq!(elements.len(), 1, "no image element: {card}");
+        let body = elements[0]["elements"][0]["content"].as_str().unwrap();
+        assert!(
+            body.contains("📎 doc.pdf · application/pdf · 4 B · 未发送"),
+            "{body}"
+        );
+        assert!(!body.contains("已内嵌"), "{body}");
+    }
+
+    /// A File Content delivered as a File Message (#649) keeps the bare record
+    /// line with the `· 已发送为文件消息` state and emits NO `img` element: the
+    /// bytes live in a separate message, not on the card.
+    #[test]
+    fn a_file_message_content_renders_its_sent_line_and_no_image() {
+        let panel = read_panel("doc.pdf", "application/pdf", b"%PDF", FileDelivery::SentAsFile);
+        let card = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_tool(panel)
+            .build();
+        let elements = card["body"]["elements"].as_array().unwrap();
+        assert_eq!(elements.len(), 1, "no image element: {card}");
+        let body = elements[0]["elements"][0]["content"].as_str().unwrap();
+        assert!(
+            body.contains("📎 doc.pdf · application/pdf · 4 B · 已发送为文件消息"),
+            "{body}"
+        );
+        assert!(!body.contains("已内嵌"), "{body}");
+    }
+
+    /// The tracking-line size estimate charges the File Message suffixes too
+    /// (#649): the block is derived from the same render, so `· 已发送为文件消息`
+    /// and `· 未发送` cost their bytes exactly as `· 已内嵌` does.
+    #[test]
+    fn file_tracking_estimate_charges_the_file_message_suffixes() {
+        let line = |delivery: FileDelivery| {
+            let panel = read_panel("doc.pdf", "application/pdf", b"%PDF", delivery);
+            file_tracking_estimate(&panel)
+        };
+        let bare = line(FileDelivery::Unresolved);
+        assert!(
+            line(FileDelivery::SentAsFile) > bare,
+            "the 已发送为文件消息 suffix must be charged"
+        );
+        assert!(
+            line(FileDelivery::Undelivered) > bare,
+            "the 未发送 suffix must be charged"
+        );
+    }
+
+    /// The tracking-line size estimate must charge the block's JSON-ESCAPED
+    /// bytes, not its raw UTF-8 length: the panel body is embedded in the card's
+    /// JSON `content` string, where every `"` becomes `\"` (and a `\` becomes
+    /// `\\`, a control char six bytes). A raw-length estimate under-counts a
+    /// pathological filename by half, letting a card pass the split check and
+    /// still be rejected by Feishu on size — which the fenced content fallback
+    /// cannot repair. 16,000 quotes are ~16KB raw but ~32KB escaped.
+    #[test]
+    fn file_tracking_estimate_charges_json_escaping() {
+        let quotes = "\"".repeat(16_000);
+        let panel = read_panel(&quotes, "image/png", b"ABC", FileDelivery::Undelivered);
+        let raw = file_tracking_block(&panel).expect("the panel carries a tracking block");
+        let estimate = file_tracking_estimate(&panel);
+
+        assert_eq!(
+            estimate,
+            raw.len() + quotes.len(),
+            "each `\"` must cost its escaped `\\\"` — one extra byte"
+        );
+        assert!(
+            estimate > raw.len(),
+            "the estimate must not be the raw UTF-8 length"
+        );
+    }
+
+    /// The same estimate must also charge the card's MARKDOWN sanitization: the
+    /// block runs through `CardMarkdown::element` before it reaches the JSON, so
+    /// every `<` a filename carries is escaped to the five-byte `&#60;`. A raw
+    /// estimate would charge one byte for each and under-count by 4x.
+    #[test]
+    fn file_tracking_estimate_charges_markdown_escaping() {
+        let angles = "<".repeat(1_000);
+        let panel = read_panel(&angles, "image/png", b"ABC", FileDelivery::Undelivered);
+        let raw = file_tracking_block(&panel).expect("the panel carries a tracking block");
+        let estimate = file_tracking_estimate(&panel);
+
+        assert_eq!(
+            estimate,
+            raw.len() + angles.len() * 4,
+            "each `<` must cost its five-byte `&#60;` — four extra bytes"
+        );
+    }
+
+    /// The whole-card content-rejection fallback fences every markdown element
+    /// but MUST preserve `img` elements (ADR-0076): an image is not content the
+    /// platform can reject, and fencing it would break the card entirely.
+    #[test]
+    fn the_content_rejection_fallback_never_fences_the_image() {
+        let panel = read_panel(
+            "shot.png",
+            "image/png",
+            b"ABC",
+            FileDelivery::Embedded {
+                image_key: "img_v2_x".into(),
+            },
+        );
+        let card = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_fenced_markdown(true)
+            .with_tool(panel)
+            .build();
+        let elements = card["body"]["elements"].as_array().unwrap();
+        assert_eq!(
+            elements[1]["tag"], "img",
+            "the image survives the fallback: {card}"
+        );
+        assert_eq!(elements[1]["img_key"], "img_v2_x");
+        let body = elements[0]["elements"][0]["content"].as_str().unwrap();
+        assert!(body.starts_with("```"), "the panel body is fenced: {body}");
+    }
 
     #[test]
     fn tool_panel_completed_is_collapsible() {

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::Instrument;
 
-use crate::backend::{MessageRole, Part, SessionTranscript, TurnAnchor, TurnSettle};
+use crate::backend::{FileContent, MessageRole, Part, SessionTranscript, TurnAnchor, TurnSettle};
 use crate::bridge::handles::{CardsHandle, FlowHandles, NoticeRules};
 use crate::bridge::turn::{
     CardClass, CardOwnership, ContinuationFacts, ContinuationLine, Disposition, SettleTiming, Turn,
@@ -747,10 +747,11 @@ impl ExternalFlow {
             static_text.push_str("\n\n**最近对话**");
             for entry in &data.tail {
                 let role = crate::feishu::snapshot_card::role_marker(&entry.role);
-                let text = if entry.text.trim().is_empty() {
+                let body = entry.body_text();
+                let text = if body.trim().is_empty() {
                     "（空消息）".to_string()
                 } else {
-                    entry.text.clone()
+                    body
                 };
                 static_text.push_str(&format!("\n{role} {text}"));
             }
@@ -1673,35 +1674,55 @@ async fn idle_bound_reached(handles: &FlowHandles, session_id: &str, anchor: &Tu
 /// Preview of the External Message for the notification card: every user
 /// message the backend reported at the anchor's server time (typically one),
 /// its text and reasoning parts concatenated verbatim with no separator, then
-/// capped at 80 characters. This mirrors the pre-transcript preview, which
-/// folded every `text` string of the newest-epoch user messages.
+/// capped at 80 characters. A File Content the message carries is recorded as
+/// its own line (`📎 name · mime · size`, ADR-0076) after the text — the bytes
+/// are never previewed, and the short record line survives the text's cap.
+/// This mirrors the pre-transcript preview, which folded every `text` string of
+/// the newest-epoch user messages.
 ///
 /// A part kind this build does not model ([`Part::Other`]) is not folded in:
 /// that would mean indexing raw protocol fields, which the read model exists to
 /// prevent. Such a part carrying top-level `text` does not occur in user
 /// messages in practice.
 fn message_preview(transcript: &SessionTranscript, anchor: &TurnAnchor) -> String {
-    transcript
+    let mut text = String::new();
+    let mut files: Vec<&FileContent> = Vec::new();
+    for message in transcript
         .messages
         .iter()
         .filter(|message| message.role == MessageRole::User)
         .filter(|message| message.time.is_some_and(|time| time.created == anchor.created_ms))
-        .flat_map(|message| message.parts.iter())
-        .filter_map(|part| match part {
-            Part::Text(text) => Some(text.text.as_str()),
-            Part::Reasoning(reasoning) => Some(reasoning.text.as_str()),
-            _ => None,
-        })
-        .collect::<String>()
-        .chars()
-        .take(80)
-        .collect()
+    {
+        for part in &message.parts {
+            match part {
+                Part::Text(text_part) => text.push_str(&text_part.text),
+                Part::Reasoning(reasoning) => text.push_str(&reasoning.text),
+                // A File Content is recorded as a line of its own (ADR-0076):
+                // its bytes are never re-delivered on the External Message path.
+                Part::File(content) => files.push(content),
+                _ => {}
+            }
+        }
+    }
+    // The text keeps the preview's 80-char cap; each File Content's record line
+    // is short and always survives, so a long text never hides the attachment.
+    let text: String = text.chars().take(80).collect();
+    let records = FileContent::record_lines(files);
+    if records.is_empty() {
+        text
+    } else if text.is_empty() {
+        records
+    } else {
+        format!("{text}\n{records}")
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{MessageRole, Part, ReasoningPart, SessionTranscript, TranscriptMessage};
+    use crate::backend::{
+        FileContent, MessageRole, Part, ReasoningPart, SessionTranscript, TranscriptMessage,
+    };
     use crate::bridge::test_support::{text_part, turn_anchor, typed_message};
 
     fn user(id: &str, created: i64, parts: Vec<Part>) -> TranscriptMessage {
@@ -1743,5 +1764,49 @@ mod tests {
         let preview = message_preview(&transcript, &anchor);
         assert_eq!(preview.chars().count(), 80, "preview must cap at 80 chars");
         assert_eq!(preview, long.chars().take(80).collect::<String>());
+    }
+
+    /// ADR-0076 (ticket #648): a user message's File Content is recorded in the
+    /// External Message preview as `📎 name · mime · size` — on its own line
+    /// after any text, and the whole preview for a files-only message. Its
+    /// bytes are never part of the preview.
+    #[test]
+    fn preview_records_a_users_file_content_line() {
+        let anchor = turn_anchor(1_000);
+        let content = FileContent::decode("data:image/png;base64,QUJD", Some("image/png"), Some("shot.png"))
+            .expect("an inline payload is a File Content");
+
+        let files_only =
+            SessionTranscript::new(vec![user("msg_u1", 1_000, vec![Part::File(content.clone())])]);
+        assert_eq!(
+            message_preview(&files_only, &anchor),
+            "📎 shot.png · image/png · 3 B"
+        );
+
+        let with_text = SessionTranscript::new(vec![user(
+            "msg_u1",
+            1_000,
+            vec![text_part("看看"), Part::File(content.clone())],
+        )]);
+        assert_eq!(
+            message_preview(&with_text, &anchor),
+            "看看\n📎 shot.png · image/png · 3 B"
+        );
+
+        // A long text is still capped at 80 chars, but the record line survives:
+        // a long message never hides its attachment.
+        let long = "很长的内容".repeat(30);
+        let long_with_file = SessionTranscript::new(vec![user(
+            "msg_u1",
+            1_000,
+            vec![text_part(&long), Part::File(content)],
+        )]);
+        assert_eq!(
+            message_preview(&long_with_file, &anchor),
+            format!(
+                "{}\n📎 shot.png · image/png · 3 B",
+                long.chars().take(80).collect::<String>()
+            )
+        );
     }
 }

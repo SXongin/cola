@@ -11,16 +11,20 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::Instrument;
 
 use crate::backend::{
-    MessageId, Part, SessionTranscript, TaskRetirementEnding, ToolStatus, TurnAnchor, Wake, WakeSource,
+    FileContent, MessageId, Part, SessionTranscript, TaskRetirementEnding, ToolStatus, TurnAnchor, Wake,
+    WakeSource,
 };
 use crate::bridge::core::SESSION_INFO_TIMEOUT;
-use crate::bridge::handles::{CardsHandle, RequestsHandle, SessionsHandle, TurnHandles};
+use crate::bridge::handles::{
+    CardsHandle, ContentCellCache, FILE_MESSAGE_SENDS_CAP, FileMessageSend, FileMessageSendHold,
+    FileMessageSends, RequestsHandle, SessionsHandle, TurnHandles, evict_oldest_idle,
+};
 use crate::bridge::span;
 use crate::bridge::turn::state;
 use crate::bridge::turn::state::{LedgerCadence, PartSource, RenderedPart, StreamAccumulator};
 use crate::config::ThreadKey;
 use crate::feishu::card::ledger::{TaskCompletionEntry, TaskEnding, TaskKind, TaskOutput};
-use crate::feishu::card::tool_render::{ChildActivity, TaskLiveness};
+use crate::feishu::card::tool_render::{ChildActivity, FileDelivery, TaskLiveness};
 
 use super::Turn;
 use super::flush::FlushOutcome;
@@ -159,9 +163,9 @@ fn renders_part(acc: &StreamAccumulator, part: &Part) -> bool {
             // the call's raw payloads into a panel only to drop it.
             !acc.tool_panel_current(call)
         }
-        // Step boundaries, patches and part kinds this build does not model
-        // render nothing — there is no content to add or dedupe.
-        Part::StepStart(_) | Part::StepFinish(_) | Part::Patch(_) | Part::Other(_) => false,
+        // Step boundaries, patches, file attachments and part kinds this build
+        // does not model render nothing — there is no content to add or dedupe.
+        Part::StepStart(_) | Part::StepFinish(_) | Part::Patch(_) | Part::File(_) | Part::Other(_) => false,
     }
 }
 
@@ -240,7 +244,9 @@ fn render_part(acc: &mut StreamAccumulator, source: Option<PartSource>, part: &P
                 acc.mark_streaming();
             }
         }
-        Part::StepStart(_) | Part::StepFinish(_) | Part::Patch(_) | Part::Other(_) => return false,
+        Part::StepStart(_) | Part::StepFinish(_) | Part::Patch(_) | Part::File(_) | Part::Other(_) => {
+            return false;
+        }
     }
     // card_state / running-tool changes reset the header phase timer.
     acc.refresh_phase();
@@ -627,6 +633,264 @@ pub(super) async fn read_planned_outputs(
             None => Some(TaskOutput::Unavailable),
         };
         plan.entry.output = output;
+    }
+}
+
+/// One File Content the render path is about to resolve (ADR-0076): the content,
+/// the content `hash` that keys the process-local upload caches, and the panel
+/// position it belongs to (`call_id`, `index`) so the send can re-validate the
+/// LIVE panel before posting the file (#649).
+struct InFlightUpload {
+    hash: u64,
+    call_id: String,
+    index: usize,
+    content: FileContent,
+}
+
+/// Pre-resolve each newly rendered File Content's card delivery before the card
+/// JSON is built (ADR-0076). An image within Feishu's caps is uploaded once —
+/// cached process-locally by content hash, so identical bytes upload once and
+/// every later PATCH reuses the key — and embedded as an `img` immediately
+/// after its Tool Panel; anything else (a non-image, an image past the embed
+/// caps, or an image whose embed upload failed) is uploaded once and posted as
+/// exactly ONE File Message replied in-thread under the live card (#649), or
+/// left `未发送` when it is past Feishu's 30MB cap or the send failed.
+/// Best-effort: a failure leaves the panel's tracking line and never fails the
+/// Turn. Runs OUTSIDE the cards lock for the uploads and the send (they are
+/// network calls), like the planned-entry output reads. Returns whether any
+/// delivery was attached — a change that owes its card PATCH.
+async fn resolve_file_deliveries(cards: &CardsHandle, session_id: &str) -> bool {
+    // 1. Collect the unresolved File Contents under a brief lock. No cache
+    //    access here, so no nested lock; the reply target is read later, in the
+    //    same critical section as the live-panel revalidation (see
+    //    `live_file_reply_target`).
+    let pending = {
+        let live = cards.cards.lock().await;
+        let Some(card) = live.get(session_id) else {
+            return false;
+        };
+        card.acc.pending_file_deliveries()
+    };
+    if pending.is_empty() {
+        return false;
+    }
+    // 2. One resolution per distinct content hash, each cached process-locally
+    //    (single-flight), so concurrent resolvers of one hash await ONE upload
+    //    and identical bytes resolve once.
+    let mut to_resolve: Vec<InFlightUpload> = Vec::new();
+    let mut decided: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    for delivery in &pending {
+        if !decided.insert(delivery.hash) {
+            continue;
+        }
+        to_resolve.push(InFlightUpload {
+            hash: delivery.hash,
+            call_id: delivery.call_id.clone(),
+            index: delivery.index,
+            content: delivery.content.clone(),
+        });
+    }
+    let mut resolved: std::collections::HashMap<u64, FileDelivery> = std::collections::HashMap::new();
+    for upload in to_resolve {
+        if let Some(delivery) = resolve_file_delivery(cards, session_id, &upload).await {
+            resolved.insert(upload.hash, delivery);
+        }
+    }
+    // 3. Attach the deliveries under a short lock, keyed by content hash so a
+    //    panel the transcript replaced mid-resolution cannot be marked with
+    //    another file's state. A content left unresolved (no live card to reply
+    //    under yet) is simply skipped and retried on a later poll.
+    let mut live = cards.cards.lock().await;
+    let Some(card) = live.get_mut(session_id) else {
+        return false;
+    };
+    let mut changed = false;
+    for delivery in pending {
+        let Some(outcome) = resolved.get(&delivery.hash) else {
+            continue;
+        };
+        if !card
+            .acc
+            .file_delivery_current(&delivery.call_id, delivery.index, delivery.hash)
+        {
+            // The panel was replaced after the send landed (#649): the File
+            // Message went out for a file this card no longer shows — the
+            // residual, benign best-effort artifact documented at the check
+            // site. The setter's hash guard would no-op; log it at DEBUG.
+            tracing::debug!(
+                "file content {:?} was delivered but its panel was replaced mid-send",
+                delivery.content.name
+            );
+            continue;
+        }
+        card.acc
+            .set_file_delivery(&delivery.call_id, delivery.index, delivery.hash, outcome);
+        changed = true;
+    }
+    if changed {
+        // A resolved delivery is rendered content, not clock churn: it owes its
+        // flush and counts as progress, like a part.
+        card.acc.bump_progress_mark();
+    }
+    changed
+}
+
+/// The single-flight cell for `hash` in a per-content-hash cache (ADR-0076):
+/// the lock, the `entry`, the `OnceCell` creation and the `Arc::clone` the
+/// image and file caches both need, in one place. Every concurrent resolver of
+/// one content hash shares one cell, so the first's platform call is awaited by
+/// the rest instead of repeated.
+async fn content_cell<T>(cache: &ContentCellCache<T>, hash: u64) -> Arc<tokio::sync::OnceCell<T>> {
+    let mut cache = cache.lock().await;
+    Arc::clone(
+        cache
+            .entry(hash)
+            .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new())),
+    )
+}
+
+/// The single-flight cell for one File Message send, keyed by `(session_id,
+/// content hash)` (#649): created if absent, evicting the oldest entry NO
+/// resolver holds past [`FILE_MESSAGE_SENDS_CAP`] so the guard never grows
+/// without limit. Concurrent resolvers of one key share one cell, so the first's
+/// send is awaited by the rest — exactly ONE send attempt per key. The returned
+/// hold marks the key in flight until it drops (cancellation included), so
+/// eviction never removes a key whose send a resolver is still driving.
+async fn file_message_cell(sends: &FileMessageSends, key: (String, u64)) -> FileMessageSendHold {
+    let mut sends = sends.lock().await;
+    if !sends.contains_key(&key) && sends.len() >= FILE_MESSAGE_SENDS_CAP {
+        evict_oldest_idle(&mut sends);
+    }
+    let entry = Arc::clone(
+        sends
+            .entry(key)
+            .or_insert_with(|| Arc::new(FileMessageSend::new())),
+    );
+    FileMessageSendHold::new(entry)
+}
+
+/// The live card's message id when its panel still holds `upload`'s content at
+/// its position, else `None` (#649). The content-hash revalidation and the reply
+/// target are read from ONE cards-lock critical section, so the File Message is
+/// replied under the very card the check just approved — a card re-pointed (a
+/// split, a re-adopt) while the upload was in flight replies under its NEW id,
+/// not the stale one the resolve started with. `None` when the card is gone, has
+/// no message id yet, or no longer holds the content — nothing to reply under.
+async fn live_file_reply_target(
+    cards: &CardsHandle,
+    session_id: &str,
+    upload: &InFlightUpload,
+) -> Option<String> {
+    let live = cards.cards.lock().await;
+    let card = live.get(session_id)?;
+    if !card
+        .acc
+        .file_delivery_current(&upload.call_id, upload.index, upload.hash)
+    {
+        return None;
+    }
+    card.card_message_id.clone()
+}
+
+/// Resolve ONE File Content's card delivery (ADR-0076, #649): embed an image
+/// within Feishu's caps, else upload the bytes once and send one File Message
+/// in-thread under the live card, else `Undelivered`. Best-effort: every failure
+/// degrades along the ladder (embed upload → File Message → `未发送`) and never
+/// errors. `None` leaves the content unresolved for a later poll — a File
+/// Message with no live card to reply under yet, or one whose live panel no
+/// longer holds the file; the upload itself is already cached, so only the send
+/// is retried.
+async fn resolve_file_delivery(
+    cards: &CardsHandle,
+    session_id: &str,
+    upload: &InFlightUpload,
+) -> Option<FileDelivery> {
+    // Embed first: an image within the caps uploads once and every later PATCH
+    // reuses the key. A non-image (`Ok(None)`) or a failed embed upload
+    // degrades to the File Message path.
+    let image_cell = content_cell(&cards.file_images, upload.hash).await;
+    match image_cell
+        .get_or_try_init(|| async { cards.feishu.upload_image(&upload.content).await })
+        .await
+    {
+        Ok(Some(image_key)) => {
+            return Some(FileDelivery::Embedded {
+                image_key: image_key.clone(),
+            });
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(
+                "file content {:?} embed upload failed, degrading to a File Message: {error}",
+                upload.content.name
+            );
+            // Cache the degradation so a later panel with the same bytes follows
+            // the same File Message path instead of re-embedding.
+            let _ = image_cell.set(None);
+        }
+    }
+    // File Message: upload once, then send ONE message in-thread. `Ok(None)`
+    // means past Feishu's 30MB cap — nothing was uploaded.
+    let file_cell = content_cell(&cards.file_uploads, upload.hash).await;
+    let file_key = match file_cell
+        .get_or_try_init(|| async { cards.feishu.upload_file(&upload.content).await })
+        .await
+    {
+        Ok(Some(file_key)) => file_key.clone(),
+        Ok(None) => return Some(FileDelivery::Undelivered),
+        Err(error) => {
+            tracing::warn!(
+                "file content {:?} file upload failed: {error}",
+                upload.content.name
+            );
+            return Some(FileDelivery::Undelivered);
+        }
+    };
+    // The send replies under the live card; without one, leave it unresolved so
+    // a later poll (with the card) retries — the upload is already cached.
+    // Once-guard, single-flight (#649): a content whose File Message already went
+    // out for this Session never sends a second one (a cola restart may resend —
+    // accepted), and two concurrent resolvers of one key await ONE send attempt
+    // instead of both missing the guard and posting duplicate File Messages. The
+    // init re-validates the LIVE panel and captures the reply target in ONE
+    // cards-lock critical section, then releases the lock BEFORE the network
+    // send. The lock is never held across a platform await — it would stall
+    // every card update on a Feishu round-trip — so the residual window is: a
+    // panel replaced between this check and the send landing still gets its File
+    // Message. That is a benign, best-effort artifact — ADR-0076 frames delivery
+    // as best-effort and permits a resend after a restart. The delivery status
+    // is only attached if the panel still matches when the send returns (the
+    // setter's hash guard), and the residual case is logged at DEBUG by the
+    // caller. A check that fails sends nothing and leaves the cell
+    // uninitialized for a later poll.
+    let cell = file_message_cell(&cards.file_messages_sent, (session_id.to_string(), upload.hash)).await;
+    match cell
+        .cell()
+        .get_or_try_init(|| async {
+            let Some(reply_target) = live_file_reply_target(cards, session_id, upload).await else {
+                return Err(());
+            };
+            let content = serde_json::json!({ "file_key": file_key });
+            match cards
+                .feishu
+                .send_message_in_thread(&reply_target, "file", &content)
+                .await
+            {
+                Ok(_) => Ok(FileDelivery::SentAsFile),
+                Err(error) => {
+                    tracing::warn!(
+                        "file content {:?} File Message send failed: {error}",
+                        upload.content.name
+                    );
+                    Ok(FileDelivery::Undelivered)
+                }
+            }
+        })
+        .await
+    {
+        Ok(delivery) => Some(delivery.clone()),
+        // The panel no longer holds this content: nothing was sent.
+        Err(()) => None,
     }
 }
 
@@ -1547,6 +1811,11 @@ async fn render_and_flush_inner(
             plans,
         )
     };
+    // Resolve every newly rendered File Content's card delivery (ADR-0076)
+    // before the flush builds the card JSON: one upload per content, outside
+    // the cards lock. Best-effort — a failure leaves the tracking line. An
+    // attached delivery is a rendered change and owes its PATCH.
+    let file_changed = resolve_file_deliveries(cards, session_id).await;
     // One output read per planned entry, OUTSIDE the cards lock (the reads are
     // network), then one short lock to announce and insert them (spec #593).
     read_planned_outputs(backend, &mut plans).await;
@@ -1637,6 +1906,7 @@ async fn render_and_flush_inner(
         FlushOutcome::Unwritten
     } else if changed
         || entries_changed
+        || file_changed
         || header_changed
         || context_changed
         || ledger.owes()
@@ -1692,7 +1962,11 @@ fn child_liveness(transcript: &SessionTranscript) -> Option<TaskLiveness> {
                     }
                 }
                 Part::Text(_) | Part::Reasoning(_) => observe(part.started_at()),
-                Part::StepStart(_) | Part::StepFinish(_) | Part::Patch(_) | Part::Other(_) => {}
+                Part::StepStart(_)
+                | Part::StepFinish(_)
+                | Part::Patch(_)
+                | Part::File(_)
+                | Part::Other(_) => {}
             }
         }
     }
@@ -1916,16 +2190,16 @@ impl RenderPoll {
 mod tests {
     use super::*;
     use crate::backend::{
-        BackgroundTask, MessageId, MessageRole, MessageTime, ReasoningPart, StepFinish, StepStart, ToolCall,
-        ToolIdentity, ToolOutput, TranscriptMessage, TurnAnchor, TurnSettle,
+        BackgroundTask, FileContent, MessageId, MessageRole, MessageTime, ReasoningPart, StepFinish,
+        StepStart, ToolCall, ToolIdentity, ToolOutput, TranscriptMessage, TurnAnchor, TurnSettle,
     };
     use crate::bridge::App;
     use crate::bridge::chain::{CursorFrontier, CursorPartKind, RenderedCursor, cursor_prefix_digest};
     use crate::bridge::test_support::{
-        MockBackend, PlatformCall, RecordingPlatform, build_app, card_text, realistic_parts,
+        MockBackend, PlatformCall, RecordingPlatform, build_app, card_text, final_card, realistic_parts,
         seed_cover_title, seed_entry, test_config, test_work_dir, text_part, turn_anchor, typed_message,
     };
-    use crate::bridge::turn::state::{CursorSeed, StreamAccumulator};
+    use crate::bridge::turn::state::{CursorSeed, StreamAccumulator, file_content_hash};
     use crate::feishu::card::CardState;
     use crate::feishu::card::tool_render::ToolPanel;
 
@@ -2329,6 +2603,56 @@ Index: /x/src/main.rs
         assert!(
             !acc.build_card().to_string().contains("已加载技能"),
             "the live Turn card must not carry the skill fold"
+        );
+    }
+
+    /// A user message's File Content never reaches the live card (ADR-0076):
+    /// the part kind is a renderer no-op (`renders_part`), so a turn whose user
+    /// message carries an attachment renders only its assistant reply — no
+    /// `img` element, no name/mime/payload line. The record line and the
+    /// delivery are the Snapshot/Platform surfaces' (tickets #647/#649); this
+    /// pins that neither leaks onto the live card.
+    #[test]
+    fn a_user_file_part_renders_nothing_on_the_live_card() {
+        let content = FileContent::decode("data:image/png;base64,QUJD", Some("image/png"), Some("shot.png"))
+            .expect("an inline payload is a File Content");
+
+        let mut acc = StreamAccumulator::new("test");
+        acc.repoint_turn_anchor(&turn_anchor(0));
+
+        // The turn: the user message that anchors it — its text beside the
+        // attachment — and the assistant reply, the only part that renders.
+        let transcript = SessionTranscript::new(vec![
+            typed_message(
+                "u1",
+                MessageRole::User,
+                Some(0),
+                vec![text_part("看看这个"), Part::File(content.clone())],
+            ),
+            message("a1", 100, vec![text_part("看到了")]),
+        ]);
+        assert!(render_new_turn_parts(&mut acc, &transcript));
+        // The render loop's own arm, walked directly for the File part: the
+        // part adds nothing, exactly as it does from the transcript read.
+        assert!(!render_parts(&mut acc, &[Part::File(content)]));
+
+        let rendered = acc.build_card().to_string();
+        assert!(rendered.contains("看到了"), "the turn's reply still renders");
+        assert!(
+            !rendered.contains(r#""img""#),
+            "a user attachment must add no image element"
+        );
+        assert!(
+            !rendered.contains("shot.png"),
+            "the file's name must stay off the live card"
+        );
+        assert!(
+            !rendered.contains("image/png"),
+            "the file's mime must stay off the live card"
+        );
+        assert!(
+            !rendered.contains("QUJD"),
+            "the inline payload must stay off the live card"
         );
     }
 
@@ -4862,6 +5186,923 @@ Index: /x/src/main.rs
             updates.last().unwrap().to_string().contains("第二段"),
             "the flushed card carries the new text: {}",
             updates.last().unwrap()
+        );
+    }
+
+    /// A `read` tool call whose decoded output carries the text header plus one
+    /// File Content (ADR-0076), the shape `read` returns for an image.
+    fn read_file_part(call_id: &str, name: &str, mime: &str, bytes: &[u8]) -> Part {
+        use base64::Engine as _;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let content = crate::backend::FileContent::decode(
+            &format!("data:{mime};base64,{encoded}"),
+            Some(mime),
+            Some(name),
+        )
+        .expect("an inline payload is a File Content");
+        Part::Tool(tool_call(
+            "read",
+            call_id,
+            ToolStatus::Completed,
+            Some(1_000),
+            None,
+            vec![
+                crate::backend::ContentBlock::Text("Image read successfully".into()),
+                crate::backend::ContentBlock::File(content),
+            ],
+        ))
+    }
+
+    /// [`read_file_part`] with the File Content's decoded `size` overridden — the
+    /// shape of a payload past Feishu's caps, which a test cannot build as real
+    /// bytes without allocating 30MB.
+    fn read_file_part_sized(call_id: &str, name: &str, mime: &str, bytes: &[u8], size: u64) -> Part {
+        let Part::Tool(mut call) = read_file_part(call_id, name, mime, bytes) else {
+            unreachable!("read_file_part builds a tool part");
+        };
+        for block in &mut call.output.blocks {
+            if let crate::backend::ContentBlock::File(content) = block {
+                content.size = size;
+            }
+        }
+        Part::Tool(call)
+    }
+
+    /// Drive one render pass for `sid` with `transcript` and return it.
+    async fn render(
+        app: &Arc<App>,
+        cards: &CardsHandle,
+        sid: &str,
+        transcript: &SessionTranscript,
+    ) -> Option<RenderPass> {
+        render_and_flush(
+            cards,
+            &app.sessions_handle(),
+            &app.opencode,
+            &app.requests_handle(),
+            sid,
+            transcript,
+        )
+        .await
+    }
+
+    /// The `(mime, size)` of every image upload the mock recorded, in order.
+    async fn uploaded_images(platform: &RecordingPlatform) -> Vec<(String, u64)> {
+        platform
+            .calls
+            .lock()
+            .await
+            .iter()
+            .filter_map(|call| match call {
+                PlatformCall::UploadImage { mime, size } => Some((mime.clone(), *size)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The `(name, size)` of every file upload the mock recorded, in order.
+    async fn uploaded_files(platform: &RecordingPlatform) -> Vec<(String, u64)> {
+        platform
+            .calls
+            .lock()
+            .await
+            .iter()
+            .filter_map(|call| match call {
+                PlatformCall::UploadFile { name, size } => Some((name.clone(), *size)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every in-thread message the mock recorded, in order:
+    /// `(target message id, msg_type, content)`.
+    async fn sent_messages(platform: &RecordingPlatform) -> Vec<(String, String, serde_json::Value)> {
+        platform
+            .calls
+            .lock()
+            .await
+            .iter()
+            .filter_map(|call| match call {
+                PlatformCall::SendMessageInThread {
+                    message_id,
+                    msg_type,
+                    content,
+                } => Some((message_id.clone(), msg_type.clone(), content.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A tool-read image renders on the card (ADR-0076): uploaded once, embedded
+    /// as an `img` immediately after its panel with `title` `📎 <name>` and
+    /// `preview` on, and the panel carries the `· 已内嵌` tracking line.
+    #[tokio::test]
+    async fn a_tool_read_image_is_uploaded_and_embedded_after_its_panel() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        platform.given_image_key("img_v2_shot");
+        let sid = "ses_embed_image";
+        let cards = app.core.cards_handle();
+        Turn::seed_card(&cards, sid, Some("om_embed")).await;
+        Turn::set_turn_anchor(&cards, sid, &turn_anchor(0)).await;
+
+        let pass = render(
+            &app,
+            &cards,
+            sid,
+            &SessionTranscript::new(vec![message(
+                "a1",
+                1_000,
+                vec![read_file_part("call_read", "shot.png", "image/png", b"ABC")],
+            )]),
+        )
+        .await;
+        assert!(pass.is_some(), "the render pass must not vanish");
+
+        assert_eq!(
+            uploaded_images(&platform).await,
+            vec![("image/png".to_string(), 3)],
+            "exactly one upload, with the decoded size"
+        );
+        let card = final_card(&platform).await;
+        let elements = card["body"]["elements"].as_array().unwrap();
+        let panel_at = elements
+            .iter()
+            .position(|e| e["tag"] == "collapsible_panel")
+            .expect("the read panel is on the card");
+        let image = &elements[panel_at + 1];
+        assert_eq!(image["tag"], "img", "the image follows the panel: {card}");
+        assert_eq!(image["img_key"], "img_v2_shot");
+        assert_eq!(image["title"]["content"], "📎 shot.png");
+        assert_eq!(image["preview"], true);
+        let body = elements[panel_at]["elements"][0]["content"].as_str().unwrap();
+        assert!(body.contains("已内嵌"), "the panel marks the embed: {body}");
+        assert!(body.contains("📎 shot.png · image/png · 3 B"), "{body}");
+    }
+
+    /// The same bytes read twice in one Session upload once: the second render
+    /// resolves the content from the process-local cache and every later PATCH
+    /// reuses the key (ADR-0076).
+    #[tokio::test]
+    async fn reading_the_same_image_twice_uploads_once_and_reuses_the_key() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        platform.given_image_key("img_v2_same");
+        let sid = "ses_embed_dedup";
+        let cards = app.core.cards_handle();
+        Turn::seed_card(&cards, sid, Some("om_dedup")).await;
+        Turn::set_turn_anchor(&cards, sid, &turn_anchor(0)).await;
+
+        let first = SessionTranscript::new(vec![message(
+            "a1",
+            1_000,
+            vec![read_file_part("call_read", "shot.png", "image/png", b"ABC")],
+        )]);
+        render(&app, &cards, sid, &first).await;
+
+        // A second call reads the SAME bytes into the same Session.
+        let second = SessionTranscript::new(vec![
+            message(
+                "a1",
+                1_000,
+                vec![read_file_part("call_read", "shot.png", "image/png", b"ABC")],
+            ),
+            message(
+                "a2",
+                2_000,
+                vec![read_file_part("call_read_2", "shot.png", "image/png", b"ABC")],
+            ),
+        ]);
+        render(&app, &cards, sid, &second).await;
+
+        assert_eq!(
+            uploaded_images(&platform).await.len(),
+            1,
+            "identical bytes upload once"
+        );
+        assert_eq!(
+            platform
+                .upload_image_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the second read is a cache hit, not a second platform call"
+        );
+        let card = final_card(&platform).await;
+        let images: Vec<_> = card["body"]["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["tag"] == "img")
+            .collect();
+        assert_eq!(images.len(), 2, "both reads show their image: {card}");
+        assert!(images.iter().all(|img| img["img_key"] == "img_v2_same"));
+    }
+
+    /// Two resolves of the SAME bytes racing on one content hash await ONE
+    /// upload (ADR-0076): the cache's in-flight guard is single-flight, so a
+    /// resolver that arrives while the first is still uploading blocks on the
+    /// shared cell instead of missing the cache and uploading the bytes again.
+    #[tokio::test]
+    async fn concurrent_resolves_of_the_same_bytes_upload_once() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        platform.given_image_key("img_v2_single_flight");
+        let sid = "ses_embed_single_flight";
+        let cards = app.core.cards_handle();
+        Turn::seed_card(&cards, sid, Some("om_single_flight")).await;
+        Turn::set_turn_anchor(&cards, sid, &turn_anchor(0)).await;
+
+        let transcript = SessionTranscript::new(vec![message(
+            "a1",
+            1_000,
+            vec![read_file_part("call_read", "shot.png", "image/png", b"ABC")],
+        )]);
+
+        // Park the first upload so the render's resolve is still in flight when
+        // a second resolve of the same bytes arrives.
+        let (entered, release) = platform.pause("upload_image", "");
+        let first = {
+            let app = Arc::clone(&app);
+            let sid = sid.to_string();
+            let transcript = transcript.clone();
+            tokio::spawn(async move {
+                let cards = app.core.cards_handle();
+                render(&app, &cards, &sid, &transcript).await;
+            })
+        };
+        entered.notified().await;
+
+        // The second resolver races the parked upload for the SAME content hash.
+        let second = {
+            let app = Arc::clone(&app);
+            let sid = sid.to_string();
+            tokio::spawn(async move {
+                let cards = app.core.cards_handle();
+                resolve_file_deliveries(&cards, &sid).await
+            })
+        };
+        // Let the second task run: single-flight leaves it blocked on the
+        // in-flight cell (not finished), having made no second upload call.
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !second.is_finished(),
+            "the second resolver must await the in-flight upload, not finish"
+        );
+        assert_eq!(
+            platform
+                .upload_image_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the second resolver must not start a second upload"
+        );
+
+        release.notify_one();
+        first.await.unwrap();
+        second.await.unwrap();
+
+        assert_eq!(
+            platform
+                .upload_image_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one upload for two concurrent resolves of identical bytes"
+        );
+        assert_eq!(
+            uploaded_images(&platform).await.len(),
+            1,
+            "exactly one UploadImage platform call"
+        );
+    }
+
+    /// A File Content that is not an embeddable image (a PDF) is uploaded once
+    /// and posted as exactly ONE File Message replied in-thread under the live
+    /// card (#649); the panel line reads `已发送为文件消息` and no `img` is
+    /// emitted. A later poll re-renders the line but never repeats the send.
+    #[tokio::test]
+    async fn a_non_image_file_content_is_sent_as_one_file_message() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        platform.given_file_key("file_v2_pdf");
+        let sid = "ses_file_pdf";
+        let cards = app.core.cards_handle();
+        Turn::seed_card(&cards, sid, Some("om_pdf")).await;
+        Turn::set_turn_anchor(&cards, sid, &turn_anchor(0)).await;
+
+        let transcript = SessionTranscript::new(vec![message(
+            "a1",
+            1_000,
+            vec![read_file_part("call_read", "doc.pdf", "application/pdf", b"%PDF")],
+        )]);
+        render(&app, &cards, sid, &transcript).await;
+
+        assert!(
+            uploaded_images(&platform).await.is_empty(),
+            "a PDF is not an embeddable image"
+        );
+        assert_eq!(
+            uploaded_files(&platform).await,
+            vec![("doc.pdf".to_string(), 4)],
+            "the file is uploaded once, with its decoded size"
+        );
+        assert_eq!(
+            sent_messages(&platform).await,
+            vec![(
+                "om_pdf".to_string(),
+                "file".to_string(),
+                serde_json::json!({ "file_key": "file_v2_pdf" }),
+            )],
+            "exactly one File Message, replied in-thread under the live card"
+        );
+        let card = final_card(&platform).await;
+        assert!(
+            card["body"]["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|e| e["tag"] != "img"),
+            "no image element: {card}"
+        );
+        let body = card["body"]["elements"][0]["elements"][0]["content"]
+            .as_str()
+            .unwrap();
+        assert!(
+            body.contains("📎 doc.pdf · application/pdf · 4 B · 已发送为文件消息"),
+            "{body}"
+        );
+
+        // A later poll renders new content (forcing its PATCH) but never repeats
+        // the File Message: the send is once, on the first poll the block
+        // appeared, while the tracking line keeps saying it was sent.
+        let second = SessionTranscript::new(vec![
+            message(
+                "a1",
+                1_000,
+                vec![read_file_part("call_read", "doc.pdf", "application/pdf", b"%PDF")],
+            ),
+            message("a2", 2_000, vec![text_part("done")]),
+        ]);
+        render(&app, &cards, sid, &second).await;
+        assert_eq!(
+            sent_messages(&platform).await.len(),
+            1,
+            "the File Message is sent on the first poll only"
+        );
+        assert_eq!(
+            uploaded_files(&platform).await.len(),
+            1,
+            "the bytes are uploaded once"
+        );
+        let body = final_card(&platform).await["body"]["elements"][0]["elements"][0]["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            body.contains("已发送为文件消息"),
+            "the later render keeps the line: {body}"
+        );
+    }
+
+    /// A File Content past Feishu's 30MB message cap is never uploaded and never
+    /// sent: it renders only `未发送` (#649).
+    #[tokio::test]
+    async fn an_oversize_file_content_is_never_uploaded_and_reads_undelivered() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        let sid = "ses_file_oversize";
+        let cards = app.core.cards_handle();
+        Turn::seed_card(&cards, sid, Some("om_big")).await;
+        Turn::set_turn_anchor(&cards, sid, &turn_anchor(0)).await;
+
+        let over = crate::feishu::file::MAX_FILE_BYTES + 1;
+        let transcript = SessionTranscript::new(vec![message(
+            "a1",
+            1_000,
+            vec![read_file_part_sized(
+                "call_read",
+                "huge.bin",
+                "application/octet-stream",
+                b"%PDF",
+                over,
+            )],
+        )]);
+        render(&app, &cards, sid, &transcript).await;
+
+        assert!(
+            uploaded_files(&platform).await.is_empty(),
+            "an over-cap file is never uploaded"
+        );
+        assert!(
+            sent_messages(&platform).await.is_empty(),
+            "an over-cap file is never sent"
+        );
+        let body = final_card(&platform).await["body"]["elements"][0]["elements"][0]["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(body.contains("· 未发送"), "{body}");
+    }
+
+    /// The ladder's first rung (#649): an embed upload that fails degrades to a
+    /// File Message, so the image is still delivered — as a file — and the Turn
+    /// is never failed.
+    #[tokio::test]
+    async fn an_embed_upload_failure_degrades_to_a_file_message() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        platform.given_file_key("file_v2_degraded");
+        platform
+            .fail_upload_image_count
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        let sid = "ses_embed_degrade";
+        let cards = app.core.cards_handle();
+        Turn::seed_card(&cards, sid, Some("om_degrade")).await;
+        Turn::set_turn_anchor(&cards, sid, &turn_anchor(0)).await;
+        let transcript = SessionTranscript::new(vec![message(
+            "a1",
+            1_000,
+            vec![read_file_part("call_read", "shot.png", "image/png", b"ABC")],
+        )]);
+
+        let pass = render(&app, &cards, sid, &transcript).await;
+        assert!(pass.is_some(), "a failed embed upload never fails the Turn");
+        assert!(
+            uploaded_images(&platform).await.is_empty(),
+            "the failed embed upload records nothing"
+        );
+        assert_eq!(
+            uploaded_files(&platform).await,
+            vec![("shot.png".to_string(), 3)],
+            "the image's bytes are uploaded as a file instead"
+        );
+        assert_eq!(
+            sent_messages(&platform).await.len(),
+            1,
+            "exactly one File Message"
+        );
+        let card = final_card(&platform).await;
+        assert!(
+            card["body"]["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|e| e["tag"] != "img"),
+            "no embed without a key: {card}"
+        );
+        let body = card["body"]["elements"][0]["elements"][0]["content"]
+            .as_str()
+            .unwrap();
+        assert!(
+            body.contains("📎 shot.png · image/png · 3 B · 已发送为文件消息"),
+            "{body}"
+        );
+    }
+
+    /// The ladder's last rung (#649): a File Message whose send fails degrades
+    /// to `未发送`, best-effort — the card is built intact and the Turn is not
+    /// failed.
+    #[tokio::test]
+    async fn a_file_message_send_failure_degrades_to_undelivered() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        platform
+            .fail_send_message_count
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        let sid = "ses_file_send_fail";
+        let cards = app.core.cards_handle();
+        Turn::seed_card(&cards, sid, Some("om_send_fail")).await;
+        Turn::set_turn_anchor(&cards, sid, &turn_anchor(0)).await;
+        let transcript = SessionTranscript::new(vec![message(
+            "a1",
+            1_000,
+            vec![read_file_part("call_read", "doc.pdf", "application/pdf", b"%PDF")],
+        )]);
+
+        let pass = render(&app, &cards, sid, &transcript).await;
+        assert!(pass.is_some(), "a failed send never fails the Turn");
+        assert_eq!(
+            uploaded_files(&platform).await.len(),
+            1,
+            "the file still uploads before the send is attempted"
+        );
+        assert!(
+            sent_messages(&platform).await.is_empty(),
+            "the failed send records nothing"
+        );
+        let body = final_card(&platform).await["body"]["elements"][0]["elements"][0]["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(body.contains("· 未发送"), "{body}");
+    }
+
+    /// Identical bytes read by two calls upload once and post exactly ONE File
+    /// Message (ADR-0076/#649): the content hash dedups both, so a turn reading
+    /// the same file twice does not spam the thread.
+    #[tokio::test]
+    async fn identical_file_bytes_upload_and_send_once() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        platform.given_file_key("file_v2_same");
+        let sid = "ses_file_dedup";
+        let cards = app.core.cards_handle();
+        Turn::seed_card(&cards, sid, Some("om_file_dedup")).await;
+        Turn::set_turn_anchor(&cards, sid, &turn_anchor(0)).await;
+
+        let transcript = SessionTranscript::new(vec![message(
+            "a1",
+            1_000,
+            vec![
+                read_file_part("call_read_1", "doc.pdf", "application/pdf", b"%PDF"),
+                read_file_part("call_read_2", "doc.pdf", "application/pdf", b"%PDF"),
+            ],
+        )]);
+        render(&app, &cards, sid, &transcript).await;
+
+        assert_eq!(
+            uploaded_files(&platform).await.len(),
+            1,
+            "identical bytes upload once"
+        );
+        assert_eq!(
+            sent_messages(&platform).await.len(),
+            1,
+            "identical bytes post exactly one File Message"
+        );
+        let card = final_card(&platform).await;
+        let lines = card["body"]["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["tag"] == "collapsible_panel")
+            .filter(|e| {
+                e["elements"][0]["content"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("已发送为文件消息"))
+            })
+            .count();
+        assert_eq!(lines, 2, "both panels show the sent line: {card}");
+    }
+
+    /// A user message's File Content is never delivered as a File Message
+    /// (ADR-0076, #648): it is record-only, so the render path uploads and sends
+    /// nothing for it.
+    #[tokio::test]
+    async fn a_user_file_part_is_never_sent_as_a_file_message() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        let sid = "ses_user_file";
+        let cards = app.core.cards_handle();
+        Turn::seed_card(&cards, sid, Some("om_user_file")).await;
+        Turn::set_turn_anchor(&cards, sid, &turn_anchor(0)).await;
+
+        let content = crate::backend::FileContent::decode(
+            "data:application/pdf;base64,JVBERi0=",
+            Some("application/pdf"),
+            Some("secret.pdf"),
+        )
+        .expect("an inline payload is a File Content");
+        let transcript = SessionTranscript::new(vec![
+            typed_message(
+                "u1",
+                MessageRole::User,
+                Some(0),
+                vec![text_part("看看这个"), Part::File(content)],
+            ),
+            message("a1", 100, vec![text_part("看到了")]),
+        ]);
+        render(&app, &cards, sid, &transcript).await;
+
+        assert!(
+            uploaded_files(&platform).await.is_empty(),
+            "a user message's file is never uploaded"
+        );
+        assert!(
+            sent_messages(&platform).await.is_empty(),
+            "a user message's file is never sent as a File Message"
+        );
+        let card = final_card(&platform).await.to_string();
+        assert!(
+            !card.contains("已发送为文件消息"),
+            "the live card records no delivery for a user file: {card}"
+        );
+    }
+
+    /// Two concurrent resolves of one non-image content make exactly ONE File
+    /// Message send (#649, ADR-0076): the once-guard is single-flight, so a
+    /// resolver arriving while the first's send is in flight awaits the shared
+    /// cell instead of missing the guard and posting a duplicate.
+    #[tokio::test]
+    async fn concurrent_resolves_send_one_file_message() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        platform.given_file_key("file_v2_single_flight");
+        let sid = "ses_file_single_flight";
+        let cards = app.core.cards_handle();
+        Turn::seed_card(&cards, sid, Some("om_file_single")).await;
+        Turn::set_turn_anchor(&cards, sid, &turn_anchor(0)).await;
+
+        let transcript = SessionTranscript::new(vec![message(
+            "a1",
+            1_000,
+            vec![read_file_part("call_read", "doc.pdf", "application/pdf", b"%PDF")],
+        )]);
+
+        // Park the first File Message send so the second resolve races the
+        // once-guard while the first is still in flight.
+        let (entered, release) = platform.pause("send_message", "om_file_single");
+        let first = {
+            let app = Arc::clone(&app);
+            let sid = sid.to_string();
+            let transcript = transcript.clone();
+            tokio::spawn(async move {
+                let cards = app.core.cards_handle();
+                render(&app, &cards, &sid, &transcript).await;
+            })
+        };
+        entered.notified().await;
+
+        // The second resolver races the parked send for the SAME key.
+        let second = {
+            let app = Arc::clone(&app);
+            let sid = sid.to_string();
+            tokio::spawn(async move {
+                let cards = app.core.cards_handle();
+                resolve_file_deliveries(&cards, &sid).await
+            })
+        };
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !second.is_finished(),
+            "the second resolver must await the in-flight send, not finish"
+        );
+        assert!(
+            sent_messages(&platform).await.is_empty(),
+            "no File Message is recorded while the first send is in flight"
+        );
+
+        release.notify_one();
+        first.await.unwrap();
+        second.await.unwrap();
+
+        assert_eq!(
+            sent_messages(&platform).await.len(),
+            1,
+            "one File Message for two concurrent resolves of the same content"
+        );
+        assert_eq!(
+            uploaded_files(&platform).await.len(),
+            1,
+            "one upload for two concurrent resolves of the same content"
+        );
+    }
+
+    /// A panel replaced while the File Message upload is in flight must not
+    /// deliver the OLD file (#649): the resolver re-validates the live panel's
+    /// content hash BEFORE sending — exactly the check the later setter applies
+    /// — so the stale send is skipped.
+    #[tokio::test]
+    async fn a_panel_replaced_mid_upload_never_sends_the_stale_file() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        platform.given_file_key("file_v2_stale");
+        let sid = "ses_file_stale";
+        let cards = app.core.cards_handle();
+        Turn::seed_card(&cards, sid, Some("om_stale")).await;
+        Turn::set_turn_anchor(&cards, sid, &turn_anchor(0)).await;
+
+        let transcript = SessionTranscript::new(vec![message(
+            "a1",
+            1_000,
+            vec![read_file_part("call_read", "doc.pdf", "application/pdf", b"%PDF")],
+        )]);
+
+        // Park the upload so the panel can be replaced while it is in flight.
+        let (entered, release) = platform.pause("upload_file", "");
+        let first = {
+            let app = Arc::clone(&app);
+            let sid = sid.to_string();
+            let transcript = transcript.clone();
+            tokio::spawn(async move {
+                let cards = app.core.cards_handle();
+                render(&app, &cards, &sid, &transcript).await;
+            })
+        };
+        entered.notified().await;
+
+        // The transcript re-read replaced the panel's file (same call, same
+        // index, different bytes) while the upload was in flight.
+        {
+            let mut live = cards.cards.lock().await;
+            let card = live.get_mut(sid).expect("the live card exists");
+            card.acc.push_tool(
+                "call_read",
+                ToolPanel::for_test_with_files("read", &[("other.bin", b"OTHER")]),
+            );
+        }
+
+        release.notify_one();
+        first.await.unwrap();
+
+        assert_eq!(
+            uploaded_files(&platform).await.len(),
+            1,
+            "the stale file still uploads (the upload was already in flight)"
+        );
+        assert!(
+            sent_messages(&platform).await.is_empty(),
+            "the replaced panel's old file is never sent as a File Message"
+        );
+    }
+
+    /// The File Message once-guard is bounded (#649): past the cap the oldest
+    /// `(session_id, hash)` entry is evicted, so a long-running bot does not
+    /// accumulate one entry per file it ever sent. An evicted entry may resend,
+    /// which ADR-0076 accepts.
+    #[tokio::test]
+    async fn file_message_guard_evicts_the_oldest_past_the_cap() {
+        let sends: FileMessageSends = Arc::new(tokio::sync::Mutex::new(indexmap::IndexMap::new()));
+        for i in 0..FILE_MESSAGE_SENDS_CAP {
+            file_message_cell(&sends, (format!("ses_{i}"), i as u64)).await;
+        }
+        assert_eq!(
+            sends.lock().await.len(),
+            FILE_MESSAGE_SENDS_CAP,
+            "the guard holds the cap"
+        );
+        assert!(sends.lock().await.contains_key(&("ses_0".to_string(), 0)));
+
+        // One more distinct key evicts the oldest and keeps the size bounded.
+        file_message_cell(&sends, ("ses_new".to_string(), 9_999)).await;
+        let sends = sends.lock().await;
+        assert_eq!(sends.len(), FILE_MESSAGE_SENDS_CAP, "the guard stays bounded");
+        assert!(
+            !sends.contains_key(&("ses_0".to_string(), 0)),
+            "the oldest entry is evicted first"
+        );
+        assert!(sends.contains_key(&("ses_1".to_string(), 1)), "the rest stay");
+        assert!(sends.contains_key(&("ses_new".to_string(), 9_999)));
+    }
+
+    /// Eviction never drops a key whose File Message send is in flight (#649):
+    /// with the guard at its cap and the oldest key's send parked in the
+    /// platform, inserting a new key evicts the next-oldest IDLE entry instead
+    /// of the in-flight one. Were the in-flight key dropped, a concurrent
+    /// resolver of that key would create a NEW cell and post a duplicate File
+    /// Message, breaking "exactly one File Message per (session, hash)".
+    #[tokio::test]
+    async fn file_message_guard_eviction_skips_an_in_flight_send() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        platform.given_file_key("file_v2_in_flight");
+        let sid = "ses_file_in_flight";
+        let cards = app.core.cards_handle();
+        Turn::seed_card(&cards, sid, Some("om_in_flight")).await;
+        Turn::set_turn_anchor(&cards, sid, &turn_anchor(0)).await;
+
+        let transcript = SessionTranscript::new(vec![message(
+            "a1",
+            1_000,
+            vec![read_file_part("call_read", "doc.pdf", "application/pdf", b"%PDF")],
+        )]);
+
+        // Park the File Message send: the key's entry is now held (in flight).
+        let (entered, release) = platform.pause("send_message", "om_in_flight");
+        let first = {
+            let app = Arc::clone(&app);
+            let sid = sid.to_string();
+            let transcript = transcript.clone();
+            tokio::spawn(async move {
+                let cards = app.core.cards_handle();
+                render(&app, &cards, &sid, &transcript).await;
+            })
+        };
+        entered.notified().await;
+
+        // The parked key is the OLDEST guard entry. Fill the guard to its cap
+        // with idle entries, then insert one more: the eviction must skip the
+        // in-flight key and take the next-oldest idle one.
+        let in_flight_key = (sid.to_string(), file_content_hash(b"%PDF"));
+        let sends = &cards.file_messages_sent;
+        assert!(
+            sends.lock().await.contains_key(&in_flight_key),
+            "the parked send's key is in the guard"
+        );
+        for i in 0..(FILE_MESSAGE_SENDS_CAP - 1) {
+            file_message_cell(sends, (format!("ses_fill_{i}"), i as u64)).await;
+        }
+        assert_eq!(
+            sends.lock().await.len(),
+            FILE_MESSAGE_SENDS_CAP,
+            "the guard is at its cap"
+        );
+        file_message_cell(sends, ("ses_overflow".to_string(), 7)).await;
+
+        {
+            let sends = sends.lock().await;
+            assert!(
+                sends.contains_key(&in_flight_key),
+                "the in-flight key survives eviction"
+            );
+            assert!(
+                !sends.contains_key(&("ses_fill_0".to_string(), 0)),
+                "the oldest IDLE entry is evicted instead"
+            );
+            assert!(sends.contains_key(&("ses_overflow".to_string(), 7)));
+        }
+
+        release.notify_one();
+        first.await.unwrap();
+        assert_eq!(
+            sent_messages(&platform).await.len(),
+            1,
+            "the in-flight key still sends exactly one File Message"
+        );
+    }
+
+    /// The File Message's reply target is captured from the SAME cards-lock
+    /// critical section as the live-panel revalidation (#649): a card re-pointed
+    /// to a new message id while the upload is in flight gets the File Message
+    /// replied under its NEW id, not the stale one the resolve started with.
+    #[tokio::test]
+    async fn a_file_message_replies_under_the_live_cards_current_id() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        platform.given_file_key("file_v2_repoint");
+        let sid = "ses_file_repoint";
+        let cards = app.core.cards_handle();
+        Turn::seed_card(&cards, sid, Some("om_before")).await;
+        Turn::set_turn_anchor(&cards, sid, &turn_anchor(0)).await;
+
+        let transcript = SessionTranscript::new(vec![message(
+            "a1",
+            1_000,
+            vec![read_file_part("call_read", "doc.pdf", "application/pdf", b"%PDF")],
+        )]);
+
+        // Park the upload so the live card can be re-pointed while it is in
+        // flight (the resolve captured the target BEFORE the upload only in the
+        // old, un-tightened code).
+        let (entered, release) = platform.pause("upload_file", "");
+        let first = {
+            let app = Arc::clone(&app);
+            let sid = sid.to_string();
+            let transcript = transcript.clone();
+            tokio::spawn(async move {
+                let cards = app.core.cards_handle();
+                render(&app, &cards, &sid, &transcript).await;
+            })
+        };
+        entered.notified().await;
+
+        // The live card is re-pointed (a split / re-adopt) mid-upload; its panel
+        // still holds the file, so the send proceeds.
+        {
+            let mut live = cards.cards.lock().await;
+            let card = live.get_mut(sid).expect("the live card exists");
+            card.repoint("om_after");
+        }
+
+        release.notify_one();
+        first.await.unwrap();
+
+        assert_eq!(
+            sent_messages(&platform).await,
+            vec![(
+                "om_after".to_string(),
+                "file".to_string(),
+                serde_json::json!({ "file_key": "file_v2_repoint" }),
+            )],
+            "the File Message replies under the live card's CURRENT id"
         );
     }
 

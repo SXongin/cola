@@ -29,10 +29,11 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::backend::{
-    BackgroundLaunch, BackgroundTask, ChildEvidence, ContentBlock, Execution, ExecutionOutcome, FinishReason,
-    MessageId, MessageRole, MessageTime, ModelIdentity, OtherPart, Part, ReasoningPart, SessionTranscript,
-    ShellEnd, ShellRuntime, SkillInfo, StepFinish, TextPart, TokenUsage, ToolCall, ToolIdentity, ToolOutput,
-    ToolStatus, TranscriptMessage, Wake, WakeSource,
+    BackgroundLaunch, BackgroundTask, ChildEvidence, ContentBlock, DEFAULT_FILE_MIME, Execution,
+    ExecutionOutcome, FileContent, FinishReason, MessageId, MessageRole, MessageTime, ModelIdentity,
+    OtherPart, Part, ReasoningPart, SessionTranscript, ShellEnd, ShellRuntime, SkillInfo, StepFinish,
+    TextPart, TokenUsage, ToolCall, ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage, Wake,
+    WakeSource,
 };
 use crate::opencode::types::{
     AgentInfo, FormFieldKind, ModelInfo, ModelOption, PermissionRequest, QuestionInfo, QuestionOption,
@@ -1030,8 +1031,9 @@ fn decode_body(kind: Option<&str>, message: &Value) -> (MessageRole, Vec<Part>) 
 }
 
 /// A user message's parts: its `text` (a malformed one stays raw, like V1's
-/// decoder) followed by one raw part per `files` attachment, so the payload is
-/// preserved without growing a file part kind the neutral model does not have.
+/// decoder) followed by one part per `files` attachment — the typed
+/// [`FileContent`] when the attachment inlines its bytes, its raw payload when
+/// it does not.
 fn decode_user_parts(message: &Value) -> Vec<Part> {
     let mut parts = Vec::new();
     match message.get("text") {
@@ -1047,13 +1049,33 @@ fn decode_user_parts(message: &Value) -> Vec<Part> {
     }
     if let Some(files) = message.get("files").and_then(Value::as_array) {
         for file in files {
-            parts.push(Part::Other(OtherPart {
-                kind: "file".to_string(),
-                raw: file.clone(),
-            }));
+            parts.push(match decode_attachment(file) {
+                Some(content) => Part::File(content),
+                None => Part::Other(OtherPart {
+                    kind: "file".to_string(),
+                    raw: file.clone(),
+                }),
+            });
         }
     }
     parts
+}
+
+/// A user message's `files` entry as a File Content. V2 persists a prompt
+/// attachment as `{data: <base64>, mime, source, name?}` — the prompt's inline
+/// `data:` URI materialized into a bare base64 `data` beside its mime (its
+/// `source.uri` is provenance, not the payload) — while a prompt-input shaped
+/// `{uri}` entry is read directly.
+fn decode_attachment(file: &Value) -> Option<FileContent> {
+    let mime = non_null(file.get("mime")).and_then(Value::as_str);
+    let name = non_null(file.get("name")).and_then(Value::as_str);
+    match non_null(file.get("data")).and_then(Value::as_str) {
+        Some(data) => {
+            let mime = mime.unwrap_or(DEFAULT_FILE_MIME);
+            FileContent::decode(&format!("data:{mime};base64,{data}"), Some(mime), name)
+        }
+        None => FileContent::decode(non_null(file.get("uri")).and_then(Value::as_str)?, mime, name),
+    }
 }
 
 /// An assistant message's parts: its `content[]` in order, then the message's
@@ -1217,7 +1239,7 @@ fn decode_tool_output(state: Option<&Value>) -> ToolOutput {
                 Some(text) if item.get("type").and_then(Value::as_str) == Some("text") => {
                     blocks.push(ContentBlock::Text(text.to_string()));
                 }
-                _ => blocks.push(ContentBlock::Other(item.clone())),
+                _ => blocks.push(content_block(item)),
             }
         }
     }
@@ -1228,6 +1250,28 @@ fn decode_tool_output(state: Option<&Value>) -> ToolOutput {
         blocks,
         error: state.get("error").and_then(decode_error),
     }
+}
+
+/// One non-text tool-output content item: the typed File Content when it
+/// inlines its payload — the `file` block `read` returns for an image or PDF,
+/// the same shape an MCP resource part carries — and the raw item otherwise, so
+/// a `file://`/`https://` reference is preserved rather than decoded.
+///
+/// Deliberately a V2-local copy of the block V1's decoder carries, not a
+/// shared helper: each generation's decoder owns its own payload field names
+/// (ADR-0055), the same split `non_null`/`has_payload` already keep.
+fn content_block(item: &Value) -> ContentBlock {
+    if item.get("type").and_then(Value::as_str) == Some("file")
+        && let Some(uri) = non_null(item.get("uri")).and_then(Value::as_str)
+        && let Some(content) = FileContent::decode(
+            uri,
+            non_null(item.get("mime")).and_then(Value::as_str),
+            non_null(item.get("name")).and_then(Value::as_str),
+        )
+    {
+        return ContentBlock::File(content);
+    }
+    ContentBlock::Other(item.clone())
 }
 
 /// Normalize a failure payload: a plain string message or an object carrying
@@ -1615,8 +1659,9 @@ mod tests {
         assert_eq!(tool(serde_json::json!({})).status, ToolStatus::Unknown);
     }
 
-    /// A `file` output block stays raw: only `text` content is text, and
-    /// per-tool payload knowledge is the Platform's (ADR-0042).
+    /// A `file` block that only *references* a file (no inline payload) is not
+    /// a File Content and stays raw — as does any other non-text kind (only
+    /// `text` content is text, ADR-0042).
     #[test]
     fn a_file_output_block_stays_raw() {
         let file = serde_json::json!({"type": "file", "uri": "file:///a", "mime": "text/plain"});
@@ -1635,6 +1680,150 @@ mod tests {
             vec![ContentBlock::Other(file), ContentBlock::Text("a.rs".into())]
         );
         assert_eq!(call.output.raw.as_ref().unwrap().as_array().unwrap().len(), 2);
+    }
+
+    /// The `file` block `read` returns for an image or PDF (an inline `data:`
+    /// URI with its mime and name) decodes into the neutral File Content view,
+    /// and the output payload stays verbatim beside the typed block.
+    #[test]
+    fn an_inline_tool_file_block_decodes_into_the_file_content_view() {
+        let file = serde_json::json!({
+            "type": "file",
+            "uri": "data:image/png;base64,QUJD",
+            "mime": "image/png",
+            "name": "shot.png"
+        });
+        let parts = parts_of(serde_json::json!({
+            "id": "msg_a", "type": "assistant", "content": [
+                {"type": "tool", "id": "call_1", "name": "read",
+                 "state": {"status": "completed", "input": {},
+                           "content": [{"type": "text", "text": "Image read successfully"}, file.clone()]}}
+            ]
+        }));
+        let Part::Tool(call) = &parts[0] else {
+            panic!("expected a tool part: {:?}", parts[0]);
+        };
+        assert_eq!(
+            call.output.blocks,
+            vec![
+                ContentBlock::Text("Image read successfully".into()),
+                ContentBlock::File(FileContent {
+                    uri: "data:image/png;base64,QUJD".into(),
+                    mime: "image/png".into(),
+                    name: "shot.png".into(),
+                    size: 3,
+                }),
+            ]
+        );
+        assert_eq!(
+            call.output.raw,
+            Some(serde_json::json!([
+                {"type": "text", "text": "Image read successfully"},
+                file
+            ])),
+            "the raw payload is preserved verbatim"
+        );
+    }
+
+    /// The same typed view comes out when the block carries no mime or name:
+    /// the sane default replaces each, and the payload still decodes.
+    #[test]
+    fn an_inline_tool_file_block_reads_defaults_for_missing_mime_and_name() {
+        let parts = parts_of(serde_json::json!({
+            "id": "msg_a", "type": "assistant", "content": [
+                {"type": "tool", "id": "call_1", "name": "read",
+                 "state": {"status": "completed", "input": {},
+                           "content": [{"type": "file", "uri": "data:application/pdf;base64,QUJD"}]}}
+            ]
+        }));
+        let Part::Tool(call) = &parts[0] else {
+            panic!("expected a tool part: {:?}", parts[0]);
+        };
+        assert_eq!(
+            call.output.blocks,
+            vec![ContentBlock::File(FileContent {
+                uri: "data:application/pdf;base64,QUJD".into(),
+                mime: DEFAULT_FILE_MIME.into(),
+                name: "file".into(),
+                size: 3,
+            })]
+        );
+    }
+
+    /// A user message's `files` entry decodes into the same typed view: V2
+    /// persists the prompt's inline URI as a bare base64 `data` beside its
+    /// mime, and a missing name reads the sane default.
+    #[test]
+    fn an_inline_user_file_entry_decodes_into_the_file_content_view() {
+        let parts = parts_of(serde_json::json!({
+            "id": "msg_u", "type": "user", "text": "看看",
+            "files": [
+                {"data": "QUJD", "mime": "image/png", "source": {"type": "inline"}, "name": "shot.png"},
+                {"data": "QUJD", "mime": "image/png", "source": {"type": "inline"}}
+            ]
+        }));
+        assert_eq!(
+            parts[0],
+            Part::Text(TextPart {
+                text: "看看".into(),
+                started_at: None
+            })
+        );
+        assert_eq!(
+            parts[1],
+            Part::File(FileContent {
+                uri: "data:image/png;base64,QUJD".into(),
+                mime: "image/png".into(),
+                name: "shot.png".into(),
+                size: 3,
+            })
+        );
+        assert_eq!(
+            parts[2],
+            Part::File(FileContent {
+                uri: "data:image/png;base64,QUJD".into(),
+                mime: "image/png".into(),
+                name: "file".into(),
+                size: 3,
+            })
+        );
+    }
+
+    /// A `files` entry that inlines no payload is not a File Content: it keeps
+    /// its raw part, exactly as every unmodelled attachment did.
+    #[test]
+    fn a_user_file_entry_without_an_inline_payload_stays_raw() {
+        let entry =
+            serde_json::json!({"mime": "image/png", "source": {"type": "uri", "uri": "file:///a.png"}});
+        let parts = parts_of(serde_json::json!({
+            "id": "msg_u", "type": "user", "files": [entry.clone()]
+        }));
+        assert_eq!(
+            parts,
+            vec![Part::Other(OtherPart {
+                kind: "file".into(),
+                raw: entry
+            })]
+        );
+    }
+
+    /// A `files` entry can carry the inline URI directly (a prompt-input shaped
+    /// read); it decodes the same way.
+    #[test]
+    fn a_user_file_entry_with_an_inline_uri_decodes_too() {
+        let parts = parts_of(serde_json::json!({
+            "id": "msg_u", "type": "user",
+            "files": [{"uri": "data:image/png;base64,QUJD", "name": "shot.png"}]
+        }));
+        assert_eq!(
+            parts,
+            vec![Part::File(FileContent {
+                uri: "data:image/png;base64,QUJD".into(),
+                mime: DEFAULT_FILE_MIME.into(),
+                name: "shot.png".into(),
+                size: 3,
+            })]
+        );
     }
 
     /// Every message type this build does not model (shell, compaction, idle,

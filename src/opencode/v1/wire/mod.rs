@@ -33,7 +33,8 @@
 pub(crate) mod legacy;
 
 use crate::backend::{
-    ContentBlock, FinishReason, OtherPart, Part, SessionTranscript, TextPart, ToolIdentity, ToolStatus,
+    ContentBlock, FileContent, FinishReason, OtherPart, Part, SessionTranscript, TextPart, ToolIdentity,
+    ToolStatus,
 };
 use serde_json::Value;
 
@@ -164,6 +165,28 @@ fn error_suppresses_fallback(status: &ToolStatus, error: Option<&str>) -> bool {
     *status == ToolStatus::Error && error.is_some()
 }
 
+/// One non-text tool-output content item: the typed File Content when it
+/// inlines its payload — the `file` block `read` returns for an image or PDF,
+/// the same shape an MCP resource part carries — and the raw item otherwise, so
+/// a `file://`/`https://` reference is preserved rather than decoded.
+///
+/// Deliberately a V1-local copy of the block V2's decoder carries, not a
+/// shared helper: each generation's decoder owns its own payload field names
+/// (ADR-0055), the same split `non_null`/`has_payload` already keep.
+fn content_block(item: &Value) -> ContentBlock {
+    if item.get("type").and_then(Value::as_str) == Some("file")
+        && let Some(uri) = non_null(item.get("uri")).and_then(Value::as_str)
+        && let Some(content) = FileContent::decode(
+            uri,
+            non_null(item.get("mime")).and_then(Value::as_str),
+            non_null(item.get("name")).and_then(Value::as_str),
+        )
+    {
+        return ContentBlock::File(content);
+    }
+    ContentBlock::Other(item.clone())
+}
+
 /// Assemble a tool state's output side from the two sources the state carries:
 /// the `content` items and a string `result`. Text runs join verbatim; a
 /// string `result` follows on a new line; every non-text item (a text item
@@ -177,7 +200,7 @@ fn assemble_tool_output(content: Option<&Value>, result: Option<&Value>) -> (Str
         for item in items {
             match content_text(item) {
                 Some(part) => text.push_str(part),
-                None => raw_blocks.push(ContentBlock::Other(item.clone())),
+                None => raw_blocks.push(content_block(item)),
             }
         }
     }

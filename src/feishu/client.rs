@@ -811,6 +811,266 @@ impl Client {
             data: bytes.to_vec(),
         })
     }
+
+    /// Upload an image to Feishu (`POST /open-apis/im/v1/images`, multipart
+    /// `image_type=message`, scope `im:resource`), returning the reusable
+    /// `image_key` a card's `img` element references (ADR-0076). The multipart
+    /// body is hand-built: cola's reqwest is compiled without its `multipart`
+    /// feature, and the one shape needed is two parts, so a new dependency
+    /// (`mime_guess`/`multer`) is not worth it.
+    pub async fn upload_image(&self, bytes: &[u8], mime: &str) -> crate::error::Result<String> {
+        let token = self.get_access_token().await?;
+        let body = image_upload_body(IMAGE_UPLOAD_BOUNDARY, mime, bytes);
+        let text = read_body_with_diag(
+            self.http
+                .post(self.endpoint("/open-apis/im/v1/images"))
+                .bearer_auth(&token)
+                .header(
+                    reqwest::header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={IMAGE_UPLOAD_BOUNDARY}"),
+                )
+                .body(body)
+                // Bound the transfer like the client's other byte-carrying call
+                // (`download_image`, 10s): a stalled upload must never hold up
+                // the render pass or the poll loop that awaits it (ADR-0076).
+                .timeout(std::time::Duration::from_secs(10))
+                .send()
+                .await?,
+            "upload image",
+        )
+        .await?;
+        let resp: ImageUploadResponse = parse_json(&text, "upload image response")?;
+
+        if resp.code != 0 {
+            return Err(api_error(
+                &format!("upload image error {}", resp.code),
+                i64::from(resp.code),
+                &resp.msg,
+            ));
+        }
+        resp.data.image_key.filter(|key| !key.is_empty()).ok_or_else(|| {
+            crate::error::BridgeError::Feishu(format!("upload image missing image_key — body: {text}"))
+        })
+    }
+
+    /// Upload a file to Feishu (`POST /open-apis/im/v1/files`, multipart
+    /// `file_type` + `file_name` + the bytes, scope `im:resource`), returning
+    /// the reusable `file_key` a `msg_type:"file"` message references
+    /// (ADR-0076). The multipart body is hand-built like
+    /// [`Self::upload_image`]'s: cola's reqwest has no `multipart` feature, and
+    /// the shape is three parts, so no new dependency is worth it.
+    pub async fn upload_file(
+        &self,
+        bytes: &[u8],
+        file_type: &str,
+        file_name: &str,
+    ) -> crate::error::Result<String> {
+        let token = self.get_access_token().await?;
+        let body = file_upload_body(FILE_UPLOAD_BOUNDARY, file_type, file_name, bytes);
+        let text = read_body_with_diag(
+            self.http
+                .post(self.endpoint("/open-apis/im/v1/files"))
+                .bearer_auth(&token)
+                .header(
+                    reqwest::header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={FILE_UPLOAD_BOUNDARY}"),
+                )
+                .body(body)
+                // Bound the transfer like the client's other byte-carrying calls
+                // (`upload_image`, `download_image`): a stalled upload must never
+                // hold up the render pass or the poll loop that awaits it.
+                .timeout(std::time::Duration::from_secs(10))
+                .send()
+                .await?,
+            "upload file",
+        )
+        .await?;
+        let resp: FileUploadResponse = parse_json(&text, "upload file response")?;
+
+        if resp.code != 0 {
+            return Err(api_error(
+                &format!("upload file error {}", resp.code),
+                i64::from(resp.code),
+                &resp.msg,
+            ));
+        }
+        resp.data.file_key.filter(|key| !key.is_empty()).ok_or_else(|| {
+            crate::error::BridgeError::Feishu(format!("upload file missing file_key — body: {text}"))
+        })
+    }
+
+    /// Send a message of an arbitrary `msg_type` replied **in thread**
+    /// (`reply_in_thread: true`) under `message_id` (ADR-0076): the send path
+    /// for a File Message (`msg_type:"file"`, `content` `{"file_key": …}`).
+    /// Returns the created message id and the topic's `thread_id`, exactly like
+    /// [`Self::reply_card_in_thread`] (`thread_id` is `None` when the chat does
+    /// not support topic replies).
+    pub async fn send_message_in_thread(
+        &self,
+        message_id: &str,
+        msg_type: &str,
+        content: &serde_json::Value,
+    ) -> crate::error::Result<(String, Option<String>)> {
+        let token = self.get_access_token().await?;
+        let body = serde_json::json!({
+            "msg_type": msg_type,
+            "reply_in_thread": true,
+            "content": content.to_string(),
+        });
+
+        let text = read_body_with_diag(
+            self.http
+                .post(self.endpoint(&format!("/open-apis/im/v1/messages/{message_id}/reply")))
+                .bearer_auth(&token)
+                .json(&body)
+                // Bound the send like the client's other byte-carrying calls
+                // (`upload_image`, `upload_file`, `download_image`): the render
+                // pass awaits this before the card can render, so a hung request
+                // must never block the card (ADR-0076, #649).
+                .timeout(std::time::Duration::from_secs(10))
+                .send()
+                .await?,
+            "send message in thread",
+        )
+        .await?;
+        let resp: MessageResponse = parse_json(&text, "send message in thread response")?;
+
+        if resp.code != 0 {
+            Err(api_error(
+                &format!("send message in thread error {}", resp.code),
+                i64::from(resp.code),
+                &resp.msg,
+            ))
+        } else {
+            Ok((resp.data.message_id, resp.data.thread_id))
+        }
+    }
+}
+
+/// The boundary token for the hand-built image-upload body (see
+/// [`Client::upload_image`]).
+const IMAGE_UPLOAD_BOUNDARY: &str = "----colaImageBoundary";
+
+/// One field of a hand-built `multipart/form-data` body (see [`multipart_body`]):
+/// a plain text field, or a byte-carrying file part with its own filename and
+/// content type.
+enum MultipartField<'a> {
+    /// A plain `name="…"` text field.
+    Text { name: &'a str, value: &'a str },
+    /// A `name="…"; filename="…"` part carrying raw `bytes`.
+    Bytes {
+        name: &'a str,
+        filename: &'a str,
+        content_type: &'a str,
+        bytes: &'a [u8],
+    },
+}
+
+/// The `multipart/form-data` body for `fields`, with `boundary` framing
+/// (RFC 7578): each part's `\r\n`-separated headers, then its value, then the
+/// closing `--boundary--`. The one hand-built body both the image and file
+/// uploads use — cola's reqwest has no `multipart` feature, so the framing lives
+/// here once instead of in two near-identical builders (ADR-0076).
+fn multipart_body(boundary: &str, fields: &[MultipartField<'_>]) -> Vec<u8> {
+    let mut body = Vec::new();
+    for field in fields {
+        match field {
+            MultipartField::Text { name, value } => {
+                body.extend_from_slice(
+                    format!(
+                        "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+                    )
+                    .as_bytes(),
+                );
+            }
+            MultipartField::Bytes {
+                name,
+                filename,
+                content_type,
+                bytes,
+            } => {
+                body.extend_from_slice(
+                    format!(
+                        "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"; filename=\"{filename}\"\r\nContent-Type: {content_type}\r\n\r\n"
+                    )
+                    .as_bytes(),
+                );
+                body.extend_from_slice(bytes);
+                body.extend_from_slice(b"\r\n");
+            }
+        }
+    }
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    body
+}
+
+/// A file name safe to interpolate into a `multipart/form-data` body (ADR-0076,
+/// #649): CR/LF are stripped (they would forge a new header or boundary) and `"`
+/// is replaced with `'` (it would close the quoted `filename` parameter early),
+/// so a server-reported name can never break the framing. Never empty: a name
+/// that sanitizes to nothing reads `file`.
+fn sanitize_multipart_filename(name: &str) -> String {
+    let sanitized: String = name
+        .chars()
+        .filter(|c| *c != '\r' && *c != '\n')
+        .map(|c| if c == '"' { '\'' } else { c })
+        .collect();
+    if sanitized.is_empty() {
+        "file".to_string()
+    } else {
+        sanitized
+    }
+}
+
+/// The `multipart/form-data` body Feishu's image upload expects: the
+/// `image_type` part (`message`) and the image part carrying `bytes` with its
+/// mime (ADR-0076).
+fn image_upload_body(boundary: &str, mime: &str, bytes: &[u8]) -> Vec<u8> {
+    multipart_body(
+        boundary,
+        &[
+            MultipartField::Text {
+                name: "image_type",
+                value: "message",
+            },
+            MultipartField::Bytes {
+                name: "image",
+                filename: "image",
+                content_type: mime,
+                bytes,
+            },
+        ],
+    )
+}
+
+/// The boundary token for the hand-built file-upload body (see
+/// [`Client::upload_file`]).
+const FILE_UPLOAD_BOUNDARY: &str = "----colaFileBoundary";
+
+/// The `multipart/form-data` body Feishu's file upload expects: the `file_type`
+/// and `file_name` parts, then the file part carrying `bytes` under the
+/// sanitized `file_name` (ADR-0076, #649).
+fn file_upload_body(boundary: &str, file_type: &str, file_name: &str, bytes: &[u8]) -> Vec<u8> {
+    let file_name = sanitize_multipart_filename(file_name);
+    multipart_body(
+        boundary,
+        &[
+            MultipartField::Text {
+                name: "file_type",
+                value: file_type,
+            },
+            MultipartField::Text {
+                name: "file_name",
+                value: &file_name,
+            },
+            MultipartField::Bytes {
+                name: "file",
+                filename: &file_name,
+                content_type: "application/octet-stream",
+                bytes,
+            },
+        ],
+    )
 }
 
 /// A minimal interactive card carrying one markdown element — the shape
@@ -869,6 +1129,38 @@ struct MessageData {
     /// id of the topic created around the seed message.
     #[serde(default)]
     thread_id: Option<String>,
+}
+
+/// Feishu's image-upload answer (`POST /open-apis/im/v1/images`): the reusable
+/// `image_key` under `data`.
+#[derive(Debug, Deserialize)]
+struct ImageUploadResponse {
+    code: i32,
+    msg: String,
+    #[serde(default)]
+    data: ImageUploadData,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ImageUploadData {
+    #[serde(default)]
+    image_key: Option<String>,
+}
+
+/// Feishu's file-upload answer (`POST /open-apis/im/v1/files`): the reusable
+/// `file_key` under `data`.
+#[derive(Debug, Deserialize)]
+struct FileUploadResponse {
+    code: i32,
+    msg: String,
+    #[serde(default)]
+    data: FileUploadData,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FileUploadData {
+    #[serde(default)]
+    file_key: Option<String>,
 }
 
 /// A message returned by `list_messages` — the newest-first page
@@ -1719,6 +2011,342 @@ mod tests {
         assert!(
             message.contains("parse get_card_view content"),
             "unexpected error: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_image_posts_the_multipart_fields_and_returns_the_key() {
+        let (server, client) = wire_client().await;
+        server.route(
+            "POST",
+            "/open-apis/im/v1/images",
+            200,
+            r#"{"code":0,"msg":"ok","data":{"image_key":"img_v2_abc"}}"#,
+        );
+
+        assert_eq!(
+            client.upload_image(b"PNGDATA", "image/png").await.unwrap(),
+            "img_v2_abc"
+        );
+
+        let request = last_request(&server);
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/open-apis/im/v1/images");
+        assert_eq!(request.header("authorization"), Some("Bearer t-abc"));
+        let content_type = request.header("content-type").unwrap_or_default();
+        assert!(
+            content_type.starts_with("multipart/form-data; boundary="),
+            "the body must be multipart: {content_type}"
+        );
+        let body = &request.body;
+        assert!(
+            body.contains("name=\"image_type\""),
+            "the image_type part is present: {body}"
+        );
+        assert!(body.contains("\r\n\r\nmessage\r\n"), "image_type=message: {body}");
+        assert!(
+            body.contains("name=\"image\""),
+            "the image part is present: {body}"
+        );
+        assert!(
+            body.contains("Content-Type: image/png"),
+            "the part carries the mime: {body}"
+        );
+        assert!(body.contains("PNGDATA"), "the part carries the bytes: {body}");
+        assert!(body.ends_with("--\r\n"), "the body closes the multipart: {body}");
+    }
+
+    /// A stalled upload must be bounded by the client's 10s request timeout,
+    /// like the client's other byte-carrying call (`download_image`): otherwise
+    /// the render pass and the poll loop that await it hang indefinitely on a
+    /// wedged Feishu (ADR-0076). The mock server hangs for 60s under a paused
+    /// clock, so the 10s timeout fires first with no wall-clock wait.
+    #[tokio::test(start_paused = true)]
+    async fn upload_image_gives_up_on_a_hung_server() {
+        let (server, client) = wire_client().await;
+        server.route_delayed(
+            "POST",
+            "/open-apis/im/v1/images",
+            200,
+            r#"{"code":0,"msg":"ok","data":{"image_key":"img_v2_abc"}}"#,
+            std::time::Duration::from_secs(60),
+        );
+
+        let err = client.upload_image(b"PNGDATA", "image/png").await.unwrap_err();
+        assert!(
+            matches!(err, crate::error::BridgeError::Http(ref e) if e.is_timeout()),
+            "the upload must time out, not hang: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_image_maps_a_business_error() {
+        let (server, client) = wire_client().await;
+        server.route(
+            "POST",
+            "/open-apis/im/v1/images",
+            200,
+            r#"{"code":40003,"msg":"invalid image"}"#,
+        );
+
+        let message = feishu_error(client.upload_image(b"junk", "image/png").await.unwrap_err());
+        assert!(
+            message.contains("upload image error 40003"),
+            "unexpected error: {message}"
+        );
+        assert!(message.contains("invalid image"), "unexpected error: {message}");
+    }
+
+    #[tokio::test]
+    async fn upload_image_reports_a_missing_key() {
+        let (server, client) = wire_client().await;
+        server.route(
+            "POST",
+            "/open-apis/im/v1/images",
+            200,
+            r#"{"code":0,"msg":"ok","data":{}}"#,
+        );
+
+        let message = feishu_error(client.upload_image(b"PNGDATA", "image/png").await.unwrap_err());
+        assert!(
+            message.contains("missing image_key"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_file_posts_the_multipart_fields_and_returns_the_key() {
+        let (server, client) = wire_client().await;
+        server.route(
+            "POST",
+            "/open-apis/im/v1/files",
+            200,
+            r#"{"code":0,"msg":"ok","data":{"file_key":"file_v2_abc"}}"#,
+        );
+
+        assert_eq!(
+            client
+                .upload_file(b"%PDFDATA", "pdf", "report.pdf")
+                .await
+                .unwrap(),
+            "file_v2_abc"
+        );
+
+        let request = last_request(&server);
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/open-apis/im/v1/files");
+        assert_eq!(request.header("authorization"), Some("Bearer t-abc"));
+        let content_type = request.header("content-type").unwrap_or_default();
+        assert!(
+            content_type.starts_with("multipart/form-data; boundary="),
+            "the body must be multipart: {content_type}"
+        );
+        let body = &request.body;
+        assert!(
+            body.contains("name=\"file_type\""),
+            "the file_type part is present: {body}"
+        );
+        assert!(body.contains("\r\n\r\npdf\r\n"), "file_type=pdf: {body}");
+        assert!(
+            body.contains("name=\"file_name\""),
+            "the file_name part is present: {body}"
+        );
+        assert!(body.contains("\r\n\r\nreport.pdf\r\n"), "file_name: {body}");
+        assert!(
+            body.contains("name=\"file\"; filename=\"report.pdf\""),
+            "the file part carries the name: {body}"
+        );
+        assert!(body.contains("%PDFDATA"), "the part carries the bytes: {body}");
+        assert!(body.ends_with("--\r\n"), "the body closes the multipart: {body}");
+    }
+
+    /// A file name carrying a quote or CRLF is sanitized before it is
+    /// interpolated (#649): a raw `"` would close the quoted `filename`
+    /// parameter early and a raw CRLF would forge a new header, so both are
+    /// neutralized in the `file_name` field and the `filename` parameter alike.
+    #[tokio::test]
+    async fn upload_file_sanitizes_the_multipart_filename() {
+        let (server, client) = wire_client().await;
+        server.route(
+            "POST",
+            "/open-apis/im/v1/files",
+            200,
+            r#"{"code":0,"msg":"ok","data":{"file_key":"file_v2_abc"}}"#,
+        );
+
+        client
+            .upload_file(b"%PDFDATA", "pdf", "ev\"il\r\nname.pdf")
+            .await
+            .unwrap();
+
+        let request = last_request(&server);
+        let body = &request.body;
+        assert!(
+            !body.contains("\r\nname.pdf"),
+            "no raw CRLF is interpolated: {body}"
+        );
+        assert!(
+            !body.contains("filename=\"ev\"il"),
+            "the quoted filename is not closed early: {body}"
+        );
+        assert!(
+            body.contains("filename=\"ev'ilname.pdf\""),
+            "the quote is neutralized in the filename parameter: {body}"
+        );
+        assert!(
+            body.contains("\r\n\r\nev'ilname.pdf\r\n"),
+            "the file_name field carries the sanitized name: {body}"
+        );
+    }
+
+    /// A stalled file upload is bounded by the client's 10s request timeout,
+    /// like `upload_image`/`download_image`: otherwise the render pass that
+    /// awaits it hangs on a wedged Feishu. The mock server hangs for 60s under
+    /// a paused clock, so the 10s timeout fires first with no wall-clock wait.
+    #[tokio::test(start_paused = true)]
+    async fn upload_file_gives_up_on_a_hung_server() {
+        let (server, client) = wire_client().await;
+        server.route_delayed(
+            "POST",
+            "/open-apis/im/v1/files",
+            200,
+            r#"{"code":0,"msg":"ok","data":{"file_key":"file_v2_abc"}}"#,
+            std::time::Duration::from_secs(60),
+        );
+
+        let err = client
+            .upload_file(b"%PDFDATA", "pdf", "report.pdf")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::error::BridgeError::Http(ref e) if e.is_timeout()),
+            "the upload must time out, not hang: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_file_maps_a_business_error() {
+        let (server, client) = wire_client().await;
+        server.route(
+            "POST",
+            "/open-apis/im/v1/files",
+            200,
+            r#"{"code":40004,"msg":"invalid file"}"#,
+        );
+
+        let message = feishu_error(client.upload_file(b"junk", "stream", "blob").await.unwrap_err());
+        assert!(
+            message.contains("upload file error 40004"),
+            "unexpected error: {message}"
+        );
+        assert!(message.contains("invalid file"), "unexpected error: {message}");
+    }
+
+    #[tokio::test]
+    async fn upload_file_reports_a_missing_key() {
+        let (server, client) = wire_client().await;
+        server.route(
+            "POST",
+            "/open-apis/im/v1/files",
+            200,
+            r#"{"code":0,"msg":"ok","data":{}}"#,
+        );
+
+        let message = feishu_error(
+            client
+                .upload_file(b"%PDFDATA", "pdf", "report.pdf")
+                .await
+                .unwrap_err(),
+        );
+        assert!(
+            message.contains("missing file_key"),
+            "unexpected error: {message}"
+        );
+    }
+
+    /// A File Message is a reply sent in thread form: `msg_type:"file"` with
+    /// `content` `{"file_key": …}`, `reply_in_thread: true` (ADR-0076).
+    #[tokio::test]
+    async fn send_message_in_thread_sends_file_content_in_thread() {
+        let (server, client) = wire_client().await;
+        server.route(
+            "POST",
+            "/open-apis/im/v1/messages/om_card/reply",
+            200,
+            r#"{"code":0,"msg":"ok","data":{"message_id":"om_file","thread_id":"omt_file"}}"#,
+        );
+        let content = serde_json::json!({ "file_key": "file_v2_abc" });
+
+        let (id, thread_id) = client
+            .send_message_in_thread("om_card", "file", &content)
+            .await
+            .unwrap();
+        assert_eq!(id, "om_file");
+        assert_eq!(thread_id.as_deref(), Some("omt_file"));
+
+        let request = last_request(&server);
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/open-apis/im/v1/messages/om_card/reply");
+        assert_eq!(request.header("authorization"), Some("Bearer t-abc"));
+        let body = body_json(&request);
+        assert_eq!(body["msg_type"], "file");
+        assert_eq!(body["reply_in_thread"], true);
+        assert_eq!(send_content(&request)["file_key"], "file_v2_abc");
+    }
+
+    #[tokio::test]
+    async fn send_message_in_thread_maps_a_business_error() {
+        let (server, client) = wire_client().await;
+        server.route(
+            "POST",
+            "/open-apis/im/v1/messages/om_card/reply",
+            200,
+            r#"{"code":230002,"msg":"file key invalid","data":{"message_id":""}}"#,
+        );
+
+        let message = feishu_error(
+            client
+                .send_message_in_thread("om_card", "file", &serde_json::json!({}))
+                .await
+                .unwrap_err(),
+        );
+        assert!(
+            message.contains("send message in thread error 230002"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("file key invalid"),
+            "unexpected error: {message}"
+        );
+    }
+
+    /// A stalled File Message send is bounded by the client's 10s request
+    /// timeout, like the other byte-carrying calls: the render pass awaits it
+    /// before the card can render, so a hung request must never block the card
+    /// (ADR-0076, #649). The mock server hangs for 60s under a paused clock, so
+    /// the 10s timeout fires first with no wall-clock wait.
+    #[tokio::test(start_paused = true)]
+    async fn send_message_in_thread_gives_up_on_a_hung_server() {
+        let (server, client) = wire_client().await;
+        server.route_delayed(
+            "POST",
+            "/open-apis/im/v1/messages/om_card/reply",
+            200,
+            r#"{"code":0,"msg":"ok","data":{"message_id":"om_file","thread_id":"omt_file"}}"#,
+            std::time::Duration::from_secs(60),
+        );
+
+        let err = client
+            .send_message_in_thread(
+                "om_card",
+                "file",
+                &serde_json::json!({ "file_key": "file_v2_abc" }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::error::BridgeError::Http(ref e) if e.is_timeout()),
+            "the send must time out, not hang: {err:?}"
         );
     }
 
