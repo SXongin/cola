@@ -366,6 +366,24 @@ pub(crate) fn extract_card_action_value(payload: &[u8]) -> Option<serde_json::Va
                     "chat_id": parts[1],
                     "thread_id": parts[2],
                 })
+            } else if parts.len() == 3 && matches!(parts[0], "browsego" | "browsepick" | "browsefilter") {
+                // `/dir` browse card form (ADR-0078): the 前往/选择/过滤 submit
+                // buttons carry the routing in the name; the typed path/filter
+                // arrives in `form_value` below. The browsed dir, hidden toggle
+                // and page ride the button `value` only — a name-only submit
+                // degrades to the handler's current-project fallback.
+                let op = match parts[0] {
+                    "browsego" => "go",
+                    "browsepick" => "pick",
+                    _ => "filter",
+                };
+                serde_json::json!({
+                    "action": "dir",
+                    "view": "browse",
+                    "op": op,
+                    "chat_id": parts[1],
+                    "thread_id": parts[2],
+                })
             } else if parts[0] == "submitm" && (parts.len() == 4 || parts.len() == 5) {
                 // A multi-select custom-answer form submit: the routing payload
                 // is encoded in the name ("submitm|<req>|<ses>|<qi>[|<dir>]")
@@ -432,6 +450,23 @@ pub(crate) fn extract_card_action_value(payload: &[u8]) -> Option<serde_json::Va
             );
         if is_search && let Some(s) = fv.get("search").and_then(|v| v.as_str()) {
             val["keyword"] = serde_json::Value::String(s.to_string());
+        }
+        // `/dir` browse form (ADR-0078): 前往/选择 carry the typed path,
+        // 过滤 the typed child filter.
+        if val.get("view").and_then(|v| v.as_str()) == Some("browse") {
+            match val.get("op").and_then(|v| v.as_str()) {
+                Some("go" | "pick") => {
+                    if let Some(s) = fv.get("path").and_then(|v| v.as_str()) {
+                        val["path"] = serde_json::Value::String(s.to_string());
+                    }
+                }
+                Some("filter") => {
+                    if let Some(s) = fv.get("filter").and_then(|v| v.as_str()) {
+                        val["keyword"] = serde_json::Value::String(s.to_string());
+                    }
+                }
+                _ => {}
+            }
         }
     }
     // The card's own message id. In the schema 2.0 callback it lives on
@@ -1101,6 +1136,56 @@ mod tests {
         assert_eq!(value["action"], "dir");
         assert_eq!(value["op"], "search");
         assert_eq!(value["keyword"], "auth");
+    }
+
+    /// The `/dir` browse card's form (ADR-0078): 前往/选择 rebuild the routing
+    /// from the button `name` and attach the typed path from `form_value.path`.
+    #[test]
+    fn browse_form_submit_rebuilds_routing_and_path() {
+        for (name, op) in [
+            ("browsego|chat_1|chat_1", "go"),
+            ("browsepick|chat_1|chat_1", "pick"),
+        ] {
+            let payload = format!(
+                r#"{{"schema":"2.0","event":{{"action":{{"tag":"button","name":"{name}","form_value":{{"path":"~/work"}}}}}}}}"#
+            );
+            let value = extract_card_action_value(payload.as_bytes()).expect("value extracted");
+            assert_eq!(value["action"], "dir");
+            assert_eq!(value["view"], "browse", "browse view routing");
+            assert_eq!(value["op"], op);
+            assert_eq!(value["path"], "~/work", "typed path attached");
+            assert_eq!(value["chat_id"], "chat_1");
+        }
+    }
+
+    /// The browse form's 过滤 submit attaches the typed filter as the keyword;
+    /// with `action.value` present its browse routing (dir/hidden) survives too.
+    #[test]
+    fn browse_form_filter_submit_attaches_keyword() {
+        let payload = r#"{
+            "schema": "2.0",
+            "event": {
+                "action": {
+                    "tag": "button",
+                    "name": "browsefilter|chat_1|chat_1",
+                    "value": {
+                        "action": "dir",
+                        "view": "browse",
+                        "op": "filter",
+                        "chat_id": "chat_1",
+                        "thread_id": "chat_1",
+                        "dir": "/work",
+                        "show_hidden": true
+                    },
+                    "form_value": { "filter": "proj" }
+                }
+            }
+        }"#;
+        let value = extract_card_action_value(payload.as_bytes()).expect("value extracted");
+        assert_eq!(value["view"], "browse");
+        assert_eq!(value["op"], "filter");
+        assert_eq!(value["dir"], "/work");
+        assert_eq!(value["keyword"], "proj");
     }
 
     /// The `/sub` child-session card's search form mirrors `/dir`'s: the

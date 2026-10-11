@@ -501,7 +501,7 @@ pub fn help_text() -> String {
 pub fn command_help(name: &str) -> Option<String> {
     let text = match name.to_lowercase().as_str() {
         "dir" => {
-            "/dir <path> [name]\nDeclare a new session rooted at <path>: nothing is created yet — the conversation's next non-command message creates the session in that directory and maps it here, so a mistaken `/dir` can be corrected with another `/dir`, `/new`, `/switch` or `/topic` and leaves no session behind.\n- `/dir` (no arg) — Recent Directories card: pick a recently-used folder and declare it there, or open it as a fresh topic (each row's 建话题 = `/topic <dir>` without typing; only from the main conversation). When there are many directories, the card carries a search box over the paths.\nExample: `/dir /root/proj/lib`"
+            "/dir <path> [name]\nDeclare a new session rooted at <path>: nothing is created yet — the conversation's next non-command message creates the session in that directory and maps it here, so a mistaken `/dir` can be corrected with another `/dir`, `/new`, `/switch` or `/topic` and leaves no session behind.\n- `/dir` (no arg) — Recent Directories card: pick a recently-used folder and declare it there, or open it as a fresh topic (each row's 建话题 = `/topic <dir>` without typing; only from the main conversation). When there are many directories, the card carries a search box over the paths. Its 📁 浏览目录 button opens a filesystem browser: drill into subdirectories, type a path (前往 browses it, 选择 declares it), toggle dot-directories, and filter the child names.\nExample: `/dir /root/proj/lib`"
         }
         "switch" => {
             "/switch [action]\nSession management card and text forms.\n- `/switch` (no arg) — interactive session card (browse / search / adopt / new)\n- `/switch <keyword>` — switch by title/directory/id; the current chat's sessions win, otherwise a unique global match is adopted. Ambiguous keywords list candidates; no match opens the card pre-filtered by the keyword.\n- `/switch <id|title> [--force]` — take over a session (exact id → id-prefix → title; the card's short hash works too; reject if owned by another chat unless `--force`, or use the card's 强制接管 button)\n- `/switch forget` — un-map this chat's session (server session stays)\nExamples: `/switch backend`, `/switch ses_abc --force`"
@@ -2136,7 +2136,20 @@ async fn adopt_session(
 /// symlinks) when the path exists. OpenCode sessions are keyed by their
 /// directory and the server fails on a session created with a `~`-style or
 /// relative path, so cola must hand it a real absolute directory.
-fn normalize_directory(input: &str) -> std::path::PathBuf {
+pub(crate) fn normalize_directory(input: &str) -> std::path::PathBuf {
+    let expanded = expand_directory(input);
+    // Canonicalize (resolving `..` and symlinks) when the directory exists;
+    // otherwise keep the normalized absolute form — the caller checks
+    // `is_dir()` and reports it as missing.
+    std::fs::canonicalize(&expanded).unwrap_or(expanded)
+}
+
+/// Expand a user-supplied directory to an absolute path WITHOUT canonicalizing:
+/// a leading `~` resolves against home, a relative path against the working
+/// directory. The `/dir` browse card (ADR-0078) uses this so the browsed
+/// spelling — and any symlink in it — stays as the user navigated it; the
+/// canonicalizing [`normalize_directory`] stays the pre-session form.
+pub(crate) fn expand_directory(input: &str) -> std::path::PathBuf {
     let home = dirs::home_dir().unwrap_or_default();
     let expanded = if input == "~" {
         home.clone()
@@ -2145,15 +2158,11 @@ fn normalize_directory(input: &str) -> std::path::PathBuf {
     } else {
         std::path::PathBuf::from(input)
     };
-    let expanded = if expanded.is_absolute() {
+    if expanded.is_absolute() {
         expanded
     } else {
         std::env::current_dir().unwrap_or_default().join(expanded)
-    };
-    // Canonicalize (resolving `..` and symlinks) when the directory exists;
-    // otherwise keep the normalized absolute form — the caller checks
-    // `is_dir()` and reports it as missing.
-    std::fs::canonicalize(&expanded).unwrap_or(expanded)
+    }
 }
 
 /// Normalize + validate a user-supplied directory for `/dir`/`/topic`. On a
@@ -2200,7 +2209,53 @@ pub(crate) fn matches_keyword(s: &crate::opencode::types::SessionListInfo, lower
         s.directory.to_lowercase(),
         s.id.to_lowercase()
     );
-    lower.split_whitespace().all(|tok| haystack.contains(tok))
+    token_and_match(&haystack, lower)
+}
+
+/// The search cards' one match rule (ADR-0051): `lower_keyword` is already
+/// lowercased, split on whitespace, and every token must appear as a substring
+/// of `haystack` (which the caller lowercases). Shared by the `/switch` and
+/// `/skill` session match, the Recent Directories path match, and the browse
+/// card's child-name filter, so the three cannot drift.
+pub(crate) fn token_and_match(haystack: &str, lower_keyword: &str) -> bool {
+    lower_keyword.split_whitespace().all(|tok| haystack.contains(tok))
+}
+
+/// Collapse `.` and `..` **textually** — no filesystem access, no symlink
+/// resolution: `/a/b/../../c` → `/c`. The `/dir` browse card's path resolution
+/// uses this on the tail of a not-yet-existing target, after canonicalizing the
+/// longest existing prefix, so `..` is applied to a symlink-free base.
+pub(crate) fn lexical_normalize(path: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut out = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            // `pop` failing means an empty (or root) base: keep a relative
+            // `..`, never climb above an absolute root.
+            Component::ParentDir => {
+                if !out.pop() && !out.has_root() {
+                    out.push("..");
+                }
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Whether two directory spellings name the same directory: equal strings, or
+/// canonicalize to the same path (best-effort — an unresolvable path compares by
+/// string only). The one rule the browse card's `当前` mark and its pick share
+/// (ADR-0078), like the search cards' `token_and_match`.
+pub(crate) fn same_dir(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    matches!(
+        (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+        (Ok(x), Ok(y)) if x == y
+    )
 }
 
 /// The "ambiguous match" candidate list shown when a keyword or id resolves to
@@ -2906,5 +2961,18 @@ mod tests {
             missing, target,
             "a nonexistent absolute path is preserved for the caller to report"
         );
+    }
+
+    /// `lexical_normalize` collapses `.`/`..` textually, without touching the
+    /// filesystem — the browser's path resolution applies it to the tail of a
+    /// not-yet-existing target (#670 review).
+    #[test]
+    fn lexical_normalize_collapses_dot_dot_textually() {
+        use std::path::Path;
+        assert_eq!(lexical_normalize(Path::new("/a/b/../../c")), Path::new("/c"));
+        assert_eq!(lexical_normalize(Path::new("/a/./b/")), Path::new("/a/b"));
+        assert_eq!(lexical_normalize(Path::new("/..")), Path::new("/"));
+        assert_eq!(lexical_normalize(Path::new("a/../b")), Path::new("b"));
+        assert_eq!(lexical_normalize(Path::new("../a")), Path::new("../a"));
     }
 }

@@ -742,6 +742,10 @@ pub fn build_dir_card(
     let page = window.page;
     let mut elements: Vec<serde_json::Value> = Vec::new();
 
+    // ADR-0078: the entry point to the filesystem browse card — the way to
+    // reach a directory the Recent Directories union does not carry.
+    elements.push(browse_entry_button(thread_key));
+
     if total > CARD_PAGE_SIZE || !keyword.is_empty() {
         elements.push(search_form(
             "dir_search",
@@ -856,6 +860,405 @@ fn dir_card_row(
         ]
     });
     vec![text_row, btn_row]
+}
+
+/// One child directory of the `/dir` browse card (ADR-0078): the display name,
+/// the absolute path its drill-down button navigates to, and whether it holds a
+/// `.git` entry (a repo — floated to the front and marked 📦).
+pub struct BrowseChild {
+    pub name: String,
+    pub path: String,
+    pub is_repo: bool,
+}
+
+/// The stateless view state every browse-card control round-trips (ADR-0078):
+/// the browsed directory, whether dot-directories show, the child filter and the
+/// page. One struct because they always travel together — bundled once here,
+/// carried by every button, and read back together by the handler.
+#[derive(Clone, Copy)]
+pub struct BrowseView<'a> {
+    pub dir: &'a str,
+    pub show_hidden: bool,
+    pub keyword: &'a str,
+    pub page: usize,
+}
+
+/// The `/dir` browse card (ADR-0078): the filesystem drill-down that reaches a
+/// directory not in the Recent Directories union. One screen holds a clickable
+/// breadcrumb, the current-directory action row (切换到这里 / 建话题), a
+/// path-and-filter form, and one page of child directories — each a full-width
+/// drill-down button. Rows descend; selection acts on the directory you are
+/// standing in (the classic file-browser model). Schema 2.0: the form is a
+/// root-level element (it cannot nest), no v1 `action` container is used, and
+/// every rebuild rides `view` (ADR-0078). `notice` carries a fallback
+/// explanation — a vanished directory clamped to its nearest existing ancestor,
+/// or an unreadable directory.
+pub fn build_dir_browse_card(
+    thread_key: &crate::config::ThreadKey,
+    children: &[BrowseChild],
+    current_dir: Option<&str>,
+    view: BrowseView<'_>,
+    show_filter: bool,
+    notice: Option<&str>,
+) -> serde_json::Value {
+    let total = children.len();
+    let window = page_window(total, view.page);
+    let page = window.page;
+    let view = BrowseView { page, ..view };
+    let mut elements: Vec<serde_json::Value> = Vec::new();
+
+    if let Some(notice) = notice {
+        elements.push(json!({
+            "tag": "markdown",
+            "content": crate::feishu::card::sanitize::sanitize_markdown(&format!("⚠️ {notice}")),
+        }));
+    }
+    elements.push(browse_breadcrumb(thread_key, view));
+    elements.push(json!({
+        "tag": "markdown",
+        "content": crate::feishu::card::sanitize::sanitize_markdown(&format!("**当前目录**：`{}`", view.dir)),
+    }));
+    elements.push(browse_node_actions(thread_key, view, current_dir));
+    elements.push(browse_form(thread_key, view, show_filter));
+
+    let header = if view.keyword.is_empty() {
+        "**子目录**".to_string()
+    } else {
+        format!("**匹配 `{}` 的子目录**", view.keyword)
+    };
+    elements.push(json!({
+        "tag": "markdown",
+        "content": crate::feishu::card::sanitize::sanitize_markdown(&header),
+    }));
+    elements.push(browse_dot_toggle(thread_key, view));
+    if total == 0 {
+        let hint = if view.keyword.is_empty() {
+            "_(没有子目录)_"
+        } else {
+            "_(无匹配子目录)_"
+        };
+        elements.push(json!({ "tag": "markdown", "content": hint }));
+    } else {
+        for child in &children[window.start..window.end] {
+            elements.push(browse_child_button(thread_key, child, view.show_hidden));
+        }
+    }
+
+    // The pager rides the extra browse routing (`view`/`dir`/`show_hidden`) so a
+    // flip rebuilds THIS card, not the Recent Directories one; the flag is a
+    // string because the shared pager only carries string callback fields.
+    let show_hidden_str = if view.show_hidden { "true" } else { "false" };
+    if let Some(pager) = pager_element(
+        "dir",
+        thread_key,
+        view.keyword,
+        None,
+        page,
+        window.total_pages,
+        total,
+        &[
+            ("view", "browse"),
+            ("dir", view.dir),
+            ("show_hidden", show_hidden_str),
+        ],
+    ) {
+        elements.push(pager);
+    }
+    elements.push(browse_recent_button(thread_key));
+
+    card_shell("📁 浏览目录", "blue", elements)
+}
+
+/// The routing payload every browse-card control carries: the card identity
+/// plus `view`. `view: "browse"` is what routes the callback to the browse
+/// handler rather than the Recent Directories one.
+fn browse_value(thread_key: &crate::config::ThreadKey, op: &str, view: BrowseView<'_>) -> serde_json::Value {
+    json!({
+        "action": "dir",
+        "view": "browse",
+        "op": op,
+        "chat_id": thread_key.chat_id,
+        "thread_id": thread_key.thread_id,
+        "dir": view.dir,
+        "show_hidden": view.show_hidden,
+        "keyword": view.keyword,
+        "page": view.page,
+    })
+}
+
+/// The browse card's clickable breadcrumb (ADR-0078): 🏠 home, ⬆ 上一级, then
+/// the path's tail segments (at most four, with a leading `…` jumping to the
+/// segment just before them) as `column_set`/`flex_mode: "flow"` buttons.
+/// Navigating away clears the child filter and returns to page 1.
+fn browse_breadcrumb(thread_key: &crate::config::ThreadKey, view: BrowseView<'_>) -> serde_json::Value {
+    let nav = |label: &str, target: &str| {
+        json!({
+            "tag": "column",
+            "width": "auto",
+            "vertical_align": "center",
+            "elements": [{
+                "tag": "button",
+                "text": { "tag": "plain_text", "content": label },
+                "type": "default",
+                "value": browse_value(thread_key, "go", BrowseView { dir: target, keyword: "", page: 1, ..view }),
+            }],
+        })
+    };
+    let mut columns: Vec<serde_json::Value> = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        columns.push(nav("🏠", &home.to_string_lossy()));
+    }
+    if let Some(parent) = std::path::Path::new(view.dir).parent() {
+        let parent = parent.to_string_lossy();
+        if !parent.is_empty() && parent != view.dir {
+            columns.push(nav("⬆ 上一级", &parent));
+        }
+    }
+    let segments = path_segments(view.dir);
+    let cut = segments.len().saturating_sub(4);
+    if cut > 0 {
+        columns.push(nav("…", &segments[cut - 1].1));
+    }
+    for (label, path) in &segments[cut..] {
+        columns.push(nav(label, path));
+    }
+    json!({
+        "tag": "column_set",
+        "flex_mode": "flow",
+        "horizontal_spacing": "default",
+        "columns": columns,
+    })
+}
+
+/// The `/`-anchored (label, absolute path) pairs of `dir`, for the breadcrumb.
+/// `/a/b/c` yields `("/", "/")`, `("a", "/a")`, `("b", "/a/b")`, `("c",
+/// "/a/b/c")`; a relative or empty spelling yields its components as-is.
+fn path_segments(dir: &str) -> Vec<(String, String)> {
+    let mut acc = std::path::PathBuf::new();
+    let mut segments = Vec::new();
+    for component in std::path::Path::new(dir).components() {
+        acc.push(component.as_os_str());
+        let label = match component {
+            std::path::Component::RootDir => "/".to_string(),
+            other => other.as_os_str().to_string_lossy().to_string(),
+        };
+        segments.push((label, acc.to_string_lossy().to_string()));
+    }
+    segments
+}
+
+/// The selected-node action row of the browse card: 切换到这里 (or ✅ 当前 when
+/// this is already the conversation's directory) and 建话题, both acting on the
+/// directory being browsed.
+fn browse_node_actions(
+    thread_key: &crate::config::ThreadKey,
+    view: BrowseView<'_>,
+    current_dir: Option<&str>,
+) -> serde_json::Value {
+    let is_current = current_dir.is_some_and(|current| crate::bridge::command::same_dir(current, view.dir));
+    let pick_label = if is_current {
+        "✅ 当前"
+    } else {
+        "切换到这里"
+    };
+    let column = |op: &str, label: &str| {
+        json!({
+            "tag": "column",
+            "width": "auto",
+            "vertical_align": "center",
+            "elements": [{
+                "tag": "button",
+                "text": { "tag": "plain_text", "content": label },
+                "type": "default",
+                "value": browse_value(thread_key, op, view),
+            }],
+        })
+    };
+    json!({
+        "tag": "column_set",
+        "flex_mode": "bisect",
+        "horizontal_spacing": "default",
+        "columns": [column("pick", pick_label), column("topic", "建话题")],
+    })
+}
+
+/// The 显示隐藏 toggle of the browse card (ADR-0078): shows or hides
+/// dot-directories. The label states the action and the payload carries the
+/// CURRENT `show_hidden` flag — the `show_hidden` op flips it (every other op
+/// passes it through unchanged).
+fn browse_dot_toggle(thread_key: &crate::config::ThreadKey, view: BrowseView<'_>) -> serde_json::Value {
+    let label = if view.show_hidden {
+        "隐藏点目录"
+    } else {
+        "显示隐藏目录"
+    };
+    json!({
+        "tag": "button",
+        "width": "fill",
+        "type": "default",
+        "text": { "tag": "plain_text", "content": label },
+        "value": browse_value(thread_key, "show_hidden", view),
+    })
+}
+
+/// One child directory of the browse card: a single full-width drill-down
+/// button (`width: "fill"`), 📦-marked when it is a repo. `op: "go"` navigates
+/// into it, clearing the child filter and returning to page 1.
+fn browse_child_button(
+    thread_key: &crate::config::ThreadKey,
+    child: &BrowseChild,
+    show_hidden: bool,
+) -> serde_json::Value {
+    let label = if child.is_repo {
+        format!("📦 {}", child.name)
+    } else {
+        format!("📁 {}", child.name)
+    };
+    json!({
+        "tag": "button",
+        "width": "fill",
+        "type": "default",
+        "text": { "tag": "plain_text", "content": label },
+        "value": browse_value(
+            thread_key,
+            "go",
+            BrowseView { dir: &child.path, show_hidden, keyword: "", page: 1 },
+        ),
+    })
+}
+
+/// The browse card's one form (ADR-0078): a path input with 前往 (navigate) and
+/// 选择 (declare a Pending Session there), plus — when the directory has more
+/// children than a page or a filter is active — a filter input with 过滤. The
+/// submit routing rides the button `name` (form submits do not always deliver
+/// the `value`) with `path`/`filter` read from `form_value`; a `name`-only
+/// submission of 过滤 loses `view` and falls back to the current project, the
+/// accepted degradation of a length-bounded name.
+fn browse_form(
+    thread_key: &crate::config::ThreadKey,
+    view: BrowseView<'_>,
+    show_filter: bool,
+) -> serde_json::Value {
+    let submit = |label: &str, prefix: &str, op: &str, btn_type: &str| {
+        json!({
+            "tag": "button",
+            "text": { "tag": "plain_text", "content": label },
+            "type": btn_type,
+            "form_action_type": "submit",
+            "name": format!("{prefix}|{}|{}", thread_key.chat_id, thread_key.thread_id),
+            "value": browse_value(thread_key, op, view),
+        })
+    };
+    let path_row = json!({
+        "tag": "column_set",
+        "flex_mode": "none",
+        "horizontal_spacing": "default",
+        "columns": [
+            {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 5,
+                "vertical_align": "center",
+                "elements": [{
+                    "tag": "input",
+                    "name": "path",
+                    "input_type": "multiline_text",
+                    "rows": 1,
+                    "auto_resize": true,
+                    "max_rows": 3,
+                    "placeholder": {
+                        "tag": "plain_text",
+                        "content": "输入或粘贴目录路径（~/work、/root/...）",
+                    },
+                    "max_length": 1000,
+                    "width": "fill",
+                }],
+            },
+            {
+                "tag": "column",
+                "width": "auto",
+                "vertical_align": "center",
+                "elements": [submit("前往", "browsego", "go", "default")],
+            },
+            {
+                "tag": "column",
+                "width": "auto",
+                "vertical_align": "center",
+                "elements": [submit("选择", "browsepick", "pick", "primary")],
+            },
+        ],
+    });
+    let mut rows = vec![path_row];
+    if show_filter {
+        rows.push(json!({
+            "tag": "column_set",
+            "flex_mode": "none",
+            "horizontal_spacing": "default",
+            "columns": [
+                {
+                    "tag": "column",
+                    "width": "weighted",
+                    "weight": 5,
+                    "vertical_align": "center",
+                    "elements": [{
+                        "tag": "input",
+                        "name": "filter",
+                        "input_type": "multiline_text",
+                        "rows": 1,
+                        "auto_resize": true,
+                        "max_rows": 3,
+                        "placeholder": {
+                            "tag": "plain_text",
+                            "content": "过滤当前目录的子目录名",
+                        },
+                        "default_value": view.keyword,
+                        "max_length": 100,
+                        "width": "fill",
+                    }],
+                },
+                {
+                    "tag": "column",
+                    "width": "auto",
+                    "vertical_align": "center",
+                    "elements": [submit("过滤", "browsefilter", "filter", "default")],
+                },
+            ],
+        }));
+    }
+    json!({ "tag": "form", "name": "dir_browse", "elements": rows })
+}
+
+/// The 「← 最近目录」 button that swaps the browse card back for the Recent
+/// Directories card in place (ADR-0078).
+fn browse_recent_button(thread_key: &crate::config::ThreadKey) -> serde_json::Value {
+    json!({
+        "tag": "button",
+        "type": "default",
+        "text": { "tag": "plain_text", "content": "← 最近目录" },
+        "value": {
+            "action": "dir",
+            "op": "recent",
+            "chat_id": thread_key.chat_id,
+            "thread_id": thread_key.thread_id,
+        },
+    })
+}
+
+/// The 「📁 浏览目录」 entry button on the Recent Directories card (ADR-0078):
+/// opens the browse card in place.
+fn browse_entry_button(thread_key: &crate::config::ThreadKey) -> serde_json::Value {
+    json!({
+        "tag": "button",
+        "width": "fill",
+        "type": "primary",
+        "text": { "tag": "plain_text", "content": "📁 浏览目录" },
+        "value": {
+            "action": "dir",
+            "op": "browse",
+            "chat_id": thread_key.chat_id,
+            "thread_id": thread_key.thread_id,
+        },
+    })
 }
 
 #[cfg(test)]
@@ -1666,17 +2069,21 @@ mod tests {
         );
     }
 
-    /// An empty Recent Directories list renders a hint and no buttons.
+    /// An empty Recent Directories list renders a hint; its only control is the
+    /// ADR-0078 browse entry (the way to reach a directory the empty union
+    /// cannot offer) — no row or pager buttons.
     #[test]
-    fn dir_card_empty_state_is_buttonless_hint() {
+    fn dir_card_empty_state_is_a_hint_plus_the_browse_entry() {
         let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
         let card = build_dir_card(&key, &[], None, "", 1);
         let text = card.to_string();
         assert!(text.contains("还没有最近目录"), "empty hint: {text}");
-        assert!(
-            !text.contains("\"tag\":\"button\"") && !text.contains("\"tag\": \"button\""),
-            "empty dir card has no buttons: {text}"
+        assert_eq!(
+            text.matches("\"tag\":\"button\"").count(),
+            1,
+            "only the browse entry button remains: {text}"
         );
+        assert!(text.contains("\"op\":\"browse\""), "the browse entry: {text}");
     }
 
     /// ADR-0052: a second page renders the next window of directories, and the
@@ -1984,5 +2391,183 @@ mod tests {
             .iter()
             .find(|e| e["tag"] == "column_set" && e["columns"][0]["elements"][0]["value"]["directory"] == dir)
             .cloned()
+    }
+
+    // ---- ADR-0078 browse card ----
+
+    fn browse_child(name: &str, repo: bool) -> BrowseChild {
+        BrowseChild {
+            name: name.to_string(),
+            path: format!("/work/{name}"),
+            is_repo: repo,
+        }
+    }
+
+    /// Every button anywhere in a card (body elements, forms, column sets), for
+    /// assertions that don't care about layout.
+    fn all_buttons(card: &serde_json::Value) -> Vec<serde_json::Value> {
+        fn walk(value: &serde_json::Value, out: &mut Vec<serde_json::Value>) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    if map.get("tag").and_then(|t| t.as_str()) == Some("button") {
+                        out.push(value.clone());
+                    }
+                    for nested in map.values() {
+                        walk(nested, out);
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for item in items {
+                        walk(item, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        walk(card, &mut out);
+        out
+    }
+
+    fn bview<'a>(dir: &'a str, show_hidden: bool, keyword: &'a str, page: usize) -> BrowseView<'a> {
+        BrowseView {
+            dir,
+            show_hidden,
+            keyword,
+            page,
+        }
+    }
+
+    #[test]
+    fn browse_card_carries_the_schema_2_form_and_view_routing() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let card = build_dir_browse_card(
+            &key,
+            &[browse_child("alpha", false), browse_child("beta", true)],
+            None,
+            bview("/work", false, "", 1),
+            false,
+            None,
+        );
+        let text = card.to_string();
+        assert_eq!(card["schema"], "2.0");
+        assert!(text.contains("\"tag\":\"form\""), "one root form: {text}");
+        assert!(text.contains("\"name\":\"dir_browse\""), "form name: {text}");
+        assert!(
+            text.contains("browsego|chat_1|chat_1") && text.contains("browsepick|chat_1|chat_1"),
+            "path submit names: {text}"
+        );
+        assert!(text.contains("📦 beta"), "repo marker: {text}");
+        assert!(text.contains("📁 alpha"), "plain dir marker: {text}");
+        assert!(text.contains("\"view\":\"browse\""), "view routing: {text}");
+        assert!(
+            text.contains("\"op\":\"recent\"") && text.contains("← 最近目录"),
+            "back-to-recent control: {text}"
+        );
+        // Schema 2.0: no v1 `action` container anywhere.
+        assert!(
+            !text.contains("\"tag\":\"action\""),
+            "no v1 action container: {text}"
+        );
+    }
+
+    #[test]
+    fn browse_card_shows_the_filter_only_when_asked_and_echoes_the_keyword() {
+        let key = crate::config::ThreadKey::new("c".into(), "c".into());
+        let without = build_dir_browse_card(&key, &[], None, bview("/work", false, "", 1), false, None);
+        assert!(
+            !without.to_string().contains("\"name\":\"filter\""),
+            "no filter input until asked: {without}"
+        );
+        let shown = build_dir_browse_card(&key, &[], None, bview("/work", false, "proj", 1), true, None);
+        let text = shown.to_string();
+        assert!(text.contains("\"name\":\"filter\""), "filter input: {text}");
+        assert!(text.contains("browsefilter|c|c"), "filter submit name: {text}");
+        assert!(
+            text.contains("\"default_value\":\"proj\""),
+            "echoes keyword: {text}"
+        );
+    }
+
+    #[test]
+    fn browse_card_dot_toggle_states_the_action_and_carries_the_current_flag() {
+        let key = crate::config::ThreadKey::new("c".into(), "c".into());
+        let shown = build_dir_browse_card(&key, &[], None, bview("/work", false, "", 1), false, None);
+        let toggle = all_buttons(&shown)
+            .into_iter()
+            .find(|button| button["value"]["op"] == "show_hidden")
+            .expect("a dot-toggle");
+        assert_eq!(toggle["text"]["content"], "显示隐藏目录");
+        assert_eq!(toggle["value"]["show_hidden"], false, "carries the current flag");
+        let dots = build_dir_browse_card(&key, &[], None, bview("/work", true, "", 1), false, None);
+        let toggle = all_buttons(&dots)
+            .into_iter()
+            .find(|button| button["value"]["op"] == "show_hidden")
+            .expect("a dot-toggle");
+        assert_eq!(toggle["text"]["content"], "隐藏点目录");
+        assert_eq!(toggle["value"]["show_hidden"], true);
+    }
+
+    #[test]
+    fn browse_card_pager_rides_the_browse_view() {
+        let key = crate::config::ThreadKey::new("chat_9".into(), "chat_9".into());
+        let children: Vec<BrowseChild> = (1..=13).map(|i| browse_child(&format!("p{i}"), false)).collect();
+        let card = build_dir_browse_card(&key, &children, None, bview("/work", true, "k", 2), true, None);
+        let pager = all_buttons(&card)
+            .into_iter()
+            .find(|button| button["value"]["op"] == "page")
+            .expect("a pager");
+        assert_eq!(pager["value"]["view"], "browse");
+        assert_eq!(pager["value"]["dir"], "/work");
+        assert_eq!(
+            pager["value"]["show_hidden"], "true",
+            "the flag rides as a string"
+        );
+        assert_eq!(pager["value"]["page"], 1, "prev-page target");
+    }
+
+    #[test]
+    fn browse_breadcrumb_truncates_a_deep_path() {
+        let key = crate::config::ThreadKey::new("c".into(), "c".into());
+        let card = build_dir_browse_card(&key, &[], None, bview("/a/b/c/d/e/f", false, "", 1), false, None);
+        let crumb = card["body"]["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["tag"] == "column_set" && e["flex_mode"] == "flow")
+            .expect("breadcrumb");
+        let labels: Vec<String> = crumb["columns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["elements"][0]["text"]["content"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            labels.contains(&"…".to_string()),
+            "ellipsis for the dropped head: {labels:?}"
+        );
+        assert!(
+            labels.contains(&"e".to_string()) && labels.contains(&"f".to_string()),
+            "tail kept: {labels:?}"
+        );
+        assert!(!labels.contains(&"b".to_string()), "head dropped: {labels:?}");
+    }
+
+    #[test]
+    fn browse_card_marks_the_current_directory() {
+        let key = crate::config::ThreadKey::new("c".into(), "c".into());
+        let card = build_dir_browse_card(
+            &key,
+            &[],
+            Some("/work"),
+            bview("/work", false, "", 1),
+            false,
+            None,
+        );
+        let pick = all_buttons(&card)
+            .into_iter()
+            .find(|button| button["value"]["op"] == "pick")
+            .expect("pick button");
+        assert_eq!(pick["text"]["content"], "✅ 当前");
     }
 }

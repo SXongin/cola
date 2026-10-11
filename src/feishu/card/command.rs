@@ -285,12 +285,11 @@ pub(crate) async fn dir_card_data(
 }
 
 /// Case-insensitive token-AND match on a directory path (ADR-0051): the
-/// `/switch` search box's rule (`matches_keyword`) applied to the path only —
-/// `lower_keyword` is already lowercased, split on whitespace, and every token
-/// must appear as a substring.
+/// `/switch` search box's rule applied to the path only — `lower_keyword` is
+/// already lowercased, split on whitespace, and every token must appear as a
+/// substring.
 fn matches_directory(dir: &str, lower_keyword: &str) -> bool {
-    let dir = dir.to_lowercase();
-    lower_keyword.split_whitespace().all(|tok| dir.contains(tok))
+    crate::bridge::command::token_and_match(&dir.to_lowercase(), lower_keyword)
 }
 
 /// Build and send the interactive `/dir` Recent Directories card. Renders the
