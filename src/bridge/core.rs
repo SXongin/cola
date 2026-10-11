@@ -226,7 +226,7 @@ pub struct SharedCore {
     pub file_uploads: crate::bridge::handles::FileUploadCache,
     /// The process-local File Message once-guard (ADR-0076, #649): the
     /// `(session_id, content hash)` entries whose File Message already went out,
-    /// so a later poll never sends a second one.
+    /// so a later poll never sends a second one. Single-flight and bounded.
     pub file_messages_sent: crate::bridge::handles::FileMessageSends,
 }
 
@@ -325,7 +325,7 @@ impl SharedCore {
             runtime_reconcile: Arc::new(crate::bridge::runtime::RuntimeReconcile::new()),
             file_images: Arc::new(Mutex::new(HashMap::new())),
             file_uploads: Arc::new(Mutex::new(HashMap::new())),
-            file_messages_sent: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            file_messages_sent: Arc::new(Mutex::new(indexmap::IndexMap::new())),
         })
     }
 

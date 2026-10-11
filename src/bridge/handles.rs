@@ -30,6 +30,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use indexmap::IndexMap;
 use tokio::sync::Mutex;
 
 use crate::bridge::card_handles::CardHandles;
@@ -786,15 +787,19 @@ impl SessionsHandle {
     }
 }
 
+/// The process-local per-content-hash single-flight cache (ADR-0076): a content
+/// hash maps to the resolution of that content. The inner cell's
+/// `get_or_try_init` is the in-flight guard: concurrent resolvers of one hash
+/// await ONE platform call instead of each missing the cache and repeating it.
+/// A failed call leaves the cell uninitialized, so a later poll retries.
+pub(crate) type ContentCellCache<T> = Arc<Mutex<HashMap<u64, Arc<tokio::sync::OnceCell<T>>>>>;
+
 /// The process-local File Content image cache (ADR-0076): a content hash maps to
 /// the single-flight resolution of that content. The inner cell holds
 /// `Some(image_key)` for an embedded image or `None` for a content the Platform
-/// will not embed, and its `get_or_try_init` is the in-flight guard: concurrent
-/// resolvers of one hash await ONE upload instead of each missing the cache and
-/// uploading the same bytes twice. A failed upload leaves the cell
-/// uninitialized, so a later poll retries. Shared process-wide, so identical
-/// bytes upload once whichever Session or card renders them.
-pub(crate) type FileImageCache = Arc<Mutex<HashMap<u64, Arc<tokio::sync::OnceCell<Option<String>>>>>>;
+/// will not embed. Shared process-wide, so identical bytes upload once whichever
+/// Session or card renders them.
+pub(crate) type FileImageCache = ContentCellCache<Option<String>>;
 
 /// The process-local File Content **file** cache (ADR-0076, #649): a content
 /// hash maps to the single-flight resolution of that content as a File Message.
@@ -802,14 +807,30 @@ pub(crate) type FileImageCache = Arc<Mutex<HashMap<u64, Arc<tokio::sync::OnceCel
 /// content past Feishu's 30MB message cap. Single-flight like
 /// [`FileImageCache`]: identical bytes upload once, whichever Session renders
 /// them.
-pub(crate) type FileUploadCache = Arc<Mutex<HashMap<u64, Arc<tokio::sync::OnceCell<Option<String>>>>>>;
+pub(crate) type FileUploadCache = ContentCellCache<Option<String>>;
+
+/// The cap on the process-local File Message once-guard (ADR-0076, #649): the
+/// guard is in-memory only and a cola restart may resend, so an entry past this
+/// bound is evicted oldest-first — an evicted entry may resend, which the ADR
+/// accepts, and the bound keeps a long-running bot from accumulating one entry
+/// per file it ever sent.
+pub(crate) const FILE_MESSAGE_SENDS_CAP: usize = 1024;
 
 /// The process-local File Message once-guard (ADR-0076, #649): `(session_id,
 /// content hash)` entries whose File Message has already been sent, so a later
 /// poll never repeats it. Keyed by the Session as well as the bytes — the
 /// message is replied under one Session's live card, so the same bytes read by
-/// another Session still gets its own. A cola restart may resend (accepted).
-pub(crate) type FileMessageSends = Arc<Mutex<std::collections::HashSet<(String, u64)>>>;
+/// another Session still gets its own. The inner `OnceCell` is the single-flight
+/// guard for the SEND, exactly like [`FileImageCache`]'s for the upload: two
+/// concurrent resolvers of one key await ONE send attempt instead of both
+/// missing the guard and posting duplicate File Messages. A failed send is
+/// cached too, so the attempt is made exactly once per key. Bounded by
+/// [`FILE_MESSAGE_SENDS_CAP`]; a cola restart may resend (accepted).
+pub(crate) type FileMessageSends = Arc<
+    Mutex<
+        IndexMap<(String, u64), Arc<tokio::sync::OnceCell<crate::feishu::card::tool_render::FileDelivery>>>,
+    >,
+>;
 
 /// The live cards, the card-handle registry, the per-session card-write locks,
 /// the topic cover records, and the platform that sends them.
@@ -872,7 +893,8 @@ pub(crate) struct CardsHandle {
     pub(crate) file_uploads: FileUploadCache,
     /// The process-local File Message once-guard (ADR-0076, #649): the
     /// `(session_id, content hash)` entries whose File Message already went out,
-    /// so a later poll never sends a second one.
+    /// so a later poll never sends a second one. Single-flight and bounded (see
+    /// [`FileMessageSends`]).
     pub(crate) file_messages_sent: FileMessageSends,
 }
 
