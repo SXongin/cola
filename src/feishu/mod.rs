@@ -208,19 +208,18 @@ pub trait Platform: Send + Sync {
 
     /// Send a message of an arbitrary `msg_type` as a reply under `message_id`
     /// (ADR-0076): the send path for a File Message (`msg_type:"file"`,
-    /// `content` `{"file_key": …}`). `reply_in_thread` selects the reply mode —
-    /// `true` for a topic-backed Session (the File Message lands in the
-    /// Session's own topic), `false` for a lobby (a plain reply under the card,
-    /// creating no topic — a thread reply there would spawn one and fork the
-    /// conversation; ADR-0076's amendment). Returns the created message id and
-    /// the topic's `thread_id` (`None` for a plain reply, or when the chat does
-    /// not support topic replies). Best-effort at the call site.
+    /// `content` `{"file_key": …}`). The body OMITS `reply_in_thread`, so Feishu
+    /// keeps the reply in the target card's own container — the Session's topic
+    /// when the card is already threaded, a plain reply that creates no topic
+    /// otherwise (ADR-0076's amendment; a thread reply in a lobby would spawn a
+    /// new topic and fork the conversation). Returns the created message id and
+    /// the topic's `thread_id` (`None` when the reply created no topic, or when
+    /// the chat does not support topic replies). Best-effort at the call site.
     async fn reply_message(
         &self,
         message_id: &str,
         msg_type: &str,
         content: &Value,
-        reply_in_thread: bool,
     ) -> Result<(String, Option<String>)>;
 
     /// Download an image embedded in a message (`GET /im/v1/messages/{id}/resources/{key}?type=image`),
@@ -430,9 +429,8 @@ impl Platform for Client {
         message_id: &str,
         msg_type: &str,
         content: &Value,
-        reply_in_thread: bool,
     ) -> Result<(String, Option<String>)> {
-        Client::reply_message(self, message_id, msg_type, content, reply_in_thread).await
+        Client::reply_message(self, message_id, msg_type, content).await
     }
 
     async fn download_image(&self, message_id: &str, image_key: &str) -> Result<client::ImageAttachment> {
