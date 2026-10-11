@@ -1792,6 +1792,21 @@ impl Platform for CardDelivery {
         self.inner.upload_image(content).await
     }
 
+    async fn upload_file(&self, content: &crate::backend::FileContent) -> Result<Option<String>> {
+        self.inner.upload_file(content).await
+    }
+
+    async fn send_message_in_thread(
+        &self,
+        message_id: &str,
+        msg_type: &str,
+        content: &Value,
+    ) -> Result<(String, Option<String>)> {
+        self.inner
+            .send_message_in_thread(message_id, msg_type, content)
+            .await
+    }
+
     async fn download_image(&self, message_id: &str, image_key: &str) -> Result<ImageAttachment> {
         self.inner.download_image(message_id, image_key).await
     }
@@ -2138,6 +2153,17 @@ mod tests {
             unimplemented!("not used")
         }
         async fn upload_image(&self, _content: &crate::backend::FileContent) -> Result<Option<String>> {
+            unimplemented!("not used")
+        }
+        async fn upload_file(&self, _content: &crate::backend::FileContent) -> Result<Option<String>> {
+            unimplemented!("not used")
+        }
+        async fn send_message_in_thread(
+            &self,
+            _message_id: &str,
+            _msg_type: &str,
+            _content: &Value,
+        ) -> Result<(String, Option<String>)> {
             unimplemented!("not used")
         }
         async fn download_image(&self, _message_id: &str, _image_key: &str) -> Result<ImageAttachment> {

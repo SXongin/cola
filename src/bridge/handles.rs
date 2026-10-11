@@ -796,6 +796,21 @@ impl SessionsHandle {
 /// bytes upload once whichever Session or card renders them.
 pub(crate) type FileImageCache = Arc<Mutex<HashMap<u64, Arc<tokio::sync::OnceCell<Option<String>>>>>>;
 
+/// The process-local File Content **file** cache (ADR-0076, #649): a content
+/// hash maps to the single-flight resolution of that content as a File Message.
+/// The inner cell holds `Some(file_key)` for a deliverable file or `None` for a
+/// content past Feishu's 30MB message cap. Single-flight like
+/// [`FileImageCache`]: identical bytes upload once, whichever Session renders
+/// them.
+pub(crate) type FileUploadCache = Arc<Mutex<HashMap<u64, Arc<tokio::sync::OnceCell<Option<String>>>>>>;
+
+/// The process-local File Message once-guard (ADR-0076, #649): `(session_id,
+/// content hash)` entries whose File Message has already been sent, so a later
+/// poll never repeats it. Keyed by the Session as well as the bytes — the
+/// message is replied under one Session's live card, so the same bytes read by
+/// another Session still gets its own. A cola restart may resend (accepted).
+pub(crate) type FileMessageSends = Arc<Mutex<std::collections::HashSet<(String, u64)>>>;
+
 /// The live cards, the card-handle registry, the per-session card-write locks,
 /// the topic cover records, and the platform that sends them.
 ///
@@ -851,6 +866,14 @@ pub(crate) struct CardsHandle {
     /// embedded / `None` not an embeddable image. Shared with the whole process
     /// so identical bytes upload once, whichever Session or card renders them.
     pub(crate) file_images: FileImageCache,
+    /// The process-local File Content file cache (ADR-0076, #649):
+    /// `content hash → the single-flight resolution` — an `OnceCell` holding
+    /// `Some(file_key)` deliverable / `None` past Feishu's 30MB cap.
+    pub(crate) file_uploads: FileUploadCache,
+    /// The process-local File Message once-guard (ADR-0076, #649): the
+    /// `(session_id, content hash)` entries whose File Message already went out,
+    /// so a later poll never sends a second one.
+    pub(crate) file_messages_sent: FileMessageSends,
 }
 
 impl CardsHandle {
@@ -864,6 +887,8 @@ impl CardsHandle {
         write_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
         preserved_view_timeout_ms: Arc<std::sync::atomic::AtomicU64>,
         file_images: FileImageCache,
+        file_uploads: FileUploadCache,
+        file_messages_sent: FileMessageSends,
     ) -> Self {
         Self {
             cards,
@@ -874,6 +899,8 @@ impl CardsHandle {
             write_locks,
             preserved_view_timeout_ms,
             file_images,
+            file_uploads,
+            file_messages_sent,
         }
     }
 
