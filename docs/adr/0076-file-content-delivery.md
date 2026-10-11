@@ -135,10 +135,17 @@ say nothing.
 name — the basename, folded to one printable line and clipped to its tail within
 the header's character budget **only when the basename itself is long** — so a
 `read`'s `/root/workspace/dev/cola/target/acc/shot.png` renders `alt: shot.png`
-and `title: 📎 shot.png`, never the full absolute path and never a path fragment
-(`📎 …ola/target/acc/shot.png`). A client renders the title as the image's
-caption, where path fragments are noise. The size estimate follows the builder,
-so it charges the name's JSON-escaped bytes once per field, exactly what renders.
+and `title: 📎 shot.png`: for a name that has a basename segment, the full
+absolute path and any path fragment (`📎 …ola/target/acc/shot.png`) never render.
+A client renders the title as the image's caption, where path fragments are
+noise. The size estimate follows the builder, so it charges the name's
+JSON-escaped bytes once per field, exactly what renders.
+
+The basename rule has one exception. `header_name_basename` returns `None` when
+the folded name ends in a separator and so has no basename segment — `foo/`,
+`dir/sub/`, `/` — and `header_file_name` then falls back to the whole folded
+name, directories and all, clipped to its tail within the same budget. Such a
+name renders its path (`alt: dir/sub/`), not a basename.
 
 ## Amendment (2026-10-11): the folded panel header carries the file marker
 
@@ -159,20 +166,32 @@ Content delivered `SentAsFile` or `Undelivered`, and it names only those files:
   after its final `/` or `\`), clipped to its **tail** within a short character
   budget **only when the basename itself is long** — a leading `…` plus the last
   characters, the `…` counted against the budget, so a long FILE name keeps its
-  extension. A long absolute PATH is reduced to its basename first, so its
-  directories never spend the budget and never render;
+  extension. An ordinary path is reduced to its basename first, so its
+  directories never spend the budget and never render; a name with no basename
+  segment (`dir/sub/`, `/`) falls back to the whole folded name, as the amendment
+  above records;
 - several — ` · 📎 <N> 个文件`, `N` the number of such files (not the panel's
   whole file count);
 - and ` · 未发送` appended when ANY of them is undelivered, so the one state that
   must never be missed is on the header itself.
 
 A panel whose files are ALL `Embedded` (or unresolved) carries **no marker at
-all**: its header is byte-for-byte the plain one. `SentAsFile` adds no state
-beyond the name — the File Message is a visible message of its own — while
-`Undelivered` is exactly the case the marker exists for. The body's detailed
-tracking line is unchanged for every file — the header is the folded summary, the
-body remains the record. The header title is card JSON, so the card-size estimate
-charges the marker's JSON-escaped bytes exactly as it charges the body line.
+all**: its header is byte-for-byte the plain one. The marker names every file the
+card does not show — `SentAsFile` (a visible File Message of its own) as well as
+`Undelivered` — and `Undelivered` additionally appends ` · 未发送`, the state
+that must never be invisible. The body's detailed tracking line is unchanged for
+every file — the header is the folded summary, the body remains the record. The
+header title is card JSON, so the card-size estimate charges the marker's
+JSON-escaped bytes exactly as it charges the body line.
+
+Three bounds are accepted. An `Unresolved` file does not mark the header, so a
+File Message that resolves before the card has a reply target shows a plain
+header on the first write and gains its marker on a later poll — a transient
+flicker, never a persistently hidden `未发送`. Two files whose basenames collide
+are indistinguishable in the marker and the caption, while the panel body's
+tracking line keeps the full path. And `alt` is the hover description in Feishu's
+own model, so a desktop client can show the basename on hover in addition to the
+`title` caption.
 
 ## Why
 
