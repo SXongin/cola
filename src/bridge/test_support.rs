@@ -1090,6 +1090,11 @@ impl feishu::Platform for RecordingPlatform {
                 "simulated upload_file failure".into(),
             ));
         }
+        // A test may park the upload (the stale-panel test): signal entry, then
+        // hold until released, so the panel can be replaced mid-upload.
+        if let Some(gate) = self.take_gate("upload_file", "") {
+            wait_gate(gate).await;
+        }
         self.calls.lock().await.push(PlatformCall::UploadFile {
             name: content.name.clone(),
             size: content.size,
@@ -1113,6 +1118,12 @@ impl feishu::Platform for RecordingPlatform {
             return Err(crate::error::BridgeError::Feishu(
                 "simulated send_message failure".into(),
             ));
+        }
+        // A test may park the send (the once-guard's single-flight tests):
+        // signal entry, then hold until released, so a concurrent resolver is
+        // forced to await it.
+        if let Some(gate) = self.take_gate("send_message", message_id) {
+            wait_gate(gate).await;
         }
         self.calls.lock().await.push(PlatformCall::SendMessageInThread {
             message_id: message_id.into(),
