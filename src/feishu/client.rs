@@ -852,6 +852,94 @@ impl Client {
             crate::error::BridgeError::Feishu(format!("upload image missing image_key — body: {text}"))
         })
     }
+
+    /// Upload a file to Feishu (`POST /open-apis/im/v1/files`, multipart
+    /// `file_type` + `file_name` + the bytes, scope `im:resource`), returning
+    /// the reusable `file_key` a `msg_type:"file"` message references
+    /// (ADR-0076). The multipart body is hand-built like
+    /// [`Self::upload_image`]'s: cola's reqwest has no `multipart` feature, and
+    /// the shape is three parts, so no new dependency is worth it.
+    pub async fn upload_file(
+        &self,
+        bytes: &[u8],
+        file_type: &str,
+        file_name: &str,
+    ) -> crate::error::Result<String> {
+        let token = self.get_access_token().await?;
+        let body = file_upload_body(FILE_UPLOAD_BOUNDARY, file_type, file_name, bytes);
+        let text = read_body_with_diag(
+            self.http
+                .post(self.endpoint("/open-apis/im/v1/files"))
+                .bearer_auth(&token)
+                .header(
+                    reqwest::header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={FILE_UPLOAD_BOUNDARY}"),
+                )
+                .body(body)
+                // Bound the transfer like the client's other byte-carrying calls
+                // (`upload_image`, `download_image`): a stalled upload must never
+                // hold up the render pass or the poll loop that awaits it.
+                .timeout(std::time::Duration::from_secs(10))
+                .send()
+                .await?,
+            "upload file",
+        )
+        .await?;
+        let resp: FileUploadResponse = parse_json(&text, "upload file response")?;
+
+        if resp.code != 0 {
+            return Err(api_error(
+                &format!("upload file error {}", resp.code),
+                i64::from(resp.code),
+                &resp.msg,
+            ));
+        }
+        resp.data.file_key.filter(|key| !key.is_empty()).ok_or_else(|| {
+            crate::error::BridgeError::Feishu(format!("upload file missing file_key — body: {text}"))
+        })
+    }
+
+    /// Send a message of an arbitrary `msg_type` replied **in thread**
+    /// (`reply_in_thread: true`) under `message_id` (ADR-0076): the send path
+    /// for a File Message (`msg_type:"file"`, `content` `{"file_key": …}`).
+    /// Returns the created message id and the topic's `thread_id`, exactly like
+    /// [`Self::reply_card_in_thread`] (`thread_id` is `None` when the chat does
+    /// not support topic replies).
+    pub async fn send_message_in_thread(
+        &self,
+        message_id: &str,
+        msg_type: &str,
+        content: &serde_json::Value,
+    ) -> crate::error::Result<(String, Option<String>)> {
+        let token = self.get_access_token().await?;
+        let body = serde_json::json!({
+            "msg_type": msg_type,
+            "reply_in_thread": true,
+            "content": content.to_string(),
+        });
+
+        let text = read_body_with_diag(
+            self.http
+                .post(self.endpoint(&format!("/open-apis/im/v1/messages/{message_id}/reply")))
+                .bearer_auth(&token)
+                .json(&body)
+                .send()
+                .await?,
+            "send message in thread",
+        )
+        .await?;
+        let resp: MessageResponse = parse_json(&text, "send message in thread response")?;
+
+        if resp.code != 0 {
+            Err(api_error(
+                &format!("send message in thread error {}", resp.code),
+                i64::from(resp.code),
+                &resp.msg,
+            ))
+        } else {
+            Ok((resp.data.message_id, resp.data.thread_id))
+        }
+    }
 }
 
 /// The boundary token for the hand-built image-upload body (see
@@ -870,6 +958,35 @@ fn image_upload_body(boundary: &str, mime: &str, bytes: &[u8]) -> Vec<u8> {
     body.extend_from_slice(
         format!(
             "--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"image\"\r\nContent-Type: {mime}\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(bytes);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    body
+}
+
+/// The boundary token for the hand-built file-upload body (see
+/// [`Client::upload_file`]).
+const FILE_UPLOAD_BOUNDARY: &str = "----colaFileBoundary";
+
+/// The `multipart/form-data` body Feishu's file upload expects: the
+/// `file_type` and `file_name` parts, then the file part carrying `bytes`
+/// under `file_name`. `\r\n` line endings and the closing `--boundary--` are
+/// per RFC 7578.
+fn file_upload_body(boundary: &str, file_type: &str, file_name: &str, bytes: &[u8]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(bytes.len() + 320);
+    body.extend_from_slice(
+        format!("--{boundary}\r\nContent-Disposition: form-data; name=\"file_type\"\r\n\r\n{file_type}\r\n")
+            .as_bytes(),
+    );
+    body.extend_from_slice(
+        format!("--{boundary}\r\nContent-Disposition: form-data; name=\"file_name\"\r\n\r\n{file_name}\r\n")
+            .as_bytes(),
+    );
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{file_name}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
         )
         .as_bytes(),
     );
@@ -950,6 +1067,22 @@ struct ImageUploadResponse {
 struct ImageUploadData {
     #[serde(default)]
     image_key: Option<String>,
+}
+
+/// Feishu's file-upload answer (`POST /open-apis/im/v1/files`): the reusable
+/// `file_key` under `data`.
+#[derive(Debug, Deserialize)]
+struct FileUploadResponse {
+    code: i32,
+    msg: String,
+    #[serde(default)]
+    data: FileUploadData,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FileUploadData {
+    #[serde(default)]
+    file_key: Option<String>,
 }
 
 /// A message returned by `list_messages` — the newest-first page
@@ -1899,6 +2032,173 @@ mod tests {
         let message = feishu_error(client.upload_image(b"PNGDATA", "image/png").await.unwrap_err());
         assert!(
             message.contains("missing image_key"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_file_posts_the_multipart_fields_and_returns_the_key() {
+        let (server, client) = wire_client().await;
+        server.route(
+            "POST",
+            "/open-apis/im/v1/files",
+            200,
+            r#"{"code":0,"msg":"ok","data":{"file_key":"file_v2_abc"}}"#,
+        );
+
+        assert_eq!(
+            client
+                .upload_file(b"%PDFDATA", "pdf", "report.pdf")
+                .await
+                .unwrap(),
+            "file_v2_abc"
+        );
+
+        let request = last_request(&server);
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/open-apis/im/v1/files");
+        assert_eq!(request.header("authorization"), Some("Bearer t-abc"));
+        let content_type = request.header("content-type").unwrap_or_default();
+        assert!(
+            content_type.starts_with("multipart/form-data; boundary="),
+            "the body must be multipart: {content_type}"
+        );
+        let body = &request.body;
+        assert!(
+            body.contains("name=\"file_type\""),
+            "the file_type part is present: {body}"
+        );
+        assert!(body.contains("\r\n\r\npdf\r\n"), "file_type=pdf: {body}");
+        assert!(
+            body.contains("name=\"file_name\""),
+            "the file_name part is present: {body}"
+        );
+        assert!(body.contains("\r\n\r\nreport.pdf\r\n"), "file_name: {body}");
+        assert!(
+            body.contains("name=\"file\"; filename=\"report.pdf\""),
+            "the file part carries the name: {body}"
+        );
+        assert!(body.contains("%PDFDATA"), "the part carries the bytes: {body}");
+        assert!(body.ends_with("--\r\n"), "the body closes the multipart: {body}");
+    }
+
+    /// A stalled file upload is bounded by the client's 10s request timeout,
+    /// like `upload_image`/`download_image`: otherwise the render pass that
+    /// awaits it hangs on a wedged Feishu. The mock server hangs for 60s under
+    /// a paused clock, so the 10s timeout fires first with no wall-clock wait.
+    #[tokio::test(start_paused = true)]
+    async fn upload_file_gives_up_on_a_hung_server() {
+        let (server, client) = wire_client().await;
+        server.route_delayed(
+            "POST",
+            "/open-apis/im/v1/files",
+            200,
+            r#"{"code":0,"msg":"ok","data":{"file_key":"file_v2_abc"}}"#,
+            std::time::Duration::from_secs(60),
+        );
+
+        let err = client
+            .upload_file(b"%PDFDATA", "pdf", "report.pdf")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::error::BridgeError::Http(ref e) if e.is_timeout()),
+            "the upload must time out, not hang: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_file_maps_a_business_error() {
+        let (server, client) = wire_client().await;
+        server.route(
+            "POST",
+            "/open-apis/im/v1/files",
+            200,
+            r#"{"code":40004,"msg":"invalid file"}"#,
+        );
+
+        let message = feishu_error(client.upload_file(b"junk", "stream", "blob").await.unwrap_err());
+        assert!(
+            message.contains("upload file error 40004"),
+            "unexpected error: {message}"
+        );
+        assert!(message.contains("invalid file"), "unexpected error: {message}");
+    }
+
+    #[tokio::test]
+    async fn upload_file_reports_a_missing_key() {
+        let (server, client) = wire_client().await;
+        server.route(
+            "POST",
+            "/open-apis/im/v1/files",
+            200,
+            r#"{"code":0,"msg":"ok","data":{}}"#,
+        );
+
+        let message = feishu_error(
+            client
+                .upload_file(b"%PDFDATA", "pdf", "report.pdf")
+                .await
+                .unwrap_err(),
+        );
+        assert!(
+            message.contains("missing file_key"),
+            "unexpected error: {message}"
+        );
+    }
+
+    /// A File Message is a reply sent in thread form: `msg_type:"file"` with
+    /// `content` `{"file_key": …}`, `reply_in_thread: true` (ADR-0076).
+    #[tokio::test]
+    async fn send_message_in_thread_sends_file_content_in_thread() {
+        let (server, client) = wire_client().await;
+        server.route(
+            "POST",
+            "/open-apis/im/v1/messages/om_card/reply",
+            200,
+            r#"{"code":0,"msg":"ok","data":{"message_id":"om_file","thread_id":"omt_file"}}"#,
+        );
+        let content = serde_json::json!({ "file_key": "file_v2_abc" });
+
+        let (id, thread_id) = client
+            .send_message_in_thread("om_card", "file", &content)
+            .await
+            .unwrap();
+        assert_eq!(id, "om_file");
+        assert_eq!(thread_id.as_deref(), Some("omt_file"));
+
+        let request = last_request(&server);
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/open-apis/im/v1/messages/om_card/reply");
+        assert_eq!(request.header("authorization"), Some("Bearer t-abc"));
+        let body = body_json(&request);
+        assert_eq!(body["msg_type"], "file");
+        assert_eq!(body["reply_in_thread"], true);
+        assert_eq!(send_content(&request)["file_key"], "file_v2_abc");
+    }
+
+    #[tokio::test]
+    async fn send_message_in_thread_maps_a_business_error() {
+        let (server, client) = wire_client().await;
+        server.route(
+            "POST",
+            "/open-apis/im/v1/messages/om_card/reply",
+            200,
+            r#"{"code":230002,"msg":"file key invalid","data":{"message_id":""}}"#,
+        );
+
+        let message = feishu_error(
+            client
+                .send_message_in_thread("om_card", "file", &serde_json::json!({}))
+                .await
+                .unwrap_err(),
+        );
+        assert!(
+            message.contains("send message in thread error 230002"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("file key invalid"),
             "unexpected error: {message}"
         );
     }

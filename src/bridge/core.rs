@@ -220,6 +220,14 @@ pub struct SharedCore {
     /// upload is cheap to repeat after a restart, and a stale key would be
     /// worse.
     pub file_images: crate::bridge::handles::FileImageCache,
+    /// The process-local File Content file cache (ADR-0076, #649): a content
+    /// hash → the single-flight resolution of that content as a File Message
+    /// (`Some(file_key)` deliverable, `None` past Feishu's 30MB cap).
+    pub file_uploads: crate::bridge::handles::FileUploadCache,
+    /// The process-local File Message once-guard (ADR-0076, #649): the
+    /// `(session_id, content hash)` entries whose File Message already went out,
+    /// so a later poll never sends a second one.
+    pub file_messages_sent: crate::bridge::handles::FileMessageSends,
 }
 
 impl SharedCore {
@@ -316,6 +324,8 @@ impl SharedCore {
             preserved_view_timeout_ms: Arc::new(std::sync::atomic::AtomicU64::new(30_000)),
             runtime_reconcile: Arc::new(crate::bridge::runtime::RuntimeReconcile::new()),
             file_images: Arc::new(Mutex::new(HashMap::new())),
+            file_uploads: Arc::new(Mutex::new(HashMap::new())),
+            file_messages_sent: Arc::new(Mutex::new(std::collections::HashSet::new())),
         })
     }
 
@@ -407,6 +417,8 @@ impl SharedCore {
             Arc::clone(&self.card_write_locks),
             Arc::clone(&self.preserved_view_timeout_ms),
             Arc::clone(&self.file_images),
+            Arc::clone(&self.file_uploads),
+            Arc::clone(&self.file_messages_sent),
         )
     }
 

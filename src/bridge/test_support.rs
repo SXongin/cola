@@ -275,6 +275,20 @@ pub enum PlatformCall {
         mime: String,
         size: u64,
     },
+    /// A file upload (ADR-0076, #649): the File Content's name and decoded
+    /// length, recorded so a test can assert how many file uploads a turn made.
+    UploadFile {
+        name: String,
+        size: u64,
+    },
+    /// A generic in-thread message send (ADR-0076, #649): the live card it
+    /// replied under and the `msg_type`/`content` it carried — the File Message
+    /// path records `msg_type:"file"` with `{"file_key": …}`.
+    SendMessageInThread {
+        message_id: String,
+        msg_type: String,
+        content: serde_json::Value,
+    },
 }
 
 /// A one-shot gate on one platform call, so a test can freeze a card write
@@ -394,6 +408,16 @@ pub struct RecordingPlatform {
     /// answers `Ok(None)` for — so a test can assert the bridge asks the
     /// platform at most once for a content it has already decided.
     pub upload_image_calls: std::sync::atomic::AtomicUsize,
+    /// The `file_key` `upload_file` returns (ADR-0076, #649).
+    pub file_key: std::sync::Mutex<String>,
+    /// The next N `upload_file` calls fail with a Feishu error after recording
+    /// nothing (tests the best-effort path: a failed file upload leaves the
+    /// card intact and never fails the Turn).
+    pub fail_upload_file_count: std::sync::atomic::AtomicUsize,
+    /// The next N `send_message_in_thread` calls fail with a Feishu error (tests
+    /// that a File Message failure degrades to `未发送` and never blocks the
+    /// card).
+    pub fail_send_message_count: std::sync::atomic::AtomicUsize,
 }
 
 impl RecordingPlatform {
@@ -423,6 +447,9 @@ impl RecordingPlatform {
             image_key: std::sync::Mutex::new("img_test".into()),
             fail_upload_image_count: std::sync::atomic::AtomicUsize::new(0),
             upload_image_calls: std::sync::atomic::AtomicUsize::new(0),
+            file_key: std::sync::Mutex::new("file_test".into()),
+            fail_upload_file_count: std::sync::atomic::AtomicUsize::new(0),
+            fail_send_message_count: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -442,6 +469,11 @@ impl RecordingPlatform {
     /// Set the `image_key` every `upload_image` returns (ADR-0076).
     pub fn given_image_key(&self, key: &str) {
         *self.image_key.lock().unwrap() = key.to_string();
+    }
+
+    /// Set the `file_key` every `upload_file` returns (ADR-0076, #649).
+    pub fn given_file_key(&self, key: &str) {
+        *self.file_key.lock().unwrap() = key.to_string();
     }
 
     /// Queue the next `reply_card` call's outcome; a failed send is not
@@ -1036,6 +1068,58 @@ impl feishu::Platform for RecordingPlatform {
             size: content.size,
         });
         Ok(Some(self.image_key.lock().unwrap().clone()))
+    }
+
+    async fn upload_file(
+        &self,
+        content: &crate::backend::FileContent,
+    ) -> crate::error::Result<Option<String>> {
+        // The same production cap the real platform applies, so a bridge test's
+        // routing (a PDF delivers, a >30MB file does not) is the real decision.
+        if !crate::feishu::file::deliverable_file(content) {
+            return Ok(None);
+        }
+        if self
+            .fail_upload_file_count
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0
+        {
+            self.fail_upload_file_count
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            return Err(crate::error::BridgeError::Feishu(
+                "simulated upload_file failure".into(),
+            ));
+        }
+        self.calls.lock().await.push(PlatformCall::UploadFile {
+            name: content.name.clone(),
+            size: content.size,
+        });
+        Ok(Some(self.file_key.lock().unwrap().clone()))
+    }
+
+    async fn send_message_in_thread(
+        &self,
+        message_id: &str,
+        msg_type: &str,
+        content: &serde_json::Value,
+    ) -> crate::error::Result<(String, Option<String>)> {
+        if self
+            .fail_send_message_count
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0
+        {
+            self.fail_send_message_count
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            return Err(crate::error::BridgeError::Feishu(
+                "simulated send_message failure".into(),
+            ));
+        }
+        self.calls.lock().await.push(PlatformCall::SendMessageInThread {
+            message_id: message_id.into(),
+            msg_type: msg_type.into(),
+            content: content.clone(),
+        });
+        Ok(("msg_file".into(), Some("omt_file".into())))
     }
 }
 

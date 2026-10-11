@@ -47,8 +47,9 @@ pub struct ToolFile {
 
 /// A File Content's card delivery (ADR-0076). Exactly one per File Content; the
 /// card build renders the line and image from it instead of re-deriving
-/// anything. Ticket #649 extends the enum with the File Message states
-/// (`已发送为文件消息` / `未发送`).
+/// anything. A content that cannot be embedded is delivered as a File Message
+/// (#649): `SentAsFile` when the message went out, `Undelivered` when it could
+/// not be — over Feishu's 30MB cap, or a failed upload/send.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileDelivery {
     /// The render path has not resolved this content yet. A card built before
@@ -58,10 +59,13 @@ pub enum FileDelivery {
     /// immediately after its Tool Panel: the reusable `image_key` the `img`
     /// element references. The panel line reads `· 已内嵌`.
     Embedded { image_key: String },
-    /// Considered with no card surface in this build: a non-image, or an image
-    /// past Feishu's caps. Renders the bare tracking line. Ticket #649 replaces
-    /// this with its File Message deliver-or-not states.
-    NoSurface,
+    /// A File Content uploaded once and posted as exactly one File Message
+    /// replied in-thread under the live card (#649). The panel line reads
+    /// `· 已发送为文件消息`.
+    SentAsFile,
+    /// A File Content that could not be delivered: over Feishu's 30MB message
+    /// cap, or a failed upload/send. The panel line reads `· 未发送`.
+    Undelivered,
 }
 
 impl FileDelivery {
@@ -69,7 +73,7 @@ impl FileDelivery {
     fn as_embedded_key(&self) -> Option<&str> {
         match self {
             FileDelivery::Embedded { image_key } => Some(image_key),
-            FileDelivery::Unresolved | FileDelivery::NoSurface => None,
+            FileDelivery::Unresolved | FileDelivery::SentAsFile | FileDelivery::Undelivered => None,
         }
     }
 }
@@ -581,8 +585,8 @@ enum BodyStyle {
 /// The tracking block a Tool Panel appends for its File Contents (ADR-0076):
 /// one line per file — `content.record_line()` plus the resolved delivery's
 /// state — so a file the panel read stops being invisible. `None` when the call
-/// carries no File Content. Extensible: ticket #649 adds the File Message
-/// states to the delivery arm.
+/// carries no File Content: `· 已内嵌` for an embedded image, `· 已发送为文件消息`
+/// for one delivered as a File Message, `· 未发送` for one that could not be.
 fn file_tracking_block(tool: &ToolPanel) -> Option<String> {
     if tool.files().is_empty() {
         return None;
@@ -592,7 +596,9 @@ fn file_tracking_block(tool: &ToolPanel) -> Option<String> {
             .iter()
             .map(|file| match &file.delivery {
                 FileDelivery::Embedded { .. } => format!("{} · 已内嵌", file.content.record_line()),
-                FileDelivery::Unresolved | FileDelivery::NoSurface => file.content.record_line(),
+                FileDelivery::SentAsFile => format!("{} · 已发送为文件消息", file.content.record_line()),
+                FileDelivery::Undelivered => format!("{} · 未发送", file.content.record_line()),
+                FileDelivery::Unresolved => file.content.record_line(),
             })
             .collect::<Vec<_>>()
             .join("\n"),
@@ -601,9 +607,10 @@ fn file_tracking_block(tool: &ToolPanel) -> Option<String> {
 
 /// The byte length of the tracking block [`file_tracking_block`] appends to a
 /// panel body (ADR-0076), for a card-size estimate that must charge the same
-/// bytes the renderer writes — the record line plus the `· 已内嵌` suffix an
-/// embedded content adds. `0` when the panel carries no File Content. Kept
-/// beside the render so the two cannot drift.
+/// bytes the renderer writes — the record line plus the `· 已内嵌` /
+/// `· 已发送为文件消息` / `· 未发送` suffix the resolved delivery adds. `0` when
+/// the panel carries no File Content. Kept beside the render so the two cannot
+/// drift.
 ///
 /// The block is charged at its **serialized** size, not its raw UTF-8 length:
 /// it is markdown-sanitized by the card's own [`CardMarkdown::element`] (which
@@ -1772,11 +1779,12 @@ mod tests {
         );
     }
 
-    /// A File Content with no embed this build (a non-image, or an upload that
-    /// failed) keeps the bare tracking line and emits NO `img` element.
+    /// A File Content with no embed — a non-image, or an image the upload could
+    /// not embed — keeps the bare record line with the `· 未发送` state and
+    /// emits NO `img` element.
     #[test]
-    fn a_file_content_without_an_embed_renders_only_its_line() {
-        let panel = read_panel("doc.pdf", "application/pdf", b"%PDF", FileDelivery::NoSurface);
+    fn an_undelivered_file_content_renders_only_its_unsent_line() {
+        let panel = read_panel("doc.pdf", "application/pdf", b"%PDF", FileDelivery::Undelivered);
         let card = CardBuilder::new()
             .with_state(CardState::Done)
             .with_tool(panel)
@@ -1784,8 +1792,51 @@ mod tests {
         let elements = card["body"]["elements"].as_array().unwrap();
         assert_eq!(elements.len(), 1, "no image element: {card}");
         let body = elements[0]["elements"][0]["content"].as_str().unwrap();
-        assert!(body.contains("📎 doc.pdf · application/pdf · 4 B"), "{body}");
+        assert!(
+            body.contains("📎 doc.pdf · application/pdf · 4 B · 未发送"),
+            "{body}"
+        );
         assert!(!body.contains("已内嵌"), "{body}");
+    }
+
+    /// A File Content delivered as a File Message (#649) keeps the bare record
+    /// line with the `· 已发送为文件消息` state and emits NO `img` element: the
+    /// bytes live in a separate message, not on the card.
+    #[test]
+    fn a_file_message_content_renders_its_sent_line_and_no_image() {
+        let panel = read_panel("doc.pdf", "application/pdf", b"%PDF", FileDelivery::SentAsFile);
+        let card = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_tool(panel)
+            .build();
+        let elements = card["body"]["elements"].as_array().unwrap();
+        assert_eq!(elements.len(), 1, "no image element: {card}");
+        let body = elements[0]["elements"][0]["content"].as_str().unwrap();
+        assert!(
+            body.contains("📎 doc.pdf · application/pdf · 4 B · 已发送为文件消息"),
+            "{body}"
+        );
+        assert!(!body.contains("已内嵌"), "{body}");
+    }
+
+    /// The tracking-line size estimate charges the File Message suffixes too
+    /// (#649): the block is derived from the same render, so `· 已发送为文件消息`
+    /// and `· 未发送` cost their bytes exactly as `· 已内嵌` does.
+    #[test]
+    fn file_tracking_estimate_charges_the_file_message_suffixes() {
+        let line = |delivery: FileDelivery| {
+            let panel = read_panel("doc.pdf", "application/pdf", b"%PDF", delivery);
+            file_tracking_estimate(&panel)
+        };
+        let bare = line(FileDelivery::Unresolved);
+        assert!(
+            line(FileDelivery::SentAsFile) > bare,
+            "the 已发送为文件消息 suffix must be charged"
+        );
+        assert!(
+            line(FileDelivery::Undelivered) > bare,
+            "the 未发送 suffix must be charged"
+        );
     }
 
     /// The tracking-line size estimate must charge the block's JSON-ESCAPED
@@ -1798,7 +1849,7 @@ mod tests {
     #[test]
     fn file_tracking_estimate_charges_json_escaping() {
         let quotes = "\"".repeat(16_000);
-        let panel = read_panel(&quotes, "image/png", b"ABC", FileDelivery::NoSurface);
+        let panel = read_panel(&quotes, "image/png", b"ABC", FileDelivery::Undelivered);
         let raw = file_tracking_block(&panel).expect("the panel carries a tracking block");
         let estimate = file_tracking_estimate(&panel);
 
@@ -1820,7 +1871,7 @@ mod tests {
     #[test]
     fn file_tracking_estimate_charges_markdown_escaping() {
         let angles = "<".repeat(1_000);
-        let panel = read_panel(&angles, "image/png", b"ABC", FileDelivery::NoSurface);
+        let panel = read_panel(&angles, "image/png", b"ABC", FileDelivery::Undelivered);
         let raw = file_tracking_block(&panel).expect("the panel carries a tracking block");
         let estimate = file_tracking_estimate(&panel);
 

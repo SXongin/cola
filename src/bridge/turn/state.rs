@@ -3485,43 +3485,24 @@ impl StreamAccumulator {
         pending
     }
 
-    /// Attach a resolved image key to one tool panel's File Content (ADR-0076),
-    /// keyed by the content `expected_hash` the resolver uploaded. A no-op when
-    /// the accumulator no longer holds the call, or when the panel's file at
-    /// `index` is no longer that content — a panel the transcript replaced
-    /// while the upload was in flight must not have a different file marked
-    /// embedded with the old key.
-    pub(super) fn set_file_image_key(
+    /// Attach a resolved delivery to one tool panel's File Content (ADR-0076,
+    /// #649), keyed by the content `expected_hash` the resolver resolved. A
+    /// no-op when the accumulator no longer holds the call, or when the panel's
+    /// file at `index` is no longer that content — a panel the transcript
+    /// replaced while the resolution was in flight must not be marked with
+    /// another file's delivery.
+    pub(super) fn set_file_delivery(
         &mut self,
         call_id: &str,
         index: usize,
         expected_hash: u64,
-        image_key: &str,
+        delivery: &FileDelivery,
     ) {
         if let Some(panel) = self.tools.get_mut(call_id) {
             if panel_file_hash(panel, index) != Some(expected_hash) {
                 return;
             }
-            panel.set_file_delivery(
-                index,
-                FileDelivery::Embedded {
-                    image_key: image_key.to_string(),
-                },
-            );
-        }
-    }
-
-    /// Mark one tool panel's File Content considered with no card surface
-    /// (ADR-0076) — a non-image or an image past Feishu's caps — so it is not
-    /// re-examined on every later poll. Keyed by the content `expected_hash`,
-    /// like [`Self::set_file_image_key`], so a stale verdict cannot mark a
-    /// different file. A no-op for a call the accumulator no longer holds.
-    pub(super) fn set_file_no_surface(&mut self, call_id: &str, index: usize, expected_hash: u64) {
-        if let Some(panel) = self.tools.get_mut(call_id) {
-            if panel_file_hash(panel, index) != Some(expected_hash) {
-                return;
-            }
-            panel.set_file_delivery(index, FileDelivery::NoSurface);
+            panel.set_file_delivery(index, delivery.clone());
         }
     }
 
@@ -5361,9 +5342,9 @@ mod tests {
         assert!(acc.render_from > 0, "render_from must advance past the split");
     }
 
-    /// A resolved upload attaches by content hash, not by position (ADR-0076):
-    /// a panel the transcript replaced while the upload was in flight must not
-    /// have a different file at that index marked embedded with the old key.
+    /// A resolved delivery attaches by content hash, not by position (ADR-0076):
+    /// a panel the transcript replaced while the resolution was in flight must
+    /// not have a different file at that index marked with the stale delivery.
     #[test]
     fn stale_file_resolve_does_not_mark_a_different_file() {
         let mut acc = StreamAccumulator::new("test");
@@ -5375,8 +5356,8 @@ mod tests {
 
         // A resolve whose hash no longer matches the panel's file is ignored.
         let stale_hash = file_content_hash(b"OTHER");
-        acc.set_file_image_key("call_read", 0, stale_hash, "img_stale");
-        acc.set_file_no_surface("call_read", 0, stale_hash);
+        acc.set_file_delivery("call_read", 0, stale_hash, &FileDelivery::SentAsFile);
+        acc.set_file_delivery("call_read", 0, stale_hash, &FileDelivery::Undelivered);
         assert_eq!(
             acc.tools().get("call_read").unwrap().files()[0].delivery,
             FileDelivery::Unresolved,
@@ -5385,7 +5366,14 @@ mod tests {
 
         // The matching hash attaches as before.
         let live_hash = file_content_hash(b"ABC");
-        acc.set_file_image_key("call_read", 0, live_hash, "img_live");
+        acc.set_file_delivery(
+            "call_read",
+            0,
+            live_hash,
+            &FileDelivery::Embedded {
+                image_key: "img_live".into(),
+            },
+        );
         assert_eq!(
             acc.tools().get("call_read").unwrap().files()[0].delivery,
             FileDelivery::Embedded {
