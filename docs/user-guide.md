@@ -392,7 +392,7 @@ detailed help for any of these.
 | --- | --- |
 | `/dir <path> [name]` | Declare a new session rooted at `<path>` — created by the next message |
 | `/claim <code>` | Claim this cola as Host (private chat only; code from the startup log) |
-| `/dir` | Recent Directories card: pick a folder and declare a session there, or open it as a fresh topic (每行「建话题」= `/topic <dir>` 的免打字版) |
+| `/dir` | Recent Directories card: pick a folder and declare a session there, or open it as a fresh topic (每行「建话题」= `/topic <dir>` 的免打字版); its 📁 浏览目录 button opens a filesystem browser — drill into subdirectories, type a path (前往 browses it, 选择 declares it), toggle dot-directories, filter child names |
 | `/switch` | Session card: browse / search / adopt / new |
 | `/switch <kw>` | Switch to a session by name/dir/id (adopts foreign ones; no match opens the card pre-filtered) |
 | `/switch <id> [--force]` | Take over a session by id/title |
@@ -456,6 +456,17 @@ Notes:
   therefore means what cola knows, not what still exists on the server: a
   directory whose sessions were cleaned up can reappear. `/switch forget` and
   removing the thread are what drop a mapped directory.
+- The union only holds directories cola already knows; its 「📁 浏览目录」 button
+  opens the **Directory Browser** (ADR-0078), which reaches anything on the
+  machine: a clickable breadcrumb, drill-down rows (repos first, 📦-marked),
+  a 显示隐藏 toggle, a child-name filter, and a path form (前往 to browse a
+  typed path, 选择 to declare a session there — like `/dir <path>` without
+  leaving the card). ← 最近目录 returns. A path that no longer exists falls back
+  to its nearest existing ancestor; only directories that already exist can be
+  selected. **The browser has no path boundary** — it can reach any directory the
+  cola process can read, so when cola is in a group chat the card shows those
+  directory names to everyone in the chat (the Access List gates who may *click*,
+  not who may *read*). A bound is tracked in the issue tracker.
 - `/agent`, `/model`, `/think`, `/autoaccept` are **per-session** and apply from
   the next message, persisting across restarts. On OpenCode 2 the first three are
   durable session state — the pick is written to the session itself (`POST
