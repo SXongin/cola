@@ -2116,8 +2116,10 @@ impl App {
         }
     }
 
-    /// Handle a `/skill` picker row tap (spec #652, ticket #656): a row carries
-    /// the skill's exact id, and the tap dispatches it straight to
+    /// Handle a `/skill` picker card callback (#664): `op: "search"` and
+    /// `op: "page"` rebuild the card in place ([`Self::rebuild_skill_card`]);
+    /// anything else is a ROW TAP (spec #652, ticket #656): a row carries the
+    /// skill's exact id, and the tap dispatches it straight to
     /// [`Self::handle_skill_command`] — the same submit path a typed command
     /// takes, minus the text parse. The id is NOT round-tripped as
     /// `/skill <id>` text: V1's id IS the skill name, which can contain
@@ -2127,11 +2129,15 @@ impl App {
     /// the ack; the picker card stays put (the dedicated loaded-skill card
     /// replies under the ORIGINAL user message, spec #655), and the
     /// agent/autoaccept toasts already established that a picker does not
-    /// replace itself.
+    /// replace itself on a pick.
     async fn handle_skill_card_action(
         self: &Arc<Self>,
         value: &serde_json::Value,
     ) -> Option<CardActionResult> {
+        let op = value.get("op").and_then(|v| v.as_str()).unwrap_or("");
+        if op == "search" || op == "page" {
+            return Some(self.rebuild_skill_card(value).await);
+        }
         let id = value.get("value").and_then(|v| v.as_str()).unwrap_or("");
         if id.is_empty() {
             return None;
@@ -2143,7 +2149,7 @@ impl App {
         tokio::spawn(async move {
             // The Chat/Topic kind the picker was sent in: every button carries
             // it next to chat_id/thread_id, since a click has no chat_type of
-            // its own (see `build_skill_cards`).
+            // its own (see `build_skill_card`).
             let callback_string =
                 |key: &str| value.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string();
             let chat_id = callback_string("chat_id");
@@ -2166,7 +2172,7 @@ impl App {
             // The loaded-skill card (and the turn's card) must reply under the
             // ORIGINAL user message the picker was sent under, exactly like a
             // typed dispatch — not under the picker card. The picker's buttons
-            // carry that id (`reply_message_id`, see `build_skill_cards`); a card
+            // carry that id (`reply_message_id`, see `build_skill_card`); a card
             // built before that field existed falls back to the picker's own
             // message.
             let reply_to = {
@@ -2202,6 +2208,78 @@ impl App {
             card: None,
             toast: Some(toast),
         })
+    }
+
+    /// Rebuild the `/skill` picker card in place for an `op: "search"` /
+    /// `op: "page"` callback (#664). The filter (keyword, page) rides the button
+    /// payload (ADR-0052); the skill list is re-read from the server — unlike
+    /// `/dir`, which reads the local store — scoped to the Chat/Topic's project
+    /// directory. Best-effort: a failed read degrades to the no-skills state.
+    /// The `chat_type` + `reply_message_id` the picker carries ride back onto the
+    /// fresh rows, so a later tap still replies the loaded-skill card under the
+    /// ORIGINAL user message (spec #655). No Lazy Start here: a rebuild never
+    /// submits a prompt, and the ack must stay fast.
+    async fn rebuild_skill_card(self: &Arc<Self>, value: &serde_json::Value) -> CardActionResult {
+        let thread_key = thread_key_from_value(value);
+        let keyword = value
+            .get("keyword")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        // A missing/garbage page reads as 1; the builder clamps an out-of-range
+        // page to the last.
+        let page = value.get("page").and_then(|v| v.as_u64()).unwrap_or(1).max(1) as usize;
+        // The picker's own `chat_type`, absent only on the WS name-only
+        // form-submit fallback. Defaulting to "group" is inert for routing:
+        // `ConversationKind::thread_key` keys every non-topic kind on `chat_id`,
+        // and a real topic is recognised by its distinct `thread_id`, not the
+        // chat type — so the rebuilt rows route identically either way. Only the
+        // tap's reply target degrades (below), the accepted fallback shape.
+        let chat_type = value
+            .get("chat_type")
+            .and_then(|v| v.as_str())
+            .filter(|t| !t.is_empty())
+            .unwrap_or("group")
+            .to_string();
+        // The original user message the picker replied under; a card built
+        // before this field existed (or the name-only form-submit fallback)
+        // falls back to the picker card's own message.
+        let reply_message_id = value
+            .get("reply_message_id")
+            .and_then(|v| v.as_str())
+            .filter(|id| !id.is_empty())
+            .or_else(|| value.get("open_message_id").and_then(|v| v.as_str()))
+            .unwrap_or("")
+            .to_string();
+        let card = self
+            .build_skill_card_for(&thread_key, &keyword, page, &chat_type, &reply_message_id)
+            .await;
+        CardActionResult {
+            card: Some(card),
+            toast: None,
+        }
+    }
+
+    /// Read the skills for `thread_key`'s project directory, narrow them by
+    /// `keyword` (id / name / description), and window them to `page` (#664).
+    async fn build_skill_card_for(
+        self: &Arc<Self>,
+        thread_key: &ThreadKey,
+        keyword: &str,
+        page: usize,
+        chat_type: &str,
+        message_id: &str,
+    ) -> serde_json::Value {
+        let directory = self.command_handles().current_project_directory(thread_key).await;
+        let skills = self
+            .opencode
+            .list_skills((!directory.is_empty()).then_some(directory.as_str()))
+            .await;
+        let filtered = crate::feishu::card::picker::filter_skills(&skills, keyword);
+        crate::feishu::card::picker::build_skill_card(
+            thread_key, &filtered, keyword, page, chat_type, message_id, None,
+        )
     }
 
     /// Handle an `/autoaccept` toggle-card button: switch the flag and refresh

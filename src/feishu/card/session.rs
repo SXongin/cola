@@ -175,15 +175,19 @@ pub(super) fn page_window(total: usize, page: usize) -> PageWindow {
     }
 }
 
-/// The list cards' search form (`/switch`, `/dir` and `/sub`; ADR-0051,
-/// ADR-0052): an input + a submit button. The routing payload rides in the
-/// submit button's `name` (form submits don't always deliver the button
-/// `value`) and the typed keyword arrives as `form_value.search`. The submit
-/// name is `<prefix>|<chat>|<thread>` plus `|<scope>` when a scope rides
+/// The list cards' search form (`/switch`, `/dir`, `/sub` and the `/skill`
+/// picker; ADR-0051, ADR-0052): an input + a submit button. The routing payload
+/// rides in the submit button's `name` (form submits don't always deliver the
+/// button `value`) and the typed keyword arrives as `form_value.search`. The
+/// submit name is `<prefix>|<chat>|<thread>` plus `|<scope>` when a scope rides
 /// along; `default_value` echoes the active keyword (NOT `value`, the passback
 /// field) so a re-render never blanks the box — an empty result stays
-/// tweakable instead of a retype.
-fn search_form(
+/// tweakable instead of a retype. `extra_fields` ride the submit's `value`
+/// only — the `name` is length-bounded, so a card that needs more routing
+/// (`/skill`'s `chat_type`/`reply_message_id`) degrades on the name-only
+/// fallback rather than growing the name past Feishu's limit.
+#[allow(clippy::too_many_arguments)] // list-card builder: every knob is a first-class card axis
+pub(super) fn search_form(
     form_name: &str,
     submit_prefix: &str,
     action: &str,
@@ -191,6 +195,7 @@ fn search_form(
     scope: Option<SwitchScope>,
     placeholder: &str,
     keyword: &str,
+    extra_fields: &[(&str, &str)],
 ) -> serde_json::Value {
     let mut submit_name = format!("{submit_prefix}|{}|{}", thread_key.chat_id, thread_key.thread_id);
     let mut submit_value = json!({
@@ -203,6 +208,7 @@ fn search_form(
         submit_name.push_str(&format!("|{}", scope.as_str()));
         submit_value["scope"] = json!(scope.as_str());
     }
+    let submit_value = super::with_callback_field(submit_value, extra_fields);
     json!({
         "tag": "form",
         "name": form_name,
@@ -237,15 +243,16 @@ fn search_form(
     })
 }
 
-/// The three-column pagination control the list cards share (`/switch`, `/dir`
-/// and `/sub`; ADR-0052): a 上一页 button, the 「第 x/y 页 · 共 N 个」 indicator,
-/// and a 下一页 button. `page` is the already-clamped current page; the
-/// boundary buttons are `disabled` (never hidden, so the layout stays stable).
-/// Every button's value carries the routing payload plus the active filter
-/// (`keyword`, and `scope` when given) and the TARGET page, so a flip rebuilds
-/// the same filtered view. `None` when there is at most one page — the caller
-/// renders nothing.
-fn pager_element(
+/// The three-column pagination control the list cards share (`/switch`, `/dir`,
+/// `/sub` and the `/skill` picker; ADR-0052): a 上一页 button, the
+/// 「第 x/y 页 · 共 N 个」 indicator, and a 下一页 button. `page` is the
+/// already-clamped current page; the boundary buttons are `disabled` (never
+/// hidden, so the layout stays stable). Every button's value carries the
+/// routing payload plus the active filter (`keyword`, `scope` when given, and
+/// `extra_fields`) and the TARGET page, so a flip rebuilds the same filtered
+/// view. `None` when there is at most one page — the caller renders nothing.
+#[allow(clippy::too_many_arguments)] // list-card builder: every knob is a first-class card axis
+pub(super) fn pager_element(
     action: &str,
     thread_key: &crate::config::ThreadKey,
     keyword: &str,
@@ -253,6 +260,7 @@ fn pager_element(
     page: usize,
     total_pages: usize,
     total_items: usize,
+    extra_fields: &[(&str, &str)],
 ) -> Option<serde_json::Value> {
     if total_pages <= 1 {
         return None;
@@ -269,6 +277,7 @@ fn pager_element(
         if let Some(scope) = scope {
             value["scope"] = json!(scope.as_str());
         }
+        let value = super::with_callback_field(value, extra_fields);
         json!({
             "tag": "column",
             "width": "auto",
@@ -343,6 +352,7 @@ pub fn build_switch_card(
         Some(scope),
         "🔍 搜索标题 / 目录 / ID",
         keyword,
+        &[],
     ));
 
     // The scope toggle: in `Directory` view show 全部, in `All` view show
@@ -442,6 +452,7 @@ pub fn build_switch_card(
         page,
         window.total_pages,
         total,
+        &[],
     ) {
         elements.push(pager);
     }
@@ -572,6 +583,7 @@ pub fn build_child_card(
         None,
         "🔍 搜索标题 / 目录 / ID",
         keyword,
+        &[],
     ));
 
     // A conversation with no Active Session, an Active Session with no
@@ -612,6 +624,7 @@ pub fn build_child_card(
         window.page,
         window.total_pages,
         total,
+        &[],
     ) {
         elements.push(pager);
     }
@@ -738,6 +751,7 @@ pub fn build_dir_card(
             None,
             "🔍 搜索目录路径",
             keyword,
+            &[],
         ));
     }
 
@@ -775,7 +789,16 @@ pub fn build_dir_card(
     }
 
     // Pagination (ADR-0052) below the rows — the old overflow hints are gone.
-    if let Some(pager) = pager_element("dir", thread_key, keyword, None, page, window.total_pages, total) {
+    if let Some(pager) = pager_element(
+        "dir",
+        thread_key,
+        keyword,
+        None,
+        page,
+        window.total_pages,
+        total,
+        &[],
+    ) {
         elements.push(pager);
     }
 

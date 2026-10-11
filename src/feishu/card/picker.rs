@@ -3,6 +3,7 @@ use serde_json::json;
 use super::MAX_CARD_JSON_CHARS;
 use super::shell::card_shell;
 use super::truncate_md;
+use super::with_callback_field;
 
 /// A generic option-picker card: one button per option. Shared by the
 /// `/agent`, `/model` and `/autoaccept` dual-form cards. Each button carries
@@ -16,23 +17,6 @@ fn option_picker_card(
     options: &[(String, String)],
 ) -> serde_json::Value {
     picker_card(header, intro, thread_key, action, None, false, None, options, &[])
-}
-
-/// Add the callback fields to a button's callback payload (spec #652,
-/// ticket #656): the `/skill` picker carries the Chat/Topic's `chat_type`
-/// alongside `chat_id`/`thread_id` (so a tap reconstructs the exact
-/// [`ConversationKind`](crate::config::ConversationKind) the picker was sent in)
-/// AND the original user message id the picker replied under, so a tap's own
-/// reply (the loaded-skill card) lands under that message rather than the picker
-/// card. Every other picker passes an empty slice.
-fn with_callback_field(
-    mut payload: serde_json::Value,
-    callback_fields: &[(&str, &str)],
-) -> serde_json::Value {
-    for (key, value) in callback_fields {
-        payload[*key] = serde_json::Value::String((*value).to_string());
-    }
-    payload
 }
 
 /// The `/model` picker-card back button's value: clicking it returns from a
@@ -431,76 +415,196 @@ pub(crate) fn skill_description_line(skill: &crate::backend::SkillInfo) -> Optio
         .map(|description| description.lines().next().unwrap_or("").trim())
 }
 
-/// The `/skill` picker (spec #652, ticket #656): one button per registered
-/// skill — its `name`, plus its `description` when it declares one — so a user
-/// who does not know an id can pick one. The callback value is the skill's
-/// generation identity (`id`); a tap re-enters the message pipeline as
-/// `#<id>`. `chat_type` rides each button so the tap reconstructs the
+/// Rows a `/skill` picker page shows at most (#664). A skill row is one short
+/// line, so more fit per page than the session cards' six; the byte budget can
+/// still shrink a page (see [`skill_pages`]), so a pathological id never builds
+/// an over-limit card.
+pub(crate) const SKILL_PAGE_ROWS: usize = 20;
+
+/// The chrome (intro markdown + search form + pager) charged against the card
+/// budget before the rows; generous, since the rows dominate for any realistic
+/// catalog.
+const SKILL_CARD_CHROME_BYTES: usize = 1_200;
+
+/// The label of one skill's picker row: its `name`, plus its first-line
+/// `description` when it declares one, clipped to [`SKILL_ROW_LABEL_CHARS`] so a
+/// single button stays one bounded line.
+fn skill_row_label(skill: &crate::backend::SkillInfo) -> String {
+    match skill_description_line(skill) {
+        Some(description) => truncate_md(
+            &format!("{} — {}", skill.name, description),
+            SKILL_ROW_LABEL_CHARS,
+        ),
+        None => truncate_md(&skill.name, SKILL_ROW_LABEL_CHARS),
+    }
+}
+
+/// Estimated serialized bytes of one skill row's button: ~200 of structure
+/// (tags, the routing callback fields) + the label's UTF-8, shown twice in the
+/// button JSON, + the callback VALUE — the skill's exact id. An unbudgeted id
+/// would let the card exceed Feishu's limit (spec #652, ticket #655).
+fn skill_row_bytes(label: &str, id: &str) -> usize {
+    200 + label.len() * 2 + id.len()
+}
+
+/// The page windows over the (already filtered) `skills` (#664). A page holds up
+/// to [`SKILL_PAGE_ROWS`] rows while their estimated bytes stay under
+/// [`MAX_CARD_JSON_CHARS`]; a single oversized row still gets its own page,
+/// exactly as the old chunker guaranteed (spec #652/#655). Always at least one
+/// (possibly empty) page, so an empty list still renders a first page.
+fn skill_pages(skills: &[crate::backend::SkillInfo]) -> Vec<std::ops::Range<usize>> {
+    let labels: Vec<String> = skills.iter().map(skill_row_label).collect();
+    let mut pages = Vec::new();
+    let mut start = 0usize;
+    while start < skills.len() {
+        let mut bytes = SKILL_CARD_CHROME_BYTES;
+        let mut end = start;
+        while end < skills.len()
+            && end - start < SKILL_PAGE_ROWS
+            && bytes + skill_row_bytes(&labels[end], &skills[end].id) <= MAX_CARD_JSON_CHARS
+        {
+            bytes += skill_row_bytes(&labels[end], &skills[end].id);
+            end += 1;
+        }
+        if end == start {
+            end = start + 1; // a single oversized row still gets its own page
+        }
+        pages.push(start..end);
+        start = end;
+    }
+    if pages.is_empty() {
+        pages.push(0..0);
+    }
+    pages
+}
+
+/// The `/skill` picker's filter (#664): each whitespace token of a
+/// case-insensitive keyword is a substring of the skill's `id`, `name` or
+/// `description` — the list cards' token-AND rule. An empty keyword keeps the
+/// whole list.
+pub(crate) fn filter_skills(
+    skills: &[crate::backend::SkillInfo],
+    keyword: &str,
+) -> Vec<crate::backend::SkillInfo> {
+    let keyword = keyword.trim().to_lowercase();
+    if keyword.is_empty() {
+        return skills.to_vec();
+    }
+    let tokens: Vec<&str> = keyword.split_whitespace().collect();
+    skills
+        .iter()
+        .filter(|skill| {
+            let id = skill.id.to_lowercase();
+            let name = skill.name.to_lowercase();
+            let description = skill.description.as_deref().unwrap_or("").to_lowercase();
+            tokens
+                .iter()
+                .all(|token| id.contains(token) || name.contains(token) || description.contains(token))
+        })
+        .cloned()
+        .collect()
+}
+
+/// The `/skill` picker (spec #652, ticket #656; paged and searchable per #664):
+/// one button per registered skill — its `name`, plus its first-line
+/// `description` when it declares one — so a user who does not know an id can
+/// pick one. `skills` is the ALREADY keyword-filtered list; the card windows it
+/// into pages of up to [`SKILL_PAGE_ROWS`] rows and renders a keyword search
+/// form (when the list outgrows a page, or a keyword is active) and a pager
+/// (when there is more than one page), both shared with the other list cards
+/// (ADR-0051, ADR-0052).
+///
+/// The callback value on a row is the skill's generation identity (`id`); a tap
+/// re-enters the message pipeline as `#<id>`. `chat_type` and `reply_message_id`
+/// ride every row — and the search/pager buttons, so a rebuild re-stamps the
+/// fresh rows — reconstructing the
 /// [`ConversationKind`](crate::config::ConversationKind) the picker was sent in
-/// (the same routing payload every card button carries, next to `chat_id` /
-/// `thread_id`), and `message_id` — the original user message the picker
-/// replied under — rides it too, so the tap's own reply (the loaded-skill card)
-/// lands under THAT message, exactly like a typed dispatch, rather than under
-/// the picker card. `error`, when set, leads the intro so the SAME card answers
-/// both a bare `/skill` and an unknown id. An empty list opens the no-skills
-/// state.
-pub(crate) fn build_skill_cards(
+/// and replying the loaded-skill card under the ORIGINAL user message, exactly
+/// like a typed dispatch (spec #655). `error`, when set, leads the intro so the
+/// SAME card answers both a bare `/skill` and an unknown id; a rebuild passes
+/// `None`. An empty list opens the no-skills state (`无匹配技能` under a
+/// keyword).
+#[allow(clippy::too_many_arguments)] // picker builder: every knob is a card axis
+pub(crate) fn build_skill_card(
     thread_key: &crate::config::ThreadKey,
     skills: &[crate::backend::SkillInfo],
+    keyword: &str,
+    page: usize,
     chat_type: &str,
     message_id: &str,
     error: Option<&str>,
-) -> Vec<serde_json::Value> {
+) -> serde_json::Value {
     let callback_fields = [("chat_type", chat_type), ("reply_message_id", message_id)];
-    let mut intro = error.map(|e| format!("{e}\n")).unwrap_or_default();
-    if skills.is_empty() {
-        intro.push_str("_(没有可用技能)_");
-        return vec![picker_card(
-            "🧩 选择技能",
-            &intro,
-            thread_key,
+    let total = skills.len();
+    let pages = skill_pages(skills);
+    let total_pages = pages.len();
+    let page = page.clamp(1, total_pages);
+    let window = &pages[page - 1];
+
+    let mut elements: Vec<serde_json::Value> = Vec::new();
+    // The search box appears once the list outgrows a page — by the row cap OR
+    // the byte budget, both of which drive `pages` — or a keyword is active (so
+    // a narrowed result stays refinable and clearable) — ADR-0051's
+    // conditional-visibility rule.
+    if total_pages > 1 || !keyword.is_empty() {
+        elements.push(super::session::search_form(
+            "skill_search",
+            "skillsearch",
             "skill",
+            thread_key,
             None,
-            false,
-            None,
-            &[],
+            "🔍 搜索技能名称 / ID / 描述",
+            keyword,
             &callback_fields,
-        )];
+        ));
     }
-    intro.push_str("**选择技能**（点击后以 `#<id>` 发送）：");
-    let options: Vec<(String, String)> = skills
-        .iter()
-        .map(|skill| {
-            let label = match skill_description_line(skill) {
-                Some(description) => {
-                    // A button is one line: the description is already clipped
-                    // to its first line, then the whole label to the row budget,
-                    // so a newline never reaches Feishu's `plain_text`.
-                    truncate_md(
-                        &format!("{} — {}", skill.name, description),
-                        SKILL_ROW_LABEL_CHARS,
-                    )
-                }
-                // Clip the bare name too: an unbounded label could alone exceed
-                // the card budget, and `chunk_picker_cards` cannot split a
-                // single oversized option. Every skill row is bounded, so that
-                // fallback is unreachable here.
-                None => truncate_md(&skill.name, SKILL_ROW_LABEL_CHARS),
-            };
-            (label, skill.id.clone())
-        })
-        .collect();
-    chunk_picker_cards(
-        "🧩 选择技能",
-        &intro,
-        thread_key,
+
+    let mut intro = error.map(|e| format!("{e}\n")).unwrap_or_default();
+    if total == 0 {
+        intro.push_str(if keyword.is_empty() {
+            "_(没有可用技能)_"
+        } else {
+            "_(无匹配技能)_"
+        });
+    } else if keyword.is_empty() {
+        intro.push_str(&format!("**选择技能**（共 {total} 个，点击后以 `#<id>` 发送）："));
+    } else {
+        intro.push_str(&format!("**匹配 `{keyword}` 的技能**（共 {total} 个）："));
+    }
+    elements.push(json!({
+        "tag": "markdown",
+        "content": crate::feishu::card::sanitize::sanitize_markdown(&intro)
+    }));
+
+    for skill in &skills[window.start..window.end] {
+        elements.push(json!({
+            "tag": "button",
+            "text": { "tag": "plain_text", "content": skill_row_label(skill) },
+            "type": "default",
+            "width": "fill",
+            "value": with_callback_field(json!({
+                "action": "skill",
+                "chat_id": thread_key.chat_id,
+                "thread_id": thread_key.thread_id,
+                "value": skill.id,
+            }), &callback_fields),
+        }));
+    }
+
+    if let Some(pager) = super::session::pager_element(
         "skill",
+        thread_key,
+        keyword,
         None,
-        false,
-        None,
-        &options,
+        page,
+        total_pages,
+        total,
         &callback_fields,
-    )
+    ) {
+        elements.push(pager);
+    }
+
+    card_shell("🧩 选择技能", "blue", elements)
 }
 
 #[cfg(test)]
@@ -735,97 +839,91 @@ mod tests {
     /// (`disable-model-invocation`) and a description-less one included — one
     /// row each under the `skill` action. The row label carries the name and,
     /// when present, the description; the callback value is the skill identity,
-    /// and the Chat/Topic's `chat_type` rides every button for the tap.
+    /// and the Chat/Topic's `chat_type` rides every button for the tap. Fewer
+    /// rows than a page means no search box and no pager (#664).
     #[test]
-    fn skill_cards_list_every_entry_with_descriptions_and_routing() {
+    fn skill_card_lists_every_entry_with_descriptions_and_routing() {
         let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
         let skills = [
-            crate::backend::SkillInfo {
-                id: "implement-spec".into(),
-                name: "Implement Spec".into(),
-                description: Some("Drive a spec to shipped code.".into()),
-                content: None,
-            },
-            crate::backend::SkillInfo {
-                id: "bare".into(),
-                name: "Bare".into(),
-                description: None,
-                content: None,
-            },
-            crate::backend::SkillInfo {
-                id: "hidden-tool".into(),
-                name: "Hidden Tool".into(),
-                description: Some("Never advertised to the model.".into()),
-                content: None,
-            },
+            skill(
+                "implement-spec",
+                "Implement Spec",
+                Some("Drive a spec to shipped code."),
+            ),
+            skill("bare", "Bare", None),
+            skill(
+                "hidden-tool",
+                "Hidden Tool",
+                Some("Never advertised to the model."),
+            ),
         ];
-        let cards = build_skill_cards(&key, &skills, "p2p", "msg_src", None);
-        assert_eq!(cards.len(), 1, "three skills fit one card");
-        let text = cards[0].to_string();
+        let card = build_skill_card(&key, &skills, "", 1, "p2p", "msg_src", None);
+        let text = card.to_string();
         assert!(text.contains("选择技能"), "header: {text}");
-        for skill in &skills {
-            assert!(text.contains(&skill.name), "row for {}: {text}", skill.name);
+        assert!(text.contains("共 3 个"), "the intro names the total: {text}");
+        for entry in &skills {
+            assert!(text.contains(&entry.name), "row for {}: {text}", entry.name);
         }
         assert!(
             text.contains("Drive a spec to shipped code."),
             "description shown: {text}"
         );
-        let buttons = cards[0]["body"]["elements"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|e| e["tag"] == "button")
-            .collect::<Vec<_>>();
-        assert_eq!(buttons.len(), 3, "one row per skill");
-        assert_eq!(buttons[0]["value"]["action"].as_str(), Some("skill"));
-        assert_eq!(buttons[0]["value"]["value"].as_str(), Some("implement-spec"));
-        assert_eq!(buttons[0]["value"]["chat_type"].as_str(), Some("p2p"));
+        assert!(search_form_of(&card).is_none(), "three skills need no search box");
+        assert!(pager_of(&card).is_none(), "three skills need no pager");
+        let rows = skill_rows(&card);
+        assert_eq!(rows.len(), 3, "one row per skill");
+        assert_eq!(rows[0]["value"]["action"].as_str(), Some("skill"));
+        assert_eq!(rows[0]["value"]["value"].as_str(), Some("implement-spec"));
+        assert_eq!(rows[0]["value"]["chat_type"].as_str(), Some("p2p"));
         assert_eq!(
-            buttons[0]["value"]["reply_message_id"].as_str(),
+            rows[0]["value"]["reply_message_id"].as_str(),
             Some("msg_src"),
             "the row carries the original user message for the tap's own reply"
         );
         assert!(
-            !buttons[1]["text"]["content"].as_str().unwrap().contains("Bare —"),
+            !rows[1]["text"]["content"].as_str().unwrap().contains("Bare —"),
             "a description-less skill shows only its name: {text}"
         );
         assert_eq!(
-            buttons[2]["value"]["value"].as_str(),
+            rows[2]["value"]["value"].as_str(),
             Some("hidden-tool"),
             "the hidden skill is selectable"
         );
     }
 
-    /// An empty skill list renders the no-skills state (one card, no buttons),
-    /// and an `error` prefix leads the SAME list on an unknown id.
+    /// An empty skill list renders the no-skills state (no rows), an `error`
+    /// prefix leads the SAME list on an unknown id, and a keyword that matches
+    /// nothing shows the no-match copy instead (#664).
     #[test]
-    fn skill_cards_render_empty_and_error_states() {
+    fn skill_card_renders_empty_error_and_no_match_states() {
         let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-        let empty = build_skill_cards(&key, &[], "group", "msg_src", None);
-        assert_eq!(empty.len(), 1);
-        assert!(empty[0].to_string().contains("没有可用技能"), "no-skills state");
+        let empty = build_skill_card(&key, &[], "", 1, "group", "msg_src", None);
+        assert!(empty.to_string().contains("没有可用技能"), "no-skills state");
+        assert!(skill_rows(&empty).is_empty(), "no rows without skills");
 
-        let skills = [crate::backend::SkillInfo {
-            id: "implement-spec".into(),
-            name: "Implement Spec".into(),
-            description: None,
-            content: None,
-        }];
-        let with_error = build_skill_cards(&key, &skills, "group", "msg_src", Some("⚠️ 未找到技能：`nope`"));
-        let text = with_error[0].to_string();
+        let no_match = build_skill_card(&key, &[], "zzz", 1, "group", "msg_src", None);
+        let text = no_match.to_string();
+        assert!(text.contains("无匹配技能"), "no-match state: {text}");
+        assert!(
+            search_form_of(&no_match).is_some(),
+            "an active keyword keeps the box"
+        );
+
+        let skills = [skill("implement-spec", "Implement Spec", None)];
+        let with_error = build_skill_card(
+            &key,
+            &skills,
+            "",
+            1,
+            "group",
+            "msg_src",
+            Some("⚠️ 未找到技能：`nope`"),
+        );
+        let text = with_error.to_string();
         assert!(text.contains("未找到技能"), "error line: {text}");
         assert!(text.contains("nope"), "error names the id: {text}");
         assert!(text.contains("Implement Spec"), "the list still follows: {text}");
-        assert_eq!(
-            with_error[0]["body"]["elements"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|e| e["tag"] == "button")
-                .count(),
-            1,
-            "the list follows the error"
-        );
+        assert_eq!(skill_rows(&with_error).len(), 1, "the list follows the error");
     }
 
     /// The one shared description normalizer both the picker row and the text
@@ -854,8 +952,8 @@ mod tests {
     }
 
     /// An over-long description-less skill name is clipped to the row budget, so
-    /// the built card stays under Feishu's byte ceiling — `chunk_picker_cards`
-    /// cannot split one oversized option, so the label itself must be bounded.
+    /// the built card stays under Feishu's byte ceiling — a single row is never
+    /// split, so the label itself must be bounded.
     #[test]
     fn skill_card_clips_an_overlong_name_and_stays_within_budget() {
         let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
@@ -865,19 +963,13 @@ mod tests {
             description: None,
             content: None,
         }];
-        let cards = build_skill_cards(&key, &skills, "p2p", "msg_src", None);
-        assert_eq!(cards.len(), 1, "one bounded row");
+        let card = build_skill_card(&key, &skills, "", 1, "p2p", "msg_src", None);
         assert!(
-            cards[0].to_string().len() <= FEISHU_CARD_LIMIT_BYTES,
+            card.to_string().len() <= FEISHU_CARD_LIMIT_BYTES,
             "card over Feishu's byte ceiling: {}",
-            cards[0].to_string().len()
+            card.to_string().len()
         );
-        let label = cards[0]["body"]["elements"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|e| e["tag"] == "button")
-            .unwrap()["text"]["content"]
+        let label = skill_rows(&card)[0]["text"]["content"]
             .as_str()
             .unwrap()
             .to_string();
@@ -891,9 +983,9 @@ mod tests {
 
     /// A registered skill with a very long CALLBACK VALUE (its exact `id`) must
     /// still produce cards under Feishu's byte ceiling (spec #652, ticket #655):
-    /// the chunker budgets the button's callback value, not just its label, so a
-    /// long id paginates instead of building an oversized card. The full id
-    /// stays in the callback so the skill remains selectable.
+    /// the page window budgets the button's callback value, not just its label,
+    /// so a huge id takes its own page instead of building an oversized card.
+    /// The full id stays in the callback so the skill remains selectable.
     #[test]
     fn skill_card_accounts_for_an_overlong_id_and_stays_within_budget() {
         let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
@@ -906,30 +998,203 @@ mod tests {
                 content: None,
             })
             .collect();
-        let cards = build_skill_cards(&key, &skills, "p2p", "msg_src", None);
-        assert!(!cards.is_empty(), "the picker must still list the skills");
-        for card in &cards {
+        let pages = skill_pages(&skills);
+        assert_eq!(pages.len(), 3, "each huge id takes its own page");
+        let mut values = Vec::new();
+        for (n, _) in pages.iter().enumerate() {
+            let card = build_skill_card(&key, &skills, "", n + 1, "p2p", "msg_src", None);
+            assert!(
+                search_form_of(&card).is_some(),
+                "byte-driven pagination still offers the search box"
+            );
             assert!(
                 card.to_string().len() <= FEISHU_CARD_LIMIT_BYTES,
                 "a long callback value pushed a card to {} bytes",
                 card.to_string().len()
             );
-        }
-        // Every skill's exact id survives in some card's callback.
-        let values: Vec<String> = cards
-            .iter()
-            .flat_map(|card| {
-                card["body"]["elements"]
-                    .as_array()
-                    .unwrap()
+            values.extend(
+                skill_rows(&card)
                     .iter()
-                    .filter(|e| e["tag"] == "button")
-                    .filter_map(|e| e["value"]["value"].as_str().map(str::to_string))
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        for skill in &skills {
-            assert!(values.contains(&skill.id), "the exact id must remain selectable");
+                    .map(|row| row["value"]["value"].as_str().unwrap().to_string()),
+            );
         }
+        for entry in &skills {
+            assert!(values.contains(&entry.id), "the exact id must remain selectable");
+        }
+    }
+
+    /// #664: past a page the picker paginates in ONE card — page 2 windows the
+    /// next rows and the pager names the position and the total; a stale page
+    /// clamps to the last (ADR-0052) rather than springing back to the first.
+    #[test]
+    fn skill_card_paginates_and_labels_the_pager() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let skills = numbered_skills(SKILL_PAGE_ROWS + 5);
+
+        let first = build_skill_card(&key, &skills, "", 1, "p2p", "msg_src", None);
+        assert_eq!(skill_rows(&first).len(), SKILL_PAGE_ROWS, "page 1 is full");
+        let pager = pager_of(&first).expect("a multi-page list renders the pager");
+        assert_eq!(
+            pager["columns"][1]["elements"][0]["content"], "第 1/2 页 · 共 25 个",
+            "{first}"
+        );
+
+        let second = build_skill_card(&key, &skills, "", 2, "p2p", "msg_src", None);
+        let rows = skill_rows(&second);
+        assert_eq!(rows.len(), 5, "page 2 holds the remainder");
+        let want = format!("s{}", SKILL_PAGE_ROWS + 1);
+        assert_eq!(rows[0]["value"]["value"].as_str(), Some(want.as_str()));
+
+        let stale = build_skill_card(&key, &skills, "", 99, "p2p", "msg_src", None);
+        assert_eq!(
+            pager_of(&stale).unwrap()["columns"][1]["elements"][0]["content"],
+            "第 2/2 页 · 共 25 个",
+            "{stale}"
+        );
+    }
+
+    /// #664: the search box appears once the list outgrows a page (or a keyword
+    /// is active) and routes to the picker; its submit carries the picker's
+    /// `chat_type` / `reply_message_id` extras, so a rebuild re-stamps the rows
+    /// and a later tap still replies under the original user message.
+    #[test]
+    fn skill_card_search_form_routes_and_carries_the_picker_extras() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let small = [skill("a", "A", None)];
+        assert!(
+            search_form_of(&build_skill_card(&key, &small, "", 1, "p2p", "msg_src", None)).is_none(),
+            "a short list needs no search box"
+        );
+
+        let long = numbered_skills(SKILL_PAGE_ROWS + 1);
+        let card = build_skill_card(&key, &long, "", 1, "p2p", "msg_src", None);
+        let form = search_form_of(&card).expect("over a page the search box appears");
+        assert_eq!(form["name"], "skill_search");
+        let elements = form["elements"].as_array().unwrap();
+        let input = elements.iter().find(|e| e["tag"] == "input").unwrap();
+        assert_eq!(input["default_value"], "");
+        assert_eq!(input["placeholder"]["content"], "🔍 搜索技能名称 / ID / 描述");
+        let submit = elements.iter().find(|e| e["tag"] == "button").unwrap();
+        assert_eq!(submit["name"], "skillsearch|chat_1|chat_1");
+        assert_eq!(submit["value"]["action"], "skill");
+        assert_eq!(submit["value"]["op"], "search");
+        assert_eq!(submit["value"]["chat_type"], "p2p");
+        assert_eq!(submit["value"]["reply_message_id"], "msg_src");
+
+        // An active keyword echoes into the box, keeps it under the cap, and
+        // names itself in the header.
+        let filtered = filter_skills(&small, "a");
+        let card = build_skill_card(&key, &filtered, "a", 1, "p2p", "msg_src", None);
+        let form = search_form_of(&card).expect("an active keyword keeps the box");
+        assert_eq!(form["name"], "skill_search");
+        assert!(
+            card.to_string().contains("匹配 `a` 的技能"),
+            "the header names the filter: {card}"
+        );
+    }
+
+    /// #664: the pager buttons carry the same routing payload as the rows —
+    /// keyword, target page and the picker's `chat_type` / `reply_message_id`
+    /// extras — so a flip rebuilds the same view.
+    #[test]
+    fn skill_card_pager_carries_the_filter_and_routing() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let skills = numbered_skills(SKILL_PAGE_ROWS + 5);
+        let card = build_skill_card(&key, &skills, "", 2, "p2p", "msg_src", None);
+        let pager = pager_of(&card).unwrap();
+        let next = &pager["columns"][2]["elements"][0]["value"];
+        assert_eq!(next["action"], "skill");
+        assert_eq!(next["op"], "page");
+        assert_eq!(next["chat_id"], "chat_1");
+        assert_eq!(next["thread_id"], "chat_1");
+        assert_eq!(next["keyword"], "");
+        assert_eq!(next["chat_type"], "p2p");
+        assert_eq!(next["reply_message_id"], "msg_src");
+    }
+
+    /// #664: the filter matches the skill's `id`, `name` AND `description`,
+    /// token-AND, case-insensitively; an empty keyword keeps everything.
+    #[test]
+    fn filter_skills_matches_id_name_and_description_tokens() {
+        let skills = [
+            skill(
+                "implement-spec",
+                "Implement Spec",
+                Some("Drive a spec to shipped code."),
+            ),
+            skill(
+                "foreman",
+                "Foreman",
+                Some("Run a spec's tickets as a serial batch."),
+            ),
+            skill("bare", "Bare", None),
+        ];
+        assert_eq!(filter_skills(&skills, "").len(), 3, "empty keyword keeps all");
+        let ids = |keyword: &str| -> Vec<String> {
+            filter_skills(&skills, keyword)
+                .into_iter()
+                .map(|s| s.id)
+                .collect()
+        };
+        assert_eq!(ids("foreman"), ["foreman"].map(str::to_string));
+        assert_eq!(
+            ids("FOREMAN"),
+            ["foreman"].map(str::to_string),
+            "case-insensitive"
+        );
+        assert_eq!(
+            ids("spec"),
+            ["implement-spec", "foreman"].map(str::to_string),
+            "an id-less match reaches the name/description"
+        );
+        assert_eq!(ids("serial batch"), ["foreman"].map(str::to_string), "token-AND");
+        assert_eq!(ids("implement shipped"), ["implement-spec"].map(str::to_string));
+        assert!(ids("nope").is_empty());
+    }
+
+    /// One `SkillInfo` for the skill tests.
+    fn skill(id: &str, name: &str, description: Option<&str>) -> crate::backend::SkillInfo {
+        crate::backend::SkillInfo {
+            id: id.into(),
+            name: name.into(),
+            description: description.map(str::to_string),
+            content: None,
+        }
+    }
+
+    /// `n` short, description-less skills (`s1`…`sn`).
+    fn numbered_skills(n: usize) -> Vec<crate::backend::SkillInfo> {
+        (1..=n)
+            .map(|i| skill(&format!("s{i}"), &format!("Skill {i}"), None))
+            .collect()
+    }
+
+    /// The picker's skill ROW buttons (top-level buttons without an `op`; the
+    /// search submit carries `op: "search"`, the pager is nested in columns).
+    fn skill_rows(card: &serde_json::Value) -> Vec<&serde_json::Value> {
+        card["body"]["elements"]
+            .as_array()
+            .expect("card body elements")
+            .iter()
+            .filter(|e| e["tag"] == "button" && e["value"].get("op").is_none())
+            .collect()
+    }
+
+    /// The card's search form, if any.
+    fn search_form_of(card: &serde_json::Value) -> Option<&serde_json::Value> {
+        card["body"]["elements"]
+            .as_array()?
+            .iter()
+            .find(|e| e["tag"] == "form")
+    }
+
+    /// The card's pager (`column_set` containing an `op: "page"` button), if any.
+    fn pager_of(card: &serde_json::Value) -> Option<&serde_json::Value> {
+        card["body"]["elements"].as_array()?.iter().find(|e| {
+            e["tag"] == "column_set"
+                && e["columns"]
+                    .as_array()
+                    .is_some_and(|cols| cols.iter().any(|c| c["elements"][0]["value"]["op"] == "page"))
+        })
     }
 }

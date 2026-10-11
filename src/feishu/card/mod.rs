@@ -10,6 +10,24 @@ pub(crate) mod shell;
 pub(crate) mod skill;
 pub(crate) mod tool_render;
 
+/// Set the given callback fields on a button's callback payload (overwriting
+/// any same-named key). Shared by the `/skill` picker's row buttons — which
+/// carry the Chat/Topic's `chat_type` and the original user message
+/// `reply_message_id`, so a tap reconstructs the
+/// [`ConversationKind`](crate::config::ConversationKind) and replies the
+/// loaded-skill card under that message — and the list cards' search/pager
+/// controls, which carry the same pair through a rebuild. Every other caller
+/// passes an empty slice.
+pub(crate) fn with_callback_field(
+    mut payload: serde_json::Value,
+    callback_fields: &[(&str, &str)],
+) -> serde_json::Value {
+    for (key, value) in callback_fields {
+        payload[*key] = serde_json::Value::String((*value).to_string());
+    }
+    payload
+}
+
 /// Card state for Feishu interactive message cards.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum CardState {
