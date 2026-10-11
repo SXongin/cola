@@ -492,9 +492,10 @@ pub(super) struct GapCoverage {
 /// Estimated serialized size (bytes) of one collapsible tool panel, mirroring
 /// [`StreamAccumulator::estimate_split_index`]'s accounting (element overhead
 /// plus the capped input and output the renderer keeps, plus the File Content
-/// tracking block the panel body appends and one `img` element per embedded
-/// image — ADR-0076). Shared by the timeline's tool items and the todo tail
-/// reserve, so every place a panel's bytes are summed charges its images too.
+/// tracking block the panel body appends, one `img` element per embedded image,
+/// and the compact file marker the folded header carries — ADR-0076). Shared by
+/// the timeline's tool items and the todo tail reserve, so every place a panel's
+/// bytes are summed charges its images and its header marker too.
 fn panel_estimate(p: &ToolPanel) -> usize {
     let input = p
         .input()
@@ -509,6 +510,7 @@ fn panel_estimate(p: &ToolPanel) -> usize {
         + output
         + crate::feishu::card::tool_render::file_tracking_estimate(p)
         + crate::feishu::card::tool_render::file_image_estimate(p)
+        + crate::feishu::card::tool_render::file_header_marker_estimate(p)
 }
 
 /// The content hash of one panel's File Content at `index` (ADR-0076), or
@@ -5357,6 +5359,29 @@ mod tests {
         assert!(
             full,
             "the tracking line's bytes must count toward the size budget"
+        );
+    }
+
+    /// The folded panel header's File Content marker (ADR-0076 amendment) is
+    /// card JSON too: `panel_estimate` must charge its bytes, or a panel with a
+    /// quote-heavy filename in the header would pass the size check while the
+    /// serialized card exceeds Feishu's cap.
+    #[test]
+    fn panel_estimate_charges_the_header_file_marker() {
+        let quotes = "\"".repeat(24);
+        let files: Vec<(&str, &[u8])> = vec![(quotes.as_str(), &b"ABC"[..])];
+        let with_files = ToolPanel::for_test_with_files("read", &files);
+        let without = ToolPanel::for_test("read", ToolStatus::Completed, None, None);
+        let marker = crate::feishu::card::tool_render::file_header_marker_estimate(&with_files);
+        assert!(marker > 0, "a file panel has a header marker");
+
+        assert_eq!(
+            panel_estimate(&with_files),
+            panel_estimate(&without)
+                + crate::feishu::card::tool_render::file_tracking_estimate(&with_files)
+                + crate::feishu::card::tool_render::file_image_estimate(&with_files)
+                + marker,
+            "panel_estimate must charge the header marker's bytes"
         );
     }
 

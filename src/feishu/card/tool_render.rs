@@ -609,6 +609,62 @@ fn file_tracking_block(tool: &ToolPanel) -> Option<String> {
     )
 }
 
+/// How many characters of a File Content's name the folded panel HEADER shows
+/// before clipping with `…` (ADR-0076 amendment): the header is a one-line
+/// status strip, so a long filename is shortened there while the body's
+/// tracking line keeps the full name.
+const FILE_HEADER_NAME_MAX_CHARS: usize = 24;
+
+/// The compact File Content marker the folded panel HEADER carries (ADR-0076
+/// amendment). The detailed tracking line lives in the panel BODY, which is
+/// collapsed by default, so the user never sees it — worst of all for `未发送`,
+/// the ONLY signal that a file was read but could not be delivered. The header
+/// therefore shows a one-line marker while folded: ` · 📎 <name>` for a single
+/// file (the name clipped to [`FILE_HEADER_NAME_MAX_CHARS`]), ` · 📎 <N> 个文件`
+/// for several, and ` · 未发送` appended when ANY of the panel's files is
+/// [`FileDelivery::Undelivered`]. `Embedded`/`SentAsFile` carry no state here —
+/// the image is rendered beside the panel and the File Message is a visible
+/// message — and the body's tracking line is unchanged. `None` when the panel
+/// carries no File Content, so a plain panel's header is byte-for-byte what it
+/// was.
+fn file_header_marker(tool: &ToolPanel) -> Option<String> {
+    let files = tool.files();
+    if files.is_empty() {
+        return None;
+    }
+    let mut marker = if files.len() == 1 {
+        format!(
+            " · 📎 {}",
+            truncate_md(&files[0].content.name, FILE_HEADER_NAME_MAX_CHARS)
+        )
+    } else {
+        format!(" · 📎 {} 个文件", files.len())
+    };
+    if files
+        .iter()
+        .any(|file| file.delivery == FileDelivery::Undelivered)
+    {
+        marker.push_str(" · 未发送");
+    }
+    Some(marker)
+}
+
+/// The byte length the folded panel HEADER's File Content marker
+/// [`file_header_marker`] contributes to the card (ADR-0076 amendment), for a
+/// card-size estimate that must charge what the header renders. The header
+/// title is a `plain_text` element — NOT markdown-sanitized like the panel body
+/// — so its bytes reach the card's JSON verbatim and only the JSON escaping
+/// (`"` → `\"`, `\` → `\\`, a control character to six bytes) inflates them;
+/// charging the raw length would under-count a quote-heavy filename and let a
+/// card pass the split check while Feishu rejects the serialized card on size.
+/// `0` when the panel carries no File Content. Kept beside the render so the
+/// two cannot drift.
+pub(crate) fn file_header_marker_estimate(tool: &ToolPanel) -> usize {
+    file_header_marker(tool)
+        .map(|marker| json_escaped_len(&marker))
+        .unwrap_or(0)
+}
+
 /// The byte length of the tracking block [`file_tracking_block`] appends to a
 /// panel body (ADR-0076), for a card-size estimate that must charge the same
 /// bytes the renderer writes — the record line plus the `· 已内嵌` /
@@ -686,8 +742,10 @@ pub(crate) fn file_image_estimate(tool: &ToolPanel) -> usize {
 /// One tool panel as a folded collapsible element. `at_ms` is the part's
 /// server `state.time.start`; when present, the panel header carries it as
 /// `· HH:MM` so the start time is visible while collapsed (#183), and when
-/// absent (a payload with no server time) no clock is rendered. `element_id`
-/// is the panel's stable identity on the card (see
+/// absent (a payload with no server time) no clock is rendered. A panel with
+/// File Contents appends the compact file marker [`file_header_marker`] so the
+/// file — and a `未发送` one above all — is visible while folded (ADR-0076
+/// amendment). `element_id` is the panel's stable identity on the card (see
 /// [`super::shell::collapsible_panel_chunks`]).
 pub(super) fn tool_panel_element(
     tool: &ToolPanel,
@@ -805,6 +863,13 @@ pub(super) fn tool_panel_element(
             " · {}",
             liveness.title_fragment(chrono::Utc::now().timestamp_millis())
         ));
+    }
+    // The File Contents' compact marker closes the header (ADR-0076 amendment):
+    // the detailed tracking line is in the body, which is folded by default, so
+    // the header names the file — and above all its `未发送` state — while the
+    // panel stays collapsed.
+    if let Some(marker) = file_header_marker(tool) {
+        title.push_str(&marker);
     }
     collapsible_panel(&title, &content, element_id)
 }
@@ -1920,6 +1985,170 @@ mod tests {
             "{body}"
         );
         assert!(!body.contains("已内嵌"), "{body}");
+    }
+
+    /// The folded panel HEADER carries the File Content marker (ADR-0076
+    /// amendment): the detailed tracking line is in the collapsed body, so the
+    /// header names the file while the panel stays folded. An embedded file
+    /// shows `📎 <name>`.
+    #[test]
+    fn an_embedded_file_marks_the_collapsed_panel_header() {
+        let panel = read_panel(
+            "shot.png",
+            "image/png",
+            b"ABC",
+            FileDelivery::Embedded {
+                image_key: "img_v2_x".into(),
+            },
+        );
+        let card = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_tool(panel)
+            .build();
+        let title = card["body"]["elements"][0]["header"]["title"]["content"]
+            .as_str()
+            .expect("panel title");
+        assert_eq!(title, "✅ read · 📎 shot.png", "{card}");
+    }
+
+    /// An undelivered File Content — the one state that must never be invisible
+    /// — carries both its name and `未发送` in the folded header, so the user
+    /// sees the failure without expanding the panel (ADR-0076 amendment).
+    #[test]
+    fn an_undelivered_file_marks_the_collapsed_panel_header_unsent() {
+        let panel = read_panel("doc.pdf", "application/pdf", b"%PDF", FileDelivery::Undelivered);
+        let card = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_tool(panel)
+            .build();
+        let title = card["body"]["elements"][0]["header"]["title"]["content"]
+            .as_str()
+            .expect("panel title");
+        assert_eq!(title, "✅ read · 📎 doc.pdf · 未发送", "{card}");
+    }
+
+    /// A panel with several File Contents shows a count in the folded header,
+    /// not one name per file (ADR-0076 amendment), and appends `未发送` when any
+    /// of them is undelivered.
+    #[test]
+    fn several_files_show_a_count_in_the_collapsed_panel_header() {
+        let panel = embedded_panel(&["a.png", "b.png"]);
+        let card = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_tool(panel)
+            .build();
+        let title = card["body"]["elements"][0]["header"]["title"]["content"]
+            .as_str()
+            .expect("panel title");
+        assert!(title.contains("📎 2 个文件"), "{title}");
+        assert!(!title.contains("a.png"), "a count, not a name: {title}");
+
+        let mut unsent = embedded_panel(&["a.png", "b.png"]);
+        unsent.set_file_delivery(1, FileDelivery::Undelivered);
+        let card = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_tool(unsent)
+            .build();
+        let title = card["body"]["elements"][0]["header"]["title"]["content"]
+            .as_str()
+            .expect("panel title");
+        assert!(title.contains("📎 2 个文件 · 未发送"), "{title}");
+    }
+
+    /// A panel with no File Content leaves its header byte-for-byte what it was:
+    /// no `📎` marker, and the existing pieces (status icon · name · time) stay
+    /// intact (ADR-0076 amendment).
+    #[test]
+    fn a_panel_without_files_leaves_the_header_unmarked() {
+        let panel = ToolPanel::for_test(
+            "bash",
+            ToolStatus::Completed,
+            Some(json!({"command": "cargo test"})),
+            Some("ok"),
+        );
+        let card = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_tool(panel)
+            .build();
+        let title = card["body"]["elements"][0]["header"]["title"]["content"]
+            .as_str()
+            .expect("panel title");
+        assert_eq!(title, "✅ bash", "{card}");
+        assert!(!title.contains("📎"), "{title}");
+    }
+
+    /// A long filename is clipped in the folded header (ADR-0076 amendment): the
+    /// header is a one-line status strip, so the name stops at
+    /// [`FILE_HEADER_NAME_MAX_CHARS`] with an `…`; the body keeps the full name.
+    #[test]
+    fn a_long_file_name_is_clipped_in_the_panel_header() {
+        let name = "a_very_long_screenshot_name_that_would_wrap_the_header.png";
+        let panel = read_panel(
+            name,
+            "image/png",
+            b"ABC",
+            FileDelivery::Embedded {
+                image_key: "img".into(),
+            },
+        );
+        let card = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_tool(panel)
+            .build();
+        let clipped: String = name.chars().take(FILE_HEADER_NAME_MAX_CHARS).collect();
+        let title = card["body"]["elements"][0]["header"]["title"]["content"]
+            .as_str()
+            .expect("panel title");
+        assert!(
+            title.contains(&format!("📎 {clipped}…")),
+            "the header clips the name: {title}"
+        );
+        assert!(!title.contains(".png"), "the tail is clipped: {title}");
+        let body = card["body"]["elements"][0]["elements"][0]["content"]
+            .as_str()
+            .unwrap();
+        assert!(body.contains(name), "the body keeps the full name: {body}");
+    }
+
+    /// The header marker is card JSON too (ADR-0076 amendment): the estimate
+    /// charges its JSON-escaped bytes, so a quote-heavy filename in the folded
+    /// header cannot push a card past Feishu's size cap unnoticed. A panel with
+    /// no File Content charges nothing.
+    #[test]
+    fn file_header_marker_estimate_charges_the_header_bytes() {
+        let plain = ToolPanel::for_test("bash", ToolStatus::Completed, None, Some("ok"));
+        assert_eq!(file_header_marker_estimate(&plain), 0);
+
+        let panel = read_panel(
+            "shot.png",
+            "image/png",
+            b"ABC",
+            FileDelivery::Embedded {
+                image_key: "img".into(),
+            },
+        );
+        let marker = file_header_marker(&panel).expect("a file panel has a header marker");
+        assert_eq!(
+            file_header_marker_estimate(&panel),
+            marker.len(),
+            "the estimate is the marker's serialized length"
+        );
+        assert!(file_header_marker_estimate(&panel) > 0);
+
+        // Each `"` in the header title costs its escaped `\"`: the JSON-escaped
+        // charge is one byte more per quote than the raw marker length.
+        let quotes = "\"".repeat(FILE_HEADER_NAME_MAX_CHARS);
+        let quoted = read_panel(&quotes, "image/png", b"ABC", FileDelivery::Undelivered);
+        let raw = file_header_marker(&quoted).expect("a file panel has a header marker");
+        assert_eq!(
+            file_header_marker_estimate(&quoted),
+            raw.len() + quotes.len(),
+            "each `\"` must cost its escaped `\\\"` — one extra byte"
+        );
+        assert!(
+            file_header_marker_estimate(&quoted) > raw.len(),
+            "the estimate must not be the raw UTF-8 length"
+        );
     }
 
     /// The tracking-line size estimate charges the File Message suffixes too
