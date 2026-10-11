@@ -129,13 +129,14 @@ no description is wanted. The element therefore carries
 avoid a rejection or a dropped image, and empty, so no text renders under the
 image.
 
-`title` is the file name folded to one printable line and clipped to its tail
-within the header's character budget — `📎 …ola/target/acc/shot.png`, never the
-full absolute path a `read` reports. A client may render a title near the image,
-so a 44-character path there is exactly the duplication the header's clipped
-marker avoids; matching the header keeps the two copies identical and short. The
-size estimate follows the builder, so it charges the clipped title's
-JSON-escaped bytes once, exactly what renders.
+`title` is the file's **basename**, folded to one printable line and clipped to
+its tail within the header's character budget **only when the basename itself is
+long** — `📎 shot.png` for a `read`'s
+`/root/workspace/dev/cola/target/acc/shot.png`, never the full absolute path and
+never a path fragment (`📎 …ola/target/acc/shot.png`). A client renders the
+title as the image's caption, where path fragments are noise; matching the
+header keeps the two copies identical and short. The size estimate follows the
+builder, so it charges the title's JSON-escaped bytes once, exactly what renders.
 
 ## Amendment (2026-10-11): the folded panel header carries the file marker
 
@@ -145,9 +146,12 @@ expands it — worst of all for `未发送`, which is the ONLY signal that a fil
 read but could not be delivered. The panel **header** therefore carries a compact
 marker, visible while the panel stays collapsed:
 
-- one File Content — ` · 📎 <name>`, the name clipped to its **tail** within a
-  short character budget — a leading `…` plus the last characters, the `…`
-  counted against the budget, so a long absolute path keeps its basename;
+- one File Content — ` · 📎 <name>`, the file's **basename** (the segment after
+  its final `/` or `\`), clipped to its **tail** within a short character budget
+  **only when the basename itself is long** — a leading `…` plus the last
+  characters, the `…` counted against the budget, so a long FILE name keeps its
+  extension. A long absolute PATH is reduced to its basename first, so its
+  directories never spend the budget and never render;
 - several — ` · 📎 <N> 个文件`;
 - and ` · 未发送` appended when ANY of the panel's File Contents is undelivered,
   so the one state that must never be missed is on the header itself.

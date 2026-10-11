@@ -610,11 +610,13 @@ fn file_tracking_block(tool: &ToolPanel) -> Option<String> {
 }
 
 /// The character budget the folded panel HEADER spends on a single File
-/// Content's name (ADR-0076 amendment): the header is a one-line status strip,
-/// so a name longer than this is clipped to its TAIL — a leading `…` plus the
-/// last characters, keeping the basename — while the body's tracking line keeps
-/// the full name. The leading `…` counts against the budget, so the rendered
-/// name is at most this many characters.
+/// Content's name (ADR-0076 amendment): the header is a one-line status strip
+/// that shows the file's BASENAME ([`header_file_name`]), so the budget only
+/// bites a genuinely long FILE name — a basename longer than this is clipped to
+/// its TAIL, a leading `…` plus the last characters, keeping the extension
+/// visible — while the body's tracking line keeps the full name. The leading
+/// `…` counts against the budget, so the rendered name is at most this many
+/// characters.
 const FILE_HEADER_NAME_MAX_CHARS: usize = 24;
 
 /// The name a File Content's folded panel HEADER falls back to when folding
@@ -660,15 +662,17 @@ fn folded_header_name(name: &str) -> String {
 }
 
 /// Clip a folded File Content name for the folded panel HEADER keeping its TAIL
-/// (ADR-0076 amendment): the header is a one-line status strip, and a name
-/// longer than [`FILE_HEADER_NAME_MAX_CHARS`] is a long absolute path whose
-/// meaningful part — the basename — is at the END, so the head is dropped and
-/// the tail kept: a leading `…` plus the last characters, the `…` counted
-/// against the budget so the whole rendered name fits it. Character-counted
-/// like the body's [`truncate_md`], so a multibyte (CJK) name clips on a
-/// character boundary and never splits one — the tail-side mirror of the head
-/// clip it replaces. A name already within the budget is returned unchanged,
-/// with no `…`.
+/// (ADR-0076 amendment): the header is a one-line status strip, and a FILE name
+/// longer than [`FILE_HEADER_NAME_MAX_CHARS`] is clipped by dropping its head
+/// and keeping its tail — a leading `…` plus the last characters, the `…`
+/// counted against the budget so the whole rendered name fits it — so a long
+/// name still shows its extension. Applied to the basename
+/// ([`header_file_name`]), this only bites a genuinely long FILE name; a long
+/// absolute PATH is reduced to its basename first, so its directories never
+/// spend the budget. Character-counted like the body's [`truncate_md`], so a
+/// multibyte (CJK) name clips on a character boundary and never splits one — the
+/// tail-side mirror of the head clip it replaces. A name already within the
+/// budget is returned unchanged, with no `…`.
 fn clip_header_name_tail(name: &str, max_chars: usize) -> String {
     let count = name.chars().count();
     if count <= max_chars {
@@ -681,15 +685,32 @@ fn clip_header_name_tail(name: &str, max_chars: usize) -> String {
     format!("…{tail}")
 }
 
+/// The basename of a folded File Content name (ADR-0076 amendment): the
+/// substring after its final `/` or `\`. `None` when the name ends in a
+/// separator (the basename is then empty), so [`header_file_name`] falls back to
+/// the whole folded name rather than render an empty marker. A name with no
+/// separator at all is returned whole — a bare filename is already its own
+/// basename.
+fn header_name_basename(folded: &str) -> Option<&str> {
+    let after = folded.rsplit(['/', '\\']).next().unwrap_or(folded);
+    if after.is_empty() { None } else { Some(after) }
+}
+
 /// The short File Content name the folded panel HEADER shows (ADR-0076
-/// amendment): the name folded to one printable line ([`folded_header_name`])
-/// then clipped to its tail within [`FILE_HEADER_NAME_MAX_CHARS`]
-/// ([`clip_header_name_tail`]). Shared by the header marker and the embedded
-/// image element's `title` ([`file_image_elements`]) so the two never diverge:
-/// the image title is the SAME short name the header shows, not a second,
-/// longer copy of the absolute path a `read` reports.
+/// amendment): the name folded to one printable line ([`folded_header_name`]),
+/// reduced to its BASENAME ([`header_name_basename`]), then clipped to its tail
+/// within [`FILE_HEADER_NAME_MAX_CHARS`] ([`clip_header_name_tail`]) — the clip
+/// now only bites a genuinely long FILE name, not a long absolute path, since
+/// the directories are dropped first. A name ending in a separator (or one with
+/// nothing printable) falls back to the whole folded name, so the marker is
+/// never empty. Shared by the header marker and the embedded image element's
+/// `title` ([`file_image_elements`]) so the two never diverge: the image title
+/// is the SAME short name the header shows, not a second, longer copy of the
+/// absolute path a `read` reports.
 fn header_file_name(name: &str) -> String {
-    clip_header_name_tail(&folded_header_name(name), FILE_HEADER_NAME_MAX_CHARS)
+    let folded = folded_header_name(name);
+    let chosen = header_name_basename(&folded).unwrap_or(&folded);
+    clip_header_name_tail(chosen, FILE_HEADER_NAME_MAX_CHARS)
 }
 
 /// The compact File Content marker the folded panel HEADER carries (ADR-0076
@@ -697,8 +718,9 @@ fn header_file_name(name: &str) -> String {
 /// collapsed by default, so the user never sees it — worst of all for `未发送`,
 /// the ONLY signal that a file was read but could not be delivered. The header
 /// therefore shows a one-line marker while folded: ` · 📎 <name>` for a single
-/// file (the name folded to one printable line, then clipped to its tail within
-/// [`FILE_HEADER_NAME_MAX_CHARS`]), ` · 📎 <N> 个文件` for several, and
+/// file (the name's BASENAME, folded to one printable line and clipped to its
+/// tail within [`FILE_HEADER_NAME_MAX_CHARS`] only when the basename itself is
+/// long), ` · 📎 <N> 个文件` for several, and
 /// ` · 未发送` appended when ANY of the panel's files is
 /// [`FileDelivery::Undelivered`]. `Embedded`/`SentAsFile` carry no state here —
 /// the image is rendered beside the panel and the File Message is a visible
@@ -775,11 +797,12 @@ fn json_escaped_len(text: &str) -> usize {
 /// The `img` elements this panel renders (ADR-0076): one per embedded File
 /// Content, all pushed immediately AFTER the panel so the image is visible and
 /// its adjacency to the panel gives the correspondence. `title` is the SAME
-/// short name the folded panel header shows — `📎 <name>` folded and clipped to
-/// its tail within [`FILE_HEADER_NAME_MAX_CHARS`] via [`header_file_name`] — NOT
-/// the full absolute path a `read` reports, since a client may render the title
+/// short name the folded panel header shows — the file's BASENAME, `📎 <name>`
+/// folded and clipped to its tail within [`FILE_HEADER_NAME_MAX_CHARS`] via
+/// [`header_file_name`] only when the basename itself is long — NOT the full
+/// absolute path a `read` reports, since a client may render the title
 /// beside the image and a 44-character path there is the duplication the
-/// header's clipped marker avoids. `alt` is **present but empty**:
+/// header's short marker avoids. `alt` is **present but empty**:
 /// Feishu's Card JSON 2.0 image component marks `alt` required (field table:
 /// `alt | Yes | Struct`) and its own example says to pass an empty value when no
 /// description is wanted, so an absent field risks rejection while an empty one
@@ -808,7 +831,7 @@ pub(super) fn file_image_elements(tool: &ToolPanel) -> Vec<serde_json::Value> {
 /// The serialized byte length the `img` elements [`file_image_elements`] emits
 /// add to a card body (ADR-0076), for a card-size estimate that must charge
 /// exactly what renders. Each element carries the File Content's name once, in
-/// its `title` (the header's folded-and-clipped short name), embedded in the
+/// its `title` (the header's folded-and-clipped basename), embedded in the
 /// card's JSON, so the name's JSON-escaped bytes — plus the element's own
 /// `img_key`, its empty `alt`, and scaffolding — are charged. A count-only
 /// charge (or a raw name-length one) under-counts a panel of embedded images,
@@ -1962,12 +1985,12 @@ mod tests {
 
     /// An embedded image's `title` is the SAME short name the folded panel header
     /// shows (ADR-0076 amendment): a `read` reports the file's absolute path, but
-    /// a client may render the title beside the image, so a 44-character path is
-    /// the duplication the header's clipped marker avoids. The title is folded and
-    /// clipped to its tail exactly as the header is — the basename survives, the
-    /// path prefix does not — and the full path appears nowhere in the element.
+    /// a client renders the title as the image's caption, where a 44-character
+    /// path is noise. The title is the file's BASENAME — `📎 shot.png`, no `/`
+    /// and no `…` — matching the header, and the full path appears nowhere in the
+    /// element.
     #[test]
-    fn an_embedded_image_title_matches_the_clipped_panel_header_name() {
+    fn an_embedded_image_title_matches_the_panel_header_basename() {
         let name = "/root/workspace/dev/cola/target/acc/shot.png";
         let panel = read_panel(
             name,
@@ -1984,8 +2007,12 @@ mod tests {
         let elements = card["body"]["elements"].as_array().unwrap();
         assert_eq!(elements[1]["tag"], "img", "{card}");
         let title = elements[1]["title"]["content"].as_str().unwrap();
-        // The tail is kept: the basename survives, the path prefix does not.
-        assert_eq!(title, "📎 …ola/target/acc/shot.png", "{card}");
+        // The basename alone: the path prefix is dropped, no clip marker shows.
+        assert_eq!(title, "📎 shot.png", "{card}");
+        assert!(
+            !title.contains('/') && !title.contains('…'),
+            "no path fragment and no clip marker in the image title: {title}"
+        );
         // The whole element carries no long absolute path anywhere.
         let serialized = serde_json::to_string(&elements[1]).unwrap();
         assert!(
@@ -2210,14 +2237,13 @@ mod tests {
         assert!(!title.contains("📎"), "{title}");
     }
 
-    /// A long absolute path is clipped in the folded header keeping its TAIL
-    /// (ADR-0076 amendment): the header is a one-line status strip, and a
-    /// `read` reports the file's absolute path, so the useful part — the
-    /// basename — is at the end. The head is dropped for a leading `…`, the
-    /// whole rendered name fitting [`FILE_HEADER_NAME_MAX_CHARS`]; the body
-    /// keeps the full name.
+    /// A long absolute path shows only its BASENAME in the folded header
+    /// (ADR-0076 amendment): a `read` reports the file's absolute path, but the
+    /// header is a one-line status strip where path fragments are noise, so the
+    /// directories are dropped and just `shot.png` renders — no `/` and no `…`,
+    /// since the basename fits the budget. The body keeps the full name.
     #[test]
-    fn a_long_file_name_keeps_its_tail_in_the_panel_header() {
+    fn a_long_absolute_path_shows_only_its_basename_in_the_panel_header() {
         let name = "/root/workspace/dev/cola/target/acc/shot.png";
         let panel = read_panel(
             name,
@@ -2234,22 +2260,10 @@ mod tests {
         let title = card["body"]["elements"][0]["header"]["title"]["content"]
             .as_str()
             .expect("panel title");
-        // The tail is kept: the basename survives, the path prefix does not.
+        assert_eq!(title, "✅ read · 📎 shot.png", "{card}");
         assert!(
-            title.contains("📎 …ola/target/acc/shot.png"),
-            "the header keeps the name's tail: {title}"
-        );
-        assert!(
-            !title.contains("/root/"),
-            "the path prefix is dropped, not shown: {title}"
-        );
-        assert!(title.contains("shot.png"), "the basename survives: {title}");
-        // The leading `…` is inside the budget: the rendered name is at most 24.
-        let shown = title.split("📎 ").nth(1).expect("the marker carries the name");
-        assert_eq!(
-            shown.chars().count(),
-            FILE_HEADER_NAME_MAX_CHARS,
-            "the `…` counts against the budget: {shown:?}"
+            !title.contains('/') && !title.contains('…'),
+            "no path fragment and no clip marker reach the header: {title}"
         );
         let body = card["body"]["elements"][0]["elements"][0]["content"]
             .as_str()
@@ -2477,6 +2491,84 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(body.contains(&name), "the body keeps the full name: {body}");
+    }
+
+    /// The header clip now bites only a genuinely long BASENAME, not a path
+    /// (ADR-0076 amendment): a file name longer than
+    /// [`FILE_HEADER_NAME_MAX_CHARS`] is clipped to its tail — a leading `…` plus
+    /// the last characters, the `…` counted against the budget — so the extension
+    /// stays visible while the whole rendered name fits. The body keeps the full
+    /// name.
+    #[test]
+    fn a_long_basename_is_clipped_keeping_its_extension() {
+        let name = "a_rather_long_screenshot_name_that_repeats.png";
+        assert!(
+            name.chars().count() > FILE_HEADER_NAME_MAX_CHARS,
+            "the fixture must exceed the clip so the boundary is exercised"
+        );
+        let panel = read_panel(
+            name,
+            "image/png",
+            b"ABC",
+            FileDelivery::Embedded {
+                image_key: "img".into(),
+            },
+        );
+        let card = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_tool(panel)
+            .build();
+        let title = card["body"]["elements"][0]["header"]["title"]["content"]
+            .as_str()
+            .expect("panel title");
+        let shown = title.split("📎 ").nth(1).expect("the marker carries the name");
+        assert!(
+            shown.starts_with('…') && shown.ends_with(".png"),
+            "the clip keeps the tail so the extension survives: {shown:?}"
+        );
+        assert_eq!(
+            shown.chars().count(),
+            FILE_HEADER_NAME_MAX_CHARS,
+            "the `…` counts against the budget: {shown:?}"
+        );
+        let expected: String = format!(
+            "…{}",
+            name.chars().skip(name.chars().count() - 23).collect::<String>()
+        );
+        assert_eq!(shown, expected, "the header clips the basename from the tail");
+        let body = card["body"]["elements"][0]["elements"][0]["content"]
+            .as_str()
+            .unwrap();
+        assert!(body.contains(name), "the body keeps the full name: {body}");
+    }
+
+    /// The basename rule must never leave the marker empty (ADR-0076 amendment):
+    /// a name with NO separator is already its own basename and renders whole,
+    /// and a name ENDING in a separator has an empty basename, so the folded whole
+    /// string is shown instead of a bare `📎`.
+    #[test]
+    fn a_name_with_no_or_a_trailing_separator_still_names_the_file() {
+        // No separator: a bare filename is its own basename and renders unchanged.
+        let bare = read_panel("shot.png", "image/png", b"ABC", FileDelivery::Undelivered);
+        assert_eq!(
+            file_header_marker(&bare).as_deref(),
+            Some(" · 📎 shot.png · 未发送"),
+            "a separator-less name is its own basename"
+        );
+
+        // A trailing separator has an empty basename: fall back to the folded
+        // whole name rather than an empty marker. Both separators, and a
+        // separators-only name, are covered.
+        for name in ["foo/", "foo\\", "/", "dir/sub/"] {
+            let panel = read_panel(name, "image/png", b"ABC", FileDelivery::Undelivered);
+            let marker = file_header_marker(&panel).expect("a file panel has a header marker");
+            assert_eq!(
+                marker,
+                format!(" · 📎 {name} · 未发送"),
+                "a trailing separator falls back to the folded whole name"
+            );
+            assert!(!marker.contains("📎  ·"), "the marker is never empty: {marker}");
+        }
     }
 
     /// The file marker is appended to the title without disturbing the panel's
