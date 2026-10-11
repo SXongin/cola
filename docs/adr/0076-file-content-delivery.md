@@ -117,18 +117,25 @@ that topic resolves to a DIFFERENT Session — a fork (found live on spec #644).
 The rest of the Decision is unchanged: exactly one File Message, sent once on the
 first poll that shows the block, best-effort.
 
-## Amendment (2026-10-11): the embedded `img` element carries no `alt`
+## Amendment (2026-10-11): the embedded `img` element's `alt` is empty and its `title` is the header name
 
-The Decision's element is `title` `📎 <name>` with `preview` enabled, and is
-deliberately **without an `alt`**. Feishu renders an `img` element's `alt` as
-visible text directly under the image, and the first cut set it to the file's
-name — so an embedded image was followed by its **full absolute path** while the
-folded panel header already showed the (clipped) name, reading as duplication.
-The header names the file, and a short `alt` would not remove the duplication, so
-the field is dropped rather than shortened. The accepted corner case is a client
-that fails to load the image showing no placeholder text; expanding the panel
-still shows the `read` that produced the image. The size estimate follows the
-builder, so it charges the name once (in `title`), not twice.
+The Decision's element carries `preview` enabled, `alt` **present but empty**,
+and a `title` that is the **same short name the folded panel header shows**.
+
+Feishu's Card JSON 2.0 image component marks `alt` **required** (its field table
+lists `alt | Yes | Struct`), and its own example says to pass an empty value when
+no description is wanted. The element therefore carries
+`alt: { "tag": "plain_text", "content": "" }`: present, to satisfy the schema and
+avoid a rejection or a dropped image, and empty, so no text renders under the
+image.
+
+`title` is the file name folded to one printable line and clipped to its tail
+within the header's character budget — `📎 …ola/target/acc/shot.png`, never the
+full absolute path a `read` reports. A client may render a title near the image,
+so a 44-character path there is exactly the duplication the header's clipped
+marker avoids; matching the header keeps the two copies identical and short. The
+size estimate follows the builder, so it charges the clipped title's
+JSON-escaped bytes once, exactly what renders.
 
 ## Amendment (2026-10-11): the folded panel header carries the file marker
 

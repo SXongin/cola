@@ -681,6 +681,17 @@ fn clip_header_name_tail(name: &str, max_chars: usize) -> String {
     format!("…{tail}")
 }
 
+/// The short File Content name the folded panel HEADER shows (ADR-0076
+/// amendment): the name folded to one printable line ([`folded_header_name`])
+/// then clipped to its tail within [`FILE_HEADER_NAME_MAX_CHARS`]
+/// ([`clip_header_name_tail`]). Shared by the header marker and the embedded
+/// image element's `title` ([`file_image_elements`]) so the two never diverge:
+/// the image title is the SAME short name the header shows, not a second,
+/// longer copy of the absolute path a `read` reports.
+fn header_file_name(name: &str) -> String {
+    clip_header_name_tail(&folded_header_name(name), FILE_HEADER_NAME_MAX_CHARS)
+}
+
 /// The compact File Content marker the folded panel HEADER carries (ADR-0076
 /// amendment). The detailed tracking line lives in the panel BODY, which is
 /// collapsed by default, so the user never sees it — worst of all for `未发送`,
@@ -700,13 +711,7 @@ fn file_header_marker(tool: &ToolPanel) -> Option<String> {
         return None;
     }
     let mut marker = if files.len() == 1 {
-        format!(
-            " · 📎 {}",
-            clip_header_name_tail(
-                &folded_header_name(&files[0].content.name),
-                FILE_HEADER_NAME_MAX_CHARS
-            )
-        )
+        format!(" · 📎 {}", header_file_name(&files[0].content.name))
     } else {
         format!(" · 📎 {} 个文件", files.len())
     };
@@ -769,16 +774,20 @@ fn json_escaped_len(text: &str) -> usize {
 
 /// The `img` elements this panel renders (ADR-0076): one per embedded File
 /// Content, all pushed immediately AFTER the panel so the image is visible and
-/// its adjacency to the panel gives the correspondence. `title` is
-/// `📎 <name>`; `preview` is on so a click enlarges it. The element carries **no
-/// `alt`**: Feishu renders an `alt` as visible text under the image, and since
-/// the folded panel header already names the file, a second copy (a full
-/// absolute path) reads as duplication. The accepted corner case is a client
-/// that fails to load the image showing no placeholder text; expanding the panel
-/// still shows the read that produced it. A content with no embed
-/// renders nothing here. EVERY embedded file emits its `img` — there is no
-/// per-panel cap: the delivery verdict is the content's intrinsic
-/// embeddability, so the render is exactly what the panel's files resolved to.
+/// its adjacency to the panel gives the correspondence. `title` is the SAME
+/// short name the folded panel header shows — `📎 <name>` folded and clipped to
+/// its tail within [`FILE_HEADER_NAME_MAX_CHARS`] via [`header_file_name`] — NOT
+/// the full absolute path a `read` reports, since a client may render the title
+/// beside the image and a 44-character path there is the duplication the
+/// header's clipped marker avoids. `alt` is **present but empty**:
+/// Feishu's Card JSON 2.0 image component marks `alt` required (field table:
+/// `alt | Yes | Struct`) and its own example says to pass an empty value when no
+/// description is wanted, so an absent field risks rejection while an empty one
+/// satisfies the schema and renders no text. `preview` is on so a click enlarges
+/// it. A content with no embed renders nothing here. EVERY embedded file emits
+/// its `img` — there is no per-panel cap: the delivery verdict is the content's
+/// intrinsic embeddability, so the render is exactly what the panel's files
+/// resolved to.
 pub(super) fn file_image_elements(tool: &ToolPanel) -> Vec<serde_json::Value> {
     tool.files()
         .iter()
@@ -787,7 +796,8 @@ pub(super) fn file_image_elements(tool: &ToolPanel) -> Vec<serde_json::Value> {
                 serde_json::json!({
                     "tag": "img",
                     "img_key": image_key,
-                    "title": { "tag": "plain_text", "content": format!("📎 {}", file.content.name) },
+                    "alt": { "tag": "plain_text", "content": "" },
+                    "title": { "tag": "plain_text", "content": format!("📎 {}", header_file_name(&file.content.name)) },
                     "preview": true,
                 })
             })
@@ -798,13 +808,14 @@ pub(super) fn file_image_elements(tool: &ToolPanel) -> Vec<serde_json::Value> {
 /// The serialized byte length the `img` elements [`file_image_elements`] emits
 /// add to a card body (ADR-0076), for a card-size estimate that must charge
 /// exactly what renders. Each element carries the File Content's name once, in
-/// its `title` (`📎 <name>`), embedded in the card's JSON, so a long or
-/// quote-heavy filename costs its JSON-escaped bytes — plus the element's own
-/// `img_key` and scaffolding. A count-only charge (or a raw name-length one)
-/// under-counts a panel of long-named images, letting a near-budget card pass
-/// the split check while Feishu rejects the serialized card on size — which the
-/// fenced content fallback cannot repair. `0` when the panel embeds nothing.
-/// Kept beside the render so the two cannot drift.
+/// its `title` (the header's folded-and-clipped short name), embedded in the
+/// card's JSON, so the name's JSON-escaped bytes — plus the element's own
+/// `img_key`, its empty `alt`, and scaffolding — are charged. A count-only
+/// charge (or a raw name-length one) under-counts a panel of embedded images,
+/// letting a near-budget card pass the split check while Feishu rejects the
+/// serialized card on size — which the fenced content fallback cannot repair.
+/// `0` when the panel embeds nothing. Kept beside the render so the two cannot
+/// drift.
 pub(crate) fn file_image_estimate(tool: &ToolPanel) -> usize {
     file_image_elements(tool)
         .iter()
@@ -1908,9 +1919,10 @@ mod tests {
 
     /// An embedded File Content (ADR-0076): the panel carries its tracking line
     /// with `· 已内嵌`, and the `img` element sits IMMEDIATELY after the panel
-    /// (not inside it — the panel is collapsed by default), `title`
-    /// `📎 <name>`, `preview` on, and NO `alt` (the header already names the
-    /// file; an `alt` would render as a duplicate visible line under the image).
+    /// (not inside it — the panel is collapsed by default), `title` the short
+    /// `📎 <name>` the header shows, `alt` PRESENT but EMPTY (Feishu's image
+    /// schema marks `alt` required, and an empty value renders no description),
+    /// `preview` on.
     #[test]
     fn an_embedded_file_content_renders_its_tracking_line_and_image_after_the_panel() {
         let panel = read_panel(
@@ -1931,9 +1943,10 @@ mod tests {
         assert_eq!(elements[1]["tag"], "img", "the image follows its panel: {card}");
         assert_eq!(elements[1]["img_key"], "img_v2_x");
         assert_eq!(elements[1]["title"]["content"], "📎 shot.png");
-        assert!(
-            elements[1].get("alt").is_none(),
-            "no alt: Feishu would render it as a duplicate name line under the image: {card}"
+        assert_eq!(
+            elements[1]["alt"],
+            json!({ "tag": "plain_text", "content": "" }),
+            "the schema-required `alt` is present and empty: {card}"
         );
         assert_eq!(elements[1]["preview"], true, "the image is clickable to enlarge");
         assert_eq!(
@@ -1944,6 +1957,48 @@ mod tests {
         assert!(
             body.contains("📎 shot.png · image/png · 3 B · 已内嵌"),
             "the panel carries the tracking line: {body}"
+        );
+    }
+
+    /// An embedded image's `title` is the SAME short name the folded panel header
+    /// shows (ADR-0076 amendment): a `read` reports the file's absolute path, but
+    /// a client may render the title beside the image, so a 44-character path is
+    /// the duplication the header's clipped marker avoids. The title is folded and
+    /// clipped to its tail exactly as the header is — the basename survives, the
+    /// path prefix does not — and the full path appears nowhere in the element.
+    #[test]
+    fn an_embedded_image_title_matches_the_clipped_panel_header_name() {
+        let name = "/root/workspace/dev/cola/target/acc/shot.png";
+        let panel = read_panel(
+            name,
+            "image/png",
+            b"ABC",
+            FileDelivery::Embedded {
+                image_key: "img_v2_x".into(),
+            },
+        );
+        let card = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_tool(panel)
+            .build();
+        let elements = card["body"]["elements"].as_array().unwrap();
+        assert_eq!(elements[1]["tag"], "img", "{card}");
+        let title = elements[1]["title"]["content"].as_str().unwrap();
+        // The tail is kept: the basename survives, the path prefix does not.
+        assert_eq!(title, "📎 …ola/target/acc/shot.png", "{card}");
+        // The whole element carries no long absolute path anywhere.
+        let serialized = serde_json::to_string(&elements[1]).unwrap();
+        assert!(
+            !serialized.contains("/root/workspace"),
+            "the image element must not repeat the absolute path: {serialized}"
+        );
+        // The header shows the same short name — no second, longer copy.
+        let header = card["body"]["elements"][0]["header"]["title"]["content"]
+            .as_str()
+            .unwrap();
+        assert!(
+            header.contains(title),
+            "the header and the image title agree: {header}"
         );
     }
 
@@ -2563,23 +2618,29 @@ mod tests {
     /// sits in the card's JSON `title` string, where each `"` becomes `\"` (a
     /// `\` `\\`, a control char to its escape — two bytes for the short forms,
     /// six for `\uXXXX`). A raw name-length charge under-counts a quote-heavy
-    /// filename by half, so a card can pass the split check and still be
-    /// rejected by Feishu on size.
+    /// filename, so a card can pass the split check and still be rejected by
+    /// Feishu on size. The name sits within the header's clip budget, so every
+    /// quote survives into the title and the escaping is isolated from clipping.
     #[test]
     fn file_image_estimate_charges_json_escaping() {
-        let quotes = "\"".repeat(2_000);
-        let panel = embedded_panel(&[&quotes]);
-        let serialized = serde_json::to_string(&file_image_elements(&panel)[0])
+        let quotes = "\"".repeat(20);
+        let plain = "x".repeat(20);
+        let quoted = file_image_estimate(&embedded_panel(&[&quotes]));
+        let unquoted = file_image_estimate(&embedded_panel(&[&plain]));
+
+        // Both names render the same element shape and length; only the 20 quotes
+        // differ — each costs one extra byte (`"` → `\"`), where a raw charge
+        // would bill them the same as the plain name.
+        assert_eq!(
+            quoted - unquoted,
+            quotes.len(),
+            "each quote must cost its escaped `\"` byte beyond its raw length"
+        );
+        // And the estimate is exactly the emitted element's serialized size.
+        let serialized = serde_json::to_string(&file_image_elements(&embedded_panel(&[&quotes]))[0])
             .unwrap()
             .len();
-
-        assert_eq!(file_image_estimate(&panel), serialized);
-        // Each quote costs its escaped `\"`: 2 bytes, where a raw charge would
-        // bill only 1 — so the title's contribution doubles the raw name length.
-        assert!(
-            file_image_estimate(&panel) > quotes.len() * 2,
-            "each quote must cost its escaped bytes in the `title`"
-        );
+        assert_eq!(quoted, serialized);
     }
 
     /// A panel with no embedded image charges nothing for images: a delivered
