@@ -189,19 +189,24 @@ async fn advance_card_fallback(cards: &CardsHandle, session_id: &str) -> Fallbac
 /// send lands. Only a confirmed write drains the staged value. Returns the
 /// stage identity the confirmation must name (spec #561, review #569); id `0`
 /// means nothing was staged (no session), which no confirmation ever matches.
+/// `rendered` is the ledger announce keys the body actually rendered (issue
+/// #671, ticket #672), from `BuiltCard::rendered_keys`: exactly what its
+/// confirmed write may mark, so a split's prefix never claims an entry its
+/// continuation shows.
 async fn stage_rendered_cursor(
     cards: &CardsHandle,
     session_id: &str,
     card_message_id: Option<&str>,
     cursor: &RenderedCursor,
     gap: Option<&crate::bridge::turn::state::GapCoverage>,
+    rendered: Vec<String>,
 ) -> crate::bridge::turn::state::StagedCursorId {
     let mut live = cards.cards.lock().await;
     match live.get_mut(session_id) {
         Some(card) => {
             let id = card
                 .acc
-                .stage_cursor(card_message_id, cursor.clone(), gap.cloned());
+                .stage_cursor(card_message_id, cursor.clone(), gap.cloned(), rendered);
             crate::bridge::turn::state::StagedCursorId {
                 id,
                 awaiting_seq: None,
@@ -245,7 +250,7 @@ async fn confirm_staged_cursor(
     if chain_id.is_some_and(|chain_id| card.chain_id() != chain_id) {
         return;
     }
-    let Some((cursor, gap)) = card.acc.take_staged_cursor(card_message_id, expected) else {
+    let Some(confirmed) = card.acc.take_staged_cursor(card_message_id, expected) else {
         return;
     };
     // The ordering test parks one confirmation here (spec #561, review #569):
@@ -258,12 +263,16 @@ async fn confirm_staged_cursor(
     // chain's orphan gap this far — a PARTIAL body only advances the durable
     // gap, so a restart (or the next slice) resumes after what a card showed,
     // while a body that reached the gap's end consumes the fact — and the
-    // cursor and the gap must never be observable apart.
+    // cursor and the gap must never be observable apart. The body's synthetic
+    // completion entries ride the same write (issue #671, ticket #672): a crash
+    // between two writes would leave the card having shown the entry with no
+    // durable mark, and a restart would re-post it.
     cards.chains.advance_cursor_and_gap(
         session_id,
         card_message_id,
-        &cursor,
-        gap.as_ref().map(|gap| (&gap.frontier, gap.complete)),
+        &confirmed.cursor,
+        confirmed.gap.as_ref().map(|gap| (&gap.frontier, gap.complete)),
+        &confirmed.rendered,
     );
 }
 
@@ -540,6 +549,7 @@ pub(super) async fn flush_card_locked(
                     Some(&card_id),
                     &built.cursor,
                     built.gap.as_ref(),
+                    built.rendered_keys.clone(),
                 )
                 .await;
                 let watermark = staged_watermark_id(cards, session_id).await;
@@ -692,6 +702,7 @@ pub(super) async fn flush_card_locked(
                         Some(&card_id),
                         &finalized.cursor,
                         finalized.gap.as_ref(),
+                        finalized.rendered_keys.clone(),
                     )
                     .await,
                 )
@@ -847,7 +858,15 @@ pub(super) async fn flush_card_locked(
         // creates are never outbox-retried, so only this send's own Ok drains
         // it (the new card's id is attached after `track_live_card`) — and only
         // while this exact stage is still the staged one (review #569).
-        let stage = stage_rendered_cursor(cards, session_id, None, &built.cursor, built.gap.as_ref()).await;
+        let stage = stage_rendered_cursor(
+            cards,
+            session_id,
+            None,
+            &built.cursor,
+            built.gap.as_ref(),
+            built.rendered_keys.clone(),
+        )
+        .await;
         let watermark = staged_watermark_id(cards, session_id).await;
         let sent = match (reply_to.as_deref(), fallback_chat.as_deref()) {
             (Some(reply_to), _) => cards.feishu.reply_card(reply_to, &built.card).await,

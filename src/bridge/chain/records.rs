@@ -16,6 +16,14 @@
 //!   completion a card announced, advanced only after the carrying card write
 //!   lands. Monotonic per Session and never removed, so a restart cannot
 //!   re-announce a Wake a previous life already showed.
+//! - **rendered** — the synthetic completion entries a card has shown
+//!   (ADR-0073's amendment, issue #671): the `runtime:<call_id>` announce keys
+//!   of runtime/child-evidence retirements a delivered card write carried.
+//!   Deliberately a SEPARATE fact from the Wake Watermark: a retirement is not
+//!   a Wake, so recording it must never move the floor a late Wake is judged
+//!   against (#590, PR #595). Like the watermark, it outlives the record it
+//!   was written on and is never removed by a release, so a restart cannot
+//!   re-show a retirement entry a previous life already rendered.
 //!
 //! The load fails open (a missing or corrupt file reads as empty) and the
 //! write is best-effort and atomic (the shared [`sidecar`] mechanics). The
@@ -285,6 +293,8 @@ struct ChainRecordFile {
     records: HashMap<String, ChainRecord>,
     #[serde(default)]
     announcements: HashMap<String, WakeMark>,
+    #[serde(default)]
+    rendered: HashMap<String, Vec<String>>,
 }
 
 /// How a re-point updates the chain's durable reply target (#580/#582): the
@@ -320,6 +330,33 @@ fn resolved_reply_to(previous: Option<&ChainRecord>, update: ReplyToUpdate<'_>) 
     }
 }
 
+/// Fold `keys` into `session_id`'s durable rendered marks (issue #671, ticket
+/// #672): append each key the session does not carry yet, evict the OLDEST
+/// past [`MAX_RENDERED_KEYS`], and report whether anything changed. The one
+/// body every record write that can carry a retirement entry funnels through,
+/// so the mark always shares its write with the cursor or re-point it was
+/// confirmed with — a crash between two writes would drop it and let the entry
+/// replay on a later card.
+fn push_rendered_marks(state: &mut State, session_id: &str, keys: &[String]) -> bool {
+    if keys.is_empty() {
+        return false;
+    }
+    let marks = state.rendered.entry(session_id.to_string()).or_default();
+    let mut changed = false;
+    for key in keys {
+        if !marks.contains(key) {
+            marks.push(key.clone());
+            changed = true;
+        }
+    }
+    if !changed {
+        return false;
+    }
+    let excess = marks.len().saturating_sub(MAX_RENDERED_KEYS);
+    marks.drain(..excess);
+    true
+}
+
 /// The pre-ADR-0069 shape, read once when `chain_records.json` is absent and
 /// never written again. The explicit `bound` keeps serde's `#[serde(default)]`
 /// inference from demanding `T: Default` (only the map is defaulted).
@@ -344,7 +381,18 @@ impl<T> Default for LegacySessions<T> {
 struct State {
     records: HashMap<String, ChainRecord>,
     announcements: HashMap<String, WakeMark>,
+    /// session_id → the synthetic completion entries that session's cards have
+    /// already rendered, oldest first (issue #671, ticket #672). Insertion
+    /// order is what [`ChainRecords::record_rendered`]'s bound evicts from.
+    rendered: HashMap<String, Vec<String>>,
 }
+
+/// The most rendered synthetic keys one Session retains (issue #671, ticket
+/// #672). A retirement's key is one per Wake-less Background Task; a Session
+/// that retires more than this in its lifetime loses the OLDEST marks first,
+/// which can at worst re-show a very old retirement entry after a restart —
+/// the duplicate-over-loss side the whole family trades toward.
+const MAX_RENDERED_KEYS: usize = 64;
 
 /// The write-through mirror of the Chain Record. Locked independently of the
 /// cards and the session store: every reader (the card paths that track a
@@ -383,12 +431,14 @@ impl ChainRecords {
             State {
                 records,
                 announcements,
+                rendered: HashMap::new(),
             }
         } else {
             let file = sidecar::load::<ChainRecordFile>(&path, "Chain Record");
             State {
                 records: file.records,
                 announcements: file.announcements,
+                rendered: file.rendered,
             }
         };
         let store = Self {
@@ -620,6 +670,7 @@ impl ChainRecords {
         reply_to: Option<&str>,
         cursor: &RenderedCursor,
         gap: Option<(&CursorFrontier, bool)>,
+        rendered: &[String],
     ) -> Option<ChainRecord> {
         self.track_carrying_cursor_with(
             session_id,
@@ -630,6 +681,7 @@ impl ChainRecords {
             known_or_carry(reply_to),
             cursor,
             gap,
+            rendered,
         )
     }
 
@@ -647,6 +699,7 @@ impl ChainRecords {
         reply_to: Option<&str>,
         cursor: &RenderedCursor,
         gap: Option<(&CursorFrontier, bool)>,
+        rendered: &[String],
     ) -> Option<ChainRecord> {
         self.track_carrying_cursor_with(
             session_id,
@@ -657,6 +710,7 @@ impl ChainRecords {
             ReplyToUpdate::Set(reply_to),
             cursor,
             gap,
+            rendered,
         )
     }
 
@@ -671,6 +725,7 @@ impl ChainRecords {
         reply_to: ReplyToUpdate<'_>,
         cursor: &RenderedCursor,
         gap: Option<(&CursorFrontier, bool)>,
+        rendered: &[String],
     ) -> Option<ChainRecord> {
         let mut state = self.lock();
         let previous = state.records.get(session_id).cloned();
@@ -698,6 +753,11 @@ impl ChainRecords {
             _ => {}
         }
         state.records.insert(session_id.to_string(), record);
+        // The synthetic entries this landed body carried leave their durable
+        // marks in the SAME write as the re-point (issue #671, ticket #672): a
+        // crash between two writes could drop the mark and let the entry replay
+        // on a later card.
+        push_rendered_marks(&mut state, session_id, rendered);
         self.write(&state);
         previous
     }
@@ -735,12 +795,15 @@ impl ChainRecords {
     /// (the 404 recreate): the card is still live, only its session id moved.
     /// The Session's announcement moves with it — the recreated id names the
     /// same logical Session, so a Wake the old id announced must not be
-    /// re-announced under the new one.
+    /// re-announced under the new one — and so do the entries its cards already
+    /// rendered (issue #671): the recreated id is the same logical Session, so
+    /// a retirement it already showed must not replay under the new one.
     pub(crate) fn rename(&self, from: &str, to: &str) {
         let mut state = self.lock();
         let record = state.records.remove(from);
         let announcement = state.announcements.remove(from);
-        if record.is_none() && announcement.is_none() {
+        let rendered = state.rendered.remove(from);
+        if record.is_none() && announcement.is_none() && rendered.is_none() {
             return;
         }
         if let Some(record) = record {
@@ -748,6 +811,9 @@ impl ChainRecords {
         }
         if let Some(announcement) = announcement {
             state.announcements.insert(to.to_string(), announcement);
+        }
+        if let Some(rendered) = rendered {
+            state.rendered.insert(to.to_string(), rendered);
         }
         self.write(&state);
     }
@@ -797,7 +863,7 @@ impl ChainRecords {
     /// helpers' form of [`Self::advance_cursor_and_gap`].
     #[cfg(test)]
     pub(crate) fn advance_cursor(&self, session_id: &str, card_message_id: &str, cursor: &RenderedCursor) {
-        self.advance_cursor_and_gap(session_id, card_message_id, cursor, None);
+        self.advance_cursor_and_gap(session_id, card_message_id, cursor, None, &[]);
     }
 
     /// Advance the Rendered Cursor AND settle the orphan gap in ONE record
@@ -815,33 +881,47 @@ impl ChainRecords {
         card_message_id: &str,
         cursor: &RenderedCursor,
         gap: Option<(&CursorFrontier, bool)>,
+        rendered: &[String],
     ) {
         let mut state = self.lock();
-        let Some(card) = state.records.get_mut(session_id) else {
-            return;
-        };
-        if card.card_message_id != card_message_id {
-            return;
-        }
-        let cursor_current = card.cursor.as_ref() == Some(cursor);
-        let gap_change = match (card.pending_gap.as_mut(), gap) {
-            (Some(recorded), Some((frontier, complete))) => {
-                if complete {
-                    card.pending_gap = None;
-                    true
-                } else if recorded.cursor.frontier.as_ref() == Some(frontier) {
-                    false
-                } else {
-                    recorded.cursor.frontier = Some(frontier.clone());
-                    true
+        let mut cursor_change = false;
+        match state.records.get_mut(session_id) {
+            Some(card) if card.card_message_id == card_message_id => {
+                let cursor_current = card.cursor.as_ref() == Some(cursor);
+                let gap_change = match (card.pending_gap.as_mut(), gap) {
+                    (Some(recorded), Some((frontier, complete))) => {
+                        if complete {
+                            card.pending_gap = None;
+                            true
+                        } else if recorded.cursor.frontier.as_ref() == Some(frontier) {
+                            false
+                        } else {
+                            recorded.cursor.frontier = Some(frontier.clone());
+                            true
+                        }
+                    }
+                    _ => false,
+                };
+                if !cursor_current || gap_change {
+                    card.cursor = Some(cursor.clone());
+                    cursor_change = true;
                 }
             }
-            _ => false,
-        };
-        if cursor_current && !gap_change {
+            // No record naming this card: the cursor and the gap are
+            // record-scoped, so their advance is dropped exactly as before (a
+            // confirmation for a record that moved on). The body's rendered
+            // marks are SESSION-scoped and still land below — they outlive the
+            // record, like the Wake Watermark.
+            _ => {}
+        }
+        // The body's synthetic completion entries ride the SAME write as the
+        // cursor and the gap it confirmed (issue #671, ticket #672): a crash
+        // between two writes would leave the card having shown the entry with
+        // no durable mark, and a restart would re-post it.
+        let rendered_change = push_rendered_marks(&mut state, session_id, rendered);
+        if !cursor_change && !rendered_change {
             return;
         }
-        card.cursor = Some(cursor.clone());
         self.write(&state);
     }
 
@@ -1002,6 +1082,34 @@ impl ChainRecords {
         self.write(&state);
     }
 
+    /// Record the synthetic completion entries a delivered card write carried
+    /// for `session_id` (issue #671, ticket #672): the announce keys
+    /// (`runtime:<call_id>`) whose `🔔 … 结束 / 已失联 / 已清理` entry a card has
+    /// really shown. Idempotent, append-only, and bounded
+    /// ([`MAX_RENDERED_KEYS`]). Deliberately NOT the Wake Watermark: a
+    /// retirement recorded here never moves the floor a late Wake is judged
+    /// against (#590, PR #595).
+    ///
+    /// The delivered body's keys normally ride [`Self::advance_cursor_and_gap`]
+    /// / [`Self::track_carrying_cursor`], so they land in the SAME record write
+    /// as the cursor they were confirmed with (spec #561, review #569; issue
+    /// #671). This plain form serves the one landed body with no record write
+    /// to ride — a projection takeover whose armed session a fresh Turn
+    /// replaced — and the unit tests.
+    pub(crate) fn record_rendered(&self, session_id: &str, keys: &[String]) {
+        let mut state = self.lock();
+        if push_rendered_marks(&mut state, session_id, keys) {
+            self.write(&state);
+        }
+    }
+
+    /// The synthetic completion keys `session_id`'s cards have already
+    /// rendered, for the render's own gate (issue #671, ticket #672). A
+    /// session that rendered nothing answers empty.
+    pub(crate) fn rendered(&self, session_id: &str) -> Vec<String> {
+        self.lock().rendered.get(session_id).cloned().unwrap_or_default()
+    }
+
     /// Persist both sections through the shared sidecar writer. The file is
     /// kept even when both sections are empty: its presence is the one-time
     /// migration marker that stops [`Self::load`] folding the legacy files
@@ -1015,6 +1123,7 @@ impl ChainRecords {
             &ChainRecordFile {
                 records: state.records.clone(),
                 announcements: state.announcements.clone(),
+                rendered: state.rendered.clone(),
             },
             false,
         );
@@ -1186,6 +1295,7 @@ mod tests {
             None,
             &RenderedCursor::default(),
             None,
+            &[],
         );
         let record = chains.get("ses_a").expect("the record");
         assert_eq!(record.reply_to, None, "the landing cleared the target");
@@ -1244,6 +1354,7 @@ mod tests {
             None,
             &RenderedCursor::default(),
             None,
+            &[],
         );
         assert_eq!(
             chains.get("ses_a").expect("the record").pending_gap,
@@ -1761,6 +1872,121 @@ mod tests {
         );
     }
 
+    /// Issue #671 / ticket #672: the rendered marks are durable, idempotent,
+    /// bounded, and — like the announcement — outlive the record they were
+    /// written on, because the whole point is the NEXT life's read.
+    #[test]
+    fn rendered_marks_persist_bound_and_outlive_the_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE);
+        let chains = ChainRecords::load(path.clone());
+        chains.track(
+            "ses_a",
+            "om_card_1",
+            MessageId::new("msg_cola_1"),
+            Some(1_000),
+            None,
+            None,
+        );
+        chains.record_rendered("ses_a", &["runtime:call_1".into(), "runtime:call_2".into()]);
+        chains.record_rendered("ses_a", &["runtime:call_1".into()]);
+
+        let reloaded = ChainRecords::load(path.clone());
+        assert_eq!(
+            reloaded.rendered("ses_a"),
+            vec!["runtime:call_1".to_string(), "runtime:call_2".to_string()],
+            "both marks persist, inserted once each and in order"
+        );
+        assert!(
+            reloaded.rendered("ses_b").is_empty(),
+            "another session is untouched"
+        );
+
+        chains.release("ses_a");
+        assert_eq!(
+            ChainRecords::load(path.clone()).rendered("ses_a"),
+            vec!["runtime:call_1".to_string(), "runtime:call_2".to_string()],
+            "the marks are not removed with the record"
+        );
+
+        // The bound evicts the OLDEST marks first, so a session can never grow
+        // the sidecar without end.
+        let keys: Vec<String> = (0..MAX_RENDERED_KEYS + 3)
+            .map(|i| format!("runtime:call_{i}"))
+            .collect();
+        chains.record_rendered("ses_a", &keys);
+        let bounded = ChainRecords::load(path).rendered("ses_a");
+        assert_eq!(bounded.len(), MAX_RENDERED_KEYS);
+        assert!(
+            !bounded.iter().any(|key| key == "runtime:call_1"),
+            "the oldest marks are evicted first: {bounded:?}"
+        );
+    }
+
+    /// Issue #671: a recreated session id names the same logical session, so
+    /// the entries its earlier cards rendered move with the announcement — a
+    /// retirement already shown must not replay under the new id.
+    #[test]
+    fn the_rendered_marks_follow_the_recreated_session_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE);
+        let chains = ChainRecords::load(path.clone());
+        chains.record_rendered("ses_old", &["runtime:call_1".into()]);
+        chains.rename("ses_old", "ses_new");
+
+        let reloaded = ChainRecords::load(path);
+        assert_eq!(reloaded.rendered("ses_new"), vec!["runtime:call_1".to_string()]);
+        assert!(reloaded.rendered("ses_old").is_empty());
+    }
+
+    /// Issue #671 / ticket #672: a confirmed body's synthetic completion keys
+    /// become durable marks in the SAME write as its cursor — and they still
+    /// land when the record no longer names that card, because the mark is
+    /// session-scoped while the cursor is record-scoped.
+    #[test]
+    fn a_confirmed_body_records_its_rendered_marks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE);
+        let chains = ChainRecords::load(path.clone());
+        chains.track(
+            "ses_a",
+            "om_card_1",
+            MessageId::new("msg_cola_1"),
+            Some(1_000),
+            None,
+            None,
+        );
+
+        chains.advance_cursor_and_gap(
+            "ses_a",
+            "om_card_1",
+            &RenderedCursor::default(),
+            None,
+            &["runtime:call_1".to_string()],
+        );
+        assert_eq!(
+            ChainRecords::load(path.clone()).rendered("ses_a"),
+            vec!["runtime:call_1".to_string()],
+            "the confirmed body's key persists with its cursor"
+        );
+
+        // A confirmation for a record that moved on drops the cursor advance
+        // (it is record-scoped) but still records the mark.
+        chains.release("ses_a");
+        chains.advance_cursor_and_gap(
+            "ses_a",
+            "om_card_1",
+            &RenderedCursor::default(),
+            None,
+            &["runtime:call_2".to_string()],
+        );
+        assert_eq!(
+            ChainRecords::load(path).rendered("ses_a"),
+            vec!["runtime:call_1".to_string(), "runtime:call_2".to_string()],
+            "the session-scoped mark survives the record's release"
+        );
+    }
+
     /// ADR-0069's migration: without `chain_records.json`, the legacy sidecars
     /// are folded in once; afterwards they are never read again, so a record
     /// removed in the new store cannot be resurrected from the stale files.
@@ -2077,6 +2303,7 @@ mod tests {
             None,
             &RenderedCursor::default(),
             None,
+            &[],
         );
         assert_eq!(
             chains

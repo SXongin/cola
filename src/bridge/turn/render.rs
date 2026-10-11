@@ -552,8 +552,13 @@ fn plan_runtime_entries(acc: &StreamAccumulator, transcript: &SessionTranscript)
     let mut plans = Vec::new();
     for retirement in &transcript.task_retirements {
         let task = &retirement.task;
-        let key = format!("runtime:{}", task.tool.call_id);
-        if acc.wake_announced(&key) {
+        let key = super::state::runtime_announce_key(task.tool.call_id.as_str());
+        // Two gates, one identity: the in-memory announce set covers this life
+        // (and this chain), the durable rendered marks cover every EARLIER life
+        // (issue #671, ticket #672) — a Wake-less retirement is re-derived on
+        // every restart, and without the second gate its entry re-renders on
+        // each new card.
+        if acc.wake_announced(&key) || acc.render_recorded(&key) {
             continue;
         }
         let kind = super::state::task_kind(&task.tool.name);
@@ -1067,7 +1072,16 @@ pub(super) fn commit_planned_entries(acc: &mut StreamAccumulator, plans: Vec<Pla
         if !announced {
             continue;
         }
-        acc.push_ledger_entry_at(plan.at, plan.entry);
+        acc.push_ledger_entry_at(
+            plan.at,
+            plan.entry,
+            match plan.announce {
+                // Only a synthetic retirement needs a durable rendered mark;
+                // a real Wake's exactly-once is the Wake Watermark (ADR-0061).
+                PlannedAnnounce::Synthetic => Some(plan.key.as_str()),
+                PlannedAnnounce::Wake { .. } => None,
+            },
+        );
         inserted = true;
     }
     inserted
