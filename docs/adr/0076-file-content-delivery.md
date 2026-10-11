@@ -117,26 +117,28 @@ that topic resolves to a DIFFERENT Session — a fork (found live on spec #644).
 The rest of the Decision is unchanged: exactly one File Message, sent once on the
 first poll that shows the block, best-effort.
 
-## Amendment (2026-10-11): the embedded `img` element's `alt` is empty and its `title` is the header name
+## Amendment (2026-10-11): the embedded `img` element's `alt` and `title` are the file's basename
 
-The Decision's element carries `preview` enabled, `alt` **present but empty**,
-and a `title` that is the **same short name the folded panel header shows**.
+The Decision's element carries `preview` enabled, an `alt` that is the file's
+**basename as plain text**, and a `title` that is `📎 <basename>` — the same
+short name the folded panel header shows when it shows one.
 
 Feishu's Card JSON 2.0 image component marks `alt` **required** (its field table
-lists `alt | Yes | Struct`), and its own example says to pass an empty value when
-no description is wanted. The element therefore carries
-`alt: { "tag": "plain_text", "content": "" }`: present, to satisfy the schema and
-avoid a rejection or a dropped image, and empty, so no text renders under the
-image.
+lists `alt | Yes | Struct`), so the element always carries it. It is the image's
+**accessible name** — the text a client shows if the image fails to load, and
+what assistive technology announces — so the common practice for an `<img>` is to
+fill it with the image's own name: the file's **basename** as PLAIN text
+(`shot.png`, no `📎` prefix, no path). An empty `alt` would satisfy the schema but
+say nothing.
 
-`title` is the file's **basename**, folded to one printable line and clipped to
-its tail within the header's character budget **only when the basename itself is
-long** — `📎 shot.png` for a `read`'s
-`/root/workspace/dev/cola/target/acc/shot.png`, never the full absolute path and
-never a path fragment (`📎 …ola/target/acc/shot.png`). A client renders the
-title as the image's caption, where path fragments are noise; matching the
-header keeps the two copies identical and short. The size estimate follows the
-builder, so it charges the title's JSON-escaped bytes once, exactly what renders.
+`title` is the visible caption, `📎 <basename>`. Both fields share the same short
+name — the basename, folded to one printable line and clipped to its tail within
+the header's character budget **only when the basename itself is long** — so a
+`read`'s `/root/workspace/dev/cola/target/acc/shot.png` renders `alt: shot.png`
+and `title: 📎 shot.png`, never the full absolute path and never a path fragment
+(`📎 …ola/target/acc/shot.png`). A client renders the title as the image's
+caption, where path fragments are noise. The size estimate follows the builder,
+so it charges the name's JSON-escaped bytes once per field, exactly what renders.
 
 ## Amendment (2026-10-11): the folded panel header carries the file marker
 
@@ -144,22 +146,32 @@ The Decision puts each File Content's tracking line in its Tool Panel **body**,
 but the panel is folded by default, so the line is invisible until the user
 expands it — worst of all for `未发送`, which is the ONLY signal that a file was
 read but could not be delivered. The panel **header** therefore carries a compact
-marker, visible while the panel stays collapsed:
+marker, visible while the panel stays collapsed.
 
-- one File Content — ` · 📎 <name>`, the file's **basename** (the segment after
-  its final `/` or `\`), clipped to its **tail** within a short character budget
-  **only when the basename itself is long** — a leading `…` plus the last
+The marker exists for the files the card does **not** show. An **embedded image
+is visible in the card** — it is rendered right after the panel with its own
+`📎 <name>` caption (the amendment above) — so naming it again in the folded
+header only duplicated the caption; an `Unresolved` file is not yet a card's
+concern. The marker therefore appears **iff** the panel has at least one File
+Content delivered `SentAsFile` or `Undelivered`, and it names only those files:
+
+- one such File Content — ` · 📎 <name>`, the file's **basename** (the segment
+  after its final `/` or `\`), clipped to its **tail** within a short character
+  budget **only when the basename itself is long** — a leading `…` plus the last
   characters, the `…` counted against the budget, so a long FILE name keeps its
   extension. A long absolute PATH is reduced to its basename first, so its
   directories never spend the budget and never render;
-- several — ` · 📎 <N> 个文件`;
-- and ` · 未发送` appended when ANY of the panel's File Contents is undelivered,
-  so the one state that must never be missed is on the header itself.
+- several — ` · 📎 <N> 个文件`, `N` the number of such files (not the panel's
+  whole file count);
+- and ` · 未发送` appended when ANY of them is undelivered, so the one state that
+  must never be missed is on the header itself.
 
-`Embedded` and `SentAsFile` add no state to the header: the image is rendered
-beside the panel and the File Message is a visible message of its own. The body's
-detailed tracking line is unchanged — the header is the folded summary, the body
-remains the record. The header title is card JSON, so the card-size estimate
+A panel whose files are ALL `Embedded` (or unresolved) carries **no marker at
+all**: its header is byte-for-byte the plain one. `SentAsFile` adds no state
+beyond the name — the File Message is a visible message of its own — while
+`Undelivered` is exactly the case the marker exists for. The body's detailed
+tracking line is unchanged for every file — the header is the folded summary, the
+body remains the record. The header title is card JSON, so the card-size estimate
 charges the marker's JSON-escaped bytes exactly as it charges the body line.
 
 ## Why
@@ -213,8 +225,9 @@ The implementation batch (spec #644, tickets #646–#649) adds the tests at the
 three existing seams: the Feishu wire client (the upload multipart fields, the
 bearer/token flow, the `msg_type:"file"` content with `reply_in_thread` omitted,
 and business-error mapping), the pure card builder (the `img` element's position
-immediately after its panel and its `title`/`preview`, the three tracking-line
-states, the user-record line, the content-rejection fenced fallback), and the
+immediately after its panel and its `alt`/`title`/`preview`, the three
+tracking-line states, the user-record line, the content-rejection fenced
+fallback), and the
 bridge mock Platform (the pre-resolve, the content-hash dedup, the fallback
 ladder, the once-guard, the File Message landing under the live card in
 whatever container the card lives, best-effort on failure).

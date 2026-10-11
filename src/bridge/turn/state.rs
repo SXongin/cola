@@ -5370,7 +5370,11 @@ mod tests {
     fn panel_estimate_charges_the_header_file_marker() {
         let quotes = "\"".repeat(24);
         let files: Vec<(&str, &[u8])> = vec![(quotes.as_str(), &b"ABC"[..])];
-        let with_files = ToolPanel::for_test_with_files("read", &files);
+        let mut with_files = ToolPanel::for_test_with_files("read", &files);
+        // The marker exists only for a file the card does NOT show, so the file
+        // must be delivered as a File Message (not left `Unresolved`, which
+        // carries no marker).
+        with_files.set_file_delivery(0, FileDelivery::SentAsFile);
         let without = ToolPanel::for_test("read", ToolStatus::Completed, None, None);
         let marker = crate::feishu::card::tool_render::file_header_marker_estimate(&with_files);
         assert!(marker > 0, "a file panel has a header marker");
