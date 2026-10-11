@@ -152,14 +152,16 @@ newly published RUSTSEC advisories surface even when nothing is pushed.
    merge — it lands on `main` as the commit message's subject, so make it
    accurate and complete).
 2. **Description** answers: what changed, why, and how it was verified.
-3. Reference the originating issue/spec when one exists (a GitHub issue
-   number; archive specs live under `.scratch/<feature>/`). To auto-close
-   issues on merge, give **every** number its own keyword — `Closes #10,
-   closes #11, closes #12`; GitHub closes only the first issue of a bare
-   comma list after a single keyword (`Closes #10, #11`). The Codex gate
-   collects references from the body and from `Refs: #N` commit trailers
-   alike; a PR that carries no reference in either place fails the review
-   workflow before the model runs.
+3. **Reference an issue — always.** The Codex gate collects references from the
+   PR body and from `Refs: #N` commit trailers, and fails the review workflow
+   before the model runs when neither carries one, so a change with no issue yet
+   **creates one first** (a ticket under its spec; `docs/agents/issue-tracker.md`).
+   Reference the originating issue/spec (a GitHub issue number; archive specs
+   live under `.scratch/<feature>/`). `Closes #N` is for an issue this PR
+   completes; `Refs: #N` links one it merely relates to. To auto-close on merge,
+   give **every** number its own keyword — `Closes #10, closes #11, closes #12`;
+   GitHub closes only the first issue of a bare comma list after a single
+   keyword (`Closes #10, #11`).
 4. Record architectural decisions as ADRs in `docs/adr/` when the change is
    hard to reverse.
 5. Do not merge until CI (fmt, clippy, test, release build, dependency audit) is

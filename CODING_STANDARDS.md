@@ -39,6 +39,12 @@ Follow Conventional Commits — see `CONTRIBUTING.md`. The format is enforced by
 - **Part payloads have no `id`**: a part's `id` is a database column not
   serialised into the part JSON. Dedupe text/reasoning on **content**, never on
   a part `id`.
+- **A card callback runs on a deadline**: the action handler is raced against a
+  short ack budget and a late result is dropped — the card is answered early and
+  never updated — so the handler behind a click is cheap and bounded: filesystem
+  or network work there caps what it scans (entries, bytes) or bounds the call
+  with a timeout, rather than growing with the machine's contents or the
+  network's latency.
 - **Use the glossary's vocabulary** (`GLOSSARY.md`): say *Bridge*, *Platform*,
   *Backend*, *Shared Store*, *Owned Server*, *Coexistent Server*, *Session*,
   *Card* — not synonyms the glossary explicitly avoids.

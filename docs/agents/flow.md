@@ -22,7 +22,7 @@ All of it runs under the `CONTRIBUTING.md` branch loop: start on `main`, branch,
 
 ## PR body
 
-`/pr` is model-invoked whenever a PR body is written. It layers on the repo's own template (`.github/pull_request_template.md`), never replaces it: keep `## What` / `## Why` / `## How tested` and the `CONTRIBUTING.md` rules (a Conventional Commits title, one `Closes #N` per issue, an ADR for a one-way door), and take the skill's rendering:
+`/pr` is model-invoked whenever a PR body is written. It layers on the repo's own template (`.github/pull_request_template.md`), never replaces it: keep `## What` / `## Why` / `## How tested` and the `CONTRIBUTING.md` rules (a Conventional Commits title, a reference to the issue — `Closes #N` when the PR completes it, `Refs: #N` when it only relates — an ADR for a one-way door), and take the skill's rendering:
 
 - `## What` opens with the smallest visual — a diff sketch, tree, sequence diagram, or pseudocode — then the paragraph.
 - `## How tested` reads as **Before:** → **After:** — failing → passing test, old log → new log, card screenshots for visual changes — ahead of the verification-loop commands.
