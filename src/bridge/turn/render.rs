@@ -6393,6 +6393,11 @@ Index: /x/src/main.rs
     /// mid-batch can no longer leave the cache oversized. This drives the
     /// production call site ([`resolve_file_deliveries`], through a render)
     /// rather than the trim helper.
+    ///
+    /// It covers both caches (the image embed cache AND the File-upload cache,
+    /// reached by a non-embeddable PDF in the same batch) on the uncontended
+    /// synchronous trim path — and then a contended lock, where the synchronous
+    /// trim cannot run and the guard must fall back to the spawned async trim.
     #[tokio::test]
     async fn a_cancelled_resolve_trims_the_content_caches() {
         let _wd = test_work_dir();
@@ -6400,28 +6405,43 @@ Index: /x/src/main.rs
         let cfg = test_config(&dir.path().join("sessions.json"));
         let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
         platform.given_image_key("img_v2_cancel");
+        platform.given_file_key("file_v2_cancel");
         let sid = "ses_cancel_trim";
         let cards = app.core.cards_handle();
         Turn::seed_card(&cards, sid, Some("om_cancel")).await;
         Turn::set_turn_anchor(&cards, sid, &turn_anchor(0)).await;
 
-        // Hold the image cache at its cap with cells the TEST owns, so the
-        // resolve's own insertion cannot evict them and the map must grow past
-        // the cap while the resolve is in flight.
+        // Hold BOTH caches at their cap with cells the TEST owns, so the
+        // resolve's own insertions cannot evict them and each map must grow past
+        // the cap while the resolve is in flight. Distinct hash ranges keep the
+        // two caches' filler keys from colliding with a real content hash.
         let mut held = Vec::new();
         for i in 0..CONTENT_CACHE_CAP {
             held.push(content_cell(&cards.file_images, i as u64).await);
+            held.push(content_cell(&cards.file_uploads, (1u64 << 63) + i as u64).await);
         }
         assert_eq!(
             cards.file_images.lock().await.len(),
             CONTENT_CACHE_CAP,
-            "the cache is at its cap"
+            "the image cache is at its cap"
+        );
+        assert_eq!(
+            cards.file_uploads.lock().await.len(),
+            CONTENT_CACHE_CAP,
+            "the file-upload cache is at its cap"
         );
 
+        // One embeddable image (the image cache) and one non-embeddable PDF (the
+        // File-upload cache) in the same batch: the image parks on its upload, so
+        // the batch is still in flight when it is cancelled, with BOTH caches
+        // pushed past the cap.
         let transcript = SessionTranscript::new(vec![message(
             "a1",
             1_000,
-            vec![read_file_part("call_read", "shot.png", "image/png", b"ABC")],
+            vec![
+                read_file_part("call_read", "shot.png", "image/png", b"ABC"),
+                read_file_part("call_pdf", "doc.pdf", "application/pdf", b"%PDF"),
+            ],
         )]);
         // Park the resolve on its image upload, so it is in flight holding its
         // own cache cell.
@@ -6429,6 +6449,7 @@ Index: /x/src/main.rs
         let resolve = {
             let app = Arc::clone(&app);
             let sid = sid.to_string();
+            let transcript = transcript.clone();
             tokio::spawn(async move {
                 let cards = app.core.cards_handle();
                 render(&app, &cards, &sid, &transcript).await
@@ -6437,17 +6458,78 @@ Index: /x/src/main.rs
         entered.notified().await;
         assert!(
             cards.file_images.lock().await.len() > CONTENT_CACHE_CAP,
-            "the in-flight resolve pushed the cache past the cap"
+            "the in-flight resolve pushed the image cache past the cap"
+        );
+        assert!(
+            cards.file_uploads.lock().await.len() > CONTENT_CACHE_CAP,
+            "the in-flight resolve pushed the file-upload cache past the cap"
         );
 
-        // Cancel the resolve mid-batch; its drop-guard trims on the way out.
+        // Cancel the resolve mid-batch; its drop-guard trims BOTH caches on the
+        // way out, uncontended.
         resolve.abort();
         let _ = resolve.await;
         assert_eq!(
             cards.file_images.lock().await.len(),
             CONTENT_CACHE_CAP,
-            "the cancelled resolve trimmed the cache back to the cap"
+            "the cancelled resolve trimmed the image cache back to the cap"
         );
+        assert_eq!(
+            cards.file_uploads.lock().await.len(),
+            CONTENT_CACHE_CAP,
+            "the cancelled resolve trimmed the file-upload cache back to the cap"
+        );
+
+        // A second pass with the image cache lock CONTENDED when the guard drops
+        // (another resolver inside `content_cell`'s brief await-free window): the
+        // synchronous `try_lock` cannot run, so the guard must fall back to the
+        // spawned async trim rather than skip the trim. The panel's deliveries
+        // were never attached (the resolve was cancelled), so a re-render
+        // re-resolves the same batch.
+        let (entered, _release) = platform.pause("upload_image", "");
+        let resolve = {
+            let app = Arc::clone(&app);
+            let sid = sid.to_string();
+            let transcript = transcript.clone();
+            tokio::spawn(async move {
+                let cards = app.core.cards_handle();
+                render(&app, &cards, &sid, &transcript).await
+            })
+        };
+        entered.notified().await;
+        assert!(
+            cards.file_images.lock().await.len() > CONTENT_CACHE_CAP,
+            "the re-resolve pushed the image cache past the cap again"
+        );
+
+        // Hold the image cache lock across the guard drop. The resolve is parked
+        // on its upload (past its own `content_cell`), so this lock is free.
+        let contended = cards.file_images.lock().await;
+        resolve.abort();
+        let _ = resolve.await;
+        // The synchronous trim could not take the contended lock, so the cache
+        // is still oversized and the trim was handed to the spawned fallback.
+        assert!(
+            contended.len() > CONTENT_CACHE_CAP,
+            "a contended lock must not skip the trim — it is deferred, not dropped"
+        );
+        drop(contended);
+
+        // Release the lock: the spawned async trim now runs and brings the cache
+        // back to the cap.
+        let mut trimmed = false;
+        for _ in 0..1_000 {
+            if cards.file_images.lock().await.len() == CONTENT_CACHE_CAP {
+                trimmed = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            trimmed,
+            "the spawned async trim brought the image cache back to the cap"
+        );
+
         // The test's own held cells survive — idle-only eviction never drops a
         // held cell.
         drop(held);
