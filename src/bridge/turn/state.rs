@@ -5412,7 +5412,7 @@ mod tests {
     }
 
     /// A panel's embedded images emit one `img` element each (ADR-0076), and
-    /// each element repeats the file NAME in `alt` and `title` — serialized into
+    /// each element carries the file NAME in its `title` — serialized into
     /// the card's JSON. The split estimate must charge those bytes: a panel of
     /// long-named embedded images whose images the estimate ignores can cross
     /// Feishu's JSON-size cap while staying under the component budget, and

@@ -770,7 +770,12 @@ fn json_escaped_len(text: &str) -> usize {
 /// The `img` elements this panel renders (ADR-0076): one per embedded File
 /// Content, all pushed immediately AFTER the panel so the image is visible and
 /// its adjacency to the panel gives the correspondence. `title` is
-/// `📎 <name>`; `preview` is on so a click enlarges it. A content with no embed
+/// `📎 <name>`; `preview` is on so a click enlarges it. The element carries **no
+/// `alt`**: Feishu renders an `alt` as visible text under the image, and since
+/// the folded panel header already names the file, a second copy (a full
+/// absolute path) reads as duplication. The accepted corner case is a client
+/// that fails to load the image showing no placeholder text; expanding the panel
+/// still shows the read that produced it. A content with no embed
 /// renders nothing here. EVERY embedded file emits its `img` — there is no
 /// per-panel cap: the delivery verdict is the content's intrinsic
 /// embeddability, so the render is exactly what the panel's files resolved to.
@@ -782,7 +787,6 @@ pub(super) fn file_image_elements(tool: &ToolPanel) -> Vec<serde_json::Value> {
                 serde_json::json!({
                     "tag": "img",
                     "img_key": image_key,
-                    "alt": { "tag": "plain_text", "content": file.content.name },
                     "title": { "tag": "plain_text", "content": format!("📎 {}", file.content.name) },
                     "preview": true,
                 })
@@ -793,15 +797,14 @@ pub(super) fn file_image_elements(tool: &ToolPanel) -> Vec<serde_json::Value> {
 
 /// The serialized byte length the `img` elements [`file_image_elements`] emits
 /// add to a card body (ADR-0076), for a card-size estimate that must charge
-/// exactly what renders. Each element repeats the File Content's name in BOTH
-/// its `alt` (`<name>`) and its `title` (`📎 <name>`), and both strings are
-/// embedded in the card's JSON, so a long or quote-heavy filename costs its
-/// JSON-escaped bytes TWICE — plus the element's own `img_key` and scaffolding.
-/// A count-only charge (or a raw name-length one) under-counts a panel of
-/// long-named images by half, letting a near-budget card pass the split check
-/// while Feishu rejects the serialized card on size — which the fenced content
-/// fallback cannot repair. `0` when the panel embeds nothing. Kept beside the
-/// render so the two cannot drift.
+/// exactly what renders. Each element carries the File Content's name once, in
+/// its `title` (`📎 <name>`), embedded in the card's JSON, so a long or
+/// quote-heavy filename costs its JSON-escaped bytes — plus the element's own
+/// `img_key` and scaffolding. A count-only charge (or a raw name-length one)
+/// under-counts a panel of long-named images, letting a near-budget card pass
+/// the split check while Feishu rejects the serialized card on size — which the
+/// fenced content fallback cannot repair. `0` when the panel embeds nothing.
+/// Kept beside the render so the two cannot drift.
 pub(crate) fn file_image_estimate(tool: &ToolPanel) -> usize {
     file_image_elements(tool)
         .iter()
@@ -1906,7 +1909,8 @@ mod tests {
     /// An embedded File Content (ADR-0076): the panel carries its tracking line
     /// with `· 已内嵌`, and the `img` element sits IMMEDIATELY after the panel
     /// (not inside it — the panel is collapsed by default), `title`
-    /// `📎 <name>`, `preview` on.
+    /// `📎 <name>`, `preview` on, and NO `alt` (the header already names the
+    /// file; an `alt` would render as a duplicate visible line under the image).
     #[test]
     fn an_embedded_file_content_renders_its_tracking_line_and_image_after_the_panel() {
         let panel = read_panel(
@@ -1927,7 +1931,10 @@ mod tests {
         assert_eq!(elements[1]["tag"], "img", "the image follows its panel: {card}");
         assert_eq!(elements[1]["img_key"], "img_v2_x");
         assert_eq!(elements[1]["title"]["content"], "📎 shot.png");
-        assert_eq!(elements[1]["alt"]["content"], "shot.png");
+        assert!(
+            elements[1].get("alt").is_none(),
+            "no alt: Feishu would render it as a duplicate name line under the image: {card}"
+        );
         assert_eq!(elements[1]["preview"], true, "the image is clickable to enlarge");
         assert_eq!(
             elements[2]["content"], "after",
@@ -2520,11 +2527,11 @@ mod tests {
     }
 
     /// The `img` elements an embedded File Content emits (ADR-0076) each carry
-    /// the file NAME in both `alt` and `title`, and the whole element is
-    /// serialized into the card's JSON. The size estimate must charge those
-    /// SERIALIZED bytes — not a count, and not the raw name length — so a
-    /// near-budget card splits instead of being rejected by Feishu on size,
-    /// which the fenced content fallback cannot repair.
+    /// the file NAME in `title`, and the whole element is serialized into the
+    /// card's JSON. The size estimate must charge those SERIALIZED bytes — not a
+    /// count, and not the raw name length — so a near-budget card splits instead
+    /// of being rejected by Feishu on size, which the fenced content fallback
+    /// cannot repair.
     #[test]
     fn file_image_estimate_charges_the_serialized_image_elements() {
         let names = [
@@ -2547,17 +2554,17 @@ mod tests {
         );
         assert!(
             file_image_estimate(&panel) > names.iter().map(|n| n.len()).sum::<usize>(),
-            "the estimate must charge more than the raw names: the element scaffolding and \
-             the second (alt + title) copy count too"
+            "the estimate must charge more than the raw names: the element scaffolding \
+             and the JSON-escaped title copy count too"
         );
     }
 
     /// The image estimate must charge the element's JSON-ESCAPED bytes: the name
-    /// sits in the card's JSON `alt`/`title` strings, where each `"` becomes
-    /// `\"` (a `\` `\\`, a control char to its escape — two bytes for the short
-    /// forms, six for `\uXXXX`). A raw name-length charge
-    /// under-counts a quote-heavy filename by half in EACH of the two fields, so
-    /// a card can pass the split check and still be rejected by Feishu on size.
+    /// sits in the card's JSON `title` string, where each `"` becomes `\"` (a
+    /// `\` `\\`, a control char to its escape — two bytes for the short forms,
+    /// six for `\uXXXX`). A raw name-length charge under-counts a quote-heavy
+    /// filename by half, so a card can pass the split check and still be
+    /// rejected by Feishu on size.
     #[test]
     fn file_image_estimate_charges_json_escaping() {
         let quotes = "\"".repeat(2_000);
@@ -2567,11 +2574,11 @@ mod tests {
             .len();
 
         assert_eq!(file_image_estimate(&panel), serialized);
-        // Each quote costs its escaped `\"` in BOTH fields: 4 bytes, where a raw
-        // charge would bill only 2.
+        // Each quote costs its escaped `\"`: 2 bytes, where a raw charge would
+        // bill only 1 — so the title's contribution doubles the raw name length.
         assert!(
             file_image_estimate(&panel) > quotes.len() * 2,
-            "each quote must cost its escaped bytes in both `alt` and `title`"
+            "each quote must cost its escaped bytes in the `title`"
         );
     }
 

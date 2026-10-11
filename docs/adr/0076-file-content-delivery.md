@@ -117,6 +117,19 @@ that topic resolves to a DIFFERENT Session — a fork (found live on spec #644).
 The rest of the Decision is unchanged: exactly one File Message, sent once on the
 first poll that shows the block, best-effort.
 
+## Amendment (2026-10-11): the embedded `img` element carries no `alt`
+
+The Decision's element is `title` `📎 <name>` with `preview` enabled, and is
+deliberately **without an `alt`**. Feishu renders an `img` element's `alt` as
+visible text directly under the image, and the first cut set it to the file's
+name — so an embedded image was followed by its **full absolute path** while the
+folded panel header already showed the (clipped) name, reading as duplication.
+The header names the file, and a short `alt` would not remove the duplication, so
+the field is dropped rather than shortened. The accepted corner case is a client
+that fails to load the image showing no placeholder text; expanding the panel
+still shows the `read` that produced the image. The size estimate follows the
+builder, so it charges the name once (in `title`), not twice.
+
 ## Amendment (2026-10-11): the folded panel header carries the file marker
 
 The Decision puts each File Content's tracking line in its Tool Panel **body**,
