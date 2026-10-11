@@ -206,17 +206,21 @@ pub trait Platform: Send + Sync {
     /// any `Err` leaves the card intact and never fails the Turn.
     async fn upload_file(&self, content: &FileContent) -> Result<Option<String>>;
 
-    /// Send a message of an arbitrary `msg_type` replied **in thread**
-    /// (`reply_in_thread: true`) under `message_id` (ADR-0076): the send path
-    /// for a File Message (`msg_type:"file"`, `content` `{"file_key": …}`).
-    /// Returns the created message id and the topic's `thread_id`, exactly like
-    /// [`Self::reply_card_in_thread`] (`thread_id` is `None` when the chat does
+    /// Send a message of an arbitrary `msg_type` as a reply under `message_id`
+    /// (ADR-0076): the send path for a File Message (`msg_type:"file"`,
+    /// `content` `{"file_key": …}`). `reply_in_thread` selects the reply mode —
+    /// `true` for a topic-backed Session (the File Message lands in the
+    /// Session's own topic), `false` for a lobby (a plain reply under the card,
+    /// creating no topic — a thread reply there would spawn one and fork the
+    /// conversation; ADR-0076's amendment). Returns the created message id and
+    /// the topic's `thread_id` (`None` for a plain reply, or when the chat does
     /// not support topic replies). Best-effort at the call site.
-    async fn send_message_in_thread(
+    async fn reply_message(
         &self,
         message_id: &str,
         msg_type: &str,
         content: &Value,
+        reply_in_thread: bool,
     ) -> Result<(String, Option<String>)>;
 
     /// Download an image embedded in a message (`GET /im/v1/messages/{id}/resources/{key}?type=image`),
@@ -421,13 +425,14 @@ impl Platform for Client {
             .map(Some)
     }
 
-    async fn send_message_in_thread(
+    async fn reply_message(
         &self,
         message_id: &str,
         msg_type: &str,
         content: &Value,
+        reply_in_thread: bool,
     ) -> Result<(String, Option<String>)> {
-        Client::send_message_in_thread(self, message_id, msg_type, content).await
+        Client::reply_message(self, message_id, msg_type, content, reply_in_thread).await
     }
 
     async fn download_image(&self, message_id: &str, image_key: &str) -> Result<client::ImageAttachment> {

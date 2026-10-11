@@ -91,6 +91,21 @@ way a turn's several images stay tied to the call that read each one.
   noise as a file attachment; the Background Task Ledger's clipped tail stays its
   surface.
 
+## Amendment (2026-10-11): the File Message's reply mode is container-aware
+
+The Decision above says the File Message is "replied in-thread under the live
+card". That is right for a **topic-backed** Session (`ThreadKey.thread_id !=
+chat_id`): `reply_in_thread: true` lands the message in the Session's own topic.
+It is wrong for a **lobby** Session (`thread_id == chat_id`): Feishu creates a
+**brand-new topic** around the card, and because cola keys a conversation by
+`(chat_id, thread_id)`, a user replying inside that topic resolves to a
+DIFFERENT Session — a fork (found in live acceptance of spec #644). The send is
+therefore container-aware: `reply_in_thread: true` when the Session is
+topic-backed, and a **plain reply** (`reply_in_thread` omitted, creating no
+topic) in a lobby, which Feishu shows as a quoted reply under the card. The rest
+of the Decision is unchanged: exactly one File Message, sent once on the first
+poll that shows the block, best-effort.
+
 ## Why
 
 - **Hybrid, not one surface, because neither alone covers the issue.** A

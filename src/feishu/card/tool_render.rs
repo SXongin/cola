@@ -60,8 +60,10 @@ pub enum FileDelivery {
     /// element references. The panel line reads `· 已内嵌`.
     Embedded { image_key: String },
     /// A File Content uploaded once and posted as exactly one File Message
-    /// replied in-thread under the live card (#649). The panel line reads
-    /// `· 已发送为文件消息`.
+    /// under the live card (#649): in the Session's own topic when it is
+    /// topic-backed (`reply_in_thread: true`), a plain reply in a lobby
+    /// (`reply_in_thread` omitted, creating no topic — ADR-0076's amendment).
+    /// The panel line reads `· 已发送为文件消息`.
     SentAsFile,
     /// A File Content that could not be delivered: over Feishu's 30MB message
     /// cap, or a failed upload/send. The panel line reads `· 未发送`.
