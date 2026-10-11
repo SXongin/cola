@@ -704,9 +704,9 @@ fn header_name_basename(folded: &str) -> Option<&str> {
 /// the directories are dropped first. A name ending in a separator (or one with
 /// nothing printable) falls back to the whole folded name, so the marker is
 /// never empty. Shared by the header marker and the embedded image element's
-/// `title` ([`file_image_elements`]) so the two never diverge: the image title
-/// is the SAME short name the header shows, not a second, longer copy of the
-/// absolute path a `read` reports.
+/// `title`/`alt` ([`file_image_elements`]) so they never diverge: the image's
+/// fields are the SAME short name the header shows when it shows one, not a
+/// second, longer copy of the absolute path a `read` reports.
 fn header_file_name(name: &str) -> String {
     let folded = folded_header_name(name);
     let chosen = header_name_basename(&folded).unwrap_or(&folded);
@@ -716,28 +716,40 @@ fn header_file_name(name: &str) -> String {
 /// The compact File Content marker the folded panel HEADER carries (ADR-0076
 /// amendment). The detailed tracking line lives in the panel BODY, which is
 /// collapsed by default, so the user never sees it — worst of all for `未发送`,
-/// the ONLY signal that a file was read but could not be delivered. The header
-/// therefore shows a one-line marker while folded: ` · 📎 <name>` for a single
-/// file (the name's BASENAME, folded to one printable line and clipped to its
-/// tail within [`FILE_HEADER_NAME_MAX_CHARS`] only when the basename itself is
-/// long), ` · 📎 <N> 个文件` for several, and
-/// ` · 未发送` appended when ANY of the panel's files is
-/// [`FileDelivery::Undelivered`]. `Embedded`/`SentAsFile` carry no state here —
-/// the image is rendered beside the panel and the File Message is a visible
-/// message — and the body's tracking line is unchanged. `None` when the panel
-/// carries no File Content, so a plain panel's header is byte-for-byte what it
-/// was.
+/// the ONLY signal that a file was read but could not be delivered. The marker
+/// exists for the files the card does NOT show: an embedded image is visible
+/// beside the panel with its own caption ([`file_image_elements`]), so naming it
+/// again in the folded header would only duplicate it, and an `Unresolved` file
+/// is not yet a card's concern. The marker therefore appears IFF the panel has at
+/// least one file delivered [`FileDelivery::SentAsFile`] or
+/// [`FileDelivery::Undelivered`], and names only those: ` · 📎 <name>` for a
+/// single one (the name's BASENAME, folded to one printable line and clipped to
+/// its tail within [`FILE_HEADER_NAME_MAX_CHARS`] only when the basename itself
+/// is long), ` · 📎 <N> 个文件` for several, and ` · 未发送` appended when ANY of
+/// them is [`FileDelivery::Undelivered`]. A panel whose files are ALL `Embedded`
+/// (or unresolved) carries NO marker, so its header is byte-for-byte the plain
+/// one. The body's tracking line is unchanged for every file. `None` when the
+/// panel carries no such file.
 fn file_header_marker(tool: &ToolPanel) -> Option<String> {
-    let files = tool.files();
-    if files.is_empty() {
+    let marked: Vec<&ToolFile> = tool
+        .files()
+        .iter()
+        .filter(|file| {
+            matches!(
+                file.delivery,
+                FileDelivery::SentAsFile | FileDelivery::Undelivered
+            )
+        })
+        .collect();
+    if marked.is_empty() {
         return None;
     }
-    let mut marker = if files.len() == 1 {
-        format!(" · 📎 {}", header_file_name(&files[0].content.name))
+    let mut marker = if marked.len() == 1 {
+        format!(" · 📎 {}", header_file_name(&marked[0].content.name))
     } else {
-        format!(" · 📎 {} 个文件", files.len())
+        format!(" · 📎 {} 个文件", marked.len())
     };
-    if files
+    if marked
         .iter()
         .any(|file| file.delivery == FileDelivery::Undelivered)
     {
@@ -796,19 +808,18 @@ fn json_escaped_len(text: &str) -> usize {
 
 /// The `img` elements this panel renders (ADR-0076): one per embedded File
 /// Content, all pushed immediately AFTER the panel so the image is visible and
-/// its adjacency to the panel gives the correspondence. `title` is the SAME
-/// short name the folded panel header shows — the file's BASENAME, `📎 <name>`
-/// folded and clipped to its tail within [`FILE_HEADER_NAME_MAX_CHARS`] via
-/// [`header_file_name`] only when the basename itself is long — NOT the full
-/// absolute path a `read` reports, since a client may render the title
-/// beside the image and a 44-character path there is the duplication the
-/// header's short marker avoids. `alt` is **present but empty**:
-/// Feishu's Card JSON 2.0 image component marks `alt` required (field table:
-/// `alt | Yes | Struct`) and its own example says to pass an empty value when no
-/// description is wanted, so an absent field risks rejection while an empty one
-/// satisfies the schema and renders no text. `preview` is on so a click enlarges
-/// it. A content with no embed renders nothing here. EVERY embedded file emits
-/// its `img` — there is no per-panel cap: the delivery verdict is the content's
+/// its adjacency to the panel gives the correspondence. `alt` and `title` share
+/// one short name — the file's BASENAME, folded and clipped to its tail within
+/// [`FILE_HEADER_NAME_MAX_CHARS`] via [`header_file_name`] only when the
+/// basename itself is long — NOT the full absolute path a `read` reports.
+/// `title` is the visible caption, `📎 <name>`; `alt` is the image's accessible
+/// name and the text a client shows if the image fails to load, so it is the
+/// **plain basename** (`shot.png`), no `📎` prefix and no path. Feishu's Card
+/// JSON 2.0 image component marks `alt` required (field table:
+/// `alt | Yes | Struct`), so the field is always present and now meaningfully
+/// populated while staying short. `preview` is on so a click enlarges it. A
+/// content with no embed renders nothing here. EVERY embedded file emits its
+/// `img` — there is no per-panel cap: the delivery verdict is the content's
 /// intrinsic embeddability, so the render is exactly what the panel's files
 /// resolved to.
 pub(super) fn file_image_elements(tool: &ToolPanel) -> Vec<serde_json::Value> {
@@ -816,11 +827,15 @@ pub(super) fn file_image_elements(tool: &ToolPanel) -> Vec<serde_json::Value> {
         .iter()
         .filter_map(|file| {
             file.delivery.as_embedded_key().map(|image_key| {
+                // One short name for both fields: the `alt` (the image's
+                // accessible name, shown if the image fails to load) and the
+                // `title` (the visible caption).
+                let name = header_file_name(&file.content.name);
                 serde_json::json!({
                     "tag": "img",
                     "img_key": image_key,
-                    "alt": { "tag": "plain_text", "content": "" },
-                    "title": { "tag": "plain_text", "content": format!("📎 {}", header_file_name(&file.content.name)) },
+                    "alt": { "tag": "plain_text", "content": name.clone() },
+                    "title": { "tag": "plain_text", "content": format!("📎 {name}") },
                     "preview": true,
                 })
             })
@@ -831,12 +846,13 @@ pub(super) fn file_image_elements(tool: &ToolPanel) -> Vec<serde_json::Value> {
 /// The serialized byte length the `img` elements [`file_image_elements`] emits
 /// add to a card body (ADR-0076), for a card-size estimate that must charge
 /// exactly what renders. Each element carries the File Content's name once, in
-/// its `title` (the header's folded-and-clipped basename), embedded in the
-/// card's JSON, so the name's JSON-escaped bytes — plus the element's own
-/// `img_key`, its empty `alt`, and scaffolding — are charged. A count-only
-/// charge (or a raw name-length one) under-counts a panel of embedded images,
-/// letting a near-budget card pass the split check while Feishu rejects the
-/// serialized card on size — which the fenced content fallback cannot repair.
+/// its `title` and again in its `alt` (the same folded-and-clipped basename),
+/// embedded in the card's JSON, so the name's JSON-escaped bytes — once per
+/// field — plus the element's own `img_key` and scaffolding are charged. A
+/// count-only charge (or a raw name-length one) under-counts a panel of
+/// embedded images, letting a near-budget card pass the split check while
+/// Feishu rejects the serialized card on size — which the fenced content
+/// fallback cannot repair.
 /// `0` when the panel embeds nothing. Kept beside the render so the two cannot
 /// drift.
 pub(crate) fn file_image_estimate(tool: &ToolPanel) -> usize {
@@ -850,10 +866,12 @@ pub(crate) fn file_image_estimate(tool: &ToolPanel) -> usize {
 /// One tool panel as a folded collapsible element. `at_ms` is the part's
 /// server `state.time.start`; when present, the panel header carries it as
 /// `· HH:MM` so the start time is visible while collapsed (#183), and when
-/// absent (a payload with no server time) no clock is rendered. A panel with
-/// File Contents appends the compact file marker [`file_header_marker`] so the
+/// absent (a payload with no server time) no clock is rendered. A panel with a
+/// File Content the card does NOT show — one sent as a File Message or left
+/// undelivered — appends the compact file marker [`file_header_marker`] so the
 /// file — and a `未发送` one above all — is visible while folded (ADR-0076
-/// amendment). `element_id` is the panel's stable identity on the card (see
+/// amendment); an embedded image, visible beside the panel, adds none.
+/// `element_id` is the panel's stable identity on the card (see
 /// [`super::shell::collapsible_panel_chunks`]).
 pub(super) fn tool_panel_element(
     tool: &ToolPanel,
@@ -1942,10 +1960,10 @@ mod tests {
 
     /// An embedded File Content (ADR-0076): the panel carries its tracking line
     /// with `· 已内嵌`, and the `img` element sits IMMEDIATELY after the panel
-    /// (not inside it — the panel is collapsed by default), `title` the short
-    /// `📎 <name>` the header shows, `alt` PRESENT but EMPTY (Feishu's image
-    /// schema marks `alt` required, and an empty value renders no description),
-    /// `preview` on.
+    /// (not inside it — the panel is collapsed by default), `title` the visible
+    /// caption `📎 <name>`, `alt` the image's accessible name — the plain
+    /// basename (Feishu's image schema marks `alt` required, so it is always
+    /// present, now meaningfully populated) — and `preview` on.
     #[test]
     fn an_embedded_file_content_renders_its_tracking_line_and_image_after_the_panel() {
         let panel = read_panel(
@@ -1968,8 +1986,8 @@ mod tests {
         assert_eq!(elements[1]["title"]["content"], "📎 shot.png");
         assert_eq!(
             elements[1]["alt"],
-            json!({ "tag": "plain_text", "content": "" }),
-            "the schema-required `alt` is present and empty: {card}"
+            json!({ "tag": "plain_text", "content": "shot.png" }),
+            "the schema-required `alt` carries the plain basename: {card}"
         );
         assert_eq!(elements[1]["preview"], true, "the image is clickable to enlarge");
         assert_eq!(
@@ -1983,14 +2001,16 @@ mod tests {
         );
     }
 
-    /// An embedded image's `title` is the SAME short name the folded panel header
-    /// shows (ADR-0076 amendment): a `read` reports the file's absolute path, but
-    /// a client renders the title as the image's caption, where a 44-character
-    /// path is noise. The title is the file's BASENAME — `📎 shot.png`, no `/`
-    /// and no `…` — matching the header, and the full path appears nowhere in the
-    /// element.
+    /// An embedded image's `alt` and `title` are the file's BASENAME (ADR-0076
+    /// amendment): a `read` reports the file's absolute path, but `alt` is the
+    /// image's accessible name (shown if the image fails to load) and `title` is
+    /// the visible caption, where a 44-character path is noise. `title` is
+    /// `📎 shot.png` and `alt` is the plain `shot.png` — no `/` and no `…` in
+    /// either — and the full path appears nowhere in the element. The header
+    /// carries no marker (the image is itself visible beside the panel), so the
+    /// short name lives only on the image.
     #[test]
-    fn an_embedded_image_title_matches_the_panel_header_basename() {
+    fn an_embedded_image_alt_and_title_are_the_plain_basename() {
         let name = "/root/workspace/dev/cola/target/acc/shot.png";
         let panel = read_panel(
             name,
@@ -2007,25 +2027,34 @@ mod tests {
         let elements = card["body"]["elements"].as_array().unwrap();
         assert_eq!(elements[1]["tag"], "img", "{card}");
         let title = elements[1]["title"]["content"].as_str().unwrap();
+        let alt = elements[1]["alt"]["content"].as_str().unwrap();
         // The basename alone: the path prefix is dropped, no clip marker shows.
         assert_eq!(title, "📎 shot.png", "{card}");
-        assert!(
-            !title.contains('/') && !title.contains('…'),
-            "no path fragment and no clip marker in the image title: {title}"
-        );
+        assert_eq!(alt, "shot.png", "the alt is the plain basename: {card}");
+        for field in [title, alt] {
+            assert!(
+                !field.contains('/') && !field.contains('\\') && !field.contains('…'),
+                "no path fragment and no clip marker in the image fields: {field}"
+            );
+        }
         // The whole element carries no long absolute path anywhere.
         let serialized = serde_json::to_string(&elements[1]).unwrap();
         assert!(
             !serialized.contains("/root/workspace"),
             "the image element must not repeat the absolute path: {serialized}"
         );
-        // The header shows the same short name — no second, longer copy.
+        // The image is visible in the card, so the folded header names nothing:
+        // no marker, no `📎`, byte-for-byte the plain header.
         let header = card["body"]["elements"][0]["header"]["title"]["content"]
             .as_str()
             .unwrap();
+        assert_eq!(
+            header, "✅ read",
+            "an embedded image leaves the header plain: {header}"
+        );
         assert!(
-            header.contains(title),
-            "the header and the image title agree: {header}"
+            !header.contains("📎"),
+            "no marker for an embedded-only panel: {header}"
         );
     }
 
@@ -2147,12 +2176,14 @@ mod tests {
         assert!(!body.contains("已内嵌"), "{body}");
     }
 
-    /// The folded panel HEADER carries the File Content marker (ADR-0076
-    /// amendment): the detailed tracking line is in the collapsed body, so the
-    /// header names the file while the panel stays folded. An embedded file
-    /// shows `📎 <name>`.
+    /// An embedded image leaves the folded panel HEADER unmarked (ADR-0076
+    /// amendment): the image is visible in the card right after the panel, with
+    /// its own `📎 <name>` caption, so naming it again in the folded header would
+    /// only duplicate it. The marker is for the files the card does NOT show, so
+    /// an all-embedded panel's header is byte-for-byte the plain one — while the
+    /// body still carries the full tracking line.
     #[test]
-    fn an_embedded_file_marks_the_collapsed_panel_header() {
+    fn an_embedded_file_leaves_the_collapsed_panel_header_unmarked() {
         let panel = read_panel(
             "shot.png",
             "image/png",
@@ -2168,7 +2199,16 @@ mod tests {
         let title = card["body"]["elements"][0]["header"]["title"]["content"]
             .as_str()
             .expect("panel title");
-        assert_eq!(title, "✅ read · 📎 shot.png", "{card}");
+        assert_eq!(title, "✅ read", "{card}");
+        assert!(!title.contains("📎"), "no marker for an embedded file: {title}");
+        // The body still records the file and its `已内嵌` state.
+        let body = card["body"]["elements"][0]["elements"][0]["content"]
+            .as_str()
+            .unwrap();
+        assert!(
+            body.contains("📎 shot.png · image/png · 3 B · 已内嵌"),
+            "the body keeps the tracking line: {body}"
+        );
     }
 
     /// An undelivered File Content — the one state that must never be invisible
@@ -2187,12 +2227,49 @@ mod tests {
         assert_eq!(title, "✅ read · 📎 doc.pdf · 未发送", "{card}");
     }
 
-    /// A panel with several File Contents shows a count in the folded header,
-    /// not one name per file (ADR-0076 amendment), and appends `未发送` when any
-    /// of them is undelivered.
+    /// A panel with several File Contents the card does NOT show — each sent as a
+    /// File Message — shows a count in the folded header, not one name per file
+    /// (ADR-0076 amendment), and appends `未发送` when any of them is
+    /// undelivered. The count is the marked files only.
     #[test]
-    fn several_files_show_a_count_in_the_collapsed_panel_header() {
-        let panel = embedded_panel(&["a.png", "b.png"]);
+    fn several_unembedded_files_show_a_count_in_the_collapsed_panel_header() {
+        let panel = |deliveries: &[FileDelivery]| {
+            let files: Vec<(&str, &[u8])> = vec![("a.png", &b"ABC"[..]), ("b.png", &b"ABC"[..])];
+            let mut panel = ToolPanel::for_test_with_files("read", &files);
+            for (i, delivery) in deliveries.iter().enumerate() {
+                panel.set_file_delivery(i, delivery.clone());
+            }
+            panel
+        };
+        let card = |panel: ToolPanel| {
+            CardBuilder::new()
+                .with_state(CardState::Done)
+                .with_tool(panel)
+                .build()
+        };
+
+        let sent = card(panel(&[FileDelivery::SentAsFile, FileDelivery::SentAsFile]));
+        let title = sent["body"]["elements"][0]["header"]["title"]["content"]
+            .as_str()
+            .expect("panel title");
+        assert!(title.contains("📎 2 个文件"), "{title}");
+        assert!(!title.contains("a.png"), "a count, not a name: {title}");
+
+        let unsent = card(panel(&[FileDelivery::SentAsFile, FileDelivery::Undelivered]));
+        let title = unsent["body"]["elements"][0]["header"]["title"]["content"]
+            .as_str()
+            .expect("panel title");
+        assert!(title.contains("📎 2 个文件 · 未发送"), "{title}");
+    }
+
+    /// A single file sent as a File Message marks the folded header with its
+    /// BASENAME (ADR-0076 amendment): the bytes live in a separate message, so
+    /// the card shows nothing for it and the header is the only signal on the
+    /// card itself.
+    #[test]
+    fn a_sent_as_file_content_marks_the_collapsed_panel_header_with_its_basename() {
+        let name = "/root/workspace/dev/cola/target/acc/doc.pdf";
+        let panel = read_panel(name, "application/pdf", b"%PDF", FileDelivery::SentAsFile);
         let card = CardBuilder::new()
             .with_state(CardState::Done)
             .with_tool(panel)
@@ -2200,19 +2277,38 @@ mod tests {
         let title = card["body"]["elements"][0]["header"]["title"]["content"]
             .as_str()
             .expect("panel title");
-        assert!(title.contains("📎 2 个文件"), "{title}");
-        assert!(!title.contains("a.png"), "a count, not a name: {title}");
+        assert_eq!(title, "✅ read · 📎 doc.pdf", "{card}");
+        assert!(!title.contains('/'), "the marker shows the basename: {title}");
+    }
 
-        let mut unsent = embedded_panel(&["a.png", "b.png"]);
-        unsent.set_file_delivery(1, FileDelivery::Undelivered);
+    /// A mixed panel — an embedded image plus an undelivered file — still marks
+    /// the folded header (ADR-0076 amendment): the embedded image is visible in
+    /// the card and needs no marker, but the undelivered file does, so the marker
+    /// appears and names the file that the card does NOT show.
+    #[test]
+    fn a_mixed_panel_marks_the_header_for_its_unembedded_file() {
+        let files: Vec<(&str, &[u8])> = vec![("shot.png", &b"ABC"[..]), ("doc.pdf", &b"%PDF"[..])];
+        let mut panel = ToolPanel::for_test_with_files("read", &files);
+        panel.set_file_delivery(
+            0,
+            FileDelivery::Embedded {
+                image_key: "img_v2_x".into(),
+            },
+        );
+        panel.set_file_delivery(1, FileDelivery::Undelivered);
         let card = CardBuilder::new()
             .with_state(CardState::Done)
-            .with_tool(unsent)
+            .with_tool(panel)
             .build();
         let title = card["body"]["elements"][0]["header"]["title"]["content"]
             .as_str()
             .expect("panel title");
-        assert!(title.contains("📎 2 个文件 · 未发送"), "{title}");
+        assert_eq!(title, "✅ read · 📎 doc.pdf · 未发送", "{card}");
+        // The embedded image still renders beside the panel; its own caption
+        // names it, so the header need not.
+        let elements = card["body"]["elements"].as_array().unwrap();
+        assert_eq!(elements[1]["tag"], "img", "{card}");
+        assert_eq!(elements[1]["title"]["content"], "📎 shot.png", "{card}");
     }
 
     /// A panel with no File Content leaves its header byte-for-byte what it was:
@@ -2245,14 +2341,7 @@ mod tests {
     #[test]
     fn a_long_absolute_path_shows_only_its_basename_in_the_panel_header() {
         let name = "/root/workspace/dev/cola/target/acc/shot.png";
-        let panel = read_panel(
-            name,
-            "image/png",
-            b"ABC",
-            FileDelivery::Embedded {
-                image_key: "img".into(),
-            },
-        );
+        let panel = read_panel(name, "image/png", b"ABC", FileDelivery::SentAsFile);
         let card = CardBuilder::new()
             .with_state(CardState::Done)
             .with_tool(panel)
@@ -2276,14 +2365,7 @@ mod tests {
     /// leading `…`.
     #[test]
     fn a_short_file_name_is_unchanged_in_the_panel_header() {
-        let panel = read_panel(
-            "shot.png",
-            "image/png",
-            b"ABC",
-            FileDelivery::Embedded {
-                image_key: "img".into(),
-            },
-        );
+        let panel = read_panel("shot.png", "image/png", b"ABC", FileDelivery::SentAsFile);
         let card = CardBuilder::new()
             .with_state(CardState::Done)
             .with_tool(panel)
@@ -2304,14 +2386,7 @@ mod tests {
         let plain = ToolPanel::for_test("bash", ToolStatus::Completed, None, Some("ok"));
         assert_eq!(file_header_marker_estimate(&plain), 0);
 
-        let panel = read_panel(
-            "shot.png",
-            "image/png",
-            b"ABC",
-            FileDelivery::Embedded {
-                image_key: "img".into(),
-            },
-        );
+        let panel = read_panel("shot.png", "image/png", b"ABC", FileDelivery::SentAsFile);
         let marker = file_header_marker(&panel).expect("a file panel has a header marker");
         assert_eq!(
             file_header_marker_estimate(&panel),
@@ -2461,14 +2536,7 @@ mod tests {
     #[test]
     fn a_multibyte_file_name_clips_at_the_character_boundary() {
         let name = "截图".repeat(20); // 40 characters, 120 bytes
-        let panel = read_panel(
-            &name,
-            "image/png",
-            b"ABC",
-            FileDelivery::Embedded {
-                image_key: "img".into(),
-            },
-        );
+        let panel = read_panel(&name, "image/png", b"ABC", FileDelivery::SentAsFile);
         let card = CardBuilder::new()
             .with_state(CardState::Done)
             .with_tool(panel)
@@ -2506,14 +2574,7 @@ mod tests {
             name.chars().count() > FILE_HEADER_NAME_MAX_CHARS,
             "the fixture must exceed the clip so the boundary is exercised"
         );
-        let panel = read_panel(
-            name,
-            "image/png",
-            b"ABC",
-            FileDelivery::Embedded {
-                image_key: "img".into(),
-            },
-        );
+        let panel = read_panel(name, "image/png", b"ABC", FileDelivery::SentAsFile);
         let card = CardBuilder::new()
             .with_state(CardState::Done)
             .with_tool(panel)
@@ -2674,11 +2735,11 @@ mod tests {
     }
 
     /// The `img` elements an embedded File Content emits (ADR-0076) each carry
-    /// the file NAME in `title`, and the whole element is serialized into the
-    /// card's JSON. The size estimate must charge those SERIALIZED bytes — not a
-    /// count, and not the raw name length — so a near-budget card splits instead
-    /// of being rejected by Feishu on size, which the fenced content fallback
-    /// cannot repair.
+    /// the file NAME in `title` and `alt`, and the whole element is serialized
+    /// into the card's JSON. The size estimate must charge those SERIALIZED
+    /// bytes — not a count, and not the raw name length — so a near-budget card
+    /// splits instead of being rejected by Feishu on size, which the fenced
+    /// content fallback cannot repair.
     #[test]
     fn file_image_estimate_charges_the_serialized_image_elements() {
         let names = [
@@ -2707,12 +2768,13 @@ mod tests {
     }
 
     /// The image estimate must charge the element's JSON-ESCAPED bytes: the name
-    /// sits in the card's JSON `title` string, where each `"` becomes `\"` (a
-    /// `\` `\\`, a control char to its escape — two bytes for the short forms,
-    /// six for `\uXXXX`). A raw name-length charge under-counts a quote-heavy
-    /// filename, so a card can pass the split check and still be rejected by
-    /// Feishu on size. The name sits within the header's clip budget, so every
-    /// quote survives into the title and the escaping is isolated from clipping.
+    /// sits in the card's JSON `title` and `alt` strings, where each `"` becomes
+    /// `\"` (a `\` `\\`, a control char to its escape — two bytes for the short
+    /// forms, six for `\uXXXX`). A raw name-length charge under-counts a
+    /// quote-heavy filename, so a card can pass the split check and still be
+    /// rejected by Feishu on size. The name sits within the header's clip budget,
+    /// so every quote survives into both fields and the escaping is isolated from
+    /// clipping.
     #[test]
     fn file_image_estimate_charges_json_escaping() {
         let quotes = "\"".repeat(20);
@@ -2721,12 +2783,13 @@ mod tests {
         let unquoted = file_image_estimate(&embedded_panel(&[&plain]));
 
         // Both names render the same element shape and length; only the 20 quotes
-        // differ — each costs one extra byte (`"` → `\"`), where a raw charge
-        // would bill them the same as the plain name.
+        // differ — each costs one extra byte (`"` → `\"`) in EACH of the two
+        // fields (`title` and `alt`) the name fills, where a raw charge would
+        // bill them the same as the plain name.
         assert_eq!(
             quoted - unquoted,
-            quotes.len(),
-            "each quote must cost its escaped `\"` byte beyond its raw length"
+            quotes.len() * 2,
+            "each quote must cost its escaped `\"` byte in both the title and the alt"
         );
         // And the estimate is exactly the emitted element's serialized size.
         let serialized = serde_json::to_string(&file_image_elements(&embedded_panel(&[&quotes]))[0])
