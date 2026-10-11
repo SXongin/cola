@@ -79,6 +79,22 @@ impl FileContent {
             .collect::<Vec<_>>()
             .join("\n")
     }
+
+    /// `text` then `records`, newline-joined — the one "message body" fragment
+    /// wherever a message's text and its File Contents are shown together
+    /// (ADR-0076): the Session Snapshot「最近对话」tail and the External Message
+    /// 「有新消息」preview both compose it, so the two cannot drift. An empty
+    /// `records` leaves `text` byte-for-byte; an empty `text` yields the
+    /// records alone.
+    pub fn join_records(text: &str, records: &str) -> String {
+        if records.is_empty() {
+            return text.to_string();
+        }
+        if text.is_empty() {
+            return records.to_string();
+        }
+        format!("{text}\n{records}")
+    }
 }
 
 /// A byte count as a human-readable size: exact bytes below 1 KiB, otherwise

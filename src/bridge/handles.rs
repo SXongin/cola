@@ -787,37 +787,60 @@ impl SessionsHandle {
     }
 }
 
-/// The process-local per-content-hash single-flight cache (ADR-0076): a content
-/// hash maps to the resolution of that content. The inner cell's
-/// `get_or_try_init` is the in-flight guard: concurrent resolvers of one hash
-/// await ONE platform call instead of each missing the cache and repeating it.
-/// A failed call leaves the cell uninitialized, so a later poll retries.
-pub(crate) type ContentCellCache<T> = Arc<Mutex<HashMap<u64, Arc<tokio::sync::OnceCell<T>>>>>;
+/// The process-local per-content-key single-flight cache (ADR-0076): a content
+/// identity maps to the resolution of that content. The inner cell is the
+/// in-flight guard (`get_or_init` / `get_or_try_init`): concurrent resolvers of
+/// one key await ONE platform call instead of each missing the cache and
+/// repeating it. Bounded by [`CONTENT_CACHE_CAP`], evicting oldest-first
+/// (ADR-0076 review): a re-upload after eviction is harmless — an upload is
+/// cheap to repeat and a stale key would be worse.
+pub(crate) type ContentCellCache<T> = Arc<Mutex<IndexMap<u64, Arc<tokio::sync::OnceCell<T>>>>>;
 
-/// The process-local File Content image cache (ADR-0076): a content hash maps to
-/// the single-flight resolution of that content. The inner cell holds
+/// The cap on a per-content-key single-flight cache (ADR-0076 review): past it
+/// the oldest **settled** entry is evicted, so a long-running bot does not
+/// accumulate one entry per distinct file it ever rendered. Eviction only ever
+/// drops a settled entry, never one a resolver is still initializing — the same
+/// rule the File Message once-guard applies to an in-flight send: dropping an
+/// in-flight cell would let a concurrent resolver of the same key create a new
+/// one and re-upload, which on the image path could re-open B1's
+/// embedded-and-sent split. A re-upload of a settled key after eviction is
+/// harmless (an upload is cheap and the resulting key is stable on Feishu's
+/// side), which the ADR accepts.
+pub(crate) const CONTENT_CACHE_CAP: usize = 1024;
+
+/// The process-local File Content image cache (ADR-0076): a content identity
+/// (bytes + mime + name, so a different mime never reuses another's verdict)
+/// maps to the single-flight resolution of that content. The inner cell holds
 /// `Some(image_key)` for an embedded image or `None` for a content the Platform
-/// will not embed. Shared process-wide, so identical bytes upload once whichever
-/// Session or card renders them.
+/// will not embed — a decided non-image AND a failed embed upload alike, so
+/// every resolver reads ONE verdict and the ladder degrades uniformly (never
+/// one resolver embedding while a concurrent one sends a File Message). Shared
+/// process-wide, so identical content uploads once whichever Session or card
+/// renders it.
 pub(crate) type FileImageCache = ContentCellCache<Option<String>>;
 
 /// The process-local File Content **file** cache (ADR-0076, #649): a content
-/// hash maps to the single-flight resolution of that content as a File Message.
-/// The inner cell holds `Some(file_key)` for a deliverable file or `None` for a
-/// content past Feishu's 30MB message cap. Single-flight like
-/// [`FileImageCache`]: identical bytes upload once, whichever Session renders
-/// them.
+/// identity (bytes + mime + name — the upload carries the name) maps to the
+/// single-flight resolution of that content as a File Message. The inner cell
+/// holds `Some(file_key)` for a deliverable file or `None` for a content past
+/// Feishu's 30MB message cap; a failed upload leaves the cell uninitialized, so
+/// a later poll retries. Single-flight like [`FileImageCache`]: identical
+/// content uploads once, whichever Session renders it.
 pub(crate) type FileUploadCache = ContentCellCache<Option<String>>;
 
 /// The cap on the process-local File Message once-guard (ADR-0076, #649): the
 /// guard is in-memory only and a cola restart may resend, so an entry past this
 /// bound is evicted oldest-first — an evicted entry may resend, which the ADR
 /// accepts, and the bound keeps a long-running bot from accumulating one entry
-/// per file it ever sent. Eviction only ever drops an entry no resolver holds
-/// (see [`FileMessageSend`]), so a key whose send is in flight is never evicted;
-/// the map can therefore sit one entry per in-flight send past the cap, bounded
-/// by concurrency rather than by every file a bot ever sent.
-pub(crate) const FILE_MESSAGE_SENDS_CAP: usize = 1024;
+/// per file it ever sent. The cap is deliberately far past anything a real
+/// deployment reaches in one process lifetime (a bot would have to deliver
+/// 65 536 distinct `(session, content)` files), so eviction is practically
+/// unreachable — it exists only to keep the map bounded, never as a routine
+/// path that duplicates a send. Eviction only ever drops an entry no resolver
+/// holds (see [`FileMessageSend`]), so a key whose send is in flight is never
+/// evicted; the map can therefore sit one entry per in-flight send past the cap,
+/// bounded by concurrency rather than by every file a bot ever sent.
+pub(crate) const FILE_MESSAGE_SENDS_CAP: usize = 1 << 16;
 
 /// One File Message send's single-flight state (ADR-0076, #649): the `OnceCell`
 /// that makes the send single-flight, plus the number of resolvers currently

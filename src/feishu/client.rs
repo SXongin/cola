@@ -152,6 +152,12 @@ impl Client {
             self.http
                 .post(self.endpoint("/open-apis/auth/v3/tenant_access_token/internal"))
                 .json(&body)
+                // Bound the token fetch like the client's other calls (ADR-0076
+                // review, B2): the upload/send timeouts start only AFTER this
+                // returns, and the client has no overall timeout, so a stalled
+                // token endpoint would otherwise block the whole upload/send
+                // path indefinitely.
+                .timeout(std::time::Duration::from_secs(10))
                 .send()
                 .await?,
             "token",
@@ -2076,6 +2082,30 @@ mod tests {
         assert!(
             matches!(err, crate::error::BridgeError::Http(ref e) if e.is_timeout()),
             "the upload must time out, not hang: {err:?}"
+        );
+    }
+
+    /// The upload/send timeouts start only AFTER `get_access_token` returns, so
+    /// a stalled TOKEN endpoint must be bounded too (ADR-0076 review, B2):
+    /// otherwise the whole upload path hangs indefinitely with no cached token,
+    /// because the client has no overall request timeout. The token route hangs
+    /// for 60s under a paused clock, so the 10s token timeout fires first.
+    #[tokio::test(start_paused = true)]
+    async fn upload_gives_up_on_a_hung_token_endpoint() {
+        let server = TestHttpServer::start().await;
+        server.route_delayed(
+            "POST",
+            TOKEN_PATH,
+            200,
+            r#"{"code":0,"msg":"ok","tenant_access_token":"t-abc","expire":7200}"#,
+            std::time::Duration::from_secs(60),
+        );
+        let client = without_env_proxy(Client::with_base_url(test_config(), server.base_url()));
+
+        let err = client.upload_image(b"PNGDATA", "image/png").await.unwrap_err();
+        assert!(
+            matches!(err, crate::error::BridgeError::Http(ref e) if e.is_timeout()),
+            "the token fetch must time out, not hang the upload: {err:?}"
         );
     }
 

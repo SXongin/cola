@@ -16,8 +16,8 @@ use crate::backend::{
 };
 use crate::bridge::core::SESSION_INFO_TIMEOUT;
 use crate::bridge::handles::{
-    CardsHandle, ContentCellCache, FILE_MESSAGE_SENDS_CAP, FileMessageSend, FileMessageSendHold,
-    FileMessageSends, RequestsHandle, SessionsHandle, TurnHandles, evict_oldest_idle,
+    CONTENT_CACHE_CAP, CardsHandle, ContentCellCache, FILE_MESSAGE_SENDS_CAP, FileMessageSend,
+    FileMessageSendHold, FileMessageSends, RequestsHandle, SessionsHandle, TurnHandles, evict_oldest_idle,
 };
 use crate::bridge::span;
 use crate::bridge::turn::state;
@@ -674,9 +674,15 @@ async fn resolve_file_deliveries(cards: &CardsHandle, session_id: &str) -> bool 
     if pending.is_empty() {
         return false;
     }
-    // 2. One resolution per distinct content hash, each cached process-locally
-    //    (single-flight), so concurrent resolvers of one hash await ONE upload
-    //    and identical bytes resolve once.
+    // 2. One resolution per distinct content key, each cached process-locally
+    //    (single-flight), so concurrent resolvers of one key await ONE upload
+    //    and identical content resolves once. The distinct contents resolve
+    //    CONCURRENTLY (ADR-0076 review, N2): each file's upload/send is
+    //    independent async work, so N slow files no longer serialize N request
+    //    timeouts before the card can flush. Each file's own send stays
+    //    single-flight (its once-guard cell) and replies in-thread under the
+    //    live card; the deliveries are keyed by content hash and attached in
+    //    panel order below, so the card's tracking lines stay correctly placed.
     let mut to_resolve: Vec<InFlightUpload> = Vec::new();
     let mut decided: std::collections::HashSet<u64> = std::collections::HashSet::new();
     for delivery in &pending {
@@ -691,9 +697,20 @@ async fn resolve_file_deliveries(cards: &CardsHandle, session_id: &str) -> bool 
         });
     }
     let mut resolved: std::collections::HashMap<u64, FileDelivery> = std::collections::HashMap::new();
-    for upload in to_resolve {
-        if let Some(delivery) = resolve_file_delivery(cards, session_id, &upload).await {
-            resolved.insert(upload.hash, delivery);
+    let resolutions = futures_util::future::join_all(to_resolve.iter().map(|upload| {
+        let cards = cards.clone();
+        let session_id = session_id.to_string();
+        async move {
+            (
+                upload.hash,
+                resolve_file_delivery(&cards, &session_id, upload).await,
+            )
+        }
+    }))
+    .await;
+    for (hash, delivery) in resolutions {
+        if let Some(delivery) = delivery {
+            resolved.insert(hash, delivery);
         }
     }
     // 3. Attach the deliveries under a short lock, keyed by content hash so a
@@ -735,13 +752,27 @@ async fn resolve_file_deliveries(cards: &CardsHandle, session_id: &str) -> bool 
     changed
 }
 
-/// The single-flight cell for `hash` in a per-content-hash cache (ADR-0076):
+/// The single-flight cell for `hash` in a per-content-key cache (ADR-0076):
 /// the lock, the `entry`, the `OnceCell` creation and the `Arc::clone` the
 /// image and file caches both need, in one place. Every concurrent resolver of
-/// one content hash shares one cell, so the first's platform call is awaited by
-/// the rest instead of repeated.
+/// one content key shares one cell, so the first's platform call is awaited by
+/// the rest instead of repeated. Bounded by [`CONTENT_CACHE_CAP`], evicting the
+/// oldest SETTLED entry first: eviction never drops a cell a resolver is still
+/// initializing — dropping an in-flight one would let a concurrent resolver of
+/// the same key create a new cell and re-upload, which on the image path could
+/// re-open B1's embedded-and-sent split. A re-upload of a settled key after
+/// eviction is harmless, and the ADR accepts it.
 async fn content_cell<T>(cache: &ContentCellCache<T>, hash: u64) -> Arc<tokio::sync::OnceCell<T>> {
     let mut cache = cache.lock().await;
+    if !cache.contains_key(&hash) && cache.len() >= CONTENT_CACHE_CAP {
+        // `IndexMap` preserves insertion order, so the first SETTLED entry is
+        // the oldest evictable one. With every entry in flight (bounded by
+        // concurrency) nothing is evicted and the map is allowed to sit past the
+        // cap rather than drop a key a resolver is still driving.
+        if let Some(index) = cache.values().position(|cell| cell.initialized()) {
+            cache.shift_remove_index(index);
+        }
+    }
     Arc::clone(
         cache
             .entry(hash)
@@ -807,27 +838,32 @@ async fn resolve_file_delivery(
 ) -> Option<FileDelivery> {
     // Embed first: an image within the caps uploads once and every later PATCH
     // reuses the key. A non-image (`Ok(None)`) or a failed embed upload
-    // degrades to the File Message path.
+    // degrades to the File Message path. The initializer is INFALLIBLE on
+    // purpose (ADR-0076 review, B1): a failed upload settles the cell as `None`
+    // — the same "not embeddable" verdict a decided non-image gets — so every
+    // resolver, the one that lost the single-flight race included, reads ONE
+    // verdict. Were the failure left as an `Err`, a waiter could re-run the
+    // upload and succeed while the failing resolver still fell back to a File
+    // Message: the same bytes would be both embedded and sent.
     let image_cell = content_cell(&cards.file_images, upload.hash).await;
-    match image_cell
-        .get_or_try_init(|| async { cards.feishu.upload_image(&upload.content).await })
-        .await
-    {
-        Ok(Some(image_key)) => {
-            return Some(FileDelivery::Embedded {
-                image_key: image_key.clone(),
-            });
-        }
-        Ok(None) => {}
-        Err(error) => {
-            tracing::warn!(
-                "file content {:?} embed upload failed, degrading to a File Message: {error}",
-                upload.content.name
-            );
-            // Cache the degradation so a later panel with the same bytes follows
-            // the same File Message path instead of re-embedding.
-            let _ = image_cell.set(None);
-        }
+    let image_key = image_cell
+        .get_or_init(|| async {
+            match cards.feishu.upload_image(&upload.content).await {
+                Ok(key) => key,
+                Err(error) => {
+                    tracing::warn!(
+                        "file content {:?} embed upload failed, degrading to a File Message: {error}",
+                        upload.content.name
+                    );
+                    None
+                }
+            }
+        })
+        .await;
+    if let Some(image_key) = image_key {
+        return Some(FileDelivery::Embedded {
+            image_key: image_key.clone(),
+        });
     }
     // File Message: upload once, then send ONE message in-thread. `Ok(None)`
     // means past Feishu's 30MB cap — nothing was uploaded.
@@ -5671,6 +5707,101 @@ Index: /x/src/main.rs
         );
     }
 
+    /// A failed embed upload SETTLES the cell as "not embeddable" (ADR-0076
+    /// review, B1): a concurrent resolver that lost the single-flight race must
+    /// read the same verdict instead of re-running the upload and succeeding —
+    /// otherwise the same bytes would be both embedded and sent as a File
+    /// Message. The failed attempt is parked so the waiter is provably blocked
+    /// on it when it fails.
+    #[tokio::test]
+    async fn a_failed_embed_upload_settles_the_cell_for_every_waiter() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        platform.given_image_key("img_v2_race");
+        platform.given_file_key("file_v2_race");
+        platform
+            .fail_upload_image_count
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        let sid = "ses_embed_fail_race";
+        let cards = app.core.cards_handle();
+        Turn::seed_card(&cards, sid, Some("om_race")).await;
+        Turn::set_turn_anchor(&cards, sid, &turn_anchor(0)).await;
+
+        let transcript = SessionTranscript::new(vec![message(
+            "a1",
+            1_000,
+            vec![read_file_part("call_read", "shot.png", "image/png", b"ABC")],
+        )]);
+
+        // Park the failing embed upload so a second resolver is provably waiting
+        // on the shared cell when the first attempt fails.
+        let (entered, release) = platform.pause("upload_image", "");
+        let first = {
+            let app = Arc::clone(&app);
+            let sid = sid.to_string();
+            let transcript = transcript.clone();
+            tokio::spawn(async move {
+                let cards = app.core.cards_handle();
+                render(&app, &cards, &sid, &transcript).await;
+            })
+        };
+        entered.notified().await;
+
+        let second = {
+            let app = Arc::clone(&app);
+            let sid = sid.to_string();
+            tokio::spawn(async move {
+                let cards = app.core.cards_handle();
+                resolve_file_deliveries(&cards, &sid).await
+            })
+        };
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !second.is_finished(),
+            "the waiter must await the in-flight embed upload, not finish"
+        );
+
+        release.notify_one();
+        first.await.unwrap();
+        second.await.unwrap();
+
+        // ONE verdict: the failure settled the cell, so the waiter never re-ran
+        // the upload — the bytes are not both embedded and sent.
+        assert_eq!(
+            platform
+                .upload_image_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the failed embed upload is attempted exactly once"
+        );
+        assert!(
+            uploaded_images(&platform).await.is_empty(),
+            "a failed embed never embeds"
+        );
+        assert_eq!(
+            sent_messages(&platform).await.len(),
+            1,
+            "exactly one File Message, never one per resolver"
+        );
+        let card = final_card(&platform).await;
+        assert!(
+            card["body"]["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|e| e["tag"] != "img"),
+            "no image is embedded: {card}"
+        );
+        let body = card["body"]["elements"][0]["elements"][0]["content"]
+            .as_str()
+            .unwrap();
+        assert!(body.contains("已发送为文件消息"), "{body}");
+    }
+
     /// The ladder's last rung (#649): a File Message whose send fails degrades
     /// to `未发送`, best-effort — the card is built intact and the Turn is not
     /// failed.
@@ -5940,6 +6071,79 @@ Index: /x/src/main.rs
         );
     }
 
+    /// A panel replaced while the File Message send is PARKED must not attach
+    /// the delivery or force a flush (#649, review N7): the send itself already
+    /// went out — the residual check→send window the check site documents and
+    /// accepts — but the status is attached only if the panel still matches when
+    /// the send returns, so the replaced panel keeps its bare line and the pass
+    /// reports no change (so it owes no PATCH for a file the card no longer
+    /// shows). The resolve is driven directly so its `changed` verdict is the
+    /// observable — the very bit that would force a flush.
+    #[tokio::test]
+    async fn a_panel_replaced_mid_send_never_attaches_the_delivery() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        platform.given_file_key("file_v2_mid_send");
+        let sid = "ses_file_mid_send";
+        let cards = app.core.cards_handle();
+        Turn::seed_card(&cards, sid, Some("om_mid_send")).await;
+        Turn::set_turn_anchor(&cards, sid, &turn_anchor(0)).await;
+
+        // The card already carries a read panel with an unresolved PDF, so the
+        // resolve below is the ONLY thing a pass would act on.
+        let Part::Tool(call) = read_file_part("call_read", "doc.pdf", "application/pdf", b"%PDF") else {
+            unreachable!("read_file_part builds a tool part");
+        };
+        {
+            let mut live = cards.cards.lock().await;
+            let card = live.get_mut(sid).expect("the live card exists");
+            card.acc.push_tool("call_read", ToolPanel::new(call));
+        }
+
+        // Park the File Message SEND so the panel can be replaced after the
+        // send left but before it returns.
+        let (entered, release) = platform.pause("send_message", "om_mid_send");
+        let resolving = {
+            let cards = cards.clone();
+            let sid = sid.to_string();
+            tokio::spawn(async move { resolve_file_deliveries(&cards, &sid).await })
+        };
+        entered.notified().await;
+
+        // The transcript re-read replaced the panel's file (same call, same
+        // index, different bytes) while the send was parked.
+        {
+            let mut live = cards.cards.lock().await;
+            let card = live.get_mut(sid).expect("the live card exists");
+            card.acc.push_tool(
+                "call_read",
+                ToolPanel::for_test_with_files("read", &[("other.bin", b"OTHER")]),
+            );
+        }
+
+        release.notify_one();
+        let changed = resolving.await.unwrap();
+
+        assert_eq!(
+            sent_messages(&platform).await.len(),
+            1,
+            "the parked send went out (the accepted residual window)"
+        );
+        assert!(
+            !changed,
+            "the replaced panel's delivery is not attached, so the pass owes no flush"
+        );
+        let live = cards.cards.lock().await;
+        let panel = live.get(sid).unwrap().acc.tools().get("call_read").unwrap();
+        assert_eq!(
+            panel.files()[0].delivery,
+            FileDelivery::Unresolved,
+            "the replaced panel is never marked delivered"
+        );
+    }
+
     /// The File Message once-guard is bounded (#649): past the cap the oldest
     /// `(session_id, hash)` entry is evicted, so a long-running bot does not
     /// accumulate one entry per file it ever sent. An evicted entry may resend,
@@ -5967,6 +6171,45 @@ Index: /x/src/main.rs
         );
         assert!(sends.contains_key(&("ses_1".to_string(), 1)), "the rest stay");
         assert!(sends.contains_key(&("ses_new".to_string(), 9_999)));
+    }
+
+    /// The per-content-key upload caches are bounded (ADR-0076 review, N4):
+    /// past the cap the oldest SETTLED key is evicted, so a long-running bot
+    /// does not accumulate one entry per file it ever rendered. A re-upload
+    /// after eviction is harmless (the ADR accepts it), so plain oldest-first
+    /// eviction of settled entries is enough — but an entry a resolver is still
+    /// initializing is never dropped, mirroring the once-guard's idle rule (a
+    /// re-created in-flight cell could re-open B1's embedded-and-sent split).
+    #[tokio::test]
+    async fn the_content_cache_evicts_the_oldest_settled_past_the_cap() {
+        let cache: ContentCellCache<Option<String>> =
+            Arc::new(tokio::sync::Mutex::new(indexmap::IndexMap::new()));
+        // The OLDEST entry is one a resolver is still initializing
+        // (uninitialized); the rest are settled.
+        content_cell(&cache, u64::MAX).await;
+        for i in 0..(CONTENT_CACHE_CAP - 1) {
+            let cell = content_cell(&cache, i as u64).await;
+            cell.set(Some(format!("k{i}"))).unwrap();
+        }
+        assert_eq!(
+            cache.lock().await.len(),
+            CONTENT_CACHE_CAP,
+            "the cache holds the cap"
+        );
+
+        content_cell(&cache, 9_999).await;
+        let cache = cache.lock().await;
+        assert_eq!(cache.len(), CONTENT_CACHE_CAP, "the cache stays bounded");
+        assert!(
+            !cache.contains_key(&0),
+            "the oldest settled entry is evicted first"
+        );
+        assert!(cache.contains_key(&1), "the rest stay");
+        assert!(
+            cache.contains_key(&u64::MAX),
+            "the oldest in-flight entry survives eviction"
+        );
+        assert!(cache.contains_key(&9_999));
     }
 
     /// Eviction never drops a key whose File Message send is in flight (#649):
@@ -6009,7 +6252,15 @@ Index: /x/src/main.rs
         // The parked key is the OLDEST guard entry. Fill the guard to its cap
         // with idle entries, then insert one more: the eviction must skip the
         // in-flight key and take the next-oldest idle one.
-        let in_flight_key = (sid.to_string(), file_content_hash(b"%PDF"));
+        let in_flight_key = (sid.to_string(), {
+            let content = crate::backend::FileContent::decode(
+                "data:application/pdf;base64,JVBERg==",
+                Some("application/pdf"),
+                Some("doc.pdf"),
+            )
+            .expect("an inline payload is a File Content");
+            file_content_hash(&content, b"%PDF")
+        });
         let sends = &cards.file_messages_sent;
         assert!(
             sends.lock().await.contains_key(&in_flight_key),

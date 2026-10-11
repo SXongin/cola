@@ -323,8 +323,8 @@ impl SharedCore {
             // own request bound (spec #571 review).
             preserved_view_timeout_ms: Arc::new(std::sync::atomic::AtomicU64::new(30_000)),
             runtime_reconcile: Arc::new(crate::bridge::runtime::RuntimeReconcile::new()),
-            file_images: Arc::new(Mutex::new(HashMap::new())),
-            file_uploads: Arc::new(Mutex::new(HashMap::new())),
+            file_images: Arc::new(Mutex::new(indexmap::IndexMap::new())),
+            file_uploads: Arc::new(Mutex::new(indexmap::IndexMap::new())),
             file_messages_sent: Arc::new(Mutex::new(indexmap::IndexMap::new())),
         })
     }
