@@ -1796,14 +1796,15 @@ impl Platform for CardDelivery {
         self.inner.upload_file(content).await
     }
 
-    async fn send_message_in_thread(
+    async fn reply_message(
         &self,
         message_id: &str,
         msg_type: &str,
         content: &Value,
+        reply_in_thread: bool,
     ) -> Result<(String, Option<String>)> {
         self.inner
-            .send_message_in_thread(message_id, msg_type, content)
+            .reply_message(message_id, msg_type, content, reply_in_thread)
             .await
     }
 
@@ -2158,11 +2159,12 @@ mod tests {
         async fn upload_file(&self, _content: &crate::backend::FileContent) -> Result<Option<String>> {
             unimplemented!("not used")
         }
-        async fn send_message_in_thread(
+        async fn reply_message(
             &self,
             _message_id: &str,
             _msg_type: &str,
             _content: &Value,
+            _reply_in_thread: bool,
         ) -> Result<(String, Option<String>)> {
             unimplemented!("not used")
         }

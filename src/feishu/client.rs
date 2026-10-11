@@ -905,24 +905,33 @@ impl Client {
         })
     }
 
-    /// Send a message of an arbitrary `msg_type` replied **in thread**
-    /// (`reply_in_thread: true`) under `message_id` (ADR-0076): the send path
-    /// for a File Message (`msg_type:"file"`, `content` `{"file_key": …}`).
-    /// Returns the created message id and the topic's `thread_id`, exactly like
-    /// [`Self::reply_card_in_thread`] (`thread_id` is `None` when the chat does
-    /// not support topic replies).
-    pub async fn send_message_in_thread(
+    /// Send a message of an arbitrary `msg_type` as a reply under `message_id`
+    /// (ADR-0076): the send path for a File Message (`msg_type:"file"`,
+    /// `content` `{"file_key": …}`). `reply_in_thread` selects the reply mode —
+    /// `true` replies in thread form (`reply_in_thread: true`), which creates a
+    /// topic around a non-topic seed (the Session's own topic, for a
+    /// topic-backed Session); `false` omits the field, a **plain reply** Feishu
+    /// shows under the seed without creating a topic (a lobby Session — a
+    /// thread reply there would spawn a new topic and fork the conversation;
+    /// ADR-0076's amendment). Returns the created message id and the topic's
+    /// `thread_id`, exactly like [`Self::reply_card_in_thread`] (`thread_id` is
+    /// `None` for a plain reply, or when the chat does not support topic
+    /// replies).
+    pub async fn reply_message(
         &self,
         message_id: &str,
         msg_type: &str,
         content: &serde_json::Value,
+        reply_in_thread: bool,
     ) -> crate::error::Result<(String, Option<String>)> {
         let token = self.get_access_token().await?;
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "msg_type": msg_type,
-            "reply_in_thread": true,
             "content": content.to_string(),
         });
+        if reply_in_thread {
+            body["reply_in_thread"] = serde_json::json!(true);
+        }
 
         let text = read_body_with_diag(
             self.http
@@ -936,14 +945,14 @@ impl Client {
                 .timeout(std::time::Duration::from_secs(10))
                 .send()
                 .await?,
-            "send message in thread",
+            "reply message",
         )
         .await?;
-        let resp: MessageResponse = parse_json(&text, "send message in thread response")?;
+        let resp: MessageResponse = parse_json(&text, "reply message response")?;
 
         if resp.code != 0 {
             Err(api_error(
-                &format!("send message in thread error {}", resp.code),
+                &format!("reply message error {}", resp.code),
                 i64::from(resp.code),
                 &resp.msg,
             ))
@@ -2294,10 +2303,11 @@ mod tests {
         );
     }
 
-    /// A File Message is a reply sent in thread form: `msg_type:"file"` with
-    /// `content` `{"file_key": …}`, `reply_in_thread: true` (ADR-0076).
+    /// A topic-backed Session's File Message is a reply sent in thread form:
+    /// `msg_type:"file"` with `content` `{"file_key": …}`, `reply_in_thread:
+    /// true` (ADR-0076), so it lands in the Session's own topic.
     #[tokio::test]
-    async fn send_message_in_thread_sends_file_content_in_thread() {
+    async fn reply_message_in_thread_sends_file_content_in_thread() {
         let (server, client) = wire_client().await;
         server.route(
             "POST",
@@ -2308,7 +2318,7 @@ mod tests {
         let content = serde_json::json!({ "file_key": "file_v2_abc" });
 
         let (id, thread_id) = client
-            .send_message_in_thread("om_card", "file", &content)
+            .reply_message("om_card", "file", &content, true)
             .await
             .unwrap();
         assert_eq!(id, "om_file");
@@ -2324,8 +2334,43 @@ mod tests {
         assert_eq!(send_content(&request)["file_key"], "file_v2_abc");
     }
 
+    /// A lobby Session's File Message is a **plain reply**: `reply_in_thread`
+    /// is absent from the body, so Feishu shows it under the card without
+    /// creating a topic — a thread reply in a lobby would spawn a new topic and
+    /// fork the conversation (ADR-0076's amendment).
     #[tokio::test]
-    async fn send_message_in_thread_maps_a_business_error() {
+    async fn reply_message_plain_omits_reply_in_thread_and_parses_no_topic() {
+        let (server, client) = wire_client().await;
+        server.route(
+            "POST",
+            "/open-apis/im/v1/messages/om_card/reply",
+            200,
+            r#"{"code":0,"msg":"ok","data":{"message_id":"om_file"}}"#,
+        );
+        let content = serde_json::json!({ "file_key": "file_v2_abc" });
+
+        let (id, thread_id) = client
+            .reply_message("om_card", "file", &content, false)
+            .await
+            .unwrap();
+        assert_eq!(id, "om_file");
+        assert_eq!(thread_id, None);
+
+        let request = last_request(&server);
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/open-apis/im/v1/messages/om_card/reply");
+        assert_eq!(request.header("authorization"), Some("Bearer t-abc"));
+        let body = body_json(&request);
+        assert_eq!(body["msg_type"], "file");
+        assert!(
+            body.get("reply_in_thread").is_none(),
+            "a plain reply omits reply_in_thread: {body}"
+        );
+        assert_eq!(send_content(&request)["file_key"], "file_v2_abc");
+    }
+
+    #[tokio::test]
+    async fn reply_message_maps_a_business_error() {
         let (server, client) = wire_client().await;
         server.route(
             "POST",
@@ -2336,12 +2381,12 @@ mod tests {
 
         let message = feishu_error(
             client
-                .send_message_in_thread("om_card", "file", &serde_json::json!({}))
+                .reply_message("om_card", "file", &serde_json::json!({}), true)
                 .await
                 .unwrap_err(),
         );
         assert!(
-            message.contains("send message in thread error 230002"),
+            message.contains("reply message error 230002"),
             "unexpected error: {message}"
         );
         assert!(
@@ -2356,7 +2401,7 @@ mod tests {
     /// (ADR-0076, #649). The mock server hangs for 60s under a paused clock, so
     /// the 10s timeout fires first with no wall-clock wait.
     #[tokio::test(start_paused = true)]
-    async fn send_message_in_thread_gives_up_on_a_hung_server() {
+    async fn reply_message_gives_up_on_a_hung_server() {
         let (server, client) = wire_client().await;
         server.route_delayed(
             "POST",
@@ -2367,10 +2412,11 @@ mod tests {
         );
 
         let err = client
-            .send_message_in_thread(
+            .reply_message(
                 "om_card",
                 "file",
                 &serde_json::json!({ "file_key": "file_v2_abc" }),
+                true,
             )
             .await
             .unwrap_err();

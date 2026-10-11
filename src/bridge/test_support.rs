@@ -281,13 +281,16 @@ pub enum PlatformCall {
         name: String,
         size: u64,
     },
-    /// A generic in-thread message send (ADR-0076, #649): the live card it
-    /// replied under and the `msg_type`/`content` it carried — the File Message
-    /// path records `msg_type:"file"` with `{"file_key": …}`.
-    SendMessageInThread {
+    /// A generic reply message send (ADR-0076, #649): the live card it replied
+    /// under, the `msg_type`/`content` it carried — the File Message path
+    /// records `msg_type:"file"` with `{"file_key": …}` — and the requested
+    /// reply mode: `true` for a topic-backed Session (thread reply), `false`
+    /// for a lobby (plain reply, no new topic; ADR-0076's amendment).
+    SendMessageReply {
         message_id: String,
         msg_type: String,
         content: serde_json::Value,
+        reply_in_thread: bool,
     },
 }
 
@@ -414,9 +417,8 @@ pub struct RecordingPlatform {
     /// nothing (tests the best-effort path: a failed file upload leaves the
     /// card intact and never fails the Turn).
     pub fail_upload_file_count: std::sync::atomic::AtomicUsize,
-    /// The next N `send_message_in_thread` calls fail with a Feishu error (tests
-    /// that a File Message failure degrades to `未发送` and never blocks the
-    /// card).
+    /// The next N `reply_message` calls fail with a Feishu error (tests that a
+    /// File Message failure degrades to `未发送` and never blocks the card).
     pub fail_send_message_count: std::sync::atomic::AtomicUsize,
 }
 
@@ -1104,11 +1106,12 @@ impl feishu::Platform for RecordingPlatform {
         Ok(Some(self.file_key.lock().unwrap().clone()))
     }
 
-    async fn send_message_in_thread(
+    async fn reply_message(
         &self,
         message_id: &str,
         msg_type: &str,
         content: &serde_json::Value,
+        reply_in_thread: bool,
     ) -> crate::error::Result<(String, Option<String>)> {
         if self
             .fail_send_message_count
@@ -1127,10 +1130,11 @@ impl feishu::Platform for RecordingPlatform {
         if let Some(gate) = self.take_gate("send_message", message_id) {
             wait_gate(gate).await;
         }
-        self.calls.lock().await.push(PlatformCall::SendMessageInThread {
+        self.calls.lock().await.push(PlatformCall::SendMessageReply {
             message_id: message_id.into(),
             msg_type: msg_type.into(),
             content: content.clone(),
+            reply_in_thread,
         });
         Ok(("msg_file".into(), Some("omt_file".into())))
     }

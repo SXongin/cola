@@ -254,7 +254,7 @@ async fn external_file_message_notifies_with_the_record_line() {
     assert!(
         !calls
             .iter()
-            .any(|c| matches!(c, PlatformCall::SendMessageInThread { .. })),
+            .any(|c| matches!(c, PlatformCall::SendMessageReply { .. })),
         "a user file is never delivered as a File Message: {calls:?}"
     );
 }
