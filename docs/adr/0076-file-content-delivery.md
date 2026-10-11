@@ -125,7 +125,9 @@ expands it — worst of all for `未发送`, which is the ONLY signal that a fil
 read but could not be delivered. The panel **header** therefore carries a compact
 marker, visible while the panel stays collapsed:
 
-- one File Content — ` · 📎 <name>`, the name clipped to a short length with `…`;
+- one File Content — ` · 📎 <name>`, the name clipped to its **tail** within a
+  short character budget — a leading `…` plus the last characters, the `…`
+  counted against the budget, so a long absolute path keeps its basename;
 - several — ` · 📎 <N> 个文件`;
 - and ` · 未发送` appended when ANY of the panel's File Contents is undelivered,
   so the one state that must never be missed is on the header itself.
