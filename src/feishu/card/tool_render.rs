@@ -615,17 +615,46 @@ fn file_tracking_block(tool: &ToolPanel) -> Option<String> {
 /// tracking line keeps the full name.
 const FILE_HEADER_NAME_MAX_CHARS: usize = 24;
 
+/// The name a File Content's folded panel HEADER falls back to when folding
+/// leaves nothing printable (ADR-0076 amendment): an all-line-breaking filename
+/// would otherwise clip to a bare, nameless `📎`.
+const DEFAULT_FILE_HEADER_NAME: &str = "文件";
+
+/// Whether `c` must fold to a space to keep the folded panel HEADER's one-line
+/// `plain_text` title on one line (ADR-0076 amendment): every `Cc` control
+/// character (a newline, carriage return, tab, `U+0085` next line, …) plus the
+/// two Unicode line-breaking separators `U+2028` LINE SEPARATOR and `U+2029`
+/// PARAGRAPH SEPARATOR. The separators are `Zl`/`Zp`, NOT `Cc`, so
+/// `char::is_control()` alone misses them while a renderer may still break a
+/// line on them.
+fn is_header_line_break(c: char) -> bool {
+    c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')
+}
+
 /// A File Content's name folded to a single printable line for the folded
-/// panel HEADER (ADR-0076 amendment): every control character — a newline, a
-/// carriage return, a tab, any other `Cc` — becomes a space, so the one-line
+/// panel HEADER (ADR-0076 amendment): every line-breaking character
+/// ([`is_header_line_break`] — a newline, a carriage return, a tab, any other
+/// `Cc`, and the `U+2028`/`U+2029` separators) becomes a space, so the one-line
 /// `plain_text` title cannot wrap or break. `truncate_md` clips by character
 /// count and would pass a newline straight through, and a valid filename may
 /// carry one. One character in, one character out, so the clip's character
-/// budget is unchanged. Mirrors the ledger's `folded_label`.
+/// budget is unchanged. The folded name is then trimmed: a name that is ALL
+/// line-breaking characters folds to a run of spaces and would spend the clip
+/// budget before any printable character, leaving a nameless `📎`, so
+/// leading/trailing spaces are dropped and an empty result falls back to
+/// [`DEFAULT_FILE_HEADER_NAME`] — the header always names the file. Mirrors the
+/// ledger's `folded_label`.
 fn folded_header_name(name: &str) -> String {
-    name.chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect()
+    let folded: String = name
+        .chars()
+        .map(|c| if is_header_line_break(c) { ' ' } else { c })
+        .collect();
+    let trimmed = folded.trim();
+    if trimmed.is_empty() {
+        DEFAULT_FILE_HEADER_NAME.to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// The compact File Content marker the folded panel HEADER carries (ADR-0076
@@ -2205,6 +2234,86 @@ mod tests {
             json_escaped_len(&marker),
             "the estimate is the marker's JSON-escaped length"
         );
+    }
+
+    /// A filename may carry a Unicode line separator (`U+2028`) or paragraph
+    /// separator (`U+2029`) — `Zl`/`Zp`, which `char::is_control()` does NOT
+    /// catch. The folded header is a one-line `plain_text` title, so both fold
+    /// to a space like any control character: no raw separator reaches the
+    /// title, and the size estimate is exactly the JSON-escaped length of the
+    /// marker that renders (ADR-0076 amendment).
+    #[test]
+    fn a_line_separator_in_a_file_name_folds_out_of_the_panel_header() {
+        for sep in ['\u{2028}', '\u{2029}'] {
+            let name = format!("report{sep}part.pdf");
+            let panel = read_panel(&name, "application/pdf", b"%PDF", FileDelivery::Undelivered);
+            let card = CardBuilder::new()
+                .with_state(CardState::Done)
+                .with_tool(panel.clone())
+                .build();
+            let title = card["body"]["elements"][0]["header"]["title"]["content"]
+                .as_str()
+                .expect("panel title");
+            assert!(
+                !title.contains(['\u{2028}', '\u{2029}']),
+                "no raw line separator in the header title: {title:?}"
+            );
+            assert_eq!(title, "✅ read · 📎 report part.pdf · 未发送", "{card}");
+
+            let marker = file_header_marker(&panel).expect("a file panel has a header marker");
+            assert!(
+                !marker.contains(['\u{2028}', '\u{2029}']),
+                "the folded marker carries no line separator: {marker:?}"
+            );
+            assert_eq!(
+                file_header_marker_estimate(&panel),
+                json_escaped_len(&marker),
+                "the estimate is the marker's JSON-escaped length"
+            );
+        }
+    }
+
+    /// A filename that STARTS with line-breaking characters folds to a run of
+    /// spaces that the 24-character clip would spend before any printable
+    /// character, leaving a `📎` marker with no usable name. Trimming drops the
+    /// fold's leading/trailing spaces, so the printable suffix survives — and a
+    /// name with nothing printable falls back to a default name — the folded
+    /// header always names the file (ADR-0076 amendment).
+    #[test]
+    fn a_control_heavy_file_name_still_names_the_file_in_the_panel_header() {
+        // 24 control characters, then a printable suffix: the clip budget would
+        // be spent on the fold's spaces, so only the trimmed suffix names it.
+        let leading = format!("{}shot.png", "\u{0001}".repeat(FILE_HEADER_NAME_MAX_CHARS));
+        let panel = read_panel(&leading, "image/png", b"ABC", FileDelivery::Undelivered);
+        assert_eq!(
+            file_header_marker(&panel).as_deref(),
+            Some(" · 📎 shot.png · 未发送"),
+            "the printable suffix survives the trim"
+        );
+
+        // Nothing printable at all: the marker falls back to a default name
+        // rather than rendering a bare, nameless `📎`.
+        let all_control = "\u{0001}\u{2028}".repeat(20);
+        let panel = read_panel(&all_control, "image/png", b"ABC", FileDelivery::Undelivered);
+        let marker = file_header_marker(&panel).expect("a file panel has a header marker");
+        assert_eq!(
+            marker, " · 📎 文件 · 未发送",
+            "an all-line-breaking name falls back to a default name"
+        );
+        assert_eq!(
+            file_header_marker_estimate(&panel),
+            json_escaped_len(&marker),
+            "the estimate is the marker's JSON-escaped length"
+        );
+
+        let card = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_tool(panel)
+            .build();
+        let title = card["body"]["elements"][0]["header"]["title"]["content"]
+            .as_str()
+            .expect("panel title");
+        assert_eq!(title, "✅ read · 📎 文件 · 未发送", "{card}");
     }
 
     /// The header clip counts CHARACTERS, not bytes: a multibyte (CJK) filename
