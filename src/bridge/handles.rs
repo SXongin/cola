@@ -28,7 +28,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use indexmap::IndexMap;
 use tokio::sync::Mutex;
@@ -813,8 +813,82 @@ pub(crate) type FileUploadCache = ContentCellCache<Option<String>>;
 /// guard is in-memory only and a cola restart may resend, so an entry past this
 /// bound is evicted oldest-first — an evicted entry may resend, which the ADR
 /// accepts, and the bound keeps a long-running bot from accumulating one entry
-/// per file it ever sent.
+/// per file it ever sent. Eviction only ever drops an entry no resolver holds
+/// (see [`FileMessageSend`]), so a key whose send is in flight is never evicted;
+/// the map can therefore sit one entry per in-flight send past the cap, bounded
+/// by concurrency rather than by every file a bot ever sent.
 pub(crate) const FILE_MESSAGE_SENDS_CAP: usize = 1024;
+
+/// One File Message send's single-flight state (ADR-0076, #649): the `OnceCell`
+/// that makes the send single-flight, plus the number of resolvers currently
+/// holding the entry. Eviction skips a held entry, so a key whose send is still
+/// in flight is never dropped from the guard — dropping it would let a
+/// concurrent resolver create a NEW cell and post a duplicate File Message.
+/// A hold ([`FileMessageSendHold`]) is released on the resolver's `Drop`
+/// (cancellation included), and an entry no resolver holds — a stale panel's
+/// abandoned cell, a completed send, a cancelled resolver — is evictable, so
+/// uninitialized entries cannot accumulate unboundedly.
+pub(crate) struct FileMessageSend {
+    cell: tokio::sync::OnceCell<crate::feishu::card::tool_render::FileDelivery>,
+    holders: AtomicUsize,
+}
+
+impl FileMessageSend {
+    pub(crate) fn new() -> Self {
+        Self {
+            cell: tokio::sync::OnceCell::new(),
+            holders: AtomicUsize::new(0),
+        }
+    }
+
+    /// Whether no resolver currently holds this entry — the only state in which
+    /// eviction may drop it.
+    pub(crate) fn is_idle(&self) -> bool {
+        self.holders.load(Ordering::SeqCst) == 0
+    }
+}
+
+/// One resolver's hold on a File Message send's entry (#649): taken under the
+/// guard lock by the cell lookup and released by `Drop`, so a resolver
+/// cancelled before its send resolves still releases the hold and eviction can
+/// never drop a key whose send is in flight.
+pub(crate) struct FileMessageSendHold {
+    entry: Arc<FileMessageSend>,
+}
+
+impl FileMessageSendHold {
+    /// Take a hold on `entry` (the entry's holder count is incremented here, so
+    /// the lookup and the hold are one atomic step under the guard lock).
+    pub(crate) fn new(entry: Arc<FileMessageSend>) -> Self {
+        entry.holders.fetch_add(1, Ordering::SeqCst);
+        Self { entry }
+    }
+
+    /// The single-flight cell this hold protects.
+    pub(crate) fn cell(&self) -> &tokio::sync::OnceCell<crate::feishu::card::tool_render::FileDelivery> {
+        &self.entry.cell
+    }
+}
+
+impl Drop for FileMessageSendHold {
+    fn drop(&mut self) {
+        self.entry.holders.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Evict the oldest entry no resolver holds (#649), so a key whose send is in
+/// flight is never dropped while a later insertion needs room. An entry with no
+/// holder — a completed send, a stale panel's abandoned cell, a cancelled
+/// resolver — is reclaimed here; with every entry held (bounded by concurrency)
+/// nothing is evicted and the map is allowed to sit past the cap rather than
+/// drop an in-flight key.
+pub(crate) fn evict_oldest_idle(sends: &mut IndexMap<(String, u64), Arc<FileMessageSend>>) {
+    if let Some(index) = sends.values().position(|entry| entry.is_idle()) {
+        // `IndexMap` preserves insertion order, and re-inserting an existing
+        // key never moves it, so the first idle entry is the oldest.
+        sends.shift_remove_index(index);
+    }
+}
 
 /// The process-local File Message once-guard (ADR-0076, #649): `(session_id,
 /// content hash)` entries whose File Message has already been sent, so a later
@@ -825,12 +899,9 @@ pub(crate) const FILE_MESSAGE_SENDS_CAP: usize = 1024;
 /// concurrent resolvers of one key await ONE send attempt instead of both
 /// missing the guard and posting duplicate File Messages. A failed send is
 /// cached too, so the attempt is made exactly once per key. Bounded by
-/// [`FILE_MESSAGE_SENDS_CAP`]; a cola restart may resend (accepted).
-pub(crate) type FileMessageSends = Arc<
-    Mutex<
-        IndexMap<(String, u64), Arc<tokio::sync::OnceCell<crate::feishu::card::tool_render::FileDelivery>>>,
-    >,
->;
+/// [`FILE_MESSAGE_SENDS_CAP`], evicting only idle entries ([`FileMessageSend`]);
+/// a cola restart may resend (accepted).
+pub(crate) type FileMessageSends = Arc<Mutex<IndexMap<(String, u64), Arc<FileMessageSend>>>>;
 
 /// The live cards, the card-handle registry, the per-session card-write locks,
 /// the topic cover records, and the platform that sends them.
