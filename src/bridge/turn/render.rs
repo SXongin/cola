@@ -5473,7 +5473,6 @@ Index: /x/src/main.rs
                     message_id,
                     msg_type,
                     content,
-                    ..
                 } => Some((message_id.clone(), msg_type.clone(), content.clone())),
                 _ => None,
             })
