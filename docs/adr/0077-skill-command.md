@@ -224,3 +224,55 @@ picker's unfiltered default (hidden and description-less skills are still
 listed).
 
 Related: #664, ADR-0051, ADR-0052.
+
+## Amendment (2026-10-11, #662): the `#<id>` grammar hardens, and its coverage is bounded
+
+The `#<id>` form shipped with a boundary-free lexer and exact-string
+resolution. Reviewing it against the sigil's whole purpose — a *text* channel for
+`/skill <id>`, because Feishu has no client-side `@skill-id` resolution — settled
+three refinements and recorded one boundary.
+
+- **A `#` opens a token only at a left boundary.** The character before it must
+  be absent or outside `[A-Za-z0-9-#]`. So `C#caveman`, `abc#foreman` and the
+  second `#` of `##foreman` are prose: they never enter the skill path and cost
+  **no** skill-list read. The **right** side stays free-ending — the id run stops
+  at the first non-id character — so `#implement-spec,` and `用#caveman试试`
+  still name their skill. That is deliberate: skill ids are ASCII, so CJK text and
+  trailing punctuation cannot be part of one, and demanding a trailing delimiter
+  would have broken the common no-space CJK spelling.
+- **Resolution is case-insensitive.** The typed token is matched against the
+  list's canonical id with `eq_ignore_ascii_case`, so `#Implement-Spec` loads
+  instead of silently landing as prose. The **matched list entry's** id — never
+  the typed token — is what rides the attachment, so the server's own
+  exact-match lookup (a miss is a `Skill not found` error) still sees the
+  canonical id; casing never crosses the wire.
+- **The coverage is bounded, and the channels are layered.** Skill ids carry no
+  format guarantee: the server's id is the skill's directory name (or its `.md`
+  filename) with no slugification, and its `Skill.ID` is an unconstrained string
+  — an id may start with a digit, contain `_` or `.`, or hold whitespace/CJK.
+  The `#<id>` grammar covers the conventional `[a-z][a-z0-9-]*` form only;
+  `/skill <id>` (a whole whitespace-delimited token) covers `2fa-helper` and
+  `web_scrape`; a picker row (a structured callback value) is the only channel
+  for an id with whitespace — a V1 name, or a V2 spaced directory. This mirrors
+  the composer, where the picker plus structured attachment is the general path
+  and no prose sigil exists at all: `#<id>` is cola's convenience for the
+  conventional form, not a promise that every id is typable.
+- **No escape hatch.** There is no way to *mention* a resolvable id without
+  loading it; writing the name without a `#` is the documented way to refer to a
+  skill in prose.
+
+Considered and rejected: **loosening the character class** to any non-whitespace
+run (it breaks `用#caveman试试` and puts `#644` on the hot path); **list-driven
+longest-prefix matching** (it makes the parse server-dependent — the command
+decision would need the skill list before `parse_command` can answer —
+re-introduces the `#644` list read, and is ambiguous over prefix-sharing ids such
+as `grill-me` / `grilling` / `grill-with-docs`); **a `\#` or code-span escape**
+(grammar for a case the current corpus does not have — every skill installed
+alongside this decision is `[a-z][a-z0-9-]*`); **retitling this ADR** (amendments
+do not rewrite history; the banner above carries the current sigil).
+
+Unchanged: the whole-message-verbatim rule, silent prose when a `#` dispatch
+resolves nothing, the `⚠️ 未找到技能：…` line when SOME ids resolve, the picker,
+the loaded-skill card, and the accepted permission gap.
+
+Related: #662, #652.

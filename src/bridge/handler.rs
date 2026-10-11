@@ -203,6 +203,22 @@ fn reject_nested_topic(thread_key: &ThreadKey) -> Option<CardActionResult> {
 /// under Feishu's 30 KB card limit (AGENTS.md #13).
 const UNKNOWN_IDS_LINE_CHARS: usize = 500;
 
+/// Resolve one Skill Token id against the read skill list (spec #662). The
+/// **exact** id always wins; a case-insensitive match is only a fallback and is
+/// accepted solely when exactly ONE registered id matches, so two ids differing
+/// only by case (`Foo` / `foo` — the server's `Skill.ID` is an unconstrained
+/// string) never make a typed spelling silently attach one of them.
+fn resolve_skill<'a>(skills: &'a [SkillInfo], id: &str) -> Option<&'a SkillInfo> {
+    if let Some(exact) = skills.iter().find(|skill| skill.id == id) {
+        return Some(exact);
+    }
+    let mut candidates = skills.iter().filter(|skill| skill.id.eq_ignore_ascii_case(id));
+    match (candidates.next(), candidates.next()) {
+        (Some(entry), None) => Some(entry),
+        _ => None,
+    }
+}
+
 /// The `⚠️ 未找到技能：<id>、…` line a `/skill` dispatch with unresolvable ids
 /// shows — on the picker card when NOTHING resolved, and on the dedicated
 /// loaded-skill card when some did (Q19). `None` when every typed id resolved
@@ -505,7 +521,9 @@ impl App {
     /// unresolvable tokens are ordinary prose (`#644`, a heading) and the message
     /// text is already the prompt. A dispatch that resolves at least one id keeps
     /// those and submits — the ids that resolve ride the prompt, exactly as the
-    /// spec's "keeps the ids that resolve" states.
+    /// spec's "keeps the ids that resolve" states. Resolution is exact-first,
+    /// with a case-insensitive fallback only when it is unambiguous (see
+    /// [`resolve_skill`]).
     ///
     /// Unlike every other command, this one runs Lazy Start first
     /// ([`Self::ensure_server_for`]): the skill list comes from the server, so a
@@ -552,7 +570,11 @@ impl App {
         // fold) the same skill twice for `/skill a /skill a`.
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for id in &ids {
-            match skills.iter().find(|skill| skill.id == *id) {
+            // Exact id first, then an unambiguous case-insensitive fallback —
+            // see [`resolve_skill`]. The matched list entry (never the typed
+            // token) is what rides the prompt, so the server's own exact-match
+            // lookup still sees the canonical id.
+            match resolve_skill(&skills, id) {
                 Some(entry) => {
                     if seen.insert(entry.id.clone()) {
                         selected.push(entry.clone());
