@@ -3506,6 +3506,18 @@ impl StreamAccumulator {
         }
     }
 
+    /// Whether the accumulator still holds `expected_hash` as the File Content
+    /// at `(call_id, index)` (ADR-0076, #649) — the content-hash check
+    /// [`Self::set_file_delivery`] applies, exposed so the render path can
+    /// re-validate a pending file against the LIVE panel BEFORE it sends a File
+    /// Message: a panel the transcript replaced while the upload was in flight
+    /// must not deliver the stale file.
+    pub(super) fn file_delivery_current(&self, call_id: &str, index: usize, expected_hash: u64) -> bool {
+        self.tools
+            .get(call_id)
+            .is_some_and(|panel| panel_file_hash(panel, index) == Some(expected_hash))
+    }
+
     /// Seed a render from the chain's Rendered Cursor (spec #561, tickets
     /// #563/#564/#565): the resolved seed makes everything at or before its
     /// frontier count as delivered, its live set enters the identity
