@@ -1047,6 +1047,13 @@ impl feishu::Platform for RecordingPlatform {
         if !crate::feishu::image::embeddable_image(content) {
             return Ok(None);
         }
+        // A test may park the upload (single-flight tests): signal entry, then
+        // hold until released, so a concurrent resolver is forced to await it.
+        // Taken BEFORE the scripted failure so a test can park a call that then
+        // fails — the failure/waiter race the settle semantics pin (B1).
+        if let Some(gate) = self.take_gate("upload_image", "") {
+            wait_gate(gate).await;
+        }
         if self
             .fail_upload_image_count
             .load(std::sync::atomic::Ordering::SeqCst)
@@ -1057,11 +1064,6 @@ impl feishu::Platform for RecordingPlatform {
             return Err(crate::error::BridgeError::Feishu(
                 "simulated upload_image failure".into(),
             ));
-        }
-        // A test may park the upload (single-flight tests): signal entry, then
-        // hold until released, so a concurrent resolver is forced to await it.
-        if let Some(gate) = self.take_gate("upload_image", "") {
-            wait_gate(gate).await;
         }
         self.calls.lock().await.push(PlatformCall::UploadImage {
             mime: content.mime.clone(),

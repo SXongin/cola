@@ -1708,13 +1708,7 @@ fn message_preview(transcript: &SessionTranscript, anchor: &TurnAnchor) -> Strin
     // is short and always survives, so a long text never hides the attachment.
     let text: String = text.chars().take(80).collect();
     let records = FileContent::record_lines(files);
-    if records.is_empty() {
-        text
-    } else if text.is_empty() {
-        records
-    } else {
-        format!("{text}\n{records}")
-    }
+    FileContent::join_records(&text, &records)
 }
 
 #[cfg(test)]

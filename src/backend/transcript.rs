@@ -1303,15 +1303,8 @@ impl TailEntry {
     /// verbatim text, then one record line per File Content (`📎 name · mime ·
     /// size`) newline-joined. A text-only entry is byte-for-byte its own text.
     pub fn body_text(&self) -> String {
-        if self.files.is_empty() {
-            return self.text.clone();
-        }
         let records = FileContent::record_lines(&self.files);
-        if self.text.is_empty() {
-            records
-        } else {
-            format!("{}\n{}", self.text, records)
-        }
+        FileContent::join_records(&self.text, &records)
     }
 }
 

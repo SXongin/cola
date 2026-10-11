@@ -512,11 +512,11 @@ fn panel_estimate(p: &ToolPanel) -> usize {
 /// re-validates a resolved upload against it before attaching the key, so an
 /// upload that outlived the panel's revision cannot mark a different file.
 fn panel_file_hash(panel: &ToolPanel, index: usize) -> Option<u64> {
-    panel
-        .files()
-        .get(index)
-        .and_then(|file| file.content.bytes())
-        .map(|bytes| file_content_hash(&bytes))
+    panel.files().get(index).and_then(|file| {
+        file.content
+            .bytes()
+            .map(|bytes| file_content_hash(&file.content, &bytes))
+    })
 }
 
 /// A permission request surfaced inline on the streaming card (instead of a
@@ -1576,14 +1576,22 @@ pub(super) struct PendingFileDelivery {
     pub(super) hash: u64,
 }
 
-/// A content hash for the process-local File Content image cache (ADR-0076):
-/// stable within the process, never persisted. It is also the identity a
-/// resolved upload attaches by, so a panel rebuilt while an upload was in
-/// flight cannot be marked with another file's key.
-pub(super) fn file_content_hash(bytes: &[u8]) -> u64 {
+/// The identity of one File Content for the process-local caches and the
+/// panel revalidation (ADR-0076): stable within the process, never persisted.
+/// It covers the bytes AND the mime and name (ADR-0076 review, N1): image
+/// embeddability depends on the mime and the file upload carries the name, so
+/// identical bytes first seen as `application/octet-stream` must not cache a
+/// verdict that blocks a later `image/png` embed, and a reused file key must
+/// not carry the first upload's name. It is also the identity a resolved upload
+/// attaches by, so a panel rebuilt while an upload was in flight cannot be
+/// marked with another file's key. `bytes` is the already-decoded payload (the
+/// callers hold it), so the identity never re-decodes a large file.
+pub(super) fn file_content_hash(content: &FileContent, bytes: &[u8]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     bytes.hash(&mut hasher);
+    content.mime.hash(&mut hasher);
+    content.name.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -3478,7 +3486,7 @@ impl StreamAccumulator {
                     call_id: call_id.clone(),
                     index,
                     content: file.content.clone(),
-                    hash: file_content_hash(&bytes),
+                    hash: file_content_hash(&file.content, &bytes),
                 });
             }
         }
@@ -5367,7 +5375,13 @@ mod tests {
         );
 
         // A resolve whose hash no longer matches the panel's file is ignored.
-        let stale_hash = file_content_hash(b"OTHER");
+        let other = FileContent::decode(
+            "data:image/png;base64,T1RIRVI=",
+            Some("image/png"),
+            Some("shot.png"),
+        )
+        .unwrap();
+        let stale_hash = file_content_hash(&other, b"OTHER");
         acc.set_file_delivery("call_read", 0, stale_hash, &FileDelivery::SentAsFile);
         acc.set_file_delivery("call_read", 0, stale_hash, &FileDelivery::Undelivered);
         assert_eq!(
@@ -5377,7 +5391,9 @@ mod tests {
         );
 
         // The matching hash attaches as before.
-        let live_hash = file_content_hash(b"ABC");
+        let live =
+            FileContent::decode("data:image/png;base64,QUJD", Some("image/png"), Some("shot.png")).unwrap();
+        let live_hash = file_content_hash(&live, b"ABC");
         acc.set_file_delivery(
             "call_read",
             0,

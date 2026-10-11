@@ -115,12 +115,15 @@ impl ToolPanel {
 
     /// How many File Contents this panel embeds (ADR-0076) — the extra `img`
     /// elements its render pushes after the panel, so a card-size estimate can
-    /// charge them.
+    /// charge them. Capped at [`MAX_PANEL_IMAGES`], the exact number
+    /// [`file_image_elements`] emits, so the estimate can never under-charge a
+    /// panel whose extra images were degraded to tracking lines only.
     pub(crate) fn embedded_file_count(&self) -> usize {
         self.files
             .iter()
             .filter(|file| file.delivery.as_embedded_key().is_some())
             .count()
+            .min(MAX_PANEL_IMAGES)
     }
 
     /// Attach the resolved delivery for the file at `index` (the render path's
@@ -636,11 +639,23 @@ fn json_escaped_len(text: &str) -> usize {
         .unwrap_or(text.len())
 }
 
+/// The most `img` elements ONE Tool Panel renders (ADR-0076 review, N3). A
+/// panel is one indivisible timeline item, so a tool returning more File
+/// Contents than this could otherwise push the card past Feishu's component
+/// ceiling with no split able to help — the item cannot be divided across
+/// cards. Past this bound the extra File Contents keep only their tracking
+/// lines (the panel body still lists every file), a bounded graceful
+/// degradation that keeps the card landing. The bound also keeps one panel's
+/// image JSON well inside the split estimate's size margin.
+pub(crate) const MAX_PANEL_IMAGES: usize = 20;
+
 /// The `img` elements this panel renders (ADR-0076): one per embedded File
 /// Content, all pushed immediately AFTER the panel so the image is visible and
 /// its adjacency to the panel gives the correspondence. `title` is
 /// `📎 <name>`; `preview` is on so a click enlarges it. A content with no
-/// embed renders nothing here.
+/// embed renders nothing here. At most [`MAX_PANEL_IMAGES`] are emitted: a
+/// panel past the bound degrades its extra images to their tracking lines, so
+/// one indivisible panel can never exceed the card's component budget.
 pub(super) fn file_image_elements(tool: &ToolPanel) -> Vec<serde_json::Value> {
     tool.files()
         .iter()
@@ -655,6 +670,7 @@ pub(super) fn file_image_elements(tool: &ToolPanel) -> Vec<serde_json::Value> {
                 })
             })
         })
+        .take(MAX_PANEL_IMAGES)
         .collect()
 }
 
@@ -1776,6 +1792,77 @@ mod tests {
         assert!(
             body.contains("📎 shot.png · image/png · 3 B · 已内嵌"),
             "the panel carries the tracking line: {body}"
+        );
+    }
+
+    /// One panel that embeds more images than the bound degrades the extra to
+    /// tracking lines (ADR-0076 review, N3): the card emits at most
+    /// [`MAX_PANEL_IMAGES`] `img` elements — so one indivisible panel can never
+    /// exceed Feishu's component budget — while the panel body still lists EVERY
+    /// file. Without the bound a single tool returning many File Contents would
+    /// be rejected by Feishu with no split able to help.
+    #[test]
+    fn a_panel_past_the_image_bound_degrades_the_extra_to_tracking_lines() {
+        use base64::Engine as _;
+        let total = MAX_PANEL_IMAGES + 5;
+        let blocks: Vec<ContentBlock> = (0..total)
+            .map(|i| {
+                let encoded = base64::engine::general_purpose::STANDARD.encode(b"ABC");
+                let name = format!("shot_{i}.png");
+                ContentBlock::File(
+                    FileContent::decode(
+                        &format!("data:image/png;base64,{encoded}"),
+                        Some("image/png"),
+                        Some(&name),
+                    )
+                    .expect("an inline payload is a File Content"),
+                )
+            })
+            .collect();
+        let call = ToolCall {
+            identity: ToolIdentity {
+                name: "read".into(),
+                call_id: "call_read".into(),
+            },
+            status: ToolStatus::Completed,
+            started_at: None,
+            input: None,
+            metadata: None,
+            output: ToolOutput {
+                raw: None,
+                blocks,
+                error: None,
+            },
+        };
+        let mut panel = ToolPanel::new(call);
+        for i in 0..total {
+            panel.set_file_delivery(
+                i,
+                FileDelivery::Embedded {
+                    image_key: format!("img_{i}"),
+                },
+            );
+        }
+        // The estimate charges exactly what the render emits.
+        assert_eq!(panel.embedded_file_count(), MAX_PANEL_IMAGES);
+
+        let card = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_tool(panel)
+            .build();
+        let elements = card["body"]["elements"].as_array().unwrap();
+        let images = elements.iter().filter(|e| e["tag"] == "img").count();
+        assert_eq!(images, MAX_PANEL_IMAGES, "at most the bound is emitted: {card}");
+        let body = elements[0]["elements"][0]["content"].as_str().unwrap();
+        assert!(body.contains("shot_0.png"), "the first file is tracked: {body}");
+        assert!(
+            body.contains(&format!("shot_{}.png", total - 1)),
+            "every file keeps its tracking line, the degraded ones included: {body}"
+        );
+        assert_eq!(
+            body.matches("已内嵌").count(),
+            total,
+            "all are still tracked as embedded: {body}"
         );
     }
 
