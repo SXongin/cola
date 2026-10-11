@@ -237,3 +237,49 @@ the user already looks at.
 
 Related: #588, #454, #462, #463, #464, #465, ADR-0054, ADR-0059, ADR-0060,
 ADR-0065, ADR-0066, ADR-0069, ADR-0071, ADR-0072.
+
+## Amendment (2026-10-11): a rendered retirement entry is durable, and "one entry" means one
+
+Issue #671 (ticket #672) tightens the paragraph above's "a cola restart may
+re-show one entry on the newest chain". In production that re-show was not
+one: a Wake-less Background Task (#454) never retires durably, so every
+restart re-derived its retirement and each restart's new card re-posted the
+same `🔔 … 结束` entry — measured 2026-10-11, seven copies of one 5h59m
+subagent's entry across a day of cola restarts. The premise the sentence
+rested on ("that card is where the user is looking") does not hold when the
+restart itself creates the card and pushes it.
+
+- The durable mark rides the **Rendered Cursor stage** of the body that carried
+  the entry (spec #561, review #569): each built body records the SYNTHETIC
+  announce keys of the ledger entries it actually rendered
+  (`BuiltCard::rendered_keys`; a Wake's entry carries none — its exactly-once is
+  the Wake Watermark), its stage carries exactly those, and the stage's
+  confirmation — the machinery that already distinguishes a DELIVERED write
+  from an owed or refused one, the queued payload's late delivery included —
+  writes them into a new `rendered` section of the Chain Record. A body claims
+  only what it rendered, so a size split's prefix never claims an entry its
+  continuation shows. A superseded stage (a newer confirmation already won)
+  hands back the base's own cursor and no gap, so its delivered keys still ride
+  that one write rather than waiting on a second. A write that never lands
+  records nothing (its confirmation is never reached), and the next card that
+  can render the entry still claims it (ADR-0065's rule, kept for a retirement
+  nothing has shown yet). `plan_runtime_entries` skips a key that mark carries,
+  so an entry one delivered card has shown never renders on a later card,
+  restart included.
+- The `rendered` marks are deliberately a SECOND durable fact, never the Wake
+  Watermark: a retirement is not a Wake, so recording it must not move the
+  floor a late Wake is judged against (#590, PR #595). It outlives the record
+  it was written on and follows a recreated session id, like the Watermark. It
+  is bounded (`MAX_RENDERED_KEYS`, oldest evicted first): past that bound a very
+  old entry may render once more after a restart — the duplicate-over-loss side
+  this family always trades toward.
+- What this does NOT change: a restart may still create a card (a Wake
+  continuation, a new Turn) and the entry may still be re-derived; only its
+  duplication is gone. Suppressing the card itself is a separate question. A
+  projection takeover whose armed session a fresh Turn replaced before the
+  re-point still marks what its landed create rendered — the create is what put
+  the body on a card, and the mark is session-scoped, so it needs no record
+  write.
+
+Related: #671, #672, #454, #590.
+
