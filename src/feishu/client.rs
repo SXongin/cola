@@ -923,6 +923,11 @@ impl Client {
                 .post(self.endpoint(&format!("/open-apis/im/v1/messages/{message_id}/reply")))
                 .bearer_auth(&token)
                 .json(&body)
+                // Bound the send like the client's other byte-carrying calls
+                // (`upload_image`, `upload_file`, `download_image`): the render
+                // pass awaits this before the card can render, so a hung request
+                // must never block the card (ADR-0076, #649).
+                .timeout(std::time::Duration::from_secs(10))
                 .send()
                 .await?,
             "send message in thread",
@@ -946,53 +951,126 @@ impl Client {
 /// [`Client::upload_image`]).
 const IMAGE_UPLOAD_BOUNDARY: &str = "----colaImageBoundary";
 
+/// One field of a hand-built `multipart/form-data` body (see [`multipart_body`]):
+/// a plain text field, or a byte-carrying file part with its own filename and
+/// content type.
+enum MultipartField<'a> {
+    /// A plain `name="…"` text field.
+    Text { name: &'a str, value: &'a str },
+    /// A `name="…"; filename="…"` part carrying raw `bytes`.
+    Bytes {
+        name: &'a str,
+        filename: &'a str,
+        content_type: &'a str,
+        bytes: &'a [u8],
+    },
+}
+
+/// The `multipart/form-data` body for `fields`, with `boundary` framing
+/// (RFC 7578): each part's `\r\n`-separated headers, then its value, then the
+/// closing `--boundary--`. The one hand-built body both the image and file
+/// uploads use — cola's reqwest has no `multipart` feature, so the framing lives
+/// here once instead of in two near-identical builders (ADR-0076).
+fn multipart_body(boundary: &str, fields: &[MultipartField<'_>]) -> Vec<u8> {
+    let mut body = Vec::new();
+    for field in fields {
+        match field {
+            MultipartField::Text { name, value } => {
+                body.extend_from_slice(
+                    format!(
+                        "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+                    )
+                    .as_bytes(),
+                );
+            }
+            MultipartField::Bytes {
+                name,
+                filename,
+                content_type,
+                bytes,
+            } => {
+                body.extend_from_slice(
+                    format!(
+                        "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"; filename=\"{filename}\"\r\nContent-Type: {content_type}\r\n\r\n"
+                    )
+                    .as_bytes(),
+                );
+                body.extend_from_slice(bytes);
+                body.extend_from_slice(b"\r\n");
+            }
+        }
+    }
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    body
+}
+
+/// A file name safe to interpolate into a `multipart/form-data` body (ADR-0076,
+/// #649): CR/LF are stripped (they would forge a new header or boundary) and `"`
+/// is replaced with `'` (it would close the quoted `filename` parameter early),
+/// so a server-reported name can never break the framing. Never empty: a name
+/// that sanitizes to nothing reads `file`.
+fn sanitize_multipart_filename(name: &str) -> String {
+    let sanitized: String = name
+        .chars()
+        .filter(|c| *c != '\r' && *c != '\n')
+        .map(|c| if c == '"' { '\'' } else { c })
+        .collect();
+    if sanitized.is_empty() {
+        "file".to_string()
+    } else {
+        sanitized
+    }
+}
+
 /// The `multipart/form-data` body Feishu's image upload expects: the
 /// `image_type` part (`message`) and the image part carrying `bytes` with its
-/// mime. `\r\n` line endings and the closing `--boundary--` are per RFC 7578.
+/// mime (ADR-0076).
 fn image_upload_body(boundary: &str, mime: &str, bytes: &[u8]) -> Vec<u8> {
-    let mut body = Vec::with_capacity(bytes.len() + 256);
-    body.extend_from_slice(
-        format!("--{boundary}\r\nContent-Disposition: form-data; name=\"image_type\"\r\n\r\nmessage\r\n")
-            .as_bytes(),
-    );
-    body.extend_from_slice(
-        format!(
-            "--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"image\"\r\nContent-Type: {mime}\r\n\r\n"
-        )
-        .as_bytes(),
-    );
-    body.extend_from_slice(bytes);
-    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
-    body
+    multipart_body(
+        boundary,
+        &[
+            MultipartField::Text {
+                name: "image_type",
+                value: "message",
+            },
+            MultipartField::Bytes {
+                name: "image",
+                filename: "image",
+                content_type: mime,
+                bytes,
+            },
+        ],
+    )
 }
 
 /// The boundary token for the hand-built file-upload body (see
 /// [`Client::upload_file`]).
 const FILE_UPLOAD_BOUNDARY: &str = "----colaFileBoundary";
 
-/// The `multipart/form-data` body Feishu's file upload expects: the
-/// `file_type` and `file_name` parts, then the file part carrying `bytes`
-/// under `file_name`. `\r\n` line endings and the closing `--boundary--` are
-/// per RFC 7578.
+/// The `multipart/form-data` body Feishu's file upload expects: the `file_type`
+/// and `file_name` parts, then the file part carrying `bytes` under the
+/// sanitized `file_name` (ADR-0076, #649).
 fn file_upload_body(boundary: &str, file_type: &str, file_name: &str, bytes: &[u8]) -> Vec<u8> {
-    let mut body = Vec::with_capacity(bytes.len() + 320);
-    body.extend_from_slice(
-        format!("--{boundary}\r\nContent-Disposition: form-data; name=\"file_type\"\r\n\r\n{file_type}\r\n")
-            .as_bytes(),
-    );
-    body.extend_from_slice(
-        format!("--{boundary}\r\nContent-Disposition: form-data; name=\"file_name\"\r\n\r\n{file_name}\r\n")
-            .as_bytes(),
-    );
-    body.extend_from_slice(
-        format!(
-            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{file_name}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
-        )
-        .as_bytes(),
-    );
-    body.extend_from_slice(bytes);
-    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
-    body
+    let file_name = sanitize_multipart_filename(file_name);
+    multipart_body(
+        boundary,
+        &[
+            MultipartField::Text {
+                name: "file_type",
+                value: file_type,
+            },
+            MultipartField::Text {
+                name: "file_name",
+                value: &file_name,
+            },
+            MultipartField::Bytes {
+                name: "file",
+                filename: &file_name,
+                content_type: "application/octet-stream",
+                bytes,
+            },
+        ],
+    )
 }
 
 /// A minimal interactive card carrying one markdown element — the shape
@@ -2082,6 +2160,45 @@ mod tests {
         assert!(body.ends_with("--\r\n"), "the body closes the multipart: {body}");
     }
 
+    /// A file name carrying a quote or CRLF is sanitized before it is
+    /// interpolated (#649): a raw `"` would close the quoted `filename`
+    /// parameter early and a raw CRLF would forge a new header, so both are
+    /// neutralized in the `file_name` field and the `filename` parameter alike.
+    #[tokio::test]
+    async fn upload_file_sanitizes_the_multipart_filename() {
+        let (server, client) = wire_client().await;
+        server.route(
+            "POST",
+            "/open-apis/im/v1/files",
+            200,
+            r#"{"code":0,"msg":"ok","data":{"file_key":"file_v2_abc"}}"#,
+        );
+
+        client
+            .upload_file(b"%PDFDATA", "pdf", "ev\"il\r\nname.pdf")
+            .await
+            .unwrap();
+
+        let request = last_request(&server);
+        let body = &request.body;
+        assert!(
+            !body.contains("\r\nname.pdf"),
+            "no raw CRLF is interpolated: {body}"
+        );
+        assert!(
+            !body.contains("filename=\"ev\"il"),
+            "the quoted filename is not closed early: {body}"
+        );
+        assert!(
+            body.contains("filename=\"ev'ilname.pdf\""),
+            "the quote is neutralized in the filename parameter: {body}"
+        );
+        assert!(
+            body.contains("\r\n\r\nev'ilname.pdf\r\n"),
+            "the file_name field carries the sanitized name: {body}"
+        );
+    }
+
     /// A stalled file upload is bounded by the client's 10s request timeout,
     /// like `upload_image`/`download_image`: otherwise the render pass that
     /// awaits it hangs on a wedged Feishu. The mock server hangs for 60s under
@@ -2200,6 +2317,36 @@ mod tests {
         assert!(
             message.contains("file key invalid"),
             "unexpected error: {message}"
+        );
+    }
+
+    /// A stalled File Message send is bounded by the client's 10s request
+    /// timeout, like the other byte-carrying calls: the render pass awaits it
+    /// before the card can render, so a hung request must never block the card
+    /// (ADR-0076, #649). The mock server hangs for 60s under a paused clock, so
+    /// the 10s timeout fires first with no wall-clock wait.
+    #[tokio::test(start_paused = true)]
+    async fn send_message_in_thread_gives_up_on_a_hung_server() {
+        let (server, client) = wire_client().await;
+        server.route_delayed(
+            "POST",
+            "/open-apis/im/v1/messages/om_card/reply",
+            200,
+            r#"{"code":0,"msg":"ok","data":{"message_id":"om_file","thread_id":"omt_file"}}"#,
+            std::time::Duration::from_secs(60),
+        );
+
+        let err = client
+            .send_message_in_thread(
+                "om_card",
+                "file",
+                &serde_json::json!({ "file_key": "file_v2_abc" }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::error::BridgeError::Http(ref e) if e.is_timeout()),
+            "the send must time out, not hang: {err:?}"
         );
     }
 
