@@ -410,7 +410,7 @@ detailed help for any of these.
 | `/agent <name>` | Switch agent (takes effect next message; persisted; `--reset` clears to the server default) |
 | `/model <p/m>` | Switch model (takes effect next message; persisted) |
 | `/think [level]` | Set/clear thinking level, per model (takes effect next message) |
-| `#<id> [#<id> …] [text]` | Load OpenCode skills into this message's prompt (e.g. `#implement-spec 644`); the whole message is submitted verbatim, and an id that matches no skill stays as plain text. A bare `/skill` opens the skill picker (`/skill <id>` is an alias) |
+| `#<id> [#<id> …] [text]` | Load OpenCode skills into this message's prompt (e.g. `#implement-spec 644`); the whole message is submitted verbatim, and an id that matches no skill stays as plain text. A bare `/skill` opens the skill picker — searchable by id/name/description and paged 20 rows at a time — and `/skill <id>` is an alias |
 | `/autoaccept [on\|off]` | Show/switch auto-allowing tool-permission requests for this session |
 | `/restart` | Restart cola (keeps startup args + log redirect) |
 | `/restart-opencode` | Restart the OpenCode server (only one cola itself started) |

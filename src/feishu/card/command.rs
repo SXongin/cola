@@ -517,15 +517,16 @@ pub(crate) async fn send_help_card(handles: &CommandHandles, message_id: &str) -
     }
 }
 
-/// Send the `/skill` picker card (spec #652, ticket #656): every registered
-/// skill, one row each — the source of truth for a user who does not know an
-/// id. The caller passes the list it already read for the dispatch, so a
-/// dispatch reads the skills exactly ONCE. `error`, when set, leads the card so
-/// an unknown-id dispatch shows the same list behind an error line. `chat_type`
-/// rides the buttons so a tap re-enters the message pipeline in the
-/// Chat/Topic kind the picker was sent in. The read behind `skills` is
+/// Send the `/skill` picker card (spec #652, ticket #656; paged + searchable per
+/// #664): every registered skill, one row each — the source of truth for a user
+/// who does not know an id. The caller passes the list it already read for the
+/// dispatch, so a dispatch reads the skills exactly ONCE. `error`, when set,
+/// leads the card so an unknown-id dispatch shows the same list behind an error
+/// line. `chat_type` rides the buttons so a tap re-enters the message pipeline
+/// in the Chat/Topic kind the picker was sent in. The read behind `skills` is
 /// generation-neutral and unfiltered, so a hidden or description-less skill is
-/// listed too; an empty list opens the no-skills state.
+/// listed too; an empty list opens the no-skills state. A catalog longer than a
+/// page renders a search box and a pager instead of several cards.
 ///
 /// A rejected card (Feishu refuses the schema/size) must not leave the command
 /// dead, so — like [`send_help_card`]'s `help_text()` fallback — the failure
@@ -538,13 +539,9 @@ pub(crate) async fn send_skill_card(
     skills: &[crate::backend::SkillInfo],
     error: Option<&str>,
 ) -> Result<()> {
+    let card = super::picker::build_skill_card(thread_key, skills, "", 1, chat_type, message_id, error);
     let fallback = skill_list_text(skills, error);
-    for card in super::picker::build_skill_cards(thread_key, skills, chat_type, message_id, error) {
-        if !reply_card_or_text(handles, message_id, &card, "skill card", &fallback).await? {
-            // The fallback text already replaced the card; stop paging.
-            return Ok(());
-        }
-    }
+    reply_card_or_text(handles, message_id, &card, "skill card", &fallback).await?;
     Ok(())
 }
 
@@ -552,17 +549,15 @@ pub(crate) async fn send_skill_card(
 /// rejects it (spec #652, ticket #655): a rejected card must not leave the
 /// command dead — the same refusal-degrades-to-text shape `send_help_card`'s
 /// `help_text()` fallback uses, shared by the `/skill` picker and the
-/// loaded-skill card. Returns `true` when the card landed, `false` when the text
-/// fallback was sent instead, so a paging sender can stop after the first
-/// failure. The reply failure itself is not surfaced: the fallback is the
-/// command's recovery.
+/// loaded-skill card. The reply failure itself is not surfaced: the fallback is
+/// the command's recovery.
 async fn reply_card_or_text(
     handles: &CommandHandles,
     message_id: &str,
     card: &serde_json::Value,
     label: &str,
     fallback_text: &str,
-) -> Result<bool> {
+) -> Result<()> {
     if let Err(e) = handles.flow.platform.reply_card(message_id, card).await {
         tracing::warn!("{label} failed ({}), falling back to text", e);
         handles
@@ -570,9 +565,8 @@ async fn reply_card_or_text(
             .platform
             .reply_text(message_id, fallback_text)
             .await?;
-        return Ok(false);
     }
-    Ok(true)
+    Ok(())
 }
 
 /// The plain-text fallback for [`send_skill_card`]: the same skills one line

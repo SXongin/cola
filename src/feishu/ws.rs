@@ -354,6 +354,18 @@ pub(crate) fn extract_card_action_value(payload: &[u8]) -> Option<serde_json::Va
                     "chat_id": parts[1],
                     "thread_id": parts[2],
                 })
+            } else if parts.len() == 3 && parts[0] == "skillsearch" {
+                // `/skill` picker search form (#664): same shape as
+                // `dirsearch`, no scope segment. The picker's extra routing
+                // (`chat_type` / `reply_message_id`) rides the button `value`
+                // only; a name-only fallback degrades to the picker card's own
+                // message for the tap's reply target.
+                serde_json::json!({
+                    "action": "skill",
+                    "op": "search",
+                    "chat_id": parts[1],
+                    "thread_id": parts[2],
+                })
             } else if parts[0] == "submitm" && (parts.len() == 4 || parts.len() == 5) {
                 // A multi-select custom-answer form submit: the routing payload
                 // is encoded in the name ("submitm|<req>|<ses>|<qi>[|<dir>]")
@@ -411,12 +423,12 @@ pub(crate) fn extract_card_action_value(payload: &[u8]) -> Option<serde_json::Va
                 break;
             }
         }
-        // `/switch` / `/dir` / `/sub` card search: the typed keyword from the
-        // search input.
+        // `/switch` / `/dir` / `/sub` / `/skill` card search: the typed keyword
+        // from the search input.
         let is_search = val.get("op").and_then(|v| v.as_str()) == Some("search")
             && matches!(
                 val.get("action").and_then(|v| v.as_str()),
-                Some("switch" | "dir" | "sub")
+                Some("switch" | "dir" | "sub" | "skill")
             );
         if is_search && let Some(s) = fv.get("search").and_then(|v| v.as_str()) {
             val["keyword"] = serde_json::Value::String(s.to_string());
@@ -1114,6 +1126,63 @@ mod tests {
         assert_eq!(value["chat_id"], "chat_1");
         assert_eq!(value["thread_id"], "chat_1");
         assert_eq!(value["keyword"], "渲染");
+    }
+
+    /// The `/skill` picker's search form mirrors `/dir`'s: the routing is
+    /// rebuilt from the button `name` ("skillsearch|<chat>|<thread>") and the
+    /// typed keyword is attached from `form_value.search` (#664).
+    #[test]
+    fn skill_search_form_submit_rebuilds_routing_and_keyword() {
+        let payload = r#"{
+            "schema": "2.0",
+            "event": {
+                "action": {
+                    "tag": "button",
+                    "name": "skillsearch|chat_1|chat_1",
+                    "form_value": {
+                        "search": "foreman"
+                    }
+                }
+            }
+        }"#;
+        let value = extract_card_action_value(payload.as_bytes()).expect("value extracted");
+        assert_eq!(value["action"], "skill");
+        assert_eq!(value["op"], "search");
+        assert_eq!(value["chat_id"], "chat_1");
+        assert_eq!(value["thread_id"], "chat_1");
+        assert_eq!(value["keyword"], "foreman");
+    }
+
+    /// The normal form-submit path (with `action.value` present) keeps the
+    /// `/skill` picker's extra routing (`chat_type` / `reply_message_id`) AND
+    /// attaches the typed keyword, so a rebuild can re-stamp its rows (#664).
+    #[test]
+    fn skill_search_form_submit_with_value_keeps_the_extras_and_keyword() {
+        let payload = r#"{
+            "schema": "2.0",
+            "event": {
+                "action": {
+                    "tag": "button",
+                    "value": {
+                        "action": "skill",
+                        "op": "search",
+                        "chat_id": "chat_1",
+                        "thread_id": "chat_1",
+                        "chat_type": "p2p",
+                        "reply_message_id": "msg_src"
+                    },
+                    "form_value": {
+                        "search": "spec"
+                    }
+                }
+            }
+        }"#;
+        let value = extract_card_action_value(payload.as_bytes()).expect("value extracted");
+        assert_eq!(value["action"], "skill");
+        assert_eq!(value["op"], "search");
+        assert_eq!(value["chat_type"], "p2p");
+        assert_eq!(value["reply_message_id"], "msg_src");
+        assert_eq!(value["keyword"], "spec");
     }
 
     /// A plain button click keeps its value untouched (no option/form_value).

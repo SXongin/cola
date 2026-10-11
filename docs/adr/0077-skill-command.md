@@ -6,6 +6,11 @@
 > as an alias. Every `/skill <id>` spelling below describes the earlier form and
 > is superseded on the sigil alone; the mechanism is unchanged. See the
 > Amendment at the end.
+>
+> **Amended 2026-10-11 (#664)**: the picker is now ONE paged, searchable card —
+> a keyword search over the skill's id/name/description plus a pager, the shape
+> ADR-0051/ADR-0052 gave `/switch`, `/dir` and `/sub`. It no longer splits a long
+> catalog across several card messages.
 
 Feishu gets its own way to load an OpenCode **skill**: the slash command
 `/skill <id>`, repeated once per skill, with the whole message text kept as the
@@ -177,3 +182,45 @@ whole-message-verbatim rule (ids ride the attachment; the `#` tokens stay in the
 text). Everything above describes the earlier `/skill <id>` spelling.
 
 Related: #651, #652.
+
+## Amendment (2026-10-11, #664): the picker paginates and searches
+
+The picker was a single list chunked across several card *messages* past the
+button/size budget (`（第 x / y 页）`), with no way to filter. It is now ONE card
+that windows the list into pages and carries a keyword search box — the shape
+ADR-0051 gave `/dir`'s search and ADR-0052 gave every list card's pager.
+
+- **Pages of 20, byte-bounded.** A page holds up to `SKILL_PAGE_ROWS` (20) rows —
+  skill rows are one short line, so more fit per page than the session cards'
+  six — while their estimated serialized bytes stay under `MAX_CARD_JSON_CHARS`.
+  A single oversized id (spec #652/#655) still takes its own page rather than
+  building an over-limit card, and a stale page clamps to the last (ADR-0052).
+- **Search over id / name / description.** The box renders once the list
+  outgrows a page, or a keyword is active (ADR-0051's conditional visibility);
+  the keyword matches the skill's id, name or description, case-insensitively,
+  whitespace-token AND — the list cards' rule. The submit is named
+  `skillsearch|<chat>|<thread>` and the typed keyword arrives as
+  `form_value.search`.
+- **Stateless filter, server re-read.** `keyword` and `page` ride every button;
+  a rebuild (a search, a flip) re-reads the server's skill list — unlike `/dir`,
+  which reads the local store — and replaces the card in place. The read is
+  best-effort (a failure degrades to the no-skills state), and a rebuild never
+  runs Lazy Start: it submits no prompt and the ack must stay fast.
+- **Row taps are unchanged.** A row still carries the exact id, `chat_type` and
+  `reply_message_id`; the search and pager buttons carry the latter two too, so a
+  rebuild re-stamps the fresh rows and a tap after a search still replies the
+  loaded-skill card under the ORIGINAL user message (spec #655). The form's
+  name-only submit fallback recovers chat/thread; the reply target then degrades
+  to the picker card, exactly as every other list card's fallback does.
+- **The text fallback matches the card.** The initial picker send still degrades
+  a rejected card to `skill_list_text` over the same list the card renders (an
+  empty keyword ⇒ the whole list). A rebuild replaces the card in place through
+  the ack — exactly like `/dir`'s and `/sub`'s rebuilds — so it has no
+  reply-with-fallback path.
+
+Unchanged: the invocation forms (`#<id>`, `/skill`, `/skill <id>`), the
+structured V2 injection and V1 text fallback, the loaded-skill card, and the
+picker's unfiltered default (hidden and description-less skills are still
+listed).
+
+Related: #664, ADR-0051, ADR-0052.

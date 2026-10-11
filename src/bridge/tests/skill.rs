@@ -1032,3 +1032,148 @@ async fn a_skill_command_on_a_serverless_cola_ensures_the_server_first() {
         "no picker on a serverless cola: {texts:?}"
     );
 }
+
+/// #664: past a page, a `/skill` search callback rebuilds the picker card in
+/// place — the skill list is re-read from the server, the rows narrow to the
+/// keyword, and the header names the filter. The rebuilt card is the ack's
+/// replacement.
+#[tokio::test]
+async fn a_skill_search_rebuilds_the_picker_card_in_place() {
+    let fx = SkillFixture::with_skills(paged_skills(crate::feishu::card::picker::SKILL_PAGE_ROWS + 5)).await;
+    fx.send("/skill").await;
+
+    // The card's own search submit, plus the keyword the extractor would attach
+    // from `form_value.search` (the unit tests cover that extraction).
+    let cards = fx.platform.replied_cards().await;
+    let mut submit = cards[0]["body"]["elements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["tag"] == "form")
+        .expect("a >page list shows the search box")["elements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["tag"] == "button")
+        .expect("the search submit")["value"]
+        .clone();
+    assert_eq!(
+        submit["chat_type"], "p2p",
+        "the submit carries the picker's extras"
+    );
+    submit["keyword"] = serde_json::json!("skill-3");
+
+    let result = fx.app.host_action(submit).await.expect("the search must ack");
+    let card = result.card.expect("the search replaces the card in place");
+    let text = card.to_string();
+    assert!(
+        text.contains("匹配 `skill-3` 的技能"),
+        "the header names the filter: {text}"
+    );
+    let ids: Vec<String> = row_buttons(&card)
+        .iter()
+        .map(|row| row["value"]["value"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids, ["skill-3"], "only the matching row survives: {text}");
+    assert_eq!(
+        fx.list_skills_calls.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "the rebuild re-reads the skill list"
+    );
+}
+
+/// #664: a page flip rebuilds the card with the next window and keeps the
+/// picker's routing, so a later row tap still replies the loaded-skill card
+/// under the ORIGINAL user message.
+#[tokio::test]
+async fn a_skill_page_flip_rebuilds_the_next_window_and_keeps_the_reply_target() {
+    let fx = SkillFixture::with_skills(paged_skills(crate::feishu::card::picker::SKILL_PAGE_ROWS + 5)).await;
+    fx.send("/skill").await;
+
+    let cards = fx.platform.replied_cards().await;
+    let next = pager_next_value(&cards[0]).expect("a >page list shows the pager");
+
+    let result = fx.app.host_action(next).await.expect("the flip must ack");
+    let card = result.card.expect("the flip replaces the card in place");
+    let rows = row_buttons(&card);
+    assert_eq!(rows.len(), 5, "page 2 holds the remainder");
+    assert_eq!(rows[0]["value"]["value"].as_str(), Some("skill-21"));
+    assert_eq!(rows[0]["value"]["chat_type"].as_str(), Some("p2p"));
+    assert_eq!(
+        rows[0]["value"]["reply_message_id"].as_str(),
+        Some("msg_skill"),
+        "the rebuilt rows keep the original user message for the tap's reply"
+    );
+}
+
+/// #664: the WS name-only form-submit fallback carries chat/thread but not the
+/// picker's `chat_type`/`reply_message_id`; a rebuild on that fallback must
+/// still route and load correctly (the defaulted chat type cannot change the
+/// derived thread key), degrading only the tap's reply target.
+#[tokio::test]
+async fn a_skill_search_from_the_name_only_fallback_still_loads_a_skill() {
+    let fx = SkillFixture::with_skills(paged_skills(crate::feishu::card::picker::SKILL_PAGE_ROWS + 5)).await;
+    fx.send("/skill").await;
+
+    // Exactly what `extract_card_action_value` rebuilds from the button name:
+    // no chat_type, no reply_message_id.
+    let submit = serde_json::json!({
+        "action": "skill",
+        "op": "search",
+        "chat_id": "chat_1",
+        "thread_id": "chat_1",
+        "keyword": "skill-3",
+    });
+    let card = fx
+        .app
+        .host_action(submit)
+        .await
+        .expect("the fallback search must ack")
+        .card
+        .expect("the fallback search replaces the card in place");
+    let rows = row_buttons(&card);
+    assert_eq!(rows.len(), 1, "the fallback search still narrows: {card}");
+    let row = rows[0]["value"].clone();
+
+    fx.app.host_action(row).await.expect("the tap must ack");
+    wait_for(&fx.prompt_calls, 1).await;
+    assert_eq!(
+        *fx.prompt_calls.lock().await,
+        vec!["#skill-3".to_string()],
+        "a row tapped after a fallback search still loads its skill"
+    );
+}
+
+/// `n` short, description-less skills (`skill-1`…`skill-n`) so a list past
+/// [`crate::feishu::card::picker::SKILL_PAGE_ROWS`] paginates.
+fn paged_skills(n: usize) -> Vec<SkillInfo> {
+    (1..=n)
+        .map(|i| SkillInfo {
+            id: format!("skill-{i}"),
+            name: format!("Skill {i}"),
+            description: None,
+            content: None,
+        })
+        .collect()
+}
+
+/// The skill ROW buttons of a card (top-level buttons without an `op`).
+fn row_buttons(card: &serde_json::Value) -> Vec<&serde_json::Value> {
+    card["body"]["elements"]
+        .as_array()
+        .expect("card body elements")
+        .iter()
+        .filter(|e| e["tag"] == "button" && e["value"].get("op").is_none())
+        .collect()
+}
+
+/// The 下一页 button's callback value (the pager's third column), if any.
+fn pager_next_value(card: &serde_json::Value) -> Option<serde_json::Value> {
+    card["body"]["elements"].as_array()?.iter().find_map(|e| {
+        (e["tag"] == "column_set"
+            && e["columns"]
+                .as_array()
+                .is_some_and(|cols| cols.iter().any(|c| c["elements"][0]["value"]["op"] == "page")))
+        .then(|| e["columns"][2]["elements"][0]["value"].clone())
+    })
+}
