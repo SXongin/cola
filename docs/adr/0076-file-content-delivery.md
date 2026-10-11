@@ -117,6 +117,25 @@ that topic resolves to a DIFFERENT Session — a fork (found live on spec #644).
 The rest of the Decision is unchanged: exactly one File Message, sent once on the
 first poll that shows the block, best-effort.
 
+## Amendment (2026-10-11): the folded panel header carries the file marker
+
+The Decision puts each File Content's tracking line in its Tool Panel **body**,
+but the panel is folded by default, so the line is invisible until the user
+expands it — worst of all for `未发送`, which is the ONLY signal that a file was
+read but could not be delivered. The panel **header** therefore carries a compact
+marker, visible while the panel stays collapsed:
+
+- one File Content — ` · 📎 <name>`, the name clipped to a short length with `…`;
+- several — ` · 📎 <N> 个文件`;
+- and ` · 未发送` appended when ANY of the panel's File Contents is undelivered,
+  so the one state that must never be missed is on the header itself.
+
+`Embedded` and `SentAsFile` add no state to the header: the image is rendered
+beside the panel and the File Message is a visible message of its own. The body's
+detailed tracking line is unchanged — the header is the folded summary, the body
+remains the record. The header title is card JSON, so the card-size estimate
+charges the marker's JSON-escaped bytes exactly as it charges the body line.
+
 ## Why
 
 - **Hybrid, not one surface, because neither alone covers the issue.** A
