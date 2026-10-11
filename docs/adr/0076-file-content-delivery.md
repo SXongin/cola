@@ -171,4 +171,5 @@ and business-error mapping), the pure card builder (the `img` element's position
 immediately after its panel and its `title`/`preview`, the three tracking-line
 states, the user-record line, the content-rejection fenced fallback), and the
 bridge mock Platform (the pre-resolve, the content-hash dedup, the fallback
-ladder, the once-guard, the in-thread placement, best-effort on failure).
+ladder, the once-guard, the File Message landing under the live card in
+whatever container the card lives, best-effort on failure).

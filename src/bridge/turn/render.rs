@@ -979,8 +979,11 @@ async fn resolve_file_delivery(
             return (Some(FileDelivery::Embedded { image_key }), holds);
         }
     }
-    // File Message: upload once, then send ONE message in-thread. `Ok(None)`
-    // means past Feishu's 30MB cap — nothing was uploaded.
+    // File Message: upload once, then send ONE reply that omits
+    // `reply_in_thread`, so Feishu places it in the target card's own
+    // container — its thread when the card is already threaded, a plain
+    // quoted reply in a lobby. `Ok(None)` means past Feishu's 30MB cap —
+    // nothing was uploaded.
     let file_cell = content_cell(&cards.file_uploads, upload.hash).await;
     let file_key = match file_cell
         .cell()
