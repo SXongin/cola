@@ -452,7 +452,7 @@ impl Turn {
         // on a missing id, and the first flush after the id lands serves it.
         let started_at = std::time::Instant::now();
         let mut acc = StreamAccumulator::new(&subtitle);
-        Self::seed_wake_floor(&handles.cards, &session_id, &mut acc);
+        Self::seed_durable_announcements(&handles.cards, &session_id, &mut acc);
         // The advisory-live opening line (ADR-0062): pushed BEFORE any part can
         // render, so it heads the card's timeline and every later flush keeps
         // it — the card that owns this message says the message merged into a
@@ -2152,19 +2152,25 @@ impl Turn {
         let Some(message_id) = message_id else {
             return;
         };
-        let previous = match confirmed {
-            Some((cursor, gap)) => cards.chains.track_carrying_cursor(
+        let previous = match confirmed.as_ref() {
+            // A SUPERSEDED stage carries the base's own cursor (a no-op write),
+            // so its delivered keys still ride this one re-point write (issue
+            // #671, ticket #672).
+            Some(confirmed) => cards.chains.track_carrying_cursor(
                 session_id,
                 card_message_id,
                 message_id,
                 created_ms,
                 context_directory.as_deref(),
                 reply_to.as_deref(),
-                &cursor,
-                gap.as_ref()
+                &confirmed.cursor,
+                confirmed
+                    .gap
+                    .as_ref()
                     .map(|coverage| (&coverage.frontier, coverage.complete)),
+                &confirmed.rendered,
             ),
-            None => cards.chains.track(
+            _ => cards.chains.track(
                 session_id,
                 card_message_id,
                 message_id,
@@ -3238,14 +3244,26 @@ impl Turn {
             .and_then(|c| c.acc.reply_to_message_id().map(str::to_string))
     }
 
-    /// Seed `acc`'s Wake floor from the chain's durable Wake Watermark (spec
-    /// #561, review #569; ADR-0061): every Wake at or below the mark was
-    /// announced by an earlier card — the mark outlives the record it was
-    /// announced on — so this card's render neither re-inserts its completion
-    /// entry nor stages a watermark advance for it. A strictly newer Wake still
-    /// renders and announces.
-    fn seed_wake_floor(cards: &CardsHandle, session_id: &str, acc: &mut state::StreamAccumulator) {
+    /// Seed `acc`'s durable announcement state from the chain's Chain Record —
+    /// one call, two facts, because both are "what an EARLIER card of this
+    /// Session already announced":
+    ///
+    /// - the **Wake floor** from the Wake Watermark (spec #561, review #569;
+    ///   ADR-0061): every Wake at or below the mark was announced by an earlier
+    ///   card — the mark outlives the record it was announced on — so this
+    ///   card's render neither re-inserts its completion entry nor stages a
+    ///   watermark advance for it. A strictly newer Wake still renders and
+    ///   announces.
+    /// - the **rendered marks** (issue #671, ticket #672): the synthetic
+    ///   retirement entries an earlier card really showed, which this card
+    ///   never re-renders.
+    ///
+    /// The two stay separate facts on purpose: the Wake floor gates Wakes, the
+    /// render marks gate retirements, and a retirement must never move the
+    /// floor a late Wake is judged against (#590).
+    fn seed_durable_announcements(cards: &CardsHandle, session_id: &str, acc: &mut state::StreamAccumulator) {
         acc.set_wake_floor(cards.chains.announced(session_id).map(|mark| mark.created_ms));
+        acc.set_render_marks(cards.chains.rendered(session_id));
     }
 
     /// Whether the session's card has rendered any part — the external
@@ -3986,7 +4004,9 @@ impl Turn {
     ) -> state::StagedCursorId {
         match cards.cards.lock().await.get_mut(session_id) {
             Some(card) => state::StagedCursorId {
-                id: card.acc.stage_cursor(card_message_id, cursor.clone(), None),
+                id: card
+                    .acc
+                    .stage_cursor(card_message_id, cursor.clone(), None, Vec::new()),
                 awaiting_seq: None,
             },
             None => state::StagedCursorId {

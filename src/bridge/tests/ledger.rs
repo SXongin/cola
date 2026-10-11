@@ -1800,7 +1800,7 @@ async fn a_permanently_refused_retirement_write_records_nothing() {
     let _wd = test_work_dir();
     let now = chrono::Utc::now().timestamp_millis();
     let live = waiting_shell(now - 5_000);
-    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    let (dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
     // The runtime confirms the shell ended mid-turn; no Wake will ever retire
     // it. The transcript stays as scripted and keeps listing the task, so only
     // the runtime read can end it.
@@ -1833,6 +1833,19 @@ async fn a_permanently_refused_retirement_write_records_nothing() {
         backend.overlay.retired_call_ids("ses_test").is_empty(),
         "a permanently refused write records nothing: {:?}",
         backend.overlay.retired_call_ids("ses_test")
+    );
+    // The durable rendered mark follows the same gate (issue #671, ticket
+    // #672): the entry never reached a card, so no mark may exist — a later
+    // card must still render it.
+    assert!(
+        ChainRecords::load(
+            dir.path()
+                .join("sessions.json")
+                .with_file_name("chain_records.json")
+        )
+        .rendered("ses_test")
+        .is_empty(),
+        "a permanently refused write records no rendered mark either"
     );
     let later = crate::backend::Backend::transcript(backend.as_ref(), "ses_test")
         .await
@@ -1892,6 +1905,23 @@ async fn a_permanently_refused_retirement_write_records_nothing() {
         vec!["call_bg".to_string()],
         "the accepted successor render records the retirement"
     );
+    // The durable rendered mark follows the same gate (issue #671, ticket
+    // #672): the doubly-refused write recorded nothing (the entry never
+    // reached a card), and the accepted successor write — which really carried
+    // the entry — records it.
+    let persisted = ChainRecords::load(
+        dir.path()
+            .join("sessions.json")
+            .with_file_name("chain_records.json"),
+    );
+    assert!(
+        persisted
+            .rendered("ses_test")
+            .iter()
+            .any(|key| key == "runtime:call_bg"),
+        "the delivered successor records the rendered mark: {:?}",
+        persisted.rendered("ses_test")
+    );
 }
 
 /// Review (spec #588, PR #595): a recoverable refusal is not a permanent one.
@@ -1922,6 +1952,57 @@ async fn a_queued_retirement_write_still_records() {
         backend.overlay.retired_call_ids("ses_test"),
         vec!["call_bg".to_string()],
         "a queued-for-retry write is accepted: the pass records"
+    );
+    // The DURABLE rendered mark rides the body's staged cursor (issue #671,
+    // ticket #672), so it is written when a write that carried the entry
+    // DELIVERS — here the queued payload's retry converges the card in the same
+    // turn, and the delivered write's stage is what records it. A write that
+    // never delivers records nothing (see
+    // `a_permanently_refused_retirement_write_records_nothing`), so an entry
+    // the user never saw still renders on the next card.
+    assert!(
+        app.cards_handle()
+            .chains
+            .rendered("ses_test")
+            .iter()
+            .any(|key| key == "runtime:call_bg"),
+        "the delivered write records the rendered mark: {:?}",
+        app.cards_handle().chains.rendered("ses_test")
+    );
+}
+
+/// Issue #671 / ticket #672: the durable rendered mark is written only by a
+/// write that DELIVERED. A recoverably failed (queued) entry write leaves the
+/// stage owed — no card has shown the entry yet — so nothing may be marked;
+/// the mark lands only when that payload's own delivery is confirmed (the
+/// staged-cursor reconcile spec #561 already runs for the cursor; its
+/// record-write side is pinned by
+/// `records::tests::a_confirmed_body_records_its_rendered_marks`).
+#[tokio::test]
+async fn a_queued_entry_write_marks_rendered_only_once_it_delivers() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = waiting_shell(now - 5_000);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    backend.task_runtime.lock().unwrap().shells = vec![(
+        "sh_call_bg".into(),
+        ShellRuntime::Ended {
+            end: ShellEnd::Killed,
+            completed_at: Some(now - 1_000),
+        },
+    )];
+    // Every transport write fails: the retirement's entry is queued, never
+    // delivered, in this pass.
+    platform.fail_update_transport_count.store(100, Ordering::SeqCst);
+
+    Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下构建并审阅"))
+        .await
+        .unwrap();
+
+    assert!(
+        app.cards_handle().chains.rendered("ses_test").is_empty(),
+        "an owed entry write records no rendered mark: {:?}",
+        app.cards_handle().chains.rendered("ses_test")
     );
 }
 
@@ -3804,6 +3885,50 @@ async fn a_runtime_retirement_never_advances_the_durable_watermark_for_a_late_wa
             .any(|card| card_text(card).contains(WAKE_LEAD)),
         "the late Wake still resumes the chain after the restart: {:?}",
         restarted_platform.calls.lock().await
+    );
+}
+
+/// Issue #671 / ticket #672: the durable RENDERED marks are a fact SEPARATE
+/// from the Wake Watermark. A delivered retirement entry records its
+/// `runtime:<call_id>` mark while leaving the Wake mark untouched — the two
+/// facts share a file and nothing else, so a late Wake is still judged against
+/// the Wake floor alone (#590, PR #595).
+#[tokio::test]
+async fn a_delivered_retirement_marks_rendered_without_moving_the_wake_mark() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = waiting_shell(now - 5_000);
+    let (dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    yield_one_task_card(&app, &platform, ctx("ses_test", "跑一下构建并审阅")).await;
+
+    let finished = now - 1_000;
+    backend.task_runtime.lock().unwrap().shells = vec![(
+        "sh_call_bg".into(),
+        ShellRuntime::Ended {
+            end: ShellEnd::Killed,
+            completed_at: Some(finished),
+        },
+    )];
+    spawn_sync(&app);
+    wait_for_card_update(&platform, "the settled card", CardUpdates::Latest, |card| {
+        card_header(card).contains("✅") && card_text(card).contains("🔔 shell 结束：gh run watch")
+    })
+    .await;
+
+    let session_file = dir.path().join("sessions.json");
+    let persisted = ChainRecords::load(session_file.with_file_name("chain_records.json"));
+    assert!(
+        persisted
+            .rendered("ses_test")
+            .iter()
+            .any(|key| key == "runtime:call_bg"),
+        "the delivered entry leaves its durable rendered mark: {:?}",
+        persisted.rendered("ses_test")
+    );
+    assert_eq!(
+        persisted.announced("ses_test"),
+        None,
+        "a synthetic retirement is not a Wake: the Watermark never moves for it"
     );
 }
 
@@ -6260,5 +6385,89 @@ async fn a_cleaned_entry_spends_no_output_read() {
     assert!(
         backend.shell_output_calls.lock().await.is_empty(),
         "the cleanup ending spends no output read"
+    );
+}
+
+/// Issue #671 / ticket #672: a Wake-less Background Task's retirement — the
+/// one ending there will ever be (#454) — renders on the card that observed
+/// it, and NEVER again. A restart re-derives the same child-evidence
+/// retirement (the launch never flips), so the durable rendered mark is the
+/// only thing standing between the reader and the same `🔔 subagent 结束`
+/// entry re-posted on every new card, hours later.
+#[tokio::test]
+async fn a_wake_less_retirement_renders_once_across_a_restart() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = SessionTranscript::new(two_task_timeline(vec![]))
+        .with_executions(vec![execution(2_500)])
+        .with_background_tasks(vec![live_subagent(now - 3_000, "call_sub")]);
+    let (dir, app, backend, platform) = scripted_app(vec![live.clone()], Some(SessionStatus::Idle)).await;
+    script_child_without_activity(&backend).await;
+    yield_one_task_card(&app, &platform, ctx("ses_test", "跑一下构建并审阅")).await;
+
+    // Life 1: the runtime reports the child inactive, its own transcript is
+    // terminal — no Wake ever arrives, so the child-evidence retirement is the
+    // only completion there will ever be.
+    backend.task_runtime.lock().unwrap().children = vec![("ses_call_sub".into(), ChildRuntime::Inactive)];
+    backend
+        .with_child_evidence(
+            "ses_call_sub",
+            ChildEvidence::Terminal {
+                completed_at: now - 1_000,
+            },
+        )
+        .await;
+    spawn_sync(&app);
+    wait_for_card_update(&platform, "the retirement entry", CardUpdates::Latest, |card| {
+        card_header(card).contains("✅") && card_text(card).contains("🔔 subagent 结束")
+    })
+    .await;
+
+    let session_file = dir.path().join("sessions.json");
+    let persisted = ChainRecords::load(session_file.with_file_name("chain_records.json"));
+    assert!(
+        persisted
+            .rendered("ses_test")
+            .iter()
+            .any(|key| key == "runtime:call_sub"),
+        "the delivered entry leaves its durable rendered mark: {:?}",
+        persisted.rendered("ses_test")
+    );
+
+    // Life 2: a fresh process over the same files, with the same read — the
+    // launch is still live (no Wake ever arrived) and the child evidence is the
+    // same terminal transcript.
+    let mut backend2 = MockBackend::new(realistic_parts());
+    backend2.given_transcript("ses_test", vec![live]);
+    backend2.with_session_status("ses_test", Some(SessionStatus::Idle));
+    backend2.task_runtime.lock().unwrap().children = vec![("ses_call_sub".into(), ChildRuntime::Inactive)];
+    backend2
+        .with_child_evidence(
+            "ses_call_sub",
+            ChildEvidence::Terminal {
+                completed_at: now - 1_000,
+            },
+        )
+        .await;
+    let backend2 = Arc::new(backend2);
+    let platform2 = Arc::new(RecordingPlatform::new());
+    let app2 = Arc::new(
+        App::new(test_config(&session_file), backend2.clone(), platform2.clone())
+            .expect("the restarted app builds"),
+    );
+    app2.turn_render_poll_ms.store(5, Ordering::Relaxed);
+    app2.turn_follow_read_timeout_ms.store(20, Ordering::Relaxed);
+    app2.runtime_reconcile.interval_ms.store(0, Ordering::Relaxed);
+    seed_session(&app2, "ses_test", "/work").await;
+
+    Turn::run(&app2.turn_handles(), ctx("ses_test", "接着来"))
+        .await
+        .unwrap();
+    let cards = platform2.updated_cards().await;
+    assert!(
+        !cards
+            .iter()
+            .any(|card| card_text(card).contains("🔔 subagent 结束")),
+        "an already-rendered retirement never replays after a restart: {cards:?}"
     );
 }

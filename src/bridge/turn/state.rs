@@ -452,8 +452,13 @@ pub(super) enum TimelineKind {
     /// completion line as a folded collapsible panel's title, the task's
     /// identity and timing in the fold. Keyed at the Wake's own server time,
     /// so the entry sits where the completion happened — never on a later
-    /// card, and never doubled by a repeated poll.
-    LedgerEntry(TaskCompletionEntry),
+    /// card, and never doubled by a repeated poll. The second field is the
+    /// entry's SYNTHETIC announce key (issue #671, ticket #672), `None` for a
+    /// real Wake — whose exactly-once is the durable Wake Watermark (ADR-0061),
+    /// not a rendered mark. The body that renders a keyed entry carries the key
+    /// to its durable rendered mark, so a body that leaves the entry to a
+    /// continuation claims nothing for it.
+    LedgerEntry(TaskCompletionEntry, Option<String>),
 }
 
 /// A card as built for one message: the JSON, whether the timeline had to
@@ -472,6 +477,11 @@ pub(super) struct BuiltCard {
     /// How far this body carries the chain's pending orphan gap (spec #561,
     /// review #569), when one is owed and the body rendered any of it.
     pub(super) gap: Option<GapCoverage>,
+    /// The announce keys of the ledger entries THIS body rendered (issue #671,
+    /// ticket #672): exactly the entries whose durable rendered mark this
+    /// delivered body may claim — a split's prefix carries only its own, and
+    /// the continuation carries the rest.
+    pub(super) rendered_keys: Vec<String>,
 }
 
 /// How far ONE built card body carries the chain's pending orphan gap (spec
@@ -994,6 +1004,16 @@ pub(super) struct StagedCursor {
     /// review #569), captured per built body: the confirmation persists the
     /// advance, and clears the durable gap only when the body reached its end.
     pub(super) gap: Option<GapCoverage>,
+    /// The synthetic completion announce keys THIS body rendered (issue #671,
+    /// ticket #672): the `runtime:<call_id>` entries of its own timeline range.
+    /// The confirmation persists them as the session's durable rendered marks —
+    /// so a retirement a delivered card really showed never re-renders on a
+    /// later card — and a stage that is discarded or never delivers records
+    /// nothing, leaving the entry to the next card that can carry it. They ride
+    /// the cursor stage on purpose: that stage is the machinery that already
+    /// distinguishes a DELIVERED write from an owed or refused one (spec #561,
+    /// review #569), including the later delivery of a queued payload.
+    pub(super) rendered: Vec<String>,
 }
 
 impl StagedCursor {
@@ -1017,6 +1037,21 @@ impl StagedCursor {
 pub(crate) struct StagedCursorId {
     pub(crate) id: u64,
     pub(crate) awaiting_seq: Option<u64>,
+}
+
+/// What a confirmed stage hands back for the durable record (spec #561; issue
+/// #671): the body's cursor, how far it carried the chain's orphan gap, and the
+/// synthetic completion announce keys its timeline showed — the three facts
+/// that must land in ONE Chain Record write, so no crash can leave the card
+/// having shown content the durable record does not know about. A SUPERSEDED
+/// stage (a newer confirmation already won) hands back the base's own cursor —
+/// writing it is a no-op — and no gap, so its delivered keys still ride that
+/// same single write.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ConfirmedBody {
+    pub(super) cursor: RenderedCursor,
+    pub(super) gap: Option<GapCoverage>,
+    pub(super) rendered: Vec<String>,
 }
 
 /// The Wake Watermark staged for the card body about to be written (ADR-0061):
@@ -1505,9 +1540,21 @@ pub(super) struct StreamAccumulator {
     /// rendering a session (`Turn`'s start, the projection/external arms, the
     /// Wake continuation); a strictly newer Wake still announces. `None` when
     /// the session announced no Wake. Private to this module: seeded by
-    /// [`Self::set_wake_floor`] (`Turn::seed_wake_floor`); read through
+    /// [`Self::set_wake_floor`] (`Turn::seed_durable_announcements`); read through
     /// [`Self::wake_floor`].
     wake_floor: Option<i64>,
+    /// The synthetic completion keys an EARLIER card of this Session already
+    /// rendered (issue #671, ticket #672): the durable `runtime:<call_id>`
+    /// marks `ChainRecords` carries, seeded when a card starts rendering a
+    /// session alongside [`Self::wake_floor`]. Every retirement here was shown
+    /// by a delivered card write, so this accumulator's render never re-inserts
+    /// its entry — the restart case the per-chain announce set cannot cover.
+    /// Deliberately NOT a Wake fact: it never joins [`Self::wake_floor`], so a
+    /// genuinely un-announced late Wake at or below a retirement's clock still
+    /// renders and resumes (#590, PR #595). Private to this module: seeded by
+    /// [`Self::set_render_marks`] (`Turn::seed_durable_announcements`); read through
+    /// [`Self::render_recorded`].
+    render_marks: std::collections::HashSet<String>,
     /// The Rendered Cursors of the card bodies built and not yet confirmed,
     /// newest last (spec #561, review #569): the flush stages one before each
     /// write and a confirmed write drains its exact stage — while a stage whose
@@ -2301,6 +2348,20 @@ impl StreamAccumulator {
         self.wake_floor = floor;
     }
 
+    /// Whether an earlier card of this Session already rendered this synthetic
+    /// retirement's entry — the durable mark the render's gate consults beside
+    /// [`Self::wake_announced`] (issue #671, ticket #672). Read-only: the plan
+    /// runs before the commit that announces, so it must not mutate.
+    pub(super) fn render_recorded(&self, key: &str) -> bool {
+        self.render_marks.contains(key)
+    }
+
+    /// Seed the durable rendered marks of the session's earlier cards (empty
+    /// for a session that rendered no retirement).
+    pub(super) fn set_render_marks(&mut self, marks: Vec<String>) {
+        self.render_marks = marks.into_iter().collect();
+    }
+
     /// Whether the neutral waiting line 「⏳ 等待当前运行接收…」 was already shown
     /// (ADR-0062). Private to this module: set by
     /// [`Self::mark_receive_hint_shown`].
@@ -2633,11 +2694,16 @@ impl StreamAccumulator {
     /// resolves it — a newer body staged since never loses an older stage's
     /// delivered confirmation (review #569). Returns the stage generation a
     /// confirmation must name (spec #561, review #569).
+    ///
+    /// `rendered` is the ledger announce keys the body actually rendered
+    /// (issue #671, ticket #672) — exactly the entries its delivered write may
+    /// mark, taken from [`Self::rendered_ledger_keys`] at build time.
     pub(super) fn stage_cursor(
         &mut self,
         card_message_id: Option<&str>,
         cursor: RenderedCursor,
         gap: Option<GapCoverage>,
+        rendered: Vec<String>,
     ) -> u64 {
         self.cursor_stage_seq = self.cursor_stage_seq.wrapping_add(1);
         self.staged_cursors.push(StagedCursor {
@@ -2646,6 +2712,10 @@ impl StreamAccumulator {
             cursor,
             awaiting_seq: None,
             gap,
+            // The ledger entries THIS body rendered (issue #671, ticket #672):
+            // a delivered body's own content is what its confirmation may mark,
+            // so a split's prefix never claims an entry its continuation shows.
+            rendered,
         });
         if self.staged_cursors.len() > MAX_STAGED_CURSORS {
             let excess = self.staged_cursors.len() - MAX_STAGED_CURSORS;
@@ -2682,11 +2752,15 @@ impl StreamAccumulator {
     /// atomic takeover calls this inside its cards-map critical section, so the
     /// record can carry the successor's frontier from the first moment it
     /// names the successor card.
+    ///
+    /// The stage's rendered keys (issue #671, ticket #672) ride back with it:
+    /// the caller persists them as this session's durable rendered marks, so
+    /// only the entries a DELIVERED body carried ever stop re-rendering.
     pub(super) fn take_staged_cursor(
         &mut self,
         card_message_id: &str,
         expected: StagedCursorId,
-    ) -> Option<(RenderedCursor, Option<GapCoverage>)> {
+    ) -> Option<ConfirmedBody> {
         let idx = self.staged_cursors.iter().position(|staged| {
             staged.id == expected.id
                 && staged.awaiting_seq == expected.awaiting_seq
@@ -2697,11 +2771,24 @@ impl StreamAccumulator {
         })?;
         let staged = self.staged_cursors.remove(idx);
         if staged.id < self.confirmed_cursor_stage {
-            return None;
+            // A newer confirmation already won: this body's cursor and gap are
+            // superseded, so hand back the base's own cursor (writing it is a
+            // no-op) and no gap — while its rendered keys still ride the
+            // caller's ONE record write, because this body DID deliver (issue
+            // #671, ticket #672). The mark never waits on a second write.
+            return Some(ConfirmedBody {
+                cursor: self.cursor.clone(),
+                gap: None,
+                rendered: staged.rendered,
+            });
         }
         self.confirmed_cursor_stage = staged.id;
         self.cursor = staged.cursor.clone();
-        Some((staged.cursor, staged.gap))
+        Some(ConfirmedBody {
+            cursor: staged.cursor,
+            gap: staged.gap,
+            rendered: staged.rendered,
+        })
     }
 
     /// Seed a fresh accumulator's empty base with a Rendered Cursor a re-point
@@ -2794,6 +2881,9 @@ impl StreamAccumulator {
     /// nothing may advance it — and a stale discard names a stage already
     /// resolved, which is a no-op. The next build re-stages from the confirmed
     /// base.
+    ///
+    /// Nothing is owed back for its ledger keys (issue #671, ticket #672): they
+    /// come from the body that staged it, so the next body derives its own.
     pub(super) fn discard_staged_cursor(&mut self, expected: StagedCursorId) {
         self.staged_cursors.retain(|staged| staged.id != expected.id);
     }
@@ -2802,9 +2892,32 @@ impl StreamAccumulator {
     /// on the card that hosted its task (ADR-0060): one folded panel, keyed at
     /// the Wake's own server time so it sorts where the completion happened —
     /// before the resumed work it announces, and never on another card.
-    pub(super) fn push_ledger_entry_at(&mut self, at_ms: Option<i64>, entry: TaskCompletionEntry) {
+    pub(super) fn push_ledger_entry_at(
+        &mut self,
+        at_ms: Option<i64>,
+        entry: TaskCompletionEntry,
+        synthetic_key: Option<&str>,
+    ) {
         let key = at_ms.unwrap_or_else(|| self.next_order());
-        self.insert_kind(key, None, TimelineKind::LedgerEntry(entry));
+        self.insert_kind(
+            key,
+            None,
+            TimelineKind::LedgerEntry(entry, synthetic_key.map(str::to_string)),
+        );
+    }
+
+    /// The announce keys of the ledger entries in the timeline range a body
+    /// renders (issue #671, ticket #672): what that body's confirmed write may
+    /// mark rendered — no more, so a split's prefix never claims an entry its
+    /// continuation carries, and no less.
+    fn rendered_ledger_keys(&self, from: usize, to: usize) -> Vec<String> {
+        self.timeline[from.min(self.timeline.len())..to.min(self.timeline.len())]
+            .iter()
+            .filter_map(|item| match &item.kind {
+                TimelineKind::LedgerEntry(_, synthetic_key) => synthetic_key.clone(),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Replace a question block's display state (the live 已选/✅ markers) in
@@ -3905,6 +4018,9 @@ impl StreamAccumulator {
             }
         }
         let state = if full { Some(CardState::Continued) } else { None };
+        // The ledger entries THIS slice renders (issue #671, ticket #672): a
+        // prefix's confirmation may mark only these, never the continuation's.
+        let rendered_keys = self.rendered_ledger_keys(self.render_from, split);
         let (card, spans, cursor, gap) = self.build_card_inner(self.render_from, split, !full, state);
         // Advance `render_from` ONLY on an actual split: while the card still
         // fits, subsequent flushes must re-render from the SAME start so the
@@ -3918,6 +4034,7 @@ impl StreamAccumulator {
             spans,
             cursor,
             gap,
+            rendered_keys,
         }
     }
 
@@ -3938,14 +4055,15 @@ impl StreamAccumulator {
     /// stays under Feishu's hard cap even when its estimate crosses the split
     /// budget.
     pub(super) fn build_card_unsplit(&self) -> BuiltCard {
-        let (card, spans, cursor, gap) =
-            self.build_card_inner(self.render_from, self.timeline.len(), true, None);
+        let end = self.timeline.len();
+        let (card, spans, cursor, gap) = self.build_card_inner(self.render_from, end, true, None);
         BuiltCard {
             card,
             full: false,
             spans,
             cursor,
             gap,
+            rendered_keys: self.rendered_ledger_keys(self.render_from, end),
         }
     }
 
@@ -3960,6 +4078,7 @@ impl StreamAccumulator {
     /// keeps its own recorded ending when the ledger handover still owes it a
     /// PATCH (ADR-0060).
     pub(super) fn build_finalized_handoff(&mut self, state: Option<CardState>) -> BuiltCard {
+        let start = self.render_from;
         let end = self.timeline.len();
         let built = self.build_card_inner(
             self.render_from,
@@ -3974,6 +4093,7 @@ impl StreamAccumulator {
             spans: built.1,
             cursor: built.2,
             gap: built.3,
+            rendered_keys: self.rendered_ledger_keys(start, end),
         }
     }
 
@@ -4131,7 +4251,7 @@ impl StreamAccumulator {
                 TimelineKind::Receipt(line) => (1, line.len() + 40, 0),
                 // A completion entry is one folded panel: its estimate is owned
                 // beside its render, like the ledger section's.
-                TimelineKind::LedgerEntry(entry) => {
+                TimelineKind::LedgerEntry(entry, _) => {
                     (4, crate::feishu::card::ledger::task_entry_estimate(entry), 0)
                 }
             };
@@ -4252,7 +4372,7 @@ impl StreamAccumulator {
                 // A completed Background Task's ledger entry (ADR-0060): one
                 // folded panel in the Wake's own position, its `entry_{seq}`
                 // id keeping the reader's fold state across re-renders.
-                TimelineKind::LedgerEntry(entry) => {
+                TimelineKind::LedgerEntry(entry, _) => {
                     if !pending.is_empty() {
                         builder = builder.with_text(&pending);
                         pending.clear();
@@ -4888,6 +5008,16 @@ pub(super) async fn refresh_context_window(
         acc.context_window_key = Some(key);
         acc.context_window = window;
     }
+}
+
+/// The announce KEY one Background Task retirement carries (issue #671, ticket
+/// #672): the runtime verdict's, the child evidence's, and the user's cleanup
+/// all share it. Two gates must agree on this one identity — the in-memory
+/// exactly-once set (`StreamAccumulator::announce_synthetic`) and the durable
+/// rendered marks (`ChainRecords::record_rendered`) — so it is minted once,
+/// here.
+pub(super) fn runtime_announce_key(call_id: &str) -> String {
+    format!("runtime:{call_id}")
 }
 
 /// The ledger kind of a Background Task's tool. Only `shell` and `subagent`
@@ -6858,13 +6988,14 @@ mod tests {
         assert_eq!(frontier.delivered_chars, second.chars().count());
     }
 
-    /// The announcement split (spec #588, review PR #595): a synthetic
-    /// retirement marks the chain's exactly-once set and stages NOTHING
-    /// durable, while a real Wake still stages the Wake Watermark — the
-    /// watermark stays Wake-scoped (ADR-0061), so a late real Wake at or below
-    /// a synthetic clock is never read as covered after a restart.
+    /// The announcement split (spec #588, review PR #595; issue #671): a
+    /// synthetic retirement marks the chain's exactly-once set and stages
+    /// NOTHING into the Wake Watermark — the watermark stays Wake-scoped
+    /// (ADR-0061), so a late real Wake at or below a synthetic clock is never
+    /// read as covered after a restart — while a real Wake still stages its
+    /// durable mark.
     #[test]
-    fn a_synthetic_announcement_marks_exactly_once_and_stages_nothing() {
+    fn a_synthetic_announcement_marks_exactly_once_and_stages_no_watermark() {
         let mut acc = StreamAccumulator::new("test");
         assert!(
             acc.announce_synthetic("runtime:call_1"),
@@ -6888,5 +7019,130 @@ mod tests {
             .expect("a real Wake stages its durable mark");
         assert_eq!(staged.wake_id, "msg_wake_1");
         assert_eq!(staged.created_ms, 1_000);
+    }
+
+    /// Issue #671 / ticket #672: a stage hands back exactly the ledger keys its
+    /// own body rendered — nothing a body that did not render the entry can
+    /// claim — and a stale stage (a newer confirmation already won) is refused
+    /// outright, so its keys never reach the durable record.
+    #[test]
+    fn a_stage_hands_back_only_its_own_rendered_keys() {
+        let mut acc = StreamAccumulator::new("test");
+        let stage = acc.stage_cursor(
+            Some("om_card"),
+            RenderedCursor::default(),
+            None,
+            vec!["runtime:call_1".to_string()],
+        );
+        let confirmed = acc
+            .take_staged_cursor(
+                "om_card",
+                StagedCursorId {
+                    id: stage,
+                    awaiting_seq: None,
+                },
+            )
+            .expect("the exact stage confirms");
+        assert_eq!(
+            confirmed.rendered,
+            vec!["runtime:call_1".to_string()],
+            "the body's own keys come back for the durable mark"
+        );
+
+        // A body that rendered no entry stages none.
+        let empty = acc.stage_cursor(Some("om_card"), RenderedCursor::default(), None, Vec::new());
+        let confirmed = acc
+            .take_staged_cursor(
+                "om_card",
+                StagedCursorId {
+                    id: empty,
+                    awaiting_seq: None,
+                },
+            )
+            .expect("the second stage confirms");
+        assert!(confirmed.rendered.is_empty());
+
+        // A stale stage's confirmation is refused: its keys never land.
+        let older = acc.stage_cursor(
+            Some("om_card"),
+            RenderedCursor::default(),
+            None,
+            vec!["runtime:call_2".to_string()],
+        );
+        let newer = acc.stage_cursor(Some("om_card"), RenderedCursor::default(), None, Vec::new());
+        assert!(
+            acc.take_staged_cursor(
+                "om_card",
+                StagedCursorId {
+                    id: newer,
+                    awaiting_seq: None,
+                },
+            )
+            .is_some()
+        );
+        // The stale stage hands back the BASE's cursor — writing it is a no-op —
+        // and no gap, but its own keys still ride the caller's single write for
+        // their durable mark.
+        let base = acc.cursor().clone();
+        let stale = acc
+            .take_staged_cursor(
+                "om_card",
+                StagedCursorId {
+                    id: older,
+                    awaiting_seq: None,
+                },
+            )
+            .expect("a delivered body's stage is never dropped");
+        assert_eq!(stale.cursor, base, "the superseded cursor never moves");
+        assert!(stale.gap.is_none(), "a superseded gap is dropped");
+        assert_eq!(
+            stale.rendered,
+            vec!["runtime:call_2".to_string()],
+            "its delivered keys still owe their mark"
+        );
+    }
+
+    /// Issue #671 / ticket #672: the attribution itself. A body claims the
+    /// ledger keys of the entries it RENDERED — so a size split's prefix claims
+    /// only the entries before the cut, and the continuation claims the rest.
+    #[test]
+    fn a_body_claims_the_ledger_keys_it_rendered() {
+        let mut acc = StreamAccumulator::new("test");
+        acc.card_state = CardState::Done;
+        // Enough text to force a split, then the entry past the cut: the prefix
+        // renders the text, the continuation the entry.
+        acc.push_text(&"很长的回答。".repeat(2000));
+        acc.push_ledger_entry_at(
+            None,
+            crate::feishu::card::ledger::TaskCompletionEntry {
+                kind: crate::feishu::card::ledger::TaskKind::Subagent,
+                label: Some("review the diff".into()),
+                id: Some("ses_child".into()),
+                started_at: Some(1_000),
+                finished_at: Some(2_000),
+                ending: crate::feishu::card::ledger::TaskEnding::RuntimeEnded,
+                output: None,
+            },
+            Some("runtime:call_1"),
+        );
+
+        let prefix = acc.build_card_with_info();
+        assert!(prefix.full, "the oversized text must split the body");
+        assert!(
+            prefix.rendered_keys.is_empty(),
+            "the prefix renders no ledger entry, so it claims none: {:?}",
+            prefix.rendered_keys
+        );
+
+        let continuation = acc.build_card_with_info();
+        assert!(
+            !continuation.full,
+            "the continuation carries the rest of the timeline"
+        );
+        assert_eq!(
+            continuation.rendered_keys,
+            vec!["runtime:call_1".to_string()],
+            "the continuation claims the entry it renders"
+        );
     }
 }
