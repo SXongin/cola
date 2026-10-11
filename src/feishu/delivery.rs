@@ -1801,11 +1801,8 @@ impl Platform for CardDelivery {
         message_id: &str,
         msg_type: &str,
         content: &Value,
-        reply_in_thread: bool,
     ) -> Result<(String, Option<String>)> {
-        self.inner
-            .reply_message(message_id, msg_type, content, reply_in_thread)
-            .await
+        self.inner.reply_message(message_id, msg_type, content).await
     }
 
     async fn download_image(&self, message_id: &str, image_key: &str) -> Result<ImageAttachment> {
@@ -2164,7 +2161,6 @@ mod tests {
             _message_id: &str,
             _msg_type: &str,
             _content: &Value,
-            _reply_in_thread: bool,
         ) -> Result<(String, Option<String>)> {
             unimplemented!("not used")
         }

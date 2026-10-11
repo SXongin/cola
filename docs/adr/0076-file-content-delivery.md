@@ -91,20 +91,31 @@ way a turn's several images stay tied to the call that read each one.
   noise as a file attachment; the Background Task Ledger's clipped tail stays its
   surface.
 
-## Amendment (2026-10-11): the File Message's reply mode is container-aware
+## Amendment (2026-10-11): the File Message's reply omits `reply_in_thread`
 
 The Decision above says the File Message is "replied in-thread under the live
-card". That is right for a **topic-backed** Session (`ThreadKey.thread_id !=
-chat_id`): `reply_in_thread: true` lands the message in the Session's own topic.
-It is wrong for a **lobby** Session (`thread_id == chat_id`): Feishu creates a
-**brand-new topic** around the card, and because cola keys a conversation by
-`(chat_id, thread_id)`, a user replying inside that topic resolves to a
-DIFFERENT Session — a fork (found in live acceptance of spec #644). The send is
-therefore container-aware: `reply_in_thread: true` when the Session is
-topic-backed, and a **plain reply** (`reply_in_thread` omitted, creating no
-topic) in a lobby, which Feishu shows as a quoted reply under the card. The rest
-of the Decision is unchanged: exactly one File Message, sent once on the first
-poll that shows the block, best-effort.
+card". The first cut of the amendment decided the reply mode from the Session's
+ThreadKey (`reply_in_thread: true` when `thread_id != chat_id`), but that reads
+the **Session mapping** while the live card target is resolved separately and can
+outlive it: a lobby Session adopted into a topic mid-turn still has a live card
+targeting the lobby-root message, so the next poll passed `true` and Feishu
+created a NEW topic around that card — exactly the fork the change was meant to
+prevent.
+
+Feishu's own rule for `POST /open-apis/im/v1/messages/:message_id/reply` settles
+it, so cola carries no mode at all. `reply_in_thread` **defaults to `false`**,
+and per the official docs: *"If the message to be replied is already in thread
+form, the reply will be in thread form by default."* A reply that simply OMITS
+the field therefore lands wherever the **target card** lives — inside the topic
+when the card is already threaded, and as a plain quoted reply (creating no
+topic) when the card is at chat level. The card's own container decides, so the
+behaviour is correct across an adopt-mid-turn transition with no mapping lookup
+and no race. Sending `reply_in_thread: true` against a lobby card would instead
+create a new topic; because cola keys a conversation by `(chat_id, thread_id)`,
+that topic resolves to a DIFFERENT Session — a fork (found live on spec #644).
+
+The rest of the Decision is unchanged: exactly one File Message, sent once on the
+first poll that shows the block, best-effort.
 
 ## Why
 
@@ -155,8 +166,8 @@ and **File Message** (the separate message cola posts for one it cannot embed).
 
 The implementation batch (spec #644, tickets #646–#649) adds the tests at the
 three existing seams: the Feishu wire client (the upload multipart fields, the
-bearer/token flow, the `msg_type:"file"` content, `reply_in_thread`, and
-business-error mapping), the pure card builder (the `img` element's position
+bearer/token flow, the `msg_type:"file"` content with `reply_in_thread` omitted,
+and business-error mapping), the pure card builder (the `img` element's position
 immediately after its panel and its `title`/`preview`, the three tracking-line
 states, the user-record line, the content-rejection fenced fallback), and the
 bridge mock Platform (the pre-resolve, the content-hash dedup, the fallback

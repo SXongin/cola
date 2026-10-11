@@ -907,31 +907,24 @@ impl Client {
 
     /// Send a message of an arbitrary `msg_type` as a reply under `message_id`
     /// (ADR-0076): the send path for a File Message (`msg_type:"file"`,
-    /// `content` `{"file_key": …}`). `reply_in_thread` selects the reply mode —
-    /// `true` replies in thread form (`reply_in_thread: true`), which creates a
-    /// topic around a non-topic seed (the Session's own topic, for a
-    /// topic-backed Session); `false` omits the field, a **plain reply** Feishu
-    /// shows under the seed without creating a topic (a lobby Session — a
-    /// thread reply there would spawn a new topic and fork the conversation;
-    /// ADR-0076's amendment). Returns the created message id and the topic's
-    /// `thread_id`, exactly like [`Self::reply_card_in_thread`] (`thread_id` is
-    /// `None` for a plain reply, or when the chat does not support topic
-    /// replies).
+    /// `content` `{"file_key": …}`). The body OMITS `reply_in_thread`, so Feishu
+    /// decides the container from the target card itself (ADR-0076's amendment):
+    /// when the card is already in thread form the reply lands in that same
+    /// topic, and when the card is at chat level the reply is a plain quoted
+    /// reply that creates no topic. Returns the created message id and the
+    /// topic's `thread_id` (`None` when the reply created no topic, or when the
+    /// chat does not support topic replies).
     pub async fn reply_message(
         &self,
         message_id: &str,
         msg_type: &str,
         content: &serde_json::Value,
-        reply_in_thread: bool,
     ) -> crate::error::Result<(String, Option<String>)> {
         let token = self.get_access_token().await?;
-        let mut body = serde_json::json!({
+        let body = serde_json::json!({
             "msg_type": msg_type,
             "content": content.to_string(),
         });
-        if reply_in_thread {
-            body["reply_in_thread"] = serde_json::json!(true);
-        }
 
         let text = read_body_with_diag(
             self.http
@@ -2303,11 +2296,13 @@ mod tests {
         );
     }
 
-    /// A topic-backed Session's File Message is a reply sent in thread form:
-    /// `msg_type:"file"` with `content` `{"file_key": …}`, `reply_in_thread:
-    /// true` (ADR-0076), so it lands in the Session's own topic.
+    /// A File Message is a reply that OMITS `reply_in_thread`, so Feishu keeps
+    /// it in the target card's own container (the Session's topic when the card
+    /// is already in one, a plain reply that creates no topic otherwise —
+    /// ADR-0076's amendment). The body still carries `msg_type:"file"` with
+    /// `content` `{"file_key": …}`, and the response's `thread_id` is parsed.
     #[tokio::test]
-    async fn reply_message_in_thread_sends_file_content_in_thread() {
+    async fn reply_message_omits_reply_in_thread_and_sends_file_content() {
         let (server, client) = wire_client().await;
         server.route(
             "POST",
@@ -2317,10 +2312,7 @@ mod tests {
         );
         let content = serde_json::json!({ "file_key": "file_v2_abc" });
 
-        let (id, thread_id) = client
-            .reply_message("om_card", "file", &content, true)
-            .await
-            .unwrap();
+        let (id, thread_id) = client.reply_message("om_card", "file", &content).await.unwrap();
         assert_eq!(id, "om_file");
         assert_eq!(thread_id.as_deref(), Some("omt_file"));
 
@@ -2330,41 +2322,9 @@ mod tests {
         assert_eq!(request.header("authorization"), Some("Bearer t-abc"));
         let body = body_json(&request);
         assert_eq!(body["msg_type"], "file");
-        assert_eq!(body["reply_in_thread"], true);
-        assert_eq!(send_content(&request)["file_key"], "file_v2_abc");
-    }
-
-    /// A lobby Session's File Message is a **plain reply**: `reply_in_thread`
-    /// is absent from the body, so Feishu shows it under the card without
-    /// creating a topic — a thread reply in a lobby would spawn a new topic and
-    /// fork the conversation (ADR-0076's amendment).
-    #[tokio::test]
-    async fn reply_message_plain_omits_reply_in_thread_and_parses_no_topic() {
-        let (server, client) = wire_client().await;
-        server.route(
-            "POST",
-            "/open-apis/im/v1/messages/om_card/reply",
-            200,
-            r#"{"code":0,"msg":"ok","data":{"message_id":"om_file"}}"#,
-        );
-        let content = serde_json::json!({ "file_key": "file_v2_abc" });
-
-        let (id, thread_id) = client
-            .reply_message("om_card", "file", &content, false)
-            .await
-            .unwrap();
-        assert_eq!(id, "om_file");
-        assert_eq!(thread_id, None);
-
-        let request = last_request(&server);
-        assert_eq!(request.method, "POST");
-        assert_eq!(request.path, "/open-apis/im/v1/messages/om_card/reply");
-        assert_eq!(request.header("authorization"), Some("Bearer t-abc"));
-        let body = body_json(&request);
-        assert_eq!(body["msg_type"], "file");
         assert!(
             body.get("reply_in_thread").is_none(),
-            "a plain reply omits reply_in_thread: {body}"
+            "the reply must omit reply_in_thread so Feishu uses the card's own container: {body}"
         );
         assert_eq!(send_content(&request)["file_key"], "file_v2_abc");
     }
@@ -2381,7 +2341,7 @@ mod tests {
 
         let message = feishu_error(
             client
-                .reply_message("om_card", "file", &serde_json::json!({}), true)
+                .reply_message("om_card", "file", &serde_json::json!({}))
                 .await
                 .unwrap_err(),
         );
@@ -2416,7 +2376,6 @@ mod tests {
                 "om_card",
                 "file",
                 &serde_json::json!({ "file_key": "file_v2_abc" }),
-                true,
             )
             .await
             .unwrap_err();

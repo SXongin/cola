@@ -653,40 +653,22 @@ struct InFlightUpload {
     content: FileContent,
 }
 
-/// Whether `session_id`'s File Message must be sent as a **thread reply**
-/// (`reply_in_thread: true`), derived from its ThreadKey (ADR-0076's amendment).
-/// A topic-backed Session (`thread_id != chat_id`) replies in-thread so the File
-/// Message lands in the Session's own topic; a lobby Session
-/// (`thread_id == chat_id`) must NOT — Feishu would create a brand-new topic
-/// around the card, and cola keys a conversation by `(chat_id, thread_id)`, so a
-/// user replying inside that topic would resolve to a DIFFERENT Session (a fork).
-/// An unmapped Session defaults to a plain reply: never create a topic we cannot
-/// key a conversation to. Read ONCE per resolve batch (the caller passes the
-/// verdict down), never per file and never with the sessions lock held across an
-/// await.
-async fn file_reply_in_thread(sessions: &SessionsHandle, session_id: &str) -> bool {
-    sessions
-        .thread_for_session(session_id)
-        .await
-        .is_some_and(|key| key.thread_id != key.chat_id)
-}
-
 /// Pre-resolve each newly rendered File Content's card delivery before the card
 /// JSON is built (ADR-0076). An image within Feishu's caps is uploaded once —
 /// cached process-locally by content hash, so identical bytes upload once and
 /// every later PATCH reuses the key — and embedded as an `img` immediately
 /// after its Tool Panel; anything else (a non-image, an image past the embed
 /// caps, or an image whose embed upload failed) is uploaded once and posted as
-/// exactly ONE File Message under the live card (#649) — in the Session's own
-/// topic when it is topic-backed (`reply_in_thread: true`), else a plain reply
-/// that creates no topic (`reply_in_thread` omitted; a lobby's thread reply
-/// would spawn a topic and fork the conversation — ADR-0076's amendment) — or
-/// left `未发送` when it is past Feishu's 30MB cap or the send failed.
+/// exactly ONE File Message under the live card (#649). The reply OMITS
+/// `reply_in_thread`, so Feishu keeps it in the card's own container — the
+/// Session's topic when the card is already threaded, a plain reply that
+/// creates no topic otherwise (ADR-0076's amendment) — or the content is left
+/// `未发送` when it is past Feishu's 30MB cap or the send failed.
 /// Best-effort: a failure leaves the panel's tracking line and never fails the
 /// Turn. Runs OUTSIDE the cards lock for the uploads and the send (they are
 /// network calls), like the planned-entry output reads. Returns whether any
 /// delivery was attached — a change that owes its card PATCH.
-async fn resolve_file_deliveries(cards: &CardsHandle, session_id: &str, reply_in_thread: bool) -> bool {
+async fn resolve_file_deliveries(cards: &CardsHandle, session_id: &str) -> bool {
     // 1. Collect the unresolved File Contents under a brief lock. No cache
     //    access here, so no nested lock; the reply target is read later, in the
     //    same critical section as the live-panel revalidation (see
@@ -719,11 +701,11 @@ async fn resolve_file_deliveries(cards: &CardsHandle, session_id: &str, reply_in
     //    CONCURRENTLY (ADR-0076 review, N2): each file's upload/send is
     //    independent async work, so N slow files no longer serialize N request
     //    timeouts before the card can flush. Each file's own send stays
-    //    single-flight (its once-guard cell) and replies under the live card in
-    //    the mode `reply_in_thread` selects (the Session's own topic when
-    //    topic-backed, a plain reply in a lobby); the deliveries are keyed by
-    //    content hash and attached in panel order below, so the card's tracking
-    //    lines stay correctly placed.
+    //    single-flight (its once-guard cell) and replies under the live card,
+    //    omitting `reply_in_thread` so Feishu keeps it in the card's own
+    //    container (ADR-0076's amendment); the deliveries are keyed by content
+    //    hash and attached in panel order below, so the card's tracking lines
+    //    stay correctly placed.
     //    The embed verdict rides the pending entry (the content's intrinsic
     //    embeddability, so every occurrence agrees — ADR-0076 review round 4);
     //    the dedup below keeps the first occurrence's `(call_id, index)` only to
@@ -749,7 +731,7 @@ async fn resolve_file_deliveries(cards: &CardsHandle, session_id: &str, reply_in
         async move {
             (
                 upload.hash,
-                resolve_file_delivery(&cards, &session_id, upload, reply_in_thread).await,
+                resolve_file_delivery(&cards, &session_id, upload).await,
             )
         }
     }))
@@ -945,8 +927,9 @@ async fn live_file_reply_target(
 
 /// Resolve ONE File Content's card delivery (ADR-0076, #649): embed an image
 /// within Feishu's caps, else upload the bytes once and send one File Message
-/// under the live card (`reply_in_thread` selects the mode: the Session's own
-/// topic when topic-backed, a plain reply in a lobby), else `Undelivered`.
+/// under the live card (omitting `reply_in_thread`, so Feishu keeps the reply in
+/// the card's own container — the Session's topic when it is already threaded, a
+/// plain reply otherwise; ADR-0076's amendment), else `Undelivered`.
 /// Best-effort: every failure degrades along the ladder (embed upload → File
 /// Message → `未发送`) and never errors. `None` leaves the content unresolved
 /// for a later poll — a File Message with no live card to reply under yet, or
@@ -959,7 +942,6 @@ async fn resolve_file_delivery(
     cards: &CardsHandle,
     session_id: &str,
     upload: &InFlightUpload,
-    reply_in_thread: bool,
 ) -> (Option<FileDelivery>, Vec<ContentCellHold<Option<String>>>) {
     let mut holds: Vec<ContentCellHold<Option<String>>> = Vec::new();
     // Embed first: a supported image uploads once and every later PATCH reuses
@@ -1045,11 +1027,7 @@ async fn resolve_file_delivery(
                 return Err(());
             };
             let content = serde_json::json!({ "file_key": file_key });
-            match cards
-                .feishu
-                .reply_message(&reply_target, "file", &content, reply_in_thread)
-                .await
-            {
+            match cards.feishu.reply_message(&reply_target, "file", &content).await {
                 Ok(_) => Ok(FileDelivery::SentAsFile),
                 Err(error) => {
                     tracing::warn!(
@@ -1989,12 +1967,11 @@ async fn render_and_flush_inner(
     // Resolve every newly rendered File Content's card delivery (ADR-0076)
     // before the flush builds the card JSON: one upload per content, outside
     // the cards lock. Best-effort — a failure leaves the tracking line. An
-    // attached delivery is a rendered change and owes its PATCH. The Session's
-    // topic-ness decides the reply mode, read ONCE here (never per file, never
-    // with the sessions lock held across an await): a topic-backed Session
-    // replies in-thread, a lobby as a plain reply (ADR-0076's amendment).
-    let reply_in_thread = file_reply_in_thread(sessions, session_id).await;
-    let file_changed = resolve_file_deliveries(cards, session_id, reply_in_thread).await;
+    // attached delivery is a rendered change and owes its PATCH. The File
+    // Message reply omits `reply_in_thread`, so Feishu keeps it in the live
+    // card's own container (ADR-0076's amendment) — no Session mapping lookup,
+    // so an adopt-mid-turn transition cannot fork the conversation.
+    let file_changed = resolve_file_deliveries(cards, session_id).await;
     // One output read per planned entry, OUTSIDE the cards lock (the reads are
     // network), then one short lock to announce and insert them (spec #593).
     read_planned_outputs(backend, &mut plans).await;
@@ -5500,22 +5477,6 @@ Index: /x/src/main.rs
             .collect()
     }
 
-    /// The requested reply mode of every File Message the mock recorded, in
-    /// order: `true` = a thread reply (the Session's own topic), `false` = a
-    /// plain reply (a lobby; ADR-0076's amendment).
-    async fn sent_reply_modes(platform: &RecordingPlatform) -> Vec<bool> {
-        platform
-            .calls
-            .lock()
-            .await
-            .iter()
-            .filter_map(|call| match call {
-                PlatformCall::SendMessageReply { reply_in_thread, .. } => Some(*reply_in_thread),
-                _ => None,
-            })
-            .collect()
-    }
-
     /// A tool-read image renders on the card (ADR-0076): uploaded once, embedded
     /// as an `img` immediately after its panel with `title` `📎 <name>` and
     /// `preview` on, and the panel carries the `· 已内嵌` tracking line.
@@ -5667,7 +5628,7 @@ Index: /x/src/main.rs
             let sid = sid.to_string();
             tokio::spawn(async move {
                 let cards = app.core.cards_handle();
-                resolve_file_deliveries(&cards, &sid, true).await
+                resolve_file_deliveries(&cards, &sid).await
             })
         };
         // Let the second task run: single-flight leaves it blocked on the
@@ -5706,10 +5667,12 @@ Index: /x/src/main.rs
     }
 
     /// A File Content that is not an embeddable image (a PDF) is uploaded once
-    /// and posted as exactly ONE File Message under the live card (#649) — in
-    /// the Session's own topic when it is topic-backed (`reply_in_thread: true`,
-    /// ADR-0076's amendment); the panel line reads `已发送为文件消息` and no `img`
-    /// is emitted. A later poll re-renders the line but never repeats the send.
+    /// and posted as exactly ONE File Message under the live card (#649), even
+    /// for a **lobby** Session (`thread_id == chat_id`) — the reply omits
+    /// `reply_in_thread`, so Feishu keeps it in the card's own container and
+    /// creates no topic (ADR-0076's amendment); the panel line reads
+    /// `已发送为文件消息` and no `img` is emitted. A later poll re-renders the line
+    /// but never repeats the send.
     #[tokio::test]
     async fn a_non_image_file_content_is_sent_as_one_file_message() {
         let _wd = test_work_dir();
@@ -5717,13 +5680,15 @@ Index: /x/src/main.rs
         let cfg = test_config(&dir.path().join("sessions.json"));
         let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
         platform.given_file_key("file_v2_pdf");
-        let sid = "ses_file_pdf";
-        // A topic-backed Session (`thread_id != chat_id`): its File Message must
-        // be a thread reply so it lands in the Session's own topic.
+        let sid = "ses_file_lobby";
+        // A lobby Session: its ThreadKey's thread_id falls back to the chat_id.
+        // The reply mode is Feishu's (the card's own container), never a
+        // Session-mapping lookup, so the send must land here without creating a
+        // topic that would fork the conversation (ADR-0076's amendment).
         seed_entry(
             &app,
             crate::config::SessionEntry {
-                thread_key: crate::config::ThreadKey::new("chat_1".into(), "omt_pdf".into()),
+                thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
                 session_id: sid.into(),
                 directory: "/tmp/x".into(),
                 agent: None,
@@ -5736,7 +5701,7 @@ Index: /x/src/main.rs
         )
         .await;
         let cards = app.core.cards_handle();
-        Turn::seed_card(&cards, sid, Some("om_pdf")).await;
+        Turn::seed_card(&cards, sid, Some("om_lobby")).await;
         Turn::set_turn_anchor(&cards, sid, &turn_anchor(0)).await;
 
         let transcript = SessionTranscript::new(vec![message(
@@ -5758,16 +5723,11 @@ Index: /x/src/main.rs
         assert_eq!(
             sent_messages(&platform).await,
             vec![(
-                "om_pdf".to_string(),
+                "om_lobby".to_string(),
                 "file".to_string(),
                 serde_json::json!({ "file_key": "file_v2_pdf" }),
             )],
             "exactly one File Message under the live card"
-        );
-        assert_eq!(
-            sent_reply_modes(&platform).await,
-            vec![true],
-            "a topic-backed Session's File Message is a thread reply"
         );
         let card = final_card(&platform).await;
         assert!(
@@ -5815,72 +5775,6 @@ Index: /x/src/main.rs
         assert!(
             body.contains("已发送为文件消息"),
             "the later render keeps the line: {body}"
-        );
-    }
-
-    /// A File Content in a **lobby** Session (`thread_id == chat_id`) is sent as
-    /// a **plain reply** under the live card, never `reply_in_thread`: Feishu
-    /// would otherwise create a brand-new topic around the card, and cola keys a
-    /// conversation by `(chat_id, thread_id)`, so a user replying inside that
-    /// topic would resolve to a DIFFERENT Session (a fork; ADR-0076's
-    /// amendment). The File Message still lands, and the tracking line still
-    /// reads `已发送为文件消息`.
-    #[tokio::test]
-    async fn a_lobby_file_content_is_sent_as_a_plain_reply_without_a_topic() {
-        let _wd = test_work_dir();
-        let dir = tempfile::tempdir().unwrap();
-        let cfg = test_config(&dir.path().join("sessions.json"));
-        let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
-        platform.given_file_key("file_v2_pdf");
-        let sid = "ses_file_lobby";
-        // A lobby Session: its ThreadKey's thread_id falls back to the chat_id.
-        seed_entry(
-            &app,
-            crate::config::SessionEntry {
-                thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-                session_id: sid.into(),
-                directory: "/tmp/x".into(),
-                agent: None,
-                model: None,
-                auto_accept: false,
-                topic_anchor: None,
-                topic_root: None,
-                variant: None,
-            },
-        )
-        .await;
-        let cards = app.core.cards_handle();
-        Turn::seed_card(&cards, sid, Some("om_lobby")).await;
-        Turn::set_turn_anchor(&cards, sid, &turn_anchor(0)).await;
-
-        let transcript = SessionTranscript::new(vec![message(
-            "a1",
-            1_000,
-            vec![read_file_part("call_read", "doc.pdf", "application/pdf", b"%PDF")],
-        )]);
-        render(&app, &cards, sid, &transcript).await;
-
-        assert_eq!(
-            sent_messages(&platform).await,
-            vec![(
-                "om_lobby".to_string(),
-                "file".to_string(),
-                serde_json::json!({ "file_key": "file_v2_pdf" }),
-            )],
-            "exactly one File Message under the live card"
-        );
-        assert_eq!(
-            sent_reply_modes(&platform).await,
-            vec![false],
-            "a lobby Session's File Message is a plain reply, never a new topic"
-        );
-        let body = final_card(&platform).await["body"]["elements"][0]["elements"][0]["content"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        assert!(
-            body.contains("📎 doc.pdf · application/pdf · 4 B · 已发送为文件消息"),
-            "the lobby File Message still records its tracking line: {body}"
         );
     }
 
@@ -6030,7 +5924,7 @@ Index: /x/src/main.rs
             let sid = sid.to_string();
             tokio::spawn(async move {
                 let cards = app.core.cards_handle();
-                resolve_file_deliveries(&cards, &sid, true).await
+                resolve_file_deliveries(&cards, &sid).await
             })
         };
         for _ in 0..16 {
@@ -6256,7 +6150,7 @@ Index: /x/src/main.rs
             let sid = sid.to_string();
             tokio::spawn(async move {
                 let cards = app.core.cards_handle();
-                resolve_file_deliveries(&cards, &sid, true).await
+                resolve_file_deliveries(&cards, &sid).await
             })
         };
         for _ in 0..32 {
@@ -6384,7 +6278,7 @@ Index: /x/src/main.rs
         let resolving = {
             let cards = cards.clone();
             let sid = sid.to_string();
-            tokio::spawn(async move { resolve_file_deliveries(&cards, &sid, true).await })
+            tokio::spawn(async move { resolve_file_deliveries(&cards, &sid).await })
         };
         entered.notified().await;
 

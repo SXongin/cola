@@ -282,15 +282,14 @@ pub enum PlatformCall {
         size: u64,
     },
     /// A generic reply message send (ADR-0076, #649): the live card it replied
-    /// under, the `msg_type`/`content` it carried — the File Message path
-    /// records `msg_type:"file"` with `{"file_key": …}` — and the requested
-    /// reply mode: `true` for a topic-backed Session (thread reply), `false`
-    /// for a lobby (plain reply, no new topic; ADR-0076's amendment).
+    /// under and the `msg_type`/`content` it carried — the File Message path
+    /// records `msg_type:"file"` with `{"file_key": …}`. The reply omits
+    /// `reply_in_thread`, so Feishu keeps it in the card's own container
+    /// (ADR-0076's amendment), which is why no mode is recorded.
     SendMessageReply {
         message_id: String,
         msg_type: String,
         content: serde_json::Value,
-        reply_in_thread: bool,
     },
 }
 
@@ -1111,7 +1110,6 @@ impl feishu::Platform for RecordingPlatform {
         message_id: &str,
         msg_type: &str,
         content: &serde_json::Value,
-        reply_in_thread: bool,
     ) -> crate::error::Result<(String, Option<String>)> {
         if self
             .fail_send_message_count
@@ -1134,7 +1132,6 @@ impl feishu::Platform for RecordingPlatform {
             message_id: message_id.into(),
             msg_type: msg_type.into(),
             content: content.clone(),
-            reply_in_thread,
         });
         Ok(("msg_file".into(), Some("omt_file".into())))
     }
