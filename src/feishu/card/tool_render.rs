@@ -615,13 +615,27 @@ fn file_tracking_block(tool: &ToolPanel) -> Option<String> {
 /// tracking line keeps the full name.
 const FILE_HEADER_NAME_MAX_CHARS: usize = 24;
 
+/// A File Content's name folded to a single printable line for the folded
+/// panel HEADER (ADR-0076 amendment): every control character — a newline, a
+/// carriage return, a tab, any other `Cc` — becomes a space, so the one-line
+/// `plain_text` title cannot wrap or break. `truncate_md` clips by character
+/// count and would pass a newline straight through, and a valid filename may
+/// carry one. One character in, one character out, so the clip's character
+/// budget is unchanged. Mirrors the ledger's `folded_label`.
+fn folded_header_name(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
 /// The compact File Content marker the folded panel HEADER carries (ADR-0076
 /// amendment). The detailed tracking line lives in the panel BODY, which is
 /// collapsed by default, so the user never sees it — worst of all for `未发送`,
 /// the ONLY signal that a file was read but could not be delivered. The header
 /// therefore shows a one-line marker while folded: ` · 📎 <name>` for a single
-/// file (the name clipped to [`FILE_HEADER_NAME_MAX_CHARS`]), ` · 📎 <N> 个文件`
-/// for several, and ` · 未发送` appended when ANY of the panel's files is
+/// file (the name folded to one printable line, then clipped to
+/// [`FILE_HEADER_NAME_MAX_CHARS`]), ` · 📎 <N> 个文件` for several, and
+/// ` · 未发送` appended when ANY of the panel's files is
 /// [`FileDelivery::Undelivered`]. `Embedded`/`SentAsFile` carry no state here —
 /// the image is rendered beside the panel and the File Message is a visible
 /// message — and the body's tracking line is unchanged. `None` when the panel
@@ -635,7 +649,10 @@ fn file_header_marker(tool: &ToolPanel) -> Option<String> {
     let mut marker = if files.len() == 1 {
         format!(
             " · 📎 {}",
-            truncate_md(&files[0].content.name, FILE_HEADER_NAME_MAX_CHARS)
+            truncate_md(
+                &folded_header_name(&files[0].content.name),
+                FILE_HEADER_NAME_MAX_CHARS
+            )
         )
     } else {
         format!(" · 📎 {} 个文件", files.len())
@@ -654,11 +671,12 @@ fn file_header_marker(tool: &ToolPanel) -> Option<String> {
 /// card-size estimate that must charge what the header renders. The header
 /// title is a `plain_text` element — NOT markdown-sanitized like the panel body
 /// — so its bytes reach the card's JSON verbatim and only the JSON escaping
-/// (`"` → `\"`, `\` → `\\`, a control character to six bytes) inflates them;
-/// charging the raw length would under-count a quote-heavy filename and let a
-/// card pass the split check while Feishu rejects the serialized card on size.
-/// `0` when the panel carries no File Content. Kept beside the render so the
-/// two cannot drift.
+/// (`"` → `\"`, `\` → `\\`, a control character to its escape — two bytes for
+/// the short `\n`/`\r`/`\t`/`\b`/`\f` forms, six for the `\uXXXX` one) inflates
+/// them; charging the raw length would under-count a quote-heavy filename and
+/// let a card pass the split check while Feishu rejects the serialized card on
+/// size. `0` when the panel carries no File Content. Kept beside the render so
+/// the two cannot drift.
 pub(crate) fn file_header_marker_estimate(tool: &ToolPanel) -> usize {
     file_header_marker(tool)
         .map(|marker| json_escaped_len(&marker))
@@ -2151,6 +2169,103 @@ mod tests {
         );
     }
 
+    /// A filename may carry a control character — a newline above all. The
+    /// folded header is a one-line `plain_text` title, so the name is folded to
+    /// spaces before it is clipped: no raw control character reaches the title,
+    /// and the size estimate is exactly the JSON-escaped length of the marker
+    /// that now renders (ADR-0076 amendment).
+    #[test]
+    fn a_control_character_in_a_file_name_folds_out_of_the_panel_header() {
+        let panel = read_panel(
+            "report\npart.pdf",
+            "application/pdf",
+            b"%PDF",
+            FileDelivery::Undelivered,
+        );
+        let card = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_tool(panel.clone())
+            .build();
+        let title = card["body"]["elements"][0]["header"]["title"]["content"]
+            .as_str()
+            .expect("panel title");
+        assert!(
+            !title.chars().any(char::is_control),
+            "no raw control character in the header title: {title:?}"
+        );
+        assert_eq!(title, "✅ read · 📎 report part.pdf · 未发送", "{card}");
+
+        let marker = file_header_marker(&panel).expect("a file panel has a header marker");
+        assert!(
+            !marker.chars().any(char::is_control),
+            "the folded marker carries no control character: {marker:?}"
+        );
+        assert_eq!(
+            file_header_marker_estimate(&panel),
+            json_escaped_len(&marker),
+            "the estimate is the marker's JSON-escaped length"
+        );
+    }
+
+    /// The header clip counts CHARACTERS, not bytes: a multibyte (CJK) filename
+    /// clips at [`FILE_HEADER_NAME_MAX_CHARS`] without panicking or splitting a
+    /// character, while the body keeps the full name (ADR-0076 amendment).
+    #[test]
+    fn a_multibyte_file_name_clips_at_the_character_boundary() {
+        let name = "截图".repeat(20); // 40 characters, 120 bytes
+        let panel = read_panel(
+            &name,
+            "image/png",
+            b"ABC",
+            FileDelivery::Embedded {
+                image_key: "img".into(),
+            },
+        );
+        let card = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_tool(panel)
+            .build();
+        let clipped: String = name.chars().take(FILE_HEADER_NAME_MAX_CHARS).collect();
+        assert_eq!(
+            clipped.chars().count(),
+            FILE_HEADER_NAME_MAX_CHARS,
+            "the fixture must exceed the clip so the boundary is exercised"
+        );
+        let title = card["body"]["elements"][0]["header"]["title"]["content"]
+            .as_str()
+            .expect("panel title");
+        assert!(
+            title.contains(&format!("📎 {clipped}…")),
+            "the header clips at the character boundary: {title}"
+        );
+        let body = card["body"]["elements"][0]["elements"][0]["content"]
+            .as_str()
+            .unwrap();
+        assert!(body.contains(&name), "the body keeps the full name: {body}");
+    }
+
+    /// The file marker is appended to the title without disturbing the panel's
+    /// identity: the `element_id` a file-carrying panel is built with survives
+    /// unchanged (ADR-0076 amendment), so the reader's fold state stays
+    /// attached to the panel.
+    #[test]
+    fn the_file_marker_preserves_the_panel_element_id() {
+        let panel = read_panel("doc.pdf", "application/pdf", b"%PDF", FileDelivery::Undelivered);
+        let card = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_tool_at(panel, None, Some("tool_call_read"))
+            .build();
+        let element = &card["body"]["elements"][0];
+        assert_eq!(element["element_id"], "tool_call_read", "{card}");
+        assert!(
+            element["header"]["title"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("📎 doc.pdf"),
+            "the marker is present alongside the id: {element}"
+        );
+    }
+
     /// The tracking-line size estimate charges the File Message suffixes too
     /// (#649): the block is derived from the same render, so `· 已发送为文件消息`
     /// and `· 未发送` cost their bytes exactly as `· 已内嵌` does.
@@ -2174,7 +2289,8 @@ mod tests {
     /// The tracking-line size estimate must charge the block's JSON-ESCAPED
     /// bytes, not its raw UTF-8 length: the panel body is embedded in the card's
     /// JSON `content` string, where every `"` becomes `\"` (and a `\` becomes
-    /// `\\`, a control char six bytes). A raw-length estimate under-counts a
+    /// `\\`, a control char to its escape — two bytes for the short forms, six
+    /// for `\uXXXX`). A raw-length estimate under-counts a
     /// pathological filename by half, letting a card pass the split check and
     /// still be rejected by Feishu on size — which the fenced content fallback
     /// cannot repair. 16,000 quotes are ~16KB raw but ~32KB escaped.
@@ -2265,7 +2381,8 @@ mod tests {
 
     /// The image estimate must charge the element's JSON-ESCAPED bytes: the name
     /// sits in the card's JSON `alt`/`title` strings, where each `"` becomes
-    /// `\"` (a `\` `\\`, a control char six bytes). A raw name-length charge
+    /// `\"` (a `\` `\\`, a control char to its escape — two bytes for the short
+    /// forms, six for `\uXXXX`). A raw name-length charge
     /// under-counts a quote-heavy filename by half in EACH of the two fields, so
     /// a card can pass the split check and still be rejected by Feishu on size.
     #[test]
