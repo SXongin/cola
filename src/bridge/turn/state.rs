@@ -492,8 +492,9 @@ pub(super) struct GapCoverage {
 /// Estimated serialized size (bytes) of one collapsible tool panel, mirroring
 /// [`StreamAccumulator::estimate_split_index`]'s accounting (element overhead
 /// plus the capped input and output the renderer keeps, plus the File Content
-/// tracking block the panel body appends — ADR-0076). Shared by the timeline's
-/// tool items and the todo tail reserve.
+/// tracking block the panel body appends and one `img` element per embedded
+/// image — ADR-0076). Shared by the timeline's tool items and the todo tail
+/// reserve, so every place a panel's bytes are summed charges its images too.
 fn panel_estimate(p: &ToolPanel) -> usize {
     let input = p
         .input()
@@ -504,7 +505,10 @@ fn panel_estimate(p: &ToolPanel) -> usize {
         .output()
         .map(|s| first_n_chars_bytes(&s, crate::feishu::card::tool_render::TOOL_OUTPUT_MAX_CHARS))
         .unwrap_or(0);
-    400 + input + output + crate::feishu::card::tool_render::file_tracking_estimate(p)
+    400 + input
+        + output
+        + crate::feishu::card::tool_render::file_tracking_estimate(p)
+        + crate::feishu::card::tool_render::file_image_estimate(p)
 }
 
 /// The content hash of one panel's File Content at `index` (ADR-0076), or
@@ -4097,7 +4101,9 @@ impl StreamAccumulator {
                     // The panel's own elements plus one `img` per embedded File
                     // Content (`with_tool_at` pushes them after the panel,
                     // ADR-0076); missing the images would let a near-budget
-                    // card be rejected by Feishu instead of splitting.
+                    // card be rejected by Feishu instead of splitting. The
+                    // size side comes from `panel_estimate`, which charges each
+                    // image's serialized bytes too.
                     let images = self
                         .tools
                         .get(call_id)
@@ -5376,6 +5382,55 @@ mod tests {
         assert!(
             full,
             "the tracking line's ESCAPED bytes must count toward the size budget"
+        );
+        assert!(acc.render_from > 0, "render_from must advance past the split");
+    }
+
+    /// A panel's embedded images emit one `img` element each (ADR-0076), and
+    /// each element repeats the file NAME in `alt` and `title` — serialized into
+    /// the card's JSON. The split estimate must charge those bytes: a panel of
+    /// long-named embedded images whose images the estimate ignores can cross
+    /// Feishu's JSON-size cap while staying under the component budget, and
+    /// Feishu rejects the card instead of the renderer splitting it (the fenced
+    /// content fallback cannot repair a size rejection).
+    #[test]
+    fn card_split_charges_embedded_image_bytes() {
+        let mut acc = StreamAccumulator::new("test");
+        acc.card_state = CardState::Done;
+        // ONE panel embedding 60 images with ~150-char names: the `img` elements
+        // alone serialize to well past MAX_CARD_JSON_CHARS, while the component
+        // count (1 panel + 60 images = 61) stays under the 150 budget — so only
+        // charging the image bytes makes this split. The tracking lines share
+        // the names but stay well under the budget on their own, so the assert
+        // below pins the images as the decisive charge.
+        let names: Vec<String> = (0..60).map(|i| format!("{i:0>3}_{}", "n".repeat(150))).collect();
+        let files: Vec<(&str, &[u8])> = names.iter().map(|n| (n.as_str(), &b"ABC"[..])).collect();
+        let mut panel = ToolPanel::for_test_with_files("read", &files);
+        for i in 0..names.len() {
+            panel.set_file_delivery(
+                i,
+                FileDelivery::Embedded {
+                    image_key: format!("img_{i}"),
+                },
+            );
+        }
+        let with_images = panel_estimate(&panel);
+        let image_bytes = crate::feishu::card::tool_render::file_image_estimate(&panel);
+        assert!(
+            with_images - image_bytes < crate::feishu::card::MAX_CARD_JSON_CHARS,
+            "the tracking lines alone must fit, or the test does not isolate the image bytes"
+        );
+        assert!(
+            with_images > crate::feishu::card::MAX_CARD_JSON_CHARS,
+            "the embedded images' serialized bytes must push the panel over the size budget"
+        );
+        acc.push_tool("call_read", panel);
+        acc.push_text("最后的结论。");
+
+        let (_card, full) = acc.build_card_with_split();
+        assert!(
+            full,
+            "the embedded images' serialized bytes must count toward the size budget"
         );
         assert!(acc.render_from > 0, "render_from must advance past the split");
     }
