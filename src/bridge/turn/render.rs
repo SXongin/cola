@@ -16,15 +16,16 @@ use crate::backend::{
 };
 use crate::bridge::core::SESSION_INFO_TIMEOUT;
 use crate::bridge::handles::{
-    CONTENT_CACHE_CAP, CardsHandle, ContentCellCache, FILE_MESSAGE_SENDS_CAP, FileMessageSend,
-    FileMessageSendHold, FileMessageSends, RequestsHandle, SessionsHandle, TurnHandles, evict_oldest_idle,
+    CONTENT_CACHE_CAP, CardsHandle, ContentCell, ContentCellCache, ContentCellHold, FILE_MESSAGE_SENDS_CAP,
+    FileMessageSend, FileMessageSendHold, FileMessageSends, RequestsHandle, SessionsHandle, TurnHandles,
+    evict_oldest_idle,
 };
 use crate::bridge::span;
 use crate::bridge::turn::state;
 use crate::bridge::turn::state::{LedgerCadence, PartSource, RenderedPart, StreamAccumulator};
 use crate::config::ThreadKey;
 use crate::feishu::card::ledger::{TaskCompletionEntry, TaskEnding, TaskKind, TaskOutput};
-use crate::feishu::card::tool_render::{ChildActivity, FileDelivery, TaskLiveness};
+use crate::feishu::card::tool_render::{ChildActivity, FileDelivery, MAX_PANEL_IMAGES, TaskLiveness};
 
 use super::Turn;
 use super::flush::FlushOutcome;
@@ -639,11 +640,16 @@ pub(super) async fn read_planned_outputs(
 /// One File Content the render path is about to resolve (ADR-0076): the content,
 /// the content `hash` that keys the process-local upload caches, and the panel
 /// position it belongs to (`call_id`, `index`) so the send can re-validate the
-/// LIVE panel before posting the file (#649).
+/// LIVE panel before posting the file (#649). `embeddable` is whether the panel
+/// will actually render this file's image — a file past [`MAX_PANEL_IMAGES`] is
+/// never embed-resolved, so its bytes take the File Message path instead of a
+/// wasted upload whose `img` the card would omit while the tracking line still
+/// claimed `已内嵌` (ADR-0076 review round 2).
 struct InFlightUpload {
     hash: u64,
     call_id: String,
     index: usize,
+    embeddable: bool,
     content: FileContent,
 }
 
@@ -693,6 +699,11 @@ async fn resolve_file_deliveries(cards: &CardsHandle, session_id: &str) -> bool 
             hash: delivery.hash,
             call_id: delivery.call_id.clone(),
             index: delivery.index,
+            // The panel renders at most [`MAX_PANEL_IMAGES`] `img` elements, so a
+            // file past that bound is never embed-resolved: it takes the File
+            // Message path instead (ADR-0076 review round 2). The panel's bound
+            // and the resolver's are this one shared constant.
+            embeddable: delivery.index < MAX_PANEL_IMAGES,
             content: delivery.content.clone(),
         });
     }
@@ -708,7 +719,13 @@ async fn resolve_file_deliveries(cards: &CardsHandle, session_id: &str) -> bool 
         }
     }))
     .await;
-    for (hash, delivery) in resolutions {
+    // Holds on the content cells, kept alive until the deliveries are attached:
+    // eviction must not drop a cell whose resolver is still finishing, or a
+    // concurrent resolver of the same content could re-upload and re-open B1's
+    // embedded-and-sent split (ADR-0076 review round 2).
+    let mut holds: Vec<ContentCellHold<Option<String>>> = Vec::new();
+    for (hash, (delivery, resolution_holds)) in resolutions {
+        holds.extend(resolution_holds);
         if let Some(delivery) = delivery {
             resolved.insert(hash, delivery);
         }
@@ -752,32 +769,29 @@ async fn resolve_file_deliveries(cards: &CardsHandle, session_id: &str) -> bool 
     changed
 }
 
-/// The single-flight cell for `hash` in a per-content-key cache (ADR-0076):
-/// the lock, the `entry`, the `OnceCell` creation and the `Arc::clone` the
-/// image and file caches both need, in one place. Every concurrent resolver of
-/// one content key shares one cell, so the first's platform call is awaited by
-/// the rest instead of repeated. Bounded by [`CONTENT_CACHE_CAP`], evicting the
-/// oldest SETTLED entry first: eviction never drops a cell a resolver is still
-/// initializing — dropping an in-flight one would let a concurrent resolver of
-/// the same key create a new cell and re-upload, which on the image path could
-/// re-open B1's embedded-and-sent split. A re-upload of a settled key after
-/// eviction is harmless, and the ADR accepts it.
-async fn content_cell<T>(cache: &ContentCellCache<T>, hash: u64) -> Arc<tokio::sync::OnceCell<T>> {
+/// The single-flight cell for `hash` in a per-content-key cache (ADR-0076): the
+/// lock, the `entry`, the `OnceCell` creation and the `Arc::clone` the image and
+/// file caches both need, in one place. Every concurrent resolver of one content
+/// key shares one cell, so the first's platform call is awaited by the rest
+/// instead of repeated. Bounded by [`CONTENT_CACHE_CAP`], evicting the oldest
+/// IDLE entry first (ADR-0076 review round 2): eviction never drops a cell a
+/// resolver is still holding — dropping an in-flight one would let a concurrent
+/// resolver of the same key create a new cell and re-run the platform call,
+/// which on the image path could re-open B1's embedded-and-sent split. Insertion
+/// trims idle entries until the map is back at/under the cap, so a batch of
+/// `join_all` insertions cannot leave it permanently oversized; a held entry may
+/// push it over temporarily, and the next insertion after those holds drop
+/// brings it back down. A re-upload of a settled key after eviction is harmless,
+/// and the ADR accepts it.
+async fn content_cell<T>(cache: &ContentCellCache<T>, hash: u64) -> ContentCellHold<T> {
     let mut cache = cache.lock().await;
-    if !cache.contains_key(&hash) && cache.len() >= CONTENT_CACHE_CAP {
-        // `IndexMap` preserves insertion order, so the first SETTLED entry is
-        // the oldest evictable one. With every entry in flight (bounded by
-        // concurrency) nothing is evicted and the map is allowed to sit past the
-        // cap rather than drop a key a resolver is still driving.
-        if let Some(index) = cache.values().position(|cell| cell.initialized()) {
-            cache.shift_remove_index(index);
-        }
+    if !cache.contains_key(&hash) {
+        // Evict idle entries until at/under the cap: evicting only one per
+        // later insertion would leave a large batch permanently oversized.
+        while cache.len() >= CONTENT_CACHE_CAP && evict_oldest_idle(&mut cache, |entry| entry.is_idle()) {}
     }
-    Arc::clone(
-        cache
-            .entry(hash)
-            .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new())),
-    )
+    let entry = Arc::clone(cache.entry(hash).or_insert_with(|| Arc::new(ContentCell::new())));
+    ContentCellHold::new(entry)
 }
 
 /// The single-flight cell for one File Message send, keyed by `(session_id,
@@ -790,7 +804,7 @@ async fn content_cell<T>(cache: &ContentCellCache<T>, hash: u64) -> Arc<tokio::s
 async fn file_message_cell(sends: &FileMessageSends, key: (String, u64)) -> FileMessageSendHold {
     let mut sends = sends.lock().await;
     if !sends.contains_key(&key) && sends.len() >= FILE_MESSAGE_SENDS_CAP {
-        evict_oldest_idle(&mut sends);
+        evict_oldest_idle(&mut sends, |entry| entry.is_idle());
     }
     let entry = Arc::clone(
         sends
@@ -830,58 +844,74 @@ async fn live_file_reply_target(
 /// errors. `None` leaves the content unresolved for a later poll — a File
 /// Message with no live card to reply under yet, or one whose live panel no
 /// longer holds the file; the upload itself is already cached, so only the send
-/// is retried.
+/// is retried. Returns the resolver's holds on the content cells it touched,
+/// which the caller keeps alive until the delivery is attached so eviction
+/// cannot drop a cell a resolver is still driving (ADR-0076 review round 2).
 async fn resolve_file_delivery(
     cards: &CardsHandle,
     session_id: &str,
     upload: &InFlightUpload,
-) -> Option<FileDelivery> {
+) -> (Option<FileDelivery>, Vec<ContentCellHold<Option<String>>>) {
+    let mut holds: Vec<ContentCellHold<Option<String>>> = Vec::new();
     // Embed first: an image within the caps uploads once and every later PATCH
-    // reuses the key. A non-image (`Ok(None)`) or a failed embed upload
-    // degrades to the File Message path. The initializer is INFALLIBLE on
-    // purpose (ADR-0076 review, B1): a failed upload settles the cell as `None`
-    // — the same "not embeddable" verdict a decided non-image gets — so every
-    // resolver, the one that lost the single-flight race included, reads ONE
-    // verdict. Were the failure left as an `Err`, a waiter could re-run the
-    // upload and succeed while the failing resolver still fell back to a File
-    // Message: the same bytes would be both embedded and sent.
-    let image_cell = content_cell(&cards.file_images, upload.hash).await;
-    let image_key = image_cell
-        .get_or_init(|| async {
-            match cards.feishu.upload_image(&upload.content).await {
-                Ok(key) => key,
-                Err(error) => {
-                    tracing::warn!(
-                        "file content {:?} embed upload failed, degrading to a File Message: {error}",
-                        upload.content.name
-                    );
-                    None
+    // reuses the key. A file past the panel's render bound is never
+    // embed-resolved — the card would omit its `img` while the tracking line
+    // still claimed `已内嵌` — so it skips the upload entirely and goes straight
+    // to the File Message path (ADR-0076 review round 2). A non-image
+    // (`Ok(None)`) or a failed embed upload degrades the same way. The
+    // initializer is INFALLIBLE on purpose (ADR-0076 review, B1): a failed
+    // upload settles the cell as `None` — the same "not embeddable" verdict a
+    // decided non-image gets — so every resolver, the one that lost the
+    // single-flight race included, reads ONE verdict. Were the failure left as
+    // an `Err`, a waiter could re-run the upload and succeed while the failing
+    // resolver still fell back to a File Message: the same bytes would be both
+    // embedded and sent.
+    if upload.embeddable {
+        let image_cell = content_cell(&cards.file_images, upload.hash).await;
+        let image_key = image_cell
+            .cell()
+            .get_or_init(|| async {
+                match cards.feishu.upload_image(&upload.content).await {
+                    Ok(key) => key,
+                    Err(error) => {
+                        tracing::warn!(
+                            "file content {:?} embed upload failed, degrading to a File Message: {error}",
+                            upload.content.name
+                        );
+                        None
+                    }
                 }
-            }
-        })
-        .await;
-    if let Some(image_key) = image_key {
-        return Some(FileDelivery::Embedded {
-            image_key: image_key.clone(),
-        });
+            })
+            .await
+            .clone();
+        holds.push(image_cell);
+        if let Some(image_key) = image_key {
+            return (Some(FileDelivery::Embedded { image_key }), holds);
+        }
     }
     // File Message: upload once, then send ONE message in-thread. `Ok(None)`
     // means past Feishu's 30MB cap — nothing was uploaded.
     let file_cell = content_cell(&cards.file_uploads, upload.hash).await;
     let file_key = match file_cell
+        .cell()
         .get_or_try_init(|| async { cards.feishu.upload_file(&upload.content).await })
         .await
     {
         Ok(Some(file_key)) => file_key.clone(),
-        Ok(None) => return Some(FileDelivery::Undelivered),
+        Ok(None) => {
+            holds.push(file_cell);
+            return (Some(FileDelivery::Undelivered), holds);
+        }
         Err(error) => {
             tracing::warn!(
                 "file content {:?} file upload failed: {error}",
                 upload.content.name
             );
-            return Some(FileDelivery::Undelivered);
+            holds.push(file_cell);
+            return (Some(FileDelivery::Undelivered), holds);
         }
     };
+    holds.push(file_cell);
     // The send replies under the live card; without one, leave it unresolved so
     // a later poll (with the card) retries — the upload is already cached.
     // Once-guard, single-flight (#649): a content whose File Message already went
@@ -900,7 +930,7 @@ async fn resolve_file_delivery(
     // caller. A check that fails sends nothing and leaves the cell
     // uninitialized for a later poll.
     let cell = file_message_cell(&cards.file_messages_sent, (session_id.to_string(), upload.hash)).await;
-    match cell
+    let delivery = match cell
         .cell()
         .get_or_try_init(|| async {
             let Some(reply_target) = live_file_reply_target(cards, session_id, upload).await else {
@@ -927,7 +957,8 @@ async fn resolve_file_delivery(
         Ok(delivery) => Some(delivery.clone()),
         // The panel no longer holds this content: nothing was sent.
         Err(()) => None,
-    }
+    };
+    (delivery, holds)
 }
 
 /// Commit a planned read (spec #593): announce each entry and insert it, under
@@ -6174,22 +6205,22 @@ Index: /x/src/main.rs
     }
 
     /// The per-content-key upload caches are bounded (ADR-0076 review, N4):
-    /// past the cap the oldest SETTLED key is evicted, so a long-running bot
-    /// does not accumulate one entry per file it ever rendered. A re-upload
-    /// after eviction is harmless (the ADR accepts it), so plain oldest-first
-    /// eviction of settled entries is enough — but an entry a resolver is still
-    /// initializing is never dropped, mirroring the once-guard's idle rule (a
-    /// re-created in-flight cell could re-open B1's embedded-and-sent split).
+    /// past the cap the oldest IDLE key is evicted, so a long-running bot does
+    /// not accumulate one entry per file it ever rendered. A re-upload after
+    /// eviction is harmless (the ADR accepts it), so plain oldest-first eviction
+    /// of idle entries is enough — but an entry a resolver still HOLDS is never
+    /// dropped, mirroring the once-guard's idle rule (a re-created in-flight cell
+    /// could re-open B1's embedded-and-sent split).
     #[tokio::test]
-    async fn the_content_cache_evicts_the_oldest_settled_past_the_cap() {
+    async fn the_content_cache_evicts_the_oldest_idle_past_the_cap() {
         let cache: ContentCellCache<Option<String>> =
             Arc::new(tokio::sync::Mutex::new(indexmap::IndexMap::new()));
-        // The OLDEST entry is one a resolver is still initializing
-        // (uninitialized); the rest are settled.
-        content_cell(&cache, u64::MAX).await;
+        // The OLDEST entry is one a resolver is still holding (its hold is kept
+        // alive by `_held`); the rest are settled and idle.
+        let _held = content_cell(&cache, u64::MAX).await;
         for i in 0..(CONTENT_CACHE_CAP - 1) {
             let cell = content_cell(&cache, i as u64).await;
-            cell.set(Some(format!("k{i}"))).unwrap();
+            cell.cell().set(Some(format!("k{i}"))).unwrap();
         }
         assert_eq!(
             cache.lock().await.len(),
@@ -6200,16 +6231,345 @@ Index: /x/src/main.rs
         content_cell(&cache, 9_999).await;
         let cache = cache.lock().await;
         assert_eq!(cache.len(), CONTENT_CACHE_CAP, "the cache stays bounded");
-        assert!(
-            !cache.contains_key(&0),
-            "the oldest settled entry is evicted first"
-        );
+        assert!(!cache.contains_key(&0), "the oldest idle entry is evicted first");
         assert!(cache.contains_key(&1), "the rest stay");
         assert!(
             cache.contains_key(&u64::MAX),
-            "the oldest in-flight entry survives eviction"
+            "the oldest held entry survives eviction"
         );
         assert!(cache.contains_key(&9_999));
+    }
+
+    /// The content cache trims back to its cap on insertion (ADR-0076 review
+    /// round 2): a batch of distinct insertions while none are settled can grow
+    /// it past [`CONTENT_CACHE_CAP`], and evicting only one per later insertion
+    /// would leave it permanently oversized. The next insertion after the batch's
+    /// holds drop evicts idle entries until the map is back at the cap.
+    #[tokio::test]
+    async fn the_content_cache_trims_back_to_the_cap_after_a_batch() {
+        let cache: ContentCellCache<Option<String>> =
+            Arc::new(tokio::sync::Mutex::new(indexmap::IndexMap::new()));
+        // A batch of insertions, every cell still held (none settled): each
+        // insertion is allowed to push the map past the cap rather than drop a
+        // held cell.
+        let mut holds = Vec::new();
+        for i in 0..(CONTENT_CACHE_CAP + 5) {
+            holds.push(content_cell(&cache, i as u64).await);
+        }
+        assert_eq!(
+            cache.lock().await.len(),
+            CONTENT_CACHE_CAP + 5,
+            "held entries push the map past the cap temporarily"
+        );
+
+        // Holds drop; the next insertion trims idle entries until at/under the
+        // cap (not just one).
+        drop(holds);
+        content_cell(&cache, 9_999).await;
+        let cache = cache.lock().await;
+        assert_eq!(
+            cache.len(),
+            CONTENT_CACHE_CAP,
+            "the map comes back down to the cap"
+        );
+        assert!(cache.contains_key(&9_999), "the new key is kept");
+        assert!(!cache.contains_key(&0), "the oldest idle entries are trimmed");
+    }
+
+    /// The content identity covers the mime and the name, not just the bytes
+    /// (ADR-0076 review, N1): identical bytes first seen as `image/png` must not
+    /// share a cache verdict with the same bytes as `image/jpeg`, and a reused
+    /// file key must not carry another name's. Removing the mime/name from the
+    /// hash would silently merge two distinct contents.
+    #[test]
+    fn identical_bytes_with_a_different_identity_are_separate_cache_keys() {
+        let content = |name: &str, mime: &str| {
+            crate::backend::FileContent::decode(&format!("data:{mime};base64,QUJD"), Some(mime), Some(name))
+                .expect("an inline payload is a File Content")
+        };
+        let bytes = b"ABC";
+        let base = content("a.png", "image/png");
+        assert_eq!(
+            file_content_hash(&base, bytes),
+            file_content_hash(&content("a.png", "image/png"), bytes),
+            "the same bytes, mime and name are one identity"
+        );
+        assert_ne!(
+            file_content_hash(&base, bytes),
+            file_content_hash(&content("b.png", "image/png"), bytes),
+            "the name is part of the identity"
+        );
+        assert_ne!(
+            file_content_hash(&base, bytes),
+            file_content_hash(&content("a.png", "image/jpeg"), bytes),
+            "the mime is part of the identity"
+        );
+    }
+
+    /// The identity's mime/name coverage reaches the resolver (ADR-0076 review,
+    /// N1): identical bytes with a different name or mime are distinct cache
+    /// entries, so each uploads on its own instead of one cache hit serving both.
+    #[tokio::test]
+    async fn identical_bytes_with_a_different_identity_upload_separately() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        platform.given_image_key("img_v2_identity");
+        let sid = "ses_identity";
+        let cards = app.core.cards_handle();
+        Turn::seed_card(&cards, sid, Some("om_identity")).await;
+        Turn::set_turn_anchor(&cards, sid, &turn_anchor(0)).await;
+
+        // Identical bytes: one with a different name, one with a different mime.
+        let transcript = SessionTranscript::new(vec![message(
+            "a1",
+            1_000,
+            vec![
+                read_file_part("call_name", "a.png", "image/png", b"ABC"),
+                read_file_part("call_name_2", "b.png", "image/png", b"ABC"),
+                read_file_part("call_mime", "a.png", "image/jpeg", b"ABC"),
+            ],
+        )]);
+        render(&app, &cards, sid, &transcript).await;
+
+        assert_eq!(
+            platform
+                .upload_image_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "a different mime/name is a different identity, never a cache hit"
+        );
+        assert_eq!(uploaded_images(&platform).await.len(), 3);
+    }
+
+    /// Distinct contents resolve CONCURRENTLY (ADR-0076 review, N2): the resolver
+    /// runs every file's upload as independent async work (`join_all`), so a slow
+    /// first file does not serialize the second. Parking the first upload and
+    /// observing the second start proves the two are not sequential — a
+    /// reverted, sequential resolver would leave the second upload unstarted
+    /// until the first was released.
+    #[tokio::test]
+    async fn distinct_contents_resolve_concurrently() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        platform.given_image_key("img_v2_concurrent");
+        let sid = "ses_concurrent";
+        let cards = app.core.cards_handle();
+        Turn::seed_card(&cards, sid, Some("om_concurrent")).await;
+        Turn::set_turn_anchor(&cards, sid, &turn_anchor(0)).await;
+
+        let transcript = SessionTranscript::new(vec![message(
+            "a1",
+            1_000,
+            vec![
+                read_file_part("call_a", "a.png", "image/png", b"AAA"),
+                read_file_part("call_b", "b.png", "image/png", b"BBB"),
+            ],
+        )]);
+
+        // Park the FIRST upload; the second distinct content must start its own
+        // upload without awaiting the first.
+        let (entered, release) = platform.pause("upload_image", "");
+        let first = {
+            let app = Arc::clone(&app);
+            let sid = sid.to_string();
+            let transcript = transcript.clone();
+            tokio::spawn(async move {
+                let cards = app.core.cards_handle();
+                render(&app, &cards, &sid, &transcript).await
+            })
+        };
+        entered.notified().await;
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            platform
+                .upload_image_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the second content's upload starts while the first is parked"
+        );
+
+        release.notify_one();
+        first.await.unwrap();
+        assert_eq!(uploaded_images(&platform).await.len(), 2);
+    }
+
+    /// A file past the panel's render bound is never embed-resolved (ADR-0076
+    /// review round 2): the card would omit its `img` while its tracking line
+    /// still claimed `已内嵌`, and the image upload would be wasted. The extra
+    /// files take the File Message path — honestly tracked `已发送为文件消息` —
+    /// so the resolver never asks the platform for an image the card will not
+    /// render.
+    #[tokio::test]
+    async fn a_panel_past_the_image_bound_sends_the_extra_as_file_messages() {
+        use base64::Engine as _;
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        platform.given_file_key("file_v2_bound");
+        let sid = "ses_panel_bound";
+        let cards = app.core.cards_handle();
+        Turn::seed_card(&cards, sid, Some("om_bound")).await;
+        Turn::set_turn_anchor(&cards, sid, &turn_anchor(0)).await;
+
+        let total = MAX_PANEL_IMAGES + 5;
+        let blocks: Vec<crate::backend::ContentBlock> = (0..total)
+            .map(|i| {
+                let encoded = base64::engine::general_purpose::STANDARD.encode(b"ABC");
+                let name = format!("shot_{i}.png");
+                crate::backend::ContentBlock::File(
+                    FileContent::decode(
+                        &format!("data:image/png;base64,{encoded}"),
+                        Some("image/png"),
+                        Some(&name),
+                    )
+                    .expect("an inline payload is a File Content"),
+                )
+            })
+            .collect();
+        let transcript = SessionTranscript::new(vec![message(
+            "a1",
+            1_000,
+            vec![Part::Tool(tool_call(
+                "read",
+                "call_read",
+                ToolStatus::Completed,
+                Some(1_000),
+                None,
+                blocks,
+            ))],
+        )]);
+        render(&app, &cards, sid, &transcript).await;
+
+        assert_eq!(
+            platform
+                .upload_image_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            MAX_PANEL_IMAGES,
+            "only the panel's first MAX images are embed-resolved (no wasted upload)"
+        );
+        assert_eq!(
+            uploaded_images(&platform).await.len(),
+            MAX_PANEL_IMAGES,
+            "the past-bound images are never uploaded as images"
+        );
+        assert_eq!(
+            uploaded_files(&platform).await.len(),
+            total - MAX_PANEL_IMAGES,
+            "the files past the bound are uploaded as files instead"
+        );
+        assert_eq!(
+            sent_messages(&platform).await.len(),
+            total - MAX_PANEL_IMAGES,
+            "and sent as File Messages"
+        );
+        let card = final_card(&platform).await;
+        let images = card["body"]["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["tag"] == "img")
+            .count();
+        assert_eq!(images, MAX_PANEL_IMAGES, "{card}");
+        let body = card["body"]["elements"][0]["elements"][0]["content"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            body.matches("已内嵌").count(),
+            MAX_PANEL_IMAGES,
+            "only the rendered images claim 已内嵌: {body}"
+        );
+        assert_eq!(
+            body.matches("已发送为文件消息").count(),
+            total - MAX_PANEL_IMAGES,
+            "the rest are honestly tracked as File Messages: {body}"
+        );
+    }
+
+    /// Content-cache eviction skips a cell a resolver still holds (ADR-0076
+    /// review round 2): a resolver proceeding from a cached `None` into the File
+    /// Message send holds its image cell, so under cache pressure a second
+    /// resolver of the same content cannot create a fresh cell, retry the cleared
+    /// embed upload, and embed while the first sends — the embedded-and-sent
+    /// split B1 closed.
+    #[tokio::test]
+    async fn content_cache_eviction_skips_a_cell_a_resolver_still_holds() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        platform.given_file_key("file_v2_held");
+        let sid = "ses_cache_held";
+        let cards = app.core.cards_handle();
+        Turn::seed_card(&cards, sid, Some("om_held")).await;
+        Turn::set_turn_anchor(&cards, sid, &turn_anchor(0)).await;
+
+        let transcript = SessionTranscript::new(vec![message(
+            "a1",
+            1_000,
+            vec![read_file_part("call_read", "doc.pdf", "application/pdf", b"%PDF")],
+        )]);
+
+        // Park the File Message send: the resolver's image-cell hold is alive
+        // while it proceeds from the cached `None` into the send.
+        let (entered, release) = platform.pause("send_message", "om_held");
+        let first = {
+            let app = Arc::clone(&app);
+            let sid = sid.to_string();
+            let transcript = transcript.clone();
+            tokio::spawn(async move {
+                let cards = app.core.cards_handle();
+                render(&app, &cards, &sid, &transcript).await
+            })
+        };
+        entered.notified().await;
+
+        let held_hash = {
+            let content = crate::backend::FileContent::decode(
+                "data:application/pdf;base64,JVBERg==",
+                Some("application/pdf"),
+                Some("doc.pdf"),
+            )
+            .expect("an inline payload is a File Content");
+            file_content_hash(&content, b"%PDF")
+        };
+        assert!(
+            cards.file_images.lock().await.contains_key(&held_hash),
+            "the resolver's image cell is in the cache while it is held"
+        );
+
+        // Fill the cache to its cap with idle entries, then insert one more: the
+        // held cell (the oldest) must survive, the oldest idle one is evicted.
+        for i in 0..(CONTENT_CACHE_CAP - 1) {
+            let cell = content_cell(&cards.file_images, 1_000_000 + i as u64).await;
+            cell.cell().set(Some(format!("k{i}"))).unwrap();
+        }
+        assert_eq!(cards.file_images.lock().await.len(), CONTENT_CACHE_CAP);
+        content_cell(&cards.file_images, 9_999_999).await;
+
+        {
+            let cache = cards.file_images.lock().await;
+            assert_eq!(cache.len(), CONTENT_CACHE_CAP, "the cache stays bounded");
+            assert!(cache.contains_key(&held_hash), "the held cell survives eviction");
+            assert!(
+                !cache.contains_key(&1_000_000),
+                "the oldest idle cell is evicted instead"
+            );
+        }
+
+        release.notify_one();
+        first.await.unwrap();
+        assert_eq!(
+            sent_messages(&platform).await.len(),
+            1,
+            "the held resolver still sends exactly one File Message"
+        );
     }
 
     /// Eviction never drops a key whose File Message send is in flight (#649):
