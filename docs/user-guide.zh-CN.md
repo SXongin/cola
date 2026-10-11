@@ -323,7 +323,7 @@ cola 总是追加写入日志文件——默认 `~/.cola/cola.log`（不含 ANSI
 | `/agent <name>` | 切换 agent（下一条消息生效；持久化；`--reset` 清除为服务器默认） |
 | `/model <p/m>` | 切换模型（下一条消息生效；持久化） |
 | `/think [level]` | 设置/清除思考等级，按模型生效（下一条消息生效） |
-| `#<id> [#<id> …] [text]` | 把 OpenCode 技能加载进本条消息的提示词（如 `#implement-spec 644`）；整段消息原样提交，匹配不到技能的 id 会原样保留为正文。裸 `/skill` 打开技能选择卡片——可按 id/名称/描述搜索、每页 20 个翻页——`/skill <id>` 为别名 |
+| `#<id> [#<id> …] [text]` | 把 OpenCode 技能加载进本条消息的提示词（如 `#implement-spec 644`）；整段消息原样提交，匹配不到技能的 `#<id>` 原样保留为正文（`#644`、`C#caveman`、`##foreman` 都不是技能记号）。裸 `/skill` 打开技能选择卡片——可按 id/名称/描述搜索、每页 20 个翻页——`/skill <id>` 是别名，用于 `#` 形式打不出的 id（`2fa-helper`、`web_scrape`） |
 | `/autoaccept [on\|off]` | 查看/切换本会话是否自动放行工具权限请求 |
 | `/restart` | 重启 cola（保留启动参数与日志重定向） |
 | `/restart-opencode` | 重启 OpenCode 服务器（仅限 cola 自己启动的那个） |

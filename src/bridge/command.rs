@@ -208,9 +208,11 @@ pub fn parse_command(text: &str) -> Option<Command> {
     let trimmed = text.trim();
     if !trimmed.starts_with('/') {
         // A plain message can still load skills via `#<id>` tokens (spec #662).
-        // The id after `#` must start with an ASCII letter, so prose like `#644`
-        // (an issue reference) or a markdown heading (`# 标题`) never enters the
-        // skill path — those messages stay plain prompts and cost no list read.
+        // The `#` must open a token (start of text, or after a non-id character)
+        // and the id after it must start with an ASCII letter, so prose like
+        // `#644` (an issue reference), `# 标题` (a markdown heading) or
+        // `C#caveman` never enters the skill path — those messages stay plain
+        // prompts and cost no list read.
         let ids = parse_hash_skill_ids(trimmed);
         if ids.is_empty() {
             return None;
@@ -416,11 +418,14 @@ fn parse_skill_ids(text: &str) -> Vec<String> {
 /// the run of id characters (`[A-Za-z0-9-]`) directly after a `#`, and it counts
 /// only when that run starts with an ASCII letter — skill ids are lowercase
 /// kebab-case — so `#644` (an issue reference) and a bare `#` or `# 标题` never
-/// enter the skill path. The run ends at any other character, so trailing
-/// punctuation and CJK text run straight into the token without a space
-/// (`#implement-spec,` and `用#caveman试试` still name `implement-spec` /
-/// `caveman`). An id is kept exactly as typed; one that matches no registered
-/// skill stays in the prompt text verbatim (the dispatch's resolve step decides).
+/// enter the skill path. The `#` also needs a **left boundary**: the character
+/// before it must be absent or outside `[A-Za-z0-9-#]`, so a `#` wedged inside
+/// a word (`C#caveman`, `abc#foreman`) and the second `#` of `##foreman` are
+/// prose too. The run ends at any other character, so trailing punctuation and
+/// CJK text run straight into the token without a space (`#implement-spec,` and
+/// `用#caveman试试` still name `implement-spec` / `caveman`). An id is kept
+/// exactly as typed; one that matches no registered skill stays in the prompt
+/// text verbatim (the dispatch's resolve step decides).
 fn parse_hash_skill_ids(text: &str) -> Vec<String> {
     fn is_id_char(c: char) -> bool {
         c.is_ascii_alphanumeric() || c == '-'
@@ -430,6 +435,13 @@ fn parse_hash_skill_ids(text: &str) -> Vec<String> {
     let mut i = 0;
     while i < chars.len() {
         if chars[i] != '#' {
+            i += 1;
+            continue;
+        }
+        // The `#` must open a token: a preceding id character means it sits
+        // inside a word (`C#`, `abc#`), and a preceding `#` means a markdown
+        // heading-ish run (`##foreman`) — neither names a skill.
+        if i > 0 && (is_id_char(chars[i - 1]) || chars[i - 1] == '#') {
             i += 1;
             continue;
         }
@@ -534,7 +546,7 @@ pub fn command_help(name: &str) -> Option<String> {
             "/autoaccept [on|off]\nShow or switch auto-allowing permission requests for this session (no permission cards). On a Pending Session (`/new`/`/dir`/`/topic` before its first message) the flag is recorded on the pending and applies to the session the first message creates.\nNo arg: show current state. `/autoaccept on` / `/autoaccept off` switch it.\nExample: `/autoaccept`"
         }
         "skill" => {
-            "#<id> [#<id> …] [text]\nLoad one or more OpenCode skills into this message's prompt. Each `#<id>` token names one skill, collected in order (`#implement-spec #foreman 644`), and the whole message text — tokens included — is submitted verbatim, so trailing text becomes the skill's argument (`#implement-spec 644`). An id that matches no registered skill is left as plain text (so `#644` stays an issue reference), and a bare `#` does nothing.\n`/skill` opens the skill picker: every registered skill, hidden ones included. `/skill <id>` is an alias for `#<id>`.\nOn V2 the ids ride the prompt's structured `skills` field (deterministic injection); on V1, which has no such field, cola folds an instruction to load the skill by name with its `skill` tool into the prompt text.\nExample: `#implement-spec 644`"
+            "#<id> [#<id> …] [text]\nLoad one or more OpenCode skills into this message's prompt. Each `#<id>` token names one skill — resolved case-insensitively against the registered ids — collected in order (`#implement-spec #foreman 644`), and the whole message text — tokens included — is submitted verbatim, so trailing text becomes the skill's argument (`#implement-spec 644`). A `#` only opens a token at the start of a word, so `C#caveman` and `##foreman` are prose; an id that matches no registered skill is left as plain text (so `#644` stays an issue reference).\n`/skill` opens the skill picker: every registered skill, hidden ones included. `/skill <id>` is an alias for `#<id>`, and the way to type an id the `#` form cannot express (`2fa-helper`, `web_scrape`).\nOn V2 the ids ride the prompt's structured `skills` field (deterministic injection); on V1, which has no such field, cola folds an instruction to load the skill by name with its `skill` tool into the prompt text.\nExample: `#implement-spec 644`"
         }
         "restart" => {
             "/restart\nRestart cola itself, keeping startup args and the log redirect. The new process takes over the singleton lock (passes --replace). Under a systemd unit cola exits and lets `Restart=on-failure` bring it back; elsewhere it re-execs. cola announces in this chat when it's back."
@@ -2732,6 +2744,38 @@ mod tests {
             Some(Command::Skill(SkillInvocation {
                 ids: vec!["a".into()],
                 picker_on_empty: true,
+            }))
+        );
+    }
+
+    /// A `#` opens a token only at a left boundary (spec #662): one wedged
+    /// inside a word (`C#caveman`, `abc#foreman`) or directly after another `#`
+    /// (`##foreman`) is prose, so `C#`-style text and heading-shaped runs never
+    /// false-trigger a skill load.
+    #[test]
+    fn hash_tokens_need_a_left_boundary() {
+        // A `#` wedged inside a word is prose, not a skill token: a letter or
+        // digit or `-` before it means the `#` sits inside a word (`C#caveman`,
+        // `abc#foreman`, `a-#foreman`), and a `#` before it means a
+        // heading-shaped run (`##foreman`). None of them open a token.
+        assert_eq!(parse_command("用的是 C#caveman 吗"), None);
+        assert_eq!(parse_command("abc#foreman"), None);
+        assert_eq!(parse_command("a-#foreman"), None);
+        assert_eq!(parse_command("##foreman"), None);
+        // A real boundary — start of text, whitespace, CJK, punctuation — opens
+        // the token as before.
+        assert_eq!(
+            parse_command("没有#caveman试试"),
+            Some(Command::Skill(SkillInvocation {
+                ids: vec!["caveman".into()],
+                picker_on_empty: false,
+            }))
+        );
+        assert_eq!(
+            parse_command("(#caveman)"),
+            Some(Command::Skill(SkillInvocation {
+                ids: vec!["caveman".into()],
+                picker_on_empty: false,
             }))
         );
     }

@@ -430,6 +430,151 @@ async fn an_unresolved_hash_token_is_a_plain_prompt() {
     );
 }
 
+/// Resolution is case-insensitive (spec #662): a hand-typed `#Implement-Spec`
+/// still attaches the list's canonical entry. The typed casing never reaches the
+/// attachment, so the server's own exact-match lookup is unaffected.
+#[tokio::test]
+async fn a_hash_token_resolves_case_insensitively() {
+    let fx = SkillFixture::build().await;
+
+    fx.send("#Implement-Spec 644").await;
+
+    assert_eq!(
+        *fx.prompt_calls.lock().await,
+        vec!["#Implement-Spec 644".to_string()],
+        "the message keeps the typed casing"
+    );
+    assert_eq!(
+        *fx.prompt_skills.lock().await,
+        vec![vec![resolved("implement-spec")]],
+        "the canonical (lowercase) id is what rides the prompt"
+    );
+}
+
+/// A `#` dispatch that resolves SOME ids and not others submits the resolved
+/// ones and names the unknown ones on the loaded-skill card — the same partial
+/// policy as `/skill <id>` (Q19). Only an ALL-unresolved `#` message is silent
+/// prose, so a lone typo beside a real load is never dropped silently.
+#[tokio::test]
+async fn a_partly_unknown_hash_dispatch_names_the_unknown_id() {
+    let fx = SkillFixture::build().await;
+
+    fx.send("#implement-spec #no-such-skill 644").await;
+
+    assert_eq!(
+        *fx.prompt_calls.lock().await,
+        vec!["#implement-spec #no-such-skill 644".to_string()]
+    );
+    assert_eq!(
+        *fx.prompt_skills.lock().await,
+        vec![vec![resolved("implement-spec")]],
+        "only the resolved id is attached"
+    );
+    let cards = fx.platform.replied_cards().await;
+    assert!(
+        cards.iter().all(|card| !card.to_string().contains("选择技能")),
+        "a partly-resolved # dispatch submits, it does not show the picker: {cards:?}"
+    );
+    let card = loaded_skill_card(&fx).await;
+    let intro = card["body"]["elements"][0]["content"].as_str().unwrap();
+    assert!(
+        intro.contains("未找到技能") && intro.contains("no-such-skill"),
+        "the unknown id is named on the dedicated card: {intro:?}"
+    );
+    assert_eq!(
+        collapsible_panels(&card).len(),
+        1,
+        "only the resolved skill folds: {card}"
+    );
+}
+
+/// A `#` wedged inside a word is prose, not a skill token (spec #662):
+/// `C#caveman` and the second `#` of `##foreman` never enter the skill path, so
+/// the list is not even read.
+#[tokio::test]
+async fn a_hash_inside_a_word_is_not_a_skill_token() {
+    let fx = SkillFixture::build().await;
+
+    fx.send("C#caveman and ##foreman").await;
+
+    assert_eq!(
+        *fx.prompt_calls.lock().await,
+        vec!["C#caveman and ##foreman".to_string()]
+    );
+    assert_eq!(
+        fx.list_skills_calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "no boundary-opening # token, so the skill list is never read"
+    );
+}
+
+/// A case-insensitive match is only a FALLBACK (spec #662): an exact id always
+/// wins, and two registered ids that differ only by case (`Foo` / `foo` — the
+/// server's `Skill.ID` is unconstrained) never make a typed spelling silently
+/// attach one of them. `#FOO` matches neither exactly and both loosely, so it
+/// resolves nothing and the message submits as a plain prompt.
+#[tokio::test]
+async fn a_case_insensitive_match_must_be_unambiguous() {
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_skills(vec![
+        SkillInfo {
+            id: "foo".into(),
+            name: "foo".into(),
+            description: None,
+            content: None,
+        },
+        SkillInfo {
+            id: "Foo".into(),
+            name: "Foo".into(),
+            description: None,
+            content: None,
+        },
+    ]);
+    let fx = SkillFixture::with(backend).await;
+
+    // Each exact spelling still resolves to its OWN entry, despite the other
+    // one matching case-insensitively.
+    fx.send("#Foo #foo 644").await;
+    assert_eq!(
+        *fx.prompt_skills.lock().await,
+        vec![vec![
+            PromptSkill {
+                id: "Foo".into(),
+                name: "Foo".into()
+            },
+            PromptSkill {
+                id: "foo".into(),
+                name: "foo".into()
+            },
+        ]],
+        "the exact id wins over the case-insensitive neighbour"
+    );
+    // A spelling matching NEITHER exactly but BOTH loosely is ambiguous:
+    // nothing resolves, so the message is a plain prompt with no attachment.
+    fx.send("#FOO 644").await;
+    assert_eq!(
+        *fx.prompt_calls.lock().await,
+        vec!["#Foo #foo 644".to_string(), "#FOO 644".to_string()]
+    );
+    assert_eq!(
+        *fx.prompt_skills.lock().await,
+        vec![
+            vec![
+                PromptSkill {
+                    id: "Foo".into(),
+                    name: "Foo".into()
+                },
+                PromptSkill {
+                    id: "foo".into(),
+                    name: "foo".into()
+                },
+            ],
+            Vec::<PromptSkill>::new(),
+        ],
+        "an ambiguous case-insensitive match must not pick one"
+    );
+}
+
 /// A message with `#` but no `#<letter…>` token is an ordinary prompt — no
 /// skill path at all, so the skill list is never even read. This is what keeps
 /// `#644` (an issue reference) and markdown headings off the hot path.
