@@ -787,24 +787,83 @@ impl SessionsHandle {
     }
 }
 
+/// One per-content-key single-flight cell (ADR-0076) plus the number of
+/// resolvers currently holding it. The `OnceCell` (`get_or_init` /
+/// `get_or_try_init`) makes concurrent resolvers of one content key await ONE
+/// platform call instead of each missing the cache and repeating it; the holder
+/// count makes eviction skip a cell a resolver is still driving. Dropping a held
+/// cell would let a concurrent resolver of the same key create a new one and
+/// re-run the platform call, which on the image path could re-open B1's
+/// embedded-and-sent split: one resolver reads the cached `None` and sends a
+/// File Message while another re-uploads and embeds the same bytes.
+pub(crate) struct ContentCell<T> {
+    cell: tokio::sync::OnceCell<T>,
+    holders: AtomicUsize,
+}
+
+impl<T> ContentCell<T> {
+    pub(crate) fn new() -> Self {
+        Self {
+            cell: tokio::sync::OnceCell::new(),
+            holders: AtomicUsize::new(0),
+        }
+    }
+
+    /// Whether no resolver currently holds this cell — the only state in which
+    /// eviction may drop it.
+    pub(crate) fn is_idle(&self) -> bool {
+        self.holders.load(Ordering::SeqCst) == 0
+    }
+}
+
+/// One resolver's hold on a content cell (ADR-0076 review round 2): taken under
+/// the cache lock by the cell lookup and released by `Drop` (cancellation
+/// included), so eviction can never drop a cell whose resolution is still in
+/// flight — from cell acquisition through the delivery attach.
+pub(crate) struct ContentCellHold<T> {
+    entry: Arc<ContentCell<T>>,
+}
+
+impl<T> ContentCellHold<T> {
+    /// Take a hold on `entry` (the entry's holder count is incremented here, so
+    /// the lookup and the hold are one atomic step under the cache lock).
+    pub(crate) fn new(entry: Arc<ContentCell<T>>) -> Self {
+        entry.holders.fetch_add(1, Ordering::SeqCst);
+        Self { entry }
+    }
+
+    /// The single-flight cell this hold protects.
+    pub(crate) fn cell(&self) -> &tokio::sync::OnceCell<T> {
+        &self.entry.cell
+    }
+}
+
+impl<T> Drop for ContentCellHold<T> {
+    fn drop(&mut self) {
+        self.entry.holders.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// The process-local per-content-key single-flight cache (ADR-0076): a content
-/// identity maps to the resolution of that content. The inner cell is the
-/// in-flight guard (`get_or_init` / `get_or_try_init`): concurrent resolvers of
-/// one key await ONE platform call instead of each missing the cache and
-/// repeating it. Bounded by [`CONTENT_CACHE_CAP`], evicting oldest-first
-/// (ADR-0076 review): a re-upload after eviction is harmless — an upload is
-/// cheap to repeat and a stale key would be worse.
-pub(crate) type ContentCellCache<T> = Arc<Mutex<IndexMap<u64, Arc<tokio::sync::OnceCell<T>>>>>;
+/// identity maps to the resolution of that content. Bounded by
+/// [`CONTENT_CACHE_CAP`], evicting oldest-first among the entries no resolver
+/// holds (ADR-0076 review): a re-upload after eviction is harmless — an upload
+/// is cheap to repeat and a stale key would be worse — while an in-flight cell
+/// is never dropped.
+pub(crate) type ContentCellCache<T> = Arc<Mutex<IndexMap<u64, Arc<ContentCell<T>>>>>;
 
 /// The cap on a per-content-key single-flight cache (ADR-0076 review): past it
-/// the oldest **settled** entry is evicted, so a long-running bot does not
+/// the oldest **idle** entry is evicted, so a long-running bot does not
 /// accumulate one entry per distinct file it ever rendered. Eviction only ever
-/// drops a settled entry, never one a resolver is still initializing — the same
-/// rule the File Message once-guard applies to an in-flight send: dropping an
-/// in-flight cell would let a concurrent resolver of the same key create a new
-/// one and re-upload, which on the image path could re-open B1's
-/// embedded-and-sent split. A re-upload of a settled key after eviction is
-/// harmless (an upload is cheap and the resulting key is stable on Feishu's
+/// drops an entry no resolver holds — the same rule the File Message once-guard
+/// applies to an in-flight send: dropping a held cell would let a concurrent
+/// resolver of the same key create a new one and re-run the platform call, which
+/// on the image path could re-open B1's embedded-and-sent split. Insertion trims
+/// idle entries until the map is back at/under the cap (ADR-0076 review round
+/// 2), so a batch of `join_all` insertions cannot leave it permanently oversized;
+/// a held entry may push it over temporarily, and the next insertion after those
+/// holds drop brings it back down. A re-upload of a settled key after eviction
+/// is harmless (an upload is cheap and the resulting key is stable on Feishu's
 /// side), which the ADR accepts.
 pub(crate) const CONTENT_CACHE_CAP: usize = 1024;
 
@@ -899,17 +958,22 @@ impl Drop for FileMessageSendHold {
     }
 }
 
-/// Evict the oldest entry no resolver holds (#649), so a key whose send is in
-/// flight is never dropped while a later insertion needs room. An entry with no
-/// holder — a completed send, a stale panel's abandoned cell, a cancelled
-/// resolver — is reclaimed here; with every entry held (bounded by concurrency)
-/// nothing is evicted and the map is allowed to sit past the cap rather than
-/// drop an in-flight key.
-pub(crate) fn evict_oldest_idle(sends: &mut IndexMap<(String, u64), Arc<FileMessageSend>>) {
-    if let Some(index) = sends.values().position(|entry| entry.is_idle()) {
-        // `IndexMap` preserves insertion order, and re-inserting an existing
-        // key never moves it, so the first idle entry is the oldest.
-        sends.shift_remove_index(index);
+/// Evict the oldest entry `is_idle` accepts, returning whether one was dropped
+/// (a trim loop uses `false` to learn every remaining entry is held). Shared by
+/// the File Message once-guard (#649) and the per-content caches (ADR-0076
+/// review round 2): a key whose platform call is in flight is never dropped
+/// while a later insertion needs room. An entry with no holder — a completed
+/// send, a stale panel's abandoned cell, a cancelled resolver — is reclaimed
+/// here; with every entry held (bounded by concurrency) nothing is evicted and
+/// the map is allowed to sit past the cap rather than drop an in-flight key.
+/// `IndexMap` preserves insertion order, and re-inserting an existing key never
+/// moves it, so the first accepted entry is the oldest.
+pub(crate) fn evict_oldest_idle<K, V>(map: &mut IndexMap<K, V>, is_idle: impl Fn(&V) -> bool) -> bool {
+    if let Some(index) = map.values().position(is_idle) {
+        map.shift_remove_index(index);
+        true
+    } else {
+        false
     }
 }
 

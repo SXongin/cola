@@ -1801,8 +1801,93 @@ mod tests {
     /// exceed Feishu's component budget — while the panel body still lists EVERY
     /// file. Without the bound a single tool returning many File Contents would
     /// be rejected by Feishu with no split able to help.
+    ///
+    /// The resolver never embed-resolves a file past the bound (ADR-0076 review
+    /// round 2), so the honest render is: the first [`MAX_PANEL_IMAGES`] files
+    /// embedded, the rest delivered as File Messages. The degraded files must NOT
+    /// still claim `已内嵌` — that was the false claim the bound used to leave.
     #[test]
     fn a_panel_past_the_image_bound_degrades_the_extra_to_tracking_lines() {
+        use base64::Engine as _;
+        let total = MAX_PANEL_IMAGES + 5;
+        let blocks: Vec<ContentBlock> = (0..total)
+            .map(|i| {
+                let encoded = base64::engine::general_purpose::STANDARD.encode(b"ABC");
+                let name = format!("shot_{i}.png");
+                ContentBlock::File(
+                    FileContent::decode(
+                        &format!("data:image/png;base64,{encoded}"),
+                        Some("image/png"),
+                        Some(&name),
+                    )
+                    .expect("an inline payload is a File Content"),
+                )
+            })
+            .collect();
+        let call = ToolCall {
+            identity: ToolIdentity {
+                name: "read".into(),
+                call_id: "call_read".into(),
+            },
+            status: ToolStatus::Completed,
+            started_at: None,
+            input: None,
+            metadata: None,
+            output: ToolOutput {
+                raw: None,
+                blocks,
+                error: None,
+            },
+        };
+        let mut panel = ToolPanel::new(call);
+        for i in 0..total {
+            panel.set_file_delivery(
+                i,
+                if i < MAX_PANEL_IMAGES {
+                    FileDelivery::Embedded {
+                        image_key: format!("img_{i}"),
+                    }
+                } else {
+                    // What the resolver attaches for a file past the bound: the
+                    // File Message path, never `Embedded`.
+                    FileDelivery::SentAsFile
+                },
+            );
+        }
+        // The estimate charges exactly what the render emits.
+        assert_eq!(panel.embedded_file_count(), MAX_PANEL_IMAGES);
+
+        let card = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_tool(panel)
+            .build();
+        let elements = card["body"]["elements"].as_array().unwrap();
+        let images = elements.iter().filter(|e| e["tag"] == "img").count();
+        assert_eq!(images, MAX_PANEL_IMAGES, "at most the bound is emitted: {card}");
+        let body = elements[0]["elements"][0]["content"].as_str().unwrap();
+        assert!(body.contains("shot_0.png"), "the first file is tracked: {body}");
+        assert!(
+            body.contains(&format!("shot_{}.png", total - 1)),
+            "every file keeps its tracking line, the degraded ones included: {body}"
+        );
+        assert_eq!(
+            body.matches("已内嵌").count(),
+            MAX_PANEL_IMAGES,
+            "only the rendered images claim 已内嵌: {body}"
+        );
+        assert_eq!(
+            body.matches("已发送为文件消息").count(),
+            total - MAX_PANEL_IMAGES,
+            "the files past the bound are honestly tracked as File Messages: {body}"
+        );
+    }
+
+    /// The panel's own render cap still holds defensively: a panel handed more
+    /// embedded deliveries than [`MAX_PANEL_IMAGES`] (the resolver never does,
+    /// but the pure builder is a public seam) emits at most the bound, so one
+    /// indivisible panel can never exceed the card's component budget.
+    #[test]
+    fn a_panel_marked_with_more_embeds_than_the_bound_still_caps_its_images() {
         use base64::Engine as _;
         let total = MAX_PANEL_IMAGES + 5;
         let blocks: Vec<ContentBlock> = (0..total)
@@ -1843,27 +1928,17 @@ mod tests {
                 },
             );
         }
-        // The estimate charges exactly what the render emits.
-        assert_eq!(panel.embedded_file_count(), MAX_PANEL_IMAGES);
-
         let card = CardBuilder::new()
             .with_state(CardState::Done)
             .with_tool(panel)
             .build();
-        let elements = card["body"]["elements"].as_array().unwrap();
-        let images = elements.iter().filter(|e| e["tag"] == "img").count();
-        assert_eq!(images, MAX_PANEL_IMAGES, "at most the bound is emitted: {card}");
-        let body = elements[0]["elements"][0]["content"].as_str().unwrap();
-        assert!(body.contains("shot_0.png"), "the first file is tracked: {body}");
-        assert!(
-            body.contains(&format!("shot_{}.png", total - 1)),
-            "every file keeps its tracking line, the degraded ones included: {body}"
-        );
-        assert_eq!(
-            body.matches("已内嵌").count(),
-            total,
-            "all are still tracked as embedded: {body}"
-        );
+        let images = card["body"]["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["tag"] == "img")
+            .count();
+        assert_eq!(images, MAX_PANEL_IMAGES, "the builder caps at the bound: {card}");
     }
 
     /// A File Content with no embed — a non-image, or an image the upload could
