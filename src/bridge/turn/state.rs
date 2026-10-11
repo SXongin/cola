@@ -14,10 +14,12 @@ use crate::bridge::handles::CardsHandle;
 use crate::feishu::card::first_n_chars_bytes;
 use crate::feishu::card::ledger::{TaskCompletionEntry, TaskKind, TaskLedgerRow};
 use crate::feishu::card::shell::CardBuilder;
-use crate::feishu::card::tool_render::{FileDelivery, TaskLiveness, ToolPanel, is_task_tool};
+use crate::feishu::card::tool_render::{
+    FileDelivery, MAX_PANEL_IMAGES, TaskLiveness, ToolPanel, is_task_tool,
+};
 use crate::feishu::card::{AwaitingAction, CardState};
 use indexmap::IndexMap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// One part already rendered into this card, addressed by content: a part
@@ -1568,12 +1570,17 @@ pub(super) struct StreamAccumulator {
 /// process-local upload cache. Named so the roles travel together instead of
 /// through a bare tuple, and so the resolver can re-validate the panel's file
 /// against the same identity it resolved ([`StreamAccumulator::set_file_image_key`]).
+/// `embeddable` is the content hash's embed verdict, computed per panel by
+/// [`StreamAccumulator::pending_file_deliveries`] (ADR-0076 review round 3): it
+/// is a function of the hash, never of the occurrence that happened to resolve
+/// it, so every occurrence of one hash agrees.
 #[derive(Debug, Clone)]
 pub(super) struct PendingFileDelivery {
     pub(super) call_id: String,
     pub(super) index: usize,
     pub(super) content: FileContent,
     pub(super) hash: u64,
+    pub(super) embeddable: bool,
 }
 
 /// The identity of one File Content for the process-local caches and the
@@ -3468,11 +3475,50 @@ impl StreamAccumulator {
     /// The unresolved File Content deliveries across every tool panel
     /// (ADR-0076): one [`PendingFileDelivery`] per File Content whose delivery
     /// the render path has not resolved yet — its owning call, position,
-    /// content and content hash. The render loop pre-resolves these before the
-    /// card JSON is built, so the panel can name the file and embed the image.
-    /// A content whose inline bytes cannot be decoded is skipped, exactly as
-    /// the render path's own hash step did.
+    /// content, content hash, and the hash's embed verdict. The render loop
+    /// pre-resolves these before the card JSON is built, so the panel can name
+    /// the file and embed the image. A content whose inline bytes cannot be
+    /// decoded is skipped, exactly as the render path's own hash step did.
+    ///
+    /// The embed verdict is a function of the content hash, not of the
+    /// occurrence that resolves it (ADR-0076 review round 3). Within a panel the
+    /// DISTINCT embeddable-image hashes are ranked by first appearance and only
+    /// the first [`MAX_PANEL_IMAGES`] are embeddable; a non-image never consumes
+    /// an image slot, and every occurrence of one hash gets the same verdict, so
+    /// content-hash dedup can neither embed in one occurrence while sending a
+    /// File Message for another (the B1 split) nor mark an occurrence `已内嵌`
+    /// whose `img` the card's own cap omits (a false status). A hash is
+    /// embeddable only if it ranks within the bound in EVERY panel it appears
+    /// in, so one verdict serves the whole process-wide dedup.
     pub(super) fn pending_file_deliveries(&self) -> Vec<PendingFileDelivery> {
+        // Pass 1: rank each panel's distinct embeddable-image hashes by first
+        // appearance; a hash is embeddable iff it is within the bound in every
+        // panel it appears in (an AND across panels, the safe verdict when one
+        // content is in-bound in one panel and past the bound in another).
+        let mut embeddable: HashMap<u64, bool> = HashMap::new();
+        for panel in self.tools.values() {
+            let mut rank = 0usize;
+            let mut ranked: HashSet<u64> = HashSet::new();
+            for file in panel.files() {
+                if !crate::feishu::image::embeddable_image(&file.content) {
+                    continue;
+                }
+                let Some(bytes) = file.content.bytes() else {
+                    continue;
+                };
+                let hash = file_content_hash(&file.content, &bytes);
+                if !ranked.insert(hash) {
+                    continue;
+                }
+                let within = rank < MAX_PANEL_IMAGES;
+                rank += 1;
+                embeddable
+                    .entry(hash)
+                    .and_modify(|verdict| *verdict &= within)
+                    .or_insert(within);
+            }
+        }
+        // Pass 2: emit the unresolved files carrying their hash's verdict.
         let mut pending = Vec::new();
         for (call_id, panel) in &self.tools {
             for (index, file) in panel.files().iter().enumerate() {
@@ -3482,11 +3528,13 @@ impl StreamAccumulator {
                 let Some(bytes) = file.content.bytes() else {
                     continue;
                 };
+                let hash = file_content_hash(&file.content, &bytes);
                 pending.push(PendingFileDelivery {
                     call_id: call_id.clone(),
                     index,
                     content: file.content.clone(),
-                    hash: file_content_hash(&file.content, &bytes),
+                    hash,
+                    embeddable: embeddable.get(&hash).copied().unwrap_or(false),
                 });
             }
         }
