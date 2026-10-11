@@ -662,6 +662,25 @@ pub(super) fn file_image_elements(tool: &ToolPanel) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// The serialized byte length the `img` elements [`file_image_elements`] emits
+/// add to a card body (ADR-0076), for a card-size estimate that must charge
+/// exactly what renders. Each element repeats the File Content's name in BOTH
+/// its `alt` (`<name>`) and its `title` (`📎 <name>`), and both strings are
+/// embedded in the card's JSON, so a long or quote-heavy filename costs its
+/// JSON-escaped bytes TWICE — plus the element's own `img_key` and scaffolding.
+/// A count-only charge (or a raw name-length one) under-counts a panel of
+/// long-named images by half, letting a near-budget card pass the split check
+/// while Feishu rejects the serialized card on size — which the fenced content
+/// fallback cannot repair. `0` when the panel embeds nothing. Kept beside the
+/// render so the two cannot drift.
+pub(crate) fn file_image_estimate(tool: &ToolPanel) -> usize {
+    file_image_elements(tool)
+        .iter()
+        .filter_map(|element| serde_json::to_string(element).ok())
+        .map(|serialized| serialized.len())
+        .sum()
+}
+
 /// One tool panel as a folded collapsible element. `at_ms` is the part's
 /// server `state.time.start`; when present, the panel header carries it as
 /// `· HH:MM` so the start time is visible while collapsed (#183), and when
@@ -1962,6 +1981,96 @@ mod tests {
             raw.len() + angles.len() * 4,
             "each `<` must cost its five-byte `&#60;` — four extra bytes"
         );
+    }
+
+    /// A panel with one embedded image per `name`, all delivered `Embedded` —
+    /// the shape the image-size estimate tests build from.
+    fn embedded_panel(names: &[&str]) -> ToolPanel {
+        let files: Vec<(&str, &[u8])> = names.iter().map(|name| (*name, &b"ABC"[..])).collect();
+        let mut panel = ToolPanel::for_test_with_files("read", &files);
+        for i in 0..names.len() {
+            panel.set_file_delivery(
+                i,
+                FileDelivery::Embedded {
+                    image_key: format!("img_{i}"),
+                },
+            );
+        }
+        panel
+    }
+
+    /// The `img` elements an embedded File Content emits (ADR-0076) each carry
+    /// the file NAME in both `alt` and `title`, and the whole element is
+    /// serialized into the card's JSON. The size estimate must charge those
+    /// SERIALIZED bytes — not a count, and not the raw name length — so a
+    /// near-budget card splits instead of being rejected by Feishu on size,
+    /// which the fenced content fallback cannot repair.
+    #[test]
+    fn file_image_estimate_charges_the_serialized_image_elements() {
+        let names = [
+            "a_rather_long_screenshot_name_that_repeats.png",
+            "second.png",
+            "third.png",
+        ];
+        let panel = embedded_panel(&names);
+        let elements = file_image_elements(&panel);
+        assert_eq!(elements.len(), names.len(), "one img per embedded file");
+        let expected: usize = elements
+            .iter()
+            .map(|element| serde_json::to_string(element).unwrap().len())
+            .sum();
+
+        assert_eq!(
+            file_image_estimate(&panel),
+            expected,
+            "the estimate must be the serialized contribution of exactly the emitted elements"
+        );
+        assert!(
+            file_image_estimate(&panel) > names.iter().map(|n| n.len()).sum::<usize>(),
+            "the estimate must charge more than the raw names: the element scaffolding and \
+             the second (alt + title) copy count too"
+        );
+    }
+
+    /// The image estimate must charge the element's JSON-ESCAPED bytes: the name
+    /// sits in the card's JSON `alt`/`title` strings, where each `"` becomes
+    /// `\"` (a `\` `\\`, a control char six bytes). A raw name-length charge
+    /// under-counts a quote-heavy filename by half in EACH of the two fields, so
+    /// a card can pass the split check and still be rejected by Feishu on size.
+    #[test]
+    fn file_image_estimate_charges_json_escaping() {
+        let quotes = "\"".repeat(2_000);
+        let panel = embedded_panel(&[&quotes]);
+        let serialized = serde_json::to_string(&file_image_elements(&panel)[0])
+            .unwrap()
+            .len();
+
+        assert_eq!(file_image_estimate(&panel), serialized);
+        // Each quote costs its escaped `\"` in BOTH fields: 4 bytes, where a raw
+        // charge would bill only 2.
+        assert!(
+            file_image_estimate(&panel) > quotes.len() * 2,
+            "each quote must cost its escaped bytes in both `alt` and `title`"
+        );
+    }
+
+    /// A panel with no embedded image charges nothing for images: a delivered
+    /// file (`未发送` / `已发送为文件消息`) emits no `img` element, so the image
+    /// estimate must stay 0 and never inflate the card-size budget.
+    #[test]
+    fn file_image_estimate_is_zero_without_an_embedded_image() {
+        for delivery in [
+            FileDelivery::Unresolved,
+            FileDelivery::Undelivered,
+            FileDelivery::SentAsFile,
+        ] {
+            let panel = read_panel("doc.pdf", "application/pdf", b"%PDF", delivery);
+            assert_eq!(
+                file_image_estimate(&panel),
+                0,
+                "a non-embedded file emits no img element"
+            );
+        }
     }
 
     /// The whole-card content-rejection fallback fences every markdown element
