@@ -609,10 +609,12 @@ fn file_tracking_block(tool: &ToolPanel) -> Option<String> {
     )
 }
 
-/// How many characters of a File Content's name the folded panel HEADER shows
-/// before clipping with `…` (ADR-0076 amendment): the header is a one-line
-/// status strip, so a long filename is shortened there while the body's
-/// tracking line keeps the full name.
+/// The character budget the folded panel HEADER spends on a single File
+/// Content's name (ADR-0076 amendment): the header is a one-line status strip,
+/// so a name longer than this is clipped to its TAIL — a leading `…` plus the
+/// last characters, keeping the basename — while the body's tracking line keeps
+/// the full name. The leading `…` counts against the budget, so the rendered
+/// name is at most this many characters.
 const FILE_HEADER_NAME_MAX_CHARS: usize = 24;
 
 /// The name a File Content's folded panel HEADER falls back to when folding
@@ -657,12 +659,34 @@ fn folded_header_name(name: &str) -> String {
     }
 }
 
+/// Clip a folded File Content name for the folded panel HEADER keeping its TAIL
+/// (ADR-0076 amendment): the header is a one-line status strip, and a name
+/// longer than [`FILE_HEADER_NAME_MAX_CHARS`] is a long absolute path whose
+/// meaningful part — the basename — is at the END, so the head is dropped and
+/// the tail kept: a leading `…` plus the last characters, the `…` counted
+/// against the budget so the whole rendered name fits it. Character-counted
+/// like the body's [`truncate_md`], so a multibyte (CJK) name clips on a
+/// character boundary and never splits one — the tail-side mirror of the head
+/// clip it replaces. A name already within the budget is returned unchanged,
+/// with no `…`.
+fn clip_header_name_tail(name: &str, max_chars: usize) -> String {
+    let count = name.chars().count();
+    if count <= max_chars {
+        return name.to_string();
+    }
+    // The leading `…` is part of the budget: it plus the last `max_chars - 1`
+    // characters is exactly `max_chars` (or fewer when `max_chars` is tiny).
+    let keep = max_chars.saturating_sub(1);
+    let tail: String = name.chars().skip(count - keep).collect();
+    format!("…{tail}")
+}
+
 /// The compact File Content marker the folded panel HEADER carries (ADR-0076
 /// amendment). The detailed tracking line lives in the panel BODY, which is
 /// collapsed by default, so the user never sees it — worst of all for `未发送`,
 /// the ONLY signal that a file was read but could not be delivered. The header
 /// therefore shows a one-line marker while folded: ` · 📎 <name>` for a single
-/// file (the name folded to one printable line, then clipped to
+/// file (the name folded to one printable line, then clipped to its tail within
 /// [`FILE_HEADER_NAME_MAX_CHARS`]), ` · 📎 <N> 个文件` for several, and
 /// ` · 未发送` appended when ANY of the panel's files is
 /// [`FileDelivery::Undelivered`]. `Embedded`/`SentAsFile` carry no state here —
@@ -678,7 +702,7 @@ fn file_header_marker(tool: &ToolPanel) -> Option<String> {
     let mut marker = if files.len() == 1 {
         format!(
             " · 📎 {}",
-            truncate_md(
+            clip_header_name_tail(
                 &folded_header_name(&files[0].content.name),
                 FILE_HEADER_NAME_MAX_CHARS
             )
@@ -2124,12 +2148,15 @@ mod tests {
         assert!(!title.contains("📎"), "{title}");
     }
 
-    /// A long filename is clipped in the folded header (ADR-0076 amendment): the
-    /// header is a one-line status strip, so the name stops at
-    /// [`FILE_HEADER_NAME_MAX_CHARS`] with an `…`; the body keeps the full name.
+    /// A long absolute path is clipped in the folded header keeping its TAIL
+    /// (ADR-0076 amendment): the header is a one-line status strip, and a
+    /// `read` reports the file's absolute path, so the useful part — the
+    /// basename — is at the end. The head is dropped for a leading `…`, the
+    /// whole rendered name fitting [`FILE_HEADER_NAME_MAX_CHARS`]; the body
+    /// keeps the full name.
     #[test]
-    fn a_long_file_name_is_clipped_in_the_panel_header() {
-        let name = "a_very_long_screenshot_name_that_would_wrap_the_header.png";
+    fn a_long_file_name_keeps_its_tail_in_the_panel_header() {
+        let name = "/root/workspace/dev/cola/target/acc/shot.png";
         let panel = read_panel(
             name,
             "image/png",
@@ -2142,19 +2169,54 @@ mod tests {
             .with_state(CardState::Done)
             .with_tool(panel)
             .build();
-        let clipped: String = name.chars().take(FILE_HEADER_NAME_MAX_CHARS).collect();
         let title = card["body"]["elements"][0]["header"]["title"]["content"]
             .as_str()
             .expect("panel title");
+        // The tail is kept: the basename survives, the path prefix does not.
         assert!(
-            title.contains(&format!("📎 {clipped}…")),
-            "the header clips the name: {title}"
+            title.contains("📎 …ola/target/acc/shot.png"),
+            "the header keeps the name's tail: {title}"
         );
-        assert!(!title.contains(".png"), "the tail is clipped: {title}");
+        assert!(
+            !title.contains("/root/"),
+            "the path prefix is dropped, not shown: {title}"
+        );
+        assert!(title.contains("shot.png"), "the basename survives: {title}");
+        // The leading `…` is inside the budget: the rendered name is at most 24.
+        let shown = title.split("📎 ").nth(1).expect("the marker carries the name");
+        assert_eq!(
+            shown.chars().count(),
+            FILE_HEADER_NAME_MAX_CHARS,
+            "the `…` counts against the budget: {shown:?}"
+        );
         let body = card["body"]["elements"][0]["elements"][0]["content"]
             .as_str()
             .unwrap();
         assert!(body.contains(name), "the body keeps the full name: {body}");
+    }
+
+    /// A short name is unchanged in the folded header (ADR-0076 amendment): a
+    /// name within [`FILE_HEADER_NAME_MAX_CHARS`] renders verbatim, with no
+    /// leading `…`.
+    #[test]
+    fn a_short_file_name_is_unchanged_in_the_panel_header() {
+        let panel = read_panel(
+            "shot.png",
+            "image/png",
+            b"ABC",
+            FileDelivery::Embedded {
+                image_key: "img".into(),
+            },
+        );
+        let card = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_tool(panel)
+            .build();
+        let title = card["body"]["elements"][0]["header"]["title"]["content"]
+            .as_str()
+            .expect("panel title");
+        assert_eq!(title, "✅ read · 📎 shot.png", "{card}");
+        assert!(!title.contains('…'), "a short name is not clipped: {title}");
     }
 
     /// The header marker is card JSON too (ADR-0076 amendment): the estimate
@@ -2317,8 +2379,9 @@ mod tests {
     }
 
     /// The header clip counts CHARACTERS, not bytes: a multibyte (CJK) filename
-    /// clips at [`FILE_HEADER_NAME_MAX_CHARS`] without panicking or splitting a
-    /// character, while the body keeps the full name (ADR-0076 amendment).
+    /// clips at [`FILE_HEADER_NAME_MAX_CHARS`] from the TAIL without panicking or
+    /// splitting a character, while the body keeps the full name (ADR-0076
+    /// amendment).
     #[test]
     fn a_multibyte_file_name_clips_at_the_character_boundary() {
         let name = "截图".repeat(20); // 40 characters, 120 bytes
@@ -2334,9 +2397,10 @@ mod tests {
             .with_state(CardState::Done)
             .with_tool(panel)
             .build();
-        let clipped: String = name.chars().take(FILE_HEADER_NAME_MAX_CHARS).collect();
+        // `…` plus the last 23 characters, each a whole 3-byte CJK char.
+        let expected: String = format!("…{}", name.chars().skip(40 - 23).collect::<String>());
         assert_eq!(
-            clipped.chars().count(),
+            expected.chars().count(),
             FILE_HEADER_NAME_MAX_CHARS,
             "the fixture must exceed the clip so the boundary is exercised"
         );
@@ -2344,8 +2408,8 @@ mod tests {
             .as_str()
             .expect("panel title");
         assert!(
-            title.contains(&format!("📎 {clipped}…")),
-            "the header clips at the character boundary: {title}"
+            title.contains(&format!("📎 {expected}")),
+            "the header clips at the character boundary from the tail: {title}"
         );
         let body = card["body"]["elements"][0]["elements"][0]["content"]
             .as_str()
