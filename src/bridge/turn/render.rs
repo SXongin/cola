@@ -16,8 +16,8 @@ use crate::backend::{
 };
 use crate::bridge::core::SESSION_INFO_TIMEOUT;
 use crate::bridge::handles::{
-    CardsHandle, ContentCellCache, FILE_MESSAGE_SENDS_CAP, FileMessageSends, RequestsHandle, SessionsHandle,
-    TurnHandles,
+    CardsHandle, ContentCellCache, FILE_MESSAGE_SENDS_CAP, FileMessageSend, FileMessageSendHold,
+    FileMessageSends, RequestsHandle, SessionsHandle, TurnHandles, evict_oldest_idle,
 };
 use crate::bridge::span;
 use crate::bridge::turn::state;
@@ -660,14 +660,16 @@ struct InFlightUpload {
 /// network calls), like the planned-entry output reads. Returns whether any
 /// delivery was attached — a change that owes its card PATCH.
 async fn resolve_file_deliveries(cards: &CardsHandle, session_id: &str) -> bool {
-    // 1. Collect the unresolved File Contents and the live card's message id
-    //    under a brief lock. No cache access here, so no nested lock.
-    let (pending, card_message_id) = {
+    // 1. Collect the unresolved File Contents under a brief lock. No cache
+    //    access here, so no nested lock; the reply target is read later, in the
+    //    same critical section as the live-panel revalidation (see
+    //    `live_file_reply_target`).
+    let pending = {
         let live = cards.cards.lock().await;
         let Some(card) = live.get(session_id) else {
             return false;
         };
-        (card.acc.pending_file_deliveries(), card.card_message_id.clone())
+        card.acc.pending_file_deliveries()
     };
     if pending.is_empty() {
         return false;
@@ -690,9 +692,7 @@ async fn resolve_file_deliveries(cards: &CardsHandle, session_id: &str) -> bool 
     }
     let mut resolved: std::collections::HashMap<u64, FileDelivery> = std::collections::HashMap::new();
     for upload in to_resolve {
-        if let Some(delivery) =
-            resolve_file_delivery(cards, session_id, card_message_id.as_deref(), &upload).await
-        {
+        if let Some(delivery) = resolve_file_delivery(cards, session_id, &upload).await {
             resolved.insert(upload.hash, delivery);
         }
     }
@@ -709,6 +709,20 @@ async fn resolve_file_deliveries(cards: &CardsHandle, session_id: &str) -> bool 
         let Some(outcome) = resolved.get(&delivery.hash) else {
             continue;
         };
+        if !card
+            .acc
+            .file_delivery_current(&delivery.call_id, delivery.index, delivery.hash)
+        {
+            // The panel was replaced after the send landed (#649): the File
+            // Message went out for a file this card no longer shows — the
+            // residual, benign best-effort artifact documented at the check
+            // site. The setter's hash guard would no-op; log it at DEBUG.
+            tracing::debug!(
+                "file content {:?} was delivered but its panel was replaced mid-send",
+                delivery.content.name
+            );
+            continue;
+        }
         card.acc
             .set_file_delivery(&delivery.call_id, delivery.index, delivery.hash, outcome);
         changed = true;
@@ -736,38 +750,46 @@ async fn content_cell<T>(cache: &ContentCellCache<T>, hash: u64) -> Arc<tokio::s
 }
 
 /// The single-flight cell for one File Message send, keyed by `(session_id,
-/// content hash)` (#649): created if absent, evicting the oldest entry past
-/// [`FILE_MESSAGE_SENDS_CAP`] so the guard never grows without limit. Concurrent
-/// resolvers of one key share one cell, so the first's send is awaited by the
-/// rest — exactly ONE send attempt per key.
-async fn file_message_cell(
-    sends: &FileMessageSends,
-    key: (String, u64),
-) -> Arc<tokio::sync::OnceCell<FileDelivery>> {
+/// content hash)` (#649): created if absent, evicting the oldest entry NO
+/// resolver holds past [`FILE_MESSAGE_SENDS_CAP`] so the guard never grows
+/// without limit. Concurrent resolvers of one key share one cell, so the first's
+/// send is awaited by the rest — exactly ONE send attempt per key. The returned
+/// hold marks the key in flight until it drops (cancellation included), so
+/// eviction never removes a key whose send a resolver is still driving.
+async fn file_message_cell(sends: &FileMessageSends, key: (String, u64)) -> FileMessageSendHold {
     let mut sends = sends.lock().await;
     if !sends.contains_key(&key) && sends.len() >= FILE_MESSAGE_SENDS_CAP {
-        // Oldest-first: `IndexMap` preserves insertion order, and re-inserting
-        // an existing key never moves it.
-        sends.shift_remove_index(0);
+        evict_oldest_idle(&mut sends);
     }
-    Arc::clone(
+    let entry = Arc::clone(
         sends
             .entry(key)
-            .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new())),
-    )
+            .or_insert_with(|| Arc::new(FileMessageSend::new())),
+    );
+    FileMessageSendHold::new(entry)
 }
 
-/// Whether the live card still holds `upload`'s content at its panel position
-/// (#649): the same content-hash check [`StreamAccumulator::set_file_delivery`]
-/// applies, read BEFORE the File Message send so a panel the transcript
-/// replaced while the upload was in flight never delivers the stale file.
-/// `false` when the card is gone — nothing to reply under.
-async fn file_delivery_current(cards: &CardsHandle, session_id: &str, upload: &InFlightUpload) -> bool {
+/// The live card's message id when its panel still holds `upload`'s content at
+/// its position, else `None` (#649). The content-hash revalidation and the reply
+/// target are read from ONE cards-lock critical section, so the File Message is
+/// replied under the very card the check just approved — a card re-pointed (a
+/// split, a re-adopt) while the upload was in flight replies under its NEW id,
+/// not the stale one the resolve started with. `None` when the card is gone, has
+/// no message id yet, or no longer holds the content — nothing to reply under.
+async fn live_file_reply_target(
+    cards: &CardsHandle,
+    session_id: &str,
+    upload: &InFlightUpload,
+) -> Option<String> {
     let live = cards.cards.lock().await;
-    live.get(session_id).is_some_and(|card| {
-        card.acc
-            .file_delivery_current(&upload.call_id, upload.index, upload.hash)
-    })
+    let card = live.get(session_id)?;
+    if !card
+        .acc
+        .file_delivery_current(&upload.call_id, upload.index, upload.hash)
+    {
+        return None;
+    }
+    card.card_message_id.clone()
 }
 
 /// Resolve ONE File Content's card delivery (ADR-0076, #649): embed an image
@@ -781,7 +803,6 @@ async fn file_delivery_current(cards: &CardsHandle, session_id: &str, upload: &I
 async fn resolve_file_delivery(
     cards: &CardsHandle,
     session_id: &str,
-    card_message_id: Option<&str>,
     upload: &InFlightUpload,
 ) -> Option<FileDelivery> {
     // Embed first: an image within the caps uploads once and every later PATCH
@@ -827,24 +848,32 @@ async fn resolve_file_delivery(
     };
     // The send replies under the live card; without one, leave it unresolved so
     // a later poll (with the card) retries — the upload is already cached.
-    let card_message_id = card_message_id?;
     // Once-guard, single-flight (#649): a content whose File Message already went
     // out for this Session never sends a second one (a cola restart may resend —
     // accepted), and two concurrent resolvers of one key await ONE send attempt
     // instead of both missing the guard and posting duplicate File Messages. The
-    // init re-validates the LIVE panel FIRST: a panel the transcript replaced
-    // while the upload was in flight must not send the stale file — the check
-    // fails, nothing is sent, and the cell stays uninitialized for a later poll.
+    // init re-validates the LIVE panel and captures the reply target in ONE
+    // cards-lock critical section, then releases the lock BEFORE the network
+    // send. The lock is never held across a platform await — it would stall
+    // every card update on a Feishu round-trip — so the residual window is: a
+    // panel replaced between this check and the send landing still gets its File
+    // Message. That is a benign, best-effort artifact — ADR-0076 frames delivery
+    // as best-effort and permits a resend after a restart. The delivery status
+    // is only attached if the panel still matches when the send returns (the
+    // setter's hash guard), and the residual case is logged at DEBUG by the
+    // caller. A check that fails sends nothing and leaves the cell
+    // uninitialized for a later poll.
     let cell = file_message_cell(&cards.file_messages_sent, (session_id.to_string(), upload.hash)).await;
     match cell
+        .cell()
         .get_or_try_init(|| async {
-            if !file_delivery_current(cards, session_id, upload).await {
+            let Some(reply_target) = live_file_reply_target(cards, session_id, upload).await else {
                 return Err(());
-            }
+            };
             let content = serde_json::json!({ "file_key": file_key });
             match cards
                 .feishu
-                .send_message_in_thread(card_message_id, "file", &content)
+                .send_message_in_thread(&reply_target, "file", &content)
                 .await
             {
                 Ok(_) => Ok(FileDelivery::SentAsFile),
@@ -2170,7 +2199,7 @@ mod tests {
         MockBackend, PlatformCall, RecordingPlatform, build_app, card_text, final_card, realistic_parts,
         seed_cover_title, seed_entry, test_config, test_work_dir, text_part, turn_anchor, typed_message,
     };
-    use crate::bridge::turn::state::{CursorSeed, StreamAccumulator};
+    use crate::bridge::turn::state::{CursorSeed, StreamAccumulator, file_content_hash};
     use crate::feishu::card::CardState;
     use crate::feishu::card::tool_render::ToolPanel;
 
@@ -5938,6 +5967,143 @@ Index: /x/src/main.rs
         );
         assert!(sends.contains_key(&("ses_1".to_string(), 1)), "the rest stay");
         assert!(sends.contains_key(&("ses_new".to_string(), 9_999)));
+    }
+
+    /// Eviction never drops a key whose File Message send is in flight (#649):
+    /// with the guard at its cap and the oldest key's send parked in the
+    /// platform, inserting a new key evicts the next-oldest IDLE entry instead
+    /// of the in-flight one. Were the in-flight key dropped, a concurrent
+    /// resolver of that key would create a NEW cell and post a duplicate File
+    /// Message, breaking "exactly one File Message per (session, hash)".
+    #[tokio::test]
+    async fn file_message_guard_eviction_skips_an_in_flight_send() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        platform.given_file_key("file_v2_in_flight");
+        let sid = "ses_file_in_flight";
+        let cards = app.core.cards_handle();
+        Turn::seed_card(&cards, sid, Some("om_in_flight")).await;
+        Turn::set_turn_anchor(&cards, sid, &turn_anchor(0)).await;
+
+        let transcript = SessionTranscript::new(vec![message(
+            "a1",
+            1_000,
+            vec![read_file_part("call_read", "doc.pdf", "application/pdf", b"%PDF")],
+        )]);
+
+        // Park the File Message send: the key's entry is now held (in flight).
+        let (entered, release) = platform.pause("send_message", "om_in_flight");
+        let first = {
+            let app = Arc::clone(&app);
+            let sid = sid.to_string();
+            let transcript = transcript.clone();
+            tokio::spawn(async move {
+                let cards = app.core.cards_handle();
+                render(&app, &cards, &sid, &transcript).await;
+            })
+        };
+        entered.notified().await;
+
+        // The parked key is the OLDEST guard entry. Fill the guard to its cap
+        // with idle entries, then insert one more: the eviction must skip the
+        // in-flight key and take the next-oldest idle one.
+        let in_flight_key = (sid.to_string(), file_content_hash(b"%PDF"));
+        let sends = &cards.file_messages_sent;
+        assert!(
+            sends.lock().await.contains_key(&in_flight_key),
+            "the parked send's key is in the guard"
+        );
+        for i in 0..(FILE_MESSAGE_SENDS_CAP - 1) {
+            file_message_cell(sends, (format!("ses_fill_{i}"), i as u64)).await;
+        }
+        assert_eq!(
+            sends.lock().await.len(),
+            FILE_MESSAGE_SENDS_CAP,
+            "the guard is at its cap"
+        );
+        file_message_cell(sends, ("ses_overflow".to_string(), 7)).await;
+
+        {
+            let sends = sends.lock().await;
+            assert!(
+                sends.contains_key(&in_flight_key),
+                "the in-flight key survives eviction"
+            );
+            assert!(
+                !sends.contains_key(&("ses_fill_0".to_string(), 0)),
+                "the oldest IDLE entry is evicted instead"
+            );
+            assert!(sends.contains_key(&("ses_overflow".to_string(), 7)));
+        }
+
+        release.notify_one();
+        first.await.unwrap();
+        assert_eq!(
+            sent_messages(&platform).await.len(),
+            1,
+            "the in-flight key still sends exactly one File Message"
+        );
+    }
+
+    /// The File Message's reply target is captured from the SAME cards-lock
+    /// critical section as the live-panel revalidation (#649): a card re-pointed
+    /// to a new message id while the upload is in flight gets the File Message
+    /// replied under its NEW id, not the stale one the resolve started with.
+    #[tokio::test]
+    async fn a_file_message_replies_under_the_live_cards_current_id() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        platform.given_file_key("file_v2_repoint");
+        let sid = "ses_file_repoint";
+        let cards = app.core.cards_handle();
+        Turn::seed_card(&cards, sid, Some("om_before")).await;
+        Turn::set_turn_anchor(&cards, sid, &turn_anchor(0)).await;
+
+        let transcript = SessionTranscript::new(vec![message(
+            "a1",
+            1_000,
+            vec![read_file_part("call_read", "doc.pdf", "application/pdf", b"%PDF")],
+        )]);
+
+        // Park the upload so the live card can be re-pointed while it is in
+        // flight (the resolve captured the target BEFORE the upload only in the
+        // old, un-tightened code).
+        let (entered, release) = platform.pause("upload_file", "");
+        let first = {
+            let app = Arc::clone(&app);
+            let sid = sid.to_string();
+            let transcript = transcript.clone();
+            tokio::spawn(async move {
+                let cards = app.core.cards_handle();
+                render(&app, &cards, &sid, &transcript).await;
+            })
+        };
+        entered.notified().await;
+
+        // The live card is re-pointed (a split / re-adopt) mid-upload; its panel
+        // still holds the file, so the send proceeds.
+        {
+            let mut live = cards.cards.lock().await;
+            let card = live.get_mut(sid).expect("the live card exists");
+            card.repoint("om_after");
+        }
+
+        release.notify_one();
+        first.await.unwrap();
+
+        assert_eq!(
+            sent_messages(&platform).await,
+            vec![(
+                "om_after".to_string(),
+                "file".to_string(),
+                serde_json::json!({ "file_key": "file_v2_repoint" }),
+            )],
+            "the File Message replies under the live card's CURRENT id"
+        );
     }
 
     /// Criterion 3 (spec #501, ticket #504): on the LIVE render path one typed
