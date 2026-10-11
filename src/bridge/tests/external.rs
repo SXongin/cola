@@ -251,6 +251,12 @@ async fn external_file_message_notifies_with_the_record_line() {
         sends, 1,
         "exactly one card is sent, no separate File Message: {calls:?}"
     );
+    assert!(
+        !calls
+            .iter()
+            .any(|c| matches!(c, PlatformCall::SendMessageInThread { .. })),
+        "a user file is never delivered as a File Message: {calls:?}"
+    );
 }
 
 /// A hung per-session message read (a half-open connection left by a server

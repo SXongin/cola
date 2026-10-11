@@ -18,12 +18,10 @@ use crate::bridge::core::SESSION_INFO_TIMEOUT;
 use crate::bridge::handles::{CardsHandle, RequestsHandle, SessionsHandle, TurnHandles};
 use crate::bridge::span;
 use crate::bridge::turn::state;
-use crate::bridge::turn::state::{
-    LedgerCadence, PartSource, PendingFileDelivery, RenderedPart, StreamAccumulator,
-};
+use crate::bridge::turn::state::{LedgerCadence, PartSource, RenderedPart, StreamAccumulator};
 use crate::config::ThreadKey;
 use crate::feishu::card::ledger::{TaskCompletionEntry, TaskEnding, TaskKind, TaskOutput};
-use crate::feishu::card::tool_render::{ChildActivity, TaskLiveness};
+use crate::feishu::card::tool_render::{ChildActivity, FileDelivery, TaskLiveness};
 
 use super::Turn;
 use super::flush::FlushOutcome;
@@ -635,12 +633,10 @@ pub(super) async fn read_planned_outputs(
     }
 }
 
-/// One content hash's in-flight upload (ADR-0076): the process-local cell that
-/// carries the shared resolution, plus the content to upload if this resolver
-/// wins the race to initialize it.
+/// One File Content the render path is about to resolve (ADR-0076): the content
+/// and the content `hash` that keys the process-local upload caches.
 struct InFlightUpload {
     hash: u64,
-    cell: Arc<tokio::sync::OnceCell<Option<String>>>,
     content: FileContent,
 }
 
@@ -648,96 +644,169 @@ struct InFlightUpload {
 /// JSON is built (ADR-0076). An image within Feishu's caps is uploaded once —
 /// cached process-locally by content hash, so identical bytes upload once and
 /// every later PATCH reuses the key — and embedded as an `img` immediately
-/// after its Tool Panel; a file this build cannot embed is left for the File
-/// Message path (#649). Best-effort: a failed upload leaves the panel's
-/// tracking line and never fails the Turn. Runs OUTSIDE the cards lock for the
-/// upload (it is a network call), like the planned-entry output reads. Returns
-/// whether any delivery was attached — a change that owes its card PATCH.
+/// after its Tool Panel; anything else (a non-image, an image past the embed
+/// caps, or an image whose embed upload failed) is uploaded once and posted as
+/// exactly ONE File Message replied in-thread under the live card (#649), or
+/// left `未发送` when it is past Feishu's 30MB cap or the send failed.
+/// Best-effort: a failure leaves the panel's tracking line and never fails the
+/// Turn. Runs OUTSIDE the cards lock for the uploads and the send (they are
+/// network calls), like the planned-entry output reads. Returns whether any
+/// delivery was attached — a change that owes its card PATCH.
 async fn resolve_file_deliveries(cards: &CardsHandle, session_id: &str) -> bool {
-    // 1. Collect the unresolved File Contents under a brief lock, with their
-    //    content hashes. No cache access here, so no nested lock.
-    let pending: Vec<PendingFileDelivery> = {
+    // 1. Collect the unresolved File Contents and the live card's message id
+    //    under a brief lock. No cache access here, so no nested lock.
+    let (pending, card_message_id) = {
         let live = cards.cards.lock().await;
         let Some(card) = live.get(session_id) else {
             return false;
         };
-        card.acc.pending_file_deliveries()
+        (card.acc.pending_file_deliveries(), card.card_message_id.clone())
     };
     if pending.is_empty() {
         return false;
     }
-    // 2. One in-flight guard per distinct content hash, taken under a brief
-    //    lock: the cache's `OnceCell` is shared, so concurrent resolvers of the
-    //    same bytes await ONE upload instead of each missing the cache and
-    //    uploading twice. The Platform owns the embeddability caps and answers
-    //    `Ok(None)` for a content it will not embed — that verdict is cached
-    //    too; a failed upload leaves the cell uninitialized, so a later poll
-    //    retries.
+    // 2. One resolution per distinct content hash, each cached process-locally
+    //    (single-flight), so concurrent resolvers of one hash await ONE upload
+    //    and identical bytes resolve once.
     let mut to_resolve: Vec<InFlightUpload> = Vec::new();
     let mut decided: std::collections::HashSet<u64> = std::collections::HashSet::new();
     for delivery in &pending {
         if !decided.insert(delivery.hash) {
             continue;
         }
-        let cell = {
-            let mut cache = cards.file_images.lock().await;
-            Arc::clone(
-                cache
-                    .entry(delivery.hash)
-                    .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new())),
-            )
-        };
         to_resolve.push(InFlightUpload {
             hash: delivery.hash,
-            cell,
             content: delivery.content.clone(),
         });
     }
-    let mut resolved: std::collections::HashMap<u64, Option<String>> = std::collections::HashMap::new();
+    let mut resolved: std::collections::HashMap<u64, FileDelivery> = std::collections::HashMap::new();
     for upload in to_resolve {
-        let attempt = upload
-            .cell
-            .get_or_try_init(|| async { cards.feishu.upload_image(&upload.content).await })
-            .await;
-        match attempt {
-            Ok(delivery) => {
-                resolved.insert(upload.hash, delivery.clone());
-            }
-            // Never cached: a later poll retries. The card is untouched.
-            Err(error) => {
-                tracing::warn!("file content {:?} upload failed: {error}", upload.content.name)
-            }
+        if let Some(delivery) =
+            resolve_file_delivery(cards, session_id, card_message_id.as_deref(), &upload).await
+        {
+            resolved.insert(upload.hash, delivery);
         }
     }
-    // 3. Attach the keys (and mark the non-embeddable contents considered)
-    //    under a short lock, keyed by content hash so a panel the transcript
-    //    replaced mid-upload cannot be marked with another file's key. A
-    //    content whose upload failed is left unresolved, so a later poll
-    //    retries it.
+    // 3. Attach the deliveries under a short lock, keyed by content hash so a
+    //    panel the transcript replaced mid-resolution cannot be marked with
+    //    another file's state. A content left unresolved (no live card to reply
+    //    under yet) is simply skipped and retried on a later poll.
     let mut live = cards.cards.lock().await;
     let Some(card) = live.get_mut(session_id) else {
         return false;
     };
     let mut changed = false;
     for delivery in pending {
-        match resolved.get(&delivery.hash) {
-            Some(Some(key)) => {
-                card.acc
-                    .set_file_image_key(&delivery.call_id, delivery.index, delivery.hash, key);
-                changed = true;
-            }
-            Some(None) => card
-                .acc
-                .set_file_no_surface(&delivery.call_id, delivery.index, delivery.hash),
-            None => {}
-        }
+        let Some(outcome) = resolved.get(&delivery.hash) else {
+            continue;
+        };
+        card.acc
+            .set_file_delivery(&delivery.call_id, delivery.index, delivery.hash, outcome);
+        changed = true;
     }
     if changed {
-        // An attached image is rendered content, not clock churn: it owes its
+        // A resolved delivery is rendered content, not clock churn: it owes its
         // flush and counts as progress, like a part.
         card.acc.bump_progress_mark();
     }
     changed
+}
+
+/// Resolve ONE File Content's card delivery (ADR-0076, #649): embed an image
+/// within Feishu's caps, else upload the bytes once and send one File Message
+/// in-thread under the live card, else `Undelivered`. Best-effort: every failure
+/// degrades along the ladder (embed upload → File Message → `未发送`) and never
+/// errors. `None` leaves the content unresolved for a later poll — the only
+/// case is a File Message with no live card to reply under yet; the upload
+/// itself is already cached, so only the send is retried.
+async fn resolve_file_delivery(
+    cards: &CardsHandle,
+    session_id: &str,
+    card_message_id: Option<&str>,
+    upload: &InFlightUpload,
+) -> Option<FileDelivery> {
+    // Embed first: an image within the caps uploads once and every later PATCH
+    // reuses the key. A non-image (`Ok(None)`) or a failed embed upload
+    // degrades to the File Message path.
+    let image_cell = {
+        let mut cache = cards.file_images.lock().await;
+        Arc::clone(
+            cache
+                .entry(upload.hash)
+                .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new())),
+        )
+    };
+    match image_cell
+        .get_or_try_init(|| async { cards.feishu.upload_image(&upload.content).await })
+        .await
+    {
+        Ok(Some(image_key)) => {
+            return Some(FileDelivery::Embedded {
+                image_key: image_key.clone(),
+            });
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(
+                "file content {:?} embed upload failed, degrading to a File Message: {error}",
+                upload.content.name
+            );
+            // Cache the degradation so a later panel with the same bytes follows
+            // the same File Message path instead of re-embedding.
+            let _ = image_cell.set(None);
+        }
+    }
+    // File Message: upload once, then send ONE message in-thread. `Ok(None)`
+    // means past Feishu's 30MB cap — nothing was uploaded.
+    let file_cell = {
+        let mut cache = cards.file_uploads.lock().await;
+        Arc::clone(
+            cache
+                .entry(upload.hash)
+                .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new())),
+        )
+    };
+    let file_key = match file_cell
+        .get_or_try_init(|| async { cards.feishu.upload_file(&upload.content).await })
+        .await
+    {
+        Ok(Some(file_key)) => file_key.clone(),
+        Ok(None) => return Some(FileDelivery::Undelivered),
+        Err(error) => {
+            tracing::warn!(
+                "file content {:?} file upload failed: {error}",
+                upload.content.name
+            );
+            return Some(FileDelivery::Undelivered);
+        }
+    };
+    // The send replies under the live card; without one, leave it unresolved so
+    // a later poll (with the card) retries — the upload is already cached.
+    let card_message_id = card_message_id?;
+    // Once-guard: a content whose File Message already went out for this Session
+    // never sends a second one (a cola restart may resend — accepted).
+    let guard = (session_id.to_string(), upload.hash);
+    if cards.file_messages_sent.lock().await.contains(&guard) {
+        return Some(FileDelivery::SentAsFile);
+    }
+    let content = serde_json::json!({ "file_key": file_key });
+    match cards
+        .feishu
+        .send_message_in_thread(card_message_id, "file", &content)
+        .await
+    {
+        Ok(_) => {
+            cards.file_messages_sent.lock().await.insert(guard);
+            Some(FileDelivery::SentAsFile)
+        }
+        Err(error) => {
+            tracing::warn!(
+                "file content {:?} File Message send failed: {error}",
+                upload.content.name
+            );
+            Some(FileDelivery::Undelivered)
+        }
+    }
 }
 
 /// Commit a planned read (spec #593): announce each entry and insert it, under
@@ -5059,6 +5128,21 @@ Index: /x/src/main.rs
         ))
     }
 
+    /// [`read_file_part`] with the File Content's decoded `size` overridden — the
+    /// shape of a payload past Feishu's caps, which a test cannot build as real
+    /// bytes without allocating 30MB.
+    fn read_file_part_sized(call_id: &str, name: &str, mime: &str, bytes: &[u8], size: u64) -> Part {
+        let Part::Tool(mut call) = read_file_part(call_id, name, mime, bytes) else {
+            unreachable!("read_file_part builds a tool part");
+        };
+        for block in &mut call.output.blocks {
+            if let crate::backend::ContentBlock::File(content) = block {
+                content.size = size;
+            }
+        }
+        Part::Tool(call)
+    }
+
     /// Drive one render pass for `sid` with `transcript` and return it.
     async fn render(
         app: &Arc<App>,
@@ -5086,6 +5170,39 @@ Index: /x/src/main.rs
             .iter()
             .filter_map(|call| match call {
                 PlatformCall::UploadImage { mime, size } => Some((mime.clone(), *size)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The `(name, size)` of every file upload the mock recorded, in order.
+    async fn uploaded_files(platform: &RecordingPlatform) -> Vec<(String, u64)> {
+        platform
+            .calls
+            .lock()
+            .await
+            .iter()
+            .filter_map(|call| match call {
+                PlatformCall::UploadFile { name, size } => Some((name.clone(), *size)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every in-thread message the mock recorded, in order:
+    /// `(target message id, msg_type, content)`.
+    async fn sent_messages(platform: &RecordingPlatform) -> Vec<(String, String, serde_json::Value)> {
+        platform
+            .calls
+            .lock()
+            .await
+            .iter()
+            .filter_map(|call| match call {
+                PlatformCall::SendMessageInThread {
+                    message_id,
+                    msg_type,
+                    content,
+                } => Some((message_id.clone(), msg_type.clone(), content.clone())),
                 _ => None,
             })
             .collect()
@@ -5280,16 +5397,18 @@ Index: /x/src/main.rs
         );
     }
 
-    /// A File Content that is not an embeddable image (a PDF) is not uploaded
-    /// and renders no `img`; its panel still names the file. File Messages are
-    /// ticket #649's, deliberately not built here.
+    /// A File Content that is not an embeddable image (a PDF) is uploaded once
+    /// and posted as exactly ONE File Message replied in-thread under the live
+    /// card (#649); the panel line reads `已发送为文件消息` and no `img` is
+    /// emitted. A later poll re-renders the line but never repeats the send.
     #[tokio::test]
-    async fn a_non_image_file_content_is_not_uploaded_and_renders_no_image() {
+    async fn a_non_image_file_content_is_sent_as_one_file_message() {
         let _wd = test_work_dir();
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_config(&dir.path().join("sessions.json"));
         let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
-        let sid = "ses_embed_pdf";
+        platform.given_file_key("file_v2_pdf");
+        let sid = "ses_file_pdf";
         let cards = app.core.cards_handle();
         Turn::seed_card(&cards, sid, Some("om_pdf")).await;
         Turn::set_turn_anchor(&cards, sid, &turn_anchor(0)).await;
@@ -5300,19 +5419,24 @@ Index: /x/src/main.rs
             vec![read_file_part("call_read", "doc.pdf", "application/pdf", b"%PDF")],
         )]);
         render(&app, &cards, sid, &transcript).await;
-        // A later poll must not re-ask: the platform already decided.
-        render(&app, &cards, sid, &transcript).await;
 
         assert!(
             uploaded_images(&platform).await.is_empty(),
-            "a PDF is not uploaded"
+            "a PDF is not an embeddable image"
         );
         assert_eq!(
-            platform
-                .upload_image_calls
-                .load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "the platform decides once; a later poll does not re-ask"
+            uploaded_files(&platform).await,
+            vec![("doc.pdf".to_string(), 4)],
+            "the file is uploaded once, with its decoded size"
+        );
+        assert_eq!(
+            sent_messages(&platform).await,
+            vec![(
+                "om_pdf".to_string(),
+                "file".to_string(),
+                serde_json::json!({ "file_key": "file_v2_pdf" }),
+            )],
+            "exactly one File Message, replied in-thread under the live card"
         );
         let card = final_card(&platform).await;
         assert!(
@@ -5326,26 +5450,101 @@ Index: /x/src/main.rs
         let body = card["body"]["elements"][0]["elements"][0]["content"]
             .as_str()
             .unwrap();
-        assert!(body.contains("📎 doc.pdf · application/pdf · 4 B"), "{body}");
-        assert!(!body.contains("已内嵌"), "{body}");
+        assert!(
+            body.contains("📎 doc.pdf · application/pdf · 4 B · 已发送为文件消息"),
+            "{body}"
+        );
+
+        // A later poll renders new content (forcing its PATCH) but never repeats
+        // the File Message: the send is once, on the first poll the block
+        // appeared, while the tracking line keeps saying it was sent.
+        let second = SessionTranscript::new(vec![
+            message(
+                "a1",
+                1_000,
+                vec![read_file_part("call_read", "doc.pdf", "application/pdf", b"%PDF")],
+            ),
+            message("a2", 2_000, vec![text_part("done")]),
+        ]);
+        render(&app, &cards, sid, &second).await;
+        assert_eq!(
+            sent_messages(&platform).await.len(),
+            1,
+            "the File Message is sent on the first poll only"
+        );
+        assert_eq!(
+            uploaded_files(&platform).await.len(),
+            1,
+            "the bytes are uploaded once"
+        );
+        let body = final_card(&platform).await["body"]["elements"][0]["elements"][0]["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            body.contains("已发送为文件消息"),
+            "the later render keeps the line: {body}"
+        );
     }
 
-    /// A failed upload is best-effort: the card is built intact with the file's
-    /// tracking line, the Turn is not failed, and a later poll retries (the
-    /// failure is never cached) so the image lands once the platform recovers.
+    /// A File Content past Feishu's 30MB message cap is never uploaded and never
+    /// sent: it renders only `未发送` (#649).
     #[tokio::test]
-    async fn a_failed_upload_keeps_the_card_intact_and_is_retried() {
+    async fn an_oversize_file_content_is_never_uploaded_and_reads_undelivered() {
         let _wd = test_work_dir();
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_config(&dir.path().join("sessions.json"));
         let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
-        platform.given_image_key("img_v2_retry");
+        let sid = "ses_file_oversize";
+        let cards = app.core.cards_handle();
+        Turn::seed_card(&cards, sid, Some("om_big")).await;
+        Turn::set_turn_anchor(&cards, sid, &turn_anchor(0)).await;
+
+        let over = crate::feishu::file::MAX_FILE_BYTES + 1;
+        let transcript = SessionTranscript::new(vec![message(
+            "a1",
+            1_000,
+            vec![read_file_part_sized(
+                "call_read",
+                "huge.bin",
+                "application/octet-stream",
+                b"%PDF",
+                over,
+            )],
+        )]);
+        render(&app, &cards, sid, &transcript).await;
+
+        assert!(
+            uploaded_files(&platform).await.is_empty(),
+            "an over-cap file is never uploaded"
+        );
+        assert!(
+            sent_messages(&platform).await.is_empty(),
+            "an over-cap file is never sent"
+        );
+        let body = final_card(&platform).await["body"]["elements"][0]["elements"][0]["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(body.contains("· 未发送"), "{body}");
+    }
+
+    /// The ladder's first rung (#649): an embed upload that fails degrades to a
+    /// File Message, so the image is still delivered — as a file — and the Turn
+    /// is never failed.
+    #[tokio::test]
+    async fn an_embed_upload_failure_degrades_to_a_file_message() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        platform.given_file_key("file_v2_degraded");
         platform
             .fail_upload_image_count
             .store(1, std::sync::atomic::Ordering::SeqCst);
-        let sid = "ses_embed_fail";
+        let sid = "ses_embed_degrade";
         let cards = app.core.cards_handle();
-        Turn::seed_card(&cards, sid, Some("om_fail")).await;
+        Turn::seed_card(&cards, sid, Some("om_degrade")).await;
         Turn::set_turn_anchor(&cards, sid, &turn_anchor(0)).await;
         let transcript = SessionTranscript::new(vec![message(
             "a1",
@@ -5354,10 +5553,20 @@ Index: /x/src/main.rs
         )]);
 
         let pass = render(&app, &cards, sid, &transcript).await;
-        assert!(pass.is_some(), "a failed upload never fails the Turn");
+        assert!(pass.is_some(), "a failed embed upload never fails the Turn");
         assert!(
             uploaded_images(&platform).await.is_empty(),
-            "the failed upload records nothing"
+            "the failed embed upload records nothing"
+        );
+        assert_eq!(
+            uploaded_files(&platform).await,
+            vec![("shot.png".to_string(), 3)],
+            "the image's bytes are uploaded as a file instead"
+        );
+        assert_eq!(
+            sent_messages(&platform).await.len(),
+            1,
+            "exactly one File Message"
         );
         let card = final_card(&platform).await;
         assert!(
@@ -5366,31 +5575,150 @@ Index: /x/src/main.rs
                 .unwrap()
                 .iter()
                 .all(|e| e["tag"] != "img"),
-            "no image without a key: {card}"
+            "no embed without a key: {card}"
         );
         let body = card["body"]["elements"][0]["elements"][0]["content"]
             .as_str()
             .unwrap();
         assert!(
-            body.contains("📎 shot.png · image/png · 3 B"),
-            "the line survives: {body}"
+            body.contains("📎 shot.png · image/png · 3 B · 已发送为文件消息"),
+            "{body}"
         );
+    }
 
-        // The next poll retries: the failure was not cached.
-        render(&app, &cards, sid, &transcript).await;
+    /// The ladder's last rung (#649): a File Message whose send fails degrades
+    /// to `未发送`, best-effort — the card is built intact and the Turn is not
+    /// failed.
+    #[tokio::test]
+    async fn a_file_message_send_failure_degrades_to_undelivered() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        platform
+            .fail_send_message_count
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        let sid = "ses_file_send_fail";
+        let cards = app.core.cards_handle();
+        Turn::seed_card(&cards, sid, Some("om_send_fail")).await;
+        Turn::set_turn_anchor(&cards, sid, &turn_anchor(0)).await;
+        let transcript = SessionTranscript::new(vec![message(
+            "a1",
+            1_000,
+            vec![read_file_part("call_read", "doc.pdf", "application/pdf", b"%PDF")],
+        )]);
+
+        let pass = render(&app, &cards, sid, &transcript).await;
+        assert!(pass.is_some(), "a failed send never fails the Turn");
         assert_eq!(
-            uploaded_images(&platform).await,
-            vec![("image/png".to_string(), 3)],
-            "a later poll uploads the image"
+            uploaded_files(&platform).await.len(),
+            1,
+            "the file still uploads before the send is attempted"
+        );
+        assert!(
+            sent_messages(&platform).await.is_empty(),
+            "the failed send records nothing"
+        );
+        let body = final_card(&platform).await["body"]["elements"][0]["elements"][0]["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(body.contains("· 未发送"), "{body}");
+    }
+
+    /// Identical bytes read by two calls upload once and post exactly ONE File
+    /// Message (ADR-0076/#649): the content hash dedups both, so a turn reading
+    /// the same file twice does not spam the thread.
+    #[tokio::test]
+    async fn identical_file_bytes_upload_and_send_once() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        platform.given_file_key("file_v2_same");
+        let sid = "ses_file_dedup";
+        let cards = app.core.cards_handle();
+        Turn::seed_card(&cards, sid, Some("om_file_dedup")).await;
+        Turn::set_turn_anchor(&cards, sid, &turn_anchor(0)).await;
+
+        let transcript = SessionTranscript::new(vec![message(
+            "a1",
+            1_000,
+            vec![
+                read_file_part("call_read_1", "doc.pdf", "application/pdf", b"%PDF"),
+                read_file_part("call_read_2", "doc.pdf", "application/pdf", b"%PDF"),
+            ],
+        )]);
+        render(&app, &cards, sid, &transcript).await;
+
+        assert_eq!(
+            uploaded_files(&platform).await.len(),
+            1,
+            "identical bytes upload once"
+        );
+        assert_eq!(
+            sent_messages(&platform).await.len(),
+            1,
+            "identical bytes post exactly one File Message"
         );
         let card = final_card(&platform).await;
+        let lines = card["body"]["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["tag"] == "collapsible_panel")
+            .filter(|e| {
+                e["elements"][0]["content"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("已发送为文件消息"))
+            })
+            .count();
+        assert_eq!(lines, 2, "both panels show the sent line: {card}");
+    }
+
+    /// A user message's File Content is never delivered as a File Message
+    /// (ADR-0076, #648): it is record-only, so the render path uploads and sends
+    /// nothing for it.
+    #[tokio::test]
+    async fn a_user_file_part_is_never_sent_as_a_file_message() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        let sid = "ses_user_file";
+        let cards = app.core.cards_handle();
+        Turn::seed_card(&cards, sid, Some("om_user_file")).await;
+        Turn::set_turn_anchor(&cards, sid, &turn_anchor(0)).await;
+
+        let content = crate::backend::FileContent::decode(
+            "data:application/pdf;base64,JVBERi0=",
+            Some("application/pdf"),
+            Some("secret.pdf"),
+        )
+        .expect("an inline payload is a File Content");
+        let transcript = SessionTranscript::new(vec![
+            typed_message(
+                "u1",
+                MessageRole::User,
+                Some(0),
+                vec![text_part("看看这个"), Part::File(content)],
+            ),
+            message("a1", 100, vec![text_part("看到了")]),
+        ]);
+        render(&app, &cards, sid, &transcript).await;
+
         assert!(
-            card["body"]["elements"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|e| e["tag"] == "img" && e["img_key"] == "img_v2_retry"),
-            "the retried upload lands on the card: {card}"
+            uploaded_files(&platform).await.is_empty(),
+            "a user message's file is never uploaded"
+        );
+        assert!(
+            sent_messages(&platform).await.is_empty(),
+            "a user message's file is never sent as a File Message"
+        );
+        let card = final_card(&platform).await.to_string();
+        assert!(
+            !card.contains("已发送为文件消息"),
+            "the live card records no delivery for a user file: {card}"
         );
     }
 
