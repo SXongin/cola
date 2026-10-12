@@ -28,9 +28,13 @@ unchanged.
     completion entry per chain; `wake_floor` is the in-memory mirror of the
     durable **Wake Watermark**; `render_marks` the mirror of the durable
     `rendered` section (ADR-0061/0071, #671/#672).
-  - *Durable* — the **Chain Record** (ADR-0069): `announcements` (the Wake
-    Watermark), `rendered` (synthetic completion keys a delivered card showed,
-    #672), `owed` (a recoverably-failed body's mirror, `src/bridge/chain/records.rs`).
+  - *Durable* — the **Chain Record** (ADR-0069), at `src/bridge/chain/records.rs`:
+    a per-chain `record`, plus **session-scoped sections that outlive it** —
+    `announcements` (the Wake Watermark) and `rendered` (the synthetic
+    completion keys a delivered card showed, #672); `owed` (a recoverably-failed
+    body's mirror) is in-memory. `ChainRecords::release` drops only the chain's
+    `record`, so a fresh, cursorless chain still reads the marks rather than
+    starting blind (ADR-0073's 2026-10-11 amendment).
   - *Planning* — `plan_wake_entries` / `plan_runtime_entries`
     (`src/bridge/turn/render.rs:481/551`) combine the floors, anchors, announce
     sets and rendered marks into the entries a render owes. *Recording* —
@@ -50,11 +54,22 @@ unchanged.
   `live_cards.json`, four `serde(skip)` marks, two in-memory overlays) into one
   **Chain Record** module with one lifecycle. The task lifecycle is the same
   shape one level down.
+- **#671's asked decision is already resolved — this ADR does not reopen it.**
+  #671 asked whether the "one entry on the newest chain" sanction still holds
+  and, if it should be tightened, proposed a durable mark separate from the
+  Wake Watermark. #672/#676 landed exactly that mark, and ADR-0073's
+  2026-10-11 amendment records the tightened semantics: once a delivered card
+  has shown a synthetic retirement's entry, no later chain — restart included —
+  re-renders it, because the marks are session-scoped and survive the observing
+  chain's record release. A restart may still create a card; its *entry* no
+  longer replays. What this ADR leaves open is a different, structural question
+  — see the next bullet — not the sanction's validity.
 - **Two adjacent deepenings are deliberately *not* folded in.** Making an
-  **ending** a durable fact rendered by the **Rendered Cursor** (so the
-  exactly-once is the cursor's job, not a parallel `rendered` set) would change
-  ADR-0065/0073's duplicate-over-loss trade and dissolve the two-key problem
-  behind #659; and resolving liveness from its three sources (transcript,
+  **ending** a durable fact rendered by the **Rendered Cursor** (so exactly-once
+  is the cursor's job, not a parallel `rendered` set) would dissolve the
+  two-key-space problem behind #659 and let the module own one ending identity;
+  it is a structural change to ADR-0061/0065/0073's design, and it is #683's own
+  ADR, not this one. And resolving liveness from its three sources (transcript,
   runtime registries, child transcript) behind one **TaskLiveness** interface is
   a pure function, a different concern from owning state. Both are their own
   ADR/PR.
@@ -79,13 +94,14 @@ unchanged.
   `src/feishu/card/ledger.rs`.
 - **The seam is internal.** A new module inside `src/bridge/`, not a new trait:
   there is exactly one adapter behind it, so a port would be a hypothetical
-  seam. The adapter's `BackgroundTaskOverlay` folds into the module, and the
-  bridge reads through a wrapper that applies the module's view;
+  seam. The adapter's `BackgroundTaskOverlay` bytes fold into the module, but
+  the OpenCode adapter keeps applying it to every read through a module-owned
+  handle (so every reader still sees a corrected read);
   `Backend::retire_background_tasks` / `set_unconfirmed_tasks` leave the trait.
 - **The durable-ownership *decision* is the module's; the staging *mechanics*
   stay in the flush.** The module says which facts a write makes durable (and
   which are volatile); the flush owns staged cursors, the owed mirror and the
-  capacity bounds. The two meet at one `commit(accepted keys)` seam — so the
+  capacity bounds. The two meet at the module's one commit seam — so the
   card-write pipeline does not leak into the task module.
 - **Zero behaviour change in the first slice.** Ticket 1 is a pure physical
   move (new module, sets relocated, callers untouched); later tickets replace
@@ -125,10 +141,10 @@ vocabulary, and rejecting the maximal design's generality:
 - **The overlay keeps its free application.** Its bytes move into the module,
   but it is still applied at the read seam — a module-owned handle the OpenCode
   adapter holds — so every reader (the reap's settle, the Snapshot status line)
-  still sees the corrected read without calling anything. This **revises Q8's
-  "the adapter stops filtering"**: the apply point stays; only the home of the
-  bytes moves. Applying it inside `read` instead was rejected because a reader
-  that skips `read` would see the raw launch list.
+  still sees the corrected read without calling anything. **The apply point
+  stays where it is; only the home of the bytes moves.** Applying it inside
+  `read` instead was rejected because a reader that skips `read` would see the
+  raw launch list.
 - **Restart re-derivation is one call.** `restore(record, scope)` seeds the
   durable tier (the Wake floor and the rendered marks) at chain install, so the
   seed-then-install race the four `seed_durable_announcements` sites police
@@ -139,7 +155,7 @@ vocabulary, and rejecting the maximal design's generality:
   as an internal representation. The minimal design's two semantic deltas —
   committing the overlay on *delivery* rather than *acceptance*, and a
   session-scoped announce set — are **not** taken in this slice; they belong to
-  the durable-ending deepening above.
+  the durable-ending deepening (#683).
 
 ## Why
 
@@ -167,10 +183,11 @@ vocabulary, and rejecting the maximal design's generality:
 - **A new port (trait) for the state, with an in-memory adapter for tests.** One
   real adapter is a hypothetical seam; the testability win comes from the read
   model, not from a trait. Rejected.
-- **Fold the durable ending (candidate 2) in now.** It is the root of #671's
-  *class* and of #659, but it changes ADR-0065/0073's trade; shipping both at
-  once repeats #672's mistake. Deferred to its own ADR/PR.
-- **Fold the TaskLiveness resolution (candidate 3) in now.** A pure function and
+- **Fold the durable ending (#683) in now.** It dissolves the two announce key
+  spaces behind #659, but it is a structural change to ADR-0061/0065/0073's
+  design; shipping both at once repeats #672's mistake. Deferred to its own
+  ADR/PR.
+- **Fold the TaskLiveness resolution (#684) in now.** A pure function and
   a state owner are different concerns; each earns its own interface. Deferred.
 - **Absorb the card renderer.** The module would then depend on card JSON and
   could not be tested on a read model. Rejected.
@@ -181,16 +198,20 @@ vocabulary, and rejecting the maximal design's generality:
 
 ## Consequences
 
-- The module's read model is the new test surface: `ledger.rs` / `wake.rs`
-  integration tests stay as the end-to-end net, and unit tests feed the three
-  inputs and assert rows / owed entries / overlay.
+- The module's read model (its `read` / `apply` interface) becomes the new test
+  surface once the callers are routed through it; until then the `ledger.rs` /
+  `wake.rs` / `reap.rs` integration tests are the end-to-end net, and the pure
+  move lands with them unchanged.
 - Migration is staged: ticket 1 is a pure physical move with no behavior change;
   later tickets replace callers (the bridge read wrapper, `ReconcilePass`,
   `plan_*`, the Cleanup click) and, last, retire `Backend::retire_background_tasks`
   / `set_unconfirmed_tasks`.
-- **#671's class is not closed by this ADR, only its cause is named.** Until the
-  durable-ending deepening lands, a Wake-less retirement is still exactly-once
-  through the `rendered` marks, and the two-key problem behind #659 remains.
+- **#671's replay is already fixed; what stays deferred is its *structure*.**
+  The session-scoped `rendered` marks (ADR-0073's 2026-10-11 amendment) suppress
+  a Wake-less retirement's re-render across a restart, so this ADR reopens no
+  sanction. It defers only #683: making the ending itself durable so exactly-once
+  is the **Rendered Cursor**'s job and the two announce key spaces behind #659
+  dissolve.
 - `plan_wake_entries` / `plan_runtime_entries` and the overlay move behind the
   seam: callers no longer see `announced_wakes`, `wake_floor`, `render_marks`
   or the `BackgroundTaskOverlay`.
