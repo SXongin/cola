@@ -544,17 +544,25 @@ fn plan_wake_entries(
         // still renders, and NOTHING durable is staged here for the Wake — its
         // Watermark stays where it was (ADR-0061; #595's "a late Wake for a
         // cleared task behaves as before"), exactly as the retirement itself
-        // never moved it. Two gates cover the two lives:
+        // never moved it.
         //
-        // - the evidence key this chain already announced (above) or recorded on
-        //   a DELIVERED card (the durable rendered mark, issue #671 / ticket
-        //   #672) covers every read after the one that retired the run, the
-        //   restart included — and only an EVIDENCE ending mints it, so a user's
-        //   🧹 cleanup never suppresses a late Wake's own completion (spec #590,
-        //   `cleanup_announce_key`);
-        // - a retirement of this run in THIS read (the reconcile just derived it
-        //   here, so nothing is announced yet): its entry is planned below and is
-        //   the run's record.
+        // The gate is the run's EVIDENCE key, in the two places that fact can
+        // already live: this chain's announce set (a retirement committed in this
+        // life — its plan and this Wake's cannot both be planned, since the
+        // commit re-checks) and the durable rendered mark a DELIVERED card left
+        // (issue #671 / ticket #672), which is what covers the read that carries
+        // the late Wake after a restart — the retirement's overlay is
+        // process-local, so no later read re-derives it. Only an EVIDENCE ending
+        // mints that key, so a user's 🧹 cleanup never suppresses a late Wake's
+        // own completion (spec #590, `cleanup_announce_key`).
+        //
+        // There is deliberately NO same-read clause ("a retirement THIS read
+        // derived"), the shape issue #659's fix direction first names: a read
+        // cannot carry both facts. The V2 decoder drops every task a read's Wake
+        // retires from that read's live list (`decode_background_tasks`,
+        // `src/opencode/v2/wire.rs`) before any reconcile runs, and the
+        // reconcile retires only tasks still live, so the run this Wake
+        // completes can never have a retirement derived beside it.
         let mut evidence_key = None;
         if let Some(task) = wake_retired_task(wake, transcript) {
             // The EVIDENCE key only: the pre-#659 spelling is deliberately not
@@ -564,11 +572,7 @@ fn plan_wake_entries(
             // [`super::state::legacy_retirement_announce_key`]).
             let key = super::state::ended_announce_key(task.tool.call_id.as_str());
             let recorded = acc.wake_announced(&key) || acc.render_recorded(&key);
-            let derived_here = transcript.task_retirements.iter().any(|retirement| {
-                retirement.task.tool.call_id == task.tool.call_id
-                    && !matches!(retirement.ending, TaskRetirementEnding::Cleaned)
-            });
-            if recorded || derived_here {
+            if recorded {
                 continue;
             }
             // Carried to the commit, which re-checks it: a plan this one raced
