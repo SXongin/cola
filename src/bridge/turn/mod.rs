@@ -969,7 +969,7 @@ impl Turn {
                     render::render_new_turn_parts_committing(
                         acc,
                         transcript,
-                        &handles.cards.chains.rendered(&self.session_id),
+                        &Turn::recorded_marks(&handles.cards, &self.session_id),
                         plans,
                     );
                 }
@@ -2136,6 +2136,10 @@ impl Turn {
         let (message_id, created_ms, context_directory, reply_to, confirmed) = {
             let mut live = cards.cards.lock().await;
             let Some(card) = live.get_mut(session_id) else {
+                // The session is gone, but the create DELIVERED: mark its keys —
+                // session-scoped, and there is no live chain to tell (issue
+                // #671, ticket #672).
+                cards.chains.record_rendered(session_id, rendered);
                 return;
             };
             let confirmed = card.acc.take_staged_cursor(card_message_id, expected);
@@ -2152,10 +2156,18 @@ impl Turn {
                 (confirmed),
             )
         };
+        // The delivered keys the re-point carries: a superseded/confirmed
+        // stage's own, or the caller's for a create whose stage was gone.
+        let keys: Vec<String> = match &confirmed {
+            Some(confirmed) => confirmed.rendered.clone(),
+            None => rendered.to_vec(),
+        };
         // A card with no Turn message to scope a settle decision with cannot be
         // reaped: no record, no reap attempt after a restart — the same rule
-        // [`Self::track_live_card`] applies.
+        // [`Self::track_live_card`] applies. The create still DELIVERED, though,
+        // so its keys are marked (issue #671, ticket #672).
         let Some(message_id) = message_id else {
+            cards.chains.record_rendered(session_id, &keys);
             return;
         };
         let previous = match confirmed.as_ref() {
@@ -2176,28 +2188,27 @@ impl Turn {
                     .map(|coverage| (&coverage.frontier, coverage.complete)),
                 &confirmed.rendered,
             ),
-            _ => cards.chains.track(
+            _ => cards.chains.track_carrying_rendered(
                 session_id,
                 card_message_id,
                 message_id,
                 created_ms,
                 context_directory.as_deref(),
                 reply_to.as_deref(),
+                rendered,
             ),
         };
-        if confirmed.is_none() {
-            // The create landed but its stage can no longer be taken — the
-            // session was replaced, or the cap evicted it. The body still
-            // delivered, so its keys are marked and the live session's
-            // accumulator gate is told, exactly like a lost projection takeover
-            // (issue #671, ticket #672).
+        {
+            // Whatever chain owns the Session now takes the delivered keys into
+            // its gate (issue #671, ticket #672): a chain that SEEDED before
+            // this landing holds the older, empty mark set, and without the
+            // insert its next read would re-plan the entry.
             let mut live = cards.cards.lock().await;
-            crate::bridge::turn::wake::record_landed_rendered(
-                cards,
-                live.get_mut(session_id),
-                session_id,
-                rendered,
-            );
+            if let Some(card) = live.get_mut(session_id) {
+                for key in &keys {
+                    card.acc.announce_synthetic(key);
+                }
+            }
         }
         // A re-point within the chain carries the Rendered Cursor (spec #561):
         // seed a fresh accumulator's empty base with the carried fact, while a
@@ -2621,7 +2632,7 @@ impl Turn {
                     &HashMap::new(),
                     now_ms,
                     state::LedgerCadence::Minute,
-                    &cards.chains.rendered(session_id),
+                    &Turn::recorded_marks(cards, session_id),
                     plans,
                 );
             card.pending_split.push(state::PendingSplit {
@@ -2709,7 +2720,7 @@ impl Turn {
                 &HashMap::new(),
                 now_ms,
                 state::LedgerCadence::Second,
-                &cards.chains.rendered(session_id),
+                &Turn::recorded_marks(cards, session_id),
                 plans,
             );
             // The chain has taken this completion's work over, when there is
@@ -2950,7 +2961,7 @@ impl Turn {
                 &activities,
                 now_ms,
                 state::LedgerCadence::Second,
-                &cards.chains.rendered(session_id),
+                &Turn::recorded_marks(cards, session_id),
                 plans,
             );
             // The read's own settle decision judges the true end (ADR-0059):
@@ -3308,6 +3319,24 @@ impl Turn {
         let mut live = cards.cards.lock().await;
         Self::seed_durable_announcements(cards, session_id, &mut acc);
         live.insert(session_id.to_string(), state::CardSession::new(acc, None));
+    }
+
+    /// The durable rendered marks a commit must honor for `session_id` (issue
+    /// #671, ticket #672): the recorded marks, PLUS the owed mirrors whose
+    /// payload has ALREADY delivered. A queued PATCH can deliver before the
+    /// drain reconcile records its mark, and a chain committing in that window
+    /// must not render the entry the delivered card already showed. Call from
+    /// under the cards lock (the commit's own critical section).
+    pub(crate) fn recorded_marks(cards: &CardsHandle, session_id: &str) -> Vec<String> {
+        // One chains snapshot for both halves (issue #671, ticket #672): two
+        // separate reads could each miss a concurrent accepted write.
+        let (mut marks, owed) = cards.chains.marks_and_owed(session_id);
+        for (card, owed) in owed {
+            if cards.feishu.card_write_delivered(&card, owed.seq) {
+                marks.extend(owed.rendered);
+            }
+        }
+        marks
     }
 
     /// Whether the session's card has rendered any part — the external
@@ -4349,6 +4378,119 @@ mod tests {
             skills: Vec::new(),
             advisory_live: false,
         }
+    }
+
+    /// Issue #671 / ticket #672 (CI gate): a continuation create whose staged
+    /// cursor can no longer be taken — the cap evicted it — still marks what the
+    /// create delivered, in the SAME write as the re-point; and a create whose
+    /// Session is gone still marks its keys (session-scoped).
+    #[tokio::test]
+    async fn a_continuation_without_its_stage_still_marks_its_keys() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        let cards = app.cards_handle();
+        Turn::seed_card(&cards, "ses_test", None).await;
+        Turn::set_turn_anchor(
+            &cards,
+            "ses_test",
+            &crate::bridge::test_support::turn_anchor(1_000),
+        )
+        .await;
+
+        let writes0 = cards.chains.writes();
+        // No stage matches (id 0): the created card delivered its entries.
+        Turn::track_continuation_card(
+            &cards,
+            "ses_test",
+            "om_next",
+            state::StagedCursorId {
+                id: 0,
+                awaiting_seq: None,
+            },
+            &["runtime:call_1".to_string()],
+        )
+        .await;
+        assert!(
+            cards
+                .chains
+                .rendered("ses_test")
+                .iter()
+                .any(|key| key == "runtime:call_1"),
+            "a continuation without its stage marks its keys: {:?}",
+            cards.chains.rendered("ses_test")
+        );
+        assert_eq!(
+            cards.chains.writes() - writes0,
+            1,
+            "the mark and the re-point ride ONE write"
+        );
+        assert_eq!(
+            cards
+                .chains
+                .get("ses_test")
+                .expect("the re-pointed record")
+                .card_message_id,
+            "om_next",
+            "the continuation re-pointed the record onto its new card"
+        );
+        assert!(
+            cards
+                .cards
+                .lock()
+                .await
+                .get("ses_test")
+                .expect("the continuation session")
+                .acc
+                .wake_announced("runtime:call_1"),
+            "the live gate takes the delivered keys"
+        );
+
+        // A create whose Session is gone still marks its keys.
+        Turn::drop_card(&cards, "ses_test").await;
+        Turn::track_continuation_card(
+            &cards,
+            "ses_test",
+            "om_last",
+            state::StagedCursorId {
+                id: 0,
+                awaiting_seq: None,
+            },
+            &["runtime:call_2".to_string()],
+        )
+        .await;
+        assert!(
+            cards
+                .chains
+                .rendered("ses_test")
+                .iter()
+                .any(|key| key == "runtime:call_2"),
+            "a vanished session's continuation still marks its keys"
+        );
+
+        // A live card with no Turn anchor to scope a record still marks its
+        // delivered keys (issue #671, ticket #672).
+        Turn::seed_card(&cards, "ses_test", None).await;
+        Turn::track_continuation_card(
+            &cards,
+            "ses_test",
+            "om_bare",
+            state::StagedCursorId {
+                id: 0,
+                awaiting_seq: None,
+            },
+            &["runtime:call_3".to_string()],
+        )
+        .await;
+        assert!(
+            cards
+                .chains
+                .rendered("ses_test")
+                .iter()
+                .any(|key| key == "runtime:call_3"),
+            "an anchorless card still marks its delivered keys"
+        );
     }
 
     /// A takeover's seed lands only in the successor it was read for (spec

@@ -974,11 +974,10 @@ impl LedgerChange {
 /// review #569): the newest stage plus the delivered-but-unconfirmed ones a
 /// delayed confirmation still needs. Real interleavings hold two; the cap only
 /// bounds a pathological pile-up (every stage resolves on its own write's
-/// outcome or the next drain). Eviction drops the oldest stage that is owed
-/// (its rendered keys, if any, are mirrored on the Chain Records, and only its
-/// cursor is left behind — the trade this cap already made) or that carries no
-/// keys; an unowed keyed stage is an in-flight confirmation whose keys exist
-/// nowhere else, and it resolves on its own send.
+/// outcome or the next drain). An evicted stage loses only its cursor and gap:
+/// an accepted write records its rendered keys the moment it is accepted (issue
+/// #671, ticket #672) and a recoverably-failed body's are mirrored on the Chain
+/// Records, so the cap can never drop the mark.
 const MAX_STAGED_CURSORS: usize = 4;
 
 /// The most staged Wake Watermarks one accumulator retains (spec #561, review
@@ -1016,10 +1015,11 @@ pub(super) struct StagedCursor {
     /// nothing, leaving the entry to the next card that can carry it. They ride
     /// the cursor stage on purpose: that stage is the machinery that already
     /// distinguishes a DELIVERED write from an owed or refused one (spec #561,
-    /// review #569), including the later delivery of a queued payload. Because a
-    /// stage can be evicted at its capacity bound, an owed body's keys are ALSO
-    /// mirrored on the Chain Record's owed mirror), so the
-    /// mark is never lost to the cap.
+    /// review #569), including the later delivery of a queued payload. They are
+    /// not the mark's only copy, though: an accepted write records the keys the
+    /// moment it is accepted and a recoverably-failed body's are mirrored on the
+    /// Chain Records, so eviction or a cancelled confirmation can only lose the
+    /// cursor, never the mark.
     pub(super) rendered: Vec<String>,
 }
 
@@ -2725,24 +2725,8 @@ impl StreamAccumulator {
             rendered,
         });
         if self.staged_cursors.len() > MAX_STAGED_CURSORS {
-            // Drop the OLDEST stage that is safe to drop (issue #671, ticket
-            // #672): one whose payload is still owed (its keys, if any, are
-            // mirrored on the Chain Records, and its cursor is left behind — the
-            // trade this cap already made, spec #561, review #569) or one that
-            // carries no rendered keys. A stage that is UNOWED and carries keys
-            // is an in-flight confirmation whose keys exist nowhere else, so it
-            // is never evicted — and it resolves on its own send, so it does not
-            // accumulate.
-            let mut excess = self.staged_cursors.len() - MAX_STAGED_CURSORS;
-            let mut retained = Vec::with_capacity(self.staged_cursors.len());
-            for stage in self.staged_cursors.drain(..) {
-                if excess > 0 && (stage.awaiting_seq.is_some() || stage.rendered.is_empty()) {
-                    excess -= 1;
-                    continue;
-                }
-                retained.push(stage);
-            }
-            self.staged_cursors = retained;
+            let excess = self.staged_cursors.len() - MAX_STAGED_CURSORS;
+            self.staged_cursors.drain(..excess);
         }
         self.cursor_stage_seq
     }
@@ -7122,86 +7106,6 @@ mod tests {
             stale.rendered,
             vec!["runtime:call_2".to_string()],
             "its delivered keys still owe their mark"
-        );
-    }
-
-    /// Issue #671 / ticket #672 (CI gate): the stage cap must never evict a
-    /// stage that carries rendered keys — that stage is the key's ONLY copy, so
-    /// losing it re-shows a delivered retirement after the next restart. Only a
-    /// keyless stage is ever dropped; its cursor and gap alone are left behind,
-    /// the trade this cap already made (spec #561, review #569).
-    #[test]
-    fn the_stage_cap_never_evicts_a_stage_carrying_keys() {
-        let mut acc = StreamAccumulator::new("test");
-        // Worst case first: the cap is full of OWED stages and a fresh keyed
-        // body is staged past it. The keyed body must survive and still confirm
-        // (it is the only copy of its entries' marks).
-        for seq in 1..=MAX_STAGED_CURSORS as u64 {
-            let owed = acc.stage_cursor(Some("om_card"), RenderedCursor::default(), None, Vec::new());
-            acc.await_cursor_write(
-                StagedCursorId {
-                    id: owed,
-                    awaiting_seq: None,
-                },
-                "om_card",
-                seq,
-            );
-        }
-        let keyed = acc.stage_cursor(
-            Some("om_card"),
-            RenderedCursor::default(),
-            None,
-            vec!["runtime:call_1".to_string()],
-        );
-        let confirmed = acc
-            .take_staged_cursor(
-                "om_card",
-                StagedCursorId {
-                    id: keyed,
-                    awaiting_seq: None,
-                },
-            )
-            .expect("a keyed body survives a cap full of owed stages");
-        assert_eq!(
-            confirmed.rendered,
-            vec!["runtime:call_1".to_string()],
-            "its keys reach the durable record"
-        );
-
-        // The victim is always a KEYLESS stage: the oldest goes, the keyed body
-        // stays, so the retained set stays bounded.
-        let mut acc = StreamAccumulator::new("test");
-        let oldest = acc.stage_cursor(Some("om_card"), RenderedCursor::default(), None, Vec::new());
-        for _ in 1..MAX_STAGED_CURSORS {
-            acc.stage_cursor(Some("om_card"), RenderedCursor::default(), None, Vec::new());
-        }
-        let keyed = acc.stage_cursor(
-            Some("om_card"),
-            RenderedCursor::default(),
-            None,
-            vec!["runtime:call_2".to_string()],
-        );
-        assert!(
-            acc.take_staged_cursor(
-                "om_card",
-                StagedCursorId {
-                    id: oldest,
-                    awaiting_seq: None,
-                },
-            )
-            .is_none(),
-            "the oldest keyless stage is the eviction victim"
-        );
-        assert!(
-            acc.take_staged_cursor(
-                "om_card",
-                StagedCursorId {
-                    id: keyed,
-                    awaiting_seq: None,
-                },
-            )
-            .is_some(),
-            "a keyed body is never the eviction victim"
         );
     }
 

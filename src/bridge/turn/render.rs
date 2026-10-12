@@ -2023,8 +2023,11 @@ async fn render_and_flush_inner(
         let mut live = cards.cards.lock().await;
         match live.get_mut(session_id) {
             Some(card) => {
-                let inserted =
-                    commit_planned_entries(&mut card.acc, plans, &cards.chains.rendered(session_id));
+                let inserted = commit_planned_entries(
+                    &mut card.acc,
+                    plans,
+                    &super::Turn::recorded_marks(cards, session_id),
+                );
                 if inserted {
                     // An inserted entry is rendered content, not clock churn:
                     // it owes its flush and counts as progress, like a part.
