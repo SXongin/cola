@@ -24,9 +24,12 @@
 //!   **Chain Record**: it keys each cell by `(session, chain generation)` — the
 //!   generation selects the entry, and a re-install prunes the session's other
 //!   generations — and reads the durable tier a fresh cell is seeded from.
+//! - [`liveness::BackgroundTaskOverlay`] — the volatile liveness memoization
+//!   (#682), moved out of the Backend's transcript module: the module owns the
+//!   bytes, while the adapter keeps holding one instance and applying it to
+//!   every read at the pinned apply seam.
 //!
-//! The liveness overlay (#682) moves in next, behind the `read` / `apply`
-//! interface. Nothing about the behaviour changes here.
+//! Nothing about the behaviour changes here.
 //!
 //! # Lock order
 //!
@@ -47,8 +50,10 @@
 //! argument.
 
 pub(crate) mod handle;
+pub(crate) mod liveness;
 pub(crate) mod model;
 pub(crate) mod state;
 
 pub(crate) use handle::TasksHandle;
+pub(crate) use liveness::BackgroundTaskOverlay;
 pub(crate) use state::TaskCell;

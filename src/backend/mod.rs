@@ -359,34 +359,23 @@ pub trait Backend: Send + Sync {
         children: &[String],
     ) -> Result<TaskRuntime>;
 
-    /// Record the Background Tasks a runtime reconciliation retired for one
-    /// session (issue #454), so every later [`Self::transcript`] read drops
-    /// them from its live list. The launch record in the transcript never
-    /// flips, so without this overlay the next read would resurrect the task
-    /// on a live card and the next Turn would yield waiting on it again. The
-    /// cleanup click's own reconcile rides its card refresh's gate (review,
-    /// PR #595): a refused write records nothing.
+    /// The Background Task liveness overlay this cola life established (issue
+    /// #454, review #588): the adapter applies it to every [`Self::transcript`]
+    /// read, so a task the runtime confirmed ended leaves the live list and a
+    /// task it could not confirm as running carries its `⚠️ 状态待确认` marker
+    /// on every read path — the reap's settle, a drain tick, the follow, the
+    /// Snapshot status line and the cleanup click's own read alike.
+    ///
+    /// The overlay's bytes live in the Background Task State module
+    /// ([`crate::bridge::tasks::BackgroundTaskOverlay`]), which owns `record` /
+    /// `set_unconfirmed` / `apply`; the adapter holds the instance it applies
+    /// and hands it out here, so the Bridge records through exactly the handle
+    /// every later read goes through (ticket #682, ADR-0079).
     ///
     /// In-memory on purpose: it is a cola-life overlay, not durable state. A
-    /// restart loses it and the next read re-derives the same retirement.
-    fn retire_background_tasks(&self, session_id: &str, call_ids: &[String]);
-
-    /// Replace one session's unconfirmed-Background-Task marker set (review,
-    /// spec #588) with exactly `call_ids` — the reconciliation's post-verdict
-    /// set of live tasks it could not confirm as running. Every later
-    /// [`Self::transcript`] read re-applies the recorded markers (a marker
-    /// only surfaces for a task still live in that read), so a read the shared
-    /// 30 s throttle did not spend a verdict on — a Session Sync refresh, a
-    /// drain tick, the follow, the cleanup click's own read — cannot drop a
-    /// `⚠️ 状态待确认` marker and the cleanup button it gates; only a verdict
-    /// resolves one (a `Running` child clears its marker). Called only after a
-    /// successful verdict read — a failed or timed-out one changes nothing —
-    /// by the reconcile itself or, from the cleanup click, once its card
-    /// refresh landed (review, PR #595).
-    ///
-    /// In-memory on purpose, like [`Self::retire_background_tasks`]: a restart
-    /// loses the markers and the next verdict re-derives them.
-    fn set_unconfirmed_tasks(&self, session_id: &str, call_ids: &[String]);
+    /// restart loses it and the next read re-derives the same retirement, the
+    /// next verdict the same markers.
+    fn task_overlay(&self) -> &crate::bridge::tasks::BackgroundTaskOverlay;
 
     /// Read one shell's captured output window (spec #588, ticket #592): the
     /// record's last [`SHELL_OUTPUT_WINDOW_BYTES`] bytes, decoded and clipped

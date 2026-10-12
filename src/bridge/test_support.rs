@@ -1493,9 +1493,9 @@ pub struct MockBackend {
     /// review PR #595).
     pub hang_shell_output: Arc<std::sync::atomic::AtomicUsize>,
     /// The Background Task overlay (issue #454, review #588): recorded
-    /// through `retire_background_tasks` / `set_unconfirmed_tasks` and applied
-    /// inside `transcript`, exactly like the real adapter's.
-    pub overlay: crate::backend::BackgroundTaskOverlay,
+    /// through the module's `record` / `set_unconfirmed` and applied inside
+    /// `transcript`, exactly like the real adapter's.
+    pub overlay: crate::bridge::tasks::BackgroundTaskOverlay,
     /// When set, `session_status` fails with this message (simulates a read
     /// failure — the caller must not guess a status).
     pub session_status_error: Option<String>,
@@ -1646,7 +1646,7 @@ impl MockBackend {
             shell_output_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             fail_shell_output_reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             hang_shell_output: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            overlay: crate::backend::BackgroundTaskOverlay::default(),
+            overlay: crate::bridge::tasks::BackgroundTaskOverlay::default(),
             session_status_error: None,
             session_status_fails: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             growing_transcript: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2946,12 +2946,8 @@ impl crate::backend::Backend for MockBackend {
             .unwrap_or(crate::backend::ChildEvidence::Unfinished))
     }
 
-    fn retire_background_tasks(&self, session_id: &str, call_ids: &[String]) {
-        self.overlay.record(session_id, call_ids);
-    }
-
-    fn set_unconfirmed_tasks(&self, session_id: &str, call_ids: &[String]) {
-        self.overlay.set_unconfirmed(session_id, call_ids);
+    fn task_overlay(&self) -> &crate::bridge::tasks::BackgroundTaskOverlay {
+        &self.overlay
     }
 
     /// The scripted output window (spec #588, #592), keyed by shell id; a
