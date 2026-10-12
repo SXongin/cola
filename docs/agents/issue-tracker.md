@@ -37,6 +37,8 @@ Run `gh issue view <number> --comments`.
 
 A spec is an issue; its tickets are standalone issues linked back to it by a `## Parent` body reference. `/to-tickets` writes the reference when the spec issue is the source it was given, so pass the spec's issue number to `/to-tickets`. To resolve a spec's batch: list the spec's open children (every open issue whose `## Parent` names the spec issue) and keep the `ready-for-agent` ones as the runnable set; every other child is a reported drop, never a silent omission.
 
+An acceptance criterion that names a lifecycle word — *accepted*, *delivered*, *rendered*, *committed* — must cite the predicate that decides it (a code symbol like `FlushOutcome::accepted`, or the shape in words: "a delivered-only drain"), never the word alone. A criterion reading "persist only after the write is **accepted** … a write still owed a retry by the outbox does not record" is self-contradictory where `accepted` already includes owed, and it costs a review round to untangle.
+
 ## Wayfinding operations
 
 Used by `/wayfinder`. The **map** is a single issue with **child** issues as tickets.
