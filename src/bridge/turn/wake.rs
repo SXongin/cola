@@ -156,9 +156,26 @@ pub(crate) struct ProjectedSlice {
 /// session a fresh Turn replaced meanwhile (issue #671, ticket #672). The
 /// create is what put the body on a card, so the mark is owed; it is
 /// session-scoped, so it needs no record.
-fn record_landed_rendered(cards: &CardsHandle, session_id: &str, rendered: &[String]) {
-    if !rendered.is_empty() {
-        cards.chains.record_rendered(session_id, rendered);
+///
+/// The live accumulator takes the keys into its announce gate as well when the
+/// caller has one: a chain that SEEDED before this mark landed (a fresh Turn
+/// that started while the create was in flight) holds the older, empty set, so
+/// without this its next read would re-plan and re-render the very entry this
+/// card just showed.
+fn record_landed_rendered(
+    cards: &CardsHandle,
+    live: Option<&mut state::CardSession>,
+    session_id: &str,
+    rendered: &[String],
+) {
+    if rendered.is_empty() {
+        return;
+    }
+    cards.chains.record_rendered(session_id, rendered);
+    if let Some(card) = live {
+        for key in rendered {
+            card.acc.announce_synthetic(key);
+        }
     }
 }
 
@@ -875,15 +892,16 @@ impl Turn {
             // create landed, so the entries it rendered still get their
             // durable mark (issue #671, ticket #672) — session-scoped, and
             // independent of the record.
-            record_landed_rendered(cards, session_id, rendered);
+            record_landed_rendered(cards, None, session_id, rendered);
             return None;
         };
         if card.chain_id() != chain_id || (require_unattached && card.card_message_id.is_some()) {
             // A fresh Turn owns the session now: its record is not ours to
             // re-point, but this body's create DID land, so its rendered keys
-            // are still marked — the successor card showed them (issue #671,
-            // ticket #672).
-            record_landed_rendered(cards, session_id, rendered);
+            // are still marked — the successor card showed them — and the
+            // Turn's own accumulator is told, so it cannot re-render them
+            // (issue #671, ticket #672).
+            record_landed_rendered(cards, Some(card), session_id, rendered);
             return None;
         }
         if let Some(card_is_live) = card_is_live {
@@ -1272,6 +1290,14 @@ mod tests {
             *fresh.acc.cursor(),
             RenderedCursor::default(),
             "no carried cursor is seeded into a replaced session"
+        );
+        // The replacement seeded its accumulator BEFORE the create landed, so
+        // its durable-mark set is empty — the landed keys must reach its
+        // announce gate too, or its next read re-renders the very entry the
+        // successor card just showed (issue #671, ticket #672).
+        assert!(
+            fresh.acc.wake_announced("runtime:call_1"),
+            "a replaced chain's gate takes the landed create's keys"
         );
         drop(live);
         assert_eq!(
