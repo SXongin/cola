@@ -280,6 +280,17 @@ restart itself creates the card and pushes it.
   re-point still marks what its landed create rendered — the create is what put
   the body on a card, and the mark is session-scoped, so it needs no record
   write.
+- A chain's read of the marks and its own install are **one critical section**
+  (found in review, twice). A fresh Turn used to seed before its `begin_turn`
+  await and insert after, and an external arm seed before its
+  `attach_work_context` await: a landed body writing a mark in that gap left the
+  new chain holding the older, empty set, and its next read re-rendered the
+  entry the successor card had just shown. Seeded under the install, the
+  orderings are total — a mark landing first is already durable when the seed
+  reads, one landing after finds this chain's session and reaches its announce
+  gate. A projection arm reads its seed inside the critical section that proves
+  the session still has no card and plans there: no writer exists while the map
+  entry is absent.
 
 Related: #671, #672, #454, #590.
 
