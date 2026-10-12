@@ -265,6 +265,15 @@ impl SharedCore {
         let chains = Arc::new(crate::bridge::chain::ChainRecords::load(
             cfg.bridge.session_file.with_file_name("chain_records.json"),
         ));
+        // The Background Task State handle is the process's ONE instance:
+        // `src/main.rs` creates it and threads it into the adapter at
+        // construction (#682), and the Bridge takes that same handle here rather
+        // than building a second — so a retirement the Bridge records is what
+        // every later adapter read applies. Its durable tier is attached now,
+        // where the Chain Record is built: the handle existed before the record
+        // did. Attach is idempotent and replaceable.
+        let tasks = opencode.tasks().clone();
+        tasks.attach_chains(Arc::clone(&chains));
         Ok(Self {
             sessions: Arc::new(Mutex::new(session_store)),
             cards: Arc::new(Mutex::new(HashMap::new())),
@@ -272,7 +281,7 @@ impl SharedCore {
                 crate::bridge::card_handles::CardHandles::with_surfaces(Arc::clone(&surfaces)),
             )),
             chains: Arc::clone(&chains),
-            tasks: crate::bridge::tasks::TasksHandle::new(chains),
+            tasks,
             permission: Arc::new(crate::bridge::request::flow::RequestFlow::new(
                 Box::new(crate::bridge::request::kind::PermissionKind),
                 Arc::clone(&surfaces),

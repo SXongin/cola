@@ -11,7 +11,7 @@
 use std::sync::{Arc, RwLock};
 
 use crate::backend::{ChildEvidence, PromptSkill, SessionTranscript, SkillInfo, TaskRuntime};
-use crate::bridge::tasks::BackgroundTaskOverlay;
+use crate::bridge::tasks::TasksHandle;
 
 use super::parsing::parse_model;
 use super::strategy::{Generation, GenerationStrategy};
@@ -50,14 +50,17 @@ pub struct OpenCodeBackend {
     /// replacement on the same port (a new generation or password). Shared
     /// across clones like the strategy.
     attached_pid: Arc<RwLock<Option<i32>>>,
-    /// The Background Task liveness overlay a Runtime Reconciliation (or a
-    /// cleanup) established this cola life (issue #454, review #588), applied
-    /// to every transcript read so the durable launch record cannot resurrect a
-    /// retired task and a marker survives the reads the shared throttle spends
-    /// no verdict on. Its bytes live in the Background Task State module
-    /// (ticket #682, ADR-0079); this field is the instance the adapter applies,
-    /// shared across clones like the strategy.
-    overlay: Arc<BackgroundTaskOverlay>,
+    /// The Background Task State handle the adapter was constructed with
+    /// (ADR-0079, ticket #682): the module's one handle, which owns the
+    /// volatile liveness tier — the Background Task facts a Runtime
+    /// Reconciliation (or a cleanup) established this cola life (issue #454,
+    /// review #588) — and is applied to every transcript read so the durable
+    /// launch record cannot resurrect a retired task and a marker survives the
+    /// reads the shared throttle spends no verdict on. `src/main.rs` creates it
+    /// and threads it in ([`Self::with_tasks`]); the Bridge holds the same
+    /// handle through [`crate::backend::Backend::tasks`], so the two can never
+    /// disagree.
+    tasks: TasksHandle,
 }
 
 impl Clone for OpenCodeBackend {
@@ -68,7 +71,7 @@ impl Clone for OpenCodeBackend {
             model: self.model.clone(),
             strategy: Arc::clone(&self.strategy),
             attached_pid: Arc::clone(&self.attached_pid),
-            overlay: Arc::clone(&self.overlay),
+            tasks: self.tasks.clone(),
         }
     }
 }
@@ -82,7 +85,27 @@ impl OpenCodeBackend {
     ///
     /// The attachment's generation was resolved by attach detection (spec #364
     /// §2), which selects the generation strategy here.
+    ///
+    /// Constructs a default Background Task State handle ([`TasksHandle::new`]);
+    /// `src/main.rs` threads the process's one handle in through
+    /// [`Self::with_tasks`] instead, so the adapter and the Bridge share it.
+    /// Kept for the tests that construct an adapter without threading a handle
+    /// (the allow is for the non-test build, where only `with_tasks` is called).
+    #[allow(dead_code)]
     pub fn new(model: Option<&str>, server: Option<crate::bridge::discovery::ResolvedServer>) -> Self {
+        Self::with_tasks(model, server, TasksHandle::new())
+    }
+
+    /// [`Self::new`] with the process's Background Task State handle threaded in
+    /// at construction (ADR-0079, ticket #682). `src/main.rs` creates the handle
+    /// (it also becomes the Bridge's, through
+    /// [`crate::backend::Backend::tasks`]) and passes it here, so the adapter
+    /// applies the very liveness tier the Bridge records through.
+    pub fn with_tasks(
+        model: Option<&str>,
+        server: Option<crate::bridge::discovery::ResolvedServer>,
+        tasks: TasksHandle,
+    ) -> Self {
         match server {
             Some(crate::bridge::discovery::ResolvedServer {
                 url,
@@ -90,14 +113,23 @@ impl OpenCodeBackend {
                 password,
                 pid,
                 generation,
-            }) => Self::with_generation(model, url, Some(&username), Some(&password), generation, pid),
-            None => Self::with_generation(
+            }) => Self::with_tasks_and_generation(
+                model,
+                url,
+                Some(&username),
+                Some(&password),
+                generation,
+                pid,
+                tasks,
+            ),
+            None => Self::with_tasks_and_generation(
                 model,
                 String::new(),
                 Some(crate::bridge::discovery::DEFAULT_SERVER_USERNAME),
                 None,
                 Generation::V1,
                 None,
+                tasks,
             ),
         }
     }
@@ -121,7 +153,10 @@ impl OpenCodeBackend {
     }
 
     /// [`Self::with_base_url`] with the generation strategy and the attached
-    /// server's identity made explicit.
+    /// server's identity made explicit. Kept for the tests that build an
+    /// adapter directly; the non-test build reaches it only through
+    /// `with_base_url` (also test-only), hence the allow.
+    #[allow(dead_code)]
     pub(crate) fn with_generation(
         model: Option<&str>,
         base_url: impl Into<String>,
@@ -130,13 +165,36 @@ impl OpenCodeBackend {
         generation: Generation,
         attached_pid: Option<i32>,
     ) -> Self {
+        Self::with_tasks_and_generation(
+            model,
+            base_url,
+            username,
+            password,
+            generation,
+            attached_pid,
+            TasksHandle::new(),
+        )
+    }
+
+    /// The one build path: the constructors above differ only in their server
+    /// shape and the Background Task State handle they carry.
+    #[allow(clippy::too_many_arguments)] // the constructor's flat wiring list
+    fn with_tasks_and_generation(
+        model: Option<&str>,
+        base_url: impl Into<String>,
+        username: Option<&str>,
+        password: Option<&str>,
+        generation: Generation,
+        attached_pid: Option<i32>,
+        tasks: TasksHandle,
+    ) -> Self {
         Self {
             transport: Transport::new(username, password, base_url),
             username: username.map(str::to_string),
             model: model.and_then(parse_model),
             strategy: Arc::new(RwLock::new(generation.strategy())),
             attached_pid: Arc::new(RwLock::new(attached_pid)),
-            overlay: Arc::new(BackgroundTaskOverlay::default()),
+            tasks,
         }
     }
 
@@ -335,25 +393,26 @@ impl OpenCodeBackend {
             .await
     }
 
-    /// The session transcript, with this cola life's Background Task overlay
-    /// applied ([`BackgroundTaskOverlay`], issue #454, review #588): a
+    /// The session transcript, with this cola life's Background Task liveness
+    /// tier applied ([`TasksHandle::apply`], issue #454, review #588): a
     /// Background Task the runtime confirmed ended leaves the live list here,
     /// and a task the runtime could not confirm as running carries its
     /// `⚠️ 状态待确认` marker, so no read path resurrects a retired task or
     /// drops a marker between verdicts.
     pub async fn transcript(&self, session_id: &str) -> crate::error::Result<SessionTranscript> {
         let mut transcript = self.strategy().transcript(&self.transport, session_id).await?;
-        self.overlay.apply(session_id, &mut transcript);
+        self.tasks.apply(session_id, &mut transcript);
         Ok(transcript)
     }
 
-    /// The liveness overlay every [`Self::transcript`] read applies
-    /// ([`BackgroundTaskOverlay`], issue #454, review #588). The Bridge reaches
-    /// it through [`crate::backend::Backend::task_overlay`], so a retirement the
-    /// reconcile commits lands on exactly the handle every later read goes
-    /// through. The module owns the bytes (ticket #682).
-    pub(crate) fn task_overlay(&self) -> &BackgroundTaskOverlay {
-        self.overlay.as_ref()
+    /// The Background Task State handle every [`Self::transcript`] read applies
+    /// the liveness tier through ([`TasksHandle`], issue #454, review #588).
+    /// The Bridge reaches the SAME handle through
+    /// [`crate::backend::Backend::tasks`], so a retirement the reconcile commits
+    /// lands on exactly the handle every later read goes through. The module
+    /// owns the tier's bytes and its instance (ticket #682).
+    pub(crate) fn tasks(&self) -> &TasksHandle {
+        &self.tasks
     }
 
     /// The session's durable model/agent selection where the generation keeps

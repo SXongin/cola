@@ -191,8 +191,8 @@ impl Backend for OpenCodeBackend {
         OpenCodeBackend::child_evidence(self, session_id).await
     }
 
-    fn task_overlay(&self) -> &crate::bridge::tasks::BackgroundTaskOverlay {
-        OpenCodeBackend::task_overlay(self)
+    fn tasks(&self) -> &crate::bridge::tasks::TasksHandle {
+        OpenCodeBackend::tasks(self)
     }
 
     async fn model_context_window(&self, provider: &str, model: &str) -> Result<Option<i64>> {

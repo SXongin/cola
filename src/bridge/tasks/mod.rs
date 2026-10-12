@@ -20,16 +20,17 @@
 //!   `wake_floor`, `render_marks`), and the shared handle to it. The cell moved
 //!   out of `StreamAccumulator` in #681; the accumulator holds a `TaskCell` and
 //!   keeps thin forwarding methods, so no caller changes.
-//! - [`handle::TasksHandle`] — the per-Session store, created beside the durable
-//!   **Chain Record**: it keys each cell by `(session, chain generation)` — the
+//! - [`handle::TasksHandle`] — the module's one handle and per-Session store,
+//!   created by `src/main.rs` and threaded into the adapter **at construction**
+//!   (#682). It keys each cell by `(session, chain generation)` — the
 //!   generation selects the entry, and a re-install prunes the session's other
-//!   generations — reads the durable tier a fresh cell is seeded from, and
-//!   re-keys a binding when its card moves to a fresh session
-//!   ([`handle::TasksHandle::rekey`], `Turn::recreate`).
-//! - [`liveness::BackgroundTaskOverlay`] — the volatile liveness memoization
-//!   (#682), moved out of the Backend's transcript module: the module owns the
-//!   bytes, while the adapter keeps holding one instance and applying it to
-//!   every read at the pinned apply seam.
+//!   generations — reads the durable tier a fresh cell is seeded from, re-keys
+//!   a binding when its card moves to a fresh session
+//!   ([`handle::TasksHandle::rekey`], `Turn::recreate`), and **owns the
+//!   volatile liveness tier**: the process-local memoization (#682) the
+//!   adapter applies to every read at the pinned apply seam and the Bridge
+//!   records through the same handle. There is one instance, held by the
+//!   adapter and the Bridge alike.
 //!
 //! Nothing about the behaviour changes here.
 //!
@@ -56,10 +57,14 @@
 //! for the clone/lifetime argument.
 
 pub(crate) mod handle;
-pub(crate) mod liveness;
 pub(crate) mod model;
 pub(crate) mod state;
 
 pub(crate) use handle::TasksHandle;
-pub(crate) use liveness::BackgroundTaskOverlay;
 pub(crate) use state::TaskCell;
+
+/// The liveness tier's own unit tests (`src/backend/transcript.rs`) still name
+/// the type they construct; it is the module's handle, since #682 folded the
+/// overlay into it. Test-only: production reaches the tier through the handle.
+#[cfg(test)]
+pub(crate) type BackgroundTaskOverlay = TasksHandle;
