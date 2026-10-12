@@ -92,6 +92,55 @@ unchanged.
   the callers one by one. Semantics — the volatile/durable split and every
   existing rule — are preserved.
 
+## The interface (design round, 2026-10-12)
+
+Three interfaces were designed in parallel — one minimising the entry-point
+count, one maximising extension, one optimising the common caller. The chosen
+shape is the common-caller-first one carrying the minimal design's claim
+vocabulary, and rejecting the maximal design's generality:
+
+- **The common path is two calls.** `read(scope, &mut transcript) -> TaskView`
+  runs off the cards lock and awaits: it applies the module's remembered
+  liveness to the read, derives the live rows, plans the completion entries
+  through every gate (the anchor, the durable Wake floor, the announce set, the
+  durable rendered marks), and spends each entry's shell-output tail.
+  `apply(scope, view)` runs under the cards lock: it re-checks every gate — a
+  mark a queued delivery landed during the await drops the plan — installs the
+  rows, records the in-memory claims, and returns what moved. Callers stop
+  knowing the anchor, the directory, the cadence, the output reads or the
+  `recorded_marks` re-check.
+- **Commit is two methods, preserving ADR-0067/0072's accepted-vs-delivered
+  split.** `commit_accepted` records the volatile liveness (the retirements and
+  the post-verdict unconfirmed set) after any accepted carrier write;
+  `commit_delivered` advances the durable **Wake Watermark** and folds the
+  body's synthetic keys into the durable `rendered` marks at the delivered-write
+  choke point. Neither is reachable from the other, so #590 and PR #595 are
+  preserved as types rather than as rules four call sites remember.
+- **One claim vocabulary.** A completion entry's exactly-once claim is one type
+  with two variants — a **Wake** (which may advance the Watermark and carries
+  the hand-off flag) and a **Retirement** (key `runtime:<call_id>`, which never
+  may). Today's `PlannedAnnounce` + the separate `synthetic_key` argument + the
+  `runtime:<call_id>` string format collapse into it, so "a retirement is not a
+  Wake" becomes unrepresentable to violate.
+- **The overlay keeps its free application.** Its bytes move into the module,
+  but it is still applied at the read seam — a module-owned handle the OpenCode
+  adapter holds — so every reader (the reap's settle, the Snapshot status line)
+  still sees the corrected read without calling anything. This **revises Q8's
+  "the adapter stops filtering"**: the apply point stays; only the home of the
+  bytes moves. Applying it inside `read` instead was rejected because a reader
+  that skips `read` would see the raw launch list.
+- **Restart re-derivation is one call.** `restore(record, scope)` seeds the
+  durable tier (the Wake floor and the rendered marks) at chain install, so the
+  seed-then-install race the four `seed_durable_announcements` sites police
+  today cannot occur.
+- **Rejected from the other two designs.** The maximal-flexibility design's
+  public rules table (`FactKey` / `FactRule` over `fn` pointers) is premature
+  for today's three ending sources; its "one identity, one key" idea survives
+  as an internal representation. The minimal design's two semantic deltas —
+  committing the overlay on *delivery* rather than *acceptance*, and a
+  session-scoped announce set — are **not** taken in this slice; they belong to
+  the durable-ending deepening above.
+
 ## Why
 
 - **Locality: bugs concentrate in one module.** Today a new ending source, a new
