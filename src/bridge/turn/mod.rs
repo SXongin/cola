@@ -3279,25 +3279,18 @@ impl Turn {
     }
 
     /// Seed `acc`'s durable announcement state from the chain's Chain Record —
-    /// one call, two facts, because both are "what an EARLIER card of this
-    /// Session already announced":
-    ///
-    /// - the **Wake floor** from the Wake Watermark (spec #561, review #569;
-    ///   ADR-0061): every Wake at or below the mark was announced by an earlier
-    ///   card — the mark outlives the record it was announced on — so this
-    ///   card's render neither re-inserts its completion entry nor stages a
-    ///   watermark advance for it. A strictly newer Wake still renders and
-    ///   announces.
-    /// - the **rendered marks** (issue #671, ticket #672): the synthetic
-    ///   retirement entries an earlier card really showed, which this card
-    ///   never re-renders.
-    ///
-    /// The two stay separate facts on purpose: the Wake floor gates Wakes, the
-    /// render marks gate retirements, and a retirement must never move the
-    /// floor a late Wake is judged against (#590).
+    /// the module's [`crate::bridge::tasks::TasksHandle::seed`] (`restore(record,
+    /// scope)`, ADR-0079). One call, two facts, because both are "what an
+    /// EARLIER card of this Session already announced": the **Wake floor** from
+    /// the Wake Watermark (spec #561, review #569; ADR-0061) and the
+    /// **rendered marks** (issue #671, ticket #672). The rule itself lives in
+    /// the Background Task State module; the two stay separate facts on purpose
+    /// (the floor gates Wakes, the marks gate retirements, and a retirement must
+    /// never move the floor a late Wake is judged against — #590).
     fn seed_durable_announcements(cards: &CardsHandle, session_id: &str, acc: &mut state::StreamAccumulator) {
-        acc.set_wake_floor(cards.chains.announced(session_id).map(|mark| mark.created_ms));
-        acc.set_render_marks(cards.chains.rendered(session_id));
+        let seed = cards.tasks.seed(session_id);
+        acc.set_wake_floor(seed.watermark_ms);
+        acc.set_render_marks(seed.rendered_keys);
     }
 
     /// Register a fresh Turn's accumulator as the session's live card (issue

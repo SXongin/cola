@@ -11,6 +11,7 @@ use super::disposition::Disposition;
 use crate::backend::{FileContent, MessageId, Part, PromptSkill, SessionTranscript, ToolCall, TurnAnchor};
 use crate::bridge::chain::{CursorFrontier, CursorPartKind, RenderedCursor};
 use crate::bridge::handles::CardsHandle;
+use crate::bridge::tasks::TaskState;
 use crate::feishu::card::first_n_chars_bytes;
 use crate::feishu::card::ledger::{TaskCompletionEntry, TaskKind, TaskLedgerRow};
 use crate::feishu::card::shell::CardBuilder;
@@ -1403,37 +1404,16 @@ pub(super) struct StreamAccumulator {
     /// [`Self::continue_on_new_card`] and the fresh arms `arm_projected_card`
     /// and `arm_wake_continuation`; read through [`Self::wake_continuation`].
     wake_continuation: bool,
-    /// The Wakes whose completion this chain has already announced: marked by
-    /// its own opening 承接 line (a Wake that opened a card) or by a
-    /// completion entry — the merged-path render of a live card, or a yielded
-    /// card's ledger refresh. One mark per Wake id; the set is kept across
-    /// [`Self::continue_on_new_card`], so a Wake that resumes a
-    /// wake-continuation card still marks exactly once (ADR-0059). Synthetic
-    /// retirements — a runtime/child-evidence retirement or the user's cleanup
-    /// — share the set under their `runtime:<call_id>` key, marked through
-    /// [`Self::announce_synthetic`]: the same exactly-once gate, staging
-    /// nothing durable (spec #588, review PR #595). This is the ANNOUNCEMENT
-    /// gate (it keeps an entry single); the Wake step's in-place decision reads
-    /// [`Self::handed_over_wakes`], because an entry a ledger refresh placed is
-    /// not a handoff. Private to this module (no external reader or writer):
-    /// written by [`Self::announce_wake`] and [`Self::announce_synthetic`]
-    /// through the private `announce_entry` (the one insert), read by
-    /// [`Self::wake_announced`].
-    announced_wakes: std::collections::HashSet<String>,
-    /// The Wakes whose resumed work this chain has HANDED OVER to a card
-    /// (ADR-0066): a 承接 line's split (a continuation card takes it) or the
-    /// in-place resume (the same card takes it). The Wake step's in-place gate
-    /// keys on THIS, never on `announced_wakes`: a yielded card's ledger
-    /// refresh places a completion entry while the Wake's work is still
-    /// unrendered (live 2026-10-01 — the resumed message's text part was empty
-    /// at the read that placed it), and that entry must not read as a handoff,
-    /// or the work would split into a 承接 card when it arrives. Once a Wake IS
-    /// handed over, a later tail past it is a Wake-less content diff: it renders
-    /// in place on the chain's open yielded card, never a second continuation
-    /// (spec #602). Like the announcement set, one mark per Wake id, kept across
-    /// [`Self::continue_on_new_card`]. Private to this module: written by
-    /// [`Self::hand_over_wake`]; read through [`Self::has_handed_over_wake`].
-    handed_over_wakes: std::collections::HashSet<String>,
+    /// The per-chain Background Task delivery sets (ADR-0079, ticket #681):
+    /// `announced_wakes`, `handed_over_wakes`, `wake_floor` and `render_marks`,
+    /// moved out of this struct into the Background Task State module
+    /// ([`TaskState`]) behind the thin forwarding methods below. Owned by value
+    /// so the four sets' lifetime (born with this accumulator's `CardSession`,
+    /// kept across [`Self::continue_on_new_card`], reset by
+    /// `Turn::install_fresh_session`'s insert) and their deep-copy on `Clone`
+    /// (probes must not mutate the live card) are unchanged. Private to this
+    /// module; every read or write goes through those forwarding methods.
+    tasks: TaskState,
     /// Whether this chain's ONE neutral residual continuation has already
     /// fired (spec #602, ticket #606): a Wake-less part the Backend wrote after
     /// the run reported idle renders on exactly one neutral card per request.
@@ -1443,8 +1423,8 @@ pub(super) struct StreamAccumulator {
     /// the existing card ([`Turn::render_residual_in_place`]), so the floor
     /// still routes every later late tail to that same in-place path. Kept
     /// across [`Self::continue_on_new_card`], so a later pass over further late
-    /// content can never post a second neutral card. Distinct from
-    /// [`Self::handed_over_wakes`] — the residual answers no Wake — and never
+    /// content can never post a second neutral card. Distinct from the
+    /// handed-over Wake set — the residual answers no Wake — and never
     /// persisted: a restart has no in-process chain to re-decide on, and the
     /// Fresh (recordless) path is Wake-scoped, so a Wake-less read there owes
     /// nothing. Private to this module: set by
@@ -1455,7 +1435,7 @@ pub(super) struct StreamAccumulator {
     /// The Wake Watermarks this chain has staged but not yet drained:
     /// `(wake id, created_ms)` stages, advanced by [`Self::announce_wake`] and
     /// persisted into the durable Wake Watermark once a card write actually
-    /// carries them (ADR-0061). In-memory `announced_wakes` is the
+    /// carries them (ADR-0061). In-memory [`TaskState`]'s announce set is the
     /// exactly-once gate. Newest last; a delivered body's mark stays drainable
     /// even after a newer mark is staged (spec #561, review #569), so a
     /// restart can never re-announce a Wake the card already showed. Bounded
@@ -1508,28 +1488,6 @@ pub(super) struct StreamAccumulator {
     /// until a complete read shows its end. Private to this module: set by
     /// [`Self::set_gap_truncated`]; read only inside this module.
     gap_truncated: bool,
-    /// The chain's durable Wake Watermark as a floor (spec #561, review #569):
-    /// every Wake at or below this `created_ms` was announced by an earlier
-    /// card, so this accumulator's render neither re-inserts its completion
-    /// entry nor stages a watermark advance for it. Seeded when a card starts
-    /// rendering a session (`Turn`'s start, the projection/external arms, the
-    /// Wake continuation); a strictly newer Wake still announces. `None` when
-    /// the session announced no Wake. Private to this module: seeded by
-    /// [`Self::set_wake_floor`] (`Turn::seed_durable_announcements`); read through
-    /// [`Self::wake_floor`].
-    wake_floor: Option<i64>,
-    /// The synthetic completion keys an EARLIER card of this Session already
-    /// rendered (issue #671, ticket #672): the durable `runtime:<call_id>`
-    /// marks `ChainRecords` carries, seeded when a card starts rendering a
-    /// session alongside [`Self::wake_floor`]. Every retirement here was shown
-    /// by a delivered card write, so this accumulator's render never re-inserts
-    /// its entry — the restart case the per-chain announce set cannot cover.
-    /// Deliberately NOT a Wake fact: it never joins [`Self::wake_floor`], so a
-    /// genuinely un-announced late Wake at or below a retirement's clock still
-    /// renders and resumes (#590, PR #595). Private to this module: seeded by
-    /// [`Self::set_render_marks`] (`Turn::seed_durable_announcements`); read through
-    /// [`Self::render_recorded`].
-    render_marks: std::collections::HashSet<String>,
     /// The Rendered Cursors of the card bodies built and not yet confirmed,
     /// newest last (spec #561, review #569): the flush stages one before each
     /// write and a confirmed write drains its exact stage — while a stage whose
@@ -2295,7 +2253,7 @@ impl StreamAccumulator {
     /// card (ADR-0066). Private to this module: written by
     /// [`Self::hand_over_wake`].
     pub(super) fn has_handed_over_wake(&self, wake_id: &str) -> bool {
-        self.handed_over_wakes.contains(wake_id)
+        self.tasks.has_handed_over_wake(wake_id)
     }
 
     /// Whether this chain's one neutral residual continuation has already fired
@@ -2314,13 +2272,13 @@ impl StreamAccumulator {
     /// at or below this `created_ms` was announced by an earlier card. Private
     /// to this module: seeded by [`Self::set_wake_floor`].
     pub(super) fn wake_floor(&self) -> Option<i64> {
-        self.wake_floor
+        self.tasks.wake_floor()
     }
 
     /// Seed the Wake floor from the chain's durable Watermark (`None` when the
     /// session announced no Wake).
     pub(super) fn set_wake_floor(&mut self, floor: Option<i64>) {
-        self.wake_floor = floor;
+        self.tasks.set_wake_floor(floor);
     }
 
     /// Whether an earlier card of this Session already rendered this synthetic
@@ -2328,13 +2286,13 @@ impl StreamAccumulator {
     /// [`Self::wake_announced`] (issue #671, ticket #672). Read-only: the plan
     /// runs before the commit that announces, so it must not mutate.
     pub(super) fn render_recorded(&self, key: &str) -> bool {
-        self.render_marks.contains(key)
+        self.tasks.render_recorded(key)
     }
 
     /// Seed the durable rendered marks of the session's earlier cards (empty
     /// for a session that rendered no retirement).
     pub(super) fn set_render_marks(&mut self, marks: Vec<String>) {
-        self.render_marks = marks.into_iter().collect();
+        self.tasks.set_render_marks(marks);
     }
 
     /// Whether the neutral waiting line 「⏳ 等待当前运行接收…」 was already shown
@@ -2603,7 +2561,7 @@ impl StreamAccumulator {
     /// have placed, so the mark must not disturb the announcement set (the
     /// entry stays single).
     pub(super) fn hand_over_wake(&mut self, wake_id: &str) {
-        self.handed_over_wakes.insert(wake_id.to_string());
+        self.tasks.hand_over_wake(wake_id);
     }
 
     /// Whether `wake_id`'s completion was already announced on this chain (spec
@@ -2611,7 +2569,7 @@ impl StreamAccumulator {
     /// can plan its completion entries — and skip their output reads for the
     /// ones already placed — without mutating the accumulator.
     pub(super) fn wake_announced(&self, wake_id: &str) -> bool {
-        self.announced_wakes.contains(wake_id)
+        self.tasks.wake_announced(wake_id)
     }
 
     /// Mark `wake_id`'s completion as announced on this chain — by the opening
@@ -2619,9 +2577,12 @@ impl StreamAccumulator {
     /// already was: the exactly-once gate both paths honour (ADR-0059). A new
     /// WAKE mark also stages the durable Wake Watermark (ADR-0061), which only
     /// a delivering card write drains; the stage's generation is what a drain
-    /// must match (spec #561, review #569).
+    /// must match (spec #561, review #569). The set insert is
+    /// [`TaskState::announce_entry`]'s; the watermark staging stays here (the
+    /// Background Task State owns the delivery sets, not the flush's staged
+    /// cursor — ADR-0079's staging-mechanics split, ticket #681 trap).
     pub(super) fn announce_wake(&mut self, wake_id: &str, created_ms: i64) -> bool {
-        if !self.announce_entry(wake_id) {
+        if !self.tasks.announce_entry(wake_id) {
             return false;
         }
         if self
@@ -2654,13 +2615,7 @@ impl StreamAccumulator {
     /// #590's "a late Wake for a cleared task behaves as before; nothing is
     /// suppressed".
     pub(super) fn announce_synthetic(&mut self, key: &str) -> bool {
-        self.announce_entry(key)
-    }
-
-    /// The one exactly-once announcement gate every class shares (ADR-0059):
-    /// insert the key and report whether it was new.
-    fn announce_entry(&mut self, key: &str) -> bool {
-        self.announced_wakes.insert(key.to_string())
+        self.tasks.announce_entry(key)
     }
 
     /// Stage the Rendered Cursor of the body about to be written (spec #561):
