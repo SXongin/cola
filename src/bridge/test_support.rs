@@ -1492,10 +1492,12 @@ pub struct MockBackend {
     /// later window reads instead of stacking another timeout (spec #588,
     /// review PR #595).
     pub hang_shell_output: Arc<std::sync::atomic::AtomicUsize>,
-    /// The Background Task overlay (issue #454, review #588): recorded
-    /// through the module's `record` / `set_unconfirmed` and applied inside
-    /// `transcript`, exactly like the real adapter's.
-    pub overlay: crate::bridge::tasks::BackgroundTaskOverlay,
+    /// The Background Task State handle (issue #454, review #588, ticket #682):
+    /// the module's one handle — the same type the adapter holds and the Bridge
+    /// records through. Its liveness tier is recorded through `record` /
+    /// `set_unconfirmed` and applied inside `transcript`, exactly like the real
+    /// adapter's. Kept named `overlay` for the tests that read it by name.
+    pub overlay: crate::bridge::tasks::TasksHandle,
     /// When set, `session_status` fails with this message (simulates a read
     /// failure — the caller must not guess a status).
     pub session_status_error: Option<String>,
@@ -1646,7 +1648,7 @@ impl MockBackend {
             shell_output_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             fail_shell_output_reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             hang_shell_output: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            overlay: crate::bridge::tasks::BackgroundTaskOverlay::default(),
+            overlay: crate::bridge::tasks::TasksHandle::new(),
             session_status_error: None,
             session_status_fails: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             growing_transcript: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2946,7 +2948,7 @@ impl crate::backend::Backend for MockBackend {
             .unwrap_or(crate::backend::ChildEvidence::Unfinished))
     }
 
-    fn task_overlay(&self) -> &crate::bridge::tasks::BackgroundTaskOverlay {
+    fn tasks(&self) -> &crate::bridge::tasks::TasksHandle {
         &self.overlay
     }
 

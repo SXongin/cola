@@ -359,23 +359,28 @@ pub trait Backend: Send + Sync {
         children: &[String],
     ) -> Result<TaskRuntime>;
 
-    /// The Background Task liveness overlay this cola life established (issue
-    /// #454, review #588): the adapter applies it to every [`Self::transcript`]
-    /// read, so a task the runtime confirmed ended leaves the live list and a
-    /// task it could not confirm as running carries its `⚠️ 状态待确认` marker
-    /// on every read path — the reap's settle, a drain tick, the follow, the
-    /// Snapshot status line and the cleanup click's own read alike.
+    /// The Background Task State module's handle (ADR-0079, tickets #681/#682)
+    /// — the one instance the adapter was constructed with and the Bridge
+    /// records through. It owns the volatile liveness tier (issue #454, review
+    /// #588): the adapter applies it to every [`Self::transcript`] read
+    /// ([`crate::bridge::tasks::TasksHandle::apply`]), so a task the runtime
+    /// confirmed ended leaves the live list and a task it could not confirm as
+    /// running carries its `⚠️ 状态待确认` marker on every read path — the reap's
+    /// settle, a drain tick, the follow, the Snapshot status line and the
+    /// cleanup click's own read alike.
     ///
-    /// The overlay's bytes live in the Background Task State module
-    /// ([`crate::bridge::tasks::BackgroundTaskOverlay`]), which owns `record` /
-    /// `set_unconfirmed` / `apply`; the adapter holds the instance it applies
-    /// and hands it out here, so the Bridge records through exactly the handle
-    /// every later read goes through (ticket #682, ADR-0079).
+    /// The module owns the tier's bytes AND its instance
+    /// ([`crate::bridge::tasks::TasksHandle`]): `src/main.rs` creates the
+    /// handle and threads it into the adapter at construction, and both the
+    /// adapter and the Bridge hold that same handle — the Bridge records
+    /// through exactly the handle every later read goes through, and a later
+    /// caller using the handle as the lifecycle owner sees the same
+    /// retirements.
     ///
     /// In-memory on purpose: it is a cola-life overlay, not durable state. A
     /// restart loses it and the next read re-derives the same retirement, the
     /// next verdict the same markers.
-    fn task_overlay(&self) -> &crate::bridge::tasks::BackgroundTaskOverlay;
+    fn tasks(&self) -> &crate::bridge::tasks::TasksHandle;
 
     /// Read one shell's captured output window (spec #588, ticket #592): the
     /// record's last [`SHELL_OUTPUT_WINDOW_BYTES`] bytes, decoded and clipped
