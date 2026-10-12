@@ -120,10 +120,11 @@ unchanged.
   which are volatile); the flush owns staged cursors, the owed mirror and the
   capacity bounds. The two meet at the module's one commit seam — so the
   card-write pipeline does not leak into the task module.
-- **Zero behaviour change in the first slice.** Ticket 1 is a pure physical
-  move (new module, sets relocated, callers untouched); later tickets replace
-  the callers one by one. Semantics — the volatile/durable split and every
-  existing rule — are preserved.
+- **Zero behaviour change in the first slice.** Ticket #680 is a pure physical
+  move — the new module and the read-model type definitions only; it relocates
+  no state and changes no caller. The state moves next (#681 the per-chain
+  sets, #682 the overlay), and the callers are replaced after that. Semantics —
+  the volatile/durable split and every existing rule — are preserved.
 
 ## The interface (design round, 2026-10-12)
 
@@ -276,5 +277,7 @@ from the **Background Task Ledger**, which is where its rows and entries render.
   - **#685** — one confirmed-write seam that commits every durable fact a card
     write carried.
 - Depended-on ADRs: ADR-0061 (the Wake Watermark), ADR-0065 (Runtime
-  Reconciliation), ADR-0069 (the Chain Record), ADR-0071 (the Rendered Cursor),
-  ADR-0072 (card delivery order), ADR-0073 (background-task exits).
+  Reconciliation), ADR-0067 (the Pending Card Update outbox and the
+  accepted-vs-delivered delivery contract), ADR-0069 (the Chain Record),
+  ADR-0071 (the Rendered Cursor), ADR-0072 (card delivery order), ADR-0073
+  (background-task exits).
