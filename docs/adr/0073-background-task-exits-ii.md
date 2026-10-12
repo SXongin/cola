@@ -331,13 +331,17 @@ run's end was recorded twice.
 
 - A Wake's completion ENTRY is suppressed when the run it completes already has
   an EVIDENCE termination on record: the chain's own `ended:<call_id>` announce
-  mark, the durable `rendered` mark a delivered card left (the amendment above),
-  or a retirement the SAME read derived (whose own entry is planned instead).
-  The Wake's resumed work is untouched — the hand-off is a separate flag
+  mark, or the durable `rendered` mark a delivered card left (the amendment
+  above). The Wake's resumed work is untouched — the hand-off is a separate flag
   (ADR-0066) — and NOTHING durable is staged for the suppressed Wake: the Wake
   Watermark stays where it was, exactly as the retirement itself never moved it
   (#595, #590). The suppression is therefore not a third durable fact; it reads
-  the retirement's mark, the same way a re-derived retirement does.
+  the retirement's mark, the same way a re-derived retirement does. Issue #659's
+  fix direction also named "a retirement the same read derived"; that shape
+  cannot arise and needs no clause: the V2 decoder drops every task a read's Wake
+  retires from that read's live list before any reconcile runs, and a reconcile
+  retires only tasks still live — so the run a Wake completes can never have a
+  retirement derived beside it.
 - The two retirement classes no longer share one key. An EVIDENCE ending — a
   runtime verdict, a shell the runtime no longer knows, the child transcript's
   own terminal evidence — mints `ended:<call_id>`, which CLAIMS the run ended
