@@ -202,3 +202,10 @@ vocabulary, and rejecting the maximal design's generality:
 
 A new **Background Task State** glossary entry names the module; it is distinct
 from the **Background Task Ledger**, which is where its rows and entries render.
+
+## Related
+
+- Implementation slices (pure moves, zero behaviour change): #680 (module +
+  read-model types), #681 (per-chain delivery sets), #682 (liveness overlay).
+- Deferred deepenings: #683 (a durable ending rendered by the Rendered Cursor),
+  #684 (one TaskLiveness resolution), #685 (one confirmed-write seam).
