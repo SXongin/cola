@@ -78,10 +78,11 @@ the user already looks at.
 - **Live-path retirement entries render exactly once.** The live render path —
   until now only refreshing ledger rows — gains the entry machinery: entries
   are planned against the same read (the retirement's synthetic
-  `runtime:<call_id>` announce key), their output reads are spent outside the
-  cards lock, and the announcements commit under it. Exactly-once comes from
-  the announce key (per observing chain) plus the process-local retirement
-  overlay the adapter applies to every later transcript read; a cola restart
+  `runtime:<call_id>` announce key, respelled by the 2026-10-13 amendment
+  below), their output reads are spent outside the cards lock, and the
+  announcements commit under it. Exactly-once comes from the announce key (per
+  observing chain) plus the process-local retirement overlay the adapter
+  applies to every later transcript read; a cola restart
   may re-show one entry on the newest chain, which is honest — that card is
   where the user is looking (ADR-0065's rule, kept). A mid-turn retirement
   therefore drops the row and records 「🔔 shell 结束」/「🔔 shell 已失联」 on
@@ -317,4 +318,67 @@ restart itself creates the card and pushes it.
   entry is absent.
 
 Related: #671, #672, #454, #590.
+
+## Amendment (2026-10-13): one run, one completion record
+
+Issue #659 (live, 2026-10-10 21:23–21:25 CST): one background subagent rendered
+TWO completion entries — `🔔 subagent 结束` from the child-evidence retirement at
+21:23:10, then `🔔 subagent 完成` from the run's own Wake ~96 s later, once the
+parent resumed off the ask-user card it had been blocked on. Each path was
+exactly-once on its own, but they asserted it in two announce key spaces
+(`runtime:<call_id>` and the Wake's own id) with no cross-key gate, so the same
+run's end was recorded twice.
+
+- A Wake's completion ENTRY is suppressed when the run it completes already has
+  an EVIDENCE termination on record: the chain's own `ended:<call_id>` announce
+  mark, the durable `rendered` mark a delivered card left (the amendment above),
+  or a retirement the SAME read derived (whose own entry is planned instead).
+  The Wake's resumed work is untouched — the hand-off is a separate flag
+  (ADR-0066) — and NOTHING durable is staged for the suppressed Wake: the Wake
+  Watermark stays where it was, exactly as the retirement itself never moved it
+  (#595, #590). The suppression is therefore not a third durable fact; it reads
+  the retirement's mark, the same way a re-derived retirement does.
+- The two retirement classes no longer share one key. An EVIDENCE ending — a
+  runtime verdict, a shell the runtime no longer knows, the child transcript's
+  own terminal evidence — mints `ended:<call_id>`, which CLAIMS the run ended
+  and hence gates the Wake's entry. The user's own **Cleanup** mints
+  `cleanup:<call_id>`: it claims nothing about how the run ended, so a cleaned
+  task's late Wake still shows its own completion (spec #588/#590,
+  `a_late_wake_after_a_cleanup_still_resumes_the_chain`). Both spellings are
+  synthetic (no Watermark staging) and feed the same two gates — the per-chain
+  announce set and the durable `rendered` marks.
+- The split is the WAKE gate's business alone. A retirement's own dedup still
+  asks one question — "has this `call_id` been recorded", in every spelling the
+  key has ever had — so a run keeps one record per call id whatever class
+  recorded it (a cleanup after an evidence ending is not a second entry, as the
+  shared key always meant); only a Wake's completion gate consults the evidence
+  spelling alone.
+- The Wake-side suppression is re-checked at COMMIT, not only when the plan is
+  built: a plan spends its output read outside the cards lock, and the run can be
+  retired in that window by a concurrent venue's flush or a queued update that
+  delivers (the same window the 2026-10-11 amendment re-checks the durable marks
+  for). The plan carries the run's evidence key, and the commit drops it when
+  that key is announced on the chain or in the marks re-read after the awaits —
+  without which the duplicate pair comes straight back through the window. The
+  window's own residual is the marks' own lag, kept as the duplicate-over-loss
+  side: a chain that takes over before the retirement's mark is DELIVERED sees
+  neither fact, so a Wake it plans can render beside the 结束 entry whose owed
+  payload lands on the older card afterwards.
+- **Upgrade.** A mark written before this amendment spells the old
+  `runtime:<call_id>` for BOTH classes, so its class is unknowable. The
+  retirement's own dedup still reads that spelling — a re-derived retirement is
+  always evidence, so an old mark keeps covering it (#671's rule survives the
+  upgrade) — but a Wake's gate never does: suppressing a Wake on a possibly
+  cleanup's mark would break #590. The cost is the duplicate-over-loss side this
+  family trades toward: a Wake whose retirement an old build recorded renders its
+  completion once more, and the old spelling ages out as `MAX_RENDERED_KEYS`
+  turns the bounded set over.
+- The run a Wake completes is its own join (`Wake::retires` over each part's
+  derived task), taking the NEWEST match: a resumed child's later launch
+  supersedes the earlier one (#552), and the interrupted run reports nothing. A
+  read that no longer carries the launch keeps today's behavior — the Wake's own
+  named keys and no suppression — the same read that already loses the entry's
+  duration.
+
+Related: #659, #671, #672, #590, #595, #552.
 

@@ -26,7 +26,8 @@ unchanged.
   - *Per-chain delivery exactly-once* — `StreamAccumulator::announced_wakes`
     (`src/bridge/turn/state.rs:1454`), `handed_over_wakes` (`:1468`),
     `wake_floor` (`:1552`), `render_marks` (`:1564`). `announced_wakes` is the
-    completion-entry gate (keyed by a Wake id or `runtime:<call_id>`);
+    completion-entry gate (keyed by a Wake id, or by the retirement's
+    `ended:<call_id>` / `cleanup:<call_id>` — issue #659);
     `handed_over_wakes` instead tracks which Wakes this chain handed to a card —
     the in-place-vs-continuation decision (ADR-0066), **not** an entry gate;
     `wake_floor` is the in-memory mirror of the durable **Wake Watermark**;
@@ -162,9 +163,11 @@ vocabulary, and rejecting the maximal design's generality:
   PR #595 are preserved as types rather than as rules four call sites remember.
 - **One claim vocabulary.** A completion entry's exactly-once claim is one type
   with two variants — a **Wake** (which may advance the Watermark and carries
-  the hand-off flag) and a **Retirement** (key `runtime:<call_id>`, which never
-  may). Today's `PlannedAnnounce` + the separate `synthetic_key` argument + the
-  `runtime:<call_id>` string format collapse into it, so "a retirement is not a
+  the hand-off flag) and a **Retirement** (key `ended:<call_id>` for an evidence
+  ending, `cleanup:<call_id>` for the user's own — one spelling per claim class,
+  issue #659; the pre-#659 `runtime:<call_id>` is read, never written — which
+  never may). Today's `PlannedAnnounce` + the separate `synthetic_key` argument
+  + the retirement's string format collapse into it, so "a retirement is not a
   Wake" becomes unrepresentable to violate.
 - **The overlay keeps its free application.** Its bytes move into the module,
   but it is still applied at the read seam — a module-owned handle the OpenCode
