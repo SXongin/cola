@@ -2,11 +2,12 @@
 
 A **Background Task**'s state has no owner. It is re-derived from the
 transcript on every read, then corrected by a hand-assembled pile of
-memoization sets that live in three tiers across four modules: the Backend's
+memoization sets that live in three tiers across three modules: the Backend's
 process-local overlay (`retired` / `unconfirmed`, the **Cleanup** dismissals),
 the `StreamAccumulator`'s per-chain delivery sets (`announced_wakes`,
 `handed_over_wakes`, `wake_floor`, `render_marks`), and the **Chain Record**'s
-durable sections (`announcements`, `rendered`, `owed`). Each set exists to
+durable sections (`announcements`, `rendered`; the owed mirror is in-memory).
+Plus the render's own planning step, which combines them. Each set exists to
 police one pairwise interleaving, and none of them owns the task. This ADR
 names the deepening: one per-Session **Background Task State** module owns the
 lifecycle, and its interface is a read model — the rows the **Background Task
@@ -24,10 +25,13 @@ unchanged.
     by design (ADR-0065/0073): a restart drops it and re-derives.
   - *Per-chain delivery exactly-once* — `StreamAccumulator::announced_wakes`
     (`src/bridge/turn/state.rs:1454`), `handed_over_wakes` (`:1468`),
-    `wake_floor` (`:1552`), `render_marks` (`:1564`). The first two keep one
-    completion entry per chain; `wake_floor` is the in-memory mirror of the
-    durable **Wake Watermark**; `render_marks` the mirror of the durable
-    `rendered` section (ADR-0061/0071, #671/#672).
+    `wake_floor` (`:1552`), `render_marks` (`:1564`). `announced_wakes` is the
+    completion-entry gate (keyed by a Wake id or `runtime:<call_id>`);
+    `handed_over_wakes` instead tracks which Wakes this chain handed to a card —
+    the in-place-vs-continuation decision (ADR-0066), **not** an entry gate;
+    `wake_floor` is the in-memory mirror of the durable **Wake Watermark**;
+    `render_marks` the mirror of the durable `rendered` section (ADR-0061/0071,
+    #671/#672).
   - *Durable* — the **Chain Record** (ADR-0069), at `src/bridge/chain/records.rs`:
     a per-chain `record`, plus **session-scoped sections that outlive it** —
     `announcements` (the Wake Watermark) and `rendered` (the synthetic
@@ -36,9 +40,9 @@ unchanged.
     `record`, so a fresh, cursorless chain still reads the marks rather than
     starting blind (ADR-0073's 2026-10-11 amendment).
   - *Planning* — `plan_wake_entries` / `plan_runtime_entries`
-    (`src/bridge/turn/render.rs:481/551`) combine the floors, anchors, announce
+    (`src/bridge/turn/render.rs:488/553`) combine the floors, anchors, announce
     sets and rendered marks into the entries a render owes. *Recording* —
-    `ReconcilePass::commit` / `record_overlay` (`src/bridge/runtime.rs:255/370`)
+    `ReconcilePass::commit` / `record_overlay` (`src/bridge/runtime.rs:255/371`)
     write the overlay after an accepted card write.
 - **The cost of the missing owner.** Issue #671 — a Wake-less Background Task
   (#454's lost-Wake mode) re-posted its `🔔 … 结束` entry on every restart, seven
@@ -54,16 +58,24 @@ unchanged.
   `live_cards.json`, four `serde(skip)` marks, two in-memory overlays) into one
   **Chain Record** module with one lifecycle. The task lifecycle is the same
   shape one level down.
-- **#671's asked decision is already resolved — this ADR does not reopen it.**
-  #671 asked whether the "one entry on the newest chain" sanction still holds
-  and, if it should be tightened, proposed a durable mark separate from the
-  Wake Watermark. #672/#676 landed exactly that mark, and ADR-0073's
-  2026-10-11 amendment records the tightened semantics: once a delivered card
-  has shown a synthetic retirement's entry, no later chain — restart included —
-  re-renders it, because the marks are session-scoped and survive the observing
-  chain's record release. A restart may still create a card; its *entry* no
-  longer replays. What this ADR leaves open is a different, structural question
-  — see the next bullet — not the sanction's validity.
+- **#671's asked decision is already resolved, with ADR-0073's two named
+  residuals left standing — this ADR does not reopen it.** #671 asked whether
+  the "one entry on the newest chain" sanction still holds and, if it should be
+  tightened, proposed a durable mark separate from the Wake Watermark.
+  #672/#676 landed exactly that mark, and ADR-0073's 2026-10-11 amendment
+  records the tightened semantics: once a delivered card has shown a synthetic
+  retirement's entry, a later chain — restart included — does not re-render it,
+  because the marks are session-scoped and survive the observing chain's record
+  release. A restart may still create a card; its *entry* no longer replays.
+  **Surfacing the conflict rather than overriding it**: that guarantee is
+  bounded, exactly as ADR-0073 states — the marks are bounded
+  (`MAX_RENDERED_KEYS`, oldest evicted first), so a very old retirement can
+  render once more after a restart; and two chains that PLAN the same retirement
+  concurrently, before either body's write is accepted, can each render it once.
+  #671's symptom — the same entry replaying on every restart — is what the
+  landed fix stops; the two residuals above are its remaining, admitted
+  exceptions. What this ADR leaves open is a different, structural question —
+  see the next bullet — not the sanction's validity.
 - **Two adjacent deepenings are deliberately *not* folded in.** Making an
   **ending** a durable fact rendered by the **Rendered Cursor** (so exactly-once
   is the cursor's job, not a parallel `rendered` set) would dissolve the
@@ -98,6 +110,11 @@ unchanged.
   the OpenCode adapter keeps applying it to every read through a module-owned
   handle (so every reader still sees a corrected read);
   `Backend::retire_background_tasks` / `set_unconfirmed_tasks` leave the trait.
+  **Surfaced ADR conflict**: ADR-0069 left that overlay with its Backend
+  adapter, "read at the seam as a predicate, never moved into the record". This
+  ADR relocates the bytes' *home*; ADR-0069's actual invariant — in-memory,
+  never in the durable record, applied at the read seam — is preserved and the
+  apply point does not move.
 - **The durable-ownership *decision* is the module's; the staging *mechanics*
   stay in the flush.** The module says which facts a write makes durable (and
   which are volatile); the flush owns staged cursors, the owed mirror and the
@@ -120,11 +137,12 @@ vocabulary, and rejecting the maximal design's generality:
   liveness to the read, derives the live rows, plans the completion entries
   through every gate (the anchor, the durable Wake floor, the announce set, the
   durable rendered marks), and spends each entry's shell-output tail.
-  `apply(scope, view)` runs under the cards lock: it re-checks every gate — a
-  mark a queued delivery landed during the await drops the plan — installs the
-  rows, records the in-memory claims, and returns what moved. Callers stop
-  knowing the anchor, the directory, the cadence, the output reads or the
-  `recorded_marks` re-check.
+  `apply(scope, view)` runs under the cards lock: it re-checks every gate
+  against the durable marks and the delivered owed keys the flush resolves
+  today (`Turn::recorded_marks`) — a mark a queued delivery landed during the
+  await drops the plan — installs the rows, records the in-memory claims, and
+  returns what moved. Callers stop knowing the anchor, the directory, the
+  cadence, the output reads or the `recorded_marks` re-check.
 - **Commit is two methods, preserving ADR-0067/0072's accepted-vs-delivered
   split.** `commit_accepted` records the volatile liveness (the retirements and
   the post-verdict unconfirmed set) after any accepted carrier write;
@@ -207,10 +225,11 @@ vocabulary, and rejecting the maximal design's generality:
   `plan_*`, the Cleanup click) and, last, retire `Backend::retire_background_tasks`
   / `set_unconfirmed_tasks`.
 - **#671's replay is already fixed; what stays deferred is its *structure*.**
-  The session-scoped `rendered` marks (ADR-0073's 2026-10-11 amendment) suppress
-  a Wake-less retirement's re-render across a restart, so this ADR reopens no
-  sanction. It defers only #683: making the ending itself durable so exactly-once
-  is the **Rendered Cursor**'s job and the two announce key spaces behind #659
+  The session-scoped `rendered` marks (ADR-0073's 2026-10-11 amendment) stop the
+  unbounded every-restart replay, within that ADR's bounded-mark and
+  concurrent-plan residuals (see Context), so this ADR reopens no sanction. It
+  defers only #683: making the ending itself durable so exactly-once is the
+  **Rendered Cursor**'s job and the two announce key spaces behind #659
   dissolve.
 - `plan_wake_entries` / `plan_runtime_entries` and the overlay move behind the
   seam: callers no longer see `announced_wakes`, `wake_floor`, `render_marks`
@@ -226,7 +245,24 @@ from the **Background Task Ledger**, which is where its rows and entries render.
 
 ## Related
 
-- Implementation slices (pure moves, zero behaviour change): #680 (module +
-  read-model types), #681 (per-chain delivery sets), #682 (liveness overlay).
-- Deferred deepenings: #683 (a durable ending rendered by the Rendered Cursor),
-  #684 (one TaskLiveness resolution), #685 (one confirmed-write seam).
+- Implementation slices (pure moves, zero behaviour change):
+  - **#680** — introduce `src/bridge/tasks/` and move the read-model type
+    definitions (`TaskKind`, `TaskEnding`, `TaskOutput`, `TaskLedgerRow`,
+    `TaskCompletionEntry`, `LedgerRowClock`, `LedgerChange`, `LedgerCadence`)
+    into it; `src/feishu/card/ledger.rs` keeps only formatting and re-exports
+    them.
+  - **#681** — move the per-chain delivery sets (`announced_wakes`,
+    `handed_over_wakes`, `wake_floor`, `render_marks`) out of
+    `StreamAccumulator` into a per-Session store keyed by chain generation, with
+    thin forwarding methods so no caller changes.
+  - **#682** — move the liveness overlay's bytes into the module while the
+    OpenCode adapter keeps applying it through a module-owned handle; remove
+    `Backend::retire_background_tasks` / `set_unconfirmed_tasks`.
+- Deferred deepenings (each needs its own ADR, not this one):
+  - **#683** — make the ending a durable fact rendered by the Rendered Cursor,
+    so exactly-once is the cursor's job and the two announce key spaces
+    dissolve.
+  - **#684** — one TaskLiveness resolution over transcript, runtime and child
+    evidence.
+  - **#685** — one confirmed-write seam that commits every durable fact a card
+    write carried.
