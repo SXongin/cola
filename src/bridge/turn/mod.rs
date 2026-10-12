@@ -452,7 +452,9 @@ impl Turn {
         // on a missing id, and the first flush after the id lands serves it.
         let started_at = std::time::Instant::now();
         let mut acc = StreamAccumulator::new(&subtitle);
-        Self::seed_durable_announcements(&handles.cards, &session_id, &mut acc);
+        // The durable announcement seed is NOT read here: it happens inside the
+        // install below, in one cards-map critical section with the insert
+        // (issue #671, ticket #672). See `install_fresh_session`.
         // The advisory-live opening line (ADR-0062): pushed BEFORE any part can
         // render, so it heads the card's timeline and every later flush keeps
         // it — the card that owns this message says the message merged into a
@@ -505,13 +507,11 @@ impl Turn {
             )
             .await;
         acc.set_turn_generation(generation);
-        {
-            let mut cards = handles.cards.cards.lock().await;
-            cards.insert(
-                session_id.clone(),
-                crate::bridge::turn::state::CardSession::new(acc, None),
-            );
-        }
+        // The fresh accumulator becomes the session's live card in ONE
+        // cards-map critical section with its durable-announcement seed
+        // (issue #671, ticket #672): see `install_fresh_session` for why the
+        // two may never be separated.
+        Self::install_fresh_session(&handles.cards, &session_id, acc).await;
 
         let mut loading = crate::feishu::card::shell::CardBuilder::new()
             .with_state(crate::feishu::card::CardState::Loading)
@@ -3266,6 +3266,27 @@ impl Turn {
         acc.set_render_marks(cards.chains.rendered(session_id));
     }
 
+    /// Register a fresh Turn's accumulator as the session's live card (issue
+    /// #671, ticket #672): the durable announcement seed and the insert share
+    /// ONE cards-map critical section, so no landed body can write a rendered
+    /// mark between this Turn's read of the chain's marks and its own install.
+    ///
+    /// Read separately — as a `Turn::start` that seeded before awaiting Instant
+    /// Reminder once did — the seed could run while a projection's create was
+    /// still in flight. That create's takeover still owns the map entry, so it
+    /// succeeds and records the mark; the fresh Turn then installs an
+    /// accumulator holding the older, empty mark set and its next read re-plans
+    /// and re-renders the very retirement the successor card just showed. Under
+    /// one lock the orderings are total: a mark that lands before the install
+    /// is already durable when the seed reads, and one that lands after finds
+    /// this Turn's session (`Lost`) and reaches its gate through
+    /// `record_landed_rendered` — the `4acd184` half of the same fix.
+    async fn install_fresh_session(cards: &CardsHandle, session_id: &str, mut acc: state::StreamAccumulator) {
+        let mut live = cards.cards.lock().await;
+        Self::seed_durable_announcements(cards, session_id, &mut acc);
+        live.insert(session_id.to_string(), state::CardSession::new(acc, None));
+    }
+
     /// Whether the session's card has rendered any part — the external
     /// renderer's "partial reply" probe before it finalizes on timeout.
     pub(crate) async fn has_rendered_content(cards: &CardsHandle, session_id: &str) -> bool {
@@ -4497,6 +4518,56 @@ mod tests {
                 .iter()
                 .all(|(reply_to, open_id, _, _)| reply_to != "msg_new" && open_id != "ou_new_requester"),
             "the replacement request is never announced the old Turn's ending: {notices:?}"
+        );
+    }
+
+    /// A fresh Turn's install reads its durable announcement seed only once it
+    /// holds the cards map (issue #671, ticket #672; the CI gate's second
+    /// ordering). Read before the lock as `Turn::start` once did — the seed
+    /// before its `begin_turn` await, the insert after — a projection create
+    /// landing in that gap records the mark durably (its Took takeover still
+    /// owns the map entry), and the Turn then installs the older, empty set: its
+    /// next read re-plans and re-renders the very retirement the successor card
+    /// just showed.
+    ///
+    /// The map lock makes the ordering deterministic: the install is spawned
+    /// first and reads its seed only after it acquires the lock, while the mark
+    /// lands while the test still holds it. A read-then-install split apart
+    /// reads the empty set before the spawn returns and fails the assertion.
+    #[tokio::test]
+    async fn a_fresh_install_seeds_under_the_same_lock_it_takes() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        let cards = app.cards_handle();
+
+        // Hold the map lock so the install queues on it while the durable mark
+        // lands — the window a landed projection body's confirmation writes in.
+        let held = cards.cards.lock().await;
+        let (ready_tx, mut ready_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let install = {
+            let cards = cards.clone();
+            let ready = ready_tx;
+            tokio::spawn(async move {
+                ready.send(()).expect("the test is receiving");
+                Turn::install_fresh_session(&cards, "ses_test", state::StreamAccumulator::new("turn")).await;
+            })
+        };
+        ready_rx.recv().await.expect("the install queued");
+        // The mark a landed projection's Took takeover records for the session,
+        // written before the install reaches the seed.
+        cards
+            .chains
+            .record_rendered("ses_test", &["runtime:call_1".to_string()]);
+        drop(held);
+        install.await.expect("the install task");
+
+        let live = cards.cards.lock().await;
+        let card = live.get("ses_test").expect("the fresh Turn's session");
+        assert!(
+            card.acc.render_recorded("runtime:call_1"),
+            "the install's seed reads the mark that landed before it"
         );
     }
 
