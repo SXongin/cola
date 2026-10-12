@@ -109,15 +109,16 @@ impl TasksHandle {
             .unwrap_or_else(|| cell.share())
     }
 
-    /// Rebind `session_id`'s cell and seed it from the durable tier — the one
-    /// call each of the four card-install sites makes. The bind resolves the
-    /// session's cell through the store, so the durable facts are written into
-    /// the cell the store owns for that binding, not through a side door.
-    pub(crate) fn restore(&self, session_id: &str, generation: u64, cell: &TaskCell) {
-        let bound = self.install(session_id, generation, cell);
-        let seed = self.durable_seed(session_id);
-        bound.set_wake_floor(seed.watermark_ms);
-        bound.set_render_marks(seed.rendered_keys);
+    /// Rebind `session_id`'s cell and hand back the durable facts it is seeded
+    /// with — the one call each of the four card-install sites makes. The bind
+    /// ([`Self::install`]) resolves the session's cell through the store, so
+    /// the facts come from [`Self::durable_seed`] read AFTER the binding; the
+    /// caller seeds them through the accumulator's forwarding setters
+    /// (`set_wake_floor` / `set_render_marks`), which reach the cell the store
+    /// owns for that binding, not a side door.
+    pub(crate) fn restore(&self, session_id: &str, generation: u64, cell: &TaskCell) -> DurableSeed {
+        self.install(session_id, generation, cell);
+        self.durable_seed(session_id)
     }
 
     fn store(&self) -> MutexGuard<'_, HashMap<String, SessionCell>> {

@@ -2271,10 +2271,15 @@ impl StreamAccumulator {
 
     /// The chain's durable Wake Watermark floor, if any (spec #561): every Wake
     /// at or below this `created_ms` was announced by an earlier card. Private
-    /// to this module: seeded by the Background Task State store
-    /// ([`crate::bridge::tasks::TasksHandle::restore`]).
+    /// to this module: seeded by [`Self::set_wake_floor`].
     pub(super) fn wake_floor(&self) -> Option<i64> {
         self.tasks.wake_floor()
+    }
+
+    /// Seed the Wake floor from the chain's durable Watermark (`None` when the
+    /// session announced no Wake).
+    pub(super) fn set_wake_floor(&mut self, floor: Option<i64>) {
+        self.tasks.set_wake_floor(floor);
     }
 
     /// Whether an earlier card of this Session already rendered this synthetic
