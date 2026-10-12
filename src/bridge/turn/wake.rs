@@ -162,7 +162,7 @@ pub(crate) struct ProjectedSlice {
 /// that started while the create was in flight) holds the older, empty set, so
 /// without this its next read would re-plan and re-render the very entry this
 /// card just showed.
-fn record_landed_rendered(
+pub(super) fn record_landed_rendered(
     cards: &CardsHandle,
     live: Option<&mut state::CardSession>,
     session_id: &str,
@@ -317,6 +317,14 @@ impl Turn {
         if live.contains_key(session_id) {
             return None;
         }
+        // `read_planned_outputs` awaited outside the lock: a queued card update
+        // can have delivered a rendered mark in that window (issue #671, ticket
+        // #672), which the seed above predates. Re-read the marks here, under
+        // the install lock, and hand them to the commit, which drops any planned
+        // entry they now cover — so the successor never re-shows one the
+        // delivered body already showed.
+        let recorded = cards.chains.rendered(session_id);
+        acc.set_render_marks(recorded.clone());
         let rendered = render::render_turn_parts(&mut acc, transcript);
         render::apply_ledger_read(
             &mut acc,
@@ -324,6 +332,7 @@ impl Turn {
             &std::collections::HashMap::new(),
             chrono::Utc::now().timestamp_millis(),
             state::LedgerCadence::Minute,
+            &recorded,
             plans,
         );
         match ending {

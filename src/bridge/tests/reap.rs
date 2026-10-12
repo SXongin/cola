@@ -10479,7 +10479,7 @@ async fn a_split_continuation_persists_its_repoint_and_cursor_once() {
     let chains = app.cards_handle().chains.clone();
     let writes0 = chains.writes();
 
-    Turn::track_continuation_card(&app.cards_handle(), "ses_test", "om_next", stage).await;
+    Turn::track_continuation_card(&app.cards_handle(), "ses_test", "om_next", stage, &[]).await;
 
     assert_eq!(
         chains.writes() - writes0,

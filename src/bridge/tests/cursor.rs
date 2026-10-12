@@ -607,6 +607,7 @@ async fn an_older_confirmation_never_overwrites_a_newer_durable_cursor() {
                 "ses_test",
                 &card_id,
                 stage_a,
+                &[],
                 Some(&gate),
             )
             .await;
@@ -618,8 +619,15 @@ async fn an_older_confirmation_never_overwrites_a_newer_durable_cursor() {
         let cards = app.cards_handle();
         let card_id = card_id.clone();
         tokio::spawn(async move {
-            crate::bridge::turn::confirm_staged_cursor_for_test(&cards, "ses_test", &card_id, stage_b, None)
-                .await;
+            crate::bridge::turn::confirm_staged_cursor_for_test(
+                &cards,
+                "ses_test",
+                &card_id,
+                stage_b,
+                &[],
+                None,
+            )
+            .await;
         })
     };
     // B gets its chance: with the atomic confirmation it waits for A's

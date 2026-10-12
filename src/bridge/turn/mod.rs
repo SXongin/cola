@@ -966,7 +966,12 @@ impl Turn {
             if let Some(card) = cards.get_mut(&self.session_id) {
                 let acc = &mut card.acc;
                 if let Some(transcript) = &final_transcript {
-                    render::render_new_turn_parts_committing(acc, transcript, plans);
+                    render::render_new_turn_parts_committing(
+                        acc,
+                        transcript,
+                        &handles.cards.chains.rendered(&self.session_id),
+                        plans,
+                    );
                 }
                 // Capture the answering model + token usage from the LATEST
                 // assistant message unconditionally — the render dedup may have
@@ -2126,6 +2131,7 @@ impl Turn {
         session_id: &str,
         card_message_id: &str,
         expected: state::StagedCursorId,
+        rendered: &[String],
     ) {
         let (message_id, created_ms, context_directory, reply_to, confirmed) = {
             let mut live = cards.cards.lock().await;
@@ -2179,6 +2185,20 @@ impl Turn {
                 reply_to.as_deref(),
             ),
         };
+        if confirmed.is_none() {
+            // The create landed but its stage can no longer be taken — the
+            // session was replaced, or the cap evicted it. The body still
+            // delivered, so its keys are marked and the live session's
+            // accumulator gate is told, exactly like a lost projection takeover
+            // (issue #671, ticket #672).
+            let mut live = cards.cards.lock().await;
+            crate::bridge::turn::wake::record_landed_rendered(
+                cards,
+                live.get_mut(session_id),
+                session_id,
+                rendered,
+            );
+        }
         // A re-point within the chain carries the Rendered Cursor (spec #561):
         // seed a fresh accumulator's empty base with the carried fact, while a
         // split continuation's accumulator already carries the same value (the
@@ -2601,6 +2621,7 @@ impl Turn {
                     &HashMap::new(),
                     now_ms,
                     state::LedgerCadence::Minute,
+                    &cards.chains.rendered(session_id),
                     plans,
                 );
             card.pending_split.push(state::PendingSplit {
@@ -2688,6 +2709,7 @@ impl Turn {
                 &HashMap::new(),
                 now_ms,
                 state::LedgerCadence::Second,
+                &cards.chains.rendered(session_id),
                 plans,
             );
             // The chain has taken this completion's work over, when there is
@@ -2928,6 +2950,7 @@ impl Turn {
                 &activities,
                 now_ms,
                 state::LedgerCadence::Second,
+                &cards.chains.rendered(session_id),
                 plans,
             );
             // The read's own settle decision judges the true end (ADR-0059):

@@ -286,6 +286,19 @@ pub(crate) struct WakeMark {
     pub(crate) created_ms: i64,
 }
 
+/// A recoverably-failed body's synthetic rendered keys, waiting on the delivery
+/// of the Pending Card Update payload at [`Self::seq`] (issue #671, ticket
+/// #672). Held on the Chain Records, keyed by card, so it survives a card
+/// accumulator being replaced, removed or re-keyed before the payload delivers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OwedRendered {
+    /// The Session the mark is owed to (corrected by
+    /// [`ChainRecords::rename`] when the Session is recreated).
+    pub(crate) session_id: String,
+    pub(crate) seq: u64,
+    pub(crate) rendered: Vec<String>,
+}
+
 /// The persisted Chain Record; a wrapper so the on-disk shape can grow.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct ChainRecordFile {
@@ -330,6 +343,20 @@ fn resolved_reply_to(previous: Option<&ChainRecord>, update: ReplyToUpdate<'_>) 
     }
 }
 
+/// Follow a Session's re-key forwarding to its CURRENT id (issue #671, ticket
+/// #672): a writer that captured the id before a recreate must still record
+/// under the recreated Session. Bounded so a corrupt cycle can never spin.
+fn resolved_session(state: &State, session_id: &str) -> String {
+    let mut current = session_id;
+    for _ in 0..16 {
+        match state.renamed.get(current) {
+            Some(next) => current = next,
+            None => break,
+        }
+    }
+    current.to_string()
+}
+
 /// Fold `keys` into `session_id`'s durable rendered marks (issue #671, ticket
 /// #672): append each key the session does not carry yet, evict the OLDEST
 /// past [`MAX_RENDERED_KEYS`], and report whether anything changed. The one
@@ -341,7 +368,11 @@ fn push_rendered_marks(state: &mut State, session_id: &str, keys: &[String]) -> 
     if keys.is_empty() {
         return false;
     }
-    let marks = state.rendered.entry(session_id.to_string()).or_default();
+    // Record under the Session's CURRENT id: a writer that captured the id
+    // before a recreate must still land on the recreated Session, never the dead
+    // one (issue #671, ticket #672).
+    let session_id = resolved_session(state, session_id);
+    let marks = state.rendered.entry(session_id).or_default();
     let mut changed = false;
     for key in keys {
         if !marks.contains(key) {
@@ -385,6 +416,21 @@ struct State {
     /// already rendered, oldest first (issue #671, ticket #672). Insertion
     /// order is what [`ChainRecords::record_rendered`]'s bound evicts from.
     rendered: HashMap<String, Vec<String>>,
+    /// card_message_id → the synthetic keys a recoverably-failed body still owes
+    /// the durable Record, waiting on the Pending Card Update payload at
+    /// [`OwedRendered::seq`] (issue #671, ticket #672). In-memory only, and held
+    /// here rather than on an accumulator on purpose: a card's accumulator can be
+    /// replaced, removed or re-keyed between the failure and the delivery, and
+    /// the keys are this fact's only copy. Keyed by the card, whose id is stable
+    /// across all of that; the Session id it names is corrected by
+    /// [`ChainRecords::rename`].
+    owed: HashMap<String, OwedRendered>,
+    /// A recreated Session's OLD id → its new one (issue #671, ticket #672):
+    /// in-memory forwarding so a concurrent writer that captured the id before
+    /// [`ChainRecords::rename`] still records the rendered marks under the
+    /// recreated Session, never the dead one. Not persisted — the rename moved
+    /// the durable marks, and no writer outlives the process.
+    renamed: HashMap<String, String>,
 }
 
 /// The most rendered synthetic keys one Session retains (issue #671, ticket
@@ -432,6 +478,8 @@ impl ChainRecords {
                 records,
                 announcements,
                 rendered: HashMap::new(),
+                owed: HashMap::new(),
+                renamed: HashMap::new(),
             }
         } else {
             let file = sidecar::load::<ChainRecordFile>(&path, "Chain Record");
@@ -439,6 +487,8 @@ impl ChainRecords {
                 records: file.records,
                 announcements: file.announcements,
                 rendered: file.rendered,
+                owed: HashMap::new(),
+                renamed: HashMap::new(),
             }
         };
         let store = Self {
@@ -800,6 +850,15 @@ impl ChainRecords {
     /// a retirement it already showed must not replay under the new one.
     pub(crate) fn rename(&self, from: &str, to: &str) {
         let mut state = self.lock();
+        // Forward the old id so a concurrent writer that captured it before this
+        // rename still records the rendered marks under the recreated Session
+        // (issue #671, ticket #672). Also re-point the owed mirrors' Session.
+        state.renamed.insert(from.to_string(), to.to_string());
+        for owed in state.owed.values_mut() {
+            if owed.session_id == from {
+                owed.session_id = to.to_string();
+            }
+        }
         let record = state.records.remove(from);
         let announcement = state.announcements.remove(from);
         let rendered = state.rendered.remove(from);
@@ -1107,7 +1166,86 @@ impl ChainRecords {
     /// rendered, for the render's own gate (issue #671, ticket #672). A
     /// session that rendered nothing answers empty.
     pub(crate) fn rendered(&self, session_id: &str) -> Vec<String> {
-        self.lock().rendered.get(session_id).cloned().unwrap_or_default()
+        let state = self.lock();
+        let session_id = resolved_session(&state, session_id);
+        state.rendered.get(&session_id).cloned().unwrap_or_default()
+    }
+
+    /// Remember the synthetic keys a recoverably-failed body owes the durable
+    /// Record, tied to the Pending Card Update payload at `seq` (issue #671,
+    /// ticket #672). Held here, keyed by the CARD — whose id is stable across a
+    /// Session's replace, remove or re-key — so no card-accumulator lifecycle
+    /// can drop the keys, which are this fact's only copy. A newer failure for
+    /// the same card supersedes the older entry, exactly as the delivery layer
+    /// supersedes its payload. In-memory only: a restart that loses it lets the
+    /// entry re-render once, the same duplicate-over-loss trade the rendered
+    /// marks' own bound makes.
+    pub(crate) fn note_owed_rendered(
+        &self,
+        card_message_id: &str,
+        session_id: &str,
+        seq: u64,
+        rendered: &[String],
+    ) {
+        if rendered.is_empty() {
+            return;
+        }
+        self.lock().owed.insert(
+            card_message_id.to_string(),
+            OwedRendered {
+                session_id: session_id.to_string(),
+                seq,
+                rendered: rendered.to_vec(),
+            },
+        );
+    }
+
+    /// Every card's owed rendered keys, with the Session they belong to and the
+    /// sequence whose delivery records them (issue #671, ticket #672).
+    pub(crate) fn owed_rendered(&self) -> Vec<(String, OwedRendered)> {
+        self.lock()
+            .owed
+            .iter()
+            .map(|(card, owed)| (card.clone(), owed.clone()))
+            .collect()
+    }
+
+    /// Drop a card's owed rendered keys once their payload's fate is settled —
+    /// delivered (its mark was written) or never delivering (nothing may be
+    /// recorded). A stale sequence names an entry a newer failure replaced, so
+    /// it is a no-op.
+    pub(crate) fn clear_owed_rendered(&self, card_message_id: &str, seq: u64) {
+        let mut state = self.lock();
+        if state
+            .owed
+            .get(card_message_id)
+            .is_some_and(|owed| owed.seq == seq)
+        {
+            state.owed.remove(card_message_id);
+        }
+    }
+
+    /// The payload at `seq` for `card_message_id` delivered: record its owed
+    /// keys as that Session's durable rendered marks AND drop the mirror, in ONE
+    /// chains critical section and write — so a [`Self::rename`] racing the
+    /// delivery can neither move the entry out from under the write nor leave it
+    /// cleared without its mark (issue #671, ticket #672). Returns the Session
+    /// and the keys, for the caller's live-gate insert; `None` when no entry
+    /// matches `seq` (a newer failure replaced it, or it was already settled).
+    pub(crate) fn confirm_owed_rendered(
+        &self,
+        card_message_id: &str,
+        seq: u64,
+    ) -> Option<(String, Vec<String>)> {
+        let mut state = self.lock();
+        if state.owed.get(card_message_id).is_none_or(|owed| owed.seq != seq) {
+            return None;
+        }
+        let owed = state.owed.remove(card_message_id).expect("checked above");
+        if push_rendered_marks(&mut state, &owed.session_id, &owed.rendered) {
+            self.write(&state);
+        }
+        Some((owed.session_id, owed.rendered))
     }
 
     /// Persist both sections through the shared sidecar writer. The file is
@@ -1921,6 +2059,84 @@ mod tests {
             !bounded.iter().any(|key| key == "runtime:call_1"),
             "the oldest marks are evicted first: {bounded:?}"
         );
+    }
+
+    /// Issue #671 / ticket #672 (CI gate): the owed rendered mirror is keyed by
+    /// the CARD — whose id is stable across a Session's replace, remove and
+    /// re-key — so nothing about a card accumulator can drop it; a newer failure
+    /// for the same card supersedes the older entry, a rename re-keys the
+    /// Session it names, and an exact clear (not a stale one) drops it.
+    #[test]
+    fn owed_rendered_marks_are_card_keyed_and_follow_a_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE);
+        let chains = ChainRecords::load(path.clone());
+
+        chains.note_owed_rendered("om_a", "ses_1", 3, &["runtime:call_1".to_string()]);
+        chains.note_owed_rendered("om_b", "ses_1", 4, &["runtime:call_2".to_string()]);
+        // A newer failure for the same card supersedes the older entry.
+        chains.note_owed_rendered("om_a", "ses_1", 9, &["runtime:call_3".to_string()]);
+        let mut owed = chains.owed_rendered();
+        owed.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(owed.len(), 2);
+        assert_eq!(
+            owed[0],
+            (
+                "om_a".to_string(),
+                OwedRendered {
+                    session_id: "ses_1".to_string(),
+                    seq: 9,
+                    rendered: vec!["runtime:call_3".to_string()],
+                }
+            ),
+            "a newer failure for the same card replaces the older entry"
+        );
+
+        // A rename re-keys the Session the mirror names.
+        chains.rename("ses_1", "ses_2");
+        assert!(
+            chains
+                .owed_rendered()
+                .iter()
+                .all(|(_, owed)| owed.session_id == "ses_2"),
+            "a recreated Session id moves the owed mirror with it"
+        );
+        // A writer that captured the OLD id — a PATCH accepted after the rename —
+        // records under the recreated Session, never the dead one.
+        chains.record_rendered("ses_1", &["runtime:call_late".to_string()]);
+        assert!(
+            chains
+                .rendered("ses_2")
+                .iter()
+                .any(|key| key == "runtime:call_late"),
+            "a stale id resolves through the rename: {:?}",
+            chains.rendered("ses_2")
+        );
+
+        // A stale clear is a no-op; the exact sequence drops the entry.
+        chains.clear_owed_rendered("om_a", 3);
+        assert!(chains.owed_rendered().iter().any(|(card, _)| card == "om_a"));
+        chains.clear_owed_rendered("om_a", 9);
+        assert!(!chains.owed_rendered().iter().any(|(card, _)| card == "om_a"));
+
+        // A delivery confirmed AFTER a rename records under the NEW id and
+        // drops the mirror, in one operation (a rename can never split the two).
+        chains.note_owed_rendered("om_c", "ses_2", 5, &["runtime:call_4".to_string()]);
+        chains.rename("ses_2", "ses_3");
+        let (session, keys) = chains
+            .confirm_owed_rendered("om_c", 5)
+            .expect("the owed entry confirms");
+        assert_eq!(session, "ses_3", "the delivery honors the rename");
+        assert_eq!(keys, vec!["runtime:call_4".to_string()]);
+        assert_eq!(
+            chains.rendered("ses_3"),
+            vec!["runtime:call_late".to_string(), "runtime:call_4".to_string()],
+            "both marks land under the recreated id"
+        );
+        assert!(!chains.owed_rendered().iter().any(|(card, _)| card == "om_c"));
+
+        // In-memory only: a reload never carries an owed mirror.
+        assert!(ChainRecords::load(path).owed_rendered().is_empty());
     }
 
     /// Issue #671: a recreated session id names the same logical session, so

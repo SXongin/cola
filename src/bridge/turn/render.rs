@@ -545,9 +545,11 @@ fn plan_wake_entries(
 /// from the anchor: the read that carries a retirement records it in the
 /// backend's process-local overlay, so no later read derives it again, and the
 /// Wake announcement set (keyed by a synthetic `runtime:<call_id>` id) covers
-/// the reads within the observing chain. That synthetic mark is in-memory
-/// only: a retirement is not a Wake, so it stages nothing durable and never
-/// advances the Wake Watermark (ADR-0061; spec #588, review PR #595).
+/// the reads within the observing chain. That synthetic mark advances NO Wake
+/// Watermark — a retirement is not a Wake (ADR-0061) — but it is not
+/// in-memory-only either: a delivered body's keys become the session's durable
+/// rendered marks (issue #671, ticket #672), gated by [`StreamAccumulator::render_recorded`]
+/// at line 561, which is what stops a restart from re-posting the entry.
 fn plan_runtime_entries(acc: &StreamAccumulator, transcript: &SessionTranscript) -> Vec<PlannedEntry> {
     let mut plans = Vec::new();
     for retirement in &transcript.task_retirements {
@@ -598,6 +600,18 @@ fn plan_runtime_entries(acc: &StreamAccumulator, transcript: &SessionTranscript)
         });
     }
     plans
+}
+
+/// Drop the planned entries a durable rendered mark now covers (issue #671,
+/// ticket #672): a plan built before an awaited output read can be stale when a
+/// queued card update delivers in that window, so a caller re-checks the marks
+/// under its install lock before committing the plan. Only synthetic
+/// retirements are gated by the marks; a Wake's exactly-once is the Watermark.
+pub(super) fn retain_unrecorded(plans: &mut Vec<PlannedEntry>, recorded: &[String]) {
+    plans.retain(|plan| match plan.announce {
+        PlannedAnnounce::Synthetic => !recorded.iter().any(|key| key == &plan.key),
+        PlannedAnnounce::Wake { .. } => true,
+    });
 }
 
 /// Spend each planned shell completion's one output read (spec #588, #593):
@@ -1062,7 +1076,18 @@ async fn resolve_file_delivery(
 /// PR #595): a real Wake's completion advances the durable Wake Watermark, a
 /// synthetic retirement only marks the in-memory announce set (ADR-0061).
 /// Returns whether any entry was inserted.
-pub(super) fn commit_planned_entries(acc: &mut StreamAccumulator, plans: Vec<PlannedEntry>) -> bool {
+pub(super) fn commit_planned_entries(
+    acc: &mut StreamAccumulator,
+    mut plans: Vec<PlannedEntry>,
+    recorded: &[String],
+) -> bool {
+    // The plan may predate an awaited output read, during which a queued card
+    // update can deliver and record a durable rendered mark (issue #671, ticket
+    // #672). Re-check it against those marks here, under the caller's install
+    // lock, and drop any synthetic entry a mark now covers, so the entry never
+    // renders twice. (The reads already spent are not wasted: the entry simply
+    // does not commit.)
+    retain_unrecorded(&mut plans, recorded);
     let mut inserted = false;
     for plan in plans {
         let announced = match plan.announce {
@@ -1111,12 +1136,13 @@ pub(super) fn apply_ledger_read(
     activities: &std::collections::HashMap<String, TaskLiveness>,
     now_ms: i64,
     cadence: LedgerCadence,
+    recorded: &[String],
     plans: Vec<PlannedEntry>,
 ) -> bool {
     let mut changed = acc
         .set_ledger_from_read(transcript, activities, now_ms, cadence)
         .owes();
-    changed |= commit_planned_entries(acc, plans);
+    changed |= commit_planned_entries(acc, plans, recorded);
     changed
 }
 
@@ -1136,7 +1162,7 @@ pub(super) fn apply_ledger_read(
 pub(super) fn render_new_turn_parts(acc: &mut StreamAccumulator, transcript: &SessionTranscript) -> bool {
     let rendered = render_turn_parts(acc, transcript);
     let plans = plan_ledger_entries(acc, transcript, acc.turn_anchor());
-    let entries = commit_planned_entries(acc, plans);
+    let entries = commit_planned_entries(acc, plans, &[]);
     rendered | refresh_ledger(acc, transcript, &std::collections::HashMap::new()).owes() | entries
 }
 
@@ -1166,10 +1192,11 @@ pub(super) fn plan_finalization_entries(
 pub(super) fn render_new_turn_parts_committing(
     acc: &mut StreamAccumulator,
     transcript: &SessionTranscript,
+    recorded: &[String],
     plans: Vec<PlannedEntry>,
 ) -> bool {
     let rendered = render_turn_parts(acc, transcript);
-    let entries = commit_planned_entries(acc, plans);
+    let entries = commit_planned_entries(acc, plans, recorded);
     rendered | refresh_ledger(acc, transcript, &std::collections::HashMap::new()).owes() | entries
 }
 
@@ -1996,7 +2023,8 @@ async fn render_and_flush_inner(
         let mut live = cards.cards.lock().await;
         match live.get_mut(session_id) {
             Some(card) => {
-                let inserted = commit_planned_entries(&mut card.acc, plans);
+                let inserted =
+                    commit_planned_entries(&mut card.acc, plans, &cards.chains.rendered(session_id));
                 if inserted {
                     // An inserted entry is rendered content, not clock churn:
                     // it owes its flush and counts as progress, like a part.
@@ -2375,6 +2403,57 @@ mod tests {
     use crate::bridge::turn::state::{CursorSeed, StreamAccumulator, file_content_hash};
     use crate::feishu::card::CardState;
     use crate::feishu::card::tool_render::ToolPanel;
+
+    /// Issue #671 / ticket #672 (CI gate): a plan built before an awaited output
+    /// read can be stale when a queued card update delivers in that window, so
+    /// the caller re-checks it against the durable rendered marks under its
+    /// install lock. A synthetic entry a mark now covers is dropped; a Wake is
+    /// never gated by the marks (its exactly-once is the Watermark).
+    #[test]
+    fn a_stale_plan_drops_only_the_entries_a_mark_now_covers() {
+        use crate::feishu::card::ledger::{TaskCompletionEntry, TaskEnding, TaskKind};
+        let entry = || TaskCompletionEntry {
+            kind: TaskKind::Subagent,
+            label: None,
+            id: None,
+            started_at: None,
+            finished_at: None,
+            ending: TaskEnding::RuntimeEnded,
+            output: None,
+        };
+        let mut plans = vec![
+            PlannedEntry {
+                key: "runtime:call_1".to_string(),
+                announce: PlannedAnnounce::Synthetic,
+                at: None,
+                directory: None,
+                entry: entry(),
+            },
+            PlannedEntry {
+                key: "runtime:call_2".to_string(),
+                announce: PlannedAnnounce::Synthetic,
+                at: None,
+                directory: None,
+                entry: entry(),
+            },
+            PlannedEntry {
+                key: "msg_wake_1".to_string(),
+                announce: PlannedAnnounce::Wake { created_ms: 1_000 },
+                at: None,
+                directory: None,
+                entry: entry(),
+            },
+        ];
+
+        retain_unrecorded(&mut plans, &["runtime:call_1".to_string()]);
+
+        let keys: Vec<&str> = plans.iter().map(|plan| plan.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["runtime:call_2", "msg_wake_1"],
+            "the covered synthetic entry is dropped, the Wake is not"
+        );
+    }
 
     /// A typed assistant message: identity, role, server time and parts, with
     /// no backend field name in the fixture (spec #332).

@@ -208,8 +208,10 @@ the user already looks at.
   a cola restart loses the overlay and the dismissal, and the next reconcile
   re-derives the same wait. Accepted: honest re-derivation, no durable format
   change. Their completion entries are synthetic: they keep exactly-once
-  through the observing chain's in-memory announcement set alone and never
-  advance the durable **Wake Watermark**, which ADR-0061 defines as the newest
+  through the observing chain's in-memory announcement set, and — since the
+  2026-10-11 amendment below — through the durable `rendered` marks for every
+  earlier chain and life. They never advance the durable **Wake Watermark**,
+  which ADR-0061 defines as the newest
   **Wake** whose completion a card announced. Staging a synthetic clock there
   would make a restart read a genuinely un-announced late Wake at or below it
   as already announced and suppress its continuation — #590's "a late Wake for
@@ -265,7 +267,21 @@ restart itself creates the card and pushes it.
   can render the entry still claims it (ADR-0065's rule, kept for a retirement
   nothing has shown yet). `plan_runtime_entries` skips a key that mark carries,
   so an entry one delivered card has shown never renders on a later card,
-  restart included.
+  restart included. A write the platform ACCEPTS records its keys in the same
+  synchronous step as the acceptance, so cancelling the flush before the
+  staged-cursor confirmation cannot lose them. A recoverably-failed body's keys
+  are mirrored on the Chain
+  Records, keyed by the card its queued payload travels on
+  (`ChainRecords::note_owed_rendered`) — the card's id survives a Session's
+  replace, removal and re-key, a rename moves the Session the entry names, and a
+  writer that captured the dead id before the rename resolves through it — and
+  the drain reconcile records them, inserting them into whatever chain is
+  live, when that payload delivers. Neither the staged-cursor cap nor a replaced
+  accumulator can then lose the mark (both found by the CI gate). The cap drops
+  a stage that is owed (its keys, if any, are mirrored, and only its cursor is
+  left behind — the trade this cap already made) or one that carries no keys; an
+  unowed keyed stage is an in-flight confirmation whose keys exist nowhere else,
+  and it resolves on its own send.
 - The `rendered` marks are deliberately a SECOND durable fact, never the Wake
   Watermark: a retirement is not a Wake, so recording it must not move the
   floor a late Wake is judged against (#590, PR #595). It outlives the record
