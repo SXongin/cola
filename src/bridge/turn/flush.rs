@@ -368,11 +368,9 @@ async fn note_cursor_write_failure(
         if let Some(seq) = cards.feishu.failed_card_write(card_message_id, card)
             && cards.feishu.card_write_delivered(card_message_id, seq)
         {
-            // The drain delivered this payload first: the write landed, so mark
-            // the keys in this synchronous step (a cancellation before the
-            // confirmation would lose them — issue #671, ticket #672) and
-            // confirm the exact stage this body carried.
-            cards.chains.record_rendered(session_id, rendered);
+            // The drain delivered this payload first: the write landed, so
+            // confirm the exact stage this body carried — the mark and the
+            // cursor in ONE write (issue #671, ticket #672).
             confirm_staged_cursor(cards, session_id, card_message_id, None, stage, rendered, None).await;
             return;
         }
@@ -619,13 +617,21 @@ pub(super) async fn flush_card_locked(
                 let watermark = staged_watermark_id(cards, session_id).await;
                 let delivered = match cards.feishu.update_message(&card_id, &built.card).await {
                     Ok(()) => {
-                        // The PATCH is accepted NOW: mark this body's rendered
-                        // keys in the same synchronous step, before the awaits
-                        // below — a cancellation between the acceptance and the
-                        // staged-cursor confirmation would otherwise lose them
-                        // (issue #671, ticket #672). The confirmation's own
-                        // write of the same keys is idempotent.
-                        cards.chains.record_rendered(session_id, &built.rendered_keys);
+                        // The PATCH is accepted NOW: advance this body's Rendered
+                        // Cursor, its gap coverage and its rendered keys in ONE
+                        // chains write, in this synchronous step before any await
+                        // (issue #671, ticket #672). A later cancellation cannot
+                        // lose the mark, and a crash cannot leave the mark apart
+                        // from the cursor it was confirmed with. The staged
+                        // confirmation below writes the same values again — an
+                        // idempotent no-op on an already-advanced record.
+                        cards.chains.advance_cursor_and_gap(
+                            session_id,
+                            &card_id,
+                            &built.cursor,
+                            built.gap.as_ref().map(|gap| (&gap.frontier, gap.complete)),
+                            &built.rendered_keys,
+                        );
                         wrote = true;
                         true
                     }
@@ -816,11 +822,17 @@ pub(super) async fn flush_card_locked(
                 let stage = stage.expect("a PATCHed slice stages its cursor");
                 match cards.feishu.update_message(&card_id, &finalized.card).await {
                     Ok(()) => {
-                        // Accepted NOW: mark the finalized body's keys in this
-                        // synchronous step (a cancellation before the staged
-                        // cursor's confirmation would lose them — issue #671,
-                        // ticket #672).
-                        cards.chains.record_rendered(session_id, &finalized.rendered_keys);
+                        // Accepted NOW: advance the finalized body's cursor, gap
+                        // and rendered keys in ONE synchronous write, before any
+                        // await (issue #671, ticket #672). The staged
+                        // confirmation below re-writes them idempotently.
+                        cards.chains.advance_cursor_and_gap(
+                            session_id,
+                            &card_id,
+                            &finalized.cursor,
+                            finalized.gap.as_ref().map(|gap| (&gap.frontier, gap.complete)),
+                            &finalized.rendered_keys,
+                        );
                         wrote = true;
                         true
                     }
@@ -996,11 +1008,11 @@ pub(super) async fn flush_card_locked(
         };
         match sent {
             Ok(new_id) => {
-                // The create is accepted NOW: mark its keys in this synchronous
-                // step, before any await (issue #671, ticket #672) — a
-                // cancellation before `track_continuation_card` would otherwise
-                // lose them.
-                cards.chains.record_rendered(session_id, &built.rendered_keys);
+                // The create is accepted. Its keys are written by
+                // `track_continuation_card` below, in the SAME one write as the
+                // record re-point and the confirmed cursor — so a crash can
+                // never leave the mark apart from the cursor it was confirmed
+                // with (issue #671, ticket #672).
                 wrote = true;
                 {
                     let mut cards = cards.cards.lock().await;
@@ -1989,6 +2001,16 @@ mod tests {
             .fail_update_transport_count
             .store(0, std::sync::atomic::Ordering::SeqCst);
         cards.feishu.drain_pending_card_updates(true).await;
+        // A chain committing in THIS window — after the payload delivered but
+        // before the reconcile records — must already see the entry's key, or it
+        // would render the retirement the delivered card already showed (issue
+        // #671, ticket #672).
+        assert!(
+            Turn::recorded_marks(&cards, "ses_test")
+                .iter()
+                .any(|key| key == "runtime:call_1"),
+            "a delivered owed mark is visible to a commit before the reconcile persists it"
+        );
         crate::bridge::turn::reconcile_staged_cursors(&cards).await;
 
         assert!(

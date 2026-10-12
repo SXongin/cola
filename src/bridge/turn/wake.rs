@@ -323,7 +323,7 @@ impl Turn {
         // the install lock, and hand them to the commit, which drops any planned
         // entry they now cover — so the successor never re-shows one the
         // delivered body already showed.
-        let recorded = cards.chains.rendered(session_id);
+        let recorded = Turn::recorded_marks(cards, session_id);
         acc.set_render_marks(recorded.clone());
         let rendered = render::render_turn_parts(&mut acc, transcript);
         render::apply_ledger_read(
@@ -970,8 +970,11 @@ impl Turn {
         // nor a restart repeats delivered gap content. No coverage at all
         // leaves the durable fact untouched.
         // A card with no Turn message to scope a settle decision with cannot
-        // be reaped: attached, but no record — `track_live_card`'s own rule.
+        // be reaped: attached, but no record — `track_live_card`'s own rule. The
+        // create still DELIVERED, though, so its keys are marked and the
+        // session's gate told (issue #671, ticket #672).
         let Some(message_id) = message_id else {
+            record_landed_rendered(cards, Some(card), session_id, rendered);
             return Some(None);
         };
         let directory = directory
@@ -1003,17 +1006,36 @@ impl Turn {
                     .map(|coverage| (&coverage.frontier, coverage.complete)),
                 &confirmed.rendered,
             ),
-            // No staged cursor matched the create's stage: nothing was
-            // confirmed, so the re-point carries the previous frontier exactly
-            // as a plain re-point does — with the landing's reply target.
-            _ => cards.chains.track_landing(
-                session_id,
-                card_message_id,
-                message_id,
-                created_ms,
-                directory.as_deref(),
-                reply_to.as_deref(),
-            ),
+            // No staged cursor matched the create's stage (the cap evicted it,
+            // or a raced write consumed it): the body still DELIVERED, so its
+            // keys are written in the SAME one write as the re-point — with the
+            // base cursor as a no-op advance — so a crash cannot leave the mark
+            // apart from the cursor, and the successor's arrival never lets the
+            // entry re-render on a later card (issue #671, ticket #672).
+            _ => {
+                // No staged cursor matched the create's stage (the cap evicted
+                // it, or a raced write consumed it): the body still DELIVERED,
+                // so its keys ride the SAME one write as the re-point — a crash
+                // can never leave the mark apart from the cursor, and the
+                // successor's arrival never lets the entry re-render on a later
+                // card (issue #671, ticket #672).
+                let previous = cards.chains.track_landing(
+                    session_id,
+                    card_message_id,
+                    message_id,
+                    created_ms,
+                    directory.as_deref(),
+                    reply_to.as_deref(),
+                    rendered,
+                );
+                // The successor's own accumulator seeded before this landing:
+                // take the delivered keys into its gate too, or its next read
+                // re-plans the entry.
+                for key in rendered {
+                    card.acc.announce_synthetic(key);
+                }
+                previous
+            }
         };
         // The projection's take-over CONSUMES the write-ahead intent (spec
         // #561, review #569): the create the mark covered has landed — this
@@ -1333,6 +1355,72 @@ mod tests {
                 .card_message_id,
             "om_turn",
             "a replaced session's record is never re-pointed"
+        );
+    }
+
+    /// Issue #671 / ticket #672 (CI gate): a takeover whose create LANDED but
+    /// whose staged cursor can no longer be taken — the cap evicted it, or a
+    /// raced write consumed it — still marks the body's rendered keys and tells
+    /// the session's gate. The stage's keys are not the mark's only copy, but
+    /// this path must record what the create delivered (the flush's own
+    /// accepted-write record does not cover a projection create).
+    #[tokio::test]
+    async fn a_takeover_without_its_stage_still_marks_its_keys() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        let cards = app.cards_handle();
+        Turn::seed_card(&cards, "ses_test", None).await;
+        Turn::set_turn_anchor(
+            &cards,
+            "ses_test",
+            &crate::bridge::test_support::turn_anchor(1_000),
+        )
+        .await;
+        let chain_id = {
+            let live = cards.cards.lock().await;
+            live.get("ses_test").expect("the armed session").chain_id()
+        };
+
+        // The create landed, but no stage matches (id 0 names none): the
+        // takeover must still record the delivered keys.
+        assert!(
+            matches!(
+                Turn::take_over_armed_card(
+                    &cards,
+                    "ses_test",
+                    chain_id,
+                    "om_late",
+                    None,
+                    Some("/work"),
+                    state::StagedCursorId {
+                        id: 0,
+                        awaiting_seq: None,
+                    },
+                    &["runtime:call_1".to_string()],
+                )
+                .await,
+                ArmedTakeover::Took(_)
+            ),
+            "the armed session takes over without its stage"
+        );
+        assert!(
+            cards
+                .chains
+                .rendered("ses_test")
+                .iter()
+                .any(|key| key == "runtime:call_1"),
+            "a takeover without its stage still marks its keys: {:?}",
+            cards.chains.rendered("ses_test")
+        );
+        let live = cards.cards.lock().await;
+        assert!(
+            live.get("ses_test")
+                .expect("the taken-over session")
+                .acc
+                .wake_announced("runtime:call_1"),
+            "its gate takes the delivered keys"
         );
     }
 }

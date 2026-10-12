@@ -345,10 +345,13 @@ fn resolved_reply_to(previous: Option<&ChainRecord>, update: ReplyToUpdate<'_>) 
 
 /// Follow a Session's re-key forwarding to its CURRENT id (issue #671, ticket
 /// #672): a writer that captured the id before a recreate must still record
-/// under the recreated Session. Bounded so a corrupt cycle can never spin.
+/// under the recreated Session. The visited set bounds a corrupt cycle without
+/// capping the depth — a Session recreated repeatedly keeps forwarding past any
+/// fixed limit.
 fn resolved_session(state: &State, session_id: &str) -> String {
     let mut current = session_id;
-    for _ in 0..16 {
+    let mut seen = std::collections::HashSet::new();
+    while seen.insert(current) {
         match state.renamed.get(current) {
             Some(next) => current = next,
             None => break,
@@ -568,6 +571,7 @@ impl ChainRecords {
             created_ms,
             directory,
             known_or_carry(reply_to),
+            &[],
         )
     }
 
@@ -577,7 +581,11 @@ impl ChainRecords {
     /// clear) — in the SAME record write as the re-point. The projection's
     /// landing paths use this so a crash can never leave the record naming a
     /// target the landing just refused; the ladder's bounded fall-through
-    /// stays as defense in depth for records older builds wrote.
+    /// stays as defense in depth for records older builds wrote. `rendered` is
+    /// the delivered body's synthetic rendered keys (issue #671, ticket #672):
+    /// they ride this same write, so a takeover whose staged cursor was evicted
+    /// can never leave the mark apart from the re-point.
+    #[allow(clippy::too_many_arguments)] // the re-point's whole fixture
     pub(crate) fn track_landing(
         &self,
         session_id: &str,
@@ -586,6 +594,7 @@ impl ChainRecords {
         created_ms: Option<i64>,
         directory: Option<&str>,
         reply_to: Option<&str>,
+        rendered: &[String],
     ) -> Option<ChainRecord> {
         self.track_with(
             session_id,
@@ -594,9 +603,38 @@ impl ChainRecords {
             created_ms,
             directory,
             ReplyToUpdate::Set(reply_to),
+            rendered,
         )
     }
 
+    /// [`Self::track_landing`] for a continuation whose reply target follows
+    /// [`Self::track`]'s known-or-carry rule, carrying the delivered body's
+    /// rendered keys in the SAME write (issue #671, ticket #672): a continuation
+    /// create whose staged cursor was evicted still marks what its create
+    /// delivered, atomically with the re-point.
+    #[allow(clippy::too_many_arguments)] // the re-point's whole fixture
+    pub(crate) fn track_carrying_rendered(
+        &self,
+        session_id: &str,
+        card_message_id: impl Into<String>,
+        message_id: MessageId,
+        created_ms: Option<i64>,
+        directory: Option<&str>,
+        reply_to: Option<&str>,
+        rendered: &[String],
+    ) -> Option<ChainRecord> {
+        self.track_with(
+            session_id,
+            card_message_id,
+            message_id,
+            created_ms,
+            directory,
+            known_or_carry(reply_to),
+            rendered,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // the record write's whole fixture
     fn track_with(
         &self,
         session_id: &str,
@@ -605,6 +643,7 @@ impl ChainRecords {
         created_ms: Option<i64>,
         directory: Option<&str>,
         reply_to: ReplyToUpdate<'_>,
+        rendered: &[String],
     ) -> Option<ChainRecord> {
         let mut state = self.lock();
         // A re-point within the chain carries the Rendered Cursor (spec #561):
@@ -633,6 +672,10 @@ impl ChainRecords {
             record.projection_intent = previous.projection_intent;
         }
         state.records.insert(session_id.to_string(), record);
+        // The delivered body's rendered keys ride this SAME write (issue #671,
+        // ticket #672): a crash must never leave the mark apart from the re-point
+        // that confirmed it.
+        push_rendered_marks(&mut state, session_id, rendered);
         self.write(&state);
         previous
     }
@@ -1210,6 +1253,23 @@ impl ChainRecords {
             .collect()
     }
 
+    /// `session_id`'s recorded marks together with its owed mirrors, read under
+    /// ONE lock (issue #671, ticket #672): a commit's snapshot must not mix a
+    /// mark and an owed entry from two instants, or a concurrent accepted write
+    /// could slip between the two reads and be missed by both.
+    pub(crate) fn marks_and_owed(&self, session_id: &str) -> (Vec<String>, Vec<(String, OwedRendered)>) {
+        let state = self.lock();
+        let session = resolved_session(&state, session_id);
+        let marks = state.rendered.get(&session).cloned().unwrap_or_default();
+        let owed = state
+            .owed
+            .iter()
+            .filter(|(_, owed)| owed.session_id == session)
+            .map(|(card, owed)| (card.clone(), owed.clone()))
+            .collect();
+        (marks, owed)
+    }
+
     /// Drop a card's owed rendered keys once their payload's fate is settled —
     /// delivered (its mark was written) or never delivering (nothing may be
     /// recorded). A stale sequence names an entry a newer failure replaced, so
@@ -1378,7 +1438,15 @@ mod tests {
 
         // A top-level landing clears the refused target in the same write.
         let writes = chains.writes();
-        chains.track_landing("ses_a", "om_2", MessageId::new("msg_cola_1"), None, None, None);
+        chains.track_landing(
+            "ses_a",
+            "om_2",
+            MessageId::new("msg_cola_1"),
+            None,
+            None,
+            None,
+            &[],
+        );
         assert_eq!(
             chains.get("ses_a").expect("the record").reply_to,
             None,
@@ -1399,6 +1467,7 @@ mod tests {
             None,
             None,
             Some("om_user_2"),
+            &[],
         );
         assert_eq!(
             chains.get("ses_a").expect("the record").reply_to.as_deref(),
@@ -2137,6 +2206,24 @@ mod tests {
 
         // In-memory only: a reload never carries an owed mirror.
         assert!(ChainRecords::load(path).owed_rendered().is_empty());
+    }
+
+    /// Issue #671 (CI gate): the re-key forwarding follows a LONG chain of
+    /// recreates — no fixed depth cap — so a stale writer still lands under the
+    /// current id; the visited set only stops a corrupt cycle.
+    #[test]
+    fn the_rendered_marks_follow_a_long_rename_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let chains = ChainRecords::load(dir.path().join(FILE));
+        for i in 0..40 {
+            chains.rename(&format!("ses_{i}"), &format!("ses_{}", i + 1));
+        }
+        chains.record_rendered("ses_0", &["runtime:call_1".to_string()]);
+        assert_eq!(
+            chains.rendered("ses_40"),
+            vec!["runtime:call_1".to_string()],
+            "a stale id resolves through the whole chain"
+        );
     }
 
     /// Issue #671: a recreated session id names the same logical session, so
