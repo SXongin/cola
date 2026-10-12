@@ -76,6 +76,11 @@ pub struct SharedCore {
     /// store, so a restart can reap the card it orphaned and never re-announce
     /// a Wake an earlier life already showed.
     pub chains: Arc<crate::bridge::chain::ChainRecords>,
+    /// The Background Task State handle (ADR-0079, ticket #681), created beside
+    /// the Chain Record it seeds from: the module's entry point for a Session's
+    /// Background Task facts. The volatile per-Session cell rides the session's
+    /// accumulator; this handle owns the durable seed.
+    pub tasks: crate::bridge::tasks::TasksHandle,
     /// Permission flow: owns `sent_cards`, polls pending requests, auto-accepts
     /// for `/autoaccept` sessions, and handles the "perm" card action.
     pub permission: Arc<crate::bridge::request::flow::RequestFlow>,
@@ -257,15 +262,19 @@ impl SharedCore {
         let long_task_notice_ms = Arc::new(std::sync::atomic::AtomicU64::new(
             crate::bridge::turn::LONG_TASK_NOTICE_MS,
         ));
+        // The durable Chain Record, created once beside the Background Task
+        // State handle that seeds from it (ADR-0069/0079).
+        let chains = Arc::new(crate::bridge::chain::ChainRecords::load(
+            cfg.bridge.session_file.with_file_name("chain_records.json"),
+        ));
         Ok(Self {
             sessions: Arc::new(Mutex::new(session_store)),
             cards: Arc::new(Mutex::new(HashMap::new())),
             card_handles: Arc::new(Mutex::new(
                 crate::bridge::card_handles::CardHandles::with_surfaces(Arc::clone(&surfaces)),
             )),
-            chains: Arc::new(crate::bridge::chain::ChainRecords::load(
-                cfg.bridge.session_file.with_file_name("chain_records.json"),
-            )),
+            chains: Arc::clone(&chains),
+            tasks: crate::bridge::tasks::TasksHandle::new(chains),
             permission: Arc::new(crate::bridge::request::flow::RequestFlow::new(
                 Box::new(crate::bridge::request::kind::PermissionKind),
                 Arc::clone(&surfaces),
@@ -414,6 +423,7 @@ impl SharedCore {
             Arc::clone(&self.cover_titles),
             Arc::clone(&self.feishu),
             Arc::clone(&self.chains),
+            self.tasks.clone(),
             Arc::clone(&self.card_write_locks),
             Arc::clone(&self.preserved_view_timeout_ms),
             Arc::clone(&self.file_images),
