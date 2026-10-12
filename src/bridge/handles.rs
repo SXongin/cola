@@ -966,7 +966,9 @@ pub(crate) type FileMessageSends =
 /// 4. The Background Task State (ADR-0079, ticket #681) is reached through
 ///    [`Self::tasks`], inside the `cards` lock — the bind-and-seed in
 ///    `Turn::install_fresh_session` is the live example, and it deliberately
-///    shares the cards critical section (issue #671). The one-way order is
+///    shares the cards critical section (issue #671); its per-Session store is
+///    keyed by `(session, chain generation)`, and `Turn::recreate` re-keys a
+///    binding whose card moved to a fresh session. The one-way order is
 ///    **`write_lock` → `cards` → task state**, and within task state the
 ///    **store lock → cell lock**: both are plain synchronous mutexes, taken
 ///    and released inside a single call — never awaited and never held across

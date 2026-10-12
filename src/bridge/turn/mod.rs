@@ -724,6 +724,11 @@ impl Turn {
         // The live-card record is a fact about the card, not the session id it
         // was filed under: re-key it so the fresh session's card is reap-able.
         handles.cards.chains.rename(&self.session_id, &fresh_id);
+        // The Background Task State binding is a fact about the card too: move
+        // it to the fresh session, re-keyed at the fresh session's current chain
+        // generation (ADR-0079, ticket #681). The `from` session's binding goes
+        // with the card, so the store never keeps a cell under a dead session.
+        handles.cards.tasks.rekey(&self.session_id, &fresh_id);
         {
             let mut inflight = handles.waits.inflight.lock().await;
             inflight.remove(&self.session_id);
@@ -3293,9 +3298,7 @@ impl Turn {
     /// retirement must never move the floor a late Wake is judged against —
     /// #590).
     fn seed_durable_announcements(cards: &CardsHandle, session_id: &str, acc: &mut state::StreamAccumulator) {
-        let seed = cards
-            .tasks
-            .restore(session_id, cards.chains.generation(session_id), acc.tasks());
+        let seed = cards.tasks.restore(session_id, acc.tasks());
         acc.set_wake_floor(seed.watermark_ms);
         acc.set_render_marks(seed.rendered_keys);
     }

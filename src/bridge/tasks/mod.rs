@@ -23,7 +23,9 @@
 //! - [`handle::TasksHandle`] — the per-Session store, created beside the durable
 //!   **Chain Record**: it keys each cell by `(session, chain generation)` — the
 //!   generation selects the entry, and a re-install prunes the session's other
-//!   generations — and reads the durable tier a fresh cell is seeded from.
+//!   generations — reads the durable tier a fresh cell is seeded from, and
+//!   re-keys a binding when its card moves to a fresh session
+//!   ([`handle::TasksHandle::rekey`], `Turn::recreate`).
 //! - [`liveness::BackgroundTaskOverlay`] — the volatile liveness memoization
 //!   (#682), moved out of the Backend's transcript module: the module owns the
 //!   bytes, while the adapter keeps holding one instance and applying it to
@@ -46,8 +48,12 @@
 //! only at a record re-point (which can land after install) and is `0` for a
 //! recordless session, so the reset happens at the `CardSession` replacement
 //! (which prunes the session's other generations) and the generation stays the
-//! render's orthogonal fact. See [`state::TaskCell`] for the clone/lifetime
-//! argument.
+//! render's orthogonal fact. Because a re-point follows the install, a binding's
+//! stamped generation can lag; the store's read re-stamps it at the chain's
+//! current generation rather than resolving a stale key, and
+//! [`handle::TasksHandle::rekey`] re-stamps and moves the binding when a
+//! `Turn::recreate` remaps the card to a fresh session. See [`state::TaskCell`]
+//! for the clone/lifetime argument.
 
 pub(crate) mod handle;
 pub(crate) mod liveness;
