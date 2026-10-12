@@ -1918,7 +1918,7 @@ async fn a_permanently_refused_retirement_write_records_nothing() {
         persisted
             .rendered("ses_test")
             .iter()
-            .any(|key| key == "runtime:call_bg"),
+            .any(|key| key == "ended:call_bg"),
         "the delivered successor records the rendered mark: {:?}",
         persisted.rendered("ses_test")
     );
@@ -1965,7 +1965,7 @@ async fn a_queued_retirement_write_still_records() {
             .chains
             .rendered("ses_test")
             .iter()
-            .any(|key| key == "runtime:call_bg"),
+            .any(|key| key == "ended:call_bg"),
         "the delivered write records the rendered mark: {:?}",
         app.cards_handle().chains.rendered("ses_test")
     );
@@ -2017,7 +2017,7 @@ async fn a_queued_entry_write_marks_rendered_only_once_it_delivers() {
             .chains
             .rendered("ses_test")
             .iter()
-            .any(|key| key == "runtime:call_bg"),
+            .any(|key| key == "ended:call_bg"),
         "a delivered entry write records its rendered mark: {:?}",
         app.cards_handle().chains.rendered("ses_test")
     );
@@ -3635,11 +3635,16 @@ async fn a_verdict_that_does_not_answer_for_the_child_keeps_its_marker() {
 /// task's completion still resumes the chain (the split continuation opens with
 /// its own work) and the Wake's completion entry still renders on the card
 /// whose chain observed it. The cleanup suppresses nothing.
+///
+/// The launches name the child session, so the Wake correlates to the run the
+/// cleanup retired: this is the guard for the CLEANUP class of that suppression
+/// (issue #659) — the cleanup claims no ending, so its key must not gate the
+/// Wake's own completion entry.
 #[tokio::test]
 async fn a_late_wake_after_a_cleanup_still_resumes_the_chain() {
     let _wd = test_work_dir();
     let now = chrono::Utc::now().timestamp_millis();
-    let live = SessionTranscript::new(two_task_timeline(vec![]))
+    let live = SessionTranscript::new(late_wake_timeline(vec![]))
         .with_executions(vec![execution(2_500)])
         .with_background_tasks(vec![live_subagent(now - 3_000, "call_sub")]);
     let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
@@ -3668,18 +3673,9 @@ async fn a_late_wake_after_a_cleanup_still_resumes_the_chain() {
     script_transcript(
         &backend,
         vec![
-            SessionTranscript::new(two_task_timeline(vec![assistant(3_100, "审阅完成。")]))
+            SessionTranscript::new(late_wake_timeline(vec![assistant(3_100, "审阅完成。")]))
                 .with_executions(vec![execution(2_500), execution(4_000)])
-                .with_wakes(vec![Wake {
-                    id: MessageId::new("msg_wake_sub_2900"),
-                    created_ms: Some(2_900),
-                    source: WakeSource::Subagent,
-                    shell_id: None,
-                    job_id: None,
-                    child_id: Some("ses_call_sub".into()),
-                    state: Some("completed".into()),
-                    label: Some("review the diff".into()),
-                }]),
+                .with_wakes(vec![late_child_wake(2_900)]),
         ],
     )
     .await;
@@ -3741,11 +3737,15 @@ async fn a_late_wake_after_a_cleanup_still_resumes_the_chain() {
 /// (its card write is confirmed, draining whatever the stage holds), the
 /// persisted sidecar is reloaded by a fresh process, and the late Wake still
 /// resumes the chain.
+///
+/// The launches name the child session, so the Wake correlates to the run the
+/// cleanup retired: the cleanup's own durable mark (`cleanup:<call_id>`, issue
+/// #659) must NOT gate that Wake's completion entry either.
 #[tokio::test]
 async fn a_cleanup_never_advances_the_durable_watermark_for_a_late_wake() {
     let _wd = test_work_dir();
     let now = chrono::Utc::now().timestamp_millis();
-    let live = SessionTranscript::new(two_task_timeline(vec![]))
+    let live = SessionTranscript::new(late_wake_timeline(vec![]))
         .with_executions(vec![execution(2_500)])
         .with_background_tasks(vec![live_subagent(now - 3_000, "call_sub")]);
     let (dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
@@ -3769,7 +3769,9 @@ async fn a_cleanup_never_advances_the_durable_watermark_for_a_late_wake() {
     .await;
 
     // The persisted sidecar, read as a fresh process reads it: the cleanup's
-    // synthetic clock is not a Wake and must not be there.
+    // synthetic clock is not a Wake and must not be there — and its own mark is
+    // the CLEANUP class, which must never stand in for the run's end (issue
+    // #659).
     let session_file = dir.path().join("sessions.json");
     let persisted = ChainRecords::load(session_file.with_file_name("chain_records.json"));
     assert_eq!(
@@ -3777,22 +3779,21 @@ async fn a_cleanup_never_advances_the_durable_watermark_for_a_late_wake() {
         None,
         "a synthetic cleanup entry never advances the durable Wake Watermark"
     );
+    assert!(
+        persisted
+            .rendered("ses_test")
+            .iter()
+            .any(|key| key == "cleanup:call_sub"),
+        "the cleanup records its own class's mark: {:?}",
+        persisted.rendered("ses_test")
+    );
 
     // Life 2: a fresh process over the same files. The late Wake arrives with
     // the subagent's resumed work, its server clock at or before the cleanup
     // click's — and nothing ever announced it.
-    let late = SessionTranscript::new(two_task_timeline(vec![assistant(3_100, "审阅完成。")]))
+    let late = SessionTranscript::new(late_wake_timeline(vec![assistant(3_100, "审阅完成。")]))
         .with_executions(vec![execution(2_500), execution(4_000)])
-        .with_wakes(vec![Wake {
-            id: MessageId::new("msg_wake_sub_2900"),
-            created_ms: Some(2_900),
-            source: WakeSource::Subagent,
-            shell_id: None,
-            job_id: None,
-            child_id: Some("ses_call_sub".into()),
-            state: Some("completed".into()),
-            label: Some("review the diff".into()),
-        }]);
+        .with_wakes(vec![late_child_wake(2_900)]);
     let (restarted, restarted_platform) = restarted_app_with_transcript(&session_file, late).await;
     assert!(
         restarted.cards_handle().chains.get("ses_test").is_none(),
@@ -3815,6 +3816,87 @@ async fn a_cleanup_never_advances_the_durable_watermark_for_a_late_wake() {
             .any(|card| card_text(card).contains(WAKE_LEAD)),
         "the late Wake still resumes the chain after the restart: {:?}",
         restarted_platform.calls.lock().await
+    );
+}
+
+/// Issue #659, the cleanup class across a restart: life 1's 🧹 cleanup leaves
+/// its OWN durable mark (`cleanup:<call_id>`); a fresh process whose late Wake
+/// renders as content on a card the Wake did NOT open must still show the run's
+/// completion. A cleanup claims nothing about how the run ended (spec #590), so
+/// its mark may never stand in for the evidence key the Wake's gate reads — and
+/// the cleanup's own entry must not be re-derived either.
+#[tokio::test]
+async fn a_cleanup_mark_never_gates_a_late_wakes_completion() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = SessionTranscript::new(late_wake_timeline(vec![]))
+        .with_executions(vec![execution(2_500)])
+        .with_background_tasks(vec![live_subagent(now - 3_000, "call_sub")]);
+    let (dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    script_child_without_activity(&backend).await;
+    yield_one_task_card(&app, &platform, ctx("ses_test", "跑一下构建并审阅")).await;
+
+    // Life 1: the child reads inactive with no concluding evidence, the user
+    // cleans its row, and the 🧹 entry's write is delivered.
+    backend.task_runtime.lock().unwrap().children = vec![("ses_call_sub".into(), ChildRuntime::Inactive)];
+    spawn_sync(&app);
+    wait_for_card_update(&platform, "the unconfirmed marker", CardUpdates::Latest, |card| {
+        card_text(card).contains("⚠️ 状态待确认")
+    })
+    .await;
+    app.host_action(serde_json::json!({ "action": "cleanup", "session_id": "ses_test" }))
+        .await
+        .expect("the cleanup click acks");
+    wait_for_card_update(&platform, "the cleaned settle", CardUpdates::Latest, |card| {
+        card_header(card).contains("✅")
+    })
+    .await;
+    let session_file = dir.path().join("sessions.json");
+    let persisted = ChainRecords::load(session_file.with_file_name("chain_records.json"));
+    assert!(
+        persisted
+            .rendered("ses_test")
+            .iter()
+            .any(|key| key == "cleanup:call_sub"),
+        "the delivered 🧹 entry records the cleanup's own mark: {:?}",
+        persisted.rendered("ses_test")
+    );
+
+    // Life 2: the user's next message opens the card and the run's late Wake
+    // (newer than that message) arrives on it with the resumed work — the same
+    // shape as the evidence case, but the only record of the run is a cleanup.
+    let late = SessionTranscript::new(late_wake_timeline(vec![
+        user("msg_cola_next", 2_800, "新问题"),
+        assistant(3_100, "审阅完成。"),
+    ]))
+    .with_executions(vec![execution(2_500), execution(4_000)])
+    .with_wakes(vec![late_child_wake(2_900)]);
+    let (restarted, restarted_platform) = restarted_app_with_transcript(&session_file, late).await;
+    let mut second = ctx("ses_test", "新问题");
+    second.message_id = "msg_next".into();
+    second.cola_message_id = Some("msg_cola_next".into());
+    Turn::run(&restarted.turn_handles(), second).await.unwrap();
+    spawn_sync(&restarted);
+    wait_for_card_update(
+        &restarted_platform,
+        "the Wake's completion",
+        CardUpdates::Latest,
+        |card| card_text(card).contains("🔔 subagent 完成：review the diff"),
+    )
+    .await;
+
+    // ... and the cleanup is not recorded a second time: the 🧹 entry stays on
+    // life 1's card, where it happened.
+    let mut bodies: Vec<String> = restarted_platform
+        .updated_cards()
+        .await
+        .iter()
+        .map(card_text)
+        .collect();
+    bodies.extend(created_cards(&restarted_platform).await.iter().map(card_text));
+    assert!(
+        bodies.iter().all(|text| !text.contains("🧹 subagent 已清理")),
+        "the cleanup is never re-derived after the restart: {bodies:?}"
     );
 }
 
@@ -3905,9 +3987,210 @@ async fn a_runtime_retirement_never_advances_the_durable_watermark_for_a_late_wa
     );
 }
 
+/// Issue #659's timeline: the anchor, the hand-off, a settled background shell
+/// launch and the background subagent launch whose metadata names its child
+/// session — the identity a retiring Wake joins its launch back by, the same
+/// join the completion entry reads. [`two_task_timeline`] is this shape WITHOUT
+/// the child id, so a Wake naming a child session never correlates on it; the
+/// tests below need the join to be exercisable at all. `resumed` appends the
+/// later content.
+fn late_wake_timeline(resumed: Vec<TranscriptMessage>) -> Vec<TranscriptMessage> {
+    let mut messages = vec![
+        user("msg_cola_anchor", 1_000, "跑一下构建并审阅"),
+        assistant(2_000, "已经交给后台了。"),
+        background_launch(
+            2_000,
+            "shell",
+            "call_bg",
+            serde_json::json!({ "command": "gh run watch" }),
+        ),
+        subagent_launch(2_100, "call_sub", "ses_call_sub"),
+    ];
+    messages.extend(resumed);
+    messages
+}
+
+/// The completion Wake the parent only wrote once it resumed: the incident's
+/// ~96 s gap, in which the child had already ended and the shell stayed live.
+/// Its child id names the launch's child session, so both the entry and the
+/// retirement's suppression correlate to the same run.
+fn late_child_wake(created_ms: i64) -> Wake {
+    Wake {
+        id: MessageId::new(format!("msg_wake_sub_{created_ms}")),
+        created_ms: Some(created_ms),
+        source: WakeSource::Subagent,
+        shell_id: None,
+        job_id: None,
+        child_id: Some("ses_call_sub".into()),
+        state: Some("completed".into()),
+        label: Some("review the diff".into()),
+    }
+}
+
+/// Issue #659: the incident — a child-evidence retirement (`🔔 subagent 结束`)
+/// followed by the SAME run's late completion Wake (`🔔 subagent 完成`) ~96 s
+/// later, once the parent resumed off the ask-user card it was blocked on. One
+/// run renders ONE completion record: the late Wake's entry is suppressed while
+/// its resumed work still lands (spec #590's continuation is never suppressed).
+#[tokio::test]
+async fn a_late_wake_never_doubles_a_child_evidences_completion_entry() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = SessionTranscript::new(late_wake_timeline(vec![]))
+        .with_executions(vec![execution(2_500)])
+        .with_background_tasks(vec![
+            live_shell(frozen_start(now), "call_bg"),
+            live_subagent(now - 3_000, "call_sub"),
+        ]);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    script_child_without_activity(&backend).await;
+    yield_waiting_card(&app, &platform, 2).await;
+
+    // The child reads inactive and its own newest assistant message is
+    // terminal: the evidence retirement renders 结束 in place while the shell
+    // keeps the card waiting.
+    backend.task_runtime.lock().unwrap().children = vec![("ses_call_sub".into(), ChildRuntime::Inactive)];
+    backend
+        .with_child_evidence(
+            "ses_call_sub",
+            ChildEvidence::Terminal {
+                completed_at: now - 1_000,
+            },
+        )
+        .await;
+    spawn_sync(&app);
+    wait_for_card_update(&platform, "the evidence entry", CardUpdates::Latest, |card| {
+        card_text(card).contains("🔔 subagent 结束：review the diff")
+    })
+    .await;
+
+    // The late Wake arrives with the resumed work: the run is no longer live
+    // (the Wake itself retires it in the read), no reconcile runs on it, and
+    // nothing is left to derive — exactly the read the incident's second render
+    // served.
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(late_wake_timeline(vec![assistant(3_100, "审阅完成。")]))
+                .with_executions(vec![execution(2_500), execution(4_000)])
+                .with_wakes(vec![late_child_wake(2_900)])
+                .with_background_tasks(vec![live_shell(frozen_start(now), "call_bg")]),
+        ],
+    )
+    .await;
+    wait_for_card_update(&platform, "the resumed work", CardUpdates::Latest, |card| {
+        card_text(card).contains("审阅完成。")
+    })
+    .await;
+
+    let card = platform.updated_cards().await.last().cloned().unwrap();
+    let text = card_text(&card);
+    assert_eq!(
+        text.matches("🔔 subagent 结束：review the diff").count(),
+        1,
+        "the evidence retirement is the run's one record: {card}"
+    );
+    assert!(
+        !text.contains("🔔 subagent 完成"),
+        "the late Wake adds no second completion entry for the same run: {card}"
+    );
+}
+
+/// Issue #659, the restart half: life 1 records the child-evidence retirement,
+/// whose `ended:<call_id>` mark rides the card that showed it (issue #671,
+/// ticket #672). A fresh process has no in-memory announce set, so the late
+/// Wake's suppression can only come from that durable mark — and it must: the
+/// restarted read carries the run's Wake (newer than the user's next message,
+/// older than its resumed work) with no live task and no retirement to derive.
+/// Never the Wake Watermark (which stays unset, #595), and the resumed work
+/// still renders (spec #590).
+#[tokio::test]
+async fn a_late_wake_after_a_restart_joins_the_retirements_rendered_mark() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = SessionTranscript::new(late_wake_timeline(vec![]))
+        .with_executions(vec![execution(2_500)])
+        .with_background_tasks(vec![live_subagent(now - 3_000, "call_sub")]);
+    let (dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    script_child_without_activity(&backend).await;
+    yield_one_task_card(&app, &platform, ctx("ses_test", "跑一下构建并审阅")).await;
+
+    // Life 1: the child's own terminal evidence retires the run and settles the
+    // waiting card — the parent has not written the Wake yet.
+    backend.task_runtime.lock().unwrap().children = vec![("ses_call_sub".into(), ChildRuntime::Inactive)];
+    backend
+        .with_child_evidence(
+            "ses_call_sub",
+            ChildEvidence::Terminal {
+                completed_at: now - 1_000,
+            },
+        )
+        .await;
+    spawn_sync(&app);
+    wait_for_card_update(&platform, "the settled card", CardUpdates::Latest, |card| {
+        card_header(card).contains("✅") && card_text(card).contains("🔔 subagent 结束：review the diff")
+    })
+    .await;
+
+    let session_file = dir.path().join("sessions.json");
+    let persisted = ChainRecords::load(session_file.with_file_name("chain_records.json"));
+    assert!(
+        persisted
+            .rendered("ses_test")
+            .iter()
+            .any(|key| key == "ended:call_sub"),
+        "life 1's delivered retirement leaves its rendered mark: {:?}",
+        persisted.rendered("ses_test")
+    );
+    assert_eq!(
+        persisted.announced("ses_test"),
+        None,
+        "a synthetic retirement is not a Wake: the Watermark never moves for it"
+    );
+
+    // Life 2: a fresh process over the same files, the user's next message, and
+    // the run's late Wake — newer than that message, so the card the message
+    // opens is what the Wake's completion entry would land on. The run is not
+    // live and no reconcile runs, so the durable mark is the only thing left
+    // that knows the run's record is already on a card.
+    let late = SessionTranscript::new(late_wake_timeline(vec![
+        user("msg_cola_next", 2_800, "新问题"),
+        assistant(3_100, "审阅完成。"),
+    ]))
+    .with_executions(vec![execution(2_500), execution(4_000)])
+    .with_wakes(vec![late_child_wake(2_900)]);
+    let (restarted, restarted_platform) = restarted_app_with_transcript(&session_file, late).await;
+    let mut second = ctx("ses_test", "新问题");
+    second.message_id = "msg_next".into();
+    second.cola_message_id = Some("msg_cola_next".into());
+    Turn::run(&restarted.turn_handles(), second).await.unwrap();
+    spawn_sync(&restarted);
+    wait_for_card_update(
+        &restarted_platform,
+        "the resumed work",
+        CardUpdates::Latest,
+        |card| card_text(card).contains("审阅完成。"),
+    )
+    .await;
+
+    // Every body the restarted process put on a card: the run life 1 recorded
+    // must not gain a second completion entry here.
+    let mut bodies: Vec<String> = restarted_platform
+        .updated_cards()
+        .await
+        .iter()
+        .map(card_text)
+        .collect();
+    bodies.extend(created_cards(&restarted_platform).await.iter().map(card_text));
+    assert!(
+        bodies.iter().all(|text| !text.contains("🔔 subagent 完成")),
+        "the late Wake adds no second completion entry after the restart: {bodies:?}"
+    );
+}
+
 /// Issue #671 / ticket #672: the durable RENDERED marks are a fact SEPARATE
 /// from the Wake Watermark. A delivered retirement entry records its
-/// `runtime:<call_id>` mark while leaving the Wake mark untouched — the two
+/// `ended:<call_id>` mark while leaving the Wake mark untouched — the two
 /// facts share a file and nothing else, so a late Wake is still judged against
 /// the Wake floor alone (#590, PR #595).
 #[tokio::test]
@@ -3938,7 +4221,7 @@ async fn a_delivered_retirement_marks_rendered_without_moving_the_wake_mark() {
         persisted
             .rendered("ses_test")
             .iter()
-            .any(|key| key == "runtime:call_bg"),
+            .any(|key| key == "ended:call_bg"),
         "the delivered entry leaves its durable rendered mark: {:?}",
         persisted.rendered("ses_test")
     );
@@ -6446,7 +6729,7 @@ async fn a_wake_less_retirement_renders_once_across_a_restart() {
         persisted
             .rendered("ses_test")
             .iter()
-            .any(|key| key == "runtime:call_sub"),
+            .any(|key| key == "ended:call_sub"),
         "the delivered entry leaves its durable rendered mark: {:?}",
         persisted.rendered("ses_test")
     );

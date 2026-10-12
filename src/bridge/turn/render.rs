@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::Instrument;
 
 use crate::backend::{
-    FileContent, MessageId, Part, SessionTranscript, TaskRetirementEnding, ToolStatus, TurnAnchor, Wake,
-    WakeSource,
+    BackgroundTask, FileContent, MessageId, Part, SessionTranscript, TaskRetirementEnding, ToolStatus,
+    TurnAnchor, Wake, WakeSource,
 };
 use crate::bridge::core::SESSION_INFO_TIMEOUT;
 use crate::bridge::handles::{
@@ -355,6 +355,32 @@ pub(super) fn capture_footer_model(acc: &mut StreamAccumulator, message: &crate:
     acc.apply_footer_model(&model.model_id, &model.provider_id, model.variant.as_deref());
 }
 
+/// The Background Task one Wake retires in this read, when the read still
+/// carries its launch record: the ONE join ([`Wake::retires`] over each part's
+/// derived task) a Wake's completion is named by, so the entry that renders it
+/// ([`wake_completion_entry`]) and the retirement that suppresses a doubled one
+/// ([`plan_wake_entries`], issue #659) can never disagree about which run the
+/// Wake completed. The read is oldest-first (V2 reads `order=asc` and the
+/// decoder never re-sorts), so the NEWEST match wins — the same survivor the
+/// live list keeps when a resumed subagent's later launch supersedes the
+/// earlier one, whose interrupted run has no completion to report (#552).
+/// `None` when no launch matches — a read whose launch scrolled past the page
+/// cap, or one that carries no launch — and callers fall back to the Wake's own
+/// named keys, never to an invented identity.
+fn wake_retired_task(wake: &Wake, transcript: &SessionTranscript) -> Option<BackgroundTask> {
+    transcript
+        .messages
+        .iter()
+        .flat_map(|message| &message.parts)
+        .filter_map(|part| match part {
+            Part::Tool(call) => call.background_task(),
+            _ => None,
+        })
+        // The read is oldest-first, so the LAST match is the run the live list
+        // keeps (`rfind` searches from the back for the first match).
+        .rfind(|task| wake.retires(task))
+}
+
 /// The completion entry a shell/subagent Wake leaves on the card that hosted
 /// its task (ADR-0060): the retired task's kind and label (the Wake's own tag
 /// attribute), its identity, and the run's own server-time span. `None` for a
@@ -363,12 +389,12 @@ pub(super) fn capture_footer_model(acc: &mut StreamAccumulator, message: &crate:
 /// invented: a Wake that named none renders the bare completion line.
 ///
 /// The retired task is joined back from the read through the backend's own
-/// correlation ([`Wake::retires`] over each part's derived task), so the entry
-/// can only name a run the Wake actually completed; the launch's start time
-/// gives the fold's duration. A read that no longer carries the launch renders
-/// the entry without a duration rather than inventing one. `finished_at` is the
-/// Wake's server time — the caller's own, already checked for orderability, so
-/// the entry's clock is never guessed here.
+/// correlation ([`wake_retired_task`]), so the entry can only name a run the
+/// Wake actually completed; the launch's start time gives the fold's duration. A
+/// read that no longer carries the launch renders the entry without a duration
+/// rather than inventing one. `finished_at` is the Wake's server time — the
+/// caller's own, already checked for orderability, so the entry's clock is
+/// never guessed here.
 fn wake_completion_entry(
     wake: &Wake,
     transcript: &SessionTranscript,
@@ -381,15 +407,7 @@ fn wake_completion_entry(
             return None;
         }
     };
-    let retired = transcript
-        .messages
-        .iter()
-        .flat_map(|message| &message.parts)
-        .filter_map(|part| match part {
-            Part::Tool(call) => call.background_task(),
-            _ => None,
-        })
-        .find(|task| wake.retires(task));
+    let retired = wake_retired_task(wake, transcript);
     // The retired task's own identity is the read's fact; the Wake's named keys
     // are the fallback when the launch is no longer in the read. The launch
     // call's own id covers a task that recorded no shell/child id. Never a
@@ -426,11 +444,12 @@ pub(super) enum PlannedAnnounce {
     /// re-announces a Wake a card already showed.
     Wake { created_ms: i64 },
     /// A synthetic retirement — a runtime verdict, a child's own terminal
-    /// transcript, or the user's cleanup (key `runtime:<call_id>`): the
-    /// exactly-once mark alone. Nothing durable is staged, so a restart still
-    /// continues a genuinely un-announced late Wake at or below the synthetic
-    /// clock (#590: "a late Wake for a cleared task behaves as before; nothing
-    /// is suppressed").
+    /// transcript, or the user's cleanup (key `ended:<call_id>` for the
+    /// evidence classes, `cleanup:<call_id>` for the user's own — issue #659):
+    /// the exactly-once mark alone. Nothing durable is staged, so a restart
+    /// still continues a genuinely un-announced late Wake at or below the
+    /// synthetic clock (#590: "a late Wake for a cleared task behaves as
+    /// before; nothing is suppressed").
     Synthetic,
 }
 
@@ -442,11 +461,18 @@ pub(super) enum PlannedAnnounce {
 /// entries render at most once, so each spends at most one read, and a plan a
 /// racing render beat to the announce is simply not committed.
 pub(super) struct PlannedEntry {
-    /// The exactly-once announce key (the Wake's id / `runtime:<call_id>`).
+    /// The exactly-once announce key (the Wake's id / the retirement's
+    /// `ended:<call_id>` / `cleanup:<call_id>`).
     key: String,
     /// What the commit announces: a real Wake's completion additionally stages
     /// the durable Wake Watermark (ADR-0061), a synthetic retirement does not.
     announce: PlannedAnnounce,
+    /// The completed run's EVIDENCE key, for a Wake plan alone (issue #659):
+    /// the commit drops the plan when that key is already announced on this
+    /// chain or recorded as a durable mark, so a plan built before an awaited
+    /// output read cannot land beside the retirement that beat it — the
+    /// #671/#672 re-check, on the Wake's side of one race.
+    evidence_key: Option<String>,
     /// The timeline insert key.
     at: Option<i64>,
     /// The directory the shell output read routes under: the card's own work
@@ -460,7 +486,7 @@ pub(super) struct PlannedEntry {
 /// reconciliation retired without a Wake (issue #454) — or the user's cleanup
 /// retired (spec #588, #590). Every gate the insertion applies is checked here
 /// (the anchor, the durable Wake floor, the announce set, the
-/// `runtime:<call_id>` synthetic key) but NOTHING is mutated: a caller can plan
+/// synthetic retirement key) but NOTHING is mutated: a caller can plan
 /// under a short lock, read each shell's output tail outside it and commit the
 /// plan the gates still admit. Without an anchor no entry can be placed, so no
 /// plan is made at all.
@@ -481,8 +507,10 @@ pub(super) fn plan_ledger_entries(
 /// about to show, in the read's order. A Wake that opened the card itself was
 /// already announced by its 承接 line, a Wake with no server time cannot be
 /// ordered (so it is skipped before its entry is built — the guard supplies
-/// `created_ms`), and a Wake outside this card's Turn is not this render's
-/// content — all are skipped. Each Wake marks at most once per chain
+/// `created_ms`), a Wake outside this card's Turn is not this render's content,
+/// and a Wake completing a run whose EVIDENCE retirement is already recorded
+/// is the same fact twice (issue #659; see the gate's own note) — all are
+/// skipped. Each Wake marks at most once per chain
 /// ([`StreamAccumulator::announce_wake`]), so a repeated poll never doubles an
 /// entry.
 fn plan_wake_entries(
@@ -508,12 +536,52 @@ fn plan_wake_entries(
         if acc.wake_announced(wake.id.as_str()) {
             continue;
         }
+        // Issue #659: the same run must not render TWO completion records — the
+        // evidence retirement's 结束/已失联 and this Wake's 完成. The retirement
+        // claims the run ended, so a Wake completing it is the same fact said
+        // twice. Suppress the ENTRY only: the Wake's resumed work is a separate
+        // handoff ([`StreamAccumulator::has_handed_over_wake`], ADR-0066) and
+        // still renders, and NOTHING durable is staged here for the Wake — its
+        // Watermark stays where it was (ADR-0061; #595's "a late Wake for a
+        // cleared task behaves as before"), exactly as the retirement itself
+        // never moved it. Two gates cover the two lives:
+        //
+        // - the evidence key this chain already announced (above) or recorded on
+        //   a DELIVERED card (the durable rendered mark, issue #671 / ticket
+        //   #672) covers every read after the one that retired the run, the
+        //   restart included — and only an EVIDENCE ending mints it, so a user's
+        //   🧹 cleanup never suppresses a late Wake's own completion (spec #590,
+        //   `cleanup_announce_key`);
+        // - a retirement of this run in THIS read (the reconcile just derived it
+        //   here, so nothing is announced yet): its entry is planned below and is
+        //   the run's record.
+        let mut evidence_key = None;
+        if let Some(task) = wake_retired_task(wake, transcript) {
+            // The EVIDENCE key only: the pre-#659 spelling is deliberately not
+            // read here — an old mark cannot say whether the run was retired on
+            // evidence or by a cleanup, and a cleanup must never suppress this
+            // entry (spec #590;
+            // [`super::state::legacy_retirement_announce_key`]).
+            let key = super::state::ended_announce_key(task.tool.call_id.as_str());
+            let recorded = acc.wake_announced(&key) || acc.render_recorded(&key);
+            let derived_here = transcript.task_retirements.iter().any(|retirement| {
+                retirement.task.tool.call_id == task.tool.call_id
+                    && !matches!(retirement.ending, TaskRetirementEnding::Cleaned)
+            });
+            if recorded || derived_here {
+                continue;
+            }
+            // Carried to the commit, which re-checks it: a plan this one raced
+            // can land a retirement while this plan awaits its output read.
+            evidence_key = Some(key);
+        }
         let Some(entry) = wake_completion_entry(wake, transcript, created_ms) else {
             continue;
         };
         plans.push(PlannedEntry {
             key: wake.id.as_str().to_string(),
             announce: PlannedAnnounce::Wake { created_ms },
+            evidence_key,
             // Keyed at the Wake's moment, so the entry sorts before the work it
             // announces, whose server times are at/after it (the 承接 line's own
             // lesson).
@@ -544,8 +612,10 @@ fn plan_wake_entries(
 /// 2026-10-01: the card settled ✅ with no entry). Exactly-once does not come
 /// from the anchor: the read that carries a retirement records it in the
 /// backend's process-local overlay, so no later read derives it again, and the
-/// Wake announcement set (keyed by a synthetic `runtime:<call_id>` id) covers
-/// the reads within the observing chain. That synthetic mark advances NO Wake
+/// Wake announcement set (ADR-0061) covers the reads within the observing chain,
+/// under the run's own key — `ended:<call_id>` for an evidence ending,
+/// `cleanup:<call_id>` for the user's own, and, for a mark an older build wrote,
+/// the pre-#659 `runtime:<call_id>` (issue #659). That synthetic mark advances NO Wake
 /// Watermark — a retirement is not a Wake (ADR-0061) — but it is not
 /// in-memory-only either: a delivered body's keys become the session's durable
 /// rendered marks (issue #671, ticket #672), gated by [`StreamAccumulator::render_recorded`]
@@ -554,13 +624,25 @@ fn plan_runtime_entries(acc: &StreamAccumulator, transcript: &SessionTranscript)
     let mut plans = Vec::new();
     for retirement in &transcript.task_retirements {
         let task = &retirement.task;
-        let key = super::state::runtime_announce_key(task.tool.call_id.as_str());
+        // The key names the CLAIM, not just the run (issue #659): an evidence
+        // ending claims the run ended, so it also suppresses a late Wake's
+        // completion entry ([`plan_wake_entries`]); the user's cleanup claims
+        // nothing of the sort and must not
+        // ([`super::state::cleanup_announce_key`]).
+        let key = match retirement.ending {
+            TaskRetirementEnding::Cleaned => super::state::cleanup_announce_key(task.tool.call_id.as_str()),
+            _ => super::state::ended_announce_key(task.tool.call_id.as_str()),
+        };
         // Two gates, one identity: the in-memory announce set covers this life
         // (and this chain), the durable rendered marks cover every EARLIER life
         // (issue #671, ticket #672) — a Wake-less retirement is re-derived on
         // every restart, and without the second gate its entry re-renders on
-        // each new card.
-        if acc.wake_announced(&key) || acc.render_recorded(&key) {
+        // each new card. What is asked is "was THIS run already recorded", in
+        // any spelling (the class split is the Wake gate's business alone): one
+        // record per call id, as the ledger's own rule reads (GLOSSARY, Runtime
+        // Reconciliation) and as the shared key always meant — including a mark
+        // an older build wrote before the split.
+        if acc.retirement_recorded(task.tool.call_id.as_str()) {
             continue;
         }
         let kind = super::state::task_kind(&task.tool.name);
@@ -594,6 +676,9 @@ fn plan_runtime_entries(acc: &StreamAccumulator, transcript: &SessionTranscript)
         plans.push(PlannedEntry {
             key,
             announce: PlannedAnnounce::Synthetic,
+            // Only a Wake's entry is completed by a run's retirement; a
+            // retirement's own plan carries no evidence guard (issue #659).
+            evidence_key: None,
             at: retirement.finished_at,
             directory: acc.directory().map(str::to_string),
             entry,
@@ -606,7 +691,9 @@ fn plan_runtime_entries(acc: &StreamAccumulator, transcript: &SessionTranscript)
 /// ticket #672): a plan built before an awaited output read can be stale when a
 /// queued card update delivers in that window, so a caller re-checks the marks
 /// under its install lock before committing the plan. Only synthetic
-/// retirements are gated by the marks; a Wake's exactly-once is the Watermark.
+/// retirements are gated HERE; a Wake's entry is dropped by the commit's own
+/// evidence re-check ([`commit_planned_entries`], issue #659), which reads the
+/// marks and this chain's announce set together.
 pub(super) fn retain_unrecorded(plans: &mut Vec<PlannedEntry>, recorded: &[String]) {
     plans.retain(|plan| match plan.announce {
         PlannedAnnounce::Synthetic => !recorded.iter().any(|key| key == &plan.key),
@@ -1090,6 +1177,18 @@ pub(super) fn commit_planned_entries(
     retain_unrecorded(&mut plans, recorded);
     let mut inserted = false;
     for plan in plans {
+        // The same window, on the Wake's side (issue #659): the run this Wake
+        // completes can be retired while the plan awaited its output read — a
+        // concurrent venue's flush, or a queued update that delivered — so the
+        // plan's evidence gate is re-checked here too, against this chain's
+        // announce set and the marks re-read after the awaits. Without it a Wake
+        // planned before a retirement landed renders beside that retirement's
+        // 结束 entry: the duplicate this change exists to stop.
+        if let Some(key) = plan.evidence_key.as_deref()
+            && (acc.wake_announced(key) || recorded.iter().any(|mark| mark == key))
+        {
+            continue;
+        }
         let announced = match plan.announce {
             PlannedAnnounce::Wake { created_ms } => acc.announce_wake(&plan.key, created_ms),
             PlannedAnnounce::Synthetic => acc.announce_synthetic(&plan.key),
@@ -2407,6 +2506,28 @@ mod tests {
     use crate::feishu::card::CardState;
     use crate::feishu::card::tool_render::ToolPanel;
 
+    /// One planned completion entry, as the planner builds it: a Wake plan
+    /// carries the run's evidence key (issue #659), every other class none.
+    fn planned_entry(key: &str, announce: PlannedAnnounce, evidence_key: Option<&str>) -> PlannedEntry {
+        use crate::feishu::card::ledger::{TaskCompletionEntry, TaskEnding, TaskKind};
+        PlannedEntry {
+            key: key.to_string(),
+            announce,
+            evidence_key: evidence_key.map(str::to_string),
+            at: None,
+            directory: None,
+            entry: TaskCompletionEntry {
+                kind: TaskKind::Subagent,
+                label: None,
+                id: None,
+                started_at: None,
+                finished_at: None,
+                ending: TaskEnding::RuntimeEnded,
+                output: None,
+            },
+        }
+    }
+
     /// Issue #671 / ticket #672 (CI gate): a plan built before an awaited output
     /// read can be stale when a queued card update delivers in that window, so
     /// the caller re-checks it against the durable rendered marks under its
@@ -2414,38 +2535,14 @@ mod tests {
     /// never gated by the marks (its exactly-once is the Watermark).
     #[test]
     fn a_stale_plan_drops_only_the_entries_a_mark_now_covers() {
-        use crate::feishu::card::ledger::{TaskCompletionEntry, TaskEnding, TaskKind};
-        let entry = || TaskCompletionEntry {
-            kind: TaskKind::Subagent,
-            label: None,
-            id: None,
-            started_at: None,
-            finished_at: None,
-            ending: TaskEnding::RuntimeEnded,
-            output: None,
-        };
         let mut plans = vec![
-            PlannedEntry {
-                key: "runtime:call_1".to_string(),
-                announce: PlannedAnnounce::Synthetic,
-                at: None,
-                directory: None,
-                entry: entry(),
-            },
-            PlannedEntry {
-                key: "runtime:call_2".to_string(),
-                announce: PlannedAnnounce::Synthetic,
-                at: None,
-                directory: None,
-                entry: entry(),
-            },
-            PlannedEntry {
-                key: "msg_wake_1".to_string(),
-                announce: PlannedAnnounce::Wake { created_ms: 1_000 },
-                at: None,
-                directory: None,
-                entry: entry(),
-            },
+            planned_entry("runtime:call_1", PlannedAnnounce::Synthetic, None),
+            planned_entry("runtime:call_2", PlannedAnnounce::Synthetic, None),
+            planned_entry(
+                "msg_wake_1",
+                PlannedAnnounce::Wake { created_ms: 1_000 },
+                Some("ended:call_2"),
+            ),
         ];
 
         retain_unrecorded(&mut plans, &["runtime:call_1".to_string()]);
@@ -2455,6 +2552,193 @@ mod tests {
             keys,
             vec!["runtime:call_2", "msg_wake_1"],
             "the covered synthetic entry is dropped, the Wake is not"
+        );
+    }
+
+    /// Issue #659, the Wake side of that SAME window (the reason
+    /// [`retain_unrecorded`] alone is not enough): the run a Wake plan completes
+    /// can be retired while the plan awaits its output read — a concurrent venue's
+    /// commit, or a queued update that delivered — so the commit re-checks the
+    /// plan's evidence key and drops the entry. Without this the duplicate
+    /// 结束 + 完成 pair comes straight back through the window. Dropping it must
+    /// stage nothing: the Wake Watermark stays untouched.
+    #[test]
+    fn a_stale_wake_plan_is_dropped_once_its_run_is_retired() {
+        let wake_plan = || {
+            planned_entry(
+                "msg_wake_1",
+                PlannedAnnounce::Wake { created_ms: 1_000 },
+                Some("ended:call_sub"),
+            )
+        };
+
+        // The chain's own announce set carries the retirement: a venue that ran
+        // while this plan awaited its read committed it.
+        let mut announced = StreamAccumulator::new("test");
+        announced.announce_synthetic("ended:call_sub");
+        assert!(
+            !commit_planned_entries(&mut announced, vec![wake_plan()], &[]),
+            "the Wake's entry does not commit once its run is retired"
+        );
+        assert!(
+            !announced.wake_announced("msg_wake_1"),
+            "a dropped Wake plan stages nothing — its Watermark stays where it was"
+        );
+
+        // ... or a delivered card recorded the mark meanwhile: the durable half,
+        // which the caller re-reads after the awaits.
+        let mut recorded = StreamAccumulator::new("test");
+        assert!(
+            !commit_planned_entries(&mut recorded, vec![wake_plan()], &["ended:call_sub".to_string()]),
+            "a durable mark alone drops the stale Wake plan too"
+        );
+
+        // The control: with neither, the very same plan commits.
+        let mut clean = StreamAccumulator::new("test");
+        assert!(
+            commit_planned_entries(&mut clean, vec![wake_plan()], &[]),
+            "an un-retired run still renders its Wake's completion"
+        );
+    }
+
+    /// The live Background Task one child's backgrounded `subagent` run left.
+    fn live_subagent_task(call_id: &str) -> BackgroundTask {
+        BackgroundTask {
+            tool: ToolIdentity {
+                name: "subagent".into(),
+                call_id: call_id.into(),
+            },
+            shell_id: None,
+            child_id: Some("ses_child".into()),
+            started_at: Some(1_000),
+        }
+    }
+
+    /// A settled background `subagent` launch part whose metadata names its child
+    /// session, exactly as the V2 wire records it (`sessionID`): the identity a
+    /// retiring Wake joins its launch back by.
+    fn subagent_launch_part(call_id: &str, child_id: &str, started: i64) -> Part {
+        Part::Tool(ToolCall {
+            identity: ToolIdentity {
+                name: "subagent".into(),
+                call_id: call_id.into(),
+            },
+            status: ToolStatus::Completed,
+            started_at: Some(started),
+            input: Some(serde_json::json!({ "description": "review the diff" })),
+            metadata: Some(serde_json::json!({ "status": "running", "sessionID": child_id })),
+            output: ToolOutput::default(),
+        })
+    }
+
+    /// The completion Wake one child's run leaves.
+    fn subagent_wake(child_id: &str, created_ms: i64) -> Wake {
+        Wake {
+            id: MessageId::new(format!("msg_wake_sub_{created_ms}")),
+            created_ms: Some(created_ms),
+            source: WakeSource::Subagent,
+            shell_id: None,
+            job_id: None,
+            child_id: Some(child_id.into()),
+            state: Some("completed".into()),
+            label: Some("review the diff".into()),
+        }
+    }
+
+    /// Issue #659: a Wake correlates to the run the READ's live list keeps — a
+    /// resumed child's later launch supersedes the earlier one (#552), whose
+    /// interrupted run reports no completion — so the join must pick the NEWEST
+    /// matching launch, not the first the read happens to carry. The
+    /// suppression keys on this very task, so this is what keeps "the
+    /// retirement's key" and "the Wake's run" one fact.
+    #[test]
+    fn a_wakes_run_is_the_resumed_childs_newest_launch() {
+        let transcript = SessionTranscript::new(vec![
+            message(
+                "msg_launch_1",
+                2_000,
+                vec![subagent_launch_part("call_sub_1", "ses_child", 2_000)],
+            ),
+            message(
+                "msg_launch_2",
+                2_600,
+                vec![subagent_launch_part("call_sub_2", "ses_child", 2_600)],
+            ),
+        ]);
+
+        let retired = wake_retired_task(&subagent_wake("ses_child", 3_000), &transcript)
+            .expect("the child's Wake correlates");
+        assert_eq!(
+            retired.tool.call_id, "call_sub_2",
+            "the resumed child's newest launch is the run the Wake completed"
+        );
+    }
+
+    /// Issue #659's upgrade rule: the mark an older build wrote
+    /// (`runtime:<call_id>`, before the class split) still covers a RE-DERIVED
+    /// evidence retirement, so the upgrade re-shows no 结束 entry (#671's rule,
+    /// kept).
+    #[test]
+    fn a_legacy_retirement_mark_still_covers_a_rederived_retirement() {
+        let mut acc = StreamAccumulator::new("test");
+        acc.set_render_marks(vec!["runtime:call_sub".to_string()]);
+        let mut transcript =
+            SessionTranscript::new(vec![]).with_background_tasks(vec![live_subagent_task("call_sub")]);
+        transcript.apply_child_evidence(
+            "call_sub",
+            crate::backend::ChildEvidence::Terminal { completed_at: 2_000 },
+        );
+
+        assert!(
+            plan_runtime_entries(&acc, &transcript).is_empty(),
+            "the pre-#659 mark still covers the re-derived retirement"
+        );
+    }
+
+    /// Issue #659: the retirement's own dedup stays "exactly once per CALL ID",
+    /// as the ledger's rule reads — the class split is the Wake gate's business
+    /// alone. A run a card has already recorded is not recorded again by a
+    /// DIFFERENT class (a cleanup after an evidence ending, an evidence ending
+    /// after a cleanup), and a pre-#659 spelling covers either.
+    #[test]
+    fn a_retirement_mark_covers_its_run_whatever_class_wrote_it() {
+        for marks in [
+            vec!["ended:call_sub".to_string()],
+            vec!["runtime:call_sub".to_string()],
+        ] {
+            let mut acc = StreamAccumulator::new("test");
+            acc.set_render_marks(marks.clone());
+            let mut transcript =
+                SessionTranscript::new(vec![]).with_background_tasks(vec![live_subagent_task("call_sub")]);
+            transcript.apply_cleanup(&["call_sub".to_string()], 2_000);
+
+            assert!(
+                plan_runtime_entries(&acc, &transcript).is_empty(),
+                "a run already recorded is not recorded again ({marks:?})"
+            );
+        }
+    }
+
+    /// Issue #659's upgrade rule, the other half: that same legacy mark must
+    /// NEVER gate a Wake — the old spelling cannot say whether a cleanup wrote
+    /// it, and a cleanup suppresses nothing (spec #590). The run's completion
+    /// renders once more instead, the duplicate-over-loss side.
+    #[test]
+    fn a_legacy_retirement_mark_never_gates_a_wake() {
+        let mut acc = StreamAccumulator::new("test");
+        acc.set_render_marks(vec!["runtime:call_sub".to_string()]);
+        let transcript = SessionTranscript::new(vec![message(
+            "msg_launch",
+            2_000,
+            vec![subagent_launch_part("call_sub", "ses_child", 2_000)],
+        )])
+        .with_wakes(vec![subagent_wake("ses_child", 3_000)]);
+
+        let plans = plan_wake_entries(&acc, &transcript, &turn_anchor(0));
+        assert_eq!(
+            plans.len(),
+            1,
+            "a pre-#659 mark's class is unknowable, so it never suppresses the Wake's entry"
         );
     }
 

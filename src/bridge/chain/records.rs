@@ -17,8 +17,10 @@
 //!   lands. Monotonic per Session and never removed, so a restart cannot
 //!   re-announce a Wake a previous life already showed.
 //! - **rendered** — the synthetic completion entries a card has shown
-//!   (ADR-0073's amendment, issue #671): the `runtime:<call_id>` announce keys
-//!   of runtime/child-evidence retirements a delivered card write carried.
+//!   (ADR-0073's amendment, issue #671): the `ended:<call_id>` /
+//!   `cleanup:<call_id>` announce keys of the retirements a delivered card
+//!   write carried (the pre-#659 `runtime:<call_id>` spelling is still READ,
+//!   never written — see `turn::state::legacy_retirement_announce_key`).
 //!   Deliberately a SEPARATE fact from the Wake Watermark: a retirement is not
 //!   a Wake, so recording it must never move the floor a late Wake is judged
 //!   against (#590, PR #595). Like the watermark, it outlives the record it
@@ -1186,8 +1188,8 @@ impl ChainRecords {
 
     /// Record the synthetic completion entries a delivered card write carried
     /// for `session_id` (issue #671, ticket #672): the announce keys
-    /// (`runtime:<call_id>`) whose `🔔 … 结束 / 已失联 / 已清理` entry a card has
-    /// really shown. Idempotent, append-only, and bounded
+    /// (`ended:<call_id>` / `cleanup:<call_id>`) whose
+    /// `🔔 … 结束 / 已失联 / 已清理` entry a card has really shown. Idempotent, append-only, and bounded
     /// ([`MAX_RENDERED_KEYS`]). Deliberately NOT the Wake Watermark: a
     /// retirement recorded here never moves the floor a late Wake is judged
     /// against (#590, PR #595).

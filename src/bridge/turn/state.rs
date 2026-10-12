@@ -977,7 +977,8 @@ pub(super) struct StagedCursor {
     /// advance, and clears the durable gap only when the body reached its end.
     pub(super) gap: Option<GapCoverage>,
     /// The synthetic completion announce keys THIS body rendered (issue #671,
-    /// ticket #672): the `runtime:<call_id>` entries of its own timeline range.
+    /// ticket #672): the `ended:<call_id>` / `cleanup:<call_id>` entries of its
+    /// own timeline range.
     /// The confirmation persists them as the session's durable rendered marks —
     /// so a retirement a delivered card really showed never re-renders on a
     /// later card — and a stage that is discarded or never delivers records
@@ -2580,6 +2581,24 @@ impl StreamAccumulator {
         self.tasks.wake_announced(wake_id)
     }
 
+    /// Whether the Background Task `call_id` already has a retirement record on
+    /// this chain or on an EARLIER card (issue #659): every spelling the run's
+    /// announce key has ever had — [`ended_announce_key`], [`cleanup_announce_key`],
+    /// and the pre-#659 [`legacy_retirement_announce_key`] — is asked against
+    /// both gates. The retirement's own dedup reads THIS, because a run gets one
+    /// record whatever class ended it (the ledger's "exactly once per call id");
+    /// a Wake's completion gate reads the EVIDENCE spelling alone, since a
+    /// cleanup must never suppress a completion (spec #590).
+    pub(super) fn retirement_recorded(&self, call_id: &str) -> bool {
+        [
+            ended_announce_key(call_id),
+            cleanup_announce_key(call_id),
+            legacy_retirement_announce_key(call_id),
+        ]
+        .iter()
+        .any(|key| self.tasks.wake_announced(key) || self.tasks.render_recorded(key))
+    }
+
     /// Mark `wake_id`'s completion as announced on this chain — by the opening
     /// 承接 line or by the merged-path completion entry. Returns false when it
     /// already was: the exactly-once gate both paths honour (ADR-0059). A new
@@ -2614,8 +2633,9 @@ impl StreamAccumulator {
 
     /// Mark a SYNTHETIC completion — a runtime verdict's retirement, a child's
     /// own terminal transcript, or the user's cleanup, keyed
-    /// `runtime:<call_id>` — as announced on this chain (spec #588, review PR
-    /// #595): the same exactly-once gate [`Self::announce_wake`] applies, but
+    /// `ended:<call_id>` (the evidence classes) or `cleanup:<call_id>` (the
+    /// user's own; issue #659) — as announced on this chain (spec #588, review
+    /// PR #595): the same exactly-once gate [`Self::announce_wake`] applies, but
     /// NOTHING durable is staged. The durable Wake Watermark is the newest
     /// WAKE whose completion a card announced (ADR-0061); staging a synthetic
     /// entry's clock there would make a restart read a genuinely un-announced
@@ -4948,13 +4968,44 @@ pub(super) async fn refresh_context_window(
     }
 }
 
-/// The announce KEY one Background Task retirement carries (issue #671, ticket
-/// #672): the runtime verdict's, the child evidence's, and the user's cleanup
-/// all share it. Two gates must agree on this one identity — the in-memory
-/// exactly-once set (`StreamAccumulator::announce_synthetic`) and the durable
-/// rendered marks (`ChainRecords::record_rendered`) — so it is minted once,
-/// here.
-pub(super) fn runtime_announce_key(call_id: &str) -> String {
+/// The announce KEY an **evidence** Background Task retirement carries (issue
+/// #671, ticket #672; respelled by issue #659): the runtime verdict's (a
+/// terminal end, or a shell the runtime no longer knows) and the child
+/// transcript's own terminal evidence. It names the CLAIM — this run's end is
+/// recorded — which is why it also gates a late Wake's completion entry
+/// ([`cleanup_announce_key`] splits the classes; [`legacy_retirement_announce_key`]
+/// is the older spelling).
+///
+/// Two gates must agree on this one identity — the in-memory exactly-once set
+/// (`StreamAccumulator::announce_synthetic`) and the durable rendered marks
+/// (`ChainRecords::record_rendered`) — so it is minted once, here.
+pub(super) fn ended_announce_key(call_id: &str) -> String {
+    format!("ended:{call_id}")
+}
+
+/// The announce KEY the user's own cleanup carries (spec #588, #590; issue
+/// #659): both classes are synthetic retirements under one exactly-once gate,
+/// but only an evidence ending CLAIMS the run ended — a cleaned task's late Wake
+/// keeps showing its own completion (spec #590) — so the two must not share a
+/// key.
+pub(super) fn cleanup_announce_key(call_id: &str) -> String {
+    format!("cleanup:{call_id}")
+}
+
+/// The PRE-#659 retirement key, `runtime:<call_id>`: READ, never written. An
+/// older build wrote it for BOTH classes, so:
+///
+/// - the retirement's own dedup still honors it, so a mark written before the
+///   upgrade keeps covering a re-derived retirement (issue #671's rule);
+/// - a Wake's completion gate must NOT read it: the old spelling cannot say
+///   which class wrote it — an old CLEANUP's mark is indistinguishable from an
+///   old evidence one — and suppressing a Wake on a cleanup's word would break
+///   spec #590. A `runtime:` mark therefore never suppresses a Wake; the run's
+///   completion renders once more instead (the duplicate-over-loss side this
+///   family trades toward, bounded by [`MAX_RENDERED_KEYS`]'s turnover).
+///
+/// [`MAX_RENDERED_KEYS`]: crate::bridge::chain::MAX_RENDERED_KEYS
+pub(super) fn legacy_retirement_announce_key(call_id: &str) -> String {
     format!("runtime:{call_id}")
 }
 

@@ -27,7 +27,8 @@ pub(crate) struct TaskState {
     /// `continue_on_new_card`, so a Wake that resumes a wake-continuation card
     /// still marks exactly once (ADR-0059). Synthetic retirements — a
     /// runtime/child-evidence retirement or the user's cleanup — share the set
-    /// under their `runtime:<call_id>` key, marked through
+    /// under their `ended:<call_id>` / `cleanup:<call_id>` key (one per
+    /// retirement class, issue #659), marked through
     /// [`Self::announce_entry`]: the same exactly-once gate, staging nothing
     /// durable (spec #588, review PR #595). This is the ANNOUNCEMENT gate (it
     /// keeps an entry single); the Wake step's in-place decision reads
@@ -60,8 +61,8 @@ pub(crate) struct TaskState {
     /// [`super::TasksHandle::restore`]); read through [`Self::wake_floor`].
     wake_floor: Option<i64>,
     /// The synthetic completion keys an EARLIER card of this Session already
-    /// rendered (issue #671, ticket #672): the durable `runtime:<call_id>`
-    /// marks `ChainRecords` carries, seeded when a card starts rendering a
+    /// rendered (issue #671, ticket #672): the durable `ended:<call_id>` /
+    /// `cleanup:<call_id>` marks `ChainRecords` carries, seeded when a card starts rendering a
     /// session alongside [`Self::wake_floor`]. Every retirement here was shown
     /// by a delivered card write, so this accumulator's render never re-inserts
     /// its entry — the restart case the per-chain announce set cannot cover.
