@@ -2004,6 +2004,23 @@ async fn a_queued_entry_write_marks_rendered_only_once_it_delivers() {
         "an owed entry write records no rendered mark: {:?}",
         app.cards_handle().chains.rendered("ses_test")
     );
+
+    // Feishu returns: the queued payload delivers and the reconcile records the
+    // mark. The absence assertion above alone would pass with the whole mark
+    // feature removed, so the delivered half is pinned here (issue #671,
+    // ticket #672).
+    platform.fail_update_transport_count.store(0, Ordering::SeqCst);
+    app.core.feishu.drain_pending_card_updates(true).await;
+    crate::bridge::turn::reconcile_staged_cursors(&app.cards_handle()).await;
+    assert!(
+        app.cards_handle()
+            .chains
+            .rendered("ses_test")
+            .iter()
+            .any(|key| key == "runtime:call_bg"),
+        "a delivered entry write records its rendered mark: {:?}",
+        app.cards_handle().chains.rendered("ses_test")
+    );
 }
 
 /// Review (spec #588, PR #595): the yielded-card refresh reports what really
