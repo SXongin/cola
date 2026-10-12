@@ -191,12 +191,8 @@ impl Backend for OpenCodeBackend {
         OpenCodeBackend::child_evidence(self, session_id).await
     }
 
-    fn retire_background_tasks(&self, session_id: &str, call_ids: &[String]) {
-        OpenCodeBackend::retire_background_tasks(self, session_id, call_ids);
-    }
-
-    fn set_unconfirmed_tasks(&self, session_id: &str, call_ids: &[String]) {
-        OpenCodeBackend::set_unconfirmed_tasks(self, session_id, call_ids);
+    fn task_overlay(&self) -> &crate::bridge::tasks::BackgroundTaskOverlay {
+        OpenCodeBackend::task_overlay(self)
     }
 
     async fn model_context_window(&self, provider: &str, model: &str) -> Result<Option<i64>> {

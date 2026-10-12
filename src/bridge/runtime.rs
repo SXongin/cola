@@ -379,10 +379,10 @@ fn record_overlay(backend: &Arc<dyn Backend>, session_id: &str, transcript: &Ses
             "session {session_id}: runtime reconciliation retired {} background task(s)",
             call_ids.len()
         );
-        backend.retire_background_tasks(session_id, &call_ids);
+        backend.task_overlay().record(session_id, &call_ids);
     }
     let unconfirmed: Vec<String> = transcript.unconfirmed_tasks.iter().cloned().collect();
-    backend.set_unconfirmed_tasks(session_id, &unconfirmed);
+    backend.task_overlay().set_unconfirmed(session_id, &unconfirmed);
 }
 
 /// The shell and child session ids a read's still-live Background Tasks name,

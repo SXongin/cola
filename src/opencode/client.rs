@@ -10,9 +10,8 @@
 
 use std::sync::{Arc, RwLock};
 
-use crate::backend::{
-    BackgroundTaskOverlay, ChildEvidence, PromptSkill, SessionTranscript, SkillInfo, TaskRuntime,
-};
+use crate::backend::{ChildEvidence, PromptSkill, SessionTranscript, SkillInfo, TaskRuntime};
+use crate::bridge::tasks::BackgroundTaskOverlay;
 
 use super::parsing::parse_model;
 use super::strategy::{Generation, GenerationStrategy};
@@ -51,11 +50,13 @@ pub struct OpenCodeBackend {
     /// replacement on the same port (a new generation or password). Shared
     /// across clones like the strategy.
     attached_pid: Arc<RwLock<Option<i32>>>,
-    /// The Background Task overlay a Runtime Reconciliation (or a cleanup)
-    /// established this cola life (issue #454, review #588), applied to every
-    /// transcript read so the durable launch record cannot resurrect a retired
-    /// task and a marker survives the reads the shared throttle spends no
-    /// verdict on. Shared across clones like the strategy.
+    /// The Background Task liveness overlay a Runtime Reconciliation (or a
+    /// cleanup) established this cola life (issue #454, review #588), applied
+    /// to every transcript read so the durable launch record cannot resurrect a
+    /// retired task and a marker survives the reads the shared throttle spends
+    /// no verdict on. Its bytes live in the Background Task State module
+    /// (ticket #682, ADR-0079); this field is the instance the adapter applies,
+    /// shared across clones like the strategy.
     overlay: Arc<BackgroundTaskOverlay>,
 }
 
@@ -346,16 +347,13 @@ impl OpenCodeBackend {
         Ok(transcript)
     }
 
-    /// Record the Background Tasks a runtime reconciliation retired (issue
-    /// #454). See [`crate::backend::Backend::retire_background_tasks`].
-    pub fn retire_background_tasks(&self, session_id: &str, call_ids: &[String]) {
-        self.overlay.record(session_id, call_ids);
-    }
-
-    /// Replace one session's unconfirmed-Background-Task marker set (review,
-    /// spec #588). See [`crate::backend::Backend::set_unconfirmed_tasks`].
-    pub fn set_unconfirmed_tasks(&self, session_id: &str, call_ids: &[String]) {
-        self.overlay.set_unconfirmed(session_id, call_ids);
+    /// The liveness overlay every [`Self::transcript`] read applies
+    /// ([`BackgroundTaskOverlay`], issue #454, review #588). The Bridge reaches
+    /// it through [`crate::backend::Backend::task_overlay`], so a retirement the
+    /// reconcile commits lands on exactly the handle every later read goes
+    /// through. The module owns the bytes (ticket #682).
+    pub(crate) fn task_overlay(&self) -> &BackgroundTaskOverlay {
+        self.overlay.as_ref()
     }
 
     /// The session's durable model/agent selection where the generation keeps
