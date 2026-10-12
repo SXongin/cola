@@ -277,7 +277,6 @@ impl Turn {
         // completion entries it owes are planned on it and their output tails
         // read before the lock is taken (spec #593; the reads are network).
         let mut acc = StreamAccumulator::new(title);
-        Self::seed_durable_announcements(cards, session_id, &mut acc);
         acc.adopt_turn_anchor(anchor);
         acc.set_session(session_id);
         // The chain's reply target (issue #580) is the target the successor's
@@ -304,6 +303,13 @@ impl Turn {
             if live.contains_key(session_id) {
                 return None;
             }
+            // The durable seed is read HERE, in the same critical section that
+            // checks the session is still card-less (issue #671, ticket #672):
+            // `read_planned_outputs` below awaits outside the lock, so a seed
+            // read before it could miss a mark a landed body wrote meanwhile.
+            // Together with the check the two are one decision — no card, so no
+            // writer — and the second check guards the install.
+            Self::seed_durable_announcements(cards, session_id, &mut acc);
             render::plan_ledger_entries(&acc, transcript, Some(anchor))
         };
         render::read_planned_outputs(backend, &mut plans).await;
@@ -389,7 +395,6 @@ impl Turn {
         anchor_text: Option<&str>,
     ) {
         let mut acc = state::StreamAccumulator::new(subtitle);
-        Self::seed_durable_announcements(cards, session_id, &mut acc);
         // The external message's anchor — identity plus server time — is the
         // turn's anchor: header date, turn filter and renderer replacement
         // guard all read it, and cola's clock is never part of the card
@@ -402,10 +407,18 @@ impl Turn {
         if let Some(text) = anchor_text.filter(|text| !text.is_empty()) {
             acc.push_text_at(Some(anchor.created_ms - 1), text);
         }
-        cards.cards.lock().await.insert(
-            session_id.to_string(),
-            state::CardSession::new(acc, Some(card_id.to_string())),
-        );
+        {
+            // The durable seed and the insert share ONE cards-map critical
+            // section (issue #671, ticket #672): the `attach_work_context`
+            // await above is where a landed mark could slip past a seed read
+            // taken before it, leaving this render to re-show the retirement.
+            let mut live = cards.cards.lock().await;
+            Self::seed_durable_announcements(cards, session_id, &mut acc);
+            live.insert(
+                session_id.to_string(),
+                state::CardSession::new(acc, Some(card_id.to_string())),
+            );
+        }
         // An adopted run's card is the session's live card: take the chain over
         // (the anchor is known here, so the record needs no transcript probe,
         // and the arm carries the directory its reads route under). A different
@@ -658,6 +671,9 @@ impl Turn {
             return None;
         }
         let mut acc = StreamAccumulator::new(facts.subtitle);
+        // The durable seed and the insert below share this one cards-map
+        // critical section already: no await separates them (issue #671,
+        // ticket #672).
         Self::seed_durable_announcements(cards, session_id, &mut acc);
         acc.adopt_turn_anchor(anchor);
         acc.set_session(session_id);
