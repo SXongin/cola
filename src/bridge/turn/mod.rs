@@ -714,21 +714,32 @@ impl Turn {
         // `session_id` travels too: the Error card's retry button is built from
         // it, so a post-recreate error must still offer a retry that resolves
         // against the fresh mapping.
+        //
+        // The live-card record and the Background Task State binding are facts
+        // about the card too, so they move in the SAME cards critical section:
+        // every card install binds its cell while holding this lock
+        // (`seed_durable_announcements` → `install`/`restore`), so a concurrent
+        // Turn cannot install a card for `fresh_id` between the remap and the
+        // re-key and then have the re-key clobber its binding (ADR-0079,
+        // ticket #681). `rename` and `rekey` are non-async, take-and-release,
+        // and never awaited, so holding the cards guard across them is the
+        // documented `cards` → task state order (see `CardsHandle`'s lock doc).
         {
             let mut cards = handles.cards.cards.lock().await;
             if let Some(mut card) = cards.remove(&self.session_id) {
                 card.acc.set_session(&fresh_id);
                 cards.insert(fresh_id.clone(), card);
             }
+            // The live-card record is a fact about the card, not the session id
+            // it was filed under: re-key it so the fresh session's card is
+            // reap-able.
+            handles.cards.chains.rename(&self.session_id, &fresh_id);
+            // The Background Task State binding is a fact about the card too:
+            // move it to the fresh session, re-keyed at the fresh session's
+            // current chain generation. The `from` session's binding goes with
+            // the card, so the store never keeps a cell under a dead session.
+            handles.cards.tasks.rekey(&self.session_id, &fresh_id);
         }
-        // The live-card record is a fact about the card, not the session id it
-        // was filed under: re-key it so the fresh session's card is reap-able.
-        handles.cards.chains.rename(&self.session_id, &fresh_id);
-        // The Background Task State binding is a fact about the card too: move
-        // it to the fresh session, re-keyed at the fresh session's current chain
-        // generation (ADR-0079, ticket #681). The `from` session's binding goes
-        // with the card, so the store never keeps a cell under a dead session.
-        handles.cards.tasks.rekey(&self.session_id, &fresh_id);
         {
             let mut inflight = handles.waits.inflight.lock().await;
             inflight.remove(&self.session_id);
