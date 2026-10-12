@@ -933,42 +933,10 @@ pub(super) struct AttemptBaseline {
     pub(super) observed: std::collections::HashSet<String>,
 }
 
-/// The granularity at which a ledger read compares its clock against what the
-/// card last rendered (ADR-0060). The stored clock is the rendered elapsed in
-/// whole seconds; the cadence decides how much of it must move to owe a flush.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum LedgerCadence {
-    /// Whole minutes — the live render and its Wake handover, whose flushes are
-    /// content-driven: a per-render second clock would owe a flush on nearly
-    /// every render. A read inside the same rendered minute owes nothing.
-    Minute,
-    /// Whole seconds — the yielded refresh: the ~8 s Session Sync reads are a
-    /// waiting card's only clock, so the moment a row's rendered second moves,
-    /// the card owes the PATCH (≈0.125 QPS per waiting card, far below
-    /// Feishu's per-message cap).
-    Second,
-}
-
-/// What a ledger refresh moved (#457), split so the live render can tell real
-/// work from clock churn: `rows` — a visible fact moved (membership, a row's
-/// label or status, the fragment's words, the output window's text) — is
-/// progress; `clock` — only a rendered elapsed, a fragment's age or the output
-/// window's cutoff crossed the path's cadence — owes the flush but is not new
-/// work. Both halves flush the card; the external renderer's idle bound renews
-/// on `rows` alone, or a silent task's ticking age would keep its card live
-/// forever.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(super) struct LedgerChange {
-    pub(super) rows: bool,
-    pub(super) clock: bool,
-}
-
-impl LedgerChange {
-    /// Whether the card owes a flush (either half moved).
-    pub(super) fn owes(self) -> bool {
-        self.rows || self.clock
-    }
-}
+// The ledger read-model types live in the Background Task State module
+// (ADR-0079); re-exported here so `state::LedgerCadence` & co. keep resolving
+// for the Turn's own callers.
+pub(super) use crate::bridge::tasks::model::{LedgerCadence, LedgerChange};
 
 /// The most staged Rendered Cursors one accumulator retains (spec #561,
 /// review #569): the newest stage plus the delivered-but-unconfirmed ones a
