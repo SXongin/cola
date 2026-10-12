@@ -142,14 +142,23 @@ vocabulary, and rejecting the maximal design's generality:
   today (`Turn::recorded_marks`) — a mark a queued delivery landed during the
   await drops the plan — installs the rows, records the in-memory claims, and
   returns what moved. Callers stop knowing the anchor, the directory, the
-  cadence, the output reads or the `recorded_marks` re-check.
+  cadence, the output reads or the `recorded_marks` re-check. **Lock order is
+  one-way: `write_lock` → `cards` → task state.** `apply` takes the module's
+  per-Session lock *inside* the cards lock, and that lock is a plain
+  **synchronous** mutex — never awaited and never held across an await — so
+  acquiring it inside the cards lock cannot suspend while holding that lock, and
+  no task-state guard spans `read`'s awaits. No path may hold the task-state
+  lock and then reach for the cards lock or `write_lock`. (The slice #681
+  records the order beside `CardsHandle`'s existing lock doc.)
 - **Commit is two methods, preserving ADR-0067/0072's accepted-vs-delivered
   split.** `commit_accepted` records the volatile liveness (the retirements and
-  the post-verdict unconfirmed set) after any accepted carrier write;
-  `commit_delivered` advances the durable **Wake Watermark** and folds the
-  body's synthetic keys into the durable `rendered` marks at the delivered-write
-  choke point. Neither is reachable from the other, so #590 and PR #595 are
-  preserved as types rather than as rules four call sites remember.
+  the post-verdict unconfirmed set) after a carrier write the delivery layer
+  *accepted* — delivered, or recoverably failed and owed for retry
+  (`FlushOutcome::Accepted`, ADR-0073/0067), **not** mere keyed-queue admission
+  (ADR-0072); `commit_delivered` advances the durable **Wake Watermark** and
+  folds the body's synthetic keys into the durable `rendered` marks at the
+  delivered-write choke point. Neither is reachable from the other, so #590 and
+  PR #595 are preserved as types rather than as rules four call sites remember.
 - **One claim vocabulary.** A completion entry's exactly-once claim is one type
   with two variants — a **Wake** (which may advance the Watermark and carries
   the hand-off flag) and a **Retirement** (key `runtime:<call_id>`, which never
@@ -266,3 +275,6 @@ from the **Background Task Ledger**, which is where its rows and entries render.
     evidence.
   - **#685** — one confirmed-write seam that commits every durable fact a card
     write carried.
+- Depended-on ADRs: ADR-0061 (the Wake Watermark), ADR-0065 (Runtime
+  Reconciliation), ADR-0069 (the Chain Record), ADR-0071 (the Rendered Cursor),
+  ADR-0072 (card delivery order), ADR-0073 (background-task exits).
