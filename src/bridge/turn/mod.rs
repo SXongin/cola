@@ -3278,19 +3278,21 @@ impl Turn {
             .and_then(|c| c.acc.reply_to_message_id().map(str::to_string))
     }
 
-    /// Seed `acc`'s durable announcement state from the chain's Chain Record —
-    /// the module's [`crate::bridge::tasks::TasksHandle::seed`] (`restore(record,
-    /// scope)`, ADR-0079). One call, two facts, because both are "what an
-    /// EARLIER card of this Session already announced": the **Wake floor** from
-    /// the Wake Watermark (spec #561, review #569; ADR-0061) and the
-    /// **rendered marks** (issue #671, ticket #672). The rule itself lives in
-    /// the Background Task State module; the two stay separate facts on purpose
-    /// (the floor gates Wakes, the marks gate retirements, and a retirement must
-    /// never move the floor a late Wake is judged against — #590).
+    /// Bind `acc`'s cell to the session and seed its durable announcement
+    /// state from the chain's Chain Record — the module's
+    /// [`crate::bridge::tasks::TasksHandle::restore`]. One call, three facts:
+    /// the **binding** (the reset point, recording the chain generation), and
+    /// the two "what an EARLIER card of this Session already announced" facts —
+    /// the **Wake floor** from the Wake Watermark (spec #561, review #569;
+    /// ADR-0061) and the **rendered marks** (issue #671, ticket #672). The
+    /// rule itself lives in the Background Task State module; the two durable
+    /// facts stay separate on purpose (the floor gates Wakes, the marks gate
+    /// retirements, and a retirement must never move the floor a late Wake is
+    /// judged against — #590).
     fn seed_durable_announcements(cards: &CardsHandle, session_id: &str, acc: &mut state::StreamAccumulator) {
-        let seed = cards.tasks.seed(session_id);
-        acc.set_wake_floor(seed.watermark_ms);
-        acc.set_render_marks(seed.rendered_keys);
+        cards
+            .tasks
+            .restore(session_id, cards.chains.generation(session_id), acc.tasks());
     }
 
     /// Register a fresh Turn's accumulator as the session's live card (issue

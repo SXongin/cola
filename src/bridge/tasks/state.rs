@@ -2,55 +2,22 @@
 //!
 //! This is the volatile tier's home: the four per-chain delivery sets a card
 //! accumulator used to own inline — `announced_wakes`, `handed_over_wakes`,
-//! `wake_floor` and `render_marks` — moved out of `StreamAccumulator` behind
-//! [`TaskState`]'s methods. `StreamAccumulator` keeps thin forwarding methods
-//! that delegate here, so no caller changes.
+//! `wake_floor` and `render_marks` — held in [`TaskState`] and reached through
+//! [`TaskCell`], the shared handle the accumulator and the per-Session store
+//! both hold. `StreamAccumulator` keeps thin forwarding methods that delegate
+//! to the cell, so no caller changes.
 //!
-//! # Lock order (ADR-0079, ticket #681)
-//!
-//! The documented order is one-way — **`write_lock` → `cards` → task state** —
-//! and it is recorded beside [`crate::bridge::handles::CardsHandle`]'s own
-//! lock doc. Today the cell is owned by value inside the accumulator, so it is
-//! reached under the `cards` lock and carries no lock of its own. When a later
-//! slice gives the module a per-Session lock, it must be a plain
-//! **synchronous** mutex — never awaited and never held across an await — so
-//! taking it inside the `cards` lock cannot suspend while holding that lock,
-//! and no task-state guard may span an await. No path may hold the task-state
-//! lock and then reach for `cards` or `write_lock`; the module's only durable
-//! reach ([`super::TasksHandle`]) reads its Chain Record under an internal
-//! [`std::sync::Mutex`] and never holds it across an await.
-//!
-//! # Generation scoping (ADR-0072; ticket #681 trap)
-//!
-//! The four sets are **per-chain**: like every other `StreamAccumulator`
-//! field, they are born with the accumulator's `CardSession` and die with it —
-//! reset by `Turn::install_fresh_session`'s unconditional insert (or the
-//! `arm_*` paths' conditional one) and kept across `continue_on_new_card` and
-//! an arm that finds a live card. The chain **generation**
-//! ([`crate::bridge::chain::ChainRecords::generation`]) is *not* the unit of
-//! reset: it bumps only at a record re-point, which for a takeover can land
-//! after the insert, and it is `0` for a session with no record. A store keyed
-//! by generation alone would therefore leak a previous card's sets into a
-//! fresh accumulator (generation unchanged) or drop a live card's sets
-//! mid-life (generation bumped) — so the sets stay bound to the `CardSession`
-//! replacement, exactly as before, and the generation remains the render's
-//! orthogonal fact (spec #571).
+//! Lock order and the generation-scoping rule are recorded once, canonically,
+//! beside `crate::bridge::handles::CardsHandle`'s lock doc; this module keeps
+//! only what is specific to the cell (see [`TaskCell`]).
 
 use std::collections::HashSet;
+use std::sync::{Arc, Mutex, MutexGuard};
 
-/// The per-Session Background Task State cell: the per-chain delivery
-/// exactly-once sets. Every field is private to this module — no reader or
-/// writer outside `crate::bridge::tasks` touches them directly; callers reach
-/// them only through the methods below (and, across the seam,
-/// `StreamAccumulator`'s forwarding methods).
-///
-/// It is owned **by value** by [`crate::bridge::turn::state::StreamAccumulator`],
-/// which is what keeps its semantics byte-identical to the inline fields it
-/// replaced: a fresh accumulator (including the ~170 session-less
-/// `StreamAccumulator::new("test")` fixtures) starts from [`Default`], and
-/// `StreamAccumulator`'s derived `Clone` deep-copies the cell — so a probe
-/// (`Turn::arm_wake_continuation`'s split probe, `Turn::ack_card`'s) cannot
-/// mutate the live card's sets through a shared handle.
+/// The per-Session Background Task State: the per-chain delivery exactly-once
+/// sets. Every field is private to this module — no reader or writer outside
+/// `crate::bridge::tasks` touches them directly; callers reach them only
+/// through [`TaskCell`]'s methods.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct TaskState {
     /// The Wakes whose completion this chain has already announced: marked by
@@ -90,7 +57,7 @@ pub(crate) struct TaskState {
     /// Wake continuation); a strictly newer Wake still announces. `None` when
     /// the session announced no Wake. Seeded by [`Self::set_wake_floor`]
     /// (`Turn::seed_durable_announcements`, through
-    /// [`super::TasksHandle::seed`]); read through [`Self::wake_floor`].
+    /// [`super::TasksHandle::restore`]); read through [`Self::wake_floor`].
     wake_floor: Option<i64>,
     /// The synthetic completion keys an EARLIER card of this Session already
     /// rendered (issue #671, ticket #672): the durable `runtime:<call_id>`
@@ -100,9 +67,9 @@ pub(crate) struct TaskState {
     /// its entry — the restart case the per-chain announce set cannot cover.
     /// Deliberately NOT a Wake fact: it never joins [`Self::wake_floor`], so a
     /// genuinely un-announced late Wake at or below a retirement's clock still
-    /// renders and resumes (#590, PR #595). Seeded by
-    /// [`Self::set_render_marks`] (`Turn::seed_durable_announcements`, through
-    /// [`super::TasksHandle::seed`]); read through [`Self::render_recorded`].
+    /// renders and resumes (#590, PR #595). Seeded by [`Self::set_render_marks`]
+    /// (`Turn::seed_durable_announcements`, through
+    /// [`super::TasksHandle::restore`]); read through [`Self::render_recorded`].
     render_marks: HashSet<String>,
 }
 
@@ -161,5 +128,107 @@ impl TaskState {
     /// runs before the commit that announces, so it must not mutate.
     pub(crate) fn render_recorded(&self, key: &str) -> bool {
         self.render_marks.contains(key)
+    }
+}
+
+/// A handle to one per-Session Background Task State cell: a shared, mutable
+/// [`TaskState`], held by the session's `StreamAccumulator` and, once bound, by
+/// the session's entry in [`super::TasksHandle`]'s store.
+///
+/// **`Clone` deep-copies.** A cloned handle owns a FRESH [`TaskState`], so
+/// `StreamAccumulator`'s derived `Clone` keeps today's exact semantics: the
+/// split probes (`Turn::arm_wake_continuation`'s and `Turn::ack_card`'s),
+/// `carry_attempt_baseline` and the ~170 session-less
+/// `StreamAccumulator::new("test")` fixtures all get an independent,
+/// unregistered cell — a speculative write can never reach the live card.
+/// [`Self::share`] is the deliberate shallow handle the store keeps to the SAME
+/// cell.
+///
+/// The inner lock is a plain [`Mutex`]: every method below takes it and
+/// releases it inside the call, so it is never awaited and never held across an
+/// await (ADR-0079's task-state lock contract — see [`CardsHandle`]'s lock doc
+/// for the one-way order).
+///
+/// [`CardsHandle`]: crate::bridge::handles::CardsHandle
+pub(crate) struct TaskCell {
+    inner: Arc<Mutex<TaskState>>,
+}
+
+impl TaskCell {
+    /// A fresh, empty cell (a session-less accumulator starts here).
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(TaskState::default())),
+        }
+    }
+
+    /// A second handle to the SAME cell — the store's copy, so the session's
+    /// registered state is the live card's state. Deliberately NOT `Clone`.
+    pub(crate) fn share(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+
+    /// The one exactly-once announcement gate (ADR-0059).
+    pub(crate) fn announce_entry(&self, key: &str) -> bool {
+        self.lock().announce_entry(key)
+    }
+
+    /// Whether `wake_id`'s completion was already announced on this chain.
+    pub(crate) fn wake_announced(&self, wake_id: &str) -> bool {
+        self.lock().wake_announced(wake_id)
+    }
+
+    /// Mark `wake_id`'s resumed work as handed to a card (ADR-0066).
+    pub(crate) fn hand_over_wake(&self, wake_id: &str) {
+        self.lock().hand_over_wake(wake_id);
+    }
+
+    /// Whether this chain has already handed a Wake's resumed work over.
+    pub(crate) fn has_handed_over_wake(&self, wake_id: &str) -> bool {
+        self.lock().has_handed_over_wake(wake_id)
+    }
+
+    /// Seed the Wake floor from the chain's durable Watermark.
+    pub(crate) fn set_wake_floor(&self, floor: Option<i64>) {
+        self.lock().set_wake_floor(floor);
+    }
+
+    /// The chain's durable Wake Watermark floor, if any (spec #561).
+    pub(crate) fn wake_floor(&self) -> Option<i64> {
+        self.lock().wake_floor()
+    }
+
+    /// Seed the durable rendered marks of the session's earlier cards.
+    pub(crate) fn set_render_marks(&self, marks: Vec<String>) {
+        self.lock().set_render_marks(marks);
+    }
+
+    /// Whether an earlier card of this Session already rendered this key.
+    pub(crate) fn render_recorded(&self, key: &str) -> bool {
+        self.lock().render_recorded(key)
+    }
+
+    fn lock(&self) -> MutexGuard<'_, TaskState> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl Default for TaskCell {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// Deliberately a manual `Clone`: a cloned handle must own a FRESH cell, never
+// share the live one (see the type's docs).
+impl Clone for TaskCell {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(self.lock().clone())),
+        }
     }
 }

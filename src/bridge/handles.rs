@@ -964,15 +964,15 @@ pub(crate) type FileMessageSends =
 ///    time.
 /// 3. `cover_titles` is independent of both.
 /// 4. The Background Task State (ADR-0079, ticket #681) is reached through
-///    [`Self::tasks`], inside the `cards` lock — the durable seed in
+///    [`Self::tasks`], inside the `cards` lock — the bind-and-seed in
 ///    `Turn::install_fresh_session` is the live example, and it deliberately
-///    shares the cards critical section (issue #671). The order is one-way:
-///    **`write_lock` → `cards` → task state**. The module's per-Session cell
-///    is owned by the accumulator today and carries no lock of its own; when a
-///    later slice gives it one it must be a plain synchronous mutex — never
-///    awaited and never held across an await — so it can be taken inside the
-///    `cards` lock without suspending while holding it. No path may hold the
-///    task-state guard and then reach for `cards` or `write_lock`.
+///    shares the cards critical section (issue #671). The one-way order is
+///    **`write_lock` → `cards` → task state**, and within task state the
+///    **store lock → cell lock**: both are plain synchronous mutexes, taken
+///    and released inside a single call — never awaited and never held across
+///    an await — so they can be taken inside the `cards` lock without
+///    suspending while holding it. No path may hold a task-state guard and then
+///    reach for `cards` or `write_lock`.
 #[derive(Clone)]
 pub(crate) struct CardsHandle {
     /// session_id → the session's one live card (accumulator + card id chain).
@@ -992,10 +992,9 @@ pub(crate) struct CardsHandle {
     /// the Fresh gate and the render's anchor refresh.
     pub(crate) chains: Arc<crate::bridge::chain::ChainRecords>,
     /// The Background Task State handle (ADR-0079, ticket #681): the module's
-    /// entry point for a Session's Background Task facts, beside the Chain
-    /// Record it seeds from. Today it owns the durable seed
-    /// ([`crate::bridge::tasks::TasksHandle::seed`]); the volatile per-Session
-    /// cell rides the session's accumulator.
+    /// per-Session store, beside the Chain Record it seeds from. A card-install
+    /// binds the session's cell here and reads the durable tier through it
+    /// ([`crate::bridge::tasks::TasksHandle::restore`]).
     pub(crate) tasks: crate::bridge::tasks::TasksHandle,
     /// session_id → the lock serializing that session's card writes. Private:
     /// [`CardsHandle::write_lock`] is the accessor.

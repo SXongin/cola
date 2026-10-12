@@ -11,7 +11,7 @@ use super::disposition::Disposition;
 use crate::backend::{FileContent, MessageId, Part, PromptSkill, SessionTranscript, ToolCall, TurnAnchor};
 use crate::bridge::chain::{CursorFrontier, CursorPartKind, RenderedCursor};
 use crate::bridge::handles::CardsHandle;
-use crate::bridge::tasks::TaskState;
+use crate::bridge::tasks::TaskCell;
 use crate::feishu::card::first_n_chars_bytes;
 use crate::feishu::card::ledger::{TaskCompletionEntry, TaskKind, TaskLedgerRow};
 use crate::feishu::card::shell::CardBuilder;
@@ -1406,14 +1406,15 @@ pub(super) struct StreamAccumulator {
     wake_continuation: bool,
     /// The per-chain Background Task delivery sets (ADR-0079, ticket #681):
     /// `announced_wakes`, `handed_over_wakes`, `wake_floor` and `render_marks`,
-    /// moved out of this struct into the Background Task State module
-    /// ([`TaskState`]) behind the thin forwarding methods below. Owned by value
-    /// so the four sets' lifetime (born with this accumulator's `CardSession`,
-    /// kept across [`Self::continue_on_new_card`], reset by
-    /// `Turn::install_fresh_session`'s insert) and their deep-copy on `Clone`
-    /// (probes must not mutate the live card) are unchanged. Private to this
-    /// module; every read or write goes through those forwarding methods.
-    tasks: TaskState,
+    /// moved out of this struct into the Background Task State module and
+    /// reached through this shared cell ([`TaskCell`]). The cell's `Clone`
+    /// deep-copies, so the four sets' lifetime (born with this accumulator's
+    /// `CardSession`, kept across [`Self::continue_on_new_card`], reset by
+    /// `Turn::install_fresh_session`'s insert) and their deep-copy on this
+    /// struct's `Clone` (probes must not mutate the live card) are unchanged.
+    /// Private to this module; every read or write goes through the forwarding
+    /// methods below.
+    tasks: TaskCell,
     /// Whether this chain's ONE neutral residual continuation has already
     /// fired (spec #602, ticket #606): a Wake-less part the Backend wrote after
     /// the run reported idle renders on exactly one neutral card per request.
@@ -1435,7 +1436,7 @@ pub(super) struct StreamAccumulator {
     /// The Wake Watermarks this chain has staged but not yet drained:
     /// `(wake id, created_ms)` stages, advanced by [`Self::announce_wake`] and
     /// persisted into the durable Wake Watermark once a card write actually
-    /// carries them (ADR-0061). In-memory [`TaskState`]'s announce set is the
+    /// carries them (ADR-0061). In-memory [`TaskCell`]'s announce set is the
     /// exactly-once gate. Newest last; a delivered body's mark stays drainable
     /// even after a newer mark is staged (spec #561, review #569), so a
     /// restart can never re-announce a Wake the card already showed. Bounded
@@ -2270,15 +2271,10 @@ impl StreamAccumulator {
 
     /// The chain's durable Wake Watermark floor, if any (spec #561): every Wake
     /// at or below this `created_ms` was announced by an earlier card. Private
-    /// to this module: seeded by [`Self::set_wake_floor`].
+    /// to this module: seeded by the Background Task State store
+    /// ([`crate::bridge::tasks::TasksHandle::restore`]).
     pub(super) fn wake_floor(&self) -> Option<i64> {
         self.tasks.wake_floor()
-    }
-
-    /// Seed the Wake floor from the chain's durable Watermark (`None` when the
-    /// session announced no Wake).
-    pub(super) fn set_wake_floor(&mut self, floor: Option<i64>) {
-        self.tasks.set_wake_floor(floor);
     }
 
     /// Whether an earlier card of this Session already rendered this synthetic
@@ -2293,6 +2289,13 @@ impl StreamAccumulator {
     /// for a session that rendered no retirement).
     pub(super) fn set_render_marks(&mut self, marks: Vec<String>) {
         self.tasks.set_render_marks(marks);
+    }
+
+    /// The Background Task State cell, for the module's store to bind and seed
+    /// (`Turn::seed_durable_announcements` → [`crate::bridge::tasks::TasksHandle::restore`]).
+    /// Everything else reaches the cell through the forwarding methods above.
+    pub(super) fn tasks(&self) -> &TaskCell {
+        &self.tasks
     }
 
     /// Whether the neutral waiting line 「⏳ 等待当前运行接收…」 was already shown
@@ -2578,7 +2581,7 @@ impl StreamAccumulator {
     /// WAKE mark also stages the durable Wake Watermark (ADR-0061), which only
     /// a delivering card write drains; the stage's generation is what a drain
     /// must match (spec #561, review #569). The set insert is
-    /// [`TaskState::announce_entry`]'s; the watermark staging stays here (the
+    /// [`TaskCell::announce_entry`]'s; the watermark staging stays here (the
     /// Background Task State owns the delivery sets, not the flush's staged
     /// cursor — ADR-0079's staging-mechanics split, ticket #681 trap).
     pub(super) fn announce_wake(&mut self, wake_id: &str, created_ms: i64) -> bool {
