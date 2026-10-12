@@ -1,9 +1,9 @@
 //! The Background Task State store (ADR-0079, ticket #681).
 //!
 //! [`TasksHandle`] is the module's entry point and its per-Session store: it
-//! maps a session to the [`TaskCell`] its live card owns, recording the chain
-//! **generation** the binding was made under, and reads the durable **Chain
-//! Record** a fresh cell is seeded from.
+//! maps a `(session, chain generation)` key to the [`TaskCell`] that
+//! generation's live card owns — the generation **selects** the entry — and
+//! reads the durable **Chain Record** a fresh cell is seeded from.
 //!
 //! It is created beside the Chain Record it seeds from: it rides `SharedCore` /
 //! `CardsHandle` next to `chains` (there is no `ChainRecords` field on
@@ -41,26 +41,26 @@ pub(crate) struct DurableSeed {
     pub(crate) rendered_keys: Vec<String>,
 }
 
-/// One session's registered cell: a shallow handle to the live card's
-/// [`TaskCell`] and the chain **generation** the binding was made under. The
-/// generation is not the reset unit (the `CardSession` replacement is), but it
-/// is what a lookup names, so a caller can tell whose chain the cell belongs
-/// to.
-struct SessionCell {
-    generation: u64,
-    state: TaskCell,
-}
-
 /// The module's per-Session store and its handle to the durable tier. Cheap to
 /// clone (the map and the Chain Record are both behind `Arc`s) and held beside
 /// the Chain Record it reads.
+///
+/// The store is keyed by `(session_id, chain generation)`: a lookup names a
+/// session AND a generation and gets exactly that chain's cell, so the
+/// generation genuinely selects the entry. [`Self::install`] keeps exactly one
+/// live cell per session by pruning the session's other generations, so a
+/// re-install under a changed generation cannot leave the previous chain's cell
+/// behind.
 #[derive(Clone)]
 pub(crate) struct TasksHandle {
     /// The durable Chain Record (ADR-0069): the Wake Watermark and the
     /// session-scoped `rendered` marks a fresh cell is seeded from.
     chains: Arc<ChainRecords>,
-    /// session_id → the cell its live card owns, with the binding's generation.
-    store: Arc<Mutex<HashMap<String, SessionCell>>>,
+    /// session_id → chain generation → the cell that generation's live card
+    /// owns. Nested rather than a flat `(String, u64)` key so the per-session
+    /// pruning in [`Self::install`] is one `retain` on the session's own map,
+    /// and the session → generation hierarchy reads as it is.
+    store: Arc<Mutex<HashMap<String, HashMap<u64, TaskCell>>>>,
 }
 
 impl TasksHandle {
@@ -82,46 +82,47 @@ impl TasksHandle {
         }
     }
 
-    /// Bind `session_id`'s cell: the reset/rebinding point (ADR-0079, ticket
-    /// #681), reached when a `CardSession` replaces the session's live card.
-    /// The store keeps a shallow handle to the SAME cell, so the registered
-    /// state is the live card's state — while the accumulator keeps its own
-    /// handle, so a later generation bump can never orphan it.
+    /// Bind `(session_id, generation)`'s cell: the reset/rebinding point
+    /// (ADR-0079, ticket #681), reached when a `CardSession` replaces the
+    /// session's live card. The store keeps a shallow handle to the SAME cell,
+    /// so the registered state is the live card's state — while the accumulator
+    /// keeps its own handle, so a later generation bump can never orphan it.
     ///
-    /// Returns the session's registered handle, resolved through the store —
-    /// the store's read side, the same resolution a later slice's `apply` uses.
+    /// The new binding is inserted under its `(session, generation)` key and the
+    /// session's OTHER generations are then pruned, so exactly one live cell per
+    /// session remains. Returns the session's handle for THIS generation,
+    /// resolved back through the store by key — the store's
+    /// generation-selecting read side, the same resolution a later slice's
+    /// `apply` uses.
     pub(crate) fn install(&self, session_id: &str, generation: u64, cell: &TaskCell) -> TaskCell {
         let mut store = self.store();
-        store.insert(
-            session_id.to_string(),
-            SessionCell {
-                generation,
-                state: cell.share(),
-            },
-        );
-        // The read side: resolve the binding just made, by generation. It
-        // cannot miss (the insert is under this same guard); the fallback keeps
-        // the result total and is the caller's own cell in any case.
-        store
-            .get(session_id)
-            .filter(|entry| entry.generation == generation)
-            .map(|entry| entry.state.share())
+        let generations = store.entry(session_id.to_string()).or_default();
+        generations.insert(generation, cell.share());
+        // Reset: the session's live card is THIS binding alone — drop whatever
+        // earlier chains left behind, so the session never holds two cells.
+        generations.retain(|bound, _| *bound == generation);
+        // The read side: resolve the binding just made, by (session,
+        // generation). It cannot miss (the insert is under this same guard); the
+        // fallback keeps the result total and is the caller's own cell anyway.
+        generations
+            .get(&generation)
+            .map(TaskCell::share)
             .unwrap_or_else(|| cell.share())
     }
 
     /// Rebind `session_id`'s cell and hand back the durable facts it is seeded
     /// with — the one call each of the four card-install sites makes. The bind
-    /// ([`Self::install`]) resolves the session's cell through the store, so
-    /// the facts come from [`Self::durable_seed`] read AFTER the binding; the
-    /// caller seeds them through the accumulator's forwarding setters
-    /// (`set_wake_floor` / `set_render_marks`), which reach the cell the store
-    /// owns for that binding, not a side door.
+    /// ([`Self::install`]) resolves the session's handle for this generation
+    /// through the store by key, so the facts come from [`Self::durable_seed`]
+    /// read AFTER the binding; the caller seeds them through the accumulator's
+    /// forwarding setters (`set_wake_floor` / `set_render_marks`), which reach
+    /// the cell the store owns for that binding, not a side door.
     pub(crate) fn restore(&self, session_id: &str, generation: u64, cell: &TaskCell) -> DurableSeed {
         self.install(session_id, generation, cell);
         self.durable_seed(session_id)
     }
 
-    fn store(&self) -> MutexGuard<'_, HashMap<String, SessionCell>> {
+    fn store(&self) -> MutexGuard<'_, HashMap<String, HashMap<u64, TaskCell>>> {
         self.store
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

@@ -144,10 +144,11 @@ impl TaskState {
 /// [`Self::share`] is the deliberate shallow handle the store keeps to the SAME
 /// cell.
 ///
-/// The inner lock is a plain [`Mutex`]: every method below takes it and
-/// releases it inside the call, so it is never awaited and never held across an
-/// await (ADR-0079's task-state lock contract — see [`CardsHandle`]'s lock doc
-/// for the one-way order).
+/// The inner lock is a plain [`Mutex`]: the methods that touch the inner state
+/// take it and release it inside the call — never awaited, never held across an
+/// await — while [`Self::new`] and [`Self::share`] never take it at all
+/// (ADR-0079's task-state lock contract — see [`CardsHandle`]'s lock doc for
+/// the one-way order).
 ///
 /// [`CardsHandle`]: crate::bridge::handles::CardsHandle
 pub(crate) struct TaskCell {
