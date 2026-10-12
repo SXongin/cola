@@ -77,9 +77,7 @@ pub struct SharedCore {
     /// a Wake an earlier life already showed.
     pub chains: Arc<crate::bridge::chain::ChainRecords>,
     /// The Background Task State handle (ADR-0079, ticket #681), created beside
-    /// the Chain Record it seeds from: the module's entry point for a Session's
-    /// Background Task facts. The volatile per-Session cell rides the session's
-    /// accumulator; this handle owns the durable seed.
+    /// the Chain Record it seeds from: the module's per-Session store of cells.
     pub tasks: crate::bridge::tasks::TasksHandle,
     /// Permission flow: owns `sent_cards`, polls pending requests, auto-accepts
     /// for `/autoaccept` sessions, and handles the "perm" card action.
