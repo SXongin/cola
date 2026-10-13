@@ -3,7 +3,7 @@
 > **Ratified (2026-10-14, spec #699)**: three points where the landed
 > implementation diverges from this ADR's literal wording — the **Wake** path
 > records its ending with its completion entry's commit, not at derivation; the
-> plan's durable read suppresses an entry, it never sources one; and the
+> plan's durable read suppresses an entry, it never creates one; and the
 > retirement's entry gate is one entry per run, whatever class. The
 > "recorded at derivation / an entry-less chain included" promise is scoped to
 > the evidence and **Cleanup** endings. See the amendment below.
@@ -19,7 +19,9 @@ derives it — as an ordinary durable fact on the **Chain Record**, keyed by
 **Task Run Id** and carrying its own "shown" fact, so exactly-once is the job of
 the confirmed card write the
 **Rendered Cursor** already rides, and both the parallel marks and the second
-key space dissolve.
+key space dissolve. A **Wake** completion is the exception to "where it derives
+it": its ending is recorded with its completion entry's commit, not at
+derivation — see the 2026-10-14 amendment below.
 
 ## Context
 
@@ -380,18 +382,23 @@ so the ask, this record and the plan agree.
   ADR's *Considered options* rejects *"Have the render plan read the durable
   endings directly (a second input beside `transcript.task_retirements`)"*
   because *"two sources would need de-duplicating in the plan"*. That is **not**
-  the shape that landed. `plan_wake_entries` / `plan_runtime_entries`
-  (`src/bridge/turn/render.rs`) receive the durable snapshot (`Endings::facts`)
-  **only to suppress** an entry already spoken for (`facts.recorded(...)`,
-  `facts.shown_any(...)`, `wake_ending_spoken_for`); they can never **add** one.
-  Every entry still originates in the read's transcript (`transcript.wakes`,
-  `transcript.task_retirements`), and the durable ending reaches that list only
-  through the adapter's `apply` seam (`TasksHandle::apply` →
+  the shape that landed: the durable snapshot (`Endings::facts`) can never
+  **create** an entry. `plan_wake_entries` / `plan_runtime_entries`
+  (`src/bridge/turn/render.rs`) plan every entry solely from the read's
+  transcript (`transcript.wakes`, `transcript.task_retirements`), with the owed
+  retirements synthesized by the adapter's `apply` seam (`TasksHandle::apply` →
   `synthesized_retirement`, `src/bridge/tasks/handle.rs`) — the same one entry
-  source the pre-ADR code had. There is nothing to de-duplicate in the plan, so
-  the rejected option's reason does not apply to the shipped shape. The
-  **Decision** bullet *"The entry renders from the durable ending, through the
-  read"* describes that `apply` synthesis, not a second plan input.
+  source the pre-ADR code had. Beside the suppress-only gates
+  (`facts.recorded(...)`, `facts.shown_any(...)`, `wake_ending_spoken_for`), the
+  snapshot may also fill in an entry's **content**: `facts.identity(run)` feeds
+  the Wake completion plan (`src/bridge/turn/render.rs:697-702`) and the runtime
+  entries fall back to the ending record's label and start clock
+  (`:831-847`) — the identity, label and duration #702's acceptance criteria
+  require when the read no longer carries the launch. It never adds an entry, so
+  there is nothing to de-duplicate in the plan and the rejected option's reason
+  does not apply to the shipped shape. The **Decision** bullet *"The entry
+  renders from the durable ending, through the read"* describes that `apply`
+  synthesis and content fallback, not a second plan input.
 - **The retirement's entry gate is one entry per run, whatever class.**
   `plan_runtime_entries`'s gate is deliberately class-agnostic — the
   `acc.ending_announced_any(&run) || facts.shown_any(&run)` check
