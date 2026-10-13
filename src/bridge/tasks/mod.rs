@@ -14,7 +14,8 @@
 //! # What lives here now
 //!
 //! - [`model`] — the read-model type definitions (#680), the rows the
-//!   **Background Task Ledger** renders.
+//!   **Background Task Ledger** renders, plus the **Task Run Id** (ADR-0080)
+//!   one run's durable **Task Ending**s are keyed by.
 //! - [`state::TaskState`] / [`state::TaskCell`] — the per-Session cell holding
 //!   the four per-chain delivery sets (`announced_wakes`, `handed_over_wakes`,
 //!   `wake_floor`, `render_marks`), and the shared handle to it. The cell moved
