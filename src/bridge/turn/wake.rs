@@ -121,10 +121,10 @@ pub(crate) struct ProjectedCard {
     /// body staged since — or a replaced session — is never advanced by the
     /// projection's late create.
     pub(crate) cursor_stage: state::StagedCursorId,
-    /// The synthetic announce keys this body rendered (issue #671, ticket
-    /// #672): the create landed, so they owe their durable mark — recorded by
-    /// the re-point, or, when the armed session was replaced meanwhile, by the
-    /// takeover's own refused-path write.
+    /// The Task Endings this body rendered (ADR-0080): the create landed, so
+    /// their shown bits are owed — flipped by the re-point, or, when the armed
+    /// session was replaced meanwhile, by the takeover's own refused-path
+    /// write.
     pub(crate) rendered_keys: Vec<EndingKey>,
     /// The stage generation of the Wake Watermark the armed body carries, if
     /// any: the create's drain names it, so a watermark staged since is left
@@ -142,9 +142,9 @@ pub(crate) struct ProjectedCard {
 pub(crate) struct ProjectedSlice {
     pub(crate) card: serde_json::Value,
     pub(crate) cursor_stage: state::StagedCursorId,
-    /// The synthetic announce keys this slice rendered (issue #671, ticket
-    /// #672): the create landed, so they owe their durable mark even when a
-    /// fresh Turn took the session over before the re-point.
+    /// The Task Endings this slice rendered (ADR-0080): the create landed, so
+    /// they owe their shown bits even when a fresh Turn took the session over
+    /// before the re-point.
     pub(crate) rendered_keys: Vec<EndingKey>,
     pub(crate) watermark_stage: Option<u64>,
     /// More content remains after this slice.
@@ -1392,7 +1392,7 @@ mod tests {
     /// path must record what the create delivered (the flush's own
     /// accepted-write record does not cover a projection create).
     #[tokio::test]
-    async fn a_takeover_without_its_stage_still_marks_its_keys() {
+    async fn a_takeover_without_its_stage_still_marks_its_endings() {
         let _wd = test_work_dir();
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_config(&dir.path().join("sessions.json"));

@@ -1407,7 +1407,8 @@ pub(super) struct StreamAccumulator {
     /// and `arm_wake_continuation`; read through [`Self::wake_continuation`].
     wake_continuation: bool,
     /// The per-chain Background Task delivery sets (ADR-0079, ticket #681):
-    /// `announced_wakes`, `handed_over_wakes`, `wake_floor` and `render_marks`,
+    /// `announced_wakes`, `handed_over_wakes`, `wake_floor` and
+    /// `announced_endings`,
     /// moved out of this struct into the Background Task State module and
     /// reached through this shared cell ([`TaskCell`]). The cell's `Clone`
     /// deep-copies, so the four sets' lifetime (born with this accumulator's
@@ -2284,19 +2285,6 @@ impl StreamAccumulator {
         self.tasks.set_wake_floor(floor);
     }
 
-    /// Whether an earlier card of this Session already rendered this synthetic
-    /// retirement's entry — the durable mark the render's gate consults beside
-    /// [`Self::wake_announced`] (issue #671, ticket #672).
-    ///
-    /// **Legacy (ADR-0080)**: the live gates read the endings' shown bits
-    /// ([`crate::bridge::chain::EndingFacts`]); this and the seeded mark set
-    /// exist only until the shrinkage slice (#703) deletes them with the
-    /// `rendered` section.
-    #[allow(dead_code)]
-    pub(super) fn render_recorded(&self, key: &str) -> bool {
-        self.tasks.render_recorded(key)
-    }
-
     /// Whether `run`'s ending of `class` already had its entry placed on this
     /// chain (ADR-0080): the in-life exactly-once gate the plan reads beside the
     /// durable shown bit.
@@ -2308,14 +2296,6 @@ impl StreamAccumulator {
     /// chain (ADR-0080): one entry per run, whatever class wrote it.
     pub(super) fn ending_announced_any(&self, run: &TaskRunId) -> bool {
         self.tasks.ending_announced_any(run)
-    }
-
-    /// Seed the legacy rendered marks of the session's earlier cards (empty for
-    /// a session that rendered no retirement). **Legacy (ADR-0080)**: the live
-    /// gates read the endings' shown bits; the shrinkage slice (#703) deletes
-    /// this set with its readers.
-    pub(super) fn set_render_marks(&mut self, marks: Vec<String>) {
-        self.tasks.set_render_marks(marks);
     }
 
     /// The Background Task State cell, for the module's store to bind and seed
@@ -4964,39 +4944,6 @@ pub(super) async fn refresh_context_window(
     }
 }
 
-/// The announce KEY an **evidence** Background Task retirement used to carry
-/// (issue #671, ticket #672; respelled by issue #659).
-///
-/// **Legacy (ADR-0080)**: a retirement's exactly-once is now keyed by the
-/// ending itself (the run plus its class) and by the durable shown bit, so
-/// nothing gates on these spellings any more. They survive only as the shape
-/// the load-time translation of the `rendered` section reads
-/// ([`crate::bridge::chain`]); the shrinkage slice (#703) deletes them with the
-/// section.
-#[allow(dead_code)]
-pub(super) fn ended_announce_key(call_id: &str) -> String {
-    format!("ended:{call_id}")
-}
-
-/// The announce KEY the user's own cleanup used to carry (spec #588, #590;
-/// issue #659) — the class split the pre-ADR key space needed, now the ending's
-/// own `TaskEndingClass::Cleanup`. **Legacy (ADR-0080)**: see
-/// [`ended_announce_key`].
-#[allow(dead_code)]
-pub(super) fn cleanup_announce_key(call_id: &str) -> String {
-    format!("cleanup:{call_id}")
-}
-
-/// The PRE-#659 retirement key, `runtime:<call_id>`: READ by nothing any more,
-/// never written. **Legacy (ADR-0080)**: translated once at load into
-/// [`TaskEndingClass::Legacy`], where only the retirement's own dedup reads it
-/// — never the Wake gate (#590) — and deleted with the section by the
-/// shrinkage slice (#703).
-#[allow(dead_code)]
-pub(super) fn legacy_retirement_announce_key(call_id: &str) -> String {
-    format!("runtime:{call_id}")
-}
-
 /// The ledger kind of a Background Task's tool, and the label its originating
 /// tool input names — the read-model pair the ledger row, the completion entry
 /// and the durable ending's identity all derive a task from. Re-exported from
@@ -6992,7 +6939,7 @@ mod tests {
     /// (a newer confirmation already won) is refused outright, so its pairs never
     /// reach the durable record unclaimed.
     #[test]
-    fn a_stage_hands_back_only_its_own_rendered_keys() {
+    fn a_stage_hands_back_only_its_own_endings() {
         let mut acc = StreamAccumulator::new("test");
         let stage = acc.stage_cursor(
             Some("om_card"),
@@ -7048,8 +6995,8 @@ mod tests {
             .is_some()
         );
         // The stale stage hands back the BASE's cursor — writing it is a no-op —
-        // and no gap, but its own keys still ride the caller's single write for
-        // their durable mark.
+        // and no gap, but its own endings still ride the caller's single write
+        // for their shown bits.
         let base = acc.cursor().clone();
         let stale = acc
             .take_staged_cursor(
@@ -7073,7 +7020,7 @@ mod tests {
     /// it RENDERED — so a size split's prefix claims only the entries before the
     /// cut, and the continuation claims the rest.
     #[test]
-    fn a_body_claims_the_ledger_keys_it_rendered() {
+    fn a_body_claims_the_ledger_endings_it_rendered() {
         let mut acc = StreamAccumulator::new("test");
         acc.card_state = CardState::Done;
         // Enough text to force a split, then the entry past the cut: the prefix

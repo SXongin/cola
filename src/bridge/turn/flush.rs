@@ -706,9 +706,9 @@ pub(super) async fn flush_card_locked(
                     // The confirmed PATCH carries this body's Rendered Cursor
                     // (spec #561): advance the chain's record — only while the
                     // exact stage this write carried is still the staged one.
-                    // The body's keys ride the same confirmation, so a
-                    // superseded or replaced chain still gets its durable mark
-                    // (issue #671, ticket #672).
+                    // The body's endings ride the same confirmation, so a
+                    // superseded or replaced chain still flips their shown bits
+                    // (ADR-0080; issue #671, ticket #672).
                     confirm_staged_cursor(
                         cards,
                         session_id,
@@ -1784,12 +1784,12 @@ mod tests {
         );
     }
 
-    /// Issue #671 / ticket #672 (CI gate): a body's rendered keys are mirrored
-    /// on the accumulator, so a stage the cap evicts before its queued payload
-    /// delivers still records its keys once that payload lands — the durable
-    /// mark is never lost to the eviction.
+    /// Issue #671 / ticket #672 (CI gate): a body's endings are mirrored on the
+    /// Chain Record, so a stage the cap evicts before its queued payload
+    /// delivers still flips their shown bits once that payload lands — the
+    /// durable fact is never lost to the eviction.
     #[tokio::test]
-    async fn an_evicted_stage_still_records_its_owed_keys_on_delivery() {
+    async fn an_evicted_stage_still_records_its_owed_endings_on_delivery() {
         use crate::feishu::card::ledger::{TaskCompletionEntry, TaskEnding, TaskKind};
 
         let (app, platform) = app_with_live_card("回答。").await;

@@ -18,7 +18,7 @@
 //!   one run's durable **Task Ending**s are keyed by.
 //! - [`state::TaskState`] / [`state::TaskCell`] — the per-Session cell holding
 //!   the four per-chain delivery sets (`announced_wakes`, `handed_over_wakes`,
-//!   `wake_floor`, `render_marks`), and the shared handle to it. The cell moved
+//!   `wake_floor`, `announced_endings`), and the shared handle to it. The cell moved
 //!   out of `StreamAccumulator` in #681; the accumulator holds a `TaskCell` and
 //!   keeps thin forwarding methods, so no caller changes.
 //! - [`handle::TasksHandle`] — the module's one handle and per-Session store,
