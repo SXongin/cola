@@ -88,18 +88,24 @@ destination, succeeds and creates it. The in-band path was left as the one
 update surface with no verification, and it reported a success nothing checked.
 
 - **The live path is resolved once, by one primitive.** `live_exe_path` /
-  `current_exe_path` (`src/update.rs`) strip the procfs marker **only when the
-  stripped path is the file that exists**, and channel detection, the install
-  target, the ExecStart comparison, the CLI's supervisor-restart verification,
-  the silent startup check and `restart_process` all read that value — so they
-  cannot disagree about which file to read and to replace. A binary that is not
-  on disk at all fails the update with a diagnostic: a resolution failure is
-  never a silent re-classification as some other channel's install.
+  `current_exe_path` (`src/update.rs`) are Linux-scoped, where the marker
+  exists: the literal path wins while it still holds the process's own
+  (device, inode) — so a binary legitimately named `"<name> (deleted)"` is not
+  mis-read — and the marker-stripped path is the live binary otherwise,
+  including when a pre-fix run's phantom sits at the literal path. Channel
+  detection, the install target, the ExecStart comparison, the CLI's
+  supervisor-restart verification, the silent startup check and
+  `restart_process` all read that value — so they cannot disagree about which
+  file to read and to replace. Elsewhere the marker does not exist and the path
+  *is* the file (no stripping: a name ending in `" (deleted)"` is just a name).
+  A binary that is not on disk at all fails the update with a diagnostic: a
+  resolution failure is never a silent re-classification as some other
+  channel's install.
 - **`install()` fails closed.** The rename destination must be an existing
-  regular file and must not carry the procfs marker (the phantom a pre-fix run
-  leaves behind is a real file, so existence alone is not enough). A rename
-  that *creates* its destination is never an install of the binary we are
-  running.
+  regular file, and on Linux must not carry the procfs marker either (the
+  phantom a pre-fix run leaves behind is a real file, so existence alone is not
+  enough there). A rename that *creates* its destination is never an install of
+  the binary we are running.
 - **The reporting guarantee now binds the in-band path too.** The replacer
   reports the swap it actually performed (`二进制已替换为 X`); the **successor**
   verifies `restart-notify.json` against the one version it cannot be wrong
