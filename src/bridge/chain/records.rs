@@ -763,6 +763,7 @@ fn translate_legacy_rendered(rendered: &HashMap<String, Vec<String>>) -> HashMap
                 call_id: Some(call_id),
                 shell_id: None,
                 child_id: None,
+                job_id: None,
                 wake_id: None,
             };
             // Every legacy key was written by a DELIVERED card write.
@@ -3519,6 +3520,57 @@ mod tests {
         );
     }
 
+    /// ADR-0080: "the record carries every id the run is known by". A Wake
+    /// reporting BOTH a shell id and a DISTINCT job id stores its record under
+    /// the shell id (the precedence is unchanged) but must carry the job id as
+    /// an alias, so a later writer naming the run by that job id resolves the
+    /// one record instead of minting a second one for a single run.
+    #[test]
+    fn a_wake_with_a_distinct_job_id_records_one_resolvable_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let chains = ChainRecords::load(dir.path().join(FILE));
+        let mut shell_and_job = wake("msg_wake_1", Some("shell_1"), None);
+        shell_and_job.job_id = Some("job_1".into());
+        let from_wake = TaskRunId::of_wake(&shell_and_job).expect("the shell id names the run");
+        assert_eq!(from_wake.key, "shell_1", "the shell id keeps precedence");
+
+        chains.record_ending(
+            "ses_a",
+            &from_wake,
+            TaskEnding::owed(TaskEndingClass::Wake, identity("wake")),
+        );
+        // A later writer names the same run by the JOB id alone.
+        let by_job = TaskRunId {
+            key: "job_1".into(),
+            call_id: None,
+            shell_id: None,
+            child_id: None,
+            wake_id: None,
+            job_id: Some("job_1".into()),
+        };
+        chains.record_ending(
+            "ses_a",
+            &by_job,
+            TaskEnding::owed(TaskEndingClass::Evidence, identity("evidence")),
+        );
+
+        let records = chains.endings("ses_a");
+        assert_eq!(
+            records.len(),
+            1,
+            "the job id resolves the Wake's one record: {records:?}"
+        );
+        assert!(
+            records[0].run.names("job_1"),
+            "the record carries the job id the Wake reported: {:?}",
+            records[0].run
+        );
+        assert_eq!(
+            classes(&records[0]),
+            vec![TaskEndingClass::Wake, TaskEndingClass::Evidence]
+        );
+    }
+
     /// The section's own resolution rule, on the one shape no writer's own ids
     /// can produce: a writer holding an id a record names always resolves that
     /// record, so two records can never share a live alias — the tie-break below
@@ -3533,6 +3585,7 @@ mod tests {
                     call_id: None,
                     shell_id: Some("shell_1".into()),
                     child_id: None,
+                    job_id: None,
                     wake_id: Some("msg_wake_1".into()),
                 },
                 endings: Vec::new(),
@@ -3543,6 +3596,7 @@ mod tests {
                     call_id: None,
                     shell_id: None,
                     child_id: Some("ses_child".into()),
+                    job_id: None,
                     wake_id: None,
                 },
                 endings: Vec::new(),
@@ -3555,6 +3609,7 @@ mod tests {
             call_id: Some("call_1".into()),
             shell_id: Some("shell_1".into()),
             child_id: Some("ses_child".into()),
+            job_id: None,
             wake_id: None,
         };
         assert_eq!(resolve_run(&records, &exact), Some(0));
@@ -3565,6 +3620,7 @@ mod tests {
             call_id: None,
             shell_id: Some("shell_1".into()),
             child_id: Some("ses_child".into()),
+            job_id: None,
             wake_id: Some("msg_wake_1".into()),
         };
         assert_eq!(resolve_run(&records, &re_encounter), Some(0));
@@ -3576,6 +3632,7 @@ mod tests {
             call_id: None,
             shell_id: None,
             child_id: Some("ses_child".into()),
+            job_id: None,
             wake_id: None,
         };
         assert_eq!(resolve_run(&records, &by_alias), Some(1));
@@ -3586,6 +3643,7 @@ mod tests {
             call_id: None,
             shell_id: None,
             child_id: None,
+            job_id: None,
             wake_id: None,
         };
         assert_eq!(resolve_run(&records, &unknown), None);
