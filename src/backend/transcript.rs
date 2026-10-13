@@ -991,15 +991,27 @@ pub enum ShellEnd {
 }
 
 impl ShellEnd {
+    /// The known terminal statuses with the variant each names, in ONE table
+    /// both directions read (ADR-0080): [`Self::as_str`] looks the variant up
+    /// and [`Self::from_status`] the status, so a wire spelling is written once
+    /// and the two can never drift. Only [`Self::Other`] can lie outside it,
+    /// and it stays verbatim.
+    const KNOWN: &'static [(&'static str, ShellEnd)] = &[
+        ("exited", ShellEnd::Exited),
+        ("timeout", ShellEnd::Timeout),
+        ("killed", ShellEnd::Killed),
+    ];
+
     /// The status string the runtime reported, as a durable ending records it
     /// (ADR-0080): the reverse of [`ShellEnd::from_status`], so a recorded
     /// evidence ending round-trips the verdict verbatim.
     pub fn as_str(&self) -> &str {
         match self {
-            Self::Exited => "exited",
-            Self::Timeout => "timeout",
-            Self::Killed => "killed",
-            Self::Other(other) => other,
+            Self::Other(status) => status,
+            known => Self::KNOWN
+                .iter()
+                .find_map(|(status, end)| (end == known).then_some(*status))
+                .expect("every non-Other ShellEnd is in KNOWN"),
         }
     }
 
@@ -1007,12 +1019,10 @@ impl ShellEnd {
     /// [`ShellEnd::as_str`], so a status this build does not know stays
     /// verbatim in [`ShellEnd::Other`].
     pub fn from_status(status: &str) -> Self {
-        match status {
-            "exited" => Self::Exited,
-            "timeout" => Self::Timeout,
-            "killed" => Self::Killed,
-            other => Self::Other(other.to_string()),
-        }
+        Self::KNOWN
+            .iter()
+            .find_map(|(known, end)| (*known == status).then(|| end.clone()))
+            .unwrap_or_else(|| Self::Other(status.to_string()))
     }
 }
 
@@ -2710,5 +2720,29 @@ mod tests {
 
         // Degenerate: neither present.
         assert_eq!(TokenUsage::default().context_used(), 0);
+    }
+
+    /// ADR-0080: a durable evidence ending records the runtime's status
+    /// verbatim and re-reads it, so `as_str` and `from_status` must name the
+    /// SAME status↔variant pairs (they derive from one table). A known status
+    /// round-trips to its variant, and an unknown one stays verbatim.
+    #[test]
+    fn shell_end_status_round_trips_both_directions() {
+        for (status, end) in [
+            ("exited", ShellEnd::Exited),
+            ("timeout", ShellEnd::Timeout),
+            ("killed", ShellEnd::Killed),
+            ("weird", ShellEnd::Other("weird".into())),
+        ] {
+            assert_eq!(end.as_str(), status, "the variant names its status");
+            assert_eq!(
+                ShellEnd::from_status(status),
+                end,
+                "the status names its variant back"
+            );
+        }
+        // An empty and an unrecognised status stay verbatim, never misread.
+        assert_eq!(ShellEnd::from_status(""), ShellEnd::Other(String::new()));
+        assert_eq!(ShellEnd::Other("gone".into()).as_str(), "gone");
     }
 }
