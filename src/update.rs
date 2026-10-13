@@ -65,12 +65,14 @@ const PROC_DELETED_SUFFIX: &str = " (deleted)";
 
 /// Strip Linux's procfs `" (deleted)"` marker from `exe`'s final component.
 ///
-/// Byte-wise on Unix so a path carrying non-UTF-8 bytes still resolves: the
-/// marker is a Linux artifact, and requiring `to_str()` would make an
-/// otherwise-locatable binary unresolvable — `/update` would refuse and
-/// `/restart` would fail to re-exec it.
+/// The marker is a Linux `/proc/self/exe` rendering, so this is Linux-scoped —
+/// there it is also stripped byte-wise, because a path carrying non-UTF-8 bytes
+/// must still resolve: requiring `to_str()` would make an otherwise-locatable
+/// binary unresolvable, and `/update` would refuse while `/restart` failed to
+/// re-exec it. Other platforms (macOS rejects non-UTF-8 names outright) keep
+/// the string path.
 fn strip_proc_deleted(exe: &Path) -> PathBuf {
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
         use std::os::unix::ffi::{OsStrExt, OsStringExt};
         if let Some(stripped) = exe
@@ -81,7 +83,7 @@ fn strip_proc_deleted(exe: &Path) -> PathBuf {
             return PathBuf::from(std::ffi::OsString::from_vec(stripped.to_vec()));
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(not(target_os = "linux"))]
     {
         if let Some(stripped) = exe.to_str().and_then(|s| s.strip_suffix(PROC_DELETED_SUFFIX)) {
             return PathBuf::from(stripped);
@@ -1135,9 +1137,10 @@ mod tests {
         assert_eq!(live_exe_path(dir.path()), None);
     }
 
-    /// A path carrying non-UTF-8 bytes is still resolved: the marker is a
-    /// Linux artifact and must not need `to_str()` to be stripped.
-    #[cfg(unix)]
+    /// A path carrying non-UTF-8 bytes is still resolved. Linux-only: the
+    /// marker is a procfs rendering, and macOS (APFS) refuses to create such a
+    /// name at all (`EILSEQ`), so the case cannot exist there.
+    #[cfg(target_os = "linux")]
     #[test]
     fn live_exe_path_resolves_a_non_utf8_path() {
         use std::ffi::OsString;
