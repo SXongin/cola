@@ -155,7 +155,7 @@ jobs:
         run: cargo test --locked -- --ignored live_v1
 
   live-v2:
-    # The live V2 contract suite (ADR-0057): the real pinned 2.0.18 binary runs
+    # The live V2 contract suite (ADR-0057): the real pinned 2.0.27 binary runs
     # its agent loop against an in-process scripted provider, in an isolated
     # store. Required by the `main: CI` ruleset (#376), same step-gating shape
     # as Live V1: only the steps are skipped for docs-only and release/* PRs,

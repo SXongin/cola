@@ -20,7 +20,7 @@ inputs:
   version:
     description: The pinned OpenCode version. Bumps move this and the SHA256 below together.
     required: false
-    default: 2.0.18
+    default: 2.0.27
 
 runs:
   using: composite
@@ -49,7 +49,7 @@ runs:
     - name: Verify and expose
       shell: bash
       env:
-        SHA256: 10d405161d8b9595f4a2ec31254e961969e6ca3f8239ac9bd55b6ff6431dc24f
+        SHA256: e26aa101cfdc40f0e680baa609ff18f131bbc6b91c60fdc11b2b2e2cba7281a4
       run: |
         set -euo pipefail
         binary="$HOME/.cache/opencode-v2/node_modules/@opencode/cli/bin/opencode.exe"
