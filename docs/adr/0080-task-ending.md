@@ -1,5 +1,13 @@
 # A Background Task's ending is one durable fact, shown once by the Rendered Cursor's confirmation
 
+> **Ratified (2026-10-14, spec #699)**: three points where the landed
+> implementation diverges from this ADR's literal wording — the **Wake** path
+> records its ending with its completion entry's commit, not at derivation; the
+> plan's durable read suppresses an entry, it never sources one; and the
+> retirement's entry gate is one entry per run, whatever class. The
+> "recorded at derivation / an entry-less chain included" promise is scoped to
+> the evidence and **Cleanup** endings. See the amendment below.
+
 A **Background Task**'s end is re-derived from the transcript on every read,
 corrected by a process-local overlay, marked single by a per-chain announce set,
 and kept single across a restart by a parallel `rendered` key set — while one
@@ -72,8 +80,10 @@ key space dissolve.
   an evidence ending says the run ended, so it suppresses a late Wake's
   completion entry (#659), while a **Cleanup** says nothing about how the run
   ended, so a cleaned run's late Wake is its own ending with its own entry
-  (#590). "Recorded once" fixes HOW each ending is recorded — at derivation,
-  never re-derived, never a second copy. Without an alias step two writers naming
+  (#590). The ENTRY gate is separate and is one entry per run, whatever class
+  (the 2026-10-14 amendment below). "Recorded once" fixes HOW each ending is
+  recorded — at derivation, never re-derived, never a second copy. Without an
+  alias step two writers naming
   one run differently — a
   Wake arriving after the launch left the read (compaction, the V2 page cap), or
   a reconciliation read that still carries the launch but whose call id the
@@ -115,7 +125,9 @@ key space dissolve.
 - **The ending is recorded when it is derived.** The reconcile writes the
   evidence ending at the moment it derives it; the Cleanup click writes its own;
   the Wake path writes the run's Wake ending when the run has no evidence
-  ending. The process-local overlay becomes this process life's **cache** of the
+  ending. The Wake path's write is scoped by the 2026-10-14 amendment below: it
+  rides the commit of the run's completion entry, not the derivation. The
+  process-local overlay becomes this process life's **cache** of the
   durable endings, seeded at install, so a restart re-derives nothing and no
   later read can resurrect a retired task — the `retired` set's job is now an
   optimization, not the fact.
@@ -156,7 +168,9 @@ key space dissolve.
   **Cleanup**, or the Wake path) derives an ending — an entry-less chain
   included, because the fact is about the run, not about the card that will show
   it; an ending derived while no card can place it still renders on the first
-  card that can. An ending is **owed** until a confirmed write shows it
+  card that can. The 2026-10-14 amendment below scopes this promise to the
+  evidence and **Cleanup** endings; the Wake path's ending is the stated
+  exception. An ending is **owed** until a confirmed write shows it
   (**shown**), or until the saturation cap below surrenders it
   (**surrendered**). Only an owed ending is ever rendered, so a surrendered one
   is never re-offered, and a record with no owed ending is ordinary
@@ -254,7 +268,9 @@ past it). The trade therefore becomes:
 - **Have the render plan read the durable endings directly** (a second input
   beside `transcript.task_retirements`). Rejected: two sources would need
   de-duplicating in the plan; routing the durable ending through `apply` keeps one
-  path and changes no downstream code.
+  path and changes no downstream code. The 2026-10-14 amendment below records
+  that the landed shape keeps this one path: the plan's durable read is a
+  suppression gate, never a second source.
 - **Make the Wake's entry ride the ending's shown bit alone, retiring the Wake
   floor.** Rejected: a Wake that opened a 承接 line announced without an entry, so
   a single ending gate would re-render it on a later card.
@@ -291,7 +307,9 @@ past it). The trade therefore becomes:
   `legacy_retirement_announce_key` retire into the ending's class.
 - Cost is unchanged per read; the new writes are one synchronous record write at
   derivation (a reconcile verdict, a cleanup click, a Wake) and the shown bits
-  riding the confirmation that already writes the cursor.
+  riding the confirmation that already writes the cursor. The Wake's write is
+  scoped by the 2026-10-14 amendment below: it rides its completion entry's
+  commit, not the derivation.
 - **A failed ending write degrades to re-derivation after a restart.** Every
   Chain Record write is best-effort and atomic (the existing sidecar contract): a
   lost write leaves this process life correct — the task stays retired, its entry
@@ -322,6 +340,73 @@ past it). The trade therefore becomes:
   unit tests for the new section's round-trip, migration, the three ending
   states, the alias order and bound eviction. Unlike ADR-0079's slices these
   tests change: the restart semantics change with them.
+
+## Amendment (2026-10-14): three ratifications of the landed implementation
+
+The implementation (spec #699, tickets #700–#704) landed three behaviours that
+this ADR's literal wording over-states or leaves implicit. Each is ratified
+here; the sentences each qualifies are scoped in place at the bullets they name,
+so the ask, this record and the plan agree.
+
+- **"Recorded when derived" does not cover the Wake path.** The **evidence**
+  ending — the reconcile's verdict, `Lost`, the child-evidence ending, written
+  by `record_new_endings` (`src/bridge/runtime.rs`, through
+  `TasksHandle::record_evidence_ending`) — and the **Cleanup** ending, written
+  by the click, are recorded at derivation, independent of any card; an
+  entry-less chain included, and `TasksHandle::apply`'s `synthesized_retirement`
+  (`src/bridge/tasks/handle.rs`) turns such an owed ending into the read's
+  `TaskRetirement`, so it renders on the first card that can place it. A **Wake**
+  completion's ending is **not** written at derivation: `Endings::record` inside
+  `commit_planned_entries` (`src/bridge/turn/render.rs`) records it as an `Owed`
+  `TaskEnding` only where the run's completion entry is committed to a card's
+  render, and that write's confirmation flips it to `Shown` (`mark_shown`,
+  `src/bridge/chain/records.rs`). `plan_wake_entries` runs only under a live card
+  (`plan_ledger_entries` returns nothing without a Turn anchor), and
+  `synthesized_retirement` returns `None` for a Wake ending, so a Wake whose
+  completion entry no card ever commits leaves **no** durable ending, and no
+  later card re-derives one. **Ratified**: a Wake completion rides its own Wake's
+  turn and its own resumed-work handoff (ADR-0066), so the pre-ADR behaviour is
+  preserved, not widened. The loss is concrete — a Wake that completes while no
+  card is in hand renders no completion entry, then or after a restart — and it
+  is accepted as the pre-existing residual it is: this batch introduced no
+  regression, and giving the Wake ending a card-independent source would be the
+  second-source shape this ADR's *Considered options* rejects. The **Decision**
+  bullet *"The ending is recorded when it is derived"* and the unconditional
+  promise in *"The ending is recorded when it is derived, unconditionally ...
+  an entry-less chain included ... renders on the first card that can"* are
+  scoped by this: both describe the evidence and **Cleanup** endings, and the
+  Wake path is the stated exception.
+- **The plan-time durable read is a gate, not a second entry source.** This
+  ADR's *Considered options* rejects *"Have the render plan read the durable
+  endings directly (a second input beside `transcript.task_retirements`)"*
+  because *"two sources would need de-duplicating in the plan"*. That is **not**
+  the shape that landed. `plan_wake_entries` / `plan_runtime_entries`
+  (`src/bridge/turn/render.rs`) receive the durable snapshot (`Endings::facts`)
+  **only to suppress** an entry already spoken for (`facts.recorded(...)`,
+  `facts.shown_any(...)`, `wake_ending_spoken_for`); they can never **add** one.
+  Every entry still originates in the read's transcript (`transcript.wakes`,
+  `transcript.task_retirements`), and the durable ending reaches that list only
+  through the adapter's `apply` seam (`TasksHandle::apply` →
+  `synthesized_retirement`, `src/bridge/tasks/handle.rs`) — the same one entry
+  source the pre-ADR code had. There is nothing to de-duplicate in the plan, so
+  the rejected option's reason does not apply to the shipped shape. The
+  **Decision** bullet *"The entry renders from the durable ending, through the
+  read"* describes that `apply` synthesis, not a second plan input.
+- **The retirement's entry gate is one entry per run, whatever class.**
+  `plan_runtime_entries`'s gate is deliberately class-agnostic — the
+  `acc.ending_announced_any(&run) || facts.shown_any(&run)` check
+  (`src/bridge/turn/render.rs`; `EndingFacts::shown_any`,
+  `src/bridge/chain/records.rs`; `ending_announced_any`,
+  `src/bridge/tasks/state.rs`) — so a **shown Cleanup** ending suppresses a
+  later **Evidence** retirement entry for the same run: that run renders ONE
+  retirement entry, not two. This preserves the pre-ADR "exactly once per call
+  id" rule and is deliberate. It is distinct from a **Wake** completion's entry,
+  which is per its own ending (`facts.shown(run, TaskEndingClass::Wake)`,
+  `wake_ending_spoken_for`): a cleaned run's late Wake still shows its own
+  completion (#590), and both endings live on the one run's record. The
+  **Decision** sentence "Once is once per ending, not once per run" answers how
+  many endings a run may hold; the ENTRY gate is separate and is one per run,
+  whatever class.
 
 ## Related
 
