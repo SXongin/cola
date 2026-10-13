@@ -2693,6 +2693,7 @@ mod tests {
             call_id: Some(call_id.to_string()),
             shell_id: None,
             child_id: Some(format!("ses_{call_id}")),
+            job_id: None,
             wake_id: None,
         }
     }

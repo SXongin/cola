@@ -1942,6 +1942,7 @@ fn run_of(call_id: &str) -> TaskRunId {
         call_id: Some(call_id.to_string()),
         shell_id: None,
         child_id: None,
+        job_id: None,
         wake_id: None,
     }
 }

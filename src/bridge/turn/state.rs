@@ -6893,6 +6893,7 @@ mod tests {
             call_id: Some(call_id.to_string()),
             shell_id: None,
             child_id: None,
+            job_id: None,
             wake_id: None,
         }
     }
