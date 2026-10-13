@@ -503,6 +503,27 @@ impl EndingFacts {
                 .any(|(owed_run, _)| run.ids().any(|id| owed_run.names(id)))
     }
 
+    /// Whether the run's ending of `class` was SHOWN (ADR-0080) — by a
+    /// confirmed card write, or by a delivered-but-unrecorded payload the
+    /// records below do not yet mark. The **Wake**'s own exactly-once gate: a
+    /// Wake whose ending a card already showed is not planned again, even when
+    /// a crash between the confirmed write and the later Wake-Watermark write
+    /// left the Watermark stale. Resolved by the alias order, so a caller
+    /// holding any spelling of the run asks the same question.
+    pub(crate) fn shown(&self, run: &TaskRunId, class: TaskEndingClass) -> bool {
+        let recorded = resolve_run(&self.records, run).is_some_and(|index| {
+            self.records[index]
+                .endings
+                .iter()
+                .any(|ending| ending.class == class && ending.state == TaskEndingState::Shown)
+        });
+        recorded
+            || self
+                .owed
+                .iter()
+                .any(|(owed_run, owed_class)| *owed_class == class && run.ids().any(|id| owed_run.names(id)))
+    }
+
     /// The run's ending of `class`, resolved by the alias order — the entry's
     /// identity, label and duration fall back to it when the read no longer
     /// carries the launch (compaction, a V2 page cap).

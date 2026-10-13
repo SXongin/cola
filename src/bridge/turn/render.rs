@@ -673,6 +673,20 @@ fn plan_wake_entries(
         {
             continue;
         }
+        // The run's OWN Wake ending is spoken for too (ADR-0080): a Wake whose
+        // completion entry a card already SHOWED — or this chain already placed
+        // in this life — must not be planned again. The shown bit, not the Wake
+        // Watermark, is what survives a crash between the confirmed write that
+        // flipped it and the later write that persists the Watermark: the floor
+        // above answers only "was this Wake's arrival announced?", which a Wake
+        // that opened a 承接 line does without an entry. An OWED Wake ending is
+        // not spoken for — the entry is exactly what the next card that can
+        // place it owes.
+        if let Some(run) = &run
+            && (facts.shown(run, TaskEndingClass::Wake) || acc.ending_announced(run, TaskEndingClass::Wake))
+        {
+            continue;
+        }
         let input = retired
             .as_ref()
             .and_then(|task| transcript.tool_input(task.tool.call_id.as_str()));
@@ -1334,7 +1348,9 @@ pub(super) fn commit_planned_entries(
         if matches!(plan.announce, PlannedAnnounce::Wake { .. })
             && let Some((run, _class)) = &plan.ending
             && (facts.recorded(run, TaskEndingClass::Evidence)
-                || acc.ending_announced(run, TaskEndingClass::Evidence))
+                || acc.ending_announced(run, TaskEndingClass::Evidence)
+                || facts.shown(run, TaskEndingClass::Wake)
+                || acc.ending_announced(run, TaskEndingClass::Wake))
         {
             continue;
         }
@@ -1349,6 +1365,13 @@ pub(super) fn commit_planned_entries(
         };
         if !announced {
             continue;
+        }
+        // The Wake's own ending class joins the chain's announce set (ADR-0080):
+        // its entry is placed now, so a later plan for the same run's Wake
+        // ending is suppressed in-life beside the durable shown bit — exactly
+        // what a synthetic retirement already does through `announce_ending`.
+        if let (PlannedAnnounce::Wake { .. }, Some((run, class))) = (&plan.announce, &plan.ending) {
+            acc.announce_ending(run, *class);
         }
         // A Wake's own ending is recorded on the run NOW (ADR-0080): the entry is
         // committed, so the run ended, and the durable record is what carries
@@ -3000,6 +3023,54 @@ mod tests {
                 "a run with no evidence ending still renders its Wake's completion"
             );
         }
+    }
+
+    /// ADR-0080: the Wake's own ending's SHOWN bit — not the Wake Watermark — is
+    /// what keeps a delivered completion entry single across a restart. The
+    /// confirmed write flips the bit and the Watermark is persisted in a LATER
+    /// write, so a crash or cancellation between them leaves a fresh chain with
+    /// the ending shown and the Watermark stale; without this gate the Wake is
+    /// planned again and its entry duplicates.
+    #[test]
+    fn a_shown_wake_ending_suppresses_the_completion_across_a_restart() {
+        let acc = StreamAccumulator::new("test");
+        let transcript = SessionTranscript::new(vec![message(
+            "msg_launch",
+            2_000,
+            vec![subagent_launch_part("call_sub", "ses_child", 2_000)],
+        )])
+        .with_wakes(vec![subagent_wake("ses_child", 3_000)]);
+
+        // A fresh accumulator (the restart): the Wake's arrival is NOT covered
+        // by a Watermark floor, so only the durable shown bit can suppress it.
+        assert!(
+            acc.wake_floor().is_none(),
+            "the restart carries a stale (absent) Watermark"
+        );
+        let plans = plan_wake_entries(
+            &acc,
+            &transcript,
+            &turn_anchor(0),
+            &facts_with("call_sub", TaskEndingClass::Wake, TaskEndingState::Shown),
+        );
+        assert!(
+            plans.is_empty(),
+            "the run's shown Wake ending suppresses the replayed completion"
+        );
+
+        // An OWED Wake ending is not spoken for: the entry is exactly what the
+        // next card that can place it owes.
+        assert_eq!(
+            plan_wake_entries(
+                &acc,
+                &transcript,
+                &turn_anchor(0),
+                &facts_with("call_sub", TaskEndingClass::Wake, TaskEndingState::Owed),
+            )
+            .len(),
+            1,
+            "an owed Wake ending still plans its entry"
+        );
     }
 
     /// The live Background Task one child's backgrounded `subagent` run left.
