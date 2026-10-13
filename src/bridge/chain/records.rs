@@ -1914,7 +1914,8 @@ pub(crate) async fn release_spent(cards: &CardsHandle, session_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{BackgroundTask, ToolIdentity, Wake, WakeSource};
+    use crate::backend::{Wake, WakeSource};
+    use crate::bridge::test_support::launch_task;
 
     const FILE: &str = "chain_records.json";
 
@@ -2640,8 +2641,8 @@ mod tests {
                 None,
             );
         }
-        let run_a = TaskRunId::of_launch(&launch("call_1", None, None));
-        let run_b = TaskRunId::of_launch(&launch("call_2", None, None));
+        let run_a = TaskRunId::of_launch(&launch_task("call_1", None, None));
+        let run_b = TaskRunId::of_launch(&launch_task("call_2", None, None));
         // A class recorded twice is stored once.
         for _ in 0..2 {
             chains.record_ending(
@@ -2770,7 +2771,7 @@ mod tests {
         for i in 0..40 {
             chains.rename(&format!("ses_{i}"), &format!("ses_{}", i + 1));
         }
-        let run = TaskRunId::of_launch(&launch("call_1", None, None));
+        let run = TaskRunId::of_launch(&launch_task("call_1", None, None));
         chains.record_ending(
             "ses_0",
             &run,
@@ -2791,7 +2792,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(FILE);
         let chains = ChainRecords::load(path.clone());
-        let run = TaskRunId::of_launch(&launch("call_1", None, None));
+        let run = TaskRunId::of_launch(&launch_task("call_1", None, None));
         chains.record_ending(
             "ses_old",
             &run,
@@ -3360,19 +3361,6 @@ mod tests {
         }
     }
 
-    /// A launch as a read still carries it.
-    fn launch(call_id: &str, shell_id: Option<&str>, child_id: Option<&str>) -> BackgroundTask {
-        BackgroundTask {
-            tool: ToolIdentity {
-                name: "shell".into(),
-                call_id: call_id.into(),
-            },
-            shell_id: shell_id.map(str::to_string),
-            child_id: child_id.map(str::to_string),
-            started_at: Some(1_000),
-        }
-    }
-
     /// A Wake naming the ids its payload carried.
     fn wake(id: &str, shell_id: Option<&str>, child_id: Option<&str>) -> Wake {
         Wake {
@@ -3390,7 +3378,7 @@ mod tests {
     /// One delivered body's staged ending (ADR-0080): the launch's run plus the
     /// class whose entry that body rendered.
     fn staged(call_id: &str, class: TaskEndingClass) -> EndingKey {
-        (TaskRunId::of_launch(&launch(call_id, None, None)), class)
+        (TaskRunId::of_launch(&launch_task(call_id, None, None)), class)
     }
 
     fn classes(record: &TaskRunRecord) -> Vec<TaskEndingClass> {
@@ -3405,7 +3393,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(FILE);
         let chains = ChainRecords::load(path.clone());
-        let run = TaskRunId::of_launch(&launch("call_1", Some("shell_1"), None));
+        let run = TaskRunId::of_launch(&launch_task("call_1", Some("shell_1"), None));
 
         assert!(chains.record_ending(
             "ses_a",
@@ -3493,7 +3481,7 @@ mod tests {
         let chains = ChainRecords::load(dir.path().join(FILE));
         let from_wake = TaskRunId::of_wake(&wake("msg_wake_1", Some("shell_1"), None))
             .expect("the shell id names the run");
-        let from_launch = TaskRunId::of_launch(&launch("call_1", Some("shell_1"), None));
+        let from_launch = TaskRunId::of_launch(&launch_task("call_1", Some("shell_1"), None));
         chains.record_ending(
             "ses_a",
             &from_wake,
@@ -3617,7 +3605,7 @@ mod tests {
         let chains = ChainRecords::load(path.clone());
         let from_wake = TaskRunId::of_wake(&wake("msg_wake_1", Some("shell_1"), None))
             .expect("the shell id names the run");
-        let from_launch = TaskRunId::of_launch(&launch("call_1", Some("shell_1"), None));
+        let from_launch = TaskRunId::of_launch(&launch_task("call_1", Some("shell_1"), None));
 
         chains.record_ending(
             "ses_a",
@@ -3745,7 +3733,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(FILE);
         let chains = ChainRecords::load(path.clone());
-        let run = TaskRunId::of_launch(&launch("call_1", Some("shell_1"), None));
+        let run = TaskRunId::of_launch(&launch_task("call_1", Some("shell_1"), None));
         for session in ["ses_a", "ses_b"] {
             chains.track(
                 session,
@@ -3797,7 +3785,7 @@ mod tests {
     fn the_bound_evicts_an_unowed_record_and_never_an_owed_one() {
         let dir = tempfile::tempdir().unwrap();
         let chains = ChainRecords::load(dir.path().join(FILE));
-        let call = |i: usize| TaskRunId::of_launch(&launch(&format!("call_{i}"), None, None));
+        let call = |i: usize| TaskRunId::of_launch(&launch_task(&format!("call_{i}"), None, None));
         // The oldest record has been SHOWN, so it is the eviction candidate.
         chains.record_ending(
             "ses_a",
@@ -3906,7 +3894,7 @@ mod tests {
     fn the_owed_cap_counts_records_not_endings() {
         let dir = tempfile::tempdir().unwrap();
         let chains = ChainRecords::load(dir.path().join(FILE));
-        let call = |i: usize| TaskRunId::of_launch(&launch(&format!("call_{i}"), None, None));
+        let call = |i: usize| TaskRunId::of_launch(&launch_task(&format!("call_{i}"), None, None));
         // The OLDEST record carries TWO owed classes, so one surrender does not
         // stop it owing.
         chains.record_ending(
@@ -3947,7 +3935,7 @@ mod tests {
     async fn the_owed_cap_surrenders_the_oldest_entry_with_a_warning() {
         let dir = tempfile::tempdir().unwrap();
         let chains = ChainRecords::load(dir.path().join(FILE));
-        let call = |i: usize| TaskRunId::of_launch(&launch(&format!("call_{i}"), None, None));
+        let call = |i: usize| TaskRunId::of_launch(&launch_task(&format!("call_{i}"), None, None));
         let ((), logs) = crate::bridge::test_support::capture_logs(async {
             for i in 0..=MAX_OWED_RUN_RECORDS {
                 chains.record_ending(
@@ -4027,7 +4015,7 @@ mod tests {
         }
         assert!(chains.ending_shown(
             "ses_a",
-            &TaskRunId::of_launch(&launch("call_1", None, None)),
+            &TaskRunId::of_launch(&launch_task("call_1", None, None)),
             TaskEndingClass::Evidence
         ));
 
@@ -4073,7 +4061,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(FILE);
         let chains = ChainRecords::load(path.clone());
-        let call = |i: usize| TaskRunId::of_launch(&launch(&format!("call_{i}"), None, None));
+        let call = |i: usize| TaskRunId::of_launch(&launch_task(&format!("call_{i}"), None, None));
         chains.record_ending(
             "ses_a",
             &call(1),
