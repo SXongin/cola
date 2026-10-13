@@ -102,10 +102,11 @@ update surface with no verification, and it reported a success nothing checked.
   resolution failure is never a silent re-classification as some other
   channel's install.
 - **`install()` fails closed.** The rename destination must be an existing
-  regular file, and on Linux must not carry the procfs marker either (the
-  phantom a pre-fix run leaves behind is a real file, so existence alone is not
-  enough there). A rename that *creates* its destination is never an install of
-  the binary we are running.
+  regular file; on Linux a marked destination is refused only when it is *not*
+  our own file — the phantom a pre-fix run leaves behind shares the name but not
+  the inode, while a binary legitimately named `"<name> (deleted)"` is the file
+  we are running and stays updatable. A rename that *creates* its destination is
+  never an install of the binary we are running.
 - **The reporting guarantee now binds the in-band path too.** The replacer
   reports the swap it actually performed (`二进制已替换为 X`); the **successor**
   verifies `restart-notify.json` against the one version it cannot be wrong

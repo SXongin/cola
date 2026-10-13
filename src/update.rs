@@ -79,6 +79,18 @@ fn runs_own_inode(path: &Path) -> bool {
     own.dev() == candidate.dev() && own.ino() == candidate.ino()
 }
 
+/// Whether `path`'s procfs marker names a file that is NOT the one we are
+/// running — the phantom a pre-fix run left behind, or anything else sitting at
+/// a replaced binary's old path.
+///
+/// A binary legitimately *named* `"<name> (deleted)"` is our own file, so the
+/// marker alone never disqualifies an install target; only a marked path whose
+/// inode is not ours does (issue #551 review).
+#[cfg(target_os = "linux")]
+fn marker_names_a_foreign_file(path: &Path) -> bool {
+    path.to_string_lossy().ends_with(PROC_DELETED_SUFFIX) && !runs_own_inode(path)
+}
+
 /// Strip Linux's procfs `" (deleted)"` marker from `exe`'s final component —
 /// byte-wise, because Linux allows path bytes that are not UTF-8 and requiring
 /// `to_str()` would make an otherwise-locatable binary unresolvable.
@@ -519,19 +531,20 @@ pub fn install(new_binary: &Path, current_exe: &Path) -> anyhow::Result<()> {
     // #551): `fs::rename` to a NONEXISTENT destination succeeds and creates
     // it, which is how an update of a replaced-under-us daemon left a phantom
     // `"<path> (deleted)"` next to the real install and still reported
-    // success. The one legitimate target is an existing file on disk, and on
-    // Linux it never carries the procfs marker — that names a file which was
-    // replaced, not the file to replace (elsewhere such a name is just a name,
-    // so the `is_file` check is the whole guard).
+    // success. The one legitimate target is an existing file on disk.
     anyhow::ensure!(
         current_exe.is_file(),
         "拒绝安装到 {}：它不是磁盘上的已有文件",
         current_exe.display()
     );
+    // On Linux a marked destination is refused only when it is not our own
+    // file: the phantom shares the name but not the inode (a pre-fix run's
+    // leftover), while a binary legitimately named `"<name> (deleted)"` is the
+    // file we are running and stays updatable.
     #[cfg(target_os = "linux")]
     {
         anyhow::ensure!(
-            !current_exe.to_string_lossy().ends_with(PROC_DELETED_SUFFIX),
+            !marker_names_a_foreign_file(current_exe),
             "拒绝安装到 procfs 已替换路径 {}",
             current_exe.display()
         );
@@ -1384,7 +1397,7 @@ not json at all
     }
 
     /// The phantom an older buggy run left behind is a real file, so existence
-    /// alone is not enough: the procfs marker disqualifies the target.
+    /// alone is not enough: a marked path that is not our own file is refused.
     /// Linux-only — elsewhere such a name is a legitimate binary.
     #[cfg(target_os = "linux")]
     #[test]
@@ -1397,5 +1410,31 @@ not json at all
         assert!(install(&new, &phantom).is_err());
         assert_eq!(std::fs::read(&phantom).unwrap(), b"old");
         assert!(new.exists());
+    }
+
+    /// Only a marked path that is *not* our file is refused: a binary
+    /// legitimately named `"<name> (deleted)"` is the file we run, so it stays
+    /// updatable. A hard link shares our inode, which is how the test stands in
+    /// for such a binary.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_marked_path_is_refused_only_when_it_is_not_our_own_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let phantom = dir.path().join("cola (deleted)");
+        std::fs::write(&phantom, b"x").unwrap();
+        assert!(marker_names_a_foreign_file(&phantom));
+        assert!(!marker_names_a_foreign_file(&dir.path().join("cola")));
+
+        let own = std::env::current_exe().unwrap();
+        let links = own
+            .parent()
+            .unwrap()
+            .join(format!("cola-deleted-name-{}", std::process::id()));
+        std::fs::create_dir_all(&links).unwrap();
+        let ours = links.join("cola (deleted)");
+        std::fs::hard_link(&own, &ours).unwrap();
+        assert!(runs_own_inode(&ours), "the hard link shares our inode");
+        assert!(!marker_names_a_foreign_file(&ours));
+        std::fs::remove_dir_all(&links).unwrap();
     }
 }
