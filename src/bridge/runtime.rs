@@ -333,8 +333,8 @@ pub(crate) async fn reconcile_now(
             // the ledger and the entry stays owed. Only the process-local
             // overlay below stays gated on the caller's accepted write; the
             // unconfirmed marker keeps that gate unchanged.
-            let mut recorded = retired_before;
-            record_new_endings(backend, session_id, transcript, &mut recorded);
+            let mut recorded_retirements = retired_before;
+            record_new_endings(backend, session_id, transcript, &mut recorded_retirements);
             // The child-evidence step (#591, issue #464): a subagent the
             // runtime no longer reports active can still be retirable on its
             // own transcript's evidence — and the very failure mode this
@@ -352,7 +352,7 @@ pub(crate) async fn reconcile_now(
                 {
                     Some(Ok(evidence)) => {
                         transcript.apply_child_evidence(&call_id, evidence);
-                        record_new_endings(backend, session_id, transcript, &mut recorded);
+                        record_new_endings(backend, session_id, transcript, &mut recorded_retirements);
                     }
                     Some(Err(error)) => {
                         tracing::debug!(
@@ -382,9 +382,10 @@ pub(crate) async fn reconcile_now(
     }
 }
 
-/// Record every evidence ending the read derived after `recorded` (ADR-0080) —
-/// one synchronous Chain Record write per newly retired run, at the moment it
-/// was derived. `recorded` is advanced past what it wrote, so a caller can
+/// Record every evidence ending the read derived after
+/// `recorded_retirements` (ADR-0080) — one synchronous Chain Record write per
+/// newly retired run, at the moment it was derived.
+/// `recorded_retirements` is advanced past what it wrote, so a caller can
 /// record again after a later child-evidence read without writing the same
 /// retirement twice. A read that FAILED or TIMED OUT never produced a
 /// retirement, so nothing is recorded for it.
@@ -392,15 +393,15 @@ fn record_new_endings(
     backend: &Arc<dyn Backend>,
     session_id: &str,
     transcript: &SessionTranscript,
-    recorded: &mut usize,
+    recorded_retirements: &mut usize,
 ) {
-    for retirement in &transcript.task_retirements[*recorded..] {
+    for retirement in &transcript.task_retirements[*recorded_retirements..] {
         let input = transcript.tool_input(retirement.task.tool.call_id.as_str());
         backend
             .tasks()
             .record_evidence_ending(session_id, retirement, input);
     }
-    *recorded = transcript.task_retirements.len();
+    *recorded_retirements = transcript.task_retirements.len();
 }
 
 /// Commit one reconcile pass's verdicts to the process-local cache (issue
