@@ -60,11 +60,19 @@ key space dissolve.
 
 **One run, one durable ending, one shown fact.**
 
-- **The identity is the run.** A new `TaskRunId`: the launch's call id when the
-  read carries the launch, else the shell/child id the Wake itself reports.
-  One run's endings — evidence, the user's Cleanup, a Wake completion — live
-  under that one id. "One record per call id", the ledger's own rule, becomes a
-  structural property instead of a spelling convention.
+- **The identity is the run, and the run's ids are aliases of one record.** A
+  new `TaskRunId`: the launch's call id when the read carries the launch, else
+  the shell/child id a Wake itself reports (never an invented one). One run's
+  endings — evidence, the user's Cleanup, a Wake completion — live under that one
+  id. The record carries every id the run is known by (the launch's call id, its
+  shell/child id, its tool call id), and a writer that can name only a
+  shell/child id — a Wake arriving after the launch left the read (compaction, the
+  V2 page cap) — resolves an existing record by matching any of those ids BEFORE
+  it mints a new one. Without that alias step the same run would be stored twice,
+  once under the call id and once under the shell id, and the duplicate #659 is
+  about would come straight back; with it, "one record per run" holds even when a
+  read has lost the launch. "One record per call id", the ledger's own rule,
+  becomes a property of the record rather than a spelling convention.
 - **A `Task Ending` is durable and outlives the record.** A new `endings`
   section of the Chain Record, **session-scoped** like `announcements` and the
   `rendered` section it replaces — `release` drops only the chain's record — so
@@ -117,6 +125,17 @@ key space dissolve.
   dedup reads — never the Wake gate, exactly as today (#590) — so one release's
   records cannot be miscounted, and only the new shape is ever written. Past the
   bound the old marks age out.
+- **The bound never drops an owed ending.** The `endings` section is bounded like
+  the `rendered` marks it replaces, but an eviction candidate is always a record
+  whose endings have all been **shown**: an unshown ending is exactly what the
+  next card owes, so dropping it would lose an entry no card has ever displayed —
+  the loss side this family never takes (every mark the old section held had
+  already been shown, so its bound could only ever cost a duplicate). When every
+  record is unshown, eviction is deferred until a card that can place entries has
+  shown them; a session whose runs keep ending while no card can carry an entry
+  accumulates those records instead — small, and the safe side. The bound keeps
+  the marks' own residual: past it, a very old **shown** ending may render once
+  more after a restart.
 - **Out of scope, deliberately.** The unconfirmed marker (`⚠️ 状态待确认`) stays
   process-local and re-derived at restart: it is "no positive evidence yet", an
   endingless state whose "an unasked read must not drop it" rule (ADR-0073) is
@@ -214,7 +233,8 @@ past it). The trade therefore becomes:
 - `ChainRecords` gains the `endings` section (session-scoped, bounded, with the
   shown bits); the `rendered` section and the pre-#659 spelling retire into its
   legacy read; `MAX_RENDERED_KEYS` becomes the bound over a session's run
-  records, oldest evicted first.
+  records — a shown record is the eviction candidate, oldest first, never an
+  unshown one.
 - `StreamAccumulator`/`StagedCursor` no longer carry a separate `rendered` key
   list — the staged body carries the endings it rendered, and the confirmation
   flips their shown bits beside the cursor; `Turn::recorded_marks` and
