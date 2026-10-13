@@ -106,8 +106,11 @@ key space dissolve.
   "was this Wake's arrival announced?", which is a Wake fact; the ending's shown
   bit answers "was this run's ending shown?", which is an ending fact. They
   legitimately differ — a Wake that opened a 承接 line announced without
-  rendering an entry — so the floor remains an entry gate, and a Wake writes an
-  ending only when the run has none.
+  rendering an entry — so the floor remains an entry gate. A Wake writes an
+  ending only when the run has no **evidence** ending: a 🧹 **Cleanup** claims
+  nothing about how the run ended, so a cleaned run's late Wake still writes its
+  own ending and shows its own completion (#590), and the two records coexist on
+  the one run.
 - **The legacy spellings are translated once.** On load, `ended:<call_id>` and
   `cleanup:<call_id>` become evidence/cleanup endings and the pre-#659
   `runtime:<call_id>` becomes a **legacy class** that only the retirement's own
@@ -121,6 +124,31 @@ key space dissolve.
   per-chain volatile set: it answers ADR-0066's in-place-vs-continuation
   question, which is not about an ending. Both are recorded as accepted
   residuals, not silently absorbed.
+
+### Where the exactly-once gate lives — a deliberate deviation from #683's wording
+
+#683 asks that the ending be rendered by the **Rendered Cursor**'s frontier, "so
+exactly-once is the cursor's job". This ADR keeps the cursor's **job** — the
+confirmed card write is the one machinery that already distinguishes delivered
+from owed from refused, and it advances the ending's shown bit in the same Chain
+Record write as the cursor itself — but not the cursor's **frontier** as the
+gate's home. The design round (2026-10-13) settled why the literal reading
+cannot carry it, and this ADR records the deviation rather than pretending it
+away:
+
+- **Lifetime.** The Rendered Cursor is a field of the **records** section and
+  dies with `release`; the shown fact must outlive the record — a restart after a
+  terminal release must not re-show an entry. A frontier-carried gate would need
+  a session-scoped twin of the cursor.
+- **Ordering.** The frontier names a *transcript position*; a retiring ending's
+  clock is the runtime's own completion time, and endings deliver out of clock
+  order, so a "newest shown" scalar would swallow a legitimately late entry. The
+  gate has to name the runs it covers — a set, not a frontier.
+- **What the cursor still owns.** Exactly one durable write path: a built body
+  stages the endings its timeline rendered, and the confirmation flips their
+  shown bits in the SAME Chain Record write as the cursor, the gap coverage and
+  the Wake Watermark. The parallel `rendered` key set and the deep link into the
+  Wake's key space dissolve, which is the structural outcome #683 is after.
 
 ## The reopened trade (ADR-0065/0073)
 
@@ -200,14 +228,28 @@ past it). The trade therefore becomes:
 - Cost is unchanged per read; the new writes are one synchronous record write at
   derivation (a reconcile verdict, a cleanup click, a Wake) and the shown bits
   riding the confirmation that already writes the cursor.
+- **A failed ending write degrades to re-derivation after a restart.** Every
+  Chain Record write is best-effort and atomic (the existing sidecar contract): a
+  lost write leaves this process life correct — the task stays retired, its entry
+  stays shown, the in-memory record is the truth for this life — so only a
+  restart can observe the loss. A restart then sees the pre-ADR-0080 shape for
+  that run: an **evidence** ending is re-derived by the next **Runtime
+  Reconciliation** verdict (the shared throttle bounds it to one per Session per
+  30 s) and a **Wake** ending is re-derived from the transcript, so the worst
+  case is one entry shown twice — the duplicate side this family trades toward.
+  The one ending with no re-derivation is the **Cleanup**'s (a user action leaves
+  no transcript trace): a lost write for it costs ADR-0073's old behavior after a
+  restart — the wait returns and the user can click again — and no retry
+  machinery is added for that case.
 - Vocabulary: **Task Ending** and **Task Run Id** join `GLOSSARY.md`; **Chain
   Record**, **Background Task State**, **Runtime Reconciliation**, **Cleanup**
   and **Wake** record the durable ending.
 - Tests: the bridge integration seam (`tests/ledger.rs`, `wake.rs`, `reap.rs`
   and the #672 restart suite) is the acceptance net — a restart renders an owed
   entry the read no longer derives, an entry shown once is never re-shown, a
-  cleanup survives a restart, an evidence ending suppresses a late Wake across a
-  restart, and a legacy mark is read once then ages out — plus `ChainRecords`
+  cleanup survives a restart, a cleaned run's late Wake still shows its own
+  completion (#590), an evidence ending suppresses a late Wake across a restart,
+  and a legacy mark is read once then ages out — plus `ChainRecords`
   unit tests for the new section's round-trip, migration, monotonic shown bits
   and bound eviction. Unlike ADR-0079's slices these tests change: the restart
   semantics change with them.
