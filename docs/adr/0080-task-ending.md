@@ -148,7 +148,10 @@ derivation — see the 2026-10-14 amendment below.
   durable ending a card still owes an entry for. `plan_wake_entries` /
   `plan_runtime_entries`, the entry's body, the settle decision and the ledger
   copy stay as they are: one path, one trust source. A restart whose read
-  derives nothing still renders the owed entry.
+  derives nothing still renders the owed entry — an **evidence** or **Cleanup**
+  retirement, which `apply` re-synthesizes from the durable record; a **Wake**
+  completion's ending has no such path and is recoverable only while the read
+  still carries that Wake (the 2026-10-14 amendment below).
 - **Exactly-once is the ending's own shown fact, advanced by the confirmed
   write.** A built body stages the endings its timeline rendered with the
   existing **Rendered Cursor** stage; the confirmation — a PATCH `Ok`, a create
@@ -430,6 +433,11 @@ so the ask, this record and the plan agree.
   **Decision** sentence "Once is once per ending, not once per run" answers how
   many endings a run may hold; the ENTRY gate is separate and is one per run,
   whatever class.
+
+One blanket reading closes the class: wherever this ADR — or `GLOSSARY.md` —
+states the general "recorded when the ending is derived" or "a restart renders
+the owed entry" rule without naming the **Wake** exception, it is read subject
+to that exception, never as a second, contradictory rule.
 
 ## Related
 
