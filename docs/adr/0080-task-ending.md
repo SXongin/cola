@@ -136,30 +136,27 @@ key space dissolve.
   dedup reads — never the Wake gate, exactly as today (#590) — so one release's
   records cannot be miscounted, and only the new shape is ever written. Past the
   bound the old marks age out.
-- **The bound never drops an owed ending; a prolonged carrier failure has one
-  ratified exception.** The `endings` section is bounded like the `rendered`
-  marks it replaces, and an eviction candidate is always a record whose endings
-  have all been **shown**: an unshown ending is what the next card owes, so
-  evicting it would lose an entry no card displayed — the loss side this family
-  never takes (every mark the old section held had already been shown, so its
-  bound could only ever cost a duplicate). A run carries at most one ending per
-  class (evidence, **Cleanup**, **Wake**), so the section grows with runs, never
-  with endings, and two safeguards keep that growth from running away:
-  - **Recording needs a placeable render path.** The durable write is made where
-    an entry can be planned — a chain with a resolved **Turn** anchor and a live
-    card, the same precondition planning already has. A chain that cannot place
-    an entry keeps today's process-local correction (its read is still corrected;
-    nothing durable is owed), so an entry-less chain cannot accumulate at all.
-  - **Saturation is capped and ratified.** A card the platform permanently
-    refuses can strand owed entries while a long run of new runs ends. The
-    unshown backlog is capped; past the cap the OLDEST owed entry is dropped with
-    a `WARN`, while its ending's fact is retained — the run stays ended and no
-    card resurrects it, and the loss is the entry alone, under a prolonged
-    failure. This is the family's one deliberate loss side, admitted explicitly
-    because the alternative — an unbounded sidecar — trades a bounded, logged
-    loss for an unbounded one.
-  The bound keeps the marks' own residual: past it, a very old **shown** ending
-  may render once more after a restart.
+- **The ending is recorded when it is derived, unconditionally; the bound never
+  evicts an owed entry, and one saturation case is an explicitly ratified loss.**
+  The durable write happens wherever the **Runtime Reconciliation** (or the
+  **Cleanup**, or the Wake path) derives an ending — an entry-less chain
+  included, because the fact is about the run, not about the card that will show
+  it; an ending derived while no card can place it still renders on the first
+  card that can. An ending is **owed** until a confirmed write shows it
+  (**shown**), or until the saturation cap below surrenders it
+  (**surrendered**). Only an owed ending is ever rendered, so a surrendered one
+  is never re-offered, and a record with no owed ending is ordinary
+  bound-eviction material. A run carries at most one ending per class (evidence,
+  **Cleanup**, **Wake**), so the section grows with runs, never with endings, and
+  it is bounded: owed records up to the saturation cap plus everything else up to
+  the bound. The saturation cap is the family's one loss side, taken for the
+  single shape that cannot otherwise bound the sidecar — a carrier the platform
+  permanently refuses while a long run of runs keeps ending. Past the cap the
+  OLDEST owed ending becomes **surrendered** with a `WARN`: the fact is retained
+  (the run stays ended, no card resurrects it) and only its entry is given up,
+  because the alternative — an unbounded backlog — trades a bounded, logged loss
+  for an unbounded one. The bound's own residual stays: past it, a very old
+  **shown** ending may render once more after a restart.
 - **Out of scope, deliberately.** The unconfirmed marker (`⚠️ 状态待确认`) stays
   process-local and re-derived at restart: it is "no positive evidence yet", an
   endingless state whose "an unasked read must not drop it" rule (ADR-0073) is
@@ -265,10 +262,9 @@ past it). The trade therefore becomes:
 - `ChainRecords` gains the `endings` section (session-scoped, bounded, with the
   shown bits); the `rendered` section and the pre-#659 spelling retire into its
   legacy read; `MAX_RENDERED_KEYS` becomes the bound over a session's run
-  records — a shown record is the eviction candidate, oldest first, never an
-  unshown one — with the two safeguards above (recording needs a placeable render
-  path; the unshown backlog is capped, the oldest owed entry dropped with a
-  `WARN` while its fact is retained).
+  records — a record with no owed ending is the eviction candidate, oldest
+  first — plus the saturation cap over owed records, past which the oldest owed
+  ending becomes **surrendered** with a `WARN` (its fact retained).
 - `StreamAccumulator`/`StagedCursor` no longer carry a separate `rendered` key
   list — the staged body carries the endings it rendered, and the confirmation
   flips their shown bits beside the cursor; `Turn::recorded_marks` and
@@ -304,12 +300,13 @@ past it). The trade therefore becomes:
   cleanup survives a restart, a cleaned run's late Wake still shows its own
   completion (#590), an evidence ending suppresses a late Wake across a restart,
   a Wake naming only a reused shell/child id resolves the NEWEST matching run
-  (and an evidence-ended run never absorbs it), an owed entry survives a chain
-  that cannot place entries and renders once that chain gains an anchor, and a
-  legacy mark is read once then ages out — plus `ChainRecords`
-  unit tests for the new section's round-trip, migration, monotonic shown bits,
-  the alias order and bound eviction. Unlike ADR-0079's slices these tests
-  change: the restart semantics change with them.
+  (and an evidence-ended run never absorbs it), an owed ending derived while no
+  card could place it renders on the first card that can, a surrendered ending
+  is never re-offered and its record is evictable, and a legacy mark is read once
+  then ages out — plus `ChainRecords`
+  unit tests for the new section's round-trip, migration, the three ending
+  states, the alias order and bound eviction. Unlike ADR-0079's slices these
+  tests change: the restart semantics change with them.
 
 ## Related
 
