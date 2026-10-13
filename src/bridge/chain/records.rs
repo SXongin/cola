@@ -674,24 +674,34 @@ fn resolve_run(records: &[TaskRunRecord], held: &TaskRunId) -> Option<usize> {
 /// by the writer's own id; fold in every id the writer holds; and keep AT MOST
 /// ONE ending per class — a class the run already carries is the derivation
 /// that already happened, so re-deriving it can never clear its shown bit.
-/// Returns whether the section changed.
+/// Returns whether the section changed — a newly folded-in ALIAS counts even
+/// when the ending's class was already present, because the alias itself must
+/// reach the durable record.
 fn insert_ending(records: &mut Vec<TaskRunRecord>, held: &TaskRunId, ending: TaskEnding) -> bool {
-    let index = match resolve_run(records, held) {
+    let (index, learned) = match resolve_run(records, held) {
         Some(index) => {
+            let before: Vec<String> = records[index].run.ids().map(str::to_string).collect();
             records[index].run.absorb(held);
-            index
+            let learned = records[index]
+                .run
+                .ids()
+                .any(|id| !before.iter().any(|known| known == id));
+            (index, learned)
         }
         None => {
             records.push(TaskRunRecord {
                 run: held.clone(),
                 endings: Vec::new(),
             });
-            records.len() - 1
+            (records.len() - 1, true)
         }
     };
     let record = &mut records[index];
     if record.endings.iter().any(|known| known.class == ending.class) {
-        return false;
+        // The class is already recorded, but a newly learned ALIAS is still a
+        // change: the write must land, or a restart resolves the run by that
+        // alias no longer and mints a second record for one run.
+        return learned;
     }
     record.endings.push(ending);
     true
@@ -3590,6 +3600,54 @@ mod tests {
             classes(&records[0]),
             vec![TaskEndingClass::Wake, TaskEndingClass::Evidence]
         );
+    }
+
+    /// ADR-0080: "the record carries every id the run is known by" — and that
+    /// alias must become DURABLE. When a second writer resolves a run and folds
+    /// in a new id but the ending's class is already on the record, the ending
+    /// is not appended again, yet the newly learned id must still be written: a
+    /// restart that lost it would mint a second record for the run.
+    #[test]
+    fn an_absorbed_alias_survives_a_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE);
+        let chains = ChainRecords::load(path.clone());
+        let from_wake = TaskRunId::of_wake(&wake("msg_wake_1", Some("shell_1"), None))
+            .expect("the shell id names the run");
+        let from_launch = TaskRunId::of_launch(&launch("call_1", Some("shell_1"), None));
+
+        chains.record_ending(
+            "ses_a",
+            &from_wake,
+            TaskEnding::owed(TaskEndingClass::Evidence, identity("evidence")),
+        );
+        // The same class again, from a writer naming the run by its call id:
+        // the class is not appended twice, but the call id is newly learned.
+        chains.record_ending(
+            "ses_a",
+            &from_launch,
+            TaskEnding::owed(TaskEndingClass::Evidence, identity("evidence")),
+        );
+
+        let reloaded = ChainRecords::load(path);
+        let records = reloaded.endings("ses_a");
+        assert_eq!(records.len(), 1, "still one record for the run: {records:?}");
+        assert!(
+            records[0].run.names("call_1"),
+            "the absorbed alias is durable across a reload: {:?}",
+            records[0].run
+        );
+
+        // A later writer holding only the call id resolves the one record.
+        let by_call = TaskRunId {
+            key: "call_1".into(),
+            call_id: Some("call_1".into()),
+            shell_id: None,
+            child_id: None,
+            job_id: None,
+            wake_id: None,
+        };
+        assert_eq!(resolve_run(&records, &by_call), Some(0));
     }
 
     /// The section's own resolution rule, on the one shape no writer's own ids
