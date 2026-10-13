@@ -387,21 +387,8 @@ pub(crate) fn task_label(kind: TaskKind, input: Option<&serde_json::Value>) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{MessageId, ToolIdentity, WakeSource};
-
-    /// A launch the read still carries: the type's own identity names the tool
-    /// call that started it.
-    fn launch(call_id: &str, shell_id: Option<&str>, child_id: Option<&str>) -> BackgroundTask {
-        BackgroundTask {
-            tool: ToolIdentity {
-                name: "shell".into(),
-                call_id: call_id.into(),
-            },
-            shell_id: shell_id.map(str::to_string),
-            child_id: child_id.map(str::to_string),
-            started_at: Some(1_000),
-        }
-    }
+    use crate::backend::{MessageId, WakeSource};
+    use crate::bridge::test_support::launch_task;
 
     /// A Wake naming whatever ids the payload carried.
     fn wake(shell_id: Option<&str>, job_id: Option<&str>, child_id: Option<&str>) -> Wake {
@@ -419,14 +406,14 @@ mod tests {
 
     #[test]
     fn a_launch_names_the_run_by_its_tool_call() {
-        let id = TaskRunId::of_launch(&launch("call_1", Some("shell_1"), None));
+        let id = TaskRunId::of_launch(&launch_task("call_1", Some("shell_1"), None));
         assert_eq!(id.key, "call_1", "the launch's own call id is the stored key");
         assert!(id.names("call_1"));
         assert!(id.names("shell_1"), "the shell id the launch carries is an alias");
         assert!(!id.names("shell_2"));
         assert_eq!(id.wake_id, None, "a launch records no Wake");
 
-        let subagent = TaskRunId::of_launch(&launch("call_2", None, Some("ses_child")));
+        let subagent = TaskRunId::of_launch(&launch_task("call_2", None, Some("ses_child")));
         assert_eq!(subagent.key, "call_2");
         assert!(subagent.names("ses_child"));
     }
@@ -475,7 +462,11 @@ mod tests {
     #[test]
     fn absorbing_a_later_writer_keeps_the_key_and_adds_the_ids() {
         let mut stored = TaskRunId::of_wake(&wake(Some("shell_1"), None, None)).expect("the wake names it");
-        stored.absorb(&TaskRunId::of_launch(&launch("call_1", Some("shell_1"), None)));
+        stored.absorb(&TaskRunId::of_launch(&launch_task(
+            "call_1",
+            Some("shell_1"),
+            None,
+        )));
         assert_eq!(
             stored.key, "shell_1",
             "the stored key is the run's own, not the newcomer's"

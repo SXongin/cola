@@ -131,6 +131,22 @@ pub(crate) fn background_shell(started_at: i64) -> BackgroundTask {
     }
 }
 
+/// A launch as a read still carries it: the launching tool call, its
+/// shell/child ids and its start clock. Shared so the Task Run Id resolution
+/// tests (`bridge::tasks::model`) and the Chain Records ending tests
+/// (`bridge::chain::records`) pin one fixture instead of two drifting copies.
+pub(crate) fn launch_task(call_id: &str, shell_id: Option<&str>, child_id: Option<&str>) -> BackgroundTask {
+    BackgroundTask {
+        tool: ToolIdentity {
+            name: "shell".into(),
+            call_id: call_id.into(),
+        },
+        shell_id: shell_id.map(str::to_string),
+        child_id: child_id.map(str::to_string),
+        started_at: Some(1_000),
+    }
+}
+
 /// The shell Wake that retires [`background_shell`], carrying the command
 /// label the Wake's own text names.
 pub(crate) fn shell_wake(created_ms: i64) -> Wake {
