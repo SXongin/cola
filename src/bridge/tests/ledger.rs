@@ -37,7 +37,7 @@ use crate::backend::{
     SessionTranscript, ShellEnd, ShellRuntime, StepFinish, ToolCall, ToolIdentity, ToolOutput, ToolStatus,
     TranscriptMessage, Wake, WakeSource,
 };
-use crate::bridge::chain::{ChainRecords, TaskEndingClass, TaskEndingState};
+use crate::bridge::chain::{ChainRecords, TaskEnding, TaskEndingClass, TaskEndingState, TaskRunIdentity};
 use crate::bridge::tasks::TaskRunId;
 use crate::bridge::test_support::*;
 use crate::bridge::turn::{PromptContext, Turn};
@@ -6627,12 +6627,16 @@ async fn a_cleaned_entry_spends_no_output_read() {
     );
 }
 
-/// Issue #671 / ticket #672: a Wake-less Background Task's retirement — the
-/// one ending there will ever be (#454) — renders on the card that observed
-/// it, and NEVER again. A restart re-derives the same child-evidence
-/// retirement (the launch never flips), so the ending's durable shown bit is
-/// the only thing standing between the reader and the same `🔔 subagent 结束`
-/// entry re-posted on every new card, hours later.
+/// Issue #671 / ticket #672, rewritten for ADR-0080: a Wake-less Background
+/// Task's retirement — the one ending there will ever be (#454) — renders on
+/// the card that observed it, and NEVER again. A restart re-derives the same
+/// child-evidence retirement (the launch never flips), so the ending's durable
+/// shown bit is the only thing standing between the reader and the same
+/// `🔔 subagent 结束` entry re-posted on every new card, hours later. The
+/// settle RELEASES the chain's record (ADR-0069), so the shown bit must be the
+/// session-scoped ending's own fact — a record-scoped mark would have gone with
+/// the record — which this test now pins explicitly (ticket #704's release
+/// case).
 #[tokio::test]
 async fn a_wake_less_retirement_renders_once_across_a_restart() {
     let _wd = test_work_dir();
@@ -6663,10 +6667,23 @@ async fn a_wake_less_retirement_renders_once_across_a_restart() {
     .await;
 
     let session_file = dir.path().join("sessions.json");
+    // The settle's confirmed write was the chain's terminal, so the Chain Record
+    // itself was RELEASED (ADR-0069) — the record the entry first rode is gone,
+    // which is exactly the shape that used to lose the exactly-once fact. The
+    // ending is session-scoped (ADR-0080): it and its shown bit outlive the
+    // record, so a restart still knows the entry was shown.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while app.cards_handle().chains.get("ses_test").is_some() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the settled chain never released its durable record"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     let persisted = ChainRecords::load(session_file.with_file_name("chain_records.json"));
     assert!(
         persisted.ending_shown("ses_test", &run_of("call_sub"), TaskEndingClass::Evidence),
-        "the delivered entry leaves its durable shown bit"
+        "the delivered entry leaves its durable shown bit past the record's release"
     );
 
     // Life 2: a fresh process over the same files, with the same read — the
@@ -6867,4 +6884,527 @@ async fn a_cleanup_survives_a_restart() {
         !cards.iter().any(|card| card_text(card).contains("🧹")),
         "a shown cleanup entry never replays after a restart: {cards:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Restart and upgrade regression for the durable **Task Ending** (spec #699,
+// ticket #704; ADR-0080). The #672 restart suite above is rewritten onto the
+// shown fact (`a_wake_less_retirement_renders_once_across_a_restart` now also
+// pins the terminal record RELEASE); the cases below are the remaining
+// end-to-end shapes ADR-0080's "Tests" section names. Every one goes through
+// the existing bridge seam (`App`/`Turn`, `MockBackend` + `RecordingPlatform`);
+// no test-only production seam is added.
+//
+// The eviction/saturation halves of two cases are bound facts `chain/records.rs`
+// owns privately — `the_bound_evicts_an_unowed_record_and_never_an_owed_one`,
+// `the_owed_cap_surrenders_the_oldest_entry_with_a_warning` and
+// `the_owed_cap_counts_records_not_endings` pin them at the store's own seam —
+// so those tests are relied on here and named in each case's comment rather
+// than reproduced through the App.
+// ---------------------------------------------------------------------------
+
+/// The per-Session run-records bound `chain/records.rs` keeps (ADR-0080:
+/// `MAX_RUN_RECORDS`). Mirrored as a literal because a test outside that module
+/// cannot read the private constant; the case that uses it self-validates by
+/// asserting the boundary it lands on.
+const SESSION_RUN_RECORDS_BOUND: usize = 64;
+
+/// Record one run's durable ending straight into the live store — the writer a
+/// previous derivation would have been (ADR-0080), so a case can put the
+/// section at a shape a real read reaches only over many passes.
+fn seed_ending(chains: &ChainRecords, call_id: &str, class: TaskEndingClass, state: TaskEndingState) {
+    chains.record_ending(
+        "ses_test",
+        &run_of(call_id),
+        TaskEnding {
+            class,
+            state,
+            finished_at: Some(1_000),
+            evidence: None,
+            identity: TaskRunIdentity {
+                tool: Some("shell".into()),
+                call_id: Some(call_id.to_string()),
+                shell_id: Some(format!("sh_{call_id}")),
+                ..Default::default()
+            },
+        },
+    );
+}
+
+/// A completion Wake naming only its shell id — the shape a read whose launch
+/// scrolled past the V2 page cap (compaction, `MAX_MESSAGE_PAGES`) yields
+/// (ADR-0080's "the call id is not always available").
+fn launchless_shell_wake(created_ms: i64, shell_id: &str) -> Wake {
+    Wake {
+        id: MessageId::new(format!("msg_wake_{created_ms}")),
+        created_ms: Some(created_ms),
+        source: WakeSource::Shell,
+        shell_id: Some(shell_id.to_string()),
+        job_id: Some(shell_id.to_string()),
+        child_id: None,
+        state: Some("completed".into()),
+        label: Some("gh run watch".into()),
+    }
+}
+
+/// A read whose anchor user message is `cola_message_id`, carrying one launched
+/// live shell (`call_bg` / `sh_call_bg`) and nothing else — the launch-carrying
+/// counterpart of [`launchless_shell_wake`], for the alias-order cases.
+fn launched_shell_read(cola_message_id: &str, started_at: i64) -> SessionTranscript {
+    SessionTranscript::new(vec![
+        user(cola_message_id, 1_000, "再来一次"),
+        background_launch(
+            1_100,
+            "shell",
+            "call_bg",
+            serde_json::json!({ "command": "gh run watch" }),
+        ),
+    ])
+    .with_executions(vec![execution(2_000)])
+    .with_background_tasks(vec![live_shell(started_at, "call_bg")])
+}
+
+/// Acceptance (spec #699, ticket #704; ADR-0080): a Wake naming only the child
+/// session a RESUMED run reuses resolves the run's NEWEST launch — the survivor
+/// the live list keeps (#552) — so the run's completion is recorded against the
+/// newest run, never an older launch's. The alias order's rule 3 ("else the
+/// NEWEST record naming any other id the writer holds") is what makes two
+/// writers naming one run agree.
+///
+/// RATIFIED RESIDUAL (#552, ratified in the #702 batch note): a resumed child
+/// folds into the run's EXISTING record, so the assertion is ONE record naming
+/// the newest call id — never two records with the newer winning. Do not "fix"
+/// this by minting a second record for the resumed launch.
+#[tokio::test]
+async fn a_wake_naming_a_reused_child_resolves_the_newest_run_into_one_record() {
+    let _wd = test_work_dir();
+    let (_dir, app, backend, platform) =
+        scripted_app(vec![resumed_subagent_waiting()], Some(SessionStatus::Idle)).await;
+    Turn::run(&app.turn_handles(), ctx("ses_test", "审阅一下"))
+        .await
+        .unwrap();
+    Turn::set_card_message_id(&app.cards_handle(), "ses_test", "om_waiting").await;
+
+    // The resume completes: the child's Wake retires the survivor (the newest
+    // launch) and the resumed work lands.
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(resumed_subagent_timeline())
+                .with_executions(vec![execution(2_500), execution(4_000)])
+                .with_wakes(vec![resumed_child_wake(3_500)]),
+        ],
+    )
+    .await;
+    spawn_sync(&app);
+    wait_for_card_update(
+        &platform,
+        "the resumed card's true end",
+        CardUpdates::Latest,
+        |card| card_header(card).contains("✅") && card_text(card).contains("审阅完成了。"),
+    )
+    .await;
+
+    let records = app.cards_handle().chains.endings("ses_test");
+    assert_eq!(
+        records.len(),
+        1,
+        "one run, one record — the #552 residual: {records:?}"
+    );
+    assert!(
+        records[0].run.names("call_sub_2"),
+        "the run is the NEWEST launch, never the older one: {:?}",
+        records[0].run
+    );
+    assert!(
+        records[0].run.names("ses_child"),
+        "the reused child id rides as an alias, so a later writer resolves this record: {:?}",
+        records[0].run
+    );
+    let card = platform.updated_cards().await.last().cloned().unwrap();
+    assert_eq!(
+        card_text(&card).matches("🔔 subagent 完成").count(),
+        1,
+        "one Wake, one entry — never one per launch part: {card}"
+    );
+}
+
+/// Acceptance (spec #699, ticket #704; ADR-0080): the alias order holds when a
+/// LAUNCHLESS Wake arrives FIRST. The Wake names the run by the shell id it
+/// reports alone, so its record is keyed by that shell id; the later
+/// launch-carrying **Runtime Reconciliation** read names the same run by its
+/// call id — and must RESOLVE that record (the launch's shell id is on it), not
+/// mint a second one. Two writers, either order, one record. (The rule is one
+/// entry per RUN, whatever class wrote it, so the run's already-shown Wake
+/// entry means the evidence ending adds no second entry — the record count is
+/// what this case pins.)
+#[tokio::test]
+async fn the_alias_order_holds_when_a_launchless_wake_arrives_first() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    // Life 1: the read carries the Wake but not the launch that named it.
+    let read = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下构建并审阅"),
+        assistant(3_000, "恢复了。"),
+    ])
+    .with_executions(vec![execution(2_000), execution(4_000)])
+    .with_wakes(vec![launchless_shell_wake(2_500, "sh_call_bg")]);
+    let (_dir, app, backend, platform) = scripted_app(vec![read], Some(SessionStatus::Idle)).await;
+    Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下构建并审阅"))
+        .await
+        .unwrap();
+
+    let records = app.cards_handle().chains.endings("ses_test");
+    assert_eq!(
+        records.len(),
+        1,
+        "the launchless Wake keys the record by the shell id: {records:?}"
+    );
+    assert!(
+        records[0].run.names("sh_call_bg"),
+        "the shell id the Wake reports names the run: {:?}",
+        records[0].run
+    );
+
+    // Life 2: a read that carries the launch, whose runtime verdict derives the
+    // run's evidence ending. It names the run by `call_bg`, and the shell id on
+    // the existing record resolves it to the SAME one — a second record would
+    // mean the two writers disagreed about the run.
+    script_transcript(&backend, vec![launched_shell_read("msg_cola_second", now)]).await;
+    backend.task_runtime.lock().unwrap().shells = vec![("sh_call_bg".into(), ShellRuntime::Missing)];
+    let mut second = ctx("ses_test", "再来一次");
+    second.message_id = "msg_2".into();
+    second.cola_message_id = Some("msg_cola_second".into());
+    spawn_turn(&app, second).await.unwrap().unwrap();
+
+    let records = app.cards_handle().chains.endings("ses_test");
+    assert_eq!(
+        records.len(),
+        1,
+        "one record for the run, both writers: {records:?}"
+    );
+    assert!(
+        records[0].run.names("call_bg") && records[0].run.names("sh_call_bg"),
+        "the launch's call id folded into the record the Wake keyed by shell id: {:?}",
+        records[0].run
+    );
+    assert!(
+        records[0]
+            .endings
+            .iter()
+            .any(|ending| ending.class == TaskEndingClass::Evidence),
+        "the verdict's evidence ending resolved the same record: {records:?}"
+    );
+    // The family's rule is one entry per RUN, whatever class wrote it
+    // (ADR-0080): life 1's shown Wake ending already gave the run its entry, so
+    // the evidence retirement adds no second one. The point here is the RECORD
+    // count — one run, however it was named — and that the second writer never
+    // rendered a duplicate.
+    let mut bodies: Vec<String> = platform.updated_cards().await.iter().map(card_text).collect();
+    bodies.extend(created_cards(&platform).await.iter().map(card_text));
+    assert!(
+        bodies.iter().all(|text| !text.contains("🔔 shell 已失联")),
+        "a run whose Wake entry was shown gains no second retirement entry: {bodies:?}"
+    );
+}
+
+/// Acceptance (spec #699, ticket #704; ADR-0080): the alias order holds when a
+/// LAUNCH-CARRYING reconciliation read arrives FIRST. Its evidence ending keys
+/// the record by the launch's call id; the later launchless Wake names the run
+/// by the shell id alone. The alias resolves the same record, so the evidence
+/// ending suppresses the Wake's completion — the Wake is never ATTACHED to a
+/// second record, and the run renders no second entry (#659).
+#[tokio::test]
+async fn the_alias_order_holds_when_a_launch_carrying_read_arrives_first() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let (_dir, app, backend, platform) = scripted_app(
+        vec![launched_shell_read("msg_cola_anchor", now)],
+        Some(SessionStatus::Idle),
+    )
+    .await;
+    backend.task_runtime.lock().unwrap().shells = vec![("sh_call_bg".into(), ShellRuntime::Missing)];
+    Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下构建并审阅"))
+        .await
+        .unwrap();
+
+    let records = app.cards_handle().chains.endings("ses_test");
+    assert_eq!(
+        records.len(),
+        1,
+        "the evidence ending keys the record by the call id: {records:?}"
+    );
+    assert!(records[0].run.names("call_bg"));
+
+    // The late launchless Wake names the shell the record already carries: it
+    // resolves the evidence-ended run, so its completion is suppressed — never
+    // absorbed by/attached to another record.
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(vec![user("msg_cola_second", 3_000, "再来一次")])
+                .with_executions(vec![execution(4_000)])
+                .with_wakes(vec![launchless_shell_wake(3_500, "sh_call_bg")]),
+        ],
+    )
+    .await;
+    let mut second = ctx("ses_test", "再来一次");
+    second.message_id = "msg_2".into();
+    second.cola_message_id = Some("msg_cola_second".into());
+    spawn_turn(&app, second).await.unwrap().unwrap();
+
+    let records = app.cards_handle().chains.endings("ses_test");
+    assert_eq!(
+        records.len(),
+        1,
+        "the launchless Wake resolved the one record: {records:?}"
+    );
+    let mut bodies: Vec<String> = platform.updated_cards().await.iter().map(card_text).collect();
+    bodies.extend(created_cards(&platform).await.iter().map(card_text));
+    assert!(
+        bodies.iter().all(|text| !text.contains("🔔 shell 完成")),
+        "an evidence-ended run never absorbs the Wake's completion: {bodies:?}"
+    );
+}
+
+/// Acceptance (spec #699, ticket #704; ADR-0080): a **Surrendered** ending is
+/// never re-offered to a render. The saturation cap gave its entry up while
+/// keeping the fact (the run stays ended), and only an OWED ending is ever
+/// synthesized or rendered — so a read that still lists the run live and whose
+/// runtime verdict confirms the end renders NO entry, while the run still
+/// leaves the ledger.
+///
+/// The record's EVICTABILITY — a surrendered ending makes its record ordinary
+/// bound-eviction material — is pinned at the store's own seam by
+/// `chain::records::tests::the_bound_evicts_an_unowed_record_and_never_an_owed_one`;
+/// that bound is private to that module, so this case leaves it there rather
+/// than reproducing 65 records through the App.
+#[tokio::test]
+async fn a_surrendered_ending_is_never_re_offered_to_a_render() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let (_dir, app, backend, platform) =
+        scripted_app(vec![waiting_shell(now)], Some(SessionStatus::Idle)).await;
+    seed_ending(
+        &app.cards_handle().chains,
+        "call_bg",
+        TaskEndingClass::Evidence,
+        TaskEndingState::Surrendered,
+    );
+
+    backend.task_runtime.lock().unwrap().shells = vec![("sh_call_bg".into(), ShellRuntime::Missing)];
+    Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下构建并审阅"))
+        .await
+        .unwrap();
+
+    let cards = platform.updated_cards().await;
+    assert!(
+        cards.iter().all(|card| !card_text(card).contains("🔔")),
+        "a surrendered entry is never re-offered to a render: {cards:?}"
+    );
+    let later = crate::backend::Backend::transcript(backend.as_ref(), "ses_test")
+        .await
+        .unwrap();
+    assert!(
+        later.background_tasks.is_empty(),
+        "the surrendered run's fact keeps it out of the ledger: {later:?}"
+    );
+}
+
+/// Acceptance (spec #699, ticket #704; ADR-0080): a legacy mark is read once,
+/// then ages out. Life 1: a pre-ADR-0080 sidecar whose `rendered` section names
+/// the still-live run's delivered entry. Loading translates it to a SHOWN
+/// evidence ending, so a restart's re-derived retirement renders no second
+/// entry (read once). The section past the shared bound then drops its OLDEST
+/// record — a translated mark is evictable exactly like any other unowed one
+/// (ages out); that is the one shape that can re-show a very old entry once
+/// more, the duplicate-over-loss residual ADR-0080 keeps. The eviction RULE is
+/// pinned at the store's seam by `chain::records::tests::the_bound_evicts_an_unowed_record_and_never_an_owed_one`.
+#[tokio::test]
+async fn a_legacy_mark_is_read_once_then_ages_out() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    std::fs::write(
+        dir.path().join("chain_records.json"),
+        r#"{"rendered":{"ses_test":["ended:call_bg"]}}"#,
+    )
+    .unwrap();
+
+    // Life 1: a fresh process over the legacy sidecar. Its read still lists the
+    // run live (the launch never flips), so only the translated SHOWN ending
+    // can keep the entry from re-posting.
+    let (restarted, platform) = restarted_app_with_transcript(&session_file, waiting_shell(now)).await;
+    assert!(
+        restarted.cards_handle().chains.ending_shown(
+            "ses_test",
+            &run_of("call_bg"),
+            TaskEndingClass::Evidence
+        ),
+        "the legacy mark translated to a SHOWN evidence ending"
+    );
+    // Admit a reconcile on the restarted process's first read, so the read
+    // really re-derives the run's evidence ending and the translated SHOWN mark
+    // is the only thing that can suppress its entry (an unasked read would make
+    // the assertion vacuous).
+    restarted
+        .runtime_reconcile
+        .interval_ms
+        .store(0, Ordering::Relaxed);
+    restarted.turn_render_poll_ms.store(5, Ordering::Relaxed);
+    restarted.turn_follow_read_timeout_ms.store(20, Ordering::Relaxed);
+    Turn::run(&restarted.turn_handles(), ctx("ses_test", "跑一下构建并审阅"))
+        .await
+        .unwrap();
+    let mut bodies: Vec<String> = platform.updated_cards().await.iter().map(card_text).collect();
+    bodies.extend(created_cards(&platform).await.iter().map(card_text));
+    assert!(
+        bodies.iter().all(|text| !text.contains("🔔")),
+        "a translated legacy mark is read once, never re-posted: {bodies:?}"
+    );
+
+    // Ages out: a `rendered` section past the shared bound keeps only its
+    // NEWEST `MAX_RUN_RECORDS` records, so the oldest mark is gone.
+    let aged = tempfile::tempdir().unwrap();
+    let keys: Vec<String> = (0..SESSION_RUN_RECORDS_BOUND + 1)
+        .map(|i| format!("ended:call_{i}"))
+        .collect();
+    std::fs::write(
+        aged.path().join("chain_records.json"),
+        serde_json::json!({ "rendered": { "ses_test": keys } }).to_string(),
+    )
+    .unwrap();
+    let records = ChainRecords::load(aged.path().join("chain_records.json")).endings("ses_test");
+    assert_eq!(
+        records.len(),
+        SESSION_RUN_RECORDS_BOUND,
+        "the translated section is bounded like any other"
+    );
+    assert!(
+        !records.iter().any(|record| record.run.key == "call_0"),
+        "the oldest legacy mark aged out: {:?}",
+        records.iter().map(|record| &record.run.key).collect::<Vec<_>>()
+    );
+}
+
+/// Acceptance (spec #699, ticket #704; ADR-0080): past the shared bound an
+/// evicted SHOWN ending may show once more, while an OWED one is never the
+/// eviction candidate.
+///
+/// RATIFIED RESIDUAL (ADR-0080, "Duplicate, accepted"): the shown bit dies with
+/// its record, so a restart after the bound evicted a shown record re-derives
+/// the run's end and shows the entry once more — the duplicate-over-loss side
+/// this family trades toward. Do not "fix" this by pinning shown records
+/// forever or by making the shown bit survive eviction; the ADR keeps it.
+#[tokio::test]
+async fn an_evicted_shown_ending_may_show_once_more_while_an_owed_one_is_never_evicted() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let (_dir, app, backend, platform) =
+        scripted_app(vec![waiting_shell(now)], Some(SessionStatus::Idle)).await;
+    let chains = app.cards_handle().chains.clone();
+    // The oldest record's entry was SHOWN by an earlier card: the entry is
+    // history, so the record is ordinary eviction material.
+    seed_ending(
+        &chains,
+        "call_bg",
+        TaskEndingClass::Evidence,
+        TaskEndingState::Shown,
+    );
+    for i in 0..SESSION_RUN_RECORDS_BOUND {
+        seed_ending(
+            &chains,
+            &format!("call_owed_{i}"),
+            TaskEndingClass::Evidence,
+            TaskEndingState::Owed,
+        );
+    }
+
+    let records = chains.endings("ses_test");
+    assert!(
+        records.len() <= SESSION_RUN_RECORDS_BOUND,
+        "the section stays bounded: {}",
+        records.len()
+    );
+    assert!(
+        !records.iter().any(|record| record.run.key == "call_bg"),
+        "the oldest UNOWED record was the eviction candidate: {:?}",
+        records.iter().map(|record| &record.run.key).collect::<Vec<_>>()
+    );
+    assert!(
+        records.iter().any(|record| record.owes()),
+        "an owed record is never evicted for the bound: {records:?}"
+    );
+
+    // The shown bit went with its record, so the read re-derives the run's end
+    // and shows the entry once more.
+    backend.task_runtime.lock().unwrap().shells = vec![("sh_call_bg".into(), ShellRuntime::Missing)];
+    Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下构建并审阅"))
+        .await
+        .unwrap();
+    wait_for_card_update(&platform, "the re-shown entry", CardUpdates::Latest, |card| {
+        card_text(card).contains("🔔 shell 已失联：gh run watch")
+    })
+    .await;
+}
+
+/// Acceptance (spec #699, ticket #704; ADR-0080): two chains planning the same
+/// ending concurrently may EACH show it once. Two Apps over ONE Session's
+/// sidecar — the shape two live cards on the session take — each say the same
+/// runtime verdict. Neither sees the other's confirmation, so both plan the
+/// run's ending while it is Owed and each flips its own shown bit at its own
+/// confirmed write.
+///
+/// RATIFIED RESIDUAL (ADR-0080, "Duplicate, accepted, unchanged in direction"):
+/// the shown bit is claimed at CONFIRMATION, so two chains that plan before
+/// either body's write is confirmed can each show the entry once. Do not "fix"
+/// this by trying to make one process's confirmation gate another's; the
+/// duplicate is the side this family trades toward.
+#[tokio::test]
+async fn two_chains_planning_the_same_ending_concurrently_may_each_show_it_once() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let dir = tempfile::tempdir().unwrap();
+
+    /// One chain: an App over the shared sidecar (its own session store) whose
+    /// runtime verdict ends the live shell.
+    async fn chain(dir: &std::path::Path, sessions: &str, now: i64) -> (Arc<App>, Arc<RecordingPlatform>) {
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.given_transcript("ses_test", vec![waiting_shell(now)]);
+        backend.with_session_status("ses_test", Some(SessionStatus::Idle));
+        backend.task_runtime.lock().unwrap().shells = vec![("sh_call_bg".into(), ShellRuntime::Missing)];
+        let platform = Arc::new(RecordingPlatform::new());
+        let app = Arc::new(
+            App::new(
+                test_config(&dir.join(sessions)),
+                Arc::new(backend),
+                platform.clone(),
+            )
+            .expect("the chain's app builds"),
+        );
+        app.turn_render_poll_ms.store(5, Ordering::Relaxed);
+        app.turn_follow_read_timeout_ms.store(20, Ordering::Relaxed);
+        app.runtime_reconcile.interval_ms.store(0, Ordering::Relaxed);
+        seed_session(&app, "ses_test", "/work").await;
+        (app, platform)
+    }
+
+    let (app_a, platform_a) = chain(dir.path(), "a_sessions.json", now).await;
+    let (app_b, platform_b) = chain(dir.path(), "b_sessions.json", now).await;
+    let (a, b) = tokio::join!(
+        spawn_turn(&app_a, ctx("ses_test", "跑一下构建并审阅")),
+        spawn_turn(&app_b, ctx("ses_test", "跑一下构建并审阅")),
+    );
+    a.unwrap().unwrap();
+    b.unwrap().unwrap();
+
+    for platform in [&platform_a, &platform_b] {
+        let settled = platform.updated_cards().await.last().cloned().unwrap();
+        assert_eq!(
+            card_text(&settled).matches("🔔 shell 已失联").count(),
+            1,
+            "each chain shows the ending's entry exactly once: {settled}"
+        );
+    }
 }
