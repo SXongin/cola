@@ -738,8 +738,12 @@ fn mark_shown(records: &mut [TaskRunRecord], shown: &[(TaskRunId, TaskEndingClas
 /// eviction candidate.
 fn bound_run_records(session_id: &str, records: &mut Vec<TaskRunRecord>) -> bool {
     let mut changed = false;
-    let mut owed = records.iter().filter(|record| record.owes()).count();
-    while owed > MAX_OWED_RUN_RECORDS {
+    // Recompute the count of OWING RECORDS each time: one record may carry
+    // several owed classes, so a single surrender does not necessarily make it
+    // stop owing. Decrementing once per ending surrendered (rather than once
+    // per record that stops owing) would end the loop early and leave more than
+    // `MAX_OWED_RUN_RECORDS` records owing.
+    while records.iter().filter(|record| record.owes()).count() > MAX_OWED_RUN_RECORDS {
         let Some(record) = records.iter_mut().find(|record| record.owes()) else {
             break;
         };
@@ -757,7 +761,6 @@ fn bound_run_records(session_id: &str, records: &mut Vec<TaskRunRecord>) -> bool
             class = ?ending.class,
             "Background Task Ending backlog past {MAX_OWED_RUN_RECORDS}: the oldest owed entry is surrendered, its ending kept"
         );
-        owed -= 1;
         changed = true;
     }
     let mut excess = records.len().saturating_sub(MAX_RUN_RECORDS);
@@ -3892,6 +3895,48 @@ mod tests {
             records.iter().filter(|record| record.owes()).count(),
             MAX_OWED_RUN_RECORDS,
             "no owed entry was evicted for the bound"
+        );
+    }
+
+    /// The owed cap counts RECORDS that owe, not endings surrendered: `owed`
+    /// must fall only when a record stops owing. A record carrying two owed
+    /// classes would otherwise free a slot after one surrender and leave the
+    /// backlog over the cap, so the count is recomputed each time.
+    #[test]
+    fn the_owed_cap_counts_records_not_endings() {
+        let dir = tempfile::tempdir().unwrap();
+        let chains = ChainRecords::load(dir.path().join(FILE));
+        let call = |i: usize| TaskRunId::of_launch(&launch(&format!("call_{i}"), None, None));
+        // The OLDEST record carries TWO owed classes, so one surrender does not
+        // stop it owing.
+        chains.record_ending(
+            "ses_a",
+            &call(0),
+            TaskEnding::owed(TaskEndingClass::Evidence, identity("a")),
+        );
+        chains.record_ending(
+            "ses_a",
+            &call(0),
+            TaskEnding::owed(TaskEndingClass::Cleanup, identity("a")),
+        );
+        for i in 1..=MAX_OWED_RUN_RECORDS {
+            chains.record_ending(
+                "ses_a",
+                &call(i),
+                TaskEnding::owed(TaskEndingClass::Evidence, identity("owed")),
+            );
+        }
+
+        let records = chains.endings("ses_a");
+        assert_eq!(
+            records.len(),
+            MAX_OWED_RUN_RECORDS + 1,
+            "no owed record is evicted under the shared bound"
+        );
+        assert!(
+            records.iter().filter(|record| record.owes()).count() <= MAX_OWED_RUN_RECORDS,
+            "the number of owing records ends at or below the cap: {}",
+            records.iter().filter(|record| record.owes()).count()
         );
     }
 
