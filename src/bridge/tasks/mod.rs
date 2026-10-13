@@ -62,7 +62,8 @@ pub(crate) mod model;
 pub(crate) mod state;
 
 pub(crate) use handle::TasksHandle;
-pub(crate) use model::{task_kind, task_label};
+pub(crate) use model::TaskRunId;
+pub(crate) use model::{identity_of_task, identity_of_wake, task_kind, task_label};
 pub(crate) use state::TaskCell;
 
 /// The liveness tier's own unit tests (`src/backend/transcript.rs`) still name
