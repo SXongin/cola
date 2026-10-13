@@ -12,7 +12,7 @@ use super::wake::record_landed_rendered;
 use super::{MAX_CARD_CHAIN, SplitKind, Turn};
 
 use crate::bridge::card_handles::RenderedBlock;
-use crate::bridge::chain::{RenderedCursor, release_spent};
+use crate::bridge::chain::{EndingKey, RenderedCursor, release_spent};
 use crate::bridge::handles::CardsHandle;
 
 /// A one-shot test gate inside the staged-cursor drain reconcile (spec #561,
@@ -190,17 +190,16 @@ async fn advance_card_fallback(cards: &CardsHandle, session_id: &str) -> Fallbac
 /// send lands. Only a confirmed write drains the staged value. Returns the
 /// stage identity the confirmation must name (spec #561, review #569); id `0`
 /// means nothing was staged (no session), which no confirmation ever matches.
-/// `rendered` is the ledger announce keys the body actually rendered (issue
-/// #671, ticket #672), from `BuiltCard::rendered_keys`: exactly what its
-/// confirmed write may mark, so a split's prefix never claims an entry its
-/// continuation shows.
+/// `rendered` is the Task Endings the body actually rendered (ADR-0080), from
+/// `BuiltCard::rendered_keys`: exactly what its confirmed write may flip, so a
+/// split's prefix never claims an entry its continuation shows.
 async fn stage_rendered_cursor(
     cards: &CardsHandle,
     session_id: &str,
     card_message_id: Option<&str>,
     cursor: &RenderedCursor,
     gap: Option<&crate::bridge::turn::state::GapCoverage>,
-    rendered: Vec<String>,
+    rendered: Vec<EndingKey>,
 ) -> crate::bridge::turn::state::StagedCursorId {
     let mut live = cards.cards.lock().await;
     match live.get_mut(session_id) {
@@ -237,7 +236,7 @@ async fn confirm_staged_cursor(
     card_message_id: &str,
     chain_id: Option<u64>,
     expected: crate::bridge::turn::state::StagedCursorId,
-    rendered: &[String],
+    rendered: &[EndingKey],
     gate: Option<&ConfirmGate>,
 ) {
     // ONE critical section (spec #561, review #569): the stage comparison —
@@ -248,10 +247,10 @@ async fn confirm_staged_cursor(
     //
     // A confirmation whose stage can NO LONGER be taken — the session was
     // replaced by a fresh Turn, its chain changed, or the cap evicted the stage
-    // — still describes a DELIVERED body, so its keys reach the durable Record
-    // and, when a session is live, that session's accumulator gate (issue #671,
-    // ticket #672): the same rule a lost projection takeover follows, and the
-    // only thing that stops an already-seeded chain from re-planning the entry.
+    // — still describes a DELIVERED body, so its endings reach the durable
+    // Record and, when a session is live, that session's accumulator gate
+    // (ADR-0080): the same rule a lost projection takeover follows, and the only
+    // thing that stops an already-seeded chain from re-planning the entry.
     let mut live = cards.cards.lock().await;
     let Some(card) = live.get_mut(session_id) else {
         record_landed_rendered(cards, None, session_id, rendered);
@@ -275,10 +274,10 @@ async fn confirm_staged_cursor(
     // chain's orphan gap this far — a PARTIAL body only advances the durable
     // gap, so a restart (or the next slice) resumes after what a card showed,
     // while a body that reached the gap's end consumes the fact — and the
-    // cursor and the gap must never be observable apart. The body's synthetic
-    // completion entries ride the same write (issue #671, ticket #672): a crash
-    // between two writes would leave the card having shown the entry with no
-    // durable mark, and a restart would re-post it.
+    // cursor and the gap must never be observable apart. The body's completion
+    // entries ride the same write (ADR-0080): a crash between two writes would
+    // leave the card having shown the entry with its shown bit still owed, and a
+    // restart would re-post it.
     cards.chains.advance_cursor_and_gap(
         session_id,
         card_message_id,
@@ -286,10 +285,10 @@ async fn confirm_staged_cursor(
         confirmed.gap.as_ref().map(|gap| (&gap.frontier, gap.complete)),
         &confirmed.rendered,
     );
-    // The owed mirror's job is done: this body's keys were recorded by the very
-    // write above (or by the superseded confirmation that already won, whose
-    // one write carries them). Drop it so the reconcile never records it twice
-    // (idempotent, but pointless).
+    // The owed mirror's job is done: this body's endings were flipped by the
+    // very write above (or by the superseded confirmation that already won,
+    // whose one write carries them). Drop it so the reconcile never flips it
+    // twice (idempotent, but pointless).
     if let Some(seq) = expected.awaiting_seq {
         cards.chains.clear_owed_rendered(card_message_id, seq);
     }
@@ -315,7 +314,7 @@ pub(crate) async fn confirm_staged_cursor_for_test(
     session_id: &str,
     card_message_id: &str,
     expected: crate::bridge::turn::state::StagedCursorId,
-    rendered: &[String],
+    rendered: &[EndingKey],
     gate: Option<&ConfirmGate>,
 ) {
     confirm_staged_cursor(cards, session_id, card_message_id, None, expected, rendered, gate).await;
@@ -339,18 +338,18 @@ async fn note_cursor_write_failure(
     card: &serde_json::Value,
     error: &crate::error::BridgeError,
     stage: crate::bridge::turn::state::StagedCursorId,
-    rendered: &[String],
+    rendered: &[EndingKey],
 ) {
     if error.is_recoverable_card_write()
         && let Some(card_message_id) = card_message_id
     {
         if let Some(seq) = cards.feishu.pending_card_write(card_message_id, card) {
             // Still owed: the drain reconcile confirms the cursor once that
-            // payload delivers. The body's rendered keys are mirrored on the
-            // Chain Records, keyed by this card (issue #671, ticket #672) — held
-            // there, not on the accumulator, because a stage can be evicted, a
-            // card replaced and a Session re-keyed before that confirmation, and
-            // the keys are this fact's only copy.
+            // payload delivers. The body's endings are mirrored on the Chain
+            // Records, keyed by this card (ADR-0080) — held there, not on the
+            // accumulator, because a stage can be evicted, a card replaced and a
+            // Session re-keyed before that confirmation, and the pairs are this
+            // fact's only copy.
             cards
                 .chains
                 .note_owed_rendered(card_message_id, session_id, seq, rendered);
@@ -438,29 +437,28 @@ async fn reconcile_staged(cards: &CardsHandle, gate: Option<&ReconcileGate>) {
             discard_staged_cursor(cards, &session_id, expected).await;
         }
     }
-    // The owed rendered keys (issue #671, ticket #672): a card whose queued
-    // payload delivered records its keys even when the stage that carried them
-    // was evicted, or the Session replaced or re-keyed meanwhile — the mark is
-    // never lost to the cap — and one that can never deliver clears them. The
-    // mirror lives on the Chain Records keyed by card, so it survives every
-    // accumulator lifecycle; the Session it names is corrected by a rename.
+    // The owed endings (ADR-0080): a card whose queued payload delivered flips
+    // its endings' shown bits even when the stage that carried them was evicted,
+    // or the Session replaced or re-keyed meanwhile — nothing owed is lost to
+    // the cap — and one that can never deliver clears them. The mirror lives on
+    // the Chain Records keyed by card, so it survives every accumulator
+    // lifecycle; the Session it names is corrected by a rename.
     let owed = cards.chains.owed_rendered();
     for (card_message_id, owed) in owed {
         if cards.feishu.card_write_delivered(&card_message_id, owed.seq) {
-            // Record the mark and tell the live session's gate in ONE chains
+            // Flip the bits and tell the live session's gate in ONE chains
             // critical section: `confirm_owed_rendered` re-reads the entry, so a
             // rename that moved it before this moment is honored (the cards lock
             // is taken first, and a recreate re-keys under that same lock, so
             // none interleaves after). A chain that SEEDED before the delivery
-            // holds the older, empty mark set, so the gate insert is what stops
-            // its next read re-planning the entry.
+            // holds the older, empty announce set, so the gate insert is what
+            // stops its next read re-planning the entry.
             let mut live = cards.cards.lock().await;
-            if let Some((session_id, rendered)) =
-                cards.chains.confirm_owed_rendered(&card_message_id, owed.seq)
+            if let Some((session_id, shown)) = cards.chains.confirm_owed_rendered(&card_message_id, owed.seq)
                 && let Some(card) = live.get_mut(&session_id)
             {
-                for key in &rendered {
-                    card.acc.announce_synthetic(key);
+                for (run, class) in shown {
+                    card.acc.announce_ending(&run, class);
                 }
             }
         } else if cards
@@ -618,13 +616,13 @@ pub(super) async fn flush_card_locked(
                 let delivered = match cards.feishu.update_message(&card_id, &built.card).await {
                     Ok(()) => {
                         // The PATCH is accepted NOW: advance this body's Rendered
-                        // Cursor, its gap coverage and its rendered keys in ONE
-                        // chains write, in this synchronous step before any await
-                        // (issue #671, ticket #672). A later cancellation cannot
-                        // lose the mark, and a crash cannot leave the mark apart
-                        // from the cursor it was confirmed with. The staged
-                        // confirmation below writes the same values again — an
-                        // idempotent no-op on an already-advanced record.
+                        // Cursor, its gap coverage and its endings' shown bits in
+                        // ONE chains write, in this synchronous step before any
+                        // await (ADR-0080). A later cancellation cannot lose the
+                        // bit, and a crash cannot leave it apart from the cursor it
+                        // was confirmed with. The staged confirmation below writes
+                        // the same values again — an idempotent no-op on an
+                        // already-advanced record.
                         cards.chains.advance_cursor_and_gap(
                             session_id,
                             &card_id,
@@ -823,9 +821,9 @@ pub(super) async fn flush_card_locked(
                 match cards.feishu.update_message(&card_id, &finalized.card).await {
                     Ok(()) => {
                         // Accepted NOW: advance the finalized body's cursor, gap
-                        // and rendered keys in ONE synchronous write, before any
-                        // await (issue #671, ticket #672). The staged
-                        // confirmation below re-writes them idempotently.
+                        // and endings' shown bits in ONE synchronous write, before
+                        // any await (ADR-0080). The staged confirmation below
+                        // re-writes them idempotently.
                         cards.chains.advance_cursor_and_gap(
                             session_id,
                             &card_id,
@@ -1251,10 +1249,41 @@ mod tests {
     use std::sync::Arc;
 
     use super::{drain_wake_watermark, note_cursor_write_failure, staged_watermark_id};
+    use crate::bridge::chain::{EndingKey, TaskEnding, TaskEndingClass, TaskEndingState, TaskRunIdentity};
+    use crate::bridge::tasks::TaskRunId;
     use crate::bridge::test_support::*;
     use crate::bridge::turn::Turn;
     use crate::bridge::turn::state::{CardFallback, CardSession, EndingWrite, StreamAccumulator};
     use crate::feishu::card::CardState;
+
+    /// The run one test's synthetic retirement belongs to (ADR-0080).
+    fn run(call_id: &str) -> TaskRunId {
+        TaskRunId {
+            key: call_id.to_string(),
+            call_id: Some(call_id.to_string()),
+            shell_id: None,
+            child_id: Some("ses_child".to_string()),
+            wake_id: None,
+        }
+    }
+
+    /// A just-derived **Task Ending** (ADR-0080), recorded durably so a
+    /// confirmation has a bit to flip.
+    fn owed_ending(class: TaskEndingClass) -> TaskEnding {
+        TaskEnding {
+            class,
+            state: TaskEndingState::Owed,
+            finished_at: Some(2_000),
+            evidence: None,
+            identity: TaskRunIdentity::default(),
+        }
+    }
+
+    /// The staged `(run, class)` pair a body rendering `call_id`'s ending
+    /// claims (ADR-0080).
+    fn staged(call_id: &str, class: TaskEndingClass) -> EndingKey {
+        (run(call_id), class)
+    }
 
     /// The markdown content of the first body element.
     fn first_markdown(card: &serde_json::Value) -> String {
@@ -1765,6 +1794,9 @@ mod tests {
 
         let (app, platform) = app_with_live_card("回答。").await;
         let cards = app.cards_handle();
+        cards
+            .chains
+            .record_ending("ses_test", &run("call_1"), owed_ending(TaskEndingClass::Evidence));
 
         // The body renders a synthetic retirement, so it claims the entry's key.
         let built = {
@@ -1781,14 +1813,14 @@ mod tests {
                     ending: TaskEnding::RuntimeEnded,
                     output: None,
                 },
-                Some("runtime:call_1"),
+                Some(staged("call_1", TaskEndingClass::Evidence)),
             );
             card.acc.build_card_with_info()
         };
         assert_eq!(
             built.rendered_keys,
-            vec!["runtime:call_1".to_string()],
-            "the body claims the entry it rendered"
+            vec![staged("call_1", TaskEndingClass::Evidence)],
+            "the body claims the ending it rendered"
         );
         let stage = super::stage_rendered_cursor(
             &cards,
@@ -1821,8 +1853,10 @@ mod tests {
         )
         .await;
         assert!(
-            cards.chains.rendered("ses_test").is_empty(),
-            "nothing is recorded while the payload is owed"
+            !cards
+                .chains
+                .ending_shown("ses_test", &run("call_1"), TaskEndingClass::Evidence),
+            "nothing is shown while the payload is owed"
         );
 
         // The cap evicts the stage before its payload delivers: the keys
@@ -1841,21 +1875,18 @@ mod tests {
         assert!(
             cards
                 .chains
-                .rendered("ses_test")
-                .iter()
-                .any(|key| key == "runtime:call_1"),
-            "an evicted stage's keys are still recorded on delivery: {:?}",
-            cards.chains.rendered("ses_test")
+                .ending_shown("ses_test", &run("call_1"), TaskEndingClass::Evidence),
+            "an evicted stage's ending is still shown on delivery"
         );
-        // The live chain's gate takes the delivered keys too, so a chain that
+        // The live chain's gate takes the delivered endings too, so a chain that
         // SEEDED before this delivery was observed cannot re-plan the entry.
         let live = cards.cards.lock().await;
         assert!(
             live.get("ses_test")
                 .expect("the live card")
                 .acc
-                .wake_announced("runtime:call_1"),
-            "the delivered keys reach the live accumulator's gate"
+                .ending_announced(&run("call_1"), TaskEndingClass::Evidence),
+            "the delivered endings reach the live accumulator's gate"
         );
     }
 
@@ -1880,7 +1911,7 @@ mod tests {
                 Some("om_live"),
                 Default::default(),
                 None,
-                vec!["runtime:call_1".to_string()],
+                vec![staged("call_1", TaskEndingClass::Evidence)],
             );
             StagedCursorId {
                 id,
@@ -1896,13 +1927,16 @@ mod tests {
         cards.cards.lock().await.insert("ses_test".into(), replacement);
 
         // The confirmation cannot take the replaced stage, but the body
-        // DELIVERED: the mark lands and the replacement's gate is told.
+        // DELIVERED: the bit lands and the replacement's gate is told.
+        cards
+            .chains
+            .record_ending("ses_test", &run("call_1"), owed_ending(TaskEndingClass::Evidence));
         super::confirm_staged_cursor_for_test(
             &cards,
             "ses_test",
             "om_live",
             stage,
-            &["runtime:call_1".to_string()],
+            &[staged("call_1", TaskEndingClass::Evidence)],
             None,
         )
         .await;
@@ -1910,18 +1944,17 @@ mod tests {
         assert!(
             cards
                 .chains
-                .rendered("ses_test")
-                .iter()
-                .any(|key| key == "runtime:call_1"),
-            "a replaced chain's delivered keys are still marked: {:?}",
-            cards.chains.rendered("ses_test")
+                .ending_shown("ses_test", &run("call_1"), TaskEndingClass::Evidence),
+            "a replaced chain's delivered endings are still shown"
         );
         let live = cards.cards.lock().await;
         let fresh = live.get("ses_test").expect("the replacement session");
         assert_eq!(fresh.chain_id(), replacement_chain);
         assert!(
-            fresh.acc.wake_announced("runtime:call_1"),
-            "the replacement's gate takes the landed keys"
+            fresh
+                .acc
+                .ending_announced(&run("call_1"), TaskEndingClass::Evidence),
+            "the replacement's gate takes the landed endings"
         );
     }
 
@@ -1938,6 +1971,9 @@ mod tests {
 
         let (app, platform) = app_with_live_card("回答。").await;
         let cards = app.cards_handle();
+        cards
+            .chains
+            .record_ending("ses_test", &run("call_1"), owed_ending(TaskEndingClass::Evidence));
         let built = {
             let mut live = cards.cards.lock().await;
             let card = live.get_mut("ses_test").expect("the live card");
@@ -1952,7 +1988,7 @@ mod tests {
                     ending: TaskEnding::RuntimeEnded,
                     output: None,
                 },
-                Some("runtime:call_1"),
+                Some(staged("call_1", TaskEndingClass::Evidence)),
             );
             card.acc.build_card_with_info()
         };
@@ -2006,28 +2042,27 @@ mod tests {
         // would render the retirement the delivered card already showed (issue
         // #671, ticket #672).
         assert!(
-            Turn::recorded_marks(&cards, "ses_test")
-                .iter()
-                .any(|key| key == "runtime:call_1"),
-            "a delivered owed mark is visible to a commit before the reconcile persists it"
+            crate::bridge::turn::render::Endings::of(&cards, "ses_test")
+                .facts()
+                .shown_any(&run("call_1")),
+            "a delivered owed ending is visible to a commit before the reconcile flips its bit"
         );
         crate::bridge::turn::reconcile_staged_cursors(&cards).await;
 
         assert!(
             cards
                 .chains
-                .rendered("ses_test")
-                .iter()
-                .any(|key| key == "runtime:call_1"),
-            "the delivered keys are marked: {:?}",
-            cards.chains.rendered("ses_test")
+                .ending_shown("ses_test", &run("call_1"), TaskEndingClass::Evidence),
+            "the delivered ending's bit is flipped"
         );
         let live = cards.cards.lock().await;
         let fresh = live.get("ses_test").expect("the fresh session");
         assert_eq!(fresh.chain_id(), replacement_chain);
         assert!(
-            fresh.acc.wake_announced("runtime:call_1"),
-            "the chain installed before the persist takes the delivered keys"
+            fresh
+                .acc
+                .ending_announced(&run("call_1"), TaskEndingClass::Evidence),
+            "the chain installed before the persist takes the delivered endings"
         );
     }
 
@@ -2042,6 +2077,9 @@ mod tests {
 
         let (app, platform) = app_with_live_card("回答。").await;
         let cards = app.cards_handle();
+        cards
+            .chains
+            .record_ending("ses_test", &run("call_1"), owed_ending(TaskEndingClass::Evidence));
         let built = {
             let mut live = cards.cards.lock().await;
             let card = live.get_mut("ses_test").expect("the live card");
@@ -2056,7 +2094,7 @@ mod tests {
                     ending: TaskEnding::RuntimeEnded,
                     output: None,
                 },
-                Some("runtime:call_1"),
+                Some(staged("call_1", TaskEndingClass::Evidence)),
             );
             card.acc.build_card_with_info()
         };
@@ -2102,11 +2140,8 @@ mod tests {
         assert!(
             cards
                 .chains
-                .rendered("ses_test")
-                .iter()
-                .any(|key| key == "runtime:call_1"),
-            "a vanished session's delivered keys are still marked: {:?}",
-            cards.chains.rendered("ses_test")
+                .ending_shown("ses_test", &run("call_1"), TaskEndingClass::Evidence),
+            "a vanished session's delivered ending is still shown"
         );
     }
 

@@ -301,17 +301,17 @@ pub(crate) struct WakeMark {
     pub(crate) created_ms: i64,
 }
 
-/// A recoverably-failed body's synthetic rendered keys, waiting on the delivery
-/// of the Pending Card Update payload at [`Self::seq`] (issue #671, ticket
-/// #672). Held on the Chain Records, keyed by card, so it survives a card
-/// accumulator being replaced, removed or re-keyed before the payload delivers.
+/// A recoverably-failed body's endings, waiting on the delivery of the Pending
+/// Card Update payload at [`Self::seq`] (ADR-0080). Held on the Chain Records,
+/// keyed by card, so it survives a card accumulator being replaced, removed or
+/// re-keyed before the payload delivers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct OwedRendered {
-    /// The Session the mark is owed to (corrected by
+    /// The Session the ending is owed to (corrected by
     /// [`ChainRecords::rename`] when the Session is recreated).
     pub(crate) session_id: String,
     pub(crate) seq: u64,
-    pub(crate) rendered: Vec<String>,
+    pub(crate) shown: Vec<EndingKey>,
 }
 
 /// One **Task Ending**'s class (ADR-0080): what ended a Background Task run. A
@@ -455,6 +455,96 @@ impl TaskRunRecord {
     }
 }
 
+/// One entry's ending as a built body stages it (ADR-0080): the run whose entry
+/// it renders and that ending's class. The unit the Rendered Cursor's stage
+/// carries, the owed mirror remembers and a confirmed write flips to SHOWN — so
+/// exactly-once is the ending's own fact, never a bare "this was rendered"
+/// claim.
+pub(crate) type EndingKey = (TaskRunId, TaskEndingClass);
+
+/// The durable **Task Ending** facts one render's exactly-once gates read
+/// (ADR-0080) — the session's run records, plus the endings a recoverably-failed
+/// body's delivered-but-unrecorded payload still owes (folded in as SHOWN: the
+/// card really showed them, the drain just has not written the bit yet). One
+/// snapshot per gate, so a plan and its re-check ask the same questions of one
+/// instant.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct EndingFacts {
+    records: Vec<TaskRunRecord>,
+    /// `(run, class)` pairs a delivered payload carries that the records below
+    /// do not yet mark shown.
+    owed: Vec<EndingKey>,
+}
+
+impl EndingFacts {
+    /// A snapshot over bare run records — the gates' own entry and the unit
+    /// tests'. The owed half starts empty (nothing delivered-but-unrecorded).
+    pub(crate) fn new(records: Vec<TaskRunRecord>) -> Self {
+        Self {
+            records,
+            owed: Vec::new(),
+        }
+    }
+
+    /// Whether the run — resolved by the alias order — carries an ending of
+    /// `class` in ANY state. The Wake's evidence gate (issue #659): an evidence
+    /// ending claims the run ended, so a late Wake's completion entry is the
+    /// same fact twice. A Cleanup claims nothing of the sort (#590), which is
+    /// why this asks a class and not "has any ending".
+    pub(crate) fn recorded(&self, run: &TaskRunId, class: TaskEndingClass) -> bool {
+        self.ending(run, class).is_some()
+    }
+
+    /// Whether ANY ending of the run was SHOWN (ADR-0080) — the retirement's
+    /// rule is one entry per run, whatever class wrote it. The **legacy** class
+    /// the load-time translation mints is `shown` by construction, so a
+    /// pre-#659 mark still covers a re-derived retirement and this is the only
+    /// reader it has.
+    pub(crate) fn shown_any(&self, run: &TaskRunId) -> bool {
+        let shown = resolve_run(&self.records, run).is_some_and(|index| {
+            self.records[index]
+                .endings
+                .iter()
+                .any(|ending| ending.state == TaskEndingState::Shown)
+        });
+        shown
+            || self
+                .owed
+                .iter()
+                .any(|(owed_run, _)| run.ids().any(|id| owed_run.names(id)))
+    }
+
+    /// The run's ending of `class`, resolved by the alias order — the entry's
+    /// identity, label and duration fall back to it when the read no longer
+    /// carries the launch (compaction, a V2 page cap).
+    pub(crate) fn ending(&self, run: &TaskRunId, class: TaskEndingClass) -> Option<&TaskEnding> {
+        let record = resolve_run(&self.records, run)?;
+        self.records[record]
+            .endings
+            .iter()
+            .find(|ending| ending.class == class)
+    }
+
+    /// The identity a run's record carries, whatever class recorded it — the
+    /// label and the start clock an entry falls back to when the read no longer
+    /// carries the launch. The newest derivation's identity (the last ending that
+    /// captured a label or a start clock) wins.
+    pub(crate) fn identity(&self, run: &TaskRunId) -> Option<&TaskRunIdentity> {
+        let record = resolve_run(&self.records, run)?;
+        self.records[record]
+            .endings
+            .iter()
+            .rev()
+            .map(|ending| &ending.identity)
+            .find(|identity| identity.label.is_some() || identity.started_at.is_some())
+    }
+
+    /// Fold a delivered-but-unrecorded body's pairs into the snapshot as SHOWN.
+    pub(crate) fn note_owed(&mut self, shown: &[EndingKey]) {
+        self.owed.extend_from_slice(shown);
+    }
+}
+
 /// The persisted Chain Record; a wrapper so the on-disk shape can grow.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct ChainRecordFile {
@@ -521,11 +611,13 @@ fn resolved_session(state: &State, session_id: &str) -> String {
 
 /// Fold `keys` into `session_id`'s durable rendered marks (issue #671, ticket
 /// #672): append each key the session does not carry yet, evict the OLDEST
-/// past [`MAX_RENDERED_KEYS`], and report whether anything changed. The one
-/// body every record write that can carry a retirement entry funnels through,
-/// so the mark always shares its write with the cursor or re-point it was
-/// confirmed with — a crash between two writes would drop it and let the entry
-/// replay on a later card.
+/// past [`MAX_RENDERED_KEYS`], and report whether anything changed.
+///
+/// **Legacy (ADR-0080).** The ending's own shown bit ([`push_shown`]) replaced
+/// every production writer of this section; only the load-time translation
+/// ([`translate_legacy_rendered`]) still reads what an older build wrote, and
+/// the shrinkage slice (#703) deletes the section with its readers.
+#[allow(dead_code)]
 fn push_rendered_marks(state: &mut State, session_id: &str, keys: &[String]) -> bool {
     if keys.is_empty() {
         return false;
@@ -548,6 +640,28 @@ fn push_rendered_marks(state: &mut State, session_id: &str, keys: &[String]) -> 
     let excess = marks.len().saturating_sub(MAX_RENDERED_KEYS);
     marks.drain(..excess);
     true
+}
+
+/// Flip the delivered body's endings to SHOWN (ADR-0080) — the Rendered Cursor's
+/// own half of the confirmation. The one funnel every record write that can
+/// carry an entry runs through, so the bit always shares its write with the
+/// cursor or the re-point it was confirmed with: a crash between two writes
+/// would leave a card having shown an entry the durable record still owes, and
+/// a restart would post it again. Reports whether anything changed; a pair the
+/// section does not know is a no-op (a confirmation never mints a record), and
+/// the flip is monotonic, so an older confirmation can never clear a newer bit.
+fn push_shown(state: &mut State, session_id: &str, shown: &[EndingKey]) -> bool {
+    if shown.is_empty() {
+        return false;
+    }
+    // Record under the Session's CURRENT id: a writer that captured the id
+    // before a recreate must still land on the recreated Session, never the dead
+    // one.
+    let session_id = resolved_session(state, session_id);
+    let Some(records) = state.endings.get_mut(&session_id) else {
+        return false;
+    };
+    mark_shown(records, shown)
 }
 
 /// Resolve `held` to the index of `records`' record for the SAME run, or `None`
@@ -605,9 +719,6 @@ fn insert_ending(records: &mut Vec<TaskRunRecord>, held: &TaskRunId, ending: Tas
 /// Rendered Cursor it was confirmed with. Additive and monotonic: it only ever
 /// SETS a bit, so an older confirmation (a subset of a newer one's, or an empty
 /// one) can never clear a newer shown bit. Returns whether anything changed.
-/// No production path writes or reads the endings section yet (spec #699,
-/// slice 1; ADR-0080) — the confirmation slice (#703) calls it.
-#[allow(dead_code)]
 fn mark_shown(records: &mut [TaskRunRecord], shown: &[(TaskRunId, TaskEndingClass)]) -> bool {
     let mut changed = false;
     for (run, class) in shown {
@@ -746,13 +857,13 @@ struct State {
     /// already rendered, oldest first (issue #671, ticket #672). Insertion
     /// order is what [`ChainRecords::record_rendered`]'s bound evicts from.
     rendered: HashMap<String, Vec<String>>,
-    /// card_message_id → the synthetic keys a recoverably-failed body still owes
-    /// the durable Record, waiting on the Pending Card Update payload at
-    /// [`OwedRendered::seq`] (issue #671, ticket #672). In-memory only, and held
-    /// here rather than on an accumulator on purpose: a card's accumulator can be
-    /// replaced, removed or re-keyed between the failure and the delivery, and
-    /// the keys are this fact's only copy. Keyed by the card, whose id is stable
-    /// across all of that; the Session id it names is corrected by
+    /// card_message_id → the endings a recoverably-failed body still owes the
+    /// durable Record, waiting on the Pending Card Update payload at
+    /// [`OwedRendered::seq`] (ADR-0080). In-memory only, and held here rather
+    /// than on an accumulator on purpose: a card's accumulator can be replaced,
+    /// removed or re-keyed between the failure and the delivery, and the pairs
+    /// are this fact's only copy. Keyed by the card, whose id is stable across
+    /// all of that; the Session id it names is corrected by
     /// [`ChainRecords::rename`].
     owed: HashMap<String, OwedRendered>,
     /// A recreated Session's OLD id → its new one (issue #671, ticket #672):
@@ -954,10 +1065,10 @@ impl ChainRecords {
     /// clear) — in the SAME record write as the re-point. The projection's
     /// landing paths use this so a crash can never leave the record naming a
     /// target the landing just refused; the ladder's bounded fall-through
-    /// stays as defense in depth for records older builds wrote. `rendered` is
-    /// the delivered body's synthetic rendered keys (issue #671, ticket #672):
-    /// they ride this same write, so a takeover whose staged cursor was evicted
-    /// can never leave the mark apart from the re-point.
+    /// stays as defense in depth for records older builds wrote. `shown` is
+    /// the delivered body's endings (ADR-0080): they ride this same write, so a
+    /// takeover whose staged cursor was evicted can never leave the shown bit
+    /// apart from the re-point.
     #[allow(clippy::too_many_arguments)] // the re-point's whole fixture
     pub(crate) fn track_landing(
         &self,
@@ -967,7 +1078,7 @@ impl ChainRecords {
         created_ms: Option<i64>,
         directory: Option<&str>,
         reply_to: Option<&str>,
-        rendered: &[String],
+        shown: &[EndingKey],
     ) -> Option<ChainRecord> {
         self.track_with(
             session_id,
@@ -976,15 +1087,15 @@ impl ChainRecords {
             created_ms,
             directory,
             ReplyToUpdate::Set(reply_to),
-            rendered,
+            shown,
         )
     }
 
     /// [`Self::track_landing`] for a continuation whose reply target follows
     /// [`Self::track`]'s known-or-carry rule, carrying the delivered body's
-    /// rendered keys in the SAME write (issue #671, ticket #672): a continuation
-    /// create whose staged cursor was evicted still marks what its create
-    /// delivered, atomically with the re-point.
+    /// endings in the SAME write (ADR-0080): a continuation create whose staged
+    /// cursor was evicted still shows what its create delivered, atomically
+    /// with the re-point.
     #[allow(clippy::too_many_arguments)] // the re-point's whole fixture
     pub(crate) fn track_carrying_rendered(
         &self,
@@ -994,7 +1105,7 @@ impl ChainRecords {
         created_ms: Option<i64>,
         directory: Option<&str>,
         reply_to: Option<&str>,
-        rendered: &[String],
+        shown: &[EndingKey],
     ) -> Option<ChainRecord> {
         self.track_with(
             session_id,
@@ -1003,7 +1114,7 @@ impl ChainRecords {
             created_ms,
             directory,
             known_or_carry(reply_to),
-            rendered,
+            shown,
         )
     }
 
@@ -1016,7 +1127,7 @@ impl ChainRecords {
         created_ms: Option<i64>,
         directory: Option<&str>,
         reply_to: ReplyToUpdate<'_>,
-        rendered: &[String],
+        shown: &[EndingKey],
     ) -> Option<ChainRecord> {
         let mut state = self.lock();
         // A re-point within the chain carries the Rendered Cursor (spec #561):
@@ -1045,10 +1156,10 @@ impl ChainRecords {
             record.projection_intent = previous.projection_intent;
         }
         state.records.insert(session_id.to_string(), record);
-        // The delivered body's rendered keys ride this SAME write (issue #671,
-        // ticket #672): a crash must never leave the mark apart from the re-point
-        // that confirmed it.
-        push_rendered_marks(&mut state, session_id, rendered);
+        // The delivered body's endings ride this SAME write (ADR-0080): a crash
+        // must never leave a shown bit apart from the re-point that confirmed
+        // it.
+        push_shown(&mut state, session_id, shown);
         self.write(&state);
         previous
     }
@@ -1136,7 +1247,7 @@ impl ChainRecords {
         reply_to: Option<&str>,
         cursor: &RenderedCursor,
         gap: Option<(&CursorFrontier, bool)>,
-        rendered: &[String],
+        shown: &[EndingKey],
     ) -> Option<ChainRecord> {
         self.track_carrying_cursor_with(
             session_id,
@@ -1147,7 +1258,7 @@ impl ChainRecords {
             known_or_carry(reply_to),
             cursor,
             gap,
-            rendered,
+            shown,
         )
     }
 
@@ -1165,7 +1276,7 @@ impl ChainRecords {
         reply_to: Option<&str>,
         cursor: &RenderedCursor,
         gap: Option<(&CursorFrontier, bool)>,
-        rendered: &[String],
+        shown: &[EndingKey],
     ) -> Option<ChainRecord> {
         self.track_carrying_cursor_with(
             session_id,
@@ -1176,7 +1287,7 @@ impl ChainRecords {
             ReplyToUpdate::Set(reply_to),
             cursor,
             gap,
-            rendered,
+            shown,
         )
     }
 
@@ -1191,7 +1302,7 @@ impl ChainRecords {
         reply_to: ReplyToUpdate<'_>,
         cursor: &RenderedCursor,
         gap: Option<(&CursorFrontier, bool)>,
-        rendered: &[String],
+        shown: &[EndingKey],
     ) -> Option<ChainRecord> {
         let mut state = self.lock();
         let previous = state.records.get(session_id).cloned();
@@ -1219,11 +1330,10 @@ impl ChainRecords {
             _ => {}
         }
         state.records.insert(session_id.to_string(), record);
-        // The synthetic entries this landed body carried leave their durable
-        // marks in the SAME write as the re-point (issue #671, ticket #672): a
-        // crash between two writes could drop the mark and let the entry replay
-        // on a later card.
-        push_rendered_marks(&mut state, session_id, rendered);
+        // The entries this landed body carried leave their shown bits in the
+        // SAME write as the re-point (ADR-0080): a crash between two writes
+        // could drop the bit and let the entry replay on a later card.
+        push_shown(&mut state, session_id, shown);
         self.write(&state);
         previous
     }
@@ -1364,7 +1474,7 @@ impl ChainRecords {
         card_message_id: &str,
         cursor: &RenderedCursor,
         gap: Option<(&CursorFrontier, bool)>,
-        rendered: &[String],
+        shown: &[EndingKey],
     ) {
         let mut state = self.lock();
         let mut cursor_change = false;
@@ -1397,12 +1507,12 @@ impl ChainRecords {
             // record, like the Wake Watermark.
             _ => {}
         }
-        // The body's synthetic completion entries ride the SAME write as the
-        // cursor and the gap it confirmed (issue #671, ticket #672): a crash
-        // between two writes would leave the card having shown the entry with
-        // no durable mark, and a restart would re-post it.
-        let rendered_change = push_rendered_marks(&mut state, session_id, rendered);
-        if !cursor_change && !rendered_change {
+        // The body's completion entries ride the SAME write as the cursor and
+        // the gap it confirmed (ADR-0080): a crash between two writes would
+        // leave the card having shown the entry with its bit still owed, and a
+        // restart would re-post it.
+        let shown_change = push_shown(&mut state, session_id, shown);
+        if !cursor_change && !shown_change {
             return;
         }
         self.write(&state);
@@ -1568,17 +1678,13 @@ impl ChainRecords {
     /// Record the synthetic completion entries a delivered card write carried
     /// for `session_id` (issue #671, ticket #672): the announce keys
     /// (`ended:<call_id>` / `cleanup:<call_id>`) whose
-    /// `🔔 … 结束 / 已失联 / 已清理` entry a card has really shown. Idempotent, append-only, and bounded
-    /// ([`MAX_RENDERED_KEYS`]). Deliberately NOT the Wake Watermark: a
-    /// retirement recorded here never moves the floor a late Wake is judged
-    /// against (#590, PR #595).
+    /// `🔔 … 结束 / 已失联 / 已清理` entry a card has really shown.
     ///
-    /// The delivered body's keys normally ride [`Self::advance_cursor_and_gap`]
-    /// / [`Self::track_carrying_cursor`], so they land in the SAME record write
-    /// as the cursor they were confirmed with (spec #561, review #569; issue
-    /// #671). This plain form serves the one landed body with no record write
-    /// to ride — a projection takeover whose armed session a fresh Turn
-    /// replaced — and the unit tests.
+    /// **Legacy (ADR-0080).** Superseded by the ending's shown bit
+    /// ([`Self::record_shown`]); kept — with the section and its load-time
+    /// translation — until the shrinkage slice (#703) deletes them all. The
+    /// unit tests still exercise the round-trip.
+    #[allow(dead_code)]
     pub(crate) fn record_rendered(&self, session_id: &str, keys: &[String]) {
         let mut state = self.lock();
         if push_rendered_marks(&mut state, session_id, keys) {
@@ -1586,9 +1692,28 @@ impl ChainRecords {
         }
     }
 
+    /// Record the endings a DELIVERED card write carried, for the one landed
+    /// body with no record write to ride (ADR-0080) — a projection takeover
+    /// whose armed session a fresh Turn replaced meanwhile. The delivered
+    /// body's endings normally ride [`Self::advance_cursor_and_gap`] /
+    /// [`Self::track_carrying_cursor`], so they land in the SAME write as the
+    /// cursor they were confirmed with; this plain form is that path's
+    /// fallback, session-scoped like the endings themselves. Returns whether
+    /// anything changed.
+    pub(crate) fn record_shown(&self, session_id: &str, shown: &[EndingKey]) -> bool {
+        let mut state = self.lock();
+        if push_shown(&mut state, session_id, shown) {
+            self.write(&state);
+            return true;
+        }
+        false
+    }
+
     /// The synthetic completion keys `session_id`'s cards have already
-    /// rendered, for the render's own gate (issue #671, ticket #672). A
-    /// session that rendered nothing answers empty.
+    /// rendered (issue #671, ticket #672). **Legacy (ADR-0080)**: the live
+    /// gates read the endings' shown bits, and the shrinkage slice (#703)
+    /// deletes this with the section.
+    #[allow(dead_code)]
     pub(crate) fn rendered(&self, session_id: &str) -> Vec<String> {
         let state = self.lock();
         let session_id = resolved_session(&state, session_id);
@@ -1605,9 +1730,6 @@ impl ChainRecords {
     /// record. One synchronous Chain Record write at derivation, the fact about
     /// the run rather than about the card that will show it. Returns whether the
     /// section changed.
-    // No production path writes or reads the endings section yet (spec #699,
-    // slice 1; ADR-0080) — its later slices (#701-#704) call this.
-    #[allow(dead_code)]
     pub(crate) fn record_ending(&self, session_id: &str, run: &TaskRunId, ending: TaskEnding) -> bool {
         let mut state = self.lock();
         let session_id = resolved_session(&state, session_id);
@@ -1623,9 +1745,9 @@ impl ChainRecords {
     /// (ADR-0080), the confirmed card write's own half: a PATCH `Ok`, a create
     /// `Ok`, or a queued payload the drain delivered. Monotonic and additive, so
     /// an older confirmation can never clear a newer shown bit. Returns whether
-    /// the section changed.
-    // No production path writes or reads the endings section yet (spec #699,
-    // slice 1; ADR-0080) — its later slices (#701-#704) call this.
+    /// the section changed. The confirmed-write paths flip bits through
+    /// [`Self::advance_cursor_and_gap`] / [`Self::record_shown`] and the
+    /// `track_*` re-points; this is the store's own seam beside them.
     #[allow(dead_code)]
     pub(crate) fn mark_endings_shown(
         &self,
@@ -1647,9 +1769,6 @@ impl ChainRecords {
     /// `session_id`'s run records, oldest first (ADR-0080) — the one read every
     /// ending consumer goes through. A session that recorded no ending answers
     /// empty.
-    // No production path writes or reads the endings section yet (spec #699,
-    // slice 1; ADR-0080) — its later slices (#701-#704) call this.
-    #[allow(dead_code)]
     pub(crate) fn endings(&self, session_id: &str) -> Vec<TaskRunRecord> {
         let state = self.lock();
         let session_id = resolved_session(&state, session_id);
@@ -1660,9 +1779,8 @@ impl ChainRecords {
     /// (ADR-0080) — the exactly-once read the retirement's dedup and the Wake
     /// gate ask. The run resolves by the alias order, so a caller holding any
     /// spelling of it asks the same question; an owed or surrendered entry, and
-    /// a run the section does not know, answer `false`.
-    // No production path writes or reads the endings section yet (spec #699,
-    // slice 1; ADR-0080) — its later slices (#701-#704) call this.
+    /// a run the section does not know, answer `false`. The render reads the
+    /// same fact through [`EndingFacts`]; this is the store's own seam.
     #[allow(dead_code)]
     pub(crate) fn ending_shown(&self, session_id: &str, run: &TaskRunId, class: TaskEndingClass) -> bool {
         let state = self.lock();
@@ -1679,23 +1797,22 @@ impl ChainRecords {
             .any(|ending| ending.class == class && ending.state == TaskEndingState::Shown)
     }
 
-    /// Remember the synthetic keys a recoverably-failed body owes the durable
-    /// Record, tied to the Pending Card Update payload at `seq` (issue #671,
-    /// ticket #672). Held here, keyed by the CARD — whose id is stable across a
-    /// Session's replace, remove or re-key — so no card-accumulator lifecycle
-    /// can drop the keys, which are this fact's only copy. A newer failure for
-    /// the same card supersedes the older entry, exactly as the delivery layer
-    /// supersedes its payload. In-memory only: a restart that loses it lets the
-    /// entry re-render once, the same duplicate-over-loss trade the rendered
-    /// marks' own bound makes.
+    /// Remember the endings a recoverably-failed body owes the durable Record,
+    /// tied to the Pending Card Update payload at `seq` (ADR-0080). Held here,
+    /// keyed by the CARD — whose id is stable across a Session's replace, remove
+    /// or re-key — so no card-accumulator lifecycle can drop the pair, which is
+    /// this fact's only copy. A newer failure for the same card supersedes the
+    /// older entry, exactly as the delivery layer supersedes its payload.
+    /// In-memory only: a restart that loses it lets the entry re-render once,
+    /// the same duplicate-over-loss trade the bound makes.
     pub(crate) fn note_owed_rendered(
         &self,
         card_message_id: &str,
         session_id: &str,
         seq: u64,
-        rendered: &[String],
+        shown: &[EndingKey],
     ) {
-        if rendered.is_empty() {
+        if shown.is_empty() {
             return;
         }
         self.lock().owed.insert(
@@ -1703,13 +1820,13 @@ impl ChainRecords {
             OwedRendered {
                 session_id: session_id.to_string(),
                 seq,
-                rendered: rendered.to_vec(),
+                shown: shown.to_vec(),
             },
         );
     }
 
-    /// Every card's owed rendered keys, with the Session they belong to and the
-    /// sequence whose delivery records them (issue #671, ticket #672).
+    /// Every card's owed endings, with the Session they belong to and the
+    /// sequence whose delivery records them (ADR-0080).
     pub(crate) fn owed_rendered(&self) -> Vec<(String, OwedRendered)> {
         self.lock()
             .owed
@@ -1718,10 +1835,31 @@ impl ChainRecords {
             .collect()
     }
 
-    /// `session_id`'s recorded marks together with its owed mirrors, read under
-    /// ONE lock (issue #671, ticket #672): a commit's snapshot must not mix a
-    /// mark and an owed entry from two instants, or a concurrent accepted write
-    /// could slip between the two reads and be missed by both.
+    /// `session_id`'s run records together with its owed mirrors, read under ONE
+    /// lock (ADR-0080): a commit's snapshot must not mix a record and an owed
+    /// entry from two instants, or a concurrent accepted write could slip
+    /// between the two reads and be missed by both.
+    pub(crate) fn endings_and_owed(
+        &self,
+        session_id: &str,
+    ) -> (Vec<TaskRunRecord>, Vec<(String, OwedRendered)>) {
+        let state = self.lock();
+        let session = resolved_session(&state, session_id);
+        let records = state.endings.get(&session).cloned().unwrap_or_default();
+        let owed = state
+            .owed
+            .iter()
+            .filter(|(_, owed)| owed.session_id == session)
+            .map(|(card, owed)| (card.clone(), owed.clone()))
+            .collect();
+        (records, owed)
+    }
+
+    /// `session_id`'s durable marks together with its owed mirrors, read under
+    /// ONE lock (issue #671, ticket #672). **Legacy (ADR-0080)**:
+    /// [`Self::endings_and_owed`] is the snapshot the live gates read; the
+    /// shrinkage slice (#703) deletes this with the section.
+    #[allow(dead_code)]
     pub(crate) fn marks_and_owed(&self, session_id: &str) -> (Vec<String>, Vec<(String, OwedRendered)>) {
         let state = self.lock();
         let session = resolved_session(&state, session_id);
@@ -1750,27 +1888,27 @@ impl ChainRecords {
         }
     }
 
-    /// The payload at `seq` for `card_message_id` delivered: record its owed
-    /// keys as that Session's durable rendered marks AND drop the mirror, in ONE
-    /// chains critical section and write — so a [`Self::rename`] racing the
-    /// delivery can neither move the entry out from under the write nor leave it
-    /// cleared without its mark (issue #671, ticket #672). Returns the Session
-    /// and the keys, for the caller's live-gate insert; `None` when no entry
-    /// matches `seq` (a newer failure replaced it, or it was already settled).
+    /// The payload at `seq` for `card_message_id` delivered: flip its owed
+    /// endings' shown bits AND drop the mirror, in ONE chains critical section
+    /// and write — so a [`Self::rename`] racing the delivery can neither move
+    /// the entry out from under the write nor leave it cleared without its bit
+    /// (ADR-0080). Returns the Session and the pairs, for the caller's
+    /// live-gate insert; `None` when no entry matches `seq` (a newer failure
+    /// replaced it, or it was already settled).
     pub(crate) fn confirm_owed_rendered(
         &self,
         card_message_id: &str,
         seq: u64,
-    ) -> Option<(String, Vec<String>)> {
+    ) -> Option<(String, Vec<EndingKey>)> {
         let mut state = self.lock();
         if state.owed.get(card_message_id).is_none_or(|owed| owed.seq != seq) {
             return None;
         }
         let owed = state.owed.remove(card_message_id).expect("checked above");
-        if push_rendered_marks(&mut state, &owed.session_id, &owed.rendered) {
+        if push_shown(&mut state, &owed.session_id, &owed.shown) {
             self.write(&state);
         }
-        Some((owed.session_id, owed.rendered))
+        Some((owed.session_id, owed.shown))
     }
 
     /// Persist both sections through the shared sidecar writer. The file is
@@ -2597,21 +2735,28 @@ mod tests {
         );
     }
 
-    /// Issue #671 / ticket #672 (CI gate): the owed rendered mirror is keyed by
-    /// the CARD — whose id is stable across a Session's replace, remove and
-    /// re-key — so nothing about a card accumulator can drop it; a newer failure
-    /// for the same card supersedes the older entry, a rename re-keys the
-    /// Session it names, and an exact clear (not a stale one) drops it.
+    /// ADR-0080 (CI gate): the owed mirror is keyed by the CARD — whose id is
+    /// stable across a Session's replace, remove and re-key — so nothing about a
+    /// card accumulator can drop it; a newer failure for the same card supersedes
+    /// the older entry, a rename re-keys the Session it names, and an exact clear
+    /// (not a stale one) drops it. A delivery the drain confirms flips the
+    /// ending's shown bit under the RECREATED id, never the dead one.
     #[test]
-    fn owed_rendered_marks_are_card_keyed_and_follow_a_rename() {
+    fn owed_endings_are_card_keyed_and_follow_a_rename() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(FILE);
         let chains = ChainRecords::load(path.clone());
+        let delivered = staged("call_1", TaskEndingClass::Evidence);
+        let superseded = staged("call_3", TaskEndingClass::Evidence);
+        let confirmed = staged("call_4", TaskEndingClass::Evidence);
+        for (run, class) in [&delivered, &superseded, &confirmed] {
+            chains.record_ending("ses_1", run, TaskEnding::owed(*class, identity("a command")));
+        }
 
-        chains.note_owed_rendered("om_a", "ses_1", 3, &["runtime:call_1".to_string()]);
-        chains.note_owed_rendered("om_b", "ses_1", 4, &["runtime:call_2".to_string()]);
+        chains.note_owed_rendered("om_a", "ses_1", 3, std::slice::from_ref(&delivered));
+        chains.note_owed_rendered("om_b", "ses_1", 4, &[staged("call_2", TaskEndingClass::Evidence)]);
         // A newer failure for the same card supersedes the older entry.
-        chains.note_owed_rendered("om_a", "ses_1", 9, &["runtime:call_3".to_string()]);
+        chains.note_owed_rendered("om_a", "ses_1", 9, std::slice::from_ref(&superseded));
         let mut owed = chains.owed_rendered();
         owed.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(owed.len(), 2);
@@ -2622,7 +2767,7 @@ mod tests {
                 OwedRendered {
                     session_id: "ses_1".to_string(),
                     seq: 9,
-                    rendered: vec!["runtime:call_3".to_string()],
+                    shown: vec![superseded.clone()],
                 }
             ),
             "a newer failure for the same card replaces the older entry"
@@ -2638,15 +2783,11 @@ mod tests {
             "a recreated Session id moves the owed mirror with it"
         );
         // A writer that captured the OLD id — a PATCH accepted after the rename —
-        // records under the recreated Session, never the dead one.
-        chains.record_rendered("ses_1", &["runtime:call_late".to_string()]);
+        // flips the bit under the recreated Session, never the dead one.
+        chains.record_shown("ses_1", std::slice::from_ref(&delivered));
         assert!(
-            chains
-                .rendered("ses_2")
-                .iter()
-                .any(|key| key == "runtime:call_late"),
-            "a stale id resolves through the rename: {:?}",
-            chains.rendered("ses_2")
+            chains.ending_shown("ses_2", &delivered.0, TaskEndingClass::Evidence),
+            "a stale id resolves through the rename"
         );
 
         // A stale clear is a no-op; the exact sequence drops the entry.
@@ -2655,19 +2796,18 @@ mod tests {
         chains.clear_owed_rendered("om_a", 9);
         assert!(!chains.owed_rendered().iter().any(|(card, _)| card == "om_a"));
 
-        // A delivery confirmed AFTER a rename records under the NEW id and
+        // A delivery confirmed AFTER a rename flips the bit under the NEW id and
         // drops the mirror, in one operation (a rename can never split the two).
-        chains.note_owed_rendered("om_c", "ses_2", 5, &["runtime:call_4".to_string()]);
+        chains.note_owed_rendered("om_c", "ses_2", 5, std::slice::from_ref(&confirmed));
         chains.rename("ses_2", "ses_3");
-        let (session, keys) = chains
+        let (session, shown) = chains
             .confirm_owed_rendered("om_c", 5)
             .expect("the owed entry confirms");
         assert_eq!(session, "ses_3", "the delivery honors the rename");
-        assert_eq!(keys, vec!["runtime:call_4".to_string()]);
-        assert_eq!(
-            chains.rendered("ses_3"),
-            vec!["runtime:call_late".to_string(), "runtime:call_4".to_string()],
-            "both marks land under the recreated id"
+        assert_eq!(shown, vec![confirmed.clone()]);
+        assert!(
+            chains.ending_shown("ses_3", &confirmed.0, TaskEndingClass::Evidence),
+            "the delivered ending's bit lands under the recreated id"
         );
         assert!(!chains.owed_rendered().iter().any(|(card, _)| card == "om_c"));
 
@@ -2709,12 +2849,13 @@ mod tests {
         assert!(reloaded.rendered("ses_old").is_empty());
     }
 
-    /// Issue #671 / ticket #672: a confirmed body's synthetic completion keys
-    /// become durable marks in the SAME write as its cursor — and they still
-    /// land when the record no longer names that card, because the mark is
-    /// session-scoped while the cursor is record-scoped.
+    /// ADR-0080: a confirmed body flips its endings' shown bits in the SAME
+    /// write as its cursor — and they still land when the record no longer names
+    /// that card, because the bit is session-scoped while the cursor is
+    /// record-scoped. A run the section does not know is a no-op: a confirmation
+    /// never mints a record.
     #[test]
-    fn a_confirmed_body_records_its_rendered_marks() {
+    fn a_confirmed_body_flips_its_endings_shown_bits() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(FILE);
         let chains = ChainRecords::load(path.clone());
@@ -2726,35 +2867,40 @@ mod tests {
             None,
             None,
         );
+        let one = staged("call_1", TaskEndingClass::Evidence);
+        let two = staged("call_2", TaskEndingClass::Evidence);
+        chains.record_ending("ses_a", &one.0, TaskEnding::owed(one.1, identity("one")));
+        chains.record_ending("ses_a", &two.0, TaskEnding::owed(two.1, identity("two")));
 
         chains.advance_cursor_and_gap(
             "ses_a",
             "om_card_1",
             &RenderedCursor::default(),
             None,
-            &["runtime:call_1".to_string()],
+            std::slice::from_ref(&one),
         );
-        assert_eq!(
-            ChainRecords::load(path.clone()).rendered("ses_a"),
-            vec!["runtime:call_1".to_string()],
-            "the confirmed body's key persists with its cursor"
+        assert!(
+            ChainRecords::load(path.clone()).ending_shown("ses_a", &one.0, TaskEndingClass::Evidence),
+            "the confirmed body's ending persists shown with its cursor"
         );
 
         // A confirmation for a record that moved on drops the cursor advance
-        // (it is record-scoped) but still records the mark.
+        // (it is record-scoped) but still flips the bit.
         chains.release("ses_a");
         chains.advance_cursor_and_gap(
             "ses_a",
             "om_card_1",
             &RenderedCursor::default(),
             None,
-            &["runtime:call_2".to_string()],
+            std::slice::from_ref(&two),
         );
-        assert_eq!(
-            ChainRecords::load(path).rendered("ses_a"),
-            vec!["runtime:call_1".to_string(), "runtime:call_2".to_string()],
-            "the session-scoped mark survives the record's release"
+        assert!(
+            ChainRecords::load(path).ending_shown("ses_a", &two.0, TaskEndingClass::Evidence),
+            "the session-scoped shown bit survives the record's release"
         );
+
+        // A confirmation naming a run the section does not know flips nothing.
+        assert!(!chains.mark_endings_shown("ses_a", &[staged("call_unknown", TaskEndingClass::Evidence)]));
     }
 
     /// ADR-0069's migration: without `chain_records.json`, the legacy sidecars
@@ -3281,6 +3427,12 @@ mod tests {
             state: Some("completed".into()),
             label: None,
         }
+    }
+
+    /// One delivered body's staged ending (ADR-0080): the launch's run plus the
+    /// class whose entry that body rendered.
+    fn staged(call_id: &str, class: TaskEndingClass) -> EndingKey {
+        (TaskRunId::of_launch(&launch(call_id, None, None)), class)
     }
 
     fn classes(record: &TaskRunRecord) -> Vec<TaskEndingClass> {

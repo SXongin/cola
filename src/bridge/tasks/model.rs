@@ -9,7 +9,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::backend::{BackgroundTask, ShellOutputWindow, ToolIdentity, Wake};
+use crate::backend::{BackgroundTask, ShellOutputWindow, ToolIdentity, Wake, WakeSource};
 use crate::bridge::chain::TaskRunIdentity;
 use crate::feishu::card::tool_render::TaskLiveness;
 
@@ -220,9 +220,6 @@ impl TaskRunId {
     /// The run a read that carries the LAUNCH names (ADR-0080): the launch's
     /// own tool call id is the stored key — the one id every writer of that
     /// read agrees on — and the ids it carries ride along as aliases.
-    // `#[allow(dead_code)]`: nothing derives an ending yet in this slice (spec
-    // #699, slice 1) — the recording writers (#701/#702) resolve runs with this.
-    #[allow(dead_code)]
     pub(crate) fn of_launch(task: &BackgroundTask) -> Self {
         let call_id = task.tool.call_id.clone();
         Self {
@@ -238,9 +235,6 @@ impl TaskRunId {
     /// else the job it reports, else the child session — keyed by that same id.
     /// `None` when the Wake names nothing at all: the identity is never
     /// invented.
-    // `#[allow(dead_code)]`: nothing derives an ending yet in this slice (spec
-    // #699, slice 1) — the Wake path (#702) names its run with this.
-    #[allow(dead_code)]
     pub(crate) fn of_wake(wake: &Wake) -> Option<Self> {
         let key = wake
             .shell_id
@@ -303,6 +297,26 @@ pub(crate) fn identity_of_task(task: &BackgroundTask, input: Option<&serde_json:
         child_id: task.child_id.clone(),
         started_at: task.started_at,
         label: task_label(task_kind(&tool), input),
+    }
+}
+
+/// The identity a run's **Wake** ending is recorded with when the read no longer
+/// carries the launch (ADR-0080): what the Wake itself names — the tool its
+/// source implies, the shell/child id, and the label its own text carried. The
+/// call id stays `None`: a Wake never carried one, and the record's stored key
+/// (the shell/child id it reports) stands in for it.
+pub(crate) fn identity_of_wake(wake: &Wake) -> TaskRunIdentity {
+    let tool = match wake.source {
+        WakeSource::Subagent => "subagent",
+        _ => "shell",
+    };
+    TaskRunIdentity {
+        tool: Some(tool.to_string()),
+        call_id: None,
+        shell_id: wake.shell_id.clone(),
+        child_id: wake.child_id.clone(),
+        started_at: None,
+        label: wake.label.clone().filter(|label| !label.trim().is_empty()),
     }
 }
 

@@ -9,9 +9,10 @@
 
 use super::disposition::Disposition;
 use crate::backend::{FileContent, MessageId, Part, PromptSkill, SessionTranscript, ToolCall, TurnAnchor};
-use crate::bridge::chain::{CursorFrontier, CursorPartKind, RenderedCursor};
+use crate::bridge::chain::{CursorFrontier, CursorPartKind, EndingKey, RenderedCursor, TaskEndingClass};
 use crate::bridge::handles::CardsHandle;
 use crate::bridge::tasks::TaskCell;
+use crate::bridge::tasks::model::TaskRunId;
 use crate::feishu::card::first_n_chars_bytes;
 use crate::feishu::card::ledger::{TaskCompletionEntry, TaskKind, TaskLedgerRow};
 use crate::feishu::card::shell::CardBuilder;
@@ -454,12 +455,14 @@ pub(super) enum TimelineKind {
     /// identity and timing in the fold. Keyed at the Wake's own server time,
     /// so the entry sits where the completion happened — never on a later
     /// card, and never doubled by a repeated poll. The second field is the
-    /// entry's SYNTHETIC announce key (issue #671, ticket #672), `None` for a
-    /// real Wake — whose exactly-once is the durable Wake Watermark (ADR-0061),
-    /// not a rendered mark. The body that renders a keyed entry carries the key
-    /// to its durable rendered mark, so a body that leaves the entry to a
-    /// continuation claims nothing for it.
-    LedgerEntry(TaskCompletionEntry, Option<String>),
+    /// **Task Ending** this entry renders (ADR-0080) — the run and the class
+    /// whose shown bit this body's confirmed write flips, `None` for an entry
+    /// whose read carried no identity to name. The body that renders an ending
+    /// stages it, so a body that leaves the entry to a continuation claims
+    /// nothing for it.
+    // Boxed: the ending pair is large and this variant is the rarest in the
+    // timeline, so the box keeps the enum (and the timeline it fills) small.
+    LedgerEntry(TaskCompletionEntry, Option<Box<EndingKey>>),
 }
 
 /// A card as built for one message: the JSON, whether the timeline had to
@@ -478,11 +481,11 @@ pub(super) struct BuiltCard {
     /// How far this body carries the chain's pending orphan gap (spec #561,
     /// review #569), when one is owed and the body rendered any of it.
     pub(super) gap: Option<GapCoverage>,
-    /// The announce keys of the ledger entries THIS body rendered (issue #671,
-    /// ticket #672): exactly the entries whose durable rendered mark this
-    /// delivered body may claim — a split's prefix carries only its own, and
-    /// the continuation carries the rest.
-    pub(super) rendered_keys: Vec<String>,
+    /// The Task Endings of the ledger entries THIS body rendered (ADR-0080):
+    /// exactly the entries whose shown bits this delivered body may flip — a
+    /// split's prefix carries only its own, and the continuation carries the
+    /// rest.
+    pub(super) rendered_keys: Vec<EndingKey>,
 }
 
 /// How far ONE built card body carries the chain's pending orphan gap (spec
@@ -944,9 +947,9 @@ pub(super) use crate::bridge::tasks::model::{LedgerCadence, LedgerChange};
 /// delayed confirmation still needs. Real interleavings hold two; the cap only
 /// bounds a pathological pile-up (every stage resolves on its own write's
 /// outcome or the next drain). An evicted stage loses only its cursor and gap:
-/// an accepted write records its rendered keys the moment it is accepted (issue
-/// #671, ticket #672) and a recoverably-failed body's are mirrored on the Chain
-/// Records, so the cap can never drop the mark.
+/// an accepted write flips its endings' shown bits the moment it is accepted
+/// (ADR-0080) and a recoverably-failed body's are mirrored on the Chain Records,
+/// so the cap can never drop the fact.
 const MAX_STAGED_CURSORS: usize = 4;
 
 /// The most staged Wake Watermarks one accumulator retains (spec #561, review
@@ -976,21 +979,19 @@ pub(super) struct StagedCursor {
     /// review #569), captured per built body: the confirmation persists the
     /// advance, and clears the durable gap only when the body reached its end.
     pub(super) gap: Option<GapCoverage>,
-    /// The synthetic completion announce keys THIS body rendered (issue #671,
-    /// ticket #672): the `ended:<call_id>` / `cleanup:<call_id>` entries of its
-    /// own timeline range.
-    /// The confirmation persists them as the session's durable rendered marks —
-    /// so a retirement a delivered card really showed never re-renders on a
-    /// later card — and a stage that is discarded or never delivers records
-    /// nothing, leaving the entry to the next card that can carry it. They ride
-    /// the cursor stage on purpose: that stage is the machinery that already
-    /// distinguishes a DELIVERED write from an owed or refused one (spec #561,
-    /// review #569), including the later delivery of a queued payload. They are
-    /// not the mark's only copy, though: an accepted write records the keys the
-    /// moment it is accepted and a recoverably-failed body's are mirrored on the
-    /// Chain Records, so eviction or a cancelled confirmation can only lose the
-    /// cursor, never the mark.
-    pub(super) rendered: Vec<String>,
+    /// The Task Endings THIS body rendered (ADR-0080): the completion entries
+    /// of its own timeline range.
+    /// The confirmation flips their shown bits — so a retirement a delivered
+    /// card really showed never re-renders on a later card — and a stage that
+    /// is discarded or never delivers records nothing, leaving the entry to the
+    /// next card that can carry it. They ride the cursor stage on purpose: that
+    /// stage is the machinery that already distinguishes a DELIVERED write from
+    /// an owed or refused one (spec #561, review #569), including the later
+    /// delivery of a queued payload. They are not the fact's only copy, though:
+    /// an accepted write flips the bits the moment it is accepted and a
+    /// recoverably-failed body's are mirrored on the Chain Records, so eviction
+    /// or a cancelled confirmation can only lose the cursor, never the bit.
+    pub(super) rendered: Vec<EndingKey>,
 }
 
 impl StagedCursor {
@@ -1018,17 +1019,17 @@ pub(crate) struct StagedCursorId {
 
 /// What a confirmed stage hands back for the durable record (spec #561; issue
 /// #671): the body's cursor, how far it carried the chain's orphan gap, and the
-/// synthetic completion announce keys its timeline showed — the three facts
-/// that must land in ONE Chain Record write, so no crash can leave the card
-/// having shown content the durable record does not know about. A SUPERSEDED
-/// stage (a newer confirmation already won) hands back the base's own cursor —
-/// writing it is a no-op — and no gap, so its delivered keys still ride that
-/// same single write.
+/// Task Endings its timeline showed — the three facts that must land in ONE
+/// Chain Record write, so no crash can leave the card having shown content the
+/// durable record does not know about. A SUPERSEDED stage (a newer confirmation
+/// already won) hands back the base's own cursor — writing it is a no-op — and
+/// no gap, so its delivered endings still flip their bits in that same single
+/// write.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ConfirmedBody {
     pub(super) cursor: RenderedCursor,
     pub(super) gap: Option<GapCoverage>,
-    pub(super) rendered: Vec<String>,
+    pub(super) rendered: Vec<EndingKey>,
 }
 
 /// The Wake Watermark staged for the card body about to be written (ADR-0061):
@@ -2285,14 +2286,34 @@ impl StreamAccumulator {
 
     /// Whether an earlier card of this Session already rendered this synthetic
     /// retirement's entry — the durable mark the render's gate consults beside
-    /// [`Self::wake_announced`] (issue #671, ticket #672). Read-only: the plan
-    /// runs before the commit that announces, so it must not mutate.
+    /// [`Self::wake_announced`] (issue #671, ticket #672).
+    ///
+    /// **Legacy (ADR-0080)**: the live gates read the endings' shown bits
+    /// ([`crate::bridge::chain::EndingFacts`]); this and the seeded mark set
+    /// exist only until the shrinkage slice (#703) deletes them with the
+    /// `rendered` section.
+    #[allow(dead_code)]
     pub(super) fn render_recorded(&self, key: &str) -> bool {
         self.tasks.render_recorded(key)
     }
 
-    /// Seed the durable rendered marks of the session's earlier cards (empty
-    /// for a session that rendered no retirement).
+    /// Whether `run`'s ending of `class` already had its entry placed on this
+    /// chain (ADR-0080): the in-life exactly-once gate the plan reads beside the
+    /// durable shown bit.
+    pub(super) fn ending_announced(&self, run: &TaskRunId, class: TaskEndingClass) -> bool {
+        self.tasks.ending_announced(run, class)
+    }
+
+    /// Whether ANY class of `run`'s ending already had its entry placed on this
+    /// chain (ADR-0080): one entry per run, whatever class wrote it.
+    pub(super) fn ending_announced_any(&self, run: &TaskRunId) -> bool {
+        self.tasks.ending_announced_any(run)
+    }
+
+    /// Seed the legacy rendered marks of the session's earlier cards (empty for
+    /// a session that rendered no retirement). **Legacy (ADR-0080)**: the live
+    /// gates read the endings' shown bits; the shrinkage slice (#703) deletes
+    /// this set with its readers.
     pub(super) fn set_render_marks(&mut self, marks: Vec<String>) {
         self.tasks.set_render_marks(marks);
     }
@@ -2581,24 +2602,6 @@ impl StreamAccumulator {
         self.tasks.wake_announced(wake_id)
     }
 
-    /// Whether the Background Task `call_id` already has a retirement record on
-    /// this chain or on an EARLIER card (issue #659): every spelling the run's
-    /// announce key has ever had — [`ended_announce_key`], [`cleanup_announce_key`],
-    /// and the pre-#659 [`legacy_retirement_announce_key`] — is asked against
-    /// both gates. The retirement's own dedup reads THIS, because a run gets one
-    /// record whatever class ended it (the ledger's "exactly once per call id");
-    /// a Wake's completion gate reads the EVIDENCE spelling alone, since a
-    /// cleanup must never suppress a completion (spec #590).
-    pub(super) fn retirement_recorded(&self, call_id: &str) -> bool {
-        [
-            ended_announce_key(call_id),
-            cleanup_announce_key(call_id),
-            legacy_retirement_announce_key(call_id),
-        ]
-        .iter()
-        .any(|key| self.tasks.wake_announced(key) || self.tasks.render_recorded(key))
-    }
-
     /// Mark `wake_id`'s completion as announced on this chain — by the opening
     /// 承接 line or by the merged-path completion entry. Returns false when it
     /// already was: the exactly-once gate both paths honour (ADR-0059). A new
@@ -2631,19 +2634,16 @@ impl StreamAccumulator {
         true
     }
 
-    /// Mark a SYNTHETIC completion — a runtime verdict's retirement, a child's
-    /// own terminal transcript, or the user's cleanup, keyed
-    /// `ended:<call_id>` (the evidence classes) or `cleanup:<call_id>` (the
-    /// user's own; issue #659) — as announced on this chain (spec #588, review
-    /// PR #595): the same exactly-once gate [`Self::announce_wake`] applies, but
-    /// NOTHING durable is staged. The durable Wake Watermark is the newest
-    /// WAKE whose completion a card announced (ADR-0061); staging a synthetic
-    /// entry's clock there would make a restart read a genuinely un-announced
-    /// late Wake at or below it as covered and suppress its continuation —
-    /// #590's "a late Wake for a cleared task behaves as before; nothing is
-    /// suppressed".
-    pub(super) fn announce_synthetic(&mut self, key: &str) -> bool {
-        self.tasks.announce_entry(key)
+    /// Mark a synthetic retirement's entry — `run` + the ending's `class` — as
+    /// placed on this chain (ADR-0080): the same exactly-once gate
+    /// [`Self::announce_wake`] applies, but NOTHING durable is staged. The
+    /// durable Wake Watermark is the newest WAKE whose completion a card
+    /// announced (ADR-0061); staging a synthetic entry's clock there would make
+    /// a restart read a genuinely un-announced late Wake at or below it as
+    /// covered and suppress its continuation — #590's "a late Wake for a cleared
+    /// task behaves as before; nothing is suppressed".
+    pub(super) fn announce_ending(&mut self, run: &TaskRunId, class: TaskEndingClass) -> bool {
+        self.tasks.announce_ending(run, class)
     }
 
     /// Stage the Rendered Cursor of the body about to be written (spec #561):
@@ -2653,15 +2653,15 @@ impl StreamAccumulator {
     /// delivered confirmation (review #569). Returns the stage generation a
     /// confirmation must name (spec #561, review #569).
     ///
-    /// `rendered` is the ledger announce keys the body actually rendered
-    /// (issue #671, ticket #672) — exactly the entries its delivered write may
-    /// mark, taken from [`Self::rendered_ledger_keys`] at build time.
+    /// `rendered` is the Task Endings the body actually rendered (ADR-0080) —
+    /// exactly the entries its delivered write may flip, taken from
+    /// [`Self::rendered_ledger_keys`] at build time.
     pub(super) fn stage_cursor(
         &mut self,
         card_message_id: Option<&str>,
         cursor: RenderedCursor,
         gap: Option<GapCoverage>,
-        rendered: Vec<String>,
+        rendered: Vec<EndingKey>,
     ) -> u64 {
         self.cursor_stage_seq = self.cursor_stage_seq.wrapping_add(1);
         self.staged_cursors.push(StagedCursor {
@@ -2670,9 +2670,9 @@ impl StreamAccumulator {
             cursor,
             awaiting_seq: None,
             gap,
-            // The ledger entries THIS body rendered (issue #671, ticket #672):
-            // a delivered body's own content is what its confirmation may mark,
-            // so a split's prefix never claims an entry its continuation shows.
+            // The Task Endings THIS body rendered (ADR-0080): a delivered
+            // body's own content is what its confirmation may flip, so a split's
+            // prefix never claims an entry its continuation shows.
             rendered,
         });
         if self.staged_cursors.len() > MAX_STAGED_CURSORS {
@@ -2711,9 +2711,9 @@ impl StreamAccumulator {
     /// record can carry the successor's frontier from the first moment it
     /// names the successor card.
     ///
-    /// The stage's rendered keys (issue #671, ticket #672) ride back with it:
-    /// the caller persists them as this session's durable rendered marks, so
-    /// only the entries a DELIVERED body carried ever stop re-rendering.
+    /// The stage's Task Endings (ADR-0080) ride back with it: the caller flips
+    /// their shown bits in the same write, so only the entries a DELIVERED body
+    /// carried ever stop re-rendering.
     pub(super) fn take_staged_cursor(
         &mut self,
         card_message_id: &str,
@@ -2731,9 +2731,9 @@ impl StreamAccumulator {
         if staged.id < self.confirmed_cursor_stage {
             // A newer confirmation already won: this body's cursor and gap are
             // superseded, so hand back the base's own cursor (writing it is a
-            // no-op) and no gap — while its rendered keys still ride the
-            // caller's ONE record write, because this body DID deliver (issue
-            // #671, ticket #672). The mark never waits on a second write.
+            // no-op) and no gap — while its endings still ride the caller's ONE
+            // record write, because this body DID deliver (ADR-0080). The shown
+            // bit never waits on a second write.
             return Some(ConfirmedBody {
                 cursor: self.cursor.clone(),
                 gap: None,
@@ -2840,8 +2840,8 @@ impl StreamAccumulator {
     /// resolved, which is a no-op. The next build re-stages from the confirmed
     /// base.
     ///
-    /// Nothing is owed back for its ledger keys (issue #671, ticket #672): they
-    /// come from the body that staged it, so the next body derives its own.
+    /// Nothing is owed back for its endings (ADR-0080): they come from the body
+    /// that staged it, so the next body derives its own.
     pub(super) fn discard_staged_cursor(&mut self, expected: StagedCursorId) {
         self.staged_cursors.retain(|staged| staged.id != expected.id);
     }
@@ -2854,25 +2854,21 @@ impl StreamAccumulator {
         &mut self,
         at_ms: Option<i64>,
         entry: TaskCompletionEntry,
-        synthetic_key: Option<&str>,
+        ending: Option<EndingKey>,
     ) {
         let key = at_ms.unwrap_or_else(|| self.next_order());
-        self.insert_kind(
-            key,
-            None,
-            TimelineKind::LedgerEntry(entry, synthetic_key.map(str::to_string)),
-        );
+        self.insert_kind(key, None, TimelineKind::LedgerEntry(entry, ending.map(Box::new)));
     }
 
-    /// The announce keys of the ledger entries in the timeline range a body
-    /// renders (issue #671, ticket #672): what that body's confirmed write may
-    /// mark rendered — no more, so a split's prefix never claims an entry its
-    /// continuation carries, and no less.
-    fn rendered_ledger_keys(&self, from: usize, to: usize) -> Vec<String> {
+    /// The Task Endings of the ledger entries in the timeline range a body
+    /// renders (ADR-0080): what that body's confirmed write may flip — no more,
+    /// so a split's prefix never claims an entry its continuation carries, and
+    /// no less.
+    fn rendered_ledger_keys(&self, from: usize, to: usize) -> Vec<EndingKey> {
         self.timeline[from.min(self.timeline.len())..to.min(self.timeline.len())]
             .iter()
             .filter_map(|item| match &item.kind {
-                TimelineKind::LedgerEntry(_, synthetic_key) => synthetic_key.clone(),
+                TimelineKind::LedgerEntry(_, ending) => ending.as_deref().cloned(),
                 _ => None,
             })
             .collect()
@@ -4968,43 +4964,35 @@ pub(super) async fn refresh_context_window(
     }
 }
 
-/// The announce KEY an **evidence** Background Task retirement carries (issue
-/// #671, ticket #672; respelled by issue #659): the runtime verdict's (a
-/// terminal end, or a shell the runtime no longer knows) and the child
-/// transcript's own terminal evidence. It names the CLAIM — this run's end is
-/// recorded — which is why it also gates a late Wake's completion entry
-/// ([`cleanup_announce_key`] splits the classes; [`legacy_retirement_announce_key`]
-/// is the older spelling).
+/// The announce KEY an **evidence** Background Task retirement used to carry
+/// (issue #671, ticket #672; respelled by issue #659).
 ///
-/// Two gates must agree on this one identity — the in-memory exactly-once set
-/// (`StreamAccumulator::announce_synthetic`) and the durable rendered marks
-/// (`ChainRecords::record_rendered`) — so it is minted once, here.
+/// **Legacy (ADR-0080)**: a retirement's exactly-once is now keyed by the
+/// ending itself (the run plus its class) and by the durable shown bit, so
+/// nothing gates on these spellings any more. They survive only as the shape
+/// the load-time translation of the `rendered` section reads
+/// ([`crate::bridge::chain`]); the shrinkage slice (#703) deletes them with the
+/// section.
+#[allow(dead_code)]
 pub(super) fn ended_announce_key(call_id: &str) -> String {
     format!("ended:{call_id}")
 }
 
-/// The announce KEY the user's own cleanup carries (spec #588, #590; issue
-/// #659): both classes are synthetic retirements under one exactly-once gate,
-/// but only an evidence ending CLAIMS the run ended — a cleaned task's late Wake
-/// keeps showing its own completion (spec #590) — so the two must not share a
-/// key.
+/// The announce KEY the user's own cleanup used to carry (spec #588, #590;
+/// issue #659) — the class split the pre-ADR key space needed, now the ending's
+/// own `TaskEndingClass::Cleanup`. **Legacy (ADR-0080)**: see
+/// [`ended_announce_key`].
+#[allow(dead_code)]
 pub(super) fn cleanup_announce_key(call_id: &str) -> String {
     format!("cleanup:{call_id}")
 }
 
-/// The PRE-#659 retirement key, `runtime:<call_id>`: READ, never written. An
-/// older build wrote it for BOTH classes, so:
-///
-/// - the retirement's own dedup still honors it, so a mark written before the
-///   upgrade keeps covering a re-derived retirement (issue #671's rule);
-/// - a Wake's completion gate must NOT read it: the old spelling cannot say
-///   which class wrote it — an old CLEANUP's mark is indistinguishable from an
-///   old evidence one — and suppressing a Wake on a cleanup's word would break
-///   spec #590. A `runtime:` mark therefore never suppresses a Wake; the run's
-///   completion renders once more instead (the duplicate-over-loss side this
-///   family trades toward, bounded by [`MAX_RENDERED_KEYS`]'s turnover).
-///
-/// [`MAX_RENDERED_KEYS`]: crate::bridge::chain::MAX_RENDERED_KEYS
+/// The PRE-#659 retirement key, `runtime:<call_id>`: READ by nothing any more,
+/// never written. **Legacy (ADR-0080)**: translated once at load into
+/// [`TaskEndingClass::Legacy`], where only the retirement's own dedup reads it
+/// — never the Wake gate (#590) — and deleted with the section by the
+/// shrinkage slice (#703).
+#[allow(dead_code)]
 pub(super) fn legacy_retirement_announce_key(call_id: &str) -> String {
     format!("runtime:{call_id}")
 }
@@ -6951,24 +6939,39 @@ mod tests {
         assert_eq!(frontier.delivered_chars, second.chars().count());
     }
 
+    /// The run one test's synthetic retirement belongs to (ADR-0080).
+    fn ending_run(call_id: &str) -> TaskRunId {
+        TaskRunId {
+            key: call_id.to_string(),
+            call_id: Some(call_id.to_string()),
+            shell_id: None,
+            child_id: None,
+            wake_id: None,
+        }
+    }
+
     /// The announcement split (spec #588, review PR #595; issue #671): a
-    /// synthetic retirement marks the chain's exactly-once set and stages
-    /// NOTHING into the Wake Watermark — the watermark stays Wake-scoped
-    /// (ADR-0061), so a late real Wake at or below a synthetic clock is never
-    /// read as covered after a restart — while a real Wake still stages its
-    /// durable mark.
+    /// synthetic retirement marks the chain's exactly-once set BY ITS ENDING
+    /// (ADR-0080) and stages NOTHING into the Wake Watermark — the watermark
+    /// stays Wake-scoped (ADR-0061), so a late real Wake at or below a synthetic
+    /// clock is never read as covered after a restart — while a real Wake still
+    /// stages its durable mark.
     #[test]
     fn a_synthetic_announcement_marks_exactly_once_and_stages_no_watermark() {
         let mut acc = StreamAccumulator::new("test");
         assert!(
-            acc.announce_synthetic("runtime:call_1"),
+            acc.announce_ending(&ending_run("call_1"), TaskEndingClass::Evidence),
             "the first synthetic mark lands"
         );
         assert!(
-            !acc.announce_synthetic("runtime:call_1"),
+            !acc.announce_ending(&ending_run("call_1"), TaskEndingClass::Evidence),
             "a repeated synthetic announce never doubles"
         );
-        assert!(acc.wake_announced("runtime:call_1"));
+        assert!(acc.ending_announced(&ending_run("call_1"), TaskEndingClass::Evidence));
+        // The run matches by ANY of its ids: the alias a Wake names it by is the
+        // same run.
+        assert!(acc.ending_announced_any(&ending_run("call_1")));
+        assert!(!acc.ending_announced_any(&ending_run("call_other")));
         assert_eq!(
             acc.pending_watermark_id(),
             None,
@@ -6984,10 +6987,10 @@ mod tests {
         assert_eq!(staged.created_ms, 1_000);
     }
 
-    /// Issue #671 / ticket #672: a stage hands back exactly the ledger keys its
-    /// own body rendered — nothing a body that did not render the entry can
-    /// claim — and a stale stage (a newer confirmation already won) is refused
-    /// outright, so its keys never reach the durable record.
+    /// ADR-0080: a stage hands back exactly the endings its own body rendered —
+    /// nothing a body that did not render the entry can claim — and a stale stage
+    /// (a newer confirmation already won) is refused outright, so its pairs never
+    /// reach the durable record unclaimed.
     #[test]
     fn a_stage_hands_back_only_its_own_rendered_keys() {
         let mut acc = StreamAccumulator::new("test");
@@ -6995,7 +6998,7 @@ mod tests {
             Some("om_card"),
             RenderedCursor::default(),
             None,
-            vec!["runtime:call_1".to_string()],
+            vec![(ending_run("call_1"), TaskEndingClass::Evidence)],
         );
         let confirmed = acc
             .take_staged_cursor(
@@ -7008,8 +7011,8 @@ mod tests {
             .expect("the exact stage confirms");
         assert_eq!(
             confirmed.rendered,
-            vec!["runtime:call_1".to_string()],
-            "the body's own keys come back for the durable mark"
+            vec![(ending_run("call_1"), TaskEndingClass::Evidence)],
+            "the body's own endings come back for the durable write"
         );
 
         // A body that rendered no entry stages none.
@@ -7025,12 +7028,13 @@ mod tests {
             .expect("the second stage confirms");
         assert!(confirmed.rendered.is_empty());
 
-        // A stale stage's confirmation is refused: its keys never land.
+        // A stale stage's confirmation is refused: its pairs never reach the
+        // durable record.
         let older = acc.stage_cursor(
             Some("om_card"),
             RenderedCursor::default(),
             None,
-            vec!["runtime:call_2".to_string()],
+            vec![(ending_run("call_2"), TaskEndingClass::Cleanup)],
         );
         let newer = acc.stage_cursor(Some("om_card"), RenderedCursor::default(), None, Vec::new());
         assert!(
@@ -7060,14 +7064,14 @@ mod tests {
         assert!(stale.gap.is_none(), "a superseded gap is dropped");
         assert_eq!(
             stale.rendered,
-            vec!["runtime:call_2".to_string()],
-            "its delivered keys still owe their mark"
+            vec![(ending_run("call_2"), TaskEndingClass::Cleanup)],
+            "its delivered endings still owe their shown bits"
         );
     }
 
-    /// Issue #671 / ticket #672: the attribution itself. A body claims the
-    /// ledger keys of the entries it RENDERED — so a size split's prefix claims
-    /// only the entries before the cut, and the continuation claims the rest.
+    /// ADR-0080: the attribution itself. A body claims the endings of the entries
+    /// it RENDERED — so a size split's prefix claims only the entries before the
+    /// cut, and the continuation claims the rest.
     #[test]
     fn a_body_claims_the_ledger_keys_it_rendered() {
         let mut acc = StreamAccumulator::new("test");
@@ -7086,7 +7090,7 @@ mod tests {
                 ending: crate::feishu::card::ledger::TaskEnding::RuntimeEnded,
                 output: None,
             },
-            Some("runtime:call_1"),
+            Some((ending_run("call_1"), TaskEndingClass::Evidence)),
         );
 
         let prefix = acc.build_card_with_info();
@@ -7104,8 +7108,8 @@ mod tests {
         );
         assert_eq!(
             continuation.rendered_keys,
-            vec!["runtime:call_1".to_string()],
-            "the continuation claims the entry it renders"
+            vec![(ending_run("call_1"), TaskEndingClass::Evidence)],
+            "the continuation claims the ending it renders"
         );
     }
 }

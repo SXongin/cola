@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use crate::backend::{MessageId, SessionTranscript, TurnAnchor, WakeSource};
-use crate::bridge::chain::{ChainRecord, RenderedCursor};
+use crate::bridge::chain::{ChainRecord, EndingKey, RenderedCursor};
 use crate::bridge::handles::{CardsHandle, FlowHandles, TurnHandles};
 use crate::bridge::turn::state::StreamAccumulator;
 
@@ -125,7 +125,7 @@ pub(crate) struct ProjectedCard {
     /// #672): the create landed, so they owe their durable mark — recorded by
     /// the re-point, or, when the armed session was replaced meanwhile, by the
     /// takeover's own refused-path write.
-    pub(crate) rendered_keys: Vec<String>,
+    pub(crate) rendered_keys: Vec<EndingKey>,
     /// The stage generation of the Wake Watermark the armed body carries, if
     /// any: the create's drain names it, so a watermark staged since is left
     /// untouched.
@@ -145,36 +145,36 @@ pub(crate) struct ProjectedSlice {
     /// The synthetic announce keys this slice rendered (issue #671, ticket
     /// #672): the create landed, so they owe their durable mark even when a
     /// fresh Turn took the session over before the re-point.
-    pub(crate) rendered_keys: Vec<String>,
+    pub(crate) rendered_keys: Vec<EndingKey>,
     pub(crate) watermark_stage: Option<u64>,
     /// More content remains after this slice.
     pub(crate) full: bool,
 }
 
-/// Mark the synthetic entries a LANDED projection create rendered, for the one
-/// path that cannot carry them into a record write — a takeover whose armed
-/// session a fresh Turn replaced meanwhile (issue #671, ticket #672). The
-/// create is what put the body on a card, so the mark is owed; it is
-/// session-scoped, so it needs no record.
+/// Flip the endings a LANDED projection create rendered, for the one path that
+/// cannot carry them into a record write — a takeover whose armed session a
+/// fresh Turn replaced meanwhile (ADR-0080). The create is what put the body on
+/// a card, so the shown bit is owed; it is session-scoped, so it needs no
+/// record.
 ///
-/// The live accumulator takes the keys into its announce gate as well when the
-/// caller has one: a chain that SEEDED before this mark landed (a fresh Turn
-/// that started while the create was in flight) holds the older, empty set, so
+/// The live accumulator takes the pairs into its announce gate as well when the
+/// caller has one: a chain that SEEDED before this landing (a fresh Turn that
+/// started while the create was in flight) holds the older, empty set, so
 /// without this its next read would re-plan and re-render the very entry this
 /// card just showed.
 pub(super) fn record_landed_rendered(
     cards: &CardsHandle,
     live: Option<&mut state::CardSession>,
     session_id: &str,
-    rendered: &[String],
+    rendered: &[EndingKey],
 ) {
     if rendered.is_empty() {
         return;
     }
-    cards.chains.record_rendered(session_id, rendered);
+    cards.chains.record_shown(session_id, rendered);
     if let Some(card) = live {
-        for key in rendered {
-            card.acc.announce_synthetic(key);
+        for (run, class) in rendered {
+            card.acc.announce_ending(run, *class);
         }
     }
 }
@@ -306,11 +306,16 @@ impl Turn {
             // The durable seed is read HERE, in the same critical section that
             // checks the session is still card-less (issue #671, ticket #672):
             // `read_planned_outputs` below awaits outside the lock, so a seed
-            // read before it could miss a mark a landed body wrote meanwhile.
+            // read before it could miss a fact a landed body wrote meanwhile.
             // Together with the check the two are one decision — no card, so no
             // writer — and the second check guards the install.
             Self::seed_durable_announcements(cards, session_id, &mut acc);
-            render::plan_ledger_entries(&acc, transcript, Some(anchor))
+            render::plan_ledger_entries(
+                &acc,
+                transcript,
+                Some(anchor),
+                render::Endings::of(cards, session_id),
+            )
         };
         render::read_planned_outputs(backend, &mut plans).await;
         let mut live = cards.cards.lock().await;
@@ -318,13 +323,12 @@ impl Turn {
             return None;
         }
         // `read_planned_outputs` awaited outside the lock: a queued card update
-        // can have delivered a rendered mark in that window (issue #671, ticket
-        // #672), which the seed above predates. Re-read the marks here, under
-        // the install lock, and hand them to the commit, which drops any planned
-        // entry they now cover — so the successor never re-shows one the
-        // delivered body already showed.
-        let recorded = Turn::recorded_marks(cards, session_id);
-        acc.set_render_marks(recorded.clone());
+        // can have delivered and flipped an ending's shown bit in that window
+        // (ADR-0080), which the seed above predates. Re-read the durable endings
+        // here, under the install lock, and hand them to the commit, which drops
+        // any planned entry they now cover — so the successor never re-shows one
+        // the delivered body already showed.
+        let endings = render::Endings::of(cards, session_id);
         let rendered = render::render_turn_parts(&mut acc, transcript);
         render::apply_ledger_read(
             &mut acc,
@@ -332,7 +336,7 @@ impl Turn {
             &std::collections::HashMap::new(),
             chrono::Utc::now().timestamp_millis(),
             state::LedgerCadence::Minute,
-            &recorded,
+            endings,
             plans,
         );
         match ending {
@@ -828,7 +832,7 @@ impl Turn {
         reply_to: Option<&str>,
         directory: Option<&str>,
         cursor_stage: state::StagedCursorId,
-        rendered: &[String],
+        rendered: &[EndingKey],
     ) -> ArmedTakeover {
         match Self::attach_and_repoint(
             cards,
@@ -872,7 +876,7 @@ impl Turn {
         reply_to: Option<&str>,
         directory: Option<&str>,
         cursor_stage: state::StagedCursorId,
-        rendered: &[String],
+        rendered: &[EndingKey],
     ) -> bool {
         Self::attach_and_repoint(
             cards,
@@ -909,23 +913,22 @@ impl Turn {
         reply_to: Option<&str>,
         directory: Option<&str>,
         cursor_stage: state::StagedCursorId,
-        rendered: &[String],
+        rendered: &[EndingKey],
     ) -> Option<Option<Box<ChainRecord>>> {
         let mut live = cards.cards.lock().await;
         let Some(card) = live.get_mut(session_id) else {
             // The session is gone entirely: no record to re-point, but the
-            // create landed, so the entries it rendered still get their
-            // durable mark (issue #671, ticket #672) — session-scoped, and
-            // independent of the record.
+            // create landed, so the endings it rendered still get their shown
+            // bits (ADR-0080) — session-scoped, independent of the record.
             record_landed_rendered(cards, None, session_id, rendered);
             return None;
         };
         if card.chain_id() != chain_id || (require_unattached && card.card_message_id.is_some()) {
             // A fresh Turn owns the session now: its record is not ours to
-            // re-point, but this body's create DID land, so its rendered keys
-            // are still marked — the successor card showed them — and the
+            // re-point, but this body's create DID land, so its endings' shown
+            // bits are still flipped — the successor card showed them — and the
             // Turn's own accumulator is told, so it cannot re-render them
-            // (issue #671, ticket #672).
+            // (ADR-0080).
             record_landed_rendered(cards, Some(card), session_id, rendered);
             return None;
         }
@@ -971,8 +974,8 @@ impl Turn {
         // leaves the durable fact untouched.
         // A card with no Turn message to scope a settle decision with cannot
         // be reaped: attached, but no record — `track_live_card`'s own rule. The
-        // create still DELIVERED, though, so its keys are marked and the
-        // session's gate told (issue #671, ticket #672).
+        // create still DELIVERED, though, so its endings are flipped and the
+        // session's gate told (ADR-0080).
         let Some(message_id) = message_id else {
             record_landed_rendered(cards, Some(card), session_id, rendered);
             return Some(None);
@@ -986,12 +989,11 @@ impl Turn {
             // write, so the record is never observable as (successor card,
             // predecessor cursor) — not even between two chains operations —
             // and the landing's reply target rides the same write (#582). The
-            // body's synthetic completion entries ride it too (issue #671,
-            // ticket #672), so the successor's arrival cannot make an entry
-            // re-render on a later card.
+            // body's completion entries ride it too (ADR-0080), so the
+            // successor's arrival cannot make an entry re-render on a later
+            // card.
             // A SUPERSEDED stage carries the base's own cursor (a no-op write),
-            // so its delivered keys still ride this one landing write (issue
-            // #671, ticket #672).
+            // so its delivered endings still ride this one landing write.
             Some(confirmed) => cards.chains.track_carrying_cursor_landing(
                 session_id,
                 card_message_id,
@@ -1015,10 +1017,10 @@ impl Turn {
             _ => {
                 // No staged cursor matched the create's stage (the cap evicted
                 // it, or a raced write consumed it): the body still DELIVERED,
-                // so its keys ride the SAME one write as the re-point — a crash
-                // can never leave the mark apart from the cursor, and the
+                // so its endings ride the SAME one write as the re-point — a
+                // crash can never leave the bits apart from the cursor, and the
                 // successor's arrival never lets the entry re-render on a later
-                // card (issue #671, ticket #672).
+                // card (ADR-0080).
                 let previous = cards.chains.track_landing(
                     session_id,
                     card_message_id,
@@ -1031,8 +1033,8 @@ impl Turn {
                 // The successor's own accumulator seeded before this landing:
                 // take the delivered keys into its gate too, or its next read
                 // re-plans the entry.
-                for key in rendered {
-                    card.acc.announce_synthetic(key);
+                for (run, class) in rendered {
+                    card.acc.announce_ending(run, *class);
                 }
                 previous
             }
@@ -1146,7 +1148,32 @@ pub(super) async fn release_inflight(handles: &TurnHandles, session_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bridge::chain::{EndingKey, TaskEnding as DurableEnding, TaskEndingClass, TaskRunIdentity};
+    use crate::bridge::tasks::TaskRunId;
     use crate::bridge::test_support::{MockBackend, build_app, realistic_parts, test_config, test_work_dir};
+
+    /// One delivered create's staged ending (ADR-0080), and the durable record
+    /// its confirmation needs to have a bit to flip.
+    fn landed(call_id: &str) -> EndingKey {
+        (
+            TaskRunId {
+                key: call_id.to_string(),
+                call_id: Some(call_id.to_string()),
+                shell_id: None,
+                child_id: None,
+                wake_id: None,
+            },
+            TaskEndingClass::Evidence,
+        )
+    }
+
+    fn record_landed(cards: &CardsHandle, call_id: &str) {
+        cards.chains.record_ending(
+            "ses_test",
+            &landed(call_id).0,
+            DurableEnding::owed(TaskEndingClass::Evidence, TaskRunIdentity::default()),
+        );
+    }
 
     /// An armed projection's takeover is ONE cards-map critical section (spec
     /// #561, review #569): the verify, the successor attach and the record
@@ -1268,6 +1295,7 @@ mod tests {
         let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
         let cards = app.cards_handle();
         Turn::seed_card(&cards, "ses_test", None).await;
+        record_landed(&cards, "call_1");
         Turn::set_turn_anchor(
             &cards,
             "ses_test",
@@ -1308,10 +1336,10 @@ mod tests {
                         id: 0,
                         awaiting_seq: None,
                     },
-                    // The landed create's rendered entries (issue #671): a lost
-                    // takeover must still mark them, because the create is what
+                    // The landed create's rendered endings (ADR-0080): a lost
+                    // takeover must still flip them, because the create is what
                     // put the body on a card.
-                    &["runtime:call_1".to_string()],
+                    &[landed("call_1")],
                 )
                 .await,
                 ArmedTakeover::Lost
@@ -1321,11 +1349,8 @@ mod tests {
         assert!(
             cards
                 .chains
-                .rendered("ses_test")
-                .iter()
-                .any(|key| key == "runtime:call_1"),
-            "a lost takeover still marks its landed create's entries: {:?}",
-            cards.chains.rendered("ses_test")
+                .ending_shown("ses_test", &landed("call_1").0, TaskEndingClass::Evidence),
+            "a lost takeover still flips its landed create's endings"
         );
         let live = cards.cards.lock().await;
         let fresh = live.get("ses_test").expect("the replacement session");
@@ -1339,11 +1364,13 @@ mod tests {
             "no carried cursor is seeded into a replaced session"
         );
         // The replacement seeded its accumulator BEFORE the create landed, so
-        // its durable-mark set is empty — the landed keys must reach its
-        // announce gate too, or its next read re-renders the very entry the
-        // successor card just showed (issue #671, ticket #672).
+        // its ending set is empty — the landed endings must reach its announce
+        // gate too, or its next read re-renders the very entry the successor
+        // card just showed (ADR-0080).
         assert!(
-            fresh.acc.wake_announced("runtime:call_1"),
+            fresh
+                .acc
+                .ending_announced(&landed("call_1").0, TaskEndingClass::Evidence),
             "a replaced chain's gate takes the landed create's keys"
         );
         drop(live);
@@ -1358,11 +1385,11 @@ mod tests {
         );
     }
 
-    /// Issue #671 / ticket #672 (CI gate): a takeover whose create LANDED but
-    /// whose staged cursor can no longer be taken — the cap evicted it, or a
-    /// raced write consumed it — still marks the body's rendered keys and tells
-    /// the session's gate. The stage's keys are not the mark's only copy, but
-    /// this path must record what the create delivered (the flush's own
+    /// ADR-0080 (CI gate): a takeover whose create LANDED but whose staged
+    /// cursor can no longer be taken — the cap evicted it, or a raced write
+    /// consumed it — still flips the body's endings' shown bits and tells the
+    /// session's gate. The stage's endings are not the fact's only copy, but this
+    /// path must record what the create delivered (the flush's own
     /// accepted-write record does not cover a projection create).
     #[tokio::test]
     async fn a_takeover_without_its_stage_still_marks_its_keys() {
@@ -1372,6 +1399,7 @@ mod tests {
         let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
         let cards = app.cards_handle();
         Turn::seed_card(&cards, "ses_test", None).await;
+        record_landed(&cards, "call_1");
         Turn::set_turn_anchor(
             &cards,
             "ses_test",
@@ -1398,7 +1426,7 @@ mod tests {
                         id: 0,
                         awaiting_seq: None,
                     },
-                    &["runtime:call_1".to_string()],
+                    &[landed("call_1")],
                 )
                 .await,
                 ArmedTakeover::Took(_)
@@ -1408,19 +1436,16 @@ mod tests {
         assert!(
             cards
                 .chains
-                .rendered("ses_test")
-                .iter()
-                .any(|key| key == "runtime:call_1"),
-            "a takeover without its stage still marks its keys: {:?}",
-            cards.chains.rendered("ses_test")
+                .ending_shown("ses_test", &landed("call_1").0, TaskEndingClass::Evidence),
+            "a takeover without its stage still flips its endings"
         );
         let live = cards.cards.lock().await;
         assert!(
             live.get("ses_test")
                 .expect("the taken-over session")
                 .acc
-                .wake_announced("runtime:call_1"),
-            "its gate takes the delivered keys"
+                .ending_announced(&landed("call_1").0, TaskEndingClass::Evidence),
+            "its gate takes the delivered endings"
         );
     }
 }

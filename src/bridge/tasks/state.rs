@@ -14,6 +14,10 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use crate::bridge::chain::TaskEndingClass;
+
+use super::model::TaskRunId;
+
 /// The per-Session Background Task State: the per-chain delivery exactly-once
 /// sets. Every field is private to this module — no reader or writer outside
 /// `crate::bridge::tasks` touches them directly; callers reach them only
@@ -25,12 +29,9 @@ pub(crate) struct TaskState {
     /// completion entry — the merged-path render of a live card, or a yielded
     /// card's ledger refresh. One mark per Wake id; the set is kept across
     /// `continue_on_new_card`, so a Wake that resumes a wake-continuation card
-    /// still marks exactly once (ADR-0059). Synthetic retirements — a
-    /// runtime/child-evidence retirement or the user's cleanup — share the set
-    /// under their `ended:<call_id>` / `cleanup:<call_id>` key (one per
-    /// retirement class, issue #659), marked through
-    /// [`Self::announce_entry`]: the same exactly-once gate, staging nothing
-    /// durable (spec #588, review PR #595). This is the ANNOUNCEMENT gate (it
+    /// still marks exactly once (ADR-0059). Synthetic retirements have their own
+    /// gate, [`Self::announced_endings`] (ADR-0080), because their identity is
+    /// the run's ending rather than a Wake id. This is the ANNOUNCEMENT gate (it
     /// keeps an entry single); the Wake step's in-place decision reads
     /// [`Self::handed_over_wakes`], because an entry a ledger refresh placed is
     /// not a handoff. Written by [`Self::announce_entry`] (the one insert),
@@ -60,17 +61,28 @@ pub(crate) struct TaskState {
     /// (`Turn::seed_durable_announcements`, through
     /// [`super::TasksHandle::restore`]); read through [`Self::wake_floor`].
     wake_floor: Option<i64>,
+    /// The Task Endings this chain has already placed an entry for (ADR-0080):
+    /// `(run, class)` pairs marked by [`Self::announce_ending`] when a plan
+    /// commits its entry. The retirement's own announce gate: a repeated read
+    /// inside one life — the entry's body still owed, refused, or delivered —
+    /// never inserts a second timeline entry. Replaces the pre-ADR key
+    /// spellings (§`ended:`/`cleanup:`), so the class itself is the identity and
+    /// a legacy spelling never gates. A later card seeds the durable half
+    /// through the Chain Record's shown bits, not through here.
+    announced_endings: Vec<(TaskRunId, TaskEndingClass)>,
     /// The synthetic completion keys an EARLIER card of this Session already
     /// rendered (issue #671, ticket #672): the durable `ended:<call_id>` /
-    /// `cleanup:<call_id>` marks `ChainRecords` carries, seeded when a card starts rendering a
-    /// session alongside [`Self::wake_floor`]. Every retirement here was shown
-    /// by a delivered card write, so this accumulator's render never re-inserts
-    /// its entry — the restart case the per-chain announce set cannot cover.
-    /// Deliberately NOT a Wake fact: it never joins [`Self::wake_floor`], so a
-    /// genuinely un-announced late Wake at or below a retirement's clock still
-    /// renders and resumes (#590, PR #595). Seeded by [`Self::set_render_marks`]
-    /// (`Turn::seed_durable_announcements`, through
-    /// [`super::TasksHandle::restore`]); read through [`Self::render_recorded`].
+    /// `cleanup:<call_id>` marks `ChainRecords` carries, seeded when a card
+    /// starts rendering a session alongside [`Self::wake_floor`].
+    ///
+    /// **Legacy (ADR-0080).** No live gate reads it: the render asks the Chain
+    /// Record's endings for the run's shown bit
+    /// ([`crate::bridge::chain::EndingFacts`]), which is the same fact without a
+    /// key spelling. The set and its seed stay until the shrinkage slice (#703)
+    /// deletes them with the `rendered` section. Deliberately never a Wake fact:
+    /// it does not join [`Self::wake_floor`], so a genuinely un-announced late
+    /// Wake at or below a retirement's clock still renders and resumes (#590, PR
+    /// #595).
     render_marks: HashSet<String>,
 }
 
@@ -79,6 +91,36 @@ impl TaskState {
     /// insert the key and report whether it was new.
     pub(crate) fn announce_entry(&mut self, key: &str) -> bool {
         self.announced_wakes.insert(key.to_string())
+    }
+
+    /// Mark `run`'s `class` entry as placed on this chain (ADR-0080) and report
+    /// whether it was new — the synthetic retirement's exactly-once gate, keyed
+    /// by the ending itself. A class the run already announced (under any id
+    /// spelling) is not announced twice.
+    pub(crate) fn announce_ending(&mut self, run: &TaskRunId, class: TaskEndingClass) -> bool {
+        if self.ending_announced(run, class) {
+            return false;
+        }
+        self.announced_endings.push((run.clone(), class));
+        true
+    }
+
+    /// Whether `run`'s ending of `class` already had its entry placed on this
+    /// chain (ADR-0080). The run matches by ANY id it is known by, so the
+    /// retirement and the Wake naming one run differently still agree.
+    pub(crate) fn ending_announced(&self, run: &TaskRunId, class: TaskEndingClass) -> bool {
+        self.announced_endings
+            .iter()
+            .any(|(held, held_class)| *held_class == class && shares_id(held, run))
+    }
+
+    /// Whether ANY class of `run`'s ending had its entry placed on this chain:
+    /// the retirement's rule is one entry per run, whatever class wrote it (as
+    /// the whole family's "exactly once per call id" reads).
+    pub(crate) fn ending_announced_any(&self, run: &TaskRunId) -> bool {
+        self.announced_endings
+            .iter()
+            .any(|(held, _)| shares_id(held, run))
     }
 
     /// Whether `wake_id`'s completion was already announced on this chain (spec
@@ -117,19 +159,28 @@ impl TaskState {
         self.wake_floor
     }
 
-    /// Seed the durable rendered marks of the session's earlier cards (empty
-    /// for a session that rendered no retirement).
+    /// Seed the durable rendered marks of the session's earlier cards (empty for
+    /// a session that rendered no retirement). **Legacy (ADR-0080)**: see
+    /// [`Self::render_marks`]; deleted with it by the shrinkage slice #703.
     pub(crate) fn set_render_marks(&mut self, marks: Vec<String>) {
         self.render_marks = marks.into_iter().collect();
     }
 
-    /// Whether an earlier card of this Session already rendered this synthetic
-    /// retirement's entry — the durable mark the render's gate consults beside
-    /// [`Self::wake_announced`] (issue #671, ticket #672). Read-only: the plan
-    /// runs before the commit that announces, so it must not mutate.
+    /// Whether an earlier card of this Session already rendered this key — the
+    /// durable mark the pre-ADR render gate consulted (issue #671, ticket
+    /// #672). **Legacy (ADR-0080)**: see [`TaskState::render_marks`]; the
+    /// shrinkage slice (#703) deletes it with the section.
+    #[allow(dead_code)]
     pub(crate) fn render_recorded(&self, key: &str) -> bool {
         self.render_marks.contains(key)
     }
+}
+
+/// Whether two run identities name the same run: they share any id (the stored
+/// key, the launch's call id, the shell/child id, the Wake id). The in-memory
+/// counterpart of the Chain Record's alias resolution, for the announce gate.
+fn shares_id(a: &TaskRunId, b: &TaskRunId) -> bool {
+    a.ids().any(|id| b.names(id))
 }
 
 /// A handle to one per-Session Background Task State cell: a shared, mutable
@@ -177,6 +228,21 @@ impl TaskCell {
         self.lock().announce_entry(key)
     }
 
+    /// Mark `run`'s `class` entry as placed on this chain (ADR-0080).
+    pub(crate) fn announce_ending(&self, run: &TaskRunId, class: TaskEndingClass) -> bool {
+        self.lock().announce_ending(run, class)
+    }
+
+    /// Whether `run`'s ending of `class` already had its entry placed here.
+    pub(crate) fn ending_announced(&self, run: &TaskRunId, class: TaskEndingClass) -> bool {
+        self.lock().ending_announced(run, class)
+    }
+
+    /// Whether ANY class of `run`'s ending already had its entry placed here.
+    pub(crate) fn ending_announced_any(&self, run: &TaskRunId) -> bool {
+        self.lock().ending_announced_any(run)
+    }
+
     /// Whether `wake_id`'s completion was already announced on this chain.
     pub(crate) fn wake_announced(&self, wake_id: &str) -> bool {
         self.lock().wake_announced(wake_id)
@@ -203,6 +269,7 @@ impl TaskCell {
     }
 
     /// Seed the durable rendered marks of the session's earlier cards.
+    /// **Legacy (ADR-0080)**: see [`TaskState::render_marks`].
     pub(crate) fn set_render_marks(&self, marks: Vec<String>) {
         self.lock().set_render_marks(marks);
     }

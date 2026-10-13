@@ -38,6 +38,7 @@ use crate::backend::{
     TranscriptMessage, Wake, WakeSource,
 };
 use crate::bridge::chain::{ChainRecords, TaskEndingClass, TaskEndingState};
+use crate::bridge::tasks::TaskRunId;
 use crate::bridge::test_support::*;
 use crate::bridge::turn::{PromptContext, Turn};
 use crate::feishu::card::CardState;
@@ -1837,18 +1838,16 @@ async fn a_permanently_refused_retirement_write_leaves_the_entry_owed() {
         "a refused carrier commits no overlay cache: {:?}",
         backend.overlay.retired_call_ids("ses_test")
     );
-    // The durable rendered mark follows the same gate (issue #671, ticket
-    // #672): the entry never reached a card, so no mark may exist — a later
-    // card must still render it.
+    // The ending's shown bit follows the same gate (ADR-0080): the entry never
+    // reached a card, so no bit may be set — a later card must still render it.
     assert!(
-        ChainRecords::load(
+        !ChainRecords::load(
             dir.path()
                 .join("sessions.json")
                 .with_file_name("chain_records.json")
         )
-        .rendered("ses_test")
-        .is_empty(),
-        "a permanently refused write records no rendered mark either"
+        .ending_shown("ses_test", &run_of("call_bg"), TaskEndingClass::Evidence),
+        "a permanently refused write flips no shown bit either"
     );
     // The ending itself, however, was recorded the moment the runtime derived
     // it (ADR-0080): durable and OWED, so the entry renders on the next card
@@ -1921,23 +1920,30 @@ async fn a_permanently_refused_retirement_write_leaves_the_entry_owed() {
         vec!["call_bg".to_string()],
         "the accepted successor render records the retirement"
     );
-    // The durable rendered mark follows the same gate (issue #671, ticket
-    // #672): the doubly-refused write recorded nothing (the entry never
-    // reached a card), and the accepted successor write — which really carried
-    // the entry — records it.
+    // The ending's shown bit follows the same gate (ADR-0080): the doubly
+    // refused write flipped nothing (the entry never reached a card), and the
+    // accepted successor write — which really carried the entry — flips it.
     let persisted = ChainRecords::load(
         dir.path()
             .join("sessions.json")
             .with_file_name("chain_records.json"),
     );
     assert!(
-        persisted
-            .rendered("ses_test")
-            .iter()
-            .any(|key| key == "ended:call_bg"),
-        "the delivered successor records the rendered mark: {:?}",
-        persisted.rendered("ses_test")
+        persisted.ending_shown("ses_test", &run_of("call_bg"), TaskEndingClass::Evidence),
+        "the delivered successor flips the ending's shown bit"
     );
+}
+
+/// The run one launch's **Task Ending** is recorded under (ADR-0080): the
+/// launch's own tool call id, the id every writer of that read agrees on.
+fn run_of(call_id: &str) -> TaskRunId {
+    TaskRunId {
+        key: call_id.to_string(),
+        call_id: Some(call_id.to_string()),
+        shell_id: None,
+        child_id: None,
+        wake_id: None,
+    }
 }
 
 /// Review (spec #588, PR #595): a recoverable refusal is not a permanent one.
@@ -1969,31 +1975,26 @@ async fn a_queued_retirement_write_still_records() {
         vec!["call_bg".to_string()],
         "a queued-for-retry write is accepted: the pass records"
     );
-    // The DURABLE rendered mark rides the body's staged cursor (issue #671,
-    // ticket #672), so it is written when a write that carried the entry
-    // DELIVERS — here the queued payload's retry converges the card in the same
-    // turn, and the delivered write's stage is what records it. A write that
-    // never delivers records nothing (see
-    // `a_permanently_refused_retirement_write_records_nothing`), so an entry
-    // the user never saw still renders on the next card.
+    // The ending's shown bit rides the body's staged cursor (ADR-0080), so it
+    // lands when a write that carried the entry DELIVERS — here the queued
+    // payload's retry converges the card in the same turn, and the delivered
+    // write's stage is what flips it. A write that never delivers flips nothing
+    // (see `a_permanently_refused_retirement_write_leaves_the_entry_owed`), so
+    // an entry the user never saw still renders on the next card.
     assert!(
         app.cards_handle()
             .chains
-            .rendered("ses_test")
-            .iter()
-            .any(|key| key == "ended:call_bg"),
-        "the delivered write records the rendered mark: {:?}",
-        app.cards_handle().chains.rendered("ses_test")
+            .ending_shown("ses_test", &run_of("call_bg"), TaskEndingClass::Evidence),
+        "the delivered write flips the ending's shown bit"
     );
 }
 
-/// Issue #671 / ticket #672: the durable rendered mark is written only by a
-/// write that DELIVERED. A recoverably failed (queued) entry write leaves the
-/// stage owed — no card has shown the entry yet — so nothing may be marked;
-/// the mark lands only when that payload's own delivery is confirmed (the
-/// staged-cursor reconcile spec #561 already runs for the cursor; its
-/// record-write side is pinned by
-/// `records::tests::a_confirmed_body_records_its_rendered_marks`).
+/// ADR-0080: the ending's shown bit is flipped only by a write that DELIVERED.
+/// A recoverably failed (queued) entry write leaves the stage owed — no card
+/// has shown the entry yet — so nothing may be marked; the bit lands only when
+/// that payload's own delivery is confirmed (the staged-cursor reconcile spec
+/// #561 already runs for the cursor; its record-write side is pinned by
+/// `records::tests::a_confirmed_body_flips_its_endings_shown_bits`).
 #[tokio::test]
 async fn a_queued_entry_write_marks_rendered_only_once_it_delivers() {
     let _wd = test_work_dir();
@@ -2016,26 +2017,23 @@ async fn a_queued_entry_write_marks_rendered_only_once_it_delivers() {
         .unwrap();
 
     assert!(
-        app.cards_handle().chains.rendered("ses_test").is_empty(),
-        "an owed entry write records no rendered mark: {:?}",
-        app.cards_handle().chains.rendered("ses_test")
+        !app.cards_handle()
+            .chains
+            .ending_shown("ses_test", &run_of("call_bg"), TaskEndingClass::Evidence),
+        "an owed entry write flips no shown bit"
     );
 
-    // Feishu returns: the queued payload delivers and the reconcile records the
-    // mark. The absence assertion above alone would pass with the whole mark
-    // feature removed, so the delivered half is pinned here (issue #671,
-    // ticket #672).
+    // Feishu returns: the queued payload delivers and the reconcile flips the
+    // bit. The absence assertion above alone would pass with the whole shown
+    // fact removed, so the delivered half is pinned here (ADR-0080).
     platform.fail_update_transport_count.store(0, Ordering::SeqCst);
     app.core.feishu.drain_pending_card_updates(true).await;
     crate::bridge::turn::reconcile_staged_cursors(&app.cards_handle()).await;
     assert!(
         app.cards_handle()
             .chains
-            .rendered("ses_test")
-            .iter()
-            .any(|key| key == "ended:call_bg"),
-        "a delivered entry write records its rendered mark: {:?}",
-        app.cards_handle().chains.rendered("ses_test")
+            .ending_shown("ses_test", &run_of("call_bg"), TaskEndingClass::Evidence),
+        "a delivered entry write flips its ending's shown bit"
     );
 }
 
@@ -3736,12 +3734,8 @@ async fn a_cleanup_never_advances_the_durable_watermark_for_a_late_wake() {
         "a synthetic cleanup entry never advances the durable Wake Watermark"
     );
     assert!(
-        persisted
-            .rendered("ses_test")
-            .iter()
-            .any(|key| key == "cleanup:call_sub"),
-        "the cleanup records its own class's mark: {:?}",
-        persisted.rendered("ses_test")
+        persisted.ending_shown("ses_test", &run_of("call_sub"), TaskEndingClass::Cleanup),
+        "the cleanup records its own class's ending"
     );
 
     // Life 2: a fresh process over the same files. The late Wake arrives with
@@ -3810,12 +3804,8 @@ async fn a_cleanup_mark_never_gates_a_late_wakes_completion() {
     let session_file = dir.path().join("sessions.json");
     let persisted = ChainRecords::load(session_file.with_file_name("chain_records.json"));
     assert!(
-        persisted
-            .rendered("ses_test")
-            .iter()
-            .any(|key| key == "cleanup:call_sub"),
-        "the delivered 🧹 entry records the cleanup's own mark: {:?}",
-        persisted.rendered("ses_test")
+        persisted.ending_shown("ses_test", &run_of("call_sub"), TaskEndingClass::Cleanup),
+        "the delivered 🧹 entry shows the cleanup's own ending"
     );
 
     // Life 2: the user's next message opens the card and the run's late Wake
@@ -4091,12 +4081,8 @@ async fn a_late_wake_after_a_restart_joins_the_retirements_rendered_mark() {
     let session_file = dir.path().join("sessions.json");
     let persisted = ChainRecords::load(session_file.with_file_name("chain_records.json"));
     assert!(
-        persisted
-            .rendered("ses_test")
-            .iter()
-            .any(|key| key == "ended:call_sub"),
-        "life 1's delivered retirement leaves its rendered mark: {:?}",
-        persisted.rendered("ses_test")
+        persisted.ending_shown("ses_test", &run_of("call_sub"), TaskEndingClass::Evidence),
+        "life 1's delivered retirement leaves its shown bit"
     );
     assert_eq!(
         persisted.announced("ses_test"),
@@ -4174,12 +4160,8 @@ async fn a_delivered_retirement_marks_rendered_without_moving_the_wake_mark() {
     let session_file = dir.path().join("sessions.json");
     let persisted = ChainRecords::load(session_file.with_file_name("chain_records.json"));
     assert!(
-        persisted
-            .rendered("ses_test")
-            .iter()
-            .any(|key| key == "ended:call_bg"),
-        "the delivered entry leaves its durable rendered mark: {:?}",
-        persisted.rendered("ses_test")
+        persisted.ending_shown("ses_test", &run_of("call_bg"), TaskEndingClass::Evidence),
+        "the delivered entry leaves its durable shown bit"
     );
     assert_eq!(
         persisted.announced("ses_test"),
@@ -6682,12 +6664,8 @@ async fn a_wake_less_retirement_renders_once_across_a_restart() {
     let session_file = dir.path().join("sessions.json");
     let persisted = ChainRecords::load(session_file.with_file_name("chain_records.json"));
     assert!(
-        persisted
-            .rendered("ses_test")
-            .iter()
-            .any(|key| key == "ended:call_sub"),
-        "the delivered entry leaves its durable rendered mark: {:?}",
-        persisted.rendered("ses_test")
+        persisted.ending_shown("ses_test", &run_of("call_sub"), TaskEndingClass::Evidence),
+        "the delivered entry leaves its durable shown bit"
     );
 
     // Life 2: a fresh process over the same files, with the same read — the
@@ -6769,8 +6747,8 @@ async fn a_restart_renders_the_owed_ending_the_read_no_longer_derives() {
         persisted.endings("ses_test")
     );
     assert!(
-        persisted.rendered("ses_test").is_empty(),
-        "the entry never reached a card, so no rendered mark exists"
+        !persisted.ending_shown("ses_test", &run_of("call_bg"), TaskEndingClass::Evidence),
+        "the entry never reached a card, so no shown bit is set"
     );
 
     // Life 2: a fresh process over the same files. Its MockBackend has no

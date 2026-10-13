@@ -16,7 +16,7 @@ pub(crate) use reconcile::{
     reconcile,
 };
 pub(crate) use records::{
-    ChainRecord, ChainRecords, CursorFrontier, CursorPartKind, PendingGap, RenderedCursor, TaskEnding,
-    TaskEndingClass, TaskEndingEvidence, TaskEndingState, TaskRunIdentity, TaskRunRecord,
-    cursor_prefix_digest, release_spent,
+    ChainRecord, ChainRecords, CursorFrontier, CursorPartKind, EndingFacts, EndingKey, PendingGap,
+    RenderedCursor, TaskEnding, TaskEndingClass, TaskEndingEvidence, TaskEndingState, TaskRunIdentity,
+    TaskRunRecord, cursor_prefix_digest, release_spent,
 };
