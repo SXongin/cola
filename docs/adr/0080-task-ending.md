@@ -5,10 +5,11 @@ corrected by a process-local overlay, marked single by a per-chain announce set,
 and kept single across a restart by a parallel `rendered` key set — while one
 run's end has **two** announce identities (`wake.id` for its Wake, the synthetic
 `runtime:<call_id>` / `ended:<call_id>` / `cleanup:<call_id>` for its evidence
-retirement), which is the root of #659. This ADR records the ending **once**,
-where the **Runtime Reconciliation** derives it, as an ordinary durable fact on
-the **Chain Record** — a **Task Ending** per **Task Run Id**, carrying its own
-"shown" fact — so exactly-once is the job of the confirmed card write the
+retirement), which is the root of #659. This ADR records each ending **once** —
+where the **Runtime Reconciliation**, the user's **Cleanup**, or a **Wake**
+derives it — as an ordinary durable fact on the **Chain Record**, keyed by
+**Task Run Id** and carrying its own "shown" fact, so exactly-once is the job of
+the confirmed card write the
 **Rendered Cursor** already rides, and both the parallel marks and the second
 key space dissolve.
 
@@ -66,7 +67,14 @@ key space dissolve.
   endings — evidence, the user's Cleanup, a Wake completion — live under that one
   id, and the record carries every id the run is known by (the launch's call id,
   its shell/child id, its tool call id, and the Wake id whose completion it
-  recorded). Without an alias step two writers naming one run differently — a
+  recorded). **"Once" is once per ending, not once per run**: a run holds at most
+  one ending of each class, because the classes are different claims about it —
+  an evidence ending says the run ended, so it suppresses a late Wake's
+  completion entry (#659), while a **Cleanup** says nothing about how the run
+  ended, so a cleaned run's late Wake is its own ending with its own entry
+  (#590). "Recorded once" fixes HOW each ending is recorded — at derivation,
+  never re-derived, never a second copy. Without an alias step two writers naming
+  one run differently — a
   Wake arriving after the launch left the read (compaction, the V2 page cap), or
   a reconciliation read that still carries the launch but whose call id the
   record no longer keys on — would each mint a record, and the duplicate #659 is
@@ -134,8 +142,8 @@ key space dissolve.
   rendering an entry — so the floor remains an entry gate. A Wake writes an
   ending only when the run has no **evidence** ending: a 🧹 **Cleanup** claims
   nothing about how the run ended, so a cleaned run's late Wake still writes its
-  own ending and shows its own completion (#590), and the two records coexist on
-  the one run.
+  own ending and shows its own completion (#590), and both endings live on the
+  one run's record, each with its own shown state.
 - **The legacy spellings are translated once.** On load, `ended:<call_id>` and
   `cleanup:<call_id>` become evidence/cleanup endings and the pre-#659
   `runtime:<call_id>` becomes a **legacy class** that only the retirement's own
