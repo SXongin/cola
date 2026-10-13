@@ -387,12 +387,11 @@ pub(crate) async fn reconcile_now(
 /// [`reconcile_now`] never calls it itself; the caller commits only after the
 /// flush that carried the read's entries was accepted.
 ///
-/// The DURABLE rendered mark (issue #671, ticket #672) is deliberately not
-/// written here: this gate counts a recoverably failed write still owed by the
-/// outbox as accepted, and a mark must ride a write that really DELIVERED the
-/// entry. The mark therefore travels with the body's staged cursor, whose
-/// confirmation is the project's delivered-write choke point — and so does the
-/// ending's own shown fact (ADR-0080, slice #702).
+/// The DURABLE Task Ending fact (ADR-0080) is deliberately not written here:
+/// this gate counts a recoverably failed write still owed by the outbox as
+/// accepted, and a shown bit must ride a write that really DELIVERED the entry.
+/// The bit therefore travels with the body's staged cursor, whose confirmation
+/// is the project's delivered-write choke point.
 fn record_overlay(backend: &Arc<dyn Backend>, session_id: &str, transcript: &SessionTranscript) {
     if !transcript.task_retirements.is_empty() {
         let call_ids: Vec<String> = transcript

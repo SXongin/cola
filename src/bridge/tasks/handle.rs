@@ -62,9 +62,10 @@ use super::model::{TaskRunId, identity_of_task, identity_task};
 
 /// The durable facts an earlier card of this Session already announced, read
 /// from the Chain Record — the durable half of ADR-0079's `restore(record,
-/// scope)`. The two stay separate facts on purpose: the Wake floor gates Wakes,
-/// the render marks gate retirements, and a retirement must never move the
-/// floor a late Wake is judged against (#590).
+/// scope)`. Only the Wake floor is a cell fact: a retirement's exactly-once is
+/// the ending's own durable shown bit (ADR-0080), read from the Chain Record
+/// where it gates, and a retirement must never move the floor a late Wake is
+/// judged against (#590).
 pub(crate) struct DurableSeed {
     /// The Wake Watermark as a floor (spec #561, review #569; ADR-0061): every
     /// Wake at or below this `created_ms` was announced by an earlier card —
@@ -73,10 +74,6 @@ pub(crate) struct DurableSeed {
     /// advance for it. A strictly newer Wake still renders and announces.
     /// `None` when the session announced no Wake.
     pub(crate) watermark_ms: Option<i64>,
-    /// The synthetic retirement entries an earlier card really showed (issue
-    /// #671, ticket #672), which the fresh cell never re-renders. Empty for a
-    /// session that rendered no retirement.
-    pub(crate) rendered_keys: Vec<String>,
 }
 
 /// The module's per-Session store, its handle to the durable tier and its
@@ -93,10 +90,11 @@ pub(crate) struct DurableSeed {
 /// session-id transition (`Turn::recreate`).
 #[derive(Clone)]
 pub(crate) struct TasksHandle {
-    /// The durable Chain Record (ADR-0069): the Wake Watermark and the
-    /// session-scoped `rendered` marks a fresh cell is seeded from. Late-bound
-    /// ([`Self::attach_chains`]) because the handle is created before the
-    /// record; `None` until then, which reads as the recordless-session shape.
+    /// The durable Chain Record (ADR-0069): the Wake Watermark a fresh cell is
+    /// seeded from, and the durable Task Endings this tier's reads consult
+    /// (ADR-0080). Late-bound ([`Self::attach_chains`]) because the handle is
+    /// created before the record; `None` until then, which reads as the
+    /// recordless-session shape.
     chains: Arc<Mutex<Option<Arc<ChainRecords>>>>,
     /// session_id → chain generation → the cell that generation's live card
     /// owns. Nested rather than a flat `(String, u64)` key so the per-session
@@ -188,19 +186,15 @@ impl TasksHandle {
         self.chains().map_or(0, |chains| chains.generation(session_id))
     }
 
-    /// Read the durable tier a fresh cell is born from: the Wake floor and the
-    /// rendered marks. The Chain Record's own lock is a plain
-    /// [`std::sync::Mutex`], taken and released inside this call.
+    /// Read the durable tier a fresh cell is born from: the Wake floor. The
+    /// Chain Record's own lock is a plain [`std::sync::Mutex`], taken and
+    /// released inside this call.
     pub(crate) fn durable_seed(&self, session_id: &str) -> DurableSeed {
         match self.chains() {
             Some(chains) => DurableSeed {
                 watermark_ms: chains.announced(session_id).map(|mark| mark.created_ms),
-                rendered_keys: chains.rendered(session_id),
             },
-            None => DurableSeed {
-                watermark_ms: None,
-                rendered_keys: Vec::new(),
-            },
+            None => DurableSeed { watermark_ms: None },
         }
     }
 
@@ -252,9 +246,9 @@ impl TasksHandle {
     /// with — the one call each of the four card-install sites makes. The bind
     /// ([`Self::install`]) keys the cell at the chain's current generation, so
     /// the facts come from [`Self::durable_seed`] read AFTER the binding; the
-    /// caller seeds them through the accumulator's forwarding setters
-    /// (`set_wake_floor` / `set_render_marks`), which reach the cell the store
-    /// owns for that binding, not a side door. The liveness tier's `retired`
+    /// caller seeds it through the accumulator's forwarding setter
+    /// (`set_wake_floor`), which reaches the cell the store owns for that
+    /// binding, not a side door. The liveness tier's `retired`
     /// cache is seeded here too (ADR-0080), from the same durable endings.
     pub(crate) fn restore(&self, session_id: &str, cell: &TaskCell) -> DurableSeed {
         self.install(session_id, cell);

@@ -3314,20 +3314,16 @@ impl Turn {
     /// state from the chain's Chain Record — the module's
     /// [`crate::bridge::tasks::TasksHandle::restore`]. The call **binds** the
     /// cell (the reset point, recording the chain generation) and RETURNS the
-    /// facts, which the accumulator's own forwarding setters then seed: the
+    /// facts, which the accumulator's own forwarding setter then seeds: the
     /// **Wake floor** from the Wake Watermark (spec #561, review #569;
-    /// ADR-0061) through [`state::StreamAccumulator::set_wake_floor`], and the
-    /// chain's **rendered marks** through
-    /// [`state::StreamAccumulator::set_render_marks`] (legacy, ADR-0080: the live
-    /// gates read the endings' shown bits off the Chain Record, and the
-    /// shrinkage slice #703 deletes this seed with the section). The rule itself
-    /// lives in the Background Task State module; the facts stay separate on
-    /// purpose (the floor gates Wakes, a retirement's ending never moves the
-    /// floor a late Wake is judged against — #590).
+    /// ADR-0061) through [`state::StreamAccumulator::set_wake_floor`]. A
+    /// retirement's exactly-once is the ending's own durable shown bit
+    /// (ADR-0080), read from the Chain Record where it gates — never a cell
+    /// fact (a retirement must not move the floor a late Wake is judged
+    /// against, #590).
     fn seed_durable_announcements(cards: &CardsHandle, session_id: &str, acc: &mut state::StreamAccumulator) {
         let seed = cards.tasks.restore(session_id, acc.tasks());
         acc.set_wake_floor(seed.watermark_ms);
-        acc.set_render_marks(seed.rendered_keys);
     }
 
     /// Register a fresh Turn's accumulator as the session's live card (ADR-0080):
@@ -4422,7 +4418,7 @@ mod tests {
     /// delivered, in the SAME write as the re-point; and a create whose Session
     /// is gone still flips its endings (session-scoped).
     #[tokio::test]
-    async fn a_continuation_without_its_stage_still_marks_its_keys() {
+    async fn a_continuation_without_its_stage_still_marks_its_endings() {
         let _wd = test_work_dir();
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_config(&dir.path().join("sessions.json"));
@@ -4723,15 +4719,16 @@ mod tests {
     /// holds the cards map (issue #671, ticket #672; the CI gate's second
     /// ordering). Read before the lock as `Turn::start` once did — the seed
     /// before its `begin_turn` await, the insert after — a projection create
-    /// landing in that gap records the mark durably (its Took takeover still
-    /// owns the map entry), and the Turn then installs the older, empty set: its
-    /// next read re-plans and re-renders the very retirement the successor card
-    /// just showed.
+    /// landing in that gap advances the durable Wake Watermark (its Took
+    /// takeover still owns the map entry), and the Turn then installs the older,
+    /// empty floor: its next read re-plans and re-renders the very wake
+    /// completion the successor card just showed.
     ///
     /// The map lock makes the ordering deterministic: the install is spawned
-    /// first and reads its seed only after it acquires the lock, while the mark
-    /// lands while the test still holds it. A read-then-install split apart
-    /// reads the empty set before the spawn returns and fails the assertion.
+    /// first and reads its seed only after it acquires the lock, while the
+    /// watermark lands while the test still holds it. A read-then-install split
+    /// apart reads the empty floor before the spawn returns and fails the
+    /// assertion.
     #[tokio::test]
     async fn a_fresh_install_seeds_under_the_same_lock_it_takes() {
         let _wd = test_work_dir();
@@ -4740,8 +4737,9 @@ mod tests {
         let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
         let cards = app.cards_handle();
 
-        // Hold the map lock so the install queues on it while the durable mark
-        // lands — the window a landed projection body's confirmation writes in.
+        // Hold the map lock so the install queues on it while the durable
+        // watermark lands — the window a landed projection body's confirmation
+        // writes in.
         let held = cards.cards.lock().await;
         let (ready_tx, mut ready_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
         let install = {
@@ -4753,19 +4751,18 @@ mod tests {
             })
         };
         ready_rx.recv().await.expect("the install queued");
-        // The mark a landed projection's Took takeover records for the session,
-        // written before the install reaches the seed.
-        cards
-            .chains
-            .record_rendered("ses_test", &["runtime:call_1".to_string()]);
+        // The Wake Watermark a landed projection's confirmation advances for the
+        // session, written before the install reaches the seed.
+        cards.chains.advance("ses_test", "msg_wake_1", 1_000);
         drop(held);
         install.await.expect("the install task");
 
         let live = cards.cards.lock().await;
         let card = live.get("ses_test").expect("the fresh Turn's session");
-        assert!(
-            card.acc.render_recorded("runtime:call_1"),
-            "the install's seed reads the mark that landed before it"
+        assert_eq!(
+            card.acc.wake_floor(),
+            Some(1_000),
+            "the install's seed reads the watermark that landed before it"
         );
     }
 

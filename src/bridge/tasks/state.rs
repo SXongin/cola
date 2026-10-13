@@ -2,7 +2,7 @@
 //!
 //! This is the volatile tier's home: the four per-chain delivery sets a card
 //! accumulator used to own inline — `announced_wakes`, `handed_over_wakes`,
-//! `wake_floor` and `render_marks` — held in [`TaskState`] and reached through
+//! `wake_floor` and `announced_endings` — held in [`TaskState`] and reached through
 //! [`TaskCell`], the shared handle the accumulator and the per-Session store
 //! both hold. `StreamAccumulator` keeps thin forwarding methods that delegate
 //! to the cell, so no caller changes.
@@ -65,25 +65,10 @@ pub(crate) struct TaskState {
     /// `(run, class)` pairs marked by [`Self::announce_ending`] when a plan
     /// commits its entry. The retirement's own announce gate: a repeated read
     /// inside one life — the entry's body still owed, refused, or delivered —
-    /// never inserts a second timeline entry. Replaces the pre-ADR key
-    /// spellings (§`ended:`/`cleanup:`), so the class itself is the identity and
-    /// a legacy spelling never gates. A later card seeds the durable half
-    /// through the Chain Record's shown bits, not through here.
+    /// never inserts a second timeline entry. The class itself is the identity,
+    /// so no synthetic key spelling ever gates. A later card seeds the durable
+    /// half through the Chain Record's shown bits, not through here.
     announced_endings: Vec<(TaskRunId, TaskEndingClass)>,
-    /// The synthetic completion keys an EARLIER card of this Session already
-    /// rendered (issue #671, ticket #672): the durable `ended:<call_id>` /
-    /// `cleanup:<call_id>` marks `ChainRecords` carries, seeded when a card
-    /// starts rendering a session alongside [`Self::wake_floor`].
-    ///
-    /// **Legacy (ADR-0080).** No live gate reads it: the render asks the Chain
-    /// Record's endings for the run's shown bit
-    /// ([`crate::bridge::chain::EndingFacts`]), which is the same fact without a
-    /// key spelling. The set and its seed stay until the shrinkage slice (#703)
-    /// deletes them with the `rendered` section. Deliberately never a Wake fact:
-    /// it does not join [`Self::wake_floor`], so a genuinely un-announced late
-    /// Wake at or below a retirement's clock still renders and resumes (#590, PR
-    /// #595).
-    render_marks: HashSet<String>,
 }
 
 impl TaskState {
@@ -157,22 +142,6 @@ impl TaskState {
     /// at or below this `created_ms` was announced by an earlier card.
     pub(crate) fn wake_floor(&self) -> Option<i64> {
         self.wake_floor
-    }
-
-    /// Seed the durable rendered marks of the session's earlier cards (empty for
-    /// a session that rendered no retirement). **Legacy (ADR-0080)**: see
-    /// [`Self::render_marks`]; deleted with it by the shrinkage slice #703.
-    pub(crate) fn set_render_marks(&mut self, marks: Vec<String>) {
-        self.render_marks = marks.into_iter().collect();
-    }
-
-    /// Whether an earlier card of this Session already rendered this key — the
-    /// durable mark the pre-ADR render gate consulted (issue #671, ticket
-    /// #672). **Legacy (ADR-0080)**: see [`TaskState::render_marks`]; the
-    /// shrinkage slice (#703) deletes it with the section.
-    #[allow(dead_code)]
-    pub(crate) fn render_recorded(&self, key: &str) -> bool {
-        self.render_marks.contains(key)
     }
 }
 
@@ -266,17 +235,6 @@ impl TaskCell {
     /// The chain's durable Wake Watermark floor, if any (spec #561).
     pub(crate) fn wake_floor(&self) -> Option<i64> {
         self.lock().wake_floor()
-    }
-
-    /// Seed the durable rendered marks of the session's earlier cards.
-    /// **Legacy (ADR-0080)**: see [`TaskState::render_marks`].
-    pub(crate) fn set_render_marks(&self, marks: Vec<String>) {
-        self.lock().set_render_marks(marks);
-    }
-
-    /// Whether an earlier card of this Session already rendered this key.
-    pub(crate) fn render_recorded(&self, key: &str) -> bool {
-        self.lock().render_recorded(key)
     }
 
     fn lock(&self) -> MutexGuard<'_, TaskState> {

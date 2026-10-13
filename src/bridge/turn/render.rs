@@ -750,14 +750,13 @@ fn wake_run(wake: &Wake, retired: Option<&BackgroundTask>) -> Option<TaskRunId> 
 /// 2026-10-01: the card settled ✅ with no entry). Exactly-once does not come
 /// from the anchor: the read that carries a retirement records it in the
 /// backend's process-local overlay, so no later read derives it again, and the
-/// Wake announcement set (ADR-0061) covers the reads within the observing chain,
-/// under the run's own key — `ended:<call_id>` for an evidence ending,
-/// `cleanup:<call_id>` for the user's own, and, for a mark an older build wrote,
-/// the pre-#659 `runtime:<call_id>` (issue #659). That synthetic mark advances NO Wake
-/// Watermark — a retirement is not a Wake (ADR-0061) — but it is not
-/// in-memory-only either: a delivered body's keys become the session's durable
-/// rendered marks (issue #671, ticket #672), gated by [`StreamAccumulator::render_recorded`]
-/// at line 561, which is what stops a restart from re-posting the entry.
+/// exactly-once gate is the run's own **Task Ending** (ADR-0080) — the
+/// `(run, class)` pair this chain announced
+/// ([`StreamAccumulator::ending_announced_any`]), or the durable **shown** bit
+/// an earlier card's confirmed write left, the load-time
+/// `runtime:`/`ended:`/`cleanup:` translations included. That ending advances
+/// NO Wake Watermark — a retirement is not a Wake (ADR-0061) — and the shown
+/// bit is what stops a restart from re-posting the entry.
 fn plan_runtime_entries(
     acc: &StreamAccumulator,
     transcript: &SessionTranscript,

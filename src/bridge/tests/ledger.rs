@@ -1794,7 +1794,7 @@ async fn a_task_ended_mid_turn_settles_the_turn_directly() {
 /// its fenced retry — so the card suspends and nothing will ever carry the entry
 /// on it. The runtime's evidence ending is recorded durably AT DERIVATION, so
 /// the task LEAVES the ledger and its entry stays OWED; only the process-local
-/// overlay and the rendered mark keep ADR-0073's accepted-write gate (PR #595).
+/// overlay and the ending's shown bit keep ADR-0073's accepted-write gate (PR #595).
 /// The next card that CAN render the entry claims it — exactly once.
 #[tokio::test]
 async fn a_permanently_refused_retirement_write_leaves_the_entry_owed() {
@@ -1829,10 +1829,10 @@ async fn a_permanently_refused_retirement_write_leaves_the_entry_owed() {
         2,
         "the plain attempt and the fenced one only"
     );
-    // The process-local overlay and the rendered mark keep the accepted-write
-    // gate (ADR-0073, PR #595): the entry never reached a card, so neither was
-    // recorded — but the ENDING is durable (ADR-0080) and the task leaves the
-    // ledger at once.
+    // The process-local overlay and the ending's shown bit keep the accepted-
+    // write gate (ADR-0073, PR #595): the entry never reached a card, so the bit
+    // was not flipped — but the ENDING is durable (ADR-0080) and the task leaves
+    // the ledger at once.
     assert!(
         backend.overlay.retired_call_ids("ses_test").is_empty(),
         "a refused carrier commits no overlay cache: {:?}",
@@ -3693,8 +3693,8 @@ async fn a_late_wake_after_a_cleanup_still_resumes_the_chain() {
 /// resumes the chain.
 ///
 /// The launches name the child session, so the Wake correlates to the run the
-/// cleanup retired: the cleanup's own durable mark (`cleanup:<call_id>`, issue
-/// #659) must NOT gate that Wake's completion entry either.
+/// cleanup retired: the cleanup's own durable ending, of the `Cleanup` class
+/// (issue #659), must NOT gate that Wake's completion entry either.
 #[tokio::test]
 async fn a_cleanup_never_advances_the_durable_watermark_for_a_late_wake() {
     let _wd = test_work_dir();
@@ -3770,11 +3770,11 @@ async fn a_cleanup_never_advances_the_durable_watermark_for_a_late_wake() {
 }
 
 /// Issue #659, the cleanup class across a restart: life 1's 🧹 cleanup leaves
-/// its OWN durable mark (`cleanup:<call_id>`); a fresh process whose late Wake
-/// renders as content on a card the Wake did NOT open must still show the run's
-/// completion. A cleanup claims nothing about how the run ended (spec #590), so
-/// its mark may never stand in for the evidence key the Wake's gate reads — and
-/// the cleanup's own entry must not be re-derived either.
+/// its OWN durable ending, of the `Cleanup` class; a fresh process whose late
+/// Wake renders as content on a card the Wake did NOT open must still show the
+/// run's completion. A cleanup claims nothing about how the run ended (spec
+/// #590), so its ending may never stand in for the evidence ending the Wake's
+/// gate reads — and the cleanup's own entry must not be re-derived either.
 #[tokio::test]
 async fn a_cleanup_mark_never_gates_a_late_wakes_completion() {
     let _wd = test_work_dir();
@@ -4043,15 +4043,15 @@ async fn a_late_wake_never_doubles_a_child_evidences_completion_entry() {
 }
 
 /// Issue #659, the restart half: life 1 records the child-evidence retirement,
-/// whose `ended:<call_id>` mark rides the card that showed it (issue #671,
-/// ticket #672). A fresh process has no in-memory announce set, so the late
-/// Wake's suppression can only come from that durable mark — and it must: the
-/// restarted read carries the run's Wake (newer than the user's next message,
-/// older than its resumed work) with no live task and no retirement to derive.
-/// Never the Wake Watermark (which stays unset, #595), and the resumed work
-/// still renders (spec #590).
+/// whose ending's shown bit rides the card that showed it (ADR-0080; issue
+/// #671, ticket #672). A fresh process has no in-memory announce set, so the
+/// late Wake's suppression can only come from that durable bit — and it must:
+/// the restarted read carries the run's Wake (newer than the user's next
+/// message, older than its resumed work) with no live task and no retirement to
+/// derive. Never the Wake Watermark (which stays unset, #595), and the resumed
+/// work still renders (spec #590).
 #[tokio::test]
-async fn a_late_wake_after_a_restart_joins_the_retirements_rendered_mark() {
+async fn a_late_wake_after_a_restart_joins_the_retirements_shown_bit() {
     let _wd = test_work_dir();
     let now = chrono::Utc::now().timestamp_millis();
     let live = SessionTranscript::new(late_wake_timeline(vec![]))
@@ -4093,8 +4093,8 @@ async fn a_late_wake_after_a_restart_joins_the_retirements_rendered_mark() {
     // Life 2: a fresh process over the same files, the user's next message, and
     // the run's late Wake — newer than that message, so the card the message
     // opens is what the Wake's completion entry would land on. The run is not
-    // live and no reconcile runs, so the durable mark is the only thing left
-    // that knows the run's record is already on a card.
+    // live and no reconcile runs, so the durable shown bit is the only thing
+    // left that knows the run's record is already on a card.
     let late = SessionTranscript::new(late_wake_timeline(vec![
         user("msg_cola_next", 2_800, "新问题"),
         assistant(3_100, "审阅完成。"),
@@ -4130,13 +4130,13 @@ async fn a_late_wake_after_a_restart_joins_the_retirements_rendered_mark() {
     );
 }
 
-/// Issue #671 / ticket #672: the durable RENDERED marks are a fact SEPARATE
-/// from the Wake Watermark. A delivered retirement entry records its
-/// `ended:<call_id>` mark while leaving the Wake mark untouched — the two
-/// facts share a file and nothing else, so a late Wake is still judged against
-/// the Wake floor alone (#590, PR #595).
+/// Issue #671 / ticket #672: the durable Task Endings are a fact SEPARATE from
+/// the Wake Watermark. A delivered retirement entry flips its ending's shown
+/// bit while leaving the Wake mark untouched — the two facts share a file and
+/// nothing else, so a late Wake is still judged against the Wake floor alone
+/// (#590, PR #595).
 #[tokio::test]
-async fn a_delivered_retirement_marks_rendered_without_moving_the_wake_mark() {
+async fn a_delivered_retirement_marks_shown_without_moving_the_wake_mark() {
     let _wd = test_work_dir();
     let now = chrono::Utc::now().timestamp_millis();
     let live = waiting_shell(now - 5_000);
@@ -6629,8 +6629,8 @@ async fn a_cleaned_entry_spends_no_output_read() {
 /// Issue #671 / ticket #672: a Wake-less Background Task's retirement — the
 /// one ending there will ever be (#454) — renders on the card that observed
 /// it, and NEVER again. A restart re-derives the same child-evidence
-/// retirement (the launch never flips), so the durable rendered mark is the
-/// only thing standing between the reader and the same `🔔 subagent 结束`
+/// retirement (the launch never flips), so the ending's durable shown bit is
+/// the only thing standing between the reader and the same `🔔 subagent 结束`
 /// entry re-posted on every new card, hours later.
 #[tokio::test]
 async fn a_wake_less_retirement_renders_once_across_a_restart() {
@@ -6709,7 +6709,7 @@ async fn a_wake_less_retirement_renders_once_across_a_restart() {
 /// Acceptance (spec #699, ticket #701): a restart whose read derives NO
 /// retirement still renders the owed entry. Life 1's runtime verdict recorded
 /// the evidence ending durably, but Feishu permanently refused the card write,
-/// so the entry never landed and no rendered mark exists. A fresh process over
+/// so the entry never landed and no shown bit was flipped. A fresh process over
 /// the same sidecar whose runtime read answers nothing (so nothing is
 /// re-derived) must still render the entry — the `apply` synthesis reads the
 /// durable ending, not the transcript.
