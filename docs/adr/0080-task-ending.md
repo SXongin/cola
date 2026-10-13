@@ -125,21 +125,19 @@ key space dissolve.
   dedup reads — never the Wake gate, exactly as today (#590) — so one release's
   records cannot be miscounted, and only the new shape is ever written. Past the
   bound the old marks age out.
-- **The bound never drops an owed ending, and the backlog is bounded too.** The
-  `endings` section is bounded like the `rendered` marks it replaces, and an
-  eviction candidate is always a record whose endings have all been **shown**: an
-  unshown ending is exactly what the next card owes, so dropping it would lose an
-  entry no card has ever displayed — the loss side this family never takes (every
-  mark the old section held had already been shown, so its bound could only ever
-  cost a duplicate). Storage stays bounded as well: every read that derives an
-  ending is a card-owning path (`Turn`'s drain, Session Sync's waiting card, the
-  follow/settle loop, the Cleanup click), and a card that can place entries
-  drains the backlog on its next render — so an unshown backlog only survives in
-  a chain that cannot place an entry at all (a record whose Turn anchor never
-  resolved, or a carrier every write refuses). That shape gets its own hard cap:
-  past it, the OLDEST unshown ending is marked **shown without a render** (with a
-  `WARN`), surrendering an entry that shape could not have placed anyway while
-  the run stays ended and no card resurrects it. The bound keeps the marks' own
+- **The bound never drops an owed ending.** The `endings` section is bounded like
+  the `rendered` marks it replaces, and an eviction candidate is always a record
+  whose endings have all been **shown**: an unshown ending is exactly what the
+  next card owes, so dropping it would lose an entry no card has ever displayed —
+  the loss side this family never takes (every mark the old section held had
+  already been shown, so its bound could only ever cost a duplicate). One shape
+  can therefore hold the section above its bound: a chain that cannot place an
+  entry at all (a record whose Turn anchor never resolved, or a carrier every
+  write refuses), where unshown endings accumulate — one small record per run
+  that ended during that window. That accumulation is accepted rather than
+  surrendered, and it is self-closing: the moment a card can place entries, one
+  render shows the whole backlog, after which those records are evictable; a
+  `WARN` marks the window while it lasts. The bound keeps the marks' own
   residual: past it, a very old **shown** ending may render once more after a
   restart.
 - **Out of scope, deliberately.** The unconfirmed marker (`⚠️ 状态待确认`) stays
@@ -236,6 +234,10 @@ past it). The trade therefore becomes:
   must not spend it.
 - **Hard-cut the legacy marks.** Rejected: one release's `rendered` data would
   replay entries; translation is cheap and keeps #590's asymmetry explicit.
+- **Cap the unshown backlog and surrender the oldest owed entry past it.**
+  Rejected: it loses an entry no card displayed — the loss side this family never
+  takes — and the only shape that can exceed the bound is a chain that cannot
+  place an entry at all, whose backlog closes as soon as one card can.
 
 ## Consequences
 
@@ -243,9 +245,9 @@ past it). The trade therefore becomes:
   shown bits); the `rendered` section and the pre-#659 spelling retire into its
   legacy read; `MAX_RENDERED_KEYS` becomes the bound over a session's run
   records — a shown record is the eviction candidate, oldest first, never an
-  unshown one — plus a hard cap on the unshown backlog, past which the oldest
-  unshown ending is marked shown without a render (a `WARN`, in the one shape
-  that could not have placed its entry).
+  unshown one. A chain that can never place an entry holds the section above that
+  bound while its backlog lasts (a `WARN`), and the backlog becomes evictable the
+  moment one render shows it.
 - `StreamAccumulator`/`StagedCursor` no longer carry a separate `rendered` key
   list — the staged body carries the endings it rendered, and the confirmation
   flips their shown bits beside the cursor; `Turn::recorded_marks` and
@@ -280,7 +282,9 @@ past it). The trade therefore becomes:
   entry the read no longer derives, an entry shown once is never re-shown, a
   cleanup survives a restart, a cleaned run's late Wake still shows its own
   completion (#590), an evidence ending suppresses a late Wake across a restart,
-  and a legacy mark is read once then ages out — plus `ChainRecords`
+  an unshown ending survives a chain that cannot place entries and renders once
+  that chain gains an anchor, and a legacy mark is read once then ages out — plus
+  `ChainRecords`
   unit tests for the new section's round-trip, migration, monotonic shown bits
   and bound eviction. Unlike ADR-0079's slices these tests change: the restart
   semantics change with them.
