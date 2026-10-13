@@ -84,7 +84,8 @@ derivation — see the 2026-10-14 amendment below.
   ended, so a cleaned run's late Wake is its own ending with its own entry
   (#590). The ENTRY gate is separate and is one entry per run, whatever class
   (the 2026-10-14 amendment below). "Recorded once" fixes HOW each ending is
-  recorded — at derivation, never re-derived, never a second copy. Without an
+  recorded — at derivation (a **Wake** completion's at its entry's commit — the
+  2026-10-14 amendment below), never re-derived, never a second copy. Without an
   alias step two writers naming
   one run differently — a
   Wake arriving after the launch left the read (compaction, the V2 page cap), or
@@ -120,7 +121,9 @@ derivation — see the 2026-10-14 amendment below.
   the identity a `BackgroundTask` needs to be re-synthesized (tool name, call
   id, shell/child id, start clock, label). The label and the start clock are
   captured when the ending is derived — that read necessarily carries the launch
-  — so a later card's entry is immune to compaction and to a truncated read.
+  — so a later card's entry is immune to compaction and to a truncated read (the
+  **Wake** path excepted: its ending is recorded with its entry's commit and
+  serves no later card — the 2026-10-14 amendment below).
   The shell **output tail** is deliberately NOT captured: it is a network read
   of a record that may only become readable once the run has settled, so it
   stays where it is, spent by the render that places the entry.
@@ -271,8 +274,9 @@ past it). The trade therefore becomes:
   beside `transcript.task_retirements`). Rejected: two sources would need
   de-duplicating in the plan; routing the durable ending through `apply` keeps one
   path and changes no downstream code. The 2026-10-14 amendment below records
-  that the landed shape keeps this one path: the plan's durable read is a
-  suppression gate, never a second source.
+  the landed shape: the plan's durable read can never **create** an entry (it
+  may fill an entry's identity, label and start clock when the read no longer
+  carries the launch), so the one entry source is unchanged.
 - **Make the Wake's entry ride the ending's shown bit alone, retiring the Wake
   floor.** Rejected: a Wake that opened a 承接 line announced without an entry, so
   a single ending gate would re-render it on a later card.
