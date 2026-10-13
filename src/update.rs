@@ -61,53 +61,73 @@ pub enum InstallChannel {
 
 /// How Linux's procfs renders `/proc/self/exe` once the file behind it was
 /// replaced or unlinked while the process kept running.
+#[cfg(target_os = "linux")]
 const PROC_DELETED_SUFFIX: &str = " (deleted)";
 
-/// Strip Linux's procfs `" (deleted)"` marker from `exe`'s final component.
+/// Whether the file at `path` holds the very inode this process is running.
 ///
-/// The marker is a Linux `/proc/self/exe` rendering, so this is Linux-scoped —
-/// there it is also stripped byte-wise, because a path carrying non-UTF-8 bytes
-/// must still resolve: requiring `to_str()` would make an otherwise-locatable
-/// binary unresolvable, and `/update` would refuse while `/restart` failed to
-/// re-exec it. Other platforms (macOS rejects non-UTF-8 names outright) keep
-/// the string path.
+/// This is what makes the Linux rendering unambiguous: `/proc/self/exe` appends
+/// `" (deleted)"` only for an unlinked dentry, so the string alone cannot tell
+/// where a replaced binary came from a binary *legitimately named*
+/// `"<name> (deleted)"`. The (device, inode) pair can.
+#[cfg(target_os = "linux")]
+fn runs_own_inode(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let (Ok(own), Ok(candidate)) = (std::fs::metadata("/proc/self/exe"), std::fs::metadata(path)) else {
+        return false;
+    };
+    own.dev() == candidate.dev() && own.ino() == candidate.ino()
+}
+
+/// Strip Linux's procfs `" (deleted)"` marker from `exe`'s final component —
+/// byte-wise, because Linux allows path bytes that are not UTF-8 and requiring
+/// `to_str()` would make an otherwise-locatable binary unresolvable.
+#[cfg(target_os = "linux")]
 fn strip_proc_deleted(exe: &Path) -> PathBuf {
-    #[cfg(target_os = "linux")]
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    match exe
+        .as_os_str()
+        .as_bytes()
+        .strip_suffix(PROC_DELETED_SUFFIX.as_bytes())
     {
-        use std::os::unix::ffi::{OsStrExt, OsStringExt};
-        if let Some(stripped) = exe
-            .as_os_str()
-            .as_bytes()
-            .strip_suffix(PROC_DELETED_SUFFIX.as_bytes())
-        {
-            return PathBuf::from(std::ffi::OsString::from_vec(stripped.to_vec()));
-        }
+        Some(stripped) => PathBuf::from(std::ffi::OsString::from_vec(stripped.to_vec())),
+        None => exe.to_path_buf(),
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        if let Some(stripped) = exe.to_str().and_then(|s| s.strip_suffix(PROC_DELETED_SUFFIX)) {
-            return PathBuf::from(stripped);
-        }
-    }
-    exe.to_path_buf()
 }
 
 /// The live on-disk path of the binary `exe` names — where `exe` is what
 /// `std::env::current_exe()` returned — or `None` when no file exists there.
 ///
-/// `current_exe()` is a handle to the running binary, not a path to a file:
-/// on Linux it reads `/proc/self/exe`, which renders as `"<path> (deleted)"`
-/// once the file behind it was replaced under the process — the normal state
-/// after any cargo/archive upgrade that left the daemon running (issue #551).
-/// The literal path then names nothing while the stripped path names the
-/// replacement the operator actually has, so that is the live binary.
-///
+/// `current_exe()` is a handle to the running binary, not a path to a file.
 /// Channel detection, the install target and the restart all resolve through
-/// here; otherwise they disagree about which file to read and to replace, and
-/// a `(deleted)` path gets handed to `fs::rename`, which *creates* it.
+/// here; otherwise they disagree about which file to read and to replace, and a
+/// replaced binary's `"<path> (deleted)"` rendering gets handed to
+/// `fs::rename`, which *creates* it (issue #551).
+///
+/// On Linux it reads `/proc/self/exe`, which renders as `"<path> (deleted)"`
+/// once the file behind it was replaced under the process — the normal state
+/// after any cargo/archive upgrade that left the daemon running. The inode
+/// decides which path that is: the literal one while it still holds our own
+/// inode (so a binary legitimately named `"<name> (deleted)"` is not mis-read),
+/// the stripped one otherwise, where the replacement lives.
+#[cfg(target_os = "linux")]
 pub fn live_exe_path(exe: &Path) -> Option<PathBuf> {
-    let target = strip_proc_deleted(exe);
-    target.is_file().then_some(target)
+    if runs_own_inode(exe) {
+        return Some(exe.to_path_buf());
+    }
+    let stripped = strip_proc_deleted(exe);
+    stripped.is_file().then_some(stripped)
+}
+
+/// [`live_exe_path`]: the path itself when a file is there, `None` when not.
+///
+/// The procfs `" (deleted)"` rendering is Linux's `/proc/self/exe` alone, so on
+/// every other platform `current_exe()` names the running file itself: there is
+/// no marker to strip, and a name that happens to end in `" (deleted)"` is a
+/// legitimate binary.
+#[cfg(not(target_os = "linux"))]
+pub fn live_exe_path(exe: &Path) -> Option<PathBuf> {
+    exe.is_file().then_some(exe.to_path_buf())
 }
 
 /// [`live_exe_path`] for this process, failing when the running binary is not
@@ -499,19 +519,23 @@ pub fn install(new_binary: &Path, current_exe: &Path) -> anyhow::Result<()> {
     // #551): `fs::rename` to a NONEXISTENT destination succeeds and creates
     // it, which is how an update of a replaced-under-us daemon left a phantom
     // `"<path> (deleted)"` next to the real install and still reported
-    // success. The one legitimate target is an existing file on disk, and it
-    // never carries the procfs marker — that names a file which was replaced,
-    // not the file to replace.
+    // success. The one legitimate target is an existing file on disk, and on
+    // Linux it never carries the procfs marker — that names a file which was
+    // replaced, not the file to replace (elsewhere such a name is just a name,
+    // so the `is_file` check is the whole guard).
     anyhow::ensure!(
         current_exe.is_file(),
         "拒绝安装到 {}：它不是磁盘上的已有文件",
         current_exe.display()
     );
-    anyhow::ensure!(
-        !current_exe.to_string_lossy().ends_with(PROC_DELETED_SUFFIX),
-        "拒绝安装到 procfs 已替换路径 {}",
-        current_exe.display()
-    );
+    #[cfg(target_os = "linux")]
+    {
+        anyhow::ensure!(
+            !current_exe.to_string_lossy().ends_with(PROC_DELETED_SUFFIX),
+            "拒绝安装到 procfs 已替换路径 {}",
+            current_exe.display()
+        );
+    }
     #[cfg(target_os = "windows")]
     {
         let old = current_exe.with_extension("old.exe");
@@ -1118,21 +1142,40 @@ mod tests {
 
     /// #551: `/proc/self/exe` renders as `"<path> (deleted)"` once the file
     /// was replaced under the running daemon. The stripped path is the file
-    /// that now exists, and it is what every decision must read.
+    /// that now exists, and it is what every decision must read. Linux-only:
+    /// the marker is a procfs rendering no other platform produces.
+    #[cfg(target_os = "linux")]
     #[test]
     fn live_exe_path_resolves_the_replaced_binary() {
         let dir = tempfile::tempdir().unwrap();
         let exe = dir.path().join("cola");
         std::fs::write(&exe, b"x").unwrap();
-        assert_eq!(live_exe_path(&exe), Some(exe.clone()));
         assert_eq!(live_exe_path(&dir.path().join("cola (deleted)")), Some(exe));
+    }
+
+    /// The inode, not the name, decides which path is the running binary: a
+    /// binary legitimately named `"<name> (deleted)"` is our own file, so its
+    /// path must win over the stripped sibling.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn runs_own_inode_distinguishes_our_binary_from_a_namesake() {
+        let dir = tempfile::tempdir().unwrap();
+        let namesake = dir.path().join("cola (deleted)");
+        std::fs::write(&namesake, b"x").unwrap();
+
+        assert!(runs_own_inode(&std::env::current_exe().unwrap()));
+        assert!(!runs_own_inode(&namesake));
+        assert_ne!(live_exe_path(&namesake), Some(dir.path().join("cola")));
     }
 
     #[test]
     fn live_exe_path_requires_a_file() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(live_exe_path(&dir.path().join("cola")), None);
-        assert_eq!(live_exe_path(&dir.path().join("cola (deleted)")), None);
+        let exe = dir.path().join("cola");
+        std::fs::write(&exe, b"x").unwrap();
+        assert_eq!(live_exe_path(&exe), Some(exe));
+        assert_eq!(live_exe_path(&dir.path().join("absent")), None);
+        assert_eq!(live_exe_path(&dir.path().join("absent (deleted)")), None);
         // A directory is not a binary.
         assert_eq!(live_exe_path(dir.path()), None);
     }
@@ -1183,6 +1226,9 @@ mod tests {
 
     /// #551 failure ①: a binary replaced under the running daemon must still
     /// classify as the cargo install it is, never fall back to GitHub.
+    /// Linux-only: only there does the input carry the procfs rendering (the
+    /// plain-path case is `detect_channel_reads_crates2_receipt`).
+    #[cfg(target_os = "linux")]
     #[test]
     fn detect_channel_resolves_a_replaced_binary_to_cargo() {
         let dir = tempfile::tempdir().unwrap();
@@ -1339,6 +1385,8 @@ not json at all
 
     /// The phantom an older buggy run left behind is a real file, so existence
     /// alone is not enough: the procfs marker disqualifies the target.
+    /// Linux-only — elsewhere such a name is a legitimate binary.
+    #[cfg(target_os = "linux")]
     #[test]
     fn install_refuses_the_proc_deleted_marker() {
         let dir = tempfile::tempdir().unwrap();
