@@ -90,11 +90,11 @@ update surface with no verification, and it reported a success nothing checked.
 - **The live path is resolved once, by one primitive.** `live_exe_path` /
   `current_exe_path` (`src/update.rs`) strip the procfs marker **only when the
   stripped path is the file that exists**, and channel detection, the install
-  target, the ExecStart comparison, the silent startup check and
-  `restart_process` all read that value — so they cannot disagree about which
-  file to read and to replace. A binary that is not on disk at all fails the
-  update with a diagnostic: a resolution failure is never a silent
-  re-classification as some other channel's install.
+  target, the ExecStart comparison, the CLI's supervisor-restart verification,
+  the silent startup check and `restart_process` all read that value — so they
+  cannot disagree about which file to read and to replace. A binary that is not
+  on disk at all fails the update with a diagnostic: a resolution failure is
+  never a silent re-classification as some other channel's install.
 - **`install()` fails closed.** The rename destination must be an existing
   regular file and must not carry the procfs marker (the phantom a pre-fix run
   leaves behind is a real file, so existence alone is not enough). A rename
