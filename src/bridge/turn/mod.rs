@@ -2178,7 +2178,7 @@ impl Turn {
         // The delivered endings the re-point carries: a superseded/confirmed
         // stage's own, or the caller's for a create whose stage was gone.
         let keys: Vec<EndingKey> = match &confirmed {
-            Some(confirmed) => confirmed.rendered.clone(),
+            Some(confirmed) => confirmed.rendered_endings.clone(),
             None => rendered.to_vec(),
         };
         // A card with no Turn message to scope a settle decision with cannot be
@@ -2205,7 +2205,7 @@ impl Turn {
                     .gap
                     .as_ref()
                     .map(|coverage| (&coverage.frontier, coverage.complete)),
-                &confirmed.rendered,
+                &confirmed.rendered_endings,
             ),
             _ => cards.chains.track_carrying_rendered(
                 session_id,

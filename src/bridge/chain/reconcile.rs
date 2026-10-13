@@ -871,7 +871,7 @@ async fn send_projected_chain(
             landing_reply_to,
             Some(directory),
             slice.cursor_stage,
-            &slice.rendered_keys,
+            &slice.rendered_endings,
         )
         .await
         {
@@ -1005,7 +1005,7 @@ async fn send_projected_successor(
     let mut slice = crate::bridge::turn::ProjectedSlice {
         card: projected.card,
         cursor_stage: projected.cursor_stage,
-        rendered_keys: projected.rendered_keys,
+        rendered_endings: projected.rendered_endings,
         watermark_stage: projected.watermark_stage,
         full: projected.full,
     };
@@ -1124,7 +1124,7 @@ async fn send_projected_successor(
         landing_reply_to,
         Some(route_directory),
         slice.cursor_stage,
-        &slice.rendered_keys,
+        &slice.rendered_endings,
     )
     .await
     else {

@@ -191,7 +191,7 @@ async fn advance_card_fallback(cards: &CardsHandle, session_id: &str) -> Fallbac
 /// stage identity the confirmation must name (spec #561, review #569); id `0`
 /// means nothing was staged (no session), which no confirmation ever matches.
 /// `rendered` is the Task Endings the body actually rendered (ADR-0080), from
-/// `BuiltCard::rendered_keys`: exactly what its confirmed write may flip, so a
+/// `BuiltCard::rendered_endings`: exactly what its confirmed write may flip, so a
 /// split's prefix never claims an entry its continuation shows.
 async fn stage_rendered_cursor(
     cards: &CardsHandle,
@@ -283,7 +283,7 @@ async fn confirm_staged_cursor(
         card_message_id,
         &confirmed.cursor,
         confirmed.gap.as_ref().map(|gap| (&gap.frontier, gap.complete)),
-        &confirmed.rendered,
+        &confirmed.rendered_endings,
     );
     // The owed mirror's job is done: this body's endings were flipped by the
     // very write above (or by the superseded confirmation that already won,
@@ -609,7 +609,7 @@ pub(super) async fn flush_card_locked(
                     Some(&card_id),
                     &built.cursor,
                     built.gap.as_ref(),
-                    built.rendered_keys.clone(),
+                    built.rendered_endings.clone(),
                 )
                 .await;
                 let watermark = staged_watermark_id(cards, session_id).await;
@@ -628,7 +628,7 @@ pub(super) async fn flush_card_locked(
                             &card_id,
                             &built.cursor,
                             built.gap.as_ref().map(|gap| (&gap.frontier, gap.complete)),
-                            &built.rendered_keys,
+                            &built.rendered_endings,
                         );
                         wrote = true;
                         true
@@ -662,7 +662,7 @@ pub(super) async fn flush_card_locked(
                                         &built.card,
                                         &e,
                                         stage,
-                                        &built.rendered_keys,
+                                        &built.rendered_endings,
                                     )
                                     .await;
                                     release_spent(cards, session_id).await;
@@ -679,7 +679,7 @@ pub(super) async fn flush_card_locked(
                             &built.card,
                             &e,
                             stage,
-                            &built.rendered_keys,
+                            &built.rendered_endings,
                         )
                         .await;
                         // The delivery layer's own split (ADR-0067): a
@@ -715,7 +715,7 @@ pub(super) async fn flush_card_locked(
                         &card_id,
                         None,
                         stage,
-                        &built.rendered_keys,
+                        &built.rendered_endings,
                         None,
                     )
                     .await;
@@ -804,7 +804,7 @@ pub(super) async fn flush_card_locked(
                         Some(&card_id),
                         &finalized.cursor,
                         finalized.gap.as_ref(),
-                        finalized.rendered_keys.clone(),
+                        finalized.rendered_endings.clone(),
                     )
                     .await,
                 )
@@ -829,7 +829,7 @@ pub(super) async fn flush_card_locked(
                             &card_id,
                             &finalized.cursor,
                             finalized.gap.as_ref().map(|gap| (&gap.frontier, gap.complete)),
-                            &finalized.rendered_keys,
+                            &finalized.rendered_endings,
                         );
                         wrote = true;
                         true
@@ -873,7 +873,7 @@ pub(super) async fn flush_card_locked(
                                 &finalized.card,
                                 &e,
                                 stage,
-                                &finalized.rendered_keys,
+                                &finalized.rendered_endings,
                             )
                             .await;
                             release_spent(cards, session_id).await;
@@ -892,7 +892,7 @@ pub(super) async fn flush_card_locked(
                             &finalized.card,
                             &e,
                             stage,
-                            &finalized.rendered_keys,
+                            &finalized.rendered_endings,
                         )
                         .await;
                         // The delivery layer's own split (ADR-0067): a
@@ -928,7 +928,7 @@ pub(super) async fn flush_card_locked(
                         &card_id,
                         None,
                         stage,
-                        &finalized.rendered_keys,
+                        &finalized.rendered_endings,
                         None,
                     )
                     .await;
@@ -995,7 +995,7 @@ pub(super) async fn flush_card_locked(
             None,
             &built.cursor,
             built.gap.as_ref(),
-            built.rendered_keys.clone(),
+            built.rendered_endings.clone(),
         )
         .await;
         let watermark = staged_watermark_id(cards, session_id).await;
@@ -1054,7 +1054,8 @@ pub(super) async fn flush_card_locked(
                 // finalized the outgoing card itself — and a crash right after
                 // Feishu accepted the create can never leave the record naming
                 // this card with the predecessor's frontier.
-                Turn::track_continuation_card(cards, session_id, &new_id, stage, &built.rendered_keys).await;
+                Turn::track_continuation_card(cards, session_id, &new_id, stage, &built.rendered_endings)
+                    .await;
                 // The continuation takes the blocks over from the finalized
                 // slice it follows (its spans are the tail this card renders).
                 cards
@@ -1082,7 +1083,7 @@ pub(super) async fn flush_card_locked(
                     &built.card,
                     &e,
                     stage,
-                    &built.rendered_keys,
+                    &built.rendered_endings,
                 )
                 .await;
                 let retry_fenced = is_card_content_rejected(&e)
@@ -1819,7 +1820,7 @@ mod tests {
             card.acc.build_card_with_info()
         };
         assert_eq!(
-            built.rendered_keys,
+            built.rendered_endings,
             vec![staged("call_1", TaskEndingClass::Evidence)],
             "the body claims the ending it rendered"
         );
@@ -1829,7 +1830,7 @@ mod tests {
             Some("om_live"),
             &built.cursor,
             built.gap.as_ref(),
-            built.rendered_keys.clone(),
+            built.rendered_endings.clone(),
         )
         .await;
 
@@ -1850,7 +1851,7 @@ mod tests {
             &built.card,
             &error,
             stage,
-            &built.rendered_keys,
+            &built.rendered_endings,
         )
         .await;
         assert!(
@@ -1999,7 +2000,7 @@ mod tests {
             Some("om_live"),
             &built.cursor,
             built.gap.as_ref(),
-            built.rendered_keys.clone(),
+            built.rendered_endings.clone(),
         )
         .await;
         // A recoverable failure: the payload is queued and the keys are
@@ -2019,7 +2020,7 @@ mod tests {
             &built.card,
             &error,
             stage,
-            &built.rendered_keys,
+            &built.rendered_endings,
         )
         .await;
         super::discard_staged_cursor(&cards, "ses_test", stage).await;
@@ -2105,7 +2106,7 @@ mod tests {
             Some("om_live"),
             &built.cursor,
             built.gap.as_ref(),
-            built.rendered_keys.clone(),
+            built.rendered_endings.clone(),
         )
         .await;
         platform
@@ -2126,7 +2127,7 @@ mod tests {
             &built.card,
             &error,
             stage,
-            &built.rendered_keys,
+            &built.rendered_endings,
         )
         .await;
 

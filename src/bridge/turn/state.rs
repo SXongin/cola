@@ -485,7 +485,7 @@ pub(super) struct BuiltCard {
     /// exactly the entries whose shown bits this delivered body may flip — a
     /// split's prefix carries only its own, and the continuation carries the
     /// rest.
-    pub(super) rendered_keys: Vec<EndingKey>,
+    pub(super) rendered_endings: Vec<EndingKey>,
 }
 
 /// How far ONE built card body carries the chain's pending orphan gap (spec
@@ -991,7 +991,7 @@ pub(super) struct StagedCursor {
     /// an accepted write flips the bits the moment it is accepted and a
     /// recoverably-failed body's are mirrored on the Chain Records, so eviction
     /// or a cancelled confirmation can only lose the cursor, never the bit.
-    pub(super) rendered: Vec<EndingKey>,
+    pub(super) rendered_endings: Vec<EndingKey>,
 }
 
 impl StagedCursor {
@@ -1029,7 +1029,7 @@ pub(crate) struct StagedCursorId {
 pub(super) struct ConfirmedBody {
     pub(super) cursor: RenderedCursor,
     pub(super) gap: Option<GapCoverage>,
-    pub(super) rendered: Vec<EndingKey>,
+    pub(super) rendered_endings: Vec<EndingKey>,
 }
 
 /// The Wake Watermark staged for the card body about to be written (ADR-0061):
@@ -2633,15 +2633,15 @@ impl StreamAccumulator {
     /// delivered confirmation (review #569). Returns the stage generation a
     /// confirmation must name (spec #561, review #569).
     ///
-    /// `rendered` is the Task Endings the body actually rendered (ADR-0080) —
-    /// exactly the entries its delivered write may flip, taken from
+    /// `rendered_endings` is the Task Endings the body actually rendered
+    /// (ADR-0080) — exactly the entries its delivered write may flip, taken from
     /// [`Self::rendered_ledger_keys`] at build time.
     pub(super) fn stage_cursor(
         &mut self,
         card_message_id: Option<&str>,
         cursor: RenderedCursor,
         gap: Option<GapCoverage>,
-        rendered: Vec<EndingKey>,
+        rendered_endings: Vec<EndingKey>,
     ) -> u64 {
         self.cursor_stage_seq = self.cursor_stage_seq.wrapping_add(1);
         self.staged_cursors.push(StagedCursor {
@@ -2653,7 +2653,7 @@ impl StreamAccumulator {
             // The Task Endings THIS body rendered (ADR-0080): a delivered
             // body's own content is what its confirmation may flip, so a split's
             // prefix never claims an entry its continuation shows.
-            rendered,
+            rendered_endings,
         });
         if self.staged_cursors.len() > MAX_STAGED_CURSORS {
             let excess = self.staged_cursors.len() - MAX_STAGED_CURSORS;
@@ -2717,7 +2717,7 @@ impl StreamAccumulator {
             return Some(ConfirmedBody {
                 cursor: self.cursor.clone(),
                 gap: None,
-                rendered: staged.rendered,
+                rendered_endings: staged.rendered_endings,
             });
         }
         self.confirmed_cursor_stage = staged.id;
@@ -2725,7 +2725,7 @@ impl StreamAccumulator {
         Some(ConfirmedBody {
             cursor: staged.cursor,
             gap: staged.gap,
-            rendered: staged.rendered,
+            rendered_endings: staged.rendered_endings,
         })
     }
 
@@ -3954,7 +3954,7 @@ impl StreamAccumulator {
         let state = if full { Some(CardState::Continued) } else { None };
         // The ledger entries THIS slice renders (issue #671, ticket #672): a
         // prefix's confirmation may mark only these, never the continuation's.
-        let rendered_keys = self.rendered_ledger_keys(self.render_from, split);
+        let rendered_endings = self.rendered_ledger_keys(self.render_from, split);
         let (card, spans, cursor, gap) = self.build_card_inner(self.render_from, split, !full, state);
         // Advance `render_from` ONLY on an actual split: while the card still
         // fits, subsequent flushes must re-render from the SAME start so the
@@ -3968,7 +3968,7 @@ impl StreamAccumulator {
             spans,
             cursor,
             gap,
-            rendered_keys,
+            rendered_endings,
         }
     }
 
@@ -3997,7 +3997,7 @@ impl StreamAccumulator {
             spans,
             cursor,
             gap,
-            rendered_keys: self.rendered_ledger_keys(self.render_from, end),
+            rendered_endings: self.rendered_ledger_keys(self.render_from, end),
         }
     }
 
@@ -4027,7 +4027,7 @@ impl StreamAccumulator {
             spans: built.1,
             cursor: built.2,
             gap: built.3,
-            rendered_keys: self.rendered_ledger_keys(start, end),
+            rendered_endings: self.rendered_ledger_keys(start, end),
         }
     }
 
@@ -6958,7 +6958,7 @@ mod tests {
             )
             .expect("the exact stage confirms");
         assert_eq!(
-            confirmed.rendered,
+            confirmed.rendered_endings,
             vec![(ending_run("call_1"), TaskEndingClass::Evidence)],
             "the body's own endings come back for the durable write"
         );
@@ -6974,7 +6974,7 @@ mod tests {
                 },
             )
             .expect("the second stage confirms");
-        assert!(confirmed.rendered.is_empty());
+        assert!(confirmed.rendered_endings.is_empty());
 
         // A stale stage's confirmation is refused: its pairs never reach the
         // durable record.
@@ -7011,7 +7011,7 @@ mod tests {
         assert_eq!(stale.cursor, base, "the superseded cursor never moves");
         assert!(stale.gap.is_none(), "a superseded gap is dropped");
         assert_eq!(
-            stale.rendered,
+            stale.rendered_endings,
             vec![(ending_run("call_2"), TaskEndingClass::Cleanup)],
             "its delivered endings still owe their shown bits"
         );
@@ -7044,9 +7044,9 @@ mod tests {
         let prefix = acc.build_card_with_info();
         assert!(prefix.full, "the oversized text must split the body");
         assert!(
-            prefix.rendered_keys.is_empty(),
+            prefix.rendered_endings.is_empty(),
             "the prefix renders no ledger entry, so it claims none: {:?}",
-            prefix.rendered_keys
+            prefix.rendered_endings
         );
 
         let continuation = acc.build_card_with_info();
@@ -7055,7 +7055,7 @@ mod tests {
             "the continuation carries the rest of the timeline"
         );
         assert_eq!(
-            continuation.rendered_keys,
+            continuation.rendered_endings,
             vec![(ending_run("call_1"), TaskEndingClass::Evidence)],
             "the continuation claims the ending it renders"
         );
