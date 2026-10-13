@@ -675,15 +675,12 @@ fn plan_wake_entries(
         }
         // The run's OWN Wake ending is spoken for too (ADR-0080): a Wake whose
         // completion entry a card already SHOWED — or this chain already placed
-        // in this life — must not be planned again. The shown bit, not the Wake
-        // Watermark, is what survives a crash between the confirmed write that
-        // flipped it and the later write that persists the Watermark: the floor
-        // above answers only "was this Wake's arrival announced?", which a Wake
-        // that opened a 承接 line does without an entry. An OWED Wake ending is
-        // not spoken for — the entry is exactly what the next card that can
-        // place it owes.
+        // in this life — must not be planned again. An OWED Wake ending is not
+        // spoken for: the entry is exactly what the next card that can place it
+        // owes. See [`wake_ending_spoken_for`] for why the shown bit, not the
+        // Wake Watermark, is the gate.
         if let Some(run) = &run
-            && (facts.shown(run, TaskEndingClass::Wake) || acc.ending_announced(run, TaskEndingClass::Wake))
+            && wake_ending_spoken_for(facts, acc, run)
         {
             continue;
         }
@@ -722,6 +719,23 @@ fn plan_wake_entries(
         });
     }
     plans
+}
+
+/// Whether the run's own **Wake** ending is already spoken for (ADR-0080): a
+/// card already SHOWED it, or this chain already placed its entry in this life.
+/// The Wake's own exactly-once gate, read by BOTH the plan
+/// ([`plan_wake_entries`]) and its commit-time re-check
+/// ([`commit_planned_entries`]) — one predicate, so the two can never drift. The
+/// shown bit, not the Wake Watermark, is what survives a crash between the
+/// confirmed write that flipped it and the later write that persists the
+/// Watermark: the floor answers only "was this Wake's arrival announced?", which
+/// a Wake that opened a 承接 line does without an entry.
+fn wake_ending_spoken_for(
+    facts: &crate::bridge::chain::EndingFacts,
+    acc: &StreamAccumulator,
+    run: &TaskRunId,
+) -> bool {
+    facts.shown(run, TaskEndingClass::Wake) || acc.ending_announced(run, TaskEndingClass::Wake)
 }
 
 /// The run a Wake completed, as every writer names it (ADR-0080): the launch's
@@ -1341,16 +1355,16 @@ pub(super) fn commit_planned_entries(
         // The same window, on the Wake's side (issue #659): the run this Wake
         // completes can be retired while the plan awaited its output read — a
         // concurrent venue's commit, or a queued update that delivered — so the
-        // plan's evidence gate is re-checked here too, against the run's ending
-        // class re-read after the awaits. Without it a Wake planned before a
-        // retirement landed renders beside that retirement's 结束 entry: the
-        // duplicate this change exists to stop.
+        // plan's evidence gate and its own Wake gate are re-checked here too,
+        // against the endings re-read after the awaits. Without this a Wake
+        // planned before a retirement (or before its own ending was shown)
+        // landed renders a duplicate entry: the #659 duplicate this change
+        // exists to stop, on either class.
         if matches!(plan.announce, PlannedAnnounce::Wake { .. })
             && let Some((run, _class)) = &plan.ending
             && (facts.recorded(run, TaskEndingClass::Evidence)
                 || acc.ending_announced(run, TaskEndingClass::Evidence)
-                || facts.shown(run, TaskEndingClass::Wake)
-                || acc.ending_announced(run, TaskEndingClass::Wake))
+                || wake_ending_spoken_for(&facts, acc, run))
         {
             continue;
         }
@@ -2866,6 +2880,78 @@ mod tests {
                 Endings::with_facts(EndingFacts::default())
             ),
             "an un-retired run still renders its Wake's completion"
+        );
+    }
+
+    /// ADR-0080 / issue #659, the two halves of the SHOWN-Wake gate that only
+    /// [`commit_planned_entries`] can apply: a plan built BEFORE its run's Wake
+    /// ending became shown (a queued update delivered while it awaited its
+    /// output read) must not place the entry, and two distinct Wakes completing
+    /// ONE run must place ONE entry between them. `plan_wake_entries` cannot see
+    /// either — it plans from an older snapshot — so this walks the commit.
+    #[test]
+    fn a_wake_plan_already_spoken_for_never_commits_a_second_entry() {
+        /// A Wake completion plan for one run, keyed by its own Wake id.
+        fn wake_plan(wake_id: &str) -> PlannedEntry {
+            use crate::feishu::card::ledger::{TaskCompletionEntry, TaskEnding as EntryEnding, TaskKind};
+            PlannedEntry {
+                announce: PlannedAnnounce::Wake {
+                    id: wake_id.to_string(),
+                    created_ms: 1_000,
+                    state: Some("completed".into()),
+                    identity: TaskRunIdentity::default(),
+                },
+                ending: Some((planned_run("call_sub"), TaskEndingClass::Wake)),
+                at: None,
+                directory: None,
+                entry: TaskCompletionEntry {
+                    kind: TaskKind::Subagent,
+                    label: None,
+                    id: None,
+                    started_at: None,
+                    finished_at: None,
+                    ending: EntryEnding::RuntimeEnded,
+                    output: None,
+                },
+            }
+        }
+
+        // The plan predates its run's shown Wake ending: the commit's re-read
+        // sees it and drops the entry (the shown bit, not the Wake Watermark).
+        let mut stale = StreamAccumulator::new("test");
+        assert!(
+            !commit_planned_entries(
+                &mut stale,
+                vec![wake_plan("msg_wake_1")],
+                Endings::with_facts(facts_with(
+                    "call_sub",
+                    TaskEndingClass::Wake,
+                    TaskEndingState::Shown
+                )),
+            ),
+            "the run's shown Wake ending drops the stale plan at commit time"
+        );
+        assert!(
+            !stale.wake_announced("msg_wake_1"),
+            "a dropped Wake plan stages nothing — its Watermark stays where it was"
+        );
+
+        // Two distinct Wake ids for ONE run, committed together: the first
+        // places the entry and announces the run's Wake class, so the second is
+        // dropped — one entry, one announce, for one run.
+        let mut both = StreamAccumulator::new("test");
+        assert!(
+            commit_planned_entries(
+                &mut both,
+                vec![wake_plan("msg_wake_1"), wake_plan("msg_wake_2")],
+                Endings::with_facts(EndingFacts::default()),
+            ),
+            "the first Wake's completion commits"
+        );
+        assert!(both.wake_announced("msg_wake_1"), "the first Wake is announced");
+        assert!(
+            !both.wake_announced("msg_wake_2"),
+            "the second Wake for the same run never places a second entry"
         );
     }
 
