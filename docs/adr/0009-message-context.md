@@ -41,3 +41,13 @@ non-text messages leaked raw JSON (`{"image_key":"..."}`) into the prompt.
 - **Only standalone image messages**: rejected. Feishu delivers "screenshot +
   caption" from the composer as a single `post` message, so rich-text embedded
   images are the common case, not an edge case.
+
+## Amendment (2026-10-13): the inbound attachment term generalizes
+
+The **Image Attachment** concept above is now the image case of a broader
+inbound **Prompt Attachment** — a platform file or image attached to a prompt.
+A `file` message and a rich-text message's top-level `files[]` entries attach
+their bytes too; only the mimes the server reads as model content are attached
+(text files normalized to `text/plain`), and an unattachable file leaves a note
+in the prompt instead of vanishing. See the ADR-0076 amendment of the same date
+for the decision and the quoted-context budget change.
