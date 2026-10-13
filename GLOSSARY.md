@@ -406,15 +406,15 @@ The one-line record left in place of an **Interaction Block** once its **Permiss
 _Avoid_: Result line, status card, stale marker
 
 **Quoted Context**:
-The parent message's content (text + attached images) that a reply answers, fetched from the platform and prepended to the prompt. Makes the reply relationship explicit and covers parents missing from session history (lobby-switch, compaction). Distinct from the user's own message text, which is the prompt's primary content. Never applied to the topic's own Topic Root or Topic Anchor — they are creation boilerplate, not genuine quotes (ADR-0023).
+The parent message's content (text + attached images and files) that a reply answers, fetched from the platform and prepended to the prompt. Makes the reply relationship explicit and covers parents missing from session history (lobby-switch, compaction). Its text is injected as soon as it arrives; the attachments download best-effort in their own budget, so a slow one never costs the quoted text. Distinct from the user's own message text, which is the prompt's primary content. Never applied to the topic's own Topic Root or Topic Anchor — they are creation boilerplate, not genuine quotes (ADR-0023).
 _Avoid_: Quote, reference, reply context
 
-**Image Attachment**:
-A platform image (a standalone image message, an image inside a rich-text message, or a quoted image) downloaded by the platform and attached to a prompt as a vision file part. Requires a vision-capable model; unsupported models surface an error.
-_Avoid_: Picture, media, attachment file
+**Prompt Attachment** (提示附件):
+An inbound platform file or image — a standalone `image` or `file` message, an `img` element or a top-level `files[]` entry inside a rich-text message, or the same in a **Quoted Context** parent — downloaded by the platform and attached to a prompt as a file part. Only what the server reads as model content is attached: a `png`/`jpeg`/`gif`/`webp` image, a PDF, or a text file **normalized to `text/plain`**; an unsupported type, a file past the 20MB attachment cap, or a failed download is left out and announced by a note in the prompt plus a short reply. An attached file reaches the model through the same neutral file part on both Generations, so no per-generation branch exists.
+_Avoid_: Image Attachment (the inbound-image-only term this generalizes), picture, media, attachment file
 
 **File Content**:
-A file payload a transcript part carries instead of text — the Backend's `file` block (a `data:` URI with its mime and name) that a Built-in Tool such as `read` returns for an image or PDF, or that a user message's `files` list carries — decoded neutrally on both Generations. A File Content is what cola may render back to the user; contrast an **Image Attachment**, an inbound platform image attached to a prompt.
+A file payload a transcript part carries instead of text — the Backend's `file` block (a `data:` URI with its mime and name) that a Built-in Tool such as `read` returns for an image or PDF, or that a user message's `files` list carries — decoded neutrally on both Generations. A File Content is what cola may render back to the user; contrast a **Prompt Attachment**, an inbound platform file or image attached to a prompt.
 _Avoid_: Attachment, media, file part, Tool File Content (too narrow — a user message carries File Content too)
 
 **File Message**:
@@ -506,7 +506,7 @@ _Avoid_: Notification, message, signal
 - A **Session** receives many **Permissions** and **Questions**
 - A **Session Snapshot** reports the state of one **Session** (its last **Turn**'s completion, pending **Permissions**/**Questions**, recent messages) to the **Chat**/**Topic** that activated it
 - The **Bridge** reads the **Session Transcript** from a **Backend** and renders **Card** updates on the **Platform**
-- A prompt's **Quoted Context** and **Image Attachment**s enrich the **Session** the reply belongs to
+- A prompt's **Quoted Context** and **Prompt Attachment**s enrich the **Session** the reply belongs to
 - A **Command** is parsed by the **Bridge** from message text before routing to the **Backend**
 - Every **Cola-Authored Message** carries a `msg_cola_` id chosen by the **Bridge**; Session Sync treats only user messages newer than the **Sync Watermark** that are NOT **Cola-Authored Message**s as **External Message**s
 - A **Distribution Channel** publishes builds; a machine's **Install Channel** records which one it got them from

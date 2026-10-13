@@ -193,6 +193,81 @@ tracking line keeps the full path. And `alt` is the hover description in Feishu'
 own model, so a desktop client can show the basename on hover in addition to the
 `title` caption.
 
+## Amendment (2026-10-13): the same File Content family is accepted inbound
+
+The Decision above is the **outbound** half of File Content: what the agent read
+reaches the user. Issue #473 asks the mirror — what the USER attaches in Feishu
+currently reaches nothing. A `file` message renders the literal `[文件]`
+placeholder and its bytes are never downloaded, and a rich-text message's
+top-level `files[]` array (the shape the Feishu client actually produces when a
+file is attached to a message with text) is not read at all, so "read this PDF"
+does nothing. The two directions share every Feishu fact — the same
+message-resource endpoint that sits beside the upload the Decision uses, and a
+download that needs only the already-held `im:message` (ADR-0009), not the
+upload's `im:resource` — but almost no code: inbound produces a prompt
+attachment, outbound renders a transcript part.
+
+- **A Prompt Attachment, not a File Content.** The inbound term generalizes
+  **Image Attachment** (ADR-0009): an inbound platform file or image downloaded
+  and attached to a prompt as a file part. Images keep their existing path; a
+  `file` message and a rich-text message's top-level `files[]` entries (a folder
+  entry excluded — it is reported as an unsupported type) join them.
+- **Attach only what the server reads as model content.** The server forwards
+  exactly `image/png`, `image/jpeg`, `image/gif`, `image/webp`,
+  `application/pdf`, and `text/plain` to the model and drops every other mime
+  silently on V2; on V1 any mime becomes a provider file part, where an
+  unsupported one fails the run. The image set is those four mimes, **not
+  `image/*`**: the server's resizer re-encodes only an image that EXCEEDS the
+  size or dimension limits, so a small `image/bmp`/`tiff`/`heic` keeps its mime
+  and is dropped. cola therefore attaches those three families only — a text
+  file (extension table plus `text/*`) normalized to `text/plain` — and leaves
+  any other type out of the prompt with a note. The image path gains this mime
+  check too, which it lacks today.
+- **The cap is the server's 20MB, checked per file.** The server measures the
+  decoded payload (`MAX_ATTACHMENT_BYTES`) and fails the WHOLE prompt past it, so
+  cola pre-checks the same line and never sends an oversize attachment. No
+  per-prompt total is imposed — the desktop client's `assertAttachmentBudget` is
+  stricter than the protocol requires. The check covers the image path as well,
+  which had none: an oversize image used to fail the whole run the same way.
+- **Nothing is dropped silently.** A file that is attached carries a success
+  marker in the prompt body when the message has no text of its own —
+  `[文件: <name>]`, replacing today's bare `[文件]`; an image carries none (it has
+  no name). An unsupported type, an oversize file, or a download failure appends
+  a note to the body — `[文件: <name> · 未附带：类型不支持 | 超过 20MB | 下载失败]`,
+  and `[图片 · 未附带：类型不支持 | 超过 20MB | 下载失败]` for an image (it has no
+  name to show) — and sends one short reply
+  (`⚠️ 文件 <name> 未能附带（<reason>）`), so the user can tell their file was not
+  read — the failure a file message has today.
+- **Quoted Context carries attachments too, and its text no longer waits behind
+  them.** The parent's files join its images; the fetch is split so the quoted
+  text is injected as soon as it arrives (keeping its 1.5s budget) while the
+  attachments download best-effort within their own budget (30s per file, where
+  the image path's is 10s). Today's single 1500ms budget over fetch plus every
+  download already discards the quoted TEXT when a parent's image download is
+  slow.
+- **No content dedup.** Upstream deduplicates only repeated `@mention`s of one
+  payload inside a single prompt (the TUI's `deduplicatePromptImages`, V2's
+  `userAttachmentContent`), which has no Feishu counterpart — a user
+  re-attaching a file is expressing intent, and Feishu's at-least-once
+  redelivery is already caught by the event-id dedupe.
+- **One protocol shape, both Generations.** V1's `file` part
+  (`{type, mime, url, filename}`) and V2's `files[]` entry (`{uri, name}`) both
+  carry an arbitrary mime and a display name, and the attachment reaches the
+  transcript as a user-message File Content — so the user's own attachment is
+  recorded where their message is shown by the machinery above, with no inbound
+  code of its own.
+
+Two live-deployment facts are checked before implementation, because either can
+change the design: whether a `file` message's content always carries
+`file_name` (older payloads may carry only `file_key`, in which case the name
+falls back to the neutral default `file`), and whether the resource response's
+Content-Type is the generic `application/octet-stream` — which decides how the
+mime is derived (the name's extension first, the header as the fallback). Tests
+land at the three existing seams — the mock Platform, the wire client's fake
+server, and the record line — with no live chain.
+
+The outbound Decision is otherwise unchanged.
+
 ## Why
 
 - **Hybrid, not one surface, because neither alone covers the issue.** A
@@ -237,6 +312,8 @@ own model, so a desktop client can show the basename on hover in addition to the
 
 The concepts enter the glossary as **File Content** (the payload a part carries)
 and **File Message** (the separate message cola posts for one it cannot embed).
+The inbound amendment above adds **Prompt Attachment** (an inbound platform file
+or image attached to a prompt), generalizing the earlier **Image Attachment**.
 
 ## Tests (implementation batch)
 
