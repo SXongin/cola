@@ -185,10 +185,16 @@ derivation — see the 2026-10-14 amendment below.
   card that can. The 2026-10-14 amendment below scopes this promise to the
   evidence and **Cleanup** endings; the Wake path's ending is the stated
   exception. An ending is **owed** until a confirmed write shows it
-  (**shown**), or until the saturation cap below surrenders it
-  (**surrendered**). Only an owed ending is ever rendered, so a surrendered one
-  is never re-offered, and a record with no owed ending is ordinary
-  bound-eviction material. A run carries at most one ending per class (evidence,
+  (**shown**), or until it is **surrendered** — by the saturation cap below, or
+  by the class-agnostic entry gate: a run that already carries a **shown** ending
+  renders one retirement entry, whatever class wrote it, so an ending recorded
+  for such a run is surrendered too, its entry never renderable. That second
+  cause is **not** a loss — the run's entry was already shown, so nothing a card
+  could have shown was given up — and the saturation cap below remains the
+  family's one ratified loss. Only an owed ending is ever rendered, so a
+  surrendered one is never re-offered, and a record with no owed ending is
+  ordinary bound-eviction material. A run carries at most one ending per class
+  (evidence,
   **Cleanup**, **Wake**), so the section grows with runs, never with endings, and
   it is bounded: owed records up to the saturation cap plus everything else up to
   the bound. The saturation cap is the family's one loss side, taken for the

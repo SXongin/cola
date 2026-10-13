@@ -3345,6 +3345,37 @@ mod tests {
         }
     }
 
+    /// The gate's race, at the render seam (ADR-0080, CI gate): after a shown
+    /// Cleanup, a stale reconciliation records an Evidence ending — which the
+    /// fix records SURRENDERED, never owed. The class-agnostic gate still renders
+    /// no second retirement entry for the run.
+    #[test]
+    fn a_gate_surrendered_evidence_ending_renders_no_second_entry() {
+        let acc = StreamAccumulator::new("test");
+        let mut transcript =
+            SessionTranscript::new(vec![]).with_background_tasks(vec![live_subagent_task("call_sub")]);
+        transcript.apply_cleanup(&["call_sub".to_string()], 2_000);
+        let ending = |class: TaskEndingClass, state: TaskEndingState| crate::bridge::chain::TaskEnding {
+            class,
+            state,
+            finished_at: Some(2_000),
+            evidence: None,
+            identity: TaskRunIdentity::default(),
+        };
+        let facts = EndingFacts::new(vec![TaskRunRecord {
+            run: planned_run("call_sub"),
+            endings: vec![
+                ending(TaskEndingClass::Cleanup, TaskEndingState::Shown),
+                ending(TaskEndingClass::Evidence, TaskEndingState::Surrendered),
+            ],
+        }]);
+
+        assert!(
+            plan_runtime_entries(&acc, &transcript, &facts).is_empty(),
+            "a run whose entry is already shown renders no second retirement entry"
+        );
+    }
+
     /// Issue #659's upgrade rule, the other half (ADR-0080): the LEGACY class
     /// must NEVER gate a Wake — the pre-#659 spelling cannot say whether a
     /// cleanup wrote it, and a cleanup suppresses nothing (spec #590). The run's
