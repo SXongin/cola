@@ -990,6 +990,32 @@ pub enum ShellEnd {
     Other(String),
 }
 
+impl ShellEnd {
+    /// The status string the runtime reported, as a durable ending records it
+    /// (ADR-0080): the reverse of [`ShellEnd::from_status`], so a recorded
+    /// evidence ending round-trips the verdict verbatim.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Exited => "exited",
+            Self::Timeout => "timeout",
+            Self::Killed => "killed",
+            Self::Other(other) => other,
+        }
+    }
+
+    /// The [`ShellEnd`] a recorded status names — the tolerant reverse of
+    /// [`ShellEnd::as_str`], so a status this build does not know stays
+    /// verbatim in [`ShellEnd::Other`].
+    pub fn from_status(status: &str) -> Self {
+        match status {
+            "exited" => Self::Exited,
+            "timeout" => Self::Timeout,
+            "killed" => Self::Killed,
+            other => Self::Other(other.to_string()),
+        }
+    }
+}
+
 /// One shell's runtime verdict from a reconciliation read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShellRuntime {

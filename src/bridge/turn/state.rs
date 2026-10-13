@@ -5009,38 +5009,12 @@ pub(super) fn legacy_retirement_announce_key(call_id: &str) -> String {
     format!("runtime:{call_id}")
 }
 
-/// The ledger kind of a Background Task's tool. Only `shell` and `subagent`
-/// ever background through the V2 tool shape (`decode_background_task` returns
-/// `None` for every other name), so the pair is matched once, here.
-pub(super) fn task_kind(tool: &str) -> TaskKind {
-    match tool {
-        "subagent" => TaskKind::Subagent,
-        _ => TaskKind::Shell,
-    }
-}
-
-/// The label the originating tool part's input names for a task of `kind`:
-/// the shell's `command` (or its `description` when the payload carries no
-/// command), the subagent's `description` — the `subagent` arm nothing else
-/// needed. `None` when the input names no label, so the row renders bare
-/// rather than inventing one (the completion entry's own rule).
-pub(super) fn task_label(kind: TaskKind, input: Option<&serde_json::Value>) -> Option<String> {
-    let label = match kind {
-        TaskKind::Shell => input
-            .and_then(|input| input.get("command"))
-            .and_then(serde_json::Value::as_str)
-            .or_else(|| {
-                input
-                    .and_then(|input| input.get("description"))
-                    .and_then(serde_json::Value::as_str)
-            }),
-        TaskKind::Subagent => input
-            .and_then(|input| input.get("description"))
-            .and_then(serde_json::Value::as_str),
-    }?;
-    let label = label.trim();
-    (!label.is_empty()).then(|| label.to_string())
-}
+/// The ledger kind of a Background Task's tool, and the label its originating
+/// tool input names — the read-model pair the ledger row, the completion entry
+/// and the durable ending's identity all derive a task from. Re-exported from
+/// the Background Task State module (ADR-0080), the one home `TaskKind` already
+/// has, so `super::state::task_kind` keeps resolving for the render.
+pub(super) use crate::bridge::tasks::{task_kind, task_label};
 
 #[cfg(test)]
 mod tests {

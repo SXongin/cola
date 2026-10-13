@@ -16,14 +16,18 @@
 //! renders the retirement entries the read carries, so nothing is swallowed by
 //! the process-local retirement overlay (ADR-0065).
 //!
-//! One uniform invariant covers every caller (spec #588, review PR #595): a
-//! reconcile pass hands back a [`ReconcilePass`] but writes NOTHING to the
+//! The reconcile records the evidence ending it derives **at derivation**
+//! (ADR-0080): one synchronous Chain Record write, the fact about the run
+//! rather than the card that will show its entry, an entry-less chain included.
+//! What remains deferred is the process-local tier (spec #588, review PR #595):
+//! a reconcile pass hands back a [`ReconcilePass`] and writes NOTHING to the
 //! overlay itself. The caller commits it — one [`ReconcilePass::commit`] call —
 //! only AFTER the card write that carried the read's entries was accepted
 //! (Session Sync's wake/ledger refresh, the drain tick's and the settle loop's
 //! completed render, the cleanup click's landed refresh). A caller whose
-//! carrier was refused drops the pass: the task stays live on every later
-//! read, and the next card that can render its entry claims it again.
+//! carrier was refused drops the pass: the durable ending still retired the
+//! task (the next read synthesizes its entry from the record), and the
+//! unconfirmed marker stays exactly as the refused read left it.
 //!
 //! Guard rails, all shared:
 //!
@@ -213,18 +217,21 @@ impl CycleBudget {
 }
 
 /// One reconcile pass's admission to commit its verdicts to the process-local
-/// Background Task overlay (spec #588, review PR #595). Returned by
+/// Background Task **cache** (spec #588, review PR #595; ADR-0080). Returned by
 /// [`RuntimeReconcile::observe`] and [`reconcile_now`] when — and only when — a
 /// verdict was applied to the read.
 ///
-/// **The one uniform invariant**: a retirement (or marker-set change) reaches
-/// the overlay only after the flush that carried its entries was accepted.
-/// This type is the only door to [`record_overlay`], so no reconcile can write
-/// the overlay from inside itself; each caller commits after the card write
-/// that carried the read's entries landed. Dropping the pass records nothing:
-/// the task stays live on every later read, and the next card that can render
-/// its entry claims it again.
-#[must_use = "commit the pass after the flush that carried its entries; dropping it records nothing"]
+/// **The invariant that stays deferred**: the process-local overlay — this
+/// life's `retired` cache and the unconfirmed-marker set — is written only
+/// after the flush that carried the read's entries was accepted. This type is
+/// the only door to [`record_overlay`], so no reconcile writes the overlay from
+/// inside itself; each caller commits after the card write that carried the
+/// read's entries landed. Dropping the pass leaves the cache untouched — which
+/// is no loss, because the ENDING itself was already recorded durably at
+/// derivation ([`reconcile_now`]): the task still leaves the ledger and its
+/// entry stays owed to the next card that can carry it, and only the marker
+/// set waits on the accepted write.
+#[must_use = "commit the pass after the flush that carried its entries; dropping it leaves the cache (not the durable ending) unwritten"]
 pub(crate) struct ReconcilePass {
     /// Whether the pass moved the read: a new retirement, or a changed
     /// unconfirmed-marker set. A pass that changed nothing is still a pass —
@@ -338,6 +345,22 @@ pub(crate) async fn reconcile_now(
                     None => {}
                 }
             }
+            // Record the endings this pass just derived, AT DERIVATION
+            // (ADR-0080): one synchronous Chain Record write per run, the fact
+            // about the run rather than about the card that will show its
+            // entry — an entry-less chain included. A failed or timed-out read
+            // never reaches this arm, so it records nothing: no verdict, no
+            // ending. This is the reopened trade (ADR-0073/PR #595): the ending
+            // is durable, so a permanently refused carrier no longer keeps the
+            // task live — the task leaves the ledger and the entry stays owed.
+            // Only the process-local overlay below stays gated on the caller's
+            // accepted write; the unconfirmed marker keeps that gate unchanged.
+            for retirement in &transcript.task_retirements[retired_before..] {
+                let input = transcript.tool_input(retirement.task.tool.call_id.as_str());
+                backend
+                    .tasks()
+                    .record_evidence_ending(session_id, retirement, input);
+            }
             // NOTHING is committed here (review, PR #595): the caller commits
             // the returned pass only after the flush that carried this read's
             // entries was accepted.
@@ -356,18 +379,20 @@ pub(crate) async fn reconcile_now(
     }
 }
 
-/// Commit one reconcile pass's verdicts to the process-local overlay (issue
+/// Commit one reconcile pass's verdicts to the process-local cache (issue
 /// #454, review PR #595) — the body [`ReconcilePass::commit`] wraps, private so
-/// the pass is the only door: every retirement the transcript carries, and the
-/// pass's post-evidence unconfirmed set. [`reconcile_now`] never calls it
-/// itself; the caller commits only after the flush that carried the read's
-/// entries was accepted.
+/// the pass is the only door: every retirement the transcript carries (the
+/// **durable ending** was already written at derivation, so this only fills
+/// this life's cache), and the pass's post-evidence unconfirmed set.
+/// [`reconcile_now`] never calls it itself; the caller commits only after the
+/// flush that carried the read's entries was accepted.
 ///
 /// The DURABLE rendered mark (issue #671, ticket #672) is deliberately not
 /// written here: this gate counts a recoverably failed write still owed by the
 /// outbox as accepted, and a mark must ride a write that really DELIVERED the
 /// entry. The mark therefore travels with the body's staged cursor, whose
-/// confirmation is the project's delivered-write choke point.
+/// confirmation is the project's delivered-write choke point — and so does the
+/// ending's own shown fact (ADR-0080, slice #702).
 fn record_overlay(backend: &Arc<dyn Backend>, session_id: &str, transcript: &SessionTranscript) {
     if !transcript.task_retirements.is_empty() {
         let call_ids: Vec<String> = transcript
