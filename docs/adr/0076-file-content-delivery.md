@@ -215,20 +215,35 @@ attachment, outbound renders a transcript part.
 - **Attach only what the server reads as model content.** The server forwards
   exactly `image/png`, `image/jpeg`, `image/gif`, `image/webp`,
   `application/pdf`, and `text/plain` to the model and drops every other mime
-  silently on V2; on V1 any mime becomes a provider file part, where an
-  unsupported one fails the run. The image set is those four mimes, **not
-  `image/*`**: the server's resizer re-encodes only an image that EXCEEDS the
-  size or dimension limits, so a small `image/bmp`/`tiff`/`heic` keeps its mime
-  and is dropped. cola therefore attaches those three families only — a text
-  file (extension table plus `text/*`) normalized to `text/plain` — and leaves
-  any other type out of the prompt with a note. The image path gains this mime
-  check too, which it lacks today.
+  silently on V2 (`packages/core/src/session/runner/to-llm-message.ts:75-82`,
+  whose `imageMimes` set is exactly those four at `:17`); on V1 any mime becomes
+  a provider file part, where an unsupported one fails the run. The image set is
+  those four mimes, **not `image/*`**: the server's resizer re-encodes only an
+  image that EXCEEDS the size or dimension limits and otherwise returns the
+  content unchanged (`packages/core/src/image/photon.ts`), so a small
+  `image/bmp`/`tiff`/`heic` keeps its mime and is dropped. cola therefore
+  attaches those three families only — a text file normalized to `text/plain`,
+  classified by its mime when that is `text/*` and otherwise by its name's
+  extension against this closed list: `txt text md markdown rst adoc csv tsv
+  json jsonl ndjson yaml yml toml ini cfg conf env properties xml html htm css
+  scss less js mjs cjs ts tsx jsx py rb go rs java kt swift c h cc cpp hpp cs php
+  sh bash zsh fish ps1 bat sql graphql gql proto tf hcl nix tex bib log diff
+  patch svg`. The list is closed: `notes.rst` and `report.csv` reported as
+  `application/octet-stream` are text, `notes.docx` is not, and an extension
+  outside the list is unsupported like any other mime — never a silent drop. The
+  image path gains this mime check too, which it lacks today.
 - **The cap is the server's 20MB, checked per file.** The server measures the
-  decoded payload (`MAX_ATTACHMENT_BYTES`) and fails the WHOLE prompt past it, so
-  cola pre-checks the same line and never sends an oversize attachment. No
-  per-prompt total is imposed — the desktop client's `assertAttachmentBudget` is
-  stricter than the protocol requires. The check covers the image path as well,
-  which had none: an oversize image used to fail the whole run the same way.
+  decoded payload (`MAX_ATTACHMENT_BYTES`, `packages/core/src/session/prompt.ts:203`)
+  and fails the WHOLE prompt past it, so cola pre-checks the same line and never
+  sends an oversize attachment. No per-prompt total is imposed, so the aggregate
+  is the message's attachment count times this cap — each attachment held once as
+  decoded bytes and once as base64 in the request body. That product is the
+  accepted worst case, stated rather than assumed: a message carrying ten
+  full-size files is one worked example of it, not a maximum cola relies on. The
+  desktop client's `assertAttachmentBudget` is a per-prompt total stricter than
+  the protocol requires, and stays the named alternative if that worst case ever
+  needs bounding. The check covers the image path as well, which
+  had none: an oversize image used to fail the whole run the same way.
 - **Nothing is dropped silently.** A file that is attached carries a success
   marker in the prompt body when the message has no text of its own —
   `[文件: <name>]`, replacing today's bare `[文件]`; an image carries none (it has
@@ -250,12 +265,23 @@ attachment, outbound renders a transcript part.
   `userAttachmentContent`), which has no Feishu counterpart — a user
   re-attaching a file is expressing intent, and Feishu's at-least-once
   redelivery is already caught by the event-id dedupe.
-- **One protocol shape, both Generations.** V1's `file` part
-  (`{type, mime, url, filename}`) and V2's `files[]` entry (`{uri, name}`) both
-  carry an arbitrary mime and a display name, and the attachment reaches the
-  transcript as a user-message File Content — so the user's own attachment is
+- **One inbound path, both Generations.** V1's `file` part
+  (`{id?, type:"file", mime, filename?, url, source?}` — `mime` an unconstrained
+  `Schema.String`, `packages/schema/src/v1/session.ts:413` of the pinned
+  1.18.31) and V2's `files[]` entry (`{uri, name}`) both carry an arbitrary mime
+  and a display name, so the neutral Prompt Attachment holds the same facts on
+  both — each generation's strategy serializing them into its own payload, as
+  ADR-0055 requires, with no branch beyond the one each strategy already owns.
+  V1 expands a `data:` URL whose mime is `text/plain` into its own synthetic text
+  parts at ingest (`packages/opencode/src/session/prompt.ts:788`,
+  `decodeDataUrl(part.url)`), so a text attachment is read as text there as well. The attachment then reaches
+  the transcript as a user-message File Content, so the user's own attachment is
   recorded where their message is shown by the machinery above, with no inbound
-  code of its own.
+  code of its own. What V1 cannot promise is the **provider**: a model that
+  cannot consume the media type fails the run, which cola already renders as its
+  error card with a retry. cola's tests therefore cover the payload it builds
+  (the V1 `file` part and the V2 `files[]` entry); verifying a V1 *server's*
+  provider acceptance is not cola's contract to test and gets no live chain.
 
 Two live-deployment facts are checked before implementation, because either can
 change the design: whether a `file` message's content always carries
