@@ -125,7 +125,7 @@ pub(crate) struct ProjectedCard {
     /// their shown bits are owed — flipped by the re-point, or, when the armed
     /// session was replaced meanwhile, by the takeover's own refused-path
     /// write.
-    pub(crate) rendered_keys: Vec<EndingKey>,
+    pub(crate) rendered_endings: Vec<EndingKey>,
     /// The stage generation of the Wake Watermark the armed body carries, if
     /// any: the create's drain names it, so a watermark staged since is left
     /// untouched.
@@ -145,7 +145,7 @@ pub(crate) struct ProjectedSlice {
     /// The Task Endings this slice rendered (ADR-0080): the create landed, so
     /// they owe their shown bits even when a fresh Turn took the session over
     /// before the re-point.
-    pub(crate) rendered_keys: Vec<EndingKey>,
+    pub(crate) rendered_endings: Vec<EndingKey>,
     pub(crate) watermark_stage: Option<u64>,
     /// More content remains after this slice.
     pub(crate) full: bool,
@@ -363,7 +363,7 @@ impl Turn {
                 None,
                 built.cursor.clone(),
                 built.gap.clone(),
-                built.rendered_keys.clone(),
+                built.rendered_endings.clone(),
             ),
             awaiting_seq: None,
         };
@@ -383,7 +383,7 @@ impl Turn {
             rendered,
             chain_id,
             cursor_stage,
-            rendered_keys: built.rendered_keys,
+            rendered_endings: built.rendered_endings,
             watermark_stage,
             full: built.full,
         })
@@ -1006,7 +1006,7 @@ impl Turn {
                     .gap
                     .as_ref()
                     .map(|coverage| (&coverage.frontier, coverage.complete)),
-                &confirmed.rendered,
+                &confirmed.rendered_endings,
             ),
             // No staged cursor matched the create's stage (the cap evicted it,
             // or a raced write consumed it): the body still DELIVERED, so its
@@ -1082,14 +1082,14 @@ impl Turn {
                 None,
                 built.cursor.clone(),
                 built.gap.clone(),
-                built.rendered_keys.clone(),
+                built.rendered_endings.clone(),
             ),
             awaiting_seq: None,
         };
         Some(ProjectedSlice {
             card: built.card,
             cursor_stage,
-            rendered_keys: built.rendered_keys,
+            rendered_endings: built.rendered_endings,
             watermark_stage: card.acc.pending_watermark_id(),
             full: built.full,
         })
@@ -1124,14 +1124,14 @@ impl Turn {
                 None,
                 built.cursor.clone(),
                 built.gap.clone(),
-                built.rendered_keys.clone(),
+                built.rendered_endings.clone(),
             ),
             awaiting_seq: None,
         };
         Some(ProjectedSlice {
             card: built.card,
             cursor_stage,
-            rendered_keys: built.rendered_keys,
+            rendered_endings: built.rendered_endings,
             watermark_stage: card.acc.pending_watermark_id(),
             full: built.full,
         })
