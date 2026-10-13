@@ -84,9 +84,10 @@ derivation — see the 2026-10-14 amendment below.
   ended, so a cleaned run's late Wake is its own ending with its own entry
   (#590). The ENTRY gate is separate and is one entry per run, whatever class
   (the 2026-10-14 amendment below). "Recorded once" fixes HOW each ending is
-  recorded — at derivation (a **Wake** completion's at its entry's commit — the
-  2026-10-14 amendment below), never re-derived, never a second copy. Without an
-  alias step two writers naming
+  recorded — at derivation, except that a **Wake** completion's ending is
+  recorded when its completion entry is committed to a card's render (per the
+  2026-10-14 amendment below) — never re-derived, never a second copy. Without
+  an alias step two writers naming
   one run differently — a
   Wake arriving after the launch left the read (compaction, the V2 page cap), or
   a reconciliation read that still carries the launch but whose call id the
@@ -121,9 +122,14 @@ derivation — see the 2026-10-14 amendment below.
   the identity a `BackgroundTask` needs to be re-synthesized (tool name, call
   id, shell/child id, start clock, label). The label and the start clock are
   captured when the ending is derived — that read necessarily carries the launch
-  — so a later card's entry is immune to compaction and to a truncated read (the
-  **Wake** path excepted: its ending is recorded with its entry's commit and
-  serves no later card — the 2026-10-14 amendment below).
+  — so an **evidence** or **Cleanup** ending's entry is immune to compaction and
+  to a truncated read, because `apply` re-synthesizes it from the durable
+  record. A **Wake** completion's ending is the exception: it is recorded with
+  its entry's commit, and while the read still carries that Wake a later card
+  can still place an owed entry (the durable identity fills the label when the
+  launch has left the read); once the Wake itself leaves the read, nothing
+  recovers it, because `apply` never synthesizes a Wake ending — the 2026-10-14
+  amendment below.
   The shell **output tail** is deliberately NOT captured: it is a network read
   of a record that may only become readable once the run has settled, so it
   stays where it is, spent by the render that places the entry.
@@ -366,17 +372,23 @@ so the ask, this record and the plan agree.
   `commit_planned_entries` (`src/bridge/turn/render.rs`) records it as an `Owed`
   `TaskEnding` only where the run's completion entry is committed to a card's
   render, and that write's confirmation flips it to `Shown` (`mark_shown`,
-  `src/bridge/chain/records.rs`). `plan_wake_entries` runs only under a live card
-  (`plan_ledger_entries` returns nothing without a Turn anchor), and
-  `synthesized_retirement` returns `None` for a Wake ending, so a Wake whose
-  completion entry no card ever commits leaves **no** durable ending, and no
-  later card re-derives one. **Ratified**: a Wake completion rides its own Wake's
-  turn and its own resumed-work handoff (ADR-0066), so the pre-ADR behaviour is
-  preserved, not widened. The loss is concrete — a Wake that completes while no
-  card is in hand renders no completion entry, then or after a restart — and it
-  is accepted as the pre-existing residual it is: this batch introduced no
-  regression, and giving the Wake ending a card-independent source would be the
-  second-source shape this ADR's *Considered options* rejects. The **Decision**
+  `src/bridge/chain/records.rs`). An `Owed` Wake ending is not dead: while the
+  read still carries that Wake, a later card can still place its entry —
+  `plan_wake_entries` plans it again under that card's own anchor, the commit
+  re-reads the durable facts, and `facts.identity(run)` fills the label when the
+  launch has left the read. What has **no** path is recovery once the **Wake
+  itself** leaves the read (compaction, or a newer Turn's anchor passing it):
+  `synthesized_retirement` (`src/bridge/tasks/handle.rs`) returns `None` for a
+  Wake ending, so — unlike the evidence and **Cleanup** endings, which `apply`
+  re-synthesizes from the durable record however late — `apply` never
+  synthesizes a Wake. **Ratified**: a Wake completion rides its own Wake's turn
+  and its own resumed-work handoff (ADR-0066), so the pre-ADR behaviour is
+  preserved, not widened. The accepted residual is that narrow: a Wake ending is
+  recoverable only while its Wake is still read, so an entry that no card ever
+  commits or shows is lost the moment the Wake leaves the read — where an
+  evidence or **Cleanup** ending would still render. Giving the Wake ending a
+  card-independent source would instead be the second-source shape this ADR's
+  *Considered options* rejects. The **Decision**
   bullet *"The ending is recorded when it is derived"* and the unconditional
   promise in *"The ending is recorded when it is derived, unconditionally ...
   an entry-less chain included ... renders on the first card that can"* are
