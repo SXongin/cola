@@ -637,19 +637,45 @@ impl App {
     /// the chat so the announcement is never silently lost.
     pub(crate) async fn announce_restart(&self, notify: &command::RestartNotify) {
         let chat_id = notify.chat_id.as_str();
-        let (title, body) = match notify.kind {
+        let (title, body, template) = match notify.kind {
             command::RestartKind::Update => {
-                let version = notify.version.as_deref().unwrap_or("");
-                (
-                    format!("✅ 已更新到 {version}"),
-                    format!("cola 已更新到 {version} 并重启完成。"),
-                )
+                // Verify before repeating the claim (issue #551). The version in
+                // the notify file is what the DYING process said it installed;
+                // this process knows exactly what it is running — its own
+                // compile-time version. An update that did not take effect is
+                // reported as such instead of announced as a success: the
+                // in-band analogue of the CLI's `supervisor_restart_took_effect`.
+                let running = crate::update::current_version().to_string();
+                match notify.version.as_deref() {
+                    Some(announced) if announced == running => (
+                        format!("✅ 已更新到 {announced}"),
+                        format!("cola 已更新到 {announced} 并重启完成。"),
+                        "green",
+                    ),
+                    Some(announced) => (
+                        format!("⚠️ 更新未生效（当前 {running}）"),
+                        format!(
+                            "cola 期望更新到 {announced}，但重启后仍在运行 {running}。请检查安装路径后重试。"
+                        ),
+                        "orange",
+                    ),
+                    // A versionless payload predates the field and has nothing
+                    // to check against: state the completion without a version
+                    // rather than invent one.
+                    None => (
+                        "✅ 已更新完成".to_string(),
+                        "cola 已更新并重启完成。".to_string(),
+                        "green",
+                    ),
+                }
             }
-            command::RestartKind::Restart => ("♻️ 已重启".to_string(), "cola 已重启完成。".to_string()),
+            command::RestartKind::Restart => {
+                ("♻️ 已重启".to_string(), "cola 已重启完成。".to_string(), "green")
+            }
         };
         let card = crate::feishu::card::shell::card_shell(
             &title,
-            "green",
+            template,
             vec![serde_json::json!({ "tag": "markdown", "content": body })],
         );
         // A topic command carries its `thread_id`; the command message itself
@@ -701,25 +727,29 @@ impl App {
         // rate limit only costs a debug log line.
         {
             tokio::spawn(async move {
-                match crate::update::check().await {
-                    Ok(crate::update::UpdateCheck::Available(info)) => {
+                // Resolve the check through the SAME install channel `/update`
+                // would apply (issue #551) — a cargo install is compared
+                // against crates.io, not GitHub Releases, so the logged
+                // version is the one its `/update` acts on.
+                match crate::update::available_for_running_channel().await {
+                    Ok(Some(latest)) => {
                         if crate::version::is_dev_build() {
                             // A dev build is typically ahead of the last release
                             // (ADR-0027): warn instead of implying an upgrade.
                             tracing::warn!(
                                 "本地 dev 构建（{}）发现新版本 {} —— 自更新会替换为发布版，可能比本地代码旧。",
                                 crate::version::display_version(),
-                                info.latest
+                                latest
                             );
                         } else {
                             tracing::info!(
                                 "新版本 {} 可用（当前 {}）—— 发送 /update 更新。",
-                                info.latest,
-                                info.current
+                                latest,
+                                crate::update::current_version()
                             );
                         }
                     }
-                    Ok(_) => {}
+                    Ok(None) => {}
                     Err(e) => tracing::debug!("update check failed: {e}"),
                 }
             });

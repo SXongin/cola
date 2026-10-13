@@ -72,3 +72,52 @@ in-band `cola update` / `/update` that reuses the existing restart machinery.
 - v1 has no rollback: the `SHA256SUMS` gate prevents corrupt installs, and
   "latest only" means downgrade via the updater is not supported.
 - Version bumps must keep `Cargo.toml` and the tag in lockstep (guarded by CI).
+
+## Amendment (2026-10-13): one live binary path, and an update announced only when verified
+
+Issue #551 (a `/update` that answered `✅ 已更新到 0.12.4。` while `/version`
+still said `0.12.3`) rests on one wrong premise the decision above never
+spelled out: that `std::env::current_exe()` is a **path to a file**.
+It is a handle to the *running* binary — on Linux `/proc/self/exe`, which
+renders as `"<path> (deleted)"` once the file behind it was replaced under the
+process. That is the normal state of any daemon kept running across a cargo or
+archive upgrade, so it is not exotic: with the marker unhandled, channel
+detection failed to `canonicalize`, silently degraded to GitHub (defeating
+ADR-0030), and handed that path to `fs::rename` — which, for a **nonexistent**
+destination, succeeds and creates it. The in-band path was left as the one
+update surface with no verification, and it reported a success nothing checked.
+
+- **The live path is resolved once, by one primitive.** `live_exe_path` /
+  `current_exe_path` (`src/update.rs`) strip the procfs marker **only when the
+  stripped path is the file that exists**, and channel detection, the install
+  target, the ExecStart comparison, the silent startup check and
+  `restart_process` all read that value — so they cannot disagree about which
+  file to read and to replace. A binary that is not on disk at all fails the
+  update with a diagnostic: a resolution failure is never a silent
+  re-classification as some other channel's install.
+- **`install()` fails closed.** The rename destination must be an existing
+  regular file and must not carry the procfs marker (the phantom a pre-fix run
+  leaves behind is a real file, so existence alone is not enough). A rename
+  that *creates* its destination is never an install of the binary we are
+  running.
+- **The reporting guarantee now binds the in-band path too.** The replacer
+  reports the swap it actually performed (`二进制已替换为 X`); the **successor**
+  verifies `restart-notify.json` against the one version it cannot be wrong
+  about — its own (`current_version()`) — and announces `已更新到 X` only on a
+  match, `⚠️ 更新未生效（当前 Y）` with an `orange` header otherwise. This is the
+  in-band analogue of the CLI's `supervisor_restart_took_effect`, and the same
+  rule applied to a different fact: **the consumer of the durable notify fact
+  verifies it rather than trusting the writer**, whose claim about a version it
+  will never run is not evidence. A versionless payload predates the field (both
+  were added together) and keeps a versionless completion rather than inventing
+  one.
+- **The silent startup check reads the channel's own source** (crates.io for a
+  cargo-tracked binary, GitHub Releases otherwise) and advertises only a release
+  that channel can apply — a `NoAssetForPlatform` release is not one — so the
+  version it logs is the one that binary's `/update` acts on, and the two update
+  surfaces no longer disagree. An unresolvable binary propagates as a check
+  failure there too, instead of the GitHub fallback this amendment removes.
+
+Related: ADR-0030 (the receipt detection this amendment keeps reachable for a
+replaced-under-the-daemon binary), ADR-0027 (a dev build's version), ADR-0021
+(the restart hand-off the successor's card reports on).

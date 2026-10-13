@@ -838,12 +838,15 @@ async fn restart_announce_replies_inside_the_topic() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
 
+    // The successor verifies the announced version against its own (#551), so
+    // a successful update announces the version this binary actually runs.
+    let version = crate::update::current_version().to_string();
     app.announce_restart(&RestartNotify {
         chat_id: "oc_1".into(),
         thread_id: Some("omt_1".into()),
         message_id: Some("om_cmd".into()),
         kind: RestartKind::Update,
-        version: Some("0.9.0".into()),
+        version: Some(version.clone()),
     })
     .await;
 
@@ -853,9 +856,45 @@ async fn restart_announce_replies_inside_the_topic() {
         PlatformCall::ReplyCard { reply_to, card } => {
             assert_eq!(reply_to, "om_cmd");
             let text = card.to_string();
-            assert!(text.contains("已更新到 0.9.0 并重启完成"), "got {text}");
+            assert!(
+                text.contains(&format!("已更新到 {version} 并重启完成")),
+                "got {text}"
+            );
         }
         other => panic!("expected a reply inside the topic, got {other:?}"),
+    }
+}
+
+/// #551 failure ②: the successor must not repeat an update claim it cannot
+/// verify. The notify file's version is what the dying process said it
+/// installed; the successor checks it against the version it is running.
+#[tokio::test]
+async fn restart_announce_reports_an_update_that_did_not_take_effect() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+
+    app.announce_restart(&RestartNotify {
+        chat_id: "oc_1".into(),
+        thread_id: Some("oc_1".into()),
+        message_id: Some("om_cmd".into()),
+        kind: RestartKind::Update,
+        version: Some("9.9.9".into()),
+    })
+    .await;
+
+    let calls = platform.calls.lock().await.clone();
+    assert_eq!(calls.len(), 1, "expected exactly one card: {calls:?}");
+    match &calls[0] {
+        PlatformCall::SendCard { card, .. } => {
+            let text = card_text(card);
+            let running = crate::update::current_version().to_string();
+            assert!(text.contains(&format!("仍在运行 {running}")), "got {text}");
+            assert!(!text.contains("9.9.9 并重启完成"), "got {text}");
+            assert_eq!(card["header"]["template"], "orange");
+        }
+        other => panic!("expected a chat card, got {other:?}"),
     }
 }
 

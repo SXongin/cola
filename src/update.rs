@@ -59,13 +59,87 @@ pub enum InstallChannel {
     Cargo,
 }
 
+/// How Linux's procfs renders `/proc/self/exe` once the file behind it was
+/// replaced or unlinked while the process kept running.
+const PROC_DELETED_SUFFIX: &str = " (deleted)";
+
+/// Strip Linux's procfs `" (deleted)"` marker from `exe`'s final component.
+///
+/// Byte-wise on Unix so a path carrying non-UTF-8 bytes still resolves: the
+/// marker is a Linux artifact, and requiring `to_str()` would make an
+/// otherwise-locatable binary unresolvable — `/update` would refuse and
+/// `/restart` would fail to re-exec it.
+fn strip_proc_deleted(exe: &Path) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        if let Some(stripped) = exe
+            .as_os_str()
+            .as_bytes()
+            .strip_suffix(PROC_DELETED_SUFFIX.as_bytes())
+        {
+            return PathBuf::from(std::ffi::OsString::from_vec(stripped.to_vec()));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if let Some(stripped) = exe.to_str().and_then(|s| s.strip_suffix(PROC_DELETED_SUFFIX)) {
+            return PathBuf::from(stripped);
+        }
+    }
+    exe.to_path_buf()
+}
+
+/// The live on-disk path of the binary `exe` names — where `exe` is what
+/// `std::env::current_exe()` returned — or `None` when no file exists there.
+///
+/// `current_exe()` is a handle to the running binary, not a path to a file:
+/// on Linux it reads `/proc/self/exe`, which renders as `"<path> (deleted)"`
+/// once the file behind it was replaced under the process — the normal state
+/// after any cargo/archive upgrade that left the daemon running (issue #551).
+/// The literal path then names nothing while the stripped path names the
+/// replacement the operator actually has, so that is the live binary.
+///
+/// Channel detection, the install target and the restart all resolve through
+/// here; otherwise they disagree about which file to read and to replace, and
+/// a `(deleted)` path gets handed to `fs::rename`, which *creates* it.
+pub fn live_exe_path(exe: &Path) -> Option<PathBuf> {
+    let target = strip_proc_deleted(exe);
+    target.is_file().then_some(target)
+}
+
+/// [`live_exe_path`] for this process, failing when the running binary is not
+/// on disk at all. A removed install is an error the update surfaces, never a
+/// silent re-classification as some other channel's binary (issue #551).
+pub fn current_exe_path() -> anyhow::Result<PathBuf> {
+    let exe = std::env::current_exe().context("locate the running executable")?;
+    live_exe_path(&exe).with_context(|| {
+        format!(
+            "运行中的二进制已不在磁盘上（{}）—— 请先重新安装 cola 再更新。",
+            exe.display()
+        )
+    })
+}
+
 /// Detect the install channel of `exe` from cargo's install receipt (ADR-0030):
 /// a binary in `<install root>/bin` whose install root carries a
 /// `.crates2.json` entry listing that binary name. Best effort — no receipt (a
 /// GitHub archive, a source build, `--no-track`, or binstall's local
 /// `--install-path`) means the GitHub channel.
 pub fn detect_install_channel(exe: &Path) -> InstallChannel {
+    // Resolve the LIVE path first (issue #551): a binary replaced under the
+    // running process arrives here as `"<path> (deleted)"`, at which no file
+    // exists — `canonicalize` fails and the fallback below would silently
+    // route a cargo-tracked install into the GitHub self-update flow.
+    let Some(exe) = live_exe_path(exe) else {
+        tracing::warn!(
+            "{} 不是磁盘上的文件，无法判定安装渠道，按 GitHub 处理",
+            exe.display()
+        );
+        return InstallChannel::GitHub;
+    };
     let Ok(exe) = exe.canonicalize() else {
+        tracing::warn!("无法解析 {}，按 GitHub 渠道处理", exe.display());
         return InstallChannel::GitHub;
     };
     let Some(bin_dir) = exe.parent() else {
@@ -419,6 +493,23 @@ fn extract_binary(archive: &[u8], dest_dir: &Path) -> anyhow::Result<PathBuf> {
 /// Windows: a running exe cannot be overwritten, so the old file is renamed
 /// aside first, then the new one moved into place, rolling back on failure.
 pub fn install(new_binary: &Path, current_exe: &Path) -> anyhow::Result<()> {
+    // Fail closed on a target that cannot be the binary we are running (issue
+    // #551): `fs::rename` to a NONEXISTENT destination succeeds and creates
+    // it, which is how an update of a replaced-under-us daemon left a phantom
+    // `"<path> (deleted)"` next to the real install and still reported
+    // success. The one legitimate target is an existing file on disk, and it
+    // never carries the procfs marker — that names a file which was replaced,
+    // not the file to replace.
+    anyhow::ensure!(
+        current_exe.is_file(),
+        "拒绝安装到 {}：它不是磁盘上的已有文件",
+        current_exe.display()
+    );
+    anyhow::ensure!(
+        !current_exe.to_string_lossy().ends_with(PROC_DELETED_SUFFIX),
+        "拒绝安装到 procfs 已替换路径 {}",
+        current_exe.display()
+    );
     #[cfg(target_os = "windows")]
     {
         let old = current_exe.with_extension("old.exe");
@@ -554,10 +645,15 @@ pub fn restart_cli(daemon_running: bool) -> Option<String> {
     let restarted = matches!(
         std::process::Command::new("sh").args(["-c", &cmd]).status(),
         Ok(s) if s.success()
-    ) && std::env::current_exe()
-        .ok()
-        .map(|exe| supervisor_restart_took_effect(old_pid, &exe))
-        .unwrap_or(false);
+    )
+        // The comparison needs the LIVE path (issue #551): this process
+        // replaced its own binary a moment ago, so `/proc/self/exe` now reads
+        // "<path> (deleted)" while the successor's exe is the clean path —
+        // comparing those two would fail the verification for a restart that
+        // did happen.
+        && current_exe_path()
+            .map(|exe| supervisor_restart_took_effect(old_pid, &exe))
+            .unwrap_or(false);
     if restarted {
         return None;
     }
@@ -633,13 +729,60 @@ async fn run_cargo_update(reporter: &dyn UpdateReporter) -> UpdateOutcome {
     }
 }
 
+/// The version the silent startup check should advertise for a GitHub-channel
+/// binary: only a release this platform can actually apply counts. A
+/// `NoAssetForPlatform` release is not one (issue #551's review) — `/update`
+/// answers "no prebuilt binary for this platform" for it, so logging "send
+/// `/update`" would contradict the command it names.
+fn github_available(check: UpdateCheck) -> Option<Version> {
+    match check {
+        UpdateCheck::Available(info) => Some(info.latest),
+        // Both are "nothing to do here": up to date, or no asset for this
+        // platform.
+        UpdateCheck::UpToDate | UpdateCheck::NoAssetForPlatform { .. } => None,
+    }
+}
+
+/// The newer version available on the channel this binary was installed
+/// through, if any (ADR-0030): the crates.io sparse index for a cargo-tracked
+/// install, GitHub Releases otherwise.
+///
+/// The silent startup check uses this so its log line agrees with what
+/// `/update` will do (issue #551): comparing a cargo install against GitHub
+/// Releases reported "send /update" for a version crates.io may not even
+/// offer — or missed one it does.
+pub async fn available_for_running_channel() -> anyhow::Result<Option<Version>> {
+    // A resolution failure propagates instead of silently becoming the GitHub
+    // channel (issue #551): the check would then advertise an update for a
+    // binary whose `/update` cannot even locate itself.
+    let channel = current_exe_path().map(|exe| detect_install_channel(&exe))?;
+    match channel {
+        InstallChannel::Cargo => crates_io_latest(&current_version()).await,
+        InstallChannel::GitHub => Ok(github_available(check().await?)),
+    }
+}
+
 /// Run the whole self-update flow against `reporter`. Returns whether an
 /// update was applied; the caller decides whether to call [`restart`].
 pub async fn run_update(reporter: &dyn UpdateReporter, mode: UpdateMode) -> UpdateOutcome {
+    // Resolve the running binary's live path ONCE and use it for every
+    // decision below — the channel, the ExecStart comparison and the install
+    // target (issue #551). On Linux `current_exe()` renders as
+    // `"<path> (deleted)"` once the file was replaced under this process, so
+    // reading it directly misrouted a cargo install to GitHub and then renamed
+    // the download onto a path named "<path> (deleted)", creating it. A binary
+    // that is no longer on disk fails loudly: degrading to the GitHub channel
+    // is exactly the silent wrong-install this guards against.
+    let exe = match current_exe_path() {
+        Ok(exe) => exe,
+        Err(e) => {
+            reporter.report(format!("❌ 无法定位当前可执行文件：{e}")).await;
+            return UpdateOutcome::Failed;
+        }
+    };
     // A cargo-tracked binary is updated through cargo, never by replacing it
     // with a GitHub asset (ADR-0030).
-    let cargo_tracked =
-        std::env::current_exe().is_ok_and(|exe| detect_install_channel(&exe) == InstallChannel::Cargo);
+    let cargo_tracked = detect_install_channel(&exe) == InstallChannel::Cargo;
 
     // A dev build has no release-tag guarantee (ADR-0027): warn before the
     // check so `/update` on a local build never silently downgrades the
@@ -695,13 +838,6 @@ pub async fn run_update(reporter: &dyn UpdateReporter, mode: UpdateMode) -> Upda
                     info.latest, info.current
                 ))
                 .await;
-            let exe = match std::env::current_exe() {
-                Ok(exe) => exe,
-                Err(err) => {
-                    reporter.report(format!("❌ 无法定位当前可执行文件：{err}")).await;
-                    return UpdateOutcome::Failed;
-                }
-            };
             // A supervisor registered earlier (systemd unit / launchd agent) has
             // its ExecStart baked to the path it ran at registration time. If it
             // points at a DIFFERENT binary than the one this update replaces,
@@ -739,7 +875,15 @@ pub async fn run_update(reporter: &dyn UpdateReporter, mode: UpdateMode) -> Upda
                         UpdateOutcome::Failed
                     }
                     Ok(()) => {
-                        reporter.report(format!("✅ 已更新到 {}。", info.latest)).await;
+                        // The swap is what this side verified; whether the NEW
+                        // binary came up is the successor's to report (issue
+                        // #551). The CLI gates its "已更新到" line on the
+                        // supervisor check, and the in-band successor verifies
+                        // its own version before announcing — see
+                        // `bridge::handler::announce_restart`.
+                        reporter
+                            .report(format!("✅ 二进制已替换为 {}。", info.latest))
+                            .await;
                         UpdateOutcome::Updated(info.latest)
                     }
                 },
@@ -970,6 +1114,90 @@ mod tests {
         assert_eq!(detect_install_channel(&root.join("cola")), InstallChannel::GitHub);
     }
 
+    /// #551: `/proc/self/exe` renders as `"<path> (deleted)"` once the file
+    /// was replaced under the running daemon. The stripped path is the file
+    /// that now exists, and it is what every decision must read.
+    #[test]
+    fn live_exe_path_resolves_the_replaced_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("cola");
+        std::fs::write(&exe, b"x").unwrap();
+        assert_eq!(live_exe_path(&exe), Some(exe.clone()));
+        assert_eq!(live_exe_path(&dir.path().join("cola (deleted)")), Some(exe));
+    }
+
+    #[test]
+    fn live_exe_path_requires_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(live_exe_path(&dir.path().join("cola")), None);
+        assert_eq!(live_exe_path(&dir.path().join("cola (deleted)")), None);
+        // A directory is not a binary.
+        assert_eq!(live_exe_path(dir.path()), None);
+    }
+
+    /// A path carrying non-UTF-8 bytes is still resolved: the marker is a
+    /// Linux artifact and must not need `to_str()` to be stripped.
+    #[cfg(unix)]
+    #[test]
+    fn live_exe_path_resolves_a_non_utf8_path() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join(OsString::from_vec(b"col\xff".to_vec()));
+        std::fs::write(&exe, b"x").unwrap();
+        let mut deleted = b"col\xff".to_vec();
+        deleted.extend_from_slice(b" (deleted)");
+        let deleted = dir.path().join(OsString::from_vec(deleted));
+        assert_eq!(live_exe_path(&deleted), Some(exe));
+    }
+
+    /// Only a release this platform can apply is worth advertising: for a
+    /// `NoAssetForPlatform` release `/update` answers "no prebuilt binary",
+    /// so the startup check must not log "send /update" for it.
+    #[test]
+    fn github_availability_advertises_only_an_applicable_release() {
+        let current = Version::parse("0.7.0").unwrap();
+        let latest = Version::parse("0.8.0").unwrap();
+        assert_eq!(github_available(UpdateCheck::UpToDate), None);
+        assert_eq!(
+            github_available(UpdateCheck::NoAssetForPlatform {
+                latest: latest.clone()
+            }),
+            None
+        );
+        assert_eq!(
+            github_available(UpdateCheck::Available(UpdateInfo {
+                current,
+                latest: latest.clone(),
+                asset_name: "cola-0.8.0-x86_64-unknown-linux-gnu.tar.gz".into(),
+                asset_url: "https://example.invalid/cola.tar.gz".into(),
+                sha256_url: "https://example.invalid/SHA256SUMS".into(),
+            })),
+            Some(latest)
+        );
+    }
+
+    /// #551 failure ①: a binary replaced under the running daemon must still
+    /// classify as the cargo install it is, never fall back to GitHub.
+    #[test]
+    fn detect_channel_resolves_a_replaced_binary_to_cargo() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::write(bin_dir.join("cola"), b"x").unwrap();
+        std::fs::write(
+            root.join(".crates2.json"),
+            r#"{"installs":{"colark 0.8.1 (registry+https://github.com/rust-lang/crates.io-index)":{"bins":["cola"]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            detect_install_channel(&bin_dir.join("cola (deleted)")),
+            InstallChannel::Cargo
+        );
+    }
+
     #[test]
     fn index_picks_newest_stable_and_skips_yanked() {
         let body = r#"{"name":"colark","vers":"0.7.0","yanked":false}
@@ -1088,5 +1316,35 @@ not json at all
         install(&new, &current).unwrap();
         assert_eq!(std::fs::read(&current).unwrap(), b"new");
         assert!(!new.exists(), "the new binary must be moved into place");
+    }
+
+    /// #551 failure ②: `fs::rename` onto a nonexistent destination succeeds
+    /// and creates it — that is how the update left a phantom
+    /// `"<path> (deleted)"` binary next to the real install and reported
+    /// success. Install must fail closed instead.
+    #[test]
+    fn install_refuses_a_nonexistent_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let new = dir.path().join("cola.new");
+        std::fs::write(&new, b"new").unwrap();
+        let phantom = dir.path().join("cola (deleted)");
+        let err = install(&new, &phantom).unwrap_err();
+        assert!(err.to_string().contains("拒绝"), "got {err}");
+        assert!(!phantom.exists(), "the phantom must never be created");
+        assert!(new.exists(), "the download stays put when the install is refused");
+    }
+
+    /// The phantom an older buggy run left behind is a real file, so existence
+    /// alone is not enough: the procfs marker disqualifies the target.
+    #[test]
+    fn install_refuses_the_proc_deleted_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let new = dir.path().join("cola.new");
+        let phantom = dir.path().join("cola (deleted)");
+        std::fs::write(&new, b"new").unwrap();
+        std::fs::write(&phantom, b"old").unwrap();
+        assert!(install(&new, &phantom).is_err());
+        assert_eq!(std::fs::read(&phantom).unwrap(), b"old");
+        assert!(new.exists());
     }
 }

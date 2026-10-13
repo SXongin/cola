@@ -591,16 +591,15 @@ use std::sync::Arc;
 /// `std::process::exit(0)` right after.
 pub(crate) fn restart_process() -> std::io::Result<()> {
     use std::process::{Command, Stdio};
-    let mut exe = std::env::current_exe()?;
-    // If the binary was replaced by a rebuild while we're running,
-    // `/proc/self/exe` resolves to "<path> (deleted)" — spawning that fails with
-    // ENOENT. Strip the suffix: the NEW binary lives at that path, which is
-    // exactly what a restart wants.
-    if let Some(s) = exe.to_str()
-        && let Some(clean) = s.strip_suffix(" (deleted)")
-    {
-        exe = std::path::PathBuf::from(clean);
-    }
+    // Resolve the LIVE binary path. `/proc/self/exe` renders as
+    // "<path> (deleted)" once the file was replaced by a rebuild or an upgrade
+    // while we're running, and spawning that fails with ENOENT; the NEW binary
+    // lives at the stripped path, which is exactly what a restart wants (issue
+    // #551). A binary that is not on disk at all is an error, not a spawn of a
+    // path that cannot exist.
+    let mut exe = crate::update::live_exe_path(&std::env::current_exe()?).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "the running binary is not on disk")
+    })?;
     // `Command::new` resolves bare names via PATH; always use an absolute path.
     if !exe.is_absolute() {
         exe = std::env::current_dir()?.join(exe);
