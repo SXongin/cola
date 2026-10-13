@@ -27,7 +27,7 @@ use crate::error::Result;
 use super::strategy::GenerationStrategy;
 use super::transport::{REPLY_TIMEOUT, Transport, read_failure, read_failure_quiet};
 use super::types::{
-    AgentInfo, FormAnswer, FormFieldKind, ImageInput, ModelInfo, ModelOption, PermissionRequest,
+    AgentInfo, FormAnswer, FormFieldKind, ModelInfo, ModelOption, PermissionRequest, PromptFile,
     ProviderModels, QuestionInfo, QuestionOption, QuestionRequest, SessionInfo, SessionListInfo,
     SessionSelection, SessionStatus,
 };
@@ -179,13 +179,13 @@ impl GenerationStrategy for V1Strategy {
     /// create (ADR-0026). The server persists it, and a retry that reuses it is
     /// idempotent — never a duplicate user message. None falls back to a
     /// server-generated id (used only by tests/other clients).
-    #[allow(clippy::too_many_arguments)] // prompt axes: session/text/images/skills + model/variant/agent/message-id
+    #[allow(clippy::too_many_arguments)] // prompt axes: session/text/files/skills + model/variant/agent/message-id
     async fn prompt(
         &self,
         http: &Transport,
         session_id: &str,
         text: &str,
-        images: &[ImageInput],
+        files: &[PromptFile],
         skills: &[PromptSkill],
         model: Option<&ModelInfo>,
         variant: Option<&str>,
@@ -193,7 +193,7 @@ impl GenerationStrategy for V1Strategy {
         message_id: Option<&str>,
     ) -> Result<()> {
         let mut body = serde_json::json!({
-            "parts": build_parts(&fold_skills(text, skills), images),
+            "parts": build_parts(&fold_skills(text, skills), files),
         });
         inject_message_id(&mut body, message_id);
         inject_model(&mut body, model, variant);
@@ -804,16 +804,23 @@ fn fold_skills(text: &str, skills: &[PromptSkill]) -> String {
 }
 
 /// The prompt `parts` array: a text part followed by one data-URL `file` part
-/// per image. OpenCode decodes the data URL and normalizes the image before
-/// handing it to a vision-capable model (FilePartInput). Used by `prompt`.
-fn build_parts(text: &str, images: &[ImageInput]) -> Vec<serde_json::Value> {
+/// per attachment. OpenCode decodes the data URL, normalizes an image before
+/// handing it to a vision-capable model, and expands a `text/plain` payload
+/// into its own text parts at ingest (FilePartInput). A file's `filename` is
+/// the display name the record line shows (ADR-0076); an image carries none.
+/// Used by `prompt`.
+fn build_parts(text: &str, files: &[PromptFile]) -> Vec<serde_json::Value> {
     let mut parts = vec![serde_json::json!({ "type": "text", "text": text })];
-    for img in images {
-        parts.push(serde_json::json!({
+    for file in files {
+        let mut part = serde_json::json!({
             "type": "file",
-            "mime": img.mime,
-            "url": format!("data:{};base64,{}", img.mime, img.data_base64),
-        }));
+            "mime": file.mime,
+            "url": format!("data:{};base64,{}", file.mime, file.data_base64),
+        });
+        if let Some(name) = &file.name {
+            part["filename"] = serde_json::json!(name);
+        }
+        parts.push(part);
     }
     parts
 }

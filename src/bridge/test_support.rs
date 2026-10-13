@@ -419,6 +419,16 @@ pub struct RecordingPlatform {
     /// The next N `reply_message` calls fail with a Feishu error (tests that a
     /// File Message failure degrades to `未发送` and never blocks the card).
     pub fail_send_message_count: std::sync::atomic::AtomicUsize,
+    /// file_key → the payload `download_file` serves. A present `Some` is
+    /// served; a present `None` fails the download (the 下载失败 omission); an
+    /// absent key serves a small PDF with the caller's name.
+    pub downloaded_files:
+        std::sync::Mutex<std::collections::HashMap<String, Option<crate::feishu::client::FileAttachment>>>,
+    /// Every `download_file` call `(message_id, file_key, name)`, in order.
+    pub download_file_calls: std::sync::Mutex<Vec<(String, String, String)>>,
+    /// When set, `download_file` sleeps this long before answering — a slow
+    /// parent download for the Quoted Context budget tests.
+    pub download_file_delay: std::sync::Mutex<Option<std::time::Duration>>,
 }
 
 impl RecordingPlatform {
@@ -451,6 +461,9 @@ impl RecordingPlatform {
             file_key: std::sync::Mutex::new("file_test".into()),
             fail_upload_file_count: std::sync::atomic::AtomicUsize::new(0),
             fail_send_message_count: std::sync::atomic::AtomicUsize::new(0),
+            downloaded_files: std::sync::Mutex::new(std::collections::HashMap::new()),
+            download_file_calls: std::sync::Mutex::new(Vec::new()),
+            download_file_delay: std::sync::Mutex::new(None),
         }
     }
 
@@ -1036,6 +1049,39 @@ impl feishu::Platform for RecordingPlatform {
         })
     }
 
+    async fn download_file(
+        &self,
+        message_id: &str,
+        file_key: &str,
+        name: &str,
+    ) -> crate::error::Result<crate::feishu::client::FileAttachment> {
+        self.download_file_calls.lock().unwrap().push((
+            message_id.to_string(),
+            file_key.to_string(),
+            name.to_string(),
+        ));
+        let delay = *self.download_file_delay.lock().unwrap();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+        // Scripted per file_key: a present `Some` is served, a present `None`
+        // fails (the 下载失败 omission). Absent = a small PDF with the caller's
+        // name, so an unscripted quoted-file parent still attaches.
+        if let Some(scripted) = self.downloaded_files.lock().unwrap().get(file_key) {
+            return match scripted {
+                Some(file) => Ok(file.clone()),
+                None => Err(crate::error::BridgeError::Feishu(format!(
+                    "mock: download file {file_key} failed"
+                ))),
+            };
+        }
+        Ok(crate::feishu::client::FileAttachment {
+            mime: "application/pdf".into(),
+            name: name.to_string(),
+            data: b"%PDF-1.7".to_vec(),
+        })
+    }
+
     async fn upload_image(
         &self,
         content: &crate::backend::FileContent,
@@ -1296,7 +1342,12 @@ pub struct MockBackend {
     /// go through the same submit, ADR-0056).
     pub prompt_calls: Arc<tokio::sync::Mutex<Vec<String>>>,
     /// Records the number of images attached to each `prompt` call.
-    pub prompt_images: Arc<tokio::sync::Mutex<Vec<usize>>>,
+    pub prompt_files: Arc<tokio::sync::Mutex<Vec<usize>>>,
+    /// Every prompt's attached file parts as `(mime, name, data_base64)`, in
+    /// call order — what `prompt_files` counts, but with the payload facts a
+    /// classification regression would show.
+    #[allow(clippy::type_complexity)]
+    pub prompt_file_parts: Arc<tokio::sync::Mutex<Vec<Vec<(String, Option<String>, String)>>>>,
     /// Records every `prompt` call's attached skills (spec #652, ticket #654):
     /// the neutral `{ id, name }` list, so a `/skill` submit is asserted
     /// through the mock.
@@ -1591,7 +1642,8 @@ impl MockBackend {
             fail_interrupt_count: std::sync::atomic::AtomicUsize::new(0).into(),
             fail_interrupt_message: None,
             prompt_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
-            prompt_images: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            prompt_files: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            prompt_file_parts: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             prompt_skills: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             prompt_models: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             prompt_variants: Arc::new(tokio::sync::Mutex::new(Vec::new())),
@@ -2428,7 +2480,7 @@ impl crate::backend::Backend for MockBackend {
         &self,
         session_id: &str,
         text: &str,
-        images: &[opencode::types::ImageInput],
+        files: &[opencode::types::PromptFile],
         skills: &[crate::backend::PromptSkill],
         _model: Option<&opencode::types::ModelInfo>,
         variant: Option<&str>,
@@ -2436,7 +2488,13 @@ impl crate::backend::Backend for MockBackend {
         message_id: Option<&str>,
     ) -> crate::error::Result<()> {
         self.prompt_calls.lock().await.push(text.to_string());
-        self.prompt_images.lock().await.push(images.len());
+        self.prompt_files.lock().await.push(files.len());
+        self.prompt_file_parts.lock().await.push(
+            files
+                .iter()
+                .map(|file| (file.mime.clone(), file.name.clone(), file.data_base64.clone()))
+                .collect(),
+        );
         self.prompt_skills.lock().await.push(skills.to_vec());
         self.prompt_message_ids
             .lock()
@@ -3174,6 +3232,8 @@ pub(crate) fn incoming(
         parent_id: None,
         text,
         images: vec![],
+        files: vec![],
+        omitted: vec![],
         requester_open_id: Some(requester.unwrap_or_else(|| TEST_HOST.to_string())),
     }
 }
@@ -3194,6 +3254,8 @@ pub(crate) fn incoming_anonymous(
         parent_id: None,
         text,
         images: vec![],
+        files: vec![],
+        omitted: vec![],
         requester_open_id: None,
     }
 }

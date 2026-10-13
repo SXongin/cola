@@ -207,13 +207,20 @@ pub struct Location {
     pub directory: String,
 }
 
-/// An image attached to a prompt, sent as a data-URL `file` part
-/// (`{type:"file", mime, url:"data:<mime>;base64,..."}`). Requires a
-/// vision-capable model; unsupported models surface an error.
+/// One inbound platform attachment sent with a prompt — a Feishu image or file
+/// (GLOSSARY: Prompt Attachment; ADR-0076's inbound amendment). `mime` is the
+/// media type the server will read it as (the four image mimes, `application/pdf`,
+/// or a text file normalized to `text/plain`), `data_base64` its bytes, and
+/// `name` its display name — `None` for an image, which has none. Each
+/// generation serializes it into its own payload: V1 a `{type:"file", mime,
+/// filename?, url:"data:<mime>;base64,…"}` part, V2 a `{uri, name?}` `files[]`
+/// entry. An image requires a vision-capable model; an unsupported one surfaces
+/// an error.
 #[derive(Debug, Clone)]
-pub struct ImageInput {
+pub struct PromptFile {
     pub mime: String,
     pub data_base64: String,
+    pub name: Option<String>,
 }
 
 /// The typed kind of a form field (V2 `Form.Field`). V1 questions map onto

@@ -80,12 +80,10 @@ use tracing::Instrument;
 
 use crate::backend::{MessageId, MessageRole, PromptSkill, SessionTranscript, TurnAnchor, TurnSettle};
 use crate::bridge::chain::{ChainRecord, RenderedCursor};
-use crate::bridge::handler::image_inputs;
 use crate::bridge::handles::{CardsHandle, NoticeRules, RequestsHandle, SessionsHandle, TurnHandles};
 use crate::bridge::span;
 use crate::bridge::turn::state::{EndingWrite, StreamAccumulator};
 use crate::config::ThreadKey;
-use crate::feishu::client::ImageAttachment;
 use crate::opencode::types::SessionStatus;
 
 /// How many consecutive drain reads must see no run before an unobserved
@@ -211,14 +209,15 @@ pub(crate) struct PromptContext {
     /// retry) so the server deduplicates by id; None means a fresh message,
     /// and the turn generates a new id.
     pub(crate) cola_message_id: Option<String>,
-    /// Downloaded images attached to this turn (Image Attachments).
-    pub(crate) images: Vec<ImageAttachment>,
+    /// The prompt file parts this turn attaches (Prompt Attachments, ADR-0076):
+    /// classified and size-checked by the handler, ready to send.
+    pub(crate) files: Vec<crate::opencode::types::PromptFile>,
     /// The skills this turn loads into the prompt (spec #652, ticket #654): the
     /// generation-neutral attachment parsed from a `/skill <id>` command. Empty
-    /// for an ordinary message. Carried across a recovery, unlike `images` (see
+    /// for an ordinary message. Carried across a recovery, unlike `files` (see
     /// [`TurnRecovery::into_context`]): skills are already-resolved small tokens
-    /// re-attached to the retry's prompt, while #391 excludes image bytes for
-    /// their re-upload cost.
+    /// re-attached to the retry's prompt, while #391 excludes attachment bytes
+    /// for their re-upload cost.
     pub(crate) skills: Vec<PromptSkill>,
     /// The Backend's ADVISORY status read reported a live Execution while cola
     /// owned no live card chain (ADR-0062): the new Turn's card opens with
@@ -245,7 +244,7 @@ pub(crate) struct Turn {
     thread_key: ThreadKey,
     text: String,
     cola_message_id: String,
-    images: Vec<ImageAttachment>,
+    files: Vec<crate::opencode::types::PromptFile>,
     /// The skills this turn loads into the prompt (spec #652, ticket #654),
     /// captured at turn start — passed to every attempt's submit.
     skills: Vec<PromptSkill>,
@@ -375,7 +374,7 @@ impl Turn {
             requester_open_id,
             is_group,
             cola_message_id,
-            images,
+            files,
             skills,
             advisory_live,
         } = ctx;
@@ -613,7 +612,7 @@ impl Turn {
             thread_key,
             text,
             cola_message_id,
-            images,
+            files,
             skills,
             directory: session_dir,
             turn_variant: None,
@@ -655,7 +654,7 @@ impl Turn {
             .prompt(
                 &self.session_id,
                 &self.text,
-                &image_inputs(&self.images),
+                &self.files,
                 &self.skills,
                 model.as_ref(),
                 self.turn_variant.as_deref(),
@@ -3114,7 +3113,7 @@ impl TurnRecovery {
     /// under the context's names, with the id policy the caller chose (`None`
     /// = a fresh `msg_cola_` id, `Some` = the previous attempt's). The skills
     /// are carried (already-resolved small tokens, the retry's whole point);
-    /// images are not re-sent on a recovery (#391, re-upload cost, out of
+    /// attachments are not re-sent on a recovery (#391, re-upload cost, out of
     /// scope).
     pub(crate) fn into_context(
         self,
@@ -3131,7 +3130,7 @@ impl TurnRecovery {
             requester_open_id: self.requester_open_id,
             is_group: self.is_group,
             cola_message_id,
-            images: Vec::new(),
+            files: Vec::new(),
             skills: self.skills,
             // A recovery never routes through the advisory read (its own
             // decision already judged the run): an ordinary card.
@@ -4388,7 +4387,7 @@ mod tests {
             requester_open_id: None,
             is_group: false,
             cola_message_id: None,
-            images: Vec::new(),
+            files: Vec::new(),
             skills: Vec::new(),
             advisory_live: false,
         }

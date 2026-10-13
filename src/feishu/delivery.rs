@@ -1809,6 +1809,15 @@ impl Platform for CardDelivery {
         self.inner.download_image(message_id, image_key).await
     }
 
+    async fn download_file(
+        &self,
+        message_id: &str,
+        file_key: &str,
+        name: &str,
+    ) -> Result<crate::feishu::client::FileAttachment> {
+        self.inner.download_file(message_id, file_key, name).await
+    }
+
     async fn set_instant_reminder(
         &self,
         chat_id: &str,
@@ -2165,6 +2174,14 @@ mod tests {
             unimplemented!("not used")
         }
         async fn download_image(&self, _message_id: &str, _image_key: &str) -> Result<ImageAttachment> {
+            unimplemented!("not used")
+        }
+        async fn download_file(
+            &self,
+            _message_id: &str,
+            _file_key: &str,
+            _name: &str,
+        ) -> Result<crate::feishu::client::FileAttachment> {
             unimplemented!("not used")
         }
         async fn set_instant_reminder(

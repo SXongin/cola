@@ -41,7 +41,7 @@ use crate::error::Result;
 use async_trait::async_trait;
 use client::OpenCodeBackend;
 use types::{
-    AgentInfo, CreateSessionInput, FormAnswer, ImageInput, ModelInfo, PermissionRequest, ProviderModels,
+    AgentInfo, CreateSessionInput, FormAnswer, ModelInfo, PermissionRequest, PromptFile, ProviderModels,
     QuestionRequest, Session, SessionInfo, SessionListInfo, SessionSelection, SessionStatus,
 };
 
@@ -71,7 +71,7 @@ impl Backend for OpenCodeBackend {
         &self,
         session_id: &str,
         text: &str,
-        images: &[ImageInput],
+        files: &[PromptFile],
         skills: &[PromptSkill],
         model: Option<&ModelInfo>,
         variant: Option<&str>,
@@ -79,7 +79,7 @@ impl Backend for OpenCodeBackend {
         message_id: Option<&str>,
     ) -> Result<()> {
         OpenCodeBackend::prompt(
-            self, session_id, text, images, skills, model, variant, agent, message_id,
+            self, session_id, text, files, skills, model, variant, agent, message_id,
         )
         .await
     }

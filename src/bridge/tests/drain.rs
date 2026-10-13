@@ -82,7 +82,7 @@ pub(crate) fn ctx(session_id: &str, text: &str) -> PromptContext {
         requester_open_id: None,
         is_group: false,
         cola_message_id: Some("msg_cola_anchor".into()),
-        images: Vec::new(),
+        files: Vec::new(),
         skills: Vec::new(),
         advisory_live: false,
     }

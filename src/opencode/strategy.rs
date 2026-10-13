@@ -23,7 +23,7 @@ use crate::error::Result;
 
 use super::transport::Transport;
 use super::types::{
-    AgentInfo, FormAnswer, ImageInput, ModelInfo, PermissionRequest, ProviderModels, QuestionRequest,
+    AgentInfo, FormAnswer, ModelInfo, PermissionRequest, PromptFile, ProviderModels, QuestionRequest,
     SessionInfo, SessionListInfo, SessionSelection, SessionStatus,
 };
 
@@ -55,13 +55,13 @@ pub(crate) trait GenerationStrategy: Send + Sync {
     /// `skills` is the generation-neutral attachment ([`PromptSkill`]); the
     /// strategy owns how its generation carries it — V2's structured `skills`
     /// body array, or V1's text instruction.
-    #[allow(clippy::too_many_arguments)] // prompt axes: session/text/images/skills + model/variant/agent/message-id
+    #[allow(clippy::too_many_arguments)] // prompt axes: session/text/files/skills + model/variant/agent/message-id
     async fn prompt(
         &self,
         http: &Transport,
         session_id: &str,
         text: &str,
-        images: &[ImageInput],
+        files: &[PromptFile],
         skills: &[PromptSkill],
         model: Option<&ModelInfo>,
         variant: Option<&str>,

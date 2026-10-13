@@ -19,7 +19,7 @@ use base64::Engine;
 pub const DEFAULT_FILE_MIME: &str = "application/octet-stream";
 
 /// The display name a File Content reads when its block carried none.
-const DEFAULT_FILE_NAME: &str = "file";
+pub(crate) const DEFAULT_FILE_NAME: &str = "file";
 
 /// One File Content, uniform across Generations and across the tool-output and
 /// user-attachment sources.

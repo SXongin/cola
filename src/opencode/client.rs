@@ -17,9 +17,9 @@ use super::parsing::parse_model;
 use super::strategy::{Generation, GenerationStrategy};
 use super::transport::Transport;
 use super::types::{
-    AgentInfo, CreateSessionInput, CreateSessionResponse, FormAnswer, ImageInput, Location, ModelInfo,
-    PermissionRequest, ProviderModels, QuestionRequest, Session, SessionInfo, SessionListInfo,
-    SessionSelection, SessionStatus,
+    AgentInfo, CreateSessionInput, CreateSessionResponse, FormAnswer, Location, ModelInfo, PermissionRequest,
+    PromptFile, ProviderModels, QuestionRequest, Session, SessionInfo, SessionListInfo, SessionSelection,
+    SessionStatus,
 };
 
 /// Session creation, on the `/api` surface both generations serve. It is a
@@ -313,12 +313,12 @@ impl OpenCodeBackend {
     /// Submit a prompt through the attached generation's strategy (ADR-0056's
     /// submit+observe contract: the call returns once the message is durable,
     /// and the Turn observes completion from the transcript + run state).
-    #[allow(clippy::too_many_arguments)] // prompt axes: session/text/images/skills + model/variant/agent/message-id
+    #[allow(clippy::too_many_arguments)] // prompt axes: session/text/files/skills + model/variant/agent/message-id
     pub async fn prompt(
         &self,
         session_id: &str,
         text: &str,
-        images: &[ImageInput],
+        files: &[PromptFile],
         skills: &[PromptSkill],
         model: Option<&ModelInfo>,
         variant: Option<&str>,
@@ -334,7 +334,7 @@ impl OpenCodeBackend {
                 &self.transport,
                 session_id,
                 text,
-                images,
+                files,
                 skills,
                 model,
                 variant,

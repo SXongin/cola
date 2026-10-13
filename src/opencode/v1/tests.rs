@@ -317,16 +317,17 @@ async fn prompt_posts_the_native_fire_and_forget_route_with_parts_model_variant_
     server.route("POST", "/session/ses_1/prompt_async", 204, "");
     let client = v1_wire_client(&server, None);
     let model = parse_model("opencode-go/deepseek-v4-flash").unwrap();
-    let images = vec![ImageInput {
+    let files = vec![PromptFile {
         mime: "image/png".to_string(),
         data_base64: "QUJD".to_string(),
+        name: None,
     }];
 
     client
         .prompt(
             "ses_1",
             "hello",
-            &images,
+            &files,
             &[],
             Some(&model),
             Some("high"),
@@ -354,6 +355,53 @@ async fn prompt_posts_the_native_fire_and_forget_route_with_parts_model_variant_
     assert_eq!(body["variant"], "high");
     assert_eq!(body["agent"], "build");
     assert_eq!(body["messageID"], "msg_cola_abc");
+}
+
+/// A named Prompt Attachment (a file) carries its display name as the V1 `file`
+/// part's `filename`; an image (no name) omits the field (ADR-0076's inbound
+/// amendment).
+#[tokio::test]
+async fn prompt_carries_a_named_files_filename_and_omits_it_for_an_image() {
+    let server = TestHttpServer::start().await;
+    server.route("POST", "/session/ses_1/prompt_async", 204, "");
+    let client = v1_wire_client(&server, None);
+
+    client
+        .prompt(
+            "ses_1",
+            "read it",
+            &[
+                PromptFile {
+                    mime: "application/pdf".into(),
+                    data_base64: "QUJD".into(),
+                    name: Some("P3173R0.pdf".into()),
+                },
+                PromptFile {
+                    mime: "image/png".into(),
+                    data_base64: "QUJD".into(),
+                    name: None,
+                },
+            ],
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let body = body_json(&last_request(&server));
+    assert_eq!(body["parts"][1]["type"], "file");
+    assert_eq!(body["parts"][1]["mime"], "application/pdf");
+    assert_eq!(body["parts"][1]["url"], "data:application/pdf;base64,QUJD");
+    assert_eq!(body["parts"][1]["filename"], "P3173R0.pdf");
+    assert_eq!(body["parts"][2]["mime"], "image/png");
+    assert!(
+        body["parts"][2].get("filename").is_none(),
+        "an image has no name: {}",
+        body["parts"][2]
+    );
 }
 
 #[tokio::test]

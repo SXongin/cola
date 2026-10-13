@@ -1,7 +1,10 @@
 use crate::bridge::EventSink;
 use crate::feishu::Platform;
 use crate::feishu::event::MessageReceiveEvent;
-use crate::feishu::message::{extract_image_keys, is_mentioned, parse_message_content, strip_mentions};
+use crate::feishu::message::{
+    FileRef, download_attachments, extract_file_refs, extract_image_keys, is_mentioned,
+    parse_message_content, strip_mentions,
+};
 #[cfg(test)]
 use crate::feishu::pbbp2::Routing;
 use crate::feishu::pbbp2::{self, Frame};
@@ -216,6 +219,27 @@ async fn connect_and_listen(
         drain_feishu.drain_pending_card_updates(true).await;
     });
     handle_connection(ws_stream, sink, feishu, state).await
+}
+
+/// The spawned receive-path step for one message: admit it (ADR-0035 — the
+/// Principal is resolved BEFORE anything else happens), then download its
+/// attachments and deliver it. Split out so the gate-before-download order is
+/// directly testable: a denied message must never fetch its file.
+async fn deliver_message(
+    sink: &dyn EventSink,
+    feishu: &Arc<dyn Platform>,
+    mut incoming: crate::bridge::IncomingMessage,
+    image_keys: &[String],
+    file_refs: &[FileRef],
+) {
+    if !sink.admit(&incoming).await {
+        return;
+    }
+    let attachments = download_attachments(feishu, &incoming.message_id, image_keys, file_refs).await;
+    incoming.images = attachments.images;
+    incoming.files = attachments.files;
+    incoming.omitted = attachments.omitted;
+    sink.handle_message(incoming).await;
 }
 
 async fn handle_connection(
@@ -708,10 +732,13 @@ async fn handle_binary_frame(
                     thread_id.as_deref().unwrap_or("-"),
                     &text.chars().take(50).collect::<String>()
                 );
-                // Images embedded in this message (image/post) are downloaded on the
-                // spawned task so the WS read loop keeps reading (heartbeats, new
-                // messages, card actions) while a download is in flight.
+                // Images and files embedded in this message (image/post/file)
+                // are downloaded on the spawned task so the WS read loop keeps
+                // reading (heartbeats, new messages, card actions) while a
+                // download is in flight. A ref that cannot be downloaded is
+                // recorded as an omission, never dropped silently (ADR-0076).
                 let image_keys = extract_image_keys(&msg_data.content, &msg_data.message_type);
+                let file_refs = extract_file_refs(&msg_data.content, &msg_data.message_type);
                 let msg_id = msg_data.message_id.clone();
                 let chat_id = msg_data.chat_id.clone();
                 let chat_type = msg_data.chat_type.clone();
@@ -720,23 +747,24 @@ async fn handle_binary_frame(
                 let feishu = feishu.clone();
                 tokio::spawn(
                     async move {
-                        let mut images = Vec::new();
-                        for key in &image_keys {
-                            match feishu.download_image(&msg_id, key).await {
-                                Ok(img) => images.push(img),
-                                Err(e) => tracing::warn!("download image {} failed: {}", key, e),
-                            }
-                        }
-                        sink.handle_message(crate::bridge::IncomingMessage {
-                            message_id: msg_id,
-                            chat_id,
-                            chat_type,
-                            thread_id,
-                            parent_id,
-                            text,
-                            images,
-                            requester_open_id: sender_open_id,
-                        })
+                        deliver_message(
+                            &*sink,
+                            &feishu,
+                            crate::bridge::IncomingMessage {
+                                message_id: msg_id,
+                                chat_id,
+                                chat_type,
+                                thread_id,
+                                parent_id,
+                                text,
+                                images: Vec::new(),
+                                files: Vec::new(),
+                                omitted: Vec::new(),
+                                requester_open_id: sender_open_id,
+                            },
+                            &image_keys,
+                            &file_refs,
+                        )
                         .await;
                     }
                     .instrument(handler_span),
@@ -1380,6 +1408,146 @@ fn process_frame_acks_stale_events_without_dispatch() {
     assert!(matches!(process_frame(&frame, &mut seen), FrameAction::Ack));
 }
 
+/// The receive path's download wiring: images and files come back as payloads
+/// (the file under the right message id and name), a folder entry is reported
+/// unsupported rather than downloaded, and a failed download is reported as
+/// `下载失败` — nothing dropped silently (ADR-0076's inbound amendment).
+#[tokio::test]
+async fn download_attachments_downloads_files_and_reports_every_unresolved_ref() {
+    use crate::bridge::OmitReason;
+    use crate::bridge::OmittedAttachment;
+    use crate::bridge::test_support::RecordingPlatform;
+    use crate::feishu::message::FileRef;
+    let platform = Arc::new(RecordingPlatform::new());
+    // The third file's download fails: it must surface as a `下载失败` omission.
+    platform
+        .downloaded_files
+        .lock()
+        .unwrap()
+        .insert("fk_bad".into(), None);
+    let feishu: Arc<dyn Platform> = platform.clone();
+    let file_refs = vec![
+        FileRef {
+            key: "fk_pdf".into(),
+            name: "P3173R0.pdf".into(),
+            folder: false,
+        },
+        FileRef {
+            key: String::new(),
+            name: "docs".into(),
+            folder: true,
+        },
+        FileRef {
+            key: "fk_bad".into(),
+            name: "broken.pdf".into(),
+            folder: false,
+        },
+    ];
+
+    let collected = download_attachments(&feishu, "om_x", &["img_1".to_string()], &file_refs).await;
+
+    assert_eq!(collected.images.len(), 1);
+    assert_eq!(collected.files.len(), 1);
+    assert_eq!(collected.files[0].name, "P3173R0.pdf");
+    assert_eq!(
+        collected.omitted,
+        vec![
+            OmittedAttachment {
+                name: Some("docs".into()),
+                reason: OmitReason::Unsupported,
+            },
+            OmittedAttachment {
+                name: Some("broken.pdf".into()),
+                reason: OmitReason::DownloadFailed,
+            },
+        ]
+    );
+    assert_eq!(
+        platform.download_file_calls.lock().unwrap().clone(),
+        vec![
+            (
+                "om_x".to_string(),
+                "fk_pdf".to_string(),
+                "P3173R0.pdf".to_string()
+            ),
+            ("om_x".to_string(), "fk_bad".to_string(), "broken.pdf".to_string()),
+        ]
+    );
+}
+
+/// The receive path resolves the Principal BEFORE downloading (ADR-0035): a
+/// denied sender's message is neither downloaded nor delivered, an admitted
+/// one is both.
+#[tokio::test]
+async fn a_denied_message_is_not_downloaded() {
+    use crate::bridge::handler::CardActionResult;
+    use crate::bridge::test_support::RecordingPlatform;
+    use crate::bridge::{EventSink, IncomingMessage};
+    use crate::feishu::message::FileRef;
+
+    struct Sink {
+        admits: bool,
+        delivered: std::sync::Arc<tokio::sync::Mutex<bool>>,
+    }
+    #[async_trait::async_trait]
+    impl EventSink for Sink {
+        async fn admit(&self, _msg: &IncomingMessage) -> bool {
+            self.admits
+        }
+        async fn handle_message(&self, _msg: IncomingMessage) {
+            *self.delivered.lock().await = true;
+        }
+        async fn handle_card_action(&self, _value: serde_json::Value) -> Option<CardActionResult> {
+            None
+        }
+    }
+
+    let platform = Arc::new(RecordingPlatform::new());
+    let feishu: Arc<dyn Platform> = platform.clone();
+    let delivered = std::sync::Arc::new(tokio::sync::Mutex::new(false));
+    let file_refs = vec![FileRef {
+        key: "fk".into(),
+        name: "a.pdf".into(),
+        folder: false,
+    }];
+    let incoming = || IncomingMessage {
+        message_id: "om_1".into(),
+        chat_id: "oc_1".into(),
+        chat_type: "p2p".into(),
+        thread_id: None,
+        parent_id: None,
+        text: "hi".into(),
+        images: Vec::new(),
+        files: Vec::new(),
+        omitted: Vec::new(),
+        requester_open_id: Some("ou_1".into()),
+    };
+
+    // Denied: no download, no delivery.
+    let denied = Sink {
+        admits: false,
+        delivered: delivered.clone(),
+    };
+    deliver_message(&denied, &feishu, incoming(), &["img_1".to_string()], &file_refs).await;
+    assert!(
+        platform.download_file_calls.lock().unwrap().is_empty(),
+        "a denied message must never download its attachments"
+    );
+    assert!(!*delivered.lock().await, "a denied message is not delivered");
+
+    // Admitted: the download happens and the message is delivered.
+    let allowed = Sink {
+        admits: true,
+        delivered: delivered.clone(),
+    };
+    deliver_message(&allowed, &feishu, incoming(), &["img_1".to_string()], &file_refs).await;
+    assert_eq!(
+        platform.download_file_calls.lock().unwrap().clone(),
+        vec![("om_1".to_string(), "fk".to_string(), "a.pdf".to_string())]
+    );
+    assert!(*delivered.lock().await, "an admitted message is delivered");
+}
+
 #[test]
 fn process_frame_acks_unparseable_and_unknown_events() {
     // Unparseable payload → ack (stop re-delivery), no dispatch.
@@ -1637,11 +1805,17 @@ mod transport_tests {
     struct RecordingSink {
         texts: Mutex<Vec<String>>,
         actions: Mutex<Vec<serde_json::Value>>,
+        /// Each dispatched message's downloaded file names, in dispatch order.
+        files: Mutex<Vec<Vec<String>>>,
     }
 
     #[async_trait::async_trait]
     impl EventSink for RecordingSink {
         async fn handle_message(&self, msg: IncomingMessage) {
+            self.files
+                .lock()
+                .await
+                .push(msg.files.iter().map(|file| file.name.clone()).collect());
             self.texts.lock().await.push(msg.text);
         }
 
@@ -1758,6 +1932,23 @@ mod transport_tests {
         .into_bytes()
     }
 
+    /// An `im.message.receive_v1` payload for `msg_type`, carrying `content`
+    /// verbatim — the shapes the inbound file paths must read.
+    fn media_receive_payload(
+        event_id: &str,
+        create_time_ms: i64,
+        message_id: &str,
+        msg_type: &str,
+        content: &str,
+    ) -> Vec<u8> {
+        let content = serde_json::to_string(content).expect("content is a JSON string");
+        format!(
+            r#"{{"header":{{"event_id":"{}","event_type":"im.message.receive_v1","create_time":"{}"}},"event":{{"sender":{{"sender_id":{{"open_id":"ou_1"}}}},"message":{{"message_id":"{message_id}","chat_id":"oc_1","chat_type":"p2p","message_type":"{msg_type}","content":{content}}}}}}}"#,
+            event_id, create_time_ms
+        )
+        .into_bytes()
+    }
+
     fn card_action_payload() -> Vec<u8> {
         serde_json::json!({
             "header": { "event_type": "card.action.trigger", "event_id": "e_card" },
@@ -1862,6 +2053,80 @@ mod transport_tests {
             .expect("listener task did not finish after close")
             .expect("listener task panicked");
         assert!(result.is_ok(), "a clean close should end the loop with Ok");
+    }
+
+    /// The whole receive path for an attachment: a `file` event and a rich-text
+    /// `post` event with a top-level `files[]` each reach the sink with their
+    /// file downloaded and the named body (ADR-0076's inbound amendment). This
+    /// is the seam the bridge-mock tests bypass — if the wiring stopped passing
+    /// the refs, the file would silently vanish again.
+    #[tokio::test]
+    async fn file_and_post_events_download_their_attachments_through_the_receive_path() {
+        let rig = rig().await;
+        rig._http.route(
+            "POST",
+            "/open-apis/auth/v3/tenant_access_token/internal",
+            200,
+            r#"{"code":0,"msg":"ok","tenant_access_token":"t-abc","expire":7200}"#,
+        );
+        rig._http.route_raw(
+            "GET",
+            "/open-apis/im/v1/messages/om_file/resources/file_v3_1",
+            200,
+            "application/pdf",
+            b"%PDF-1.7".to_vec(),
+        );
+        rig._http.route_raw(
+            "GET",
+            "/open-apis/im/v1/messages/om_post/resources/file_v3_2",
+            200,
+            "application/octet-stream",
+            b"# notes".to_vec(),
+        );
+
+        let recorder = Arc::new(RecordingSink::default());
+        let sink: Arc<dyn EventSink> = recorder.clone();
+        let listener = tokio::spawn({
+            let sink = Arc::clone(&sink);
+            let feishu = Arc::clone(&rig.feishu);
+            let state = Arc::clone(&rig.state);
+            async move { connect_and_listen(&sink, &feishu, &state).await }
+        });
+        let mut socket = rig.ws.accept().await;
+
+        // A `file` message: the body names it, and the file is downloaded.
+        socket
+            .send_binary(event_bytes(&media_receive_payload(
+                "e_file",
+                chrono::Utc::now().timestamp_millis(),
+                "om_file",
+                "file",
+                r#"{"file_key":"file_v3_1","file_name":"P3173R0.pdf"}"#,
+            )))
+            .await;
+        // A rich-text `post` whose top-level `files[]` carries a text file.
+        socket
+            .send_binary(event_bytes(&media_receive_payload(
+                "e_post",
+                chrono::Utc::now().timestamp_millis(),
+                "om_post",
+                "post",
+                r#"{"content":[[{"tag":"text","text":"我发这个文件吧"}]],"files":[{"file_key":"file_v3_2","file_name":"notes.md","is_folder":false}]}"#,
+            )))
+            .await;
+
+        wait_for_texts(&recorder, 2).await;
+        assert_eq!(
+            recorder.texts.lock().await.clone(),
+            vec!["[文件: P3173R0.pdf]", "我发这个文件吧"]
+        );
+        assert_eq!(
+            recorder.files.lock().await.clone(),
+            vec![vec!["P3173R0.pdf".to_string()], vec!["notes.md".to_string()]]
+        );
+
+        socket.close().await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), listener).await;
     }
 
     /// ADR-0048: the inbound message path enters its chat/topic span at receipt

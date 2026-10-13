@@ -45,7 +45,7 @@ use crate::error::Result;
 use super::strategy::GenerationStrategy;
 use super::transport::{Transport, body_preview, read_failure, read_failure_quiet};
 use super::types::{
-    AgentInfo, FormAnswer, FormValue, ImageInput, ModelInfo, PermissionRequest, ProviderModels,
+    AgentInfo, FormAnswer, FormValue, ModelInfo, PermissionRequest, PromptFile, ProviderModels,
     QuestionRequest, SessionInfo, SessionListInfo, SessionSelection, SessionStatus,
 };
 
@@ -316,7 +316,7 @@ impl GenerationStrategy for V2Strategy {
         http: &Transport,
         session_id: &str,
         text: &str,
-        images: &[ImageInput],
+        files: &[PromptFile],
         skills: &[PromptSkill],
         model: Option<&ModelInfo>,
         variant: Option<&str>,
@@ -330,7 +330,7 @@ impl GenerationStrategy for V2Strategy {
             );
         }
         let admitted = self
-            .dispatch(http, session_id, text, images, skills, message_id)
+            .dispatch(http, session_id, text, files, skills, message_id)
             .await?;
         tracing::info!("prompt sent to session {session_id} (V2 admitted {admitted})");
         Ok(())
@@ -966,22 +966,28 @@ impl V2Strategy {
         http: &Transport,
         session_id: &str,
         text: &str,
-        images: &[ImageInput],
+        files: &[PromptFile],
         skills: &[PromptSkill],
         message_id: Option<&str>,
     ) -> Result<String> {
         let mut body = serde_json::json!({ "text": text });
-        if !images.is_empty() {
+        if !files.is_empty() {
             body["files"] = serde_json::Value::Array(
-                images
+                files
                     .iter()
-                    .map(|image| {
+                    .map(|file| {
                         // V2 attachments take a URI; a data URL is the inline
                         // form the server decodes itself (V1's `file` part
-                        // carried the same URL).
-                        serde_json::json!({
-                            "uri": format!("data:{};base64,{}", image.mime, image.data_base64)
-                        })
+                        // carried the same URL). The optional `name` is the
+                        // display name the record line shows (ADR-0076) — an
+                        // image carries none.
+                        let mut entry = serde_json::json!({
+                            "uri": format!("data:{};base64,{}", file.mime, file.data_base64)
+                        });
+                        if let Some(name) = &file.name {
+                            entry["name"] = serde_json::json!(name);
+                        }
+                        entry
                     })
                     .collect(),
             );

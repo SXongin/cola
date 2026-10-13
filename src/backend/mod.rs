@@ -28,7 +28,7 @@ use async_trait::async_trait;
 
 use crate::error::Result;
 use crate::opencode::types::{
-    AgentInfo, CreateSessionInput, FormAnswer, ImageInput, ModelInfo, PermissionRequest, ProviderModels,
+    AgentInfo, CreateSessionInput, FormAnswer, ModelInfo, PermissionRequest, PromptFile, ProviderModels,
     QuestionRequest, Session, SessionInfo, SessionListInfo, SessionSelection, SessionStatus,
 };
 
@@ -183,8 +183,9 @@ pub trait Backend: Send + Sync {
     /// `agent` is the per-session `/agent` override; None → the server uses the
     /// session's own/default agent.
     ///
-    /// `images` are attached as data-URL `file` parts; requires a vision-capable
-    /// model (unsupported models surface an error).
+    /// `files` are the prompt's inbound attachments, each attached as a
+    /// data-URL part; a non-text one requires a vision-capable model
+    /// (unsupported models surface an error).
     ///
     /// `skills` asks the server to load those skills with this prompt. The
     /// attachment is generation-neutral ([`PromptSkill`]); each generation's
@@ -200,12 +201,12 @@ pub trait Backend: Send + Sync {
     /// [`Self::reuse_continues_an_admitted_turn`] is true does it continue the
     /// admitted turn (V1); on V2 the admitted id makes the re-post a no-op.
     /// None falls back to a server-generated id.
-    #[allow(clippy::too_many_arguments)] // prompt axes: session/text/images/skills + model/variant/agent/message-id
+    #[allow(clippy::too_many_arguments)] // prompt axes: session/text/files/skills + model/variant/agent/message-id
     async fn prompt(
         &self,
         session_id: &str,
         text: &str,
-        images: &[ImageInput],
+        files: &[PromptFile],
         skills: &[PromptSkill],
         model: Option<&ModelInfo>,
         variant: Option<&str>,

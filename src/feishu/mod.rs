@@ -223,10 +223,23 @@ pub trait Platform: Send + Sync {
     ) -> Result<(String, Option<String>)>;
 
     /// Download an image embedded in a message (`GET /im/v1/messages/{id}/resources/{key}?type=image`),
-    /// used to attach Image Attachments to a prompt. Requires the `im:message`
+    /// used to attach images to a prompt. Requires the `im:message`
     /// permission (already held); callers degrade to a `[图片]` placeholder on
     /// error.
     async fn download_image(&self, message_id: &str, image_key: &str) -> Result<client::ImageAttachment>;
+
+    /// Download a file attached to a message (`GET
+    /// /im/v1/messages/{id}/resources/{key}?type=file`, ADR-0076's inbound
+    /// amendment), used to attach a Prompt Attachment to a prompt. `name` is
+    /// the display name from the message content (the resource response carries
+    /// none). Requires the `im:message` permission (already held); a caller
+    /// reports a failure instead of dropping the file silently.
+    async fn download_file(
+        &self,
+        message_id: &str,
+        file_key: &str,
+        name: &str,
+    ) -> Result<client::FileAttachment>;
 
     /// Set or clear a Chat/Topic's **Instant Reminder** (`time_sensitive`,
     /// ADR-0043): a group targets its own `chat_id`, a bot p2p chat targets
@@ -435,6 +448,15 @@ impl Platform for Client {
 
     async fn download_image(&self, message_id: &str, image_key: &str) -> Result<client::ImageAttachment> {
         Client::download_image(self, message_id, image_key).await
+    }
+
+    async fn download_file(
+        &self,
+        message_id: &str,
+        file_key: &str,
+        name: &str,
+    ) -> Result<client::FileAttachment> {
+        Client::download_file(self, message_id, file_key, name).await
     }
 
     async fn set_instant_reminder(
