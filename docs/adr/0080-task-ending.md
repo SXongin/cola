@@ -66,24 +66,30 @@ key space dissolve.
   endings — evidence, the user's Cleanup, a Wake completion — live under that one
   id, and the record carries every id the run is known by (the launch's call id,
   its shell/child id, its tool call id, and the Wake id whose completion it
-  recorded). Without an alias step a Wake arriving after the launch left the read
-  (compaction, the V2 page cap) would mint a second record for a run that
-  already has one, and the duplicate #659 is about would come straight back. The
-  resolution order is fixed, strongest identity first:
+  recorded). Without an alias step two writers naming one run differently — a
+  Wake arriving after the launch left the read (compaction, the V2 page cap), or
+  a reconciliation read that still carries the launch but whose call id the
+  record no longer keys on — would each mint a record, and the duplicate #659 is
+  about would come straight back. So **every writer resolves before it mints**,
+  and it resolves by every id it holds, strongest identity first:
   1. an exact **`TaskRunId`** — the launch's call id; a retirement always holds
      it, so evidence and cleanup endings are exact;
   2. an exact **Wake id** already on a record — a Wake's own id is unique, so a
      re-encounter is exact;
-  3. else the **newest** record whose captured ids contain the shell/child id the
-     Wake reports — the same newest-match rule the entry join already uses
-     (#552: a resumed child's later launch supersedes the earlier one), so a
-     reused child id cannot attach a Wake to an older run, and a Wake delayed
-     past a resume reports the newer launch, the residual #552 already accepts.
-  A record already carrying an **evidence** ending is never merged into: the
-  resolution stops and the Wake's completion is suppressed (#659), it is not
-  attached to some other run. Only when no record matches does the writer mint
-  one under the id it holds. "One record per run", the ledger's own rule, is a
-  property of the record rather than a spelling convention.
+  3. else the **newest** record naming any other id the writer holds (the
+     shell/child id, the tool call id) — the same newest-match rule the entry
+     join already uses (#552: a resumed child's later launch supersedes the
+     earlier one), so a reused child id cannot attach a Wake to an older run and
+     a Wake delayed past a resume reports the newer launch, the residual #552
+     already accepts.
+  The first match wins and a writer mints only when nothing matched, so the order
+  in which the two writers arrive cannot matter: a launchless Wake resolves the
+  record a reconciliation read keyed by call id (its shell/child id is on that
+  record), and a reconciliation read resolves the record a launchless Wake keyed
+  by shell id (the read's shell/child id names it) — one record per run, however
+  the run is named. A record already carrying an **evidence** ending is never
+  merged into: the resolution stops and the Wake's completion is suppressed
+  (#659), it is not attached to some other run.
 - **A `Task Ending` is durable and outlives the record.** A new `endings`
   section of the Chain Record, **session-scoped** like `announcements` and the
   `rendered` section it replaces — `release` drops only the chain's record — so
@@ -300,10 +306,11 @@ past it). The trade therefore becomes:
   cleanup survives a restart, a cleaned run's late Wake still shows its own
   completion (#590), an evidence ending suppresses a late Wake across a restart,
   a Wake naming only a reused shell/child id resolves the NEWEST matching run
-  (and an evidence-ended run never absorbs it), an owed ending derived while no
-  card could place it renders on the first card that can, a surrendered ending
-  is never re-offered and its record is evictable, and a legacy mark is read once
-  then ages out — plus `ChainRecords`
+  (and an evidence-ended run never absorbs it), the alias order holds in both
+  arrival orders so two writers never make two records for one run, an owed
+  ending derived while no card could place it renders on the first card that
+  can, a surrendered ending is never re-offered and its record is evictable, and
+  a legacy mark is read once then ages out — plus `ChainRecords`
   unit tests for the new section's round-trip, migration, the three ending
   states, the alias order and bound eviction. Unlike ADR-0079's slices these
   tests change: the restart semantics change with them.
