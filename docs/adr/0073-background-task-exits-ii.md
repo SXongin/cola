@@ -1,5 +1,14 @@
 # Background-task exits II: one shared reconcile, subagent evidence, manual cleanup, output tails
 
+> **Reopened by ADR-0080**: the accepted-write gate below ("a permanently refused
+> carrier records nothing") and the deferred durable dismissal both give way to
+> the durable **Task Ending** — the ending is recorded when it is derived, its
+> completion entry is owed to the next card that can place it, and a **Cleanup**
+> survives a restart. The `rendered` marks this ADR's 2026-10-11 amendment
+> introduced become the ending's own shown fact. Every other rule here — the
+> shared reconcile, the child evidence matrix, the cleanup button, the output
+> tails, the exactly-once intent — stands.
+
 ## Context
 
 ADR-0065 landed the first exit cut for a **Background Task** whose completion

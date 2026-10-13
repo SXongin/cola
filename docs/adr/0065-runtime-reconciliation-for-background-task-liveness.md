@@ -1,5 +1,12 @@
 # Runtime reconciliation for background-task liveness
 
+> **Reopened by ADR-0080**: the process-local overlay and the "a retirement is
+> observed only while a waiting card can receive it" gate give way to the
+> durable **Task Ending** — the reconcile derives the ending once and it
+> outlives the process. The positive-evidence rules below (one verdict per
+> Session per 30 s, a failed read changes nothing, only positive evidence ends a
+> task) are unchanged.
+
 ## Context
 
 ADR-0059/0060 derive a **Background Task**'s liveness from durable transcript

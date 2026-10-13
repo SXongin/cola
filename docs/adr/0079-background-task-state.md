@@ -1,5 +1,10 @@
 # One owner for a Background Task's lifecycle: the Background Task State module
 
+> **Resolved by ADR-0080**: the durable-ending deepening this ADR deferred
+> (#683) landed as its own ADR. The module this ADR installs is where the
+> **Task Ending** facts live; the read-model interface described below is still
+> the shape the caller migration targets.
+
 A **Background Task**'s state has no owner. It is re-derived from the
 transcript on every read, then corrected by a hand-assembled pile of
 memoization sets that live in three tiers across three modules: the Backend's
