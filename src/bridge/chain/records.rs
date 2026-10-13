@@ -1,7 +1,7 @@
 //! The Chain Record (ADR-0069): one module owns the durable per-Session facts
 //! about a Card Chain, in one sidecar (`chain_records.json`).
 //!
-//! Two sections with two lifetimes share the file:
+//! The sections share the file with independent lifetimes:
 //!
 //! - **records** — the live card record (ADR-0063): which card a Session is
 //!   currently streaming into and the Turn it answers, plus the Session's
@@ -16,6 +16,16 @@
 //!   completion a card announced, advanced only after the carrying card write
 //!   lands. Monotonic per Session and never removed, so a restart cannot
 //!   re-announce a Wake a previous life already showed.
+//! - **endings** — the per-run **Task Ending**s (ADR-0080): one
+//!   [`TaskRunRecord`] per [`TaskRunId`], each carrying at most one ending per
+//!   class and its entry's own state. Recorded where the ending is derived
+//!   (never when a card write lands), so a restart re-derives nothing. Like the
+//!   watermark it is session-scoped — `release` drops only the chain's record —
+//!   because the fact is about the run, not about the card that will show it.
+//!   Bounded: the OLDEST record with no owed ending goes first, and past the
+//!   owed cap the oldest owed entry is surrendered with a `WARN` (its fact
+//!   kept). The legacy spelling of its coverage — the `rendered` section below
+//!   — is translated into it once, at load.
 //! - **rendered** — the synthetic completion entries a card has shown
 //!   (ADR-0073's amendment, issue #671): the `ended:<call_id>` /
 //!   `cleanup:<call_id>` announce keys of the retirements a delivered card
@@ -25,12 +35,14 @@
 //!   a Wake, so recording it must never move the floor a late Wake is judged
 //!   against (#590, PR #595). Like the watermark, it outlives the record it
 //!   was written on and is never removed by a release, so a restart cannot
-//!   re-show a retirement entry a previous life already rendered.
+//!   re-show a retirement entry a previous life already rendered. Superseded by
+//!   **endings** (ADR-0080) and deleted with its consumers by that change's
+//!   shrinkage slice; until then it is read once, at load, and translated.
 //!
 //! The load fails open (a missing or corrupt file reads as empty) and the
 //! write is best-effort and atomic (the shared [`sidecar`] mechanics). The
 //! one deviation from the sidecar convention: the file is **kept even when
-//! both sections are empty**, because its presence is the one-time migration
+//! every section is empty**, because its presence is the one-time migration
 //! marker from the pre-ADR-0069 sidecars (`live_cards.json`,
 //! `wake_watermarks.json`). When it is absent, [`ChainRecords::load`] folds
 //! those legacy files into the two sections once and they are never written
@@ -46,6 +58,7 @@ use serde::{Deserialize, Serialize};
 use crate::backend::{MessageId, TurnAnchor};
 use crate::bridge::handles::CardsHandle;
 use crate::bridge::sidecar;
+use crate::bridge::tasks::model::TaskRunId;
 
 /// The orphan gap a restart must still deliver (spec #561, review #569): the
 /// message-first takeover's undelivered tail, recorded durably because the
@@ -301,6 +314,147 @@ pub(crate) struct OwedRendered {
     pub(crate) rendered: Vec<String>,
 }
 
+/// One **Task Ending**'s class (ADR-0080): what ended a Background Task run. A
+/// run carries at most one ending per class, because the classes are different
+/// claims about it — an [`TaskEndingClass::Evidence`] ending says the run ENDED,
+/// so it suppresses a late **Wake**'s completion entry (#659), while a
+/// [`TaskEndingClass::Cleanup`] claims nothing about how the run ended, so a
+/// cleaned run's late Wake is its own ending (#590).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TaskEndingClass {
+    /// An evidence ending: a **Runtime Reconciliation** verdict, a shell the
+    /// runtime no longer knows, or a subagent's own terminal transcript.
+    Evidence,
+    /// The user's own **Cleanup** (spec #588, #590).
+    Cleanup,
+    /// The backend's own completion **Wake**, recorded for a run that has no
+    /// evidence ending.
+    Wake,
+    /// The pre-#659 `runtime:<call_id>` spelling, translated once at load: read
+    /// by the retirement's own dedup, never by the Wake gate (#590).
+    Legacy,
+}
+
+/// What a derivation had as evidence for a run's end (ADR-0080): the detail its
+/// class does not carry. Kept as the derivation reported it, so a later read
+/// synthesizes the entry without re-reading the transcript.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TaskEndingEvidence {
+    /// The runtime's terminal shell verdict, verbatim — a status this build does
+    /// not know stays as it came.
+    Ended(String),
+    /// The runtime has no record of the task at all.
+    Lost,
+    /// The child session's own newest assistant message ended the run (#591).
+    ChildEnded,
+    /// The state a **Wake** reported (`completed` / `cancelled` / `error`),
+    /// `None` when it reported none.
+    Wake(Option<String>),
+}
+
+/// An ending's entry state (ADR-0080). Monotonic: it only ever moves AWAY from
+/// [`TaskEndingState::Owed`] — a confirmed card write shows it, or the
+/// saturation cap surrenders it — so no later write can return an entry to
+/// `Owed` and re-offer it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TaskEndingState {
+    /// The entry the next card still renders.
+    Owed,
+    /// A confirmed card write displayed the entry.
+    Shown,
+    /// The saturation cap gave the entry up (its fact stays): only an owed
+    /// ending is ever rendered, so a surrendered one is never re-offered.
+    Surrendered,
+}
+
+/// The identity a [`BackgroundTask`] is re-synthesized from (ADR-0080): what an
+/// entry needs when the read no longer carries the run's launch, so the
+/// synthesis never depends on the transcript's own scope. The label and the
+/// start clock are captured when the ending is DERIVED — that read necessarily
+/// carries the launch — which makes a later card's entry immune to compaction
+/// and to a truncated (V2 page-capped) read.
+///
+/// [`BackgroundTask`]: crate::backend::BackgroundTask
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TaskRunIdentity {
+    /// The tool that launched the run (`shell` / `subagent`) — the kind the
+    /// entry renders as.
+    #[serde(default)]
+    pub(crate) tool: Option<String>,
+    /// The launch's own tool call id.
+    #[serde(default)]
+    pub(crate) call_id: Option<String>,
+    /// The shell the run executes in.
+    #[serde(default)]
+    pub(crate) shell_id: Option<String>,
+    /// The child session a subagent runs in.
+    #[serde(default)]
+    pub(crate) child_id: Option<String>,
+    /// When the run started.
+    #[serde(default)]
+    pub(crate) started_at: Option<i64>,
+    /// The label the launch's input carried, when it named one.
+    #[serde(default)]
+    pub(crate) label: Option<String>,
+}
+
+/// One durable **Task Ending** (ADR-0080): a claim about how one Background Task
+/// run ended, recorded at derivation and outliving the record it was first
+/// written beside.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TaskEnding {
+    pub(crate) class: TaskEndingClass,
+    pub(crate) state: TaskEndingState,
+    /// When the run ended — the Wake's own server time, the runtime's reported
+    /// completion time, or `None` for an ending the runtime could not stamp.
+    #[serde(default)]
+    pub(crate) finished_at: Option<i64>,
+    /// The class's own evidence, when the derivation reported any.
+    #[serde(default)]
+    pub(crate) evidence: Option<TaskEndingEvidence>,
+    /// The identity a Background Task is re-synthesized from.
+    #[serde(default)]
+    pub(crate) identity: TaskRunIdentity,
+}
+
+impl TaskEnding {
+    /// A just-derived ending: nothing has shown it yet, so it is OWED until a
+    /// confirmed card write shows it (ADR-0080).
+    pub(crate) fn owed(class: TaskEndingClass, identity: TaskRunIdentity) -> Self {
+        Self {
+            class,
+            state: TaskEndingState::Owed,
+            finished_at: None,
+            evidence: None,
+            identity,
+        }
+    }
+}
+
+/// One run's record in the `endings` section (ADR-0080): the ids the run is
+/// known by and at most one ending per class.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TaskRunRecord {
+    /// The run's identity: its stored key and every id it is known by.
+    pub(crate) run: TaskRunId,
+    #[serde(default)]
+    pub(crate) endings: Vec<TaskEnding>,
+}
+
+impl TaskRunRecord {
+    /// Whether the record still owes an entry: an ending no card has shown and
+    /// the cap has not surrendered. Only an OWED ending is ever rendered, and
+    /// only a record with no owed ending is the bound's eviction candidate.
+    pub(crate) fn owes(&self) -> bool {
+        self.endings
+            .iter()
+            .any(|ending| ending.state == TaskEndingState::Owed)
+    }
+}
+
 /// The persisted Chain Record; a wrapper so the on-disk shape can grow.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct ChainRecordFile {
@@ -310,6 +464,9 @@ struct ChainRecordFile {
     announcements: HashMap<String, WakeMark>,
     #[serde(default)]
     rendered: HashMap<String, Vec<String>>,
+    /// session_id → the Session's run records, oldest first (ADR-0080).
+    #[serde(default)]
+    endings: HashMap<String, Vec<TaskRunRecord>>,
 }
 
 /// How a re-point updates the chain's durable reply target (#580/#582): the
@@ -393,6 +550,174 @@ fn push_rendered_marks(state: &mut State, session_id: &str, keys: &[String]) -> 
     true
 }
 
+/// Resolve `held` to the index of `records`' record for the SAME run, or `None`
+/// (the caller mints one). Strongest identity first (ADR-0080): an exact run id;
+/// else an exact **Wake** id already on a record; else the NEWEST record naming
+/// any other id the writer holds (#552's newest-match rule). The first match
+/// wins, so the arrival order of a launchless Wake and a launch-carrying
+/// reconciliation read cannot matter — a writer mints only when nothing matched.
+fn resolve_run(records: &[TaskRunRecord], held: &TaskRunId) -> Option<usize> {
+    if let Some(index) = records.iter().position(|record| record.run.key == held.key) {
+        return Some(index);
+    }
+    if let Some(wake_id) = held.wake_id.as_deref()
+        && let Some(index) = records
+            .iter()
+            .position(|record| record.run.wake_id.as_deref() == Some(wake_id))
+    {
+        return Some(index);
+    }
+    records
+        .iter()
+        .rposition(|record| held.ids().any(|id| record.run.names(id)))
+}
+
+/// Record `ending` on the run `held` names (ADR-0080), inside the session's
+/// oldest-first `records`: resolve the run by the alias order, or mint one keyed
+/// by the writer's own id; fold in every id the writer holds; and keep AT MOST
+/// ONE ending per class — a class the run already carries is the derivation
+/// that already happened, so re-deriving it can never clear its shown bit.
+/// Returns whether the section changed.
+fn insert_ending(records: &mut Vec<TaskRunRecord>, held: &TaskRunId, ending: TaskEnding) -> bool {
+    let index = match resolve_run(records, held) {
+        Some(index) => {
+            records[index].run.absorb(held);
+            index
+        }
+        None => {
+            records.push(TaskRunRecord {
+                run: held.clone(),
+                endings: Vec::new(),
+            });
+            records.len() - 1
+        }
+    };
+    let record = &mut records[index];
+    if record.endings.iter().any(|known| known.class == ending.class) {
+        return false;
+    }
+    record.endings.push(ending);
+    true
+}
+
+/// Flip the entries `shown` names to [`TaskEndingState::Shown`] (ADR-0080) —
+/// the confirmed card write's own half, riding the SAME record write as the
+/// Rendered Cursor it was confirmed with. Additive and monotonic: it only ever
+/// SETS a bit, so an older confirmation (a subset of a newer one's, or an empty
+/// one) can never clear a newer shown bit. Returns whether anything changed.
+/// No production path writes or reads the endings section yet (spec #699,
+/// slice 1; ADR-0080) — the confirmation slice (#703) calls it.
+#[allow(dead_code)]
+fn mark_shown(records: &mut [TaskRunRecord], shown: &[(TaskRunId, TaskEndingClass)]) -> bool {
+    let mut changed = false;
+    for (run, class) in shown {
+        let Some(index) = resolve_run(records, run) else {
+            continue;
+        };
+        for ending in &mut records[index].endings {
+            if ending.class == *class && ending.state != TaskEndingState::Shown {
+                ending.state = TaskEndingState::Shown;
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+/// Bound one Session's run records (ADR-0080). The saturation cap first: past
+/// [`MAX_OWED_RUN_RECORDS`] the OLDEST owed ending becomes
+/// [`TaskEndingState::Surrendered`] with a `WARN` — the fact is kept (the run
+/// stays ended, no card resurrects it) and only its entry is given up, so an
+/// unbounded backlog can never grow the sidecar — which is also what makes its
+/// record ordinary eviction material below. Then the shared bound: the OLDEST
+/// record with no owed ending goes first, and an owed record is NEVER the
+/// eviction candidate.
+fn bound_run_records(session_id: &str, records: &mut Vec<TaskRunRecord>) -> bool {
+    let mut changed = false;
+    let mut owed = records.iter().filter(|record| record.owes()).count();
+    while owed > MAX_OWED_RUN_RECORDS {
+        let Some(record) = records.iter_mut().find(|record| record.owes()) else {
+            break;
+        };
+        let Some(ending) = record
+            .endings
+            .iter_mut()
+            .find(|ending| ending.state == TaskEndingState::Owed)
+        else {
+            break;
+        };
+        ending.state = TaskEndingState::Surrendered;
+        tracing::warn!(
+            session = session_id,
+            run = record.run.key,
+            class = ?ending.class,
+            "Background Task Ending backlog past {MAX_OWED_RUN_RECORDS}: the oldest owed entry is surrendered, its ending kept"
+        );
+        owed -= 1;
+        changed = true;
+    }
+    let mut excess = records.len().saturating_sub(MAX_RUN_RECORDS);
+    while excess > 0 {
+        let Some(index) = records.iter().position(|record| !record.owes()) else {
+            break;
+        };
+        records.remove(index);
+        excess -= 1;
+        changed = true;
+    }
+    changed
+}
+
+/// Translate the `rendered` section's legacy keys into the `endings` section
+/// ONCE, at load (ADR-0080): `ended:<call_id>` is an evidence ending,
+/// `cleanup:<call_id>` the user's own **Cleanup**, and the pre-#659
+/// `runtime:<call_id>` a [`TaskEndingClass::Legacy`] ending the retirement's own
+/// dedup reads — never the Wake gate (#590). Every key was written by a
+/// DELIVERED card write, so its translated ending is `shown`: a restart must not
+/// re-post the entry. A key this build does not know is dropped, and a key that
+/// resolves a run the file's own `endings` section already carries merges into
+/// it instead of minting a second record.
+fn translate_legacy_rendered(rendered: &HashMap<String, Vec<String>>) -> HashMap<String, Vec<TaskRunRecord>> {
+    let mut endings: HashMap<String, Vec<TaskRunRecord>> = HashMap::new();
+    for (session_id, keys) in rendered {
+        let records = endings.entry(session_id.clone()).or_default();
+        for key in keys {
+            let Some((class, call_id)) = legacy_ending_key(key) else {
+                continue;
+            };
+            let run = TaskRunId {
+                key: call_id.clone(),
+                call_id: Some(call_id),
+                shell_id: None,
+                child_id: None,
+                wake_id: None,
+            };
+            // Every legacy key was written by a DELIVERED card write.
+            let ending = TaskEnding {
+                state: TaskEndingState::Shown,
+                ..TaskEnding::owed(class, TaskRunIdentity::default())
+            };
+            insert_ending(records, &run, ending);
+        }
+        bound_run_records(session_id, records);
+    }
+    endings
+}
+
+/// The class and call id a legacy `rendered` key names (ADR-0080) — the three
+/// spellings `src/bridge/turn/state.rs` used to mint, read once here as the
+/// section it wrote is translated. `None` for a key this build does not know.
+fn legacy_ending_key(key: &str) -> Option<(TaskEndingClass, String)> {
+    if let Some(call_id) = key.strip_prefix("ended:") {
+        return Some((TaskEndingClass::Evidence, call_id.to_string()));
+    }
+    if let Some(call_id) = key.strip_prefix("cleanup:") {
+        return Some((TaskEndingClass::Cleanup, call_id.to_string()));
+    }
+    key.strip_prefix("runtime:")
+        .map(|call_id| (TaskEndingClass::Legacy, call_id.to_string()))
+}
+
 /// The pre-ADR-0069 shape, read once when `chain_records.json` is absent and
 /// never written again. The explicit `bound` keeps serde's `#[serde(default)]`
 /// inference from demanding `T: Default` (only the map is defaulted).
@@ -436,6 +761,12 @@ struct State {
     /// recreated Session, never the dead one. Not persisted — the rename moved
     /// the durable marks, and no writer outlives the process.
     renamed: HashMap<String, String>,
+    /// session_id → the Session's run records, oldest first (ADR-0080): one
+    /// record per [`TaskRunId`], each carrying at most one ending per class.
+    /// Insertion order is what the bound evicts from — the OLDEST record with no
+    /// owed ending first. Session-scoped like the announcements and the
+    /// `rendered` marks it replaces: `release` drops only the chain's record.
+    endings: HashMap<String, Vec<TaskRunRecord>>,
 }
 
 /// The most rendered synthetic keys one Session retains (issue #671, ticket
@@ -444,6 +775,25 @@ struct State {
 /// which can at worst re-show a very old retirement entry after a restart —
 /// the duplicate-over-loss side the whole family trades toward.
 const MAX_RENDERED_KEYS: usize = 64;
+
+/// The most run records one Session retains (ADR-0080) — the shared bound the
+/// `rendered` marks' [`MAX_RENDERED_KEYS`] becomes, exactly as many as the
+/// marks it replaces: one run record is what a retirement key used to name. The
+/// eviction candidate is the OLDEST record with no owed ending, so an ending a
+/// card still owes is never lost; past it a very old SHOWN ending may render
+/// once more after a restart, the same duplicate-over-loss side the family
+/// trades toward.
+const MAX_RUN_RECORDS: usize = MAX_RENDERED_KEYS;
+
+/// The most run records one Session may hold an OWED ending for (ADR-0080):
+/// past this the OLDEST owed ending becomes [`TaskEndingState::Surrendered`]
+/// with a `WARN` — the family's one ratified loss, taken so a carrier the
+/// platform permanently refuses while run after run keeps ending cannot grow
+/// the sidecar without bound. The ending itself is kept (the run stays ended;
+/// no card resurrects it); only its entry is given up. Strictly below
+/// [`MAX_RUN_RECORDS`], so the total bound always has a non-owed record left to
+/// evict.
+const MAX_OWED_RUN_RECORDS: usize = 48;
 
 /// The write-through mirror of the Chain Record. Locked independently of the
 /// cards and the session store: every reader (the card paths that track a
@@ -485,13 +835,34 @@ impl ChainRecords {
                 rendered: HashMap::new(),
                 owed: HashMap::new(),
                 renamed: HashMap::new(),
+                endings: HashMap::new(),
             }
         } else {
             let file = sidecar::load::<ChainRecordFile>(&path, "Chain Record");
+            // The legacy `rendered` marks are the OLDER shape, so they are
+            // translated first and the file's own `endings` merge into them
+            // (ADR-0080): the section keeps its oldest-first order, a run the
+            // marks already name resolves instead of being minted a second time,
+            // and a class both shapes carry stays the derivation the marks
+            // already recorded.
+            let mut endings = translate_legacy_rendered(&file.rendered);
+            for (session_id, records) in file.endings {
+                if records.is_empty() {
+                    continue;
+                }
+                let kept = endings.entry(session_id.clone()).or_default();
+                for record in records {
+                    for ending in record.endings {
+                        insert_ending(kept, &record.run, ending);
+                    }
+                }
+                bound_run_records(&session_id, kept);
+            }
             State {
                 records: file.records,
                 announcements: file.announcements,
                 rendered: file.rendered,
+                endings,
                 owed: HashMap::new(),
                 renamed: HashMap::new(),
             }
@@ -891,8 +1262,9 @@ impl ChainRecords {
     /// The Session's announcement moves with it — the recreated id names the
     /// same logical Session, so a Wake the old id announced must not be
     /// re-announced under the new one — and so do the entries its cards already
-    /// rendered (issue #671): the recreated id is the same logical Session, so
-    /// a retirement it already showed must not replay under the new one.
+    /// rendered (issue #671) and the run records its endings live on (ADR-0080):
+    /// the recreated id is the same logical Session, so a retirement it already
+    /// showed must not replay under the new one.
     pub(crate) fn rename(&self, from: &str, to: &str) {
         let mut state = self.lock();
         // Forward the old id so a concurrent writer that captured it before this
@@ -907,7 +1279,11 @@ impl ChainRecords {
         let record = state.records.remove(from);
         let announcement = state.announcements.remove(from);
         let rendered = state.rendered.remove(from);
-        if record.is_none() && announcement.is_none() && rendered.is_none() {
+        // The run records move with the logical Session too (ADR-0080): the
+        // recreated id names the same Session, so an ending (and its shown bit)
+        // must not replay under it.
+        let endings = state.endings.remove(from);
+        if record.is_none() && announcement.is_none() && rendered.is_none() && endings.is_none() {
             return;
         }
         if let Some(record) = record {
@@ -918,6 +1294,9 @@ impl ChainRecords {
         }
         if let Some(rendered) = rendered {
             state.rendered.insert(to.to_string(), rendered);
+        }
+        if let Some(endings) = endings {
+            state.endings.insert(to.to_string(), endings);
         }
         self.write(&state);
     }
@@ -1216,6 +1595,90 @@ impl ChainRecords {
         state.rendered.get(&session_id).cloned().unwrap_or_default()
     }
 
+    /// Record one **Task Ending** (ADR-0080), resolving its run first — an exact
+    /// run id; else an exact Wake id already on a record; else the NEWEST record
+    /// naming any other id the writer holds; else a fresh record keyed by the
+    /// writer's own id — so two writers naming one run differently can never
+    /// make two records for it. The first derivation of a class is the fact: a
+    /// class the run already carries is not recorded again, and re-deriving it
+    /// can never clear its shown bit. The run's ids all ride the resolved
+    /// record. One synchronous Chain Record write at derivation, the fact about
+    /// the run rather than about the card that will show it. Returns whether the
+    /// section changed.
+    // No production path writes or reads the endings section yet (spec #699,
+    // slice 1; ADR-0080) — its later slices (#701-#704) call this.
+    #[allow(dead_code)]
+    pub(crate) fn record_ending(&self, session_id: &str, run: &TaskRunId, ending: TaskEnding) -> bool {
+        let mut state = self.lock();
+        let session_id = resolved_session(&state, session_id);
+        let records = state.endings.entry(session_id.clone()).or_default();
+        let changed = insert_ending(records, run, ending) | bound_run_records(&session_id, records);
+        if changed {
+            self.write(&state);
+        }
+        changed
+    }
+
+    /// Flip the entries `shown` names — a `(run, class)` pair each — to SHOWN
+    /// (ADR-0080), the confirmed card write's own half: a PATCH `Ok`, a create
+    /// `Ok`, or a queued payload the drain delivered. Monotonic and additive, so
+    /// an older confirmation can never clear a newer shown bit. Returns whether
+    /// the section changed.
+    // No production path writes or reads the endings section yet (spec #699,
+    // slice 1; ADR-0080) — its later slices (#701-#704) call this.
+    #[allow(dead_code)]
+    pub(crate) fn mark_endings_shown(
+        &self,
+        session_id: &str,
+        shown: &[(TaskRunId, TaskEndingClass)],
+    ) -> bool {
+        let mut state = self.lock();
+        let session_id = resolved_session(&state, session_id);
+        let Some(records) = state.endings.get_mut(&session_id) else {
+            return false;
+        };
+        if !mark_shown(records, shown) {
+            return false;
+        }
+        self.write(&state);
+        true
+    }
+
+    /// `session_id`'s run records, oldest first (ADR-0080) — the one read every
+    /// ending consumer goes through. A session that recorded no ending answers
+    /// empty.
+    // No production path writes or reads the endings section yet (spec #699,
+    // slice 1; ADR-0080) — its later slices (#701-#704) call this.
+    #[allow(dead_code)]
+    pub(crate) fn endings(&self, session_id: &str) -> Vec<TaskRunRecord> {
+        let state = self.lock();
+        let session_id = resolved_session(&state, session_id);
+        state.endings.get(&session_id).cloned().unwrap_or_default()
+    }
+
+    /// Whether the run's ending of `class` was SHOWN by a confirmed card write
+    /// (ADR-0080) — the exactly-once read the retirement's dedup and the Wake
+    /// gate ask. The run resolves by the alias order, so a caller holding any
+    /// spelling of it asks the same question; an owed or surrendered entry, and
+    /// a run the section does not know, answer `false`.
+    // No production path writes or reads the endings section yet (spec #699,
+    // slice 1; ADR-0080) — its later slices (#701-#704) call this.
+    #[allow(dead_code)]
+    pub(crate) fn ending_shown(&self, session_id: &str, run: &TaskRunId, class: TaskEndingClass) -> bool {
+        let state = self.lock();
+        let session_id = resolved_session(&state, session_id);
+        let Some(records) = state.endings.get(&session_id) else {
+            return false;
+        };
+        let Some(record) = resolve_run(records, run).map(|index| &records[index]) else {
+            return false;
+        };
+        record
+            .endings
+            .iter()
+            .any(|ending| ending.class == class && ending.state == TaskEndingState::Shown)
+    }
+
     /// Remember the synthetic keys a recoverably-failed body owes the durable
     /// Record, tied to the Pending Card Update payload at `seq` (issue #671,
     /// ticket #672). Held here, keyed by the CARD — whose id is stable across a
@@ -1324,6 +1787,7 @@ impl ChainRecords {
                 records: state.records.clone(),
                 announcements: state.announcements.clone(),
                 rendered: state.rendered.clone(),
+                endings: state.endings.clone(),
             },
             false,
         );
@@ -1376,6 +1840,7 @@ pub(crate) async fn release_spent(cards: &CardsHandle, session_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::{BackgroundTask, ToolIdentity, Wake, WakeSource};
 
     const FILE: &str = "chain_records.json";
 
@@ -2773,6 +3238,620 @@ mod tests {
                 .generation,
             0,
             "the released version never leaks into the next chain"
+        );
+    }
+
+    // ===== The durable endings section (ADR-0080, spec #699) =====
+
+    /// The identity a Background Task is re-synthesized from, as these tests
+    /// record it.
+    fn identity(label: &str) -> TaskRunIdentity {
+        TaskRunIdentity {
+            tool: Some("shell".into()),
+            call_id: Some("call_1".into()),
+            shell_id: Some("shell_1".into()),
+            child_id: None,
+            started_at: Some(1_000),
+            label: Some(label.into()),
+        }
+    }
+
+    /// A launch as a read still carries it.
+    fn launch(call_id: &str, shell_id: Option<&str>, child_id: Option<&str>) -> BackgroundTask {
+        BackgroundTask {
+            tool: ToolIdentity {
+                name: "shell".into(),
+                call_id: call_id.into(),
+            },
+            shell_id: shell_id.map(str::to_string),
+            child_id: child_id.map(str::to_string),
+            started_at: Some(1_000),
+        }
+    }
+
+    /// A Wake naming the ids its payload carried.
+    fn wake(id: &str, shell_id: Option<&str>, child_id: Option<&str>) -> Wake {
+        Wake {
+            id: MessageId::new(id),
+            created_ms: Some(2_000),
+            source: WakeSource::Shell,
+            shell_id: shell_id.map(str::to_string),
+            job_id: None,
+            child_id: child_id.map(str::to_string),
+            state: Some("completed".into()),
+            label: None,
+        }
+    }
+
+    fn classes(record: &TaskRunRecord) -> Vec<TaskEndingClass> {
+        record.endings.iter().map(|ending| ending.class).collect()
+    }
+
+    /// The section's own shape: one record per run, at most one ending per
+    /// class, every field round-tripping through the sidecar, and the shown read
+    /// answering per class.
+    #[test]
+    fn a_run_record_round_trips_with_one_ending_per_class() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE);
+        let chains = ChainRecords::load(path.clone());
+        let run = TaskRunId::of_launch(&launch("call_1", Some("shell_1"), None));
+
+        assert!(chains.record_ending(
+            "ses_a",
+            &run,
+            TaskEnding::owed(TaskEndingClass::Evidence, identity("cargo test")),
+        ));
+        let mut ended = TaskEnding::owed(TaskEndingClass::Cleanup, identity("cargo test"));
+        ended.finished_at = Some(2_000);
+        ended.evidence = Some(TaskEndingEvidence::Ended("exited".into()));
+        chains.record_ending("ses_a", &run, ended);
+        // A cleaned run's late Wake is its OWN ending (#590): a Cleanup claims
+        // nothing about how the run ended.
+        chains.record_ending(
+            "ses_a",
+            &run,
+            TaskEnding::owed(TaskEndingClass::Wake, identity("cargo test")),
+        );
+
+        let reloaded = ChainRecords::load(path.clone());
+        let records = reloaded.endings("ses_a");
+        assert_eq!(records.len(), 1, "one record per run: {records:?}");
+        assert_eq!(records[0].run, run, "the record keeps the run's ids");
+        assert_eq!(
+            classes(&records[0]),
+            vec![
+                TaskEndingClass::Evidence,
+                TaskEndingClass::Cleanup,
+                TaskEndingClass::Wake
+            ],
+            "at most one ending per class, in derivation order"
+        );
+        let evidence = &records[0].endings[0];
+        assert_eq!(
+            evidence.state,
+            TaskEndingState::Owed,
+            "a derived ending starts owed"
+        );
+        assert_eq!(evidence.identity.label.as_deref(), Some("cargo test"));
+        assert_eq!(evidence.identity.started_at, Some(1_000));
+        assert!(
+            evidence
+                .identity
+                .tool
+                .as_deref()
+                .is_some_and(|tool| tool == "shell")
+        );
+        assert_eq!(
+            records[0].endings[1].finished_at,
+            Some(2_000),
+            "the clock round-trips"
+        );
+        assert_eq!(
+            records[0].endings[1].evidence,
+            Some(TaskEndingEvidence::Ended("exited".into())),
+            "the class's own evidence round-trips"
+        );
+        assert!(!reloaded.ending_shown("ses_a", &run, TaskEndingClass::Evidence));
+
+        // The first derivation is the fact: recording the same class again
+        // neither duplicates it nor moves its state.
+        assert!(!chains.record_ending(
+            "ses_a",
+            &run,
+            TaskEnding::owed(TaskEndingClass::Evidence, identity("again")),
+        ));
+        assert_eq!(
+            ChainRecords::load(path.clone()).endings("ses_a")[0].endings.len(),
+            3,
+            "a re-recorded class is not appended twice"
+        );
+        assert!(
+            ChainRecords::load(path).endings("ses_b").is_empty(),
+            "another session is untouched"
+        );
+    }
+
+    /// The alias order (ADR-0080): an exact run id; else an exact Wake id
+    /// already on a record; else the NEWEST record naming any other id the
+    /// writer holds (#552). The two arrival orders must agree — one run, one
+    /// record, however the run is named.
+    #[test]
+    fn the_alias_order_resolves_a_run_named_from_either_side() {
+        // A launchless Wake first, the launch-carrying read second.
+        let dir = tempfile::tempdir().unwrap();
+        let chains = ChainRecords::load(dir.path().join(FILE));
+        let from_wake = TaskRunId::of_wake(&wake("msg_wake_1", Some("shell_1"), None))
+            .expect("the shell id names the run");
+        let from_launch = TaskRunId::of_launch(&launch("call_1", Some("shell_1"), None));
+        chains.record_ending(
+            "ses_a",
+            &from_wake,
+            TaskEnding::owed(TaskEndingClass::Wake, identity("wake")),
+        );
+        chains.record_ending(
+            "ses_a",
+            &from_launch,
+            TaskEnding::owed(TaskEndingClass::Evidence, identity("evidence")),
+        );
+
+        let records = chains.endings("ses_a");
+        assert_eq!(
+            records.len(),
+            1,
+            "the read resolves the Wake's record: {records:?}"
+        );
+        assert_eq!(
+            records[0].run.key, "shell_1",
+            "the run keeps the key it was first minted under"
+        );
+        assert!(
+            records[0].run.names("call_1")
+                && records[0].run.names("shell_1")
+                && records[0].run.names("msg_wake_1"),
+            "the record carries every id the run is known by: {:?}",
+            records[0].run
+        );
+        assert_eq!(
+            classes(&records[0]),
+            vec![TaskEndingClass::Wake, TaskEndingClass::Evidence]
+        );
+
+        // The reverse arrival order agrees: the launch first, the Wake second.
+        let dir = tempfile::tempdir().unwrap();
+        let chains = ChainRecords::load(dir.path().join(FILE));
+        chains.record_ending(
+            "ses_b",
+            &from_launch,
+            TaskEnding::owed(TaskEndingClass::Evidence, identity("evidence")),
+        );
+        chains.record_ending(
+            "ses_b",
+            &from_wake,
+            TaskEnding::owed(TaskEndingClass::Wake, identity("wake")),
+        );
+
+        let records = chains.endings("ses_b");
+        assert_eq!(
+            records.len(),
+            1,
+            "the Wake resolves the read's record: {records:?}"
+        );
+        assert_eq!(records[0].run.key, "call_1");
+        assert_eq!(
+            classes(&records[0]),
+            vec![TaskEndingClass::Evidence, TaskEndingClass::Wake]
+        );
+    }
+
+    /// The section's own resolution rule, on the one shape no writer's own ids
+    /// can produce: a writer holding an id a record names always resolves that
+    /// record, so two records can never share a live alias — the tie-break below
+    /// is the section's defensive rule (#552's newest-match), pinned here
+    /// directly.
+    #[test]
+    fn the_alias_order_prefers_the_exact_ids_and_takes_the_newest_alias() {
+        let mut records = vec![
+            TaskRunRecord {
+                run: TaskRunId {
+                    key: "shell_1".into(),
+                    call_id: None,
+                    shell_id: Some("shell_1".into()),
+                    child_id: None,
+                    wake_id: Some("msg_wake_1".into()),
+                },
+                endings: Vec::new(),
+            },
+            TaskRunRecord {
+                run: TaskRunId {
+                    key: "ses_child".into(),
+                    call_id: None,
+                    shell_id: None,
+                    child_id: Some("ses_child".into()),
+                    wake_id: None,
+                },
+                endings: Vec::new(),
+            },
+        ];
+
+        // 1. An exact run id names its own record, whatever else it holds.
+        let exact = TaskRunId {
+            key: "shell_1".into(),
+            call_id: Some("call_1".into()),
+            shell_id: Some("shell_1".into()),
+            child_id: Some("ses_child".into()),
+            wake_id: None,
+        };
+        assert_eq!(resolve_run(&records, &exact), Some(0));
+
+        // 2. An exact Wake id already on a record beats a shared alias.
+        let re_encounter = TaskRunId {
+            key: "job_1".into(),
+            call_id: None,
+            shell_id: Some("shell_1".into()),
+            child_id: Some("ses_child".into()),
+            wake_id: Some("msg_wake_1".into()),
+        };
+        assert_eq!(resolve_run(&records, &re_encounter), Some(0));
+
+        // 3. Otherwise the NEWEST record naming any id the writer holds (#552:
+        // a resumed child's later launch supersedes the earlier one).
+        let by_alias = TaskRunId {
+            key: "job_2".into(),
+            call_id: None,
+            shell_id: None,
+            child_id: Some("ses_child".into()),
+            wake_id: None,
+        };
+        assert_eq!(resolve_run(&records, &by_alias), Some(1));
+
+        // A writer holding an id no record names mints its own.
+        let unknown = TaskRunId {
+            key: "job_3".into(),
+            call_id: None,
+            shell_id: None,
+            child_id: None,
+            wake_id: None,
+        };
+        assert_eq!(resolve_run(&records, &unknown), None);
+        assert!(insert_ending(
+            &mut records,
+            &unknown,
+            TaskEnding::owed(TaskEndingClass::Wake, identity("run"))
+        ));
+        assert_eq!(records.len(), 3);
+    }
+
+    /// The section is SESSION-scoped (ADR-0080): it outlives the Chain Record it
+    /// was written beside — a restart after a terminal release still knows the
+    /// fact — and an unrelated Session's release never touches it.
+    #[test]
+    fn the_endings_outlive_the_record_they_were_written_beside() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE);
+        let chains = ChainRecords::load(path.clone());
+        let run = TaskRunId::of_launch(&launch("call_1", Some("shell_1"), None));
+        for session in ["ses_a", "ses_b"] {
+            chains.track(
+                session,
+                format!("om_card_{session}"),
+                MessageId::new("msg_cola_1"),
+                Some(1_000),
+                None,
+                None,
+            );
+        }
+        chains.record_ending(
+            "ses_a",
+            &run,
+            TaskEnding::owed(TaskEndingClass::Evidence, identity("a")),
+        );
+        chains.record_ending(
+            "ses_b",
+            &run,
+            TaskEnding::owed(TaskEndingClass::Evidence, identity("b")),
+        );
+
+        chains.release("ses_a");
+        let reloaded = ChainRecords::load(path.clone());
+        assert_eq!(reloaded.get("ses_a"), None, "the record is gone");
+        assert_eq!(
+            classes(&reloaded.endings("ses_a")[0]),
+            vec![TaskEndingClass::Evidence],
+            "the ending is not removed with the record"
+        );
+        assert_eq!(
+            classes(&reloaded.endings("ses_b")[0]),
+            vec![TaskEndingClass::Evidence],
+            "an unrelated Session's endings are untouched"
+        );
+
+        // A recreated Session id names the same logical Session, so its run
+        // records and their shown bits move with it.
+        chains.rename("ses_a", "ses_a2");
+        assert!(ChainRecords::load(path.clone()).endings("ses_a").is_empty());
+        assert_eq!(
+            classes(&ChainRecords::load(path).endings("ses_a2")[0]),
+            vec![TaskEndingClass::Evidence]
+        );
+    }
+
+    /// The shared bound (ADR-0080) evicts the OLDEST record with no owed ending
+    /// and NEVER an owed one.
+    #[test]
+    fn the_bound_evicts_an_unowed_record_and_never_an_owed_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let chains = ChainRecords::load(dir.path().join(FILE));
+        let call = |i: usize| TaskRunId::of_launch(&launch(&format!("call_{i}"), None, None));
+        // The oldest record has been SHOWN, so it is the eviction candidate.
+        chains.record_ending(
+            "ses_a",
+            &call(0),
+            TaskEnding::owed(TaskEndingClass::Evidence, identity("shown")),
+        );
+        chains.mark_endings_shown("ses_a", &[(call(0), TaskEndingClass::Evidence)]);
+        for i in 1..MAX_RUN_RECORDS {
+            chains.record_ending(
+                "ses_a",
+                &call(i),
+                TaskEnding::owed(TaskEndingClass::Evidence, identity("owed")),
+            );
+        }
+        assert_eq!(chains.endings("ses_a").len(), MAX_RUN_RECORDS);
+
+        // The one over the bound evicts the shown record — the oldest record
+        // with no owed ending — and nothing else.
+        chains.record_ending(
+            "ses_a",
+            &call(MAX_RUN_RECORDS),
+            TaskEnding::owed(TaskEndingClass::Evidence, identity("owed")),
+        );
+        let records = chains.endings("ses_a");
+        assert_eq!(records.len(), MAX_RUN_RECORDS, "the section stays bounded");
+        assert!(
+            !records.iter().any(|record| record.run.key == "call_0"),
+            "the oldest unowed record went"
+        );
+        assert!(
+            records
+                .iter()
+                .any(|record| record.run.key == format!("call_{MAX_RUN_RECORDS}")),
+            "the newest record stays"
+        );
+
+        // An owed record is never the eviction candidate: a session whose
+        // records are ALL owed keeps every owed entry — past the saturation cap
+        // the OLDEST entry is surrendered instead, which is what makes its
+        // record evictable, and the fact is kept either way.
+        let dir = tempfile::tempdir().unwrap();
+        let chains = ChainRecords::load(dir.path().join(FILE));
+        for i in 0..MAX_OWED_RUN_RECORDS + 2 {
+            chains.record_ending(
+                "ses_b",
+                &call(i),
+                TaskEnding::owed(TaskEndingClass::Evidence, identity("owed")),
+            );
+        }
+        let records = chains.endings("ses_b");
+        assert_eq!(
+            records.len(),
+            MAX_OWED_RUN_RECORDS + 2,
+            "no owed record is evicted under the shared bound"
+        );
+        assert!(
+            records.iter().all(|record| !record.endings.is_empty()),
+            "every run keeps its ending's fact, surrendered or owed"
+        );
+        assert_eq!(
+            records.iter().filter(|record| record.owes()).count(),
+            MAX_OWED_RUN_RECORDS,
+            "the owed backlog is capped"
+        );
+        assert_eq!(
+            records
+                .iter()
+                .take(2)
+                .map(|record| record.endings[0].state)
+                .collect::<Vec<_>>(),
+            vec![TaskEndingState::Surrendered; 2],
+            "the OLDEST owed entries are the ones surrendered"
+        );
+
+        // A surrendered entry makes its record ordinary eviction material: once
+        // the section passes the shared bound, those records go — never an owed
+        // one.
+        for i in MAX_OWED_RUN_RECORDS + 2..MAX_RUN_RECORDS + 3 {
+            chains.record_ending(
+                "ses_b",
+                &call(i),
+                TaskEnding::owed(TaskEndingClass::Evidence, identity("owed")),
+            );
+        }
+        let records = chains.endings("ses_b");
+        assert_eq!(records.len(), MAX_RUN_RECORDS, "the shared bound holds");
+        assert!(
+            !records
+                .iter()
+                .any(|record| record.run.key == "call_0" || record.run.key == "call_1"),
+            "the surrendered records are evictable: {:?}",
+            records.iter().map(|record| &record.run.key).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            records.iter().filter(|record| record.owes()).count(),
+            MAX_OWED_RUN_RECORDS,
+            "no owed entry was evicted for the bound"
+        );
+    }
+
+    /// Past the owed cap the OLDEST owed ending becomes SURRENDERED with a
+    /// `WARN` — its fact retained — which is what makes its record ordinary
+    /// eviction material, and a surrendered entry is never owed to a render.
+    #[tokio::test]
+    async fn the_owed_cap_surrenders_the_oldest_entry_with_a_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let chains = ChainRecords::load(dir.path().join(FILE));
+        let call = |i: usize| TaskRunId::of_launch(&launch(&format!("call_{i}"), None, None));
+        let ((), logs) = crate::bridge::test_support::capture_logs(async {
+            for i in 0..=MAX_OWED_RUN_RECORDS {
+                chains.record_ending(
+                    "ses_a",
+                    &call(i),
+                    TaskEnding::owed(TaskEndingClass::Evidence, identity("owed")),
+                );
+            }
+        })
+        .await;
+        let warn = crate::bridge::test_support::assert_line_level(
+            &logs,
+            "the oldest owed entry is surrendered",
+            "WARN",
+        );
+        assert!(
+            warn.contains("call_0"),
+            "the WARN names the surrendered run: {warn}"
+        );
+
+        let records = chains.endings("ses_a");
+        assert_eq!(records.len(), MAX_OWED_RUN_RECORDS + 1);
+        let surrendered = records
+            .iter()
+            .find(|record| record.run.key == "call_0")
+            .expect("the oldest run");
+        assert_eq!(
+            surrendered.endings[0].state,
+            TaskEndingState::Surrendered,
+            "the oldest owed ending is surrendered"
+        );
+        assert!(
+            !surrendered.owes(),
+            "a surrendered entry is never re-offered, so its record owes nothing"
+        );
+        assert!(
+            records.iter().filter(|record| record.owes()).count() == MAX_OWED_RUN_RECORDS,
+            "the owed backlog is capped"
+        );
+    }
+
+    /// The legacy `rendered` keys are translated ONCE at load (ADR-0080):
+    /// `ended:<call_id>` is evidence, `cleanup:<call_id>` the user's Cleanup,
+    /// and the pre-#659 `runtime:<call_id>` a legacy class read only by the
+    /// retirement's own dedup. Every one was written by a DELIVERED card write,
+    /// so it translates SHOWN.
+    #[test]
+    fn the_legacy_rendered_keys_translate_to_their_classes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE);
+        std::fs::write(
+            &path,
+            r#"{"rendered":{"ses_a":["ended:call_1","cleanup:call_2","runtime:call_3"]}}"#,
+        )
+        .unwrap();
+        let chains = ChainRecords::load(path.clone());
+
+        let records = chains.endings("ses_a");
+        assert_eq!(records.len(), 3, "one record per legacy run: {records:?}");
+        let class_of = |key: &str| {
+            let record = records
+                .iter()
+                .find(|record| record.run.key == key)
+                .expect("the run");
+            record.endings[0].class
+        };
+        assert_eq!(class_of("call_1"), TaskEndingClass::Evidence);
+        assert_eq!(class_of("call_2"), TaskEndingClass::Cleanup);
+        assert_eq!(class_of("call_3"), TaskEndingClass::Legacy);
+        for record in &records {
+            assert_eq!(
+                record.endings[0].state,
+                TaskEndingState::Shown,
+                "a translated mark was already delivered"
+            );
+            assert!(!record.owes(), "a legacy mark is never re-offered to a render");
+        }
+        assert!(chains.ending_shown(
+            "ses_a",
+            &TaskRunId::of_launch(&launch("call_1", None, None)),
+            TaskEndingClass::Evidence
+        ));
+
+        // The old section is still written while its consumers live (the
+        // shrinkage dissolves it), and a reload translates it again without
+        // double-counting: the class is already recorded.
+        chains.record_rendered("ses_a", &["ended:call_1".to_string(), "ended:call_4".to_string()]);
+        let reloaded = ChainRecords::load(path);
+        let records = reloaded.endings("ses_a");
+        assert_eq!(
+            records.len(),
+            4,
+            "a re-translated mark merges into its record: {records:?}"
+        );
+        assert_eq!(
+            records
+                .iter()
+                .find(|record| record.run.key == "call_1")
+                .expect("call_1")
+                .endings
+                .len(),
+            1,
+            "the class recorded from the first translation is not appended twice"
+        );
+    }
+
+    /// The shown bit is MONOTONIC (ADR-0080): a confirmation only ever sets it,
+    /// so an older confirmation — a subset of a newer one's, or an empty one
+    /// landing after it — can never clear a newer shown bit.
+    #[test]
+    fn the_shown_bit_is_only_ever_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE);
+        let chains = ChainRecords::load(path.clone());
+        let call = |i: usize| TaskRunId::of_launch(&launch(&format!("call_{i}"), None, None));
+        chains.record_ending(
+            "ses_a",
+            &call(1),
+            TaskEnding::owed(TaskEndingClass::Evidence, identity("one")),
+        );
+        chains.record_ending(
+            "ses_a",
+            &call(2),
+            TaskEnding::owed(TaskEndingClass::Cleanup, identity("two")),
+        );
+
+        assert!(chains.mark_endings_shown(
+            "ses_a",
+            &[
+                (call(1), TaskEndingClass::Evidence),
+                (call(2), TaskEndingClass::Cleanup)
+            ]
+        ));
+        assert!(chains.ending_shown("ses_a", &call(1), TaskEndingClass::Evidence));
+        assert!(chains.ending_shown("ses_a", &call(2), TaskEndingClass::Cleanup));
+        assert!(
+            !chains.ending_shown("ses_a", &call(1), TaskEndingClass::Cleanup),
+            "another class is not shown"
+        );
+
+        // An OLDER body's confirmation names a subset (here, one run): the newer
+        // bit it does not name must survive, and a bit already set is a no-op.
+        assert!(!chains.mark_endings_shown("ses_a", &[(call(1), TaskEndingClass::Evidence)]));
+        assert!(!chains.mark_endings_shown("ses_a", &[]));
+        assert!(
+            chains.ending_shown("ses_a", &call(2), TaskEndingClass::Cleanup),
+            "an older confirmation never clears the newer shown bit"
+        );
+
+        // A shown ending is not owed, so it is never the record's owed entry;
+        // and a class recorded AGAIN after being shown keeps its shown bit.
+        assert!(!chains.endings("ses_a").iter().any(|record| record.owes()));
+        chains.record_ending(
+            "ses_a",
+            &call(1),
+            TaskEnding::owed(TaskEndingClass::Evidence, identity("again")),
+        );
+        let reloaded = ChainRecords::load(path);
+        assert!(
+            reloaded.ending_shown("ses_a", &call(1), TaskEndingClass::Evidence),
+            "re-deriving a class never clears its shown bit"
         );
     }
 }
