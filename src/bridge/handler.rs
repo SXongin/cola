@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use tracing::Instrument;
 
-use crate::backend::{PromptSkill, SkillInfo};
+use crate::backend::{PromptSkill, SkillInfo, TaskRetirementEnding};
 use crate::bridge::access::{Access, Decision, DenyReason};
 use crate::bridge::command;
 use crate::bridge::core::SharedCore;
@@ -3132,14 +3132,19 @@ impl App {
     /// ADR-0060).
     /// EVERY overlay record the click owes — the runtime/evidence retirements
     /// its pass applied, the cleared ids, and the resolved marker set — is
-    /// committed only when that refresh lands (review, PR #595): a card that
-    /// refuses the write — a new Turn superseded it mid-pipeline — records
-    /// nothing, so the tasks stay live and the successor's button can clear
-    /// them, instead of being hidden without their entries. Every verdict that
-    /// moved the read refreshes the card, a marker-resolving `Running` verdict
-    /// included (review, PR #595): the stale ⚠️ 状态待确认 row and its button
-    /// leave on the click's own pass. A read that fails, and a verdict that
-    /// changed nothing at all, give the claim back so the button stays usable.
+    /// committed only when that refresh lands (review, PR #595). But the
+    /// ENDINGS themselves are durable at derivation (ADR-0080): the reconcile's
+    /// evidence endings and this click's own Cleanup endings were recorded the
+    /// moment they were derived, so a card that refuses the write — a new Turn
+    /// superseded it mid-pipeline — still leaves the tasks ended, their rows
+    /// gone from every later read and their entries owed to the successor's own
+    /// admitted paths, instead of being hidden without their entries. Only the
+    /// overlay cache and the unconfirmed marker wait on the accepted write.
+    /// Every verdict that moved the read refreshes the card, a marker-resolving
+    /// `Running` verdict included (review, PR #595): the stale ⚠️ 状态待确认 row
+    /// and its button leave on the click's own pass. A read that fails, and a
+    /// verdict that changed nothing at all, give the claim back so the button
+    /// stays usable.
     async fn run_cleanup(
         handles: crate::bridge::handles::TurnHandles,
         session_id: String,
@@ -3177,9 +3182,9 @@ impl App {
             crate::bridge::runtime::CycleBudget::within(read_timeout_ms),
         )
         .await;
-        // Apply-only, never recorded here (review, PR #595): the pass commits
-        // its overlay record below, and only when the refresh that carried it
-        // landed — a card that refuses the write records nothing.
+        // The pass's evidence endings are already durable (recorded by
+        // `reconcile_now` at derivation); only its process-local overlay record
+        // waits, and only on a landed refresh (review, PR #595).
         let Some(pass) = verdict else {
             tracing::warn!("cleanup: no runtime verdict on session {session_id}; clearing nothing");
             crate::bridge::turn::Turn::release_cleanup_claim(&handles.cards, &session_id).await;
@@ -3211,9 +3216,27 @@ impl App {
             // The read's own cleanup rides the local transcript BEFORE the
             // refresh (review, PR #595): the dropped rows, the 🧹 entries and
             // the settle decision all come from this transcript, so it carries
-            // them into the write. The process-local overlay record does NOT
-            // sit here — it is gated on the refresh's outcome below.
+            // them into the write.
             transcript.apply_cleanup(&cleared, now_ms);
+        }
+        // The click's own ending, recorded AT DERIVATION (ADR-0080): every
+        // cleared run's Cleanup ending is durable the moment the click derives
+        // it — OUTSIDE the refresh gate below, because the fact is about the
+        // run, not about the card that will show its 🧹 entry. A refresh the
+        // chain replaces still leaves the task ended and the entry owed to the
+        // next card that can carry it; only the process-local overlay record
+        // waits on the refresh. The process-local overlay record does NOT sit
+        // here — it is gated on the refresh's outcome below.
+        for retirement in transcript
+            .task_retirements
+            .iter()
+            .filter(|retirement| matches!(retirement.ending, TaskRetirementEnding::Cleaned))
+        {
+            let input = transcript.tool_input(retirement.task.tool.call_id.as_str());
+            handles
+                .backend
+                .tasks()
+                .record_cleanup_ending(&session_id, &retirement.task, now_ms, input);
         }
         let stopped = handles.waits.is_stopped(&session_id).await;
         let update = crate::bridge::turn::Turn::refresh_yielded_ledger(
@@ -3227,32 +3250,32 @@ impl App {
             read_timeout_ms,
         )
         .await;
-        // EVERY overlay record the click owes is gated on the refresh's
-        // outcome (review, PR #595): the write admission is re-checked under
-        // the card lock, and a card replaced while this pipeline's reads were
-        // in flight (a new Turn's supersede, a late Wake) refuses the write —
-        // `Unchanged`, nothing submitted. The runtime/evidence retirements the
-        // pass applied and the cleared ids recorded anyway would hide the
-        // tasks from every later transcript read without ever rendering their
-        // entries, and a resolved marker recorded anyway would drop the ⚠️ row
-        // and its button on a card that never took the resolution; no later
-        // read can reconstruct either. An accepted write counts even when the
-        // delivery layer drains it later (ADR-0067/0072), the same rule the
+        // EVERY process-local record the click owes is gated on the refresh's
+        // outcome (review, PR #595): the durable ENDINGS were already recorded
+        // at derivation above, but the `retired` cache and the resolved marker
+        // set ride here. The write admission is re-checked under the card lock,
+        // and a card replaced while this pipeline's reads were in flight (a new
+        // Turn's supersede, a late Wake) refuses the write — `Unchanged`,
+        // nothing submitted. A resolved marker recorded anyway would drop the
+        // ⚠️ row and its button on a card that never took the resolution; no
+        // later read can reconstruct that. An accepted write counts even when
+        // the delivery layer drains it later (ADR-0067/0072), the same rule the
         // Wake Watermark's drain uses, while a permanently refused one never
         // writes (the card suspended; review, PR #595): `update.accepted()` is
-        // the one gate over both, and a refusal records nothing so the tasks
-        // stay live and the still-usable button can clear them on the card
-        // that took the chain. The commit is one call for the union — the
-        // pass's retirements, the cleaned retirements `apply_cleanup` appended
-        // above, and the post-verdict marker set — so no part can outlive the
+        // the one gate over the cache. A refusal writes no cache entry — the
+        // durable ending already took the task out of the ledger and left its
+        // entry owed — and the marker stays as the read left it, so the
+        // successor's still-usable button can clear it on the card that took the
+        // chain. The commit is one call for the union — the pass's retirements,
+        // the cleaned retirements `apply_cleanup` appended above, and the
+        // post-verdict marker set — so no part of the cache can outlive the
         // others.
         if update.accepted() {
             pass.commit(&handles.backend, &session_id, &transcript);
         } else {
             tracing::warn!(
                 "cleanup: the refresh was not accepted on session {session_id}; \
-                 recording nothing ({} task(s) stay live)",
-                transcript.task_retirements.len()
+                 the durable ending stands, the cache and marker are left unwritten"
             );
         }
         tracing::info!(

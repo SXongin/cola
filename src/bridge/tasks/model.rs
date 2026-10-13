@@ -9,7 +9,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::backend::{BackgroundTask, ShellOutputWindow, Wake};
+use crate::backend::{BackgroundTask, ShellOutputWindow, ToolIdentity, Wake};
+use crate::bridge::chain::TaskRunIdentity;
 use crate::feishu::card::tool_render::TaskLiveness;
 
 /// The kind of Background Task a ledger row names. Only these two background
@@ -287,6 +288,75 @@ impl TaskRunId {
             }
         }
     }
+}
+
+/// The identity a just-derived ending records (ADR-0080): the launch's own
+/// facts, plus the label its originating tool input names. Captured when the
+/// ending is derived — that read necessarily carries the launch — so a later
+/// card's entry is immune to compaction and to a truncated read.
+pub(crate) fn identity_of_task(task: &BackgroundTask, input: Option<&serde_json::Value>) -> TaskRunIdentity {
+    let tool = task.tool.name.clone();
+    TaskRunIdentity {
+        tool: Some(tool.clone()),
+        call_id: Some(task.tool.call_id.clone()),
+        shell_id: task.shell_id.clone(),
+        child_id: task.child_id.clone(),
+        started_at: task.started_at,
+        label: task_label(task_kind(&tool), input),
+    }
+}
+
+/// The [`BackgroundTask`] a durable identity re-synthesizes (ADR-0080), so a
+/// read that no longer carries the launch still renders the run's entry.
+/// `fallback_key` stands in for a call id a Wake-keyed record never captured,
+/// and a record written before the tool name was captured reads as a shell (the
+/// tolerant default every other reader uses).
+pub(crate) fn identity_task(identity: &TaskRunIdentity, fallback_key: &str) -> BackgroundTask {
+    BackgroundTask {
+        tool: ToolIdentity {
+            name: identity.tool.clone().unwrap_or_else(|| "shell".to_string()),
+            call_id: identity
+                .call_id
+                .clone()
+                .unwrap_or_else(|| fallback_key.to_string()),
+        },
+        shell_id: identity.shell_id.clone(),
+        child_id: identity.child_id.clone(),
+        started_at: identity.started_at,
+    }
+}
+
+/// The ledger kind of a Background Task's tool. Only `shell` and `subagent`
+/// ever background through the V2 tool shape (`decode_background_task` returns
+/// `None` for every other name), so the pair is matched once, here.
+pub(crate) fn task_kind(tool: &str) -> TaskKind {
+    match tool {
+        "subagent" => TaskKind::Subagent,
+        _ => TaskKind::Shell,
+    }
+}
+
+/// The label the originating tool part's input names for a task of `kind`:
+/// the shell's `command` (or its `description` when the payload carries no
+/// command), the subagent's `description` — the `subagent` arm nothing else
+/// needed. `None` when the input names no label, so the row renders bare
+/// rather than inventing one (the completion entry's own rule).
+pub(crate) fn task_label(kind: TaskKind, input: Option<&serde_json::Value>) -> Option<String> {
+    let label = match kind {
+        TaskKind::Shell => input
+            .and_then(|input| input.get("command"))
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                input
+                    .and_then(|input| input.get("description"))
+                    .and_then(serde_json::Value::as_str)
+            }),
+        TaskKind::Subagent => input
+            .and_then(|input| input.get("description"))
+            .and_then(serde_json::Value::as_str),
+    }?;
+    let label = label.trim();
+    (!label.is_empty()).then(|| label.to_string())
 }
 
 #[cfg(test)]

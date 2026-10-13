@@ -37,7 +37,7 @@ use crate::backend::{
     SessionTranscript, ShellEnd, ShellRuntime, StepFinish, ToolCall, ToolIdentity, ToolOutput, ToolStatus,
     TranscriptMessage, Wake, WakeSource,
 };
-use crate::bridge::chain::ChainRecords;
+use crate::bridge::chain::{ChainRecords, TaskEndingClass, TaskEndingState};
 use crate::bridge::test_support::*;
 use crate::bridge::turn::{PromptContext, Turn};
 use crate::feishu::card::CardState;
@@ -1788,15 +1788,15 @@ async fn a_task_ended_mid_turn_settles_the_turn_directly() {
     );
 }
 
-/// Review (spec #588, PR #595): the record-after-flush gate reads the real
-/// write outcome, not the accumulator's survival. Feishu permanently refuses
-/// the flush that carries the retirement entry — the plain attempt AND its
-/// fenced retry — so the card suspends and nothing will ever carry the entry.
-/// Recording the retirement anyway would hide the task from every later read
-/// with no entry ever rendered; the task must stay live, and the next card
-/// that CAN render its entry claims it — exactly once.
+/// ADR-0080's reopened trade (spec #699, ticket #701): Feishu permanently
+/// refuses the flush that carries the retirement entry — the plain attempt AND
+/// its fenced retry — so the card suspends and nothing will ever carry the entry
+/// on it. The runtime's evidence ending is recorded durably AT DERIVATION, so
+/// the task LEAVES the ledger and its entry stays OWED; only the process-local
+/// overlay and the rendered mark keep ADR-0073's accepted-write gate (PR #595).
+/// The next card that CAN render the entry claims it — exactly once.
 #[tokio::test]
-async fn a_permanently_refused_retirement_write_records_nothing() {
+async fn a_permanently_refused_retirement_write_leaves_the_entry_owed() {
     let _wd = test_work_dir();
     let now = chrono::Utc::now().timestamp_millis();
     let live = waiting_shell(now - 5_000);
@@ -1828,10 +1828,13 @@ async fn a_permanently_refused_retirement_write_records_nothing() {
         2,
         "the plain attempt and the fenced one only"
     );
-    // Nothing may be recorded: the task stays live on every later read ...
+    // The process-local overlay and the rendered mark keep the accepted-write
+    // gate (ADR-0073, PR #595): the entry never reached a card, so neither was
+    // recorded — but the ENDING is durable (ADR-0080) and the task leaves the
+    // ledger at once.
     assert!(
         backend.overlay.retired_call_ids("ses_test").is_empty(),
-        "a permanently refused write records nothing: {:?}",
+        "a refused carrier commits no overlay cache: {:?}",
         backend.overlay.retired_call_ids("ses_test")
     );
     // The durable rendered mark follows the same gate (issue #671, ticket
@@ -1847,17 +1850,30 @@ async fn a_permanently_refused_retirement_write_records_nothing() {
         .is_empty(),
         "a permanently refused write records no rendered mark either"
     );
+    // The ending itself, however, was recorded the moment the runtime derived
+    // it (ADR-0080): durable and OWED, so the entry renders on the next card
+    // that can carry it.
+    let persisted = ChainRecords::load(
+        dir.path()
+            .join("sessions.json")
+            .with_file_name("chain_records.json"),
+    );
+    assert!(
+        persisted.endings("ses_test").iter().any(|record| {
+            record.run.names("call_bg")
+                && record.endings.iter().any(|ending| {
+                    ending.class == TaskEndingClass::Evidence && ending.state == TaskEndingState::Owed
+                })
+        }),
+        "the refused carrier still records the durable evidence ending: {:?}",
+        persisted.endings("ses_test")
+    );
     let later = crate::backend::Backend::transcript(backend.as_ref(), "ses_test")
         .await
         .unwrap();
-    assert_eq!(
-        later
-            .background_tasks
-            .iter()
-            .map(|task| task.tool.call_id.as_str())
-            .collect::<Vec<_>>(),
-        vec!["call_bg"],
-        "the task stays live until a card that can render its entry claims it"
+    assert!(
+        later.background_tasks.is_empty(),
+        "the durable ending takes the task out of the ledger, its entry owed: {later:?}"
     );
 
     // ... and the next card that CAN render it claims it exactly once: a new
@@ -2023,15 +2039,16 @@ async fn a_queued_entry_write_marks_rendered_only_once_it_delivers() {
     );
 }
 
-/// Review (spec #588, PR #595): the yielded-card refresh reports what really
-/// became of its write. Feishu permanently refuses the refresh that carries the
-/// retirement entry — the plain attempt AND its fenced retry — so the card
-/// suspends and the entry can never land. The pass must not be recorded, the
-/// task must stay live for a card that CAN render its entry, and the suspended
-/// card must not be PATCHed again; `Refreshed`/`Settled` stay reserved for an
-/// accepted write.
+/// ADR-0080's reopened trade (spec #699, ticket #701): the yielded-card refresh
+/// reports what really became of its write. Feishu permanently refuses the
+/// refresh that carries the retirement entry — the plain attempt AND its fenced
+/// retry — so the card suspends and the entry can never land on it. The
+/// process-local cache is not committed (ADR-0073), but the runtime's evidence
+/// ending was recorded at derivation, so the task LEAVES the ledger and its
+/// entry stays OWED to a card that CAN render it, while the suspended card is
+/// not PATCHed again; `Refreshed`/`Settled` stay reserved for an accepted write.
 #[tokio::test]
-async fn a_permanently_refused_yielded_refresh_records_nothing() {
+async fn a_permanently_refused_yielded_refresh_leaves_the_entry_owed() {
     let _wd = test_work_dir();
     let now = chrono::Utc::now().timestamp_millis();
     // A frozen row clock: no second-granular ledger churn can add a PATCH
@@ -2079,20 +2096,15 @@ async fn a_permanently_refused_yielded_refresh_records_nothing() {
     // still render its entry ...
     assert!(
         backend.overlay.retired_call_ids("ses_test").is_empty(),
-        "a permanently refused refresh records nothing: {:?}",
+        "a refused refresh commits no overlay cache: {:?}",
         backend.overlay.retired_call_ids("ses_test")
     );
     let later = crate::backend::Backend::transcript(backend.as_ref(), "ses_test")
         .await
         .unwrap();
-    assert_eq!(
-        later
-            .background_tasks
-            .iter()
-            .map(|task| task.tool.call_id.as_str())
-            .collect::<Vec<_>>(),
-        vec!["call_bg"],
-        "the task stays live until a card that can render its entry claims it"
+    assert!(
+        later.background_tasks.is_empty(),
+        "the durable ending takes the task out of the ledger, its entry owed: {later:?}"
     );
 }
 
@@ -2975,15 +2987,19 @@ async fn a_cleanup_click_with_a_failed_verdict_read_clears_nothing() {
         !text.contains("🧹"),
         "a failed read invents no cleanup entry: {latest}"
     );
+    assert!(
+        app.cards_handle().chains.endings("ses_test").is_empty(),
+        "a failed verdict read records no durable ending: {:?}",
+        app.cards_handle().chains.endings("ses_test")
+    );
 }
 
-/// Review (spec #588 / #589 / #590, PR #595): the cleanup's overlay record is
-/// gated on its refresh landing — every part of it. The click's own reconcile
-/// retires a runtime-ended task and clears the unconfirmed residue; when a new
-/// Turn takes the chain while its reads are in flight, the waiting card stops
-/// admitting the write, and recording any of it anyway would hide the tasks
-/// from every later transcript read without ever rendering their entries
-/// (🔔 结束/已失联, 🧹 已清理) — which no later read can reconstruct.
+/// ADR-0080's reopened trade (spec #699, ticket #701): the cleanup click's
+/// ENDINGS are recorded durably at derivation, so a card replaced while the
+/// click's reads are in flight no longer loses the retirements — the tasks
+/// leave the ledger and their entries (🔔 已失联, 🧹 已清理) stay owed to the
+/// next card that can carry them. Only the process-local cache and the carried
+/// marker wait on the refresh's outcome (ADR-0073, PR #595).
 ///
 /// The arrangement is deterministic, no wall-clock margin decides:
 /// - the click's reads complete while the test holds the session's card-write
@@ -2996,11 +3012,12 @@ async fn a_cleanup_click_with_a_failed_verdict_read_clears_nothing() {
 ///   parked, and the lock is released only after the collect actually landed
 ///   on the old card.
 ///
-/// The assertions are properties — nothing recorded, nothing hidden, no entry
-/// half-rendered, the collect the old card's last write — never exact patch
-/// counts, so a benign extra ledger refresh cannot fail them.
+/// The assertions are properties — the endings durable, no entry half-rendered
+/// on the refusing card, the entries rendered exactly once on the successor,
+/// the collect the old card's last write — never exact patch counts, so a
+/// benign extra ledger refresh cannot fail them.
 #[tokio::test]
-async fn a_cleanup_click_whose_card_is_replaced_never_hides_the_tasks() {
+async fn a_cleanup_click_whose_card_is_replaced_still_ends_the_tasks() {
     let _wd = test_work_dir();
     let now = chrono::Utc::now().timestamp_millis();
     let live = SessionTranscript::new(two_task_timeline(vec![]))
@@ -3117,39 +3134,39 @@ async fn a_cleanup_click_whose_card_is_replaced_never_hides_the_tasks() {
     // assertions below read a still world.
     let guard2 = write_lock.lock().await;
 
-    // Nothing of the click's pass was recorded — neither the runtime
-    // retirement of the shell nor the dismissal of the unconfirmed child — so
-    // the tasks stay live on every later read and the successor's own
-    // admitted paths can render their entries.
+    // The click's ENDINGS are durable at derivation (ADR-0080), even though
+    // its refresh was refused: the runtime's 已失联 ending for the shell and
+    // the user's 🧹 ending for the cleared child both recorded, so the tasks
+    // leave the ledger on every later read. Only the process-local cache and
+    // the carried marker keep ADR-0073's accepted-write gate.
     assert!(
-        backend.overlay.retired_call_ids("ses_test").is_empty(),
-        "a refused refresh records nothing: {:?}",
-        backend.overlay.retired_call_ids("ses_test")
+        app.cards_handle()
+            .chains
+            .endings("ses_test")
+            .iter()
+            .any(|record| record.run.names("call_bg")),
+        "the click's reconcile records the shell's durable evidence ending: {:?}",
+        app.cards_handle().chains.endings("ses_test")
     );
-    assert_eq!(
-        backend.overlay.unconfirmed_call_ids("ses_test"),
-        vec!["call_sub".to_string()],
-        "the carried marker state rides the refused refresh untouched"
+    assert!(
+        app.cards_handle()
+            .chains
+            .endings("ses_test")
+            .iter()
+            .any(|record| record.run.names("call_sub")),
+        "the click records the cleared child's durable cleanup ending: {:?}",
+        app.cards_handle().chains.endings("ses_test")
     );
     let later = crate::backend::Backend::transcript(backend.as_ref(), "ses_test")
         .await
         .unwrap();
-    assert_eq!(
-        later
-            .background_tasks
-            .iter()
-            .map(|task| task.tool.call_id.as_str())
-            .collect::<Vec<_>>(),
-        vec!["call_bg", "call_sub"],
-        "a refresh that never landed must not hide the task: it would have no entry"
-    );
     assert!(
-        later.unconfirmed_tasks.contains("call_sub"),
-        "the carried marker survives for the successor's button: {later:?}"
+        later.background_tasks.is_empty(),
+        "the durable endings take both tasks out of the ledger: {later:?}"
     );
-    // No card carries a half-rendered retirement or cleanup entry: the
-    // click's local transcript never reached a card, and the takeover
-    // rendered its own collect instead.
+    // No card carries a half-rendered retirement or cleanup entry: the click's
+    // local transcript never reached a card, and the takeover rendered its own
+    // collect instead. The entries stay OWED to the successor.
     let mut cards = platform.updated_cards().await;
     cards.extend(platform.replied_cards().await);
     cards.extend(platform.sent_cards().await);
@@ -3159,9 +3176,8 @@ async fn a_cleanup_click_whose_card_is_replaced_never_hides_the_tasks() {
             .all(|card| !card_text(card).contains("🔔") && !card_text(card).contains("🧹")),
         "a refused refresh renders no entry anywhere: {cards:?}"
     );
-    // The takeover's collect is the old card's last write; a benign extra
-    // ledger refresh may precede it, nothing may follow, and no payload may
-    // carry an entry.
+    // The takeover's collect is the old card's last write; nothing may follow,
+    // and no payload may carry an entry.
     let patches = patches_to(&platform, "om_waiting").await;
     assert!(
         patches
@@ -3177,38 +3193,24 @@ async fn a_cleanup_click_whose_card_is_replaced_never_hides_the_tasks() {
     );
     drop(guard2);
 
-    // The successor's turn runs to its waiting yield: with nothing recorded,
-    // the live tasks, their marker and the cleanup button are still there.
+    // The successor claims the owed entries: both render exactly once on it,
+    // and with no live task left the card settles ✅.
     next_turn.await.unwrap().unwrap();
     wait_for_card_update_within(
         &platform,
-        "the successor's waiting card",
+        "the successor's owed entries",
         Duration::from_secs(10),
         CardUpdates::Latest,
-        |card| card_text(card).contains("⚠️ 状态待确认") && card_text(card).contains("清理待确认任务"),
+        |card| {
+            card_header(card).contains("✅")
+                && card_text(card).contains("🔔 shell 已失联：gh run watch")
+                && card_text(card).contains("🧹 subagent 已清理：review the diff（人工）")
+        },
     )
     .await;
     let successor_id = Turn::card_message_id(&app.cards_handle(), "ses_test")
         .await
         .expect("the successor carries its card id");
-
-    // A later admitted path — Session Sync, unfrozen and re-activated — ends
-    // the shell: its row leaves and exactly one 已失联 entry renders, while
-    // the unconfirmed child keeps its row, marker and button.
-    seed_session(&app, "ses_test", "/work").await;
-    app.runtime_reconcile.interval_ms.store(0, Ordering::Relaxed);
-    wait_for_card_update_within(
-        &platform,
-        "the shell's 已失联 entry",
-        Duration::from_secs(10),
-        CardUpdates::Latest,
-        |card| {
-            card_header(card).contains("⏳")
-                && card_text(card).contains("🔔 shell 已失联：gh run watch")
-                && card_text(card).contains("清理待确认任务")
-        },
-    )
-    .await;
     let updates = patches_to(&platform, &successor_id).await;
     assert!(
         updates
@@ -3219,75 +3221,26 @@ async fn a_cleanup_click_whose_card_is_replaced_never_hides_the_tasks() {
     assert!(
         updates
             .iter()
-            .any(|card| card_text(card).contains("🔔 shell 已失联")),
-        "the runtime retirement renders on the successor: {updates:?}"
-    );
-    assert!(
-        updates
-            .last()
-            .is_some_and(|card| card_text(card).contains("🔔 shell 已失联")),
-        "the entry's own refresh is the newest write: {updates:?}"
-    );
-
-    // The successor's own click clears the child and renders its 🧹 entry
-    // exactly once; both retirements are now recorded (their refreshes
-    // landed), so every later read keeps the tasks out.
-    let ack = app
-        .host_action(serde_json::json!({ "action": "cleanup", "session_id": "ses_test" }))
-        .await
-        .expect("the cleanup click on the successor acks");
-    assert_eq!(ack.toast.as_deref(), Some("正在清理..."));
-    wait_for_card_update_within(
-        &platform,
-        "the successor's cleaned settle",
-        Duration::from_secs(10),
-        CardUpdates::Latest,
-        |card| {
-            card_header(card).contains("✅")
-                && card_text(card).contains("🧹 subagent 已清理：review the diff（人工）")
-        },
-    )
-    .await;
-    let updates = patches_to(&platform, &successor_id).await;
-    assert!(
-        updates
-            .iter()
             .all(|card| card_text(card).matches("🧹 subagent 已清理").count() <= 1),
         "the cleanup entry never doubles within one render: {updates:?}"
     );
-    // The settled card carries each retirement exactly once: the shell's
-    // entry (rendered by the earlier admitted refresh) re-renders with the
-    // card, never duplicated, and the click adds its own 🧹 entry once.
-    let settled = updates.last().expect("the successor's settle is a write");
-    assert!(
-        card_header(settled).contains("✅"),
-        "the last task gone settles the card: {settled}"
-    );
+    let settled = platform.updated_cards().await.last().cloned().unwrap();
     assert_eq!(
-        card_text(settled).matches("🧹 subagent 已清理").count(),
+        card_text(&settled).matches("🧹 subagent 已清理").count(),
         1,
         "one cleanup entry on the settled card: {settled}"
     );
     assert_eq!(
-        card_text(settled).matches("🔔 shell 已失联").count(),
+        card_text(&settled).matches("🔔 shell 已失联").count(),
         1,
         "the shell's entry stays exactly one on the settled card: {settled}"
-    );
-    assert_eq!(
-        backend.overlay.retired_call_ids("ses_test"),
-        vec!["call_bg".to_string(), "call_sub".to_string()],
-        "both landed refreshes recorded their retirements"
-    );
-    assert!(
-        backend.overlay.unconfirmed_call_ids("ses_test").is_empty(),
-        "the landed cleanup clears the marker set"
     );
     let later = crate::backend::Backend::transcript(backend.as_ref(), "ses_test")
         .await
         .unwrap();
     assert!(
         later.background_tasks.is_empty(),
-        "accepted retirements keep the tasks out of later reads: {later:?}"
+        "the durable endings keep the tasks out of later reads: {later:?}"
     );
 }
 
@@ -3313,19 +3266,20 @@ async fn wait_for_external_notify(platform: &RecordingPlatform) -> serde_json::V
     }
 }
 
-/// Review (spec #588 / #589, PR #595): Session Sync commits its reconcile
-/// pass's overlay record only after the flush that carried its entries was
-/// accepted — the same invariant the cleanup click obeys for its own pass.
+/// Review (spec #588 / #589, PR #595; reopened trade ADR-0080, ticket #701):
+/// Session Sync commits its reconcile pass's process-local cache only after the
+/// flush that carried its entries was accepted — the same gate the cleanup click
+/// obeys for its own pass.
 ///
 /// A newer External Message in the same read as the reconcile supersedes the
 /// waiting card: the yielded-card write admission passes (the card is still
 /// the live, no-handoff Waiting one), the runtime retires the shell, and only
 /// THEN does the chain-held check reject the card — the notification path
 /// collects it and arms the fresh renderer, so this read's retirement entry has
-/// no card to land on. Recording the retirement anyway would hide the task from
-/// every later read (the launch record never flips) with no entry ever
-/// rendered; the task must stay live until a card that can carry its entry
-/// receives one.
+/// no card to land on. The evidence ending is still durable (recorded at
+/// derivation, ADR-0080), so the run is ended for good and its entry stays owed
+/// to the first card that can carry it; only the cache and the marker wait on
+/// the accepted write.
 ///
 /// Deterministic, no wall-clock margin decides: the pass's transcript read is
 /// parked on the mock's gate while the test scripts BOTH facts it will read
@@ -3333,7 +3287,7 @@ async fn wait_for_external_notify(platform: &RecordingPlatform) -> serde_json::V
 /// notification's landing is awaited as a condition, and the reads behind it
 /// stay parked while the assertions run.
 #[tokio::test]
-async fn an_external_supersede_records_no_runtime_retirement() {
+async fn an_external_supersede_records_no_overlay_but_keeps_the_ending() {
     let _wd = test_work_dir();
     let now = chrono::Utc::now().timestamp_millis();
     let (_dir, app, backend, platform) =
@@ -3387,14 +3341,21 @@ async fn an_external_supersede_records_no_runtime_retirement() {
         "the notification previews the newer message: {notify}"
     );
     assert!(
-        backend.overlay.retired_call_ids("ses_test").is_empty(),
-        "a superseded pass records nothing: {:?}",
-        backend.overlay.retired_call_ids("ses_test")
-    );
-    assert!(
         backend.overlay.unconfirmed_call_ids("ses_test").is_empty(),
-        "a superseded pass records no marker state either: {:?}",
+        "a superseded pass records no marker state: {:?}",
         backend.overlay.unconfirmed_call_ids("ses_test")
+    );
+    // ADR-0080's reopened trade: the pass's carrier was superseded, so nothing
+    // was committed to the process-local cache — but the runtime's evidence
+    // ending was recorded durably AT DERIVATION, so the run is ended for good.
+    assert!(
+        app.cards_handle()
+            .chains
+            .endings("ses_test")
+            .iter()
+            .any(|record| record.run.names("call_bg")),
+        "the superseded pass still records the durable evidence ending: {:?}",
+        app.cards_handle().chains.endings("ses_test")
     );
     let mut cards = platform.updated_cards().await;
     cards.extend(platform.replied_cards().await);
@@ -3408,7 +3369,7 @@ async fn an_external_supersede_records_no_runtime_retirement() {
 
     // Freeze the shared throttle wide, THEN release the readers parked behind
     // the notification: no later pass can spend a verdict, so the world stays
-    // frozen and the task provably stays live on every read.
+    // frozen — and the durable ending already took the task out of the ledger.
     app.runtime_reconcile
         .interval_ms
         .store(600_000, Ordering::Relaxed);
@@ -3417,14 +3378,9 @@ async fn an_external_supersede_records_no_runtime_retirement() {
     let later = crate::backend::Backend::transcript(backend.as_ref(), "ses_test")
         .await
         .unwrap();
-    assert_eq!(
-        later
-            .background_tasks
-            .iter()
-            .map(|task| task.tool.call_id.as_str())
-            .collect::<Vec<_>>(),
-        vec!["call_bg"],
-        "the task stays live until a card that can render its entry takes the chain"
+    assert!(
+        later.background_tasks.is_empty(),
+        "the durable ending takes the task out of the ledger, its entry owed: {later:?}"
     );
 
     // A later receivable card renders exactly one entry: the external render's
@@ -6769,5 +6725,167 @@ async fn a_wake_less_retirement_renders_once_across_a_restart() {
             .iter()
             .any(|card| card_text(card).contains("🔔 subagent 结束")),
         "an already-rendered retirement never replays after a restart: {cards:?}"
+    );
+}
+
+/// Acceptance (spec #699, ticket #701): a restart whose read derives NO
+/// retirement still renders the owed entry. Life 1's runtime verdict recorded
+/// the evidence ending durably, but Feishu permanently refused the card write,
+/// so the entry never landed and no rendered mark exists. A fresh process over
+/// the same sidecar whose runtime read answers nothing (so nothing is
+/// re-derived) must still render the entry — the `apply` synthesis reads the
+/// durable ending, not the transcript.
+#[tokio::test]
+async fn a_restart_renders_the_owed_ending_the_read_no_longer_derives() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = waiting_shell(now - 5_000);
+    let (dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    // Life 1: the runtime confirms the shell ended, but both the plain write
+    // and its fenced retry are refused — the card suspends and the entry never
+    // lands. The ending is recorded at derivation all the same.
+    backend.task_runtime.lock().unwrap().shells = vec![(
+        "sh_call_bg".into(),
+        ShellRuntime::Ended {
+            end: ShellEnd::Killed,
+            completed_at: Some(now - 1_000),
+        },
+    )];
+    platform.fail_update_card_content_count.store(2, Ordering::SeqCst);
+    Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下构建并审阅"))
+        .await
+        .unwrap();
+
+    let session_file = dir.path().join("sessions.json");
+    let persisted = ChainRecords::load(session_file.with_file_name("chain_records.json"));
+    assert!(
+        persisted.endings("ses_test").iter().any(|record| {
+            record.run.names("call_bg")
+                && record.endings.iter().any(|ending| {
+                    ending.class == TaskEndingClass::Evidence && ending.state == TaskEndingState::Owed
+                })
+        }),
+        "the refused carrier still records the durable evidence ending: {:?}",
+        persisted.endings("ses_test")
+    );
+    assert!(
+        persisted.rendered("ses_test").is_empty(),
+        "the entry never reached a card, so no rendered mark exists"
+    );
+
+    // Life 2: a fresh process over the same files. Its MockBackend has no
+    // runtime verdict scripted, so the read derives NOTHING — only the durable
+    // ending can produce the entry.
+    let mut backend2 = MockBackend::new(realistic_parts());
+    backend2.given_transcript("ses_test", vec![waiting_shell(now - 5_000)]);
+    backend2.with_session_status("ses_test", Some(SessionStatus::Idle));
+    let backend2 = Arc::new(backend2);
+    let platform2 = Arc::new(RecordingPlatform::new());
+    let app2 = Arc::new(
+        App::new(test_config(&session_file), backend2.clone(), platform2.clone())
+            .expect("the restarted app builds"),
+    );
+    app2.turn_render_poll_ms.store(5, Ordering::Relaxed);
+    app2.turn_follow_read_timeout_ms.store(20, Ordering::Relaxed);
+    app2.runtime_reconcile.interval_ms.store(0, Ordering::Relaxed);
+    seed_session(&app2, "ses_test", "/work").await;
+
+    Turn::run(&app2.turn_handles(), ctx("ses_test", "接着来"))
+        .await
+        .unwrap();
+    wait_for_card_update(&platform2, "the owed entry", CardUpdates::Latest, |card| {
+        card_text(card).contains("🔔 shell 结束：gh run watch")
+    })
+    .await;
+    let cards = platform2.updated_cards().await;
+    assert!(
+        cards
+            .iter()
+            .filter(|card| card_text(card).contains("🔔 shell 结束"))
+            .all(|card| card_text(card).matches("🔔 shell 结束").count() == 1),
+        "the owed entry renders exactly once: {cards:?}"
+    );
+}
+
+/// Acceptance (spec #699, ticket #701): a 🧹 cleanup survives a restart —
+/// the cleared row stays cleared and its entry never replays. Life 1's click
+/// records the Cleanup ending durably and its accepted refresh shows the 🧹
+/// entry; a fresh process over the same sidecar, with a read that still lists
+/// the task live, must neither resurrect the row nor re-render the entry.
+#[tokio::test]
+async fn a_cleanup_survives_a_restart() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = SessionTranscript::new(two_task_timeline(vec![]))
+        .with_executions(vec![execution(2_500)])
+        .with_background_tasks(vec![live_subagent(now - 3_000, "call_sub")]);
+    let (dir, app, backend, platform) = scripted_app(vec![live.clone()], Some(SessionStatus::Idle)).await;
+    script_child_without_activity(&backend).await;
+    yield_one_task_card(&app, &platform, ctx("ses_test", "跑一下构建并审阅")).await;
+
+    // The runtime cannot confirm the child: the row gains its marker and the
+    // card its cleanup button.
+    backend.task_runtime.lock().unwrap().children = vec![("ses_call_sub".into(), ChildRuntime::Inactive)];
+    spawn_sync(&app);
+    wait_for_card_update(&platform, "the unconfirmed marker", CardUpdates::Latest, |card| {
+        card_text(card).contains("⚠️ 状态待确认") && card_text(card).contains("清理待确认任务")
+    })
+    .await;
+
+    // The click records the Cleanup ending and its accepted refresh shows 🧹.
+    app.host_action(serde_json::json!({ "action": "cleanup", "session_id": "ses_test" }))
+        .await
+        .expect("the cleanup click acks");
+    wait_for_card_update(&platform, "the cleaned settle", CardUpdates::Latest, |card| {
+        card_header(card).contains("✅")
+            && card_text(card).contains("🧹 subagent 已清理：review the diff（人工）")
+    })
+    .await;
+
+    let session_file = dir.path().join("sessions.json");
+    let persisted = ChainRecords::load(session_file.with_file_name("chain_records.json"));
+    assert!(
+        persisted.endings("ses_test").iter().any(|record| {
+            record.run.names("call_sub")
+                && record
+                    .endings
+                    .iter()
+                    .any(|ending| ending.class == TaskEndingClass::Cleanup)
+        }),
+        "the click records the durable cleanup ending: {:?}",
+        persisted.endings("ses_test")
+    );
+
+    // Life 2: a fresh process whose read STILL lists the subagent live — the
+    // durable ending must keep it out and its shown entry must not replay.
+    let mut backend2 = MockBackend::new(realistic_parts());
+    backend2.given_transcript("ses_test", vec![live]);
+    backend2.with_session_status("ses_test", Some(SessionStatus::Idle));
+    let backend2 = Arc::new(backend2);
+    let platform2 = Arc::new(RecordingPlatform::new());
+    let app2 = Arc::new(
+        App::new(test_config(&session_file), backend2.clone(), platform2.clone())
+            .expect("the restarted app builds"),
+    );
+    app2.turn_render_poll_ms.store(5, Ordering::Relaxed);
+    app2.turn_follow_read_timeout_ms.store(20, Ordering::Relaxed);
+    app2.runtime_reconcile.interval_ms.store(0, Ordering::Relaxed);
+    seed_session(&app2, "ses_test", "/work").await;
+
+    let later = crate::backend::Backend::transcript(backend2.as_ref(), "ses_test")
+        .await
+        .unwrap();
+    assert!(
+        later.background_tasks.is_empty(),
+        "the durable cleanup ending keeps the cleared row out of the read: {later:?}"
+    );
+
+    Turn::run(&app2.turn_handles(), ctx("ses_test", "接着来"))
+        .await
+        .unwrap();
+    let cards = platform2.updated_cards().await;
+    assert!(
+        !cards.iter().any(|card| card_text(card).contains("🧹")),
+        "a shown cleanup entry never replays after a restart: {cards:?}"
     );
 }

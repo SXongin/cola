@@ -3733,6 +3733,11 @@ async fn a_failed_runtime_read_leaves_the_turn_waiting() {
         !backend.task_runtime_calls.lock().await.is_empty(),
         "the attempt was made (and failed)"
     );
+    assert!(
+        app.cards_handle().chains.endings("ses_test").is_empty(),
+        "a failed read records no durable ending: {:?}",
+        app.cards_handle().chains.endings("ses_test")
+    );
 }
 
 /// Acceptance (#589): a runtime read that times out changes nothing either —
@@ -3766,6 +3771,11 @@ async fn a_timed_out_runtime_read_leaves_the_turn_waiting() {
     assert!(
         !text.contains("🔔 shell"),
         "no entry from a read that timed out: {card}"
+    );
+    assert!(
+        app.cards_handle().chains.endings("ses_test").is_empty(),
+        "a timed-out read records no durable ending: {:?}",
+        app.cards_handle().chains.endings("ses_test")
     );
 }
 
