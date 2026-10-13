@@ -58,7 +58,7 @@ key space dissolve.
 
 ## Decision
 
-**One run, one durable ending, one shown fact.**
+**One run, one record; one shown fact per ending.**
 
 - **The identity is the run, and the run's ids are aliases of one record.** A
   new `TaskRunId`: the launch's call id when the read carries the launch, else
@@ -125,17 +125,23 @@ key space dissolve.
   dedup reads — never the Wake gate, exactly as today (#590) — so one release's
   records cannot be miscounted, and only the new shape is ever written. Past the
   bound the old marks age out.
-- **The bound never drops an owed ending.** The `endings` section is bounded like
-  the `rendered` marks it replaces, but an eviction candidate is always a record
-  whose endings have all been **shown**: an unshown ending is exactly what the
-  next card owes, so dropping it would lose an entry no card has ever displayed —
-  the loss side this family never takes (every mark the old section held had
-  already been shown, so its bound could only ever cost a duplicate). When every
-  record is unshown, eviction is deferred until a card that can place entries has
-  shown them; a session whose runs keep ending while no card can carry an entry
-  accumulates those records instead — small, and the safe side. The bound keeps
-  the marks' own residual: past it, a very old **shown** ending may render once
-  more after a restart.
+- **The bound never drops an owed ending, and the backlog is bounded too.** The
+  `endings` section is bounded like the `rendered` marks it replaces, and an
+  eviction candidate is always a record whose endings have all been **shown**: an
+  unshown ending is exactly what the next card owes, so dropping it would lose an
+  entry no card has ever displayed — the loss side this family never takes (every
+  mark the old section held had already been shown, so its bound could only ever
+  cost a duplicate). Storage stays bounded as well: every read that derives an
+  ending is a card-owning path (`Turn`'s drain, Session Sync's waiting card, the
+  follow/settle loop, the Cleanup click), and a card that can place entries
+  drains the backlog on its next render — so an unshown backlog only survives in
+  a chain that cannot place an entry at all (a record whose Turn anchor never
+  resolved, or a carrier every write refuses). That shape gets its own hard cap:
+  past it, the OLDEST unshown ending is marked **shown without a render** (with a
+  `WARN`), surrendering an entry that shape could not have placed anyway while
+  the run stays ended and no card resurrects it. The bound keeps the marks' own
+  residual: past it, a very old **shown** ending may render once more after a
+  restart.
 - **Out of scope, deliberately.** The unconfirmed marker (`⚠️ 状态待确认`) stays
   process-local and re-derived at restart: it is "no positive evidence yet", an
   endingless state whose "an unasked read must not drop it" rule (ADR-0073) is
@@ -153,7 +159,10 @@ from owed from refused, and it advances the ending's shown bit in the same Chain
 Record write as the cursor itself — but not the cursor's **frontier** as the
 gate's home. The design round (2026-10-13) settled why the literal reading
 cannot carry it, and this ADR records the deviation rather than pretending it
-away:
+away. **The originating issue records the same supersession in its decision
+comment** ([#683 comment](https://github.com/SXongin/cola/issues/683#issuecomment-6144150664)),
+and the implementation spec ([#699](https://github.com/SXongin/cola/issues/699))
+restates it, so the ask, the record and the plan agree:
 
 - **Lifetime.** The Rendered Cursor is a field of the **records** section and
   dies with `release`; the shown fact must outlive the record — a restart after a
@@ -234,7 +243,9 @@ past it). The trade therefore becomes:
   shown bits); the `rendered` section and the pre-#659 spelling retire into its
   legacy read; `MAX_RENDERED_KEYS` becomes the bound over a session's run
   records — a shown record is the eviction candidate, oldest first, never an
-  unshown one.
+  unshown one — plus a hard cap on the unshown backlog, past which the oldest
+  unshown ending is marked shown without a render (a `WARN`, in the one shape
+  that could not have placed its entry).
 - `StreamAccumulator`/`StagedCursor` no longer carry a separate `rendered` key
   list — the staged body carries the endings it rendered, and the confirmation
   flips their shown bits beside the cursor; `Turn::recorded_marks` and
