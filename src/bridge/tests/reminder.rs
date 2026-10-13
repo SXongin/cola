@@ -424,7 +424,7 @@ fn turn_ctx(session_id: &str) -> PromptContext {
         requester_open_id: Some(TEST_HOST.into()),
         is_group: false,
         cola_message_id: None,
-        images: Vec::new(),
+        files: Vec::new(),
         skills: Vec::new(),
         advisory_live: false,
     }

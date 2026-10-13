@@ -11,7 +11,7 @@ use crate::bridge::test_support::{assert_line_level, capture_logs, level_count};
 use crate::error::BridgeError;
 use crate::opencode::client::OpenCodeBackend;
 use crate::opencode::strategy::Generation;
-use crate::opencode::types::{ImageInput, SessionStatus};
+use crate::opencode::types::{PromptFile, SessionStatus};
 use crate::test_http::{DynamicResponse, MockResponse, RecordedRequest, TestHttpServer};
 
 /// A client pointed at the fake server with both Basic-auth parts set, speaking
@@ -1301,9 +1301,10 @@ async fn prompt_admits_the_text_files_and_id_then_returns_without_waiting() {
         .prompt(
             "ses_1",
             "hi",
-            &[ImageInput {
+            &[PromptFile {
                 mime: "image/png".into(),
                 data_base64: "AAAA".into(),
+                name: None,
             }],
             &[],
             None,
@@ -1331,6 +1332,59 @@ async fn prompt_admits_the_text_files_and_id_then_returns_without_waiting() {
             "delivery": "steer",
         }),
         "V2's prompt payload: text + files + the durable id + explicit steer; no model/agent axes"
+    );
+}
+
+/// A named Prompt Attachment carries its display name in the `files[]` entry,
+/// and an image (no name) omits it (ADR-0076's inbound amendment).
+#[tokio::test]
+async fn prompt_carries_a_named_files_name_and_omits_it_for_an_image() {
+    let server = TestHttpServer::start().await;
+    server.route(
+        "POST",
+        "/api/session/ses_1/prompt",
+        200,
+        admitted_body("msg_cola_1"),
+    );
+    let client = v2_wire_client(&server);
+
+    client
+        .prompt(
+            "ses_1",
+            "read it",
+            &[
+                PromptFile {
+                    mime: "application/pdf".into(),
+                    data_base64: "QUJD".into(),
+                    name: Some("P3173R0.pdf".into()),
+                },
+                PromptFile {
+                    mime: "image/png".into(),
+                    data_base64: "QUJD".into(),
+                    name: None,
+                },
+            ],
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let body = body_json(&request_at(&server, 0));
+    assert_eq!(
+        body["files"][0],
+        serde_json::json!({
+            "uri": "data:application/pdf;base64,QUJD",
+            "name": "P3173R0.pdf",
+        })
+    );
+    assert_eq!(
+        body["files"][1],
+        serde_json::json!({"uri": "data:image/png;base64,QUJD"}),
+        "an image has no name"
     );
 }
 

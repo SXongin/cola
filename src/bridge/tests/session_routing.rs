@@ -494,6 +494,8 @@ async fn stale_topic_recreate_preserves_creation_messages() {
         parent_id: Some("om_root_cmd".into()),
         text: "第一条".into(),
         images: vec![],
+        files: vec![],
+        omitted: vec![],
         requester_open_id: Some(TEST_HOST.into()),
     })
     .await;
@@ -524,6 +526,8 @@ async fn stale_topic_recreate_preserves_creation_messages() {
         parent_id: Some("om_root_cmd".into()),
         text: "第二条".into(),
         images: vec![],
+        files: vec![],
+        omitted: vec![],
         requester_open_id: Some(TEST_HOST.into()),
     })
     .await;

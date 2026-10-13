@@ -818,6 +818,55 @@ impl Client {
         })
     }
 
+    /// Download a file attached to a message (`GET
+    /// /im/v1/messages/{id}/resources/{key}?type=file`, ADR-0076's inbound
+    /// amendment), returning its bytes, the server-declared content type and the
+    /// caller-supplied display name (`name`, from the message content's
+    /// `file_name`). The `file` resource type and its 30s timeout distinguish
+    /// it from the image download (10s): a file is commonly larger, and a slow
+    /// one must not discard the rest of the turn. Requires the `im:message`
+    /// permission (already held); a caller reports a failure instead of
+    /// dropping the file silently.
+    pub async fn download_file(
+        &self,
+        message_id: &str,
+        file_key: &str,
+        name: &str,
+    ) -> crate::error::Result<FileAttachment> {
+        let token = self.get_access_token().await?;
+        let resp = self
+            .http
+            .get(self.endpoint(&format!(
+                "/open-apis/im/v1/messages/{message_id}/resources/{file_key}?type=file"
+            )))
+            .bearer_auth(&token)
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(crate::error::BridgeError::Feishu(format!(
+                "download file failed: {status}: {}",
+                body_snippet(&text, 300)
+            )));
+        }
+        // The declared type may be the generic `application/octet-stream`; the
+        // classifier derives the real one from the name then (ADR-0076).
+        let mime = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        let bytes = resp.bytes().await?;
+        Ok(FileAttachment {
+            mime,
+            name: name.to_string(),
+            data: bytes.to_vec(),
+        })
+    }
+
     /// Upload an image to Feishu (`POST /open-apis/im/v1/images`, multipart
     /// `image_type=message`, scope `im:resource`), returning the reusable
     /// `image_key` a card's `img` element references (ADR-0076). The multipart
@@ -1200,20 +1249,23 @@ pub struct FeishuMessage {
 }
 
 /// A downloaded Feishu image, ready to be attached to a prompt as a vision
-/// file part.
+/// file part. It carries no name — an image message has none (ADR-0076).
 #[derive(Debug, Clone)]
 pub struct ImageAttachment {
     pub mime: String,
     pub data: Vec<u8>,
 }
 
-/// The prompt-relevant content of a Feishu message: extracted text plus any
-/// images downloaded from it. Produced for quoted/replied parents so the model
-/// sees what the reply answers.
+/// A downloaded Feishu file (a `file` message or a rich-text message's
+/// top-level `files[]` entry), ready to be attached to a prompt as a file part
+/// (ADR-0076's inbound amendment). `mime` is the resource response's declared
+/// type (possibly the generic `application/octet-stream`, decided by the
+/// classifier later), `name` the display name from the message content.
 #[derive(Debug, Clone)]
-pub struct MessageContext {
-    pub text: String,
-    pub images: Vec<ImageAttachment>,
+pub struct FileAttachment {
+    pub mime: String,
+    pub name: String,
+    pub data: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2425,6 +2477,73 @@ mod tests {
         );
         assert!(message.contains("500"), "unexpected error: {message}");
         assert!(message.contains("boom"), "unexpected error: {message}");
+    }
+
+    /// A file download uses the `type=file` resource and carries the bytes, the
+    /// declared content type and the caller's display name (ADR-0076's inbound
+    /// amendment).
+    #[tokio::test]
+    async fn download_file_passes_through_bytes_content_type_and_name() {
+        let (server, client) = wire_client().await;
+        server.route_raw(
+            "GET",
+            "/open-apis/im/v1/messages/om_7/resources/file_1",
+            200,
+            "application/pdf",
+            b"%PDF-1.7".to_vec(),
+        );
+
+        let file = client
+            .download_file("om_7", "file_1", "P3173R0.pdf")
+            .await
+            .unwrap();
+        assert_eq!(file.mime, "application/pdf");
+        assert_eq!(file.name, "P3173R0.pdf");
+        assert_eq!(file.data, b"%PDF-1.7");
+
+        let request = last_request(&server);
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.path, "/open-apis/im/v1/messages/om_7/resources/file_1");
+        assert_eq!(request.header("authorization"), Some("Bearer t-abc"));
+        assert_eq!(request.query_param("type").as_deref(), Some("file"));
+    }
+
+    /// The declared type may be the generic `application/octet-stream` — the
+    /// live question — and the classifier derives the real mime from the name
+    /// then. The download must pass it through untouched.
+    #[tokio::test]
+    async fn download_file_passes_a_generic_content_type_through() {
+        let (server, client) = wire_client().await;
+        server.route_raw(
+            "GET",
+            "/open-apis/im/v1/messages/om_8/resources/file_9",
+            200,
+            "application/octet-stream",
+            b"# notes".to_vec(),
+        );
+
+        let file = client.download_file("om_8", "file_9", "notes.md").await.unwrap();
+        assert_eq!(file.mime, "application/octet-stream");
+        assert_eq!(file.data, b"# notes");
+    }
+
+    #[tokio::test]
+    async fn download_file_maps_http_error() {
+        let (server, client) = wire_client().await;
+        server.route_raw(
+            "GET",
+            "/open-apis/im/v1/messages/om_7/resources/file_1",
+            404,
+            "text/plain",
+            "gone",
+        );
+
+        let message = feishu_error(client.download_file("om_7", "file_1", "a.pdf").await.unwrap_err());
+        assert!(
+            message.contains("download file failed"),
+            "unexpected error: {message}"
+        );
+        assert!(message.contains("404"), "unexpected error: {message}");
     }
 
     #[tokio::test]

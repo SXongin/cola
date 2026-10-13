@@ -11,11 +11,11 @@ use crate::bridge::handles::{PickReply, classify_pick};
 use crate::bridge::session::PendingEntry;
 use crate::bridge::span;
 use crate::bridge::turn::PromptContext;
+use crate::bridge::{OmitReason, OmittedAttachment};
 use crate::config::{Config, ConversationKind, ThreadKey};
 use crate::feishu;
 use crate::feishu::card::session::BrowseView;
-use crate::opencode;
-use crate::opencode::types::SessionStatus;
+use crate::opencode::types::{PromptFile, SessionStatus};
 
 /// Shown once when the first top-level message in a group auto-creates the
 /// group's lobby session.
@@ -31,20 +31,113 @@ const GROUP_LOBBY_GUIDANCE: &str = "\
 // shell log redirect (`cola ... > test.log 2>&1`) carries into the new process.
 // The current process then calls `std::process::exit(0)` right after.
 
-/// Convert downloaded platform images into OpenCode `ImageInput`s (data-URL
-/// `file` parts). Empty for text-only turns; the retry path loses images (they
-/// are not persisted on the accumulator) and sends text alone.
-pub(crate) fn image_inputs(
+/// The server's per-attachment cap (`MAX_ATTACHMENT_BYTES`, the decoded payload
+/// size past which the server fails the WHOLE prompt). cola pre-checks the same
+/// line so an oversize attachment is reported instead of sent.
+const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
+
+/// One inbound attachment cola could not attach, with the reason to show
+/// (ADR-0076's inbound amendment: nothing is dropped silently).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Omission {
+    /// The file's display name; `None` for an image (it has no name).
+    pub name: Option<String>,
+    pub reason: OmitReason,
+}
+
+/// Classify downloaded inbound attachments into prompt file parts (ADR-0076's
+/// inbound amendment). An image keeps one of the four server-readable image
+/// mimes; a file becomes `application/pdf`, one of the four image mimes, or
+/// `text/plain`; anything else is omitted as unsupported. An attachment past
+/// the server's 20MB cap is omitted too — for both images and files, since the
+/// image path previously had no check and an oversize image failed the whole
+/// run. Returns the attachable parts (images then files) and the omissions.
+pub(crate) fn prompt_files(
     images: &[crate::feishu::client::ImageAttachment],
-) -> Vec<opencode::types::ImageInput> {
+    files: &[crate::feishu::client::FileAttachment],
+) -> (Vec<PromptFile>, Vec<Omission>) {
+    let mut parts = Vec::new();
+    let mut omissions = Vec::new();
+    for image in images {
+        // An image has no name, so its mime alone decides; the four-mime check
+        // drops a `bmp`/`tiff`/`heic` the server would silently discard on V2.
+        match classify_attachment(&image.mime, None, &image.data) {
+            Ok(part) => parts.push(part),
+            Err(omission) => omissions.push(omission),
+        }
+    }
+    for file in files {
+        match classify_attachment(&file.mime, Some(file.name.clone()), &file.data) {
+            Ok(part) => parts.push(part),
+            Err(omission) => omissions.push(omission),
+        }
+    }
+    (parts, omissions)
+}
+
+/// One downloaded attachment's payload as a prompt file part, or the omission
+/// it must be reported as. `name` is `None` for an image (it has no name).
+/// Type is decided before size, so an unsupported oversize file reads
+/// `类型不支持` (it would never be sent anyway).
+fn classify_attachment(mime: &str, name: Option<String>, data: &[u8]) -> Result<PromptFile, Omission> {
     use base64::Engine;
-    images
+    match crate::feishu::file::inbound_mime(mime, name.as_deref().unwrap_or("")) {
+        Some(mime) if data.len() <= MAX_ATTACHMENT_BYTES => Ok(PromptFile {
+            mime,
+            data_base64: base64::engine::general_purpose::STANDARD.encode(data),
+            name,
+        }),
+        Some(_) => Err(Omission {
+            name,
+            reason: OmitReason::OverSize,
+        }),
+        None => Err(Omission {
+            name,
+            reason: OmitReason::Unsupported,
+        }),
+    }
+}
+
+/// The prompt-body fragment one omitted attachment contributes: `[文件: <name> ·
+/// 未附带：<reason>]`, or `[图片 · 未附带：<reason>]` for an image (no name).
+fn omission_note(name: Option<&str>, reason: OmitReason) -> String {
+    match name {
+        Some(name) => format!("[文件: {name} · 未附带：{}]", reason.label()),
+        None => format!("[图片 · 未附带：{}]", reason.label()),
+    }
+}
+
+/// Join the omission notes onto a message body. When the body IS the message's
+/// own placeholder (`[文件: <name>]` for a file message, `[图片]` for an
+/// image), the note annotates it in place; otherwise it is appended on its own
+/// new line so the body's own text stands (ADR-0076's "有正文则另起一行追加").
+pub(crate) fn join_omissions(text: &mut String, omissions: &[Omission]) {
+    for omission in omissions {
+        let base = match omission.name.as_deref() {
+            Some(name) => format!("[文件: {name}]"),
+            None => "[图片]".to_string(),
+        };
+        let note = omission_note(omission.name.as_deref(), omission.reason);
+        if text.trim() == base {
+            *text = note;
+        } else {
+            text.push('\n');
+            text.push_str(&note);
+        }
+    }
+}
+
+/// The one `⚠️` reply naming every attachment the turn could not attach, so the
+/// user can tell their file was not read (ADR-0076's inbound amendment).
+fn omission_warning(omissions: &[Omission]) -> String {
+    omissions
         .iter()
-        .map(|img| opencode::types::ImageInput {
-            mime: img.mime.clone(),
-            data_base64: base64::engine::general_purpose::STANDARD.encode(&img.data),
+        .map(|omission| match omission.name.as_deref() {
+            Some(name) => format!("⚠️ 文件 {name} 未能附带（{}）", omission.reason.label()),
+            None => format!("⚠️ 图片 未能附带（{}）", omission.reason.label()),
         })
-        .collect()
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// One bounded `session_status` read for the prompt path — the ADVISORY read
@@ -129,6 +222,17 @@ impl Deref for App {
 
 #[async_trait::async_trait]
 impl crate::bridge::EventSink for App {
+    async fn admit(&self, msg: &crate::bridge::IncomingMessage) -> bool {
+        // The Access gate, run BEFORE any attachment download (ADR-0035: the
+        // Principal is resolved before anything else happens). `gate_message`
+        // fully answers a refusal/Claim; `handle_message` runs it again
+        // (idempotently for an admitted message) as its own entry-point guard.
+        match self.self_arc() {
+            Some(app) => !app.gate_message(msg).await,
+            None => false,
+        }
+    }
+
     async fn handle_message(&self, msg: crate::bridge::IncomingMessage) {
         if let Some(app) = self.self_arc() {
             app.handle_message(msg).await;
@@ -689,6 +793,9 @@ impl App {
             // dispatch lives on the shared core, but the prompt pipeline is the
             // coordinator's — so Forward is routed here, before the command flow.
             if let command::Command::Forward(text) = cmd {
+                // The forward is the user's own message, so its downloaded
+                // attachments ride along (an unrecognized `/command` with a
+                // file attached must not silently lose the file).
                 let forward = crate::bridge::IncomingMessage {
                     message_id: msg.message_id,
                     chat_id: msg.chat_id,
@@ -696,7 +803,9 @@ impl App {
                     thread_id: msg.thread_id,
                     parent_id: None,
                     text,
-                    images: vec![],
+                    images: msg.images,
+                    files: msg.files,
+                    omitted: msg.omitted,
                     requester_open_id: None,
                 };
                 if let Err(e) = self.handle_prompt(thread_key, forward, kind, Vec::new()).await {
@@ -1052,6 +1161,8 @@ impl App {
             parent_id,
             text,
             images,
+            files,
+            omitted,
             requester_open_id,
             ..
         } = msg;
@@ -1068,7 +1179,11 @@ impl App {
         }
         let is_group = chat_type == "group";
         let mut text = text;
-        let mut images = images;
+        // The quoted parent's attachments, filled by the two-phase fetch below
+        // and prepended to the message's own (ADR-0076's inbound amendment).
+        let mut quoted_images = Vec::new();
+        let mut quoted_files = Vec::new();
+        let mut quoted_omitted = Vec::new();
 
         // Quoted Context: when this message replies to another, fetch the
         // parent and prepend it so the model sees what the reply answers —
@@ -1097,20 +1212,65 @@ impl App {
             None => false,
         };
         if let Some(pid) = parent_id.as_deref().filter(|_| !parent_is_topic_creation) {
-            let fetch = feishu::message::quoted_context(&self.feishu, pid);
+            // Phase 1, on its own 1.5s budget: the parent's TEXT (and the
+            // attachment refs). The text is injected the moment it arrives.
+            let fetch = feishu::message::quoted_source(&self.feishu, pid);
             let fetch = tokio::time::timeout(std::time::Duration::from_millis(1500), fetch);
             match fetch.await {
-                Ok(Ok(ctx)) => {
-                    if !ctx.text.is_empty() {
-                        let capped: String = ctx.text.chars().take(2000).collect();
+                Ok(Ok(source)) => {
+                    if !source.text.is_empty() {
+                        let capped: String = source.text.chars().take(2000).collect();
                         text = format!("[引用消息]:\n{}\n\n{}", capped, text);
                     }
-                    // Quoted images come first, then the reply's own images.
-                    images.splice(0..0, ctx.images);
+                    // Phase 2, best-effort and outside the 1.5s budget: the
+                    // parent's attachments, each within its own platform timeout
+                    // (10s image / 30s file). A slow download now loses only the
+                    // attachment, never the quoted text.
+                    let quoted = feishu::message::download_attachments(
+                        &self.feishu,
+                        pid,
+                        &source.image_keys,
+                        &source.file_refs,
+                    )
+                    .await;
+                    quoted_images = quoted.images;
+                    quoted_files = quoted.files;
+                    quoted_omitted = quoted.omitted;
                 }
                 Ok(Err(e)) => tracing::debug!("quoted context fetch failed for {}: {}", pid, e),
                 Err(_) => tracing::debug!("quoted context fetch timed out for {}", pid),
             }
+        }
+
+        // Prompt Attachments (ADR-0076's inbound amendment). The quoted
+        // parent's come first, then this message's own. Every attachment that
+        // cannot be attached is reported — the quoted parent's too, since "a
+        // file was not read" is exactly what the user must be able to tell.
+        let (quoted_parts, quoted_omissions) = prompt_files(&quoted_images, &quoted_files);
+        let (own_parts, own_omissions) = prompt_files(&images, &files);
+        let mut attachments = quoted_parts;
+        attachments.extend(own_parts);
+        // A ref the platform could not resolve (a folder, a failed download)
+        // joins the classification omissions, so every one is reported. The
+        // message's own come before the quoted parent's, so an own file
+        // message's placeholder is still annotated in place.
+        let mut omissions: Vec<Omission> = omitted
+            .into_iter()
+            .map(|OmittedAttachment { name, reason }| Omission { name, reason })
+            .collect();
+        omissions.extend(own_omissions);
+        omissions.extend(
+            quoted_omitted
+                .into_iter()
+                .map(|OmittedAttachment { name, reason }| Omission { name, reason }),
+        );
+        omissions.extend(quoted_omissions);
+        join_omissions(&mut text, &omissions);
+        if !omissions.is_empty() {
+            let _ = self
+                .feishu
+                .reply_text(&message_id, &omission_warning(&omissions))
+                .await;
         }
 
         let (session_id, created) = self
@@ -1153,7 +1313,7 @@ impl App {
                     requester_open_id,
                     is_group,
                     cola_message_id: None,
-                    images,
+                    files: attachments,
                     skills,
                     advisory_live,
                 })
@@ -1176,7 +1336,6 @@ impl App {
             // outlived the drain bound keeps merging into the still-live chain
             // instead of freezing its card.
             PromptRoute::Supplement => {
-                let image_inputs = image_inputs(&images);
                 // Each supplement is its own logical user message: fresh
                 // cola-authored id (ADR-0026), never reused.
                 let cola_msg_id = crate::opencode::parsing::cola_message_id();
@@ -1185,7 +1344,7 @@ impl App {
                     .prompt(
                         &session_id,
                         &text,
-                        &image_inputs,
+                        &attachments,
                         &skills,
                         self.session_model_override(&session_id).await.as_ref(),
                         self.session_variant_override(&session_id).await.as_deref(),
@@ -2639,6 +2798,8 @@ impl App {
                     parent_id: None,
                     text: format!("#{id}"),
                     images: vec![],
+                    files: vec![],
+                    omitted: vec![],
                     requester_open_id: requester,
                 },
                 crate::bridge::command::SkillInvocation {
