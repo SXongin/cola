@@ -694,12 +694,10 @@ fn plan_wake_entries(
             Some(task) => crate::bridge::tasks::identity_of_task(task, input),
             None => crate::bridge::tasks::identity_of_wake(wake),
         };
-        let Some(entry) = wake_completion_entry(
-            wake,
-            retired.as_ref(),
-            created_ms,
-            run.as_ref().and_then(|run| facts.identity(run)),
-        ) else {
+        // The identity the entry falls back to when the read no longer carries
+        // the launch: resolved per field from the run's endings (ADR-0080).
+        let durable = run.as_ref().and_then(|run| facts.identity(run));
+        let Some(entry) = wake_completion_entry(wake, retired.as_ref(), created_ms, durable.as_ref()) else {
             continue;
         };
         plans.push(PlannedEntry {
@@ -840,11 +838,11 @@ fn plan_runtime_entries(
         let entry = TaskCompletionEntry {
             kind,
             label: super::state::task_label(kind, input)
-                .or_else(|| durable.and_then(|identity| identity.label.clone())),
+                .or_else(|| durable.as_ref().and_then(|identity| identity.label.clone())),
             id,
             started_at: task
                 .started_at
-                .or_else(|| durable.and_then(|identity| identity.started_at)),
+                .or_else(|| durable.as_ref().and_then(|identity| identity.started_at)),
             finished_at: retirement.finished_at,
             ending,
             output: None,
@@ -3041,6 +3039,57 @@ mod tests {
             plans[0].entry.started_at,
             Some(1_000),
             "the duration comes from the ending's captured identity"
+        );
+    }
+
+    /// ADR-0080 (CI gate): the durable identity resolves PER FIELD, so a partial
+    /// one never drops a field a fuller ending already captured. A Cleanup
+    /// captured both a label and a start clock; a launchless Wake is then
+    /// recorded with a label but NO start clock — the completion entry the Wake
+    /// owes still keeps the Cleanup's start clock.
+    #[test]
+    fn a_partial_identity_never_drops_the_start_clock() {
+        let acc = StreamAccumulator::new("test");
+        let transcript =
+            SessionTranscript::new(vec![]).with_wakes(vec![subagent_wake("ses_call_sub", 3_000)]);
+        let ending = |class: TaskEndingClass,
+                      state: TaskEndingState,
+                      started_at: Option<i64>,
+                      label: &str| crate::bridge::chain::TaskEnding {
+            class,
+            state,
+            finished_at: Some(2_000),
+            evidence: None,
+            identity: TaskRunIdentity {
+                tool: Some("subagent".into()),
+                call_id: Some("call_sub".into()),
+                shell_id: None,
+                child_id: Some("ses_call_sub".into()),
+                started_at,
+                label: Some(label.into()),
+            },
+        };
+        let facts = EndingFacts::new(vec![TaskRunRecord {
+            run: planned_run("call_sub"),
+            endings: vec![
+                // The Cleanup captured the run's start clock ...
+                ending(
+                    TaskEndingClass::Cleanup,
+                    TaskEndingState::Shown,
+                    Some(1_000),
+                    "cleanup",
+                ),
+                // ... and the launchless Wake that follows carried no clock.
+                ending(TaskEndingClass::Wake, TaskEndingState::Owed, None, "wake"),
+            ],
+        }]);
+
+        let plans = plan_wake_entries(&acc, &transcript, &turn_anchor(0), &facts);
+        assert_eq!(plans.len(), 1, "the Wake's completion plans");
+        assert_eq!(
+            plans[0].entry.started_at,
+            Some(1_000),
+            "the Cleanup's start clock survives the Wake's partial identity"
         );
     }
 

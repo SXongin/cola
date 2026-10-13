@@ -536,17 +536,37 @@ impl EndingFacts {
     }
 
     /// The identity a run's record carries, whatever class recorded it — the
-    /// label and the start clock an entry falls back to when the read no longer
-    /// carries the launch. The newest derivation's identity (the last ending that
-    /// captured a label or a start clock) wins.
-    pub(crate) fn identity(&self, run: &TaskRunId) -> Option<&TaskRunIdentity> {
+    /// label, the start clock and the ids an entry falls back to when the read
+    /// no longer carries the launch. Resolved PER FIELD, newest first (ADR-0080,
+    /// CI gate): a partial identity can never drop a field a fuller ending
+    /// already captured — a launchless Wake recorded with a label but no start
+    /// clock still leaves the Cleanup's start clock in place. `None` when no
+    /// ending captured a label or a start clock (nothing to fall back to).
+    pub(crate) fn identity(&self, run: &TaskRunId) -> Option<TaskRunIdentity> {
         let record = resolve_run(&self.records, run)?;
-        self.records[record]
-            .endings
-            .iter()
-            .rev()
-            .map(|ending| &ending.identity)
-            .find(|identity| identity.label.is_some() || identity.started_at.is_some())
+        let mut identity = TaskRunIdentity::default();
+        for ending in self.records[record].endings.iter().rev() {
+            let held = &ending.identity;
+            if identity.tool.is_none() {
+                identity.tool = held.tool.clone();
+            }
+            if identity.call_id.is_none() {
+                identity.call_id = held.call_id.clone();
+            }
+            if identity.shell_id.is_none() {
+                identity.shell_id = held.shell_id.clone();
+            }
+            if identity.child_id.is_none() {
+                identity.child_id = held.child_id.clone();
+            }
+            if identity.started_at.is_none() {
+                identity.started_at = held.started_at;
+            }
+            if identity.label.is_none() {
+                identity.label = held.label.clone();
+            }
+        }
+        (identity.label.is_some() || identity.started_at.is_some()).then_some(identity)
     }
 
     /// Fold a delivered-but-unrecorded body's pairs into the snapshot as SHOWN.
