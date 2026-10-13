@@ -320,6 +320,21 @@ pub(crate) async fn reconcile_now(
             // a marker the verdict resolves is a change too.
             let unconfirmed_before = transcript.unconfirmed_tasks.clone();
             transcript.apply_task_runtime(&runtime);
+            // Record the RUNTIME verdict's endings AT DERIVATION (ADR-0080) —
+            // one synchronous Chain Record write per run, the fact about the run
+            // rather than the card that will show its entry, an entry-less chain
+            // included — BEFORE the child-evidence reads below. A slow or
+            // timed-out child read (and a pass the caller abandons while it
+            // waits) can then neither delay nor lose a parent's ending. A failed
+            // or timed-out runtime READ never reaches this arm, so it records
+            // nothing: no verdict, no ending. This is the reopened trade
+            // (ADR-0073/PR #595): the ending is durable, so a permanently
+            // refused carrier no longer keeps the task live — the task leaves
+            // the ledger and the entry stays owed. Only the process-local
+            // overlay below stays gated on the caller's accepted write; the
+            // unconfirmed marker keeps that gate unchanged.
+            let mut recorded = retired_before;
+            record_new_endings(backend, session_id, transcript, &mut recorded);
             // The child-evidence step (#591, issue #464): a subagent the
             // runtime no longer reports active can still be retirable on its
             // own transcript's evidence — and the very failure mode this
@@ -328,13 +343,17 @@ pub(crate) async fn reconcile_now(
             // stamp retires the task, a gone child session retires it as lost,
             // and a read that cannot conclude — or fails, or times out, or is
             // skipped by the spent cycle budget — keeps the row exactly as the
-            // runtime marked it, never guessed.
+            // runtime marked it, never guessed. A read that DOES conclude
+            // records its ending at the derivation too.
             for (call_id, child_id) in transcript.unconfirmed_children() {
                 match budget
                     .read("child evidence read", backend.child_evidence(&child_id))
                     .await
                 {
-                    Some(Ok(evidence)) => transcript.apply_child_evidence(&call_id, evidence),
+                    Some(Ok(evidence)) => {
+                        transcript.apply_child_evidence(&call_id, evidence);
+                        record_new_endings(backend, session_id, transcript, &mut recorded);
+                    }
                     Some(Err(error)) => {
                         tracing::debug!(
                             "session {session_id} child {child_id} evidence read failed: {error}; keeping its row"
@@ -344,22 +363,6 @@ pub(crate) async fn reconcile_now(
                     // — yields no verdict, like the runtime read above.
                     None => {}
                 }
-            }
-            // Record the endings this pass just derived, AT DERIVATION
-            // (ADR-0080): one synchronous Chain Record write per run, the fact
-            // about the run rather than about the card that will show its
-            // entry — an entry-less chain included. A failed or timed-out read
-            // never reaches this arm, so it records nothing: no verdict, no
-            // ending. This is the reopened trade (ADR-0073/PR #595): the ending
-            // is durable, so a permanently refused carrier no longer keeps the
-            // task live — the task leaves the ledger and the entry stays owed.
-            // Only the process-local overlay below stays gated on the caller's
-            // accepted write; the unconfirmed marker keeps that gate unchanged.
-            for retirement in &transcript.task_retirements[retired_before..] {
-                let input = transcript.tool_input(retirement.task.tool.call_id.as_str());
-                backend
-                    .tasks()
-                    .record_evidence_ending(session_id, retirement, input);
             }
             // NOTHING is committed here (review, PR #595): the caller commits
             // the returned pass only after the flush that carried this read's
@@ -377,6 +380,27 @@ pub(crate) async fn reconcile_now(
         }
         None => None,
     }
+}
+
+/// Record every evidence ending the read derived after `recorded` (ADR-0080) —
+/// one synchronous Chain Record write per newly retired run, at the moment it
+/// was derived. `recorded` is advanced past what it wrote, so a caller can
+/// record again after a later child-evidence read without writing the same
+/// retirement twice. A read that FAILED or TIMED OUT never produced a
+/// retirement, so nothing is recorded for it.
+fn record_new_endings(
+    backend: &Arc<dyn Backend>,
+    session_id: &str,
+    transcript: &SessionTranscript,
+    recorded: &mut usize,
+) {
+    for retirement in &transcript.task_retirements[*recorded..] {
+        let input = transcript.tool_input(retirement.task.tool.call_id.as_str());
+        backend
+            .tasks()
+            .record_evidence_ending(session_id, retirement, input);
+    }
+    *recorded = transcript.task_retirements.len();
 }
 
 /// Commit one reconcile pass's verdicts to the process-local cache (issue
@@ -469,5 +493,99 @@ async fn capture_shell_outputs(
             None => ShellOutputRead::Unavailable,
         };
         transcript.shell_outputs.insert(shell_id, output);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::{BackgroundTask, ChildRuntime, ShellEnd, ShellRuntime, ToolIdentity};
+    use crate::bridge::chain::ChainRecords;
+    use crate::bridge::test_support::MockBackend;
+    use std::sync::Arc;
+
+    /// A launch as a read still carries it.
+    fn task(call_id: &str, shell_id: Option<&str>, child_id: Option<&str>) -> BackgroundTask {
+        BackgroundTask {
+            tool: ToolIdentity {
+                name: "shell".into(),
+                call_id: call_id.into(),
+            },
+            shell_id: shell_id.map(str::to_string),
+            child_id: child_id.map(str::to_string),
+            started_at: Some(1_000),
+        }
+    }
+
+    /// ADR-0080: "The ending is recorded when it is derived." A parent's
+    /// runtime verdict must be durable the moment it is derived — BEFORE the
+    /// pass awaits a child-evidence read — so a slow or timed-out child read
+    /// can neither delay it nor, if the pass is abandoned while it waits, lose
+    /// it. The runtime READ here succeeded, so the ticket's rule ("a failed or
+    /// timed-out runtime read records nothing") does not apply.
+    #[tokio::test]
+    async fn a_parent_verdict_records_before_a_timed_out_child_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let chains = Arc::new(ChainRecords::load(dir.path().join("chain_records.json")));
+        let backend = Arc::new(MockBackend::new(Vec::new()));
+        backend.overlay.attach_chains(Arc::clone(&chains));
+        // The shell is retired by the runtime verdict; the child stays a
+        // suspect, so the pass spends a child-evidence read — which hangs.
+        backend.task_runtime.lock().unwrap().shells = vec![(
+            "sh_call_bg".into(),
+            ShellRuntime::Ended {
+                end: ShellEnd::Killed,
+                completed_at: Some(2_000),
+            },
+        )];
+        backend.task_runtime.lock().unwrap().children = vec![("ses_call_sub".into(), ChildRuntime::Inactive)];
+        backend.hang_child_evidence_reads(1);
+
+        let mut transcript = SessionTranscript::new(vec![]).with_background_tasks(vec![
+            task("call_bg", Some("sh_call_bg"), None),
+            task("call_sub", None, Some("ses_call_sub")),
+        ]);
+
+        let dyn_backend: Arc<dyn Backend> = backend.clone();
+        let handle = tokio::spawn(async move {
+            reconcile_now(
+                &dyn_backend,
+                "ses_test",
+                None,
+                &mut transcript,
+                CycleBudget::within(200),
+            )
+            .await
+        });
+
+        // Wait until the (hanging) child-evidence read has STARTED.
+        for _ in 0..2_000 {
+            if !backend.child_evidence_calls.lock().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(
+            !backend.child_evidence_calls.lock().await.is_empty(),
+            "the child-evidence read must have started"
+        );
+        // The parent's ending is already durable while that read is still in
+        // flight: it was recorded AT DERIVATION, not after the loop.
+        assert!(
+            chains
+                .endings("ses_test")
+                .iter()
+                .any(|record| record.run.names("call_bg")),
+            "the parent verdict's ending is recorded before the child read returns"
+        );
+        assert!(
+            !chains
+                .endings("ses_test")
+                .iter()
+                .any(|record| record.run.names("call_sub")),
+            "the child's ending is not derived: its read gave no verdict"
+        );
+
+        let _ = handle.await;
     }
 }
