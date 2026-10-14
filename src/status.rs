@@ -70,21 +70,44 @@ fn channel_label(channel: InstallChannel) -> &'static str {
     }
 }
 
-/// Gather the status snapshot. `loaded` is the config parse result: `None` when
-/// no path resolved, `Some(Err)` when the file is broken. Its absence only
-/// narrows what can be reported (claim state, the generation override), never
-/// fails the command.
-pub async fn gather(
-    cfg_path: Option<PathBuf>,
-    loaded: Option<&anyhow::Result<Config>>,
-    log_path: &Path,
-) -> Status {
-    let cfg = loaded.and_then(|r| r.as_ref().ok());
+/// The config's resolved path plus its parse result — the pair every
+/// introspection command needs. Bundled so `gather`/`doctor_checks` take one
+/// argument instead of three that always travel together.
+pub struct ConfigState {
+    pub path: Option<PathBuf>,
+    loaded: Option<anyhow::Result<Config>>,
+}
+
+impl ConfigState {
+    /// Resolve and load from the ambient environment (`cola config`'s lookup).
+    /// A missing file is `loaded: None`; a broken one is `loaded: Some(Err)` —
+    /// neither is an error here.
+    pub fn from_env(explicit: Option<&str>) -> Self {
+        let path = config::resolve_path_from_env(explicit);
+        let loaded = path.as_deref().map(config::load);
+        Self { path, loaded }
+    }
+
+    /// The parsed config, when one loaded cleanly.
+    pub fn cfg(&self) -> Option<&Config> {
+        self.loaded.as_ref().and_then(|r| r.as_ref().ok())
+    }
+
+    /// Whether a config file was found AND parsed.
+    pub fn ok(&self) -> bool {
+        matches!(self.loaded, Some(Ok(_)))
+    }
+}
+
+/// Gather the status snapshot. Its absence only narrows what can be reported
+/// (claim state, the generation override), never fails the command.
+pub async fn gather(state: &ConfigState, log_path: &Path) -> Status {
+    let cfg = state.cfg();
     let channel = crate::update::current_exe_path()
         .map(|exe| channel_label(crate::update::detect_install_channel(&exe)))
         .unwrap_or("unknown");
     let autostart = AutostartStatus {
-        registered: crate::autostart::supervisor_restart_command().is_some(),
+        registered: crate::autostart::is_registered(),
         active: crate::autostart::supervisor_is_active(),
         binary: crate::autostart::supervisor_binary_path(),
     };
@@ -95,7 +118,6 @@ pub async fn gather(
         }
         None => (None, None),
     };
-    let config_ok = matches!(loaded, Some(Ok(_)));
     let server = probe_server(cfg).await;
 
     Status {
@@ -105,8 +127,8 @@ pub async fn gather(
         autostart,
         claimed,
         host,
-        config_path: cfg_path,
-        config_ok,
+        config_path: state.path.clone(),
+        config_ok: state.ok(),
         log_path: log_path.to_path_buf(),
         server,
     }
@@ -294,36 +316,21 @@ pub fn render_doctor(checks: &[Check]) -> String {
     out
 }
 
-/// Resolve config without exiting: `None` when no file is found. Shared by
-/// `status` and `doctor`, which must report a missing config instead of dying.
-pub fn resolve_config_lenient(explicit: Option<&str>) -> Option<PathBuf> {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    config::resolve_config_path(explicit, &cwd, &home)
-}
-
 /// Run `cola doctor`: gather the checks, print the report, and return whether
 /// every check passed.
 pub async fn run_doctor(explicit_config: Option<&str>, log_path: &Path) -> anyhow::Result<bool> {
-    let path = resolve_config_lenient(explicit_config);
-    let loaded = path.as_deref().map(config::load);
-    let cfg = loaded.as_ref().and_then(|r| r.as_ref().ok());
-    let checks = doctor_checks(&path, &loaded, cfg, log_path).await;
+    let state = ConfigState::from_env(explicit_config);
+    let checks = doctor_checks(&state, log_path).await;
     print!("{}", render_doctor(&checks));
     Ok(doctor_ok(&checks))
 }
 
-/// Assemble the doctor checks. `loaded` is the config parse result (`None` when
-/// no path resolved); `cfg` is the parsed config when it loaded.
-async fn doctor_checks(
-    config_path: &Option<PathBuf>,
-    loaded: &Option<anyhow::Result<Config>>,
-    cfg: Option<&Config>,
-    log_path: &Path,
-) -> Vec<Check> {
+/// Assemble the doctor checks from the resolved config state.
+async fn doctor_checks(state: &ConfigState, log_path: &Path) -> Vec<Check> {
     let mut checks = Vec::new();
+    let cfg = state.cfg();
 
-    match (config_path, loaded) {
+    match (&state.path, &state.loaded) {
         (Some(p), Some(Ok(_))) => checks.push(Check::pass("配置文件", p.display().to_string())),
         (Some(p), Some(Err(e))) => {
             checks.push(Check::fail("配置文件", format!("{} 无法解析：{e}", p.display())))
@@ -399,7 +406,10 @@ async fn feishu_check(client: &crate::feishu::client::Client, app_id: &str) -> C
     match client.get_access_token().await {
         Ok(_) => match client.bot_open_id().await {
             Ok(bot) => Check::pass("飞书凭证", format!("app {app_id}，bot {bot}")),
-            Err(e) => Check::warn(
+            // Both halves are the credential check (ADR-0081): a token that
+            // works but a bot identity that does not means the app cannot read
+            // its own bot — a failure, not a warning.
+            Err(e) => Check::fail(
                 "飞书凭证",
                 format!("app {app_id} 可取 token，但读取 bot 信息失败：{e}"),
             ),
@@ -431,12 +441,33 @@ fn which_opencode_in(path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
     for dir in std::env::split_paths(path?) {
         for name in OPENCODE_BIN_NAMES {
             let candidate = dir.join(name);
-            if candidate.is_file() {
+            if is_executable_file(&candidate) {
                 return Some(candidate);
             }
         }
     }
     None
+}
+
+/// Whether `path` is a file cola could actually execute: a regular file that,
+/// on unix, carries an execute bit (a non-executable `opencode` would make the
+/// spawn fail, so PATH lookup must not report it as found).
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 /// The executable names to look for on `PATH`.
@@ -589,6 +620,42 @@ mod tests {
     }
 
     #[test]
+    fn config_state_reports_missing_broken_and_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("none.toml");
+        let s = ConfigState::from_env(missing.to_str());
+        assert_eq!(s.path.as_deref(), Some(missing.as_path()));
+        assert!(s.cfg().is_none());
+        assert!(!s.ok());
+
+        let broken = dir.path().join("broken.toml");
+        std::fs::write(&broken, "not = valid = toml").unwrap();
+        let s = ConfigState::from_env(broken.to_str());
+        assert!(s.cfg().is_none());
+        assert!(!s.ok(), "a path that fails to parse is not ok");
+
+        let good = dir.path().join("good.toml");
+        std::fs::write(&good, "[feishu]\napp_id = \"a\"\napp_secret = \"b\"\n").unwrap();
+        let s = ConfigState::from_env(good.to_str());
+        assert!(s.cfg().is_some());
+        assert!(s.ok());
+    }
+
+    #[test]
+    fn log_check_reports_present_and_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("cola.log");
+        std::fs::write(&file, b"hello\n").unwrap();
+        assert_eq!(log_check(&file).status, CheckStatus::Pass);
+
+        let never = dir.path().join("never.log");
+        assert_eq!(log_check(&never).status, CheckStatus::Pass); // parent exists
+
+        let gone = dir.path().join("gone").join("cola.log");
+        assert_eq!(log_check(&gone).status, CheckStatus::Warn); // parent missing
+    }
+
+    #[test]
     fn doctor_ok_fails_only_on_a_failing_check() {
         let pass = Check::pass("a", "fine");
         let warn = Check::warn("b", "meh");
@@ -621,12 +688,27 @@ mod tests {
     }
 
     #[test]
-    fn which_opencode_finds_a_binary_on_path() {
+    fn which_opencode_finds_an_executable_on_path() {
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("opencode");
         std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
-        let path = dir.path().as_os_str();
-        assert_eq!(which_opencode_in(Some(path)), Some(bin));
+        make_executable(&bin);
+        assert_eq!(which_opencode_in(Some(dir.path().as_os_str())), Some(bin));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn which_opencode_skips_a_non_executable_file() {
+        // A same-named file without an execute bit cannot be spawned, so PATH
+        // lookup must not report it as found.
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("opencode");
+        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&bin, perms).unwrap();
+        assert_eq!(which_opencode_in(Some(dir.path().as_os_str())), None);
     }
 
     #[test]
@@ -634,5 +716,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(which_opencode_in(Some(dir.path().as_os_str())), None);
         assert_eq!(which_opencode_in(None), None);
+    }
+
+    /// `chmod +x` where it exists; a no-op elsewhere.
+    fn make_executable(path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(path, perms).unwrap();
+        }
+        #[cfg(not(unix))]
+        let _ = path;
     }
 }

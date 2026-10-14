@@ -629,13 +629,26 @@ fn restart_cli(assume_yes: bool) -> anyhow::Result<()> {
     let Some((argv0, args)) = argv.split_first() else {
         anyhow::bail!("运行中 cola 的启动参数为空");
     };
-    // Prefer the process's own executable path: argv[0] may be relative to the
-    // daemon's cwd, which differs from the CLI's.
+    // Prefer the process's own executable path, resolved through
+    // `live_exe_path`: it strips Linux's "/path/cola (deleted)" a replaced
+    // binary renders as and checks a file actually exists there (issue #551),
+    // which also protects the spawn from a phantom path. Fall back to argv[0]
+    // only when it is a real file or a bare name on PATH; otherwise refuse
+    // BEFORE touching the running instance, so a failed restart never leaves
+    // cola down.
     let program = exe
+        .as_deref()
+        .and_then(crate::update::live_exe_path)
         .map(|p| p.to_string_lossy().into_owned())
         .filter(|p| !p.is_empty())
+        .filter(|p| spawnable(p))
         .unwrap_or_else(|| argv0.clone());
-    replace_instance(pid)?;
+    if !spawnable(&program) {
+        anyhow::bail!("无法定位运行中 cola 的可执行文件（{program}）；请先 `cola stop` 再手动启动。");
+    }
+    // Spawn FIRST with `--replace`: the successor takes the lock by terminating
+    // the old holder itself (the same takeover `/restart` uses), so there is no
+    // window where cola is down.
     spawn_detached(&program, args)?;
     report_restart(wait_for_new_daemon(Some(pid)));
     Ok(())
@@ -650,6 +663,21 @@ fn report_restart(confirmed: bool) {
     } else {
         println!("重启已请求，但未确认新实例接管单例锁；请用 `cola status` 查看。");
     }
+}
+
+/// Whether `program` can be spawned: an existing file, or a bare name (no path
+/// separator) that some `PATH` entry resolves. A path with a separator that does
+/// not exist is not spawnable — the guard that keeps `cola restart` from
+/// stopping an instance it then cannot bring back.
+fn spawnable(program: &str) -> bool {
+    let path = std::path::Path::new(program);
+    if path.is_file() {
+        return true;
+    }
+    if program.contains('/') || program.contains(std::path::MAIN_SEPARATOR) {
+        return false;
+    }
+    std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(program).is_file()))
 }
 
 /// Spawn a detached cola from `exe` + `args`, appending `--replace` so it may
@@ -695,9 +723,8 @@ async fn status_cli(
     explicit_config: Option<&str>,
     log_path: &std::path::Path,
 ) -> anyhow::Result<()> {
-    let config_path = status::resolve_config_lenient(explicit_config);
-    let loaded = config_path.as_deref().map(config::load);
-    let snapshot = status::gather(config_path, loaded.as_ref(), log_path).await;
+    let state = status::ConfigState::from_env(explicit_config);
+    let snapshot = status::gather(&state, log_path).await;
     if json {
         println!(
             "{}",
@@ -1169,6 +1196,19 @@ mod tests {
         // cola — the guard must recognise it (the takeover path depends on it).
         assert!(is_cola_process(std::process::id() as i32));
         assert!(!is_cola_process(i32::MAX - 1));
+    }
+
+    #[test]
+    fn spawnable_accepts_an_existing_file_and_rejects_a_missing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("cola");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(spawnable(file.to_str().unwrap()));
+        // A path with a separator that does not exist is not spawnable.
+        assert!(!spawnable("/nonexistent/dir/cola"));
+        assert!(!spawnable("./definitely-not-here"));
+        // A bare name that no PATH entry resolves is not spawnable either.
+        assert!(!spawnable("cola-definitely-not-on-path-xyz"));
     }
 
     #[test]

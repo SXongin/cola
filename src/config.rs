@@ -374,10 +374,18 @@ pub enum ConfigAction {
     Validate,
 }
 
-pub fn run(action: ConfigAction, explicit: Option<&str>) -> anyhow::Result<()> {
+/// Resolve the config path from the ambient environment — the current
+/// directory and home — with the documented fallback chain. The lenient
+/// counterpart of `main::resolve_config_or_exit`: `None` when no file is found,
+/// never an exit. Shared by `cola config` and `cola status`/`doctor`.
+pub fn resolve_path_from_env(explicit: Option<&str>) -> Option<PathBuf> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    let path = resolve_config_path(explicit, &cwd, &home);
+    resolve_config_path(explicit, &cwd, &home)
+}
+
+pub fn run(action: ConfigAction, explicit: Option<&str>) -> anyhow::Result<()> {
+    let path = resolve_path_from_env(explicit);
     match action {
         ConfigAction::Path => {
             match path {
@@ -388,10 +396,7 @@ pub fn run(action: ConfigAction, explicit: Option<&str>) -> anyhow::Result<()> {
         }
         ConfigAction::Show => {
             let path = path.ok_or_else(|| anyhow::anyhow!("未找到配置文件"))?;
-            let cfg = load(&path)?;
-            let mut masked = cfg.clone();
-            masked.feishu.app_secret = mask_secret(&masked.feishu.app_secret);
-            print!("{}", toml::to_string_pretty(&masked)?);
+            print!("{}", masked_config_toml(&load(&path)?)?);
             Ok(())
         }
         ConfigAction::Validate => {
@@ -403,6 +408,14 @@ pub fn run(action: ConfigAction, explicit: Option<&str>) -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+/// The effective config as TOML with the Feishu app secret masked — what
+/// `cola config show` prints. The secret never leaves this function.
+pub fn masked_config_toml(cfg: &Config) -> anyhow::Result<String> {
+    let mut masked = cfg.clone();
+    masked.feishu.app_secret = mask_secret(&masked.feishu.app_secret);
+    Ok(toml::to_string_pretty(&masked)?)
 }
 
 /// Mask a secret for display: never print it, but say whether one is set and
@@ -454,15 +467,20 @@ mod tests {
     }
 
     #[test]
-    fn config_show_masks_the_app_secret() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cola.toml");
-        std::fs::write(&path, "[feishu]\napp_id = \"cli_abc\"\napp_secret = \"s3cr3t\"\n").unwrap();
-        let cfg = load(&path).unwrap();
-        let mut masked = cfg.clone();
-        masked.feishu.app_secret = mask_secret(&masked.feishu.app_secret);
-        let dumped = toml::to_string_pretty(&masked).unwrap();
-        assert!(dumped.contains("cli_abc"));
+    fn masked_config_toml_hides_the_app_secret() {
+        // The production renderer `cola config show` prints: the secret must not
+        // survive it. Asserted against `masked_config_toml` (not a re-derived
+        // transformation) so removing the masking would fail this test.
+        let cfg = Config {
+            opencode: OpenCodeConfig::default(),
+            feishu: FeishuConfig {
+                app_id: "cli_abc".into(),
+                app_secret: "s3cr3t".into(),
+            },
+            bridge: BridgeConfig::default(),
+        };
+        let dumped = masked_config_toml(&cfg).unwrap();
+        assert!(dumped.contains("cli_abc"), "the app id is shown: {dumped}");
         assert!(!dumped.contains("s3cr3t"), "secret leaked: {dumped}");
     }
 
