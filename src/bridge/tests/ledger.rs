@@ -1917,8 +1917,9 @@ async fn a_permanently_refused_retirement_write_leaves_the_entry_owed() {
     );
     assert_eq!(
         backend.overlay.retired_call_ids("ses_test"),
-        vec!["call_bg".to_string()],
-        "the accepted successor render records the retirement"
+        vec!["call_bg".to_string(), "sh_call_bg".to_string()],
+        "the accepted successor render records the retirement, and the durable \
+         ending's own shell-id alias is seeded beside it (ADR-0080)"
     );
     // The ending's shown bit follows the same gate (ADR-0080): the doubly
     // refused write flipped nothing (the entry never reached a card), and the
@@ -3396,8 +3397,9 @@ async fn an_external_supersede_records_no_overlay_but_keeps_the_ending() {
     .await;
     assert_eq!(
         backend.overlay.retired_call_ids("ses_test"),
-        vec!["call_bg".to_string()],
-        "the accepted refresh records the retirement"
+        vec!["call_bg".to_string(), "sh_call_bg".to_string()],
+        "the accepted refresh records the retirement, and the durable ending's \
+         own shell-id alias is seeded beside it (ADR-0080)"
     );
     let mut cards = platform.updated_cards().await;
     cards.extend(platform.replied_cards().await);
@@ -7029,17 +7031,18 @@ async fn a_wake_naming_a_reused_child_resolves_the_newest_run_into_one_record() 
     );
 }
 
-/// Acceptance (spec #699, ticket #704; ADR-0080): the alias order holds when a
-/// LAUNCHLESS Wake arrives FIRST. The Wake names the run by the shell id it
-/// reports alone, so its record is keyed by that shell id; the later
-/// launch-carrying **Runtime Reconciliation** read names the same run by its
-/// call id — and must RESOLVE that record (the launch's shell id is on it), not
-/// mint a second one. Two writers, either order, one record. (The rule is one
-/// entry per RUN, whatever class wrote it, so the run's already-shown Wake
-/// entry means the evidence ending adds no second entry — the record count is
-/// what this case pins.)
+/// Acceptance (spec #699, ticket #704; ADR-0080, CI gate): a LAUNCHLESS Wake
+/// arrives FIRST, so its record is keyed by the shell id it reports alone; a
+/// later launch-carrying read still lists the run, named by its call id — a
+/// DIFFERENT id than the record's key, but the same shell id. The alias-aware
+/// row pruning takes that row before the reconcile can act (ADR-0080: a run with
+/// a durable ending leaves the live list "so a later reconcile cannot
+/// resurrect it"), so the run renders no second entry: one record, one entry,
+/// however the read names the run. The store's own alias resolution — the rule
+/// the two writers share — is pinned directly by
+/// `chain::records::tests::the_alias_order_resolves_a_run_named_from_either_side`.
 #[tokio::test]
-async fn the_alias_order_holds_when_a_launchless_wake_arrives_first() {
+async fn a_launchless_wake_first_prunes_the_later_launch_carrying_row() {
     let _wd = test_work_dir();
     let now = chrono::Utc::now().timestamp_millis();
     // Life 1: the read carries the Wake but not the launch that named it.
@@ -7066,10 +7069,10 @@ async fn the_alias_order_holds_when_a_launchless_wake_arrives_first() {
         records[0].run
     );
 
-    // Life 2: a read that carries the launch, whose runtime verdict derives the
-    // run's evidence ending. It names the run by `call_bg`, and the shell id on
-    // the existing record resolves it to the SAME one — a second record would
-    // mean the two writers disagreed about the run.
+    // Life 2: a read that carries the launch and still lists the run, whose
+    // runtime verdict would derive the run's evidence ending. The row names the
+    // run by `call_bg`, but the shell id on the existing record resolves it — so
+    // the alias-aware prune takes the row first, and nothing is derived.
     script_transcript(&backend, vec![launched_shell_read("msg_cola_second", now)]).await;
     backend.task_runtime.lock().unwrap().shells = vec![("sh_call_bg".into(), ShellRuntime::Missing)];
     let mut second = ctx("ses_test", "再来一次");
@@ -7081,30 +7084,93 @@ async fn the_alias_order_holds_when_a_launchless_wake_arrives_first() {
     assert_eq!(
         records.len(),
         1,
-        "one record for the run, both writers: {records:?}"
+        "one record for the run, however the read names it: {records:?}"
     );
     assert!(
-        records[0].run.names("call_bg") && records[0].run.names("sh_call_bg"),
-        "the launch's call id folded into the record the Wake keyed by shell id: {:?}",
+        records[0].run.names("sh_call_bg"),
+        "the record stays keyed by the shell id the Wake named: {:?}",
         records[0].run
     );
+    let later = crate::backend::Backend::transcript(backend.as_ref(), "ses_test")
+        .await
+        .unwrap();
     assert!(
-        records[0]
-            .endings
-            .iter()
-            .any(|ending| ending.class == TaskEndingClass::Evidence),
-        "the verdict's evidence ending resolved the same record: {records:?}"
+        later.background_tasks.is_empty(),
+        "the durable ending keeps the run out of the ledger, however the read names it: {later:?}"
     );
     // The family's rule is one entry per RUN, whatever class wrote it
     // (ADR-0080): life 1's shown Wake ending already gave the run its entry, so
-    // the evidence retirement adds no second one. The point here is the RECORD
-    // count — one run, however it was named — and that the second writer never
-    // rendered a duplicate.
+    // the later read adds no second one.
     let mut bodies: Vec<String> = platform.updated_cards().await.iter().map(card_text).collect();
     bodies.extend(created_cards(&platform).await.iter().map(card_text));
     assert!(
         bodies.iter().all(|text| !text.contains("🔔 shell 已失联")),
         "a run whose Wake entry was shown gains no second retirement entry: {bodies:?}"
+    );
+}
+
+/// The gate's case (ADR-0080, CI gate): a launchless Wake keys the run's record
+/// by the SHELL id it reports; a later read carries the SAME run's row under a
+/// DIFFERENT call id (that read saw a launch the record does not key on) but the
+/// same shell id. The row must still leave the read — the pruning matches the
+/// run by EVERY id it is known by, never the row's call id alone — so the ledger
+/// is not live for a run that already has a durable ending. An unrelated row is
+/// left alone.
+#[tokio::test]
+async fn a_durable_ending_prunes_a_row_named_by_a_different_call_id() {
+    let _wd = test_work_dir();
+    // Life 1: the read carries the Wake but not the launch that named it, so the
+    // run's record is keyed by the shell id alone.
+    let read = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下构建并审阅"),
+        assistant(3_000, "恢复了。"),
+    ])
+    .with_executions(vec![execution(2_000), execution(4_000)])
+    .with_wakes(vec![launchless_shell_wake(2_500, "sh_call_bg")]);
+    let (_dir, app, backend, _platform) = scripted_app(vec![read], Some(SessionStatus::Idle)).await;
+    Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下构建并审阅"))
+        .await
+        .unwrap();
+    let records = app.cards_handle().chains.endings("ses_test");
+    assert_eq!(
+        records.len(),
+        1,
+        "the launchless Wake keys the record by the shell id: {records:?}"
+    );
+    assert!(records[0].run.names("sh_call_bg"));
+    assert!(
+        !records[0].run.names("call_bg"),
+        "the record does not key on the call id the later read carries: {:?}",
+        records[0].run
+    );
+
+    // Life 2: the read carries the run's row under `call_bg` — a DIFFERENT id
+    // than the record's key, but the same shell id — plus an unrelated row. No
+    // reconcile runs, so the durable ending is the only thing that can prune.
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(vec![user("msg_cola_second", 3_000, "再看看")]).with_background_tasks(
+                vec![live_shell(2_000, "call_bg"), live_shell(2_000, "call_other")],
+            ),
+        ],
+    )
+    .await;
+    let later = crate::backend::Backend::transcript(backend.as_ref(), "ses_test")
+        .await
+        .unwrap();
+    let ids: Vec<&str> = later
+        .background_tasks
+        .iter()
+        .map(|task| task.tool.call_id.as_str())
+        .collect();
+    assert!(
+        !ids.contains(&"call_bg"),
+        "the durable ending prunes the row named by a different call id: {later:?}"
+    );
+    assert!(
+        ids.contains(&"call_other"),
+        "an unrelated row is never pruned: {later:?}"
     );
 }
 

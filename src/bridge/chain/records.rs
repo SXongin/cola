@@ -706,6 +706,16 @@ fn resolve_run(records: &[TaskRunRecord], held: &TaskRunId) -> Option<usize> {
         .rposition(|record| held.ids().any(|id| record.run.names(id)))
 }
 
+/// Whether `records` already name the run `held` names — the alias-aware match
+/// the liveness tier's row pruning uses (ADR-0080). It reuses [`resolve_run`],
+/// so a READER of the section (a read's live row, named by whatever id that read
+/// carries) resolves a run by exactly the order every WRITER mints one — a row
+/// the read names by a different call id than the record's key still matches
+/// when they share any other id the run is known by.
+pub(crate) fn resolves_run(records: &[TaskRunRecord], held: &TaskRunId) -> bool {
+    resolve_run(records, held).is_some()
+}
+
 /// Whether an ending's entry is decided by the run's CLASS-AGNOSTIC gate — the
 /// retirement's one-entry-per-run rule ([`EndingFacts::shown_any`]), so a shown
 /// ending of ANY class gives this ending's entry up. The **Wake**'s completion
