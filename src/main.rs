@@ -132,9 +132,8 @@ fn default_log_path() -> std::path::PathBuf {
 /// are mandatory, so silently running on defaults is pointless) and exits
 /// non-zero.
 fn resolve_config_or_exit(explicit: &Option<String>) -> std::path::PathBuf {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-    match config::resolve_config_path(explicit.as_deref(), &cwd, &home) {
+    match config::resolve_path_from_env(explicit.as_deref()) {
         Some(path) => path,
         None => {
             let home_cfg = home.join(".cola").join("cola.toml");
@@ -671,13 +670,15 @@ fn report_restart(confirmed: bool) {
 /// stopping an instance it then cannot bring back.
 fn spawnable(program: &str) -> bool {
     let path = std::path::Path::new(program);
-    if path.is_file() {
+    if crate::update::is_executable_file(path) {
         return true;
     }
     if program.contains('/') || program.contains(std::path::MAIN_SEPARATOR) {
         return false;
     }
-    std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(program).is_file()))
+    std::env::var_os("PATH").is_some_and(|p| {
+        std::env::split_paths(&p).any(|d| crate::update::is_executable_file(&d.join(program)))
+    })
 }
 
 /// Spawn a detached cola from `exe` + `args`, appending `--replace` so it may
@@ -1199,16 +1200,40 @@ mod tests {
     }
 
     #[test]
-    fn spawnable_accepts_an_existing_file_and_rejects_a_missing_path() {
+    fn spawnable_accepts_an_executable_file_and_rejects_a_missing_path() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("cola");
         std::fs::write(&file, b"x").unwrap();
+        make_executable(&file);
         assert!(spawnable(file.to_str().unwrap()));
         // A path with a separator that does not exist is not spawnable.
         assert!(!spawnable("/nonexistent/dir/cola"));
         assert!(!spawnable("./definitely-not-here"));
         // A bare name that no PATH entry resolves is not spawnable either.
         assert!(!spawnable("cola-definitely-not-on-path-xyz"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawnable_rejects_a_non_executable_file() {
+        // A same-named file without an execute bit cannot be spawned.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("cola");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(!spawnable(file.to_str().unwrap()));
+    }
+
+    /// `chmod +x` where it exists; a no-op elsewhere.
+    fn make_executable(path: &std::path::Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(path, perms).unwrap();
+        }
+        #[cfg(not(unix))]
+        let _ = path;
     }
 
     #[test]

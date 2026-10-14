@@ -146,7 +146,11 @@ pub(crate) fn supervisor_binary_path() -> Option<std::path::PathBuf> {
     {
         macos::supervisor_binary_path()
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "windows")]
+    {
+        windows::supervisor_binary_path()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         None
     }
@@ -162,7 +166,9 @@ fn exe_path() -> anyhow::Result<String> {
 
 /// Read a supervisor config file and map its executable entry to a path
 /// (systemd `ExecStart=` / launchd `ProgramArguments`), shared by the
-/// platform-specific parsers.
+/// platform-specific parsers. Windows reads its `Run`-key value instead, so
+/// this has no caller there.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn parse_supervisor_binary(
     path: &std::path::Path,
     parse: fn(&str) -> Option<String>,
@@ -610,6 +616,7 @@ mod macos {
 #[cfg(target_os = "windows")]
 mod windows {
     use super::*;
+    use std::path::PathBuf;
 
     const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
     const VALUE: &str = "cola";
@@ -663,6 +670,28 @@ mod windows {
             _ => println!("cola autostart: not installed ({VALUE} absent from {RUN_KEY})"),
         }
         Ok(())
+    }
+
+    /// The binary path the `Run`-key value names — the Windows analogue of the
+    /// supervisor's `ExecStart`, so `cola doctor` can flag a stale registration
+    /// (a moved binary). The value is written double-quoted (`enable`).
+    pub(super) fn supervisor_binary_path() -> Option<PathBuf> {
+        let out = std::process::Command::new("reg")
+            .args(["query", RUN_KEY, "/v", VALUE])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        let value = text
+            .lines()
+            .find(|line| line.contains("REG_SZ"))
+            .and_then(|line| line.split("REG_SZ").nth(1))?
+            .trim()
+            .trim_matches('"')
+            .trim();
+        (!value.is_empty()).then(|| PathBuf::from(value))
     }
 }
 

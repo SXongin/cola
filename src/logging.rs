@@ -217,7 +217,17 @@ pub fn rotated_path(base: &Path, day: &str) -> PathBuf {
 /// a midnight rotation, which reopens the fresh base file.
 pub fn run_logs(base: &Path, follow: bool, lines: usize, date: Option<&str>) -> io::Result<()> {
     let path = match date {
-        Some(day) => rotated_path(base, day),
+        // The date is only ever an exact `YYYY-MM-DD`: anything else could
+        // carry path-traversal components and point the tail at another file.
+        Some(day) => {
+            if !is_date(day) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("--date 需要 YYYY-MM-DD，收到 {day:?}"),
+                ));
+            }
+            rotated_path(base, day)
+        }
         None => base.to_path_buf(),
     };
     if !path.exists() {
@@ -323,20 +333,25 @@ fn drain_complete_lines(pending: &mut Vec<u8>, out: &mut impl Write) -> io::Resu
     Ok(())
 }
 
-/// A stable identity for the file at `path`, used to notice rotation: on unix
-/// the `(device, inode)` pair. `None` elsewhere (rotation then falls back to the
-/// length-decrease check) and when the file is absent.
+/// A stable identity for the file at `path`, used to notice rotation. `None`
+/// when it cannot be read (rotation then falls back to the length-decrease
+/// check). Unchanged by appends; a rotation replaces the file at the path with a
+/// new one, so the identity moves.
 #[cfg(unix)]
-fn file_identity(path: &Path) -> Option<(u64, u64)> {
+fn file_identity(path: &Path) -> Option<u128> {
     use std::os::unix::fs::MetadataExt;
     let meta = std::fs::metadata(path).ok()?;
-    Some((meta.dev(), meta.ino()))
+    Some(((meta.dev() as u128) << 64) | meta.ino() as u128)
 }
 
-/// [`file_identity`]: no portable identity outside unix.
+/// [`file_identity`] elsewhere: the file's creation time stands in — a rotation
+/// creates a NEW file (a new timestamp), which an append never changes. The
+/// unix `(dev, ino)` pair is preferred where available because a creation
+/// timestamp has coarse filesystem resolution.
 #[cfg(not(unix))]
-fn file_identity(_path: &Path) -> Option<(u64, u64)> {
-    None
+fn file_identity(path: &Path) -> Option<u128> {
+    let created = std::fs::metadata(path).ok()?.created().ok()?;
+    Some(created.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos())
 }
 
 /// `YYYY-MM-DD` for the local timezone, as chrono is already a dependency.
@@ -543,6 +558,15 @@ mod tests {
         // `run_logs` with a date prints that day's file, not the base; the base
         // need not exist.
         run_logs(&base, false, 10, Some("2026-01-02")).unwrap();
+    }
+
+    #[test]
+    fn run_logs_rejects_a_non_date_selector() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("cola.log");
+        // A traversal component must be refused before it becomes a path.
+        let err = run_logs(&base, false, 10, Some("../secret")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]
