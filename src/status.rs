@@ -229,7 +229,10 @@ fn server_line(server: Option<&ServerStatus>, generation_override: &str) -> Stri
                 "{} (PID {}, 世代 {}，覆盖 {})",
                 s.url, s.pid, g, generation_override
             ),
-            None => format!("{} (PID {}, 世代未知：{})", s.url, s.pid, s.evidence),
+            None => format!(
+                "{} (PID {}, 世代未知：{}；覆盖 {})",
+                s.url, s.pid, s.evidence, generation_override
+            ),
         },
     }
 }
@@ -522,6 +525,12 @@ fn lock_check(state: crate::LockState) -> Check {
         crate::LockState::Foreign(pid) => {
             Check::warn("单例锁", format!("锁文件指向的 PID {pid} 不是 cola 进程"))
         }
+        // The file exists but is unusable: a failure, because a start would have
+        // to reclaim it and an operator must know the lock is corrupt.
+        crate::LockState::Malformed => Check::fail(
+            "单例锁",
+            "锁文件无法解析（内容不是 PID）；下次启动会回收，但建议检查".to_string(),
+        ),
     }
 }
 
@@ -679,6 +688,8 @@ mod tests {
             lock_check(crate::LockState::Foreign(42)).status,
             CheckStatus::Warn
         );
+        // A malformed lock file is a failure, not a healthy pass.
+        assert_eq!(lock_check(crate::LockState::Malformed).status, CheckStatus::Fail);
     }
 
     #[test]

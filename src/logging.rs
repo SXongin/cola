@@ -347,41 +347,58 @@ fn follow_file(
     pending: Vec<u8>,
     out: &mut impl Write,
 ) -> io::Result<()> {
-    use io::{Read, Seek, SeekFrom};
     let poll = std::time::Duration::from_millis(300);
     let mut identity = identity;
     let mut offset = start;
     let mut pending: Vec<u8> = pending;
     loop {
         std::thread::sleep(poll);
-        // Identity AND length come from the SAME opened handle, so a rotation
-        // between the two cannot pair a new file's length with an old offset
-        // (which would skip a prefix and then replay it as duplicates).
-        let Ok(mut file) = std::fs::File::open(path) else {
-            continue;
-        };
-        let Ok(meta) = file.metadata() else {
-            continue;
-        };
-        let current = handle_identity(&file);
-        let len = meta.len();
-        let (next, restarted) = resume(identity, current, offset, len);
-        identity = current;
-        offset = next;
-        if restarted {
-            pending.clear();
-        }
-        if len == offset {
-            continue;
-        }
+        let (i, o, p) = poll_file(path, identity, offset, pending, out)?;
+        identity = i;
+        offset = o;
+        pending = p;
+        out.flush()?;
+    }
+}
+
+/// One follow iteration: read whatever was appended since `offset` and emit the
+/// complete lines, returning the new `(identity, offset, pending)`. Split out
+/// from the loop so append/rotation/partial-line behavior is unit-testable; the
+/// loop itself only sleeps and calls this.
+///
+/// Identity AND length come from the SAME opened handle, so a rotation between
+/// the two cannot pair a new file's length with an old offset (which would skip
+/// a prefix and then replay it as duplicates). A missing file keeps the state
+/// (a rotation in progress) — the next poll reopens the fresh one.
+fn poll_file(
+    path: &Path,
+    identity: Option<u128>,
+    offset: u64,
+    mut pending: Vec<u8>,
+    out: &mut impl Write,
+) -> io::Result<(Option<u128>, u64, Vec<u8>)> {
+    use io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return Ok((identity, offset, pending));
+    };
+    let Ok(meta) = file.metadata() else {
+        return Ok((identity, offset, pending));
+    };
+    let current = handle_identity(&file);
+    let len = meta.len();
+    let (mut offset, restarted) = resume(identity, current, offset, len);
+    if restarted {
+        pending.clear();
+    }
+    if len != offset {
         file.seek(SeekFrom::Start(offset))?;
         let mut chunk = Vec::new();
         file.take(len - offset).read_to_end(&mut chunk)?;
         offset += chunk.len() as u64;
         pending.extend_from_slice(&chunk);
         drain_complete_lines(&mut pending, out)?;
-        out.flush()?;
     }
+    Ok((current, offset, pending))
 }
 
 /// Write every complete line in `pending` to `out`, leaving any trailing
@@ -649,6 +666,56 @@ mod tests {
         // Identity unavailable (non-unix): the shrink check still applies.
         assert_eq!(resume(None, None, 100, 150), (100, false));
         assert_eq!(resume(None, None, 100, 90), (0, true));
+    }
+
+    #[test]
+    fn poll_file_follows_appends_completes_partials_and_restarts_on_rotation() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cola.log");
+        std::fs::write(&path, b"one\n").unwrap();
+
+        // First poll with no prior state reads the whole file.
+        let mut out: Vec<u8> = Vec::new();
+        let (mut id, mut off, mut pend) = poll_file(&path, None, 0, Vec::new(), &mut out).unwrap();
+        assert_eq!(out, b"one\n");
+
+        // An append is read from the remembered offset.
+        {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(b"two\n").unwrap();
+        }
+        let (i2, o2, p2) = poll_file(&path, id, off, pend, &mut out).unwrap();
+        (id, off, pend) = (i2, o2, p2);
+        assert_eq!(out, b"one\ntwo\n");
+
+        // A partial line is buffered, not emitted...
+        {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(b"par").unwrap();
+        }
+        let (i3, o3, p3) = poll_file(&path, id, off, pend, &mut out).unwrap();
+        (id, off, pend) = (i3, o3, p3);
+        assert_eq!(out, b"one\ntwo\n", "an incomplete line is held back");
+        assert_eq!(pend, b"par");
+        // ...then emitted whole once its newline arrives.
+        {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(b"tial\n").unwrap();
+        }
+        let (i4, o4, p4) = poll_file(&path, id, off, pend, &mut out).unwrap();
+        (id, off, pend) = (i4, o4, p4);
+        assert_eq!(out, b"one\ntwo\npartial\n", "the line is not split");
+
+        // Rotation to a NEW file that is already larger than the old offset:
+        // identity forces a read from the top, so nothing is skipped.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"fresh\ntail\n").unwrap();
+        let (_, _, _) = poll_file(&path, id, off, pend, &mut out).unwrap();
+        assert_eq!(
+            out, b"one\ntwo\npartial\nfresh\ntail\n",
+            "a larger replacement file is read from byte zero"
+        );
     }
 
     #[cfg(unix)]
