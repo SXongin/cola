@@ -36,6 +36,9 @@ pub struct Status {
     /// a broken config; `false` with no path is "no config found".
     pub config_ok: bool,
     pub log_path: PathBuf,
+    /// The `[opencode] generation` override spelling (`auto`/`v1`/`v2`),
+    /// reported even when no server is running so a script can read it.
+    pub generation_override: String,
     pub server: Option<ServerStatus>,
 }
 
@@ -56,8 +59,6 @@ pub struct ServerStatus {
     /// The generation the attach probe resolved (`v1`/`v2`), `None` when the
     /// probe was inconclusive (never guessed).
     pub generation: Option<String>,
-    /// The `[opencode] generation` override spelling (`auto`/`v1`/`v2`).
-    pub override_setting: String,
     /// The probe's evidence — the detail line when the generation is unknown.
     pub evidence: String,
 }
@@ -119,6 +120,7 @@ pub async fn gather(state: &ConfigState, log_path: &Path) -> Status {
         None => (None, None),
     };
     let server = probe_server(cfg).await;
+    let generation_override = cfg.map(|c| c.opencode.generation).unwrap_or_default().to_string();
 
     Status {
         version: crate::version::display_version(),
@@ -130,6 +132,7 @@ pub async fn gather(state: &ConfigState, log_path: &Path) -> Status {
         config_path: state.path.clone(),
         config_ok: state.ok(),
         log_path: log_path.to_path_buf(),
+        generation_override,
         server,
     }
 }
@@ -155,14 +158,12 @@ async fn probe_server(cfg: Option<&Config>) -> Option<ServerStatus> {
             url: resolved.url,
             pid: candidate.pid,
             generation: Some(resolved.generation.as_str().to_string()),
-            override_setting: generation_override.to_string(),
             evidence: String::new(),
         }),
         Err(evidence) => Some(ServerStatus {
             url: candidate.url(),
             pid: candidate.pid,
             generation: None,
-            override_setting: generation_override.to_string(),
             evidence,
         }),
     }
@@ -184,7 +185,10 @@ pub fn render(s: &Status) -> String {
         }
     ));
     out.push_str(&format!("日志: {}\n", s.log_path.display()));
-    out.push_str(&format!("OpenCode: {}\n", server_line(s.server.as_ref())));
+    out.push_str(&format!(
+        "OpenCode: {}\n",
+        server_line(s.server.as_ref(), &s.generation_override)
+    ));
     out
 }
 
@@ -217,13 +221,13 @@ fn claimed_line(s: &Status) -> String {
     }
 }
 
-fn server_line(server: Option<&ServerStatus>) -> String {
+fn server_line(server: Option<&ServerStatus>, generation_override: &str) -> String {
     match server {
-        None => "未发现共享服务器（LAZY 启动或 attach-only）".to_string(),
+        None => format!("未发现共享服务器（LAZY 启动或 attach-only），覆盖 {generation_override}"),
         Some(s) => match &s.generation {
             Some(g) => format!(
                 "{} (PID {}, 世代 {}，覆盖 {})",
-                s.url, s.pid, g, s.override_setting
+                s.url, s.pid, g, generation_override
             ),
             None => format!("{} (PID {}, 世代未知：{})", s.url, s.pid, s.evidence),
         },
@@ -246,11 +250,11 @@ pub fn render_json(s: &Status) -> serde_json::Value {
         "config_path": s.config_path.as_ref().map(|p| p.display().to_string()),
         "config_ok": s.config_ok,
         "log_path": s.log_path.display().to_string(),
+        "generation_override": s.generation_override,
         "opencode": s.server.as_ref().map(|s| serde_json::json!({
             "url": s.url,
             "pid": s.pid,
             "generation": s.generation,
-            "generation_override": s.override_setting,
             "evidence": s.evidence,
         })),
     })
@@ -540,11 +544,11 @@ mod tests {
             config_path: Some(PathBuf::from("/home/u/cola.toml")),
             config_ok: true,
             log_path: PathBuf::from("/home/u/.cola/cola.log"),
+            generation_override: "auto".into(),
             server: Some(ServerStatus {
                 url: "http://localhost:4096".into(),
                 pid: 99,
                 generation: Some("v2".into()),
-                override_setting: "auto".into(),
                 evidence: String::new(),
             }),
         }
@@ -604,7 +608,6 @@ mod tests {
                 url: "http://localhost:49374".into(),
                 pid: 7,
                 generation: None,
-                override_setting: "auto".into(),
                 evidence: "GET /api/info -> 503 (migrating)".into(),
             }),
             ..sample_status()
@@ -621,6 +624,7 @@ mod tests {
         assert_eq!(v["autostart"]["registered"], true);
         assert_eq!(v["autostart"]["binary"], "/usr/local/bin/cola");
         assert_eq!(v["claimed"], true);
+        assert_eq!(v["generation_override"], "auto");
         assert_eq!(v["opencode"]["generation"], "v2");
         assert_eq!(v["opencode"]["pid"], 99);
     }
@@ -639,6 +643,8 @@ mod tests {
         assert!(v["claimed"].is_null());
         assert!(v["config_path"].is_null());
         assert!(v["opencode"].is_null());
+        // The override is still readable with no server running.
+        assert_eq!(v["generation_override"], "auto");
     }
 
     #[test]
