@@ -400,7 +400,13 @@ async fn doctor_checks(state: &ConfigState, log_path: &Path) -> Vec<Check> {
                     current.display()
                 ),
             )),
-            Err(_) => {}
+            // The registered path exists, but our own binary is not on disk (a
+            // replaced/unlinked install): the comparison cannot be made, so
+            // report a warning rather than dropping the check.
+            Err(_) => checks.push(Check::warn(
+                "自启动二进制",
+                format!("注册指向 {}，但当前二进制不在磁盘上，无法比较", bin.display()),
+            )),
         },
         // A registration exists but its executable could not be read (a
         // malformed unit/plist/Run value): the requested check must still

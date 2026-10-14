@@ -354,16 +354,20 @@ impl SingletonLock {
                         // Owner died, turned zombie, or is mid-exit between the
                         // stale check and the open; loop to reclaim it and retry.
                         Ok(_) => {}
-                        // Malformed/empty content — no PID to judge, and
-                        // `stale_lock_owner` cannot reclaim it either (it parses
-                        // a PID). Remove it here, or the loop below spins
-                        // forever on a lock no one can use.
+                        // Content that is not a PID: no owner to verify. Removing
+                        // it here would race a concurrent starter — both read the
+                        // same bogus content, one removes-and-creates a valid
+                        // lock, the other then removes THAT and creates its own,
+                        // and two colas hold the lock. Fail closed instead (the
+                        // lock's existence is the mutex; the PID is only
+                        // advisory), and let the operator clear it — `cola doctor`
+                        // reports it as a failure.
                         Err(_) => {
-                            tracing::warn!(
-                                "Removing malformed singleton lock at {} (no PID to check)",
+                            anyhow::bail!(
+                                "单例锁文件内容无法解析（{}）—— 为避免两个实例同时运行，\
+                                 拒绝启动。确认没有 cola 在运行后删除该文件再启动。",
                                 path.display()
-                            );
-                            let _ = std::fs::remove_file(&path);
+                            )
                         }
                     }
                 }
@@ -1227,17 +1231,23 @@ mod tests {
     }
 
     #[test]
-    fn acquire_at_reclaims_a_malformed_lock() {
-        // Regression: a lock file whose content is not a PID used to spin the
-        // acquire loop forever (`stale_lock_owner` cannot parse it, and the
-        // open keeps failing with AlreadyExists). It must be reclaimed.
+    fn acquire_at_refuses_a_malformed_lock() {
+        // Regression: a lock whose content is not a PID used to spin the acquire
+        // loop forever (`stale_lock_owner` cannot parse it, and the open keeps
+        // failing with AlreadyExists). It must neither hang NOR be reclaimed —
+        // reclaiming races a concurrent starter into a double acquisition — so
+        // it fails closed with an actionable error.
         let home = tempfile::tempdir().unwrap();
         let lock = home.path().join("cola.lock");
         std::fs::write(&lock, "not a pid").unwrap();
-        match SingletonLock::acquire_at(lock).unwrap() {
-            AcquireOutcome::Acquired(_) => {}
-            AcquireOutcome::HeldByInstance { .. } => panic!("a malformed lock must be reclaimed"),
+        match SingletonLock::acquire_at(lock.clone()) {
+            Ok(_) => panic!("a malformed lock must fail closed, not be acquired"),
+            Err(e) => assert!(
+                e.to_string().contains("无法解析"),
+                "the error must explain the lock: {e}"
+            ),
         }
+        assert!(lock.exists(), "fail-closed must leave the file for the operator");
     }
 
     #[test]
@@ -1383,10 +1393,18 @@ mod tests {
         // `--config`/`./cola.toml` resolves as before.
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("where");
-        let script = format!("pwd > {}", marker.display());
+        let arg0 = dir.path().join("arg0");
+        // `$0` is the first word after the `-c` script — i.e. the argument
+        // `spawn_detached` appends — so this also pins that the replacement
+        // carries `--replace` (the takeover the restart relies on).
+        let script = format!(
+            "pwd > {}; printf '%s' \"$0\" > {}",
+            marker.display(),
+            arg0.display()
+        );
         spawn_detached("sh", &["-c".to_string(), script], Some(dir.path())).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::time::Instant::now() < deadline && !marker.exists() {
+        while std::time::Instant::now() < deadline && !(marker.exists() && arg0.exists()) {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         let printed = std::fs::read_to_string(&marker).expect("child wrote its cwd");
@@ -1394,6 +1412,11 @@ mod tests {
         assert_eq!(
             std::fs::canonicalize(printed.trim()).unwrap(),
             std::fs::canonicalize(dir.path()).unwrap()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&arg0).unwrap(),
+            "--replace",
+            "the detached replacement must carry --replace"
         );
     }
 
