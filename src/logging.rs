@@ -216,6 +216,18 @@ pub fn rotated_path(base: &Path, day: &str) -> PathBuf {
 /// and, with `follow`, stream new lines as they are appended — including across
 /// a midnight rotation, which reopens the fresh base file.
 pub fn run_logs(base: &Path, follow: bool, lines: usize, date: Option<&str>) -> io::Result<()> {
+    run_logs_to(base, follow, lines, date, &mut io::stdout())
+}
+
+/// [`run_logs`] over an explicit writer, so the selection and the tail are
+/// unit-testable without capturing the process's stdout.
+pub fn run_logs_to(
+    base: &Path,
+    follow: bool,
+    lines: usize,
+    date: Option<&str>,
+    out: &mut impl Write,
+) -> io::Result<()> {
     let path = match date {
         // The date is only ever an exact `YYYY-MM-DD`: anything else could
         // carry path-traversal components and point the tail at another file.
@@ -235,13 +247,12 @@ pub fn run_logs(base: &Path, follow: bool, lines: usize, date: Option<&str>) -> 
         return Ok(());
     }
     let tail = tail_lines(&path, lines)?;
-    let mut out = io::stdout();
     for line in &tail {
         writeln!(out, "{line}")?;
     }
     out.flush()?;
     if follow {
-        follow_file(&path, &mut out)?;
+        follow_file(&path, out)?;
     }
     Ok(())
 }
@@ -287,17 +298,25 @@ fn tail_lines(path: &Path, n: usize) -> io::Result<Vec<String>> {
 fn follow_file(path: &Path, out: &mut impl Write) -> io::Result<()> {
     use io::{Read, Seek, SeekFrom};
     let poll = std::time::Duration::from_millis(300);
-    let mut identity = file_identity(path);
-    let mut offset = std::fs::metadata(path)?.len();
+    let opener = std::fs::File::open(path)?;
+    let mut identity = handle_identity(&opener);
+    let mut offset = opener.metadata()?.len();
+    drop(opener);
     let mut pending: Vec<u8> = Vec::new();
     loop {
         std::thread::sleep(poll);
-        let Ok(meta) = std::fs::metadata(path) else {
+        // Identity AND length come from the SAME opened handle, so a rotation
+        // between the two cannot pair a new file's length with an old offset
+        // (which would skip a prefix and then replay it as duplicates).
+        let Ok(mut file) = std::fs::File::open(path) else {
+            continue;
+        };
+        let Ok(meta) = file.metadata() else {
             continue;
         };
         // A new file at the same path (rotation) restarts from the top: only
         // comparing lengths would miss a fresh base that grew past the offset.
-        let current = file_identity(path);
+        let current = handle_identity(&file);
         if current != identity {
             identity = current;
             offset = 0;
@@ -311,7 +330,6 @@ fn follow_file(path: &Path, out: &mut impl Write) -> io::Result<()> {
         if len == offset {
             continue;
         }
-        let mut file = std::fs::File::open(path)?;
         file.seek(SeekFrom::Start(offset))?;
         let mut chunk = Vec::new();
         file.take(len - offset).read_to_end(&mut chunk)?;
@@ -333,24 +351,25 @@ fn drain_complete_lines(pending: &mut Vec<u8>, out: &mut impl Write) -> io::Resu
     Ok(())
 }
 
-/// A stable identity for the file at `path`, used to notice rotation. `None`
+/// A stable identity for an OPEN file handle, used to notice rotation. `None`
 /// when it cannot be read (rotation then falls back to the length-decrease
 /// check). Unchanged by appends; a rotation replaces the file at the path with a
-/// new one, so the identity moves.
+/// new one, so the identity moves. Read from the handle itself — never from the
+/// path — so it always describes the bytes the caller is about to read.
 #[cfg(unix)]
-fn file_identity(path: &Path) -> Option<u128> {
+fn handle_identity(file: &std::fs::File) -> Option<u128> {
     use std::os::unix::fs::MetadataExt;
-    let meta = std::fs::metadata(path).ok()?;
+    let meta = file.metadata().ok()?;
     Some(((meta.dev() as u128) << 64) | meta.ino() as u128)
 }
 
-/// [`file_identity`] elsewhere: the file's creation time stands in — a rotation
-/// creates a NEW file (a new timestamp), which an append never changes. The
-/// unix `(dev, ino)` pair is preferred where available because a creation
-/// timestamp has coarse filesystem resolution.
+/// [`handle_identity`] elsewhere: the file's creation time stands in — a
+/// rotation creates a NEW file (a new timestamp), which an append never
+/// changes. The unix `(dev, ino)` pair is preferred where available because a
+/// creation timestamp has coarse filesystem resolution.
 #[cfg(not(unix))]
-fn file_identity(path: &Path) -> Option<u128> {
-    let created = std::fs::metadata(path).ok()?.created().ok()?;
+fn handle_identity(file: &std::fs::File) -> Option<u128> {
+    let created = file.metadata().ok()?.created().ok()?;
     Some(created.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos())
 }
 
@@ -535,18 +554,18 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn file_identity_changes_when_the_file_is_replaced() {
+    fn handle_identity_changes_when_the_file_is_replaced() {
         // Rotation writes a NEW file at the same path; identity must move so the
         // follow loop restarts from the top even if the new file grew past the
         // old offset.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cola.log");
         std::fs::write(&path, b"one\n").unwrap();
-        let first = file_identity(&path);
+        let first = handle_identity(&std::fs::File::open(&path).unwrap());
         std::fs::remove_file(&path).unwrap();
         std::fs::write(&path, b"two\n").unwrap();
         assert!(first.is_some());
-        assert_ne!(first, file_identity(&path));
+        assert_ne!(first, handle_identity(&std::fs::File::open(&path).unwrap()));
     }
 
     #[test]
@@ -555,9 +574,22 @@ mod tests {
         let base = dir.path().join("cola.log");
         let dated = rotated_path(&base, "2026-01-02");
         std::fs::write(&dated, b"old one\nold two\n").unwrap();
-        // `run_logs` with a date prints that day's file, not the base; the base
-        // need not exist.
-        run_logs(&base, false, 10, Some("2026-01-02")).unwrap();
+        // The date picks that day's file, not the (absent) base: the output must
+        // carry the dated file's content, so a `--date` that were ignored would
+        // fail here.
+        let mut out: Vec<u8> = Vec::new();
+        run_logs_to(&base, false, 10, Some("2026-01-02"), &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "old one\nold two\n");
+    }
+
+    #[test]
+    fn run_logs_to_prints_the_base_tail_without_a_date() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("cola.log");
+        std::fs::write(&base, b"a\nb\nc\n").unwrap();
+        let mut out: Vec<u8> = Vec::new();
+        run_logs_to(&base, false, 2, None, &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "b\nc\n");
     }
 
     #[test]
