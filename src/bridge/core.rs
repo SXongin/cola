@@ -171,6 +171,11 @@ pub struct SharedCore {
     /// long notifies on completion. Injectable for tests (the external
     /// poller's interval-atomics pattern).
     pub long_task_notice_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// The Completion Notice's repaint delay (ms, #650): how long the notice
+    /// waits after its terminal write's carrier is accepted before it is sent,
+    /// so the client has a chance to repaint the card first. Injectable for
+    /// tests (the same atomics pattern as the threshold above).
+    pub completion_notice_delay_ms: Arc<std::sync::atomic::AtomicU64>,
     /// The Instant Reminder lifecycle (ADR-0043, from `[bridge] instant_reminder`): pins a
     /// Chat/Topic while a Permission/Question is pending. Off means every
     /// method is a no-op — no reminder call is ever made.
@@ -260,6 +265,12 @@ impl SharedCore {
         let long_task_notice_ms = Arc::new(std::sync::atomic::AtomicU64::new(
             crate::bridge::turn::LONG_TASK_NOTICE_MS,
         ));
+        // The Completion Notice's repaint delay (#650): created once beside the
+        // threshold, for the same reason — the Turn's endings and Session Sync's
+        // quiet true-end settle must read the SAME atomic.
+        let completion_notice_delay_ms = Arc::new(std::sync::atomic::AtomicU64::new(
+            crate::bridge::turn::COMPLETION_NOTICE_DELAY_MS,
+        ));
         // The durable Chain Record, created once beside the Background Task
         // State handle that seeds from it (ADR-0069/0079).
         let chains = Arc::new(crate::bridge::chain::ChainRecords::load(
@@ -295,6 +306,7 @@ impl SharedCore {
                     cfg.bridge.group_completion_notice,
                     cfg.bridge.long_task_notice,
                     Arc::clone(&long_task_notice_ms),
+                    Arc::clone(&completion_notice_delay_ms),
                 ),
             )),
             snapshot_claims: Arc::new(Mutex::new(
@@ -318,6 +330,7 @@ impl SharedCore {
             group_completion_notice: cfg.bridge.group_completion_notice,
             long_task_notice: cfg.bridge.long_task_notice,
             long_task_notice_ms,
+            completion_notice_delay_ms,
             reminder: Arc::new(crate::bridge::reminder::ReminderState::new(
                 cfg.bridge.instant_reminder,
                 // The persisted pin set lives beside the session mapping
@@ -470,6 +483,7 @@ impl SharedCore {
             Arc::clone(&self.turn_render_poll_ms),
             Arc::clone(&self.turn_follow_grace_ms),
             Arc::clone(&self.turn_follow_read_timeout_ms),
+            Arc::clone(&self.completion_notice_delay_ms),
             self.work_dir.clone(),
         )
     }

@@ -1246,6 +1246,10 @@ pub(crate) struct TurnConfig {
     pub(crate) long_task_notice: bool,
     /// The long-task notice threshold (ms); injectable for tests.
     pub(crate) long_task_notice_ms: Arc<AtomicU64>,
+    /// The Completion Notice's repaint delay (ms, #650): how long a notice waits
+    /// after its terminal write's carrier is accepted before it is sent;
+    /// injectable for tests.
+    pub(crate) completion_notice_delay_ms: Arc<AtomicU64>,
     /// A Turn's render poll cadence (ms); injectable for tests.
     pub(crate) turn_render_poll_ms: Arc<AtomicU64>,
     /// The single grace (ms) on the post-prompt path (#603): the merged
@@ -1269,6 +1273,7 @@ impl TurnConfig {
         turn_render_poll_ms: Arc<AtomicU64>,
         turn_follow_grace_ms: Arc<AtomicU64>,
         turn_follow_read_timeout_ms: Arc<AtomicU64>,
+        completion_notice_delay_ms: Arc<AtomicU64>,
         work_dir: Option<String>,
     ) -> Self {
         Self {
@@ -1278,6 +1283,7 @@ impl TurnConfig {
             turn_render_poll_ms,
             turn_follow_grace_ms,
             turn_follow_read_timeout_ms,
+            completion_notice_delay_ms,
             work_dir,
         }
     }
@@ -1324,20 +1330,23 @@ impl TurnConfig {
             self.group_completion_notice,
             self.long_task_notice,
             Arc::clone(&self.long_task_notice_ms),
+            Arc::clone(&self.completion_notice_delay_ms),
         )
     }
 }
 
 /// The Completion Notice's opt-in rules (ADR-0043 amendment 2026-09-21), split
 /// out of [`TurnConfig`] for callers that are not a Turn: whether groups notify,
-/// whether a long p2p run notifies, and the injectable threshold. The threshold
-/// stays the SAME atomic as the Turn config's, so a test that stores a tiny
-/// value moves both clock readers at once.
+/// whether a long p2p run notifies, the injectable threshold, and the repaint
+/// delay the send waits out (#650). The threshold and the delay stay the SAME
+/// atomics as the Turn config's, so a test that stores a tiny value moves both
+/// clock readers at once.
 #[derive(Clone)]
 pub(crate) struct NoticeRules {
     pub(crate) group_completion_notice: bool,
     pub(crate) long_task_notice: bool,
     long_task_notice_ms: Arc<AtomicU64>,
+    completion_notice_delay_ms: Arc<AtomicU64>,
 }
 
 impl NoticeRules {
@@ -1345,16 +1354,24 @@ impl NoticeRules {
         group_completion_notice: bool,
         long_task_notice: bool,
         long_task_notice_ms: Arc<AtomicU64>,
+        completion_notice_delay_ms: Arc<AtomicU64>,
     ) -> Self {
         Self {
             group_completion_notice,
             long_task_notice,
             long_task_notice_ms,
+            completion_notice_delay_ms,
         }
     }
 
     pub(crate) fn long_task_notice_ms(&self) -> u64 {
         self.long_task_notice_ms.load(Ordering::Relaxed)
+    }
+
+    /// The repaint delay (ms) the notice waits out after its terminal write's
+    /// carrier is accepted (#650, ADR-0074 §3's amendment).
+    pub(crate) fn completion_notice_delay_ms(&self) -> u64 {
+        self.completion_notice_delay_ms.load(Ordering::Relaxed)
     }
 }
 

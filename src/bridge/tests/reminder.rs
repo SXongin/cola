@@ -458,6 +458,8 @@ async fn a_long_p2p_turn_sends_a_completion_notice() {
     gate.add_permits(1);
     turn.await.unwrap().unwrap();
 
+    // The notice's send is spawned (#650): await it before asserting.
+    super::drain::wait_for_notice(&platform).await;
     let notices = platform.completion_notices().await;
     assert_eq!(notices.len(), 1, "one notice: {notices:?}");
     assert_eq!(notices[0].0, "msg_1", "it replies to the prompt");

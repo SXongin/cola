@@ -422,6 +422,8 @@ async fn a_split_registers_the_continuation_card() {
 /// Card's send. The continuation create carries no owed Pending Card Update, so
 /// the notice's gate answers "delivered now", and the send it follows has
 /// already happened — the notice trails the new card rather than preceding it.
+/// The repaint delay (#650) is injected small: the ordering property is what
+/// this test pins, and its companion below pins the delay itself.
 #[tokio::test]
 async fn a_size_split_terminal_write_notifies_after_the_new_card() {
     let _wd = test_work_dir();
@@ -454,6 +456,11 @@ async fn a_size_split_terminal_write_notifies_after_the_new_card() {
     let terminal_card = Turn::card_message_id(&cards, "ses_split")
         .await
         .expect("the continuation card is the session's current card");
+    // A repaint delay the notice must wait out (#650): its send is spawned, so
+    // the ordering assertion below has to await the notice rather than assume it
+    // already landed.
+    app.completion_notice_delay_ms
+        .store(100, std::sync::atomic::Ordering::Relaxed);
     let before = platform.calls.lock().await.len();
 
     crate::bridge::turn::announce_completion(
@@ -466,6 +473,7 @@ async fn a_size_split_terminal_write_notifies_after_the_new_card() {
         Some(&terminal_card),
     )
     .await;
+    super::drain::wait_for_notice(&platform).await;
 
     let calls = platform.calls.lock().await.clone();
     let reply_at = calls
@@ -481,6 +489,119 @@ async fn a_size_split_terminal_write_notifies_after_the_new_card() {
         reply_at < notice_at,
         "the notice must follow the new card's send: {calls:?}"
     );
+}
+
+/// #650 (ADR-0074 §3's amendment): the card's ownership is re-checked AFTER the
+/// notice's repaint delay, so a card a newer Turn replaced (or a collect took)
+/// while the notice waited never has the old request's ending announced to its
+/// requester.
+#[tokio::test]
+async fn a_card_replaced_during_the_notice_delay_suppresses_the_notice() {
+    let _wd = test_work_dir();
+    let (_dir, app, platform, cards) = swap_app().await;
+    // A delay long enough to place the replacement *inside* it, and long enough
+    // that a re-check taken before the sleep (the design this pins against) would
+    // have already passed.
+    app.completion_notice_delay_ms
+        .store(500, std::sync::atomic::Ordering::Relaxed);
+    announce_swap(&app, &cards).await;
+
+    // A newer Turn replaces the card while the notice waits its delay out —
+    // after any check taken at arm time, before the delay ends.
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    Turn::seed_card(&cards, "ses_swap", Some("om_replacement")).await;
+
+    // Past the delay's end: a check taken after it saw the replacement and
+    // suppressed the notice, while a check taken before it would have sent one.
+    tokio::time::sleep(std::time::Duration::from_millis(450)).await;
+    assert!(
+        !super::drain::noticed(&platform).await,
+        "a replaced card must suppress the old request's notice: {:?}",
+        platform.calls.lock().await
+    );
+}
+
+/// #650: the re-check also covers a card that is GONE. A collect during the
+/// delay leaves no card to announce on, so the notice is suppressed rather than
+/// sent over a card that has been taken away.
+#[tokio::test]
+async fn a_collect_during_the_notice_delay_suppresses_the_notice() {
+    let _wd = test_work_dir();
+    let (_dir, app, platform, cards) = swap_app().await;
+    app.completion_notice_delay_ms
+        .store(500, std::sync::atomic::Ordering::Relaxed);
+    announce_swap(&app, &cards).await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    Turn::drop_card(&cards, "ses_swap").await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(450)).await;
+    assert!(
+        !super::drain::noticed(&platform).await,
+        "a collected card must suppress the old request's notice: {:?}",
+        platform.calls.lock().await
+    );
+}
+
+/// #650: the production default is the constant, wired once in `SharedCore::new`
+/// — every other notice test injects its own value or runs on a fixture that
+/// zeroes it, so a zeroed or mis-wired default would otherwise go unnoticed.
+#[tokio::test]
+async fn the_notice_delay_defaults_to_its_constant() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = Arc::new(MockBackend::new(realistic_parts()));
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend, platform).unwrap());
+
+    let delay = app
+        .completion_notice_delay_ms
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        delay,
+        crate::bridge::turn::COMPLETION_NOTICE_DELAY_MS,
+        "SharedCore::new wires the notice's repaint delay to its constant"
+    );
+    assert!(
+        delay >= 3_000,
+        "the delay is the few seconds ADR-0074 §3's amendment fixes, never a token: {delay} ms"
+    );
+}
+
+/// A session with a terminal card and the notice's recipient, for the two
+/// delay-suppression tests above.
+async fn swap_app() -> (
+    tempfile::TempDir,
+    Arc<App>,
+    Arc<RecordingPlatform>,
+    crate::bridge::handles::CardsHandle,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = Arc::new(MockBackend::new(realistic_parts()));
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend, platform.clone()).unwrap());
+    let cards = app.cards_handle();
+    Turn::seed_card(&cards, "ses_swap", Some("om_filled")).await;
+    Turn::set_card_state(&cards, "ses_swap", CardState::Done).await;
+    Turn::set_reply_target(&cards, "ses_swap", "msg_1").await;
+    Turn::set_turn_identity(&cards, "ses_swap", TEST_HOST, true, 1).await;
+    (dir, app, platform, cards)
+}
+
+/// Announce the terminal card `swap_app` seeded, as the ending path would.
+async fn announce_swap(app: &Arc<App>, cards: &crate::bridge::handles::CardsHandle) {
+    crate::bridge::turn::announce_completion(
+        cards,
+        &app.feishu,
+        &app.turn_config().notice_rules(),
+        "ses_swap",
+        std::time::Instant::now(),
+        &crate::bridge::turn::Disposition::Done,
+        Some("om_filled"),
+    )
+    .await;
 }
 
 /// A partial answer click on a card that is no longer the accumulator's
