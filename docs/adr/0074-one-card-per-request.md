@@ -1,5 +1,12 @@
 # One card per request: one unbounded post-prompt path, honest continuations, and a delivered Completion Notice
 
+> **Amended 2026-10-14 (#650)**: §3's promise is narrowed. The gate guarantees
+> *send* order — the notice is sent only after the terminal write's carrier is
+> accepted — never *client-visible* order: a card PATCH pushes nothing while the
+> notice is a new message, and no Feishu API reports that a client has repainted.
+> The notice now also **waits out a repaint delay** before it is sent, and the
+> delay's losses are ratified as residuals. See the amendment at the end.
+
 ## Context
 
 On a long Turn a Feishu user saw the card lifecycle lie in three ways, and all
@@ -181,6 +188,105 @@ call it followed.
   follow grace and the follow read timeout remain the surface an operator
   tunes.
 
-Related: #602, #603, #604, #605, #606, #607, #493, #511, #512, ADR-0043,
+## Amendment (2026-10-14): the notice waits out a repaint delay — the gate's promise is send order, not client-visible order
+
+Issue #650, live 2026-10-10 (p2p, `long_task_notice = true`): on turns longer
+than five minutes the plain-text 「✅ 已完成。」 still surfaced ahead of the final
+answer on the Card — the very symptom #512 set out to remove — on a build
+carrying every #602/#607 commit. The API-level order was already correct: the
+chat's own timeline (`im/v1/messages`, `update_time`) showed each notice
+0.56–0.72 s *after* its turn's terminal card PATCH, and no same-turn card write
+after any notice. §3's gate was doing its job; the residual inversion is
+client-side and no gate can see it:
+
+- the notice is a **new** message, so Feishu **pushes** it (notification, newest
+  line, unread badge);
+- the card is a **PATCH** to an existing message, which pushes nothing — the
+  client repaints it asynchronously, and a large card (the terminal PATCH
+  re-renders the live slice — up to `MAX_CARD_TEXT_CHARS` of body plus its
+  panels) does not repaint in ~0.6 s.
+
+No Feishu API reports a client repaint, so no rule at this seam can close the
+gap: `im/v1/messages/{id}/read_users` and `im.message.message_read_v1` are
+message-level read receipts (the bot's own sends, a 7-day window) that say
+nothing about an update; the card PATCH has no notify option; card JSON 2.0's
+`config` has no notification field; and every bot message into p2p or a group
+pushes — the only non-notifying send, `ephemeral/v1/send`, is group-only,
+online-only and explicitly unpatchable.
+
+**The decision.** A Completion Notice is sent once the terminal write's carrier
+is accepted **and** the repaint delay has elapsed:
+
+- **`COMPLETION_NOTICE_DELAY_MS` (3 000 ms)** — a constant with a test-injectable
+  atomic, like `LONG_TASK_NOTICE_MS` (a constant, not a config key: the value is
+  a judgement call no operator can measure either).
+- **One rule for every carrier.** The wait is clocked from the carrier's
+  acceptance — the direct PATCH's return, the size-split continuation create, or
+  the drain that delivers the owed retry — never from arming: an ending that is
+  owed waits the delay *after* its drain fires, not from the flush that armed
+  it. The clock is read when the send is *scheduled*, which is at or after
+  acceptance (the ending path does its topic-cover update in between), so the
+  guarantee is the one the promise states: the notice never trails acceptance by
+  *less* than the delay, and may trail it by more.
+- **The delay and the send run on a spawned task**, so no caller ever waits
+  them out: the Turn's `finish` releases its busy guard at once, Session Sync's
+  quiet settle never stalls a pass, and the delivery layer's drain is not
+  extended. The three send sites collapse into one entry point (`spawn_notice`),
+  which replaces `deliver_deferred_notice`.
+- **Ownership is re-checked after the delay.** A card a newer Turn replaced (or
+  a collect took) while the notice waited suppresses it — the same rule the
+  announce already applied to a card replaced *before* it — and the recipient
+  is still resolved against the **captured** card, never a re-read. The identity
+  is the card's message id, the name cola gives a card everywhere, and it is
+  sufficient here: a fresh Turn installs its card with no id at all
+  (`install_fresh_session`) and takes the id of the loading card `reply_card`
+  creates for *it* — a retry and a takeover included — so a newer request can
+  never answer for an older card's id; and the one id reused on purpose (a Wake
+  resuming its own waiting card in place) is the same request continuing, which
+  is what the notice announces anyway. The delay also never outlives a process,
+  so the window a restart could have created does not exist (residual 2 below).
+
+**§3's promise, restated.** The gate guarantees that the notice is not sent
+before the terminal write's carrier is accepted, and that it trails that
+acceptance by at least the delay. It does **not** guarantee that the user sees
+the final answer first — that fact lives in the client, and nothing on the wire
+exposes it. Story 3 of spec #602 reads this way from here on.
+
+**Ratified residuals** (a heuristic is only honest with its losses named):
+
+1. **The delay may be too short.** A very large card on a slow client can still
+   repaint after it and the notice then lands first. That is exactly what the
+   restated promise covers; tuning is one constant.
+2. **A notice still in its delay dies with the process.** Nothing about the
+   notice is durable — it never was, and it rides no staged structure.
+3. **An armed notice is still lost to stage eviction, supersession or a
+   permanent refusal** — unchanged, and the delay sits *after* firing, so it adds
+   no new ownership (pinned by `an_evicted_owed_write_suppresses_the_notice`).
+4. **Every notice now trails its turn's end by the delay** (groups included) —
+   the deliberate cost of one rule.
+
+**Tests.** The four acceptance tests named below are rewritten to the delayed
+rule — `a_direct_terminal_patch_notifies_at_once` becomes
+`a_delivered_terminal_write_notifies_only_after_the_delay` (the gate still never
+defers a delivered write; the send just waits its delay, and the turn's guard is
+released meanwhile), and
+`a_queued_ending_patch_notifies_only_after_it_drains`,
+`a_size_split_terminal_write_notifies_after_the_new_card` /
+`a_size_split_terminal_flush_notifies_after_the_new_card` and
+`a_quiet_settle_defers_the_notice_until_the_retry_drains` assert the notice
+*arrives* rather than that it was already sent — the queued one also pinning
+that the delay's clock starts at delivery, not at arming. New:
+`the_notice_delay_never_blocks_the_turn` (a 60 s delay cannot hold
+`Turn::run`, so the send is spawned) and
+`a_card_replaced_during_the_notice_delay_suppresses_the_notice`. Two #602
+review-ordering tests change shape with it:
+`a_replace_between_captures_never_redirects_a_delivered_notice` now pins
+suppression across the capture→send window (the window the delay creates), and
+`a_delivered_notice_uses_the_original_recipient` still pins the captured
+recipient. The bridge fixtures inject a zero delay except in the tests that pin
+it (`scripted_app_with`, `build_app`), because the production value is a
+wall-clock wait with nothing for a test to observe.
+
+Related: #602, #603, #604, #605, #606, #607, #493, #511, #512, #650, ADR-0043,
 ADR-0050, ADR-0056, ADR-0059, ADR-0060, ADR-0061, ADR-0066, ADR-0070,
 ADR-0072.
