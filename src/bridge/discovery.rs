@@ -434,6 +434,22 @@ pub fn process_cmd(pid: i32) -> Option<Vec<String>> {
         .map(|p| p.cmd().iter().map(|s| s.to_string_lossy().into_owned()).collect())
 }
 
+/// The executable a process is running, from sysinfo (None if not visible or
+/// the platform does not report it). `cola restart` uses it to re-exec the lock
+/// holder by its own absolute binary path rather than a possibly-relative
+/// argv[0] (ADR-0081).
+pub fn process_exe(pid: i32) -> Option<std::path::PathBuf> {
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[Pid::from_u32(pid as u32)]),
+        false,
+        ProcessRefreshKind::nothing().with_exe(UpdateKind::Always),
+    );
+    system
+        .process(Pid::from_u32(pid as u32))
+        .and_then(|p| p.exe().map(|e| e.to_path_buf()))
+}
+
 /// Whether a PID refers to a live process (not a zombie, not missing).
 ///
 /// Conservative on platforms where sysinfo cannot determine zombie state: a

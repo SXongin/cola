@@ -206,6 +206,97 @@ where
         .with(mirror_layer)
 }
 
+/// The rotated file for a day (`cola-YYYY-MM-DD.log`), mirroring the rotation
+/// naming so `cola logs --date` finds what `rotate_if_needed` wrote.
+pub fn rotated_path(base: &Path, day: &str) -> PathBuf {
+    dated_path(base, day)
+}
+
+/// `cola logs`: print the tail of the active log file (or a rotated day's file)
+/// and, with `follow`, stream new lines as they are appended — including across
+/// a midnight rotation, which reopens the fresh base file.
+pub fn run_logs(base: &Path, follow: bool, lines: usize, date: Option<&str>) -> io::Result<()> {
+    let path = match date {
+        Some(day) => rotated_path(base, day),
+        None => base.to_path_buf(),
+    };
+    if !path.exists() {
+        eprintln!("日志文件不存在: {}", path.display());
+        return Ok(());
+    }
+    let tail = tail_lines(&path, lines)?;
+    let mut out = io::stdout();
+    for line in &tail {
+        writeln!(out, "{line}")?;
+    }
+    out.flush()?;
+    if follow {
+        follow_file(&path, &mut out)?;
+    }
+    Ok(())
+}
+
+/// The last `n` lines of `path`, read from the end so a large log never loads
+/// whole. A file that does not end in a newline still yields its final line.
+fn tail_lines(path: &Path, n: usize) -> io::Result<Vec<String>> {
+    use io::{Read, Seek, SeekFrom};
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    let block: u64 = 8192;
+    let mut pos = len;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut newlines = 0usize;
+    while pos > 0 && newlines <= n {
+        let read = pos.min(block);
+        pos -= read;
+        file.seek(SeekFrom::Start(pos))?;
+        let mut chunk = vec![0u8; read as usize];
+        file.read_exact(&mut chunk)?;
+        chunk.extend_from_slice(&buf);
+        buf = chunk;
+        newlines = buf.iter().filter(|&&b| b == b'\n').count();
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    if lines.len() > n {
+        lines.drain(0..lines.len() - n);
+    }
+    Ok(lines)
+}
+
+/// Poll `path` for appended bytes and print them, reopening from the start when
+/// the file is rotated out from under us (the base `cola.log` moves to a dated
+/// file and a fresh base starts). Blocks forever; the caller exits on Ctrl-C.
+fn follow_file(path: &Path, out: &mut impl Write) -> io::Result<()> {
+    use io::{Read, Seek, SeekFrom};
+    let poll = std::time::Duration::from_millis(300);
+    let mut offset = std::fs::metadata(path)?.len();
+    loop {
+        std::thread::sleep(poll);
+        let Ok(meta) = std::fs::metadata(path) else {
+            continue;
+        };
+        let len = meta.len();
+        if len < offset {
+            // Rotated or truncated: start over from the beginning.
+            offset = 0;
+        }
+        if len == offset {
+            continue;
+        }
+        let mut file = std::fs::File::open(path)?;
+        file.seek(SeekFrom::Start(offset))?;
+        let mut chunk = String::new();
+        file.read_to_string(&mut chunk)?;
+        out.write_all(chunk.as_bytes())?;
+        out.flush()?;
+        offset = len;
+    }
+}
+
 /// `YYYY-MM-DD` for the local timezone, as chrono is already a dependency.
 fn today_str() -> String {
     chrono::Local::now().format("%Y-%m-%d").to_string()
@@ -345,6 +436,49 @@ mod tests {
         log.make_writer().write_all(b"line\n").unwrap();
         let content = std::fs::read_to_string(&base).unwrap();
         assert_eq!(content, "old\nline\n", "same-day restart must append");
+    }
+
+    #[test]
+    fn tail_lines_returns_the_last_n_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("cola.log");
+        let mut body = String::new();
+        for i in 1..=10 {
+            body.push_str(&format!("line {i}\n"));
+        }
+        std::fs::write(&file, &body).unwrap();
+        assert_eq!(tail_lines(&file, 3).unwrap(), vec!["line 8", "line 9", "line 10"]);
+        // Fewer lines than requested yields the whole file.
+        assert_eq!(tail_lines(&file, 50).unwrap().len(), 10);
+        // Zero means nothing.
+        assert!(tail_lines(&file, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn tail_lines_keeps_a_final_unterminated_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("cola.log");
+        std::fs::write(&file, b"a\nb\nc").unwrap();
+        assert_eq!(tail_lines(&file, 2).unwrap(), vec!["b", "c"]);
+    }
+
+    #[test]
+    fn run_logs_selects_the_rotated_file_by_date() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("cola.log");
+        let dated = rotated_path(&base, "2026-01-02");
+        std::fs::write(&dated, b"old one\nold two\n").unwrap();
+        // `run_logs` with a date prints that day's file, not the base; the base
+        // need not exist.
+        run_logs(&base, false, 10, Some("2026-01-02")).unwrap();
+    }
+
+    #[test]
+    fn run_logs_missing_file_is_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("cola.log");
+        // No file at all: the command prints a hint and exits 0.
+        run_logs(&base, false, 10, None).unwrap();
     }
 
     #[test]

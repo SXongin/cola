@@ -9,6 +9,7 @@ mod feishu;
 mod git;
 mod logging;
 mod opencode;
+mod status;
 #[cfg(test)]
 mod test_http;
 #[cfg(test)]
@@ -69,6 +70,50 @@ enum Subcommand {
         #[arg(short = 'y', long)]
         yes: bool,
     },
+    /// Restart the running cola instance (Supervisor restart, else a detached
+    /// re-exec with the instance's own command line; ADR-0081).
+    Restart {
+        /// Skip the confirmation prompt. A non-TTY run never prompts.
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+    /// Print a one-shot snapshot of the cola installation: run state, autostart,
+    /// claim, config/log paths, and the shared OpenCode server (ADR-0081).
+    Status {
+        /// Emit the same facts as JSON for scripts.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run the environment checks a support request needs (config, Feishu
+    /// credentials, OpenCode binary/server, singleton lock, autostart path) and
+    /// exit non-zero when a check fails (ADR-0081).
+    Doctor,
+    /// Print the tail of the log file; `-f` follows it (ADR-0081).
+    Logs {
+        /// Stream new lines as they are appended (blocks; Ctrl-C to stop).
+        #[arg(short = 'f', long)]
+        follow: bool,
+        /// How many lines to print.
+        #[arg(short = 'n', long, default_value_t = 50)]
+        lines: usize,
+        /// Read a rotated day's file (`cola-YYYY-MM-DD.log`) instead of today's.
+        #[arg(long, value_name = "YYYY-MM-DD")]
+        date: Option<String>,
+    },
+    /// Inspect the config file: its resolved path, effective values, or validity
+    /// (ADR-0081).
+    Config {
+        #[command(subcommand)]
+        action: config::ConfigAction,
+    },
+    /// Print a shell completion script to stdout.
+    Completions {
+        /// The shell to generate completions for.
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
+    /// Print cola's version and build provenance (same as `--version`).
+    Version,
 }
 
 /// The default append log file, used when `--log-file` is not given.
@@ -545,6 +590,133 @@ fn stop_cli(assume_yes: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `cola restart` (ADR-0081). A registered Supervisor restarts the unit
+/// (`systemctl --user restart` / `launchctl kickstart -k`), which also brings it
+/// back up. Without one, the lock holder is terminated and a detached
+/// replacement is spawned from the instance's OWN command line (the CLI has no
+/// startup args of its own to reuse) plus `--replace`. The replacement's stdio
+/// is null — logs already go to the log file.
+fn restart_cli(assume_yes: bool) -> anyhow::Result<()> {
+    let Some(pid) = running_daemon_pid() else {
+        println!("cola 未运行。");
+        return Ok(());
+    };
+    if !assume_yes
+        && std::io::stdin().is_terminal()
+        && !confirm(&format!(
+            "⚠️ 重启运行中的 cola (PID {pid})？正在进行的对话会被截断。[y/N] "
+        ))?
+    {
+        println!("已取消。");
+        return Ok(());
+    }
+    // Read the instance's identity BEFORE stopping it: without a supervisor its
+    // command line and executable are the only record of how it was started.
+    let argv = bridge::discovery::process_cmd(pid);
+    let exe = bridge::discovery::process_exe(pid);
+    // Supervisor first, like `cola stop`: a launchd agent with KeepAlive must be
+    // restarted through launchd. A supervisor command that FAILS falls back to
+    // the direct path below instead of leaving cola down.
+    if let Some(cmd) = autostart::supervisor_restart_command()
+        && run_supervisor_command(&cmd).is_ok()
+    {
+        report_restart(wait_for_new_daemon(Some(pid)));
+        return Ok(());
+    }
+    let Some(argv) = argv else {
+        anyhow::bail!("无法读取运行中 cola 的启动参数；请先 `cola stop` 再手动启动。");
+    };
+    let Some((argv0, args)) = argv.split_first() else {
+        anyhow::bail!("运行中 cola 的启动参数为空");
+    };
+    // Prefer the process's own executable path: argv[0] may be relative to the
+    // daemon's cwd, which differs from the CLI's.
+    let program = exe
+        .map(|p| p.to_string_lossy().into_owned())
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| argv0.clone());
+    replace_instance(pid)?;
+    spawn_detached(&program, args)?;
+    report_restart(wait_for_new_daemon(Some(pid)));
+    Ok(())
+}
+
+/// Print the restart outcome; verification is what keeps the CLI honest — a
+/// supervisor restart reports success even when the new instance never took the
+/// lock (ADR-0081).
+fn report_restart(confirmed: bool) {
+    if confirmed {
+        println!("cola 已重启。");
+    } else {
+        println!("重启已请求，但未确认新实例接管单例锁；请用 `cola status` 查看。");
+    }
+}
+
+/// Spawn a detached cola from `exe` + `args`, appending `--replace` so it may
+/// take the singleton lock left by the instance just terminated.
+fn spawn_detached(exe: &str, args: &[String]) -> anyhow::Result<()> {
+    use std::process::{Command, Stdio};
+    let mut all: Vec<String> = args.to_vec();
+    if !all.iter().any(|a| a == "--replace") {
+        all.push("--replace".to_string());
+    }
+    Command::new(exe)
+        .args(all)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("无法启动新的 cola 实例（{exe}）：{e}"))?;
+    Ok(())
+}
+
+/// Wait until a daemon OTHER than `old_pid` holds the singleton lock — proof a
+/// restart took effect. Bounded so a failed restart surfaces instead of hanging.
+fn wait_for_new_daemon(old_pid: Option<i32>) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Some(pid) = running_daemon_pid()
+            && Some(pid) != old_pid
+        {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+/// `cola status` (ADR-0081): resolve the config leniently, gather the snapshot,
+/// and print it as text or JSON. A missing or broken config narrows the report
+/// instead of failing.
+async fn status_cli(
+    json: bool,
+    explicit_config: Option<&str>,
+    log_path: &std::path::Path,
+) -> anyhow::Result<()> {
+    let config_path = status::resolve_config_lenient(explicit_config);
+    let loaded = config_path.as_deref().map(config::load);
+    let snapshot = status::gather(config_path, loaded.as_ref(), log_path).await;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&status::render_json(&snapshot))?
+        );
+    } else {
+        print!("{}", status::render(&snapshot));
+    }
+    Ok(())
+}
+
+/// `cola completions <shell>`: print the generated script to stdout.
+fn print_completions(shell: clap_complete::Shell) -> anyhow::Result<()> {
+    use clap::CommandFactory;
+    let mut command = Cli::command();
+    clap_complete::generate(shell, &mut command, "cola", &mut std::io::stdout());
+    Ok(())
+}
+
 impl Drop for SingletonLock {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
@@ -576,6 +748,38 @@ async fn main() -> anyhow::Result<()> {
     // must work on a bot whose config is broken (ADR-0039).
     if let Some(Subcommand::Stop { yes }) = cli.subcommand {
         return stop_cli(yes);
+    }
+    // `cola version` mirrors `--version` as a subcommand for symmetry.
+    if let Some(Subcommand::Version) = cli.subcommand {
+        println!("{}", version::display_version());
+        return Ok(());
+    }
+    // Shell completions are pure — no config, no lock, no I/O.
+    if let Some(Subcommand::Completions { shell }) = cli.subcommand {
+        return print_completions(shell);
+    }
+    // Introspection (ADR-0081): read-only, config-light, and lock-free — all
+    // three must work while cola is running and against a broken install.
+    if let Some(Subcommand::Logs { follow, lines, date }) = &cli.subcommand {
+        let log_path = cli.log_file.clone().unwrap_or_else(default_log_path);
+        return logging::run_logs(&log_path, *follow, *lines, date.as_deref()).map_err(Into::into);
+    }
+    if let Some(Subcommand::Config { action }) = cli.subcommand {
+        return config::run(action, cli.config.as_deref());
+    }
+    if let Some(Subcommand::Restart { yes }) = cli.subcommand {
+        return restart_cli(yes);
+    }
+    if let Some(Subcommand::Status { json }) = cli.subcommand {
+        let log_path = cli.log_file.clone().unwrap_or_else(default_log_path);
+        return status_cli(json, cli.config.as_deref(), &log_path).await;
+    }
+    if let Some(Subcommand::Doctor) = cli.subcommand {
+        let log_path = cli.log_file.clone().unwrap_or_else(default_log_path);
+        if !status::run_doctor(cli.config.as_deref(), &log_path).await? {
+            std::process::exit(1);
+        }
+        return Ok(());
     }
 
     // Config first: `[bridge] log_days` feeds the daily-rotating log writer.
