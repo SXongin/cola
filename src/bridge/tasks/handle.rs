@@ -398,16 +398,19 @@ impl TasksHandle {
             .insert(session_id.to_string(), call_ids.iter().cloned().collect());
     }
 
-    /// The call ids one session's liveness tier has recorded as retired, sorted
-    /// — the test seam for "a refused refresh records nothing" (spec #588,
-    /// review PR #595). Production reads the tier only through [`Self::apply`].
+    /// Every id one session's liveness tier has recorded as retired, sorted —
+    /// the test seam for "a refused refresh records nothing" (spec #588, review
+    /// PR #595). The set holds EVERY id a run is known by (its call id, its
+    /// shell/child id, its Wake id), not just call ids, so it matches a row the
+    /// read names by any of them. Production reads the tier only through
+    /// [`Self::apply`].
     #[cfg(test)]
-    pub(crate) fn retired_call_ids(&self, session_id: &str) -> Vec<String> {
+    pub(crate) fn retired_ids(&self, session_id: &str) -> Vec<String> {
         self.sorted_ids(|state| state.retired.get(session_id))
     }
 
     /// The call ids one session's liveness tier carries as unconfirmed, sorted
-    /// — [`Self::retired_call_ids`]'s marker-side twin.
+    /// — [`Self::retired_ids`]'s marker-side twin.
     #[cfg(test)]
     pub(crate) fn unconfirmed_call_ids(&self, session_id: &str) -> Vec<String> {
         self.sorted_ids(|state| state.unconfirmed.get(session_id))
@@ -468,12 +471,24 @@ impl TasksHandle {
         // (ADR-0080): the record carries every id the run is known by, and the
         // row's own ids (its call id, its shell/child id) resolve the same
         // record — so a launchless Wake that keyed the record by a shell id
-        // still prunes a row the read names by a different call id. The
-        // process-local `retired` cache rides along for a run whose ending write
-        // a restart lost; it too matches any id the row is known by.
-        transcript
-            .background_tasks
-            .retain(|task| !resolves_run(&records, &TaskRunId::of_launch(task)));
+        // still prunes a row the read names by a different call id. RESOLVE,
+        // THEN FOLD: the prune also hands the record the ids the row was named
+        // by (one write, only when an id was learned), so a later writer holding
+        // only that id resolves the one record instead of minting a second one
+        // for one run. The process-local `retired` cache rides along for a run
+        // whose ending write a restart lost; it too matches any id the row is
+        // known by.
+        let chains = self.chains();
+        transcript.background_tasks.retain(|task| {
+            let run = TaskRunId::of_launch(task);
+            if !resolves_run(&records, &run) {
+                return true;
+            }
+            if let Some(chains) = &chains {
+                chains.fold_run_ids(session_id, &run);
+            }
+            false
+        });
         if let Some(ids) = state.retired.get(session_id) {
             transcript.background_tasks.retain(|task| {
                 let run = TaskRunId::of_launch(task);
@@ -580,7 +595,7 @@ mod tests {
         // endings.
         handle.restore("ses_a", &TaskCell::new());
 
-        let ids = handle.retired_call_ids("ses_a");
+        let ids = handle.retired_ids("ses_a");
         assert!(
             ids.contains(&"sh_call_bg".to_string()),
             "the shell id (the record's key) is seeded: {ids:?}"

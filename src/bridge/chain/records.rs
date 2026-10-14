@@ -756,6 +756,17 @@ fn surrender_owed_beside_shown(record: &mut TaskRunRecord) -> bool {
     changed
 }
 
+/// Fold `held`'s ids into `record`'s run and report whether any id was LEARNED
+/// (ADR-0080) — the `TaskRunId::absorb` fold every writer runs, shared by
+/// [`insert_ending`] (a writer resolving or minting) and
+/// [`ChainRecords::fold_run_ids`] (the read-side prune) so the two can never
+/// drift. A record already knowing every id learns nothing.
+fn absorb_run(record: &mut TaskRunRecord, held: &TaskRunId) -> bool {
+    let before: Vec<String> = record.run.ids().map(str::to_string).collect();
+    record.run.absorb(held);
+    record.run.ids().any(|id| !before.iter().any(|known| known == id))
+}
+
 /// Record `ending` on the run `held` names (ADR-0080), inside the session's
 /// oldest-first `records`: resolve the run by the alias order, or mint one keyed
 /// by the writer's own id; fold in every id the writer holds; and keep AT MOST
@@ -767,12 +778,7 @@ fn surrender_owed_beside_shown(record: &mut TaskRunRecord) -> bool {
 fn insert_ending(records: &mut Vec<TaskRunRecord>, held: &TaskRunId, ending: TaskEnding) -> bool {
     let (index, learned) = match resolve_run(records, held) {
         Some(index) => {
-            let before: Vec<String> = records[index].run.ids().map(str::to_string).collect();
-            records[index].run.absorb(held);
-            let learned = records[index]
-                .run
-                .ids()
-                .any(|id| !before.iter().any(|known| known == id));
+            let learned = absorb_run(&mut records[index], held);
             (index, learned)
         }
         None => {
@@ -1794,6 +1800,33 @@ impl ChainRecords {
             self.write(&state);
         }
         changed
+    }
+
+    /// Fold every id `held` carries into the run's record (ADR-0080), recording
+    /// no ending — the same [`absorb_run`] every writer runs, so a record learns
+    /// EVERY id its run is known by and a later writer holding only one of them
+    /// resolves this record instead of minting a second one for one run. The
+    /// read-side half of "resolve before you mint": a read that RESOLVES a run
+    /// while pruning its live row hands the record the ids that row was named
+    /// by. Resolves by the alias order; `false` when the section names no such
+    /// run (a fold never mints) or already knows every id, so a no-op costs no
+    /// write. One synchronous Chain Record write, only when an id was learned.
+    pub(crate) fn fold_run_ids(&self, session_id: &str, held: &TaskRunId) -> bool {
+        let mut state = self.lock();
+        let session_id = resolved_session(&state, session_id);
+        let learned = {
+            let Some(records) = state.endings.get_mut(&session_id) else {
+                return false;
+            };
+            let Some(index) = resolve_run(records, held) else {
+                return false;
+            };
+            absorb_run(&mut records[index], held)
+        };
+        if learned {
+            self.write(&state);
+        }
+        learned
     }
 
     /// Flip the entries `shown` names — a `(run, class)` pair each — to SHOWN

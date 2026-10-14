@@ -1783,7 +1783,7 @@ async fn a_task_ended_mid_turn_settles_the_turn_directly() {
     // process-local overlay only once the drain's render carried its entry —
     // the shared record-after-flush invariant, pinned on this path.
     assert_eq!(
-        backend.overlay.retired_call_ids("ses_test"),
+        backend.overlay.retired_ids("ses_test"),
         vec!["call_bg".to_string()],
         "the drain's accepted render records the retirement"
     );
@@ -1834,9 +1834,9 @@ async fn a_permanently_refused_retirement_write_leaves_the_entry_owed() {
     // was not flipped — but the ENDING is durable (ADR-0080) and the task leaves
     // the ledger at once.
     assert!(
-        backend.overlay.retired_call_ids("ses_test").is_empty(),
+        backend.overlay.retired_ids("ses_test").is_empty(),
         "a refused carrier commits no overlay cache: {:?}",
-        backend.overlay.retired_call_ids("ses_test")
+        backend.overlay.retired_ids("ses_test")
     );
     // The ending's shown bit follows the same gate (ADR-0080): the entry never
     // reached a card, so no bit may be set — a later card must still render it.
@@ -1916,7 +1916,7 @@ async fn a_permanently_refused_retirement_write_leaves_the_entry_owed() {
         "the entry renders exactly once on the card that can carry it: {successor}"
     );
     assert_eq!(
-        backend.overlay.retired_call_ids("ses_test"),
+        backend.overlay.retired_ids("ses_test"),
         vec!["call_bg".to_string(), "sh_call_bg".to_string()],
         "the accepted successor render records the retirement, and the durable \
          ending's own shell-id alias is seeded beside it (ADR-0080)"
@@ -1973,7 +1973,7 @@ async fn a_queued_retirement_write_still_records() {
         .unwrap();
 
     assert_eq!(
-        backend.overlay.retired_call_ids("ses_test"),
+        backend.overlay.retired_ids("ses_test"),
         vec!["call_bg".to_string()],
         "a queued-for-retry write is accepted: the pass records"
     );
@@ -2095,9 +2095,9 @@ async fn a_permanently_refused_yielded_refresh_leaves_the_entry_owed() {
     // Nothing was recorded: the task stays live, so a later receivable card can
     // still render its entry ...
     assert!(
-        backend.overlay.retired_call_ids("ses_test").is_empty(),
+        backend.overlay.retired_ids("ses_test").is_empty(),
         "a refused refresh commits no overlay cache: {:?}",
-        backend.overlay.retired_call_ids("ses_test")
+        backend.overlay.retired_ids("ses_test")
     );
     let later = crate::backend::Backend::transcript(backend.as_ref(), "ses_test")
         .await
@@ -3396,7 +3396,7 @@ async fn an_external_supersede_records_no_overlay_but_keeps_the_ending() {
     )
     .await;
     assert_eq!(
-        backend.overlay.retired_call_ids("ses_test"),
+        backend.overlay.retired_ids("ses_test"),
         vec!["call_bg".to_string(), "sh_call_bg".to_string()],
         "the accepted refresh records the retirement, and the durable ending's \
          own shell-id alias is seeded beside it (ADR-0080)"
@@ -7107,9 +7107,10 @@ async fn a_wake_naming_a_reused_child_resolves_the_newest_run_into_one_record() 
 /// DIFFERENT id than the record's key, but the same shell id. The alias-aware
 /// row pruning takes that row before the reconcile can act (ADR-0080: a run with
 /// a durable ending leaves the live list "so a later reconcile cannot
-/// resurrect it"), so the run renders no second entry: one record, one entry,
-/// however the read names the run. The store's own alias resolution — the rule
-/// the two writers share — is pinned directly by
+/// resurrect it") AND folds the row's call id into the record it resolved, so
+/// the run is ONE record naming both ids and renders no second entry: one
+/// record, one entry, however the read names the run. The store's own alias
+/// resolution — the rule the two writers share — is pinned directly by
 /// `chain::records::tests::the_alias_order_resolves_a_run_named_from_either_side`.
 #[tokio::test]
 async fn a_launchless_wake_first_prunes_the_later_launch_carrying_row() {
@@ -7157,8 +7158,8 @@ async fn a_launchless_wake_first_prunes_the_later_launch_carrying_row() {
         "one record for the run, however the read names it: {records:?}"
     );
     assert!(
-        records[0].run.names("sh_call_bg"),
-        "the record stays keyed by the shell id the Wake named: {:?}",
+        records[0].run.names("sh_call_bg") && records[0].run.names("call_bg"),
+        "one record for the run, naming both ids the two writers knew it by: {:?}",
         records[0].run
     );
     let later = crate::backend::Backend::transcript(backend.as_ref(), "ses_test")
@@ -7184,8 +7185,10 @@ async fn a_launchless_wake_first_prunes_the_later_launch_carrying_row() {
 /// DIFFERENT call id (that read saw a launch the record does not key on) but the
 /// same shell id. The row must still leave the read — the pruning matches the
 /// run by EVERY id it is known by, never the row's call id alone — so the ledger
-/// is not live for a run that already has a durable ending. An unrelated row is
-/// left alone.
+/// is not live for a run that already has a durable ending. RESOLVE, THEN FOLD:
+/// the prune also hands the record the row's call id, so a later writer holding
+/// ONLY that id resolves the one record instead of minting a second one. An
+/// unrelated row is left alone.
 #[tokio::test]
 async fn a_durable_ending_prunes_a_row_named_by_a_different_call_id() {
     let _wd = test_work_dir();
@@ -7242,6 +7245,20 @@ async fn a_durable_ending_prunes_a_row_named_by_a_different_call_id() {
         ids.contains(&"call_other"),
         "an unrelated row is never pruned: {later:?}"
     );
+
+    // The prune folded the row's call id into the record it resolved: a writer
+    // holding ONLY `call_bg` resolves the one record, never a second one.
+    let records = app.cards_handle().chains.endings("ses_test");
+    assert_eq!(records.len(), 1, "one record for the run: {records:?}");
+    assert!(
+        records[0].run.names("call_bg"),
+        "the prune folded the row's call id into the record it resolved: {:?}",
+        records[0].run
+    );
+    assert!(
+        crate::bridge::chain::resolves_run(&records, &run_of("call_bg")),
+        "a writer holding only the later call id resolves the one record: {records:?}"
+    );
 }
 
 /// Acceptance (spec #699, ticket #704; ADR-0080): the alias order holds when a
@@ -7270,7 +7287,11 @@ async fn the_alias_order_holds_when_a_launch_carrying_read_arrives_first() {
         1,
         "the evidence ending keys the record by the call id: {records:?}"
     );
-    assert!(records[0].run.names("call_bg"));
+    assert!(
+        records[0].run.names("call_bg") && records[0].run.names("sh_call_bg"),
+        "the minted record names the launch's call id and the shell id it carries: {:?}",
+        records[0].run
+    );
 
     // The late launchless Wake names the shell the record already carries: it
     // resolves the evidence-ended run, so its completion is suppressed — never
