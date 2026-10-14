@@ -749,8 +749,8 @@ fn surrender_owed_beside_shown(record: &mut TaskRunRecord) -> bool {
 /// Fold `held`'s ids into `record`'s run and report whether any id was LEARNED
 /// (ADR-0080) — the `TaskRunId::absorb` fold every writer runs, shared by
 /// [`insert_ending`] (a writer resolving or minting) and
-/// [`ChainRecords::fold_run_ids`] (the read-side prune) so the two can never
-/// drift. A record already knowing every id learns nothing.
+/// [`ChainRecords::observe_run`] (the read-side observation) so the two can
+/// never drift. A record already knowing every id learns nothing.
 fn absorb_run(record: &mut TaskRunRecord, held: &TaskRunId) -> bool {
     let before: Vec<String> = record.run.ids().map(str::to_string).collect();
     record.run.absorb(held);
@@ -4522,5 +4522,64 @@ mod tests {
             "a Wake ending recorded beside a shown Cleanup stays owed (#590): {record:?}"
         );
         assert!(record.owes(), "the record still owes the Wake's entry");
+    }
+
+    /// ADR-0080 (CI gate): an observation is a READ — it never mints. An id no
+    /// record names leaves the section exactly as it was (no record, no write)
+    /// and reports that the run is not named, so the caller keeps the row
+    /// instead of pruning it on a phantom.
+    #[test]
+    fn an_observation_never_mints_a_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let chains = ChainRecords::load(dir.path().join(FILE));
+        let known = TaskRunId::of_launch(&launch_task("call_1", Some("shell_1"), None));
+        chains.record_ending(
+            "ses_a",
+            &known,
+            TaskEnding::owed(TaskEndingClass::Evidence, identity("one")),
+        );
+
+        let writes = chains.writes();
+        let stranger = TaskRunId::of_launch(&launch_task("call_2", Some("shell_2"), None));
+        assert!(
+            !chains.observe_run("ses_a", &stranger),
+            "a run no record names is not named back"
+        );
+        assert_eq!(
+            chains.endings("ses_a").len(),
+            1,
+            "a miss mints no record: {:?}",
+            chains.endings("ses_a")
+        );
+        assert_eq!(
+            chains.writes() - writes,
+            0,
+            "a miss leaves the section unchanged — no write"
+        );
+    }
+
+    /// ADR-0080 (CI gate): observing a run whose record already knows every id
+    /// the observer holds learns nothing, so it costs no Chain Record write.
+    #[test]
+    fn an_observation_that_learns_nothing_costs_no_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let chains = ChainRecords::load(dir.path().join(FILE));
+        let run = TaskRunId::of_launch(&launch_task("call_1", Some("shell_1"), None));
+        chains.record_ending(
+            "ses_a",
+            &run,
+            TaskEnding::owed(TaskEndingClass::Evidence, identity("one")),
+        );
+
+        let writes = chains.writes();
+        assert!(
+            chains.observe_run("ses_a", &run),
+            "the record names the run it was observed by"
+        );
+        assert_eq!(
+            chains.writes() - writes,
+            0,
+            "every id is already on the record, so the observation writes nothing"
+        );
     }
 }
