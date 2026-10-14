@@ -142,7 +142,15 @@ async fn probe_server(cfg: Option<&Config>) -> Option<ServerStatus> {
     let generation_override = cfg.map(|c| c.opencode.generation).unwrap_or_default();
     let candidates = discovery::scan_processes();
     let candidate = discovery::pick_server(&candidates, preferred_port, discovery::self_spawned_pid())?;
-    match attach::resolve_candidate(candidate, generation_override).await {
+    // The probe carries Basic credentials and the endpoint is always loopback,
+    // so it must bypass any env proxy (ADR-0081) — `new_loopback`, not the
+    // production attach transport.
+    let transport = crate::opencode::transport::Transport::new_loopback(
+        Some(&candidate.username),
+        Some(&candidate.password),
+        candidate.url(),
+    );
+    match attach::resolve_candidate_over(&transport, candidate, generation_override).await {
         Ok(resolved) => Some(ServerStatus {
             url: resolved.url,
             pid: candidate.pid,
@@ -372,8 +380,8 @@ async fn doctor_checks(state: &ConfigState, log_path: &Path) -> Vec<Check> {
     checks.push(lock_check(crate::lock_state()));
     checks.push(log_check(log_path));
 
-    if let Some(bin) = crate::autostart::supervisor_binary_path() {
-        match crate::update::current_exe_path() {
+    match crate::autostart::supervisor_binary_path() {
+        Some(bin) => match crate::update::current_exe_path() {
             Ok(current) if paths_equal(&bin, &current) => {
                 checks.push(Check::pass("自启动二进制", bin.display().to_string()))
             }
@@ -386,7 +394,15 @@ async fn doctor_checks(state: &ConfigState, log_path: &Path) -> Vec<Check> {
                 ),
             )),
             Err(_) => {}
-        }
+        },
+        // A registration exists but its executable could not be read (a
+        // malformed unit/plist/Run value): the requested check must still
+        // report, as a warning, rather than vanish from the list.
+        None if crate::autostart::is_registered() => checks.push(Check::warn(
+            "自启动二进制",
+            "已注册，但无法从注册中解析出可执行路径".to_string(),
+        )),
+        None => {}
     }
 
     checks
@@ -400,21 +416,29 @@ fn paths_equal(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// How long either Feishu probe may take before `doctor` calls the check a
+/// failure. Without this, a service that accepts the connection but never
+/// responds would hang the command instead of reporting (ADR-0081).
+const FEISHU_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Verify the Feishu credentials by exchanging them for a tenant access token
-/// and reading the bot's identity. Never reports the secret.
+/// and reading the bot's identity, each bounded by [`FEISHU_CHECK_TIMEOUT`].
+/// Never reports the secret.
 async fn feishu_check(client: &crate::feishu::client::Client, app_id: &str) -> Check {
-    match client.get_access_token().await {
-        Ok(_) => match client.bot_open_id().await {
-            Ok(bot) => Check::pass("飞书凭证", format!("app {app_id}，bot {bot}")),
+    match tokio::time::timeout(FEISHU_CHECK_TIMEOUT, client.get_access_token()).await {
+        Err(_) => Check::fail("飞书凭证", format!("app {app_id} 认证超时")),
+        Ok(Err(e)) => Check::fail("飞书凭证", format!("app {app_id} 认证失败：{e}")),
+        Ok(Ok(_)) => match tokio::time::timeout(FEISHU_CHECK_TIMEOUT, client.bot_open_id()).await {
+            Err(_) => Check::fail("飞书凭证", format!("app {app_id} 读取 bot 信息超时")),
+            Ok(Ok(bot)) => Check::pass("飞书凭证", format!("app {app_id}，bot {bot}")),
             // Both halves are the credential check (ADR-0081): a token that
             // works but a bot identity that does not means the app cannot read
             // its own bot — a failure, not a warning.
-            Err(e) => Check::fail(
+            Ok(Err(e)) => Check::fail(
                 "飞书凭证",
                 format!("app {app_id} 可取 token，但读取 bot 信息失败：{e}"),
             ),
         },
-        Err(e) => Check::fail("飞书凭证", format!("app {app_id} 认证失败：{e}")),
     }
 }
 

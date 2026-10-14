@@ -88,6 +88,21 @@ impl Transport {
         Self::new_with(username, password, base_url, false)
     }
 
+    /// A transport for a DISCOVERED loopback server whose request must never
+    /// traverse an env proxy. Discovery only ever yields
+    /// `http://localhost:<port>` (`ServerCandidate::url`), and the generation
+    /// probe carries Basic credentials, so an inherited `HTTP_PROXY` would send
+    /// the server's password to a third party. `cola status`/`doctor` build
+    /// their probe transport with this; production attach/prompt transports keep
+    /// honoring env proxies by design (ticket 09, ADR-0081).
+    pub(crate) fn new_loopback(
+        username: Option<&str>,
+        password: Option<&str>,
+        base_url: impl Into<String>,
+    ) -> Self {
+        Self::new_with(username, password, base_url, true)
+    }
+
     /// The shared builder. `no_env_proxy` is set only by wire tests: their fake
     /// server is loopback, and a developer shell that exports `http_proxy` must
     /// not intercept it — production keeps honoring env proxies (ticket 09).
