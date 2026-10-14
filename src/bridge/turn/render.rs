@@ -14,7 +14,7 @@ use crate::backend::{
     BackgroundTask, FileContent, MessageId, Part, SessionTranscript, TaskRetirementEnding, ToolStatus,
     TurnAnchor, Wake, WakeSource,
 };
-use crate::bridge::chain::{EndingFacts, EndingKey, TaskEndingClass};
+use crate::bridge::chain::{EndingFacts, EndingKey, TaskEndingClass, TaskEndingState};
 use crate::bridge::core::SESSION_INFO_TIMEOUT;
 use crate::bridge::handles::{
     CONTENT_CACHE_CAP, CardsHandle, ContentCell, ContentCellCache, ContentCellHold, FILE_MESSAGE_SENDS_CAP,
@@ -719,21 +719,33 @@ fn plan_wake_entries(
     plans
 }
 
-/// Whether the run's own **Wake** ending is already spoken for (ADR-0080): a
-/// card already SHOWED it, or this chain already placed its entry in this life.
-/// The Wake's own exactly-once gate, read by BOTH the plan
-/// ([`plan_wake_entries`]) and its commit-time re-check
-/// ([`commit_planned_entries`]) — one predicate, so the two can never drift. The
-/// shown bit, not the Wake Watermark, is what survives a crash between the
-/// confirmed write that flipped it and the later write that persists the
-/// Watermark: the floor answers only "was this Wake's arrival announced?", which
-/// a Wake that opened a 承接 line does without an entry.
+/// Whether the run's own **Wake** ending is already spoken for (ADR-0080) — i.e.
+/// NOT renderable. Only an OWED ending is ever rendered, so an ending in any
+/// OTHER state is spoken for: a SHOWN one was already displayed, and a
+/// SURRENDERED one the saturation cap gave up is never re-offered. A run with NO
+/// Wake ending yet is NOT spoken for — the Wake path records its ending at its
+/// entry's commit, so "no ending yet" must still plan. The Wake's own
+/// exactly-once gate, read by BOTH the plan ([`plan_wake_entries`]) and its
+/// commit-time re-check ([`commit_planned_entries`]) — one predicate, so the two
+/// can never disagree. The shown bit, not the Wake Watermark, is what survives a
+/// crash between the confirmed write that flipped it and the later write that
+/// persists the Watermark: the floor answers only "was this Wake's arrival
+/// announced?", which a Wake that opened a 承接 line does without an entry.
 fn wake_ending_spoken_for(
     facts: &crate::bridge::chain::EndingFacts,
     acc: &StreamAccumulator,
     run: &TaskRunId,
 ) -> bool {
-    facts.shown(run, TaskEndingClass::Wake) || acc.ending_announced(run, TaskEndingClass::Wake)
+    // The durable ending exists and is no longer OWED — SHOWN, or SURRENDERED by
+    // the saturation cap.
+    let not_owed = facts
+        .ending(run, TaskEndingClass::Wake)
+        .is_some_and(|ending| ending.state != TaskEndingState::Owed);
+    not_owed
+        // Adds the delivered-but-unrecorded payload's pair (the owed mirror); the
+        // record's own SHOWN state is already caught above.
+        || facts.shown(run, TaskEndingClass::Wake)
+        || acc.ending_announced(run, TaskEndingClass::Wake)
 }
 
 /// The run a Wake completed, as every writer names it (ADR-0080): the launch's
@@ -3332,6 +3344,92 @@ mod tests {
             .len(),
             1,
             "an owed Wake ending still plans its entry"
+        );
+    }
+
+    /// ADR-0080 / spec #699: "only an OWED ending is ever rendered, so a
+    /// surrendered one is never re-offered." A Wake ending the saturation cap
+    /// marked SURRENDERED is spoken for even while its Wake is still in the read:
+    /// the plan declines it and the commit-time re-check declines a plan made
+    /// before the surrender, staging nothing. Its record is ordinary eviction
+    /// material. The control: an OWED Wake ending is exactly what the next card
+    /// that can place it owes, so the plan and the commit both place it.
+    #[tokio::test]
+    async fn a_surrendered_wake_ending_is_never_re_offered() {
+        use crate::bridge::chain::{ChainRecords, TaskEnding as ChainEnding, TaskRunIdentity};
+
+        let dir = tempfile::tempdir().unwrap();
+        let chains = ChainRecords::load(dir.path().join("chain_records.json"));
+        let run = planned_run("call_sub");
+        chains.record_ending(
+            "ses_test",
+            &run,
+            ChainEnding {
+                class: TaskEndingClass::Wake,
+                state: TaskEndingState::Surrendered,
+                finished_at: Some(2_000),
+                evidence: None,
+                identity: TaskRunIdentity::default(),
+            },
+        );
+        let records = chains.endings("ses_test");
+        assert!(
+            !records[0].owes(),
+            "a surrendered Wake record owes nothing, so it is evictable: {records:?}"
+        );
+        let surrendered = EndingFacts::new(records);
+
+        let transcript = SessionTranscript::new(vec![message(
+            "msg_launch",
+            2_000,
+            vec![subagent_launch_part("call_sub", "ses_child", 2_000)],
+        )])
+        .with_wakes(vec![subagent_wake("ses_child", 3_000)]);
+
+        // The plan declines: the Wake is still in the read, but its ending was
+        // surrendered, so no entry is offered.
+        assert!(
+            plan_wake_entries(
+                &StreamAccumulator::new("test"),
+                &transcript,
+                &turn_anchor(0),
+                &surrendered,
+            )
+            .is_empty(),
+            "a surrendered Wake ending is never re-offered to a render"
+        );
+
+        // The commit-time re-check declines too — a plan made BEFORE the
+        // surrender — through the SAME predicate, and stages nothing.
+        let mut acc = StreamAccumulator::new("test");
+        assert!(
+            !commit_planned_entries(
+                &mut acc,
+                vec![planned_entry("call_sub", TaskEndingClass::Wake)],
+                Endings::with_facts(surrendered),
+            ),
+            "the commit declines the surrendered Wake entry"
+        );
+        assert!(
+            !acc.wake_announced("msg_wake_call_sub"),
+            "a declined Wake entry stages nothing — its Watermark stays where it was"
+        );
+
+        // The control: an OWED Wake ending still renders — the next card that can
+        // place it owes the entry.
+        let owed = facts_with("call_sub", TaskEndingClass::Wake, TaskEndingState::Owed);
+        assert_eq!(
+            plan_wake_entries(&acc, &transcript, &turn_anchor(0), &owed).len(),
+            1,
+            "an owed Wake ending still plans its entry"
+        );
+        assert!(
+            commit_planned_entries(
+                &mut acc,
+                vec![planned_entry("call_sub", TaskEndingClass::Wake)],
+                Endings::with_facts(owed),
+            ),
+            "an owed Wake ending still commits its entry"
         );
     }
 
