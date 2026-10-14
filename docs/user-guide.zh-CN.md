@@ -264,6 +264,23 @@ cola 总是追加写入日志文件——默认 `~/.cola/cola.log`（不含 ANSI
 `grep session_id=... cola-*.log` 查询。当 stdout 是真实终端时，日志也会
 镜像到那里；被重定向的 stdout 不会收到 cola 日志，从而保持重定向目标干净。
 
+`cola logs` 打印日志文件末尾（`-n N` 行，默认 50 行）；`--date YYYY-MM-DD`
+读取某天轮转出的文件，`-f` 持续跟随新行，跨午夜轮转时会重新打开新文件。
+
+## 检查（status / doctor / config）
+
+`cola status` 打印一次性快照：运行状态、自启动、认领、解析到的配置与日志
+路径，以及所连接的 OpenCode 服务器及其世代。`--json` 以相同事实输出，供脚本
+使用。
+
+`cola doctor` 运行支持排查所需的检查——配置解析、飞书凭证、`PATH` 上的
+`opencode`、共享服务器探测、单实例锁、日志路径、自启动二进制路径——每项带
+✅/⚠️/❌ 标记并给出汇总，任一检查失败时以非零码退出。
+
+`cola config path|show|validate` 分别打印解析到的配置路径、脱敏后的生效配置、
+或做一次解析校验。`cola version` 等价于 `--version`，`cola completions <shell>`
+打印补全脚本。
+
 ## 单实例锁与重启
 
 同一时间只能运行一个 cola（两个实例会重复处理飞书事件）。锁位于
@@ -280,6 +297,10 @@ cola 总是追加写入日志文件——默认 `~/.cola/cola.log`（不含 ANSI
 - 在 systemd 单元下，`/restart`（与 `/update` 一样）不会派生新子进程——
   它以重启码退出，由单元的 `Restart=on-failure` 用同一个 ExecStart 把
   cola 拉起来。
+
+`cola restart [-y]` 无需手动先停后启即可重启运行中的实例：已注册自启动时走
+平台监督者，否则读取锁持有者自身的命令行并以脱离终端的方式重新执行（附加
+`--replace`）。两条路径都会确认新实例已接管锁，再报告成功。
 
 ## 自更新
 
