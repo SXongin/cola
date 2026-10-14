@@ -718,6 +718,34 @@ fn gated_by_any_shown(class: TaskEndingClass) -> bool {
     !matches!(class, TaskEndingClass::Wake)
 }
 
+/// Settle a run's owed state against the class-agnostic entry gate (ADR-0080):
+/// a record that carries a SHOWN ending renders one retirement entry, whatever
+/// class wrote it, so every ending of it whose entry that gate decides
+/// ([`gated_by_any_shown`]) can never be rendered — its OWED state becomes
+/// SURRENDERED (the fact is kept; its entry was never renderable, so nothing a
+/// card could have shown is given up). This is the ONE transition both writers
+/// run — [`insert_ending`] after a new ending lands, [`mark_shown`] after a
+/// confirmed write sets a bit — so the two can never drift. Monotonic: only
+/// OWED endings move, so a SHOWN bit is never cleared and a Wake's own ending
+/// is never given up. Returns whether anything changed.
+fn surrender_owed_beside_shown(record: &mut TaskRunRecord) -> bool {
+    if !record
+        .endings
+        .iter()
+        .any(|ending| ending.state == TaskEndingState::Shown)
+    {
+        return false;
+    }
+    let mut changed = false;
+    for ending in &mut record.endings {
+        if ending.state == TaskEndingState::Owed && gated_by_any_shown(ending.class) {
+            ending.state = TaskEndingState::Surrendered;
+            changed = true;
+        }
+    }
+    changed
+}
+
 /// Record `ending` on the run `held` names (ADR-0080), inside the session's
 /// oldest-first `records`: resolve the run by the alias order, or mint one keyed
 /// by the writer's own id; fold in every id the writer holds; and keep AT MOST
@@ -753,27 +781,13 @@ fn insert_ending(records: &mut Vec<TaskRunRecord>, held: &TaskRunId, ending: Tas
         return learned;
     }
     record.endings.push(ending);
-    // The owed state must AGREE with the class-agnostic entry gate (ADR-0080,
-    // CI gate): a run already carrying a SHOWN ending renders one retirement
-    // entry, whatever class wrote it, so no other ending of it can ever owe one.
-    // Recording it OWED would leave it unevictable and let repeated races
-    // consume the owed cap with no prolonged carrier failure — so it is
-    // surrendered (the fact is kept; its entry was never renderable). Checking
-    // the whole record after the push covers both arrival orders: a new ending
-    // recorded after a shown one is surrendered, and a newly recorded SHOWN
-    // ending gives up an OWED ending already on the run. A Wake is exempt
-    // ([`gated_by_any_shown`], #590).
-    if record
-        .endings
-        .iter()
-        .any(|known| known.state == TaskEndingState::Shown)
-    {
-        for known in &mut record.endings {
-            if known.state == TaskEndingState::Owed && gated_by_any_shown(known.class) {
-                known.state = TaskEndingState::Surrendered;
-            }
-        }
-    }
+    // Re-settle the record's owed state AT THE INSERT (ADR-0080, CI gate): a
+    // newly landed ending can make it disagree with the class-agnostic entry
+    // gate in either arrival order — a new ending recorded after a shown one,
+    // or a newly recorded SHOWN ending giving up an OWED one already on the
+    // run. The push itself already changed the section, so the helper's own
+    // report is not needed here.
+    surrender_owed_beside_shown(record);
     true
 }
 
@@ -798,26 +812,10 @@ fn mark_shown(records: &mut [TaskRunRecord], shown: &[(TaskRunId, TaskEndingClas
                 changed = true;
             }
         }
-        // The confirmed write has just SHOWN this run's entry, so the
-        // class-agnostic gate now covers the run: every OTHER owed ending's
-        // entry is given up in this SAME write, or it would stay owed —
-        // unevictable, consuming the owed cap — while the gate suppresses its
-        // entry forever. Only OWED endings move; a shown bit is never cleared,
-        // and a Wake's own entry is exempt ([`gated_by_any_shown`], #590).
-        if record
-            .endings
-            .iter()
-            .any(|ending| ending.state == TaskEndingState::Shown)
-        {
-            for ending in &mut record.endings {
-                if ending.class != *class
-                    && ending.state == TaskEndingState::Owed
-                    && gated_by_any_shown(ending.class)
-                {
-                    ending.state = TaskEndingState::Surrendered;
-                    changed = true;
-                }
-            }
+        // The confirmed write has just SHOWN this run's entry, so re-settle the
+        // record's owed state against the gate in this SAME write (ADR-0080).
+        if surrender_owed_beside_shown(record) {
+            changed = true;
         }
     }
     changed
@@ -4388,5 +4386,107 @@ mod tests {
             "the cap surrenders the oldest OWED run: {warn}"
         );
         assert!(!warn.contains("call_0"), "never the gate-surrendered run: {warn}");
+    }
+
+    /// The Wake exemption (ADR-0080, #590) in the arrival order [`mark_shown`]
+    /// settles: an OWED Wake ending is already on the run when a non-Wake
+    /// entry (the user's 🧹 Cleanup) is shown. The shown Cleanup must NOT give
+    /// the Wake's own completion up — its entry is per its own class — so the
+    /// Wake ending stays OWED, the record still owes, and it is never the
+    /// bound's eviction candidate.
+    #[test]
+    fn a_shown_cleanup_does_not_surrender_an_owed_wake_ending() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE);
+        let chains = ChainRecords::load(path.clone());
+        let run = TaskRunId::of_launch(&launch_task("call_gate", Some("shell_1"), None));
+        chains.record_ending(
+            "ses_a",
+            &run,
+            TaskEnding::owed(TaskEndingClass::Wake, identity("wake")),
+        );
+        chains.record_ending(
+            "ses_a",
+            &run,
+            TaskEnding::owed(TaskEndingClass::Cleanup, identity("clean")),
+        );
+
+        assert!(chains.mark_endings_shown("ses_a", &[(run.clone(), TaskEndingClass::Cleanup)]));
+
+        let record = &ChainRecords::load(path.clone()).endings("ses_a")[0];
+        let wake = record
+            .endings
+            .iter()
+            .find(|ending| ending.class == TaskEndingClass::Wake)
+            .expect("the Wake ending");
+        let cleanup = record
+            .endings
+            .iter()
+            .find(|ending| ending.class == TaskEndingClass::Cleanup)
+            .expect("the Cleanup ending");
+        assert_eq!(cleanup.state, TaskEndingState::Shown);
+        assert_eq!(
+            wake.state,
+            TaskEndingState::Owed,
+            "a shown Cleanup never gives up the Wake's own completion (#590): {record:?}"
+        );
+        assert!(record.owes(), "the record still owes the Wake's entry");
+
+        // The owed record is never the bound's eviction candidate: filling the
+        // section past the shared bound with unowed records leaves it in place.
+        let call = |i: usize| TaskRunId::of_launch(&launch_task(&format!("call_{i}"), None, None));
+        for i in 0..MAX_RUN_RECORDS {
+            let run_i = call(i);
+            chains.record_ending(
+                "ses_a",
+                &run_i,
+                TaskEnding::owed(TaskEndingClass::Evidence, identity("shown")),
+            );
+            chains.mark_endings_shown("ses_a", &[(run_i, TaskEndingClass::Evidence)]);
+        }
+        let records = ChainRecords::load(path).endings("ses_a");
+        assert_eq!(records.len(), MAX_RUN_RECORDS, "the section stays bounded");
+        assert!(
+            records.iter().any(|record| record.run.key == "call_gate"),
+            "an owed Wake record is not evicted first: {:?}",
+            records.iter().map(|record| &record.run.key).collect::<Vec<_>>()
+        );
+    }
+
+    /// The same exemption in the arrival order [`insert_ending`] settles: the
+    /// Cleanup is shown FIRST, then a launchless Wake records its own ending.
+    /// The new Wake ending must stay OWED — the insert's re-settle must not give
+    /// it up — so the record still owes and the Wake's completion can still
+    /// render (#590).
+    #[test]
+    fn a_wake_ending_recorded_after_a_shown_cleanup_stays_owed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE);
+        let chains = ChainRecords::load(path.clone());
+        let run = TaskRunId::of_launch(&launch_task("call_1", Some("shell_1"), None));
+        chains.record_ending(
+            "ses_a",
+            &run,
+            TaskEnding::owed(TaskEndingClass::Cleanup, identity("clean")),
+        );
+        chains.mark_endings_shown("ses_a", &[(run.clone(), TaskEndingClass::Cleanup)]);
+        chains.record_ending(
+            "ses_a",
+            &run,
+            TaskEnding::owed(TaskEndingClass::Wake, identity("wake")),
+        );
+
+        let record = &ChainRecords::load(path).endings("ses_a")[0];
+        let wake = record
+            .endings
+            .iter()
+            .find(|ending| ending.class == TaskEndingClass::Wake)
+            .expect("the Wake ending");
+        assert_eq!(
+            wake.state,
+            TaskEndingState::Owed,
+            "a Wake ending recorded beside a shown Cleanup stays owed (#590): {record:?}"
+        );
+        assert!(record.owes(), "the record still owes the Wake's entry");
     }
 }
