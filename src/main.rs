@@ -610,13 +610,18 @@ fn restart_cli(assume_yes: bool) -> anyhow::Result<()> {
         return Ok(());
     }
     // Read the instance's identity BEFORE stopping it: without a supervisor its
-    // command line and executable are the only record of how it was started.
+    // command line, executable and working directory are the only record of how
+    // it was started.
     let argv = bridge::discovery::process_cmd(pid);
     let exe = bridge::discovery::process_exe(pid);
-    // Supervisor first, like `cola stop`: a launchd agent with KeepAlive must be
-    // restarted through launchd. A supervisor command that FAILS falls back to
+    let cwd = bridge::discovery::process_cwd(pid);
+    // Supervisor first — but ONLY when the supervisor actually owns the running
+    // process (ADR-0021): restarting the unit while an unrelated manual instance
+    // holds the lock starts a process that cannot acquire it, which
+    // `Restart=on-failure` then crash-loops. A command that FAILS falls back to
     // the direct path below instead of leaving cola down.
     if let Some(cmd) = autostart::supervisor_restart_command()
+        && autostart::supervisor_owns(pid)
         && run_supervisor_command(&cmd).is_ok()
     {
         report_restart(wait_for_new_daemon(Some(pid)));
@@ -647,8 +652,9 @@ fn restart_cli(assume_yes: bool) -> anyhow::Result<()> {
     }
     // Spawn FIRST with `--replace`: the successor takes the lock by terminating
     // the old holder itself (the same takeover `/restart` uses), so there is no
-    // window where cola is down.
-    spawn_detached(&program, args)?;
+    // window where cola is down. Re-exec in the instance's own working directory
+    // so a relative `--config`/`./cola.toml` resolves as before.
+    spawn_detached(&program, args, cwd.as_deref())?;
     report_restart(wait_for_new_daemon(Some(pid)));
     Ok(())
 }
@@ -694,18 +700,60 @@ fn restart_args(args: &[String]) -> Vec<String> {
 }
 
 /// Spawn a detached cola from `exe` + `args`, appending `--replace` so it may
-/// take the singleton lock left by the instance just terminated.
-fn spawn_detached(exe: &str, args: &[String]) -> anyhow::Result<()> {
+/// take the singleton lock left by the instance just terminated. `cwd` is the
+/// instance's own working directory, when known.
+fn spawn_detached(exe: &str, args: &[String], cwd: Option<&std::path::Path>) -> anyhow::Result<()> {
     use std::process::{Command, Stdio};
-    let all = restart_args(args);
-    Command::new(exe)
-        .args(all)
+    let mut command = Command::new(exe);
+    command
+        .args(restart_args(args))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(dir) = cwd {
+        command.current_dir(dir);
+    }
+    command
         .spawn()
         .map_err(|e| anyhow::anyhow!("无法启动新的 cola 实例（{exe}）：{e}"))?;
     Ok(())
+}
+
+/// The Singleton Lock's state, for `cola doctor`/`cola status` (ADR-0081): a
+/// live holder is healthy, a stale file (dead PID) is reclaimable, and a file
+/// naming a non-cola process is the PID-reuse hazard the takeover guards
+/// against.
+pub(crate) enum LockState {
+    /// No lock file.
+    Absent,
+    /// A live cola holds it.
+    Held(i32),
+    /// The file names a PID that is not alive.
+    Stale(i32),
+    /// The file names a live process that is not cola.
+    Foreign(i32),
+}
+
+/// Read the Singleton Lock's state. Never fails: an unreadable/malformed file is
+/// "absent" (a broken lock blocks nothing — the next start reclaims it).
+pub(crate) fn lock_state() -> LockState {
+    lock_state_at(&lock_file_path())
+}
+
+fn lock_state_at(path: &std::path::Path) -> LockState {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return LockState::Absent;
+    };
+    let Ok(pid) = raw.trim().parse::<i32>() else {
+        return LockState::Absent;
+    };
+    if !pid_alive(pid) {
+        LockState::Stale(pid)
+    } else if is_cola_process(pid) {
+        LockState::Held(pid)
+    } else {
+        LockState::Foreign(pid)
+    }
 }
 
 /// Wait until a daemon OTHER than `old_pid` holds the singleton lock — proof a
@@ -1206,6 +1254,53 @@ mod tests {
         // cola — the guard must recognise it (the takeover path depends on it).
         assert!(is_cola_process(std::process::id() as i32));
         assert!(!is_cola_process(i32::MAX - 1));
+    }
+
+    #[test]
+    fn lock_state_at_distinguishes_absent_stale_and_held() {
+        let home = tempfile::tempdir().unwrap();
+        let lock = home.path().join("cola.lock");
+        assert!(matches!(lock_state_at(&lock), LockState::Absent));
+
+        // A dead PID is stale, not absent (the doctor must not false-pass it).
+        std::fs::write(&lock, i32::MAX.to_string()).unwrap();
+        assert!(matches!(lock_state_at(&lock), LockState::Stale(p) if p == i32::MAX));
+
+        // Our own process is a live cola (the test binary is named after the
+        // crate), so the lock reads as held.
+        std::fs::write(&lock, std::process::id().to_string()).unwrap();
+        assert!(matches!(lock_state_at(&lock), LockState::Held(p) if p == std::process::id() as i32));
+
+        // An unreadable/garbage file is treated as absent, never a failure.
+        std::fs::write(&lock, "not a pid").unwrap();
+        assert!(matches!(lock_state_at(&lock), LockState::Absent));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_state_at_reports_a_live_non_cola_owner_as_foreign() {
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 5")
+            .spawn()
+            .expect("spawn sh");
+        let home = tempfile::tempdir().unwrap();
+        let lock = home.path().join("cola.lock");
+        std::fs::write(&lock, child.id().to_string()).unwrap();
+        // The child's identity may lag its spawn; retry until visible, like the
+        // takeover tests do.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut seen = false;
+        while std::time::Instant::now() < deadline {
+            if matches!(lock_state_at(&lock), LockState::Foreign(_)) {
+                seen = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(seen, "a live non-cola PID must read as Foreign");
     }
 
     #[test]

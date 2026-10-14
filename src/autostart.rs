@@ -86,6 +86,28 @@ pub(crate) fn supervisor_stop_command() -> Option<String> {
     }
 }
 
+/// Whether the OS supervisor owns the process `pid` — i.e. the supervisor
+/// started it, not the user's shell. `cola restart` uses the supervisor path
+/// only then (ADR-0021/0039): restarting the unit while an unrelated manual
+/// instance holds the Singleton Lock would start a process that cannot acquire
+/// it, and `Restart=on-failure` would then crash-loop it. When this is `false`
+/// the restart takes the direct path instead.
+pub(crate) fn supervisor_owns(pid: i32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        linux::supervisor_owns(pid)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::supervisor_owns(pid)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
 /// Whether an Autostart registration is installed on this platform — the
 /// platform artifact exists (systemd unit / launchd plist / Run-key value),
 /// independent of whether a *supervisor restart* is available (Windows' Run key
@@ -201,6 +223,26 @@ mod linux {
     /// Whether the user unit is installed (its file exists).
     pub(super) fn is_registered() -> bool {
         unit_path().exists()
+    }
+
+    /// Whether systemd owns `pid`: the unit stamps `INVOCATION_ID` into every
+    /// process it starts, and `SYSTEMD_EXEC_PID` names the main one. Both must
+    /// hold, the same pair `update::supervisor_restart_code` checks for itself.
+    pub(super) fn supervisor_owns(pid: i32) -> bool {
+        let Some(env) = crate::bridge::discovery::process_environ(pid) else {
+            return false;
+        };
+        let mut invocation = false;
+        let mut exec_pid = false;
+        for kv in &env {
+            if kv.starts_with("INVOCATION_ID=") {
+                invocation = true;
+            }
+            if let Some(v) = kv.strip_prefix("SYSTEMD_EXEC_PID=") {
+                exec_pid = v.trim() == pid.to_string();
+            }
+        }
+        invocation && exec_pid
     }
 
     /// systemd ExecStart accepts a path unquoted; quote only when it contains
@@ -438,6 +480,13 @@ mod macos {
     /// Whether the LaunchAgent plist is installed (its file exists).
     pub(super) fn is_registered() -> bool {
         plist_path().exists()
+    }
+
+    /// Whether launchd owns `pid`: a job process carries its label in
+    /// `XPC_SERVICE_NAME`.
+    pub(super) fn supervisor_owns(pid: i32) -> bool {
+        crate::bridge::discovery::process_environ(pid)
+            .is_some_and(|env| env.iter().any(|kv| kv == &format!("XPC_SERVICE_NAME={LABEL}")))
     }
 
     fn plist_content(exe: &str) -> String {

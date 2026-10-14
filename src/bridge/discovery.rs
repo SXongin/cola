@@ -450,6 +450,41 @@ pub fn process_exe(pid: i32) -> Option<std::path::PathBuf> {
         .and_then(|p| p.exe().map(|e| e.to_path_buf()))
 }
 
+/// The environment of a process, from sysinfo (`None` if not visible). Used to
+/// tell whether a supervisor owns a running cola (ADR-0021): systemd stamps
+/// `INVOCATION_ID`/`SYSTEMD_EXEC_PID` into every unit process, launchd sets
+/// `XPC_SERVICE_NAME`. Reading another process's env is best-effort — it is
+/// limited to same-user processes on macOS/Windows.
+pub fn process_environ(pid: i32) -> Option<Vec<String>> {
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[Pid::from_u32(pid as u32)]),
+        false,
+        ProcessRefreshKind::nothing().with_environ(UpdateKind::Always),
+    );
+    system.process(Pid::from_u32(pid as u32)).map(|p| {
+        p.environ()
+            .iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect()
+    })
+}
+
+/// The working directory of a process, from sysinfo (`None` if not visible).
+/// `cola restart` re-execs the replacement in the instance's own directory so a
+/// relative `--config` or a `./cola.toml` resolves exactly as it did.
+pub fn process_cwd(pid: i32) -> Option<std::path::PathBuf> {
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[Pid::from_u32(pid as u32)]),
+        false,
+        ProcessRefreshKind::nothing().with_cwd(UpdateKind::Always),
+    );
+    system
+        .process(Pid::from_u32(pid as u32))
+        .and_then(|p| p.cwd().map(|c| c.to_path_buf()))
+}
+
 /// Whether a PID refers to a live process (not a zombie, not missing).
 ///
 /// Conservative on platforms where sysinfo cannot determine zombie state: a

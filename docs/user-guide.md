@@ -383,10 +383,10 @@ lock lives at `~/.cola/cola.lock`.
   back up from the same ExecStart.
 
 `cola restart [-y]` restarts the running instance without a manual
-stop-then-start: through the platform supervisor when an autostart registration
-is installed, otherwise by re-execing the lock holder's own command line
-detached (plus `--replace`). Both paths verify a new instance took the lock
-before reporting success.
+stop-then-start: through the platform supervisor when it owns the running
+instance, otherwise by re-execing the lock holder's own command line and
+working directory detached (plus `--replace`). Both paths verify a new instance
+took the lock before reporting success.
 
 ## Self-update
 

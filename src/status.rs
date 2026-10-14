@@ -369,7 +369,7 @@ async fn doctor_checks(state: &ConfigState, log_path: &Path) -> Vec<Check> {
         )),
     }
 
-    checks.push(lock_check());
+    checks.push(lock_check(crate::lock_state()));
     checks.push(log_check(log_path));
 
     if let Some(bin) = crate::autostart::supervisor_binary_path() {
@@ -473,13 +473,20 @@ fn log_check(path: &Path) -> Check {
     }
 }
 
-/// Report the Singleton Lock state: a lock held by a live cola is healthy,
-/// otherwise there is nothing running (a stale lock is reclaimed by the next
-/// start, so it is not a failure).
-fn lock_check() -> Check {
-    match crate::running_daemon_pid() {
-        Some(pid) => Check::pass("单例锁", format!("由 PID {pid} 持有")),
-        None => Check::pass("单例锁", "无运行实例".to_string()),
+/// Report the Singleton Lock state (ADR-0081). A live cola holder is healthy;
+/// a stale or foreign lock is a WARNING, not a silent pass — a stale file means
+/// the last instance died uncleanly (the next start reclaims it), and a
+/// non-cola owner is the PID-reuse hazard the takeover guards against.
+fn lock_check(state: crate::LockState) -> Check {
+    match state {
+        crate::LockState::Absent => Check::pass("单例锁", "无运行实例".to_string()),
+        crate::LockState::Held(pid) => Check::pass("单例锁", format!("由 PID {pid} 持有")),
+        crate::LockState::Stale(pid) => {
+            Check::warn("单例锁", format!("陈旧锁（PID {pid} 已不存在），下次启动会回收"))
+        }
+        crate::LockState::Foreign(pid) => {
+            Check::warn("单例锁", format!("锁文件指向的 PID {pid} 不是 cola 进程"))
+        }
     }
 }
 
@@ -623,6 +630,18 @@ mod tests {
         let s = ConfigState::from_env(good.to_str());
         assert!(s.cfg().is_some());
         assert!(s.ok());
+    }
+
+    #[test]
+    fn lock_check_never_silently_passes_a_stale_or_foreign_lock() {
+        assert_eq!(lock_check(crate::LockState::Absent).status, CheckStatus::Pass);
+        assert_eq!(lock_check(crate::LockState::Held(42)).status, CheckStatus::Pass);
+        // A dead PID must not read as a healthy pass.
+        assert_eq!(lock_check(crate::LockState::Stale(42)).status, CheckStatus::Warn);
+        assert_eq!(
+            lock_check(crate::LockState::Foreign(42)).status,
+            CheckStatus::Warn
+        );
     }
 
     #[test]
