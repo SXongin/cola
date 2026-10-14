@@ -19,9 +19,12 @@
 //! - **endings** — the per-run **Task Ending**s (ADR-0080): one
 //!   [`TaskRunRecord`] per [`TaskRunId`], each carrying at most one ending per
 //!   class and its entry's own state. Recorded where the ending is derived
-//!   (never when a card write lands), so a restart re-derives nothing. Like the
-//!   watermark it is session-scoped — `release` drops only the chain's record —
-//!   because the fact is about the run, not about the card that will show it.
+//!   (never when a card write lands as the fact) — except a **Wake**
+//!   completion's ending, recorded where its completion entry is committed to a
+//!   card's render (as `owed`; the confirmation flips it to `shown`) — so a
+//!   restart re-derives nothing. Like the watermark it is session-scoped —
+//!   `release` drops only the chain's record — because the fact is about the
+//!   run, not about the card that will show it.
 //!   Bounded: the OLDEST record with no owed ending goes first, and past the
 //!   owed cap the oldest owed entry is surrendered with a `WARN` (its fact
 //!   kept). The pre-ADR-0080 `rendered` section an older build wrote is
@@ -396,8 +399,9 @@ pub(crate) struct TaskRunIdentity {
 }
 
 /// One durable **Task Ending** (ADR-0080): a claim about how one Background Task
-/// run ended, recorded at derivation and outliving the record it was first
-/// written beside.
+/// run ended, recorded at derivation — except a **Wake** completion's, recorded
+/// where its completion entry is committed to a card's render — and outliving
+/// the record it was first written beside.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TaskEnding {
     pub(crate) class: TaskEndingClass,
@@ -1778,9 +1782,10 @@ impl ChainRecords {
     /// make two records for it. The first derivation of a class is the fact: a
     /// class the run already carries is not recorded again, and re-deriving it
     /// can never clear its shown bit. The run's ids all ride the resolved
-    /// record. One synchronous Chain Record write at derivation, the fact about
-    /// the run rather than about the card that will show it. Returns whether the
-    /// section changed.
+    /// record. One synchronous Chain Record write where the ending is recorded —
+    /// at derivation, or at a **Wake** completion entry's commit — the fact
+    /// about the run rather than about the card that will show it. Returns
+    /// whether the section changed.
     pub(crate) fn record_ending(&self, session_id: &str, run: &TaskRunId, ending: TaskEnding) -> bool {
         let mut state = self.lock();
         let session_id = resolved_session(&state, session_id);
