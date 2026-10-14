@@ -441,33 +441,12 @@ fn which_opencode_in(path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
     for dir in std::env::split_paths(path?) {
         for name in OPENCODE_BIN_NAMES {
             let candidate = dir.join(name);
-            if is_executable_file(&candidate) {
+            if crate::update::is_executable_file(&candidate) {
                 return Some(candidate);
             }
         }
     }
     None
-}
-
-/// Whether `path` is a file cola could actually execute: a regular file that,
-/// on unix, carries an execute bit (a non-executable `opencode` would make the
-/// spawn fail, so PATH lookup must not report it as found).
-fn is_executable_file(path: &Path) -> bool {
-    let Ok(meta) = std::fs::metadata(path) else {
-        return false;
-    };
-    if !meta.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        meta.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
 }
 
 /// The executable names to look for on `PATH`.

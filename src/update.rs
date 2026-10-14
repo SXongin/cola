@@ -155,6 +155,28 @@ pub fn current_exe_path() -> anyhow::Result<PathBuf> {
     })
 }
 
+/// Whether `path` is a file this process could actually execute: a regular file
+/// that, on unix, carries an execute bit. The one predicate for "spawnable
+/// binary" — `cola doctor`'s PATH lookup and `cola restart`'s program guard both
+/// use it, so a non-executable same-named file is never mistaken for runnable.
+pub fn is_executable_file(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 /// Detect the install channel of `exe` from cargo's install receipt (ADR-0030):
 /// a binary in `<install root>/bin` whose install root carries a
 /// `.crates2.json` entry listing that binary name. Best effort — no receipt (a
