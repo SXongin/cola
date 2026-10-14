@@ -246,26 +246,31 @@ pub fn run_logs_to(
         eprintln!("日志文件不存在: {}", path.display());
         return Ok(());
     }
-    let tail = tail_lines(&path, lines)?;
+    let (tail, end, identity) = tail_lines(&path, lines)?;
     for line in &tail {
         writeln!(out, "{line}")?;
     }
     out.flush()?;
     if follow {
-        follow_file(&path, out)?;
+        // Continue from exactly where the tail stopped, so a line appended
+        // between the tail read and the follow loop is printed, not skipped.
+        follow_file(&path, end, identity, out)?;
     }
     Ok(())
 }
 
-/// The last `n` lines of `path`, read from the end so a large log never loads
-/// whole. A file that does not end in a newline still yields its final line.
-fn tail_lines(path: &Path, n: usize) -> io::Result<Vec<String>> {
+/// The last `n` lines of `path`, plus the byte offset the tail ends at and the
+/// handle's identity at read time — what [`follow_file`] needs to resume from
+/// that exact point. A file that does not end in a newline still yields its
+/// final line. Read from the end so a large log is never loaded whole.
+fn tail_lines(path: &Path, n: usize) -> io::Result<(Vec<String>, u64, Option<u128>)> {
     use io::{Read, Seek, SeekFrom};
-    if n == 0 {
-        return Ok(Vec::new());
-    }
     let mut file = std::fs::File::open(path)?;
     let len = file.metadata()?.len();
+    let identity = handle_identity(&file);
+    if n == 0 {
+        return Ok((Vec::new(), len, identity));
+    }
     let block: u64 = 8192;
     let mut pos = len;
     let mut buf: Vec<u8> = Vec::new();
@@ -285,7 +290,7 @@ fn tail_lines(path: &Path, n: usize) -> io::Result<Vec<String>> {
     if lines.len() > n {
         lines.drain(0..lines.len() - n);
     }
-    Ok(lines)
+    Ok((lines, len, identity))
 }
 
 /// Poll `path` for appended bytes and print them, starting from the top when the
@@ -295,13 +300,11 @@ fn tail_lines(path: &Path, n: usize) -> io::Result<Vec<String>> {
 /// past the old offset). A trailing partial line is held back until its newline
 /// arrives, so a write caught mid-line is neither split nor duplicated. Blocks
 /// forever; the caller exits on Ctrl-C.
-fn follow_file(path: &Path, out: &mut impl Write) -> io::Result<()> {
+fn follow_file(path: &Path, start: u64, identity: Option<u128>, out: &mut impl Write) -> io::Result<()> {
     use io::{Read, Seek, SeekFrom};
     let poll = std::time::Duration::from_millis(300);
-    let opener = std::fs::File::open(path)?;
-    let mut identity = handle_identity(&opener);
-    let mut offset = opener.metadata()?.len();
-    drop(opener);
+    let mut identity = identity;
+    let mut offset = start;
     let mut pending: Vec<u8> = Vec::new();
     loop {
         std::thread::sleep(poll);
@@ -523,11 +526,18 @@ mod tests {
             body.push_str(&format!("line {i}\n"));
         }
         std::fs::write(&file, &body).unwrap();
-        assert_eq!(tail_lines(&file, 3).unwrap(), vec!["line 8", "line 9", "line 10"]);
+        let (lines, end, identity) = tail_lines(&file, 3).unwrap();
+        assert_eq!(lines, vec!["line 8", "line 9", "line 10"]);
+        // The tail ends at the file's length, so follow resumes there.
+        assert_eq!(end, body.len() as u64);
+        #[cfg(unix)]
+        assert!(identity.is_some(), "the handle identity travels to follow");
         // Fewer lines than requested yields the whole file.
-        assert_eq!(tail_lines(&file, 50).unwrap().len(), 10);
-        // Zero means nothing.
-        assert!(tail_lines(&file, 0).unwrap().is_empty());
+        assert_eq!(tail_lines(&file, 50).unwrap().0.len(), 10);
+        // Zero means nothing (but still reports where to resume).
+        let (none, end0, _) = tail_lines(&file, 0).unwrap();
+        assert!(none.is_empty());
+        assert_eq!(end0, body.len() as u64);
     }
 
     #[test]
@@ -535,7 +545,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("cola.log");
         std::fs::write(&file, b"a\nb\nc").unwrap();
-        assert_eq!(tail_lines(&file, 2).unwrap(), vec!["b", "c"]);
+        assert_eq!(tail_lines(&file, 2).unwrap().0, vec!["b", "c"]);
     }
 
     #[test]

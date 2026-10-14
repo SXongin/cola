@@ -23,12 +23,15 @@ Six additions, all **config-light and lock-free** — they must work while cola 
 running and against a broken install, so they are handled before the
 config/log/lock machinery exactly like `autostart`, `update` and `stop`.
 
-1. **`cola status [--json]`** — a one-shot, offline snapshot: run state (the
-   Singleton Lock holder's PID), autostart registration/state and its binary
-   path, claim state and Host, the resolved config path and whether it parsed,
-   the log path, and the shared OpenCode server (URL, PID, generation V1/V2, and
-   the `[opencode] generation` override). `--json` emits the same facts under
-   stable keys for scripts.
+1. **`cola status [--json]`** — a one-shot snapshot: run state (the Singleton
+   Lock holder's PID), autostart registration/state and its binary path, claim
+   state and Host, the resolved config path and whether it parsed, the log path,
+   and the shared OpenCode server (URL, PID, generation V1/V2, and the
+   `[opencode] generation` override). `--json` emits the same facts under stable
+   keys for scripts. It is local and makes no outbound call; the one network act
+   is the attach probe for the server's generation, a **bounded (5 s) loopback**
+   request to the server discovery already found — it never reaches the internet
+   and a wedged server degrades to "世代未知" rather than hanging indefinitely.
 2. **`cola doctor`** — the checks a support request needs, each printed with a
    ✅/⚠️/❌ mark and a summary: the config parses, the Feishu credentials
    authenticate (a tenant token **and** `bot/v3/info`), `opencode` is on `PATH`,
@@ -36,14 +39,18 @@ config/log/lock machinery exactly like `autostart`, `update` and `stop`.
    log file/dir is present, and the autostart registration's binary path matches
    the running binary. Exits non-zero when any check **fails** (warnings do not
    fail the run).
-3. **`cola restart [-y]`** — restart the running instance. A registered
-   Supervisor goes first (`systemctl --user restart` / `launchctl kickstart -k`),
-   which also brings the unit back up; otherwise the lock holder is terminated and
-   a **detached** replacement is spawned from the instance's OWN command line
-   (the CLI has no startup args of its own to reuse) plus `--replace`. Both paths
-   verify, within a bounded wait, that a **different** PID took the lock before
-   reporting success — a supervisor restart reports success even when the new
-   instance never started.
+3. **`cola restart [-y]`** — restart the running instance. The Supervisor path
+   (`systemctl --user restart` / `launchctl kickstart -k`) is used **only when
+   the Supervisor owns the running process** (detected from the lock holder's
+   environment: systemd's `INVOCATION_ID` + `SYSTEMD_EXEC_PID`, launchd's
+   `XPC_SERVICE_NAME`): restarting the unit while an unrelated manual instance
+   holds the lock would start a process that cannot acquire it, which
+   `Restart=on-failure` would then crash-loop. Otherwise — and whenever the
+   Supervisor command fails — a **detached** replacement is spawned from the
+   instance's OWN command line, executable and working directory (so a relative
+   `--config`/`./cola.toml` still resolves) plus `--replace`. Both paths verify,
+   within a bounded wait, that a **different** PID took the lock before reporting
+   success.
 4. **`cola logs [-f] [-n N] [--date YYYY-MM-DD]`** — the tail of today's log, or
    a rotated day's file; `-f` follows appended lines and reopens the fresh base
    file across a midnight rotation.
