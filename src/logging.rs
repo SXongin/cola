@@ -246,30 +246,54 @@ pub fn run_logs_to(
         eprintln!("日志文件不存在: {}", path.display());
         return Ok(());
     }
-    let (tail, end, identity) = tail_lines(&path, lines)?;
-    for line in &tail {
+    let tail = tail_lines(&path, lines)?;
+    for line in &tail.lines {
         writeln!(out, "{line}")?;
     }
-    out.flush()?;
     if follow {
-        // Continue from exactly where the tail stopped, so a line appended
-        // between the tail read and the follow loop is printed, not skipped.
-        follow_file(&path, end, identity, out)?;
+        // Continue from exactly where the tail stopped — same offset, same
+        // identity — and carry a trailing partial line into the follow buffer so
+        // the writer completing it lands on ONE line, not a split in two.
+        follow_file(&path, tail.end, tail.identity, tail.partial, out)?;
+    } else if !tail.partial.is_empty() {
+        // One-shot: a final unterminated line is still shown, terminated here.
+        out.write_all(&tail.partial)?;
+        writeln!(out)?;
     }
+    out.flush()?;
     Ok(())
+}
+
+/// The last lines of a log, split from the byte stream so the follow loop can
+/// take over without a lost or duplicated partial line.
+struct Tail {
+    /// Complete lines to print.
+    lines: Vec<String>,
+    /// A trailing bytes-without-newline run, held back for the follow buffer
+    /// (or terminated by a one-shot print).
+    partial: Vec<u8>,
+    /// The byte offset the tail ends at (the file length at read time).
+    end: u64,
+    /// The handle's identity at read time, so follow notices a rotation since.
+    identity: Option<u128>,
 }
 
 /// The last `n` lines of `path`, plus the byte offset the tail ends at and the
 /// handle's identity at read time — what [`follow_file`] needs to resume from
 /// that exact point. A file that does not end in a newline still yields its
 /// final line. Read from the end so a large log is never loaded whole.
-fn tail_lines(path: &Path, n: usize) -> io::Result<(Vec<String>, u64, Option<u128>)> {
+fn tail_lines(path: &Path, n: usize) -> io::Result<Tail> {
     use io::{Read, Seek, SeekFrom};
     let mut file = std::fs::File::open(path)?;
     let len = file.metadata()?.len();
     let identity = handle_identity(&file);
     if n == 0 {
-        return Ok((Vec::new(), len, identity));
+        return Ok(Tail {
+            lines: Vec::new(),
+            partial: Vec::new(),
+            end: len,
+            identity,
+        });
     }
     let block: u64 = 8192;
     let mut pos = len;
@@ -285,12 +309,28 @@ fn tail_lines(path: &Path, n: usize) -> io::Result<(Vec<String>, u64, Option<u12
         buf = chunk;
         newlines = buf.iter().filter(|&&b| b == b'\n').count();
     }
-    let text = String::from_utf8_lossy(&buf);
+    // Split the trailing bytes-without-newline run off: it is not a line yet.
+    let (complete, partial) = match buf.iter().rposition(|&b| b == b'\n') {
+        Some(i) => (buf[..=i].to_vec(), buf[i + 1..].to_vec()),
+        None => (Vec::new(), buf),
+    };
+    // The partial counts toward `n` in one-shot printing, so `n` lines out.
+    let keep = if partial.is_empty() {
+        n
+    } else {
+        n.saturating_sub(1)
+    };
+    let text = String::from_utf8_lossy(&complete);
     let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
-    if lines.len() > n {
-        lines.drain(0..lines.len() - n);
+    if lines.len() > keep {
+        lines.drain(0..lines.len() - keep);
     }
-    Ok((lines, len, identity))
+    Ok(Tail {
+        lines,
+        partial,
+        end: len,
+        identity,
+    })
 }
 
 /// Poll `path` for appended bytes and print them, starting from the top when the
@@ -300,12 +340,18 @@ fn tail_lines(path: &Path, n: usize) -> io::Result<(Vec<String>, u64, Option<u12
 /// past the old offset). A trailing partial line is held back until its newline
 /// arrives, so a write caught mid-line is neither split nor duplicated. Blocks
 /// forever; the caller exits on Ctrl-C.
-fn follow_file(path: &Path, start: u64, identity: Option<u128>, out: &mut impl Write) -> io::Result<()> {
+fn follow_file(
+    path: &Path,
+    start: u64,
+    identity: Option<u128>,
+    pending: Vec<u8>,
+    out: &mut impl Write,
+) -> io::Result<()> {
     use io::{Read, Seek, SeekFrom};
     let poll = std::time::Duration::from_millis(300);
     let mut identity = identity;
     let mut offset = start;
-    let mut pending: Vec<u8> = Vec::new();
+    let mut pending: Vec<u8> = pending;
     loop {
         std::thread::sleep(poll);
         // Identity AND length come from the SAME opened handle, so a rotation
@@ -536,26 +582,43 @@ mod tests {
             body.push_str(&format!("line {i}\n"));
         }
         std::fs::write(&file, &body).unwrap();
-        let (lines, end, identity) = tail_lines(&file, 3).unwrap();
-        assert_eq!(lines, vec!["line 8", "line 9", "line 10"]);
+        let tail = tail_lines(&file, 3).unwrap();
+        assert_eq!(tail.lines, vec!["line 8", "line 9", "line 10"]);
+        assert!(tail.partial.is_empty(), "the file ends on a newline");
         // The tail ends at the file's length, so follow resumes there.
-        assert_eq!(end, body.len() as u64);
+        assert_eq!(tail.end, body.len() as u64);
         #[cfg(unix)]
-        assert!(identity.is_some(), "the handle identity travels to follow");
+        assert!(tail.identity.is_some(), "the handle identity travels to follow");
         // Fewer lines than requested yields the whole file.
-        assert_eq!(tail_lines(&file, 50).unwrap().0.len(), 10);
+        assert_eq!(tail_lines(&file, 50).unwrap().lines.len(), 10);
         // Zero means nothing (but still reports where to resume).
-        let (none, end0, _) = tail_lines(&file, 0).unwrap();
-        assert!(none.is_empty());
-        assert_eq!(end0, body.len() as u64);
+        let none = tail_lines(&file, 0).unwrap();
+        assert!(none.lines.is_empty());
+        assert_eq!(none.end, body.len() as u64);
     }
 
     #[test]
-    fn tail_lines_keeps_a_final_unterminated_line() {
+    fn tail_lines_separates_a_final_unterminated_line() {
+        // A write caught mid-line: the partial run must travel separately so
+        // follow can complete it on ONE line (not a re-printed suffix), while a
+        // one-shot print still shows the last `n` lines.
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("cola.log");
         std::fs::write(&file, b"a\nb\nc").unwrap();
-        assert_eq!(tail_lines(&file, 2).unwrap().0, vec!["b", "c"]);
+        let tail = tail_lines(&file, 2).unwrap();
+        assert_eq!(tail.lines, vec!["b"], "the partial counts toward n");
+        assert_eq!(tail.partial, b"c");
+        assert_eq!(tail.end, 5);
+    }
+
+    #[test]
+    fn one_shot_print_terminates_a_partial_final_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("cola.log");
+        std::fs::write(&base, b"a\nb\nc").unwrap();
+        let mut out: Vec<u8> = Vec::new();
+        run_logs_to(&base, false, 2, None, &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "b\nc\n");
     }
 
     #[test]
