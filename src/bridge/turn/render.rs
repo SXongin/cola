@@ -3043,12 +3043,12 @@ mod tests {
     }
 
     /// ADR-0080 (CI gate): the durable identity resolves PER FIELD, so a partial
-    /// one never drops a field a fuller ending already captured. A Cleanup
-    /// captured both a label and a start clock; a launchless Wake is then
-    /// recorded with a label but NO start clock — the completion entry the Wake
-    /// owes still keeps the Cleanup's start clock.
+    /// one never drops a field a fuller ending already captured.
     #[test]
-    fn a_partial_identity_never_drops_the_start_clock() {
+    fn a_partial_identity_never_drops_a_captured_field() {
+        // A Cleanup captured both a label and a start clock; a launchless Wake is
+        // then recorded with a label but NO start clock — the completion entry
+        // the Wake owes still keeps the Cleanup's start clock.
         let acc = StreamAccumulator::new("test");
         let transcript =
             SessionTranscript::new(vec![]).with_wakes(vec![subagent_wake("ses_call_sub", 3_000)]);
@@ -3090,6 +3090,133 @@ mod tests {
             plans[0].entry.started_at,
             Some(1_000),
             "the Cleanup's start clock survives the Wake's partial identity"
+        );
+
+        // The ID-only case: an ending that captured ONLY ids, then a later ending
+        // that captured a label but no ids. The earlier ids must survive — the
+        // launchless shell Wake, which names no shell of its own, takes the
+        // durable shell id for its entry rather than the Wake's job-id fallback.
+        let acc = StreamAccumulator::new("test");
+        let wake = Wake {
+            id: MessageId::new("msg_wake_shell"),
+            created_ms: Some(3_000),
+            source: WakeSource::Shell,
+            shell_id: None,
+            job_id: Some("job_1".into()),
+            child_id: None,
+            state: Some("completed".into()),
+            label: None,
+        };
+        let transcript = SessionTranscript::new(vec![]).with_wakes(vec![wake]);
+        let ids_only = crate::bridge::chain::TaskEnding {
+            class: TaskEndingClass::Cleanup,
+            state: TaskEndingState::Shown,
+            finished_at: Some(2_000),
+            evidence: None,
+            identity: TaskRunIdentity {
+                tool: Some("shell".into()),
+                call_id: Some("call_sub".into()),
+                shell_id: Some("shell_durable".into()),
+                child_id: None,
+                started_at: None,
+                label: None,
+            },
+        };
+        let label_only = crate::bridge::chain::TaskEnding {
+            class: TaskEndingClass::Wake,
+            state: TaskEndingState::Owed,
+            finished_at: Some(2_000),
+            evidence: None,
+            identity: TaskRunIdentity {
+                label: Some("wake".into()),
+                ..TaskRunIdentity::default()
+            },
+        };
+        let facts = EndingFacts::new(vec![TaskRunRecord {
+            run: TaskRunId {
+                key: "call_sub".into(),
+                call_id: Some("call_sub".into()),
+                shell_id: Some("shell_durable".into()),
+                child_id: None,
+                job_id: Some("job_1".into()),
+                wake_id: None,
+            },
+            endings: vec![ids_only, label_only],
+        }]);
+
+        let plans = plan_wake_entries(&acc, &transcript, &turn_anchor(0), &facts);
+        assert_eq!(plans.len(), 1, "the shell Wake's completion plans");
+        assert_eq!(
+            plans[0].entry.id.as_deref(),
+            Some("shell_durable"),
+            "the ID-only ending's shell id survives the later label-only ending"
+        );
+    }
+
+    /// ADR-0080 (CI gate): an ending that captured ONLY ids must not be dropped —
+    /// the identity is a fallback whenever ANY field is set, not only when a
+    /// label or a start clock is. A launchless shell Wake that resolves through
+    /// a job-id alias and names no shell of its own takes the durable shell id
+    /// for its entry instead of the Wake's job-id last resort.
+    #[test]
+    fn an_id_only_identity_is_not_dropped() {
+        let acc = StreamAccumulator::new("test");
+        let wake = Wake {
+            id: MessageId::new("msg_wake_shell"),
+            created_ms: Some(3_000),
+            source: WakeSource::Shell,
+            shell_id: None,
+            job_id: Some("job_1".into()),
+            child_id: None,
+            state: Some("completed".into()),
+            label: None,
+        };
+        let transcript = SessionTranscript::new(vec![]).with_wakes(vec![wake]);
+        let ids_only = crate::bridge::chain::TaskEnding {
+            class: TaskEndingClass::Cleanup,
+            state: TaskEndingState::Shown,
+            finished_at: Some(2_000),
+            evidence: None,
+            identity: TaskRunIdentity {
+                tool: Some("shell".into()),
+                call_id: Some("call_sub".into()),
+                shell_id: Some("shell_durable".into()),
+                child_id: None,
+                started_at: None,
+                label: None,
+            },
+        };
+        // The newest ending named no id at all (a launchless Wake's own
+        // identity), so the durable ids can come only from the earlier one — and
+        // nothing on the record carries a label or a start clock.
+        let wake_ending = crate::bridge::chain::TaskEnding {
+            class: TaskEndingClass::Wake,
+            state: TaskEndingState::Owed,
+            finished_at: Some(3_000),
+            evidence: None,
+            identity: TaskRunIdentity {
+                tool: Some("shell".into()),
+                ..TaskRunIdentity::default()
+            },
+        };
+        let facts = EndingFacts::new(vec![TaskRunRecord {
+            run: TaskRunId {
+                key: "call_sub".into(),
+                call_id: Some("call_sub".into()),
+                shell_id: Some("shell_durable".into()),
+                child_id: None,
+                job_id: Some("job_1".into()),
+                wake_id: None,
+            },
+            endings: vec![ids_only, wake_ending],
+        }]);
+
+        let plans = plan_wake_entries(&acc, &transcript, &turn_anchor(0), &facts);
+        assert_eq!(plans.len(), 1, "the shell Wake's completion plans");
+        assert_eq!(
+            plans[0].entry.id.as_deref(),
+            Some("shell_durable"),
+            "an id-only identity is still a fallback for the entry's id"
         );
     }
 
