@@ -55,7 +55,6 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use crate::backend::{BackgroundTask, SessionTranscript, TaskRetirement, TaskRetirementEnding};
 use crate::bridge::chain::{
     ChainRecords, TaskEnding, TaskEndingClass, TaskEndingEvidence, TaskEndingState, TaskRunRecord,
-    resolves_run,
 };
 
 use super::TaskCell;
@@ -471,23 +470,20 @@ impl TasksHandle {
         // (ADR-0080): the record carries every id the run is known by, and the
         // row's own ids (its call id, its shell/child id) resolve the same
         // record — so a launchless Wake that keyed the record by a shell id
-        // still prunes a row the read names by a different call id. RESOLVE,
-        // THEN FOLD: the prune also hands the record the ids the row was named
-        // by (one write, only when an id was learned), so a later writer holding
-        // only that id resolves the one record instead of minting a second one
-        // for one run. The process-local `retired` cache rides along for a run
-        // whose ending write a restart lost; it too matches any id the row is
-        // known by.
+        // still prunes a row the read names by a different call id. RESOLVE AND
+        // FOLD IN ONE LOCK (`observe_run`): the read hands the record the ids
+        // the row was named by before any writer can act on the same observation,
+        // so a writer holding only one of them resolves the one record instead of
+        // minting a second one for one run. The process-local `retired` cache
+        // rides along for a run whose ending write a restart lost; it too matches
+        // any id the row is known by.
         let chains = self.chains();
         transcript.background_tasks.retain(|task| {
             let run = TaskRunId::of_launch(task);
-            if !resolves_run(&records, &run) {
-                return true;
+            match &chains {
+                Some(chains) => !chains.observe_run(session_id, &run),
+                None => true,
             }
-            if let Some(chains) = &chains {
-                chains.fold_run_ids(session_id, &run);
-            }
-            false
         });
         if let Some(ids) = state.retired.get(session_id) {
             transcript.background_tasks.retain(|task| {
@@ -603,6 +599,83 @@ mod tests {
         assert!(
             ids.contains(&"msg_wake_1".to_string()),
             "every id the run is known by is seeded, not just the key: {ids:?}"
+        );
+    }
+
+    /// A live `shell` row: the launch's call id, and (when the read named one)
+    /// the shell it runs in.
+    fn shell_task(call_id: &str, shell_id: Option<&str>) -> BackgroundTask {
+        BackgroundTask {
+            tool: crate::backend::ToolIdentity {
+                name: "shell".into(),
+                call_id: call_id.into(),
+            },
+            shell_id: shell_id.map(str::to_string),
+            child_id: None,
+            started_at: Some(2_000),
+        }
+    }
+
+    /// The run a writer holds when it knows ONLY the launch's call id.
+    fn only_call_id_run(call_id: &str) -> TaskRunId {
+        TaskRunId {
+            key: call_id.into(),
+            call_id: Some(call_id.into()),
+            shell_id: None,
+            child_id: None,
+            job_id: None,
+            wake_id: None,
+        }
+    }
+
+    /// The reviewer's interleaving (ADR-0080, CI gate): the read observes a row
+    /// whose run's record is keyed by the SHELL id alone; a writer holding ONLY
+    /// the row's later call id must resolve that record, never mint a second one.
+    /// The observation and the fold are ONE critical section ([`ChainRecords::observe_run`]),
+    /// so the record carries every id the read saw BEFORE any writer can act —
+    /// and a SECOND row naming the run by that later id alone resolves the same
+    /// record too, instead of surviving on a stale snapshot.
+    #[test]
+    fn a_read_observes_every_row_before_a_writer_can_mint() {
+        let dir = tempfile::tempdir().unwrap();
+        let chains = std::sync::Arc::new(ChainRecords::load(dir.path().join("chain_records.json")));
+        // The launchless Wake's record: keyed by the shell id alone.
+        let run = TaskRunId::of_wake(&launchless_wake("sh_call_bg")).expect("the Wake names the run");
+        chains.record_ending(
+            "ses_a",
+            &run,
+            TaskEnding::owed(TaskEndingClass::Wake, TaskRunIdentity::default()),
+        );
+
+        let handle = TasksHandle::new();
+        handle.attach_chains(chains.clone());
+
+        // The read carries the run's row twice: once named by the shell id the
+        // record keys on (with the later call id the launch adds), and once by
+        // that later call id ALONE — the id a concurrent writer holds.
+        let mut transcript = SessionTranscript::new(vec![]).with_background_tasks(vec![
+            shell_task("call_bg", Some("sh_call_bg")),
+            shell_task("call_bg", None),
+        ]);
+        handle.apply("ses_a", &mut transcript);
+        assert!(
+            transcript.background_tasks.is_empty(),
+            "every row the read observed leaves the ledger: {transcript:?}"
+        );
+
+        // The concurrent writer holding ONLY the later call id resolves the one
+        // record, never a second one for the run.
+        chains.record_ending(
+            "ses_a",
+            &only_call_id_run("call_bg"),
+            TaskEnding::owed(TaskEndingClass::Evidence, TaskRunIdentity::default()),
+        );
+        let records = chains.endings("ses_a");
+        assert_eq!(records.len(), 1, "one record for the run: {records:?}");
+        assert!(
+            records[0].run.names("call_bg") && records[0].run.names("sh_call_bg"),
+            "the record carries both ids the read observed: {:?}",
+            records[0].run
         );
     }
 }
