@@ -477,6 +477,13 @@ impl TasksHandle {
         // minting a second one for one run. The process-local `retired` cache
         // rides along for a run whose ending write a restart lost; it too matches
         // any id the row is known by.
+        //
+        // ORDERING: the endings snapshot above was taken BEFORE this
+        // observation, so a completion a writer records in between is pruned
+        // from THIS read's live list while its ending is synthesized only on a
+        // later read — the prune may make one card update miss a completion
+        // entry it would otherwise have shown, and that entry stays owed to the
+        // next card.
         let chains = self.chains();
         transcript.background_tasks.retain(|task| {
             let run = TaskRunId::of_launch(task);
