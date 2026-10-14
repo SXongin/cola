@@ -30,7 +30,9 @@ config/log/lock machinery exactly like `autostart`, `update` and `stop`.
    `[opencode] generation` override). `--json` emits the same facts under stable
    keys for scripts. It is local and makes no outbound call; the one network act
    is the attach probe for the server's generation, a **bounded (5 s) loopback**
-   request to the server discovery already found — it never reaches the internet
+   request to the server discovery already found, made through
+   `Transport::new_loopback` so an inherited `HTTP_PROXY` can never carry the
+   server's Basic credentials off the machine — it never reaches the internet,
    and a wedged server degrades to "世代未知" rather than hanging indefinitely.
 2. **`cola doctor`** — the checks a support request needs, each printed with a
    ✅/⚠️/❌ mark and a summary: the config parses, the Feishu credentials

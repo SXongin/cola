@@ -317,17 +317,12 @@ fn follow_file(path: &Path, start: u64, identity: Option<u128>, out: &mut impl W
         let Ok(meta) = file.metadata() else {
             continue;
         };
-        // A new file at the same path (rotation) restarts from the top: only
-        // comparing lengths would miss a fresh base that grew past the offset.
         let current = handle_identity(&file);
-        if current != identity {
-            identity = current;
-            offset = 0;
-            pending.clear();
-        }
         let len = meta.len();
-        if len < offset {
-            offset = 0;
+        let (next, restarted) = resume(identity, current, offset, len);
+        identity = current;
+        offset = next;
+        if restarted {
             pending.clear();
         }
         if len == offset {
@@ -352,6 +347,21 @@ fn drain_complete_lines(pending: &mut Vec<u8>, out: &mut impl Write) -> io::Resu
         out.write_all(&line)?;
     }
     Ok(())
+}
+
+/// How the follow loop resumes on a poll: the offset to read from, and whether
+/// the file was replaced or truncated (so its partial-line buffer must be
+/// dropped). A changed identity (rotation) or a shrunk length restarts from 0 —
+/// only comparing lengths would miss a fresh base that grew past the old offset.
+fn resume(
+    prev_identity: Option<u128>,
+    cur_identity: Option<u128>,
+    prev_offset: u64,
+    cur_len: u64,
+) -> (u64, bool) {
+    let restarted = cur_identity != prev_identity || cur_len < prev_offset;
+    let offset = if restarted { 0 } else { prev_offset };
+    (offset, restarted)
 }
 
 /// A stable identity for an OPEN file handle, used to notice rotation. `None`
@@ -560,6 +570,22 @@ mod tests {
         drain_complete_lines(&mut pending, &mut out).unwrap();
         assert_eq!(out, b"a\nb\npartial done\n");
         assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn resume_restarts_on_a_new_identity_or_a_shrunk_file() {
+        // Same file, appended: continue from the old offset.
+        assert_eq!(resume(Some(7), Some(7), 100, 250), (100, false));
+        // Same file, nothing new.
+        assert_eq!(resume(Some(7), Some(7), 100, 100), (100, false));
+        // A new file at the path (rotation), even one already larger than the
+        // old offset: restart from the top.
+        assert_eq!(resume(Some(7), Some(8), 100, 500), (0, true));
+        // Truncated in place: restart from the top.
+        assert_eq!(resume(Some(7), Some(7), 100, 40), (0, true));
+        // Identity unavailable (non-unix): the shrink check still applies.
+        assert_eq!(resume(None, None, 100, 150), (100, false));
+        assert_eq!(resume(None, None, 100, 90), (0, true));
     }
 
     #[cfg(unix)]
