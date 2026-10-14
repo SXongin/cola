@@ -548,8 +548,9 @@ impl EndingFacts {
     /// no longer carries the launch. Resolved PER FIELD, newest first (ADR-0080,
     /// CI gate): a partial identity can never drop a field a fuller ending
     /// already captured — a launchless Wake recorded with a label but no start
-    /// clock still leaves the Cleanup's start clock in place. `None` when no
-    /// ending captured a label or a start clock (nothing to fall back to).
+    /// clock still leaves the Cleanup's start clock in place, and an ending that
+    /// captured only ids still yields them beside a later label-only ending.
+    /// `None` only when no ending captured ANY field (nothing to fall back to).
     pub(crate) fn identity(&self, run: &TaskRunId) -> Option<TaskRunIdentity> {
         let record = resolve_run(&self.records, run)?;
         let mut identity = TaskRunIdentity::default();
@@ -574,7 +575,15 @@ impl EndingFacts {
                 identity.label = held.label.clone();
             }
         }
-        (identity.label.is_some() || identity.started_at.is_some()).then_some(identity)
+        // Any captured field is a usable fallback — an ID-only ending must not
+        // be dropped just because it named no label and no start clock.
+        let any = identity.tool.is_some()
+            || identity.call_id.is_some()
+            || identity.shell_id.is_some()
+            || identity.child_id.is_some()
+            || identity.started_at.is_some()
+            || identity.label.is_some();
+        any.then_some(identity)
     }
 
     /// Fold a delivered-but-unrecorded body's pairs into the snapshot as SHOWN.
