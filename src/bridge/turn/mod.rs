@@ -106,6 +106,21 @@ const IDLE_CONFIRMATIONS: usize = 3;
 /// tiny value through the turn config's `long_task_notice_ms` atomic.
 pub(crate) const LONG_TASK_NOTICE_MS: u64 = 300_000;
 
+/// The Completion Notice's repaint delay (#650, ADR-0074 §3's amendment): how
+/// long the notice waits after its terminal write's carrier is accepted before
+/// it is sent. Feishu patches a card in place without pushing — the notice's own
+/// new message is the only push a Turn has — and a client repaints an updated
+/// card asynchronously. Measured live, the ~0.6 s between a large terminal PATCH
+/// and the notice it followed was not enough: the push surfaced before the
+/// answer was visible. The delay gives the repaint a head start.
+///
+/// It is a heuristic, and it can still lose: no Feishu API reports that a client
+/// has repainted, so a very large card on a slow client can outlast it (ratified
+/// in ADR-0074 §3's amendment). Like [`LONG_TASK_NOTICE_MS`] it is a constant,
+/// not a config key; tests inject a tiny value through the turn config's
+/// `completion_notice_delay_ms` atomic.
+pub(crate) const COMPLETION_NOTICE_DELAY_MS: u64 = 3_000;
+
 /// What one drain read saw (ADR-0043).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DrainState {
@@ -439,8 +454,9 @@ impl Turn {
         }
 
         // Fresh accumulator per prompt: reuse leaks stale text/tools from the
-        // previous turn into the next card. The card's IDENTITY (the message
-        // id) carries over — only the content is reset.
+        // previous turn into the next card, so only the content is reset. The
+        // attempt takes over the session's card slot with NO message id of its
+        // own; it takes one from the loading card it replies with below.
         //
         // The CardSession is inserted BEFORE the loading-card round-trip (and
         // with `card_message_id: None`, filled in once the reply lands): a
@@ -3809,7 +3825,7 @@ impl Turn {
 /// the notice is suppressed rather than announced on the successor. A deferred
 /// notice additionally carries the
 /// ORIGINAL request's requester and re-checks the card's identity before sending
-/// ([`deliver_deferred_notice`]), so a newer Turn's card is never announced over
+/// ([`spawn_notice`]), so a newer Turn's card is never announced over
 /// the old request's ending (review findings 1, 5 and 6).
 pub(crate) async fn announce_completion(
     cards: &CardsHandle,
@@ -3880,6 +3896,11 @@ pub(crate) async fn announce_completion(
     // replaced while the terminal write was still owed. `None` keeps it silent
     // (the disposition, the opt-ins or a missing requester/reply target).
     let resolved = captured.resolve(session_id, rules, started_at, disposition);
+    // The repaint delay (#650): read once, before any gate, so every carrier —
+    // delivered now, or fired later by a drain — waits the same span from the
+    // moment its terminal write was accepted. It holds back the SEND only; the
+    // write itself is never deferred by it.
+    let delay_ms = rules.completion_notice_delay_ms();
     match captured.ending {
         // The terminal slice's own carrier refused: the delivery layer would
         // answer for the OLD card (whose earlier write delivered), so the
@@ -3888,11 +3909,11 @@ pub(crate) async fn announce_completion(
         EndingWrite::Failed => {
             tracing::warn!("completion notice suppressed: the terminal write for {session_id} was refused");
         }
-        // The terminal slice is on Feishu: announce at once, to the request that
-        // ended.
+        // The terminal slice is on Feishu: announce after the repaint delay, to
+        // the request that ended.
         EndingWrite::Delivered => {
             if let Some(notice) = resolved {
-                send_resolved_notice(platform, &notice).await;
+                spawn_notice(cards, platform, delay_ms, notice);
             }
         }
         // The terminal slice is owed by the delivery layer's retry at THIS
@@ -3904,25 +3925,21 @@ pub(crate) async fn announce_completion(
             let Some(notice) = resolved else {
                 return;
             };
-            // The deferred closure spawns the send on fire: the delivery layer
-            // calls it from a drain, and the notice's own reply must not run
-            // under the delivery layer's lock. It carries the resolved recipient
-            // AND the original card's identity, so it re-checks ownership before
-            // sending (review finding 1).
+            // The deferred closure spawns the delayed send on fire: the delivery
+            // layer calls it from a drain, and the notice's own reply must not
+            // run under the delivery layer's lock. It carries the resolved
+            // recipient AND the original card's identity, so the send re-checks
+            // ownership after its delay (review finding 1).
             let deferred: crate::feishu::DeferredNotice = {
                 let cards = cards.clone();
                 let platform = Arc::clone(platform);
                 let notice = notice.clone();
-                Box::new(move || {
-                    tokio::spawn(async move {
-                        deliver_deferred_notice(&cards, &platform, notice).await;
-                    });
-                })
+                Box::new(move || spawn_notice(&cards, &platform, delay_ms, notice))
             };
             match platform.defer_notice_until_delivered(&card_id, seq, deferred) {
                 crate::feishu::NoticeGate::Armed => {}
                 crate::feishu::NoticeGate::Delivered => {
-                    send_resolved_notice(platform, &notice).await;
+                    spawn_notice(cards, platform, delay_ms, notice);
                 }
                 crate::feishu::NoticeGate::Never => {
                     tracing::warn!(
@@ -4016,28 +4033,40 @@ async fn send_resolved_notice(platform: &Arc<dyn crate::feishu::Platform>, notic
     }
 }
 
-/// Fire a deferred Completion Notice, but only if the session's card is STILL
-/// the one the notice was armed against (spec #602, review finding 1): a newer
-/// Turn that replaced the card must not have the OLD request's ending announced
-/// to its requester. A missing card is a replacement/collect too — suppress.
-async fn deliver_deferred_notice(
+/// Send a resolved Completion Notice after the repaint delay (#650, ADR-0074
+/// §3's amendment). Both the delay and the send run on a task of their own, so
+/// no caller — the Turn's own finish, Session Sync's quiet settle, the delivery
+/// layer's drain — ever waits them out; and the card's ownership is re-checked
+/// AFTER the delay, because a card a newer Turn replaced (or a collect took)
+/// while the notice waited must not have the OLD request's ending announced to
+/// its requester (spec #602, review finding 1). A missing card is a
+/// replacement/collect too — suppress.
+fn spawn_notice(
     cards: &CardsHandle,
     platform: &Arc<dyn crate::feishu::Platform>,
+    delay_ms: u64,
     notice: ResolvedNotice,
 ) {
-    let current = {
-        let live = cards.cards.lock().await;
-        live.get(&notice.session_id)
-            .and_then(|c| c.card_message_id.clone())
-    };
-    if current.as_deref() != Some(notice.card_message_id.as_str()) {
-        tracing::warn!(
-            "completion notice suppressed: the card for {} was replaced before its terminal write drained",
-            notice.session_id
-        );
-        return;
-    }
-    send_resolved_notice(platform, &notice).await;
+    let cards = cards.clone();
+    let platform = Arc::clone(platform);
+    tokio::spawn(async move {
+        if delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        }
+        let current = {
+            let live = cards.cards.lock().await;
+            live.get(&notice.session_id)
+                .and_then(|c| c.card_message_id.clone())
+        };
+        if current.as_deref() != Some(notice.card_message_id.as_str()) {
+            tracing::warn!(
+                "completion notice suppressed: the card for {} was replaced before the notice's delay elapsed",
+                notice.session_id
+            );
+            return;
+        }
+        send_resolved_notice(&platform, &notice).await;
+    });
 }
 
 /// The Turn's test seam (spec #298, A3): the fixtures tests outside the Turn
@@ -4620,6 +4649,8 @@ mod tests {
             Some("om_1"),
         )
         .await;
+        // The notice's send is spawned (#650): await it before asserting.
+        crate::bridge::tests::drain::wait_for_notice(&platform).await;
         assert!(
             platform.calls.lock().await.iter().any(|call| matches!(
                 call,
@@ -4633,17 +4664,18 @@ mod tests {
         );
     }
 
-    /// Finding (spec #602 pre-push review 5): `announce_completion` captured the
-    /// card carrying the terminal write under one lock, then resolved the
-    /// notice's recipient from a SEPARATE read of the session's current card. A
-    /// newer Turn that replaces the card between those two reads redirects a
-    /// DELIVERED notice to the replacement's requester.
+    /// Finding (spec #602 pre-push review 5), under the repaint delay (#650):
+    /// `announce_completion` captures the card carrying the terminal write — and
+    /// with it the notice's recipient — under ONE lock, never a separate
+    /// re-read; the card's ownership is then re-checked again after the delay. A
+    /// newer Turn that replaces the card inside that window therefore gets no
+    /// notice at all: the old ending is never announced on the replacement, and
+    /// the (now collected) old card's request is not notified over it.
     ///
-    /// The map lock makes the race deterministic: the announce (spawned first)
-    /// takes the lock, captures the ORIGINAL card and releases; the replacement
-    /// (spawned second, already queued) swaps in a fully formed card before the
-    /// announce resolves. The notice must still land on the ORIGINAL request's
-    /// recipient, never the replacement's.
+    /// The map lock makes the ordering deterministic: the announce (spawned
+    /// first) takes the lock, captures the ORIGINAL card and releases; the
+    /// replacement (spawned second, already queued) swaps in a fully formed card
+    /// while the notice waits its delay out.
     #[tokio::test]
     async fn a_replace_between_captures_never_redirects_a_delivered_notice() {
         let _wd = test_work_dir();
@@ -4654,6 +4686,11 @@ mod tests {
         Turn::seed_card(&cards, "ses_test", Some("om_old")).await;
         Turn::set_reply_target(&cards, "ses_test", "msg_old").await;
         Turn::set_turn_identity(&cards, "ses_test", "ou_old", true, 1).await;
+
+        // A delay long enough that the replacement (below) certainly lands
+        // inside it — the window the repaint delay creates (#650).
+        app.completion_notice_delay_ms
+            .store(300, std::sync::atomic::Ordering::Relaxed);
 
         // Hold the map lock so the announce and the replacement queue on it in
         // spawn order: the announce first, the newer Turn's replacement second.
@@ -4701,18 +4738,13 @@ mod tests {
         announce.await.expect("the announce task");
         replace.await.expect("the replacement task");
 
+        // The card was replaced while the notice waited its delay out: neither
+        // the old (collected) request nor the replacement is told the old ending.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         let notices = platform.completion_notices().await;
         assert!(
-            notices
-                .iter()
-                .any(|(reply_to, open_id, _, _)| reply_to == "msg_old" && open_id == "ou_old"),
-            "the request that ended is still notified: {notices:?}"
-        );
-        assert!(
-            notices
-                .iter()
-                .all(|(reply_to, open_id, _, _)| reply_to != "msg_new" && open_id != "ou_new_requester"),
-            "the replacement request is never announced the old Turn's ending: {notices:?}"
+            notices.is_empty(),
+            "a replaced card suppresses the notice instead of redirecting it: {notices:?}"
         );
     }
 
@@ -4853,6 +4885,8 @@ mod tests {
         )
         .await;
 
+        // The notice's send is spawned (#650): await it before asserting.
+        crate::bridge::tests::drain::wait_for_notice(&platform).await;
         assert_eq!(
             platform.completion_notices().await,
             vec![(

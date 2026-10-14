@@ -3225,6 +3225,13 @@ pub(crate) async fn build_app(
 ) -> (Arc<App>, Arc<RecordingPlatform>) {
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, Arc::new(backend), platform.clone()).unwrap());
+    // The Completion Notice's repaint delay (#650) is a production timing
+    // constant, like the cadences `scripted_app_with` injects: the tests that pin
+    // it store their own value, and every other notice test runs without the
+    // wall-clock wait. The send is still spawned either way, so a test asserting
+    // a notice must await it (`wait_for_notice`).
+    app.completion_notice_delay_ms
+        .store(0, std::sync::atomic::Ordering::Relaxed);
     (app, platform)
 }
 

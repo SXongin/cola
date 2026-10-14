@@ -1564,6 +1564,8 @@ async fn a_long_reattached_run_still_sends_the_notice() {
         |card| card_header(card) == "✅ 完成" && card_text(card).contains("LONG_END"),
     )
     .await;
+    // The notice's send is spawned (#650): await it before asserting.
+    super::drain::wait_for_notice(&platform).await;
     let notices = platform.completion_notices().await;
     assert!(
         notices.iter().any(|(_, _, _, text)| text.contains("已完成")),
@@ -2201,6 +2203,8 @@ async fn group_completion_sends_notice_to_requester() {
     ))
     .await;
 
+    // The notice's send is spawned (#650): await it before asserting.
+    super::drain::wait_for_notice(&platform).await;
     let calls = platform.calls.lock().await.clone();
     let notices: Vec<_> = calls
         .iter()
@@ -2251,6 +2255,8 @@ async fn group_completion_at_mentions_requester_when_name_resolvable() {
     ))
     .await;
 
+    // The notice's send is spawned (#650): await it before asserting.
+    super::drain::wait_for_notice(&platform).await;
     let calls = platform.calls.lock().await.clone();
     let notices: Vec<_> = calls
         .iter()

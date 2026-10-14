@@ -136,6 +136,10 @@ pub(crate) async fn scripted_app_with(
     // The shared runtime-reconcile cadence (#589) is test time too: every
     // tick may observe unless a test pins the throttle with a large interval.
     app.runtime_reconcile.interval_ms.store(0, Ordering::Relaxed);
+    // The Completion Notice's repaint delay (#650) is a production timing
+    // constant like the cadences above: the tests that pin it inject their own
+    // value, and every other notice test runs without the wall-clock wait.
+    app.completion_notice_delay_ms.store(0, Ordering::Relaxed);
     (dir, app, backend, platform)
 }
 
@@ -2884,6 +2888,8 @@ async fn a_retirement_inside_the_finalization_window_ends_the_turn_normally() {
         card_text(&card).contains("CI 通过了。"),
         "the true end's content lands: {card}"
     );
+    // The notice's send is spawned (#650): await it before asserting.
+    wait_for_notice(&platform).await;
     assert!(
         noticed(&platform).await,
         "the notice fires at the true end: {:?}",
@@ -3457,6 +3463,8 @@ async fn a_wake_in_the_finalization_window_cannot_complete_the_turn_early() {
         card_text(&card).contains("合并完成。"),
         "the true end's content lands: {card}"
     );
+    // The notice's send is spawned (#650): await it before asserting.
+    wait_for_notice(&platform).await;
     assert!(noticed(&platform).await, "the notice fires at the true end");
 }
 
@@ -3512,6 +3520,8 @@ async fn a_task_retiring_while_the_drain_renders_ends_the_turn_normally() {
         card_text(&final_card).contains("CI 通过了。"),
         "the true end's content lands: {final_card}"
     );
+    // The notice's send is spawned (#650): await it before asserting.
+    wait_for_notice(&platform).await;
     assert!(noticed(&platform).await, "the notice fires at the true end");
     assert_no_further_rendering(&backend, &platform).await;
 }
@@ -3612,6 +3622,8 @@ async fn a_v2_idle_read_with_no_live_background_task_completes_as_before() {
 
     let card = platform.updated_cards().await.last().cloned().unwrap();
     assert!(card_header(&card).contains("完成"), "{card}");
+    // The notice's send is spawned (#650): await it before asserting.
+    wait_for_notice(&platform).await;
     assert!(
         noticed(&platform).await,
         "the notice fires at the true end: {:?}",
@@ -4012,12 +4024,14 @@ async fn a_throttled_drain_read_keeps_the_unconfirmed_marker() {
 // terminal write's carrier — delivered now, or owed by a Pending Card Update
 // that must drain first. One rule for every carrier (the direct PATCH, the
 // size split, the queued retry); the quiet in-place settle is gated identically
-// in `refreshed_yielded_card`.
+// in `refreshed_yielded_card`. Since #650 (ADR-0074 §3's amendment) the send
+// also waits out a repaint delay on its own spawned task, so these tests await
+// the notice instead of assuming it already landed.
 // ---------------------------------------------------------------------------
 
-/// Await the Completion Notice or panic after 5 s: a gated notice is fired from
-/// the delivery layer's drain on its own spawned task, so it trails the drain
-/// call that delivered the write.
+/// Await the Completion Notice or panic after 5 s: the notice is sent from a
+/// spawned task (after its repaint delay, #650), so it trails whatever call
+/// accepted the terminal write.
 pub(crate) async fn wait_for_notice(platform: &RecordingPlatform) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while !noticed(platform).await {
@@ -4030,25 +4044,85 @@ pub(crate) async fn wait_for_notice(platform: &RecordingPlatform) {
     }
 }
 
-/// Acceptance (ticket #607): a terminal PATCH that lands directly announces at
-/// once — the gate must never defer a delivered write.
+/// Acceptance (#650, ADR-0074 §3's amendment): a terminal PATCH that lands
+/// directly still never *defers* the notice — no drain is needed to reach the
+/// send — but the send now waits out the repaint delay, so the client has time
+/// to repaint the card before the notice's own push arrives.
 #[tokio::test]
-async fn a_direct_terminal_patch_notifies_at_once() {
+async fn a_delivered_terminal_write_notifies_only_after_the_delay() {
     let _wd = test_work_dir();
     let transcript = SessionTranscript::new(vec![
         user("msg_cola_anchor", 1_000, "你好"),
         assistant(2_000, "最终答复。"),
     ]);
     let (_dir, app, _backend, platform) = scripted_app(vec![transcript], Some(SessionStatus::Idle)).await;
+    app.completion_notice_delay_ms.store(400, Ordering::Relaxed);
     let mut context = ctx("ses_test", "你好");
     context.is_group = true;
     context.requester_open_id = Some(TEST_HOST.to_string());
 
+    // The terminal write is delivered by the time the turn returns; the notice is
+    // then still owed, and the delay is real rather than a scheduling accident
+    // (with the wait removed the notice lands in milliseconds).
     Turn::run(&app.turn_handles(), context).await.unwrap();
 
+    // The terminal write was delivered (the turn ended), so the gate has nothing
+    // to defer — the notice is simply waiting out its delay.
     assert!(
-        noticed(&platform).await,
-        "a delivered terminal PATCH notifies without waiting for a drain: {:?}",
+        !noticed(&platform).await,
+        "the notice must wait out the repaint delay: {:?}",
+        platform.calls.lock().await
+    );
+
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert!(
+        !noticed(&platform).await,
+        "the notice must still be owed 250 ms into its 400 ms delay: {:?}",
+        platform.calls.lock().await
+    );
+
+    wait_for_notice(&platform).await;
+
+    let calls = platform.calls.lock().await.clone();
+    let terminal_at = calls
+        .iter()
+        .rposition(|c| matches!(c, PlatformCall::UpdateMessage { .. }))
+        .expect("the terminal card was written");
+    let notice_at = calls
+        .iter()
+        .rposition(|c| matches!(c, PlatformCall::CompletionNotice { .. }))
+        .expect("the notice fired");
+    assert!(
+        terminal_at < notice_at,
+        "the notice trails the terminal write: {calls:?}"
+    );
+}
+
+/// #650: the delay runs on a task of its own, never awaited by the ending's own
+/// task. With a delay far longer than the whole turn, `Turn::run` still returns
+/// promptly — an inline wait would hold the Turn's busy guard (`self.release`)
+/// for a minute and this test would time out — and nothing was announced early.
+#[tokio::test]
+async fn the_notice_delay_never_blocks_the_turn() {
+    let _wd = test_work_dir();
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "你好"),
+        assistant(2_000, "最终答复。"),
+    ]);
+    let (_dir, app, _backend, platform) = scripted_app(vec![transcript], Some(SessionStatus::Idle)).await;
+    app.completion_notice_delay_ms.store(60_000, Ordering::Relaxed);
+    let mut context = ctx("ses_test", "你好");
+    context.is_group = true;
+    context.requester_open_id = Some(TEST_HOST.to_string());
+
+    tokio::time::timeout(Duration::from_secs(5), Turn::run(&app.turn_handles(), context))
+        .await
+        .expect("Turn::run must not wait out the notice's delay")
+        .unwrap();
+
+    assert!(
+        !noticed(&platform).await,
+        "a 60 s delay cannot have elapsed: {:?}",
         platform.calls.lock().await
     );
 }
@@ -4067,6 +4141,10 @@ async fn a_queued_ending_patch_notifies_only_after_it_drains() {
     let (_dir, app, _backend, platform) = scripted_app(vec![transcript], Some(SessionStatus::Idle)).await;
     // Every content write fails at the transport: the ending PATCH is owed.
     platform.fail_update_transport_count.store(100, Ordering::SeqCst);
+    // The repaint delay's clock starts when the carrier is ACCEPTED (#650), so
+    // this armed-but-undelivered ending must wait it out from the drain, not
+    // from the flush that armed it.
+    app.completion_notice_delay_ms.store(300, Ordering::Relaxed);
     let mut context = ctx("ses_test", "你好");
     context.is_group = true;
     context.requester_open_id = Some(TEST_HOST.to_string());
@@ -4079,9 +4157,26 @@ async fn a_queued_ending_patch_notifies_only_after_it_drains() {
         platform.calls.lock().await
     );
 
-    // Feishu returns: the drain delivers the owed update, and the notice fires.
+    // Nothing was delivered, so the delay cannot have started: waiting longer
+    // than the delay itself still announces nothing.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !noticed(&platform).await,
+        "the notice's delay starts at delivery, not at arming: {:?}",
+        platform.calls.lock().await
+    );
+
+    // Feishu returns: the drain delivers the owed update, and only then does the
+    // notice's delay start — it is still owed a fifth of a second later (with the
+    // wait removed the drain's own delivery would fire it at once).
     platform.fail_update_transport_count.store(0, Ordering::SeqCst);
     app.core.feishu.drain_pending_card_updates(true).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !noticed(&platform).await,
+        "the drain's delivery starts the notice's delay: {:?}",
+        platform.calls.lock().await
+    );
     wait_for_notice(&platform).await;
 
     // The delivered card is the terminal content the notice announces.
@@ -4096,7 +4191,9 @@ async fn a_queued_ending_patch_notifies_only_after_it_drains() {
 /// whose terminal answer outgrows one Card size-splits on its own flush, and
 /// the Completion Notice must follow the new Card's send — never precede it.
 /// Unlike the hand-seeded companion in `card_handles.rs`, this drives the real
-/// `Turn::run`, so the gate is exercised end to end.
+/// `Turn::run`, so the gate is exercised end to end. The repaint delay (#650)
+/// applies to this carrier too — the continuation create that carries the
+/// terminal slice — so the notice is still owed when the turn returns.
 #[tokio::test]
 async fn a_size_split_terminal_flush_notifies_after_the_new_card() {
     let _wd = test_work_dir();
@@ -4115,6 +4212,7 @@ async fn a_size_split_terminal_flush_notifies_after_the_new_card() {
     // earlier, which is what the bug is about (#607). The drain shares this
     // cadence, so the turn still finishes in well under the notice's deadline.
     app.turn_render_poll_ms.store(200, Ordering::Relaxed);
+    app.completion_notice_delay_ms.store(400, Ordering::Relaxed);
     // Distinct create ids: the loading card and the split's continuation must be
     // DIFFERENT card ids. The mock's constant `msg_reply` would hide the bug —
     // the size split would move the terminal slice to a continuation that
@@ -4127,6 +4225,20 @@ async fn a_size_split_terminal_flush_notifies_after_the_new_card() {
     context.requester_open_id = Some(TEST_HOST.to_string());
 
     Turn::run(&app.turn_handles(), context).await.unwrap();
+
+    // The continuation create delivered the terminal slice, and the notice still
+    // waits out its delay — this carrier obeys the same rule as the PATCH.
+    assert!(
+        !noticed(&platform).await,
+        "a size-split carrier waits the repaint delay too: {:?}",
+        platform.calls.lock().await
+    );
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert!(
+        !noticed(&platform).await,
+        "the size-split notice must still be owed 250 ms into its 400 ms delay: {:?}",
+        platform.calls.lock().await
+    );
     wait_for_notice(&platform).await;
 
     let calls = platform.calls.lock().await.clone();
