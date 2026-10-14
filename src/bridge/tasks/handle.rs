@@ -55,6 +55,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use crate::backend::{BackgroundTask, SessionTranscript, TaskRetirement, TaskRetirementEnding};
 use crate::bridge::chain::{
     ChainRecords, TaskEnding, TaskEndingClass, TaskEndingEvidence, TaskEndingState, TaskRunRecord,
+    resolves_run,
 };
 
 use super::TaskCell;
@@ -261,7 +262,10 @@ impl TasksHandle {
     /// endings (ADR-0080): every run with a durable ending ended, whatever the
     /// read still lists, so a fresh install's reads carry the retirements the
     /// Chain Record already knows about without spending a reconcile verdict on
-    /// them. Idempotent — [`Self::record`] folds the same ids.
+    /// them. EVERY id the run is known by is seeded — not just its stored key
+    /// and call id — so the process-local fallback matches a row a read names by
+    /// an alias (a shell/child id where the read's call id differs). Idempotent —
+    /// [`Self::record`] folds the same ids.
     fn seed_retired(&self, session_id: &str) {
         let records = self.session_run_records(session_id);
         if records.is_empty() {
@@ -270,12 +274,9 @@ impl TasksHandle {
         let mut state = self.liveness();
         let retired = state.retired.entry(session_id.to_string()).or_default();
         for record in &records {
-            // The entry's own call id is what a read's live row carries;
-            // a Wake-keyed record stores the run's key instead.
-            if let Some(call_id) = &record.run.call_id {
-                retired.insert(call_id.clone());
+            for id in record.run.ids() {
+                retired.insert(id.to_string());
             }
-            retired.insert(record.run.key.clone());
         }
     }
 
@@ -463,17 +464,21 @@ impl TasksHandle {
         }
         // Every run with a durable ending has ended, whenever it was derived:
         // its row leaves the read, so a later reconcile cannot resurrect it and
-        // the ledger cannot keep waiting on it. The process-local `retired`
-        // cache rides along for a run whose ending write a restart lost.
-        transcript.background_tasks.retain(|task| {
-            !records
-                .iter()
-                .any(|record| record.run.names(task.tool.call_id.as_str()))
-        });
+        // the ledger cannot keep waiting on it. The match is ALIAS-AWARE
+        // (ADR-0080): the record carries every id the run is known by, and the
+        // row's own ids (its call id, its shell/child id) resolve the same
+        // record — so a launchless Wake that keyed the record by a shell id
+        // still prunes a row the read names by a different call id. The
+        // process-local `retired` cache rides along for a run whose ending write
+        // a restart lost; it too matches any id the row is known by.
+        transcript
+            .background_tasks
+            .retain(|task| !resolves_run(&records, &TaskRunId::of_launch(task)));
         if let Some(ids) = state.retired.get(session_id) {
-            transcript
-                .background_tasks
-                .retain(|task| !ids.contains(task.tool.call_id.as_str()));
+            transcript.background_tasks.retain(|task| {
+                let run = TaskRunId::of_launch(task);
+                !run.ids().any(|id| ids.contains(id))
+            });
         }
         let Some(ids) = state.unconfirmed.get(session_id) else {
             return;
@@ -530,4 +535,59 @@ fn synthesized_retirement(record: &TaskRunRecord, ending: &TaskEnding) -> Option
         ending: retirement_ending,
         finished_at: ending.finished_at,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::{MessageId, Wake, WakeSource};
+    use crate::bridge::chain::TaskRunIdentity;
+
+    /// A Wake naming only the shell id it reports — the launchless shape a read
+    /// whose launch left it yields (ADR-0080).
+    fn launchless_wake(shell_id: &str) -> Wake {
+        Wake {
+            id: MessageId::new("msg_wake_1"),
+            created_ms: Some(2_500),
+            source: WakeSource::Shell,
+            shell_id: Some(shell_id.to_string()),
+            job_id: Some(shell_id.to_string()),
+            child_id: None,
+            state: Some("completed".into()),
+            label: Some("gh run watch".into()),
+        }
+    }
+
+    /// ADR-0080 (CI gate): the retired cache a restart seeds holds EVERY id the
+    /// run is known by — not just its stored key and call id — so the
+    /// process-local fallback still matches a row a later read names by an alias
+    /// (the gate's row-pruning case, whose durable half is pinned by
+    /// `bridge::tests::ledger::a_durable_ending_prunes_a_row_named_by_a_different_call_id`).
+    #[test]
+    fn the_retired_cache_is_seeded_with_every_id_the_run_is_known_by() {
+        let dir = tempfile::tempdir().unwrap();
+        let chains = ChainRecords::load(dir.path().join("chain_records.json"));
+        let run = TaskRunId::of_wake(&launchless_wake("sh_call_bg")).expect("the Wake names the run");
+        chains.record_ending(
+            "ses_a",
+            &run,
+            TaskEnding::owed(TaskEndingClass::Wake, TaskRunIdentity::default()),
+        );
+
+        let handle = TasksHandle::new();
+        handle.attach_chains(std::sync::Arc::new(chains));
+        // The install a restart runs: it seeds the retired cache from the durable
+        // endings.
+        handle.restore("ses_a", &TaskCell::new());
+
+        let ids = handle.retired_call_ids("ses_a");
+        assert!(
+            ids.contains(&"sh_call_bg".to_string()),
+            "the shell id (the record's key) is seeded: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"msg_wake_1".to_string()),
+            "every id the run is known by is seeded, not just the key: {ids:?}"
+        );
+    }
 }
