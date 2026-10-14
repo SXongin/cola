@@ -1,0 +1,638 @@
+//! `cola status` and `cola doctor`: read-only introspection of a cola
+//! installation (ADR-0081).
+//!
+//! The CLI's job is lifecycle and introspection; the Feishu slash commands own
+//! session control. `status` is a fast, config-light snapshot — it resolves what
+//! it can and reports the rest as absent instead of failing — while `doctor`
+//! runs the environment checks a support request needs (config, Feishu
+//! credentials, the OpenCode binary and server, the singleton lock, the
+//! autostart binary path) and exits non-zero when a check fails.
+//!
+//! Neither command takes the Singleton Lock: they must work while cola runs, and
+//! against a broken install where cola cannot run at all.
+
+use std::path::{Path, PathBuf};
+
+use crate::bridge::attach;
+use crate::bridge::discovery;
+use crate::config::{self, Config};
+use crate::update::InstallChannel;
+
+/// Everything `cola status` prints, gathered from the machine. The pure
+/// renderers take this by reference; gathering is the process/OS boundary.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Status {
+    pub version: String,
+    pub channel: String,
+    /// PID of the live cola daemon (the Singleton Lock holder), if any.
+    pub running_pid: Option<i32>,
+    pub autostart: AutostartStatus,
+    /// Whether the bot is claimed; `None` when the access file could not be
+    /// inspected (no config).
+    pub claimed: Option<bool>,
+    pub host: Option<String>,
+    pub config_path: Option<PathBuf>,
+    /// Whether the resolved config file parsed. `false` with a path present is
+    /// a broken config; `false` with no path is "no config found".
+    pub config_ok: bool,
+    pub log_path: PathBuf,
+    pub server: Option<ServerStatus>,
+}
+
+/// The registered boot-time launcher, as far as it can be read.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AutostartStatus {
+    pub registered: bool,
+    pub active: bool,
+    /// The binary the installed supervisor would start.
+    pub binary: Option<PathBuf>,
+}
+
+/// The shared OpenCode server cola would attach to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServerStatus {
+    pub url: String,
+    pub pid: i32,
+    /// The generation the attach probe resolved (`v1`/`v2`), `None` when the
+    /// probe was inconclusive (never guessed).
+    pub generation: Option<String>,
+    /// The `[opencode] generation` override spelling (`auto`/`v1`/`v2`).
+    pub override_setting: String,
+    /// The probe's evidence — the detail line when the generation is unknown.
+    pub evidence: String,
+}
+
+/// The install channel as a stable CLI spelling.
+fn channel_label(channel: InstallChannel) -> &'static str {
+    match channel {
+        InstallChannel::GitHub => "github",
+        InstallChannel::Cargo => "cargo",
+    }
+}
+
+/// Gather the status snapshot. `loaded` is the config parse result: `None` when
+/// no path resolved, `Some(Err)` when the file is broken. Its absence only
+/// narrows what can be reported (claim state, the generation override), never
+/// fails the command.
+pub async fn gather(
+    cfg_path: Option<PathBuf>,
+    loaded: Option<&anyhow::Result<Config>>,
+    log_path: &Path,
+) -> Status {
+    let cfg = loaded.and_then(|r| r.as_ref().ok());
+    let channel = crate::update::current_exe_path()
+        .map(|exe| channel_label(crate::update::detect_install_channel(&exe)))
+        .unwrap_or("unknown");
+    let autostart = AutostartStatus {
+        registered: crate::autostart::supervisor_restart_command().is_some(),
+        active: crate::autostart::supervisor_is_active(),
+        binary: crate::autostart::supervisor_binary_path(),
+    };
+    let (claimed, host) = match cfg {
+        Some(cfg) => {
+            let list = crate::bridge::access::AccessList::load(&cfg.bridge.access_file);
+            (Some(list.is_claimed()), list.host().map(str::to_string))
+        }
+        None => (None, None),
+    };
+    let config_ok = matches!(loaded, Some(Ok(_)));
+    let server = probe_server(cfg).await;
+
+    Status {
+        version: crate::version::display_version(),
+        channel: channel.to_string(),
+        running_pid: crate::running_daemon_pid(),
+        autostart,
+        claimed,
+        host,
+        config_path: cfg_path,
+        config_ok,
+        log_path: log_path.to_path_buf(),
+        server,
+    }
+}
+
+/// Scan for a shared OpenCode server and probe its generation. `None` when
+/// nothing is running on the shared store; a probe that cannot classify still
+/// returns the candidate with `generation: None` and the evidence.
+async fn probe_server(cfg: Option<&Config>) -> Option<ServerStatus> {
+    let preferred_port = cfg.and_then(|c| c.opencode.preferred_port());
+    let generation_override = cfg.map(|c| c.opencode.generation).unwrap_or_default();
+    let candidates = discovery::scan_processes();
+    let candidate = discovery::pick_server(&candidates, preferred_port, discovery::self_spawned_pid())?;
+    match attach::resolve_candidate(candidate, generation_override).await {
+        Ok(resolved) => Some(ServerStatus {
+            url: resolved.url,
+            pid: candidate.pid,
+            generation: Some(resolved.generation.as_str().to_string()),
+            override_setting: generation_override.to_string(),
+            evidence: String::new(),
+        }),
+        Err(evidence) => Some(ServerStatus {
+            url: candidate.url(),
+            pid: candidate.pid,
+            generation: None,
+            override_setting: generation_override.to_string(),
+            evidence,
+        }),
+    }
+}
+
+/// The human-readable `cola status` report.
+pub fn render(s: &Status) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("{}  ({} 通道)\n", s.version, s.channel));
+    out.push_str(&format!("运行: {}\n", running_line(s)));
+    out.push_str(&format!("自启动: {}\n", autostart_line(&s.autostart)));
+    out.push_str(&format!("认领: {}\n", claimed_line(s)));
+    out.push_str(&format!(
+        "配置: {}\n",
+        match &s.config_path {
+            Some(p) if s.config_ok => p.display().to_string(),
+            Some(p) => format!("{}（解析失败）", p.display()),
+            None => "未找到（见 `cola.toml.example`）".to_string(),
+        }
+    ));
+    out.push_str(&format!("日志: {}\n", s.log_path.display()));
+    out.push_str(&format!("OpenCode: {}\n", server_line(s.server.as_ref())));
+    out
+}
+
+fn running_line(s: &Status) -> String {
+    match s.running_pid {
+        Some(pid) => format!("✅ 运行中 (PID {pid})"),
+        None => "✗ 未运行".to_string(),
+    }
+}
+
+fn autostart_line(a: &AutostartStatus) -> String {
+    if !a.registered {
+        return "✗ 未注册".to_string();
+    }
+    let state = if a.active { "active" } else { "inactive" };
+    match &a.binary {
+        Some(p) => format!("✅ 已注册 ({state}) → {}", p.display()),
+        None => format!("✅ 已注册 ({state})"),
+    }
+}
+
+fn claimed_line(s: &Status) -> String {
+    match s.claimed {
+        Some(true) => match &s.host {
+            Some(h) => format!("✅ 机主 = {h}"),
+            None => "✅ 已认领".to_string(),
+        },
+        Some(false) => "✗ 未认领（认领码在启动日志里）".to_string(),
+        None => "? 未知（无配置）".to_string(),
+    }
+}
+
+fn server_line(server: Option<&ServerStatus>) -> String {
+    match server {
+        None => "未发现共享服务器（LAZY 启动或 attach-only）".to_string(),
+        Some(s) => match &s.generation {
+            Some(g) => format!(
+                "{} (PID {}, 世代 {}，覆盖 {})",
+                s.url, s.pid, g, s.override_setting
+            ),
+            None => format!("{} (PID {}, 世代未知：{})", s.url, s.pid, s.evidence),
+        },
+    }
+}
+
+/// The `cola status --json` payload — the same facts, stable keys for scripts.
+pub fn render_json(s: &Status) -> serde_json::Value {
+    serde_json::json!({
+        "version": s.version,
+        "channel": s.channel,
+        "running": s.running_pid,
+        "autostart": {
+            "registered": s.autostart.registered,
+            "active": s.autostart.active,
+            "binary": s.autostart.binary.as_ref().map(|p| p.display().to_string()),
+        },
+        "claimed": s.claimed,
+        "host": s.host,
+        "config_path": s.config_path.as_ref().map(|p| p.display().to_string()),
+        "config_ok": s.config_ok,
+        "log_path": s.log_path.display().to_string(),
+        "opencode": s.server.as_ref().map(|s| serde_json::json!({
+            "url": s.url,
+            "pid": s.pid,
+            "generation": s.generation,
+            "generation_override": s.override_setting,
+            "evidence": s.evidence,
+        })),
+    })
+}
+
+/// One `cola doctor` check.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Check {
+    pub label: String,
+    pub status: CheckStatus,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckStatus {
+    Pass,
+    Warn,
+    Fail,
+}
+
+impl Check {
+    fn pass(label: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            status: CheckStatus::Pass,
+            detail: detail.into(),
+        }
+    }
+    fn warn(label: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            status: CheckStatus::Warn,
+            detail: detail.into(),
+        }
+    }
+    fn fail(label: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            status: CheckStatus::Fail,
+            detail: detail.into(),
+        }
+    }
+}
+
+/// Whether the report has no failing check (warnings do not fail the run).
+pub fn doctor_ok(checks: &[Check]) -> bool {
+    !checks.iter().any(|c| c.status == CheckStatus::Fail)
+}
+
+/// The human-readable `cola doctor` report, with a summary line.
+pub fn render_doctor(checks: &[Check]) -> String {
+    let mut out = String::from("cola doctor — 环境检查\n\n");
+    for c in checks {
+        let mark = match c.status {
+            CheckStatus::Pass => "✅",
+            CheckStatus::Warn => "⚠️",
+            CheckStatus::Fail => "❌",
+        };
+        out.push_str(&format!("{mark} {}: {}\n", c.label, c.detail));
+    }
+    let pass = checks.iter().filter(|c| c.status == CheckStatus::Pass).count();
+    let warn = checks.iter().filter(|c| c.status == CheckStatus::Warn).count();
+    let fail = checks.iter().filter(|c| c.status == CheckStatus::Fail).count();
+    out.push_str(&format!(
+        "\n{} 项检查，{} 通过，{} 警告，{} 失败\n",
+        checks.len(),
+        pass,
+        warn,
+        fail
+    ));
+    out
+}
+
+/// Resolve config without exiting: `None` when no file is found. Shared by
+/// `status` and `doctor`, which must report a missing config instead of dying.
+pub fn resolve_config_lenient(explicit: Option<&str>) -> Option<PathBuf> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    config::resolve_config_path(explicit, &cwd, &home)
+}
+
+/// Run `cola doctor`: gather the checks, print the report, and return whether
+/// every check passed.
+pub async fn run_doctor(explicit_config: Option<&str>, log_path: &Path) -> anyhow::Result<bool> {
+    let path = resolve_config_lenient(explicit_config);
+    let loaded = path.as_deref().map(config::load);
+    let cfg = loaded.as_ref().and_then(|r| r.as_ref().ok());
+    let checks = doctor_checks(&path, &loaded, cfg, log_path).await;
+    print!("{}", render_doctor(&checks));
+    Ok(doctor_ok(&checks))
+}
+
+/// Assemble the doctor checks. `loaded` is the config parse result (`None` when
+/// no path resolved); `cfg` is the parsed config when it loaded.
+async fn doctor_checks(
+    config_path: &Option<PathBuf>,
+    loaded: &Option<anyhow::Result<Config>>,
+    cfg: Option<&Config>,
+    log_path: &Path,
+) -> Vec<Check> {
+    let mut checks = Vec::new();
+
+    match (config_path, loaded) {
+        (Some(p), Some(Ok(_))) => checks.push(Check::pass("配置文件", p.display().to_string())),
+        (Some(p), Some(Err(e))) => {
+            checks.push(Check::fail("配置文件", format!("{} 无法解析：{e}", p.display())))
+        }
+        _ => checks.push(Check::fail(
+            "配置文件",
+            "未找到（依次查找 ./cola.toml、~/.cola/cola.toml）".to_string(),
+        )),
+    }
+
+    match cfg {
+        Some(cfg) => {
+            let client = crate::feishu::client::Client::new(cfg.feishu.clone());
+            checks.push(feishu_check(&client, &cfg.feishu.app_id).await);
+        }
+        None => checks.push(Check::fail("飞书凭证", "无配置，无法检查".to_string())),
+    }
+
+    checks.push(opencode_binary_check());
+
+    let server = probe_server(cfg).await;
+    match &server {
+        Some(s) => match &s.generation {
+            Some(g) => checks.push(Check::pass(
+                "共享 OpenCode 服务器",
+                format!("{} (世代 {g})", s.url),
+            )),
+            None => checks.push(Check::warn(
+                "共享 OpenCode 服务器",
+                format!("{} 世代未知：{}", s.url, s.evidence),
+            )),
+        },
+        None => checks.push(Check::warn(
+            "共享 OpenCode 服务器",
+            "未发现（federated 服务器未运行；LAZY 启动或 attach-only）".to_string(),
+        )),
+    }
+
+    checks.push(lock_check());
+    checks.push(log_check(log_path));
+
+    if let Some(bin) = crate::autostart::supervisor_binary_path() {
+        match crate::update::current_exe_path() {
+            Ok(current) if paths_equal(&bin, &current) => {
+                checks.push(Check::pass("自启动二进制", bin.display().to_string()))
+            }
+            Ok(current) => checks.push(Check::warn(
+                "自启动二进制",
+                format!(
+                    "注册指向 {}，当前为 {}——重新运行 `cola autostart enable`",
+                    bin.display(),
+                    current.display()
+                ),
+            )),
+            Err(_) => {}
+        }
+    }
+
+    checks
+}
+
+/// Whether two binary paths resolve to the same file (symlinks followed).
+fn paths_equal(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a == b,
+    }
+}
+
+/// Verify the Feishu credentials by exchanging them for a tenant access token
+/// and reading the bot's identity. Never reports the secret.
+async fn feishu_check(client: &crate::feishu::client::Client, app_id: &str) -> Check {
+    match client.get_access_token().await {
+        Ok(_) => match client.bot_open_id().await {
+            Ok(bot) => Check::pass("飞书凭证", format!("app {app_id}，bot {bot}")),
+            Err(e) => Check::warn(
+                "飞书凭证",
+                format!("app {app_id} 可取 token，但读取 bot 信息失败：{e}"),
+            ),
+        },
+        Err(e) => Check::fail("飞书凭证", format!("app {app_id} 认证失败：{e}")),
+    }
+}
+
+/// Whether `opencode` is available where cola would spawn it — the PATH an
+/// autostart supervisor snapshots (ADR-0013).
+fn opencode_binary_check() -> Check {
+    match which_opencode() {
+        Some(p) => Check::pass("opencode 二进制", p.display().to_string()),
+        None => Check::warn(
+            "opencode 二进制",
+            "PATH 中未找到 `opencode`（eager/lazy 启动会失败；attach 到已有服务器不受影响）".to_string(),
+        ),
+    }
+}
+
+/// Locate an executable named `opencode` on `PATH` (plus `.exe` on Windows).
+fn which_opencode() -> Option<PathBuf> {
+    which_opencode_in(std::env::var_os("PATH").as_deref())
+}
+
+/// [`which_opencode`] over an explicit PATH string, so the lookup is unit-testable
+/// without mutating the process environment (which would race sibling tests).
+fn which_opencode_in(path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    for dir in std::env::split_paths(path?) {
+        for name in OPENCODE_BIN_NAMES {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// The executable names to look for on `PATH`.
+const OPENCODE_BIN_NAMES: &[&str] = &["opencode", "opencode.exe"];
+
+/// Report the log file's state: present (with size), not yet created in an
+/// existing directory, or in a directory that does not exist yet (created on
+/// the next start).
+fn log_check(path: &Path) -> Check {
+    match std::fs::metadata(path) {
+        Ok(m) => Check::pass("日志文件", format!("{}（{} 字节）", path.display(), m.len())),
+        Err(_) if path.parent().is_some_and(Path::exists) => {
+            Check::pass("日志文件", format!("{}（尚未创建）", path.display()))
+        }
+        Err(_) => Check::warn(
+            "日志文件",
+            format!("{} 所在目录不存在（启动时会创建）", path.display()),
+        ),
+    }
+}
+
+/// Report the Singleton Lock state: a lock held by a live cola is healthy,
+/// otherwise there is nothing running (a stale lock is reclaimed by the next
+/// start, so it is not a failure).
+fn lock_check() -> Check {
+    match crate::running_daemon_pid() {
+        Some(pid) => Check::pass("单例锁", format!("由 PID {pid} 持有")),
+        None => Check::pass("单例锁", "无运行实例".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_status() -> Status {
+        Status {
+            version: "cola 0.13.1-dev main@abc1234".into(),
+            channel: "github".into(),
+            running_pid: Some(4321),
+            autostart: AutostartStatus {
+                registered: true,
+                active: true,
+                binary: Some(PathBuf::from("/usr/local/bin/cola")),
+            },
+            claimed: Some(true),
+            host: Some("ou_abc".into()),
+            config_path: Some(PathBuf::from("/home/u/cola.toml")),
+            config_ok: true,
+            log_path: PathBuf::from("/home/u/.cola/cola.log"),
+            server: Some(ServerStatus {
+                url: "http://localhost:4096".into(),
+                pid: 99,
+                generation: Some("v2".into()),
+                override_setting: "auto".into(),
+                evidence: String::new(),
+            }),
+        }
+    }
+
+    #[test]
+    fn render_reports_every_fact() {
+        let text = render(&sample_status());
+        assert!(text.contains("cola 0.13.1-dev main@abc1234"));
+        assert!(text.contains("github 通道"));
+        assert!(text.contains("✅ 运行中 (PID 4321)"));
+        assert!(text.contains("✅ 已注册 (active) → /usr/local/bin/cola"));
+        assert!(text.contains("✅ 机主 = ou_abc"));
+        assert!(text.contains("/home/u/cola.toml"));
+        assert!(text.contains("/home/u/.cola/cola.log"));
+        assert!(text.contains("http://localhost:4096 (PID 99, 世代 v2，覆盖 auto)"));
+    }
+
+    #[test]
+    fn render_handles_absent_facts() {
+        let s = Status {
+            running_pid: None,
+            autostart: AutostartStatus {
+                registered: false,
+                active: false,
+                binary: None,
+            },
+            claimed: Some(false),
+            host: None,
+            config_path: None,
+            config_ok: false,
+            server: None,
+            ..sample_status()
+        };
+        let text = render(&s);
+        assert!(text.contains("✗ 未运行"));
+        assert!(text.contains("✗ 未注册"));
+        assert!(text.contains("✗ 未认领"));
+        assert!(text.contains("未找到"));
+        assert!(text.contains("未发现共享服务器"));
+    }
+
+    #[test]
+    fn render_shows_a_broken_config_path() {
+        let s = Status {
+            config_path: Some(PathBuf::from("/bad/cola.toml")),
+            config_ok: false,
+            ..sample_status()
+        };
+        assert!(render(&s).contains("/bad/cola.toml（解析失败）"));
+    }
+
+    #[test]
+    fn render_reports_an_inconclusive_generation_with_evidence() {
+        let s = Status {
+            server: Some(ServerStatus {
+                url: "http://localhost:49374".into(),
+                pid: 7,
+                generation: None,
+                override_setting: "auto".into(),
+                evidence: "GET /api/info -> 503 (migrating)".into(),
+            }),
+            ..sample_status()
+        };
+        let text = render(&s);
+        assert!(text.contains("世代未知"));
+        assert!(text.contains("503"));
+    }
+
+    #[test]
+    fn render_json_carries_the_same_facts() {
+        let v = render_json(&sample_status());
+        assert_eq!(v["running"], 4321);
+        assert_eq!(v["autostart"]["registered"], true);
+        assert_eq!(v["autostart"]["binary"], "/usr/local/bin/cola");
+        assert_eq!(v["claimed"], true);
+        assert_eq!(v["opencode"]["generation"], "v2");
+        assert_eq!(v["opencode"]["pid"], 99);
+    }
+
+    #[test]
+    fn render_json_nulls_absent_facts() {
+        let v = render_json(&Status {
+            running_pid: None,
+            claimed: None,
+            host: None,
+            config_path: None,
+            server: None,
+            ..sample_status()
+        });
+        assert!(v["running"].is_null());
+        assert!(v["claimed"].is_null());
+        assert!(v["config_path"].is_null());
+        assert!(v["opencode"].is_null());
+    }
+
+    #[test]
+    fn doctor_ok_fails_only_on_a_failing_check() {
+        let pass = Check::pass("a", "fine");
+        let warn = Check::warn("b", "meh");
+        let fail = Check::fail("c", "broken");
+        assert!(doctor_ok(&[pass.clone(), warn.clone()]));
+        assert!(!doctor_ok(&[pass, fail]));
+    }
+
+    #[test]
+    fn render_doctor_summarizes_all_three_kinds() {
+        let checks = [
+            Check::pass("配置", "/x/cola.toml"),
+            Check::warn("服务器", "未发现"),
+            Check::fail("飞书", "认证失败"),
+        ];
+        let text = render_doctor(&checks);
+        assert!(text.contains("✅ 配置: /x/cola.toml"));
+        assert!(text.contains("⚠️ 服务器: 未发现"));
+        assert!(text.contains("❌ 飞书: 认证失败"));
+        assert!(text.contains("3 项检查，1 通过，1 警告，1 失败"));
+    }
+
+    #[test]
+    fn paths_equal_follows_existing_files_and_falls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("cola");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(paths_equal(&file, &file));
+        assert!(!paths_equal(&file, &dir.path().join("other")));
+    }
+
+    #[test]
+    fn which_opencode_finds_a_binary_on_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("opencode");
+        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        let path = dir.path().as_os_str();
+        assert_eq!(which_opencode_in(Some(path)), Some(bin));
+    }
+
+    #[test]
+    fn which_opencode_returns_none_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(which_opencode_in(Some(dir.path().as_os_str())), None);
+        assert_eq!(which_opencode_in(None), None);
+    }
+}

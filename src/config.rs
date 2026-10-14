@@ -362,9 +362,109 @@ impl SessionEntry {
     }
 }
 
+/// The subcommands of `cola config` (ADR-0081): print where the config came
+/// from, print the effective values with secrets masked, or parse-check it.
+#[derive(Debug, Clone, Copy, clap::Subcommand)]
+pub enum ConfigAction {
+    /// Print the resolved config file path (the fallback lookup order).
+    Path,
+    /// Print the effective config with secrets masked.
+    Show,
+    /// Parse the config and report whether it is valid.
+    Validate,
+}
+
+pub fn run(action: ConfigAction, explicit: Option<&str>) -> anyhow::Result<()> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let path = resolve_config_path(explicit, &cwd, &home);
+    match action {
+        ConfigAction::Path => {
+            match path {
+                Some(p) => println!("{}", p.display()),
+                None => println!("未找到配置文件（依次查找 ./cola.toml、~/.cola/cola.toml）"),
+            }
+            Ok(())
+        }
+        ConfigAction::Show => {
+            let path = path.ok_or_else(|| anyhow::anyhow!("未找到配置文件"))?;
+            let cfg = load(&path)?;
+            let mut masked = cfg.clone();
+            masked.feishu.app_secret = mask_secret(&masked.feishu.app_secret);
+            print!("{}", toml::to_string_pretty(&masked)?);
+            Ok(())
+        }
+        ConfigAction::Validate => {
+            let path = path.ok_or_else(|| anyhow::anyhow!("未找到配置文件"))?;
+            // `load` is the same parser the daemon uses, so a valid result here
+            // is exactly what `cola` would accept at boot.
+            load(&path)?;
+            println!("配置有效: {}", path.display());
+            Ok(())
+        }
+    }
+}
+
+/// Mask a secret for display: never print it, but say whether one is set and
+/// how long it is, which is what a config-support question actually needs.
+pub fn mask_secret(secret: &str) -> String {
+    if secret.is_empty() {
+        return "(未设置)".to_string();
+    }
+    format!("***（{} 个字符）", secret.chars().count())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mask_secret_hides_the_value() {
+        assert_eq!(mask_secret(""), "(未设置)");
+        let masked = mask_secret("super-secret-value");
+        assert!(!masked.contains("super"), "the value must not leak: {masked}");
+        assert!(masked.contains("18"), "the length is reported: {masked}");
+    }
+
+    #[test]
+    fn config_run_handles_every_action_for_a_valid_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cola.toml");
+        std::fs::write(&path, "[feishu]\napp_id = \"cli_abc\"\napp_secret = \"s3cr3t\"\n").unwrap();
+        let explicit = path.to_str();
+        run(ConfigAction::Path, explicit).unwrap();
+        run(ConfigAction::Show, explicit).unwrap();
+        run(ConfigAction::Validate, explicit).unwrap();
+    }
+
+    #[test]
+    fn config_run_validate_rejects_a_broken_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cola.toml");
+        std::fs::write(&path, "not = valid = toml").unwrap();
+        assert!(run(ConfigAction::Validate, path.to_str()).is_err());
+    }
+
+    #[test]
+    fn config_run_show_without_a_file_is_an_error() {
+        // An explicit path that does not exist: `load` fails.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope.toml");
+        assert!(run(ConfigAction::Show, missing.to_str()).is_err());
+    }
+
+    #[test]
+    fn config_show_masks_the_app_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cola.toml");
+        std::fs::write(&path, "[feishu]\napp_id = \"cli_abc\"\napp_secret = \"s3cr3t\"\n").unwrap();
+        let cfg = load(&path).unwrap();
+        let mut masked = cfg.clone();
+        masked.feishu.app_secret = mask_secret(&masked.feishu.app_secret);
+        let dumped = toml::to_string_pretty(&masked).unwrap();
+        assert!(dumped.contains("cli_abc"));
+        assert!(!dumped.contains("s3cr3t"), "secret leaked: {dumped}");
+    }
 
     #[test]
     fn from_message_uses_thread_id_when_present() {
