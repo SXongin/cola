@@ -4,14 +4,15 @@
 # `main: review` ruleset needs (ADR-0034 item 6); it replaces the OpenCode
 # review workflow (trial: issue #516 / PR #517).
 #
-# Codex reaches the model through the OpenCode Go subscription: Console's
-# inference API serves an OpenAI Responses-compatible endpoint and documents
-# Codex as a validated client; `gpt-6-luna` is the top GPT model in Go. The
-# action's Responses proxy points at that endpoint (`responses-api-endpoint`),
-# keeps the Go key inside the proxy process, and runs Codex read-only
-# (`permission-profile: ":read-only"` with the action's default safety
-# strategy). GH_TOKEN stays on the gh steps only — never in the Codex step's
-# environment, where prompt-injected PR content could read it.
+# Codex reaches the model through the OpenCode Go subscription: the Go
+# provider's Responses-compatible endpoint recognizes Codex's native session
+# header (a validated client), and `gpt-6-luna` is the top GPT model in Go. The
+# action's Responses proxy points at that endpoint (`responses-api-endpoint`)
+# rather than Console inference, so the gate's usage is attributed to
+# `opencode-go`; it keeps the Go key inside the proxy process, and runs Codex
+# read-only (`permission-profile: ":read-only"` with the action's default
+# safety strategy). GH_TOKEN stays on the gh steps only — never in the Codex
+# step's environment, where prompt-injected PR content could read it.
 #
 # Approval contract: this workflow posts the review itself and records the new
 # comment's ID as a step output; the approve step fetches exactly that comment
@@ -289,7 +290,7 @@ jobs:
         uses: openai/codex-action@52fe01ec70a42f454c9d2ebd47598f9fd6893d56 # v1.11
         with:
           openai-api-key: ${{ secrets.OPENCODE_API_KEY }}
-          responses-api-endpoint: https://opencode.ai/inference/openai/v1/responses
+          responses-api-endpoint: https://opencode.ai/zen/go/v1/responses
           model: gpt-6-luna
           codex-version: 0.160.0
           permission-profile: ":read-only"

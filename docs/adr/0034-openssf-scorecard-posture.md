@@ -340,3 +340,22 @@ read-only `code-reviewer`, and the reviewer is never the author. Fixes return to
 an implementer (`docs/agents/flow.md`): the originating session for a
 ticket-local finding, a fresh one for a cross-ticket finding, with the merger
 landing the result and the pass re-run at that same scope.
+
+## Amendment (2026-10-14): the gate reaches Go through the Go provider endpoint
+
+The 2026-10-04 amendment pointed the Codex action's Responses proxy at Console's
+inference endpoint (`https://opencode.ai/inference/openai/v1/responses`). That
+surface is served under the `opencode` provider slug, so the gate's own usage
+was reported as `opencode/gpt-6-luna` in the OpenCode Go usage report — beside
+the author-side `/code-review` pair's `opencode-go/gpt-6-luna` — even though the
+same Go key paid for both. The endpoint moves to the Go provider's own
+Responses-compatible path, `https://opencode.ai/zen/go/v1/responses`, so the
+gate's usage is attributed to `opencode-go`.
+
+Nothing else about the model changes: `gpt-6-luna` is the same model on both
+paths, and the action's Responses proxy (`codex-responses-api-proxy`) forwards
+every request header except `Authorization` and `Host`, so Codex's native
+session header — which Go recognizes — reaches the endpoint. Verified locally
+end-to-end: Codex 0.160.0 through the action's proxy against
+`/zen/go/v1/responses` completes a review request. `CONTRIBUTING.md`'s
+"Reviewing" section and the workflow header name the new endpoint.
