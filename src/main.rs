@@ -353,7 +353,18 @@ impl SingletonLock {
                         }
                         // Owner died, turned zombie, or is mid-exit between the
                         // stale check and the open; loop to reclaim it and retry.
-                        _ => {}
+                        Ok(_) => {}
+                        // Malformed/empty content — no PID to judge, and
+                        // `stale_lock_owner` cannot reclaim it either (it parses
+                        // a PID). Remove it here, or the loop below spins
+                        // forever on a lock no one can use.
+                        Err(_) => {
+                            tracing::warn!(
+                                "Removing malformed singleton lock at {} (no PID to check)",
+                                path.display()
+                            );
+                            let _ = std::fs::remove_file(&path);
+                        }
                     }
                 }
                 Err(e) => return Err(e.into()),
@@ -762,6 +773,10 @@ pub(crate) enum LockState {
     Stale(i32),
     /// The file names a live process that is not cola.
     Foreign(i32),
+    /// The file exists but cannot be read, or its content is not a PID (empty,
+    /// corrupted). A normal start reclaims it (see `SingletonLock::acquire_at`),
+    /// but it is a misconfiguration the doctor must surface, not a healthy pass.
+    Malformed,
 }
 
 /// Read the Singleton Lock's state. Never fails: an unreadable/malformed file is
@@ -771,11 +786,15 @@ pub(crate) fn lock_state() -> LockState {
 }
 
 fn lock_state_at(path: &std::path::Path) -> LockState {
-    let Ok(raw) = std::fs::read_to_string(path) else {
-        return LockState::Absent;
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        // No file at all is the healthy "not running" case; a file that exists
+        // but cannot be read (permissions, I/O) is a problem.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return LockState::Absent,
+        Err(_) => return LockState::Malformed,
     };
     let Ok(pid) = raw.trim().parse::<i32>() else {
-        return LockState::Absent;
+        return LockState::Malformed;
     };
     if !pid_alive(pid) {
         LockState::Stale(pid)
@@ -1208,6 +1227,20 @@ mod tests {
     }
 
     #[test]
+    fn acquire_at_reclaims_a_malformed_lock() {
+        // Regression: a lock file whose content is not a PID used to spin the
+        // acquire loop forever (`stale_lock_owner` cannot parse it, and the
+        // open keeps failing with AlreadyExists). It must be reclaimed.
+        let home = tempfile::tempdir().unwrap();
+        let lock = home.path().join("cola.lock");
+        std::fs::write(&lock, "not a pid").unwrap();
+        match SingletonLock::acquire_at(lock).unwrap() {
+            AcquireOutcome::Acquired(_) => {}
+            AcquireOutcome::HeldByInstance { .. } => panic!("a malformed lock must be reclaimed"),
+        }
+    }
+
+    #[test]
     fn acquire_at_reclaims_stale_lock_and_acquires() {
         let home = tempfile::tempdir().unwrap();
         let lock = home.path().join("cola.lock");
@@ -1301,9 +1334,10 @@ mod tests {
         std::fs::write(&lock, std::process::id().to_string()).unwrap();
         assert!(matches!(lock_state_at(&lock), LockState::Held(p) if p == std::process::id() as i32));
 
-        // An unreadable/garbage file is treated as absent, never a failure.
+        // A file that is not a PID is malformed: reclaimable by a start, but the
+        // doctor must be able to tell it from a clean absence.
         std::fs::write(&lock, "not a pid").unwrap();
-        assert!(matches!(lock_state_at(&lock), LockState::Absent));
+        assert!(matches!(lock_state_at(&lock), LockState::Malformed));
     }
 
     #[cfg(unix)]
