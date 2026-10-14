@@ -748,6 +748,15 @@ fn spawn_detached(exe: &str, args: &[String], cwd: Option<&std::path::Path>) -> 
     if let Some(dir) = cwd {
         command.current_dir(dir);
     }
+    // Unix: put the child in its OWN process group, so a Ctrl-C in the caller's
+    // terminal (SIGINT to the foreground process group) does not also hit the
+    // replacement while `restart` waits for it to take the lock. Stdio is null,
+    // so nothing is lost by leaving the terminal's group.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     // Windows: without a new process group / no console, the child stays tied to
     // the caller's console and a console close (the user closing the window)
     // sends it CTRL_CLOSE_EVENT, killing the replacement.
@@ -1394,17 +1403,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("where");
         let arg0 = dir.path().join("arg0");
+        let pgrp = dir.path().join("pgrp");
+        let pid = dir.path().join("pid");
         // `$0` is the first word after the `-c` script — i.e. the argument
-        // `spawn_detached` appends — so this also pins that the replacement
-        // carries `--replace` (the takeover the restart relies on).
+        // `spawn_detached` appends — so this pins that the replacement carries
+        // `--replace` (the takeover the restart relies on). `$$` and its process
+        // group prove the child leads its OWN group: a Ctrl-C in the caller's
+        // terminal must not reach it.
         let script = format!(
-            "pwd > {}; printf '%s' \"$0\" > {}",
+            "pwd > {}; printf '%s' \"$0\" > {}; printf '%s' \"$$\" > {}; \
+             printf '%s' \"$(ps -o pgid= -p $$ | tr -d ' ')\" > {}",
             marker.display(),
-            arg0.display()
+            arg0.display(),
+            pid.display(),
+            pgrp.display()
         );
         spawn_detached("sh", &["-c".to_string(), script], Some(dir.path())).unwrap();
+        let all = [&marker, &arg0, &pgrp, &pid];
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::time::Instant::now() < deadline && !(marker.exists() && arg0.exists()) {
+        while std::time::Instant::now() < deadline && !all.iter().all(|p| p.exists()) {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         let printed = std::fs::read_to_string(&marker).expect("child wrote its cwd");
@@ -1417,6 +1434,12 @@ mod tests {
             std::fs::read_to_string(&arg0).unwrap(),
             "--replace",
             "the detached replacement must carry --replace"
+        );
+        let child = std::fs::read_to_string(&pid).unwrap();
+        let group = std::fs::read_to_string(&pgrp).unwrap();
+        assert_eq!(
+            group, child,
+            "the replacement must lead its own process group (child {child}, pgrp {group})"
         );
     }
 

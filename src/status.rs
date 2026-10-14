@@ -535,7 +535,7 @@ fn lock_check(state: crate::LockState) -> Check {
         // to reclaim it and an operator must know the lock is corrupt.
         crate::LockState::Malformed => Check::fail(
             "单例锁",
-            "锁文件无法解析（内容不是 PID）；下次启动会回收，但建议检查".to_string(),
+            "锁文件内容无法解析（不是 PID）；启动会拒绝并要求手动删除该文件".to_string(),
         ),
     }
 }

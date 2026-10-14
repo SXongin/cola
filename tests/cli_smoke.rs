@@ -34,6 +34,19 @@ fn status_runs_with_a_missing_config() {
     );
 }
 
+/// A failing check makes `doctor` exit non-zero — the dispatch must convert the
+/// `false` from `run_doctor` into a non-zero exit, not just print the report. A
+/// missing config fails the config and credential checks without any network.
+#[test]
+fn doctor_exits_nonzero_when_a_check_fails() {
+    let (ok, stdout, stderr) = run(&["--config", "/nonexistent/cola.toml", "doctor"]);
+    assert!(
+        !ok,
+        "a failing doctor must exit non-zero; stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(stdout.contains("❌"), "the failed check is shown: {stdout}");
+}
+
 /// `cola config path` and `cola completions` are pure: no config, no lock.
 #[test]
 fn config_and_completions_run_without_a_config() {

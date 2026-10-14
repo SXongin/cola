@@ -238,7 +238,13 @@ pub fn run_logs_to(
                     format!("--date 需要 YYYY-MM-DD，收到 {day:?}"),
                 ));
             }
-            rotated_path(base, day)
+            // Today's log has not been rotated yet: it is still the active
+            // `cola.log`, so `--date <today>` selects the base file.
+            if day == today_str() {
+                base.to_path_buf()
+            } else {
+                rotated_path(base, day)
+            }
         }
         None => base.to_path_buf(),
     };
@@ -746,6 +752,18 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         run_logs_to(&base, false, 10, Some("2026-01-02"), &mut out).unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), "old one\nold two\n");
+    }
+
+    #[test]
+    fn run_logs_selects_the_active_file_for_todays_date() {
+        // Today's log has not rotated: `--date <today>` must read `cola.log`,
+        // not a `cola-<today>.log` that does not exist yet.
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("cola.log");
+        std::fs::write(&base, b"today log\n").unwrap();
+        let mut out: Vec<u8> = Vec::new();
+        run_logs_to(&base, false, 10, Some(&today_str()), &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "today log\n");
     }
 
     #[test]
