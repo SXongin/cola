@@ -267,34 +267,76 @@ fn tail_lines(path: &Path, n: usize) -> io::Result<Vec<String>> {
     Ok(lines)
 }
 
-/// Poll `path` for appended bytes and print them, reopening from the start when
-/// the file is rotated out from under us (the base `cola.log` moves to a dated
-/// file and a fresh base starts). Blocks forever; the caller exits on Ctrl-C.
+/// Poll `path` for appended bytes and print them, starting from the top when the
+/// file is rotated out from under us — the base `cola.log` moves to a dated file
+/// and a fresh base starts, which the next poll detects as a **changed file
+/// identity**, not merely a shorter file (the fresh base may already have grown
+/// past the old offset). A trailing partial line is held back until its newline
+/// arrives, so a write caught mid-line is neither split nor duplicated. Blocks
+/// forever; the caller exits on Ctrl-C.
 fn follow_file(path: &Path, out: &mut impl Write) -> io::Result<()> {
     use io::{Read, Seek, SeekFrom};
     let poll = std::time::Duration::from_millis(300);
+    let mut identity = file_identity(path);
     let mut offset = std::fs::metadata(path)?.len();
+    let mut pending: Vec<u8> = Vec::new();
     loop {
         std::thread::sleep(poll);
         let Ok(meta) = std::fs::metadata(path) else {
             continue;
         };
+        // A new file at the same path (rotation) restarts from the top: only
+        // comparing lengths would miss a fresh base that grew past the offset.
+        let current = file_identity(path);
+        if current != identity {
+            identity = current;
+            offset = 0;
+            pending.clear();
+        }
         let len = meta.len();
         if len < offset {
-            // Rotated or truncated: start over from the beginning.
             offset = 0;
+            pending.clear();
         }
         if len == offset {
             continue;
         }
         let mut file = std::fs::File::open(path)?;
         file.seek(SeekFrom::Start(offset))?;
-        let mut chunk = String::new();
-        file.read_to_string(&mut chunk)?;
-        out.write_all(chunk.as_bytes())?;
+        let mut chunk = Vec::new();
+        file.take(len - offset).read_to_end(&mut chunk)?;
+        offset += chunk.len() as u64;
+        pending.extend_from_slice(&chunk);
+        drain_complete_lines(&mut pending, out)?;
         out.flush()?;
-        offset = len;
     }
+}
+
+/// Write every complete line in `pending` to `out`, leaving any trailing
+/// bytes-without-newline buffered (a write caught mid-line lands whole next
+/// time). `pending` is drained of what it wrote.
+fn drain_complete_lines(pending: &mut Vec<u8>, out: &mut impl Write) -> io::Result<()> {
+    while let Some(newline) = pending.iter().position(|&b| b == b'\n') {
+        let line: Vec<u8> = pending.drain(..=newline).collect();
+        out.write_all(&line)?;
+    }
+    Ok(())
+}
+
+/// A stable identity for the file at `path`, used to notice rotation: on unix
+/// the `(device, inode)` pair. `None` elsewhere (rotation then falls back to the
+/// length-decrease check) and when the file is absent.
+#[cfg(unix)]
+fn file_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.dev(), meta.ino()))
+}
+
+/// [`file_identity`]: no portable identity outside unix.
+#[cfg(not(unix))]
+fn file_identity(_path: &Path) -> Option<(u64, u64)> {
+    None
 }
 
 /// `YYYY-MM-DD` for the local timezone, as chrono is already a dependency.
@@ -460,6 +502,36 @@ mod tests {
         let file = dir.path().join("cola.log");
         std::fs::write(&file, b"a\nb\nc").unwrap();
         assert_eq!(tail_lines(&file, 2).unwrap(), vec!["b", "c"]);
+    }
+
+    #[test]
+    fn drain_complete_lines_writes_only_complete_lines() {
+        let mut pending = b"a\nb\npartial".to_vec();
+        let mut out: Vec<u8> = Vec::new();
+        drain_complete_lines(&mut pending, &mut out).unwrap();
+        assert_eq!(out, b"a\nb\n");
+        assert_eq!(pending, b"partial", "an incomplete tail stays buffered");
+        // Completing the line flushes it on the next poll.
+        pending.extend_from_slice(b" done\n");
+        drain_complete_lines(&mut pending, &mut out).unwrap();
+        assert_eq!(out, b"a\nb\npartial done\n");
+        assert!(pending.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_identity_changes_when_the_file_is_replaced() {
+        // Rotation writes a NEW file at the same path; identity must move so the
+        // follow loop restarts from the top even if the new file grew past the
+        // old offset.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cola.log");
+        std::fs::write(&path, b"one\n").unwrap();
+        let first = file_identity(&path);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"two\n").unwrap();
+        assert!(first.is_some());
+        assert_ne!(first, file_identity(&path));
     }
 
     #[test]

@@ -86,6 +86,30 @@ pub(crate) fn supervisor_stop_command() -> Option<String> {
     }
 }
 
+/// Whether an Autostart registration is installed on this platform — the
+/// platform artifact exists (systemd unit / launchd plist / Run-key value),
+/// independent of whether a *supervisor restart* is available (Windows' Run key
+/// has none). `cola status` reports this; `restart` uses
+/// [`supervisor_restart_command`] instead.
+pub(crate) fn is_registered() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        linux::is_registered()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::is_registered()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        windows::is_registered()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        false
+    }
+}
+
 /// Whether the registered supervisor currently runs the unit: systemd
 /// `active`/`activating`/`reloading`, or a loaded launchd agent. `autostart
 /// disable` uses this to stop an instance that never took the Singleton Lock:
@@ -166,6 +190,11 @@ mod linux {
             .join("systemd")
             .join("user")
             .join(UNIT_NAME)
+    }
+
+    /// Whether the user unit is installed (its file exists).
+    pub(super) fn is_registered() -> bool {
+        unit_path().exists()
     }
 
     /// systemd ExecStart accepts a path unquoted; quote only when it contains
@@ -400,6 +429,11 @@ mod macos {
             .join(PLIST)
     }
 
+    /// Whether the LaunchAgent plist is installed (its file exists).
+    pub(super) fn is_registered() -> bool {
+        plist_path().exists()
+    }
+
     fn plist_content(exe: &str) -> String {
         format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -607,6 +641,14 @@ mod windows {
             .status();
         println!("cola autostart disabled: {VALUE} at {RUN_KEY}");
         Ok(())
+    }
+
+    /// Whether the `Run`-key value exists (the same `reg query` `status` uses).
+    pub(super) fn is_registered() -> bool {
+        std::process::Command::new("reg")
+            .args(["query", RUN_KEY, "/v", VALUE])
+            .output()
+            .is_ok_and(|o| o.status.success())
     }
 
     pub(super) fn status() -> anyhow::Result<()> {
