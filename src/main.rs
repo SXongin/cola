@@ -681,14 +681,23 @@ fn spawnable(program: &str) -> bool {
     })
 }
 
-/// Spawn a detached cola from `exe` + `args`, appending `--replace` so it may
-/// take the singleton lock left by the instance just terminated.
-fn spawn_detached(exe: &str, args: &[String]) -> anyhow::Result<()> {
-    use std::process::{Command, Stdio};
+/// The arguments a detached restart re-execs with: the instance's own args plus
+/// `--replace` (appended once) so the successor may take the singleton lock
+/// while the old holder is still dying. Pure, so the `--replace` guarantee is
+/// unit-testable without spawning.
+fn restart_args(args: &[String]) -> Vec<String> {
     let mut all: Vec<String> = args.to_vec();
     if !all.iter().any(|a| a == "--replace") {
         all.push("--replace".to_string());
     }
+    all
+}
+
+/// Spawn a detached cola from `exe` + `args`, appending `--replace` so it may
+/// take the singleton lock left by the instance just terminated.
+fn spawn_detached(exe: &str, args: &[String]) -> anyhow::Result<()> {
+    use std::process::{Command, Stdio};
+    let all = restart_args(args);
     Command::new(exe)
         .args(all)
         .stdin(Stdio::null())
@@ -1197,6 +1206,15 @@ mod tests {
         // cola — the guard must recognise it (the takeover path depends on it).
         assert!(is_cola_process(std::process::id() as i32));
         assert!(!is_cola_process(i32::MAX - 1));
+    }
+
+    #[test]
+    fn restart_args_appends_replace_exactly_once() {
+        let args = vec!["--config".to_string(), "x.toml".to_string()];
+        assert_eq!(restart_args(&args), vec!["--config", "x.toml", "--replace"]);
+        // Already carrying it: not duplicated.
+        let with = vec!["--replace".to_string()];
+        assert_eq!(restart_args(&with), vec!["--replace"]);
     }
 
     #[test]

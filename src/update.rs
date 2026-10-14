@@ -155,10 +155,15 @@ pub fn current_exe_path() -> anyhow::Result<PathBuf> {
     })
 }
 
-/// Whether `path` is a file this process could actually execute: a regular file
-/// that, on unix, carries an execute bit. The one predicate for "spawnable
-/// binary" — `cola doctor`'s PATH lookup and `cola restart`'s program guard both
-/// use it, so a non-executable same-named file is never mistaken for runnable.
+/// Whether `path` is a file cola would try to execute: a regular file that, on
+/// unix, carries an execute bit. The one predicate for "spawnable binary" —
+/// `cola doctor`'s PATH lookup and `cola restart`'s program guard both use it,
+/// so a non-executable same-named file is never mistaken for runnable.
+///
+/// A heuristic, not an `access(X_OK)` check: a file another user owns with mode
+/// `0100` still passes, so the lookup can name a file *this* user cannot run.
+/// That is the rare case; a missing/execute-bitless file — the common
+/// mistake — is caught.
 pub fn is_executable_file(path: &Path) -> bool {
     let Ok(meta) = std::fs::metadata(path) else {
         return false;
