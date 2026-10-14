@@ -7256,7 +7256,9 @@ async fn a_durable_ending_prunes_a_row_named_by_a_different_call_id() {
         records[0].run
     );
     assert!(
-        crate::bridge::chain::resolves_run(&records, &run_of("call_bg")),
+        app.cards_handle()
+            .chains
+            .observe_run("ses_test", &run_of("call_bg")),
         "a writer holding only the later call id resolves the one record: {records:?}"
     );
 }

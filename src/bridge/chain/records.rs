@@ -706,16 +706,6 @@ fn resolve_run(records: &[TaskRunRecord], held: &TaskRunId) -> Option<usize> {
         .rposition(|record| held.ids().any(|id| record.run.names(id)))
 }
 
-/// Whether `records` already name the run `held` names — the alias-aware match
-/// the liveness tier's row pruning uses (ADR-0080). It reuses [`resolve_run`],
-/// so a READER of the section (a read's live row, named by whatever id that read
-/// carries) resolves a run by exactly the order every WRITER mints one — a row
-/// the read names by a different call id than the record's key still matches
-/// when they share any other id the run is known by.
-pub(crate) fn resolves_run(records: &[TaskRunRecord], held: &TaskRunId) -> bool {
-    resolve_run(records, held).is_some()
-}
-
 /// Whether an ending's entry is decided by the run's CLASS-AGNOSTIC gate — the
 /// retirement's one-entry-per-run rule ([`EndingFacts::shown_any`]), so a shown
 /// ending of ANY class gives this ending's entry up. The **Wake**'s completion
@@ -1802,31 +1792,32 @@ impl ChainRecords {
         changed
     }
 
-    /// Fold every id `held` carries into the run's record (ADR-0080), recording
-    /// no ending — the same [`absorb_run`] every writer runs, so a record learns
-    /// EVERY id its run is known by and a later writer holding only one of them
-    /// resolves this record instead of minting a second one for one run. The
-    /// read-side half of "resolve before you mint": a read that RESOLVES a run
-    /// while pruning its live row hands the record the ids that row was named
-    /// by. Resolves by the alias order; `false` when the section names no such
-    /// run (a fold never mints) or already knows every id, so a no-op costs no
-    /// write. One synchronous Chain Record write, only when an id was learned.
-    pub(crate) fn fold_run_ids(&self, session_id: &str, held: &TaskRunId) -> bool {
+    /// Observe the run `held` names for a READ (ADR-0080): resolve it by the
+    /// writers' own alias order and fold every id `held` carries into its record,
+    /// in ONE critical section — the read-side half of "resolve before you mint".
+    /// Because the resolve and the fold share this one lock, no writer can slip a
+    /// mint between them: by the time any writer takes the section, the record
+    /// already carries every id the read observed, so a writer holding only one
+    /// of them resolves this record instead of minting a second one for one run.
+    /// `false` when the section names no such run (an observation never mints) or
+    /// when the durable tier is empty. One synchronous Chain Record write, only
+    /// when an id was actually learned.
+    pub(crate) fn observe_run(&self, session_id: &str, held: &TaskRunId) -> bool {
         let mut state = self.lock();
         let session_id = resolved_session(&state, session_id);
-        let learned = {
+        let (resolved, learned) = {
             let Some(records) = state.endings.get_mut(&session_id) else {
                 return false;
             };
-            let Some(index) = resolve_run(records, held) else {
-                return false;
-            };
-            absorb_run(&mut records[index], held)
+            match resolve_run(records, held) {
+                Some(index) => (true, absorb_run(&mut records[index], held)),
+                None => (false, false),
+            }
         };
         if learned {
             self.write(&state);
         }
-        learned
+        resolved
     }
 
     /// Flip the entries `shown` names — a `(run, class)` pair each — to SHOWN
