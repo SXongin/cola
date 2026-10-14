@@ -517,16 +517,35 @@ fn stop_running_cola_at(
     Ok(StopOutcome::Stopped { pid })
 }
 
-/// Run a Supervisor stop command (`systemctl --user stop ...` /
-/// `launchctl bootout ...`) through `sh -c`, so a failure is a value the caller
-/// can fall back from instead of a hard error (ADR-0039).
+/// How long a Supervisor command may run before it is killed. `systemctl
+/// --user`/`launchctl` can stall on a wedged user manager; a bounded wait keeps
+/// `cola restart`/`stop` responsive (the bounded PID check that follows would
+/// otherwise never start).
+const SUPERVISOR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Run a Supervisor command (`systemctl --user stop|restart ...` /
+/// `launchctl bootout|kickstart ...`) through `sh -c`, so a failure is a value
+/// the caller can fall back from instead of a hard error (ADR-0039). Bounded by
+/// [`SUPERVISOR_TIMEOUT`]: a stalled command is killed and reported as a
+/// failure.
 fn run_supervisor_command(cmd: &str) -> anyhow::Result<()> {
-    let status = std::process::Command::new("sh")
+    let mut child = std::process::Command::new("sh")
         .args(["-c", cmd])
-        .status()
+        .spawn()
         .map_err(|e| anyhow::anyhow!("cannot run `{cmd}`: {e}"))?;
-    anyhow::ensure!(status.success(), "`{cmd}` exited with {status}");
-    Ok(())
+    let deadline = std::time::Instant::now() + SUPERVISOR_TIMEOUT;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            anyhow::ensure!(status.success(), "`{cmd}` exited with {status}");
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("`{cmd}` 超时（{}s）", SUPERVISOR_TIMEOUT.as_secs());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 }
 
 /// Stop the running cola instance (ADR-0039). On an interactive terminal the
@@ -624,7 +643,7 @@ fn restart_cli(assume_yes: bool) -> anyhow::Result<()> {
         && autostart::supervisor_owns(pid)
         && run_supervisor_command(&cmd).is_ok()
     {
-        report_restart(wait_for_new_daemon(Some(pid)));
+        report_restart(wait_for_new_daemon(Some(pid)))?;
         return Ok(());
     }
     let Some(argv) = argv else {
@@ -655,18 +674,19 @@ fn restart_cli(assume_yes: bool) -> anyhow::Result<()> {
     // window where cola is down. Re-exec in the instance's own working directory
     // so a relative `--config`/`./cola.toml` resolves as before.
     spawn_detached(&program, args, cwd.as_deref())?;
-    report_restart(wait_for_new_daemon(Some(pid)));
-    Ok(())
+    report_restart(wait_for_new_daemon(Some(pid)))
 }
 
 /// Print the restart outcome; verification is what keeps the CLI honest — a
 /// supervisor restart reports success even when the new instance never took the
-/// lock (ADR-0081).
-fn report_restart(confirmed: bool) {
+/// lock, so an unconfirmed restart is a non-zero exit (ADR-0081), letting a
+/// script notice.
+fn report_restart(confirmed: bool) -> anyhow::Result<()> {
     if confirmed {
         println!("cola 已重启。");
+        Ok(())
     } else {
-        println!("重启已请求，但未确认新实例接管单例锁；请用 `cola status` 查看。");
+        anyhow::bail!("重启已请求，但未确认新实例接管单例锁；请用 `cola status` 查看。")
     }
 }
 
@@ -712,6 +732,16 @@ fn spawn_detached(exe: &str, args: &[String], cwd: Option<&std::path::Path>) -> 
         .stderr(Stdio::null());
     if let Some(dir) = cwd {
         command.current_dir(dir);
+    }
+    // Windows: without a new process group / no console, the child stays tied to
+    // the caller's console and a console close (the user closing the window)
+    // sends it CTRL_CLOSE_EVENT, killing the replacement.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
     }
     command
         .spawn()
@@ -1301,6 +1331,36 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
         assert!(seen, "a live non-cola PID must read as Foreign");
+    }
+
+    #[test]
+    fn report_restart_is_an_error_when_unconfirmed() {
+        assert!(report_restart(true).is_ok());
+        assert!(
+            report_restart(false).is_err(),
+            "an unverified restart must not exit 0"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_detached_runs_in_the_given_directory() {
+        // The replacement must inherit the instance's cwd so a relative
+        // `--config`/`./cola.toml` resolves as before.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("where");
+        let script = format!("pwd > {}", marker.display());
+        spawn_detached("sh", &["-c".to_string(), script], Some(dir.path())).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline && !marker.exists() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let printed = std::fs::read_to_string(&marker).expect("child wrote its cwd");
+        // `pwd` may resolve symlinks; compare canonical paths.
+        assert_eq!(
+            std::fs::canonicalize(printed.trim()).unwrap(),
+            std::fs::canonicalize(dir.path()).unwrap()
+        );
     }
 
     #[test]
