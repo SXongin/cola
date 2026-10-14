@@ -486,6 +486,13 @@ const OPENCODE_BIN_NAMES: &[&str] = &["opencode"];
 /// the next start).
 fn log_check(path: &Path) -> Check {
     match std::fs::metadata(path) {
+        // A directory at the log path can never be opened for appending — the
+        // daemon would fail to start logging. A misconfigured `--log-file` is a
+        // failure, not a pass.
+        Ok(m) if m.is_dir() => Check::fail(
+            "日志文件",
+            format!("{} 是目录，无法作为日志文件写入", path.display()),
+        ),
         Ok(m) => Check::pass("日志文件", format!("{}（{} 字节）", path.display(), m.len())),
         Err(_) if path.parent().is_some_and(Path::exists) => {
             Check::pass("日志文件", format!("{}（尚未创建）", path.display()))
@@ -680,6 +687,12 @@ mod tests {
 
         let gone = dir.path().join("gone").join("cola.log");
         assert_eq!(log_check(&gone).status, CheckStatus::Warn); // parent missing
+
+        // A directory at the log path can never be appended to: a failure, not
+        // a pass.
+        let as_dir = dir.path().join("logs-dir");
+        std::fs::create_dir(&as_dir).unwrap();
+        assert_eq!(log_check(&as_dir).status, CheckStatus::Fail);
     }
 
     #[test]
