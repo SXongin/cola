@@ -449,8 +449,13 @@ fn which_opencode_in(path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
     None
 }
 
-/// The executable names to look for on `PATH`.
-const OPENCODE_BIN_NAMES: &[&str] = &["opencode", "opencode.exe"];
+/// The executable names to look for on `PATH`. Windows resolves executables by
+/// extension, so only `opencode.exe` counts there — an extensionless file named
+/// `opencode` is not runnable and must not shadow it.
+#[cfg(windows)]
+const OPENCODE_BIN_NAMES: &[&str] = &["opencode.exe"];
+#[cfg(not(windows))]
+const OPENCODE_BIN_NAMES: &[&str] = &["opencode"];
 
 /// Report the log file's state: present (with size), not yet created in an
 /// existing directory, or in a directory that does not exist yet (created on
@@ -669,7 +674,7 @@ mod tests {
     #[test]
     fn which_opencode_finds_an_executable_on_path() {
         let dir = tempfile::tempdir().unwrap();
-        let bin = dir.path().join("opencode");
+        let bin = dir.path().join(OPENCODE_BIN_NAMES[0]);
         std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
         make_executable(&bin);
         assert_eq!(which_opencode_in(Some(dir.path().as_os_str())), Some(bin));
@@ -681,7 +686,7 @@ mod tests {
         // A same-named file without an execute bit cannot be spawned, so PATH
         // lookup must not report it as found.
         let dir = tempfile::tempdir().unwrap();
-        let bin = dir.path().join("opencode");
+        let bin = dir.path().join(OPENCODE_BIN_NAMES[0]);
         std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
         let mut perms = std::fs::metadata(&bin).unwrap().permissions();
         use std::os::unix::fs::PermissionsExt;
