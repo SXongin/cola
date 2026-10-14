@@ -724,21 +724,12 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn handle_identity_changes_when_the_file_is_replaced() {
-        // Rotation writes a NEW file at the same path; identity must move so the
-        // follow loop restarts from the top even if the new file grew past the
-        // old offset.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cola.log");
-        std::fs::write(&path, b"one\n").unwrap();
-        let first = handle_identity(&std::fs::File::open(&path).unwrap());
-        std::fs::remove_file(&path).unwrap();
-        std::fs::write(&path, b"two\n").unwrap();
-        assert!(first.is_some());
-        assert_ne!(first, handle_identity(&std::fs::File::open(&path).unwrap()));
-    }
+    // NOTE: no test asserts that `handle_identity` *differs* after a
+    // remove+recreate — the OS may reuse the inode (seen on the CI runner), so
+    // that assertion is inherently flaky. The rotation behavior it exists to
+    // drive is covered deterministically by `resume_restarts_*` (the decision)
+    // and `poll_file_follows_*_rotation` (the integration), neither of which
+    // depends on the inode actually changing.
 
     #[test]
     fn run_logs_selects_the_rotated_file_by_date() {
