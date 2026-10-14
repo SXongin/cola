@@ -344,6 +344,25 @@ overwrite). Logs rotate **daily**: yesterday's content moves to
 mirror there; a redirected stdout gets no cola logs, keeping the redirect target
 clean.
 
+`cola logs` prints the tail of the log file (`-n N` lines, default 50);
+`--date YYYY-MM-DD` reads a rotated day's file, and `-f` follows new lines,
+reopening the fresh file across a midnight rotation.
+
+## Inspect (status / doctor / config)
+
+`cola status` prints a one-shot snapshot: run state, autostart, claim, the
+resolved config and log paths, and the attached OpenCode server with its
+generation. `--json` emits the same facts for scripts.
+
+`cola doctor` runs the checks a support request needs — config parse, Feishu
+credentials, `opencode` on `PATH`, the shared server probe, the singleton lock,
+the log path, and the autostart binary path — each with a ✅/⚠️/❌ mark and a
+summary, and exits non-zero when a check fails.
+
+`cola config path|show|validate` prints the resolved config path, the effective
+config with the app secret masked, or a parse check. `cola version` mirrors
+`--version`, and `cola completions <shell>` prints a completion script.
+
 ## Singleton lock & restart
 
 Only one cola may run at a time (two would double-handle Feishu events). The
@@ -362,6 +381,12 @@ lock lives at `~/.cola/cola.lock`.
 - Under a systemd unit, `/restart` (like `/update`) does NOT spawn a child — it
   exits with a restart code and lets the unit's `Restart=on-failure` bring cola
   back up from the same ExecStart.
+
+`cola restart [-y]` restarts the running instance without a manual
+stop-then-start: through the platform supervisor when an autostart registration
+is installed, otherwise by re-execing the lock holder's own command line
+detached (plus `--replace`). Both paths verify a new instance took the lock
+before reporting success.
 
 ## Self-update
 

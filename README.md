@@ -167,6 +167,11 @@ cola attaches to an already-running `opencode serve` on the shared store
 (so sessions stay shared with OpenChamber / the CLI), and lazily starts its own
 when none is running.
 
+Inspect and control it from the shell: `cola status` (a snapshot — run state,
+autostart, claim, server + generation; `--json` for scripts), `cola doctor` (the
+environment checks a support request needs), `cola logs [-f]` (tail the log),
+`cola restart`, `cola config path|show|validate`, and `cola completions <shell>`.
+
 ### 5. Claim the bot
 
 cola is **private by default**: a fresh (or upgraded) instance starts
