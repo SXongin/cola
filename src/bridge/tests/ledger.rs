@@ -4133,6 +4133,76 @@ async fn a_late_wake_after_a_restart_joins_the_retirements_shown_bit() {
     );
 }
 
+/// The gate's case (ADR-0080, CI gate): the Wake ending's shown bit must be
+/// persisted by the REAL confirmed-write path — the Rendered Cursor's own
+/// confirmation, never a direct `record_shown` — and a restart must then
+/// suppress the run's completion. Life 1 renders the Wake's completion on the
+/// settled card, whose confirmed write flips the durable shown bit. Life 2 is a
+/// fresh process over the same files whose read still carries a NEWER Wake for
+/// the same run — newer than the durable Wake Watermark, so the floor cannot be
+/// what suppresses it: only the durable shown bit can.
+#[tokio::test]
+async fn a_confirmed_write_persists_the_wake_ending_and_a_restart_suppresses_it() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = waiting_shell(now - 5_000);
+    let (dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    yield_one_task_card(&app, &platform, ctx("ses_test", "跑一下构建并审阅")).await;
+
+    // Life 1: the read carries the Wake and no live task, so the Wake's own
+    // completion entry renders — and the settled card's confirmed write is what
+    // flips its ending's shown bit.
+    script_quiet_true_end(&backend).await;
+    spawn_sync(&app);
+    wait_for_card_update(&platform, "the settled card", CardUpdates::Latest, |card| {
+        card_header(card).contains("✅") && card_text(card).contains("🔔 shell 完成：gh run watch")
+    })
+    .await;
+
+    let session_file = dir.path().join("sessions.json");
+    let persisted = ChainRecords::load(session_file.with_file_name("chain_records.json"));
+    assert!(
+        persisted.ending_shown("ses_test", &run_of("sh_bg"), TaskEndingClass::Wake),
+        "the confirmed card write persists the Wake ending's shown bit: {:?}",
+        persisted.endings("ses_test")
+    );
+
+    // Life 2: a fresh process, the user's next message, and a NEWER Wake for the
+    // same run (same shell id, a later clock) — newer than the durable Wake
+    // Watermark, so the floor cannot suppress it and only the shown bit can.
+    let late = SessionTranscript::new(two_task_timeline(vec![
+        user("msg_cola_next", 2_800, "新问题"),
+        assistant(3_100, "答复。"),
+    ]))
+    .with_executions(vec![execution(2_500), execution(4_000)])
+    .with_wakes(vec![shell_wake(3_900)]);
+    let (restarted, restarted_platform) = restarted_app_with_transcript(&session_file, late).await;
+    let mut second = ctx("ses_test", "新问题");
+    second.message_id = "msg_next".into();
+    second.cola_message_id = Some("msg_cola_next".into());
+    Turn::run(&restarted.turn_handles(), second).await.unwrap();
+    spawn_sync(&restarted);
+    wait_for_card_update(
+        &restarted_platform,
+        "the resumed work",
+        CardUpdates::Latest,
+        |card| card_text(card).contains("答复。"),
+    )
+    .await;
+
+    let mut bodies: Vec<String> = restarted_platform
+        .updated_cards()
+        .await
+        .iter()
+        .map(card_text)
+        .collect();
+    bodies.extend(created_cards(&restarted_platform).await.iter().map(card_text));
+    assert!(
+        bodies.iter().all(|text| !text.contains("🔔 shell 完成")),
+        "the shown Wake ending suppresses the completion across the restart: {bodies:?}"
+    );
+}
+
 /// Issue #671 / ticket #672: the durable Task Endings are a fact SEPARATE from
 /// the Wake Watermark. A delivered retirement entry flips its ending's shown
 /// bit while leaving the Wake mark untouched — the two facts share a file and
