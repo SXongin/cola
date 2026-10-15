@@ -746,8 +746,17 @@ impl ExternalFlow {
         if !data.tail.is_empty() {
             static_text.push_str("\n\n**最近对话**");
             for entry in &data.tail {
-                let role = crate::feishu::snapshot_card::role_marker(&entry.role);
-                let body = entry.body_text();
+                // A Compaction marker is deliberately NOT repeated here: this
+                // card is a live one, and its timeline renders the session's
+                // compaction rows itself (a session-scoped fact, ADR-0082), so
+                // copying the marker into the static prefix would show it
+                // twice. The one-shot snapshot — which has no timeline — is
+                // where the tail's marker is the only vehicle.
+                let Some(message) = entry.message() else {
+                    continue;
+                };
+                let role = crate::feishu::snapshot_card::role_marker(&message.role);
+                let body = message.body_text();
                 let text = if body.trim().is_empty() {
                     "（空消息）".to_string()
                 } else {

@@ -659,14 +659,18 @@ async fn transcript_reads_the_same_neutral_view_on_every_generation() {
         // The Session Snapshot tail: the text-bearing conversation, newest
         // last, with the tool-only in-flight step excluded.
         let tail = transcript.transcript_tail();
-        let tail_texts: Vec<&str> = tail.iter().map(|entry| entry.text.as_str()).collect();
+        let messages: Vec<&crate::backend::TailMessage> = tail
+            .iter()
+            .filter_map(crate::backend::TailEntry::message)
+            .collect();
+        let tail_texts: Vec<&str> = messages.iter().map(|entry| entry.text.as_str()).collect();
         assert_eq!(
             tail_texts,
             [fixture.previous_text, fixture.user_text, fixture.assistant_text],
             "{generation}: tail"
         );
-        assert_eq!(tail[2].role, MessageRole::Assistant);
-        assert_eq!(tail[2].created_ms, fixture.assistant_created_ms);
+        assert_eq!(messages[2].role, MessageRole::Assistant);
+        assert_eq!(messages[2].created_ms, fixture.assistant_created_ms);
     }
 }
 

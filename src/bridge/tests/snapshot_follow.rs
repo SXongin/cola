@@ -1306,3 +1306,98 @@ async fn busy_follow_static_tail_records_a_file_line() {
         "the follow's static tail records the file line: {follow_card}"
     );
 }
+
+/// ADR-0082 (ticket #723): the busy-adopt follow card shows a compaction
+/// EXACTLY ONCE. Its live timeline renders the session's compaction rows itself
+/// (a session-scoped fact), which is why the static 最近对话 prefix deliberately
+/// does not repeat the tail's marker — a card carrying both would show the
+/// reader the same compaction twice.
+#[tokio::test]
+async fn busy_follow_shows_a_compaction_once() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_sessions(vec![list_session(
+        "ses_alpha01",
+        "唯一外部标题",
+        "/work/ext",
+        100,
+    )]);
+    backend.with_session_status("ses_alpha01", Some(opencode::types::SessionStatus::Busy));
+    backend.given_transcript(
+        "ses_alpha01",
+        vec![SessionTranscript::new(vec![
+            typed_message(
+                "msg_earlier",
+                MessageRole::User,
+                Some(1_000),
+                vec![text_part("先前的对话")],
+            ),
+            compaction_message("msg_comp", 1_500, "更早的对话已被压缩。"),
+            typed_message(
+                "msg_user",
+                MessageRole::User,
+                Some(2_000),
+                vec![text_part("继续")],
+            ),
+            typed_message(
+                "msg_assist",
+                MessageRole::Assistant,
+                Some(3_000),
+                vec![Part::StepFinish(StepFinish {
+                    reason: FinishReason::Stop,
+                })],
+            ),
+        ])],
+    );
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    app.core
+        .external
+        .render_poll_ms
+        .store(20, std::sync::atomic::Ordering::Relaxed);
+
+    send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
+
+    wait_for_card_update(&platform, "the follow card", CardUpdates::Latest, |card| {
+        card_header(card).contains("✅")
+    })
+    .await;
+
+    let calls = platform.calls.lock().await.clone();
+    let follow_card = calls
+        .iter()
+        .filter_map(|c| match c {
+            PlatformCall::UpdateMessage { message_id, card } if message_id == "msg_reply" => {
+                Some(card.to_string())
+            }
+            _ => None,
+        })
+        .next_back()
+        .expect("the busy-adopt follow re-renders the snapshot card in place");
+    assert_eq!(
+        follow_card.matches("已压缩上下文（自动）").count(),
+        1,
+        "the follow card carries the marker exactly once: {follow_card}"
+    );
+}
+
+/// One compaction message, the way V2 persists it: its server time is the
+/// MESSAGE's `time.created`.
+fn compaction_message(id: &str, created: i64, summary: &str) -> crate::backend::TranscriptMessage {
+    typed_message(
+        id,
+        MessageRole::Other("compaction".into()),
+        Some(created),
+        vec![Part::Compaction(crate::backend::Compaction {
+            status: crate::backend::CompactionStatus::Completed,
+            reason: crate::backend::CompactionReason::Auto,
+            summary: summary.to_string(),
+            usage: None,
+            error: None,
+            recent: String::new(),
+        })],
+    )
+}

@@ -111,13 +111,18 @@ fn assert_completed_turn(transcript: &SessionTranscript) {
 
     // The Session Snapshot tail ends on the final answer, once.
     let tail = transcript.transcript_tail();
+    let messages: Vec<&crate::backend::TailMessage> = tail
+        .iter()
+        .filter_map(crate::backend::TailEntry::message)
+        .collect();
     assert_eq!(
-        tail.last().map(|entry| entry.text.as_str()),
+        messages.last().map(|entry| entry.text.as_str()),
         Some("live-harness-final-text"),
         "the tail ends on the final answer: {tail:#?}"
     );
     assert_eq!(
-        tail.iter()
+        messages
+            .iter()
             .filter(|entry| entry.text == "live-harness-final-text")
             .count(),
         1,

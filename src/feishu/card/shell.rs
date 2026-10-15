@@ -1,7 +1,7 @@
 use serde_json::json;
 
 use super::MAX_ELEMENT_TEXT_CHARS;
-use super::compaction::{compaction_summary, compaction_title};
+use super::compaction::compaction_elements;
 use super::ledger::{
     TASK_LEDGER_ELEMENT_ID, TaskCompletionEntry, TaskLedgerRow, task_entry_body, task_entry_title,
     task_ledger_text, task_ledger_title,
@@ -290,27 +290,11 @@ impl CardBuilder {
     /// terminal successor share one timeline entry, so the id keeps the reader's
     /// fold state across the in-place update. The compaction's own usage rides
     /// the title when the server reports one, never the Turn Footer's context
-    /// figure.
+    /// figure. The elements themselves are shared with the Session Snapshot's
+    /// tail marker row (ticket #723), so the two surfaces cannot disagree.
     pub fn with_compaction(mut self, compaction: &Compaction, element_id: Option<&str>) -> Self {
-        let title = compaction_title(compaction);
-        match compaction_summary(compaction) {
-            Some(summary) => {
-                let chunks: Vec<String> =
-                    crate::feishu::card::chunk_text(&summary, crate::feishu::card::MAX_ELEMENT_TEXT_CHARS)
-                        .iter()
-                        .map(|chunk| self.markdown.element(chunk))
-                        .collect();
-                self.body
-                    .push(collapsible_panel_chunks(&title, &chunks, element_id));
-            }
-            // Nothing to fold: a running compaction (the Backend writes the text
-            // only at the end), a failure, or a completion that carries no
-            // summary at all. The row is then its title alone.
-            None => {
-                let line = self.markdown.element(&title);
-                self.body.push(json!({ "tag": "markdown", "content": line }));
-            }
-        }
+        let elements = compaction_elements(compaction, element_id, &mut self.markdown);
+        self.body.extend(elements);
         self
     }
 
