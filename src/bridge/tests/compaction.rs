@@ -446,10 +446,11 @@ async fn a_failed_compaction_renders_a_row_carrying_the_backends_error() {
 /// vanish with the turn's update, and a failure is what the reader most needs.
 #[tokio::test]
 async fn a_long_failed_error_is_clipped_on_the_card() {
-    use crate::feishu::card::compaction::{ERROR_TRUNCATED_MARKER, MAX_COMPACTION_ERROR_CHARS};
+    use crate::feishu::card::MAX_ELEMENT_TEXT_CHARS;
+    use crate::feishu::card::compaction::ERROR_TRUNCATED_MARKER;
 
     let _wd = test_work_dir();
-    let error = "字".repeat(MAX_COMPACTION_ERROR_CHARS * 100);
+    let error = "字".repeat(MAX_ELEMENT_TEXT_CHARS * 100);
     let timeline = vec![
         user("msg_cola_anchor", 1_000, "第一条消息"),
         compaction("msg_comp", 2_000, failed(CompactionReason::Auto, &error)),
@@ -464,13 +465,15 @@ async fn a_long_failed_error_is_clipped_on_the_card() {
         text.contains(ERROR_TRUNCATED_MARKER),
         "the clip is named on the card"
     );
+    let rows = compaction_rows(&card);
     assert!(
-        text.contains(&"字".repeat(MAX_COMPACTION_ERROR_CHARS)),
-        "the head of the error is kept"
+        rows[0].0.chars().count() <= MAX_ELEMENT_TEXT_CHARS,
+        "the clipped title stays one budgeted element: {} chars",
+        rows[0].0.chars().count()
     );
     assert!(
-        !text.contains(&"字".repeat(MAX_COMPACTION_ERROR_CHARS + 1)),
-        "nothing past the cap reaches the card"
+        rows[0].0.contains(&"字".repeat(100)),
+        "the head of the error is kept"
     );
     assert!(
         card.to_string().len() < crate::feishu::card::MAX_CARD_JSON_CHARS,

@@ -87,29 +87,34 @@ pub(crate) fn sanitize_markdown(text: &str) -> String {
     CardMarkdown::new().clean(text)
 }
 
-/// The serialized bytes `text` costs once the card's sanitizer has run, as an
-/// upper bound: its UTF-8 length, plus [`LESS_THAN_ESCAPE`]'s extra four bytes
-/// for every `<` (one raw byte, five escaped). A pure function of the text — the
-/// state machine that decides where an escape applies stays in
-/// [`CardMarkdown::clean`] — and deliberately CONSERVATIVE: the sanitizer leaves
-/// a `<` alone inside a fenced code block or an inline code span, so charging
-/// every one of them over-estimates a body carrying markup inside code. That is
-/// the safe side for a size estimate: a card splitter (or a per-row cap) must
-/// never under-charge what Feishu will receive. The other expansions a card can
-/// see are bounded elsewhere and are not charged here — a table that outgrows its
-/// budget gains one code fence per line, and an image only loses characters.
-pub(crate) fn escaped_len(text: &str) -> usize {
-    text.chars().map(escaped_char_len).sum()
-}
-
-/// [`escaped_len`]'s one-character cost, for callers clipping text as they walk
-/// it.
-pub(crate) fn escaped_char_len(ch: char) -> usize {
-    if ch == '<' {
-        LESS_THAN_ESCAPE.len()
+/// The JSON-string bytes the card will carry for `text`, EXACTLY: the
+/// sanitizer's content expansion (`<` becomes the five-byte `&#60;`, what
+/// [`CardMarkdown::clean`] does outside a code context) applied first, then the
+/// text encoded as a JSON string value by [`serde_json`] — so control
+/// characters (`\u0000` costs six), quotes, backslashes and non-ASCII are
+/// measured by the encoder that will write them, with no per-character table to
+/// keep in sync.
+///
+/// A pure function of the text: the state machine deciding *where* an escape
+/// applies stays in [`CardMarkdown::clean`], so a `<` inside a fenced block or an
+/// inline code span is expanded here and not on the card — an over-charge, the
+/// safe side for a per-row cap or a splitter, which must never under-charge what
+/// Feishu receives. Two sanitizer expansions are NOT string-content
+/// substitutions and stay outside this measure, both bounded by the card text
+/// they wrap: a table that outgrows its budget gains a code fence around it, an
+/// image span collapses to a shorter link, and the rejection fallback's fence
+/// grows with the chunk it wraps ([`fenced_code`] uses one backtick more than the
+/// chunk's longest run) — each is absorbed by the per-element wrapper constant
+/// the callers add on top, and the element's own character cap bounds it.
+pub(crate) fn serialized_len(text: &str) -> usize {
+    let expanded = if text.contains('<') {
+        text.replace('<', LESS_THAN_ESCAPE)
     } else {
-        ch.len_utf8()
-    }
+        text.to_string()
+    };
+    serde_json::to_string(&expanded)
+        .map(|quoted| quoted.len().saturating_sub(2))
+        .unwrap_or_else(|_| expanded.len())
 }
 
 /// The markdown construction a delivered prefix leaves open at its cut point
