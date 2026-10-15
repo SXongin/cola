@@ -12,7 +12,7 @@
 //! is never rendered: it is history the reader already has.
 
 use crate::backend::{Compaction, CompactionReason, CompactionStatus};
-use crate::feishu::card::sanitize::CardMarkdown;
+use crate::feishu::card::sanitize::{CardMarkdown, escaped_len};
 use crate::feishu::card::shell::collapsible_panel_chunks;
 use crate::feishu::card::{MAX_CARD_TEXT_CHARS, MAX_ELEMENT_TEXT_CHARS, chunk_text, format_tokens};
 use serde_json::json;
@@ -127,6 +127,17 @@ fn compaction_error(compaction: &Compaction) -> String {
 /// keeps its summary whole: this caps what the card SHOWS.
 pub(crate) const MAX_COMPACTION_SUMMARY_CHARS: usize = MAX_CARD_TEXT_CHARS;
 
+/// The bytes one row's fold body may SERIALIZE to: the escaped cost a worst-case
+/// CJK body at [`MAX_COMPACTION_SUMMARY_CHARS`] already carries (three bytes per
+/// character, which is what the character cap was sized for). The body is bounded
+/// by both — the character cap keeps an ordinary summary whole, and this byte cap
+/// keeps the serialized size inside one card when the sanitizer EXPANDS the text:
+/// a `<` becomes the five-byte `&#60;`, so a summary of markup at the character
+/// cap alone would reach ~30 KB and blow the card, which is the very failure the
+/// per-row cap exists to prevent. Only the tail of such a body is lost; prose is
+/// untouched.
+pub(crate) const MAX_COMPACTION_BODY_BYTES: usize = MAX_COMPACTION_SUMMARY_CHARS * 3;
+
 /// The marker a clipped fold body ends with, as an element of its own so no
 /// element outgrows the per-element budget.
 pub(crate) const SUMMARY_TRUNCATED_MARKER: &str = "…（摘要已截断）";
@@ -162,19 +173,38 @@ pub(crate) const ERROR_TRUNCATED_MARKER: &str = "…（错误已截断）";
 /// title alone, rather than a fold holding nothing.
 ///
 /// The ONE source the render, [`compaction_components`] and
-/// [`compaction_estimate`] read, so the three cannot drift: the cap, the chunking
+/// [`compaction_estimate`] read, so the three cannot drift: the caps, the chunking
 /// and the marker are measured exactly as they are built.
 pub(crate) fn compaction_fold_body(compaction: &Compaction) -> Option<Vec<String>> {
     let summary = compaction.summary.trim();
     if summary.is_empty() {
         return None;
     }
-    let clipped: String = summary.chars().take(MAX_COMPACTION_SUMMARY_CHARS).collect();
+    let (clipped, truncated) = clipped_summary(summary);
     let mut chunks = chunk_text(&clipped, MAX_ELEMENT_TEXT_CHARS);
-    if clipped.chars().count() < summary.chars().count() {
+    if truncated {
         chunks.push(SUMMARY_TRUNCATED_MARKER.to_string());
     }
     Some(chunks)
+}
+
+/// The summary text one row's fold shows, and whether it was cut: at most
+/// [`MAX_COMPACTION_SUMMARY_CHARS`] CHARACTERS and at most
+/// [`MAX_COMPACTION_BODY_BYTES`] SERIALIZED bytes ([`escaped_len`]) — the
+/// character cap for an ordinary summary, the byte cap for text the sanitizer
+/// expands, so neither extreme can outgrow one card.
+fn clipped_summary(summary: &str) -> (String, bool) {
+    let mut clipped = String::new();
+    let mut bytes = 0;
+    for (chars, ch) in summary.chars().enumerate() {
+        let cost = crate::feishu::card::sanitize::escaped_char_len(ch);
+        if chars >= MAX_COMPACTION_SUMMARY_CHARS || bytes + cost > MAX_COMPACTION_BODY_BYTES {
+            return (clipped, true);
+        }
+        clipped.push(ch);
+        bytes += cost;
+    }
+    (clipped, false)
 }
 
 /// How many body elements one Compaction row adds: a plain line is one element,
@@ -190,15 +220,17 @@ pub(crate) fn compaction_components(compaction: &Compaction) -> usize {
 /// The bytes one Compaction row adds to the body (ADR-0082): its title, plus —
 /// for a folded row — the panel's own element overhead and the body's markdown
 /// chunks, measured from the same chunks the render builds so the two cannot
-/// drift. The body is charged in JSON bytes rather than as card text, like a
-/// ledger entry's output: a fold body is one element per chunk and cannot be
-/// split the way streamed text can. Because the body is capped, a row's cost is
-/// bounded whatever the stored summary holds.
+/// drift. Every charge is [`escaped_len`]'s: what the sanitizer will SERIALIZE,
+/// not the raw text, so a markup-heavy row (every `<` becomes the five-byte
+/// `&#60;`) cannot be charged less than it costs. The body is charged in JSON
+/// bytes rather than as card text, like a ledger entry's output: a fold body is
+/// one element per chunk and cannot be split the way streamed text can. Because
+/// both are capped, a row's cost is bounded whatever the stored summary holds.
 pub(crate) fn compaction_estimate(compaction: &Compaction) -> usize {
-    let title = compaction_title(compaction).len();
+    let title = escaped_len(&compaction_title(compaction));
     match compaction_fold_body(compaction) {
         None => title + 80,
-        Some(chunks) => 300 + title + chunks.iter().map(|chunk| chunk.len() + 40).sum::<usize>(),
+        Some(chunks) => 300 + title + chunks.iter().map(|chunk| escaped_len(chunk) + 40).sum::<usize>(),
     }
 }
 
@@ -278,6 +310,7 @@ mod tests {
     /// A summary made of markup therefore costs one rejected write, and the
     /// fenced rebuild — what a rejected card is retried as — lands inside the
     /// budget: the row is never lost, and the cap still bounds the body it holds.
+    /// (The byte cap below keeps the FIRST attempt inside the budget too.)
     #[test]
     fn a_markup_laden_summary_lands_inside_the_budget_through_the_fenced_fallback() {
         let summary = "<".repeat(MAX_COMPACTION_SUMMARY_CHARS * 20);
@@ -292,6 +325,99 @@ mod tests {
             "the fenced rebuild must fit the budget, got {} bytes",
             fenced.len()
         );
+    }
+
+    /// Markup the sanitizer EXPANDS is bounded by serialized bytes, not characters
+    /// alone: a summary of pure `<` at the character cap would serialize to ~30 KB
+    /// (every `<` becomes the five-byte `&#60;`) and Feishu would reject the card,
+    /// taking the row with it. The fold body is clipped so its escaped cost fits
+    /// [`MAX_COMPACTION_BODY_BYTES`] — the allowance a worst-case CJK body at the
+    /// character cap already costs — and the row's card stays inside the budget.
+    #[test]
+    fn a_markup_laden_fold_body_stays_inside_the_card_budget() {
+        for (label, summary) in [
+            ("at the character cap", "<".repeat(MAX_COMPACTION_SUMMARY_CHARS)),
+            (
+                "far past every cap",
+                "<".repeat(MAX_COMPACTION_SUMMARY_CHARS * 20),
+            ),
+            (
+                "markup inside a code fence",
+                format!("```\n{}\n```", "<".repeat(MAX_COMPACTION_SUMMARY_CHARS)),
+            ),
+        ] {
+            let json = card_json(&summary);
+            assert!(
+                json.len() < MAX_CARD_JSON_CHARS,
+                "{label}: the card must stay inside the whole-card JSON budget, got {} bytes",
+                json.len()
+            );
+        }
+
+        // The clip keeps the head, names itself, and stops at the BYTE cap: a
+        // pure-`<` body shows as many characters as the escaped budget allows.
+        let body = compaction_fold_body(&compaction(&"<".repeat(MAX_COMPACTION_SUMMARY_CHARS)))
+            .expect("a folded body");
+        assert_eq!(body.last().map(String::as_str), Some(SUMMARY_TRUNCATED_MARKER));
+        let visible: String = body[..body.len() - 1].concat();
+        let cap = MAX_COMPACTION_BODY_BYTES / 5;
+        assert_eq!(visible, "<".repeat(cap), "the head is kept up to the byte cap");
+        assert!(crate::feishu::card::sanitize::escaped_len(&visible) <= MAX_COMPACTION_BODY_BYTES);
+    }
+
+    /// A failure's error can carry markup too, and the title is one element: the
+    /// escaped clip still leaves the whole card inside the budget while keeping
+    /// the head of the error.
+    #[test]
+    fn a_markup_heavy_error_stays_inside_the_card_budget() {
+        for (label, error) in [
+            ("at the cap", "<".repeat(MAX_COMPACTION_ERROR_CHARS)),
+            ("far past the cap", "<".repeat(MAX_COMPACTION_ERROR_CHARS * 20)),
+        ] {
+            let json = card_of(&failed(&error));
+            assert!(
+                json.len() < MAX_CARD_JSON_CHARS,
+                "{label}: the card must stay inside the whole-card JSON budget, got {} bytes",
+                json.len()
+            );
+        }
+        let title = compaction_title(&failed(&"<".repeat(MAX_COMPACTION_ERROR_CHARS * 2)));
+        assert!(title.contains(ERROR_TRUNCATED_MARKER));
+        assert!(title.contains(&"<".repeat(MAX_COMPACTION_ERROR_CHARS)));
+        assert!(!title.contains(&"<".repeat(MAX_COMPACTION_ERROR_CHARS + 1)));
+    }
+
+    /// The charge is never an UNDER-charge: for a markup-heavy row the estimate
+    /// covers what the row's elements actually serialize to — measured from the
+    /// very builder the render uses — so the splitter cannot be told a card fits
+    /// when it does not.
+    #[test]
+    fn the_estimate_never_undercharges_a_markup_heavy_row() {
+        for (label, fact) in [
+            (
+                "a markup-heavy summary",
+                compaction(&"<".repeat(MAX_COMPACTION_SUMMARY_CHARS * 5)),
+            ),
+            ("a prose summary", compaction("保留了结论。")),
+            (
+                "a markup-heavy error",
+                failed(&"<".repeat(MAX_COMPACTION_ERROR_CHARS * 5)),
+            ),
+            ("a short error", failed("context length exceeded")),
+        ] {
+            let mut md = CardMarkdown::new();
+            let serialized: usize =
+                crate::feishu::card::compaction::compaction_elements(&fact, Some("compaction_1"), &mut md)
+                    .iter()
+                    .map(|element| element.to_string().len())
+                    .sum();
+            assert!(
+                compaction_estimate(&fact) >= serialized,
+                "{label}: the estimate ({}) must cover the row's serialized {} bytes",
+                compaction_estimate(&fact),
+                serialized
+            );
+        }
     }
 
     /// The capped body keeps the head of the summary and says it was cut, with

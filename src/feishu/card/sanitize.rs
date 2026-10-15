@@ -87,6 +87,31 @@ pub(crate) fn sanitize_markdown(text: &str) -> String {
     CardMarkdown::new().clean(text)
 }
 
+/// The serialized bytes `text` costs once the card's sanitizer has run, as an
+/// upper bound: its UTF-8 length, plus [`LESS_THAN_ESCAPE`]'s extra four bytes
+/// for every `<` (one raw byte, five escaped). A pure function of the text — the
+/// state machine that decides where an escape applies stays in
+/// [`CardMarkdown::clean`] — and deliberately CONSERVATIVE: the sanitizer leaves
+/// a `<` alone inside a fenced code block or an inline code span, so charging
+/// every one of them over-estimates a body carrying markup inside code. That is
+/// the safe side for a size estimate: a card splitter (or a per-row cap) must
+/// never under-charge what Feishu will receive. The other expansions a card can
+/// see are bounded elsewhere and are not charged here — a table that outgrows its
+/// budget gains one code fence per line, and an image only loses characters.
+pub(crate) fn escaped_len(text: &str) -> usize {
+    text.chars().map(escaped_char_len).sum()
+}
+
+/// [`escaped_len`]'s one-character cost, for callers clipping text as they walk
+/// it.
+pub(crate) fn escaped_char_len(ch: char) -> usize {
+    if ch == '<' {
+        LESS_THAN_ESCAPE.len()
+    } else {
+        ch.len_utf8()
+    }
+}
+
 /// The markdown construction a delivered prefix leaves open at its cut point
 /// (spec #561, ticket #563): what a tail that starts mid-construct must
 /// re-establish to render as the content it continues.
