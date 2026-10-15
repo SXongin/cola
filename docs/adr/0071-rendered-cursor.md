@@ -5,6 +5,10 @@
 > ordering assumption below (the per-card delivery lock alone, and candidate 5
 > "not a prerequisite") reads under that amendment. See the amendment at the
 > end.
+>
+> **Amended (2026-10-15)**: `release` now hands the record's confirmed frontier
+> to a Session-scoped delivered position, so "no long-lived state accumulates"
+> holds except for that one fact (ADR-0082). See the last amendment.
 
 ## Context
 
@@ -536,3 +540,31 @@ Consequences:
   cursorless fallback is untouched.
 
 Related: #583, #454, #561, ADR-0059, ADR-0063, ADR-0066, ADR-0069, ADR-0072.
+
+## Amendment (2026-10-15): the release hands one fact over, so not nothing accumulates (ADR-0082)
+
+The Decision bullet **"The cursor is chain-level and belongs to the record's
+lifetime"** ends "`release` drops it with the record. No long-lived state
+accumulates". The first half stands; the second is narrowed, because one fact
+cannot be chain-scoped and still do its job. `release`/`release_if_card` now
+hand the record's CONFIRMED frontier to a **Session-scoped delivered position**
+(`ChainRecords::delivered`: one `session_id → message` entry) in the same atomic
+write that drops the record. It exists for exactly one reader — the
+session-scoped compaction walk, whose exactly-once must hold ACROSS Turns while
+the cursor that carried the bound dies with every terminal card (ADR-0082's
+amendment of 2026-10-15, "the Session's delivered position outlives the chain's
+record").
+
+Consequences:
+
+- The cursor is not what changed: it is still chain-level, still carried across
+  a re-point, still dropped with the record. The exception is one Session-scoped
+  entry written by no one but `release`/`release_if_card` (a cursorless record
+  hands over nothing) and read by no one but the compaction walk.
+- What is handed over is the record's CONFIRMED frontier, never a stage a write
+  may still be owed or a refusal discarded: a compaction no card actually
+  delivered still renders on the next one.
+- "One home and one atomic write" still describes the file: the handover and the
+  removal share the release's single write.
+
+Related: ADR-0082, #721, ADR-0069.
