@@ -9,14 +9,19 @@
 //! The wire envelope types are private to this decoder: outside the adapter a
 //! caller reaches a transcript only through [`decode_response`], so no protocol
 //! field name can leak (ADR-0053).
+//!
+//! One event this generation does NOT put on a message of its own is the
+//! **Compaction** (ADR-0082): V1 states it as a `compaction` part on a user
+//! message plus a paired assistant summary message, and [`decode`] pairs the
+//! two into the one generation-neutral fact before any message is classified.
 
 use serde::Deserialize;
 use serde_json::Value;
 
 use crate::backend::{
-    ContentBlock, FileContent, MessageId, MessageRole, MessageTime, ModelIdentity, OtherPart, Part, Patch,
-    ReasoningPart, SessionTranscript, StepFinish, StepStart, TokenUsage, ToolCall, ToolOutput, ToolStatus,
-    TranscriptMessage,
+    Compaction, CompactionReason, CompactionStatus, ContentBlock, FileContent, MessageId, MessageRole,
+    MessageTime, ModelIdentity, OtherPart, Part, Patch, ReasoningPart, SessionTranscript, StepFinish,
+    StepStart, TokenUsage, ToolCall, ToolOutput, ToolStatus, TranscriptMessage,
 };
 use crate::error::Result;
 
@@ -41,6 +46,20 @@ struct WireMessageInfo {
     role: Option<String>,
     #[serde(default)]
     time: Option<WireMessageTime>,
+    /// The message an assistant message was produced from (V1's `parentID`).
+    /// The compaction pairing links a summary message to its carrier through it.
+    #[serde(rename = "parentID", default)]
+    parent_id: Option<String>,
+    /// The mode an assistant message was produced in; a compaction summary
+    /// carries `"compaction"`.
+    #[serde(default)]
+    mode: Option<String>,
+    /// Whether an assistant message is a summary; a compaction summary carries
+    /// `true`. Kept raw because V1's USER messages spell `summary` as an object
+    /// (`{additions, deletions, files, diffs}`, the user-message format
+    /// summary); a bool field would fail the whole read on one.
+    #[serde(default)]
+    summary: Option<Value>,
     #[serde(rename = "modelID", default)]
     model_id: Option<String>,
     #[serde(rename = "providerID", default)]
@@ -91,9 +110,160 @@ pub(super) fn decode_response(json: &Value) -> Result<SessionTranscript> {
     Ok(decode(&messages))
 }
 
+/// The role a paired compaction message carries (`MessageRole::Other`), the
+/// verbatim kind exactly as `synthetic` and `skill` keep theirs — so no
+/// language-model role gains a member.
+const COMPACTION_ROLE: &str = "compaction";
+
+/// Which message states which part of one **Compaction** (ADR-0082). V1 spells
+/// a single compaction across TWO messages, so a message's neutral role and
+/// parts can only be decoded once its sibling is known.
+enum CompactionRole {
+    /// The user message carrying a `compaction` part — the event's **carrier**.
+    /// It holds the typed fact; `summary` is the paired message's text.
+    Carrier {
+        reason: CompactionReason,
+        summary: String,
+    },
+    /// The assistant summary message paired with a carrier. It is the
+    /// compaction's own text, so it is never an Assistant message: it answers
+    /// no Turn, and its tokens never become the Turn Footer's context figure.
+    Summary,
+    /// A summary message whose carrier this read does not carry. It is still a
+    /// compaction's summary, not an answer, so it degrades to a completed,
+    /// summary-less fact rather than rendering as conversation.
+    OrphanedSummary,
+}
+
 /// Decode every message of one session, preserving the server's order.
+///
+/// The compaction pairing runs over the WHOLE read first: V1 states one
+/// **Compaction** as a `compaction` part on a user message plus a paired
+/// assistant summary message, and neither message can be classified without
+/// the other.
 fn decode(messages: &[WireSessionMessage]) -> SessionTranscript {
-    SessionTranscript::new(messages.iter().map(decode_message).collect())
+    let roles = compaction_roles(messages);
+    SessionTranscript::new(
+        messages
+            .iter()
+            .zip(roles)
+            .map(|(message, role)| decode_message(message, role))
+            .collect(),
+    )
+}
+
+/// A completed compaction fact as V1 can state it. V1 has no `status` field and
+/// no failed event (ADR-0082), so every compaction it states is completed; it
+/// carries no usage on the compaction, and its own `tail_start_id` is not a
+/// decoded fact (`recent` stays V2-only).
+fn completed_fact(reason: CompactionReason, summary: String) -> Compaction {
+    Compaction {
+        status: CompactionStatus::Completed,
+        reason,
+        summary,
+        usage: None,
+        error: None,
+        recent: String::new(),
+    }
+}
+
+/// Pair every V1 **Compaction** this read spells out (ADR-0082), in message
+/// order: one entry per message, `Some` when it is part of a pair.
+///
+/// The partner of a carrier is the assistant message that names it as its
+/// `parentID` and states itself as a summary — V1 writes both `summary:true`
+/// and `mode:"compaction"`, and either signal marks it. Neither orphan
+/// vanishes: a carrier the read cannot pair (the summarizer never wrote its
+/// summary, or the read is a page that lost it) keeps a summary-less fact, and
+/// so does a summary whose carrier the read lost.
+fn compaction_roles(messages: &[WireSessionMessage]) -> Vec<Option<CompactionRole>> {
+    let mut roles: Vec<Option<CompactionRole>> = Vec::with_capacity(messages.len());
+    roles.resize_with(messages.len(), || None);
+    let mut paired = vec![false; messages.len()];
+    for (carrier_index, carrier) in messages.iter().enumerate() {
+        if carrier.info.role.as_deref() != Some("user") {
+            continue;
+        }
+        let Some(part) = compaction_part(&carrier.parts) else {
+            continue;
+        };
+        let paired_index = messages.iter().enumerate().position(|(index, message)| {
+            !paired[index]
+                && is_summary_message(message)
+                && message.info.parent_id.as_deref() == Some(carrier.info.id.as_str())
+        });
+        let summary = match paired_index {
+            Some(index) => {
+                paired[index] = true;
+                summary_text(&messages[index].parts)
+            }
+            None => String::new(),
+        };
+        roles[carrier_index] = Some(CompactionRole::Carrier {
+            reason: decode_compaction_reason(part),
+            summary,
+        });
+    }
+    for (index, message) in messages.iter().enumerate() {
+        if paired[index] {
+            roles[index] = Some(CompactionRole::Summary);
+        } else if roles[index].is_none() && is_summary_message(message) {
+            roles[index] = Some(CompactionRole::OrphanedSummary);
+        }
+    }
+    roles
+}
+
+/// The `compaction` part of a message's raw `parts`, when it carries one: the
+/// one part kind that is not a body but the statement of a Session-scoped
+/// event.
+fn compaction_part(parts: &Value) -> Option<&Value> {
+    parts
+        .as_array()?
+        .iter()
+        .find(|part| part.get("type").and_then(Value::as_str) == Some("compaction"))
+}
+
+/// Whether an assistant message states itself as a compaction summary: V1
+/// writes `summary:true` and `mode:"compaction"` together, and either one names
+/// it (a tolerant read of a server that writes only one of the two).
+fn is_summary_message(message: &WireSessionMessage) -> bool {
+    message.info.role.as_deref() == Some("assistant")
+        && (message.info.summary.as_ref() == Some(&Value::Bool(true))
+            || message.info.mode.as_deref() == Some(COMPACTION_ROLE))
+}
+
+/// Why a V1 `compaction` part ran: automatic when the server set `auto` or
+/// triggered it on an overflow, manual when the user asked. V2 states an
+/// overflow as `reason:"auto"`, so the two generations agree.
+fn decode_compaction_reason(part: &Value) -> CompactionReason {
+    let flag = |field: &str| part.get(field).and_then(Value::as_bool).unwrap_or(false);
+    if flag("auto") || flag("overflow") {
+        CompactionReason::Auto
+    } else {
+        CompactionReason::Manual
+    }
+}
+
+/// The text a compaction summary message carries: its non-empty `text` parts in
+/// order, joined as paragraphs. The join matches V1's own summary composition
+/// (and the migration that replaced it), so a multi-part summary reads the way
+/// the server wrote it; an empty part contributes nothing.
+fn summary_text(parts: &Value) -> String {
+    parts
+        .as_array()
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|part| match part.get("type").and_then(Value::as_str) {
+                    Some("text") => part.get("text").and_then(Value::as_str),
+                    _ => None,
+                })
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        })
+        .unwrap_or_default()
 }
 
 /// Decode one raw `parts` array through the per-part decoder.
@@ -104,11 +274,31 @@ pub(super) fn decode_parts(parts: &Value) -> Vec<Part> {
         .unwrap_or_default()
 }
 
-fn decode_message(message: &WireSessionMessage) -> TranscriptMessage {
+fn decode_message(message: &WireSessionMessage, compaction: Option<CompactionRole>) -> TranscriptMessage {
     let info = &message.info;
+    let (role, parts) = match compaction {
+        Some(CompactionRole::Carrier { reason, summary }) => (
+            MessageRole::Other(COMPACTION_ROLE.to_string()),
+            vec![Part::Compaction(completed_fact(reason, summary))],
+        ),
+        // The summary message's body IS the summary, and it now rides the
+        // carrier's fact: the message keeps its identity, time and failure, but
+        // its text is not decoded a second time (the summary renders once).
+        Some(CompactionRole::Summary) => (MessageRole::Other(COMPACTION_ROLE.to_string()), Vec::new()),
+        // A summary whose carrier the read lost is still a compaction, never an
+        // answer: a completed fact with no summary to attach.
+        Some(CompactionRole::OrphanedSummary) => (
+            MessageRole::Other(COMPACTION_ROLE.to_string()),
+            vec![Part::Compaction(completed_fact(
+                CompactionReason::Auto,
+                String::new(),
+            ))],
+        ),
+        None => (decode_role(info.role.as_deref()), decode_parts(&message.parts)),
+    };
     TranscriptMessage {
         id: MessageId::new(info.id.clone()),
-        role: decode_role(info.role.as_deref()),
+        role,
         time: info.time.as_ref().map(|time| MessageTime {
             created: time.created,
             completed: time.completed,
@@ -122,7 +312,7 @@ fn decode_message(message: &WireSessionMessage) -> TranscriptMessage {
         }),
         tokens: info.tokens.as_ref().map(decode_tokens),
         error: info.error.as_ref().and_then(decode_message_error),
-        parts: decode_parts(&message.parts),
+        parts,
     }
 }
 
@@ -283,27 +473,43 @@ fn decode_tool_output(state: Option<&Value>, status: &ToolStatus) -> ToolOutput 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{TextPart, ToolStatus};
+    use crate::backend::{CompactionReason, CompactionStatus, TextPart, ToolStatus};
 
-    /// Decode one tool part's state into its typed call.
-    fn tool(state: Value) -> ToolCall {
-        let message = WireSessionMessage {
+    /// One raw V1 message envelope — id, role, a server time and raw parts:
+    /// the shape every decoder test drives. Its compaction-pairing fields
+    /// (`parentID`, `mode`, `summary`) are left unset; the compaction tests
+    /// below spell them on the wire instead.
+    fn envelope(id: &str, role: &str, created: i64, parts: Value) -> WireSessionMessage {
+        WireSessionMessage {
             info: WireMessageInfo {
-                id: "msg_a1".into(),
-                role: Some("assistant".into()),
+                id: id.into(),
+                role: Some(role.into()),
                 time: Some(WireMessageTime {
-                    created: 1_000,
-                    completed: Some(1_000),
+                    created,
+                    completed: Some(created),
                 }),
+                parent_id: None,
+                mode: None,
+                summary: None,
                 model_id: None,
                 provider_id: None,
                 tokens: None,
                 error: None,
             },
-            parts: serde_json::json!([
+            parts,
+        }
+    }
+
+    /// Decode one tool part's state into its typed call.
+    fn tool(state: Value) -> ToolCall {
+        let message = envelope(
+            "msg_a1",
+            "assistant",
+            1_000,
+            serde_json::json!([
                 {"type": "tool", "tool": "bash", "callID": "call_1", "state": state}
             ]),
-        };
+        );
         let transcript = decode(&[message]);
         let Part::Tool(call) = &transcript.messages[0].parts[0] else {
             panic!("expected a tool part: {:?}", transcript.messages[0].parts[0]);
@@ -613,21 +819,7 @@ mod tests {
 
     /// Decode one message's parts into its transcript message.
     fn decoded_message(parts: Value) -> TranscriptMessage {
-        let transcript = decode(&[WireSessionMessage {
-            info: WireMessageInfo {
-                id: "msg_a1".into(),
-                role: Some("assistant".into()),
-                time: Some(WireMessageTime {
-                    created: 1_000,
-                    completed: Some(1_000),
-                }),
-                model_id: None,
-                provider_id: None,
-                tokens: None,
-                error: None,
-            },
-            parts,
-        }]);
+        let transcript = decode(&[envelope("msg_a1", "assistant", 1_000, parts)]);
         transcript.messages.into_iter().next().expect("one message")
     }
 
@@ -747,6 +939,249 @@ mod tests {
             decode_one(Value::Null).error.is_none(),
             "a message without an error carries none"
         );
+    }
+
+    /// Decode one compaction carrier (a user message whose only part is the
+    /// `compaction` part) plus, when given, its paired summary message.
+    fn decode_pair(part: Value, summary: Option<Value>) -> SessionTranscript {
+        let mut messages = vec![serde_json::json!({
+            "info": {"id": "msg_u1", "role": "user", "time": {"created": 1_000}},
+            "parts": [part],
+        })];
+        if let Some(summary) = summary {
+            messages.push(summary);
+        }
+        decode_response(&Value::Array(messages)).expect("a valid payload decodes")
+    }
+
+    /// A paired summary assistant message: `parentID` names the carrier, and V1
+    /// writes `mode:"compaction"` and `summary:true` together.
+    fn summary_message(parent: &str, parts: Value) -> Value {
+        serde_json::json!({
+            "info": {"id": "msg_a1", "role": "assistant", "parentID": parent,
+                      "mode": "compaction", "summary": true,
+                      "time": {"created": 2_000, "completed": 2_100}},
+            "parts": parts,
+        })
+    }
+
+    /// The typed fact the carrier message of a decoded pair carries.
+    fn fact_of(transcript: &SessionTranscript) -> &Compaction {
+        let Part::Compaction(fact) = &transcript.messages[0].parts[0] else {
+            panic!(
+                "expected a compaction fact: {:?}",
+                transcript.messages[0].parts[0]
+            );
+        };
+        fact
+    }
+
+    /// One V1 compaction (ADR-0082) is TWO messages: a `compaction` part on a
+    /// user message (the carrier) and a paired assistant summary message
+    /// (`parentID` naming the carrier, `mode:"compaction"`, `summary:true`).
+    /// The pair decodes to ONE typed fact on the carrier, the summary attached
+    /// — and both messages leave the conversation roles, so the carrier can
+    /// never become a Turn anchor and the summary can never answer a Turn.
+    #[test]
+    fn a_compaction_part_and_its_paired_summary_decode_to_one_fact() {
+        let transcript = decode_response(&serde_json::json!([
+            {"info": {"id": "msg_cola_anchor", "role": "user", "time": {"created": 500}},
+             "parts": [{"type": "text", "text": "第一条消息"}]},
+            {"info": {"id": "msg_u1", "role": "user", "time": {"created": 1_000}},
+             "parts": [{"type": "compaction", "auto": true}]},
+            {"info": {"id": "msg_a1", "role": "assistant", "parentID": "msg_u1",
+                       "mode": "compaction", "summary": true,
+                       "time": {"created": 2_000, "completed": 2_100}},
+             "parts": [{"type": "text", "text": "保留了结论与未决问题。"}]},
+        ]))
+        .expect("a valid payload decodes");
+
+        assert_eq!(
+            transcript.messages[1].role,
+            MessageRole::Other("compaction".into()),
+            "the carrier is never a User (a Turn anchor), so it stays the verbatim kind"
+        );
+        let Part::Compaction(fact) = &transcript.messages[1].parts[0] else {
+            panic!(
+                "expected the typed compaction fact: {:?}",
+                transcript.messages[1].parts[0]
+            );
+        };
+        assert_eq!(fact.status, CompactionStatus::Completed);
+        assert_eq!(fact.reason, CompactionReason::Auto);
+        assert_eq!(
+            fact.summary, "保留了结论与未决问题。",
+            "the paired message's text rides the fact"
+        );
+        assert_eq!(
+            transcript.messages[1].parts.len(),
+            1,
+            "the pair is ONE fact, not the raw part beside it"
+        );
+        assert_eq!(
+            transcript.messages[2].role,
+            MessageRole::Other("compaction".into()),
+            "the summary message is never an Assistant (it answers no Turn)"
+        );
+    }
+
+    /// V1's `overflow` flag maps onto the automatic reason — the reason V2
+    /// itself writes for the same event — and a part that reports neither flag
+    /// is the user's own `/compact`.
+    #[test]
+    fn a_compaction_part_reports_its_reason_from_auto_and_overflow() {
+        let auto = decode_pair(serde_json::json!({"type": "compaction", "auto": true}), None);
+        assert_eq!(
+            fact_of(&auto).reason,
+            CompactionReason::Auto,
+            "an auto compaction is automatic"
+        );
+        let overflow = decode_pair(
+            serde_json::json!({"type": "compaction", "auto": true, "overflow": true}),
+            None,
+        );
+        assert_eq!(
+            fact_of(&overflow).reason,
+            CompactionReason::Auto,
+            "an overflow maps onto the automatic reason, exactly as V2 states it"
+        );
+        let manual = decode_pair(serde_json::json!({"type": "compaction", "auto": false}), None);
+        assert_eq!(
+            fact_of(&manual).reason,
+            CompactionReason::Manual,
+            "a part the user asked for is manual"
+        );
+        let bare = decode_pair(serde_json::json!({"type": "compaction"}), None);
+        assert_eq!(
+            fact_of(&bare).reason,
+            CompactionReason::Manual,
+            "a part that reports no flag is not guessed into an automatic one"
+        );
+    }
+
+    /// An orphaned part — a carrier the read cannot pair with a summary
+    /// message — still decodes to a completed fact, with no summary rather
+    /// than vanishing.
+    #[test]
+    fn an_orphaned_compaction_part_degrades_to_a_summaryless_completed_fact() {
+        let transcript = decode_pair(serde_json::json!({"type": "compaction", "auto": true}), None);
+
+        assert_eq!(
+            transcript.messages[0].role,
+            MessageRole::Other("compaction".into()),
+            "an orphaned carrier is still the compaction's carrier"
+        );
+        let fact = fact_of(&transcript);
+        assert_eq!(fact.status, CompactionStatus::Completed);
+        assert_eq!(fact.reason, CompactionReason::Auto);
+        assert_eq!(fact.summary, "", "there is no summary to attach");
+    }
+
+    /// A summary message whose carrier this read does not carry is not an
+    /// ordinary assistant answer either: it degrades to the same completed,
+    /// summary-less fact rather than rendering as conversation.
+    #[test]
+    fn an_orphaned_summary_message_degrades_to_a_summaryless_fact() {
+        // The read carries the summary but not the user message that owns the
+        // `compaction` part (a page that lost it, or a run the server stopped
+        // between the two writes).
+        let transcript = decode_response(&serde_json::json!([summary_message(
+            "msg_gone",
+            serde_json::json!([{"type": "text", "text": "保留了结论。"}]),
+        )]))
+        .expect("a valid payload decodes");
+
+        assert_eq!(
+            transcript.messages[0].role,
+            MessageRole::Other("compaction".into()),
+            "the orphaned summary is never an Assistant (it answers no Turn)"
+        );
+        let Part::Compaction(fact) = &transcript.messages[0].parts[0] else {
+            panic!(
+                "expected a degraded compaction fact: {:?}",
+                transcript.messages[0].parts[0]
+            );
+        };
+        assert_eq!(fact.status, CompactionStatus::Completed);
+        assert_eq!(fact.summary, "");
+    }
+
+    /// V1 spells `summary` differently per role — a bool on an assistant, an
+    /// object (`{additions, deletions, files, diffs}`) on a user message. The
+    /// decoder reads past the user-message shape instead of failing the whole
+    /// read on it, and never treats a user message as a compaction summary.
+    #[test]
+    fn a_user_messages_summary_object_is_not_a_compaction_summary() {
+        let transcript = decode_response(&serde_json::json!([
+            {"info": {"id": "msg_u1", "role": "user", "time": {"created": 1_000},
+                       "summary": {"additions": 0, "deletions": 0, "files": 0, "diffs": []}},
+             "parts": [{"type": "text", "text": "改了一下"}]},
+        ]))
+        .expect("a user message's format summary must not fail the read");
+
+        assert_eq!(transcript.messages[0].role, MessageRole::User);
+        assert_eq!(transcript.messages[0].text(), "改了一下");
+    }
+
+    /// The summary is the paired message's non-empty `text` parts, joined as
+    /// paragraphs in order — V1 composes a summary that way, and an empty part
+    /// contributes nothing.
+    #[test]
+    fn a_multi_part_summary_joins_its_non_empty_text_parts() {
+        let transcript = decode_pair(
+            serde_json::json!({"type": "compaction", "auto": true}),
+            Some(summary_message(
+                "msg_u1",
+                serde_json::json!([
+                    {"type": "text", "text": "第一段。"},
+                    {"type": "text", "text": ""},
+                    {"type": "text", "text": "第二段。"},
+                ]),
+            )),
+        );
+
+        assert_eq!(fact_of(&transcript).summary, "第一段。\n\n第二段。");
+    }
+
+    /// The carrier is never a User message and the paired summary never an
+    /// Assistant one, so the transcript's own projections — the ones that
+    /// decide Turn membership — cannot pick either up: a newer carrier is not
+    /// the session's newest user, and a summary answers no Turn.
+    #[test]
+    fn a_carrier_is_never_a_turn_anchor_and_a_summary_never_answers() {
+        let transcript = decode_response(&serde_json::json!([
+            {"info": {"id": "msg_cola_anchor", "role": "user", "time": {"created": 1_000}},
+             "parts": [{"type": "text", "text": "第一条消息"}]},
+            {"info": {"id": "msg_u1", "role": "user", "time": {"created": 2_000}},
+             "parts": [{"type": "compaction", "auto": true}]},
+            {"info": {"id": "msg_a1", "role": "assistant", "parentID": "msg_u1",
+                       "mode": "compaction", "summary": true,
+                       "time": {"created": 2_100, "completed": 2_200}},
+             "parts": [{"type": "text", "text": "保留了结论。"}]},
+            {"info": {"id": "msg_a2", "role": "assistant", "parentID": "msg_cola_anchor",
+                       "mode": "build", "time": {"created": 3_000, "completed": 3_100}},
+             "parts": [{"type": "text", "text": "第一轮回答。"},
+                        {"type": "step-finish", "reason": "stop"}]},
+        ]))
+        .expect("a valid payload decodes");
+
+        let newest = transcript
+            .newest_user()
+            .expect("the real user message is the session's newest user");
+        assert_eq!(
+            newest.id.as_str(),
+            "msg_cola_anchor",
+            "a compaction carrier, though newer, is never the newest user"
+        );
+        let anchor = newest.anchor().expect("the anchor carries its server time");
+        let turn = transcript.turn_for_user(&anchor);
+        let ids: Vec<_> = turn.messages.iter().map(|message| message.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["msg_a2"],
+            "the compaction summary neither answers the Turn nor completes it"
+        );
+        assert!(turn.complete, "the real step-finish completes the Turn");
     }
 
     /// The adapter-facing entry point parses the raw response array; malformed
