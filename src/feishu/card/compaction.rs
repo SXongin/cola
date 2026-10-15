@@ -14,7 +14,9 @@
 use crate::backend::{Compaction, CompactionReason, CompactionStatus};
 use crate::feishu::card::sanitize::{CardMarkdown, serialized_len};
 use crate::feishu::card::shell::collapsible_panel_chunks;
-use crate::feishu::card::{MAX_CARD_TEXT_CHARS, MAX_ELEMENT_TEXT_CHARS, chunk_text, format_tokens};
+use crate::feishu::card::{
+    MAX_CARD_TEXT_CHARS, MAX_ELEMENT_TEXT_CHARS, chunk_text, fenced_overhead, format_tokens,
+};
 use serde_json::json;
 
 /// The card elements one Compaction row is made of (ADR-0082), shared by every
@@ -182,33 +184,41 @@ pub(crate) fn compaction_fold_body(compaction: &Compaction) -> Option<Vec<String
 }
 
 /// The summary text one row's fold shows, and whether it was cut: at most
-/// [`MAX_COMPACTION_SUMMARY_CHARS`] CHARACTERS and — the clip's marker included —
-/// at most [`MAX_COMPACTION_BODY_BYTES`] SERIALIZED bytes ([`serialized_len`]) —
-/// the character cap for an ordinary summary, the byte cap for text the card
-/// encodes larger, so neither extreme can outgrow one card.
+/// [`MAX_COMPACTION_SUMMARY_CHARS`] CHARACTERS and — the clip's marker included,
+/// and the rejection fallback's fence too — at most
+/// [`MAX_COMPACTION_BODY_BYTES`] SERIALIZED bytes ([`body_bytes`]) — the
+/// character cap for an ordinary summary, the byte cap for text the card encodes
+/// or fences larger, so neither extreme can outgrow one card on either attempt.
 fn clipped_summary(summary: &str) -> (String, bool) {
     let chars = summary.chars().count();
     let at_char_cap = chars.min(MAX_COMPACTION_SUMMARY_CHARS);
     let head: String = summary.chars().take(at_char_cap).collect();
-    if chars <= MAX_COMPACTION_SUMMARY_CHARS && serialized_len(&head) <= MAX_COMPACTION_BODY_BYTES {
+    if chars <= MAX_COMPACTION_SUMMARY_CHARS && body_bytes(&head) <= MAX_COMPACTION_BODY_BYTES {
         return (head, false);
     }
     // The body IS cut, so the marker rides in the same budget: search the longest
-    // prefix whose body — the prefix plus the marker the card will show — fits.
-    // The cost is monotone in the prefix's length, and the character cap bounds
-    // the search.
+    // prefix whose body — the prefix plus the marker the card will show, fence
+    // included — fits. The cost is monotone in the prefix's length, and the
+    // character cap bounds the search.
     let (mut keep, mut too_long) = (0usize, at_char_cap);
     while keep < too_long {
         let mid = keep + (too_long - keep).div_ceil(2);
         let candidate: String = summary.chars().take(mid).collect();
-        if serialized_len(&candidate) + serialized_len(SUMMARY_TRUNCATED_MARKER) <= MAX_COMPACTION_BODY_BYTES
-        {
+        if body_bytes(&candidate) + body_bytes(SUMMARY_TRUNCATED_MARKER) <= MAX_COMPACTION_BODY_BYTES {
             keep = mid;
         } else {
             too_long = mid - 1;
         }
     }
     (summary.chars().take(keep).collect(), true)
+}
+
+/// What one text costs the body budget: its exact serialized bytes
+/// ([`serialized_len`]) plus the fence the rejection fallback wraps it in
+/// ([`fenced_overhead`]), so a body at [`MAX_COMPACTION_BODY_BYTES`] still fits
+/// one card when Feishu rejects the first attempt.
+fn body_bytes(text: &str) -> usize {
+    serialized_len(text) + fenced_overhead(text)
 }
 
 /// How many body elements one Compaction row adds: a plain line is one element,
@@ -224,25 +234,27 @@ pub(crate) fn compaction_components(compaction: &Compaction) -> usize {
 /// The bytes one Compaction row adds to the body (ADR-0082): its title, plus —
 /// for a folded row — the panel's own element overhead and the body's markdown
 /// chunks, measured from the same chunks the render builds so the two cannot
-/// drift. The text of every charge is [`serialized_len`]'s: EXACTLY what the card
-/// will carry for it (the sanitizer's `<` expansion and the JSON encoding
-/// included), so no expansion vector — escaping, control characters, encoding —
-/// can make a row cost more than it was charged. The fixed per-element constants
-/// on top cover the element skeletons and the sanitizer's non-content wrappers (a
-/// table's fence, the rejection fallback's fence), each bounded by the card text
-/// it wraps. The body is charged in JSON bytes rather than as card text, like a
-/// ledger entry's output: a fold body is one element per chunk and cannot be
-/// split the way streamed text can. Because both are capped, a row's cost is
-/// bounded whatever the stored summary holds.
+/// drift. Every text is charged its exact serialized bytes
+/// ([`serialized_len`]: the sanitizer's `<` expansion and the JSON encoding) PLUS
+/// the fence the rejection fallback would wrap it in ([`fenced_overhead`]), so
+/// the row is covered on both attempts — the charge the splitter reads is the
+/// larger of what the two renders serialize. The fixed per-element constants
+/// cover the element skeletons and the sanitizer's non-content wrappers (a
+/// table's fence, the minimum fence every fenced element carries), each bounded
+/// by the card text it wraps. The body is charged in JSON bytes rather than as
+/// card text, like a ledger entry's output: a fold body is one element per chunk
+/// and cannot be split the way streamed text can. Because both are capped, a
+/// row's cost is bounded whatever the stored summary holds.
 pub(crate) fn compaction_estimate(compaction: &Compaction) -> usize {
-    let title = serialized_len(&compaction_title(compaction));
+    let title = compaction_title(compaction);
+    let title = serialized_len(&title) + fenced_overhead(&title);
     match compaction_fold_body(compaction) {
         None => title + 80,
         Some(chunks) => {
             300 + title
                 + chunks
                     .iter()
-                    .map(|chunk| serialized_len(chunk) + 40)
+                    .map(|chunk| serialized_len(chunk) + fenced_overhead(chunk) + 40)
                     .sum::<usize>()
         }
     }
@@ -279,14 +291,16 @@ mod tests {
 
     /// One atom of each content kind whose card encoding differs from its raw
     /// length — the vectors that made hand-rolled size arithmetic wrong: escaped
-    /// markup, CJK, control characters, JSON metacharacters, and a mix.
-    fn atoms() -> [(&'static str, &'static str); 5] {
+    /// markup, CJK, control characters, JSON metacharacters, the rejection
+    /// fallback's fence, and a mix.
+    fn atoms() -> [(&'static str, &'static str); 6] {
         [
             ("NUL", "\0"),
             ("markup", "<"),
             ("CJK", "摘"),
             ("quotes and backslashes", "\"\\"),
-            ("mixed", "a<\0\\\"摘"),
+            ("backticks", "`"),
+            ("mixed", "a<\0\\\"摘`"),
         ]
     }
 
@@ -305,19 +319,44 @@ mod tests {
     }
 
     /// What the row's own elements serialize to — the very builder the render
-    /// uses, so the charge can be held against the real payload.
-    fn row_serialized_len(fact: &Compaction) -> usize {
-        let mut md = CardMarkdown::new();
+    /// uses, so the charge can be held against the real payload. `fenced` builds
+    /// the rejection fallback's rebuild instead of the first attempt.
+    fn row_serialized_len(fact: &Compaction, fenced: bool) -> usize {
+        let mut md = if fenced {
+            CardMarkdown::fenced()
+        } else {
+            CardMarkdown::new()
+        };
         compaction_elements(fact, Some("compaction_1"), &mut md)
             .iter()
             .map(|element| element.to_string().len())
             .sum()
     }
 
-    /// What one fold body's TEXT serializes to, the truncation marker included —
-    /// the quantity [`MAX_COMPACTION_BODY_BYTES`] bounds.
+    /// The card the row builds, `fenced` selecting the rejection fallback's
+    /// rebuild.
+    fn card_with(fact: &Compaction, fenced: bool) -> String {
+        CardBuilder::new()
+            .with_state(crate::feishu::card::CardState::Done)
+            .with_fenced_markdown(fenced)
+            .with_compaction(fact, Some("compaction_1"))
+            .build()
+            .to_string()
+    }
+
+    /// What one fold body's TEXT serializes to, the truncation marker included.
     fn body_serialized_len(chunks: &[String]) -> usize {
         chunks.iter().map(|chunk| serialized_len(chunk)).sum()
+    }
+
+    /// What one fold body costs its budget: every element's serialized bytes PLUS
+    /// the fence the rejection fallback would wrap it in — the quantity
+    /// [`MAX_COMPACTION_BODY_BYTES`] bounds (`body_bytes`, summed).
+    fn body_bytes_len(chunks: &[String]) -> usize {
+        chunks
+            .iter()
+            .map(|chunk| serialized_len(chunk) + fenced_overhead(chunk))
+            .sum()
     }
 
     /// The measure is never below what the card actually carries: it applies the
@@ -428,10 +467,12 @@ mod tests {
         }
     }
 
-    /// The charge is never an UNDER-charge: for every content kind, at and past
-    /// each cap, the estimate covers what the row's elements actually serialize
-    /// to — measured from the very builder the render uses — so the splitter
-    /// cannot be told a card fits when it does not.
+    /// The charge is never an UNDER-charge: for every content kind — the
+    /// fallback's backtick fence included — at and past each cap, the estimate
+    /// covers what the row's elements serialize to on BOTH attempts (the first,
+    /// and the fenced rebuild Feishu forces after a content rejection), measured
+    /// from the very builder the render uses. The splitter can therefore never be
+    /// told a card fits when it does not.
     #[test]
     fn the_estimate_never_undercharges_a_row() {
         let mut cases: Vec<(String, Compaction)> = vec![
@@ -456,12 +497,15 @@ mod tests {
             }
         }
         for (label, fact) in cases {
-            let serialized = row_serialized_len(&fact);
-            assert!(
-                compaction_estimate(&fact) >= serialized,
-                "{label}: the estimate ({}) must cover the row's serialized {serialized} bytes",
-                compaction_estimate(&fact)
-            );
+            for (render, fenced) in [("the first attempt", false), ("the fenced rebuild", true)] {
+                let serialized = row_serialized_len(&fact, fenced);
+                assert!(
+                    compaction_estimate(&fact) >= serialized,
+                    "{label} on {render}: the estimate ({}) must cover the row's serialized \
+                     {serialized} bytes",
+                    compaction_estimate(&fact)
+                );
+            }
         }
     }
 
@@ -602,6 +646,130 @@ mod tests {
             "⚠️ 压缩失败：未知错误",
             "a failure with no error text says so"
         );
+    }
+
+    /// A summary of long backtick runs is charged for the fence the rejection
+    /// fallback wraps it in: the fenced rebuild — which Feishu forces after a
+    /// content rejection — stays inside the whole-card budget, the charge covers
+    /// what that rebuild serializes, and the body's budget admits the fence.
+    /// Without the term, ~6 KB of fence per chunk rode free.
+    #[test]
+    fn a_backtick_heavy_fold_body_stays_inside_the_budget_once_fenced() {
+        for (label, summary) in [
+            ("at the cap", "`".repeat(MAX_COMPACTION_SUMMARY_CHARS)),
+            ("far past the cap", "`".repeat(MAX_COMPACTION_SUMMARY_CHARS * 20)),
+            (
+                "a long run inside prose",
+                format!("{}{}{}", "a".repeat(1_000), "`".repeat(3_000), "b".repeat(1_000)),
+            ),
+            (
+                // The fence, not the text, is what overflows here: the run's
+                // fence costs twice its length, and only a body that counts it
+                // stops inside the budget.
+                "a run plus control characters",
+                format!("{}{}", "`".repeat(3_000), "\0".repeat(3_000)),
+            ),
+        ] {
+            let fact = compaction(&summary);
+            let body = compaction_fold_body(&fact).expect("a folded body");
+            let visible: String = match body.last().map(String::as_str) {
+                Some(SUMMARY_TRUNCATED_MARKER) => body[..body.len() - 1].concat(),
+                _ => body.concat(),
+            };
+            assert!(
+                summary.trim().starts_with(&visible),
+                "{label}: the body is the head of the summary"
+            );
+            assert!(
+                body_bytes_len(&body) <= MAX_COMPACTION_BODY_BYTES,
+                "{label}: the body — fence included — must fit its own byte budget, got {} bytes",
+                body_bytes_len(&body)
+            );
+
+            let fenced = card_with(&fact, true);
+            assert!(
+                fenced.len() < MAX_CARD_JSON_CHARS,
+                "{label}: the fenced rebuild must stay inside the whole-card budget, got {} bytes",
+                fenced.len()
+            );
+            let serialized = row_serialized_len(&fact, true);
+            assert!(
+                compaction_estimate(&fact) >= serialized,
+                "{label}: the estimate ({}) must cover the fenced row's {serialized} bytes",
+                compaction_estimate(&fact)
+            );
+        }
+    }
+
+    /// The same for a failure's error, whose fence the fallback adds around the
+    /// whole title element.
+    #[test]
+    fn a_backtick_heavy_error_stays_inside_the_budget_once_fenced() {
+        for (label, error) in [
+            ("at the cap", "`".repeat(MAX_ELEMENT_TEXT_CHARS)),
+            ("far past the cap", "`".repeat(MAX_ELEMENT_TEXT_CHARS * 20)),
+        ] {
+            let fact = failed(&error);
+            let fenced = card_with(&fact, true);
+            assert!(
+                fenced.len() < MAX_CARD_JSON_CHARS,
+                "{label}: the fenced rebuild must stay inside the whole-card budget, got {} bytes",
+                fenced.len()
+            );
+            let serialized = row_serialized_len(&fact, true);
+            assert!(
+                compaction_estimate(&fact) >= serialized,
+                "{label}: the estimate ({}) must cover the fenced row's {serialized} bytes",
+                compaction_estimate(&fact)
+            );
+        }
+    }
+
+    /// Ordinary prose is charged and rendered exactly as it was before the fence
+    /// term: no backtick run means no extra fence, so the charge stays text plus
+    /// the wrapper constants and the card carries the text verbatim, with no
+    /// marker.
+    #[test]
+    fn the_ordinary_path_charges_and_renders_unchanged() {
+        for (label, fact) in [
+            ("a prose summary", compaction("保留了结论。")),
+            ("an ASCII summary", compaction("kept the conclusions.")),
+            ("a prose error", failed("context length exceeded")),
+        ] {
+            let title = compaction_title(&fact);
+            assert_eq!(fenced_overhead(&title), 0, "{label}: no extra fence to charge");
+            match compaction_fold_body(&fact) {
+                None => assert_eq!(
+                    compaction_estimate(&fact),
+                    serialized_len(&title) + 80,
+                    "{label}: the plain-row charge is the one before the fence term"
+                ),
+                Some(chunks) => {
+                    assert!(
+                        chunks.iter().all(|chunk| fenced_overhead(chunk) == 0),
+                        "{label}: no chunk carries a fence charge"
+                    );
+                    assert_eq!(
+                        compaction_estimate(&fact),
+                        300 + serialized_len(&title)
+                            + chunks
+                                .iter()
+                                .map(|chunk| serialized_len(chunk) + 40)
+                                .sum::<usize>(),
+                        "{label}: the folded-row charge is the one before the fence term"
+                    );
+                    assert_eq!(
+                        chunks.concat(),
+                        fact.summary.trim(),
+                        "{label}: the body is the text, verbatim"
+                    );
+                }
+            }
+            assert!(
+                !card_of(&fact).contains("已截断"),
+                "{label}: nothing is clipped on the ordinary path"
+            );
+        }
     }
 
     /// The component count and the size estimate measure the SAME capped body the
