@@ -1131,6 +1131,116 @@ async fn a_completed_compaction_is_never_re_rendered_on_a_later_turns_card() {
     );
 }
 
+/// The terminal card's OWN read can be the first to carry a compaction: one
+/// that lands after the turn's last live read and before finalization settles
+/// renders its row in the settling pass, which deliberately writes no card — so
+/// the row's FIRST PATCH is the terminal card's own ending write. That write is
+/// then the one confirming the frontier that names the row, and the SAME flush
+/// releases the chain's record (the card just reached its ending), handing the
+/// frontier to the session's delivered position. Exactly-once (ADR-0082 §3)
+/// hangs on that handover: the next Turn opens a new chain, so a released
+/// position that lost the row's frontier would replay it on the new card. The
+/// compaction is the read's NEWEST fact here, so the frontier names the row
+/// itself rather than the reply before it.
+#[tokio::test]
+async fn a_compaction_first_surfaced_by_the_terminal_read_is_not_re_rendered() {
+    /// A later Turn's own prompt: its own cola message id, so the read's Turn
+    /// window (and the anchor capture) is that turn's, not the first's.
+    fn turn_ctx(cola_message_id: &str, text: &str) -> PromptContext {
+        let mut context = ctx("ses_test", text);
+        context.cola_message_id = Some(cola_message_id.to_string());
+        context
+    }
+
+    let _wd = test_work_dir();
+    let timeline = vec![
+        user("msg_cola_anchor", 1_000, "第一条消息"),
+        assistant(2_000, "第一轮回答。"),
+        compaction(
+            "msg_comp",
+            3_000,
+            completed(CompactionReason::Auto, "更早的对话已被压缩。"),
+        ),
+    ];
+    let (_dir, app, backend, platform) =
+        scripted_app(vec![SessionTranscript::new(timeline)], Some(SessionStatus::Idle)).await;
+
+    let first = spawn_turn(&app, ctx("ses_test", "第一条消息"));
+    tokio::time::timeout(Duration::from_secs(5), first)
+        .await
+        .expect("the first Turn must finish")
+        .unwrap()
+        .unwrap();
+
+    // The row's first card write IS the terminal one: no earlier write carried
+    // it, and the terminal write is the settled card's own.
+    let turn_cards = platform.updated_cards().await;
+    let (terminal, earlier) = turn_cards
+        .split_last()
+        .expect("the first Turn must write its card");
+    let rows = compaction_rows(terminal);
+    assert_eq!(
+        rows.len(),
+        1,
+        "the terminal card carries the row once: {:?}",
+        body_lines(terminal)
+    );
+    assert_eq!(rows[0].0, "已压缩上下文（自动）");
+    assert_eq!(rows[0].1, "更早的对话已被压缩。");
+    assert!(
+        earlier.iter().all(|card| compaction_rows(card).is_empty()),
+        "the row first appears on the terminal write, not an earlier one: {:?}",
+        earlier.iter().map(body_lines).collect::<Vec<_>>()
+    );
+
+    // The second Turn: the session's transcript grows by that turn's own
+    // exchange, and a new card opens on a new chain.
+    {
+        let mut scripts = backend.transcript_scripts.lock().await;
+        let transcript = &mut scripts.get_mut("ses_test").expect("the scripted read")[0];
+        transcript
+            .messages
+            .push(user("msg_cola_second", 4_000, "第二条消息"));
+        transcript.messages.push(assistant(5_000, "第二轮回答。"));
+    }
+    let updates_before = platform.updated_cards().await.len();
+    let second = spawn_turn(&app, turn_ctx("msg_cola_second", "第二条消息"));
+    tokio::time::timeout(Duration::from_secs(5), second)
+        .await
+        .expect("the second Turn must finish")
+        .unwrap()
+        .unwrap();
+
+    let updates = platform.updated_cards().await;
+    let second_turn_cards = &updates[updates_before..];
+    assert!(
+        !second_turn_cards.is_empty(),
+        "the second Turn must render its own card"
+    );
+    let carrying: Vec<Vec<String>> = second_turn_cards
+        .iter()
+        .filter(|card| !compaction_rows(card).is_empty())
+        .map(body_lines)
+        .collect();
+    assert!(
+        carrying.is_empty(),
+        "the terminal write that carried the row released the chain's record in \
+         the same flush — the row is the session's delivered past now, exactly \
+         once — so the second Turn's card must not carry it: {carrying:?}"
+    );
+    let second_card = second_turn_cards.last().unwrap();
+    assert!(
+        card_text(second_card).contains("第二轮回答。"),
+        "the second Turn's card carries its own reply: {:?}",
+        body_lines(second_card)
+    );
+    assert!(
+        !card_text(second_card).contains("第一轮回答。"),
+        "and not the previous Turn's: {:?}",
+        body_lines(second_card)
+    );
+}
+
 /// The other half of exactly-once (ADR-0082 §3/§4): a compaction NO confirmed
 /// card has surfaced still renders — on the newest live card if there is one,
 /// otherwise on the next Turn's card. The previous Turn's delivered position
