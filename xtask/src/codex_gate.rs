@@ -263,7 +263,7 @@ mod tests {
         // PR; this guards the wiring against a silent revert.
         let codex = step(&workflow, "Run Codex (read-only)");
         for needle in [
-            "52fe01ec70a42f454c9d2ebd47598f9fd6893d56", // v1.11: v1.12 hangs (#150/#169)
+            "bdf19a4a223ec2549a3e2274a0cf61556bc07675", // v1.13: bounds #150/#169's stdio hang
             "continue-on-error: true",
             "timeout-minutes: 12",
         ] {
