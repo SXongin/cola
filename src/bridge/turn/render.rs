@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::Instrument;
 
 use crate::backend::{
-    BackgroundTask, FileContent, MessageId, Part, SessionTranscript, TaskRetirementEnding, ToolStatus,
-    TurnAnchor, Wake, WakeSource,
+    BackgroundTask, Compaction, FileContent, MessageId, Part, SessionTranscript, TaskRetirementEnding,
+    ToolStatus, TurnAnchor, Wake, WakeSource,
 };
 use crate::bridge::chain::{EndingFacts, EndingKey, TaskEndingClass, TaskEndingState};
 use crate::bridge::core::SESSION_INFO_TIMEOUT;
@@ -165,6 +165,12 @@ fn renders_part(acc: &StreamAccumulator, part: &Part) -> bool {
             // the call's raw payloads into a panel only to drop it.
             !acc.tool_panel_current(call)
         }
+        // A compaction is renderable content of its own (ADR-0082): the row is
+        // Session-scoped, and the read that newly delivered it must not be the
+        // read an ending is decided on. Its dedup is the rendered revision the
+        // card already carries, never its content alone — a `running` row
+        // updates in place into its terminal one.
+        Part::Compaction(fact) => renders_compaction(acc, fact),
         // Step boundaries, patches, file attachments and part kinds this build
         // does not model render nothing — there is no content to add or dedupe.
         Part::StepStart(_) | Part::StepFinish(_) | Part::Patch(_) | Part::File(_) | Part::Other(_) => false,
@@ -249,6 +255,11 @@ fn render_part(acc: &mut StreamAccumulator, source: Option<PartSource>, part: &P
         Part::StepStart(_) | Part::StepFinish(_) | Part::Patch(_) | Part::File(_) | Part::Other(_) => {
             return false;
         }
+        // A compaction never travels the Turn window's walks: it is a
+        // Session-scoped fact on a message of its own, rendered by
+        // [`render_compactions`], which is also the one place with the MESSAGE's
+        // server time in hand (a part carries none, ADR-0082).
+        Part::Compaction(_) => return false,
     }
     // card_state / running-tool changes reset the header phase timer.
     acc.refresh_phase();
@@ -1567,6 +1578,12 @@ pub(super) fn render_turn_parts(acc: &mut StreamAccumulator, transcript: &Sessio
     // gap rendered (spec #561, review #569).
     let mut rendered_any = resolve_seeded_calls(acc, transcript);
     rendered_any |= gap_rendered;
+    // The Session's compaction facts (ADR-0082) render before the anchor gate,
+    // for the same reason the live set does: a compaction is a fact of the
+    // SESSION, not of this Turn's window, so one that ran while the session was
+    // idle — before this Turn's anchor, or before the anchor is observed at all
+    // — still belongs on this card, at its own server time.
+    rendered_any |= render_compactions(acc, transcript);
     // The seed (spec #561) resolves against THIS read: its at-or-before-the-
     // frontier rule uses the read's own message order. The positions map serves
     // both walks below — the seed's own scope and the accumulator's window.
@@ -1950,6 +1967,98 @@ fn render_seed_scope(
     rendered
 }
 
+/// Render the Session's compaction facts this card does not carry yet
+/// (ADR-0082). A compaction is a fact of the **Session**, not of a Turn, so the
+/// rows come from the transcript's own [`Part::Compaction`] positions — never
+/// from [`SessionTranscript::turn_for_user`] — and one that precedes this Turn's
+/// anchor (it ran while the session was idle) still belongs on this Turn's card,
+/// at its own server time among the parts. The walk runs before the anchor gate
+/// for the same reason: a compaction needs no Turn anchor to be placed.
+///
+/// Everything at or before the chain's Rendered Cursor frontier is skipped
+/// ([`cursor_bound`]): a compaction an earlier card already showed is never
+/// replayed, and a `running` fact that ended updates its own row in place rather
+/// than adding a second. Returns whether a row entered the card.
+fn render_compactions(acc: &mut StreamAccumulator, transcript: &SessionTranscript) -> bool {
+    let owed = owed_compactions(acc, transcript);
+    if owed.is_empty() {
+        return false;
+    }
+    for (source, at_ms, fact) in owed {
+        acc.mark_rendered(RenderedPart::compaction(fact));
+        acc.push_compaction_at(at_ms, source, fact);
+    }
+    true
+}
+
+/// Whether the session-scoped compaction walk would add a row to `acc` — the
+/// probe half of [`render_compactions`], so the settled-read gate and the render
+/// it guards can never disagree.
+pub(super) fn renders_compactions(acc: &StreamAccumulator, transcript: &SessionTranscript) -> bool {
+    !owed_compactions(acc, transcript).is_empty()
+}
+
+/// The compaction facts this read owes this card, in server order. A fact is owed
+/// when its rendered revision is not already on the card and its position is not
+/// at or before the chain's Rendered Cursor frontier — unless the card already
+/// carries a row at that very position, which makes the fact an in-place UPDATE
+/// (a `running` row ending, ADR-0082) rather than a replay. Messages an error-card
+/// retry's baseline suppresses are skipped. The one source both
+/// [`render_compactions`] and [`renders_compactions`] read, so the two cannot
+/// drift. The fact's server time is its MESSAGE's: a part carries none.
+fn owed_compactions<'a>(
+    acc: &StreamAccumulator,
+    transcript: &'a SessionTranscript,
+) -> Vec<(PartSource, Option<i64>, &'a Compaction)> {
+    let bound = cursor_bound(acc, transcript);
+    let mut owed = Vec::new();
+    for (position, message) in transcript.messages.iter().enumerate() {
+        if acc.baseline_suppresses(message.id.as_str()) {
+            continue;
+        }
+        for (index, part) in message.parts.iter().enumerate() {
+            let Part::Compaction(fact) = part else { continue };
+            let source = PartSource::at(message.id.clone(), index);
+            // A position this card already carries is an UPDATE, never a
+            // replay: the row's own confirmed write advanced the chain cursor
+            // past the position, so the bound must not skip the terminal
+            // revision of a row the card is already showing.
+            if !acc.compaction_row_at(&source) && bound.is_some_and(|bound| position <= bound) {
+                continue;
+            }
+            if renders_compaction(acc, fact) {
+                owed.push((source, message.time.map(|time| time.created), fact));
+            }
+        }
+    }
+    owed
+}
+
+/// Whether this compaction fact would add a row the card does not already
+/// carry: the content-keyed dedup's compaction arm, read by the walk and by the
+/// probe so the two cannot disagree. The key is the fact's rendered revision
+/// ([`RenderedPart::compaction`]): a `running` row differs from its terminal one
+/// and re-renders onto the same timeline entry, while a re-read carrying the same
+/// revision renders nothing.
+fn renders_compaction(acc: &StreamAccumulator, fact: &Compaction) -> bool {
+    !acc.has_rendered_part(&RenderedPart::compaction(fact))
+}
+
+/// The read position of the chain's Rendered Cursor frontier message, when this
+/// read carries it: the bound the session-scoped compaction walk skips past, so
+/// a compaction an earlier card already showed is not replayed. `None` — a
+/// cursorless chain, or a frontier this read cannot place — bounds nothing, and
+/// the walk then renders every compaction it sees: exactly as a cut-at-0 seed
+/// renders everything at and before an unverifiable frontier rather than
+/// guessing where the delivered content ended.
+fn cursor_bound(acc: &StreamAccumulator, transcript: &SessionTranscript) -> Option<usize> {
+    let frontier = acc.cursor().frontier.as_ref()?;
+    transcript
+        .messages
+        .iter()
+        .position(|message| message.id == frontier.message_id)
+}
+
 /// Render the frontier part of a projection seed (spec #561, ticket #563):
 /// only its undelivered `text[delivered..]` suffix enters the card — with the
 /// markdown lead its cut needs ([`crate::feishu::card::sanitize::neutralize_tail`])
@@ -2141,18 +2250,23 @@ fn refresh_ledger(
 /// same content or revision, and that earlier part was itself renderable — so
 /// the first renderable part this scan finds is exactly where a real render
 /// would produce something.
+///
+/// The scan covers the same two scopes the real render walks: this Turn's own
+/// window, and the Session's compaction facts ([`renders_compactions`]), which
+/// no Turn window reaches because a compaction is a Session-scoped fact.
 pub(super) fn renders_new_content(
     acc: &StreamAccumulator,
     transcript: &SessionTranscript,
     anchor: &TurnAnchor,
 ) -> bool {
-    transcript.turn_for_user(anchor).messages.iter().any(|message| {
-        !acc.baseline_suppresses(message.id.as_str())
-            && message
-                .parts
-                .iter()
-                .any(|part| renders_part(acc, part) && !acc.part_seeded_delivered(&message.id, part))
-    })
+    renders_compactions(acc, transcript)
+        || transcript.turn_for_user(anchor).messages.iter().any(|message| {
+            !acc.baseline_suppresses(message.id.as_str())
+                && message
+                    .parts
+                    .iter()
+                    .any(|part| renders_part(acc, part) && !acc.part_seeded_delivered(&message.id, part))
+        })
 }
 
 /// What one render pass did, for the loops that log it.
@@ -2492,6 +2606,7 @@ fn child_liveness(transcript: &SessionTranscript) -> Option<TaskLiveness> {
                 | Part::StepFinish(_)
                 | Part::Patch(_)
                 | Part::File(_)
+                | Part::Compaction(_)
                 | Part::Other(_) => {}
             }
         }
@@ -2716,8 +2831,9 @@ impl RenderPoll {
 mod tests {
     use super::*;
     use crate::backend::{
-        BackgroundTask, FileContent, MessageId, MessageRole, MessageTime, ReasoningPart, StepFinish,
-        StepStart, ToolCall, ToolIdentity, ToolOutput, TranscriptMessage, TurnAnchor, TurnSettle,
+        BackgroundTask, Compaction, CompactionReason, CompactionStatus, FileContent, MessageId, MessageRole,
+        MessageTime, ReasoningPart, StepFinish, StepStart, ToolCall, ToolIdentity, ToolOutput,
+        TranscriptMessage, TurnAnchor, TurnSettle,
     };
     use crate::bridge::App;
     use crate::bridge::chain::{
@@ -3808,6 +3924,48 @@ mod tests {
         ]);
         render_new_turn_parts(&mut acc, &transcript);
         assert_eq!(acc.context_tokens(), 216_860);
+    }
+
+    /// A compaction the card has not shown yet is NEW CONTENT (ADR-0082): the
+    /// same-snapshot ending rule (#604) may not decide a Turn's terminal on the
+    /// very read that delivered the row, or the row would be decided away before
+    /// a card ever showed it. Once the card carries it, that read owes nothing.
+    #[test]
+    fn a_newly_delivered_compaction_is_new_content() {
+        let transcript = SessionTranscript::new(vec![
+            crate::bridge::tests::drain::user("msg_cola_anchor", 1_000, "问题"),
+            typed_message(
+                "msg_comp",
+                MessageRole::Other("compaction".into()),
+                Some(2_000),
+                vec![Part::Compaction(Compaction {
+                    status: CompactionStatus::Completed,
+                    reason: CompactionReason::Auto,
+                    summary: "保留了结论。".into(),
+                    usage: None,
+                    error: None,
+                    recent: String::new(),
+                })],
+            ),
+        ]);
+        let anchor = transcript.messages[0]
+            .anchor()
+            .expect("the submitted message anchors the Turn");
+        let mut acc = StreamAccumulator::new("test");
+
+        assert!(
+            renders_new_content(&acc, &transcript, &anchor),
+            "the read that delivered the row reports new part content"
+        );
+        render_new_turn_parts(&mut acc, &transcript);
+        assert!(
+            acc.build_card().to_string().contains("已压缩上下文（自动）"),
+            "the row reached the card"
+        );
+        assert!(
+            !renders_new_content(&acc, &transcript, &anchor),
+            "the card carries the row now: the same read owes nothing"
+        );
     }
 
     #[test]

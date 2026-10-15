@@ -29,11 +29,11 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::backend::{
-    BackgroundLaunch, BackgroundTask, ChildEvidence, ContentBlock, DEFAULT_FILE_MIME, Execution,
-    ExecutionOutcome, FileContent, FinishReason, MessageId, MessageRole, MessageTime, ModelIdentity,
-    OtherPart, Part, ReasoningPart, SessionTranscript, ShellEnd, ShellRuntime, SkillInfo, StepFinish,
-    TextPart, TokenUsage, ToolCall, ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage, Wake,
-    WakeSource,
+    BackgroundLaunch, BackgroundTask, ChildEvidence, Compaction, CompactionReason, CompactionStatus,
+    ContentBlock, DEFAULT_FILE_MIME, Execution, ExecutionOutcome, FileContent, FinishReason, MessageId,
+    MessageRole, MessageTime, ModelIdentity, OtherPart, Part, ReasoningPart, SessionTranscript, ShellEnd,
+    ShellRuntime, SkillInfo, StepFinish, TextPart, TokenUsage, ToolCall, ToolIdentity, ToolOutput,
+    ToolStatus, TranscriptMessage, Wake, WakeSource,
 };
 use crate::opencode::types::{
     AgentInfo, FormFieldKind, ModelInfo, ModelOption, PermissionRequest, QuestionInfo, QuestionOption,
@@ -1007,9 +1007,13 @@ fn decode_tokens(tokens: Option<&Value>) -> Option<TokenUsage> {
 
 /// Decode a message body into its neutral role and parts. Conversation is only
 /// ever user/assistant; the message types that are neither (system, synthetic,
-/// skill, shell, compaction, idle, the switch markers) stay out of the
-/// conversation projections by role, and unknown kinds keep their raw payload
-/// so a newer server never breaks the read.
+/// skill, shell, idle, the switch markers) stay out of the conversation
+/// projections by role, and unknown kinds keep their raw payload so a newer
+/// server never breaks the read. A `compaction` is the one non-conversation
+/// kind this build models: it decodes to the typed [`Part::Compaction`] while
+/// keeping its verbatim kind as its role, exactly as `synthetic` and `skill`
+/// keep theirs — so no language-model role gains a member, and a compaction can
+/// never become a Turn anchor.
 fn decode_body(kind: Option<&str>, message: &Value) -> (MessageRole, Vec<Part>) {
     match kind {
         Some("user") => (MessageRole::User, decode_user_parts(message)),
@@ -1022,11 +1026,49 @@ fn decode_body(kind: Option<&str>, message: &Value) -> (MessageRole, Vec<Part>) 
             decode_text_body(message),
         ),
         Some("skill") => (MessageRole::Other("skill".to_string()), decode_text_body(message)),
+        Some("compaction") => (
+            MessageRole::Other("compaction".to_string()),
+            vec![Part::Compaction(decode_compaction(message))],
+        ),
         Some(other) => (
             MessageRole::Other(other.to_string()),
             vec![raw_message_part(other, message)],
         ),
         None => (MessageRole::Unknown, vec![raw_message_part("", message)]),
+    }
+}
+
+/// A V2 `compaction` message as the neutral fact (ADR-0082): its own `status`
+/// (absent reads as completed — V1's shape, which has no such field), `reason`,
+/// `summary` and `recent`, the usage of its own request, and the failure's
+/// error. A payload missing a field never fails the read: a missing or unknown
+/// status and reason degrade to the values that render safely, and a compaction
+/// is never dropped.
+fn decode_compaction(message: &Value) -> Compaction {
+    Compaction {
+        status: match message.get("status").and_then(Value::as_str) {
+            Some("running") => CompactionStatus::Running,
+            Some("failed") => CompactionStatus::Failed,
+            Some(_) => CompactionStatus::Completed,
+            None => CompactionStatus::Completed,
+        },
+        reason: match message.get("reason").and_then(Value::as_str) {
+            Some("manual") => CompactionReason::Manual,
+            Some(_) => CompactionReason::Auto,
+            None => CompactionReason::Auto,
+        },
+        summary: message
+            .get("summary")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        usage: decode_tokens(message.get("tokens")),
+        error: message.get("error").and_then(decode_error),
+        recent: message
+            .get("recent")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
     }
 }
 
@@ -1826,17 +1868,17 @@ mod tests {
         );
     }
 
-    /// Every message type this build does not model (shell, compaction, idle,
-    /// the switch markers) keeps its raw payload as one part and stays out of
-    /// the conversation roles.
+    /// Every message type this build does not model (shell, idle, the switch
+    /// markers) keeps its raw payload as one part and stays out of the
+    /// conversation roles.
     #[test]
     fn unmodelled_message_types_keep_their_raw_payload() {
         let transcript = decode_messages(&[
-            serde_json::json!({"id": "msg_c", "type": "compaction", "status": "completed", "summary": "s"}),
+            serde_json::json!({"id": "msg_sh", "type": "shell", "command": "ls"}),
             serde_json::json!({"id": "msg_i", "type": "idle", "outcome": "succeeded", "time": {"created": 1}}),
         ]);
 
-        for (message, kind) in transcript.messages.iter().zip(["compaction", "idle"]) {
+        for (message, kind) in transcript.messages.iter().zip(["shell", "idle"]) {
             assert_eq!(message.role, MessageRole::Other(kind.into()));
             let Part::Other(raw) = &message.parts[0] else {
                 panic!("expected a raw part: {:?}", message.parts[0]);
@@ -1844,6 +1886,104 @@ mod tests {
             assert_eq!(raw.kind, kind);
             assert_eq!(raw.raw.get("type").and_then(Value::as_str), Some(kind));
         }
+    }
+
+    /// A V2 compaction is a first-class fact (ADR-0082): the message keeps its
+    /// verbatim kind as its role and decodes to one typed part for every
+    /// status, with the usage of the compaction request itself, the summary
+    /// only once the server wrote it, and the failure's own error.
+    #[test]
+    fn a_compaction_message_decodes_to_the_typed_fact_for_every_status() {
+        let transcript = decode_messages(&[
+            serde_json::json!({
+                "id": "msg_run", "type": "compaction", "status": "running", "reason": "auto",
+                "summary": "", "recent": "最近的对话", "time": {"created": 1_000}
+            }),
+            serde_json::json!({
+                "id": "msg_done", "type": "compaction", "status": "completed", "reason": "manual",
+                "summary": "保留了结论。", "recent": "最近的对话", "time": {"created": 2_000},
+                "providerContext": {"tokens": 9},
+                "tokens": {"input": 11, "output": 7, "reasoning": 3, "cache": {"read": 5, "write": 2}}
+            }),
+            serde_json::json!({
+                "id": "msg_fail", "type": "compaction", "status": "failed", "reason": "auto",
+                "error": {"message": "provider exploded"}, "time": {"created": 3_000},
+                "tokens": {"input": 1, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}}
+            }),
+        ]);
+
+        for message in &transcript.messages {
+            assert_eq!(
+                message.role,
+                MessageRole::Other("compaction".into()),
+                "the verbatim kind keeps a compaction out of the conversation roles — and so out \
+                 of every usage read, which takes an assistant message's own tokens"
+            );
+        }
+
+        let Part::Compaction(running) = &transcript.messages[0].parts[0] else {
+            panic!(
+                "expected a compaction part: {:?}",
+                transcript.messages[0].parts[0]
+            );
+        };
+        assert_eq!(running.status, CompactionStatus::Running);
+        assert_eq!(running.reason, CompactionReason::Auto);
+        assert!(running.summary.is_empty(), "a running row has no summary yet");
+        assert_eq!(running.recent, "最近的对话");
+        assert!(running.usage.is_none());
+        assert!(running.error.is_none());
+
+        let Part::Compaction(done) = &transcript.messages[1].parts[0] else {
+            panic!(
+                "expected a compaction part: {:?}",
+                transcript.messages[1].parts[0]
+            );
+        };
+        assert_eq!(done.status, CompactionStatus::Completed);
+        assert_eq!(done.reason, CompactionReason::Manual);
+        assert_eq!(done.summary, "保留了结论。");
+        assert_eq!(done.recent, "最近的对话");
+        assert_eq!(
+            done.usage.unwrap(),
+            TokenUsage {
+                input: 11,
+                output: 7,
+                total: 28,
+                cache_read: 5,
+                cache_write: 2,
+            },
+            "the compaction's own usage is the server's own sum, like every V2 token shape"
+        );
+        assert!(
+            done.error.is_none(),
+            "a completion carries no error, whatever its providerContext says"
+        );
+
+        let Part::Compaction(failed) = &transcript.messages[2].parts[0] else {
+            panic!(
+                "expected a compaction part: {:?}",
+                transcript.messages[2].parts[0]
+            );
+        };
+        assert_eq!(failed.status, CompactionStatus::Failed);
+        assert_eq!(failed.error.as_deref(), Some("provider exploded"));
+        assert_eq!(failed.usage.unwrap().total, 1);
+
+        // A compaction message without a numeric `time.created` cannot be
+        // ordered among the parts, and one without a `status` is V1's shape:
+        // completed.
+        let statusless = decode_messages(&[serde_json::json!({
+            "id": "msg_v1ish", "type": "compaction", "reason": "auto", "summary": "s"
+        })]);
+        let Part::Compaction(fact) = &statusless.messages[0].parts[0] else {
+            panic!(
+                "expected a compaction part: {:?}",
+                statusless.messages[0].parts[0]
+            );
+        };
+        assert_eq!(fact.status, CompactionStatus::Completed);
+        assert!(statusless.messages[0].time.is_none());
     }
 
     /// The message id survives verbatim (V2's `msg_` rule is tighter than V1's

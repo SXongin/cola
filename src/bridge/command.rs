@@ -160,6 +160,12 @@ pub(crate) const NO_RUNNING_TASK: &str = "当前没有正在执行的任务。";
 /// acks and names the ending that will land then.
 pub(crate) const STOPPED_WAITING: &str = "⏹ 已停止等待；后台任务结束后卡片会标记为已停止。";
 
+/// `/compact` on a mapped session: the submit acknowledgement, and the only
+/// thing the command replies — no result is rendered here. The compaction itself
+/// is surfaced by the card that owns the chain, in its own server-time place
+/// (ADR-0082), so the ack says where to look instead of promising a chat reply.
+const COMPACTING: &str = "已提交压缩，完成后会显示在卡片上。";
+
 /// What `/switch` should do (ADR-0012). The text-direct forms all share the
 /// session store; the no-arg form pops the interactive card.
 #[derive(Debug, Clone, PartialEq)]
@@ -1047,11 +1053,7 @@ pub(crate) async fn handle_command(
         Command::Compact => {
             if let Some(id) = handles.flow.sessions.get_session_id(&thread_key).await {
                 handles.flow.backend.compact(&id).await?;
-                handles
-                    .flow
-                    .platform
-                    .reply_text(message_id, "Compacting...")
-                    .await?;
+                handles.flow.platform.reply_text(message_id, COMPACTING).await?;
             } else {
                 handles
                     .flow
