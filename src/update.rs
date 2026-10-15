@@ -536,7 +536,7 @@ fn extract_binary(archive: &[u8], dest_dir: &Path) -> anyhow::Result<PathBuf> {
     let mut dest: Option<PathBuf> = None;
     for i in 0..zip.len() {
         let mut file = zip.by_index(i).context("read zip entry")?;
-        let name = file.name().to_string();
+        let name = file.name().context("read zip entry name")?.to_string();
         if name.to_lowercase().contains("cola") && name.to_lowercase().ends_with(".exe") {
             let path = dest_dir.join("cola.exe");
             let mut out = std::fs::File::create(&path).context("create new binary")?;
