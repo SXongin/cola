@@ -145,9 +145,11 @@ term.
 Consequences:
 
 - The invariant this section now stands for is **exactly-once for deliveries a
-  card write confirmed by this build onward**: a compaction a confirmed write
-  has surfaced renders once and is never replayed onto a later card, on every
-  path except the two named below.
+  card write confirmed by this build onward, while the sidecar held**: the
+  Chain Record loads failing open and its write is best-effort, so a lost or
+  corrupt sidecar can replay a surfaced compaction. Where it survived, a
+  compaction a confirmed write has surfaced renders once and is never replayed
+  onto a later card, apart from the paths named below.
 - **One-time migration replay.** A Session whose compaction a pre-fix build
   already surfaced has no recovered position — the `delivered` section defaults
   empty for a sidecar written before this change — so the upgrade replays that
@@ -156,7 +158,7 @@ Consequences:
   one-release migration seam the cursor family already carries (ADR-0071: a
   cursor written by an older release resolves nothing, and the first confirmed
   write after the upgrade gives it a digest).
-- **Takeover-lost is duplicate-not-lost, and it is the one path where the
+- **Takeover-lost is duplicate-not-lost, and it is one of the paths where the
   invariant is not enforced.** A projection whose create landed while its
   confirmation could no longer be taken — the session was replaced, the chain
   moved, the stage was evicted — records what it can prove, the rendered
@@ -166,6 +168,21 @@ Consequences:
   therefore not marked delivered and renders once more rather than being
   swallowed — the same duplicate-over-loss trade the Rendered Cursor itself
   ratifies (ADR-0071: an ambiguous create is never retried).
+- **A stage-evicted landing that still succeeded replays too, by a different
+  route.** When the armed Session is still current and only the stage is gone,
+  the landing goes through `track_landing`, which carries the record's OLD
+  cursor while pointing it at the landed card; a terminal projection then
+  releases that record (`release_spent`) and hands over the cursor it carried —
+  the old frontier, not the new body's. So that body's compaction is not marked
+  delivered and renders once more. The outcome is the takeover-lost path's
+  (replay, never a swallow); the mechanism is the carried cursor, not
+  `release_if_card` declining a record that names another card.
+- **An unplaceable bound is duplicate-not-loss as well.** The bound is resolved
+  against the read: when a later read carries neither stored frontier message, it
+  resolves to none, the walk then has no bound and renders the row again. That is
+  the family's documented fallback, the one `cursor_bound` names — a cut-at-0
+  seed renders everything rather than guess where delivery ended. The row replays;
+  it is never swallowed.
 - The cursor stays chain-level, exactly as ADR-0071 decided. The new fact is the
   Session's, like the Wake Watermark and the run records: `release` drops the
   chain's record, not the Session's delivered past. No reader other than the
