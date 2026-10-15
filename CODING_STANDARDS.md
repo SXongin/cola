@@ -45,6 +45,12 @@ Follow Conventional Commits — see `CONTRIBUTING.md`. The format is enforced by
   or network work there caps what it scans (entries, bytes) or bounds the call
   with a timeout, rather than growing with the machine's contents or the
   network's latency.
+- **A durable exactly-once fact must not ride a staged structure's lifecycle**:
+  a stage is evicted at its capacity bound, discarded on a permanent refusal,
+  superseded by a newer confirmation, and only sometimes confirmed — a fact
+  attached to one can therefore be dropped without ever being written. Derive it
+  from the body's own build (the slice the body really rendered), or keep it
+  outside the stage; the stage may *carry* it, never *own* it.
 - **Use the glossary's vocabulary** (`GLOSSARY.md`): say *Bridge*, *Platform*,
   *Backend*, *Shared Store*, *Owned Server*, *Coexistent Server*, *Session*,
   *Card* — not synonyms the glossary explicitly avoids.
