@@ -112,6 +112,24 @@ fn line_index(card: &serde_json::Value, needle: &str) -> usize {
         .unwrap_or_else(|| panic!("no line carrying {needle:?}: {:?}", body_lines(card)))
 }
 
+/// The `element_id` of every folded panel whose title names a compaction, in body
+/// order: two rows carry two identities, one row one.
+fn compaction_panel_ids(card: &serde_json::Value) -> Vec<String> {
+    card["body"]["elements"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|element| {
+            element
+                .pointer("/header/title/content")
+                .and_then(|value| value.as_str())
+                .is_some_and(|title| title.starts_with("已压缩上下文"))
+        })
+        .filter_map(|element| element.get("element_id").and_then(|value| value.as_str()))
+        .map(str::to_string)
+        .collect()
+}
+
 /// Run the Turn to its end and return the card it settled on.
 async fn finished_card(app: &Arc<App>, platform: &RecordingPlatform) -> serde_json::Value {
     let turn = spawn_turn(app, ctx("ses_test", "第一条消息"));
@@ -354,7 +372,9 @@ async fn a_live_turns_in_flight_compaction_renders_a_live_row() {
 
 /// The compaction request's own usage rides its row and never becomes the Turn
 /// Footer's context figure: V2's `cost`/`tokens` on a compaction are the summary
-/// request's own consumption, not the size of the context it produced.
+/// request's own consumption, not the size of the context it produced. An
+/// explicitly reported ZERO is still a reported usage — presence, not magnitude,
+/// decides whether the row names one.
 #[tokio::test]
 async fn the_compactions_own_usage_rides_its_row_and_never_the_turn_footer() {
     let _wd = test_work_dir();
@@ -366,7 +386,9 @@ async fn the_compactions_own_usage_rides_its_row_and_never_the_turn_footer() {
         cache_read: 0,
         cache_write: 0,
     });
-    let mut reply = assistant(3_000, "第一轮回答。");
+    let mut zero_usage = completed(CompactionReason::Auto, "更早的对话已被压缩。");
+    zero_usage.usage = Some(TokenUsage::default());
+    let mut reply = assistant(4_000, "第一轮回答。");
     reply.tokens = Some(TokenUsage {
         input: 42_000,
         output: 0,
@@ -376,7 +398,8 @@ async fn the_compactions_own_usage_rides_its_row_and_never_the_turn_footer() {
     });
     let timeline = vec![
         user("msg_cola_anchor", 1_000, "第一条消息"),
-        compaction("msg_comp", 2_000, summarized),
+        compaction("msg_comp_zero", 2_000, zero_usage),
+        compaction("msg_comp", 3_000, summarized),
         reply,
     ];
     let (_dir, app, _backend, platform) =
@@ -384,10 +407,14 @@ async fn the_compactions_own_usage_rides_its_row_and_never_the_turn_footer() {
 
     let card = finished_card(&app, &platform).await;
     let rows = compaction_rows(&card);
-    assert_eq!(rows.len(), 1, "{:?}", body_lines(&card));
+    assert_eq!(rows.len(), 2, "{:?}", body_lines(&card));
     assert_eq!(
-        rows[0].0, "已压缩上下文（手动） · 300k tokens",
+        rows[1].0, "已压缩上下文（手动） · 300k tokens",
         "the row names its reason and carries the compaction's own usage"
+    );
+    assert_eq!(
+        rows[0].0, "已压缩上下文（自动） · 0 tokens",
+        "a reported zero usage is a reported usage: {rows:?}"
     );
     let text = card_text(&card);
     assert!(
@@ -479,6 +506,83 @@ async fn a_checkpoint_completion_is_labelled_like_any_other() {
     assert_eq!(
         rows[0].0, "已压缩上下文（手动）",
         "a checkpoint completion gains no label of its own"
+    );
+}
+
+/// Two DISTINCT compactions that happen to render the same fields are two rows,
+/// not one: the dedup is the position the card holds a row at, never the fields
+/// alone — otherwise a second compaction with an identical summary (a repeated
+/// `/compact` over the same context, say) would vanish and could never hold the
+/// card's settlement. Each row keeps its own server-time place and identity.
+#[tokio::test]
+async fn two_identical_compactions_at_distinct_positions_both_render() {
+    let _wd = test_work_dir();
+    let shared = completed(CompactionReason::Auto, "保留了结论。");
+    let first = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "第一条消息"),
+        compaction("msg_comp_a", 2_000, shared.clone()),
+        assistant(4_000, "第一轮回答。"),
+    ]);
+    // The second compaction lands later, on a session whose card already shows
+    // the first one's row.
+    let mut later = first.clone();
+    later.messages.push(compaction("msg_comp_b", 5_000, shared));
+    let (_dir, app, backend, platform) = scripted_app(vec![first], Some(SessionStatus::Busy)).await;
+
+    let turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
+    wait_for_card_update(&platform, "the first compaction row", CardUpdates::Any, |card| {
+        card_text(card).contains("已压缩上下文（自动）")
+    })
+    .await;
+    backend
+        .given_transcript_after_build("ses_test", vec![later])
+        .await;
+    wait_for_card_update(&platform, "both compaction rows", CardUpdates::Any, |card| {
+        compaction_panel_ids(card).len() == 2
+    })
+    .await;
+    backend
+        .set_session_status("ses_test", Some(SessionStatus::Idle))
+        .await;
+    tokio::time::timeout(Duration::from_secs(5), turn)
+        .await
+        .expect("the turn must finish once the run reads idle")
+        .unwrap()
+        .unwrap();
+
+    let card = platform
+        .updated_cards()
+        .await
+        .pop()
+        .expect("the final card flush");
+    let rows = compaction_rows(&card);
+    assert_eq!(
+        rows.len(),
+        2,
+        "each compaction is a row of its own: {:?}",
+        body_lines(&card)
+    );
+    assert!(
+        rows.iter()
+            .all(|(title, body)| title == "已压缩上下文（自动）" && body == "保留了结论。"),
+        "both rows render their own fields: {rows:?}"
+    );
+    let ids = compaction_panel_ids(&card);
+    assert_ne!(ids[0], ids[1], "the rows are distinct entries: {ids:?}");
+
+    // Each row keeps its own server-time place: the first before the reply, the
+    // second after it.
+    let lines = body_lines(&card);
+    let row_lines: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.starts_with("已压缩上下文"))
+        .map(|(index, _)| index)
+        .collect();
+    let reply = line_index(&card, "第一轮回答。");
+    assert!(
+        row_lines[0] < reply && reply < row_lines[1],
+        "each row sits at its own server time: {lines:?}"
     );
 }
 

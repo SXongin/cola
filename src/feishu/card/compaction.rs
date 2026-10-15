@@ -12,6 +12,24 @@
 use crate::backend::{Compaction, CompactionReason, CompactionStatus};
 use crate::feishu::card::{MAX_ELEMENT_TEXT_CHARS, chunk_text, format_tokens};
 
+/// Whether two compaction facts render the SAME row (ADR-0082): everything the
+/// row shows — how it ended, why it ran, the summary, the failure's error and the
+/// usage it reports, presence included. `recent` is deliberately not compared:
+/// the card never renders it, so a refreshed `recent` alone is not a change on
+/// the card.
+///
+/// This is the row's rendered revision, and POSITION is not part of it: what a
+/// card holds is decided per transcript position (two distinct compactions with
+/// identical fields are two rows), so the comparison belongs beside the copy it
+/// must agree with rather than in a key of its own.
+pub(crate) fn same_row(left: &Compaction, right: &Compaction) -> bool {
+    left.status == right.status
+        && left.reason == right.reason
+        && left.summary == right.summary
+        && left.error == right.error
+        && left.usage.map(|usage| usage.total) == right.usage.map(|usage| usage.total)
+}
+
 /// The title one Compaction row carries (ADR-0082): the reason it ran, and the
 /// usage of the compaction's OWN request as a trailing segment when the server
 /// reports one. A completion carrying `providerContext` — V2's provider-native
@@ -34,11 +52,9 @@ pub(crate) fn compaction_title(compaction: &Compaction) -> String {
                 .unwrap_or("未知错误")
         ),
     };
-    match compaction
-        .usage
-        .map(|usage| usage.total)
-        .filter(|total| *total > 0)
-    {
+    // Presence, not magnitude: a request the server reports with a zero usage is
+    // still a reported usage, and the row says so.
+    match compaction.usage.map(|usage| usage.total) {
         Some(total) => format!("{title} · {} tokens", format_tokens(total)),
         None => title,
     }

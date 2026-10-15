@@ -25,6 +25,7 @@ use crate::bridge::tasks::TaskRunId;
 use crate::bridge::turn::state;
 use crate::bridge::turn::state::{LedgerCadence, PartSource, RenderedPart, StreamAccumulator};
 use crate::config::ThreadKey;
+use crate::feishu::card::compaction::same_row;
 use crate::feishu::card::ledger::{TaskCompletionEntry, TaskEnding, TaskKind, TaskOutput};
 use crate::feishu::card::tool_render::{ChildActivity, FileDelivery, TaskLiveness};
 
@@ -140,6 +141,11 @@ async fn refresh_session_title(
 /// reads exactly the rule the rendering applies — without rendering, and
 /// without cloning the accumulator. The apply half re-checks nothing and
 /// assumes this returned true.
+///
+/// A Compaction is the one part this answers position-free (`true`): its dedup
+/// needs the part's transcript position, which this predicate does not carry, so
+/// the Session-scoped walk applies it instead ([`owed_compactions`]) — and the
+/// apply half never sees one, because a compaction is no Turn-window part.
 fn renders_part(acc: &StreamAccumulator, part: &Part) -> bool {
     match part {
         // Reasoning/text parts are written with empty text first, then updated
@@ -167,10 +173,12 @@ fn renders_part(acc: &StreamAccumulator, part: &Part) -> bool {
         }
         // A compaction is renderable content of its own (ADR-0082): the row is
         // Session-scoped, and the read that newly delivered it must not be the
-        // read an ending is decided on. Its dedup is the rendered revision the
-        // card already carries, never its content alone — a `running` row
-        // updates in place into its terminal one.
-        Part::Compaction(fact) => renders_compaction(acc, fact),
+        // read an ending is decided on. Its dedup is POSITION-aware — the row the
+        // card already carries at that transcript position, at that rendered
+        // revision ([`owed_compactions`]) — so it needs a position this predicate
+        // does not carry: a compaction never travels the Turn-window walks this
+        // answer serves, and the walk that does render it applies its own dedup.
+        Part::Compaction(_) => true,
         // Step boundaries, patches, file attachments and part kinds this build
         // does not model render nothing — there is no content to add or dedupe.
         Part::StepStart(_) | Part::StepFinish(_) | Part::Patch(_) | Part::File(_) | Part::Other(_) => false,
@@ -1976,16 +1984,16 @@ fn render_seed_scope(
 /// for the same reason: a compaction needs no Turn anchor to be placed.
 ///
 /// Everything at or before the chain's Rendered Cursor frontier is skipped
-/// ([`cursor_bound`]): a compaction an earlier card already showed is never
-/// replayed, and a `running` fact that ended updates its own row in place rather
-/// than adding a second. Returns whether a row entered the card.
+/// ([`cursor_bound`]) unless the card already carries a row at that very
+/// position: a compaction an earlier card already showed is never replayed, while
+/// a `running` fact that ended updates its own row in place rather than adding a
+/// second. Returns whether a row entered the card.
 fn render_compactions(acc: &mut StreamAccumulator, transcript: &SessionTranscript) -> bool {
     let owed = owed_compactions(acc, transcript);
     if owed.is_empty() {
         return false;
     }
     for (source, at_ms, fact) in owed {
-        acc.mark_rendered(RenderedPart::compaction(fact));
         acc.push_compaction_at(at_ms, source, fact);
     }
     true
@@ -1999,11 +2007,10 @@ pub(super) fn renders_compactions(acc: &StreamAccumulator, transcript: &SessionT
 }
 
 /// The compaction facts this read owes this card, in server order. A fact is owed
-/// when its rendered revision is not already on the card and its position is not
-/// at or before the chain's Rendered Cursor frontier — unless the card already
-/// carries a row at that very position, which makes the fact an in-place UPDATE
-/// (a `running` row ending, ADR-0082) rather than a replay. Messages an error-card
-/// retry's baseline suppresses are skipped. The one source both
+/// when the card carries no row at its position — or carries one whose rendered
+/// revision has changed — and, for a position the card has never shown, when the
+/// chain's Rendered Cursor frontier has not already passed it. Messages an
+/// error-card retry's baseline suppresses are skipped. The one source both
 /// [`render_compactions`] and [`renders_compactions`] read, so the two cannot
 /// drift. The fact's server time is its MESSAGE's: a part carries none.
 fn owed_compactions<'a>(
@@ -2019,29 +2026,24 @@ fn owed_compactions<'a>(
         for (index, part) in message.parts.iter().enumerate() {
             let Part::Compaction(fact) = part else { continue };
             let source = PartSource::at(message.id.clone(), index);
-            // A position this card already carries is an UPDATE, never a
-            // replay: the row's own confirmed write advanced the chain cursor
-            // past the position, so the bound must not skip the terminal
-            // revision of a row the card is already showing.
-            if !acc.compaction_row_at(&source) && bound.is_some_and(|bound| position <= bound) {
+            // The row this card already carries AT THIS POSITION, at whatever
+            // revision. It is the only thing a fact dedupes against: two distinct
+            // compactions may render the same fields, and only their positions
+            // tell them apart. A carried row is an UPDATE, never a replay: the
+            // row's own confirmed write advanced the chain cursor past the
+            // position, so the bound must not skip the terminal revision of a row
+            // the card is already showing.
+            let carried = acc.compaction_row(&source);
+            if carried.is_none() && bound.is_some_and(|bound| position <= bound) {
                 continue;
             }
-            if renders_compaction(acc, fact) {
-                owed.push((source, message.time.map(|time| time.created), fact));
+            if carried.is_some_and(|row| same_row(row, fact)) {
+                continue;
             }
+            owed.push((source, message.time.map(|time| time.created), fact));
         }
     }
     owed
-}
-
-/// Whether this compaction fact would add a row the card does not already
-/// carry: the content-keyed dedup's compaction arm, read by the walk and by the
-/// probe so the two cannot disagree. The key is the fact's rendered revision
-/// ([`RenderedPart::compaction`]): a `running` row differs from its terminal one
-/// and re-renders onto the same timeline entry, while a re-read carrying the same
-/// revision renders nothing.
-fn renders_compaction(acc: &StreamAccumulator, fact: &Compaction) -> bool {
-    !acc.has_rendered_part(&RenderedPart::compaction(fact))
 }
 
 /// The read position of the chain's Rendered Cursor frontier message, when this
