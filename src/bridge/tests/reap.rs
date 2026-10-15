@@ -19,9 +19,9 @@ use super::drain::{
     spawn_turn, tool_assistant, user, wait_for_card_header, wait_for_card_text, wait_for_guard_release,
 };
 use crate::backend::{
-    BackgroundTask, ChildRuntime, ContentBlock, FinishReason, MessageId, MessageRole, MessageTime, Part,
-    ReasoningPart, SessionTranscript, StepFinish, TextPart, ToolCall, ToolIdentity, ToolOutput, ToolStatus,
-    TranscriptMessage,
+    BackgroundTask, ChildRuntime, Compaction, CompactionReason, CompactionStatus, ContentBlock, FinishReason,
+    MessageId, MessageRole, MessageTime, Part, ReasoningPart, SessionTranscript, StepFinish, TextPart,
+    ToolCall, ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage,
 };
 use crate::bridge::card_handles::RenderedBlock;
 use crate::bridge::chain::{
@@ -6057,6 +6057,223 @@ async fn an_ended_projection_with_an_empty_delta_still_settles_in_place() {
         platform.calls.lock().await
     );
     wait_for_record_gone(&app, "ses_test").await;
+}
+
+/// One completed compaction fact on a message of its own — the neutral typed
+/// shape V2 persists (ADR-0082), with its server time on the MESSAGE.
+fn compaction_message(id: &str, created: i64, summary: &str) -> TranscriptMessage {
+    typed_message(
+        id,
+        MessageRole::Other("compaction".into()),
+        Some(created),
+        vec![Part::Compaction(Compaction {
+            status: CompactionStatus::Completed,
+            reason: CompactionReason::Auto,
+            summary: summary.to_string(),
+            usage: None,
+            error: None,
+            recent: "读者已经读过的最近对话".to_string(),
+        })],
+    )
+}
+
+/// The Compaction frontier (ADR-0082, ticket #722): a chain whose newest
+/// delivered fact is a compaction is CONSUMED by the restart projection, never
+/// replayed. The frontier names the compaction's position, so the armed
+/// successor renders nothing the old card already showed and is dropped — the
+/// old card takes its ending in place, and the compaction row is never
+/// re-rendered.
+#[tokio::test]
+async fn a_restart_over_a_compaction_frontier_re_renders_nothing_it_already_showed() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
+        Some(CursorFrontier {
+            message_id: MessageId::new("msg_comp"),
+            part_index: 0,
+            kind: CursorPartKind::Compaction,
+            started_at: Some(3_000),
+            delivered_chars: 0,
+            prefix_digest: Some(cursor_prefix_digest("")),
+        }),
+        &[],
+    );
+    let ended = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "问题"),
+        assistant(2_000, "第一轮回答。"),
+        compaction_message("msg_comp", 3_000, "保留的摘要。"),
+    ])
+    .with_executions(vec![execution(3_500)]);
+    let (app, platform, _backend) =
+        restarted_app_with_backend(&session_file, ended, Some(SessionStatus::Idle)).await;
+
+    spawn_sync(&app);
+    wait_for_update(&platform, "om_frozen", "the in-place ✅ ending", |card| {
+        card_header(card).contains("✅")
+    })
+    .await;
+
+    assert_eq!(
+        card_posts(&platform).await,
+        0,
+        "the compaction frontier covers the read: no successor is posted: {:?}",
+        platform.calls.lock().await
+    );
+    let ending = last_update_of(&platform, "om_frozen")
+        .await
+        .expect("the recorded card settles in place");
+    assert!(
+        !card_text(&ending).contains("已压缩上下文"),
+        "the compaction the old card already showed is never re-rendered: {ending}"
+    );
+    wait_for_record_gone(&app, "ses_test").await;
+}
+
+/// A compaction NEWER than the recorded frontier (ADR-0082, ticket #722): it
+/// has never been on a card, so the restart projection rides it onto the next
+/// card — exactly once. The successor's confirmed create advances the chain's
+/// frontier onto the compaction, so the compaction can never ride a later card
+/// again: no further successor, and a second restart projects nothing.
+#[tokio::test]
+async fn a_compaction_newer_than_the_frontier_rides_the_next_card_exactly_once() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let delivered = "第一轮回答。";
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
+        Some(text_frontier(delivered)),
+        &[],
+    );
+    let transcript = || {
+        SessionTranscript::new(vec![
+            user("msg_cola_anchor", 1_000, "问题"),
+            assistant(2_000, delivered),
+            compaction_message("msg_comp", 3_000, "保留的摘要。"),
+        ])
+        .with_executions(vec![execution(3_500)])
+    };
+
+    // Life 1: the projection posts ONE successor carrying the compaction row —
+    // and never re-renders the delivered text the frontier already covered.
+    let (app, platform, _backend) =
+        restarted_app_with_backend(&session_file, transcript(), Some(SessionStatus::Idle)).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+    platform.given_reply_id("om_successor_1");
+    spawn_sync(&app);
+    let (successor, successor_text) = wait_for_projection(&platform, "om_frozen").await;
+    assert!(
+        successor_text.contains("已压缩上下文"),
+        "the compaction rides the successor: {successor}"
+    );
+    assert!(
+        successor_text.contains("保留的摘要。"),
+        "the successor carries the summary: {successor}"
+    );
+    assert!(
+        !successor_text.contains(delivered),
+        "the delivered text the frontier covered is never repeated: {successor}"
+    );
+    // The successor's confirmed create advanced the chain's frontier ONTO the
+    // compaction, so every further pass owes nothing: the chain settles on
+    // that one successor and spends its record.
+    wait_for_record_gone(&app, "ses_test").await;
+    assert_eq!(
+        card_posts(&platform).await,
+        1,
+        "the compaction rides the next card exactly once: {:?}",
+        platform.calls.lock().await
+    );
+    drop(app); // life 1 ends
+
+    // Life 2: nothing is left to project — the compaction was shown once and
+    // the frontier recorded it.
+    let (restarted, platform2, backend2) =
+        restarted_app_with_backend(&session_file, transcript(), Some(SessionStatus::Idle)).await;
+    platform2.given_card_view("om_successor_1", realistic_card_view());
+    spawn_sync(&restarted);
+    // The pass ran (its per-session transcript read) before the negative
+    // assertion.
+    wait_for_transcript_reads(&backend2, "ses_test", 2).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        card_posts(&platform2).await,
+        0,
+        "a second restart never re-projects the compaction: {:?}",
+        platform2.calls.lock().await
+    );
+}
+
+/// The record-surviving restart is where a replayed compaction would show: a
+/// WAITING chain projects a successor per restart (issue #583), so a frontier
+/// parked before the compaction would let it ride EVERY successor forever
+/// (ADR-0082, ticket #722). The first successor's confirmed create advances the
+/// frontier onto the compaction, so the second restart's successor carries the
+/// wait — and never the compaction again.
+#[tokio::test]
+async fn a_compaction_already_shown_never_rides_a_later_restarts_successor() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let delivered = "第一轮回答。";
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
+        Some(text_frontier(delivered)),
+        &[],
+    );
+    let waiting = || {
+        SessionTranscript::new(vec![
+            user("msg_cola_anchor", 1_000, "跑一下 CI"),
+            assistant(2_000, delivered),
+            compaction_message("msg_comp", 3_000, "保留的摘要。"),
+        ])
+        .with_executions(vec![execution(3_500)])
+        .with_background_tasks(vec![background_shell(2_100)])
+    };
+
+    // Life 1: the compaction is newer than the recorded frontier, so it rides
+    // the first successor exactly once.
+    let (app1, platform1, _backend1) =
+        restarted_app_with_backend(&session_file, waiting(), Some(SessionStatus::Idle)).await;
+    platform1.given_card_view("om_frozen", realistic_card_view());
+    platform1.given_reply_id("om_successor_1");
+    spawn_sync(&app1);
+    let (successor1, successor1_text) = wait_for_projection(&platform1, "om_frozen").await;
+    assert_eq!(card_header(&successor1), "⏳ 等待后台任务");
+    assert!(
+        successor1_text.contains("已压缩上下文"),
+        "the compaction rides the first successor: {successor1}"
+    );
+    wait_for_record_card(&app1, "ses_test", "om_successor_1").await;
+    drop(app1); // life 1 ends
+
+    // Life 2: the same wait projects its own successor — and the compaction is
+    // NOT on it, because the frontier now names the compaction's own position.
+    let (app2, platform2, _backend2) =
+        restarted_app_with_backend(&session_file, waiting(), Some(SessionStatus::Idle)).await;
+    platform2.given_card_view("om_successor_1", realistic_card_view());
+    platform2.given_reply_id("om_successor_2");
+    spawn_sync(&app2);
+    let (successor2, successor2_text) = wait_for_projection(&platform2, "om_frozen").await;
+    assert_eq!(card_header(&successor2), "⏳ 等待后台任务");
+    assert!(
+        !successor2_text.contains("已压缩上下文") && !successor2_text.contains("保留的摘要。"),
+        "a compaction an earlier card already showed never rides a later restart's successor: {successor2}"
+    );
 }
 
 /// The accepted per-restart cost (issue #583, ADR-0071 amendment): the waiting
