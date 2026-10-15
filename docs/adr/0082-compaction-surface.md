@@ -160,11 +160,11 @@ Consequences:
   write after the upgrade gives it a digest).
 - **Takeover-lost is duplicate-not-lost, and it is one of the paths where the
   invariant is not enforced.** A projection whose create landed while its
-  confirmation could no longer be taken — the session was replaced, the chain
-  moved, the stage was evicted — records what it can prove, the rendered
-  endings, and deliberately no cursor: its landing path does not invent a
-  frontier it cannot confirm, and the card's ending cannot hand over a record
-  naming another card (`release_if_card` declines it). That body's compaction is
+  confirmation could no longer be taken — the session was replaced or the chain
+  moved, so the landed body has no cursor to hand over — records what it can
+  prove, the rendered endings, and deliberately no cursor: its landing path does
+  not invent a frontier it cannot confirm, and the card's ending cannot hand over
+  a record naming another card (`release_if_card` declines it). That body's compaction is
   therefore not marked delivered and renders once more rather than being
   swallowed — the same duplicate-over-loss trade the Rendered Cursor itself
   ratifies (ADR-0071: an ambiguous create is never retried).
