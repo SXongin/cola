@@ -14,7 +14,7 @@
 use crate::backend::{Compaction, CompactionReason, CompactionStatus};
 use crate::feishu::card::sanitize::CardMarkdown;
 use crate::feishu::card::shell::collapsible_panel_chunks;
-use crate::feishu::card::{MAX_ELEMENT_TEXT_CHARS, chunk_text, format_tokens};
+use crate::feishu::card::{MAX_CARD_TEXT_CHARS, MAX_ELEMENT_TEXT_CHARS, chunk_text, format_tokens};
 use serde_json::json;
 
 /// The card elements one Compaction row is made of (ADR-0082), shared by every
@@ -25,23 +25,22 @@ use serde_json::json;
 ///
 /// A completed compaction is one folded panel: `element_id` its stable identity
 /// (the reader's fold state survives an in-place update), the panel's title the
-/// row's, the fold body the summary chunked to cola's per-element budget. With
-/// nothing to fold — an in-flight compaction, a failure, or a completion the
-/// Backend gave no text (an orphaned V1 part, say) — the row is its title alone.
-/// `md` is the card's markdown state, so the summary draws from the card's one
-/// table budget and fenced fallback.
+/// row's, the fold body [`compaction_fold_body`]'s — the summary capped to one
+/// row's budget ([`MAX_COMPACTION_SUMMARY_CHARS`]) with its truncation marker,
+/// then chunked to cola's per-element budget. With nothing to fold — an
+/// in-flight compaction, a failure, or a completion the Backend gave no text (an
+/// orphaned V1 part, say) — the row is its title alone. `md` is the card's
+/// markdown state, so the summary draws from the card's one table budget and
+/// fenced fallback.
 pub(crate) fn compaction_elements(
     compaction: &Compaction,
     element_id: Option<&str>,
     md: &mut CardMarkdown,
 ) -> Vec<serde_json::Value> {
     let title = compaction_title(compaction);
-    match compaction_summary(compaction) {
-        Some(summary) => {
-            let chunks: Vec<String> = chunk_text(&summary, MAX_ELEMENT_TEXT_CHARS)
-                .iter()
-                .map(|chunk| md.element(chunk))
-                .collect();
+    match compaction_fold_body(compaction) {
+        Some(body) => {
+            let chunks: Vec<String> = body.iter().map(|chunk| md.element(chunk)).collect();
             vec![collapsible_panel_chunks(&title, &chunks, element_id)]
         }
         None => vec![json!({ "tag": "markdown", "content": md.element(&title) })],
@@ -96,38 +95,210 @@ pub(crate) fn compaction_title(compaction: &Compaction) -> String {
     }
 }
 
-/// The summary a folded row shows, with whitespace around it trimmed. `None`
-/// when there is none to fold — a running or failed compaction, and a completed
-/// one the Backend never gave a text (an orphaned V1 part, say): the row is then
-/// its title alone, rather than a fold holding nothing.
-pub(crate) fn compaction_summary(compaction: &Compaction) -> Option<String> {
+/// How much of a compaction's summary one row's fold shows, in CHARACTERS.
+///
+/// A Compaction row is a single timeline entry, and the card splitter can only
+/// break BETWEEN entries — never inside one — so this row's own body has to fit
+/// one card by itself. [`MAX_CARD_TEXT_CHARS`] is exactly the text budget the
+/// splitter already gives a whole card of streamed text: capping the fold there
+/// means one row costs at most one card's worth of text and nothing more. A
+/// worst-case CJK summary at this cap serializes to ~18 KB (three bytes per
+/// character; [`serde_json`] encodes non-ASCII as UTF-8, never as `\u` escapes),
+/// which sits inside [`MAX_CARD_JSON_CHARS`](crate::feishu::card::MAX_CARD_JSON_CHARS)
+/// (25 KB) once the panel, title, header and footer are added — and well inside
+/// Feishu's 30 KB hard limit. The stored [`Part::Compaction`](crate::backend::Part)
+/// keeps its summary whole: this caps what the card SHOWS.
+pub(crate) const MAX_COMPACTION_SUMMARY_CHARS: usize = MAX_CARD_TEXT_CHARS;
+
+/// The marker a clipped fold body ends with, as an element of its own so no
+/// element outgrows the per-element budget.
+pub(crate) const SUMMARY_TRUNCATED_MARKER: &str = "…（摘要已截断）";
+
+/// The fold body one Compaction row renders, chunked at the card's per-element
+/// budget: the summary clipped to [`MAX_COMPACTION_SUMMARY_CHARS`] with an
+/// explicit [`SUMMARY_TRUNCATED_MARKER`] element when it was cut. `None` when
+/// there is nothing to fold — a running or failed compaction, and a completed one
+/// the Backend never gave a text (an orphaned V1 part, say): the row is then its
+/// title alone, rather than a fold holding nothing.
+///
+/// The ONE source the render, [`compaction_components`] and
+/// [`compaction_estimate`] read, so the three cannot drift: the cap, the chunking
+/// and the marker are measured exactly as they are built.
+pub(crate) fn compaction_fold_body(compaction: &Compaction) -> Option<Vec<String>> {
     let summary = compaction.summary.trim();
-    (!summary.is_empty()).then(|| summary.to_string())
+    if summary.is_empty() {
+        return None;
+    }
+    let clipped: String = summary.chars().take(MAX_COMPACTION_SUMMARY_CHARS).collect();
+    let mut chunks = chunk_text(&clipped, MAX_ELEMENT_TEXT_CHARS);
+    if clipped.chars().count() < summary.chars().count() {
+        chunks.push(SUMMARY_TRUNCATED_MARKER.to_string());
+    }
+    Some(chunks)
 }
 
 /// How many body elements one Compaction row adds: a plain line is one element,
 /// a folded row is the panel (as a reasoning panel charges it) plus one markdown
-/// element per summary chunk.
+/// element per fold-body chunk — the truncation marker included, since it is one.
 pub(crate) fn compaction_components(compaction: &Compaction) -> usize {
-    match compaction_summary(compaction) {
-        Some(summary) => 3 + chunk_text(&summary, MAX_ELEMENT_TEXT_CHARS).len(),
+    match compaction_fold_body(compaction) {
+        Some(chunks) => 3 + chunks.len(),
         None => 1,
     }
 }
 
 /// The bytes one Compaction row adds to the body (ADR-0082): its title, plus —
-/// for a folded row — the panel's own element overhead and the summary's
-/// markdown chunks, measured from the same chunks the render builds so the two
-/// cannot drift. The summary is charged in JSON bytes rather than as card text,
-/// like a ledger entry's output: a fold body is one element per chunk and cannot
-/// be split the way streamed text can.
+/// for a folded row — the panel's own element overhead and the body's markdown
+/// chunks, measured from the same chunks the render builds so the two cannot
+/// drift. The body is charged in JSON bytes rather than as card text, like a
+/// ledger entry's output: a fold body is one element per chunk and cannot be
+/// split the way streamed text can. Because the body is capped, a row's cost is
+/// bounded whatever the stored summary holds.
 pub(crate) fn compaction_estimate(compaction: &Compaction) -> usize {
     let title = compaction_title(compaction).len();
-    match compaction_summary(compaction) {
+    match compaction_fold_body(compaction) {
         None => title + 80,
-        Some(summary) => {
-            let chunks = chunk_text(&summary, MAX_ELEMENT_TEXT_CHARS);
-            300 + title + chunks.iter().map(|chunk| chunk.len() + 40).sum::<usize>()
+        Some(chunks) => 300 + title + chunks.iter().map(|chunk| chunk.len() + 40).sum::<usize>(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::feishu::card::MAX_CARD_JSON_CHARS;
+    use crate::feishu::card::shell::CardBuilder;
+
+    fn compaction(summary: &str) -> Compaction {
+        Compaction {
+            status: CompactionStatus::Completed,
+            reason: CompactionReason::Auto,
+            summary: summary.to_string(),
+            usage: None,
+            error: None,
+            recent: "读者已经读过的最近对话".to_string(),
         }
+    }
+
+    /// The card one compaction row builds, serialized as Feishu receives it.
+    fn card_json(summary: &str) -> String {
+        CardBuilder::new()
+            .with_state(crate::feishu::card::CardState::Done)
+            .with_compaction(&compaction(summary), Some("compaction_1"))
+            .build()
+            .to_string()
+    }
+
+    /// One row cannot be split by the card splitter, so its fold body is capped
+    /// (ADR-0082): a summary at the cap, one far past it, and one whose content
+    /// is CJK — 3 bytes per character, the worst a summary's own encoding can
+    /// cost, since the JSON writer emits UTF-8 rather than `\u` escapes — each
+    /// render a card inside the whole-card JSON budget. Without the cap a long
+    /// summary blows the budget and Feishu rejects the card, taking the row and
+    /// the turn's update with it.
+    #[test]
+    fn a_summary_past_the_cap_stays_inside_the_card_budget() {
+        for (label, summary) in [
+            ("at the cap", "摘".repeat(MAX_COMPACTION_SUMMARY_CHARS)),
+            ("far past the cap", "摘".repeat(MAX_COMPACTION_SUMMARY_CHARS * 20)),
+            (
+                "ASCII far past the cap",
+                "a".repeat(MAX_COMPACTION_SUMMARY_CHARS * 20),
+            ),
+        ] {
+            let json = card_json(&summary);
+            assert!(
+                json.len() < MAX_CARD_JSON_CHARS,
+                "{label}: the card must stay inside the whole-card JSON budget, got {} bytes",
+                json.len()
+            );
+        }
+    }
+
+    /// The ONE amplification the cap does not bound is the markdown sanitizer's
+    /// own escaping (`<` → `&#60;`, five characters each) — the exposure every
+    /// model-markdown element carries, and the reason the fenced fallback exists.
+    /// A summary made of markup therefore costs one rejected write, and the
+    /// fenced rebuild — what a rejected card is retried as — lands inside the
+    /// budget: the row is never lost, and the cap still bounds the body it holds.
+    #[test]
+    fn a_markup_laden_summary_lands_inside_the_budget_through_the_fenced_fallback() {
+        let summary = "<".repeat(MAX_COMPACTION_SUMMARY_CHARS * 20);
+        let fenced = CardBuilder::new()
+            .with_state(crate::feishu::card::CardState::Done)
+            .with_fenced_markdown(true)
+            .with_compaction(&compaction(&summary), Some("compaction_1"))
+            .build()
+            .to_string();
+        assert!(
+            fenced.len() < MAX_CARD_JSON_CHARS,
+            "the fenced rebuild must fit the budget, got {} bytes",
+            fenced.len()
+        );
+    }
+
+    /// The capped body keeps the head of the summary and says it was cut, with
+    /// the marker in an element of its own so no element outgrows the per-element
+    /// budget. A summary within the cap renders whole, with no marker.
+    #[test]
+    fn a_clipped_fold_body_keeps_the_head_and_names_the_truncation() {
+        let summary = "摘".repeat(MAX_COMPACTION_SUMMARY_CHARS * 2);
+        let body = compaction_fold_body(&compaction(&summary)).expect("a folded body");
+        assert_eq!(
+            body.last().map(String::as_str),
+            Some(SUMMARY_TRUNCATED_MARKER),
+            "the clip is named, never silent: {body:?}"
+        );
+        assert!(
+            body.iter()
+                .all(|chunk| chunk.chars().count() <= MAX_ELEMENT_TEXT_CHARS),
+            "the marker rides its own element: {body:?}"
+        );
+        let visible: String = body[..body.len() - 1].concat();
+        assert_eq!(
+            visible,
+            "摘".repeat(MAX_COMPACTION_SUMMARY_CHARS),
+            "the head of the summary is kept"
+        );
+
+        let short = "保留了结论。";
+        assert_eq!(
+            compaction_fold_body(&compaction(short)).unwrap().concat(),
+            short,
+            "a summary within the cap is rendered whole"
+        );
+    }
+
+    /// The component count and the size estimate measure the SAME capped body the
+    /// render builds: past the cap a summary costs no more than one at the cap
+    /// plus the marker's own element, so the splitter charges a bounded row.
+    #[test]
+    fn the_row_cost_cannot_outgrow_the_capped_body() {
+        let at_cap = compaction(&"摘".repeat(MAX_COMPACTION_SUMMARY_CHARS));
+        let past_cap = compaction(&"摘".repeat(MAX_COMPACTION_SUMMARY_CHARS * 50));
+        let further = compaction(&"摘".repeat(MAX_COMPACTION_SUMMARY_CHARS * 500));
+        let marker_cost = SUMMARY_TRUNCATED_MARKER.len() + 40;
+        assert_eq!(
+            compaction_estimate(&past_cap),
+            compaction_estimate(&at_cap) + marker_cost,
+            "the estimate is the capped body's (plus its marker), not the stored summary's"
+        );
+        assert_eq!(
+            compaction_estimate(&further),
+            compaction_estimate(&past_cap),
+            "past the cap the row's cost cannot grow"
+        );
+        assert_eq!(
+            compaction_components(&past_cap),
+            compaction_components(&at_cap) + 1
+        );
+        assert_eq!(
+            compaction_components(&at_cap),
+            3 + MAX_COMPACTION_SUMMARY_CHARS.div_ceil(MAX_ELEMENT_TEXT_CHARS),
+            "the panel plus one element per chunk"
+        );
+        assert!(
+            compaction_estimate(&further) + compaction_title(&further).len() < MAX_CARD_JSON_CHARS,
+            "one row leaves room for a card's own chrome"
+        );
     }
 }

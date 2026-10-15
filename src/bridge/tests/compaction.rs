@@ -63,6 +63,18 @@ fn failed(reason: CompactionReason, error: &str) -> Compaction {
     }
 }
 
+/// A compaction message with no server time of its own: the decoder tolerates a
+/// payload without `time.created`, and the row is then keyed by arrival order
+/// rather than a clock.
+fn timeless_compaction(id: &str, fact: Compaction) -> TranscriptMessage {
+    typed_message(
+        id,
+        MessageRole::Other("compaction".into()),
+        None,
+        vec![Part::Compaction(fact)],
+    )
+}
+
 /// The card's body as it renders, in order: a folded panel contributes its title
 /// then its body chunks, any other element its own markdown content.
 fn body_lines(card: &serde_json::Value) -> Vec<String> {
@@ -110,6 +122,28 @@ fn line_index(card: &serde_json::Value, needle: &str) -> usize {
         .iter()
         .position(|line| line.contains(needle))
         .unwrap_or_else(|| panic!("no line carrying {needle:?}: {:?}", body_lines(card)))
+}
+
+/// The fold body of the card's compaction row, in element order: the panel's own
+/// markdown chunks (the truncation marker included, when there is one).
+fn compaction_fold_chunks(card: &serde_json::Value) -> Vec<String> {
+    card["body"]["elements"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|element| {
+            element
+                .pointer("/header/title/content")
+                .and_then(|value| value.as_str())
+                .is_some_and(|title| title.starts_with("已压缩上下文"))
+        })
+        .expect("the compaction fold")["elements"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|chunk| chunk.get("content").and_then(|value| value.as_str()))
+        .map(str::to_string)
+        .collect()
 }
 
 /// The `element_id` of every folded panel whose title names a compaction, in body
@@ -429,6 +463,75 @@ async fn an_in_flight_compaction_holds_the_card_then_updates_in_place() {
     );
 }
 
+/// A compaction whose message reports NO server time is keyed by arrival order,
+/// and its row updates in place just the same: a revision that arrived after the
+/// running row must replace it, not sit beside it. A fresh synthetic key per
+/// revision would leave the live row behind, and the settlement gate would keep
+/// reading it.
+#[tokio::test]
+async fn a_timeless_compaction_updates_its_row_in_place() {
+    let _wd = test_work_dir();
+    let live = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "第一条消息"),
+        timeless_compaction("msg_comp", running(CompactionReason::Auto)),
+        assistant(3_000, "第一轮回答。"),
+    ]);
+    let ended = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "第一条消息"),
+        timeless_compaction("msg_comp", completed(CompactionReason::Auto, "保留了结论。")),
+        assistant(3_000, "第一轮回答。"),
+    ]);
+    let (_dir, app, backend, platform) = scripted_app(vec![live, ended], Some(SessionStatus::Busy)).await;
+
+    let turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
+    wait_for_card_update(&platform, "the timeless live row", CardUpdates::Any, |card| {
+        card_text(card).contains("⏳ 压缩中（自动）")
+    })
+    .await;
+    let in_flight = platform
+        .updated_cards()
+        .await
+        .into_iter()
+        .find(|card| card_text(card).contains("⏳ 压缩中（自动）"))
+        .expect("the recorded live row");
+    let row_index = line_index(&in_flight, "⏳ 压缩中（自动）");
+
+    backend
+        .set_session_status("ses_test", Some(SessionStatus::Idle))
+        .await;
+    tokio::time::timeout(Duration::from_secs(5), turn)
+        .await
+        .expect("the turn must finish once the run reads idle")
+        .unwrap()
+        .unwrap();
+
+    let card = platform
+        .updated_cards()
+        .await
+        .pop()
+        .expect("the final card flush");
+    let rows = compaction_rows(&card);
+    assert_eq!(
+        rows.len(),
+        1,
+        "the terminal revision replaces the live row: {:?}",
+        body_lines(&card)
+    );
+    assert_eq!(rows[0].0, "已压缩上下文（自动）");
+    assert_eq!(rows[0].1, "保留了结论。");
+    assert!(
+        !card_text(&card).contains("⏳ 压缩中"),
+        "no live row is left behind: {:?}",
+        body_lines(&card)
+    );
+    assert_eq!(
+        line_index(&card, "已压缩上下文（自动）"),
+        row_index,
+        "the updated row keeps its arrival place: {:?}",
+        body_lines(&card)
+    );
+}
+
 /// A compaction that starts while the chain is live shows its in-flight row on
 /// the card, and the row keeps its place when it ends: the same timeline entry
 /// becomes the folded row, never a second one.
@@ -550,7 +653,8 @@ async fn the_compactions_own_usage_rides_its_row_and_never_the_turn_footer() {
 
 /// The fold body carries the summary chunked past the card's per-element budget,
 /// and the protocol's `recent` field — the verbatim tail kept beside the summary
-/// — never reaches the card.
+/// — never reaches the card. The summary sits exactly at the row's cap, so it is
+/// rendered whole (the cap's own clipping is pinned separately).
 #[tokio::test]
 async fn the_summary_is_chunked_and_the_recent_tail_never_renders() {
     let _wd = test_work_dir();
@@ -568,23 +672,7 @@ async fn the_summary_is_chunked_and_the_recent_tail_never_renders() {
         !card_text(&card).contains("读者已经读过的最近对话"),
         "the protocol's recent tail is never rendered"
     );
-    let panel = card["body"]["elements"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .find(|element| {
-            element
-                .pointer("/header/title/content")
-                .and_then(|value| value.as_str())
-                .is_some_and(|title| title.starts_with("已压缩上下文"))
-        })
-        .expect("the compaction fold");
-    let chunks: Vec<&str> = panel["elements"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|chunk| chunk.get("content").and_then(|value| value.as_str()))
-        .collect();
+    let chunks = compaction_fold_chunks(&card);
     assert!(
         chunks.len() > 1,
         "a summary past the per-element budget is chunked: {} chunks",
@@ -601,6 +689,52 @@ async fn the_summary_is_chunked_and_the_recent_tail_never_renders() {
         chunks.concat(),
         summary,
         "the chunks are the summary, whole and in order"
+    );
+}
+
+/// A summary past the row's cap is CLIPPED, not fatal: the row keeps the head of
+/// the summary and says it was cut, every element stays inside the per-element
+/// budget, and the whole card — one timeline row cannot be split — stays inside
+/// the JSON budget Feishu accepts. The stored fact keeps its summary whole; only
+/// the card is capped.
+#[tokio::test]
+async fn a_summary_past_the_cap_is_clipped_with_a_marker() {
+    use crate::feishu::card::compaction::{MAX_COMPACTION_SUMMARY_CHARS, SUMMARY_TRUNCATED_MARKER};
+
+    let _wd = test_work_dir();
+    let summary = "a".repeat(MAX_COMPACTION_SUMMARY_CHARS + 5_000);
+    let timeline = vec![
+        user("msg_cola_anchor", 1_000, "第一条消息"),
+        compaction("msg_comp", 2_000, completed(CompactionReason::Auto, &summary)),
+        assistant(3_000, "第一轮回答。"),
+    ];
+    let (_dir, app, _backend, platform) =
+        scripted_app(vec![SessionTranscript::new(timeline)], Some(SessionStatus::Idle)).await;
+
+    let card = finished_card(&app, &platform).await;
+    let chunks = compaction_fold_chunks(&card);
+    assert_eq!(
+        chunks.last().map(String::as_str),
+        Some(SUMMARY_TRUNCATED_MARKER),
+        "the clip is named on the card, never silent"
+    );
+    for chunk in &chunks {
+        assert!(
+            chunk.chars().count() <= crate::feishu::card::MAX_ELEMENT_TEXT_CHARS,
+            "no chunk may exceed the card's per-element budget: {}",
+            chunk.chars().count()
+        );
+    }
+    let visible: String = chunks[..chunks.len() - 1].concat();
+    assert_eq!(
+        visible,
+        "a".repeat(MAX_COMPACTION_SUMMARY_CHARS),
+        "the head of the summary is kept, exactly up to the cap"
+    );
+    assert!(
+        card.to_string().len() < crate::feishu::card::MAX_CARD_JSON_CHARS,
+        "the whole card stays inside the JSON budget: {} bytes",
+        card.to_string().len()
     );
 }
 

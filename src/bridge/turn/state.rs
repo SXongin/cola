@@ -2581,20 +2581,21 @@ impl StreamAccumulator {
     /// the position it rendered from. A row this position already carries is
     /// UPDATED IN PLACE, keeping its key, its timeline identity and the reader's
     /// fold state: an in-flight compaction becomes its terminal row rather than
-    /// leaving a second one behind (the renderer's dedup only re-renders it when
-    /// its rendered revision changed).
+    /// leaving a second one behind (the renderer only re-renders it when its
+    /// rendered revision changed). The position is what identifies the row, not
+    /// the key: a compaction whose message reports no server time is keyed by a
+    /// synthetic arrival order, so a fresh key would miss the row a revision
+    /// update must replace.
     pub(super) fn push_compaction_at(
         &mut self,
         at_ms: Option<i64>,
         source: PartSource,
         compaction: &Compaction,
     ) {
-        let key = at_ms.unwrap_or_else(|| self.next_order());
-        match self.source_entry(key, Some(&source), |kind| {
-            matches!(kind, TimelineKind::Compaction(_))
-        }) {
+        match self.carried_compaction(&source).map(|(index, _)| index) {
             Some(index) => self.timeline[index].kind = TimelineKind::Compaction(compaction.clone()),
             None => {
+                let key = at_ms.unwrap_or_else(|| self.next_order());
                 self.insert_kind_src(
                     key,
                     at_ms,
@@ -2795,6 +2796,23 @@ impl StreamAccumulator {
         self.pending_gap = Some(gap);
     }
 
+    /// The timeline index and the fact of the Compaction row THIS card carries at
+    /// `source`'s position, whatever its key or revision (ADR-0082): the one scan
+    /// both the render's in-place update and its dedup read go through. A row
+    /// keyed by a synthetic order (a compaction whose message reports no server
+    /// time) is found by its position alone, exactly like one keyed by a clock.
+    fn carried_compaction(&self, source: &PartSource) -> Option<(usize, &Compaction)> {
+        self.timeline
+            .iter()
+            .enumerate()
+            .find_map(|(index, item)| match (&item.kind, item.source.as_ref()) {
+                (TimelineKind::Compaction(fact), Some(item_source)) if item_source.same_part(source) => {
+                    Some((index, fact))
+                }
+                _ => None,
+            })
+    }
+
     /// The Compaction row THIS card carries at `source`'s position, whatever
     /// revision it holds (ADR-0082): the row's own confirmed write advances the
     /// chain's Rendered Cursor past the position, so a later revision of the same
@@ -2803,14 +2821,7 @@ impl StreamAccumulator {
     /// no row there: the position is then bounded by the chain cursor, and a
     /// compaction the card has never shown renders.
     pub(super) fn compaction_row(&self, source: &PartSource) -> Option<&Compaction> {
-        self.timeline
-            .iter()
-            .find_map(|item| match (&item.kind, item.source.as_ref()) {
-                (TimelineKind::Compaction(fact), Some(item_source)) if item_source.same_part(source) => {
-                    Some(fact)
-                }
-                _ => None,
-            })
+        self.carried_compaction(source).map(|(_, fact)| fact)
     }
 
     /// The accumulator's confirmed Rendered Cursor (spec #561): the frontier the

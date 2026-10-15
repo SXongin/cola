@@ -291,7 +291,10 @@ impl CardBuilder {
     /// fold state across the in-place update. The compaction's own usage rides
     /// the title when the server reports one, never the Turn Footer's context
     /// figure. The elements themselves are shared with the Session Snapshot's
-    /// tail marker row (ticket #723), so the two surfaces cannot disagree.
+    /// tail marker row (ticket #723), so the two surfaces cannot disagree — and
+    /// the fold body is that module's capped, chunked body
+    /// ([`crate::feishu::card::compaction::compaction_fold_body`]): one timeline
+    /// row cannot be split, so the row's own body must fit one card.
     pub fn with_compaction(mut self, compaction: &Compaction, element_id: Option<&str>) -> Self {
         let elements = compaction_elements(compaction, element_id, &mut self.markdown);
         self.body.extend(elements);
