@@ -770,6 +770,62 @@ async fn the_summary_is_chunked_and_the_recent_tail_never_renders() {
     );
 }
 
+/// A body whose CEILING exceeds a whole card is placed on a card of its own: one
+/// timeline row cannot be split, so the splitter finalizes the card carrying the
+/// row as a split prefix and the turn's other content rides a continuation. That
+/// placement is what the ceiling buys — the row's real payload is bounded by its
+/// caps, but the splitter must not be told it shares a card with content the card
+/// layer may yet enlarge past Feishu's limit.
+#[tokio::test]
+async fn a_large_compaction_row_takes_a_card_of_its_own() {
+    use crate::feishu::card::compaction::MAX_COMPACTION_SUMMARY_CHARS;
+
+    let _wd = test_work_dir();
+    let summary = "摘".repeat(MAX_COMPACTION_SUMMARY_CHARS);
+    let timeline = vec![
+        user("msg_cola_anchor", 1_000, "第一条消息"),
+        compaction("msg_comp", 2_000, completed(CompactionReason::Auto, &summary)),
+        assistant(3_000, "第一轮回答。"),
+    ];
+    let (_dir, app, _backend, platform) =
+        scripted_app(vec![SessionTranscript::new(timeline)], Some(SessionStatus::Idle)).await;
+
+    let finalized = finished_card(&app, &platform).await;
+    assert!(
+        compaction_fold_chunks(&finalized).len() > 1,
+        "the row renders whole on its own card: {:?}",
+        body_lines(&finalized)
+    );
+    assert!(
+        card_header(&finalized).contains("部分完成"),
+        "the row's card finalizes as a split prefix: {}",
+        card_header(&finalized)
+    );
+    assert!(
+        !card_text(&finalized).contains("第一轮回答。"),
+        "the reply moved to the continuation: {:?}",
+        body_lines(&finalized)
+    );
+
+    // The continuation is the newest replied card, and the row is not repeated on
+    // it: one row, one card.
+    let (_, continuation) = platform
+        .replied_cards_with_targets()
+        .await
+        .pop()
+        .expect("the continuation reply");
+    assert!(
+        card_text(&continuation).contains("第一轮回答。"),
+        "the reply rides the continuation: {:?}",
+        body_lines(&continuation)
+    );
+    assert!(
+        !card_text(&continuation).contains("已压缩上下文"),
+        "the row is not repeated on the continuation: {:?}",
+        body_lines(&continuation)
+    );
+}
+
 /// A summary past the row's cap is CLIPPED, not fatal: the row keeps the head of
 /// the summary and says it was cut, every element stays inside the per-element
 /// budget, and the whole card — one timeline row cannot be split — stays inside

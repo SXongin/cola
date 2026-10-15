@@ -100,7 +100,12 @@ fact and render it.
 - A row's fold body is clipped at `MAX_COMPACTION_SUMMARY_CHARS` (6000 characters — the
   card text budget) with an explicit `…（摘要已截断）` element: one row cannot be split
   across cards, so a row must cost at most one card's worth of text. Only what the card
-  SHOWS is capped; the transcript keeps the summary whole.
+  SHOWS is capped; the transcript keeps the summary whole. What the row is *charged* in
+  the card splitter's budget is a deliberately conservative ceiling over everything the
+  card layer can serialize for it — the sanitizer's markup escaping, the JSON encoding,
+  the rejection fallback's fence and the table fence — rather than a measurement the
+  splitter cannot make: a row with a large body therefore travels on a card of its own
+  instead of risking a rejected write.
 - The **Session Snapshot**'s recent tail has no aggregate size budget — its entries are
   chunked per element but never bounded as a whole, so an oversized tail is a card Feishu
   rejects silently. The gap predates this change and is tracked as issue #726.
