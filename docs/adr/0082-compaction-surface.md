@@ -97,6 +97,13 @@ fact and render it.
   delivered it, and the next read may decide an ending.
 - The card timeline gains a `TimelineKind::Compaction`; a `Receipt`-style plain line does
   not suffice, because the row is a fold.
+- A row's fold body is clipped at `MAX_COMPACTION_SUMMARY_CHARS` (6000 characters — the
+  card text budget) with an explicit `…（摘要已截断）` element: one row cannot be split
+  across cards, so a row must cost at most one card's worth of text. Only what the card
+  SHOWS is capped; the transcript keeps the summary whole.
+- The **Session Snapshot**'s recent tail has no aggregate size budget — its entries are
+  chunked per element but never bounded as a whole, so an oversized tail is a card Feishu
+  rejects silently. The gap predates this change and is tracked as issue #726.
 
 ## Domain note
 
