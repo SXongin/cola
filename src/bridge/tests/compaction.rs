@@ -272,6 +272,42 @@ async fn the_snapshot_tail_carries_a_compaction_at_its_server_position() {
     );
 }
 
+/// A transcript that kept no conversation message at all — a `/compact` on a
+/// session whose only readable fact is the compaction itself — still carries its
+/// marker: the snapshot's recent tail shows the compaction "either way"
+/// (ADR-0082, ticket #723). A reader who sees nothing else at least learns why.
+#[tokio::test]
+async fn the_snapshot_tail_carries_a_compaction_with_no_conversation_message() {
+    let _wd = test_work_dir();
+    let timeline = vec![compaction(
+        "msg_comp",
+        1_000,
+        completed(CompactionReason::Manual, "保留了结论。"),
+    )];
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_session_status("ses_own1", Some(SessionStatus::Busy));
+    backend.given_transcript("ses_own1", vec![SessionTranscript::new(timeline)]);
+    let (app, platform, _dir) = build_reeswitch_app(backend).await;
+
+    send_command(&app, "/switch 本项目", "msg_switch").await;
+    let card = platform
+        .replied_cards()
+        .await
+        .into_iter()
+        .next()
+        .expect("the busy re-switch reports a snapshot");
+
+    let rows = compaction_rows(&card);
+    assert_eq!(
+        rows.len(),
+        1,
+        "a compaction-only session still carries its marker: {:?}",
+        body_lines(&card)
+    );
+    assert_eq!(rows[0].0, "已压缩上下文（手动）");
+    assert_eq!(rows[0].1, "保留了结论。", "the marker's fold is the summary");
+}
+
 /// A compaction inside the tail's window never displaces a message: a marker is
 /// not a message, so the snapshot's 最近对话 keeps its four messages and the
 /// marker rides between them (ADR-0082, ticket #723). A compaction that

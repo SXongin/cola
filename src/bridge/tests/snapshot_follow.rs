@@ -1,6 +1,6 @@
 use super::drain::spawn_sync;
 use crate::backend::{
-    FileContent, FinishReason, MessageRole, Part, SessionTranscript, StepFinish, TranscriptMessage,
+    FileContent, FinishReason, MessageRole, OtherPart, Part, SessionTranscript, StepFinish, TranscriptMessage,
 };
 use crate::bridge::test_support::*;
 
@@ -1400,4 +1400,83 @@ fn compaction_message(id: &str, created: i64, summary: &str) -> crate::backend::
             recent: String::new(),
         })],
     )
+}
+
+/// ADR-0082 (ticket #723): a 最近对话 tail carrying ONLY compaction markers
+/// renders no 最近对话 section on the follow card's static text — a header with
+/// nothing under it would read as an empty conversation. The card still shows the
+/// compaction, through the live timeline that renders the session's rows.
+#[tokio::test]
+async fn busy_follow_renders_no_empty_tail_header_for_a_marker_only_tail() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_sessions(vec![list_session(
+        "ses_alpha01",
+        "唯一外部标题",
+        "/work/ext",
+        100,
+    )]);
+    backend.with_session_status("ses_alpha01", Some(opencode::types::SessionStatus::Busy));
+    // The newest user message carries nothing conversational (a part this build
+    // does not model), so no tail entry is a message: the markers stand alone.
+    backend.given_transcript(
+        "ses_alpha01",
+        vec![SessionTranscript::new(vec![
+            compaction_message("msg_comp", 1_000, "更早的对话已被压缩。"),
+            typed_message(
+                "msg_user",
+                MessageRole::User,
+                Some(2_000),
+                vec![Part::Other(OtherPart {
+                    kind: "file".into(),
+                    raw: serde_json::Value::Null,
+                })],
+            ),
+            typed_message(
+                "msg_assist",
+                MessageRole::Assistant,
+                Some(3_000),
+                vec![Part::StepFinish(StepFinish {
+                    reason: FinishReason::Stop,
+                })],
+            ),
+        ])],
+    );
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    app.core
+        .external
+        .render_poll_ms
+        .store(20, std::sync::atomic::Ordering::Relaxed);
+
+    send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
+
+    wait_for_card_update(&platform, "the follow card", CardUpdates::Latest, |card| {
+        card_header(card).contains("✅")
+    })
+    .await;
+
+    let calls = platform.calls.lock().await.clone();
+    let follow_card = calls
+        .iter()
+        .filter_map(|c| match c {
+            PlatformCall::UpdateMessage { message_id, card } if message_id == "msg_reply" => {
+                Some(card.to_string())
+            }
+            _ => None,
+        })
+        .next_back()
+        .expect("the busy-adopt follow re-renders the snapshot card in place");
+    assert!(
+        !follow_card.contains("**最近对话**"),
+        "a marker-only tail leaves no header behind: {follow_card}"
+    );
+    assert_eq!(
+        follow_card.matches("已压缩上下文（自动）").count(),
+        1,
+        "the live timeline is where the marker shows: {follow_card}"
+    );
 }

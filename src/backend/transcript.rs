@@ -544,6 +544,9 @@ impl SessionTranscript {
     /// span from the oldest KEPT message onward, so a compaction that preceded
     /// the visible conversation stays out of it — and a transcript with no
     /// compaction in that window projects exactly the entries it always did.
+    /// With no kept message at all the window opens at the transcript's start,
+    /// so the markers are still carried: the tail's compaction shows "either
+    /// way", alongside kept messages or alone.
     /// A marker takes its position from the message that carried it, so one on
     /// a timeless message is dropped exactly as a timeless message is.
     pub fn transcript_tail(&self) -> Vec<TailEntry> {
@@ -578,12 +581,14 @@ impl SessionTranscript {
         messages.sort_by_key(|(position, entry)| (entry.created_ms(), *position));
         let start = messages.len().saturating_sub(TAIL_LIMIT);
         messages.drain(..start);
-        // Nothing with a created time to order by → no window, no tail (a
-        // session whose only fact is a compaction has no recent conversation to
-        // put it among).
-        let Some(cut) = messages.iter().map(|(position, _)| *position).min() else {
-            return Vec::new();
-        };
+        // The window opens at the oldest KEPT message, so a compaction that
+        // preceded the visible conversation stays out of it. With no kept message
+        // there is no conversation to open the window inside, so it opens at the
+        // transcript's own start and the tail is the markers alone: a session
+        // whose only readable fact IS the compaction still says so, while one
+        // carrying neither messages nor a compaction projects the empty tail it
+        // always did.
+        let cut = messages.iter().map(|(position, _)| *position).min().unwrap_or(0);
         let mut out = messages;
         for (position, message) in self.messages.iter().enumerate().skip(cut) {
             let Some(created_ms) = message.time.map(|time| time.created) else {
@@ -2863,6 +2868,74 @@ mod tests {
         assert_eq!(
             with_older_marker, plain,
             "a compaction outside the window leaves the tail byte-for-byte unchanged"
+        );
+    }
+
+    /// A transcript that kept no conversation message at all still carries its
+    /// Compaction markers: with nothing to open the window inside, it opens at
+    /// the transcript's own start (ADR-0082, ticket #723) — while a transcript
+    /// with neither a kept message nor a compaction stays the empty tail it
+    /// always was.
+    #[test]
+    fn tail_carries_a_compaction_with_no_conversation_message() {
+        let compaction_fact = Compaction {
+            status: CompactionStatus::Completed,
+            reason: CompactionReason::Manual,
+            summary: "保留了结论。".into(),
+            usage: None,
+            error: None,
+            recent: String::new(),
+        };
+        let carrier = |id: &str, created: i64| {
+            message(
+                id,
+                MessageRole::Other("compaction".into()),
+                Some(MessageTime {
+                    created,
+                    completed: Some(created),
+                }),
+                vec![Part::Compaction(compaction_fact.clone())],
+            )
+        };
+        // Only inner monologue besides the markers: nothing is a conversation
+        // message, so nothing is kept.
+        let reasoning_only = message(
+            "a1",
+            MessageRole::Assistant,
+            Some(MessageTime {
+                created: 1_500,
+                completed: Some(1_500),
+            }),
+            vec![Part::Reasoning(ReasoningPart {
+                text: "想想".into(),
+                started_at: None,
+            })],
+        );
+
+        let tail = SessionTranscript::new(vec![
+            carrier("c1", 1_000),
+            reasoning_only.clone(),
+            carrier("c2", 2_000),
+        ])
+        .transcript_tail();
+        assert_eq!(
+            tail.len(),
+            2,
+            "both markers are carried, in server order: {tail:#?}"
+        );
+        assert!(matches!(tail[0], TailEntry::Compaction(_)));
+        assert_eq!(tail[0].created_ms(), 1_000);
+        assert_eq!(tail[1].created_ms(), 2_000);
+        assert!(
+            tail_messages(&tail).is_empty(),
+            "no conversation message was kept: {tail:#?}"
+        );
+
+        assert!(
+            SessionTranscript::new(vec![reasoning_only])
+                .transcript_tail()
+                .is_empty(),
+            "no kept message and no compaction is still no tail at all"
         );
     }
 

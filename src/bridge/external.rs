@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::Instrument;
 
-use crate::backend::{FileContent, MessageRole, Part, SessionTranscript, TurnAnchor, TurnSettle};
+use crate::backend::{FileContent, MessageRole, Part, SessionTranscript, TailEntry, TurnAnchor, TurnSettle};
 use crate::bridge::handles::{CardsHandle, FlowHandles, NoticeRules};
 use crate::bridge::turn::{
     CardClass, CardOwnership, ContinuationFacts, ContinuationLine, Disposition, SettleTiming, Turn,
@@ -743,18 +743,17 @@ impl ExternalFlow {
         } else {
             format!("已{verb} {title}（正在继续该会话的回合，有新进展会自动更新）")
         };
-        if !data.tail.is_empty() {
+        // A Compaction marker is deliberately NOT repeated here: this card is a
+        // live one, and its timeline renders the session's compaction rows itself
+        // (a session-scoped fact, ADR-0082), so copying the marker into the
+        // static prefix would show it twice. The one-shot snapshot — which has no
+        // timeline — is where the tail's marker is the only vehicle. A tail
+        // carrying only markers therefore renders no 最近对话 section at all: a
+        // header with nothing under it would read as an empty conversation.
+        let messages: Vec<_> = data.tail.iter().filter_map(TailEntry::message).collect();
+        if !messages.is_empty() {
             static_text.push_str("\n\n**最近对话**");
-            for entry in &data.tail {
-                // A Compaction marker is deliberately NOT repeated here: this
-                // card is a live one, and its timeline renders the session's
-                // compaction rows itself (a session-scoped fact, ADR-0082), so
-                // copying the marker into the static prefix would show it
-                // twice. The one-shot snapshot — which has no timeline — is
-                // where the tail's marker is the only vehicle.
-                let Some(message) = entry.message() else {
-                    continue;
-                };
+            for message in messages {
                 let role = crate::feishu::snapshot_card::role_marker(&message.role);
                 let body = message.body_text();
                 let text = if body.trim().is_empty() {
