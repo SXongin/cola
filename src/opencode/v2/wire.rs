@@ -1046,16 +1046,17 @@ fn decode_body(kind: Option<&str>, message: &Value) -> (MessageRole, Vec<Part>) 
 /// is never dropped.
 fn decode_compaction(message: &Value) -> Compaction {
     Compaction {
+        // `completed`, an unknown status, and no status at all (V1's shape, which
+        // has no such field) all read as the value that renders safely.
         status: match message.get("status").and_then(Value::as_str) {
             Some("running") => CompactionStatus::Running,
             Some("failed") => CompactionStatus::Failed,
-            Some(_) => CompactionStatus::Completed,
-            None => CompactionStatus::Completed,
+            _ => CompactionStatus::Completed,
         },
+        // Likewise: `auto`, an unknown reason, and no reason at all.
         reason: match message.get("reason").and_then(Value::as_str) {
             Some("manual") => CompactionReason::Manual,
-            Some(_) => CompactionReason::Auto,
-            None => CompactionReason::Auto,
+            _ => CompactionReason::Auto,
         },
         summary: message
             .get("summary")

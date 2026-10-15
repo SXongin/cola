@@ -9,8 +9,7 @@
 
 use super::disposition::Disposition;
 use crate::backend::{
-    Compaction, CompactionReason, CompactionStatus, FileContent, MessageId, Part, PromptSkill,
-    SessionTranscript, ToolCall, TurnAnchor,
+    Compaction, FileContent, MessageId, Part, PromptSkill, SessionTranscript, ToolCall, TurnAnchor,
 };
 use crate::bridge::chain::{CursorFrontier, CursorPartKind, EndingKey, RenderedCursor, TaskEndingClass};
 use crate::bridge::handles::CardsHandle;
@@ -29,38 +28,15 @@ use std::sync::Arc;
 /// payload carries no stable id (AGENTS.md #9), so text and reasoning dedupe
 /// on the content itself — equal content never renders twice, whatever message
 /// carried it.
+///
+/// A Compaction row is deliberately NOT keyed here: its dedup is per transcript
+/// POSITION (two distinct compactions may render the same fields), so it is read
+/// off the row the card already carries at that position
+/// ([`StreamAccumulator::compaction_row`]).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) enum RenderedPart {
     Text(String),
     Reasoning(String),
-    /// A Compaction row's **rendered revision** (ADR-0082): the facts the row
-    /// SHOWS, and nothing else. Its `recent` tail is deliberately absent — the
-    /// card never renders it, so a refreshed `recent` alone is not a change on
-    /// the card — while the status is present, so the in-flight row differs from
-    /// its terminal one and that position renders again (in place, at the same
-    /// timeline entry). `usage` is the request's own total, `0` when the server
-    /// reports none.
-    Compaction {
-        status: CompactionStatus,
-        reason: CompactionReason,
-        summary: String,
-        error: Option<String>,
-        usage: i64,
-    },
-}
-
-impl RenderedPart {
-    /// The rendered revision of `fact` — the key [`RenderedPart::Compaction`]
-    /// dedupes by.
-    pub(super) fn compaction(fact: &Compaction) -> Self {
-        RenderedPart::Compaction {
-            status: fact.status,
-            reason: fact.reason,
-            summary: fact.summary.clone(),
-            error: fact.error.clone(),
-            usage: fact.usage.map(|usage| usage.total).unwrap_or(0),
-        }
-    }
 }
 
 /// One entry on a turn's chronological timeline: a rendered item plus the
@@ -1746,6 +1722,10 @@ impl StreamAccumulator {
             || !self.seeded_delivered.is_empty()
             || !self.tools.is_empty()
             || self.todo_panel.is_some()
+            || self
+                .timeline
+                .iter()
+                .any(|item| matches!(item.kind, TimelineKind::Compaction(_)))
     }
 
     /// Whether this part's content was already rendered into the card — the
@@ -2807,16 +2787,22 @@ impl StreamAccumulator {
         self.pending_gap = Some(gap);
     }
 
-    /// Whether THIS card already carries a Compaction row at `source`'s position,
-    /// whatever revision that row holds (ADR-0082): the row's own confirmed write
-    /// advances the chain's Rendered Cursor past the position, so a later
-    /// revision of the same compaction — its `running` row ending — must update
-    /// the row in place rather than be read as a replay and skipped.
-    pub(super) fn compaction_row_at(&self, source: &PartSource) -> bool {
-        self.timeline.iter().any(|item| {
-            matches!(item.kind, TimelineKind::Compaction(_))
-                && item.source.as_ref().is_some_and(|item| item.same_part(source))
-        })
+    /// The Compaction row THIS card carries at `source`'s position, whatever
+    /// revision it holds (ADR-0082): the row's own confirmed write advances the
+    /// chain's Rendered Cursor past the position, so a later revision of the same
+    /// compaction — its `running` row ending — must update the row in place
+    /// rather than be read as a replay and skipped. `None` when the card carries
+    /// no row there: the position is then bounded by the chain cursor, and a
+    /// compaction the card has never shown renders.
+    pub(super) fn compaction_row(&self, source: &PartSource) -> Option<&Compaction> {
+        self.timeline
+            .iter()
+            .find_map(|item| match (&item.kind, item.source.as_ref()) {
+                (TimelineKind::Compaction(fact), Some(item_source)) if item_source.same_part(source) => {
+                    Some(fact)
+                }
+                _ => None,
+            })
     }
 
     /// The accumulator's confirmed Rendered Cursor (spec #561): the frontier the
