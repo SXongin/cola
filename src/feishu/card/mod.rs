@@ -1,4 +1,5 @@
 pub(crate) mod command;
+pub(crate) mod compaction;
 pub(crate) mod help;
 pub(crate) mod ledger;
 pub(crate) mod notify;
@@ -482,9 +483,33 @@ pub(crate) fn first_n_chars_bytes(s: &str, n: usize) -> usize {
     s.chars().take(n).map(|c| c.len_utf8()).sum()
 }
 
+/// A token count as the card shows it: `842`, `84k`, `1.2M` — one formatter for
+/// every figure a card renders (the Turn Footer's context segment, a Compaction
+/// row's own usage), so two places can never spell the same count differently.
+pub(crate) fn format_tokens(n: i64) -> String {
+    if n >= 10_000_000 {
+        format!("{}M", n / 1_000_000)
+    } else if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{}k", n / 1_000)
+    } else {
+        format!("{n}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_tokens_is_compact() {
+        assert_eq!(format_tokens(842), "842");
+        assert_eq!(format_tokens(84_200), "84k");
+        assert_eq!(format_tokens(200_000), "200k");
+        assert_eq!(format_tokens(1_200_000), "1.2M");
+        assert_eq!(format_tokens(20_000_000), "20M");
+    }
 
     /// The one set of states whose header must beat the awaiting override
     /// (ADR-0014/#386, ADR-0059): a terminal card's wait is over and a Waiting

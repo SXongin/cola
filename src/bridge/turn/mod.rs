@@ -1543,9 +1543,11 @@ impl Turn {
 
     /// Whether a settled read still carries turn parts the card lacks — the
     /// pure probe ([`render::renders_new_content`]) that decides whether the
-    /// settled tick must render before it may settle (#604). Only the turn's own
-    /// window is covered: seeded/gap content the probe cannot place is rendered
-    /// by finalization's own reconcile.
+    /// settled tick must render before it may settle (#604). Covers this Turn's
+    /// own window and the Session's compaction facts — a compaction is
+    /// Session-scoped, so it counts even on a card whose anchor never landed.
+    /// Seeded/gap content the probe cannot place is rendered by finalization's
+    /// own reconcile.
     async fn drain_owes_render(&self, handles: &TurnHandles, transcript: &SessionTranscript) -> bool {
         let mut cards = handles.cards.cards.lock().await;
         match cards.get_mut(&self.session_id) {
@@ -1553,7 +1555,7 @@ impl Turn {
                 card.acc.capture_turn_anchor(transcript);
                 match card.acc.turn_anchor().cloned() {
                     Some(anchor) => render::renders_new_content(&card.acc, transcript, &anchor),
-                    None => false,
+                    None => render::renders_compactions(&card.acc, transcript),
                 }
             }
             None => false,

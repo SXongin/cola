@@ -1,6 +1,7 @@
 use serde_json::json;
 
 use super::MAX_ELEMENT_TEXT_CHARS;
+use super::compaction::{compaction_summary, compaction_title};
 use super::ledger::{
     TASK_LEDGER_ELEMENT_ID, TaskCompletionEntry, TaskLedgerRow, task_entry_body, task_entry_title,
     task_ledger_text, task_ledger_title,
@@ -10,6 +11,7 @@ use super::tool_render::{ToolPanel, file_image_elements, tool_panel_element};
 use super::{
     CardActionButton, CardState, HeaderProgress, chunk_text, fenced_code, fmt_local_time, truncate_md,
 };
+use crate::backend::Compaction;
 
 /// Format a duration in seconds for the header's live timer (ADR-0014):
 /// `42s`, `1m23s`, `2h5m`, `3d4h`. Whole seconds, so a header signature built
@@ -278,6 +280,37 @@ impl CardBuilder {
         let title = task_entry_title(entry);
         let body = self.markdown.element(&task_entry_body(entry));
         self.body.push(collapsible_panel(&title, &body, element_id));
+        self
+    }
+
+    /// One Compaction row (ADR-0082, [`crate::feishu::card::compaction`]): a
+    /// folded panel naming its reason with the summary in the fold, or — while
+    /// it runs or when it failed — a plain live or failure line. `element_id` is
+    /// the panel's stable identity on the card; the in-flight row and its
+    /// terminal successor share one timeline entry, so the id keeps the reader's
+    /// fold state across the in-place update. The compaction's own usage rides
+    /// the title when the server reports one, never the Turn Footer's context
+    /// figure.
+    pub fn with_compaction(mut self, compaction: &Compaction, element_id: Option<&str>) -> Self {
+        let title = compaction_title(compaction);
+        match compaction_summary(compaction) {
+            Some(summary) => {
+                let chunks: Vec<String> =
+                    crate::feishu::card::chunk_text(&summary, crate::feishu::card::MAX_ELEMENT_TEXT_CHARS)
+                        .iter()
+                        .map(|chunk| self.markdown.element(chunk))
+                        .collect();
+                self.body
+                    .push(collapsible_panel_chunks(&title, &chunks, element_id));
+            }
+            // Nothing to fold: a running compaction (the Backend writes the text
+            // only at the end), a failure, or a completion that carries no
+            // summary at all. The row is then its title alone.
+            None => {
+                let line = self.markdown.element(&title);
+                self.body.push(json!({ "tag": "markdown", "content": line }));
+            }
+        }
         self
     }
 

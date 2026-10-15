@@ -8,7 +8,10 @@
 //! accumulator's own tests are the module's internal seam.
 
 use super::disposition::Disposition;
-use crate::backend::{FileContent, MessageId, Part, PromptSkill, SessionTranscript, ToolCall, TurnAnchor};
+use crate::backend::{
+    Compaction, CompactionReason, CompactionStatus, FileContent, MessageId, Part, PromptSkill,
+    SessionTranscript, ToolCall, TurnAnchor,
+};
 use crate::bridge::chain::{CursorFrontier, CursorPartKind, EndingKey, RenderedCursor, TaskEndingClass};
 use crate::bridge::handles::CardsHandle;
 use crate::bridge::tasks::TaskCell;
@@ -17,7 +20,7 @@ use crate::feishu::card::first_n_chars_bytes;
 use crate::feishu::card::ledger::{TaskCompletionEntry, TaskKind, TaskLedgerRow};
 use crate::feishu::card::shell::CardBuilder;
 use crate::feishu::card::tool_render::{FileDelivery, TaskLiveness, ToolPanel, is_task_tool};
-use crate::feishu::card::{AwaitingAction, CardState};
+use crate::feishu::card::{AwaitingAction, CardState, format_tokens};
 use indexmap::IndexMap;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -30,6 +33,34 @@ use std::sync::Arc;
 pub(super) enum RenderedPart {
     Text(String),
     Reasoning(String),
+    /// A Compaction row's **rendered revision** (ADR-0082): the facts the row
+    /// SHOWS, and nothing else. Its `recent` tail is deliberately absent — the
+    /// card never renders it, so a refreshed `recent` alone is not a change on
+    /// the card — while the status is present, so the in-flight row differs from
+    /// its terminal one and that position renders again (in place, at the same
+    /// timeline entry). `usage` is the request's own total, `0` when the server
+    /// reports none.
+    Compaction {
+        status: CompactionStatus,
+        reason: CompactionReason,
+        summary: String,
+        error: Option<String>,
+        usage: i64,
+    },
+}
+
+impl RenderedPart {
+    /// The rendered revision of `fact` — the key [`RenderedPart::Compaction`]
+    /// dedupes by.
+    pub(super) fn compaction(fact: &Compaction) -> Self {
+        RenderedPart::Compaction {
+            status: fact.status,
+            reason: fact.reason,
+            summary: fact.summary.clone(),
+            error: fact.error.clone(),
+            usage: fact.usage.map(|usage| usage.total).unwrap_or(0),
+        }
+    }
 }
 
 /// One entry on a turn's chronological timeline: a rendered item plus the
@@ -463,6 +494,13 @@ pub(super) enum TimelineKind {
     // Boxed: the ending pair is large and this variant is the rarest in the
     // timeline, so the box keeps the enum (and the timeline it fills) small.
     LedgerEntry(TaskCompletionEntry, Option<Box<EndingKey>>),
+    /// One **Compaction** (ADR-0082): a folded row naming its reason with the
+    /// summary in the fold — or, while it is in flight or failed, a plain live
+    /// or failure row — keyed at the compaction's own server time, so it sits in
+    /// history where it happened rather than at the card's end. The typed fact
+    /// rides the entry: the row's revision is what dedupes against it
+    /// ([`RenderedPart::compaction`]).
+    Compaction(Compaction),
 }
 
 /// A card as built for one message: the JSON, whether the timeline had to
@@ -637,20 +675,6 @@ impl InteractionBlock {
             InteractionBlock::Question(q) => crate::feishu::card::question::question_target(&q.questions),
             InteractionBlock::Receipt(_) => String::new(),
         }
-    }
-}
-
-/// Compact token count for the Turn Footer's context segment: `842`, `84k`,
-/// `1.2M`. One decimal only under 10M, so a large window stays readable.
-fn format_tokens(n: i64) -> String {
-    if n >= 10_000_000 {
-        format!("{}M", n / 1_000_000)
-    } else if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    } else if n >= 1_000 {
-        format!("{}k", n / 1_000)
-    } else {
-        format!("{n}")
     }
 }
 
@@ -1715,8 +1739,8 @@ impl StreamAccumulator {
 
     /// Whether this accumulator has rendered any part — the external
     /// renderer's "partial reply" probe before it finalizes on timeout: any
-    /// text/reasoning mark, a seeded delivery, a tool panel or the `todowrite`
-    /// tail.
+    /// text/reasoning mark, a seeded delivery, a tool panel, the `todowrite`
+    /// tail, or a Compaction row (ADR-0082).
     pub(super) fn has_rendered_content(&self) -> bool {
         !self.rendered_parts.is_empty()
             || !self.seeded_delivered.is_empty()
@@ -2564,6 +2588,35 @@ impl StreamAccumulator {
         self.insert_kind(key, None, TimelineKind::Receipt(text.to_string()));
     }
 
+    /// Place one Compaction row (ADR-0082) at `at_ms` — the catalogued fact's own
+    /// server time (its MESSAGE's `time.created`; a part carries none) — keyed by
+    /// the position it rendered from. A row this position already carries is
+    /// UPDATED IN PLACE, keeping its key, its timeline identity and the reader's
+    /// fold state: an in-flight compaction becomes its terminal row rather than
+    /// leaving a second one behind (the renderer's dedup only re-renders it when
+    /// its rendered revision changed).
+    pub(super) fn push_compaction_at(
+        &mut self,
+        at_ms: Option<i64>,
+        source: PartSource,
+        compaction: &Compaction,
+    ) {
+        let key = at_ms.unwrap_or_else(|| self.next_order());
+        match self.source_entry(key, Some(&source), |kind| {
+            matches!(kind, TimelineKind::Compaction(_))
+        }) {
+            Some(index) => self.timeline[index].kind = TimelineKind::Compaction(compaction.clone()),
+            None => {
+                self.insert_kind_src(
+                    key,
+                    at_ms,
+                    Some(source),
+                    TimelineKind::Compaction(compaction.clone()),
+                );
+            }
+        }
+    }
+
     /// Mark `wake_id`'s resumed work as handed to a card: the handoff a 承接
     /// line's split or the in-place resume performs (ADR-0059, ADR-0066).
     /// Idempotent, and independent of [`Self::announce_wake`] — the in-place
@@ -2754,9 +2807,22 @@ impl StreamAccumulator {
         self.pending_gap = Some(gap);
     }
 
-    /// The accumulator's confirmed Rendered Cursor (spec #561): a test read of
-    /// the frontier only a confirmed write moves.
-    #[cfg(test)]
+    /// Whether THIS card already carries a Compaction row at `source`'s position,
+    /// whatever revision that row holds (ADR-0082): the row's own confirmed write
+    /// advances the chain's Rendered Cursor past the position, so a later
+    /// revision of the same compaction — its `running` row ending — must update
+    /// the row in place rather than be read as a replay and skipped.
+    pub(super) fn compaction_row_at(&self, source: &PartSource) -> bool {
+        self.timeline.iter().any(|item| {
+            matches!(item.kind, TimelineKind::Compaction(_))
+                && item.source.as_ref().is_some_and(|item| item.same_part(source))
+        })
+    }
+
+    /// The accumulator's confirmed Rendered Cursor (spec #561): the frontier the
+    /// session-scoped compaction walk bounds itself by (ADR-0082), so a row an
+    /// earlier card already showed is not replayed. Only a confirmed write moves
+    /// it.
     pub(super) fn cursor(&self) -> &RenderedCursor {
         &self.cursor
     }
@@ -3639,7 +3705,12 @@ impl StreamAccumulator {
                         .insert(call.identity.call_id.clone(), ToolPanel::new(call.clone()));
                 }
             }
-            Part::StepStart(_) | Part::StepFinish(_) | Part::Patch(_) | Part::File(_) | Part::Other(_) => {}
+            Part::StepStart(_)
+            | Part::StepFinish(_)
+            | Part::Patch(_)
+            | Part::File(_)
+            | Part::Compaction(_)
+            | Part::Other(_) => {}
         }
     }
 
@@ -4188,6 +4259,17 @@ impl StreamAccumulator {
                 TimelineKind::LedgerEntry(entry, _) => {
                     (4, crate::feishu::card::ledger::task_entry_estimate(entry), 0)
                 }
+                // A Compaction row is one element (a plain live/failure line) or
+                // a folded panel plus one markdown element per summary chunk:
+                // its estimate is owned beside its render, like the ledger
+                // entry's, and the summary is charged in JSON bytes rather than
+                // as card text — a fold body cannot be split the way streamed
+                // text can.
+                TimelineKind::Compaction(compaction) => (
+                    crate::feishu::card::compaction::compaction_components(compaction),
+                    crate::feishu::card::compaction::compaction_estimate(compaction),
+                    0,
+                ),
             };
             comps += c;
             size += s;
@@ -4312,6 +4394,18 @@ impl StreamAccumulator {
                         pending.clear();
                     }
                     builder = builder.with_task_entry(entry, Some(&format!("entry_{}", item.seq)));
+                }
+                // One Compaction (ADR-0082): a folded row naming its reason, a
+                // live row while it runs, a failure row carrying the Backend's
+                // error — in its own server-time position among the parts. Its
+                // `compaction_{seq}` id keeps the reader's fold state across the
+                // in-place update from the live row to its terminal one.
+                TimelineKind::Compaction(compaction) => {
+                    if !pending.is_empty() {
+                        builder = builder.with_text(&pending);
+                        pending.clear();
+                    }
+                    builder = builder.with_compaction(compaction, Some(&format!("compaction_{}", item.seq)));
                 }
             }
         }
@@ -5032,15 +5126,6 @@ mod tests {
             text.contains("📊 上下文 42k") && !text.contains("42k/"),
             "a stale denominator must not render: {text}"
         );
-    }
-
-    #[test]
-    fn format_tokens_is_compact() {
-        assert_eq!(format_tokens(842), "842");
-        assert_eq!(format_tokens(84_200), "84k");
-        assert_eq!(format_tokens(200_000), "200k");
-        assert_eq!(format_tokens(1_200_000), "1.2M");
-        assert_eq!(format_tokens(20_000_000), "20M");
     }
 
     /// The footer model line renders the full identity `provider/model@variant`

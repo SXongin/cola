@@ -1236,6 +1236,13 @@ pub enum Part {
     /// [`FileContent`] view (ADR-0076). A `file` part that inlines no payload
     /// is not a File Content and stays [`Part::Other`].
     File(FileContent),
+    /// One **Compaction** (ADR-0082): a generation-neutral fact stating how it
+    /// ended, why it ran, the summary it wrote and the usage of its own
+    /// request. V2 states it as a message of its own; V1 states it as a
+    /// `CompactionPart` plus a paired assistant summary message. It is
+    /// renderable content, so a card cannot settle on the read that delivered
+    /// it.
+    Compaction(Compaction),
     /// A part kind this build does not model, kept raw.
     Other(OtherPart),
 }
@@ -1245,14 +1252,21 @@ impl Part {
     /// reasoning and tool parts carry a start; boundary kinds carry none. The
     /// one place the part-kind-to-time mapping lives, so liveness reads cannot
     /// drift.
+    ///
+    /// A Compaction reports none: its server time is its MESSAGE's
+    /// (`time.created`), which a part cannot see — the renderer reads the
+    /// message, one level up.
     pub fn started_at(&self) -> Option<i64> {
         match self {
             Part::Text(text) => text.started_at,
             Part::Reasoning(reasoning) => reasoning.started_at,
             Part::Tool(call) => call.started_at,
-            Part::StepStart(_) | Part::StepFinish(_) | Part::Patch(_) | Part::File(_) | Part::Other(_) => {
-                None
-            }
+            Part::StepStart(_)
+            | Part::StepFinish(_)
+            | Part::Patch(_)
+            | Part::File(_)
+            | Part::Compaction(_)
+            | Part::Other(_) => None,
         }
     }
 }
@@ -1321,6 +1335,49 @@ pub struct OtherPart {
     /// The backend's kind name, empty when the payload named none.
     pub kind: String,
     pub raw: Value,
+}
+
+/// One **Compaction** (ADR-0082): the Backend summarized the Session's older
+/// conversation to free its context window. A Session-scoped fact — it answers
+/// no prompt, is never a Turn anchor, and may happen between Turns — carrying
+/// how it ended, why it ran, the summary it wrote, and the usage of its own
+/// request (never the size of the context it produced).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Compaction {
+    pub status: CompactionStatus,
+    pub reason: CompactionReason,
+    /// The summary this compaction wrote. Empty while it is still running (the
+    /// Backend writes the text only at the end) and on a failure.
+    pub summary: String,
+    /// The usage of the compaction request itself: it rides this fact alone and
+    /// is never the Turn's context figure (ADR-0044).
+    pub usage: Option<TokenUsage>,
+    /// The Backend's failure message, on a failed compaction. `None` for every
+    /// other status.
+    pub error: Option<String>,
+    /// The verbatim recent tail V2 keeps beside the summary. Decoded as part of
+    /// the protocol fact and never rendered (ADR-0082): it is history the
+    /// reader already has.
+    pub recent: String,
+}
+
+/// How a compaction ended. A payload that reports no `status` (V1's shape,
+/// which has no such field) is [completed](CompactionStatus::Completed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CompactionStatus {
+    /// Still summarizing. No summary is readable yet.
+    Running,
+    Completed,
+    Failed,
+}
+
+/// Why a compaction ran: on its own because the window filled
+/// ([`Auto`](CompactionReason::Auto), V1's `overflow` included), or because the
+/// user asked ([`Manual`](CompactionReason::Manual)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CompactionReason {
+    Auto,
+    Manual,
 }
 
 /// One tool call: who it is, how it is doing, and its raw payloads.
