@@ -29,9 +29,10 @@ use serde_json::json;
 /// row's budget ([`MAX_COMPACTION_SUMMARY_CHARS`]) with its truncation marker,
 /// then chunked to cola's per-element budget. With nothing to fold — an
 /// in-flight compaction, a failure, or a completion the Backend gave no text (an
-/// orphaned V1 part, say) — the row is its title alone. `md` is the card's
-/// markdown state, so the summary draws from the card's one table budget and
-/// fenced fallback.
+/// orphaned V1 part, say) — the row is its title alone, and a failure's error is
+/// capped to one element's budget in the title ([`MAX_COMPACTION_ERROR_CHARS`]).
+/// `md` is the card's markdown state, so the summary draws from the card's one
+/// table budget and fenced fallback.
 pub(crate) fn compaction_elements(
     compaction: &Compaction,
     element_id: Option<&str>,
@@ -69,7 +70,11 @@ pub(crate) fn same_row(left: &Compaction, right: &Compaction) -> bool {
 /// usage of the compaction's OWN request as a trailing segment when the server
 /// reports one. A completion carrying `providerContext` — V2's provider-native
 /// checkpoint — is labelled no differently: that is the mechanism, not the
-/// domain fact.
+/// domain fact. A failure's error is clipped like the fold body is
+/// ([`compaction_error`]): the title is ONE card element and the row is one
+/// unsplittable timeline item, so an oversized error would make the card's
+/// minimum one-row slice exceed the whole-card budget — and the failure row, the
+/// case the reader most needs, would vanish with it.
 pub(crate) fn compaction_title(compaction: &Compaction) -> String {
     let reason = match compaction.reason {
         CompactionReason::Auto => "自动",
@@ -78,20 +83,32 @@ pub(crate) fn compaction_title(compaction: &Compaction) -> String {
     let title = match compaction.status {
         CompactionStatus::Running => format!("⏳ 压缩中（{reason}）"),
         CompactionStatus::Completed => format!("已压缩上下文（{reason}）"),
-        CompactionStatus::Failed => format!(
-            "⚠️ 压缩失败：{}",
-            compaction
-                .error
-                .as_deref()
-                .filter(|error| !error.is_empty())
-                .unwrap_or("未知错误")
-        ),
+        CompactionStatus::Failed => format!("⚠️ 压缩失败：{}", compaction_error(compaction)),
     };
     // Presence, not magnitude: a request the server reports with a zero usage is
     // still a reported usage, and the row says so.
     match compaction.usage.map(|usage| usage.total) {
         Some(total) => format!("{title} · {} tokens", format_tokens(total)),
         None => title,
+    }
+}
+
+/// The error a failed row's title splices in, clipped to
+/// [`MAX_COMPACTION_ERROR_CHARS`] with [`ERROR_TRUNCATED_MARKER`] on a line of its
+/// own when it was cut. The stored `Compaction.error` keeps the Backend's whole
+/// text: this caps what the card SHOWS, exactly as the fold body's cap does for
+/// the summary.
+fn compaction_error(compaction: &Compaction) -> String {
+    let error = compaction
+        .error
+        .as_deref()
+        .filter(|error| !error.is_empty())
+        .unwrap_or("未知错误");
+    let clipped: String = error.chars().take(MAX_COMPACTION_ERROR_CHARS).collect();
+    if clipped.chars().count() < error.chars().count() {
+        format!("{clipped}\n{ERROR_TRUNCATED_MARKER}")
+    } else {
+        clipped
     }
 }
 
@@ -113,6 +130,29 @@ pub(crate) const MAX_COMPACTION_SUMMARY_CHARS: usize = MAX_CARD_TEXT_CHARS;
 /// The marker a clipped fold body ends with, as an element of its own so no
 /// element outgrows the per-element budget.
 pub(crate) const SUMMARY_TRUNCATED_MARKER: &str = "…（摘要已截断）";
+
+/// The copy a failure title always carries around the error it splices in: the
+/// `⚠️ 压缩失败：` prefix, the widest ` · 12k tokens` usage suffix, and the clip's
+/// own marker and its newline. Reserved against the card's per-element budget so
+/// a clipped title is still ONE element inside it (a test pins the widest
+/// combination against [`MAX_ELEMENT_TEXT_CHARS`]).
+const TITLE_RESERVED_CHARS: usize = 32;
+
+/// How much of a failed compaction's error the row's title shows, in CHARACTERS.
+///
+/// The title is one card element — the row is a plain line, never a fold — so
+/// [`MAX_ELEMENT_TEXT_CHARS`], cola's per-element budget, is its natural bound,
+/// less the copy the title reserves ([`TITLE_RESERVED_CHARS`]). Worst case, an
+/// error at this cap is ~9 KB of card JSON (CJK, three bytes per character:
+/// [`serde_json`] emits UTF-8, never `\u` escapes) — comfortable inside
+/// [`MAX_CARD_JSON_CHARS`](crate::feishu::card::MAX_CARD_JSON_CHARS) (25 KB) and
+/// Feishu's 30 KB hard limit, which is what an unbounded error (a stack trace)
+/// would otherwise blow for the whole card, failure row included.
+pub(crate) const MAX_COMPACTION_ERROR_CHARS: usize = MAX_ELEMENT_TEXT_CHARS - TITLE_RESERVED_CHARS;
+
+/// The marker a clipped error ends with, on a line of its own so a long single
+/// line of diagnostic cannot bury it.
+pub(crate) const ERROR_TRUNCATED_MARKER: &str = "…（错误已截断）";
 
 /// The fold body one Compaction row renders, chunked at the card's per-element
 /// budget: the summary clipped to [`MAX_COMPACTION_SUMMARY_CHARS`] with an
@@ -179,11 +219,29 @@ mod tests {
         }
     }
 
+    /// A failed compaction carrying `error` — and, when asked, a usage of its own
+    /// and a summary (a malformed payload can carry both).
+    fn failed(error: &str) -> Compaction {
+        Compaction {
+            status: CompactionStatus::Failed,
+            reason: CompactionReason::Auto,
+            summary: String::new(),
+            usage: None,
+            error: Some(error.to_string()),
+            recent: String::new(),
+        }
+    }
+
     /// The card one compaction row builds, serialized as Feishu receives it.
     fn card_json(summary: &str) -> String {
+        card_of(&compaction(summary))
+    }
+
+    /// [`card_json`] for any fact.
+    fn card_of(fact: &Compaction) -> String {
         CardBuilder::new()
             .with_state(crate::feishu::card::CardState::Done)
-            .with_compaction(&compaction(summary), Some("compaction_1"))
+            .with_compaction(fact, Some("compaction_1"))
             .build()
             .to_string()
     }
@@ -299,6 +357,91 @@ mod tests {
         assert!(
             compaction_estimate(&further) + compaction_title(&further).len() < MAX_CARD_JSON_CHARS,
             "one row leaves room for a card's own chrome"
+        );
+
+        // A failure row is a plain line, and its cost is the CLIPPED title's: an
+        // error far past the cap costs no more than one at the cap.
+        let failed_at_cap = failed(&"字".repeat(MAX_COMPACTION_ERROR_CHARS));
+        let failed_past_cap = failed(&"字".repeat(MAX_COMPACTION_ERROR_CHARS * 100));
+        assert_eq!(
+            compaction_estimate(&failed_past_cap),
+            compaction_estimate(&failed_at_cap) + ERROR_TRUNCATED_MARKER.len() + 1, /* the marker's own line break */
+            "the estimate is the clipped title's, not the stored error's"
+        );
+        assert_eq!(
+            compaction_components(&failed_past_cap),
+            1,
+            "a plain row is one element"
+        );
+        assert!(
+            compaction_estimate(&failed_past_cap) < MAX_CARD_JSON_CHARS,
+            "one failure row leaves room for a card's own chrome"
+        );
+    }
+
+    /// A failure row's card stays inside the whole-card JSON budget whatever the
+    /// Backend's error holds: the title is one element and the row one
+    /// unsplittable timeline item, so an unbounded error (a stack trace) would
+    /// make the card's minimum one-row slice too large and Feishu would reject it
+    /// — the failure row vanishing, which is the case the reader most needs.
+    #[test]
+    fn a_failure_error_past_the_cap_stays_inside_the_card_budget() {
+        for (label, error) in [
+            ("at the cap", "字".repeat(MAX_COMPACTION_ERROR_CHARS)),
+            ("far past the cap", "字".repeat(MAX_COMPACTION_ERROR_CHARS * 100)),
+            (
+                "a stack trace far past the cap",
+                "Error: boom\n    at src/main.rs:1\n".repeat(MAX_COMPACTION_ERROR_CHARS),
+            ),
+        ] {
+            let json = card_of(&failed(&error));
+            assert!(
+                json.len() < MAX_CARD_JSON_CHARS,
+                "{label}: the card must stay inside the whole-card JSON budget, got {} bytes",
+                json.len()
+            );
+        }
+    }
+
+    /// The clipped failure title keeps the head of the error and names the
+    /// truncation, stays ONE element inside the per-element budget — with the
+    /// widest usage suffix a completion can add — and leaves a short error (the
+    /// ordinary case) exactly as the Backend wrote it.
+    #[test]
+    fn a_clipped_error_keeps_the_head_and_names_the_truncation() {
+        let error = "字".repeat(MAX_COMPACTION_ERROR_CHARS * 3);
+        let mut fact = failed(&error);
+        fact.usage = Some(crate::backend::TokenUsage {
+            total: 20_000_000,
+            ..Default::default()
+        });
+        let title = compaction_title(&fact);
+        assert!(
+            title.contains(ERROR_TRUNCATED_MARKER),
+            "the clip is named, never silent: {title}"
+        );
+        assert!(
+            title.contains(&"字".repeat(MAX_COMPACTION_ERROR_CHARS)),
+            "the head of the error is kept"
+        );
+        assert!(
+            !title.contains(&"字".repeat(MAX_COMPACTION_ERROR_CHARS + 1)),
+            "nothing past the cap renders"
+        );
+        assert!(
+            title.ends_with(" · 20M tokens"),
+            "the usage suffix still closes the row: {title}"
+        );
+        assert!(
+            title.chars().count() <= MAX_ELEMENT_TEXT_CHARS,
+            "the widest title must stay one budgeted element, got {} chars",
+            title.chars().count()
+        );
+
+        assert_eq!(
+            compaction_title(&failed("context length exceeded")),
+            "⚠️ 压缩失败：context length exceeded",
+            "a short error renders exactly as the Backend wrote it"
         );
     }
 }
