@@ -13,7 +13,7 @@ use crate::backend::{
 };
 use crate::bridge::chain::{CursorFrontier, CursorPartKind, RenderedCursor, cursor_prefix_digest};
 use crate::bridge::test_support::*;
-use crate::bridge::tests::drain::{assistant, ctx, scripted_app, spawn_turn, user};
+use crate::bridge::tests::drain::{assistant, ctx, scripted_app, scripted_app_with, spawn_turn, user};
 use crate::bridge::turn::PromptContext;
 use crate::opencode::types::SessionStatus;
 
@@ -123,6 +123,14 @@ fn line_index(card: &serde_json::Value, needle: &str) -> usize {
         .iter()
         .position(|line| line.contains(needle))
         .unwrap_or_else(|| panic!("no line carrying {needle:?}: {:?}", body_lines(card)))
+}
+
+/// A later Turn's own prompt: its own cola message id, so the read's Turn
+/// window (and the anchor capture) is that turn's, not the first's.
+fn turn_ctx(cola_message_id: &str, text: &str) -> PromptContext {
+    let mut context = ctx("ses_test", text);
+    context.cola_message_id = Some(cola_message_id.to_string());
+    context
 }
 
 /// The fold body of the card's compaction row, in element order: the panel's own
@@ -1036,14 +1044,6 @@ async fn a_compaction_behind_the_rendered_cursor_is_not_replayed() {
 /// all.
 #[tokio::test]
 async fn a_completed_compaction_is_never_re_rendered_on_a_later_turns_card() {
-    /// A later Turn's own prompt: its own cola message id, so the read's Turn
-    /// window (and the anchor capture) is that turn's, not the first's.
-    fn turn_ctx(cola_message_id: &str, text: &str) -> PromptContext {
-        let mut context = ctx("ses_test", text);
-        context.cola_message_id = Some(cola_message_id.to_string());
-        context
-    }
-
     let _wd = test_work_dir();
     let timeline = vec![
         user("msg_cola_anchor", 1_000, "第一条消息"),
@@ -1131,6 +1131,104 @@ async fn a_completed_compaction_is_never_re_rendered_on_a_later_turns_card() {
     );
 }
 
+/// The one-time migration replay (ADR-0082 amendment): a Session compacted
+/// while an earlier build was live already had its row surfaced, but that build
+/// wrote no `delivered` section, so the sidecar cannot say the compaction was
+/// delivered. The upgrade therefore replays it **once**, on the first card after
+/// it — and that card's own confirmed write hands the position over, so the
+/// replay cannot repeat.
+#[tokio::test]
+async fn a_sidecar_without_the_delivered_section_replays_a_compaction_once() {
+    let _wd = test_work_dir();
+    let timeline = vec![
+        user("msg_cola_anchor", 1_000, "第一条消息"),
+        compaction(
+            "msg_comp",
+            2_000,
+            completed(CompactionReason::Auto, "升级前的压缩。"),
+        ),
+        assistant(3_000, "第一轮回答。"),
+    ];
+    let (dir, app, backend, platform) = scripted_app_with(
+        vec![SessionTranscript::new(timeline)],
+        Some(SessionStatus::Idle),
+        |cfg| {
+            // The shape a pre-fix build leaves behind: the terminal card
+            // released the chain's record, and the file has no `delivered`
+            // section at all.
+            std::fs::write(
+                cfg.bridge.session_file.with_file_name("chain_records.json"),
+                r#"{"records":{},"announcements":{}}"#,
+            )
+            .unwrap();
+        },
+    )
+    .await;
+    let sidecar_path = dir.path().join("chain_records.json");
+
+    // The first card after the upgrade replays the row: the sidecar carries no
+    // position saying this compaction was ever surfaced.
+    let first = spawn_turn(&app, ctx("ses_test", "第一条消息"));
+    tokio::time::timeout(Duration::from_secs(5), first)
+        .await
+        .expect("the first Turn must finish")
+        .unwrap()
+        .unwrap();
+    let first_card = platform
+        .updated_cards()
+        .await
+        .pop()
+        .expect("the first Turn's final card flush");
+    let rows = compaction_rows(&first_card);
+    assert_eq!(
+        rows.len(),
+        1,
+        "a pre-fix sidecar cannot say the row was surfaced, so it replays: {:?}",
+        body_lines(&first_card)
+    );
+    assert_eq!(rows[0].1, "升级前的压缩。");
+
+    // That write is the handover: the released record's confirmed cursor becomes
+    // the Session's delivered position.
+    let sidecar: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&sidecar_path).unwrap()).unwrap();
+    assert_eq!(
+        sidecar["delivered"]["ses_test"], "msg_a_3000",
+        "the first card's confirmed write gives the Session its position: {sidecar}"
+    );
+
+    // And so the replay cannot repeat: the next Turn's card must not carry it.
+    {
+        let mut scripts = backend.transcript_scripts.lock().await;
+        let transcript = &mut scripts.get_mut("ses_test").expect("the scripted read")[0];
+        transcript
+            .messages
+            .push(user("msg_cola_second", 4_000, "第二条消息"));
+        transcript.messages.push(assistant(5_000, "第二轮回答。"));
+    }
+    let second = spawn_turn(&app, turn_ctx("msg_cola_second", "第二条消息"));
+    tokio::time::timeout(Duration::from_secs(5), second)
+        .await
+        .expect("the second Turn must finish")
+        .unwrap()
+        .unwrap();
+    let card = platform
+        .updated_cards()
+        .await
+        .pop()
+        .expect("the second Turn's final card flush");
+    assert!(
+        compaction_rows(&card).is_empty(),
+        "the replay was pinned by the first card's write: {:?}",
+        body_lines(&card)
+    );
+    assert!(
+        card_text(&card).contains("第二轮回答。"),
+        "the second Turn's card carries its own reply: {:?}",
+        body_lines(&card)
+    );
+}
+
 /// The terminal card's OWN read can be the first to carry a compaction: one
 /// that lands after the turn's last live read and before finalization settles
 /// renders its row in the settling pass, which deliberately writes no card — so
@@ -1144,14 +1242,6 @@ async fn a_completed_compaction_is_never_re_rendered_on_a_later_turns_card() {
 /// itself rather than the reply before it.
 #[tokio::test]
 async fn a_compaction_first_surfaced_by_the_terminal_read_is_not_re_rendered() {
-    /// A later Turn's own prompt: its own cola message id, so the read's Turn
-    /// window (and the anchor capture) is that turn's, not the first's.
-    fn turn_ctx(cola_message_id: &str, text: &str) -> PromptContext {
-        let mut context = ctx("ses_test", text);
-        context.cola_message_id = Some(cola_message_id.to_string());
-        context
-    }
-
     let _wd = test_work_dir();
     let timeline = vec![
         user("msg_cola_anchor", 1_000, "第一条消息"),
@@ -1275,20 +1365,22 @@ async fn a_compaction_no_card_has_surfaced_yet_renders_on_the_next_turns_card() 
         body_lines(&first_card)
     );
 
-    // The session is compacted while idle (the manual `/compact` case), then the
-    // next Turn opens: the row has never been on a card, so it must ride this
-    // one.
+    // The session is compacted while idle — the compaction lands BEFORE the
+    // next user message, so no card exists to carry it and it waits (ADR-0082
+    // §4: "it rides the newest live card if there is one, otherwise it waits for
+    // the next Turn's card"). The next Turn then opens: the row has never been
+    // on a card, so it must ride this one.
     {
         let mut scripts = backend.transcript_scripts.lock().await;
         let transcript = &mut scripts.get_mut("ses_test").expect("the scripted read")[0];
+        transcript.messages.push(compaction(
+            "msg_comp",
+            2_500,
+            completed(CompactionReason::Auto, "保留了结论与未决问题。"),
+        ));
         transcript
             .messages
             .push(user("msg_cola_second", 3_000, "第二条消息"));
-        transcript.messages.push(compaction(
-            "msg_comp",
-            3_500,
-            completed(CompactionReason::Auto, "保留了结论与未决问题。"),
-        ));
         transcript.messages.push(assistant(4_000, "第二轮回答。"));
     }
     let second = spawn_turn(&app, {
