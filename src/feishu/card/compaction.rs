@@ -216,9 +216,48 @@ fn clipped_summary(summary: &str) -> (String, bool) {
 /// What one text costs the body budget: its exact serialized bytes
 /// ([`serialized_len`]) plus the fence the rejection fallback wraps it in
 /// ([`fenced_overhead`]), so a body at [`MAX_COMPACTION_BODY_BYTES`] still fits
-/// one card when Feishu rejects the first attempt.
+/// one card when Feishu rejects the first attempt. This is a CAP quantity, not
+/// the splitter's charge: the caps bound the row's actual body, while
+/// [`charged_bytes`] bounds the splitter's decision.
 fn body_bytes(text: &str) -> usize {
     serialized_len(text) + fenced_overhead(text)
+}
+
+/// The safety factor every rendered element's charge is multiplied by. A row's
+/// per-element charge cannot be exact, because the card layer computes some
+/// expansions from state the splitter does not have; this factor turns the
+/// measurable part into a CEILING over all of them.
+///
+/// The four expansions a rendered compaction element can meet, and where each is
+/// covered:
+///
+/// - the sanitizer's markup escape — `<` becomes the five-byte `&#60;` — is
+///   [`serialized_len`]'s, exactly;
+/// - the JSON encoder's control-character escapes — a NUL becomes the six-byte
+///   `\u0000`, and quotes and backslashes double — are [`serialized_len`]'s too;
+/// - the rejection fallback's backtick fence, sized from the text's longest run,
+///   is [`fenced_overhead`]'s;
+/// - the table sanitizer's fence — a table past the card's five-table allowance
+///   (or its 49-row cap) gains eight bytes of fence around syntax that needs at
+///   least four — is this factor's. Its adder never exceeds ~2x the text it
+///   wraps, so three covers it with room to spare.
+///
+/// Deliberately conservative: ordinary prose is charged three times what it
+/// serializes, and a `<` or a backtick inside code (where neither expansion
+/// applies) is charged as though it expanded. Over-charging is the safe
+/// direction for a splitter — the worst it does is give a row a card of its own —
+/// while under-charging is a card Feishu rejects, taking the row and the turn's
+/// update with it.
+pub(crate) const COMPACTION_CHARGE_FACTOR: usize = 3;
+
+/// The bytes one rendered text is CHARGED for, as a ceiling: its serialized
+/// content ([`serialized_len`]) plus the fallback's fence
+/// ([`fenced_overhead`]), multiplied by [`COMPACTION_CHARGE_FACTOR`]. The charge
+/// is what the card splitter's budget sees; what the card actually writes is
+/// bounded by the row's caps ([`MAX_COMPACTION_SUMMARY_CHARS`],
+/// [`MAX_COMPACTION_BODY_BYTES`]) instead.
+fn charged_bytes(text: &str) -> usize {
+    (serialized_len(text) + fenced_overhead(text)) * COMPACTION_CHARGE_FACTOR
 }
 
 /// How many body elements one Compaction row adds: a plain line is one element,
@@ -231,30 +270,31 @@ pub(crate) fn compaction_components(compaction: &Compaction) -> usize {
     }
 }
 
-/// The bytes one Compaction row adds to the body (ADR-0082): its title, plus —
-/// for a folded row — the panel's own element overhead and the body's markdown
-/// chunks, measured from the same chunks the render builds so the two cannot
-/// drift. Every text is charged its exact serialized bytes
-/// ([`serialized_len`]: the sanitizer's `<` expansion and the JSON encoding) PLUS
-/// the fence the rejection fallback would wrap it in ([`fenced_overhead`]), so
-/// the row is covered on both attempts — the charge the splitter reads is the
-/// larger of what the two renders serialize. The fixed per-element constants
-/// cover the element skeletons and the sanitizer's non-content wrappers (a
-/// table's fence, the minimum fence every fenced element carries), each bounded
-/// by the card text it wraps. The body is charged in JSON bytes rather than as
-/// card text, like a ledger entry's output: a fold body is one element per chunk
-/// and cannot be split the way streamed text can. Because both are capped, a
-/// row's cost is bounded whatever the stored summary holds.
+/// The bytes one Compaction row is CHARGED in the card splitter's budget
+/// (ADR-0082): its title, plus — for a folded row — the panel's own element
+/// overhead and the body's markdown chunks, measured from the same chunks the
+/// render builds so the two cannot drift. Every text is charged
+/// [`charged_bytes`]'s ceiling, so the expansions the card layer applies but the
+/// splitter cannot see cannot make a row cost more than it was charged; the fixed
+/// per-element constants cover the element skeletons and the minimum fence every
+/// fenced element carries. The body is charged in bytes rather than as card text,
+/// like a ledger entry's output: a fold body is one element per chunk and cannot
+/// be split the way streamed text can.
+///
+/// A consequence, and the point: a large body's ceiling now exceeds a card's
+/// budget, so the row travels on a card of its own. That is the correct placement
+/// — the row cannot be split, and the caps bound what it really writes — where
+/// before it shared a card and risked the whole write.
 pub(crate) fn compaction_estimate(compaction: &Compaction) -> usize {
     let title = compaction_title(compaction);
-    let title = serialized_len(&title) + fenced_overhead(&title);
+    let title = charged_bytes(&title);
     match compaction_fold_body(compaction) {
         None => title + 80,
         Some(chunks) => {
             300 + title
                 + chunks
                     .iter()
-                    .map(|chunk| serialized_len(chunk) + fenced_overhead(chunk) + 40)
+                    .map(|chunk| charged_bytes(chunk) + 40)
                     .sum::<usize>()
         }
     }
@@ -264,6 +304,7 @@ pub(crate) fn compaction_estimate(compaction: &Compaction) -> usize {
 mod tests {
     use super::*;
     use crate::feishu::card::MAX_CARD_JSON_CHARS;
+    use crate::feishu::card::sanitize::MAX_CARD_TABLES;
     use crate::feishu::card::shell::CardBuilder;
 
     fn compaction(summary: &str) -> Compaction {
@@ -322,15 +363,36 @@ mod tests {
     /// uses, so the charge can be held against the real payload. `fenced` builds
     /// the rejection fallback's rebuild instead of the first attempt.
     fn row_serialized_len(fact: &Compaction, fenced: bool) -> usize {
-        let mut md = if fenced {
+        let md = if fenced {
             CardMarkdown::fenced()
         } else {
             CardMarkdown::new()
         };
+        row_serialized_len_with(fact, md)
+    }
+
+    /// [`row_serialized_len`] with a caller-built markdown state — the way to
+    /// render a row whose card has already spent its table budget, so every table
+    /// in the text takes the sanitizer's own fence.
+    fn row_serialized_len_with(fact: &Compaction, mut md: CardMarkdown) -> usize {
         compaction_elements(fact, Some("compaction_1"), &mut md)
             .iter()
             .map(|element| element.to_string().len())
             .sum()
+    }
+
+    /// The multi-table body the adversarial pass described: hundreds of minimal
+    /// markdown tables in one element, every one of them past the card's
+    /// five-table allowance and so wrapped in the sanitizer's fence.
+    fn many_short_tables() -> String {
+        "a|\n|-\n\n".repeat(333)
+    }
+
+    /// The same body, long enough that the fixed wrapper constants cannot mask the
+    /// adder (measured: 1,000 minimal tables serialize to 10,000 bytes and render
+    /// to 17,458 — the fence is ~2x the syntax it wraps).
+    fn a_thousand_short_tables() -> String {
+        "a|\n|-\n\n".repeat(1_000)
     }
 
     /// The card the row builds, `fenced` selecting the rejection fallback's
@@ -467,17 +529,30 @@ mod tests {
         }
     }
 
-    /// The charge is never an UNDER-charge: for every content kind — the
-    /// fallback's backtick fence included — at and past each cap, the estimate
-    /// covers what the row's elements serialize to on BOTH attempts (the first,
-    /// and the fenced rebuild Feishu forces after a content rejection), measured
-    /// from the very builder the render uses. The splitter can therefore never be
-    /// told a card fits when it does not.
+    /// The charge is never an UNDER-charge: for every content kind — control
+    /// characters, markup, the fallback's backtick fence and the sanitizer's
+    /// table fence included — at and past each cap, the estimate covers what the
+    /// row's elements serialize to in the ordinary render, in the fenced rebuild
+    /// Feishu forces after a content rejection, and in a render whose tables all
+    /// take the sanitizer's fence. Measured from the very builder the render uses,
+    /// so the splitter can never be told a card fits when it does not.
     #[test]
     fn the_estimate_never_undercharges_a_row() {
         let mut cases: Vec<(String, Compaction)> = vec![
             ("a prose summary".to_string(), compaction("保留了结论。")),
             ("a short error".to_string(), failed("context length exceeded")),
+            (
+                "the many-short-tables body".to_string(),
+                compaction(&many_short_tables()),
+            ),
+            (
+                "a thousand-short-tables body".to_string(),
+                compaction(&a_thousand_short_tables()),
+            ),
+            (
+                "a many-short-tables error".to_string(),
+                failed(&many_short_tables()),
+            ),
         ];
         for (label, atom) in atoms() {
             for (scale, length) in [
@@ -497,8 +572,18 @@ mod tests {
             }
         }
         for (label, fact) in cases {
-            for (render, fenced) in [("the first attempt", false), ("the fenced rebuild", true)] {
-                let serialized = row_serialized_len(&fact, fenced);
+            let mut spent_tables = CardMarkdown::new();
+            // Spend the card's five-table allowance first: every table the row
+            // carries is then fenced, the worst case for this adder.
+            spent_tables.clean(&"a|\n|-\n\n".repeat(MAX_CARD_TABLES));
+            for (render, serialized) in [
+                ("the first attempt", row_serialized_len(&fact, false)),
+                ("the fenced rebuild", row_serialized_len(&fact, true)),
+                (
+                    "a render whose tables are all fenced",
+                    row_serialized_len_with(&fact, spent_tables),
+                ),
+            ] {
                 assert!(
                     compaction_estimate(&fact) >= serialized,
                     "{label} on {render}: the estimate ({}) must cover the row's serialized \
@@ -725,12 +810,39 @@ mod tests {
         }
     }
 
-    /// Ordinary prose is charged and rendered exactly as it was before the fence
-    /// term: no backtick run means no extra fence, so the charge stays text plus
-    /// the wrapper constants and the card carries the text verbatim, with no
-    /// marker.
+    /// The charge is a CEILING over the measurable cost: for any content it is at
+    /// least the serialized bytes plus the fallback's fence, and at most the
+    /// safety factor times them — never below what the card can spend, and never
+    /// wildly above it.
     #[test]
-    fn the_ordinary_path_charges_and_renders_unchanged() {
+    fn the_charge_is_a_ceiling_over_the_measurable_cost() {
+        for (label, atom) in atoms() {
+            for length in [1, 10, MAX_ELEMENT_TEXT_CHARS, MAX_ELEMENT_TEXT_CHARS * 5] {
+                let text = atom.repeat(length);
+                let measured = serialized_len(&text) + fenced_overhead(&text);
+                assert!(
+                    charged_bytes(&text) >= measured,
+                    "{label} ×{length}: the charge ({}) must dominate the measured {measured} bytes",
+                    charged_bytes(&text)
+                );
+                assert!(
+                    charged_bytes(&text) <= measured * COMPACTION_CHARGE_FACTOR,
+                    "{label} ×{length}: the charge must stay within the factor of the measurement"
+                );
+                assert!(
+                    charged_bytes(&text) >= text.len(),
+                    "{label} ×{length}: the charge must dominate the raw bytes too"
+                );
+            }
+        }
+    }
+
+    /// Ordinary prose RENDERS exactly as it did before the charge became a
+    /// ceiling: no backtick run means no fence, nothing is clipped, and the card
+    /// carries the text verbatim. Its charge is the ceiling — deliberately more
+    /// than it serializes — which is the safe direction for a splitter.
+    #[test]
+    fn the_ordinary_path_renders_unchanged_under_a_ceiling_charge() {
         for (label, fact) in [
             ("a prose summary", compaction("保留了结论。")),
             ("an ASCII summary", compaction("kept the conclusions.")),
@@ -738,33 +850,34 @@ mod tests {
         ] {
             let title = compaction_title(&fact);
             assert_eq!(fenced_overhead(&title), 0, "{label}: no extra fence to charge");
-            match compaction_fold_body(&fact) {
-                None => assert_eq!(
-                    compaction_estimate(&fact),
-                    serialized_len(&title) + 80,
-                    "{label}: the plain-row charge is the one before the fence term"
-                ),
+            let exact = match compaction_fold_body(&fact) {
+                None => serialized_len(&title) + 80,
                 Some(chunks) => {
                     assert!(
                         chunks.iter().all(|chunk| fenced_overhead(chunk) == 0),
                         "{label}: no chunk carries a fence charge"
                     );
                     assert_eq!(
-                        compaction_estimate(&fact),
-                        300 + serialized_len(&title)
-                            + chunks
-                                .iter()
-                                .map(|chunk| serialized_len(chunk) + 40)
-                                .sum::<usize>(),
-                        "{label}: the folded-row charge is the one before the fence term"
-                    );
-                    assert_eq!(
                         chunks.concat(),
                         fact.summary.trim(),
                         "{label}: the body is the text, verbatim"
                     );
+                    assert_eq!(chunks.len(), 1, "{label}: ordinary prose fits one element");
+                    300 + serialized_len(&title)
+                        + chunks
+                            .iter()
+                            .map(|chunk| serialized_len(chunk) + 40)
+                            .sum::<usize>()
                 }
-            }
+            };
+            assert!(
+                compaction_estimate(&fact) >= exact,
+                "{label}: the ceiling is never below the exact cost"
+            );
+            assert!(
+                compaction_estimate(&fact) <= exact * COMPACTION_CHARGE_FACTOR,
+                "{label}: and never more than the factor above it"
+            );
             assert!(
                 !card_of(&fact).contains("已截断"),
                 "{label}: nothing is clipped on the ordinary path"
@@ -801,27 +914,48 @@ mod tests {
             "the panel plus one element per chunk"
         );
         assert!(
-            compaction_estimate(&further) + serialized_len(&compaction_title(&further)) < MAX_CARD_JSON_CHARS,
-            "one row leaves room for a card's own chrome"
+            compaction_estimate(&further) >= row_serialized_len(&further, false),
+            "the ceiling covers what the row writes"
         );
 
-        // A failure row is a plain line, and its cost is the CLIPPED title's: an
-        // error far past the caps costs no more than one at the cap.
+        // A failure row is a plain line, and its charge is the CLIPPED title's: an
+        // error far past the caps costs the marker more than one at the cap, never
+        // more.
         let failed_at_cap = failed(&"字".repeat(MAX_ELEMENT_TEXT_CHARS));
         let failed_past_cap = failed(&"字".repeat(MAX_ELEMENT_TEXT_CHARS * 100));
-        assert_eq!(
-            compaction_estimate(&failed_past_cap),
-            compaction_estimate(&failed_at_cap),
-            "the estimate is the clipped title's, not the stored error's"
-        );
         assert_eq!(
             compaction_components(&failed_past_cap),
             1,
             "a plain row is one element"
         );
         assert!(
-            compaction_estimate(&failed_past_cap) < MAX_CARD_JSON_CHARS,
-            "one failure row leaves room for a card's own chrome"
+            compaction_estimate(&failed_past_cap)
+                <= compaction_estimate(&failed_at_cap)
+                    + charged_bytes(&format!("\n{ERROR_TRUNCATED_MARKER}")),
+            "the cut adds the marker's own charge, nothing else"
         );
+
+        // The CEILING may exceed a whole card — that is the splitter being told the
+        // truth about a row it cannot split — while what the row actually WRITES
+        // stays inside one card, which is what the caps bound.
+        for (render, fact) in [
+            ("the capped body", &further),
+            ("a capped error", &failed_past_cap),
+        ] {
+            for (attempt, serialized) in [
+                ("the first attempt", row_serialized_len(fact, false)),
+                ("the fenced rebuild", row_serialized_len(fact, true)),
+            ] {
+                assert!(
+                    serialized < MAX_CARD_JSON_CHARS,
+                    "{render} on {attempt}: the row's real payload must stay inside one card, \
+                     got {serialized} bytes"
+                );
+                assert!(
+                    compaction_estimate(fact) >= serialized,
+                    "{render} on {attempt}: the ceiling must cover the payload"
+                );
+            }
+        }
     }
 }
