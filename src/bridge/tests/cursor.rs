@@ -16,7 +16,8 @@ use super::drain::{
     wait_for_card_text,
 };
 use crate::backend::{
-    MessageId, MessageRole, MessageTime, Part, SessionTranscript, TextPart, ToolStatus, TranscriptMessage,
+    Compaction, CompactionReason, CompactionStatus, MessageId, MessageRole, MessageTime, Part,
+    SessionTranscript, TextPart, ToolStatus, TranscriptMessage,
 };
 use crate::bridge::chain::{CursorFrontier, CursorPartKind, RenderedCursor, cursor_prefix_digest};
 use crate::bridge::test_support::{
@@ -781,5 +782,56 @@ async fn a_delivered_cursor_survives_a_newer_stage_that_replaces_it() {
     assert!(
         !successor_text.contains("答复。"),
         "the delivered content is never repeated on the restart: {successor_text}"
+    );
+}
+
+/// A completed compaction is the newest delivered fact on the card (ADR-0082,
+/// ticket #722): the confirmed card write advances the record's frontier ONTO
+/// the compaction's own position, so a restart consumes the chain instead of
+/// replaying the row. The frontier is a position, not a text: its delivered
+/// extent is the empty prefix.
+#[tokio::test]
+async fn a_confirmed_write_on_a_compaction_advances_the_cursor_onto_it() {
+    let _wd = test_work_dir();
+    let timeline = vec![
+        user("msg_cola_anchor", 1_000, "第一条消息"),
+        assistant(2_000, "第一轮回答。"),
+        typed_message(
+            "msg_comp",
+            MessageRole::Other("compaction".into()),
+            Some(3_000),
+            vec![Part::Compaction(Compaction {
+                status: CompactionStatus::Completed,
+                reason: CompactionReason::Auto,
+                summary: "保留了结论与未决问题。".into(),
+                usage: None,
+                error: None,
+                recent: String::new(),
+            })],
+        ),
+    ];
+    let (_dir, app, _backend, platform) =
+        scripted_app(vec![SessionTranscript::new(timeline)], Some(SessionStatus::Busy)).await;
+    let _turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
+    wait_for_card_text(&platform, "已压缩上下文").await;
+
+    let cursor = wait_for_cursor(&app, |cursor| {
+        cursor
+            .frontier
+            .as_ref()
+            .is_some_and(|frontier| frontier.kind == CursorPartKind::Compaction)
+    })
+    .await;
+    assert_eq!(
+        cursor.frontier,
+        Some(CursorFrontier {
+            message_id: MessageId::new("msg_comp"),
+            part_index: 0,
+            kind: CursorPartKind::Compaction,
+            started_at: Some(3_000),
+            delivered_chars: 0,
+            prefix_digest: Some(cursor_prefix_digest("")),
+        }),
+        "the frontier is the compaction's own position"
     );
 }
