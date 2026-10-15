@@ -1,7 +1,8 @@
 use super::drain::{noticed, spawn_sync};
 use crate::backend::{
-    ContentBlock, FileContent, FinishReason, MessageId, MessageRole, Part, ReasoningPart, SessionTranscript,
-    StepFinish, StepStart, ToolCall, ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage, TurnAnchor,
+    Compaction, CompactionReason, CompactionStatus, ContentBlock, FileContent, FinishReason, MessageId,
+    MessageRole, Part, ReasoningPart, SessionTranscript, StepFinish, StepStart, ToolCall, ToolIdentity,
+    ToolOutput, ToolStatus, TranscriptMessage, TurnAnchor,
 };
 use crate::bridge::chain::AdoptedFollow;
 use crate::bridge::test_support::*;
@@ -167,6 +168,95 @@ async fn external_message_from_shared_store_notifies_feishu() {
         card_text(&notify).contains("OpenChamber 里发的消息"),
         "notification should preview the message: {}",
         notify
+    );
+}
+
+/// A V1 compaction carrier is not a user message (ADR-0082, ticket #724): a
+/// session whose NEWEST message is a compaction pair still routes its External
+/// Message to the real user message the pair follows, never to the carrier —
+/// so the notification previews the message the user actually sent instead of
+/// arming a Turn against the compaction. The transcript shape here is exactly
+/// what V1's decoder produces (`compaction` role on both messages, the typed
+/// fact on the carrier), pinned by the decoder test
+/// `a_carrier_is_never_a_turn_anchor_and_a_summary_never_answers`; this test
+/// drives the routing that shape decides.
+#[tokio::test]
+async fn a_compaction_carrier_is_never_the_external_message() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut mock = MockBackend::new(realistic_parts());
+    // The pair lies NEWER than the real user message, exactly as V1 writes it:
+    // the carrier and its summary message are both `compaction`-role, so the
+    // session's newest USER is still the message the person sent.
+    mock.given_transcript(
+        "ses_ext",
+        vec![SessionTranscript::new(vec![
+            user("msg_ext_user", now_ms() - 30_000, "OpenChamber 里发的消息"),
+            typed_message(
+                "msg_comp_carrier",
+                MessageRole::Other("compaction".into()),
+                Some(now_ms() - 10_000),
+                vec![Part::Compaction(Compaction {
+                    status: CompactionStatus::Completed,
+                    reason: CompactionReason::Auto,
+                    summary: String::new(),
+                    usage: None,
+                    error: None,
+                    recent: String::new(),
+                })],
+            ),
+            typed_message(
+                "msg_comp_summary",
+                MessageRole::Other("compaction".into()),
+                Some(now_ms() - 9_000),
+                Vec::new(),
+            ),
+        ])],
+    );
+    let (app, platform) = build_app(cfg, mock).await;
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
+            session_id: "ses_ext".into(),
+            directory: "/tmp/ext".into(),
+            agent: None,
+            model: None,
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        },
+    )
+    .await;
+    let watermark = now_ms() - 60_000;
+    app.external
+        .last_user_msg_epoch
+        .lock()
+        .await
+        .insert("ses_ext".into(), watermark);
+
+    app.external
+        .poll_interval_ms
+        .store(50, std::sync::atomic::Ordering::Relaxed);
+    tokio::spawn({
+        let app = app.clone();
+        async move {
+            let _ = app.external.poll_loop(&app.flow_handles()).await;
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let calls = platform.calls.lock().await.clone();
+    let notify = calls.iter().find_map(|c| match c {
+        PlatformCall::SendCard { card, .. } if card_text(card).contains("有新消息") => Some(card.clone()),
+        _ => None,
+    });
+    let notify = notify.expect("the real user message should produce a notification card");
+    assert!(
+        card_text(&notify).contains("OpenChamber 里发的消息"),
+        "the notification previews the real user message, not the carrier: {notify}"
     );
 }
 

@@ -795,3 +795,72 @@ async fn compact_acknowledges_in_chinese() {
         "the acknowledgement still follows the submit"
     );
 }
+
+/// A V1 pair (ADR-0082, ticket #724) as the V1 decoder classifies it: the
+/// carrier user message holds the fact, and the paired summary message is a
+/// `compaction`-role tombstone beside it. Neither may touch the conversation —
+/// the summary answers no Turn, and its tokens never become the Turn Footer's
+/// context figure (V2 gets that for free, because its compaction usage is not
+/// carried on an assistant message at all).
+#[tokio::test]
+async fn a_v1_summary_message_never_answers_the_turn_nor_feeds_the_footer() {
+    let _wd = test_work_dir();
+    let carrier = typed_message(
+        "msg_comp_carrier",
+        MessageRole::Other("compaction".into()),
+        Some(2_000),
+        vec![Part::Compaction(completed(
+            CompactionReason::Auto,
+            "保留了结论与未决问题。",
+        ))],
+    );
+    let mut summary = typed_message(
+        "msg_comp_summary",
+        MessageRole::Other("compaction".into()),
+        Some(2_100),
+        Vec::new(),
+    );
+    summary.tokens = Some(TokenUsage {
+        input: 300_000,
+        output: 0,
+        total: 300_000,
+        cache_read: 0,
+        cache_write: 0,
+    });
+    let mut reply = assistant(3_000, "第一轮回答。");
+    reply.tokens = Some(TokenUsage {
+        input: 42_000,
+        output: 0,
+        total: 42_000,
+        cache_read: 0,
+        cache_write: 0,
+    });
+    let timeline = vec![
+        user("msg_cola_anchor", 1_000, "第一条消息"),
+        carrier,
+        summary,
+        reply,
+    ];
+    let (_dir, app, _backend, platform) =
+        scripted_app(vec![SessionTranscript::new(timeline)], Some(SessionStatus::Idle)).await;
+
+    let card = finished_card(&app, &platform).await;
+    let rows = compaction_rows(&card);
+    assert_eq!(rows.len(), 1, "{:?}", body_lines(&card));
+    assert_eq!(rows[0].0, "已压缩上下文（自动）");
+    assert_eq!(rows[0].1, "保留了结论与未决问题。");
+    let text = card_text(&card);
+    assert_eq!(
+        text.matches("保留了结论与未决问题。").count(),
+        1,
+        "the summary renders exactly once: {text}"
+    );
+    assert!(
+        text.contains("📊 上下文 42k"),
+        "the footer keeps the answering step's figure: {text}"
+    );
+    assert!(
+        !text.contains("300k"),
+        "a V1 summary message's own tokens never become the context figure: {text}"
+    );
+}
