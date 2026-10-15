@@ -1394,6 +1394,26 @@ not json at all
         }
     }
 
+    /// The zip side of the archive contract, run by the Windows CI job (the
+    /// extractor below is Windows-only): a release zip with one `cola.exe`
+    /// yields that binary, which is what zip 9's fallible `entry.name()` gates.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn extract_binary_reads_single_exe_zip_archive() {
+        use std::io::Write;
+
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        zip.start_file("cola.exe", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"MZ\x90\x00\x01").unwrap();
+        let archive = zip.finish().unwrap().into_inner();
+
+        let dir = tempfile::tempdir().unwrap();
+        let exe = extract_binary(&archive, dir.path()).unwrap();
+        assert_eq!(exe.file_name().unwrap(), "cola.exe");
+        assert_eq!(std::fs::read(&exe).unwrap(), b"MZ\x90\x00\x01");
+    }
+
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn install_replaces_binary_in_place() {
