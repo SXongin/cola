@@ -8,9 +8,10 @@ pub(crate) use crate::feishu;
 pub(crate) use crate::opencode;
 
 use crate::backend::{
-    BackgroundTask, ChildEvidence, ContentBlock, Execution, ExecutionOutcome, FinishReason, MessageId,
-    MessageRole, MessageTime, Part, ReasoningPart, SessionTranscript, StepFinish, StepStart, TextPart,
-    ToolCall, ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage, TurnAnchor, Wake, WakeSource,
+    BackgroundTask, ChildEvidence, Compaction, CompactionReason, CompactionStatus, ContentBlock, Execution,
+    ExecutionOutcome, FinishReason, MessageId, MessageRole, MessageTime, Part, ReasoningPart,
+    SessionTranscript, StepFinish, StepStart, TextPart, ToolCall, ToolIdentity, ToolOutput, ToolStatus,
+    TranscriptMessage, TurnAnchor, Wake, WakeSource,
 };
 
 /// One typed transcript message for view-shaped fixtures (spec #332): identity,
@@ -59,6 +60,27 @@ pub(crate) fn two_parts_at_one_time(first: &str, second: &str) -> crate::backend
                 reason: crate::backend::FinishReason::Stop,
             }),
         ],
+    )
+}
+
+/// One completed auto **Compaction** on a message of its own — the neutral typed
+/// shape V2 persists (ADR-0082), with its server time on the MESSAGE (a part
+/// carries none). Shared by the bridge test surfaces, so the fixture a
+/// compaction-only transcript is scripted from cannot drift; a test needing a
+/// running, failed or usage-carrying fact builds its own.
+pub(crate) fn compaction_message(id: &str, created: i64, summary: &str) -> TranscriptMessage {
+    typed_message(
+        id,
+        MessageRole::Other("compaction".into()),
+        Some(created),
+        vec![Part::Compaction(Compaction {
+            status: CompactionStatus::Completed,
+            reason: CompactionReason::Auto,
+            summary: summary.to_string(),
+            usage: None,
+            error: None,
+            recent: "读者已经读过的最近对话".to_string(),
+        })],
     )
 }
 

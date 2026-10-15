@@ -19,9 +19,9 @@ use super::drain::{
     spawn_turn, tool_assistant, user, wait_for_card_header, wait_for_card_text, wait_for_guard_release,
 };
 use crate::backend::{
-    BackgroundTask, ChildRuntime, Compaction, CompactionReason, CompactionStatus, ContentBlock, FinishReason,
-    MessageId, MessageRole, MessageTime, Part, ReasoningPart, SessionTranscript, StepFinish, TextPart,
-    ToolCall, ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage,
+    BackgroundTask, ChildRuntime, ContentBlock, FinishReason, MessageId, MessageRole, MessageTime, Part,
+    ReasoningPart, SessionTranscript, StepFinish, TextPart, ToolCall, ToolIdentity, ToolOutput, ToolStatus,
+    TranscriptMessage,
 };
 use crate::bridge::card_handles::RenderedBlock;
 use crate::bridge::chain::{
@@ -6057,24 +6057,6 @@ async fn an_ended_projection_with_an_empty_delta_still_settles_in_place() {
         platform.calls.lock().await
     );
     wait_for_record_gone(&app, "ses_test").await;
-}
-
-/// One completed compaction fact on a message of its own — the neutral typed
-/// shape V2 persists (ADR-0082), with its server time on the MESSAGE.
-fn compaction_message(id: &str, created: i64, summary: &str) -> TranscriptMessage {
-    typed_message(
-        id,
-        MessageRole::Other("compaction".into()),
-        Some(created),
-        vec![Part::Compaction(Compaction {
-            status: CompactionStatus::Completed,
-            reason: CompactionReason::Auto,
-            summary: summary.to_string(),
-            usage: None,
-            error: None,
-            recent: "读者已经读过的最近对话".to_string(),
-        })],
-    )
 }
 
 /// The Compaction frontier (ADR-0082, ticket #722): a chain whose newest

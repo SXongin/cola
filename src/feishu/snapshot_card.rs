@@ -412,8 +412,10 @@ mod tests {
         }
     }
 
-    /// One compaction message, the way V2 persists it.
-    fn compaction_message(
+    /// One compaction message, the way V2 persists it — the carrier the bridge's
+    /// own fixture builds a completed fact on (`test_support::compaction_message`),
+    /// here with whatever fact a test needs.
+    fn compaction_carrier(
         id: &str,
         created: i64,
         fact: crate::backend::Compaction,
@@ -856,7 +858,7 @@ mod tests {
         let mut with_older_marker = messages;
         with_older_marker.insert(
             0,
-            compaction_message(
+            compaction_carrier(
                 "c_old",
                 500,
                 compaction(
