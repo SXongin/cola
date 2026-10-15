@@ -440,6 +440,45 @@ async fn a_failed_compaction_renders_a_row_carrying_the_backends_error() {
     );
 }
 
+/// A failure whose error is far past one element's budget is clipped on the card
+/// — the row keeps the head of the error and names the truncation — and the whole
+/// card stays inside the JSON budget Feishu accepts: a row that blew it would
+/// vanish with the turn's update, and a failure is what the reader most needs.
+#[tokio::test]
+async fn a_long_failed_error_is_clipped_on_the_card() {
+    use crate::feishu::card::compaction::{ERROR_TRUNCATED_MARKER, MAX_COMPACTION_ERROR_CHARS};
+
+    let _wd = test_work_dir();
+    let error = "字".repeat(MAX_COMPACTION_ERROR_CHARS * 100);
+    let timeline = vec![
+        user("msg_cola_anchor", 1_000, "第一条消息"),
+        compaction("msg_comp", 2_000, failed(CompactionReason::Auto, &error)),
+        assistant(3_000, "第一轮回答。"),
+    ];
+    let (_dir, app, _backend, platform) =
+        scripted_app(vec![SessionTranscript::new(timeline)], Some(SessionStatus::Idle)).await;
+
+    let card = finished_card(&app, &platform).await;
+    let text = card_text(&card);
+    assert!(
+        text.contains(ERROR_TRUNCATED_MARKER),
+        "the clip is named on the card"
+    );
+    assert!(
+        text.contains(&"字".repeat(MAX_COMPACTION_ERROR_CHARS)),
+        "the head of the error is kept"
+    );
+    assert!(
+        !text.contains(&"字".repeat(MAX_COMPACTION_ERROR_CHARS + 1)),
+        "nothing past the cap reaches the card"
+    );
+    assert!(
+        card.to_string().len() < crate::feishu::card::MAX_CARD_JSON_CHARS,
+        "the whole card stays inside the JSON budget: {} bytes",
+        card.to_string().len()
+    );
+}
+
 /// An in-flight compaction is a live row, and the read that delivered it does
 /// not decide the Turn's ending on the spot: the row updates IN PLACE to its
 /// terminal state once the Backend writes the summary. The transcript a settled
