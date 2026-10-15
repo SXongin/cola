@@ -329,7 +329,8 @@ impl Turn {
         // any planned entry they now cover — so the successor never re-shows one
         // the delivered body already showed.
         let endings = render::Endings::of(cards, session_id);
-        let rendered = render::render_turn_parts(&mut acc, transcript);
+        let bound = render::rendered_bound(cards, session_id, transcript);
+        let rendered = render::render_turn_parts(&mut acc, transcript, bound);
         render::apply_ledger_read(
             &mut acc,
             transcript,
@@ -498,7 +499,8 @@ impl Turn {
                 // same-life card's anchor is the user message's, so the common
                 // path is unchanged.
                 let anchor = card.acc.turn_anchor().unwrap_or(turn_anchor);
-                if !render::renders_new_content(&card.acc, transcript, anchor) {
+                let bound = render::rendered_bound(cards, session_id, transcript);
+                if !render::renders_new_content(&card.acc, transcript, anchor, bound) {
                     return None;
                 }
                 // An OPEN yielded card resumes IN PLACE (ADR-0066), so no second
@@ -634,10 +636,11 @@ impl Turn {
         // already-announced or stale Wake owes nothing regardless.
         if reads.needs_render_probe() {
             let probe = StreamAccumulator::new("");
+            let bound = render::rendered_bound(cards, session_id, transcript);
             reads.renders = reads
                 .wake
                 .as_ref()
-                .is_some_and(|anchor| render::renders_new_content(&probe, transcript, anchor));
+                .is_some_and(|anchor| render::renders_new_content(&probe, transcript, anchor, bound));
         }
         match crate::bridge::chain::fresh(&reads) {
             crate::bridge::chain::FreshDisposition::Announce(anchor) => {

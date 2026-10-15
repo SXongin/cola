@@ -1004,6 +1004,7 @@ impl Turn {
                     render::render_new_turn_parts_committing(
                         acc,
                         transcript,
+                        render::rendered_bound(&handles.cards, &self.session_id, transcript),
                         render::Endings::of(&handles.cards, &self.session_id),
                         plans,
                     );
@@ -1553,9 +1554,13 @@ impl Turn {
         match cards.get_mut(&self.session_id) {
             Some(card) => {
                 card.acc.capture_turn_anchor(transcript);
+                // The durable delivered frontier (ADR-0082 §3): the compaction
+                // walk's bound on this card, so a row an earlier card surfaced is
+                // not counted as content this read owes.
+                let bound = render::rendered_bound(&handles.cards, &self.session_id, transcript);
                 match card.acc.turn_anchor().cloned() {
-                    Some(anchor) => render::renders_new_content(&card.acc, transcript, &anchor),
-                    None => render::renders_compactions(&card.acc, transcript),
+                    Some(anchor) => render::renders_new_content(&card.acc, transcript, &anchor, bound),
+                    None => render::renders_compactions(&card.acc, transcript, bound),
                 }
             }
             None => false,
