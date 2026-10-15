@@ -486,13 +486,18 @@ async fn live_v2_scripted_transcript_read() {
     // The Session Snapshot tail: the newest text-bearing conversation, with the
     // tool/reasoning-only steps excluded and nothing duplicated.
     let tail = transcript.transcript_tail();
+    let messages: Vec<&crate::backend::TailMessage> = tail
+        .iter()
+        .filter_map(crate::backend::TailEntry::message)
+        .collect();
     assert_eq!(
-        tail.last().map(|entry| entry.text.as_str()),
+        messages.last().map(|entry| entry.text.as_str()),
         Some(provider::FINAL_TEXT),
         "the tail ends on the final answer: {tail:#?}"
     );
     assert_eq!(
-        tail.iter()
+        messages
+            .iter()
             .filter(|entry| entry.text == provider::FINAL_TEXT)
             .count(),
         1,

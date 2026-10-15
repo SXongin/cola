@@ -1,4 +1,4 @@
-use crate::backend::{MessageRole, TailEntry};
+use crate::backend::{MessageRole, TailEntry, TailMessage};
 use crate::bridge::snapshot::{ElsewherePending, SnapshotData};
 use crate::feishu::card::session::{BackToList, back_to_list_button};
 use crate::opencode;
@@ -106,7 +106,10 @@ pub type SnapshotQuestionState = std::collections::HashMap<String, QuestionBlock
 /// folded — its header previews the entry briefly and expanding reveals the
 /// full verbatim text (chunked to cola's per-element budget) together with one
 /// `📎 name · mime · size` record line per File Content the message carried
-/// (ADR-0076). No tail → no panel.
+/// (ADR-0076). A **Compaction** marker (ADR-0082, ticket #723) is shown as the
+/// same folded row the live card's timeline renders, from the same builder, so
+/// an adopted session whose history looks oddly short has its explanation
+/// sitting where it happened. No tail → no panel.
 /// `md` is the card's markdown state: the entry texts share its one table budget
 /// and fenced fallback. A tail entry's attached skills are NOT rendered here
 /// (spec #652, ticket #655, acceptance reversal): the snapshot tail is text only.
@@ -120,13 +123,30 @@ fn tail_panels(
     }
     panels.push(json!({ "tag": "markdown", "content": "**最近对话**" }));
     for (i, entry) in tail.iter().enumerate() {
-        let (role, preview) = tail_preview(entry);
+        // The snapshot is sent once, but SnapshotClaims rebuilds it in place on
+        // a claim ack and on remote resolution — so its panels take stable ids
+        // too (the tail's order is fixed, so the entry index is stable).
+        let element_id = format!("snap_{i}");
+        let message = match entry {
+            // One Compaction marker: the live card's own row builder, so the two
+            // surfaces can never disagree on the copy or the fold.
+            TailEntry::Compaction(marker) => {
+                panels.extend(crate::feishu::card::compaction::compaction_elements(
+                    &marker.compaction,
+                    Some(&element_id),
+                    md,
+                ));
+                continue;
+            }
+            TailEntry::Message(message) => message,
+        };
+        let (role, preview) = tail_preview(message);
         let title = if preview.is_empty() {
             format!("{role} （空消息）")
         } else {
             format!("{role} {preview}…")
         };
-        let body = entry.body_text();
+        let body = message.body_text();
         let chunks = crate::feishu::card::chunk_text(&body, crate::feishu::card::MAX_ELEMENT_TEXT_CHARS);
         let chunks = if chunks.is_empty() {
             vec!["（空消息）".to_string()]
@@ -134,13 +154,10 @@ fn tail_panels(
             chunks
         };
         let chunks: Vec<String> = chunks.iter().map(|c| md.clean(c)).collect();
-        // The snapshot is sent once, but SnapshotClaims rebuilds it in place on
-        // a claim ack and on remote resolution — so its panels take stable ids
-        // too (the tail's order is fixed, so the entry index is stable).
         panels.push(crate::feishu::card::shell::collapsible_panel_chunks(
             &title,
             &chunks,
-            Some(&format!("snap_{i}")),
+            Some(&element_id),
         ));
     }
     panels
@@ -157,18 +174,18 @@ pub(crate) fn role_marker(role: &MessageRole) -> &'static str {
     }
 }
 
-/// One tail entry's role marker + short preview, shared by the static
+/// One tail message's role marker + short preview, shared by the static
 /// snapshot's collapsible panels and the busy-adopt follow's static text
 /// (ADR-0028). A files-only entry previews its record line so the folded panel
 /// names the file (ADR-0076); a text-bearing entry previews its text, unchanged.
-pub(crate) fn tail_preview(entry: &TailEntry) -> (&'static str, String) {
-    let source = if entry.text.trim().is_empty() && !entry.files.is_empty() {
-        entry.body_text()
+pub(crate) fn tail_preview(message: &TailMessage) -> (&'static str, String) {
+    let source = if message.text.trim().is_empty() && !message.files.is_empty() {
+        message.body_text()
     } else {
-        entry.text.clone()
+        message.text.clone()
     };
     let preview: String = source.chars().take(40).collect::<String>().trim().to_string();
-    (role_marker(&entry.role), preview)
+    (role_marker(&message.role), preview)
 }
 
 /// The snapshot's display title: the cleaned session label, falling back to
@@ -296,6 +313,7 @@ pub fn build_switched_state_card(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::TailMarker;
     use crate::bridge::request::kind::PendingRequest;
     use crate::bridge::snapshot::SnapshotData;
     use crate::opencode::types::{PermissionRequest, QuestionInfo, QuestionOption, QuestionRequest};
@@ -357,17 +375,55 @@ mod tests {
     }
 
     fn tail(role: MessageRole, created_ms: i64, text: &str) -> TailEntry {
-        TailEntry {
+        TailEntry::Message(TailMessage {
             role,
             created_ms,
             text: text.into(),
             files: Vec::new(),
-        }
+        })
     }
 
     fn file(name: &str) -> crate::backend::FileContent {
         crate::backend::FileContent::decode("data:image/png;base64,QUJD", Some("image/png"), Some(name))
             .expect("an inline payload is a File Content")
+    }
+
+    /// The snapshot card a session's own transcript projects (ADR-0082, ticket
+    /// #723): the card is built from the shared `transcript_tail`, exactly as an
+    /// adoption builds it.
+    fn snapshot_of(transcript: &crate::backend::SessionTranscript) -> serde_json::Value {
+        let d = data(
+            Some(opencode::types::SessionStatus::Idle),
+            vec![],
+            transcript.transcript_tail(),
+        );
+        build_snapshot_card("接管", "t", &d, None)
+    }
+
+    /// A **Compaction**'s neutral fact, as the transcript carries it.
+    fn compaction(status: crate::backend::CompactionStatus, summary: &str) -> crate::backend::Compaction {
+        crate::backend::Compaction {
+            status,
+            reason: crate::backend::CompactionReason::Manual,
+            summary: summary.to_string(),
+            usage: None,
+            error: None,
+            recent: "读者已经读过的最近对话".to_string(),
+        }
+    }
+
+    /// One compaction message, the way V2 persists it.
+    fn compaction_message(
+        id: &str,
+        created: i64,
+        fact: crate::backend::Compaction,
+    ) -> crate::backend::TranscriptMessage {
+        crate::bridge::test_support::typed_message(
+            id,
+            MessageRole::Other("compaction".into()),
+            Some(created),
+            vec![crate::backend::Part::Compaction(fact)],
+        )
     }
 
     fn elements(card: &serde_json::Value) -> &[serde_json::Value] {
@@ -677,18 +733,18 @@ mod tests {
             Some(opencode::types::SessionStatus::Idle),
             vec![],
             vec![
-                TailEntry {
+                TailEntry::Message(TailMessage {
                     role: MessageRole::User,
                     created_ms: 1_000,
                     text: String::new(),
                     files: vec![file("only.png")],
-                },
-                TailEntry {
+                }),
+                TailEntry::Message(TailMessage {
                     role: MessageRole::User,
                     created_ms: 2_000,
                     text: "看看这个".into(),
                     files: vec![file("and.png")],
-                },
+                }),
             ],
         );
         let card = build_snapshot_card("接管", "t", &d, None);
@@ -714,7 +770,111 @@ mod tests {
     /// change leaves a file-free snapshot byte-for-byte unchanged (ADR-0076).
     #[test]
     fn a_tail_entry_without_files_renders_its_text_alone() {
-        assert_eq!(tail(MessageRole::User, 1_000, "问题一").body_text(), "问题一");
+        assert_eq!(
+            tail(MessageRole::User, 1_000, "问题一")
+                .message()
+                .expect("a message entry")
+                .body_text(),
+            "问题一"
+        );
+    }
+
+    /// The tail's Compaction marker is the LIVE card's row (ADR-0082, ticket
+    /// #723): one builder, so the copy, the fold and the chunking cannot
+    /// disagree between the two surfaces — a failure is a plain line carrying
+    /// the Backend's error, a completion is a folded panel whose body is the
+    /// summary, chunked to cola's per-element budget.
+    #[test]
+    fn the_tail_marker_row_is_the_live_cards_row() {
+        let failed = crate::backend::Compaction {
+            error: Some("context length exceeded".into()),
+            ..compaction(crate::backend::CompactionStatus::Failed, "")
+        };
+        let summary = "摘要正文。".repeat(1_200);
+        let d = data(
+            Some(opencode::types::SessionStatus::Idle),
+            vec![],
+            vec![
+                tail(MessageRole::User, 1_000, "问题一"),
+                TailEntry::Compaction(TailMarker {
+                    created_ms: 2_000,
+                    compaction: failed,
+                }),
+                TailEntry::Compaction(TailMarker {
+                    created_ms: 3_000,
+                    compaction: compaction(crate::backend::CompactionStatus::Completed, &summary),
+                }),
+            ],
+        );
+        let card = build_snapshot_card("接管", "t", &d, None);
+        let s = card.to_string();
+        assert!(
+            s.contains("⚠️ 压缩失败：context length exceeded"),
+            "the live row's failure copy: {s}"
+        );
+        let panel = elements(&card)
+            .iter()
+            .find(|element| {
+                element
+                    .pointer("/header/title/content")
+                    .and_then(|value| value.as_str())
+                    == Some("已压缩上下文（手动）")
+            })
+            .expect("the completion's folded panel");
+        let chunks: Vec<&str> = panel["elements"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|chunk| chunk.get("content").and_then(|value| value.as_str()))
+            .collect();
+        assert!(chunks.len() > 1, "the summary is chunked: {panel}");
+        assert_eq!(chunks.concat(), summary, "the chunks are the summary, whole");
+        assert!(
+            !s.contains("读者已经读过的最近对话"),
+            "the protocol's recent tail is never rendered: {s}"
+        );
+    }
+
+    /// A snapshot of a session with no compaction in the window is byte-for-byte
+    /// unchanged (ADR-0082, ticket #723): a compaction that preceded the tail's
+    /// oldest kept message contributes no entry, so the card is the very JSON the
+    /// pre-#723 build produced — asserted here by building it from two
+    /// transcripts that differ only by that older compaction.
+    #[test]
+    fn a_snapshot_without_a_compaction_in_the_window_is_unchanged() {
+        let user_at = |i: i64| {
+            crate::bridge::test_support::typed_message(
+                &format!("u{i}"),
+                MessageRole::User,
+                Some(i * 1_000),
+                vec![crate::bridge::test_support::text_part(&format!("m{i}"))],
+            )
+        };
+        let messages: Vec<_> = (1..=5).map(user_at).collect();
+        let plain = snapshot_of(&crate::backend::SessionTranscript::new(messages.clone()));
+
+        let mut with_older_marker = messages;
+        with_older_marker.insert(
+            0,
+            compaction_message(
+                "c_old",
+                500,
+                compaction(
+                    crate::backend::CompactionStatus::Completed,
+                    "更早的对话已被压缩。",
+                ),
+            ),
+        );
+        let summarized = snapshot_of(&crate::backend::SessionTranscript::new(with_older_marker));
+
+        assert_eq!(
+            summarized, plain,
+            "a compaction outside the window leaves the snapshot byte-for-byte unchanged"
+        );
+        assert!(
+            !plain.to_string().contains("已压缩上下文"),
+            "and the compaction-free snapshot carries no marker at all"
+        );
     }
 
     /// A tail entry's text is rendered alone (spec #652, ticket #655, acceptance

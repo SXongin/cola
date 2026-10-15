@@ -529,38 +529,80 @@ impl SessionTranscript {
     }
 
     /// The recent-conversation tail: the last (at most four) conversation
-    /// messages, newest last. A message is conversation when it carries at
-    /// least one non-empty text part OR a File Content — a files-only user
-    /// message is kept so its record line reaches wherever the message's body
-    /// is shown (ADR-0076). Reasoning/tool/step parts are inner monologue, not
-    /// conversation, and are excluded. Messages without a created time cannot
-    /// be ordered and are dropped.
+    /// messages, newest last, with the Compactions that happened inside that
+    /// window interleaved between them at their server positions (ADR-0082).
+    /// A message is conversation when it carries at least one non-empty text
+    /// part OR a File Content — a files-only user message is kept so its record
+    /// line reaches wherever the message's body is shown (ADR-0076).
+    /// Reasoning/tool/step parts are inner monologue, not conversation, and are
+    /// excluded. Messages without a created time cannot be ordered and are
+    /// dropped.
+    ///
+    /// A Compaction is a marker, not a message: it never consumes one of the
+    /// four message slots, so the conversation the tail carries does not shrink
+    /// just because the session was compacted nearby. The window is the server
+    /// span from the oldest KEPT message onward, so a compaction that preceded
+    /// the visible conversation stays out of it — and a transcript with no
+    /// compaction in that window projects exactly the entries it always did.
+    /// A marker takes its position from the message that carried it, so one on
+    /// a timeless message is dropped exactly as a timeless message is.
     pub fn transcript_tail(&self) -> Vec<TailEntry> {
         const TAIL_LIMIT: usize = 4;
-        let mut out: Vec<TailEntry> = self
+        // The message's own server position travels with it: it is the window's
+        // cut (a position, not a time two messages can share) and the tie-break
+        // the interleave sorts by.
+        let mut messages: Vec<(usize, TailEntry)> = self
             .messages
             .iter()
-            .filter(|message| matches!(message.role, MessageRole::User | MessageRole::Assistant))
-            .filter_map(|message| {
+            .enumerate()
+            .filter(|(_, message)| matches!(message.role, MessageRole::User | MessageRole::Assistant))
+            .filter_map(|(position, message)| {
                 let text = message.text();
                 let files = message.files();
                 if text.trim().is_empty() && files.is_empty() {
                     return None;
                 }
-                Some(TailEntry {
-                    role: message.role.clone(),
-                    created_ms: message.time?.created,
-                    text,
-                    files,
-                })
+                Some((
+                    position,
+                    TailEntry::Message(TailMessage {
+                        role: message.role.clone(),
+                        created_ms: message.time?.created,
+                        text,
+                        files,
+                    }),
+                ))
             })
             .collect();
         // Oldest → newest, then keep only the newest `TAIL_LIMIT` so the tail
         // is the last four messages, newest last.
-        out.sort_by_key(|entry| entry.created_ms);
-        let start = out.len().saturating_sub(TAIL_LIMIT);
-        out.drain(..start);
-        out
+        messages.sort_by_key(|(position, entry)| (entry.created_ms(), *position));
+        let start = messages.len().saturating_sub(TAIL_LIMIT);
+        messages.drain(..start);
+        // Nothing with a created time to order by → no window, no tail (a
+        // session whose only fact is a compaction has no recent conversation to
+        // put it among).
+        let Some(cut) = messages.iter().map(|(position, _)| *position).min() else {
+            return Vec::new();
+        };
+        let mut out = messages;
+        for (position, message) in self.messages.iter().enumerate().skip(cut) {
+            let Some(created_ms) = message.time.map(|time| time.created) else {
+                continue;
+            };
+            for part in &message.parts {
+                if let Part::Compaction(compaction) = part {
+                    out.push((
+                        position,
+                        TailEntry::Compaction(TailMarker {
+                            created_ms,
+                            compaction: compaction.clone(),
+                        }),
+                    ));
+                }
+            }
+        }
+        out.sort_by_key(|(position, entry)| (entry.created_ms(), *position));
+        out.into_iter().map(|(_, entry)| entry).collect()
     }
 }
 
@@ -1199,11 +1241,41 @@ pub enum TaskRetirementEnding {
     Cleaned,
 }
 
-/// One recent-conversation tail entry: a conversation message's role, created
-/// time, verbatim text, and the File Contents it carries (a files-only message
-/// has an empty `text` and at least one file; ADR-0076).
+/// One item of the recent-conversation tail (ADR-0082): a conversation message,
+/// or a **Compaction** marker interleaved at its own server position. A marker
+/// is not a message — it never consumes one of the tail's four message slots.
 #[derive(Debug, Clone, PartialEq)]
-pub struct TailEntry {
+pub enum TailEntry {
+    /// A conversation message, with the File Contents it carried.
+    Message(TailMessage),
+    /// A Compaction that happened inside the tail's window.
+    Compaction(TailMarker),
+}
+
+impl TailEntry {
+    /// The server time this entry sits at — the key the tail interleaves by.
+    pub fn created_ms(&self) -> i64 {
+        match self {
+            TailEntry::Message(message) => message.created_ms,
+            TailEntry::Compaction(marker) => marker.created_ms,
+        }
+    }
+
+    /// This entry as a conversation message — `None` for a Compaction marker,
+    /// which is a marker rather than a message.
+    pub fn message(&self) -> Option<&TailMessage> {
+        match self {
+            TailEntry::Message(message) => Some(message),
+            TailEntry::Compaction(_) => None,
+        }
+    }
+}
+
+/// One conversation message's tail entry: its role, created time, verbatim text,
+/// and the File Contents it carries (a files-only message has an empty `text`
+/// and at least one file; ADR-0076).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TailMessage {
     pub role: MessageRole,
     pub created_ms: i64,
     pub text: String,
@@ -1212,7 +1284,7 @@ pub struct TailEntry {
     pub files: Vec<FileContent>,
 }
 
-impl TailEntry {
+impl TailMessage {
     /// The entry's body as it is shown where the message's body is shown: its
     /// verbatim text, then one record line per File Content (`📎 name · mime ·
     /// size`) newline-joined. A text-only entry is byte-for-byte its own text.
@@ -1220,6 +1292,15 @@ impl TailEntry {
         let records = FileContent::record_lines(&self.files);
         FileContent::join_records(&self.text, &records)
     }
+}
+
+/// One **Compaction** inside the tail's window (ADR-0082): the fact itself,
+/// plus the server time of the message that carried it (a part carries none),
+/// so the marker takes its place among the kept messages.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TailMarker {
+    pub created_ms: i64,
+    pub compaction: Compaction,
 }
 
 /// A message part, typed. Unknown kinds decode into [`Part::Other`] with their
@@ -1497,6 +1578,11 @@ mod tests {
             text: text.to_string(),
             started_at: None,
         })
+    }
+
+    /// A tail's MESSAGE entries, in order — a Compaction marker is not one.
+    fn tail_messages(tail: &[TailEntry]) -> Vec<&TailMessage> {
+        tail.iter().filter_map(TailEntry::message).collect()
     }
 
     fn finish(reason: FinishReason) -> Part {
@@ -2517,8 +2603,9 @@ mod tests {
         assert!(!turn.complete);
         assert_eq!(transcript.newest_user().unwrap().id.as_str(), "msg_u1");
         let tail = transcript.transcript_tail();
-        assert_eq!(tail.len(), 1);
-        assert_eq!(tail[0].text, "问题");
+        let messages = tail_messages(&tail);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].text, "问题");
     }
 
     /// A user message's file part is payload, not conversation: it joins no
@@ -2585,17 +2672,18 @@ mod tests {
         ]);
 
         let tail = transcript.transcript_tail();
+        let messages = tail_messages(&tail);
         assert_eq!(
-            tail.len(),
+            messages.len(),
             2,
             "file-bearing and text-bearing entries survive, reasoning-only does not"
         );
-        assert_eq!(tail[0].text, "", "a files-only message has no text");
-        assert_eq!(tail[0].files.len(), 1);
-        assert_eq!(tail[0].files[0].name, "only.png");
-        assert_eq!(tail[1].text, "看看");
-        assert_eq!(tail[1].files.len(), 1);
-        assert_eq!(tail[1].files[0].name, "and.png");
+        assert_eq!(messages[0].text, "", "a files-only message has no text");
+        assert_eq!(messages[0].files.len(), 1);
+        assert_eq!(messages[0].files[0].name, "only.png");
+        assert_eq!(messages[1].text, "看看");
+        assert_eq!(messages[1].files.len(), 1);
+        assert_eq!(messages[1].files[0].name, "and.png");
     }
 
     #[test]
@@ -2663,14 +2751,175 @@ mod tests {
         ));
 
         let tail = SessionTranscript::new(messages).transcript_tail();
-        let texts: Vec<_> = tail.iter().map(|entry| entry.text.as_str()).collect();
+        let messages = tail_messages(&tail);
+        let texts: Vec<_> = messages.iter().map(|entry| entry.text.as_str()).collect();
         assert_eq!(
             texts,
             vec!["m5", "m6", "m7", "m8"],
             "tail must cap at 4, newest last"
         );
-        assert_eq!(tail[0].role, MessageRole::User);
-        assert_eq!(tail[3].created_ms, 8_000);
+        assert_eq!(messages[0].role, MessageRole::User);
+        assert_eq!(messages[3].created_ms, 8_000);
+    }
+
+    /// The tail interleaves a Compaction inside its window at its server time,
+    /// between the messages it happened between, and the marker rides the whole
+    /// fact (ADR-0082, ticket #723).
+    #[test]
+    fn tail_interleaves_an_in_window_compaction_at_its_server_time() {
+        let compaction = Compaction {
+            status: CompactionStatus::Completed,
+            reason: CompactionReason::Auto,
+            summary: "保留了结论。".into(),
+            usage: None,
+            error: None,
+            recent: String::new(),
+        };
+        let transcript = SessionTranscript::new(vec![
+            message(
+                "u1",
+                MessageRole::User,
+                Some(MessageTime {
+                    created: 1_000,
+                    completed: Some(1_000),
+                }),
+                vec![text_part("问题一")],
+            ),
+            message(
+                "c1",
+                MessageRole::Other("compaction".into()),
+                Some(MessageTime {
+                    created: 2_000,
+                    completed: Some(2_000),
+                }),
+                vec![Part::Compaction(compaction.clone())],
+            ),
+            message(
+                "u2",
+                MessageRole::User,
+                Some(MessageTime {
+                    created: 3_000,
+                    completed: Some(3_000),
+                }),
+                vec![text_part("问题二")],
+            ),
+        ]);
+
+        let tail = transcript.transcript_tail();
+        assert_eq!(tail.len(), 3, "the marker joins the two messages: {tail:#?}");
+        assert_eq!(tail[0].message().expect("a message entry").text, "问题一");
+        assert_eq!(tail[1].created_ms(), 2_000);
+        assert_eq!(
+            tail[1],
+            TailEntry::Compaction(TailMarker {
+                created_ms: 2_000,
+                compaction
+            }),
+            "the marker carries the whole typed fact"
+        );
+        assert_eq!(tail[2].message().expect("a message entry").text, "问题二");
+    }
+
+    /// A compaction that happened BEFORE the window's oldest kept message stays
+    /// out of the tail: the window is the span the kept messages cover, so a
+    /// marker from the summarized past — history the reader is no longer shown —
+    /// adds nothing, and a transcript with no compaction inside that window
+    /// projects exactly the entries it always did (ADR-0082, ticket #723).
+    #[test]
+    fn a_compaction_outside_the_tail_window_leaves_the_tail_unchanged() {
+        let user_at = |i: i64| {
+            message(
+                &format!("u{i}"),
+                MessageRole::User,
+                Some(MessageTime {
+                    created: i * 1_000,
+                    completed: Some(i * 1_000),
+                }),
+                vec![text_part(&format!("m{i}"))],
+            )
+        };
+        let summarized = message(
+            "c_old",
+            MessageRole::Other("compaction".into()),
+            Some(MessageTime {
+                created: 500,
+                completed: Some(500),
+            }),
+            vec![Part::Compaction(Compaction {
+                status: CompactionStatus::Completed,
+                reason: CompactionReason::Auto,
+                summary: "更早的对话已被压缩。".into(),
+                usage: None,
+                error: None,
+                recent: String::new(),
+            })],
+        );
+
+        let mut messages: Vec<_> = (1..=5).map(user_at).collect();
+        let plain = SessionTranscript::new(messages.clone()).transcript_tail();
+        assert_eq!(plain.len(), 4, "the four-message budget: {plain:#?}");
+        messages.insert(0, summarized);
+        let with_older_marker = SessionTranscript::new(messages).transcript_tail();
+        assert_eq!(
+            with_older_marker, plain,
+            "a compaction outside the window leaves the tail byte-for-byte unchanged"
+        );
+    }
+
+    /// A compaction that is NEWER than every kept message — the auto-compaction
+    /// that ran while the session was idle, which is exactly the case when an
+    /// adopted session's history looks oddly short — is inside the window too,
+    /// and lands last, at its own server time (ADR-0082, ticket #723).
+    #[test]
+    fn tail_carries_a_compaction_newer_than_every_message() {
+        let transcript = SessionTranscript::new(vec![
+            message(
+                "u1",
+                MessageRole::User,
+                Some(MessageTime {
+                    created: 1_000,
+                    completed: Some(1_000),
+                }),
+                vec![text_part("问题")],
+            ),
+            message(
+                "a1",
+                MessageRole::Assistant,
+                Some(MessageTime {
+                    created: 2_000,
+                    completed: Some(2_000),
+                }),
+                vec![text_part("回答")],
+            ),
+            message(
+                "c1",
+                MessageRole::Other("compaction".into()),
+                Some(MessageTime {
+                    created: 3_000,
+                    completed: Some(3_000),
+                }),
+                vec![Part::Compaction(Compaction {
+                    status: CompactionStatus::Completed,
+                    reason: CompactionReason::Manual,
+                    summary: "保留了结论。".into(),
+                    usage: None,
+                    error: None,
+                    recent: String::new(),
+                })],
+            ),
+        ]);
+
+        let tail = transcript.transcript_tail();
+        assert_eq!(
+            tail.last().and_then(TailEntry::message).map(|m| m.text.as_str()),
+            None,
+            "the marker is the newest entry: {tail:#?}"
+        );
+        assert_eq!(tail.last().expect("a marker").created_ms(), 3_000);
+        assert!(
+            matches!(tail.last(), Some(TailEntry::Compaction(_))),
+            "the compaction that ended the session's visible life is carried: {tail:#?}"
+        );
     }
 
     #[test]
@@ -2697,12 +2946,13 @@ mod tests {
             ),
         ]);
         let tail = transcript.transcript_tail();
-        let roles: Vec<_> = tail.iter().map(|entry| entry.role.clone()).collect();
+        let messages = tail_messages(&tail);
+        let roles: Vec<_> = messages.iter().map(|entry| entry.role.clone()).collect();
         assert_eq!(roles, vec![MessageRole::User, MessageRole::Assistant]);
-        assert_eq!(tail[0].text, "第一段\n第二段");
-        assert_eq!(tail[1].text, "回答");
-        assert!(tail[0].files.is_empty(), "a text-only entry carries no files");
-        assert!(tail[1].files.is_empty(), "a text-only entry carries no files");
+        assert_eq!(messages[0].text, "第一段\n第二段");
+        assert_eq!(messages[1].text, "回答");
+        assert!(messages[0].files.is_empty(), "a text-only entry carries no files");
+        assert!(messages[1].files.is_empty(), "a text-only entry carries no files");
     }
 
     #[test]

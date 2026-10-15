@@ -183,6 +183,127 @@ async fn a_completed_compaction_renders_a_folded_row_at_its_server_time() {
     );
 }
 
+/// An adopted session's Session Snapshot carries the compaction in its 最近对话
+/// tail, at its server position among the kept messages (ADR-0082, ticket #723):
+/// a session whose visible history looks oddly short has its explanation
+/// sitting right where it happened, instead of a reader wondering why the
+/// conversation starts mid-thread.
+#[tokio::test]
+async fn the_snapshot_tail_carries_a_compaction_at_its_server_position() {
+    let _wd = test_work_dir();
+    let timeline = vec![
+        user("msg_u1", 1_000, "第一个问题"),
+        assistant(2_000, "第一个回答"),
+        compaction(
+            "msg_comp",
+            3_000,
+            completed(CompactionReason::Auto, "保留了结论。"),
+        ),
+        user("msg_u2", 4_000, "第二个问题"),
+        assistant(5_000, "第二个回答"),
+    ];
+    let mut backend = MockBackend::new(realistic_parts());
+    // Busy, so the re-switch reports the full snapshot instead of the compact
+    // 已切换 state (ADR-0028 suppression).
+    backend.with_session_status("ses_own1", Some(SessionStatus::Busy));
+    backend.given_transcript("ses_own1", vec![SessionTranscript::new(timeline)]);
+    let (app, platform, _dir) = build_reeswitch_app(backend).await;
+
+    send_command(&app, "/switch 本项目", "msg_switch").await;
+    let card = platform
+        .replied_cards()
+        .await
+        .into_iter()
+        .next()
+        .expect("the busy re-switch reports a snapshot");
+
+    let rows = compaction_rows(&card);
+    assert_eq!(
+        rows.len(),
+        1,
+        "the tail carries one marker: {:?}",
+        body_lines(&card)
+    );
+    assert_eq!(rows[0].0, "已压缩上下文（自动）");
+    assert_eq!(rows[0].1, "保留了结论。", "the marker's fold is the summary");
+    assert!(
+        line_index(&card, "第一个回答") < line_index(&card, "已压缩上下文（自动）"),
+        "the marker sits below the message it followed: {:?}",
+        body_lines(&card)
+    );
+    assert!(
+        line_index(&card, "已压缩上下文（自动）") < line_index(&card, "第二个问题"),
+        "and above the one that followed it: {:?}",
+        body_lines(&card)
+    );
+}
+
+/// A compaction inside the tail's window never displaces a message: a marker is
+/// not a message, so the snapshot's 最近对话 keeps its four messages and the
+/// marker rides between them (ADR-0082, ticket #723). A compaction that
+/// PRECEDED the window's oldest message stays out of it entirely.
+#[tokio::test]
+async fn a_compaction_in_the_snapshot_tail_never_displaces_a_message() {
+    let _wd = test_work_dir();
+    let timeline = vec![
+        user("msg_u0", 500, "窗口外的问题"),
+        user("msg_u1", 1_000, "消息一"),
+        assistant(2_000, "回答一"),
+        user("msg_u2", 3_000, "消息二"),
+        compaction(
+            "msg_comp",
+            3_500,
+            completed(CompactionReason::Auto, "保留了结论。"),
+        ),
+        assistant(4_000, "回答二"),
+        user("msg_u3", 5_000, "消息三"),
+        assistant(6_000, "回答三"),
+    ];
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_session_status("ses_own1", Some(SessionStatus::Busy));
+    backend.given_transcript("ses_own1", vec![SessionTranscript::new(timeline)]);
+    let (app, platform, _dir) = build_reeswitch_app(backend).await;
+
+    send_command(&app, "/switch 本项目", "msg_switch").await;
+    let card = platform
+        .replied_cards()
+        .await
+        .into_iter()
+        .next()
+        .expect("the busy re-switch reports a snapshot");
+
+    let lines = body_lines(&card);
+    let previews: Vec<&str> = lines.iter().map(|line| line.as_str()).collect();
+    for message in ["消息二", "回答二", "消息三", "回答三"] {
+        assert!(
+            previews
+                .iter()
+                .any(|line| line.starts_with(&format!("👤 {message}"))
+                    || line.starts_with(&format!("🤖 {message}"))),
+            "the tail keeps its four messages, {message} among them: {lines:?}"
+        );
+    }
+    assert!(
+        !card_text(&card).contains("消息一") && !card_text(&card).contains("回答一"),
+        "the fifth-newest message is past the four-message budget: {lines:?}"
+    );
+    assert_eq!(
+        compaction_rows(&card).len(),
+        1,
+        "the marker rides between the messages: {lines:?}"
+    );
+    assert!(
+        line_index(&card, "消息二") < line_index(&card, "已压缩上下文（自动）")
+            && line_index(&card, "已压缩上下文（自动）") < line_index(&card, "回答二"),
+        "at its own server position: {lines:?}"
+    );
+    assert!(
+        !card_text(&card).contains("窗口外的问题"),
+        "a compaction's message is not a message, but the window's cut is still \
+         the oldest KEPT message: nothing before it appears: {lines:?}"
+    );
+}
+
 /// A compaction the Turn's own window cannot reach — its server time precedes
 /// the Turn's anchor, because it ran while the session was idle — still renders
 /// on that Turn's card: the rows come from the session's compaction facts, never

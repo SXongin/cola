@@ -1,7 +1,9 @@
 //! The **Compaction** row (ADR-0082, spec #719): how one compaction renders on
 //! a card. A Session-scoped fact — it answers no prompt and is never a Turn
 //! anchor — so its row is owned by the card timeline, which places it at the
-//! compaction's own server time rather than at the card's end.
+//! compaction's own server time rather than at the card's end. The Session
+//! Snapshot's 最近对话 tail (ticket #723) renders the same row through
+//! [`compaction_elements`], so the two surfaces cannot disagree.
 //!
 //! Three shapes, one row: an in-flight compaction is a live line that updates in
 //! place when the Backend writes the summary, a completed one is a folded panel
@@ -10,7 +12,41 @@
 //! is never rendered: it is history the reader already has.
 
 use crate::backend::{Compaction, CompactionReason, CompactionStatus};
+use crate::feishu::card::sanitize::CardMarkdown;
+use crate::feishu::card::shell::collapsible_panel_chunks;
 use crate::feishu::card::{MAX_ELEMENT_TEXT_CHARS, chunk_text, format_tokens};
+use serde_json::json;
+
+/// The card elements one Compaction row is made of (ADR-0082), shared by every
+/// surface that shows a row — the live card's timeline
+/// ([`crate::feishu::card::shell::CardBuilder::with_compaction`]) and the Session
+/// Snapshot's 最近对话 tail (ticket #723) — so the two cannot disagree on the
+/// copy, the fold, or the session time they render.
+///
+/// A completed compaction is one folded panel: `element_id` its stable identity
+/// (the reader's fold state survives an in-place update), the panel's title the
+/// row's, the fold body the summary chunked to cola's per-element budget. With
+/// nothing to fold — an in-flight compaction, a failure, or a completion the
+/// Backend gave no text (an orphaned V1 part, say) — the row is its title alone.
+/// `md` is the card's markdown state, so the summary draws from the card's one
+/// table budget and fenced fallback.
+pub(crate) fn compaction_elements(
+    compaction: &Compaction,
+    element_id: Option<&str>,
+    md: &mut CardMarkdown,
+) -> Vec<serde_json::Value> {
+    let title = compaction_title(compaction);
+    match compaction_summary(compaction) {
+        Some(summary) => {
+            let chunks: Vec<String> = chunk_text(&summary, MAX_ELEMENT_TEXT_CHARS)
+                .iter()
+                .map(|chunk| md.element(chunk))
+                .collect();
+            vec![collapsible_panel_chunks(&title, &chunks, element_id)]
+        }
+        None => vec![json!({ "tag": "markdown", "content": md.element(&title) })],
+    }
+}
 
 /// Whether two compaction facts render the SAME row (ADR-0082): everything the
 /// row shows — how it ended, why it ran, the summary, the failure's error and the

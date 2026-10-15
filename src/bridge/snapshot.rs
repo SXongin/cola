@@ -47,8 +47,11 @@ pub struct SnapshotData {
     /// instead of falling back to the server run state; see [`ElsewherePending`].
     pub pending_elsewhere: Option<ElsewherePending>,
     /// The 最近对话 tail: the last conversation user/assistant messages,
-    /// newest last — the Session Transcript's shared `transcript_tail`
-    /// projection (a files-only user message is included, for its record line).
+    /// newest last, with the **Compaction**s that happened inside that window
+    /// interleaved at their server positions — a marker that never consumes one
+    /// of the tail's four message slots (ADR-0082) — from the Session
+    /// Transcript's shared `transcript_tail` projection (a files-only user
+    /// message is included, for its record line).
     pub tail: Vec<TailEntry>,
     /// The newest user message's anchor — its identity together with its
     /// server time — from the Session Transcript's `newest_user` projection.
@@ -326,7 +329,7 @@ mod tests {
     use super::*;
     use crate::backend::{
         BackgroundTask, FinishReason, MessageRole, OtherPart, Part, ReasoningPart, StepFinish, StepStart,
-        ToolCall, ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage,
+        TailMessage, ToolCall, ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage,
     };
     use crate::bridge::test_support::{MockBackend, background_shell, execution, text_part, typed_message};
 
@@ -475,9 +478,10 @@ mod tests {
         ]))
         .await;
         let tail = snap.tail;
+        let messages: Vec<&TailMessage> = tail.iter().filter_map(TailEntry::message).collect();
         // Reasoning-only, image-only and system messages are dropped; the four
         // surviving text-bearing messages stay newest-last.
-        let roles: Vec<_> = tail.iter().map(|t| t.role.clone()).collect();
+        let roles: Vec<_> = messages.iter().map(|t| t.role.clone()).collect();
         assert_eq!(
             roles,
             vec![
@@ -487,10 +491,10 @@ mod tests {
                 MessageRole::Assistant
             ]
         );
-        let texts: Vec<_> = tail.iter().map(|t| t.text.as_str()).collect();
+        let texts: Vec<_> = messages.iter().map(|t| t.text.as_str()).collect();
         assert_eq!(texts, vec!["问题一", "回答一", "问题二", "回答二"]);
-        assert_eq!(tail[0].created_ms, 1000);
-        assert_eq!(tail[3].created_ms, 6000);
+        assert_eq!(messages[0].created_ms, 1000);
+        assert_eq!(messages[3].created_ms, 6000);
     }
 
     #[tokio::test]
@@ -500,10 +504,11 @@ mod tests {
             .collect();
         let snap = gather_from_typed_backend(typed_backend(messages)).await;
         let tail = snap.tail;
-        assert_eq!(tail.len(), 4, "tail must cap at 4");
-        assert_eq!(tail[0].text, "m6");
-        assert_eq!(tail[3].text, "m9");
-        assert_eq!(tail[3].created_ms, 9000);
+        let messages: Vec<&TailMessage> = tail.iter().filter_map(TailEntry::message).collect();
+        assert_eq!(messages.len(), 4, "tail must cap at 4");
+        assert_eq!(messages[0].text, "m6");
+        assert_eq!(messages[3].text, "m9");
+        assert_eq!(messages[3].created_ms, 9000);
     }
 
     #[tokio::test]
@@ -523,9 +528,10 @@ mod tests {
         )]))
         .await;
         let tail = snap.tail;
+        let message = tail[0].message().expect("a message entry");
         assert_eq!(tail.len(), 1);
-        assert_eq!(tail[0].text, "第一段\n第二段");
-        assert_eq!(tail[0].role, MessageRole::User);
+        assert_eq!(message.text, "第一段\n第二段");
+        assert_eq!(message.role, MessageRole::User);
     }
 
     #[tokio::test]
@@ -620,7 +626,7 @@ mod tests {
         // The tail and newest user come from the scripted transcript, not the
         // mock's default shape.
         assert_eq!(snap.tail.len(), 1);
-        assert_eq!(snap.tail[0].text, "你好");
+        assert_eq!(snap.tail[0].message().expect("a message entry").text, "你好");
         assert_eq!(snap.newest_user_anchor.map(|a| a.created_ms), Some(1000));
     }
 
