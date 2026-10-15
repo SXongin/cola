@@ -1384,24 +1384,6 @@ async fn busy_follow_shows_a_compaction_once() {
     );
 }
 
-/// One compaction message, the way V2 persists it: its server time is the
-/// MESSAGE's `time.created`.
-fn compaction_message(id: &str, created: i64, summary: &str) -> crate::backend::TranscriptMessage {
-    typed_message(
-        id,
-        MessageRole::Other("compaction".into()),
-        Some(created),
-        vec![Part::Compaction(crate::backend::Compaction {
-            status: crate::backend::CompactionStatus::Completed,
-            reason: crate::backend::CompactionReason::Auto,
-            summary: summary.to_string(),
-            usage: None,
-            error: None,
-            recent: String::new(),
-        })],
-    )
-}
-
 /// ADR-0082 (ticket #723): a 最近对话 tail carrying ONLY compaction markers
 /// renders no 最近对话 section on the follow card's static text — a header with
 /// nothing under it would read as an empty conversation. The card still shows the
