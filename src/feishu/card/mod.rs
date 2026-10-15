@@ -345,8 +345,23 @@ pub(crate) const AWAITING_BOTH_TITLE: &str = "⏳ 等待你的授权/回答";
 /// The fence is sized longer than any backtick run in the content, so an
 /// embedded ``` can't break out of the block.
 pub(crate) fn fenced_code(text: &str, lang: Option<&str>) -> String {
-    let max_run = text
-        .chars()
+    let fence = "`".repeat(fenced_run(text).max(MIN_FENCE_LEN));
+    let head = match lang {
+        Some(l) if !l.is_empty() => format!("{fence}{l}"),
+        _ => fence.clone(),
+    };
+    format!("{head}\n{text}\n{fence}")
+}
+
+/// The shortest fence [`fenced_code`] ever emits, in backticks.
+const MIN_FENCE_LEN: usize = 3;
+
+/// The fence length [`fenced_code`] needs for `text`: one backtick longer than
+/// the text's longest backtick run, so a run inside the content can never close
+/// the block. The one place the rule lives — the fence and the size charge that
+/// must cover it both read it.
+fn fenced_run(text: &str) -> usize {
+    text.chars()
         .fold((0usize, 0usize), |(best, run), c| {
             if c == '`' {
                 let run = run + 1;
@@ -355,13 +370,22 @@ pub(crate) fn fenced_code(text: &str, lang: Option<&str>) -> String {
                 (best, 0)
             }
         })
-        .0;
-    let fence = "`".repeat((max_run + 1).max(3));
-    let head = match lang {
-        Some(l) if !l.is_empty() => format!("{fence}{l}"),
-        _ => fence.clone(),
-    };
-    format!("{head}\n{text}\n{fence}")
+        .0
+        + 1
+}
+
+/// The bytes the **rejection fallback**'s fence adds around `text`, beyond the
+/// minimum fence every fenced element carries: [`fenced_code`] wraps the text in
+/// two fences as long as its longest backtick run (plus one), so a chunk of 3,000
+/// backticks gains ~6 KB of fence while ordinary prose gains nothing at all.
+///
+/// The minimum fence's own bytes are NOT part of this quantity: the per-element
+/// wrapper constant the callers add on top already covers them. Pure, and
+/// measured from the text alone — the same [`fenced_run`] the render sizes its
+/// fence with, so the charge cannot drift from what will be written.
+pub(crate) fn fenced_overhead(text: &str) -> usize {
+    let fence = fenced_run(text).max(MIN_FENCE_LEN);
+    (2 * fence + 2).saturating_sub(2 * MIN_FENCE_LEN + 2)
 }
 
 /// The content cap for a session title, in characters. The server's `title`
@@ -501,6 +525,39 @@ pub(crate) fn format_tokens(n: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fence charge is exactly the fence the render writes: `fenced_overhead`
+    /// plus the minimum fence (which the per-element wrapper constant covers)
+    /// equals the bytes `fenced_code` adds around the text — and it is zero for
+    /// text whose longest backtick run the minimum fence already contains, so
+    /// ordinary prose is charged nothing extra.
+    #[test]
+    fn the_fence_charge_is_the_fence_the_render_writes() {
+        /// The minimum fence's own bytes: two fences of [`MIN_FENCE_LEN`] plus
+        /// their line breaks — the part the wrapper constant covers.
+        const MIN_FENCE_BYTES: usize = 2 * MIN_FENCE_LEN + 2;
+        for (label, text) in [
+            ("prose", "a plain summary。".to_string()),
+            ("a quoted command", "run `cargo test`".to_string()),
+            ("a two-tick run", "``".to_string()),
+            ("a three-tick run", "```".to_string()),
+            ("a long run", "`".repeat(3_000)),
+            ("a long run inside prose", format!("a{}b", "`".repeat(50))),
+            (
+                "markup and backticks",
+                format!("{}`{}", "<".repeat(10), "`".repeat(9)),
+            ),
+        ] {
+            assert_eq!(
+                fenced_overhead(&text) + MIN_FENCE_BYTES,
+                fenced_code(&text, None).len() - text.len(),
+                "{label}: the charge plus the minimum fence must be what the render adds"
+            );
+            if !text.contains("```") && !text.contains("``") {
+                assert_eq!(fenced_overhead(&text), 0, "{label}: no extra fence to charge");
+            }
+        }
+    }
 
     #[test]
     fn format_tokens_is_compact() {
