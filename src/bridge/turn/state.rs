@@ -206,6 +206,14 @@ impl CursorSeed {
                     crate::backend::Part::Tool(call) => {
                         (frontier.kind == CursorPartKind::Tool, call.started_at)
                     }
+                    // A Compaction (ADR-0082, ticket #722) is a frontier
+                    // POSITION, not a text extent: the kind matches and the
+                    // part carries no server clock of its own. The extent lands
+                    // on the empty prefix, so the frontier verifies and the
+                    // chain is consumed rather than falling back for ever.
+                    crate::backend::Part::Compaction(_) => {
+                        (frontier.kind == CursorPartKind::Compaction, None)
+                    }
                     _ => (false, None),
                 };
                 // The frontier's identity is the message, the ordinal and the
@@ -4803,6 +4811,13 @@ impl StreamAccumulator {
                         // A timeline tool entry is settled by construction: a
                         // running panel lives in the tail, not the timeline.
                         TimelineKind::Tool(_) => CursorPartKind::Tool,
+                        // A delivered Compaction is a frontier position of its
+                        // own (ADR-0082, ticket #722): without it the frontier
+                        // would park before a compaction-only tail and every
+                        // restart projection would replay the row. It has no
+                        // text extent — the empty prefix is its whole delivered
+                        // content, so resolution verifies rather than falls back.
+                        TimelineKind::Compaction(_) => CursorPartKind::Compaction,
                         _ => return None,
                     };
                     Some((idx, source, kind, item.shown_at))
@@ -4826,6 +4841,11 @@ impl StreamAccumulator {
                     None => (0, Some(crate::bridge::chain::cursor_prefix_digest(""))),
                 }
             }
+            // A compaction has no extent of its own either (ADR-0082, ticket
+            // #722): the empty prefix is its delivered content, exactly like a
+            // tool with no text before it, so the cursor resolves on the next
+            // read instead of falling back.
+            CursorPartKind::Compaction => (0, Some(crate::bridge::chain::cursor_prefix_digest(""))),
             _ => (self.source_extent_in(source, end), source.prefix_digest),
         };
         Some(CursorFrontier {

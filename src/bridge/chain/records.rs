@@ -88,6 +88,13 @@ pub(crate) enum CursorPartKind {
     /// showed. `CursorFrontier::delivered_chars` then belongs to the newest
     /// text/reasoning part at or before it — a tool has no extent of its own.
     Tool,
+    /// A delivered **Compaction** (ADR-0082, ticket #722): the frontier names
+    /// its position so a restart never re-renders a row the old card already
+    /// showed. A compaction has no extent of its own either — it is a position,
+    /// not a text: without this kind the frontier would park before a
+    /// compaction-only tail and every restart projection would replay it. An
+    /// older sidecar has no such frontier and reads as cursorless for it.
+    Compaction,
 }
 
 /// The digest a Rendered Cursor frontier stores for a part's delivered prefix
@@ -105,10 +112,11 @@ pub(crate) fn cursor_prefix_digest(prefix: &str) -> u64 {
 /// The transcript position of the newest delivered content a Card Chain has
 /// confirmed delivered (spec #561): the message identity, the part's position
 /// and — for a text/reasoning frontier — the delivered character extent of
-/// that part. A settled tool may be the frontier too (review #569), by
-/// position alone; the extent then belongs to the newest text/reasoning part
-/// at or before it, so that part still renders its growth. Position and
-/// identity only, plus the prefix's derived digest — never content.
+/// that part. A settled tool or a Compaction may be the frontier too (review
+/// #569, ADR-0082) by position alone; for a tool the extent then belongs to
+/// the newest text/reasoning part at or before it, so that part still renders
+/// its growth, while a compaction has no extent at all. Position and identity
+/// only, plus the prefix's derived digest — never content.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CursorFrontier {
     /// The assistant message that carried the part.
@@ -133,11 +141,12 @@ pub(crate) struct CursorFrontier {
 
 /// The **Rendered Cursor** (spec #561): how far a Card Chain's card has
 /// confirmed rendered. The frontier is the newest delivered text/reasoning
-/// position; `live_calls` is the set of tool call ids whose newest delivered
-/// state was `running`. Stored on the [Chain Record](ChainRecord) and
-/// advanced only by a confirmed card write; `None` on the record means
-/// cursorless — an older release, or a chain whose first write has not been
-/// confirmed — which reads as the existing fallback behavior.
+/// position — or a settled tool's, or a Compaction's (ADR-0082); `live_calls`
+/// is the set of tool call ids whose newest delivered state was `running`.
+/// Stored on the [Chain Record](ChainRecord) and advanced only by a confirmed
+/// card write; `None` on the record means cursorless — an older release, or a
+/// chain whose first write has not been confirmed — which reads as the
+/// existing fallback behavior.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RenderedCursor {
     #[serde(default)]
@@ -3186,6 +3195,59 @@ mod tests {
             legacy.get("ses_legacy").unwrap().card_message_id,
             "om_card",
             "the legacy record still reads"
+        );
+    }
+
+    /// The Compaction frontier kind (ADR-0082, ticket #722) round-trips
+    /// through the sidecar like every other kind, and a sidecar written before
+    /// the kind existed loads unchanged — no migration step, no error — with no
+    /// compaction frontier to be had: for it, that record is cursorless.
+    #[test]
+    fn a_compaction_frontier_round_trips_and_a_pre_change_sidecar_reads_cursorless_for_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE);
+        let chains = ChainRecords::load(path.clone());
+        chains.track(
+            "ses_a",
+            "om_card_1",
+            MessageId::new("msg_cola_1"),
+            Some(1_000),
+            None,
+            None,
+        );
+        let cursor = RenderedCursor {
+            frontier: Some(CursorFrontier {
+                message_id: MessageId::new("msg_comp"),
+                part_index: 0,
+                kind: CursorPartKind::Compaction,
+                started_at: Some(3_000),
+                delivered_chars: 0,
+                prefix_digest: Some(cursor_prefix_digest("")),
+            }),
+            live_calls: Default::default(),
+        };
+        chains.advance_cursor("ses_a", "om_card_1", &cursor);
+        assert_eq!(
+            ChainRecords::load(path.clone()).cursor("ses_a"),
+            Some(cursor),
+            "the compaction frontier round-trips through the sidecar"
+        );
+
+        // A sidecar written before the kind existed: its newest delivered fact
+        // is a text part, and no record could ever have named a compaction.
+        std::fs::write(
+            dir.path().join("legacy.json"),
+            r#"{"records":{"ses_legacy":{"card_message_id":"om_card","message_id":"msg_cola_1","cursor":{"frontier":{"message_id":"msg_a_1","part_index":0,"kind":"text","started_at":2000,"delivered_chars":3,"prefix_digest":7},"live_calls":[]}}},"announcements":{}}"#,
+        )
+        .unwrap();
+        let legacy = ChainRecords::load(dir.path().join("legacy.json"));
+        let cursor = legacy
+            .cursor("ses_legacy")
+            .expect("a pre-change cursor still reads");
+        assert_eq!(
+            cursor.frontier.map(|frontier| frontier.kind),
+            Some(CursorPartKind::Text),
+            "a pre-change sidecar carries no compaction frontier: the kind reads cursorless"
         );
     }
 
