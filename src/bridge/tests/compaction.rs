@@ -14,6 +14,7 @@ use crate::backend::{
 use crate::bridge::chain::{CursorFrontier, CursorPartKind, RenderedCursor, cursor_prefix_digest};
 use crate::bridge::test_support::*;
 use crate::bridge::tests::drain::{assistant, ctx, scripted_app, spawn_turn, user};
+use crate::bridge::turn::PromptContext;
 use crate::opencode::types::SessionStatus;
 
 /// One compaction message: the neutral typed fact on a message of its own, the
@@ -1022,6 +1023,192 @@ async fn a_compaction_behind_the_rendered_cursor_is_not_replayed() {
     assert!(
         compaction_rows(&card).is_empty(),
         "a compaction past the cursor is not re-rendered: {:?}",
+        body_lines(&card)
+    );
+}
+
+/// A completed compaction is a SESSION-scoped fact delivered **exactly once**
+/// (ADR-0082 §3): the card that carried its row is the one it stays on. A later
+/// Turn opens a NEW card on a new chain, so its walk must not surface the row
+/// again — the row belongs to the session's delivered past, not to every
+/// subsequent card. Driven over two consecutive Turns through the real path: the
+/// first Turn renders the row once, the second Turn's card must not carry it at
+/// all.
+#[tokio::test]
+async fn a_completed_compaction_is_never_re_rendered_on_a_later_turns_card() {
+    /// A later Turn's own prompt: its own cola message id, so the read's Turn
+    /// window (and the anchor capture) is that turn's, not the first's.
+    fn turn_ctx(cola_message_id: &str, text: &str) -> PromptContext {
+        let mut context = ctx("ses_test", text);
+        context.cola_message_id = Some(cola_message_id.to_string());
+        context
+    }
+
+    let _wd = test_work_dir();
+    let timeline = vec![
+        user("msg_cola_anchor", 1_000, "第一条消息"),
+        compaction(
+            "msg_comp",
+            2_000,
+            completed(CompactionReason::Auto, "更早的对话已被压缩。"),
+        ),
+        assistant(3_000, "第一轮回答。"),
+    ];
+    let (_dir, app, backend, platform) =
+        scripted_app(vec![SessionTranscript::new(timeline)], Some(SessionStatus::Idle)).await;
+
+    // The first Turn renders the row on its own card; its confirmed write is
+    // what carries the delivered position past the compaction — and that fact
+    // has to outlive the chain the terminal card releases.
+    let first = spawn_turn(&app, ctx("ses_test", "第一条消息"));
+    tokio::time::timeout(Duration::from_secs(5), first)
+        .await
+        .expect("the first Turn must finish")
+        .unwrap()
+        .unwrap();
+    let first_card = platform
+        .updated_cards()
+        .await
+        .pop()
+        .expect("the first Turn's final card flush");
+    let rows = compaction_rows(&first_card);
+    assert_eq!(
+        rows.len(),
+        1,
+        "the compaction renders once on the Turn that delivered it: {:?}",
+        body_lines(&first_card)
+    );
+    assert_eq!(rows[0].0, "已压缩上下文（自动）");
+    assert_eq!(rows[0].1, "更早的对话已被压缩。");
+
+    // The second Turn: the session's transcript grows by that turn's own
+    // exchange, and a new card opens on the same chain.
+    {
+        let mut scripts = backend.transcript_scripts.lock().await;
+        let transcript = &mut scripts.get_mut("ses_test").expect("the scripted read")[0];
+        transcript
+            .messages
+            .push(user("msg_cola_second", 4_000, "第二条消息"));
+        transcript.messages.push(assistant(5_000, "第二轮回答。"));
+    }
+    let updates_before = platform.updated_cards().await.len();
+    let second = spawn_turn(&app, turn_ctx("msg_cola_second", "第二条消息"));
+    tokio::time::timeout(Duration::from_secs(5), second)
+        .await
+        .expect("the second Turn must finish")
+        .unwrap()
+        .unwrap();
+
+    let updates = platform.updated_cards().await;
+    let second_turn_cards = &updates[updates_before..];
+    assert!(
+        !second_turn_cards.is_empty(),
+        "the second Turn must render its own card"
+    );
+    let second_turn_bodies: Vec<Vec<String>> = second_turn_cards.iter().map(body_lines).collect();
+    let carrying: Vec<&Vec<String>> = second_turn_bodies
+        .iter()
+        .filter(|lines| {
+            lines
+                .iter()
+                .any(|line| line.starts_with("已压缩上下文") || line.starts_with("⏳ 压缩中"))
+        })
+        .collect();
+    assert!(
+        carrying.is_empty(),
+        "the row was already delivered by the first Turn's card — exactly once — \
+         so the second Turn's card must not carry it: {carrying:?}"
+    );
+    assert!(
+        card_text(second_turn_cards.last().unwrap()).contains("第二轮回答。"),
+        "the second Turn's card carries its own reply: {:?}",
+        body_lines(second_turn_cards.last().unwrap())
+    );
+    assert!(
+        !card_text(second_turn_cards.last().unwrap()).contains("第一轮回答。"),
+        "and not the previous Turn's: {:?}",
+        body_lines(second_turn_cards.last().unwrap())
+    );
+}
+
+/// The other half of exactly-once (ADR-0082 §3/§4): a compaction NO confirmed
+/// card has surfaced still renders — on the newest live card if there is one,
+/// otherwise on the next Turn's card. The previous Turn's delivered position
+/// bounds the walk, so a compaction that lands AFTER it is owed, not swallowed by
+/// a bound that has outlived its chain.
+#[tokio::test]
+async fn a_compaction_no_card_has_surfaced_yet_renders_on_the_next_turns_card() {
+    let _wd = test_work_dir();
+    let first = vec![
+        user("msg_cola_anchor", 1_000, "第一条消息"),
+        assistant(2_000, "第一轮回答。"),
+    ];
+    let (_dir, app, backend, platform) =
+        scripted_app(vec![SessionTranscript::new(first)], Some(SessionStatus::Idle)).await;
+
+    // The first Turn has no compaction at all: its confirmed write leaves the
+    // chain's record — and the Session's delivered position — at its own reply.
+    let turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
+    tokio::time::timeout(Duration::from_secs(5), turn)
+        .await
+        .expect("the first Turn must finish")
+        .unwrap()
+        .unwrap();
+    let first_card = platform
+        .updated_cards()
+        .await
+        .pop()
+        .expect("the first Turn's final card flush");
+    assert!(
+        compaction_rows(&first_card).is_empty(),
+        "nothing compacted yet: {:?}",
+        body_lines(&first_card)
+    );
+
+    // The session is compacted while idle (the manual `/compact` case), then the
+    // next Turn opens: the row has never been on a card, so it must ride this
+    // one.
+    {
+        let mut scripts = backend.transcript_scripts.lock().await;
+        let transcript = &mut scripts.get_mut("ses_test").expect("the scripted read")[0];
+        transcript
+            .messages
+            .push(user("msg_cola_second", 3_000, "第二条消息"));
+        transcript.messages.push(compaction(
+            "msg_comp",
+            3_500,
+            completed(CompactionReason::Auto, "保留了结论与未决问题。"),
+        ));
+        transcript.messages.push(assistant(4_000, "第二轮回答。"));
+    }
+    let second = spawn_turn(&app, {
+        let mut context = ctx("ses_test", "第二条消息");
+        context.cola_message_id = Some("msg_cola_second".into());
+        context
+    });
+    tokio::time::timeout(Duration::from_secs(5), second)
+        .await
+        .expect("the second Turn must finish")
+        .unwrap()
+        .unwrap();
+
+    let card = platform
+        .updated_cards()
+        .await
+        .pop()
+        .expect("the second Turn's final card flush");
+    let rows = compaction_rows(&card);
+    assert_eq!(
+        rows.len(),
+        1,
+        "an unsurfaced compaction renders exactly once, on this Turn's card: {:?}",
+        body_lines(&card)
+    );
+    assert_eq!(rows[0].0, "已压缩上下文（自动）");
+    assert_eq!(rows[0].1, "保留了结论与未决问题。");
+    assert!(
+        line_index(&card, "已压缩上下文（自动）") < line_index(&card, "第二轮回答。"),
+        "at its own server time, above the reply: {:?}",
         body_lines(&card)
     );
 }

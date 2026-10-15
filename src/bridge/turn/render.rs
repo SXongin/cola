@@ -1497,9 +1497,15 @@ pub(super) fn apply_ledger_read(
 /// through [`plan_finalization_entries`] + [`read_planned_outputs`] +
 /// [`render_new_turn_parts_committing`], so its entries carry their output
 /// tails too (spec #588, #593). Returns true if anything new was rendered.
+///
+/// The fixture drives a chainless accumulator — the test module holds no Chain
+/// Record, so no card write has been confirmed and nothing is known surfaced:
+/// the compaction walk's bound is `None`, exactly as a brand-new session's
+/// ([`rendered_bound`]). A test that needs the confirmed bound drives the real
+/// bridge instead (see `tests::compaction`).
 #[cfg(test)]
 pub(super) fn render_new_turn_parts(acc: &mut StreamAccumulator, transcript: &SessionTranscript) -> bool {
-    let rendered = render_turn_parts(acc, transcript);
+    let rendered = render_turn_parts(acc, transcript, None);
     let plans = plan_ledger_entries(acc, transcript, acc.turn_anchor(), Endings::none());
     let entries = commit_planned_entries(acc, plans, Endings::none());
     rendered | refresh_ledger(acc, transcript, &std::collections::HashMap::new()).owes() | entries
@@ -1528,14 +1534,17 @@ pub(super) fn plan_finalization_entries(
 /// OUTSIDE the cards lock and commits here, so a shell completion first seen
 /// on the final read carries its tail — or 「输出已不可用」 — like every other
 /// venue (spec #588, #593). The commit's announce gate keeps the entry exactly
-/// once whatever racing venue announced it first.
+/// once whatever racing venue announced it first. `bound` is the durable
+/// delivered frontier ([`rendered_bound`]), the same bound
+/// [`render_turn_parts`] scopes its session-scoped compaction walk with.
 pub(super) fn render_new_turn_parts_committing(
     acc: &mut StreamAccumulator,
     transcript: &SessionTranscript,
+    bound: Option<usize>,
     endings: Endings<'_>,
     plans: Vec<PlannedEntry>,
 ) -> bool {
-    let rendered = render_turn_parts(acc, transcript);
+    let rendered = render_turn_parts(acc, transcript, bound);
     let entries = commit_planned_entries(acc, plans, endings);
     rendered | refresh_ledger(acc, transcript, &std::collections::HashMap::new()).owes() | entries
 }
@@ -1565,7 +1574,16 @@ pub(super) fn render_new_turn_parts_committing(
 /// the anchor — either created within the turn or still being produced as the
 /// turn began — while one that finished before the anchor stays the previous
 /// turn's and never bleeds in (#190).
-pub(super) fn render_turn_parts(acc: &mut StreamAccumulator, transcript: &SessionTranscript) -> bool {
+///
+/// `bound` is the durable delivered frontier ([`rendered_bound`]): the position
+/// the session-scoped compaction walk skips past. It is the SESSION's delivered
+/// past, not this card's, which is why it is passed in rather than read off
+/// `acc` — a fresh Turn's accumulator is deliberately cursorless.
+pub(super) fn render_turn_parts(
+    acc: &mut StreamAccumulator,
+    transcript: &SessionTranscript,
+    bound: Option<usize>,
+) -> bool {
     acc.capture_turn_anchor(transcript);
     // The orphan gap this accumulator owes (spec #561, review #569) renders
     // first, on the first read that can place its cursor: the content was never
@@ -1590,8 +1608,10 @@ pub(super) fn render_turn_parts(acc: &mut StreamAccumulator, transcript: &Sessio
     // for the same reason the live set does: a compaction is a fact of the
     // SESSION, not of this Turn's window, so one that ran while the session was
     // idle — before this Turn's anchor, or before the anchor is observed at all
-    // — still belongs on this card, at its own server time.
-    rendered_any |= render_compactions(acc, transcript);
+    // — still belongs on this card, at its own server time. `bound` is the
+    // chain's durable delivered frontier ([`rendered_bound`]), so a row an
+    // earlier card already showed is never replayed onto this one.
+    rendered_any |= render_compactions(acc, transcript, bound);
     // The seed (spec #561) resolves against THIS read: its at-or-before-the-
     // frontier rule uses the read's own message order. The positions map serves
     // both walks below — the seed's own scope and the accumulator's window.
@@ -1983,13 +2003,17 @@ fn render_seed_scope(
 /// at its own server time among the parts. The walk runs before the anchor gate
 /// for the same reason: a compaction needs no Turn anchor to be placed.
 ///
-/// Everything at or before the chain's Rendered Cursor frontier is skipped
-/// ([`cursor_bound`]) unless the card already carries a row at that very
+/// Everything at or before the bound `rendered_bound` resolves from the durable
+/// record (ADR-0082 §3) is skipped unless the card already carries a row at that very
 /// position: a compaction an earlier card already showed is never replayed, while
 /// a `running` fact that ended updates its own row in place rather than adding a
 /// second. Returns whether a row entered the card.
-fn render_compactions(acc: &mut StreamAccumulator, transcript: &SessionTranscript) -> bool {
-    let owed = owed_compactions(acc, transcript);
+fn render_compactions(
+    acc: &mut StreamAccumulator,
+    transcript: &SessionTranscript,
+    bound: Option<usize>,
+) -> bool {
+    let owed = owed_compactions(acc, transcript, bound);
     if owed.is_empty() {
         return false;
     }
@@ -2001,23 +2025,29 @@ fn render_compactions(acc: &mut StreamAccumulator, transcript: &SessionTranscrip
 
 /// Whether the session-scoped compaction walk would add a row to `acc` — the
 /// probe half of [`render_compactions`], so the settled-read gate and the render
-/// it guards can never disagree.
-pub(super) fn renders_compactions(acc: &StreamAccumulator, transcript: &SessionTranscript) -> bool {
-    !owed_compactions(acc, transcript).is_empty()
+/// it guards can never disagree. Both read the one `bound`
+/// [`rendered_bound`] resolves for the Session.
+pub(super) fn renders_compactions(
+    acc: &StreamAccumulator,
+    transcript: &SessionTranscript,
+    bound: Option<usize>,
+) -> bool {
+    !owed_compactions(acc, transcript, bound).is_empty()
 }
 
 /// The compaction facts this read owes this card, in server order. A fact is owed
 /// when the card carries no row at its position — or carries one whose rendered
 /// revision has changed — and, for a position the card has never shown, when the
-/// chain's Rendered Cursor frontier has not already passed it. Messages an
-/// error-card retry's baseline suppresses are skipped. The one source both
-/// [`render_compactions`] and [`renders_compactions`] read, so the two cannot
-/// drift. The fact's server time is its MESSAGE's: a part carries none.
+/// session's durable delivered position has not already passed it
+/// ([`rendered_bound`]). Messages an error-card retry's baseline suppresses are
+/// skipped. The one source both [`render_compactions`] and
+/// [`renders_compactions`] read, so the two cannot drift. The fact's server time
+/// is its MESSAGE's: a part carries none.
 fn owed_compactions<'a>(
     acc: &StreamAccumulator,
     transcript: &'a SessionTranscript,
+    bound: Option<usize>,
 ) -> Vec<(PartSource, Option<i64>, &'a Compaction)> {
-    let bound = cursor_bound(acc, transcript);
     let mut owed = Vec::new();
     for (position, message) in transcript.messages.iter().enumerate() {
         if acc.baseline_suppresses(message.id.as_str()) {
@@ -2046,19 +2076,49 @@ fn owed_compactions<'a>(
     owed
 }
 
-/// The read position of the chain's Rendered Cursor frontier message, when this
-/// read carries it: the bound the session-scoped compaction walk skips past, so
-/// a compaction an earlier card already showed is not replayed. `None` — a
-/// cursorless chain, or a frontier this read cannot place — bounds nothing, and
-/// the walk then renders every compaction it sees: exactly as a cut-at-0 seed
-/// renders everything at and before an unverifiable frontier rather than
+/// The bound the session-scoped compaction walk skips past (ADR-0082 §3): the
+/// read position of the message the Session's **durable** delivered position
+/// names, or `None` when nothing has been surfaced yet — or a position this read
+/// cannot place. Nothing confirmed has surfaced content, and an unplaceable
+/// position cannot be verified, so neither bounds the walk: it then renders every
+/// compaction it sees, exactly as a cut-at-0 seed renders everything rather than
 /// guessing where the delivered content ended.
-fn cursor_bound(acc: &StreamAccumulator, transcript: &SessionTranscript) -> Option<usize> {
-    let frontier = acc.cursor().frontier.as_ref()?;
-    transcript
-        .messages
-        .iter()
-        .position(|message| message.id == frontier.message_id)
+///
+/// Two durable facts name that position, and the NEWER one binds: the chain's
+/// Rendered Cursor (while its record lives — a Turn in flight, a crash's reap)
+/// and the Session's delivered position, which outlives the record a terminal
+/// card releases ([`crate::bridge::chain::ChainRecords::delivered`], ADR-0082
+/// §3). The record alone cannot bound a fact that must hold ACROSS Turns: after
+/// every terminal ending the record is gone, and with it the frontier — the bug
+/// where one compaction re-rendered on each later Turn's first card.
+///
+/// Both are advanced only by a CONFIRMED card write, never by a stage the flush
+/// may evict or discard: a refused or merely owed write must leave the
+/// compaction re-renderable, while one an earlier card surfaced is never
+/// replayed onto a later card. Deliberately not `acc.cursor()`: a fresh Turn's
+/// accumulator is cursorless because THAT card has shown nothing, while these are
+/// what the SESSION has delivered.
+pub(super) fn rendered_bound(
+    cards: &CardsHandle,
+    session_id: &str,
+    transcript: &SessionTranscript,
+) -> Option<usize> {
+    let cursor_frontier = cards.chains.cursor(session_id).and_then(|cursor| cursor.frontier);
+    let delivered = cards.chains.delivered(session_id);
+    let mut bound = None;
+    for message in [cursor_frontier.map(|frontier| frontier.message_id), delivered]
+        .into_iter()
+        .flatten()
+    {
+        if let Some(position) = transcript
+            .messages
+            .iter()
+            .position(|candidate| candidate.id == message)
+        {
+            bound = Some(bound.map_or(position, |bound: usize| bound.max(position)));
+        }
+    }
+    bound
 }
 
 /// Render the frontier part of a projection seed (spec #561, ticket #563):
@@ -2255,13 +2315,16 @@ fn refresh_ledger(
 ///
 /// The scan covers the same two scopes the real render walks: this Turn's own
 /// window, and the Session's compaction facts ([`renders_compactions`]), which
-/// no Turn window reaches because a compaction is a Session-scoped fact.
+/// no Turn window reaches because a compaction is a Session-scoped fact — both
+/// reading the durable delivered frontier as the compaction bound, so the probe
+/// and the render agree on which rows are already surfaced.
 pub(super) fn renders_new_content(
     acc: &StreamAccumulator,
     transcript: &SessionTranscript,
     anchor: &TurnAnchor,
+    bound: Option<usize>,
 ) -> bool {
-    renders_compactions(acc, transcript)
+    renders_compactions(acc, transcript, bound)
         || transcript.turn_for_user(anchor).messages.iter().any(|message| {
             !acc.baseline_suppresses(message.id.as_str())
                 && message
@@ -2419,7 +2482,12 @@ async fn render_and_flush_inner(
             card.acc.turn_anchor(),
             Endings::of(cards, session_id),
         );
-        let changed = render_turn_parts(&mut card.acc, transcript);
+        // The durable delivered frontier, read under the SAME lock that renders:
+        // the session-scoped compaction walk skips every position it has already
+        // passed, so a row an earlier card surfaced is never replayed onto this
+        // one.
+        let bound = rendered_bound(cards, session_id, transcript);
+        let changed = render_turn_parts(&mut card.acc, transcript, bound);
         if changed {
             // Mark the progress NOW: a later stage of this pass may be
             // abandoned by the caller's timeout (#457), and the external
@@ -3956,7 +4024,7 @@ mod tests {
         let mut acc = StreamAccumulator::new("test");
 
         assert!(
-            renders_new_content(&acc, &transcript, &anchor),
+            renders_new_content(&acc, &transcript, &anchor, None),
             "the read that delivered the row reports new part content"
         );
         render_new_turn_parts(&mut acc, &transcript);
@@ -3965,8 +4033,82 @@ mod tests {
             "the row reached the card"
         );
         assert!(
-            !renders_new_content(&acc, &transcript, &anchor),
+            !renders_new_content(&acc, &transcript, &anchor, None),
             "the card carries the row now: the same read owes nothing"
+        );
+    }
+
+    /// The session-scoped compaction walk's bound is positional and explicit
+    /// (ADR-0082 §3): a compaction at or before it — one a confirmed card write
+    /// already surfaced — is not owed, one past it is, and a row the card
+    /// already carries is an in-place UPDATE whatever the bound says.
+    #[test]
+    fn the_compaction_walk_skips_only_what_is_at_or_before_its_bound() {
+        let compaction_typed = |summary: &str| {
+            typed_message(
+                "msg_comp",
+                MessageRole::Other("compaction".into()),
+                Some(2_000),
+                vec![Part::Compaction(Compaction {
+                    status: CompactionStatus::Completed,
+                    reason: CompactionReason::Auto,
+                    summary: summary.into(),
+                    usage: None,
+                    error: None,
+                    recent: String::new(),
+                })],
+            )
+        };
+        // Message order: the anchor (0), the compaction (1), the reply (2).
+        let transcript = SessionTranscript::new(vec![
+            crate::bridge::tests::drain::user("msg_cola_anchor", 1_000, "问题"),
+            compaction_typed("保留了结论。"),
+            crate::bridge::tests::drain::assistant(3_000, "回答。"),
+        ]);
+        let acc = StreamAccumulator::new("test");
+
+        assert_eq!(
+            owed_compactions(&acc, &transcript, None).len(),
+            1,
+            "nothing surfaced bounds nothing: the row is owed"
+        );
+        assert_eq!(
+            owed_compactions(&acc, &transcript, Some(0)).len(),
+            1,
+            "a bound before the row does not reach it"
+        );
+        assert!(
+            owed_compactions(&acc, &transcript, Some(1)).is_empty(),
+            "the row's own position is surfaced: not owed again"
+        );
+        assert!(
+            owed_compactions(&acc, &transcript, Some(2)).is_empty(),
+            "a bound past the row (the reply a confirmed card delivered) covers it"
+        );
+
+        // The card already carries a RUNNING row at that position and the fact
+        // ended: the terminal revision is an UPDATE, never suppressed by the
+        // bound — the row the card shows must resolve in place.
+        let mut carried = StreamAccumulator::new("test");
+        let source = PartSource::at(MessageId::new("msg_comp"), 0);
+        let running = Compaction {
+            status: CompactionStatus::Running,
+            reason: CompactionReason::Auto,
+            summary: String::new(),
+            usage: None,
+            error: None,
+            recent: String::new(),
+        };
+        carried.push_compaction_at(Some(2_000), source, &running);
+        let ended = SessionTranscript::new(vec![
+            crate::bridge::tests::drain::user("msg_cola_anchor", 1_000, "问题"),
+            compaction_typed("保留了结论。"),
+            crate::bridge::tests::drain::assistant(3_000, "回答。"),
+        ]);
+        assert_eq!(
+            owed_compactions(&carried, &ended, Some(2)).len(),
+            1,
+            "a carried row's terminal revision is owed however far the bound went"
         );
     }
 

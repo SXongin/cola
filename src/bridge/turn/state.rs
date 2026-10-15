@@ -2815,19 +2815,25 @@ impl StreamAccumulator {
 
     /// The Compaction row THIS card carries at `source`'s position, whatever
     /// revision it holds (ADR-0082): the row's own confirmed write advances the
-    /// chain's Rendered Cursor past the position, so a later revision of the same
-    /// compaction — its `running` row ending — must update the row in place
-    /// rather than be read as a replay and skipped. `None` when the card carries
-    /// no row there: the position is then bounded by the chain cursor, and a
-    /// compaction the card has never shown renders.
+    /// session's durable delivered position past the position, so a later
+    /// revision of the same compaction — its `running` row ending — must update
+    /// the row in place rather than be read as a replay and skipped. `None` when
+    /// the card carries no row there: the position is then bounded by the
+    /// Session's delivered past
+    /// ([`crate::bridge::turn::render::rendered_bound`]), and a compaction no
+    /// confirmed card has shown yet renders.
     pub(super) fn compaction_row(&self, source: &PartSource) -> Option<&Compaction> {
         self.carried_compaction(source).map(|(_, fact)| fact)
     }
 
-    /// The accumulator's confirmed Rendered Cursor (spec #561): the frontier the
-    /// session-scoped compaction walk bounds itself by (ADR-0082), so a row an
-    /// earlier card already showed is not replayed. Only a confirmed write moves
-    /// it.
+    /// The accumulator's confirmed Rendered Cursor (spec #561): the frontier a
+    /// confirmed write mirrored into this card's base. **Not** what the
+    /// session-scoped compaction walk bounds itself by (ADR-0082 §3): that bound
+    /// is the durable delivered position
+    /// ([`crate::bridge::turn::render::rendered_bound`]), because a fresh Turn's
+    /// accumulator is cursorless while the Session has delivered content. A
+    /// test-only read now: the walk no longer asks the accumulator.
+    #[cfg(test)]
     pub(super) fn cursor(&self) -> &RenderedCursor {
         &self.cursor
     }

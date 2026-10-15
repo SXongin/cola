@@ -30,6 +30,15 @@
 //!   kept). The pre-ADR-0080 `rendered` section an older build wrote is
 //!   translated into it once, at load — a `serde`-only field on
 //!   [`ChainRecordFile`], never kept nor written again.
+//! - **delivered** — the Session's **delivered position** (ADR-0082's
+//!   2026-10-15 amendment): the message of the newest content a confirmed card
+//!   write surfaced for the Session, handed over by [`ChainRecords::release`]
+//!   as it drops the record's own confirmed cursor (and by nothing else).
+//!   Session-scoped for the same reason the watermark is: a fact that must not
+//!   replay across Turns — a **Compaction** row — needs a bound that outlives
+//!   the chain whose card showed it. Read only by the compaction walk's bound
+//!   ([`crate::bridge::turn::render::rendered_bound`]); the chain cursor stays
+//!   chain-level (ADR-0071).
 //!
 //! The load fails open (a missing or corrupt file reads as empty) and the
 //! write is best-effort and atomic (the shared [`sidecar`] mechanics). The
@@ -623,6 +632,12 @@ struct ChainRecordFile {
     /// session_id → the Session's run records, oldest first (ADR-0080).
     #[serde(default)]
     endings: HashMap<String, Vec<TaskRunRecord>>,
+    /// session_id → the Session's **delivered position** (ADR-0082 §3): the
+    /// newest content a confirmed card write surfaced for it, kept past the
+    /// release of the chain's record. An older sidecar has no such section and
+    /// reads as "nothing delivered", exactly as it read before.
+    #[serde(default)]
+    delivered: HashMap<String, MessageId>,
 }
 
 /// How a re-point updates the chain's durable reply target (#580/#582): the
@@ -673,6 +688,24 @@ fn resolved_session(state: &State, session_id: &str) -> String {
         }
     }
     current.to_string()
+}
+
+/// Record the Session's **delivered position** (ADR-0082 §3) as a released
+/// record hands it over: the message of the record's confirmed Rendered Cursor
+/// frontier, when it has one. Session-scoped, so [`ChainRecords::release`] can
+/// drop the record while the fact that a card surfaced that content — the bound
+/// a Compaction row's exactly-once needs across Turns — survives. A cursorless
+/// record is a no-op: nothing was ever delivered, and a later card must still be
+/// free to surface the Session's first Compaction.
+fn note_delivered(state: &mut State, session_id: &str, cursor: Option<&RenderedCursor>) {
+    let Some(frontier) = cursor.and_then(|cursor| cursor.frontier.as_ref()) else {
+        return;
+    };
+    // Under the Session's CURRENT id, like every other session-scoped write: a
+    // release that ran with the id captured before a recreate must still land on
+    // the recreated Session.
+    let session_id = resolved_session(state, session_id);
+    state.delivered.insert(session_id, frontier.message_id.clone());
 }
 
 /// Flip the delivered body's endings to SHOWN (ADR-0080) — the Rendered Cursor's
@@ -962,6 +995,15 @@ impl<T> Default for LegacySessions<T> {
 struct State {
     records: HashMap<String, ChainRecord>,
     announcements: HashMap<String, WakeMark>,
+    /// session_id → the **delivered position** — the newest content a CONFIRMED
+    /// card write has surfaced for this Session (ADR-0082 §3). Session-scoped,
+    /// exactly like the announcements and the run records: [`Self::release`]
+    /// drops the chain's record (a terminal card is owed no reap), and the
+    /// Session's delivered past must outlive it, or a Session-scoped fact that
+    /// must not replay across Turns — a **Compaction** row — loses its bound at
+    /// every Turn boundary. Written only from a record's own confirmed cursor as
+    /// that record is released, never by a refused or merely owed write.
+    delivered: HashMap<String, MessageId>,
     /// card_message_id → the endings a recoverably-failed body still owes the
     /// durable Record, waiting on the Pending Card Update payload at
     /// [`OwedRendered::seq`] (ADR-0080). In-memory only, and held here rather
@@ -1041,6 +1083,7 @@ impl ChainRecords {
             State {
                 records,
                 announcements,
+                delivered: HashMap::new(),
                 owed: HashMap::new(),
                 renamed: HashMap::new(),
                 endings: HashMap::new(),
@@ -1070,6 +1113,7 @@ impl ChainRecords {
             State {
                 records: file.records,
                 announcements: file.announcements,
+                delivered: file.delivered,
                 endings,
                 owed: HashMap::new(),
                 renamed: HashMap::new(),
@@ -1438,18 +1482,26 @@ impl ChainRecords {
     /// The one removal: drop the session's record — the card reached a
     /// terminal or was collected, so nothing is owed a reap. Its announcement,
     /// if any, stays: the watermark outlives the record it was announced on.
+    /// Its **delivered position** stays too (ADR-0082 §3): the Session's
+    /// delivered past is not the chain's, and a Session-scoped fact that must
+    /// not replay across Turns — a Compaction row — needs it after the record
+    /// is gone. Only the CONFIRMED cursor moves down; a refused or merely owed
+    /// write never advanced it, so it still re-renders.
     pub(crate) fn release(&self, session_id: &str) {
         let mut state = self.lock();
-        if state.records.remove(session_id).is_some() {
-            self.write(&state);
-        }
+        let Some(record) = state.records.remove(session_id) else {
+            return;
+        };
+        note_delivered(&mut state, session_id, record.cursor.as_ref());
+        self.write(&state);
     }
 
     /// Drop `session_id`'s record only while it still names
     /// `card_message_id` (spec #561, review #569): the ending that just landed
     /// belongs to that card, and a chain that moved on meanwhile — a fresh Turn
     /// taking the session over — keeps its own record. Returns whether a
-    /// record was released.
+    /// record was released. The released record's delivered position is kept,
+    /// exactly as [`Self::release`] keeps it.
     pub(crate) fn release_if_card(&self, session_id: &str, card_message_id: &str) -> bool {
         let mut state = self.lock();
         if state
@@ -1459,7 +1511,12 @@ impl ChainRecords {
         {
             return false;
         }
-        state.records.remove(session_id);
+        let record = state.records.remove(session_id);
+        note_delivered(
+            &mut state,
+            session_id,
+            record.as_ref().and_then(|record| record.cursor.as_ref()),
+        );
         self.write(&state);
         true
     }
@@ -1488,7 +1545,11 @@ impl ChainRecords {
         // recreated id names the same Session, so an ending (and its shown bit)
         // must not replay under it.
         let endings = state.endings.remove(from);
-        if record.is_none() && announcement.is_none() && endings.is_none() {
+        // The delivered position moves with the logical Session too (ADR-0082
+        // §3): the recreated id names the same Session, so content a card
+        // already surfaced must not be surfaced again under it.
+        let delivered = state.delivered.remove(from);
+        if record.is_none() && announcement.is_none() && endings.is_none() && delivered.is_none() {
             return;
         }
         if let Some(record) = record {
@@ -1499,6 +1560,9 @@ impl ChainRecords {
         }
         if let Some(endings) = endings {
             state.endings.insert(to.to_string(), endings);
+        }
+        if let Some(delivered) = delivered {
+            state.delivered.insert(to.to_string(), delivered);
         }
         self.write(&state);
     }
@@ -1533,6 +1597,21 @@ impl ChainRecords {
             .records
             .get(session_id)
             .and_then(|record| record.cursor.clone())
+    }
+
+    /// The message of the newest content a **confirmed card write** has
+    /// surfaced for `session_id` (ADR-0082 §3) — the Session's delivered
+    /// position, which outlives the chain's record.
+    ///
+    /// A released record hands its confirmed Rendered Cursor over here
+    /// ([`note_delivered`]), because the record itself is dropped the moment its
+    /// card reaches a terminal ending: a Session-scoped fact that must not
+    /// replay across Turns — a **Compaction** row — would otherwise lose its
+    /// bound at every Turn boundary and re-render on each new card. Only a
+    /// confirmed write moves it: a body whose write was refused or is still owed
+    /// advanced nothing.
+    pub(crate) fn delivered(&self, session_id: &str) -> Option<MessageId> {
+        self.lock().delivered.get(session_id).cloned()
     }
 
     /// Whether the session has a durable Chain Record at all — the Fresh
@@ -2003,6 +2082,7 @@ impl ChainRecords {
                 announcements: state.announcements.clone(),
                 rendered: HashMap::new(),
                 endings: state.endings.clone(),
+                delivered: state.delivered.clone(),
             },
             false,
         );
@@ -2495,6 +2575,90 @@ mod tests {
             ChainRecords::load(path).get("ses_a"),
             None,
             "the removal persists across a reload"
+        );
+    }
+
+    /// The Session's delivered position outlives the chain's record (ADR-0082
+    /// §3): a terminal card's release hands the record's CONFIRMED Rendered Cursor
+    /// to the session-scoped fact, so the next Turn — a card on a NEW chain, its
+    /// record cursorless — still knows what a card already surfaced. A record
+    /// that never confirmed anything hands nothing over: the Session's next card
+    /// must stay free to surface its first Compaction. Session-scoped like the
+    /// announcement and the run records, the fact persists across a reload and
+    /// follows a recreated Session id.
+    #[test]
+    fn release_hands_the_delivered_position_to_the_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE);
+        let chains = ChainRecords::load(path.clone());
+        let frontier = CursorFrontier {
+            message_id: MessageId::new("msg_a_3000"),
+            part_index: 0,
+            kind: CursorPartKind::Text,
+            started_at: Some(3_000),
+            delivered_chars: 5,
+            prefix_digest: Some(cursor_prefix_digest("回答。")),
+        };
+        let cursor = RenderedCursor {
+            frontier: Some(frontier),
+            live_calls: Default::default(),
+        };
+        chains.track(
+            "ses_a",
+            "om_card_1",
+            MessageId::new("msg_cola_1"),
+            Some(1_000),
+            None,
+            None,
+        );
+        chains.advance_cursor("ses_a", "om_card_1", &cursor);
+        assert_eq!(
+            chains.delivered("ses_a"),
+            None,
+            "the fact is the release's handover, never a second copy of the record"
+        );
+
+        chains.release("ses_a");
+        assert_eq!(
+            chains.delivered("ses_a"),
+            Some(MessageId::new("msg_a_3000")),
+            "the confirmed frontier survives the chain's release"
+        );
+        assert_eq!(
+            ChainRecords::load(path.clone()).delivered("ses_a"),
+            Some(MessageId::new("msg_a_3000")),
+            "and persists across a reload"
+        );
+
+        // A later chain that confirmed nothing of its own, released too, keeps
+        // the fact: a cursorless record hands over nothing rather than clearing
+        // it.
+        chains.track(
+            "ses_a",
+            "om_card_2",
+            MessageId::new("msg_cola_2"),
+            Some(4_000),
+            None,
+            None,
+        );
+        chains.release("ses_a");
+        assert_eq!(
+            chains.delivered("ses_a"),
+            Some(MessageId::new("msg_a_3000")),
+            "a cursorless record hands over nothing"
+        );
+
+        chains.rename("ses_a", "ses_fresh");
+        assert_eq!(chains.delivered("ses_a"), None);
+        assert_eq!(
+            chains.delivered("ses_fresh"),
+            Some(MessageId::new("msg_a_3000")),
+            "the recreated id names the same Session"
+        );
+        assert_eq!(
+            chains.delivered("ses_never_tracked"),
+            None,
+            "a Session nothing was released for has surfaced nothing"
         );
     }
 
