@@ -359,3 +359,34 @@ session header — which Go recognizes — reaches the endpoint. Verified locall
 end-to-end: Codex 0.160.0 through the action's proxy against
 `/zen/go/v1/responses` completes a review request. `CONTRIBUTING.md`'s
 "Reviewing" section and the workflow header name the new endpoint.
+
+## Amendment (2026-10-16): the gate moves to codex-action v1.13
+
+The 2026-10-05 amendment pinned the gate to **v1.11** and said to revisit the
+pin when the wrapper fix shipped. The community wrapper fix
+(`openai/codex-action#151`) is still open upstream, but OpenAI shipped its own
+equivalent in **v1.13** (2026-10-05): the post-exit output drain is bounded to
+five seconds and the action tears down its own pipes, so a descendant that
+outlives the direct Codex child can no longer keep the runner's stdio open —
+the exact #150/#169 failure. v1.13 also restores the runner's service sockets
+under Linux `drop-sudo` (v1.12's rewrite chmodded root-owned `/run` sockets,
+the community's #160, independently sufficient to kill a run), and its
+`drop-sudo` now requires `setfacl`; GitHub's `ubuntu-latest` image ships the
+`acl` package (`setfacl` 2.3.2 on `ubuntu-24.04`).
+
+`.github/workflows/codex-review.yml` therefore pins **v1.13**
+(`bdf19a4a223ec2549a3e2274a0cf61556bc07675`), and the `xtask` guard
+(`codex_gate::tests::the_workflow_uses_the_shared_scripts`, which asserts the
+step's `uses:` SHA so a group bump cannot silently revert the pin) moves its
+expected SHA with it. Everything the previous amendment installed stays: the
+Codex step's 12-minute bound with `continue-on-error`, and publication only
+through the parser the workflow writes into `$RUNNER_TEMP`. The bump does not
+widen the hang's blast radius — a recurrence still costs one bounded run and
+salvages a completed review through that parser.
+
+The frozen v1.11 SHA had also become a standing red: `.github/dependabot.yml`
+proposes every action in one `github-actions` group, so each group PR carried
+the pinned SHA's bump and failed `cargo test -p xtask` until the guard's
+expected SHA moved with it (PR #713, the bump to v1.13 this amendment lands).
+The guard's job is to make that move deliberate — this is that deliberation —
+not to freeze the pin against every future release.

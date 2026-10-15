@@ -35,18 +35,23 @@
 # Robustness (#530): the Codex action can hang AFTER Codex has written its
 # complete output — a surviving descendant keeps the runner's stdio open, so
 # the action never returns and the job dies on its timeout with the result
-# already on disk (upstream openai/codex-action#150/#169; the wrapper fix,
-# #151, is unreleased). The action is pinned to v1.11, whose wrapper handles
-# the same heavy workload cleanly, and the Codex step is bounded with its
-# output salvaged through the parser this workflow writes to `$RUNNER_TEMP`
-# (never sourced from the reviewed tree, which may predate it; tested by
-# xtask), so a recurrence cannot discard a finished review.
+# already on disk (upstream openai/codex-action#150/#169). v1.12's rewrite
+# handed the runner's descriptors to the whole Codex process tree and waited
+# for them to close; the action is pinned to v1.13, which bounds the post-exit
+# output drain and tears its own pipes down, so a surviving descendant can no
+# longer keep the step open. v1.13 also restores the runner's service sockets
+# under Linux `drop-sudo` (v1.12 chmodded `/run` — the community's #160) and,
+# in doing so, requires `setfacl`, which GitHub's `ubuntu-latest` image ships.
+# The Codex step stays bounded with its output salvaged through the parser
+# this workflow writes to `$RUNNER_TEMP` (never sourced from the reviewed
+# tree, which may predate it; tested by xtask), so a recurrence cannot discard
+# a finished review.
 # Publication and approval are two tiers: a review whose last line ends with
 # the verdict is published, while approval requires the marker to stand on its
 # own line, so a quoted marker can never approve a change. A same-job retry is
 # impossible: the action's drop-sudo safety strategy removes
-# passwordless sudo, so a second invocation in the job cannot start. Revisit
-# the pin when the wrapper fix ships.
+# passwordless sudo, so a second invocation in the job cannot start. The
+# v1.11 pin is retired by ADR-0034's 2026-10-16 amendment.
 #
 # Trust model: like the OpenCode gate before it, this is a `pull_request`
 # workflow, so a same-repo PR runs the workflow definition from its merge ref.
