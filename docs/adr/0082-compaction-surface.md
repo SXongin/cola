@@ -1,7 +1,8 @@
 # Compaction is a first-class card fact: generation-neutral, session-scoped, and never a silent vanish
 
-> §3's exactly-once lied across Turns: the bound it leaned on was chain-scoped.
-> See the amendment at the end.
+> **Amended (2026-10-15)**: §3's exactly-once held only within a chain — the
+> bound it leaned on was chain-scoped, while the fact is the Session's. See the
+> amendment at the end.
 
 V2 persists a compaction as a first-class message (`status` running/completed/failed,
 `reason` auto|manual, `summary`, `recent`, and the compaction request's own usage), and
@@ -120,34 +121,60 @@ term.
 
 ## Amendment (2026-10-15): the Session's delivered position outlives the chain's record
 
-§3 promised a compaction renders **exactly once**, session-scoped. It did not: the bound
-the render walk leaned on was the chain's Rendered Cursor, and that cursor is chain-scoped
-by design (ADR-0071: "`release` drops it with the record"). Every Turn ends on a terminal
-card, `release_spent` drops the record, the next Turn opens a card on a NEW chain whose
-record is cursorless — so a completed compaction was owed again by every later Turn and
-re-rendered on that Turn's **first** card, forever (live session `ses_ec20badc5ffeq4jL1RYFuN8PaR`,
-one manual compaction re-shown on each Turn after it). A fresh Turn's accumulator is
-cursorless too, so the walk found no bound on either side.
-
-The Chain Record gains a fourth, session-scoped section: **`delivered`** — `session_id →
-the message of the newest content a CONFIRMED card write surfaced for that Session`. It is
-handed over by `release`/`release_if_card` from the record's own confirmed cursor as they
-drop it (one atomic write; a cursorless record hands over nothing), written by nothing
-else and read by nothing else. The compaction walk's bound is the **newer** of it and the
-chain cursor's own frontier, resolved against the read; both advance only on a confirmed
-card write, so a refused or still-owed body leaves the compaction re-renderable, while one
-an earlier card surfaced is never replayed onto a later card.
+7. **Session-scoped, exactly once — the bound has to outlive the chain.** §3
+   promised that a compaction renders **exactly once**, for the Session. The
+   bound the render walk leaned on could not carry that promise: it was the
+   chain's **Rendered Cursor**, and that cursor is chain-scoped by design
+   (ADR-0071: "`release` drops it with the record"). Every Turn ends on a
+   terminal card, `release_spent` drops the record, and the next Turn opens a
+   card on a NEW chain whose record is cursorless — so a completed compaction
+   was owed again by every later Turn and re-rendered on that Turn's **first**
+   card (observed live 2026-10-15 on session `ses_ec20badc5ffeq4jL1RYFuN8PaR`:
+   one manual compaction re-shown on each Turn after it). A fresh Turn's
+   accumulator is cursorless too, so the walk found no bound on either side. The
+   Chain Record gains a fourth, session-scoped section — **`delivered`**:
+   `session_id → the message of the newest content a CONFIRMED card write
+   surfaced for that Session`. `release`/`release_if_card` hand it over from the
+   record's own confirmed cursor as they drop it (one atomic write; a cursorless
+   record hands over nothing), written by nothing else and read by nothing else.
+   The compaction walk's bound is the **newer** of it and the chain cursor's own
+   frontier, resolved against the read; both advance only on a confirmed card
+   write, so a refused or still-owed body leaves its compaction re-renderable,
+   while one an earlier card surfaced is never replayed onto a later card.
 
 Consequences:
 
-- The cursor stays chain-level, exactly as ADR-0071 decided. The new fact is the Session's,
-  like the Wake Watermark and the run records: `release` drops the chain's record, not the
-  Session's delivered past. No reader other than the compaction walk uses it.
-- The sidecar grows a `delivered` section; an older sidecar has none and reads as "nothing
-  surfaced", which is what it meant before (the record's cursor still binds while the
-  record lives).
-- `rename` carries the section with the recreated Session id, like the announcement and
-  the run records.
-- The `Compaction` frontier kind (#722) is unchanged: it still consumes a chain whose
-  newest fact is a compaction for the restart projection. It is just no longer the only
-  thing standing between a compaction and a re-render.
+- The invariant this section now stands for is **exactly-once for deliveries a
+  card write confirmed by this build onward**: a compaction a confirmed write
+  has surfaced renders once and is never replayed onto a later card, on every
+  path except the two named below.
+- **One-time migration replay.** A Session whose compaction a pre-fix build
+  already surfaced has no recovered position — the `delivered` section defaults
+  empty for a sidecar written before this change — so the upgrade replays that
+  compaction **once**, on the first card after it. That card's own confirmed
+  write gives the Session its position and the replay cannot repeat. This is the
+  one-release migration seam the cursor family already carries (ADR-0071: a
+  cursor written by an older release resolves nothing, and the first confirmed
+  write after the upgrade gives it a digest).
+- **Takeover-lost is duplicate-not-lost, and it is the one path where the
+  invariant is not enforced.** A projection whose create landed while its
+  confirmation could no longer be taken — the session was replaced, the chain
+  moved, the stage was evicted — records what it can prove, the rendered
+  endings, and deliberately no cursor: its landing path does not invent a
+  frontier it cannot confirm, and the card's ending cannot hand over a record
+  naming another card (`release_if_card` declines it). That body's compaction is
+  therefore not marked delivered and renders once more rather than being
+  swallowed — the same duplicate-over-loss trade the Rendered Cursor itself
+  ratifies (ADR-0071: an ambiguous create is never retried).
+- The cursor stays chain-level, exactly as ADR-0071 decided. The new fact is the
+  Session's, like the Wake Watermark and the run records: `release` drops the
+  chain's record, not the Session's delivered past. No reader other than the
+  compaction walk uses it.
+- The sidecar grows a `delivered` section; an older sidecar has none and reads
+  as "nothing surfaced", which is what it meant before (the record's cursor
+  still binds while the record lives).
+- `rename` carries the section with the recreated Session id, like the
+  announcement and the run records.
+- The `Compaction` frontier kind (#722) is unchanged: it still consumes a chain
+  whose newest fact is a compaction for the restart projection. It is just no
+  longer the only thing standing between a compaction and a re-render.
