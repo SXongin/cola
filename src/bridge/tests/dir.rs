@@ -1703,6 +1703,127 @@ async fn dir_browse_pager_counts_files_toward_the_six_per_page() {
     );
 }
 
+/// A **symlinked** file row names the RESOLVED target, not the link (ADR-0083
+/// §3: "the path is the one that was resolved, not the one that was typed").
+/// The row dispatches straight to the viewer — it does not pass through the
+/// browse handler's `resolve_browse_path` — so the listing itself must store
+/// the resolved path, or the viewer would name the link that was typed into
+/// the directory.
+#[cfg(unix)]
+#[tokio::test]
+async fn dir_browse_file_row_names_the_resolved_target_of_a_symlink() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let target = proj.path().join("real.md");
+    std::fs::write(&target, "# real\n").unwrap();
+    let link = proj.path().join("link.md");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let proj_dir = canonical_of(proj.path());
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    seed_entry(&app, seeded_entry(&key, &proj_dir)).await;
+
+    let card = app
+        .host_action(browse_action("go", &proj_dir))
+        .await
+        .unwrap()
+        .card
+        .expect("card");
+    // The row is the LINK's (that is the entry in this directory) and its size
+    // is the target's — `metadata()` follows the link.
+    assert_eq!(
+        file_row(&card, "link.md")["text"]["content"],
+        "📄 link.md · 7 B",
+        "the link's row reports its target's size"
+    );
+    let payload = file_row(&card, "link.md")["value"].clone();
+    assert_eq!(
+        payload["path"],
+        canonical_of(&target),
+        "the row names the resolved target, not the link: {payload}"
+    );
+    assert_ne!(
+        payload["path"].as_str(),
+        Some(link.to_string_lossy().as_ref()),
+        "never the link spelling the scan read: {payload}"
+    );
+
+    // Clicking it opens the viewer at that same resolved path: the header and
+    // the naming block name the TARGET, and — the point of the fix — the link
+    // spelling never reaches the card at all.
+    let viewer = app
+        .host_action(payload)
+        .await
+        .expect("the click answers")
+        .card
+        .expect("the viewer patches the browse card");
+    assert_eq!(
+        card_header(&viewer),
+        "📄 real.md",
+        "the viewer names the resolved target"
+    );
+    let text = card_text(&viewer);
+    assert!(
+        text.contains(&canonical_of(&target)),
+        "the resolved path is shown: {text}"
+    );
+    assert!(
+        !text.contains("link.md"),
+        "the link spelling is nowhere on the viewer: {text}"
+    );
+    assert!(text.contains("# real"), "and the target's bytes: {text}");
+}
+
+/// A non-regular, non-directory entry — a socket, a FIFO, a device node — is
+/// not a row at all (#742 review): only a directory and a **regular file** are
+/// listed, so a pseudo-file is never misrepresented as a `0 B` file the viewer
+/// could open. It also never counts toward `visible`, which is what decides
+/// whether the filter control shows.
+#[cfg(unix)]
+#[tokio::test]
+async fn dir_browse_lists_only_regular_files_and_directories() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let cap = crate::feishu::card::session::CARD_PAGE_SIZE;
+    for i in 1..=cap {
+        std::fs::write(proj.path().join(format!("f{i:02}.txt")), "x").unwrap();
+    }
+    // A Unix domain socket: `metadata()` succeeds (no broken-symlink skip) and
+    // reports neither a file nor a directory. Exists as long as this tempdir.
+    let socket = proj.path().join("agent.sock");
+    let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let proj_dir = canonical_of(proj.path());
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    seed_entry(&app, seeded_entry(&key, &proj_dir)).await;
+
+    let card = app
+        .host_action(browse_action("go", &proj_dir))
+        .await
+        .unwrap()
+        .card
+        .expect("card");
+    let text = card_text(&card);
+    assert!(!text.contains("agent.sock"), "no socket row: {text}");
+    assert_eq!(
+        file_row(&card, "f01.txt")["text"]["content"],
+        "📄 f01.txt · 1 B",
+        "regular files stay file rows"
+    );
+    // Exactly `cap` rows: one page, so no pager — and no filter control, which
+    // shows only when MORE than a page of entries was seen. Both would be
+    // present if the socket had been counted as a row.
+    assert_eq!(dir_pager_label(&card), None, "a socket is not an entry: {text}");
+    assert!(
+        !card.to_string().contains("\"name\":\"filter\""),
+        "a socket is not a visible entry either: {card}"
+    );
+}
+
 /// A directory larger than `BROWSE_SCAN_CAP` is scanned only up to the cap and
 /// says so — the render cannot outrun the card callback budget (#670 review).
 /// Files count toward the cap exactly like directories, so a directory holding

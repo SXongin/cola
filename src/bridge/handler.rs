@@ -323,11 +323,13 @@ pub(crate) const BROWSE_SCAN_CAP: usize = 2000;
 /// ADR-0083 §3): resolve the target (symlinks followed, see
 /// [`resolve_browse_path`]), fall back to the nearest existing ancestor when the
 /// directory is gone, then list its children — directories first (a repo, a
-/// child holding a `.git` entry, floats to the very front) and files after,
-/// each group case-insensitively alphabetical; dot-entries behind the hidden
-/// toggle; token-AND filtered by `keyword` over directory AND file names. All
-/// local `stat`/`read_dir`: the card callback runs inside Feishu's 3 s,
-/// no-retry budget.
+/// child holding a `.git` entry, floats to the very front) and **regular files**
+/// after, each group case-insensitively alphabetical; dot-entries behind the
+/// hidden toggle; token-AND filtered by `keyword` over directory AND file names.
+/// A file row carries the RESOLVED path (ADR-0083 §3), because its click goes
+/// straight to the viewer — the path it names is the path it shows. All local
+/// `stat`/`read_dir`: the card callback runs inside Feishu's 3 s, no-retry
+/// budget.
 fn browse_dir_state(view: BrowseView<'_>) -> BrowseState {
     let keyword = view.keyword;
     let show_hidden = view.show_hidden;
@@ -392,19 +394,43 @@ fn browse_dir_state(view: BrowseView<'_>) -> BrowseState {
                 let Ok(meta) = std::fs::metadata(&path) else {
                     continue;
                 };
+                // Only a directory and a REGULAR file are rows (#742 review): a
+                // FIFO, socket or device node is not a file the viewer could
+                // preview, so listing one as a `0 B` file would be a lie. It is
+                // no row at all — and never counted into `visible`, which is
+                // what decides whether the filter control shows.
+                let is_file = meta.is_file();
+                if !meta.is_dir() && !is_file {
+                    continue;
+                }
                 visible += 1;
                 if !lower_keyword.is_empty()
                     && !crate::bridge::command::token_and_match(&name.to_lowercase(), &lower_keyword)
                 {
                     continue;
                 }
+                // A file row's path is the one the viewer will NAME (ADR-0083
+                // §3: "the path is the one that was resolved, not the one that
+                // was typed"). Its click bypasses `resolve_browse_path` — the
+                // row routes straight to `action: "file"` — so the link path
+                // `read_dir` handed us must not be stored: a symlinked file
+                // would otherwise open a viewer naming the link. The browsed
+                // directory is canonical, so resolving here is exactly the
+                // `stat`-followed target the row's size came from. A directory
+                // row keeps the entry path: its click re-resolves through the
+                // browse handler anyway.
+                let row_path = if is_file {
+                    std::fs::canonicalize(&path).unwrap_or(path)
+                } else {
+                    path
+                };
                 children.push(crate::feishu::card::session::BrowseChild {
                     name,
-                    path: path.to_string_lossy().to_string(),
-                    is_repo: meta.is_dir() && path.join(".git").exists(),
+                    path: row_path.to_string_lossy().to_string(),
+                    is_repo: meta.is_dir() && row_path.join(".git").exists(),
                     // `Some` marks a file row: files are listed beside
                     // directories and open the File Viewer (ADR-0083 §3).
-                    size: (!meta.is_dir()).then_some(meta.len()),
+                    size: is_file.then_some(meta.len()),
                 });
             }
         }
