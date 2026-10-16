@@ -417,7 +417,7 @@ detailed help for any of these.
 | --- | --- |
 | `/dir <path> [name]` | Declare a new session rooted at `<path>` — created by the next message |
 | `/claim <code>` | Claim this cola as Host (private chat only; code from the startup log) |
-| `/cat <path>` | Open a Host file in a File Viewer card: text uses a fenced code block with an extension language hint, `.csv`/`.tsv` uses a markdown table, images are embedded, and other binary files are sent as a File Message. The card names the resolved path, size and type. `/cat <directory>` opens the Directory Browser there; bare `/cat` answers with usage (`/help cat` gives details). `~` expands, relative paths resolve against the session directory (the current project while a session is pending), and absolute paths are used as-is |
+| `/cat <path>` | Open a Host file in a File Viewer card: text uses a fenced code block with an extension language hint, `.csv`/`.tsv` uses a markdown table, and images are embedded when Feishu's limits allow. Other binary files, images beyond those limits and text beyond the 8 MB preview cap use the File Message lane only up to Feishu's 30 MB upload cap; above it, nothing is sent and the card says 未发送. The card names the resolved path, size and type. `/cat <directory>` opens the Directory Browser there; bare `/cat` answers with usage (`/help cat` gives details). `~` expands, relative paths resolve against the session directory (the current project while a session is pending), and absolute paths resolve as absolute paths, including outside the session directory |
 | `/dir` | Recent Directories card: pick a folder and declare a session there, or open it as a fresh topic (每行「建话题」= `/topic <dir>` 的免打字版); its 📁 浏览目录 button opens a filesystem browser — drill into subdirectories, type a path (前往 browses it, 选择 declares it), toggle dot-directories, filter child names |
 | `/switch` | Session card: browse / search / adopt / new |
 | `/switch <kw>` | Switch to a session by name/dir/id (adopts foreign ones; no match opens the card pre-filtered) |
@@ -452,23 +452,26 @@ Notes:
   unsupported language hint falls back to plain text; large text previews page
   by lines), `.csv`/`.tsv` as a markdown table, and images are embedded when
   Feishu's limits allow. Other binary files, images beyond those limits and text
-  beyond the 8 MB preview cap are sent as a File Message.
-  A structurally oversized preview is sent as one Rich Text Message, or as a
-  File Message when it exceeds that lane's 30 KB limit; the card says where the
-  content went. 「🔄 重新读取」 re-reads and updates the viewer in
+  beyond the 8 MB preview cap use the File Message lane only up to Feishu's 30 MB
+  upload cap; past it, nothing is sent and the card says 未发送. A preview that
+  cannot fit in the card may use the Rich Text Message lane, subject to Feishu's
+  rendering; content beyond that lane's 30 KB budget uses the File Message lane
+  (subject to the same upload cap). The card reports the delivery outcome.
+  「🔄 重新读取」 re-reads and updates the viewer in
   place. 「📂 所在目录」 opens the file's parent in the Directory Browser;
   「← 返回目录」 returns from a browse-row viewer to its listing. A write/edit
   Tool Panel's 「📂 打开」 button opens its file in the viewer. A File Message
   is a file for the reader to download or hand to the client; cola does **not**
   promise inline preview.
 - The **Path Scope** (`~` expanded, relative paths resolved from the session
-  directory, absolute paths passed through) is a **privacy hint, not a security
+  directory, absolute paths resolved as absolute paths) is a **privacy hint, not a security
   control or boundary**: any path the Host can read is reachable. Missing,
   unreadable and empty paths are reported distinctly with the resolved path.
   Examples: `/cat src/main.rs`, `/cat ~/notes.md`, `/cat /etc/hosts`. A card's
   content is readable by everyone in its chat, so a group chat can read whatever
-  a Host opens. The Access List (`/claim`) gates **only who may click**, not who
-  may read.
+  a Host opens. The Access List (`/claim`) gates who may **act** in cola (send
+  commands or drive a session), not who may **read**: card content is visible to
+  everyone in the chat.
 - `/new`, `/dir` and `/topic` only **declare** the session — the conversation's
   next non-command message creates it in the chosen directory and maps it here,
   so a mistaken `/new`, `/dir` or `/topic` can be corrected with another `/new`,
@@ -518,7 +521,7 @@ Notes:
   its nearest existing ancestor, and only existing directories can be selected.
   **Path Scope is not a security boundary**: the browser can reach any directory
   the Host process can read. In a group chat everyone can read the card, while
-  the Access List gates only who may click, not who may read.
+  the Access List gates who may act in cola, not who may read.
 - `/agent`, `/model`, `/think`, `/autoaccept` are **per-session** and apply from
   the next message, persisting across restarts. On OpenCode 2 the first three are
   durable session state — the pick is written to the session itself (`POST
