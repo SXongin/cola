@@ -1,5 +1,9 @@
 # The `/dir` browse card reaches any directory by drill-down or typed path
 
+> **Amended (2026-10-16)**: the card lists **files** as well as directories, and a file row
+> opens a **File Viewer** — see **ADR-0083**. The "directories only" scope below is the first
+> version's; ADR-0083 governs the listing now.
+
 The `/dir` Recent Directories card could only pick from the directories cola
 already knew — the ADR-0046 union of the shared store's session directories,
 cola's mappings and the conversation's current directory. A directory the user
@@ -66,7 +70,8 @@ same 切换到这里 / 建话题 node actions the Recent Directories rows carry.
   form-submit convention) with the typed value read from `form_value`; the
   browsed dir/hidden/page ride the button `value` and degrade on a name-only
   submit (the handler falls back to the current project).
-- **Child listing**: directories only (a symlink to a directory counts, via
+- **Child listing**: directories only in this version — **files were added by ADR-0083**, which
+  also gives a file row the File Viewer it opens (a symlink to a directory counts, via
   `is_dir()`); dot-directories hidden unless the `显示隐藏` toggle is on; filtered
   by the child filter (case-insensitive token-AND on the name); **repos first**
   (a child containing a `.git` entry, 📦-marked), then case-insensitive
