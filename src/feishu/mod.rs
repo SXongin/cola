@@ -366,6 +366,9 @@ pub trait Platform: Send + Sync {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageEditOutcome {
     Updated,
+    /// Feishu refused because this message has exhausted its edit budget.
+    EditLimitReached,
+    /// A business refusal for any reason other than the exhausted edit budget.
     Refused,
 }
 

@@ -1815,13 +1815,48 @@ async fn rich_text_messages(platform: &RecordingPlatform) -> Vec<PlatformCall> {
 }
 
 fn reread_payload(card: &serde_json::Value) -> serde_json::Value {
-    let mut payload = card_buttons(card)
+    card_buttons(card)
         .into_iter()
         .find(|button| button["text"]["content"] == "🔄 重新读取")
         .unwrap_or_else(|| panic!("viewer has no refresh button: {}", card_text(card)))["value"]
-        .clone();
-    payload["open_message_id"] = serde_json::json!("msg_reply");
-    payload
+        .clone()
+}
+
+async fn open_overflow_csv_viewer() -> (
+    tempfile::TempDir,
+    tempfile::TempDir,
+    tempfile::TempDir,
+    Arc<App>,
+    Arc<RecordingPlatform>,
+    std::path::PathBuf,
+    serde_json::Value,
+) {
+    let work_dir = test_work_dir();
+    let project = tempfile::tempdir().unwrap();
+    let file = project.path().join("people.csv");
+    let csv = format!(
+        "name,age\n{}",
+        (0..60)
+            .map(|i| format!("r{i},{i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    std::fs::write(&file, csv).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &project.path().to_string_lossy())).await;
+    send_command_in(
+        &app,
+        "/cat people.csv",
+        key,
+        "m_csv",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let card = first_card(&platform).await;
+    (work_dir, project, state, app, platform, file, card)
 }
 
 /// #741: a preview the card structurally cannot hold — a table past the
@@ -1937,9 +1972,16 @@ async fn reread_refreshes_the_viewer_card_in_place() {
     let payload = reread_payload(&original);
     assert_eq!(payload["op"], "reread");
     assert_eq!(payload["path"], canonical(&file));
+    assert!(
+        payload.get("open_message_id").is_none(),
+        "Feishu supplies the containing message id as callback context, not card JSON"
+    );
 
     std::fs::write(&file, "after refresh\n").unwrap();
-    let result = app.host_action(payload).await.expect("refresh click is handled");
+    let result = app
+        .host_action_on_message(payload, "msg_reply")
+        .await
+        .expect("refresh click is handled");
     assert!(result.card.is_none(), "the callback leaves work off its ack path");
     wait_for_card_update(&platform, "refreshed file contents", CardUpdates::Any, |card| {
         card_text(card).contains("after refresh")
@@ -1974,6 +2016,7 @@ async fn changed_file_does_not_refresh_the_viewer_without_a_click() {
     )
     .await;
     let original = first_card(&platform).await;
+    assert_eq!(reread_payload(&original)["op"], "reread");
     std::fs::write(&file, "changed without a click\n").unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     assert_eq!(first_card(&platform).await, original);
@@ -1981,8 +2024,8 @@ async fn changed_file_does_not_refresh_the_viewer_without_a_click() {
     assert!(rich_text_messages(&platform).await.is_empty());
 }
 
-/// A failed local re-read is returned on the click's ack and never replaces
-/// the last good viewer card.
+/// A failed local re-read is answered under the viewer after the immediate
+/// callback ack and never replaces the last good viewer card.
 #[tokio::test]
 async fn failed_reread_keeps_the_viewer_card_and_answers_with_the_failure() {
     let _wd = test_work_dir();
@@ -2006,14 +2049,83 @@ async fn failed_reread_keeps_the_viewer_card_and_answers_with_the_failure() {
     let payload = reread_payload(&original);
     std::fs::remove_file(&file).unwrap();
 
-    let result = app.host_action(payload).await.expect("refresh click is handled");
+    let result = app
+        .host_action_on_message(payload, "msg_reply")
+        .await
+        .expect("refresh click is handled");
     assert!(result.card.is_none(), "a failure leaves the existing card intact");
     assert!(
-        result.toast.unwrap().contains("找不到路径"),
-        "the ack answers with the read failure"
+        result.toast.unwrap().contains("重新读取"),
+        "the callback acks first"
     );
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let answered = platform.calls.lock().await.iter().any(|call| {
+                matches!(call, PlatformCall::ReplyText { message_id, text }
+                    if message_id == "msg_reply" && text.contains("找不到路径"))
+            });
+            if answered {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the off-thread failure reply arrives");
     assert_eq!(first_card(&platform).await, original);
     assert!(platform.updated_cards().await.is_empty());
+}
+
+/// A FIFO stalls the read until a writer arrives. The click still returns its
+/// ack before the read finishes, proving filesystem I/O is off the callback.
+#[cfg(unix)]
+#[tokio::test]
+async fn reread_ack_is_not_blocked_by_a_stalled_filesystem_read() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let file = proj.path().join("notes.txt");
+    std::fs::write(&file, "initial\n").unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+    send_command_in(
+        &app,
+        "/cat notes.txt",
+        key,
+        "m_cat",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let original = first_card(&platform).await;
+    let payload = reread_payload(&original);
+    std::fs::remove_file(&file).unwrap();
+    let status = std::process::Command::new("mkfifo").arg(&file).status().unwrap();
+    assert!(status.success(), "create a FIFO to park the file read");
+
+    let writer_path = file.clone();
+    let writer = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        let mut fifo = std::fs::OpenOptions::new().write(true).open(writer_path).unwrap();
+        std::io::Write::write_all(&mut fifo, b"read completed after the ack\n").unwrap();
+    });
+    let started = std::time::Instant::now();
+    let result = app
+        .host_action_on_message(payload, "msg_reply")
+        .await
+        .expect("refresh click is handled");
+    assert!(result.toast.unwrap().contains("重新读取"));
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(700),
+        "callback ack waited for the FIFO read: {:?}",
+        started.elapsed()
+    );
+    wait_for_card_update(&platform, "FIFO read result", CardUpdates::Any, |card| {
+        card_text(card).contains("read completed after the ack")
+    })
+    .await;
+    writer.join().unwrap();
 }
 
 /// An overflow re-read edits the Rich Text Message at the id in the viewer
@@ -2051,7 +2163,10 @@ async fn reread_edits_the_same_overflow_message_and_updates_the_card() {
     assert_eq!(payload["rich_message_id"], "msg_file");
     std::fs::write(&file, csv(61)).unwrap();
 
-    let result = app.host_action(payload).await.expect("refresh click is handled");
+    let result = app
+        .host_action_on_message(payload, "msg_reply")
+        .await
+        .expect("refresh click is handled");
     assert!(result.card.is_none());
     wait_for_card_update(&platform, "new overflow tracking id", CardUpdates::Any, |card| {
         card_buttons(card)
@@ -2116,7 +2231,9 @@ async fn refused_rich_message_edit_resends_and_tracks_the_fresh_message() {
         .store(1, std::sync::atomic::Ordering::SeqCst);
     platform.given_message_reply_id("msg_fresh");
 
-    app.host_action(payload).await.expect("refresh click is handled");
+    app.host_action_on_message(payload, "msg_reply")
+        .await
+        .expect("refresh click is handled");
     wait_for_card_update(
         &platform,
         "fresh rich-message tracking",
@@ -2131,7 +2248,7 @@ async fn refused_rich_message_edit_resends_and_tracks_the_fresh_message() {
     let calls = platform.calls.lock().await.clone();
     assert!(
         calls.iter().any(|call| matches!(call, PlatformCall::EditMessage {
-            message_id, outcome: crate::feishu::MessageEditOutcome::Refused, ..
+            message_id, outcome: crate::feishu::MessageEditOutcome::EditLimitReached, ..
         } if message_id == "msg_file")),
         "the original edit is explicitly refused: {calls:?}"
     );
@@ -2144,6 +2261,11 @@ async fn refused_rich_message_edit_resends_and_tracks_the_fresh_message() {
         "the refreshed content is sent as a fresh Rich Text Message: {calls:?}"
     );
     let card = platform.updated_cards().await.pop().expect("viewer card update");
+    assert!(
+        card_text(&card).contains("当前消息 `msg_fresh`"),
+        "the visible tracking line identifies the fresh copy as current: {}",
+        card_text(&card)
+    );
     assert_eq!(
         card_buttons(&card)
             .into_iter()
@@ -2151,6 +2273,96 @@ async fn refused_rich_message_edit_resends_and_tracks_the_fresh_message() {
             .unwrap()["value"]["rich_message_id"],
         "msg_fresh"
     );
+}
+
+/// A business refusal other than the edit-budget ceiling is not a license to
+/// duplicate the overflow. The card keeps the old id and names it as current.
+#[tokio::test]
+async fn unrelated_rich_message_edit_refusal_does_not_resend() {
+    let (_work_dir, _project, _state, app, platform, file, original) = open_overflow_csv_viewer().await;
+    std::fs::write(
+        &file,
+        format!(
+            "name,age\n{}",
+            (0..61)
+                .map(|i| format!("r{i},{i}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
+    )
+    .unwrap();
+    platform
+        .reject_edit_message_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+
+    let result = app
+        .host_action_on_message(reread_payload(&original), "msg_reply")
+        .await
+        .expect("refresh click is handled");
+    assert!(result.toast.unwrap().contains("重新读取"));
+    wait_for_card_update(&platform, "honest edit refusal", CardUpdates::Any, |card| {
+        card_text(card).contains("富文本刷新失败")
+    })
+    .await;
+    let calls = platform.calls.lock().await.clone();
+    assert!(calls.iter().any(|call| matches!(call, PlatformCall::EditMessage {
+        message_id,
+        outcome: crate::feishu::MessageEditOutcome::Refused,
+        ..
+    } if message_id == "msg_file")));
+    assert_eq!(
+        rich_text_messages(&platform).await.len(),
+        1,
+        "no duplicate message is sent"
+    );
+    let card = platform.updated_cards().await.pop().unwrap();
+    assert!(card_text(&card).contains("当前仍是消息 `msg_file`"));
+    assert_eq!(reread_payload(&card)["rich_message_id"], "msg_file");
+}
+
+/// An ambiguous transport failure is not treated as an edit-budget refusal:
+/// no fresh message is sent, and the card keeps the carried message id.
+#[tokio::test]
+async fn ambiguous_rich_message_edit_does_not_resend_and_preserves_id() {
+    let (_work_dir, _project, _state, app, platform, file, original) = open_overflow_csv_viewer().await;
+    std::fs::write(
+        &file,
+        format!(
+            "name,age\n{}",
+            (0..61)
+                .map(|i| format!("r{i},{i}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
+    )
+    .unwrap();
+    platform
+        .fail_edit_message_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+
+    app.host_action_on_message(reread_payload(&original), "msg_reply")
+        .await
+        .expect("refresh click is handled");
+    wait_for_card_update(&platform, "ambiguous edit failure", CardUpdates::Any, |card| {
+        card_text(card).contains("富文本刷新失败")
+    })
+    .await;
+    let calls = platform.calls.lock().await.clone();
+    assert!(
+        calls
+            .iter()
+            .any(|call| matches!(call, PlatformCall::EditMessageFailed {
+        message_id, ..
+    } if message_id == "msg_file"))
+    );
+    assert_eq!(
+        rich_text_messages(&platform).await.len(),
+        1,
+        "ambiguous edits never duplicate content"
+    );
+    let card = platform.updated_cards().await.pop().unwrap();
+    assert!(card_text(&card).contains("当前仍是消息 `msg_file`"));
+    assert_eq!(reread_payload(&card)["rich_message_id"], "msg_file");
 }
 
 /// #741: a Rich Text Message send that FAILS drops nothing — the card keeps
