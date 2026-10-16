@@ -1024,6 +1024,131 @@ async fn send_as_file_transfers_off_the_callback_path() {
     );
 }
 
+/// The 「发为文件」 transfer uploads ONE byte snapshot: a text file replaced by a
+/// PDF between its classification and the click goes out under the BYTES' own
+/// label — `application/pdf`, and the PDF's length — never the stale
+/// `text/plain` of the earlier verdict (finding #739, round 3).
+///
+/// The race itself cannot be driven through a click deterministically (the
+/// handler re-classifies on the way in), so the transfer is called with exactly
+/// the state a click hands it: a text preview's classification, whose file has
+/// since been replaced.
+#[tokio::test]
+async fn the_transfer_labels_the_bytes_it_uploads() {
+    let _wd = test_work_dir();
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("notes.txt");
+    let text = b"# notes\n";
+    std::fs::write(&path, text).unwrap();
+    // What the viewer classified: text, and a preview that keeps no bytes.
+    let mut classified =
+        crate::bridge::viewer::classify(&path, text.len() as u64).expect("a text file classifies");
+    assert_eq!(classified.kind, crate::bridge::viewer::ClassifiedKind::Text);
+    assert!(classified.bytes.is_none(), "a text preview holds no bytes");
+
+    // The same path holds other bytes by the time the click lands.
+    let pdf = b"%PDF-1.7\nand not text at all\n";
+    std::fs::write(&path, pdf).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+
+    let lane = crate::bridge::viewer::send_as_file(
+        &app.feishu,
+        &app.cards_handle(),
+        "msg_view_card",
+        &path,
+        "notes.txt",
+        &mut classified,
+        app.cards_handle().viewer_transfer_timeout_ms(),
+    )
+    .await;
+
+    assert_eq!(
+        lane.delivery,
+        crate::feishu::card::tool_render::FileDelivery::SentAsFile,
+        "the transfer posts the file"
+    );
+    assert_eq!(
+        lane.mime, "application/pdf",
+        "the lane's label is the bytes it sent, never the stale text/plain"
+    );
+    assert_eq!(lane.size, pdf.len() as u64, "and so is its size");
+    let recorded = uploads(&platform).await;
+    assert_eq!(recorded.len(), 1, "exactly one upload: {recorded:?}");
+    match &recorded[0] {
+        PlatformCall::UploadFile { name, mime, size } => {
+            assert_eq!(name, "notes.txt");
+            assert_eq!(
+                mime, "application/pdf",
+                "the uploaded content's label names the uploaded bytes"
+            );
+            assert_eq!(
+                *size,
+                pdf.len() as u64,
+                "the upload carries the PDF's bytes, not the text's"
+            );
+        }
+        other => panic!("expected a file upload, got {other:?}"),
+    }
+    // The card the click PATCHes is built from this classification, so the
+    // viewer and the File Message name the same bytes.
+    assert_eq!(classified.mime, "application/pdf");
+    assert_eq!(classified.size, pdf.len() as u64);
+    assert!(classified.text.is_none(), "the stale preview text is gone");
+}
+
+/// A transfer of a file the viewer already read whole (an image/binary lane)
+/// uploads THAT snapshot — no second read of the path (finding #739, round 3):
+/// the file is gone by the click and the File Message still carries the
+/// classified bytes under the classified label.
+#[tokio::test]
+async fn the_transfer_sends_the_snapshot_it_classified() {
+    let _wd = test_work_dir();
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("report.pdf");
+    let payload: Vec<u8> = b"%PDF-1.7\nclassified bytes only\n".to_vec();
+    std::fs::write(&path, &payload).unwrap();
+    let mut classified =
+        crate::bridge::viewer::classify(&path, payload.len() as u64).expect("a PDF classifies");
+    assert_eq!(classified.kind, crate::bridge::viewer::ClassifiedKind::File);
+    assert_eq!(classified.mime, "application/pdf");
+
+    // Nothing is re-read: a re-read would find no file at all.
+    std::fs::remove_file(&path).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+
+    let lane = crate::bridge::viewer::send_as_file(
+        &app.feishu,
+        &app.cards_handle(),
+        "msg_view_card",
+        &path,
+        "report.pdf",
+        &mut classified,
+        app.cards_handle().viewer_transfer_timeout_ms(),
+    )
+    .await;
+
+    assert_eq!(
+        lane.delivery,
+        crate::feishu::card::tool_render::FileDelivery::SentAsFile,
+        "the classified snapshot is deliverable without the path"
+    );
+    assert_eq!(lane.mime, "application/pdf");
+    assert_eq!(lane.size, payload.len() as u64);
+    match &uploads(&platform).await[..] {
+        [PlatformCall::UploadFile { mime, size, .. }] => {
+            assert_eq!(mime, "application/pdf");
+            assert_eq!(*size, payload.len() as u64);
+        }
+        other => panic!("expected exactly one file upload, got {other:?}"),
+    }
+}
+
 /// A failed upload surfaces as 未发送 on the card — a stated outcome, never a
 /// dropped result — and posts no File Message (ADR-0083 §5).
 #[tokio::test]

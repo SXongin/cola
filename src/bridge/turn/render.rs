@@ -6997,7 +6997,7 @@ Index: /x/src/main.rs
             .await
             .iter()
             .filter_map(|call| match call {
-                PlatformCall::UploadFile { name, size } => Some((name.clone(), *size)),
+                PlatformCall::UploadFile { name, size, .. } => Some((name.clone(), *size)),
                 _ => None,
             })
             .collect()
