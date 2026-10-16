@@ -168,12 +168,67 @@ pub(crate) struct Classified {
     pub(crate) bytes: Option<Vec<u8>>,
 }
 
-/// Read `path` and decide what its bytes are (ADR-0083 §6): a bounded header is
-/// sniffed for magic bytes (image / known binary), then — for anything the
-/// sniff does not decide — the bytes decide by UTF-8 validity. A text file past
-/// the preview cap is never previewed, but it is still TEXT: it takes the File
-/// Message lane under a text label (a text-shaped header, for a file past
-/// Feishu's upload cap, is the best a never-read file can be named by).
+/// What a bounded header's bytes say about a file: `infer`'s name for the magic
+/// it found, whether that magic was an image or a known binary (an `infer` Text
+/// matcher — html, xml, a shell script — is still TEXT), and whether the header
+/// itself is UTF-8 text.
+struct Sniff {
+    mime_from_infer: Option<String>,
+    is_image: bool,
+    is_known_binary: bool,
+    is_text: bool,
+}
+
+impl Sniff {
+    /// The mime a byte-carrying lane reports when only a header could name it:
+    /// `infer`'s answer when magic bytes found one, else `text/plain` for a
+    /// text-shaped header and the generic octet type otherwise.
+    fn octet_mime(&self) -> String {
+        self.mime_from_infer.clone().unwrap_or_else(|| {
+            if self.is_text {
+                "text/plain".to_string()
+            } else {
+                crate::backend::file_content::DEFAULT_FILE_MIME.to_string()
+            }
+        })
+    }
+}
+
+/// Sniff a bounded header (ADR-0083 §6): magic bytes decide an image or a known
+/// binary first, then the header's own UTF-8 shape decides whether it *looks*
+/// like text. Callers pass at most [`SNIFF_BYTES`] bytes — the depth `infer`
+/// itself reads — so this is a bounded, cheap read's worth of work.
+fn sniff(header: &[u8]) -> Sniff {
+    let inferred = infer::get(header);
+    Sniff {
+        mime_from_infer: inferred.map(|kind| kind.mime_type().to_string()),
+        is_image: inferred.is_some_and(|kind| kind.matcher_type() == infer::MatcherType::Image),
+        // `infer`'s Text matchers (html, xml, a shell script) are still TEXT:
+        // they must fall through to the UTF-8 decision rather than being called
+        // binary.
+        is_known_binary: inferred.is_some_and(|kind| {
+            !matches!(
+                kind.matcher_type(),
+                infer::MatcherType::Image | infer::MatcherType::Text
+            )
+        }),
+        is_text: is_text_bytes(header),
+    }
+}
+
+/// Read `path` and decide what its bytes are (ADR-0083 §6): magic bytes
+/// (image / known binary) are decided first, then UTF-8 validity decides text.
+/// A text file past the preview cap is never previewed, but it is still TEXT:
+/// it takes the File Message lane under a text label (a text-shaped header, for
+/// a file past Feishu's upload cap, is the best a never-read file can be named
+/// by).
+///
+/// A file **within** Feishu's upload cap is read **ONCE** and classified from
+/// exactly those bytes, which are then handed to the delivery lane — so a file
+/// that changed between two reads can never be described by one read's bytes
+/// and delivered from another's, and no byte within the cap is read twice. A
+/// file **past** the cap is never delivered, so a single bounded header is all
+/// that is read to name it.
 ///
 /// Emptiness is decided by the **bytes actually read**, never by the `stat`
 /// size: a pseudo-file (procfs, sysfs) reports size 0 in its metadata while
@@ -182,72 +237,61 @@ pub(crate) struct Classified {
 /// pseudo-file) is still bounded, and the reported size is the bytes' own
 /// length.
 pub(crate) fn classify(path: &Path, size: u64) -> Result<Classified, CatFailure> {
-    // The bounded header is read FIRST and decides emptiness: the `stat` size
-    // cannot, because a size-0 pseudo-file has real content.
-    let header = read_prefix(path, SNIFF_BYTES)?;
-    if header.is_empty() {
-        return Err(CatFailure::Empty);
-    }
-    let inferred = infer::get(&header);
-    let mime_from_infer = inferred.map(|kind| kind.mime_type().to_string());
-    let is_image = inferred.is_some_and(|kind| kind.matcher_type() == infer::MatcherType::Image);
-    // `infer`'s Text matchers (html, xml, a shell script) are still TEXT: they
-    // must fall through to the UTF-8 decision rather than being called binary.
-    let is_known_binary = inferred.is_some_and(|kind| {
-        !matches!(
-            kind.matcher_type(),
-            infer::MatcherType::Image | infer::MatcherType::Text
-        )
-    });
-    let header_is_text = is_text_bytes(&header);
-    let octet_mime = || {
-        mime_from_infer.clone().unwrap_or_else(|| {
-            if header_is_text {
-                "text/plain".to_string()
-            } else {
-                crate::backend::file_content::DEFAULT_FILE_MIME.to_string()
-            }
-        })
-    };
-
-    // Past Feishu's 30MB upload cap: nothing is read, so only the header can say
-    // what this is. A text-shaped header is still TEXT — too large to preview —
-    // never 「二进制」.
+    // Past Feishu's 30MB upload cap (by the caller's `stat`): nothing can be
+    // delivered, so ONE bounded header is all this reads — the sniff is the only
+    // thing that can name a never-read file. A text-shaped header is still TEXT
+    // — too large to preview — never 「二进制」.
     if size > crate::feishu::file::MAX_FILE_BYTES {
+        let header = read_prefix(path, SNIFF_BYTES)?;
+        count_read(header.len());
+        if header.is_empty() {
+            return Err(CatFailure::Empty);
+        }
+        let sniffed = sniff(&header);
         return Ok(past_cap(
             size,
-            octet_mime(),
-            is_image,
-            is_known_binary,
-            header_is_text,
+            sniffed.octet_mime(),
+            sniffed.is_image,
+            sniffed.is_known_binary,
+            sniffed.is_text,
         ));
     }
 
-    // Within Feishu's upload cap: read the file ONCE, bounded by that cap. The
-    // bytes' own length is the truth the card reports (`size` below), so a file
-    // that shrank — or a pseudo-file whose `stat` size is 0 — is named by what
-    // was actually read, and `FileContent::from_bytes` receives those same
-    // bytes. A file that GREW past the cap after the caller's `stat` reads one
-    // byte past it and is reported past-cap — never as its truncated prefix —
-    // so the card says 未发送 instead of claiming a partial file was sent.
+    // Within Feishu's upload cap: read the file ONCE, bounded by that cap (plus
+    // the one byte that detects growth), and let exactly those bytes decide
+    // everything. The bytes' own length is the truth the card reports (`size`
+    // below), so a file that shrank — or a pseudo-file whose `stat` size is 0 —
+    // is named by what was actually read, and `FileContent::from_bytes`
+    // receives those same bytes.
     let Some(bytes) = read_bounded(path, crate::feishu::file::MAX_FILE_BYTES)? else {
+        // A file that GREW past the cap after the caller's `stat` reads one
+        // byte over it and is reported past-cap — never as its truncated
+        // prefix — so the card says 未发送 instead of claiming a partial file
+        // was sent. Nothing is deliverable, so only a bounded header names it.
         let grown = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(size);
+        let header = read_prefix(path, SNIFF_BYTES)?;
+        count_read(header.len());
+        let sniffed = sniff(&header);
         return Ok(past_cap(
             grown,
-            octet_mime(),
-            is_image,
-            is_known_binary,
-            header_is_text,
+            sniffed.octet_mime(),
+            sniffed.is_image,
+            sniffed.is_known_binary,
+            sniffed.is_text,
         ));
     };
-    let size = bytes.len() as u64;
-    if size == 0 {
+    count_read(bytes.len());
+    if bytes.is_empty() {
         return Err(CatFailure::Empty);
     }
-    if is_image {
+    // The sniff sees only a header-BOUNDED prefix of the read bytes (the depth
+    // `infer` reads), while the text decision below sees the whole file.
+    let sniffed = sniff(&bytes[..bytes.len().min(SNIFF_BYTES)]);
+    let size = bytes.len() as u64;
+    if sniffed.is_image {
         return Ok(Classified {
             size,
-            mime: octet_mime(),
+            mime: sniffed.octet_mime(),
             kind: ClassifiedKind::Image,
             text: None,
             bytes: Some(bytes),
@@ -256,7 +300,7 @@ pub(crate) fn classify(path: &Path, size: u64) -> Result<Classified, CatFailure>
     // A NUL byte means this is not text whatever its encoding — rendering it
     // would put a control character into the card (issue #519's family), and
     // the byte lane is where it belongs.
-    let is_text = !is_known_binary && is_text_bytes(&bytes);
+    let is_text = !sniffed.is_known_binary && is_text_bytes(&bytes);
     if is_text && size <= PREVIEW_READ_CAP as u64 {
         let text = String::from_utf8(bytes).expect("validated as UTF-8");
         return Ok(Classified {
@@ -281,7 +325,9 @@ pub(crate) fn classify(path: &Path, size: u64) -> Result<Classified, CatFailure>
     }
     // The whole file failed the UTF-8 test, so its header's shape must not label
     // it `text/plain`: only `infer` may name it, else it is a generic binary.
-    let mime = mime_from_infer.unwrap_or_else(|| crate::backend::file_content::DEFAULT_FILE_MIME.to_string());
+    let mime = sniffed
+        .mime_from_infer
+        .unwrap_or_else(|| crate::backend::file_content::DEFAULT_FILE_MIME.to_string());
     Ok(Classified {
         size,
         mime,
@@ -289,6 +335,23 @@ pub(crate) fn classify(path: &Path, size: u64) -> Result<Classified, CatFailure>
         text: None,
         bytes: Some(bytes),
     })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Bytes [`classify`] read for the calling thread — test-only instrumentation
+    /// for ADR-0083 §6's single-read invariant (finding #739 §1, round 2). A
+    /// thread-local keeps each test to its own reads, so the parallel test
+    /// threads cannot see each other's parses.
+    static CLASSIFY_BYTES_READ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Record that [`classify`] read `n` bytes from a file (tests only; a no-op in
+/// the production build).
+#[inline]
+fn count_read(_n: usize) {
+    #[cfg(test)]
+    CLASSIFY_BYTES_READ.with(|count| count.set(count.get() + _n as u64));
 }
 
 /// Whether `bytes` are UTF-8 text: valid UTF-8 and carrying no NUL byte (a NUL
@@ -854,6 +917,64 @@ mod tests {
         // One byte past the limit means MORE bytes remain: reported as `None`,
         // never as a 5-byte prefix of a 10-byte file.
         assert_eq!(read_bounded(&file, 5).unwrap(), None);
+    }
+
+    /// ADR-0083 §6: a file WITHIN the 30MB upload cap is read **once**, and
+    /// exactly those bytes both decide its type and reach the delivery lane — so
+    /// a file changing between two reads can never be described by one read's
+    /// bytes and delivered from another's. Pinned by counting the bytes
+    /// `classify` actually read: a second header read would show up as a count
+    /// above the file's own length, and for a bytes lane the delivered bytes must
+    /// BE the read bytes (finding #739 §1, round 2).
+    #[test]
+    fn classify_reads_a_file_within_the_cap_once() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // The bytes lane: the delivered bytes are exactly the classified bytes,
+        // and nothing is read beyond them.
+        let binary = dir.path().join("blob.bin");
+        let payload: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
+        let size = write(&binary, &payload);
+        CLASSIFY_BYTES_READ.with(|count| count.set(0));
+        let classified = classify(&binary, size).unwrap();
+        assert_eq!(
+            classified.bytes.as_deref(),
+            Some(payload.as_slice()),
+            "the delivered bytes ARE the classified bytes"
+        );
+        assert_eq!(
+            CLASSIFY_BYTES_READ.with(|count| count.get()),
+            size,
+            "the file is read exactly once"
+        );
+
+        // The text lane: the preview is the read text, and the read is still one.
+        let text = dir.path().join("note.txt");
+        let body = b"one read, one classification";
+        let size = write(&text, body);
+        CLASSIFY_BYTES_READ.with(|count| count.set(0));
+        let classified = classify(&text, size).unwrap();
+        assert_eq!(classified.text.as_deref(), Some("one read, one classification"));
+        assert_eq!(
+            CLASSIFY_BYTES_READ.with(|count| count.get()),
+            size,
+            "the text preview is also read exactly once"
+        );
+
+        // A file past the cap is never read: one bounded header names it.
+        let huge = dir.path().join("huge.bin");
+        let handle = std::fs::File::create(&huge).unwrap();
+        handle.set_len(crate::feishu::file::MAX_FILE_BYTES + 1).unwrap();
+        drop(handle);
+        let size = std::fs::metadata(&huge).unwrap().len();
+        CLASSIFY_BYTES_READ.with(|count| count.set(0));
+        let classified = classify(&huge, size).unwrap();
+        assert!(classified.bytes.is_none(), "a past-cap file delivers nothing");
+        assert_eq!(
+            CLASSIFY_BYTES_READ.with(|count| count.get()),
+            SNIFF_BYTES as u64,
+            "a past-cap file is named from one bounded header, never read"
+        );
     }
 
     /// The same growth at the two callers that guard the 30MB cap: `classify`
