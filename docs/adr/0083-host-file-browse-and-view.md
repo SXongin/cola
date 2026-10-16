@@ -95,7 +95,14 @@ loop.
    **The whole-bytes lane is a user action, not a promise**: every viewer carries
    「发为文件」, which uploads the file and posts it as that File Message, and that is the only
    thing that gets a file whose preview fits nowhere (a 5000-line log, a 60-row table) out of
-   the chat. A text file's card preview is a
+   the chat. **That transfer never runs inside the card callback.** The click records the
+   intent and acknowledges; a bounded, timed-out step performs the upload and the send off
+   the callback path, and the card reports the outcome — including a failure or a timeout —
+   so a 30 MB upload can neither die with the callback's 3 s budget nor leave the clicker
+   with a dropped result (CODING_STANDARDS.md's callback-network rule). Local work a click
+   does stays inline, because that work is bounded by design: resolving a path, a `stat`, and
+   a read under the preview cap are the Directory Browser's own scan-cap discipline, and no
+   transfer shares it. A text file's card preview is a
    fenced code block with a language hint, paged by **lines** with the shared pager control —
    **except a delimited-text file (`.csv`, `.tsv`), whose preview is a markdown table**, since
    a table is what those bytes *are* and the platform renders one natively; that lane is
@@ -133,6 +140,11 @@ loop.
    surface: scan cap, result cap, `.gitignore`); and no inline preview of non-image binaries,
    because the client's 在线预览 format list could not be obtained from the docs and cola must
    not promise a preview it has not measured.
+
+These are the **decisions**; the behavioural contract is the spec #669's — every user story
+and acceptance criterion, down to the copy for a missing, unreadable or empty path and the
+commands `/help` documents. Where this record's prose is silent, the spec governs, and a
+divergence between the two is a defect in this record rather than a design change.
 
 ## Considered options
 
