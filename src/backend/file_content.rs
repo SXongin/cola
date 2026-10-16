@@ -99,7 +99,9 @@ impl FileContent {
 
 /// A byte count as a human-readable size: exact bytes below 1 KiB, otherwise
 /// one decimal in the largest binary unit that fits (`512 B`, `1.2 MB`).
-fn human_size(bytes: u64) -> String {
+/// Shared by the File Content record line and the File Viewer's naming block
+/// (ADR-0083 §3), so the two surfaces spell a size the same way.
+pub(crate) fn human_size(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut value = bytes as f64;
     let mut unit = 0;

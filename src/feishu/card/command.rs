@@ -29,6 +29,7 @@ use crate::bridge::handles::CommandHandles;
 use crate::config::ThreadKey;
 use crate::error::Result;
 
+use super::session::BrowseView;
 use super::session::SwitchScope;
 
 /// Fetch + shape the data the `/switch` card renders: the session list
@@ -303,6 +304,91 @@ pub(crate) async fn send_dir_card(
     let (dirs, current_dir) = dir_card_data(handles, thread_key, "").await;
     let card = super::session::build_dir_card(thread_key, &dirs, current_dir.as_deref(), "", 1);
     handles.flow.platform.reply_card(message_id, &card).await?;
+    Ok(())
+}
+
+/// The bare `/cat` usage line: `/cat` with no path answers this instead of
+/// being forwarded as a prompt (ADR-0083 §2).
+pub(crate) const CAT_USAGE: &str = "\
+用法：`/cat <路径>` —— 在卡片里查看宿主机上的一个文件（目录则打开该目录的浏览卡，不会报错）。
+- 相对路径按**当前会话目录**解析；会话还没创建时用当前项目目录，都没有则用默认目录。
+- `~` 展开为 home，绝对路径（包括会话目录之外的）原样使用。
+- 只是隐私提示，不是沙箱；谁能操作仍由 Access List 决定，而群聊里卡片人人可读。
+例：`/cat src/main.rs`、`/cat ~/notes.md`、`/cat /etc/hosts`";
+
+/// Open `/cat <path>` (ADR-0083 §2, §3): the File Viewer card for a file, the
+/// Directory Browser for a directory, the usage line for a bare `/cat`, and —
+/// for a path that cannot be shown — that path's own honest answer, never an
+/// empty card. The bytes are read locally (`bridge::viewer`), so the command
+/// is generation- and backend-neutral, and the answer is a plain command card:
+/// it joins no Card Chain, is never written to the Chain Record and is never
+/// reaped.
+pub(crate) async fn send_cat_card(
+    handles: &CommandHandles,
+    thread_key: &ThreadKey,
+    message_id: &str,
+    arg: Option<&str>,
+) -> Result<()> {
+    let platform = &handles.flow.platform;
+    let Some(arg) = arg.map(str::trim).filter(|a| !a.is_empty()) else {
+        platform.reply_text(message_id, CAT_USAGE).await?;
+        return Ok(());
+    };
+    // The Path Scope (ADR-0083 §4): `current_project_directory` is pending-first
+    // — the Pending Session's directory wins, else the active session's, else
+    // the default — so a conversation with no session yet still resolves
+    // against its current project.
+    let session_dir = handles.current_project_directory(thread_key).await;
+    let resolved = crate::bridge::viewer::resolve_cat_path(arg, &session_dir);
+    match crate::bridge::viewer::open_cat_path(&resolved) {
+        // `/cat <directory>` answers the Directory Browser there rather than
+        // erroring: `/cat` always means "show me this path" (ADR-0083 §2).
+        crate::bridge::viewer::CatOpen::Directory(dir) => {
+            let dir = dir.to_string_lossy().to_string();
+            let card = crate::bridge::handler::build_dir_browse_card_for(
+                &handles.flow.sessions,
+                thread_key,
+                BrowseView {
+                    dir: &dir,
+                    show_hidden: false,
+                    keyword: "",
+                    page: 1,
+                },
+            )
+            .await;
+            platform.reply_card(message_id, &card).await?;
+        }
+        crate::bridge::viewer::CatOpen::File { path, size } => {
+            // A file past the preview read cap yields its bounded prefix; the
+            // card says so (#739 routes such a file to the File Message lane).
+            let truncated = size > crate::bridge::viewer::PREVIEW_READ_CAP as u64;
+            match crate::bridge::viewer::read_preview(&path, size) {
+                Ok(text) => {
+                    let ext = path.extension().and_then(|e| e.to_str());
+                    let shown = path.to_string_lossy().to_string();
+                    let card = super::viewer::build_viewer_card(
+                        thread_key,
+                        super::viewer::ViewerCard {
+                            path: &shown,
+                            size,
+                            kind: super::viewer::kind_for_extension(ext),
+                            ext,
+                            text: &text,
+                            truncated,
+                            return_to: None,
+                        },
+                    );
+                    platform.reply_card(message_id, &card).await?;
+                }
+                Err(failure) => {
+                    platform.reply_text(message_id, &failure.line(&path)).await?;
+                }
+            }
+        }
+        crate::bridge::viewer::CatOpen::Failed(failure) => {
+            platform.reply_text(message_id, &failure.line(&resolved)).await?;
+        }
+    }
     Ok(())
 }
 

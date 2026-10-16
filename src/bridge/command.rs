@@ -80,6 +80,12 @@ pub enum Command {
     Skill(SkillInvocation),
     /// Forward unrecognized slash command to OpenCode as prompt text
     Forward(String),
+    /// `/cat <path>` — open one **Host** file as a **File Viewer** card, or a
+    /// directory as the **Directory Browser** (ADR-0083 §2). `None` is the bare
+    /// `/cat`, which answers usage instead of becoming a prompt. The path
+    /// resolves on the **Path Scope** (relative to the Session's directory,
+    /// `~` expanded, absolute passed through) and is advisory, not a boundary.
+    Cat(Option<String>),
 }
 
 /// One skill-invocation request (spec #662): the ids a message named, and which
@@ -306,6 +312,10 @@ pub fn parse_command(text: &str) -> Option<Command> {
             }
         },
         "/new" => Some(Command::New(arg.map(|s| s.to_string()))),
+        // `/cat <path>` opens one host file as a card, a directory as the
+        // browse card, and a bare `/cat` answer usage (ADR-0083 §2). The whole
+        // remainder of the line is the path, so a path with spaces survives.
+        "/cat" => Some(Command::Cat(arg.map(|s| s.to_string()))),
         "/topic" => match arg {
             Some(a) => {
                 // `/topic --adopt <keyword> [--force]` — adopt an existing
@@ -473,6 +483,7 @@ pub fn help_text() -> String {
     "\
 **cola commands**
 `/dir <path> [name]` · Declare a new session in a project directory (created by the next message)
+`/cat <path>` · View a host file in a card (a directory opens the Directory Browser there)
 `/switch` · Session card: browse / search / adopt / new
 `/switch <kw>` · Switch to a session by name/dir/id (adopts foreign ones)
 `/switch <id> [--force]` · Take over a session by id/title
@@ -506,6 +517,9 @@ pub fn help_text() -> String {
 /// Detailed help for one command (`/help <command>`). `None` for unknown names.
 pub fn command_help(name: &str) -> Option<String> {
     let text = match name.to_lowercase().as_str() {
+        "cat" => {
+            "/cat <path>\nOpen one host file as a File Viewer card. cola reads the bytes itself — no model, no server round-trip — so behaviour is identical on every Generation. The card names the file it shows (its RESOLVED path, size and type) and renders a text file as a fenced code block carrying the extension's language hint; an extension the platform has no token for degrades honestly to plain_text rather than being mislabelled. A delimited-text file (.csv/.tsv) previews as a markdown table, because a table is what those bytes are. The card's 「📂 所在目录」 opens the Directory Browser at the file's parent directory.\n- `/cat <directory>` — open the Directory Browser at that directory instead of erroring: `/cat` always means \"show me this path\"\n- `/cat` (no arg) — this help\nPath Scope: `~` expands, a relative path resolves against this session's directory (the conversation's current project while the session is still pending), and an absolute path — inside or outside that directory — is used as-is. The scope is a privacy hint, not a sandbox: whoever can read the chat can read the card, and who may act is the Access List's call.\nA path that does not exist, one cola cannot read, and an empty file each answer distinctly, naming the path.\nExamples: `/cat src/main.rs`, `/cat ~/notes.md`, `/cat /etc/hosts`"
+        }
         "dir" => {
             "/dir <path> [name]\nDeclare a new session rooted at <path>: nothing is created yet — the conversation's next non-command message creates the session in that directory and maps it here, so a mistaken `/dir` can be corrected with another `/dir`, `/new`, `/switch` or `/topic` and leaves no session behind.\n- `/dir` (no arg) — Recent Directories card: pick a recently-used folder and declare it there, or open it as a fresh topic (each row's 建话题 = `/topic <dir>` without typing; only from the main conversation). When there are many directories, the card carries a search box over the paths. Its 📁 浏览目录 button opens a filesystem browser: drill into subdirectories, type a path (前往 browses it, 选择 declares it), toggle dot-directories, and filter the child names.\nExample: `/dir /root/proj/lib`"
         }
@@ -770,6 +784,10 @@ pub(crate) async fn handle_command(
         }
         Command::DirCard => {
             crate::feishu::card::command::send_dir_card(handles, &thread_key, message_id).await?;
+        }
+        Command::Cat(path) => {
+            crate::feishu::card::command::send_cat_card(handles, &thread_key, message_id, path.as_deref())
+                .await?;
         }
         Command::Switch(action) => {
             handle_switch_action(handles, &thread_key, action, message_id, kind).await?;
@@ -2151,6 +2169,16 @@ pub(crate) fn normalize_directory(input: &str) -> std::path::PathBuf {
 /// spelling — and any symlink in it — stays as the user navigated it; the
 /// canonicalizing [`normalize_directory`] stays the pre-session form.
 pub(crate) fn expand_directory(input: &str) -> std::path::PathBuf {
+    expand_against(input, &std::env::current_dir().unwrap_or_default())
+}
+
+/// [`expand_directory`] with an explicit base for a relative path: `~` still
+/// expands against home, an absolute path still passes through, and a relative
+/// one joins `base` instead of the process cwd. The **Path Scope** (ADR-0083
+/// §4) is the one caller that needs it — a `/cat`/viewer path resolves against
+/// the Session's directory (the conversation's current project while the
+/// Session is still Pending), never against wherever cola was started.
+pub(crate) fn expand_against(input: &str, base: &std::path::Path) -> std::path::PathBuf {
     let home = dirs::home_dir().unwrap_or_default();
     let expanded = if input == "~" {
         home.clone()
@@ -2162,7 +2190,7 @@ pub(crate) fn expand_directory(input: &str) -> std::path::PathBuf {
     if expanded.is_absolute() {
         expanded
     } else {
-        std::env::current_dir().unwrap_or_default().join(expanded)
+        base.join(expanded)
     }
 }
 
@@ -2677,6 +2705,35 @@ mod tests {
         assert_eq!(parse_command("/CARD"), Some(Command::Card));
     }
 
+    /// `/cat` is a registered Command (ADR-0083 §2): a path opens it, a bare
+    /// `/cat` answers usage, the token is case-insensitive and takes the whole
+    /// rest of the line, and a longer token stays an unknown command — so
+    /// `/cat` swallows nothing else.
+    #[test]
+    fn parse_cat() {
+        assert_eq!(
+            parse_command("/cat src/main.rs"),
+            Some(Command::Cat(Some("src/main.rs".into())))
+        );
+        assert_eq!(parse_command("/cat"), Some(Command::Cat(None)));
+        assert_eq!(parse_command("/cat   "), Some(Command::Cat(None)));
+        assert_eq!(
+            parse_command("/CAT ~/notes.md"),
+            Some(Command::Cat(Some("~/notes.md".into())))
+        );
+        assert_eq!(
+            parse_command("/cat /tmp/a b.txt"),
+            Some(Command::Cat(Some("/tmp/a b.txt".into()))),
+            "the whole remainder is the path"
+        );
+        // Only the exact token is `/cat`: unknown `/...` commands still forward.
+        assert_eq!(
+            parse_command("/catalog x"),
+            Some(Command::Forward("/catalog x".into()))
+        );
+        assert_eq!(parse_command("/cats"), Some(Command::Forward("/cats".into())));
+    }
+
     #[test]
     fn parse_agent() {
         assert_eq!(
@@ -2711,6 +2768,14 @@ mod tests {
         assert!(command_help("model").unwrap().contains("/model"));
         assert!(command_help("think").unwrap().contains("/think"));
         assert!(command_help("dir").unwrap().contains("next non-command message"));
+        let cat = command_help("cat").expect("cat has a help topic");
+        assert!(cat.contains("/cat <path>"), "{cat}");
+        assert!(cat.contains("/cat <directory>"), "{cat}");
+        assert!(
+            cat.contains("plain_text"),
+            "the honest degradation is documented: {cat}"
+        );
+        assert!(cat.contains("相对") || cat.contains("Path Scope"), "{cat}");
         assert!(command_help("version").unwrap().contains("/version"));
         assert!(command_help("sub").unwrap().contains("/sub list"));
         assert!(

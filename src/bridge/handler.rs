@@ -306,7 +306,7 @@ fn reject_nested_topic(thread_key: &ThreadKey) -> Option<CardActionResult> {
 /// actually browsed (after resolution and any ancestor fallback), its child
 /// directories (filtered + sorted), whether the filter control shows, and any
 /// fallback explanation.
-struct BrowseState {
+pub(crate) struct BrowseState {
     dir: String,
     children: Vec<crate::feishu::card::session::BrowseChild>,
     show_filter: bool,
@@ -420,6 +420,36 @@ fn browse_dir_state(view: BrowseView<'_>) -> BrowseState {
         show_filter,
         notice,
     }
+}
+
+/// Read + build the `/dir` browse card (ADR-0078, ADR-0083 §2) for `view`:
+/// resolve the target (symlinks followed, landing on the nearest existing
+/// ancestor when it is gone), list its child directories, and render the card
+/// with the conversation's current directory marked. Shared by the App's own
+/// browse rebuilds and the `/cat <directory>` answer — a command card has no
+/// `App`, only the [`CommandHandles`](crate::bridge::handles::CommandHandles)
+/// its dispatch carries — so both render from one source of truth.
+pub(crate) async fn build_dir_browse_card_for(
+    sessions: &crate::bridge::handles::SessionsHandle,
+    thread_key: &ThreadKey,
+    view: BrowseView<'_>,
+) -> serde_json::Value {
+    let state = browse_dir_state(view);
+    let current_dir = sessions.current_directory(thread_key).await;
+    // The card renders the RESOLVED directory (post-resolution/ancestor
+    // fallback), not the requested one.
+    let resolved = BrowseView {
+        dir: &state.dir,
+        ..view
+    };
+    crate::feishu::card::session::build_dir_browse_card(
+        thread_key,
+        &state.children,
+        current_dir.as_deref(),
+        resolved,
+        state.show_filter,
+        state.notice.as_deref(),
+    )
 }
 
 /// Resolve a browse target to the real directory it denotes, following
@@ -2366,29 +2396,16 @@ impl App {
         thread_key: &ThreadKey,
         view: BrowseView<'_>,
     ) -> serde_json::Value {
-        let state = browse_dir_state(view);
-        let current_dir = core.sessions.lock().await.current_directory(thread_key);
-        // The card renders the RESOLVED directory (post-resolution/ancestor
-        // fallback), not the requested one.
-        let resolved = BrowseView {
-            dir: &state.dir,
-            ..view
-        };
-        crate::feishu::card::session::build_dir_browse_card(
-            thread_key,
-            &state.children,
-            current_dir.as_deref(),
-            resolved,
-            state.show_filter,
-            state.notice.as_deref(),
-        )
+        let sessions = core.command_handles().flow.sessions;
+        build_dir_browse_card_for(&sessions, thread_key, view).await
     }
 
     /// Handle a `/dir` browse-card click (ADR-0078). `go` drills down (a child
     /// row, a breadcrumb hop, or the form's typed path); `pick`/`topic` act on
     /// the directory you stand in (or the typed path), mirroring the Recent
     /// Directories card's two ops; `filter`/`page`/`show_hidden` rebuild the
-    /// view; `recent` swaps back to the Recent Directories card. A typed path
+    /// view; `restore` rebuilds it untouched (a viewer's 「← 返回目录」);
+    /// `recent` swaps back to the Recent Directories card. A typed path
     /// wins over the payload's `dir`, and the current project is the fallback
     /// when a name-only form submit lost the dir.
     async fn handle_dir_browse_action(
@@ -2455,6 +2472,15 @@ impl App {
                     self.build_dir_browse_for(core, &thread_key, BrowseView { page: 1, ..base })
                         .await,
                 ),
+                toast: None,
+            }),
+            // ADR-0083 §3: a File Viewer's 「← 返回目录」 restores the listing
+            // it was opened from — a pure rebuild of the payload's own state
+            // (directory, filter, hidden toggle, page), so `base` is used
+            // verbatim. `go` cannot serve it: a drill-down deliberately clears
+            // the filter and returns to page 1.
+            "restore" => Some(CardActionResult {
+                card: Some(self.build_dir_browse_for(core, &thread_key, base).await),
                 toast: None,
             }),
             "page" => Some(CardActionResult {

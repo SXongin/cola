@@ -986,6 +986,20 @@ fn browse_value(thread_key: &crate::config::ThreadKey, op: &str, view: BrowseVie
     })
 }
 
+/// [`browse_value`] for a card that is not a browse card but still hands the
+/// browse handler a navigation (ADR-0083 §3): the **File Viewer**'s
+/// 「📂 所在目录」 (`op: "go"` at the file's parent directory) and its
+/// 「← 返回目录」 (`op: "restore"`, the listing's whole state so the return is
+/// exact). Sharing the builder keeps a viewer's payloads `BrowseView`-shaped
+/// and unable to drift from the browse card's own.
+pub(crate) fn browse_view_value(
+    thread_key: &crate::config::ThreadKey,
+    op: &str,
+    view: BrowseView<'_>,
+) -> serde_json::Value {
+    browse_value(thread_key, op, view)
+}
+
 /// The browse card's clickable breadcrumb (ADR-0078): 🏠 home, ⬆ 上一级, then
 /// the path's tail segments (at most four, with a leading `…` jumping to the
 /// segment just before them) as `column_set`/`flex_mode: "flow"` buttons.
