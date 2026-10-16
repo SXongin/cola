@@ -220,15 +220,18 @@ impl ToolPanel {
     /// about which file the call touched. `None` for any other tool — a `read`
     /// above all, whose content is already on the card — and for a call whose
     /// path is absent or unusable (no input, a non-object input, a missing or
-    /// non-string key, or an empty string): those panels carry no button
-    /// rather than a broken one. Natural-language paths in the agent's prose
-    /// never reach here — only the call's structured input is read.
+    /// non-string key, or a blank string): those panels carry no button
+    /// rather than a broken one. A path that merely carries surrounding
+    /// whitespace is still a name Unix allows, so it stays verbatim — only a
+    /// path with nothing printable is unusable. Natural-language paths in the
+    /// agent's prose never reach here — only the call's structured input is
+    /// read.
     pub(crate) fn file_open_path(&self) -> Option<&str> {
         if !matches!(self.name(), "write" | "edit") {
             return None;
         }
         let obj = self.input()?.as_object()?;
-        input_path(obj).filter(|path| !path.is_empty())
+        input_path(obj).filter(|path| !path.trim().is_empty())
     }
 
     /// How many body elements the 「📂 打开」 button adds (ADR-0083 §8, #743):
@@ -2499,6 +2502,7 @@ mod tests {
     fn write_and_edit_panels_carry_an_open_button_from_the_structured_path() {
         for (name, input) in [
             ("write", json!({"filePath": "report.md", "content": "hi"})),
+            ("write", json!({"path": "src/v2w.rs"})),
             ("edit", json!({"filePath": "src/main.rs"})),
             ("edit", json!({"path": "src/v2.rs"})),
         ] {
@@ -2536,8 +2540,9 @@ mod tests {
 
     /// A call whose path is absent or unusable carries no button rather than a
     /// broken one (#743): no input at all, a non-object input, a missing key,
-    /// a non-string path, or an empty path — and prose in the OUTPUT naming a
-    /// path never becomes a control either.
+    /// a non-string path, or a blank path (empty or whitespace-only — a button
+    /// for one could only ever answer 找不到) — and prose in the OUTPUT naming
+    /// a path never becomes a control either.
     #[test]
     fn a_panel_without_a_usable_path_carries_no_open_button() {
         let cases: Vec<(&str, Option<serde_json::Value>, Option<&str>)> = vec![
@@ -2546,7 +2551,9 @@ mod tests {
             ("write", Some(json!({"content": "hi"})), None),
             ("write", Some(json!({"filePath": 7})), None),
             ("write", Some(json!({"filePath": ""})), None),
+            ("write", Some(json!({"filePath": "   "})), None),
             ("edit", Some(json!({"filePath": ""})), None),
+            ("edit", Some(json!({"path": "  "})), None),
             (
                 "bash",
                 Some(json!({"command": "cat report.md"})),
@@ -2560,9 +2567,19 @@ mod tests {
                 tool_open_button_element(&panel, Some("ses_1")).is_none(),
                 "no button for {name}"
             );
+            assert_eq!(
+                tool_open_button_estimate(&panel, Some("ses_1")),
+                0,
+                "no button, no estimate charge for {name}"
+            );
+            assert_eq!(
+                panel.open_button_count(Some("ses_1")),
+                0,
+                "no button, no component charge for {name}"
+            );
         }
-        // No Session to route by, no button either — the click could not know
-        // whose viewer to open.
+        // No Session to route by — or an empty one, which routes nowhere — no
+        // button either: the click could not know whose viewer to open.
         let panel = ToolPanel::for_test(
             "write",
             ToolStatus::Completed,
@@ -2570,6 +2587,10 @@ mod tests {
             None,
         );
         assert!(tool_open_button_element(&panel, None).is_none());
+        assert!(
+            tool_open_button_element(&panel, Some("")).is_none(),
+            "an empty Session id routes nowhere"
+        );
     }
 
     /// The 「📂 打开」 rides BESIDE the folded panel, not inside it (ADR-0083
