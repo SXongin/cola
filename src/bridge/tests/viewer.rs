@@ -818,11 +818,12 @@ async fn an_image_opened_twice_uploads_once() {
     }
 }
 
-/// A text file past the preview read cap is NOT previewed: it takes the File
-/// Message lane, and its bytes are never rendered in the card (ADR-0083 §5,
-/// §6).
+/// A text file past the preview read cap is NOT previewed, but it is still
+/// TEXT: it is named 「文本（过大，未预览）」 — never 二进制 — and takes the File
+/// Message lane (ADR-0083 §5, §6; finding #739 §5). Its bytes never reach the
+/// card.
 #[tokio::test]
-async fn a_text_file_past_the_preview_cap_takes_the_file_lane() {
+async fn a_text_file_past_the_preview_cap_is_text_too_large_not_binary() {
     let _wd = test_work_dir();
     let proj = tempfile::tempdir().unwrap();
     let big = vec![b'a'; crate::bridge::viewer::PREVIEW_READ_CAP + 1];
@@ -845,12 +846,45 @@ async fn a_text_file_past_the_preview_cap_takes_the_file_lane() {
     let card = first_card(&platform).await;
     let text = card_text(&card);
     assert!(
-        text.contains("二进制"),
-        "past the cap there is no preview: {text}"
+        text.contains("文本（过大，未预览）"),
+        "a big UTF-8 file is named as text too large to preview: {text}"
     );
+    assert!(!text.contains("二进制"), "it must never be called 二进制: {text}");
     assert!(text.contains("已发送为文件消息"), "{text}");
     assert!(!text.contains("```"), "the bytes are not previewed: {text}");
     assert_eq!(file_messages(&platform).await.len(), 1, "one File Message");
+}
+
+/// A binary past the preview read cap stays 二进制 — the label follows the
+/// content, not the size (finding #739 §5's other side).
+#[tokio::test]
+async fn a_binary_past_the_preview_cap_stays_binary() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let mut blob = vec![0xffu8; crate::bridge::viewer::PREVIEW_READ_CAP + 1];
+    // A NUL in the header means not text, whatever the size.
+    blob[0] = 0;
+    std::fs::write(proj.path().join("huge.bin"), &blob).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+
+    send_command_in(
+        &app,
+        "/cat huge.bin",
+        key.clone(),
+        "m_huge_bin",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let card = first_card(&platform).await;
+    let text = card_text(&card);
+    assert!(text.contains("二进制（.bin）"), "{text}");
+    assert!(!text.contains("文本（过大"), "{text}");
+    assert!(text.contains("已发送为文件消息"), "{text}");
 }
 
 /// A file past Feishu's 30MB cap leaves only the 未发送 line — no upload, no
@@ -1110,6 +1144,108 @@ async fn send_as_file_past_the_cap_leaves_unsent() {
     })
     .await;
     assert!(uploads(&platform).await.is_empty(), "nothing is read or uploaded");
+    assert!(file_messages(&platform).await.is_empty(), "no File Message");
+}
+
+/// A path that vanished between the viewer and the 「发为文件」 click states the
+/// outcome ON THE CARD — 找不到路径, no File Message, no upload — instead of
+/// dropping the click's result (finding #739 §4).
+#[tokio::test]
+async fn a_vanished_transfer_file_states_the_failure_on_the_card() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let file = proj.path().join("notes.txt");
+    std::fs::write(&file, "# notes\n").unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+
+    send_command_in(
+        &app,
+        "/cat notes.txt",
+        key.clone(),
+        "m_view",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let card = first_card(&platform).await;
+    let mut payload = send_as_file_payload(&card);
+    payload["open_message_id"] = serde_json::json!("msg_view_card");
+    // The RESOLVED path the click carries — what the outcome card must name.
+    let resolved = payload["path"].as_str().unwrap().to_string();
+
+    // The file is gone by the time the click lands.
+    std::fs::remove_file(&file).unwrap();
+    app.host_action(payload).await.expect("the click acks");
+
+    wait_for_card_update(&platform, "找不到路径", CardUpdates::Latest, |card| {
+        card_text(card).contains("找不到路径")
+    })
+    .await;
+    let patch = patches_to(&platform, "msg_view_card").await;
+    let outcome = patch.last().expect("the card was PATCHed with the outcome");
+    assert!(
+        card_text(outcome).contains(&resolved),
+        "the outcome names the resolved path: {}",
+        card_text(outcome)
+    );
+    assert!(
+        uploads(&platform).await.is_empty(),
+        "nothing is read or uploaded for a vanished path"
+    );
+    assert!(
+        file_messages(&platform).await.is_empty(),
+        "a vanished path posts no File Message"
+    );
+}
+
+/// A path that became unreadable between the viewer and the click states
+/// 无法读取 ON THE CARD — never a separate text reply, never a dropped result
+/// (finding #739 §4). A directory where the file was is unreadable at every
+/// privilege level, so this holds for a root test runner too.
+#[tokio::test]
+async fn an_unreadable_transfer_file_states_the_failure_on_the_card() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let file = proj.path().join("notes.txt");
+    std::fs::write(&file, "# notes\n").unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+
+    send_command_in(
+        &app,
+        "/cat notes.txt",
+        key.clone(),
+        "m_view",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let card = first_card(&platform).await;
+    let mut payload = send_as_file_payload(&card);
+    payload["open_message_id"] = serde_json::json!("msg_view_card");
+
+    // The file is now a directory: reading it fails at every privilege level.
+    std::fs::remove_file(&file).unwrap();
+    std::fs::create_dir(&file).unwrap();
+    app.host_action(payload).await.expect("the click acks");
+
+    wait_for_card_update(&platform, "无法读取", CardUpdates::Latest, |card| {
+        card_text(card).contains("无法读取")
+    })
+    .await;
+    assert!(
+        platform.texts().await.is_empty(),
+        "the outcome lands on the card, not as a separate text reply: {:?}",
+        platform.texts().await
+    );
+    assert!(uploads(&platform).await.is_empty(), "nothing is uploaded");
     assert!(file_messages(&platform).await.is_empty(), "no File Message");
 }
 

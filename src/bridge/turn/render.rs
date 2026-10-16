@@ -2886,7 +2886,8 @@ mod tests {
     };
     use crate::bridge::test_support::{
         MockBackend, PlatformCall, RecordingPlatform, build_app, card_text, final_card, realistic_parts,
-        seed_cover_title, seed_entry, test_config, test_work_dir, text_part, turn_anchor, typed_message,
+        seed_cover_title, seed_entry, send_command_in, test_config, test_work_dir, text_part, turn_anchor,
+        typed_message,
     };
     use crate::bridge::turn::state::{CursorSeed, StreamAccumulator, file_content_hash};
     use crate::feishu::card::CardState;
@@ -7128,6 +7129,110 @@ Index: /x/src/main.rs
             .collect();
         assert_eq!(images.len(), 2, "both reads show their image: {card}");
         assert!(images.iter().all(|img| img["img_key"] == "img_v2_same"));
+    }
+
+    /// The content-hash upload cache is SHARED across surfaces (#739, finding):
+    /// the same image the transcript path renders from a tool's `read` output
+    /// and `/cat` reopens from disk uploads ONCE. The reopen test above only
+    /// proves viewer-to-viewer reuse; this pins the cross-path key space, so a
+    /// re-open never re-uploads bytes a render already embedded.
+    #[tokio::test]
+    async fn an_image_delivered_by_a_tool_and_reopened_in_the_viewer_uploads_once() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let proj = tempfile::tempdir().unwrap();
+        // A structurally real PNG: `infer` names it image/png, its IHDR is a
+        // real 4×4, and BOTH paths carry exactly these bytes with the name
+        // `shot.png`, so the identity (bytes, mime, name) matches exactly.
+        let png = {
+            let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+            bytes.extend_from_slice(&13u32.to_be_bytes());
+            bytes.extend_from_slice(b"IHDR");
+            bytes.extend_from_slice(&4u32.to_be_bytes());
+            bytes.extend_from_slice(&4u32.to_be_bytes());
+            bytes.extend_from_slice(&[8, 6, 0, 0, 0]);
+            bytes
+        };
+        std::fs::write(proj.path().join("shot.png"), &png).unwrap();
+
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        platform.given_image_key("img_v2_cross_path");
+        let sid = "ses_cross_path";
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        seed_entry(
+            &app,
+            crate::config::SessionEntry {
+                thread_key: key.clone(),
+                session_id: sid.into(),
+                directory: proj.path().to_string_lossy().to_string(),
+                agent: None,
+                model: None,
+                auto_accept: false,
+                topic_anchor: None,
+                topic_root: None,
+                variant: None,
+            },
+        )
+        .await;
+        let cards = app.core.cards_handle();
+        Turn::seed_card(&cards, sid, Some("om_cross")).await;
+        Turn::set_turn_anchor(&cards, sid, &turn_anchor(0)).await;
+
+        // Path 1: a tool's `read` output carrying the very same image content.
+        let transcript = SessionTranscript::new(vec![message(
+            "a1",
+            1_000,
+            vec![read_file_part("call_read", "shot.png", "image/png", &png)],
+        )]);
+        render(&app, &cards, sid, &transcript).await;
+        assert_eq!(
+            platform
+                .upload_image_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the transcript path embeds the image"
+        );
+
+        // Path 2: `/cat` reopens the same file — same bytes, mime and name.
+        send_command_in(
+            &app,
+            "/cat shot.png",
+            key.clone(),
+            "m_cat",
+            crate::config::ConversationKind::P2p,
+        )
+        .await;
+
+        assert_eq!(
+            platform
+                .upload_image_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the same content resolved via both paths uploads exactly once"
+        );
+        assert_eq!(uploaded_images(&platform).await.len(), 1);
+        // Both surfaces embedded it, from the one cached key: the render's card
+        // and the /cat viewer card.
+        let render_card = final_card(&platform).await;
+        assert!(
+            card_text(&render_card).contains("已内嵌"),
+            "the render card: {render_card}"
+        );
+        let viewer_card = platform
+            .replied_cards()
+            .await
+            .into_iter()
+            .last()
+            .expect("the /cat viewer card");
+        assert!(
+            card_text(&viewer_card).contains("已内嵌"),
+            "the viewer card: {viewer_card}"
+        );
+        assert!(
+            viewer_card.to_string().contains("img_v2_cross_path"),
+            "the viewer reuses the cached image key: {viewer_card}"
+        );
     }
 
     /// Two resolves of the SAME bytes racing on one content hash await ONE

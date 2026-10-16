@@ -3104,10 +3104,13 @@ impl App {
     /// The 「发为文件」 transfer, off the card callback (ADR-0083 §5): re-read the
     /// file locally, upload its bytes once and post exactly ONE File Message
     /// under the clicked card, then PATCH the card with the outcome. Every
-    /// network call is bounded by [`SharedCore::viewer_transfer_timeout_ms`], so
-    /// a failure or a timeout surfaces as `未发送` on the card rather than a
-    /// dropped result. Local work (a `stat`, a read under the caps) is bounded by
-    /// design and runs here.
+    /// network call — the outcome PATCH included — is bounded by
+    /// [`SharedCore::viewer_transfer_timeout_ms`], so a failure or a timeout
+    /// surfaces as `未发送` on the card rather than a dropped result. A path
+    /// that vanished or became unreadable between the viewer and the click has
+    /// no lane to report: its own failure line IS the PATCHed card's body, so
+    /// the click's outcome is stated either way (finding #739 §4). Local work (a
+    /// read under the caps) is bounded by design and runs here.
     async fn run_viewer_file_transfer(
         self: &Arc<Self>,
         thread_key: ThreadKey,
@@ -3144,43 +3147,59 @@ impl App {
                 .unwrap_or(1)
                 .max(1) as usize,
         });
-        // A vanished path has no card to rebuild honestly: nothing was sent, and
-        // the viewer it came from is already showing the file that is now gone.
-        let Ok(meta) = std::fs::metadata(&resolved) else {
-            tracing::warn!("viewer transfer: {path} vanished before the read");
-            return;
-        };
-        let mut classified = match crate::bridge::viewer::classify(&resolved, meta.len()) {
-            Ok(classified) => classified,
-            Err(failure) => {
-                // An unreadable path: state it; no File Message goes out.
-                let _ = self
-                    .feishu
-                    .reply_text(&message_id, &failure.line(&resolved))
+        // Re-stat and re-classify: the path may have changed since the viewer
+        // was opened. A vanished or unreadable path (a denied `stat` included)
+        // states its own cause on the card; every other outcome renders the
+        // viewer with the lane that says where the bytes went.
+        let card = match std::fs::metadata(&resolved) {
+            Ok(meta) => match crate::bridge::viewer::classify(&resolved, meta.len()) {
+                Ok(mut classified) => {
+                    let name = crate::feishu::card::command::file_display_name(&resolved);
+                    let lane = crate::bridge::viewer::send_as_file(
+                        &self.feishu,
+                        &self.cards_handle(),
+                        &message_id,
+                        &resolved,
+                        &name,
+                        &mut classified,
+                        timeout_ms,
+                    )
                     .await;
-                return;
+                    crate::feishu::card::command::build_viewer_for_classified(
+                        &thread_key,
+                        &resolved,
+                        &classified,
+                        Some(lane),
+                        return_to,
+                    )
+                }
+                Err(failure) => crate::feishu::card::viewer::build_viewer_failure_card(
+                    &thread_key,
+                    &path,
+                    &failure.line(&resolved),
+                    return_to,
+                ),
+            },
+            Err(error) => {
+                let failure = crate::bridge::viewer::stat_failure(&error);
+                crate::feishu::card::viewer::build_viewer_failure_card(
+                    &thread_key,
+                    &path,
+                    &failure.line(&resolved),
+                    return_to,
+                )
             }
         };
-        let name = crate::feishu::card::command::file_display_name(&resolved);
-        let lane = crate::bridge::viewer::send_as_file(
-            &self.feishu,
-            &self.cards_handle(),
-            &message_id,
-            &resolved,
-            &name,
-            &mut classified,
-            timeout_ms,
-        )
-        .await;
-        let card = crate::feishu::card::command::build_viewer_for_classified(
-            &thread_key,
-            &resolved,
-            &classified,
-            Some(lane),
-            return_to,
-        );
-        if let Err(error) = self.feishu.update_message(&message_id, &card).await {
-            tracing::warn!("viewer transfer: card update failed for {message_id}: {error}");
+        if !matches!(
+            crate::bridge::bounded_call(
+                "viewer transfer card update",
+                timeout_ms,
+                self.feishu.update_message(&message_id, &card),
+            )
+            .await,
+            Some(Ok(()))
+        ) {
+            tracing::warn!("viewer transfer: card update for {message_id} did not land");
         }
     }
 
