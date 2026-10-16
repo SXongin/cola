@@ -1801,3 +1801,317 @@ async fn tool_panel_open_button_with_an_unknown_session_answers_honestly() {
     let toast = result.toast.expect("an honest Toast");
     assert!(toast.contains("report.md"), "the Toast names the path: {toast}");
 }
+
+/// Every Rich Text Message `platform` posted (`msg_type:"post"`).
+async fn rich_text_messages(platform: &RecordingPlatform) -> Vec<PlatformCall> {
+    platform
+        .calls
+        .lock()
+        .await
+        .iter()
+        .filter(|call| matches!(call, PlatformCall::SendMessageReply { msg_type, .. } if msg_type == "post"))
+        .cloned()
+        .collect()
+}
+
+/// #741: a preview the card structurally cannot hold — a table past the
+/// 49-row cap — goes out as exactly one Rich Text Message with the content
+/// intact, while the card still renders with a tracking line saying so.
+/// Nothing is truncated: the card carries no preview and no cut note.
+#[tokio::test]
+async fn structural_overflow_goes_out_as_one_rich_text_message() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let csv = format!(
+        "name,age\n{}",
+        (0..60)
+            .map(|i| format!("r{i},{i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    std::fs::write(proj.path().join("people.csv"), &csv).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+
+    send_command_in(
+        &app,
+        "/cat people.csv",
+        key.clone(),
+        "m_csv",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+
+    // Exactly one Rich Text Message, with the content intact.
+    let posts = rich_text_messages(&platform).await;
+    assert_eq!(posts.len(), 1, "exactly one Rich Text Message: {posts:?}");
+    match &posts[0] {
+        PlatformCall::SendMessageReply {
+            message_id,
+            msg_type,
+            content,
+        } => {
+            assert_eq!(message_id, "m_csv", "the reply targets the card's own command");
+            assert_eq!(msg_type, "post");
+            assert_eq!(content["zh_cn"]["content"][0][0]["tag"], "md");
+            let md = content["zh_cn"]["content"][0][0]["text"]
+                .as_str()
+                .expect("the md text");
+            assert!(md.contains("| name | age |"), "the header: {md}");
+            assert!(md.contains("| r59 | 59 |"), "every row, none cut: {md}");
+        }
+        other => panic!("expected a post reply, got {other:?}"),
+    }
+    assert!(
+        file_messages(&platform).await.is_empty(),
+        "no File Message: the post cap holds this table"
+    );
+
+    // The card still renders — naming, the tracking line, the buttons — with
+    // no preview and no truncation note.
+    let card = first_card(&platform).await;
+    assert_eq!(card_header(&card), "📄 people.csv");
+    let text = card_text(&card);
+    assert!(
+        text.contains(&canonical(&proj.path().join("people.csv"))),
+        "the resolved path is named: {text}"
+    );
+    assert!(text.contains("表格（.csv）"), "the type is named: {text}");
+    assert!(
+        text.contains("已发送为富文本消息"),
+        "the tracking line says where the content went: {text}"
+    );
+    assert!(
+        !text.contains("表格过长") && !text.contains("已截断"),
+        "nothing is cut, so no cut is stated: {text}"
+    );
+    assert!(
+        !text.contains("| r0 |"),
+        "the preview lives in the message, not on the card: {text}"
+    );
+    assert!(
+        card_buttons(&card)
+            .iter()
+            .any(|b| b["text"]["content"] == "发为文件"),
+        "the whole bytes stay one click away: {text}"
+    );
+}
+
+/// #741: content that fits the card's structural limits stays on the card —
+/// this lane is not taken for size alone. A large single code block that fits
+/// the budget previews in place with no message of any kind.
+#[tokio::test]
+async fn fitting_content_stays_on_the_card() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    std::fs::write(proj.path().join("small.csv"), "name,age\nann,3\nbob,7\n").unwrap();
+    // ~15 KB: several fenced elements, within one card's budget.
+    std::fs::write(proj.path().join("big.rs"), "let x = 1;\n".repeat(1_400)).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+
+    send_command_in(
+        &app,
+        "/cat small.csv",
+        key.clone(),
+        "m_small",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let card = first_card(&platform).await;
+    let text = card_text(&card);
+    assert!(
+        text.contains("| ann | 3 |"),
+        "the table previews on the card: {text}"
+    );
+    assert!(
+        !text.contains("富文本"),
+        "no tracking line for content that fits: {text}"
+    );
+
+    send_command_in(
+        &app,
+        "/cat big.rs",
+        key.clone(),
+        "m_big",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let card = platform.replied_cards().await.last().cloned().expect("a card");
+    let text = card_text(&card);
+    assert!(
+        text.contains("```rust") && text.contains("let x = 1;"),
+        "a large fitting block stays on the card: {text}"
+    );
+
+    assert!(
+        rich_text_messages(&platform).await.is_empty(),
+        "no Rich Text Message for fitting content"
+    );
+    assert!(
+        file_messages(&platform).await.is_empty(),
+        "and no File Message either"
+    );
+}
+
+/// #741: the lane is bounded by the same 30 KB body cap as a card — content
+/// whose rich-text body would exceed it goes to the File Message lane, and
+/// the card says so.
+#[tokio::test]
+async fn a_post_body_past_the_cap_goes_to_the_file_lane() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let csv = format!(
+        "name,age\n{}",
+        (0..4_000)
+            .map(|i| format!("r{i},{i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    std::fs::write(proj.path().join("huge.csv"), &csv).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+
+    send_command_in(
+        &app,
+        "/cat huge.csv",
+        key.clone(),
+        "m_huge",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+
+    assert!(
+        rich_text_messages(&platform).await.is_empty(),
+        "no Rich Text Message past the post cap"
+    );
+    assert_eq!(
+        file_messages(&platform).await.len(),
+        1,
+        "exactly one File Message instead"
+    );
+    let card = first_card(&platform).await;
+    let text = card_text(&card);
+    assert!(
+        text.contains("已发送为文件消息"),
+        "the card says where the content went: {text}"
+    );
+    assert!(
+        !text.contains("富文本"),
+        "and does not claim the lane it did not take: {text}"
+    );
+}
+
+/// #741: a text preview past the element budget cannot ride a post body
+/// either — its bytes dwarf the same 30 KB cap — so it goes to the File
+/// Message lane with the card saying so.
+#[tokio::test]
+async fn element_overflow_text_goes_to_the_file_lane() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    // ~1 MB of short lines: hundreds of fenced elements, past the card's
+    // element budget and far past the post cap, within the 8 MB preview cap.
+    std::fs::write(proj.path().join("long.log"), "x\n".repeat(500_000)).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+
+    send_command_in(
+        &app,
+        "/cat long.log",
+        key.clone(),
+        "m_long",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+
+    assert!(
+        rich_text_messages(&platform).await.is_empty(),
+        "no Rich Text Message past the post cap"
+    );
+    assert_eq!(
+        file_messages(&platform).await.len(),
+        1,
+        "exactly one File Message instead"
+    );
+    let card = first_card(&platform).await;
+    let text = card_text(&card);
+    assert_eq!(card_header(&card), "📄 long.log");
+    assert!(
+        text.contains("已发送为文件消息"),
+        "the card says where the content went: {text}"
+    );
+}
+
+/// #741: the Rich Text Message lands as a reply in the card's own container —
+/// the generic reply path omits `reply_in_thread`, so in a lobby it creates
+/// no topic. Pinned here for a group lobby and for a p2p chat alike.
+#[tokio::test]
+async fn the_rich_text_reply_targets_the_cards_own_container() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let csv = format!(
+        "k,v\n{}",
+        (0..60)
+            .map(|i| format!("a{i},{i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    std::fs::write(proj.path().join("data.csv"), &csv).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+
+    // A group lobby: top-level group message, no topic.
+    let lobby = crate::config::ThreadKey::new("chat_group".into(), "chat_group".into());
+    seed_entry(&app, seeded_entry(&lobby, &proj.path().to_string_lossy())).await;
+    send_command_in(
+        &app,
+        "/cat data.csv",
+        lobby,
+        "m_lobby",
+        crate::config::ConversationKind::GroupLobby,
+    )
+    .await;
+    // A p2p chat.
+    let p2p = thread();
+    seed_entry(&app, seeded_entry(&p2p, &proj.path().to_string_lossy())).await;
+    send_command_in(
+        &app,
+        "/cat data.csv",
+        p2p,
+        "m_p2p",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+
+    let posts = rich_text_messages(&platform).await;
+    assert_eq!(posts.len(), 2, "one Rich Text Message per command: {posts:?}");
+    let targets: Vec<String> = posts
+        .iter()
+        .map(|call| match call {
+            PlatformCall::SendMessageReply { message_id, .. } => message_id.clone(),
+            other => panic!("expected a post reply, got {other:?}"),
+        })
+        .collect();
+    assert!(
+        targets.contains(&"m_lobby".to_string()) && targets.contains(&"m_p2p".to_string()),
+        "each reply targets its own card's command: {targets:?}"
+    );
+}

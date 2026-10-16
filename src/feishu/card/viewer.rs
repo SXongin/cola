@@ -25,11 +25,14 @@ use serde_json::json;
 use crate::backend::file_content::human_size;
 use crate::config::ThreadKey;
 
-use super::sanitize::{CardMarkdown, MAX_TABLE_ROWS, serialized_len};
+use super::sanitize::{CardMarkdown, MAX_CARD_TABLES, MAX_TABLE_ROWS, serialized_len};
 use super::session::{BrowseView, browse_view_value, pager_element};
 use super::shell::card_shell;
 use super::tool_render::{FileDelivery, delivery_suffix, file_image_element};
-use super::{MAX_CARD_JSON_CHARS, MAX_ELEMENT_TEXT_CHARS, chunk_text, fenced_code};
+use super::{
+    FEISHU_CARD_LIMIT_BYTES, MAX_CARD_COMPONENTS, MAX_CARD_JSON_CHARS, MAX_ELEMENT_TEXT_CHARS, chunk_text,
+    fenced_code,
+};
 
 /// What the viewer decided a file's bytes are (§6): decided by CONTENT — magic
 /// bytes first, then UTF-8 validity — never by the file's name.
@@ -74,6 +77,152 @@ pub(crate) struct ViewerFileLane {
     pub(crate) name: String,
     pub(crate) size: u64,
     pub(crate) delivery: FileDelivery,
+}
+
+/// Why a preview cannot ride the card (ADR-0083 §5, #741): the RENDERED
+/// structure — element/table/row counts, never byte size — past what a card
+/// holds. A large single code block that fits the budget is none of these and
+/// stays on the card.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum StructuralOverflow {
+    /// A text preview needing more fenced elements than the card holds: one
+    /// fenced block per element, past [`MAX_CARD_COMPONENTS`].
+    TooManyElements {
+        /// Fenced elements the full preview needs.
+        chunks: usize,
+    },
+    /// A delimited preview past the card's table budget: more tables than
+    /// [`MAX_CARD_TABLES`], or more body rows than [`MAX_TABLE_ROWS`].
+    TableOverBudget {
+        /// Markdown tables the preview renders (one per delimited file).
+        tables: usize,
+        /// Body rows the preview's table carries.
+        rows: usize,
+    },
+}
+
+/// Detect whether a preview the card would render structurally overflows it
+/// (#741, ADR-0083 §5): branch on the RENDERED shape — fenced elements for
+/// text, tables and rows for delimited text — never on byte size. `None` when
+/// the preview fits the card's structural limits (the card layer still pages
+/// or budgets it by size, #740). The byte lanes ([`ViewerKind::Image`],
+/// [`ViewerKind::Binary`], [`ViewerKind::TextTooLarge`]) never take this lane.
+pub(crate) fn detect_structural_overflow(
+    kind: ViewerKind,
+    ext: Option<&str>,
+    text: &str,
+) -> Option<StructuralOverflow> {
+    match kind {
+        ViewerKind::Text => {
+            let chunks = chunk_text(text, PREVIEW_CHUNK_CHARS).len();
+            (chunks > MAX_CARD_COMPONENTS).then_some(StructuralOverflow::TooManyElements { chunks })
+        }
+        ViewerKind::Delimited => {
+            let delim = delim_for(ext);
+            let mut records = delimited_records(text, delim);
+            // No records at all: no table renders (the card fences the bytes),
+            // so the preview is one fenced block — the text rule.
+            records.next()?;
+            let mut rows = 0usize;
+            for _ in records {
+                rows += 1;
+                // Past the row cap the verdict is settled: stop pulling, so a
+                // file of millions of rows costs this decision a bounded
+                // prefix, never the whole file.
+                if rows > MAX_TABLE_ROWS {
+                    break;
+                }
+            }
+            (1 > MAX_CARD_TABLES || rows > MAX_TABLE_ROWS)
+                .then_some(StructuralOverflow::TableOverBudget { tables: 1, rows })
+        }
+        ViewerKind::Image | ViewerKind::Binary | ViewerKind::TextTooLarge => None,
+    }
+}
+
+/// The delimiter one delimited-text preview parses with: tab for `.tsv`,
+/// comma otherwise.
+fn delim_for(ext: Option<&str>) -> char {
+    if ext.map(str::to_ascii_lowercase).as_deref() == Some("tsv") {
+        '\t'
+    } else {
+        ','
+    }
+}
+
+/// The Rich Text Message body for a structurally-overflowing preview (#741):
+/// the content intact — the full fenced block for text (with its language
+/// hint), the full markdown table for delimited text (every row, unclipped).
+/// `None` when that body would exceed the platform's 30 KB body cap
+/// ([`FEISHU_CARD_LIMIT_BYTES`], the same cap a card carries): such content
+/// does NOT take this lane — it goes to the File Message lane, with the card
+/// saying so. `None` for the byte lanes, which never take this lane.
+pub(crate) fn rich_post_md(kind: ViewerKind, ext: Option<&str>, text: &str) -> Option<String> {
+    match kind {
+        ViewerKind::Text => {
+            // Byte length lower-bounds the serialized body (JSON escaping only
+            // expands), so a preview past the cap is decided with no build.
+            if text.len() > FEISHU_CARD_LIMIT_BYTES {
+                return None;
+            }
+            let md = fenced_code(text, Some(language_token(ext)));
+            (serialized_len(&md) + 128 <= FEISHU_CARD_LIMIT_BYTES).then_some(md)
+        }
+        ViewerKind::Delimited => full_delimited_table(text, delim_for(ext)),
+        ViewerKind::Image | ViewerKind::Binary | ViewerKind::TextTooLarge => None,
+    }
+}
+
+/// The `post` message content carrying `md` as its one rich-text element —
+/// the shape the generic reply path sends as `msg_type: "post"` (the same
+/// single-`md` envelope cc-connect's card-overflow fallback uses).
+pub(crate) fn rich_post_content(md: &str) -> serde_json::Value {
+    json!({
+        "zh_cn": {
+            "content": [[{ "tag": "md", "text": md }]],
+        },
+    })
+}
+
+/// A delimited-text preview as one WHOLE markdown table for the Rich Text
+/// Message lane (#741): the first record is the header, the rest the body —
+/// every row, every column, no clipping — because the lane carries the content
+/// intact or not at all. `None` when the text holds no records, or when the
+/// table would exceed [`FEISHU_CARD_LIMIT_BYTES`]: the build aborts past the
+/// cap, so a file of millions of rows costs a bounded prefix, never the whole
+/// file (the File Message lane owns what does not fit here).
+///
+/// Cells keep their structural validity: a `|` cannot split the row and an
+/// embedded newline stays on one markdown line — the same validity the card's
+/// own [`table_row`] keeps, without its budgets.
+fn full_delimited_table(text: &str, delim: char) -> Option<String> {
+    let mut records = delimited_records(text, delim);
+    let header = records.next()?;
+    let mut lines = vec![full_table_row(&header)];
+    lines.push(full_table_row(&vec!["---".to_string(); header.len().max(1)]));
+    let mut used = lines.iter().map(|line| serialized_len(line) + 8).sum::<usize>();
+    for row in records {
+        let line = full_table_row(&row);
+        used += serialized_len(&line) + 8;
+        if used > FEISHU_CARD_LIMIT_BYTES {
+            return None;
+        }
+        lines.push(line);
+    }
+    let table = lines.join("\n");
+    (serialized_len(&table) + 128 <= FEISHU_CARD_LIMIT_BYTES).then_some(table)
+}
+
+/// One markdown table row for the Rich Text Message lane: every column kept, a
+/// `|` inside a cell escaped so it cannot split the row, a newline inside a
+/// cell flattened so the row stays on one markdown line — the same validity
+/// the card's own [`table_row`] keeps, without its budgets.
+fn full_table_row(cells: &[String]) -> String {
+    let shown: Vec<String> = cells
+        .iter()
+        .map(|cell| cell.replace(['\n', '\r'], " ").replace('|', "\\|"))
+        .collect();
+    format!("| {} |", shown.join(" | "))
 }
 
 /// What a file's extension declares: `.csv`/`.tsv` are delimited text,
@@ -324,6 +473,12 @@ pub(crate) struct ViewerCard<'a> {
     /// text preview that took no lane on open (its 「发为文件」 transfer still
     /// works — the click carries the path).
     pub(crate) lane: Option<ViewerFileLane>,
+    /// The preview went out as its own message (#741): a structurally
+    /// overflowing preview rides the Rich Text Message lane (or the File
+    /// Message lane past the post cap), so the card carries NO preview
+    /// elements and NO truncation note — naming, the lane's tracking line and
+    /// the buttons are the whole card, and nothing is silently dropped.
+    pub(crate) overflowed: bool,
 }
 
 /// Build the File Viewer card (ADR-0083 §3).
@@ -340,99 +495,107 @@ pub(crate) fn build_viewer_card(thread_key: &ThreadKey, view: ViewerCard<'_>) ->
         "content": markdown.clean(&naming_block(&view)),
     }));
 
-    match view.kind {
-        // An image the open lane embedded: the `img` element IS the preview.
-        // An image Feishu would not embed (past its caps) has no element — its
-        // tracking line below says it went out as a File Message instead.
-        ViewerKind::Image => {
-            if let Some(ViewerFileLane {
-                delivery: FileDelivery::Embedded { image_key },
-                name,
-                ..
-            }) = &view.lane
-            {
-                elements.push(file_image_element(image_key, name));
-            }
-        }
-        // No preview: the bytes went out (or could not) as a File Message, and
-        // the tracking line below is the whole card body.
-        ViewerKind::Binary | ViewerKind::TextTooLarge => {}
-        ViewerKind::Delimited => {
-            let delim = if view.ext.map(str::to_ascii_lowercase).as_deref() == Some("tsv") {
-                '\t'
-            } else {
-                ','
-            };
-            match delimited_table(view.text, delim) {
-                Some((table, cut)) => {
-                    truncated |= cut.rows;
-                    clipped_cells = cut.cells;
-                    elements.push(json!({
-                        "tag": "markdown",
-                        "content": markdown.clean(&table),
-                    }));
-                }
-                // A delimited file with no rows (whitespace only) has no table
-                // to render: show the bytes in a block rather than invent one.
-                None => {
-                    let block = fenced_code(view.text, Some(PLAIN_TEXT));
-                    elements.push(json!({
-                        "tag": "markdown",
-                        "content": markdown.clean(&block),
-                    }));
+    // An overflowed preview went out as its own message (#741): the card
+    // carries no preview and no truncation note — the tracking line below
+    // says where the content went.
+    if !view.overflowed {
+        match view.kind {
+            // An image the open lane embedded: the `img` element IS the preview.
+            // An image Feishu would not embed (past its caps) has no element — its
+            // tracking line below says it went out as a File Message instead.
+            ViewerKind::Image => {
+                if let Some(ViewerFileLane {
+                    delivery: FileDelivery::Embedded { image_key },
+                    name,
+                    ..
+                }) = &view.lane
+                {
+                    elements.push(file_image_element(image_key, name));
                 }
             }
-        }
-        ViewerKind::Text => {
-            let lang = language_token(view.ext);
-            let mut used = 0usize;
-            let mut blocks: Vec<String> = Vec::new();
-            let mut paged = false;
-            for chunk in chunk_text(view.text, PREVIEW_CHUNK_CHARS) {
-                let block = fenced_code(&chunk, Some(lang));
-                let cost = super::sanitize::serialized_len(&block) + 128;
-                if used + cost > PREVIEW_JSON_BUDGET {
-                    paged = true;
-                    break;
+            // No preview: the bytes went out (or could not) as a File Message, and
+            // the tracking line below is the whole card body.
+            ViewerKind::Binary | ViewerKind::TextTooLarge => {}
+            ViewerKind::Delimited => {
+                let delim = if view.ext.map(str::to_ascii_lowercase).as_deref() == Some("tsv") {
+                    '\t'
+                } else {
+                    ','
+                };
+                match delimited_table(view.text, delim) {
+                    Some((table, cut)) => {
+                        truncated |= cut.rows;
+                        clipped_cells = cut.cells;
+                        elements.push(json!({
+                            "tag": "markdown",
+                            "content": markdown.clean(&table),
+                        }));
+                    }
+                    // A delimited file with no rows (whitespace only) has no table
+                    // to render: show the bytes in a block rather than invent one.
+                    None => {
+                        let block = fenced_code(view.text, Some(PLAIN_TEXT));
+                        elements.push(json!({
+                            "tag": "markdown",
+                            "content": markdown.clean(&block),
+                        }));
+                    }
                 }
-                used += cost;
-                blocks.push(block);
             }
-            if paged {
-                // A text preview longer than one card holds pages by LINES
-                // through the shared pager (#740): the budget cut above only
-                // decides THAT it pages, never what the reader sees.
-                push_text_page(&mut elements, &mut markdown, thread_key, &view, lang);
-            } else {
-                for block in blocks {
-                    elements.push(json!({
-                        "tag": "markdown",
-                        "content": markdown.clean(&block),
-                    }));
+            ViewerKind::Text => {
+                let lang = language_token(view.ext);
+                let mut used = 0usize;
+                let mut blocks: Vec<String> = Vec::new();
+                let mut paged = false;
+                for chunk in chunk_text(view.text, PREVIEW_CHUNK_CHARS) {
+                    let block = fenced_code(&chunk, Some(lang));
+                    let cost = super::sanitize::serialized_len(&block) + 128;
+                    if used + cost > PREVIEW_JSON_BUDGET {
+                        paged = true;
+                        break;
+                    }
+                    used += cost;
+                    blocks.push(block);
+                }
+                if paged {
+                    // A text preview longer than one card holds pages by LINES
+                    // through the shared pager (#740): the budget cut above only
+                    // decides THAT it pages, never what the reader sees.
+                    push_text_page(&mut elements, &mut markdown, thread_key, &view, lang);
+                } else {
+                    for block in blocks {
+                        elements.push(json!({
+                            "tag": "markdown",
+                            "content": markdown.clean(&block),
+                        }));
+                    }
                 }
             }
         }
     }
 
-    if truncated {
-        elements.push(json!({
-            "tag": "markdown",
-            "content": match view.kind {
-                ViewerKind::Delimited => format!("_（表格过长，仅显示前 {MAX_TABLE_ROWS} 行）_"),
-                _ => "_（内容过长，预览已截断）_".to_string(),
-            },
-        }));
-    }
-    if clipped_cells {
-        elements.push(json!({
-            "tag": "markdown",
-            "content": format!("_（过长的单元格已截断，每格最多 {MAX_CELL_CHARS} 字）_"),
-        }));
+    if !view.overflowed {
+        if truncated {
+            elements.push(json!({
+                "tag": "markdown",
+                "content": match view.kind {
+                    ViewerKind::Delimited => format!("_（表格过长，仅显示前 {MAX_TABLE_ROWS} 行）_"),
+                    _ => "_（内容过长，预览已截断）_".to_string(),
+                },
+            }));
+        }
+        if clipped_cells {
+            elements.push(json!({
+                "tag": "markdown",
+                "content": format!("_（过长的单元格已截断，每格最多 {MAX_CELL_CHARS} 字）_"),
+            }));
+        }
     }
 
     // The whole-bytes lane's tracking line: names the file and says where its
     // bytes went — 已内嵌 (an image in this card), 已发送为文件消息 (one File
-    // Message), or 未发送 (past Feishu's 30MB cap, or a failed upload/send).
+    // Message), 已发送为富文本消息 (one Rich Text Message, #741), or 未发送
+    // (past Feishu's 30MB cap, or a failed upload/send).
     if let Some(lane) = &view.lane {
         elements.push(json!({
             "tag": "markdown",
@@ -1153,6 +1316,7 @@ mod tests {
             page: 1,
             return_to: None,
             lane: None,
+            overflowed: false,
         }
     }
 
@@ -1767,5 +1931,103 @@ mod tests {
             card_text(&card).contains('x'),
             "the split line continues on the next page"
         );
+    }
+
+    /// #741: the structural-overflow lane is chosen from the RENDERED
+    /// structure, never from byte size — past the element budget (a text
+    /// preview needing more fenced elements than the card holds), past the
+    /// five-table cap, or past the 49-row table cap.
+    #[test]
+    fn structural_overflow_is_detected_from_the_rendered_structure() {
+        // A table past the row cap overflows, whatever its byte size.
+        let long_csv = format!(
+            "h1,h2\n{}",
+            (0..MAX_TABLE_ROWS + 11)
+                .map(|i| format!("r{i},v{i}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        assert!(
+            detect_structural_overflow(ViewerKind::Delimited, Some("csv"), &long_csv).is_some(),
+            "a table past the 49-row cap takes the lane"
+        );
+        // Exactly at the cap fits.
+        let at_cap = format!(
+            "h1,h2\n{}",
+            (0..MAX_TABLE_ROWS)
+                .map(|i| format!("r{i},v{i}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        assert!(
+            detect_structural_overflow(ViewerKind::Delimited, Some("csv"), &at_cap).is_none(),
+            "a table within the row cap stays on the card"
+        );
+        // A text preview needing more fenced elements than the card holds
+        // overflows; a large single block that fits stays.
+        let many = "x".repeat(PREVIEW_CHUNK_CHARS * (MAX_CARD_COMPONENTS + 1) + 1);
+        assert!(
+            detect_structural_overflow(ViewerKind::Text, Some("txt"), &many).is_some(),
+            "past the element budget takes the lane"
+        );
+        let fitting = "y".repeat(PREVIEW_CHUNK_CHARS * 3);
+        assert!(
+            detect_structural_overflow(ViewerKind::Text, Some("txt"), &fitting).is_none(),
+            "a large block that fits the budget stays on the card"
+        );
+        // The byte lanes never take this lane.
+        assert!(detect_structural_overflow(ViewerKind::Binary, Some("bin"), "x").is_none());
+        assert!(detect_structural_overflow(ViewerKind::Image, Some("png"), "x").is_none());
+        assert!(detect_structural_overflow(ViewerKind::TextTooLarge, Some("log"), "x").is_none());
+    }
+
+    /// #741: the Rich Text Message carries the content intact — the full
+    /// table, every row — while a body that would exceed the platform's
+    /// 30 KB cap takes no post body at all (it goes to the File lane).
+    #[test]
+    fn the_rich_post_body_carries_the_content_intact_within_the_cap() {
+        let csv = format!(
+            "name,age\n{}",
+            (0..60)
+                .map(|i| format!("r{i},{i}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let md = rich_post_md(ViewerKind::Delimited, Some("csv"), &csv)
+            .expect("a 60-row small-cell table fits the post cap");
+        assert!(md.contains("| name | age |"), "the header: {md}");
+        assert!(md.contains("| r59 | 59 |"), "every row, none cut: {md}");
+        // A body past the cap is no post body: the File lane owns it. Cells
+        // are parser-bounded, so the overflow comes from ROWS — thousands of
+        // them — and the build aborts past the cap instead of materializing
+        // the whole table.
+        let many_rows = format!(
+            "name,age\n{}",
+            (0..4_000)
+                .map(|i| format!("r{i},{i}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        assert!(
+            rich_post_md(ViewerKind::Delimited, Some("csv"), &many_rows).is_none(),
+            "a post body past 30 KB does not take this lane"
+        );
+        // A text preview past the element budget never fits a post body
+        // either: its bytes dwarf the same cap, so it goes to the File lane.
+        let many = "x".repeat(PREVIEW_CHUNK_CHARS * (MAX_CARD_COMPONENTS + 1) + 1);
+        assert!(rich_post_md(ViewerKind::Text, Some("txt"), &many).is_none());
+        // ...while a fitting text preview has an intact post body by
+        // construction (unused on open — it stays on the card).
+        let md = rich_post_md(ViewerKind::Text, Some("rs"), "fn main() {}\n").expect("fits");
+        assert!(md.contains("```rust") && md.contains("fn main() {}"), "{md}");
+    }
+
+    /// #741: the post content is one `md` message — the shape the generic
+    /// reply path sends as `msg_type: "post"`.
+    #[test]
+    fn the_post_content_is_one_md_message() {
+        let content = rich_post_content("hello");
+        assert_eq!(content["zh_cn"]["content"][0][0]["tag"], "md");
+        assert_eq!(content["zh_cn"]["content"][0][0]["text"], "hello");
     }
 }
