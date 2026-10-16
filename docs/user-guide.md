@@ -417,7 +417,7 @@ detailed help for any of these.
 | --- | --- |
 | `/dir <path> [name]` | Declare a new session rooted at `<path>` — created by the next message |
 | `/claim <code>` | Claim this cola as Host (private chat only; code from the startup log) |
-| `/cat <path>` | View one file on cola's host as a File Viewer card, classified by content: a text file as a fenced code block with its extension's language hint (an extension the platform has no token for renders as plain text), a `.csv`/`.tsv` file as a markdown table, an image embedded in the card, and any other binary — or a file past the 8 MB preview cap — sent as a File Message (past Feishu's 30 MB upload cap the card says 未发送 and sends nothing). Every viewer's 发为文件 button uploads the file's full bytes as one File Message. The card names the file's resolved path, size and type, and its 📂 所在目录 button opens the Directory Browser at the file's parent. `/cat <directory>` opens the browser there instead, and a bare `/cat` shows usage. The path resolves on the Path Scope: `~` expands, a relative path resolves against the session's directory (the conversation's current project while the session is still pending), an absolute path is used as-is — including one outside that directory |
+| `/cat <path>` | Open a Host file in a File Viewer card: text uses a fenced code block with an extension language hint, `.csv`/`.tsv` uses a markdown table, images are embedded, and other binary files are sent as a File Message. The card names the resolved path, size and type. `/cat <directory>` opens the Directory Browser there; bare `/cat` answers with usage (`/help cat` gives details). `~` expands, relative paths resolve against the session directory (the current project while a session is pending), and absolute paths are used as-is |
 | `/dir` | Recent Directories card: pick a folder and declare a session there, or open it as a fresh topic (每行「建话题」= `/topic <dir>` 的免打字版); its 📁 浏览目录 button opens a filesystem browser — drill into subdirectories, type a path (前往 browses it, 选择 declares it), toggle dot-directories, filter child names |
 | `/switch` | Session card: browse / search / adopt / new |
 | `/switch <kw>` | Switch to a session by name/dir/id (adopts foreign ones; no match opens the card pre-filtered) |
@@ -446,14 +446,29 @@ detailed help for any of these.
 
 Notes:
 
-- `/cat` reads the file's bytes on the machine cola itself runs on — no model
-  in the loop, and the same behaviour whatever Generation the server speaks.
-  A File Message is just a file the reader downloads or hands to the client:
-  cola does **not** promise it will be previewed inline.
-  Its **Path Scope** (relative to the session's directory, `~` expanded,
-  absolute paths passed through) is a **privacy hint, not a sandbox**: any path
-  cola's user can read is reachable, and every card cola sends is readable by
-  everyone in that chat. Who may *act* is still the Access List (`/claim`).
+- `/cat` reads bytes on the Host where cola runs — no model is involved, and the
+  behavior is the same across OpenCode generations. The viewer names the resolved
+  path, size and type; text appears in a language-hinted fenced block (an
+  unsupported language hint falls back to plain text; large text previews page
+  by lines), `.csv`/`.tsv` as a markdown table, and images are embedded when
+  Feishu's limits allow. Other binary files, images beyond those limits and text
+  beyond the 8 MB preview cap are sent as a File Message.
+  A structurally oversized preview is sent as one Rich Text Message, or as a
+  File Message when it exceeds that lane's 30 KB limit; the card says where the
+  content went. 「🔄 重新读取」 re-reads and updates the viewer in
+  place. 「📂 所在目录」 opens the file's parent in the Directory Browser;
+  「← 返回目录」 returns from a browse-row viewer to its listing. A write/edit
+  Tool Panel's 「📂 打开」 button opens its file in the viewer. A File Message
+  is a file for the reader to download or hand to the client; cola does **not**
+  promise inline preview.
+- The **Path Scope** (`~` expanded, relative paths resolved from the session
+  directory, absolute paths passed through) is a **privacy hint, not a security
+  control or boundary**: any path the Host can read is reachable. Missing,
+  unreadable and empty paths are reported distinctly with the resolved path.
+  Examples: `/cat src/main.rs`, `/cat ~/notes.md`, `/cat /etc/hosts`. A card's
+  content is readable by everyone in its chat, so a group chat can read whatever
+  a Host opens. The Access List (`/claim`) gates **only who may click**, not who
+  may read.
 - `/new`, `/dir` and `/topic` only **declare** the session — the conversation's
   next non-command message creates it in the chosen directory and maps it here,
   so a mistaken `/new`, `/dir` or `/topic` can be corrected with another `/new`,
@@ -492,15 +507,18 @@ Notes:
   removing the thread are what drop a mapped directory.
 - The union only holds directories cola already knows; its 「📁 浏览目录」 button
   opens the **Directory Browser** (ADR-0078), which reaches anything on the
-  machine: a clickable breadcrumb, drill-down rows (repos first, 📦-marked),
-  a 显示隐藏 toggle, a child-name filter, and a path form (前往 to browse a
-  typed path, 选择 to declare a session there — like `/dir <path>` without
-  leaving the card). ← 最近目录 returns. A path that no longer exists falls back
-  to its nearest existing ancestor; only directories that already exist can be
-  selected. **The browser has no path boundary** — it can reach any directory the
-  cola process can read, so when cola is in a group chat the card shows those
-  directory names to everyone in the chat (the Access List gates who may *click*,
-  not who may *read*). A bound is tracked in the issue tracker.
+  machine: a clickable breadcrumb, drill-down directory rows (repos first,
+  📦-marked), then file rows showing each file's name and size under 「子目录与
+  文件」. Clicking a file row replaces the browse card with its File Viewer in
+  place; 「← 返回目录」 restores that listing, including its page, filter and
+  hidden-item setting. The card also has a 「显示隐藏项」 toggle, child-name
+  filter, and path form (前往 browses a typed path, 选择 declares a session
+  there — like `/dir <path>` without leaving the card). 「没有子目录或文件」
+  is shown when the listing is empty; a path that no longer exists falls back to
+  its nearest existing ancestor, and only existing directories can be selected.
+  **Path Scope is not a security boundary**: the browser can reach any directory
+  the Host process can read. In a group chat everyone can read the card, while
+  the Access List gates only who may click, not who may read.
 - `/agent`, `/model`, `/think`, `/autoaccept` are **per-session** and apply from
   the next message, persisting across restarts. On OpenCode 2 the first three are
   durable session state — the pick is written to the session itself (`POST
