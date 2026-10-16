@@ -653,6 +653,13 @@ struct ViewerReread {
     page: usize,
 }
 
+/// Blocking filesystem reads cannot be cancelled by their async timeout. Keep
+/// only this many outstanding viewer reads; a timed-out closure holds its slot
+/// until the OS call returns, and later taps fail fast instead of queueing more.
+const MAX_CONCURRENT_VIEWER_REREADS: usize = 4;
+static VIEWER_REREAD_FS_SLOTS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(MAX_CONCURRENT_VIEWER_REREADS);
+
 /// A viewer payload's viewer page (#740): the pager's TARGET page, or the page
 /// the 「发为文件」 transfer's card PATCH rebuilds — a missing page reads as
 /// the first window, and the builder clamps an out-of-range one.
@@ -2973,10 +2980,27 @@ impl App {
         // `metadata` and classify may block on the host filesystem (e.g. a
         // network mount). Run that bounded read off the callback/runtime worker:
         // the card click has already been acknowledged before this task starts.
+        let read_permit = match VIEWER_REREAD_FS_SLOTS.try_acquire() {
+            Ok(permit) => permit,
+            Err(_) => {
+                self.answer_viewer_reread_failure(
+                    &card_message_id,
+                    "⚠️ 重新读取任务繁忙，请稍后再试。",
+                    timeout_ms,
+                )
+                .await;
+                return;
+            }
+        };
         let read_path = resolved.clone();
-        let read = tokio::task::spawn_blocking(move || match std::fs::metadata(&read_path) {
-            Ok(metadata) => crate::bridge::viewer::classify(&read_path, metadata.len()),
-            Err(error) => Err(crate::bridge::viewer::stat_failure(&error)),
+        let read = tokio::task::spawn_blocking(move || {
+            // `timeout` below stops awaiting this job, not the OS call. Keeping
+            // the permit in the closure bounds both running and stranded reads.
+            let _read_permit = read_permit;
+            match std::fs::metadata(&read_path) {
+                Ok(metadata) => crate::bridge::viewer::classify(&read_path, metadata.len()),
+                Err(error) => Err(crate::bridge::viewer::stat_failure(&error)),
+            }
         });
         let mut classified =
             match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), read).await {
