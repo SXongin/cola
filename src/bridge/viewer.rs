@@ -795,15 +795,21 @@ pub(crate) async fn open_lane(
 /// Feishu's 30MB cap; past it (or on a failed upload/send) the lane is 未发送 and
 /// no message is posted. Off the card callback, bounded by `timeout_ms` per
 /// network call.
-pub(crate) async fn send_as_file(
-    platform: &Arc<dyn Platform>,
-    cards: &CardsHandle,
-    reply_target: &str,
+/// The filesystem half of 「发为文件」 (ADR-0083 §5). Call from the bounded
+/// blocking-read pool when initiated by a card callback; it includes both the
+/// classification snapshot and the text-preview re-read.
+pub(crate) struct PreparedFileTransfer {
+    mime: String,
+    name: String,
+    size: u64,
+    content: Option<FileContent>,
+}
+
+pub(crate) fn prepare_file_transfer(
     path: &Path,
     name: &str,
     classified: &mut Classified,
-    timeout_ms: u64,
-) -> ViewerFileLane {
+) -> PreparedFileTransfer {
     // ONE byte snapshot decides and travels (finding #739, round 3). The bytes
     // the open already read (an image/binary lane) go out as they are; for a
     // text preview, which kept only its decoded text, the transfer reads the
@@ -819,9 +825,32 @@ pub(crate) async fn send_as_file(
     // to the Platform (the same number `FileContent::from_bytes` carries).
     let size = bytes.as_ref().map_or(classified.size, |bytes| bytes.len() as u64);
     let mime = classified.mime.clone();
-    let delivery = match bytes {
-        Some(bytes) => {
-            let content = FileContent::from_bytes(&mime, name, bytes);
+    let content = bytes.map(|bytes| FileContent::from_bytes(&mime, name, bytes));
+    PreparedFileTransfer {
+        mime,
+        name: name.to_string(),
+        size,
+        content,
+    }
+}
+
+/// Deliver a prepared file snapshot. Network calls are bounded by timeout_ms;
+/// no filesystem work remains in this async half.
+pub(crate) async fn send_prepared_file_transfer(
+    platform: &Arc<dyn Platform>,
+    cards: &CardsHandle,
+    reply_target: &str,
+    prepared: PreparedFileTransfer,
+    timeout_ms: u64,
+) -> ViewerFileLane {
+    let PreparedFileTransfer {
+        mime,
+        name,
+        size,
+        content,
+    } = prepared;
+    let delivery = match content {
+        Some(content) => {
             deliver(
                 platform,
                 cards,
@@ -836,7 +865,7 @@ pub(crate) async fn send_as_file(
     };
     ViewerFileLane {
         mime,
-        name: name.to_string(),
+        name,
         size,
         delivery,
         rich_message_id: None,

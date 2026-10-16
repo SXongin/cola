@@ -1001,8 +1001,8 @@ async fn send_as_file_transfers_off_the_callback_path() {
 
     // Park the transfer's upload: the click must still ack immediately, and the
     // ack must carry no upload work.
-    let (_entered, release) = platform.pause("upload_file", "");
-    let result = app.host_action(payload).await.expect("the click acks");
+    let (entered, release) = platform.pause("upload_file", "");
+    let result = app.host_action(payload.clone()).await.expect("the click acks");
     assert!(
         result.card.is_none(),
         "the click does not rebuild the card inline"
@@ -1012,6 +1012,14 @@ async fn send_as_file_transfers_off_the_callback_path() {
         uploads(&platform).await.is_empty(),
         "the click returned before the upload ran"
     );
+    tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+        .await
+        .expect("the first click reaches the parked upload");
+    let repeated = app
+        .host_action(payload)
+        .await
+        .expect("a duplicate send click is acknowledged");
+    assert!(repeated.card.is_none());
 
     // Release the upload; the spawned transfer lands and PATCHes the card.
     release.notify_one();
@@ -1047,6 +1055,110 @@ async fn send_as_file_transfers_off_the_callback_path() {
     );
 }
 
+/// A FIFO can stall the transfer's classification/read without blocking a
+/// Tokio worker. Its timeout patches the card and releases the action guard, so
+/// a later click on the same card can still send a now-readable file.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_stalled_transfer_read_times_out_and_releases_the_card_guard() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let file = proj.path().join("notes.txt");
+    std::fs::write(&file, "initial preview\n").unwrap();
+
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+    send_command_in(
+        &app,
+        "/cat notes.txt",
+        key,
+        "m_view",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let card = first_card(&platform).await;
+    let mut payload = send_as_file_payload(&card);
+    payload["open_message_id"] = serde_json::json!("msg_view_card");
+
+    app.viewer_transfer_timeout_ms
+        .store(200, std::sync::atomic::Ordering::Relaxed);
+    std::fs::remove_file(&file).unwrap();
+    let status = std::process::Command::new("mkfifo").arg(&file).status().unwrap();
+    assert!(status.success(), "create a FIFO to park the transfer read");
+    let (writer_opened_tx, writer_opened_rx) = tokio::sync::oneshot::channel();
+    let (release_writer_tx, release_writer_rx) = std::sync::mpsc::channel();
+    let writer_path = file.clone();
+    let writer = std::thread::spawn(move || {
+        let mut fifo = std::fs::OpenOptions::new().write(true).open(writer_path).unwrap();
+        writer_opened_tx.send(()).unwrap();
+        release_writer_rx.recv().unwrap();
+        std::io::Write::write_all(&mut fifo, b"late FIFO bytes\n").unwrap();
+    });
+
+    let result = app
+        .host_action(payload.clone())
+        .await
+        .expect("the transfer click acks before filesystem work");
+    assert!(result.card.is_none());
+    tokio::time::timeout(std::time::Duration::from_secs(2), writer_opened_rx)
+        .await
+        .expect("the background reader opened the FIFO")
+        .unwrap();
+    wait_for_card_update(
+        &platform,
+        "bounded filesystem timeout",
+        CardUpdates::Latest,
+        |card| card_text(card).contains("超时"),
+    )
+    .await;
+
+    // Replace the path while the timed-out spawn_blocking read still holds its
+    // FIFO descriptors. A later card action must get a new guard and read this
+    // regular file rather than being permanently suppressed.
+    std::fs::remove_file(&file).unwrap();
+    std::fs::write(&file, "read after timeout\n").unwrap();
+    let (second_upload_entered, release_second_upload) = platform.pause("upload_file", "");
+    let retried = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            app.host_action(payload.clone())
+                .await
+                .expect("a later send click is acknowledged");
+            if tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                second_upload_entered.notified(),
+            )
+            .await
+            .is_ok()
+            {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(retried.is_ok(), "the timeout must release the card action guard");
+    release_second_upload.notify_one();
+    wait_for_card_update(
+        &platform,
+        "later transfer succeeds",
+        CardUpdates::Latest,
+        |card| card_text(card).contains("已发送为文件消息"),
+    )
+    .await;
+    assert_eq!(
+        file_messages(&platform).await.len(),
+        1,
+        "only the later action sends"
+    );
+
+    release_writer_tx.send(()).unwrap();
+    tokio::task::spawn_blocking(move || writer.join().unwrap())
+        .await
+        .unwrap();
+}
+
 /// The 「发为文件」 transfer uploads ONE byte snapshot: a text file replaced by a
 /// PDF between its classification and the click goes out under the BYTES' own
 /// label — `application/pdf`, and the PDF's length — never the stale
@@ -1077,13 +1189,12 @@ async fn the_transfer_labels_the_bytes_it_uploads() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
 
-    let lane = crate::bridge::viewer::send_as_file(
+    let prepared = crate::bridge::viewer::prepare_file_transfer(&path, "notes.txt", &mut classified);
+    let lane = crate::bridge::viewer::send_prepared_file_transfer(
         &app.feishu,
         &app.cards_handle(),
         "msg_view_card",
-        &path,
-        "notes.txt",
-        &mut classified,
+        prepared,
         app.cards_handle().viewer_transfer_timeout_ms(),
     )
     .await;
@@ -1145,13 +1256,12 @@ async fn the_transfer_sends_the_snapshot_it_classified() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
 
-    let lane = crate::bridge::viewer::send_as_file(
+    let prepared = crate::bridge::viewer::prepare_file_transfer(&path, "report.pdf", &mut classified);
+    let lane = crate::bridge::viewer::send_prepared_file_transfer(
         &app.feishu,
         &app.cards_handle(),
         "msg_view_card",
-        &path,
-        "report.pdf",
-        &mut classified,
+        prepared,
         app.cards_handle().viewer_transfer_timeout_ms(),
     )
     .await;
@@ -1241,7 +1351,7 @@ async fn a_timed_out_transfer_surfaces_as_unsent() {
 
     // A transfer bound so short the parked upload cannot answer in time.
     app.viewer_transfer_timeout_ms
-        .store(1, std::sync::atomic::Ordering::Relaxed);
+        .store(500, std::sync::atomic::Ordering::Relaxed);
     let (_entered, _release) = platform.pause("upload_file", "");
     app.host_action(payload).await.expect("the click acks");
 
@@ -2191,6 +2301,63 @@ async fn reread_edits_the_same_overflow_message_and_updates_the_card() {
             .find(|button| button["text"]["content"] == "🔄 重新读取")
             .unwrap()["value"]["rich_message_id"],
         "msg_file"
+    );
+}
+
+/// Two re-read callbacks on the same card must not both reach the edit-limit
+/// fallback and send duplicate Rich Text Messages.
+#[tokio::test]
+async fn duplicate_reread_click_sends_only_one_fresh_rich_message() {
+    let (_work_dir, _project, _state, app, platform, file, original) = open_overflow_csv_viewer().await;
+    let csv = format!(
+        "name,age\n{}",
+        (0..61)
+            .map(|i| format!("r{i},{i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    std::fs::write(&file, csv).unwrap();
+    platform
+        .refuse_edit_message_count
+        .store(2, std::sync::atomic::Ordering::SeqCst);
+    platform.given_message_reply_id("msg_fresh");
+    let (entered, release) = platform.pause("send_message", "msg_reply");
+    let payload = reread_payload(&original);
+
+    app.host_action_on_message(payload.clone(), "msg_reply")
+        .await
+        .expect("the first re-read acknowledges");
+    tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+        .await
+        .expect("the first re-read reaches the paused fresh-message send");
+    app.host_action_on_message(payload, "msg_reply")
+        .await
+        .expect("the duplicate re-read acknowledges");
+    release.notify_one();
+
+    wait_for_card_update(&platform, "fresh rich tracking", CardUpdates::Latest, |card| {
+        reread_payload(card)["rich_message_id"] == "msg_fresh"
+    })
+    .await;
+    let calls = platform.calls.lock().await.clone();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(
+                |call| matches!(call, PlatformCall::SendMessageReply { msg_type, content, .. }
+                if msg_type == "post" && content.to_string().contains("r60"))
+            )
+            .count(),
+        1,
+        "only the claimed re-read may send the refreshed rich body"
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| matches!(call, PlatformCall::EditMessage { message_id, .. } if message_id == "msg_file"))
+            .count(),
+        1,
+        "the duplicate callback does not start a second edit"
     );
 }
 
