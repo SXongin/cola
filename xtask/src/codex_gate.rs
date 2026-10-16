@@ -231,6 +231,22 @@ mod tests {
         }
     }
 
+    /// GitHub fills a PR body from the template, so the template's own text is
+    /// collector input: a worked example would be read as this PR's reference,
+    /// seed an unrelated issue as the review's spec, and satisfy the
+    /// no-reference failure the collector exists to raise (#555). The template
+    /// therefore spells its examples `#N`, and this pins that.
+    #[test]
+    fn the_pr_template_seeds_no_issue_reference() {
+        let template =
+            std::fs::read_to_string(crate::repo_root().join(".github/pull_request_template.md")).unwrap();
+        assert_eq!(
+            run_stdin("codex_issue_refs_stdin", &template).trim(),
+            "",
+            "the PR template must not carry a reference the collector picks up"
+        );
+    }
+
     #[test]
     fn linked_issue_refs_are_deduplicated_in_first_seen_order() {
         let out = run_stdin(
