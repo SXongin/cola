@@ -494,11 +494,12 @@ pub(crate) struct ViewerCard<'a> {
     /// the File Message lane past the post cap), so the card carries NO
     /// preview elements, NO truncation note and NO 「发为文件」 — the content
     /// is already delivered, so a rescue button would deliver the same file a
-    /// second time. Naming, the lane's tracking line and the directory buttons
-    /// are the whole card, and nothing is silently dropped. `false` whenever
-    /// the lane did NOT land (including a failed/timed-out send): the card
-    /// then keeps its truncated preview, its honest cut note and the rescue
-    /// button, with the tracking line stating the content was not delivered.
+    /// second time. A whole-bytes lane for an image or binary likewise records
+    /// where its content went; an embedded image is itself visible on this card
+    /// and keeps the explicit File Message action. `false` whenever a required
+    /// lane did not land: a structural overflow then keeps its truncated
+    /// preview, honest cut note and rescue button, with the tracking line
+    /// stating the content was not delivered.
     pub(crate) overflowed: bool,
 }
 
@@ -903,8 +904,9 @@ fn lane_line(lane: &ViewerFileLane) -> String {
 fn viewer_buttons(thread_key: &ThreadKey, view: &ViewerCard<'_>) -> serde_json::Value {
     let mut columns = vec![button_column("🔄 重新读取", reread_value(thread_key, view))];
     columns.extend(directory_columns(thread_key, view.path, view.return_to));
-    // A landed overflow preview is already delivered: offering 「发为文件」
-    // would deliver the same file a second time (#741, deliver-once).
+    // A preview landed in its own Rich Text/File Message already: offering
+    // 「发为文件」 would deliver the same file a second time (#741, deliver-once).
+    // Embedded images remain visible on this card and keep the explicit action.
     if !view.overflowed {
         columns.push(button_column("发为文件", transfer_value(thread_key, view)));
     }

@@ -249,7 +249,16 @@ fn sniff(header: &[u8]) -> Sniff {
 /// pseudo-file) is still bounded, and the reported size is the bytes' own
 /// length.
 pub(crate) fn classify(path: &Path, size: u64) -> Result<Classified, CatFailure> {
-    // Past Feishu's 30MB upload cap (by the caller's `stat`): nothing can be
+    // The caller's stat can go stale before classification. Refresh it before
+    // choosing the header-only path, so a file that already shrank under the
+    // upload cap gets the bounded whole-file read and its actual bytes decide
+    // the result. If the path disappeared, retain the caller's size only as a
+    // fallback; the read below will report the actual failure.
+    let size = std::fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(size);
+
+    // Past Feishu's 30MB upload cap (by the refreshed `stat`): nothing can be
     // delivered, so ONE bounded header is all this reads — the sniff is the only
     // thing that can name a never-read file. A text-shaped header is still TEXT
     // — too large to preview — never 「二进制」.
@@ -452,8 +461,29 @@ pub(crate) async fn open_overflow_lane(
     existing_rich_message_id: Option<&str>,
 ) -> Option<ViewerFileLane> {
     let structural_overflow = detect_structural_overflow(preview.kind, preview.ext, preview.text).is_some();
-    if !structural_overflow && existing_rich_message_id.is_none() {
-        return None;
+    if !structural_overflow {
+        let message_id = existing_rich_message_id?;
+        // The refreshed preview now fits on the card. Never put that same body
+        // into the old Rich Text Message as well: replace it with a retirement
+        // notice, then let the viewer card carry the current content exactly
+        // once. A failed/limited edit leaves the old message tracked honestly.
+        let notice = rich_post_content("文件内容已更新；最新内容以文件查看卡为准。");
+        let (delivery, refreshed_id, refresh_failed) =
+            refresh_rich_message(platform, reply_target, &notice, Some(message_id), timeout_ms).await;
+        if matches!(delivery, FileDelivery::SentAsRichText)
+            && !refresh_failed
+            && refreshed_id.as_deref() == Some(message_id)
+        {
+            return None;
+        }
+        return Some(ViewerFileLane {
+            mime: preview.mime.to_string(),
+            name: preview.name.to_string(),
+            size: preview.size,
+            delivery: FileDelivery::Undelivered,
+            rich_message_id: Some(message_id.to_string()),
+            refresh_failed: true,
+        });
     }
     if let Some(md) = rich_post_md(preview.kind, preview.ext, preview.text) {
         let content = rich_post_content(&md);
@@ -1421,6 +1451,21 @@ mod tests {
         assert_eq!(classified.kind, ClassifiedKind::Text);
         assert_eq!(classified.size, 4, "the bytes actually read, not the stat figure");
         assert_eq!(classified.text.as_deref(), Some("tiny"));
+    }
+
+    /// A stale stat above the upload cap must not force a header-only verdict
+    /// when the file has already shrunk: classify the snapshot that exists now.
+    #[test]
+    fn classify_reads_a_file_that_shrank_below_the_upload_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("shrank-from-over-cap.log");
+        write(&file, b"now small\n");
+
+        let classified = classify(&file, crate::feishu::file::MAX_FILE_BYTES + 1).unwrap();
+        assert_eq!(classified.kind, ClassifiedKind::Text);
+        assert_eq!(classified.text.as_deref(), Some("now small\n"));
+        assert_eq!(classified.size, 10);
+        assert!(classified.bytes.is_none());
     }
 
     /// An empty file is its own answer, never a lane.

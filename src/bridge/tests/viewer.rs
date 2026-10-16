@@ -2194,6 +2194,146 @@ async fn reread_edits_the_same_overflow_message_and_updates_the_card() {
     );
 }
 
+/// When an overflowing preview becomes small enough for the card, the old rich
+/// message is retired with a notice and the current content appears only on the
+/// viewer card.
+#[tokio::test]
+async fn reread_from_overflow_to_fitting_retires_rich_copy() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let csv = |rows: usize| {
+        format!(
+            "name,age\n{}",
+            (0..rows)
+                .map(|i| format!("r{i},{i}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    };
+    let file = proj.path().join("people.csv");
+    std::fs::write(&file, csv(60)).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+    send_command_in(
+        &app,
+        "/cat people.csv",
+        key,
+        "m_overflow",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let original = first_card(&platform).await;
+    let rich_id = reread_payload(&original)["rich_message_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    std::fs::write(&file, csv(2)).unwrap();
+
+    app.host_action_on_message(reread_payload(&original), "msg_reply")
+        .await
+        .expect("the re-read acknowledges");
+    wait_for_card_update(&platform, "fitting refresh", CardUpdates::Latest, |card| {
+        card_text(card).contains("| r1 | 1 |")
+    })
+    .await;
+
+    let updated = platform.updated_cards().await.pop().expect("viewer patch");
+    let text = card_text(&updated);
+    assert_eq!(
+        text.matches("| r0 | 0 |").count(),
+        1,
+        "current content occurs once: {text}"
+    );
+    assert!(
+        text.contains("| r1 | 1 |"),
+        "the current fitting table is on the card: {text}"
+    );
+    assert!(
+        !card_buttons(&updated)
+            .iter()
+            .any(|button| button["value"]["rich_message_id"] == rich_id),
+        "the retired rich message is no longer tracked"
+    );
+    let calls = platform.calls.lock().await.clone();
+    assert!(
+        calls.iter().any(|call| matches!(call, PlatformCall::EditMessage {
+            message_id, msg_type, content,
+            outcome: crate::feishu::MessageEditOutcome::Updated,
+            ..
+        } if message_id == &rich_id && msg_type == "post"
+            && content.to_string().contains("最新内容以文件查看卡为准")
+            && !content.to_string().contains("| r0 |"))),
+        "the old rich copy is replaced with a retirement notice: {calls:?}"
+    );
+}
+
+/// A fitting preview that grows past the structural limit moves to one rich
+/// message, and the card retains only its tracking line.
+#[tokio::test]
+async fn reread_from_fitting_to_overflow_sends_and_tracks_rich_copy() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let csv = |rows: usize| {
+        format!(
+            "name,age\n{}",
+            (0..rows)
+                .map(|i| format!("r{i},{i}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    };
+    let file = proj.path().join("people.csv");
+    std::fs::write(&file, csv(2)).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+    send_command_in(
+        &app,
+        "/cat people.csv",
+        key,
+        "m_fitting",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let original = first_card(&platform).await;
+    assert!(reread_payload(&original).get("rich_message_id").is_none());
+    std::fs::write(&file, csv(60)).unwrap();
+
+    app.host_action_on_message(reread_payload(&original), "msg_reply")
+        .await
+        .expect("the re-read acknowledges");
+    wait_for_card_update(&platform, "overflow refresh", CardUpdates::Latest, |card| {
+        card_text(card).contains("已发送为富文本消息")
+    })
+    .await;
+
+    assert_eq!(
+        rich_text_messages(&platform).await.len(),
+        1,
+        "one fresh rich message"
+    );
+    let updated = platform.updated_cards().await.pop().expect("viewer patch");
+    let text = card_text(&updated);
+    assert!(
+        !text.contains("| r0 |"),
+        "full content is not duplicated on the card: {text}"
+    );
+    assert!(
+        card_buttons(&updated).iter().any(|button| {
+            button["text"]["content"] == "🔄 重新读取"
+                && button["value"]["rich_message_id"]
+                    .as_str()
+                    .is_some_and(|id| !id.is_empty())
+        }),
+        "the card tracks the rich message for the next re-read: {text}"
+    );
+}
+
 /// A definite edit refusal causes a fresh Rich Text Message send, and the
 /// refreshed card tracks that new id instead of claiming the rejected edit.
 #[tokio::test]
