@@ -660,6 +660,23 @@ const MAX_CONCURRENT_VIEWER_REREADS: usize = 4;
 static VIEWER_REREAD_FS_SLOTS: tokio::sync::Semaphore =
     tokio::sync::Semaphore::const_new(MAX_CONCURRENT_VIEWER_REREADS);
 
+/// Acquire a bounded slot before submitting work, and hold it inside the
+/// blocking closure so timing out its JoinHandle cannot free capacity early.
+fn spawn_bounded_viewer_fs_read<T, F>(
+    slots: &'static tokio::sync::Semaphore,
+    work: F,
+) -> Result<tokio::task::JoinHandle<T>, tokio::sync::TryAcquireError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let permit = slots.try_acquire()?;
+    Ok(tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    }))
+}
+
 /// A viewer payload's viewer page (#740): the pager's TARGET page, or the page
 /// the 「发为文件」 transfer's card PATCH rebuilds — a missing page reads as
 /// the first window, and the builder clamps an out-of-range one.
@@ -2980,28 +2997,25 @@ impl App {
         // `metadata` and classify may block on the host filesystem (e.g. a
         // network mount). Run that bounded read off the callback/runtime worker:
         // the card click has already been acknowledged before this task starts.
-        let read_permit = match VIEWER_REREAD_FS_SLOTS.try_acquire() {
-            Ok(permit) => permit,
-            Err(_) => {
-                self.answer_viewer_reread_failure(
-                    &card_message_id,
-                    "⚠️ 重新读取任务繁忙，请稍后再试。",
-                    timeout_ms,
-                )
-                .await;
-                return;
-            }
-        };
         let read_path = resolved.clone();
-        let read = tokio::task::spawn_blocking(move || {
-            // `timeout` below stops awaiting this job, not the OS call. Keeping
-            // the permit in the closure bounds both running and stranded reads.
-            let _read_permit = read_permit;
-            match std::fs::metadata(&read_path) {
-                Ok(metadata) => crate::bridge::viewer::classify(&read_path, metadata.len()),
-                Err(error) => Err(crate::bridge::viewer::stat_failure(&error)),
-            }
-        });
+        let read =
+            match spawn_bounded_viewer_fs_read(&VIEWER_REREAD_FS_SLOTS, move || {
+                match std::fs::metadata(&read_path) {
+                    Ok(metadata) => crate::bridge::viewer::classify(&read_path, metadata.len()),
+                    Err(error) => Err(crate::bridge::viewer::stat_failure(&error)),
+                }
+            }) {
+                Ok(read) => read,
+                Err(_) => {
+                    self.answer_viewer_reread_failure(
+                        &card_message_id,
+                        "⚠️ 重新读取任务繁忙，请稍后再试。",
+                        timeout_ms,
+                    )
+                    .await;
+                    return;
+                }
+            };
         let mut classified =
             match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), read).await {
                 Ok(Ok(Ok(classified))) => classified,
@@ -4283,5 +4297,44 @@ impl App {
             // message still runs; whoever owns the card renders it.
             crate::bridge::turn::Turn::release_recovery_claim(&handles.cards, &session_id).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod viewer_reread_slot_tests {
+    use super::spawn_bounded_viewer_fs_read;
+
+    /// A timed-out wait leaves the blocking job's slot held until its closure
+    /// returns; subsequent work is refused rather than accumulated in the pool.
+    #[tokio::test]
+    async fn a_timed_out_reader_keeps_its_slot_until_the_os_work_returns() {
+        static SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut first = spawn_bounded_viewer_fs_read(&SLOTS, move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        })
+        .unwrap();
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(1), &mut first)
+                .await
+                .is_err()
+        );
+        assert!(
+            spawn_bounded_viewer_fs_read(&SLOTS, || ()).is_err(),
+            "the timed-out worker still holds the only slot"
+        );
+
+        release_tx.send(()).unwrap();
+        first.await.unwrap();
+        spawn_bounded_viewer_fs_read(&SLOTS, || ())
+            .unwrap()
+            .await
+            .unwrap();
     }
 }

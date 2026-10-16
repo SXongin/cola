@@ -1486,3 +1486,86 @@ mod tests {
         assert_eq!(reread_for_transfer(&file, &mut classified), None);
     }
 }
+
+#[cfg(test)]
+mod rich_message_edit_wire_tests {
+    use super::*;
+    use crate::feishu::Platform;
+    use crate::feishu::client::Client;
+
+    async fn client_for_edit_response(code: i32) -> (crate::test_http::TestHttpServer, Arc<dyn Platform>) {
+        let server = crate::test_http::TestHttpServer::start().await;
+        server.route(
+            "POST",
+            "/open-apis/auth/v3/tenant_access_token/internal",
+            200,
+            r#"{"code":0,"msg":"ok","tenant_access_token":"test-token","expire":7200}"#,
+        );
+        server.route(
+            "PUT",
+            "/open-apis/im/v1/messages/om_rich",
+            400,
+            format!(r#"{{"code":{code},"msg":"edit refused"}}"#),
+        );
+        server.route(
+            "POST",
+            "/open-apis/im/v1/messages/om_card/reply",
+            200,
+            r#"{"code":0,"msg":"ok","data":{"message_id":"om_fresh"}}"#,
+        );
+        let client = Client::for_test_server(
+            crate::config::FeishuConfig {
+                app_id: "test-app".into(),
+                app_secret: "test-secret".into(),
+            },
+            server.base_url(),
+        );
+        (server, Arc::new(client))
+    }
+
+    /// The real wire shape is HTTP 400 + business code 230072. That exact
+    /// response reaches the bridge as `EditLimitReached`, which re-sends once.
+    #[tokio::test]
+    async fn http_400_edit_limit_body_triggers_one_fresh_rich_message() {
+        let (server, platform) = client_for_edit_response(230072).await;
+        let content = rich_post_content("updated overflow");
+
+        let (delivery, message_id, refresh_failed) =
+            refresh_rich_message(&platform, "om_card", &content, Some("om_rich"), 2_000).await;
+
+        assert_eq!(delivery, FileDelivery::SentAsRichText);
+        assert_eq!(message_id.as_deref(), Some("om_fresh"));
+        assert!(!refresh_failed);
+        let requests = server.requests();
+        assert_eq!(requests.len(), 3, "token, refused PUT, then one fresh POST");
+        assert_eq!(requests[1].method, "PUT");
+        assert_eq!(requests[1].path, "/open-apis/im/v1/messages/om_rich");
+        assert_eq!(requests[2].method, "POST");
+        assert_eq!(requests[2].path, "/open-apis/im/v1/messages/om_card/reply");
+        let body: serde_json::Value = serde_json::from_str(&requests[2].body).unwrap();
+        assert_eq!(body["msg_type"], "post");
+    }
+
+    /// HTTP 400 + 230020 is the frequency limit, not edit-budget exhaustion;
+    /// preserve the carried message and do not issue a duplicate POST.
+    #[tokio::test]
+    async fn http_400_frequency_limit_keeps_the_existing_message_without_resend() {
+        let (server, platform) = client_for_edit_response(230020).await;
+        let content = rich_post_content("updated overflow");
+
+        let (delivery, message_id, refresh_failed) =
+            refresh_rich_message(&platform, "om_card", &content, Some("om_rich"), 2_000).await;
+
+        assert_eq!(delivery, FileDelivery::Undelivered);
+        assert_eq!(message_id.as_deref(), Some("om_rich"));
+        assert!(refresh_failed);
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2, "token + refused PUT; no duplicate POST");
+        assert_eq!(requests[1].method, "PUT");
+        assert_eq!(requests[1].path, "/open-apis/im/v1/messages/om_rich");
+        assert!(
+            !requests.iter().any(|request| request.path.ends_with("/reply")),
+            "rate limiting must never send a fresh copy"
+        );
+    }
+}
