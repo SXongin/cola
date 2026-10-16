@@ -304,8 +304,8 @@ fn reject_nested_topic(thread_key: &ThreadKey) -> Option<CardActionResult> {
 
 /// The read model of one `/dir` browse card render (ADR-0078): the directory
 /// actually browsed (after resolution and any ancestor fallback), its child
-/// directories (filtered + sorted), whether the filter control shows, and any
-/// fallback explanation.
+/// rows (directories and files, filtered + sorted), whether the filter control
+/// shows, and any fallback explanation.
 pub(crate) struct BrowseState {
     dir: String,
     children: Vec<crate::feishu::card::session::BrowseChild>,
@@ -319,13 +319,15 @@ pub(crate) struct BrowseState {
 /// entirely — so the scan stops here and the card says it was truncated
 /// (#670 review).
 pub(crate) const BROWSE_SCAN_CAP: usize = 2000;
-/// Read + shape the browse card's data for a requested directory (ADR-0078):
-/// resolve the target (symlinks followed, see [`resolve_browse_path`]), fall back
-/// to the nearest existing ancestor when the directory is gone, then list its
-/// child directories — directories only, dot-directories behind the hidden
-/// toggle, token-AND filtered by `keyword`, repos first then case-insensitive
-/// alphabetical. All local `stat`/`read_dir`: the card callback runs inside
-/// Feishu's 3 s, no-retry budget.
+/// Read + shape the browse card's data for a requested directory (ADR-0078,
+/// ADR-0083 §3): resolve the target (symlinks followed, see
+/// [`resolve_browse_path`]), fall back to the nearest existing ancestor when the
+/// directory is gone, then list its children — directories first (a repo, a
+/// child holding a `.git` entry, floats to the very front) and files after,
+/// each group case-insensitively alphabetical; dot-entries behind the hidden
+/// toggle; token-AND filtered by `keyword` over directory AND file names. All
+/// local `stat`/`read_dir`: the card callback runs inside Feishu's 3 s,
+/// no-retry budget.
 fn browse_dir_state(view: BrowseView<'_>) -> BrowseState {
     let keyword = view.keyword;
     let show_hidden = view.show_hidden;
@@ -379,11 +381,17 @@ fn browse_dir_state(view: BrowseView<'_>) -> BrowseState {
                 };
                 let path = entry.path();
                 let name = entry.file_name().to_string_lossy().to_string();
-                // `is_dir()` follows a symlink, so a linked directory is a
-                // legitimate browsing target.
-                if !path.is_dir() || (!show_hidden && name.starts_with('.')) {
+                // A dot-directory and a dot-file are hidden alike (ADR-0083 §3).
+                if !show_hidden && name.starts_with('.') {
                     continue;
                 }
+                // `metadata()` follows a symlink, so a linked directory is a
+                // legitimate browsing target and a linked file reports its
+                // target's size; an entry that cannot be stat'ed at all (a
+                // broken symlink) is no row at all.
+                let Ok(meta) = std::fs::metadata(&path) else {
+                    continue;
+                };
                 visible += 1;
                 if !lower_keyword.is_empty()
                     && !crate::bridge::command::token_and_match(&name.to_lowercase(), &lower_keyword)
@@ -393,7 +401,10 @@ fn browse_dir_state(view: BrowseView<'_>) -> BrowseState {
                 children.push(crate::feishu::card::session::BrowseChild {
                     name,
                     path: path.to_string_lossy().to_string(),
-                    is_repo: path.join(".git").exists(),
+                    is_repo: meta.is_dir() && path.join(".git").exists(),
+                    // `Some` marks a file row: files are listed beside
+                    // directories and open the File Viewer (ADR-0083 §3).
+                    size: (!meta.is_dir()).then_some(meta.len()),
                 });
             }
         }
@@ -410,6 +421,9 @@ fn browse_dir_state(view: BrowseView<'_>) -> BrowseState {
     children.sort_by(|a, b| {
         b.is_repo
             .cmp(&a.is_repo)
+            // Directories first (ADR-0083 §3): a file row sorts after every
+            // directory row, each group case-insensitively alphabetical.
+            .then_with(|| a.size.is_some().cmp(&b.size.is_some()))
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
             .then_with(|| a.name.cmp(&b.name))
     });
@@ -424,11 +438,12 @@ fn browse_dir_state(view: BrowseView<'_>) -> BrowseState {
 
 /// Read + build the `/dir` browse card (ADR-0078, ADR-0083 §2) for `view`:
 /// resolve the target (symlinks followed, landing on the nearest existing
-/// ancestor when it is gone), list its child directories, and render the card
-/// with the conversation's current directory marked. Shared by the App's own
-/// browse rebuilds and the `/cat <directory>` answer — a command card has no
-/// `App`, only the [`CommandHandles`](crate::bridge::handles::CommandHandles)
-/// its dispatch carries — so both render from one source of truth.
+/// ancestor when it is gone), list its child directories and files, and render
+/// the card with the conversation's current directory marked. Shared by the
+/// App's own browse rebuilds and the `/cat <directory>` answer — a command card
+/// has no `App`, only the
+/// [`CommandHandles`](crate::bridge::handles::CommandHandles) its dispatch
+/// carries — so both render from one source of truth.
 pub(crate) async fn build_dir_browse_card_for(
     sessions: &crate::bridge::handles::SessionsHandle,
     thread_key: &ThreadKey,
@@ -1676,6 +1691,18 @@ impl App {
                 "switch" => self.handle_switch_card_action(&self.core, &value).await,
                 "sub" => self.handle_sub_card_action(&self.core, &value).await,
                 "dir" => self.handle_dir_card_action(&self.core, &value).await,
+                // Two different cards carry `action: "file"` (#739, #742): the
+                // viewer's own 「发为文件」 button, whose payload carries
+                // `op: "send"` and transfers the file's whole bytes, and a browse
+                // card's file row, which carries no op and opens the file in
+                // place. The op is what tells the two clicks apart.
+                "file" => {
+                    if value.get("op").and_then(|v| v.as_str()) == Some("send") {
+                        self.handle_viewer_file_action(&value).await
+                    } else {
+                        self.handle_file_card_action(&self.core, &value).await
+                    }
+                }
                 "agent" => self.handle_agent_card_action(&self.core, &value, false).await,
                 "agent_clear" => self.handle_agent_card_action(&self.core, &value, true).await,
                 "model" => self.handle_model_card_action(&self.core, &value).await,
@@ -1683,7 +1710,6 @@ impl App {
                 "think_clear" => self.handle_think_card_action(&self.core, &value, true).await,
                 "autoaccept" => self.handle_autoaccept_card_action(&self.core, &value).await,
                 "skill" => self.handle_skill_card_action(&value).await,
-                "file" => self.handle_viewer_file_action(&value).await,
                 _ => None,
             }
         };
@@ -2533,6 +2559,93 @@ impl App {
             _ => Some(CardActionResult {
                 card: None,
                 toast: Some("无效操作".to_string()),
+            }),
+        }
+    }
+
+    /// Handle a browse card's **file row** (ADR-0083 §3): read the file and
+    /// answer its **File Viewer** card, which replaces the browse card *in
+    /// place* — the ack patches the clicked message, the same move as the browse
+    /// card replacing the Recent Directories card, so the listing is never left
+    /// as a second message.
+    ///
+    /// The row's payload carries the listing's own state (`dir`/`keyword`/
+    /// `page`/`show_hidden`), so the viewer's 「← 返回目录」 restores it exactly.
+    /// The action tag is `file`, never the browse card's `dir`: a file row
+    /// offers no 选择/建话题, because declaring a Session requires a directory
+    /// (the pick op refuses a file path on its own too).
+    async fn handle_file_card_action(
+        self: &Arc<Self>,
+        core: &Arc<SharedCore>,
+        value: &serde_json::Value,
+    ) -> Option<CardActionResult> {
+        let thread_key = thread_key_from_value(value);
+        let path = value
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if path.is_empty() {
+            return Some(CardActionResult {
+                card: None,
+                toast: Some("无效操作".to_string()),
+            });
+        }
+        // The listing to return to, when the row came from one
+        // (`browse_file_value`). Absent — a viewer opened from a tool panel
+        // (#743) — leaves the viewer without a 返回目录 control.
+        let home_dir = value
+            .get("dir")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let home_keyword = value
+            .get("keyword")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let home_page = value.get("page").and_then(|v| v.as_u64()).unwrap_or(1).max(1) as usize;
+        let home_hidden = parse_show_hidden(value);
+        let return_to = (!home_dir.is_empty()).then(|| BrowseView {
+            dir: &home_dir,
+            show_hidden: home_hidden,
+            keyword: &home_keyword,
+            page: home_page,
+        });
+        match crate::feishu::card::command::path_answer(&thread_key, std::path::Path::new(&path), return_to) {
+            crate::feishu::card::command::PathAnswer::Viewer(card) => Some(CardActionResult {
+                card: Some(card),
+                toast: None,
+            }),
+            // The row said file, but that path is a directory now: answer the
+            // Directory Browser where the row pointed rather than invent a
+            // viewer (the same rule as `/cat <directory>`).
+            crate::feishu::card::command::PathAnswer::Directory(dir) => {
+                let dir = dir.to_string_lossy().to_string();
+                Some(CardActionResult {
+                    card: Some(
+                        self.build_dir_browse_for(
+                            core,
+                            &thread_key,
+                            BrowseView {
+                                dir: &dir,
+                                show_hidden: false,
+                                keyword: "",
+                                page: 1,
+                            },
+                        )
+                        .await,
+                    ),
+                    toast: None,
+                })
+            }
+            // The file vanished or cannot be read between the scan and the
+            // click: the reason as a Toast, the browse card still standing —
+            // never an empty viewer (ADR-0083 §2).
+            crate::feishu::card::command::PathAnswer::Line(line) => Some(CardActionResult {
+                card: None,
+                toast: Some(line),
             }),
         }
     }

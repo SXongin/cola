@@ -316,6 +316,62 @@ pub(crate) const CAT_USAGE: &str = "\
 - 只是隐私提示，不是沙箱；谁能操作仍由 Access List 决定，而群聊里卡片人人可读。
 例：`/cat src/main.rs`、`/cat ~/notes.md`、`/cat /etc/hosts`";
 
+/// What a resolved path answers (ADR-0083 §2/§3): the **File Viewer** card for a
+/// file, a directory for the caller to answer with the **Directory Browser**
+/// there, or the one honest line saying why there is no card.
+pub(crate) enum PathAnswer {
+    /// A viewer card, ready to send or to patch over the card that opened it.
+    Viewer(Value),
+    /// A directory: the caller renders the Directory Browser at it (it holds
+    /// the SessionsHandle the browser marks the current directory with).
+    Directory(std::path::PathBuf),
+    /// Why there is no card — a missing, unreadable, empty or non-text path.
+    Line(String),
+}
+
+/// Shape an already-resolved path into its answer (ADR-0083 §2/§3) for a click
+/// that answers a **path**: the browse card's file row (and anything else that
+/// opens one). The bytes are classified locally and by CONTENT
+/// (`bridge::viewer::classify`, ADR-0083 §6) and shaped by
+/// [`build_viewer_for_classified`] — the same classifier and the same card
+/// builder `/cat` answers through — so the two entry points cannot disagree
+/// about what a file is, nor about the copy a failure states. `return_to` is the
+/// browse listing the viewer returns to, when it was opened from one; a viewer
+/// with no listing passes `None` and carries no 「← 返回目录」.
+pub(crate) fn path_answer(
+    thread_key: &ThreadKey,
+    resolved: &std::path::Path,
+    return_to: Option<BrowseView<'_>>,
+) -> PathAnswer {
+    match crate::bridge::viewer::open_cat_path(resolved) {
+        // `/cat <directory>` — and a browse row whose file became a directory —
+        // answers the Directory Browser there rather than erroring: the path
+        // always means "show me this path" (ADR-0083 §2).
+        crate::bridge::viewer::CatOpen::Directory(dir) => PathAnswer::Directory(dir),
+        crate::bridge::viewer::CatOpen::File { path, size } => {
+            // Classify the CONTENT (ADR-0083 §6), exactly as `/cat` does: the
+            // row's card is built by the same classifier and the same builder,
+            // so `/cat <path>` and a row clicked in the listing can never
+            // describe the same file differently. The click patches the browse
+            // card IN PLACE, so it opens no whole-bytes lane (`None`) — a file
+            // past the preview read cap says so and offers 「发为文件」, the
+            // transfer that lane's own user action performs.
+            let classified = match crate::bridge::viewer::classify(&path, size) {
+                Ok(classified) => classified,
+                Err(failure) => return PathAnswer::Line(failure.line(&path)),
+            };
+            PathAnswer::Viewer(build_viewer_for_classified(
+                thread_key,
+                &path,
+                &classified,
+                None,
+                return_to,
+            ))
+        }
+        crate::bridge::viewer::CatOpen::Failed(failure) => PathAnswer::Line(failure.line(resolved)),
+    }
+}
+
 /// Open `/cat <path>` (ADR-0083 §2, §3): the File Viewer card for a file, the
 /// Directory Browser for a directory, the usage line for a bare `/cat`, and —
 /// for a path that cannot be shown — that path's own honest answer, never an

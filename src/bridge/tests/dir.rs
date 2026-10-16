@@ -1358,15 +1358,365 @@ async fn dir_browse_pick_on_a_file_refuses() {
     );
 }
 
+/// A file row whose file vanished between the scan and the click answers the
+/// honest reason as a Toast — the browse card stays, never an empty viewer — and
+/// a row whose path is a directory answers the Directory Browser there, exactly
+/// as `/cat <directory>` does (ADR-0083 §2/§3).
+#[tokio::test]
+async fn dir_browse_file_row_on_a_vanished_path_toasts_and_a_directory_opens_the_browser() {
+    let _wd = test_work_dir();
+    let proj = browse_project();
+    let proj_dir = canonical_of(proj.path());
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    seed_entry(&app, seeded_entry(&key, &proj_dir)).await;
+
+    let ghost = proj.path().join("ghost.txt");
+    let result = app
+        .host_action(serde_json::json!({
+            "action": "file",
+            "path": ghost.to_string_lossy(),
+            "chat_id": "chat_1",
+            "thread_id": "chat_1",
+        }))
+        .await
+        .expect("the click answers");
+    assert!(result.card.is_none(), "a vanished file patches no card");
+    let toast = result.toast.unwrap_or_default();
+    assert!(toast.contains("找不到路径"), "the reason is stated: {toast}");
+    assert!(
+        toast.contains(&canonical_of(&ghost)),
+        "and names the path: {toast}"
+    );
+    assert!(platform.replied_cards().await.is_empty(), "never an empty viewer");
+
+    let result = app
+        .host_action(serde_json::json!({
+            "action": "file",
+            "path": proj_dir,
+            "chat_id": "chat_1",
+            "thread_id": "chat_1",
+        }))
+        .await
+        .expect("the click answers");
+    let card = result.card.expect("a directory answers the browser");
+    assert_eq!(card_header(&card), "📁 浏览目录");
+    assert!(
+        card_text(&card).contains("📁 alpha"),
+        "at that directory: {}",
+        card_text(&card)
+    );
+}
+
+// ---- ADR-0083 §3: files in the browse card ----
+
+/// The canonical spelling of `path` — what the viewer names, since it resolves
+/// the file it opened rather than echoing the typed spelling.
+fn canonical_of(path: &std::path::Path) -> String {
+    std::fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .to_string()
+}
+
+/// The card's file row button for `name` (its label is `📄 <name> · <size>`).
+fn file_row<'a>(card: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+    let prefix = format!("📄 {name}");
+    card_buttons(card)
+        .into_iter()
+        .find(|b| {
+            b["text"]["content"]
+                .as_str()
+                .is_some_and(|label| label.starts_with(&prefix))
+        })
+        .unwrap_or_else(|| panic!("file row `{name}` not found: {}", card_text(card)))
+}
+
+/// The browse card lists a directory's FILES beside its directories (ADR-0083
+/// §3): a file row is 📄 + name + size, files sort after every directory, the
+/// repo stays first (📦), dot-files hide behind the same toggle as dot-dirs,
+/// and the keyword filter narrows file names too.
+#[tokio::test]
+async fn dir_browse_lists_files_after_directories_with_their_size() {
+    let _wd = test_work_dir();
+    let proj = browse_project();
+    std::fs::write(proj.path().join("README.md"), "hello\n").unwrap();
+    std::fs::write(proj.path().join("zenith.txt"), "1234567890").unwrap();
+    std::fs::write(proj.path().join(".env"), "SECRET=1\n").unwrap();
+    let proj_dir = proj.path().to_string_lossy().to_string();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    seed_entry(&app, seeded_entry(&key, &proj_dir)).await;
+
+    let card = app
+        .host_action(browse_action("go", &proj_dir))
+        .await
+        .unwrap()
+        .card
+        .expect("card");
+    assert_eq!(
+        file_row(&card, "README.md")["text"]["content"],
+        "📄 README.md · 6 B",
+        "a file row names the file and its size"
+    );
+    assert_eq!(
+        file_row(&card, "zenith.txt")["text"]["content"],
+        "📄 zenith.txt · 10 B"
+    );
+    // Ordering: the repo 📦, then the plain directories, then the files — each
+    // group case-insensitively alphabetical.
+    let text = card_text(&card);
+    let order: Vec<usize> = ["📦 repo", "📁 alpha", "📁 beta", "📄 README.md", "📄 zenith.txt"]
+        .iter()
+        .map(|needle| {
+            text.find(needle)
+                .unwrap_or_else(|| panic!("`{needle}` missing: {text}"))
+        })
+        .collect();
+    assert!(
+        order.windows(2).all(|pair| pair[0] < pair[1]),
+        "directories first, files after: {text}"
+    );
+    assert!(!text.contains(".env"), "dot files hide by default: {text}");
+
+    // The toggle reveals dot-files as well as dot-directories.
+    let mut shown = browse_action("show_hidden", &proj_dir);
+    shown["show_hidden"] = serde_json::json!(false);
+    let card = app.host_action(shown).await.unwrap().card.expect("card");
+    assert_eq!(file_row(&card, ".env")["text"]["content"], "📄 .env · 9 B");
+
+    // The keyword filter applies to file names too.
+    let mut filtered = browse_action("filter", &proj_dir);
+    filtered["keyword"] = serde_json::json!("read");
+    let card = app.host_action(filtered).await.unwrap().card.expect("card");
+    let text = card_text(&card);
+    assert!(text.contains("📄 README.md"), "the matching file stays: {text}");
+    assert!(
+        !text.contains("📁 alpha") && !text.contains("📦 repo"),
+        "and the directories drop out: {text}"
+    );
+}
+
+/// A file row opens that file's File Viewer by replacing the browse card IN
+/// PLACE (ADR-0083 §3): the ack patches the clicked card — one message, no new
+/// send, exactly as the browse card replaces the Recent Directories card. The
+/// row is `action: "file"` and carries no pick/topic op, so declaring a Session
+/// still requires a directory.
+#[tokio::test]
+async fn dir_browse_file_row_opens_the_viewer_in_place_and_declares_nothing() {
+    let _wd = test_work_dir();
+    let proj = browse_project();
+    let file = proj.path().join("notes.md");
+    std::fs::write(&file, "# notes\nbody\n").unwrap();
+    let proj_dir = proj.path().to_string_lossy().to_string();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    seed_entry(&app, seeded_entry(&key, &proj_dir)).await;
+
+    let card = app
+        .host_action(browse_action("go", &proj_dir))
+        .await
+        .unwrap()
+        .card
+        .expect("card");
+    let payload = file_row(&card, "notes.md")["value"].clone();
+    assert_eq!(
+        payload["action"], "file",
+        "the row routes to the viewer, not the browse handler: {payload}"
+    );
+    assert!(
+        payload.get("op").is_none(),
+        "no pick/topic op on a file row: {payload}"
+    );
+    assert_eq!(payload["path"], canonical_of(&file), "the row names the file");
+
+    let sent_before = platform.calls.lock().await.len();
+    let result = app.host_action(payload).await.expect("the click answers");
+    let viewer = result.card.expect("the viewer patches the browse card in place");
+    assert!(result.toast.is_none(), "opening a file is not a toast");
+    assert_eq!(card_header(&viewer), "📄 notes.md", "the viewer names the file");
+    let text = card_text(&viewer);
+    assert!(text.contains(&canonical_of(&file)), "the resolved path: {text}");
+    assert!(text.contains("13 B"), "the size: {text}");
+    assert!(
+        text.contains("```markdown") && text.contains("# notes"),
+        "the file's own bytes: {text}"
+    );
+    assert!(
+        text.contains("← 返回目录"),
+        "a viewer opened from a listing can return: {text}"
+    );
+    // In place: the ack patches the clicked message, so nothing is sent anew.
+    assert_eq!(
+        platform.calls.lock().await.len(),
+        sent_before,
+        "no new message — the ack patches the browse card"
+    );
+    assert!(
+        platform.replied_cards().await.is_empty(),
+        "and nothing is replied"
+    );
+    assert!(
+        app.sessions.lock().await.pending_for(&key).is_none(),
+        "a file row declares no Session"
+    );
+}
+
+/// 「← 返回目录」 restores the browse card at the same directory, page, filter
+/// and hidden-toggle (ADR-0083 §3): the file row round-trips the listing's whole
+/// state through its payload, so opening a file never loses your place.
+#[tokio::test]
+async fn dir_browse_file_row_returns_to_the_same_listing_state() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    for i in 1..=12 {
+        std::fs::write(proj.path().join(format!("a{i:02}.txt")), "x").unwrap();
+    }
+    std::fs::write(proj.path().join(".a00.txt"), "x").unwrap();
+    let proj_dir = canonical_of(proj.path());
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    seed_entry(&app, seeded_entry(&key, &proj_dir)).await;
+
+    // Twelve `aNN.txt` plus one dot-file, filtered to `a` with the toggle on:
+    // thirteen rows, three pages.
+    let mut filtered = browse_action("filter", &proj_dir);
+    filtered["keyword"] = serde_json::json!("a");
+    filtered["show_hidden"] = serde_json::json!(true);
+    let page1 = app.host_action(filtered).await.unwrap().card.expect("card");
+    assert_eq!(
+        dir_pager_label(&page1).as_deref(),
+        Some("第 1/3 页 · 共 13 个"),
+        "{}",
+        card_text(&page1)
+    );
+
+    let next = pager_button(&page1, "下一页")["value"].clone();
+    let page2 = app.host_action(next).await.unwrap().card.expect("card");
+    assert!(
+        card_text(&page2).contains("📄 a06.txt"),
+        "page two holds the seventh row: {}",
+        card_text(&page2)
+    );
+
+    let viewer = app
+        .host_action(file_row(&page2, "a06.txt")["value"].clone())
+        .await
+        .unwrap()
+        .card
+        .expect("viewer");
+    let back = card_buttons(&viewer)
+        .into_iter()
+        .find(|b| b["text"]["content"] == "← 返回目录")
+        .expect("a viewer from a listing carries 返回目录")
+        .clone();
+    assert_eq!(back["value"]["action"], "dir");
+    assert_eq!(back["value"]["op"], "restore");
+    assert_eq!(back["value"]["dir"], proj_dir);
+    assert_eq!(back["value"]["show_hidden"], true);
+    assert_eq!(back["value"]["keyword"], "a");
+    assert_eq!(back["value"]["page"], 2);
+
+    let restored = app
+        .host_action(back["value"].clone())
+        .await
+        .unwrap()
+        .card
+        .expect("the listing comes back");
+    let text = card_text(&restored);
+    assert!(text.contains("📄 a06.txt"), "the same rows come back: {text}");
+    assert!(
+        !text.contains("📄 a01.txt"),
+        "page one's rows stay off the restored page: {text}"
+    );
+    assert_eq!(
+        dir_pager_label(&restored).as_deref(),
+        Some("第 2/3 页 · 共 13 个"),
+        "the page is restored: {text}"
+    );
+    assert!(
+        restored.to_string().contains("\"default_value\":\"a\""),
+        "the filter is restored: {restored}"
+    );
+    assert!(
+        text.contains("隐藏点开头的项"),
+        "the hidden toggle is restored as on: {text}"
+    );
+}
+
+/// Six entries per page counts directories AND files together (ADR-0083 §3):
+/// the pager's total is the combined list, so page one is the directories and
+/// page two the files.
+#[tokio::test]
+async fn dir_browse_pager_counts_files_toward_the_six_per_page() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    for i in 1..=6 {
+        std::fs::create_dir(proj.path().join(format!("d{i:02}"))).unwrap();
+        std::fs::write(proj.path().join(format!("f{i:02}.txt")), "x").unwrap();
+    }
+    let proj_dir = canonical_of(proj.path());
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    seed_entry(&app, seeded_entry(&key, &proj_dir)).await;
+
+    let page1 = app
+        .host_action(browse_action("go", &proj_dir))
+        .await
+        .unwrap()
+        .card
+        .expect("card");
+    let text = card_text(&page1);
+    assert!(
+        text.contains("📁 d01") && text.contains("📁 d06"),
+        "the directories: {text}"
+    );
+    assert!(!text.contains("📄 f01.txt"), "and no file yet: {text}");
+    assert_eq!(
+        dir_pager_label(&page1).as_deref(),
+        Some("第 1/2 页 · 共 12 个"),
+        "the pager counts directories and files together: {text}"
+    );
+
+    let next = pager_button(&page1, "下一页")["value"].clone();
+    let page2 = app.host_action(next).await.unwrap().card.expect("card");
+    let text = card_text(&page2);
+    assert!(
+        text.contains("📄 f01.txt") && text.contains("📄 f06.txt"),
+        "the files: {text}"
+    );
+    assert!(!text.contains("📁 d01"), "and no directory: {text}");
+    assert_eq!(
+        dir_pager_label(&page2).as_deref(),
+        Some("第 2/2 页 · 共 12 个"),
+        "{text}"
+    );
+}
+
 /// A directory larger than `BROWSE_SCAN_CAP` is scanned only up to the cap and
 /// says so — the render cannot outrun the card callback budget (#670 review).
+/// Files count toward the cap exactly like directories, so a directory holding
+/// `cap - 1` dirs and 2 files (one entry past the cap) is still truncated.
 #[tokio::test]
 async fn dir_browse_caps_a_huge_directory_scan() {
     let _wd = test_work_dir();
     let proj = tempfile::tempdir().unwrap();
     let cap = crate::bridge::handler::BROWSE_SCAN_CAP;
-    for i in 0..=cap {
+    for i in 0..cap - 1 {
         std::fs::create_dir(proj.path().join(format!("d{i:05}"))).unwrap();
+    }
+    for i in 0..2 {
+        std::fs::write(proj.path().join(format!("f{i:05}.txt")), "x").unwrap();
     }
     let proj_dir = proj.path().to_string_lossy().to_string();
     let dir = tempfile::tempdir().unwrap();
