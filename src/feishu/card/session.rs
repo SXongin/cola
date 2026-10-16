@@ -862,13 +862,18 @@ fn dir_card_row(
     vec![text_row, btn_row]
 }
 
-/// One child directory of the `/dir` browse card (ADR-0078): the display name,
-/// the absolute path its drill-down button navigates to, and whether it holds a
-/// `.git` entry (a repo — floated to the front and marked 📦).
+/// One child row of the `/dir` browse card (ADR-0078, ADR-0083 §3): the display
+/// name, the absolute path its button acts on, and what the row is. A directory
+/// carries `is_repo` (it holds a `.git` entry — floated to the front and marked
+/// 📦) and no `size`; a file carries `size`, the byte count its row names, and
+/// opens the **File Viewer** in place.
 pub struct BrowseChild {
     pub name: String,
     pub path: String,
     pub is_repo: bool,
+    /// `Some` exactly when this row is a file (ADR-0083 §3 lists files beside
+    /// directories); `None` marks a directory row.
+    pub size: Option<u64>,
 }
 
 /// The stateless view state every browse-card control round-trips (ADR-0078):
@@ -922,9 +927,9 @@ pub fn build_dir_browse_card(
     elements.push(browse_form(thread_key, view, show_filter));
 
     let header = if view.keyword.is_empty() {
-        "**子目录**".to_string()
+        "**子目录与文件**".to_string()
     } else {
-        format!("**匹配 `{}` 的子目录**", view.keyword)
+        format!("**匹配 `{}` 的子目录与文件**", view.keyword)
     };
     elements.push(json!({
         "tag": "markdown",
@@ -933,14 +938,17 @@ pub fn build_dir_browse_card(
     elements.push(browse_dot_toggle(thread_key, view));
     if total == 0 {
         let hint = if view.keyword.is_empty() {
-            "_(没有子目录)_"
+            "_(没有子目录或文件)_"
         } else {
-            "_(无匹配子目录)_"
+            "_(无匹配的子目录或文件)_"
         };
         elements.push(json!({ "tag": "markdown", "content": hint }));
     } else {
         for child in &children[window.start..window.end] {
-            elements.push(browse_child_button(thread_key, child, view.show_hidden));
+            elements.push(match child.size {
+                Some(size) => browse_file_button(thread_key, child, size, view),
+                None => browse_child_button(thread_key, child, view.show_hidden),
+            });
         }
     }
 
@@ -998,6 +1006,34 @@ pub(crate) fn browse_view_value(
     view: BrowseView<'_>,
 ) -> serde_json::Value {
     browse_value(thread_key, op, view)
+}
+
+/// The routing payload a browse card's **file row** carries (ADR-0083 §3):
+/// `action: "file"` — never the browse card's `dir` — dispatches the click to
+/// the File Viewer opener, which is what keeps a file row from offering
+/// 选择/建话题 (declaring a Session needs a directory). `path` is the file to
+/// open; `view` is the listing the row was clicked in, whose whole state
+/// (`dir`/`show_hidden`/`keyword`/`page`) rides along so the viewer's
+/// 「← 返回目录」 restores it exactly. A viewer opened with no listing to return
+/// to (a tool panel's 打开 button, #743) passes `None`.
+pub(crate) fn browse_file_value(
+    thread_key: &crate::config::ThreadKey,
+    path: &str,
+    view: Option<BrowseView<'_>>,
+) -> serde_json::Value {
+    let mut value = json!({
+        "action": "file",
+        "path": path,
+        "chat_id": thread_key.chat_id,
+        "thread_id": thread_key.thread_id,
+    });
+    if let Some(view) = view {
+        value["dir"] = json!(view.dir);
+        value["show_hidden"] = json!(view.show_hidden);
+        value["keyword"] = json!(view.keyword);
+        value["page"] = json!(view.page);
+    }
+    value
 }
 
 /// The browse card's clickable breadcrumb (ADR-0078): 🏠 home, ⬆ 上一级, then
@@ -1096,15 +1132,16 @@ fn browse_node_actions(
     })
 }
 
-/// The 显示隐藏 toggle of the browse card (ADR-0078): shows or hides
-/// dot-directories. The label states the action and the payload carries the
-/// CURRENT `show_hidden` flag — the `show_hidden` op flips it (every other op
-/// passes it through unchanged).
+/// The 显示隐藏 toggle of the browse card (ADR-0078, ADR-0083 §3): shows or
+/// hides every dot-prefixed entry — a dot-directory and a dot-file alike. The
+/// label states the action and the payload carries the CURRENT `show_hidden`
+/// flag — the `show_hidden` op flips it (every other op passes it through
+/// unchanged).
 fn browse_dot_toggle(thread_key: &crate::config::ThreadKey, view: BrowseView<'_>) -> serde_json::Value {
     let label = if view.show_hidden {
-        "隐藏点目录"
+        "隐藏点开头的项"
     } else {
-        "显示隐藏目录"
+        "显示隐藏项"
     };
     json!({
         "tag": "button",
@@ -1138,6 +1175,27 @@ fn browse_child_button(
             "go",
             BrowseView { dir: &child.path, show_hidden, keyword: "", page: 1 },
         ),
+    })
+}
+
+/// One file row of the browse card (ADR-0083 §3): a single full-width button
+/// (📄 + the name + its size) that opens the file's **File Viewer** in place —
+/// the same ack-patch move as the browse card replacing the Recent Directories
+/// card. Its payload carries the whole listing `view`, so the viewer's
+/// 「← 返回目录」 comes back to this exact page, filter and toggle.
+fn browse_file_button(
+    thread_key: &crate::config::ThreadKey,
+    child: &BrowseChild,
+    size: u64,
+    view: BrowseView<'_>,
+) -> serde_json::Value {
+    let size = crate::backend::file_content::human_size(size);
+    json!({
+        "tag": "button",
+        "width": "fill",
+        "type": "default",
+        "text": { "tag": "plain_text", "content": format!("📄 {} · {size}", child.name) },
+        "value": browse_file_value(thread_key, &child.path, Some(view)),
     })
 }
 
@@ -1223,7 +1281,7 @@ fn browse_form(
                         "max_rows": 3,
                         "placeholder": {
                             "tag": "plain_text",
-                            "content": "过滤当前目录的子目录名",
+                            "content": "过滤当前目录的子目录与文件名",
                         },
                         "default_value": view.keyword,
                         "max_length": 100,
@@ -2414,6 +2472,17 @@ mod tests {
             name: name.to_string(),
             path: format!("/work/{name}"),
             is_repo: repo,
+            size: None,
+        }
+    }
+
+    /// A file row of the browse card, with its byte size.
+    fn browse_file(name: &str, size: u64) -> BrowseChild {
+        BrowseChild {
+            name: name.to_string(),
+            path: format!("/work/{name}"),
+            is_repo: false,
+            size: Some(size),
         }
     }
 
@@ -2511,15 +2580,46 @@ mod tests {
             .into_iter()
             .find(|button| button["value"]["op"] == "show_hidden")
             .expect("a dot-toggle");
-        assert_eq!(toggle["text"]["content"], "显示隐藏目录");
+        assert_eq!(toggle["text"]["content"], "显示隐藏项");
         assert_eq!(toggle["value"]["show_hidden"], false, "carries the current flag");
         let dots = build_dir_browse_card(&key, &[], None, bview("/work", true, "", 1), false, None);
         let toggle = all_buttons(&dots)
             .into_iter()
             .find(|button| button["value"]["op"] == "show_hidden")
             .expect("a dot-toggle");
-        assert_eq!(toggle["text"]["content"], "隐藏点目录");
+        assert_eq!(toggle["text"]["content"], "隐藏点开头的项");
         assert_eq!(toggle["value"]["show_hidden"], true);
+    }
+
+    #[test]
+    fn browse_card_file_rows_unmap_to_the_viewer_and_carry_the_listing() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let mut children: Vec<BrowseChild> = (1..=7).map(|i| browse_child(&format!("p{i}"), false)).collect();
+        children.push(browse_file("notes.md", 1536));
+        let card = build_dir_browse_card(&key, &children, None, bview("/work", true, "no", 2), true, None);
+        let file = all_buttons(&card)
+            .into_iter()
+            .find(|button| button["value"]["action"] == "file")
+            .unwrap_or_else(|| panic!("a file row: {card}"));
+        assert_eq!(file["text"]["content"], "📄 notes.md · 1.5 KB");
+        assert_eq!(file["value"]["path"], "/work/notes.md");
+        // The listing's whole state rides the row, so 返回目录 restores it.
+        assert_eq!(file["value"]["dir"], "/work");
+        assert_eq!(file["value"]["show_hidden"], true);
+        assert_eq!(file["value"]["keyword"], "no");
+        assert_eq!(file["value"]["page"], 2);
+        // A file row is never browse-card routing, so it offers no `pick`/`topic`.
+        assert!(file["value"].get("op").is_none(), "no op on a file row: {file}");
+        assert!(file["value"].get("view").is_none(), "not browse routing: {file}");
+        assert!(
+            card.to_string().contains("的子目录与文件"),
+            "the header names both kinds: {card}"
+        );
+        // A viewer opened with no listing to return to (#743's tool panel) gets
+        // the same payload without the browse state, so no 返回目录 is rendered.
+        let bare = browse_file_value(&key, "/work/notes.md", None);
+        assert_eq!(bare["path"], "/work/notes.md");
+        assert!(bare.get("dir").is_none(), "no listing, no return target: {bare}");
     }
 
     #[test]

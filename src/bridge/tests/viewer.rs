@@ -1412,7 +1412,7 @@ async fn return_to_directory_restores_the_listing_state() {
         "with its active filter preserved: {text}"
     );
     assert!(
-        text.contains("隐藏点目录"),
+        text.contains("隐藏点开头的项"),
         "and its hidden toggle preserved: {text}"
     );
     assert!(
