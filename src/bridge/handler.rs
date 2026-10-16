@@ -596,6 +596,53 @@ fn return_page_num(value: &serde_json::Value) -> usize {
     page.max(1) as usize
 }
 
+/// Whether opening `resolved` shows a preview the card structurally cannot
+/// hold (#741): the path is classified by CONTENT exactly as the viewer
+/// opener classifies it, and the verdict is read from the RENDERED shape —
+/// never from byte size. `false` for a directory, for a path that cannot be
+/// read, and for anything the whole-bytes lanes own (an image, a binary, a
+/// text past the preview cap): none of those take the Rich Text Message
+/// lane. The click's own routing pre-check only — the spawned send re-stats
+/// and re-classifies, so the double read is a routing decision, not a second
+/// verdict.
+fn viewer_opens_structural_overflow(resolved: &std::path::Path) -> bool {
+    let (path, size) = match crate::bridge::viewer::open_cat_path(resolved) {
+        crate::bridge::viewer::CatOpen::File { path, size } => (path, size),
+        _ => return false,
+    };
+    let classified = match crate::bridge::viewer::classify(&path, size) {
+        Ok(classified) => classified,
+        Err(_) => return false,
+    };
+    // The same kind mapping `/cat` opens through: only a text preview can
+    // render a card preview that overflows — the byte lanes decide the rest
+    // before this lane is ever asked.
+    let ext = path.extension().and_then(|e| e.to_str());
+    let kind = match classified.kind {
+        crate::bridge::viewer::ClassifiedKind::Text => crate::feishu::card::viewer::kind_for_extension(ext),
+        _ => crate::feishu::card::viewer::ViewerKind::Binary,
+    };
+    crate::feishu::card::viewer::detect_structural_overflow(
+        kind,
+        ext,
+        classified.text.as_deref().unwrap_or(""),
+    )
+    .is_some()
+}
+
+/// The browse listing a clicked viewer returns to, owned for a spawned task
+/// (ADR-0052's statelessness rides the button; the task carries the same
+/// state owned): `dir: None` when the viewer was opened with no listing (a
+/// tool panel's 打开, #743), exactly like the borrowed [`BrowseView`] the
+/// in-place open renders — which is what makes that viewer carry no
+/// 「← 返回目录」.
+struct OwnedReturnTo {
+    dir: Option<String>,
+    keyword: String,
+    show_hidden: bool,
+    page: usize,
+}
+
 /// A viewer payload's viewer page (#740): the pager's TARGET page, or the page
 /// the 「发为文件」 transfer's card PATCH rebuilds — a missing page reads as
 /// the first window, and the builder clamps an out-of-range one.
@@ -2779,6 +2826,37 @@ impl App {
             keyword: &home_keyword,
             page: home_page,
         });
+        // #741: a click that OPENS a structurally-overflowing preview takes
+        // the Rich Text Message lane — the send runs off the callback path
+        // (spawned and bounded, the pattern #739's 「发为文件」 already uses)
+        // and the clicked card is PATCHed once it lands, so the rich text is
+        // delivered and the card says so. A pager flip (`op: "page"`) never
+        // takes this lane: it re-renders the standing card in place — and
+        // content that fits stays on the synchronous in-place path below, no
+        // send of any kind, exactly as #742 pins it.
+        if op.is_empty()
+            && let Some(open_message_id) = value.get("open_message_id").and_then(|v| v.as_str())
+            && !open_message_id.is_empty()
+            && viewer_opens_structural_overflow(&resolved)
+        {
+            let app = Arc::clone(self);
+            let message_id = open_message_id.to_string();
+            let path = resolved.to_string_lossy().to_string();
+            let return_to = OwnedReturnTo {
+                dir: (!home_dir.is_empty()).then(|| home_dir.clone()),
+                keyword: home_keyword.clone(),
+                show_hidden: home_hidden,
+                page: home_page,
+            };
+            tokio::spawn(async move {
+                app.run_viewer_overflow_open(thread_key, path, message_id, return_to, page)
+                    .await;
+            });
+            return Some(CardActionResult {
+                card: None,
+                toast: Some("正在发送预览…".to_string()),
+            });
+        }
         match crate::feishu::card::command::path_answer(&thread_key, &resolved, return_to, page) {
             crate::feishu::card::command::PathAnswer::Viewer(card) => Some(CardActionResult {
                 card: Some(card),
@@ -2813,6 +2891,97 @@ impl App {
                 card: None,
                 toast: Some(line),
             }),
+        }
+    }
+
+    /// Open a structurally-overflowing preview from a click, off the card
+    /// callback (ADR-0083 §5, #741): the click already acked (a toast, no
+    /// card), and this task sends the preview as its own message — the Rich
+    /// Text Message, or the File Message past the post cap — under the
+    /// clicked card, then PATCHes that card with the viewer. The card renders
+    /// `overflowed` exactly when the content landed; a failed send PATCHes
+    /// the truncated preview with its cut note, its 未发送 line and the
+    /// 「发为文件」 rescue, so nothing is silently dropped. Every network
+    /// call — the send and the outcome PATCH — is bounded by
+    /// [`SharedCore::viewer_transfer_timeout_ms`]. The file is re-statted
+    /// and re-classified here (like the 「发为文件」 transfer): the click's
+    /// own pre-check only decided THAT it overflows, and a file that changed
+    /// since takes the lane its CURRENT bytes take — one that fits now
+    /// renders in place.
+    async fn run_viewer_overflow_open(
+        self: &Arc<Self>,
+        thread_key: ThreadKey,
+        path: String,
+        message_id: String,
+        return_to: OwnedReturnTo,
+        page: usize,
+    ) {
+        let timeout_ms = self
+            .viewer_transfer_timeout_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        // The browse listing the viewer was opened from, when it was — so
+        // the PATCHed card keeps 「← 返回目录」 (ADR-0083 §3, ADR-0052).
+        // Absent — a tool panel's 打开 (#743) — leaves the viewer without
+        // one, exactly as its in-place open does.
+        let return_to = return_to.dir.as_deref().map(|dir| BrowseView {
+            dir,
+            show_hidden: return_to.show_hidden,
+            keyword: &return_to.keyword,
+            page: return_to.page,
+        });
+        let resolved = std::path::PathBuf::from(&path);
+        let card = match std::fs::metadata(&resolved) {
+            Ok(meta) => match crate::bridge::viewer::classify(&resolved, meta.len()) {
+                Ok(mut classified) => {
+                    let name = crate::feishu::card::command::file_display_name(&resolved);
+                    let ext = resolved.extension().and_then(|e| e.to_str());
+                    let (lane, overflowed) = crate::bridge::viewer::open_viewer_lanes(
+                        &self.feishu,
+                        &self.cards_handle(),
+                        &message_id,
+                        &name,
+                        ext,
+                        &mut classified,
+                        timeout_ms,
+                    )
+                    .await;
+                    crate::feishu::card::command::build_viewer_for_classified(
+                        &thread_key,
+                        &resolved,
+                        &classified,
+                        lane,
+                        return_to,
+                        page,
+                        overflowed,
+                    )
+                }
+                Err(failure) => crate::feishu::card::viewer::build_viewer_failure_card(
+                    &thread_key,
+                    &path,
+                    &failure.line(&resolved),
+                    return_to,
+                ),
+            },
+            Err(error) => {
+                let failure = crate::bridge::viewer::stat_failure(&error);
+                crate::feishu::card::viewer::build_viewer_failure_card(
+                    &thread_key,
+                    &path,
+                    &failure.line(&resolved),
+                    return_to,
+                )
+            }
+        };
+        if !matches!(
+            crate::bridge::bounded_call(
+                "viewer overflow card update",
+                timeout_ms,
+                self.feishu.update_message(&message_id, &card),
+            )
+            .await,
+            Some(Ok(()))
+        ) {
+            tracing::warn!("viewer overflow: card update for {message_id} did not land");
         }
     }
 

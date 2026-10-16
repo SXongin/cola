@@ -25,7 +25,7 @@ use serde_json::json;
 use crate::backend::file_content::human_size;
 use crate::config::ThreadKey;
 
-use super::sanitize::{CardMarkdown, MAX_CARD_TABLES, MAX_TABLE_ROWS, serialized_len};
+use super::sanitize::{CardMarkdown, MAX_TABLE_ROWS, serialized_len};
 use super::session::{BrowseView, browse_view_value, pager_element};
 use super::shell::card_shell;
 use super::tool_render::{FileDelivery, delivery_suffix, file_image_element};
@@ -80,7 +80,7 @@ pub(crate) struct ViewerFileLane {
 }
 
 /// Why a preview cannot ride the card (ADR-0083 §5, #741): the RENDERED
-/// structure — element/table/row counts, never byte size — past what a card
+/// structure — element/row counts, never byte size — past what a card
 /// holds. A large single code block that fits the budget is none of these and
 /// stays on the card.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -91,10 +91,13 @@ pub(crate) enum StructuralOverflow {
         /// Fenced elements the full preview needs.
         chunks: usize,
     },
-    /// A delimited preview past the card's table budget: more tables than
-    /// [`MAX_CARD_TABLES`], or more body rows than [`MAX_TABLE_ROWS`].
+    /// A delimited preview past the card's row budget: more body rows than
+    /// [`MAX_TABLE_ROWS`].
     TableOverBudget {
-        /// Markdown tables the preview renders (one per delimited file).
+        /// Markdown tables the preview renders (always one: a single-file
+        /// preview renders a single markdown table, so the card's five-table
+        /// cap is unreachable here — the card-level sanitizer still enforces
+        /// it across a card's elements).
         tables: usize,
         /// Body rows the preview's table carries.
         rows: usize,
@@ -133,8 +136,10 @@ pub(crate) fn detect_structural_overflow(
                     break;
                 }
             }
-            (1 > MAX_CARD_TABLES || rows > MAX_TABLE_ROWS)
-                .then_some(StructuralOverflow::TableOverBudget { tables: 1, rows })
+            // Only the row cap can fire here: a single-file preview renders a
+            // single markdown table, so the card's five-table cap is
+            // unreachable from this lane (no second table can ever render).
+            (rows > MAX_TABLE_ROWS).then_some(StructuralOverflow::TableOverBudget { tables: 1, rows })
         }
         ViewerKind::Image | ViewerKind::Binary | ViewerKind::TextTooLarge => None,
     }
@@ -153,10 +158,13 @@ fn delim_for(ext: Option<&str>) -> char {
 /// The Rich Text Message body for a structurally-overflowing preview (#741):
 /// the content intact — the full fenced block for text (with its language
 /// hint), the full markdown table for delimited text (every row, unclipped).
-/// `None` when that body would exceed the platform's 30 KB body cap
-/// ([`FEISHU_CARD_LIMIT_BYTES`], the same cap a card carries): such content
-/// does NOT take this lane — it goes to the File Message lane, with the card
-/// saying so. `None` for the byte lanes, which never take this lane.
+/// `None` when that body would exceed the documented 30 KB message-body cap
+/// ([`FEISHU_CARD_LIMIT_BYTES`], the card limit this lane sizes itself by):
+/// such content does NOT take this lane — it goes to the File Message lane,
+/// with the card saying so. The shared cap is the documented card limit, not
+/// a measured `post` limit — no `post` body was ever sized against the live
+/// platform here — so this lane treats it as the budget, not a proven fact.
+/// `None` for the byte lanes, which never take this lane.
 pub(crate) fn rich_post_md(kind: ViewerKind, ext: Option<&str>, text: &str) -> Option<String> {
     match kind {
         ViewerKind::Text => {
@@ -188,9 +196,12 @@ pub(crate) fn rich_post_content(md: &str) -> serde_json::Value {
 /// Message lane (#741): the first record is the header, the rest the body —
 /// every row, every column, no clipping — because the lane carries the content
 /// intact or not at all. `None` when the text holds no records, or when the
-/// table would exceed [`FEISHU_CARD_LIMIT_BYTES`]: the build aborts past the
-/// cap, so a file of millions of rows costs a bounded prefix, never the whole
-/// file (the File Message lane owns what does not fit here).
+/// table would exceed the documented 30 KB body cap
+/// ([`FEISHU_CARD_LIMIT_BYTES`], the card limit this lane sizes itself by —
+/// asserted from the documented limit, never measured against a live `post`
+/// send): the build aborts past the cap, so a file of millions of rows costs
+/// a bounded prefix, never the whole file (the File Message lane owns what
+/// does not fit here).
 ///
 /// Cells keep their structural validity: a `|` cannot split the row and an
 /// embedded newline stays on one markdown line — the same validity the card's
@@ -473,11 +484,16 @@ pub(crate) struct ViewerCard<'a> {
     /// text preview that took no lane on open (its 「发为文件」 transfer still
     /// works — the click carries the path).
     pub(crate) lane: Option<ViewerFileLane>,
-    /// The preview went out as its own message (#741): a structurally
-    /// overflowing preview rides the Rich Text Message lane (or the File
-    /// Message lane past the post cap), so the card carries NO preview
-    /// elements and NO truncation note — naming, the lane's tracking line and
-    /// the buttons are the whole card, and nothing is silently dropped.
+    /// The preview went out as its own message and LANDED (#741): a
+    /// structurally overflowing preview rides the Rich Text Message lane (or
+    /// the File Message lane past the post cap), so the card carries NO
+    /// preview elements, NO truncation note and NO 「发为文件」 — the content
+    /// is already delivered, so a rescue button would deliver the same file a
+    /// second time. Naming, the lane's tracking line and the directory buttons
+    /// are the whole card, and nothing is silently dropped. `false` whenever
+    /// the lane did NOT land (including a failed/timed-out send): the card
+    /// then keeps its truncated preview, its honest cut note and the rescue
+    /// button, with the tracking line stating the content was not delivered.
     pub(crate) overflowed: bool,
 }
 
@@ -495,9 +511,10 @@ pub(crate) fn build_viewer_card(thread_key: &ThreadKey, view: ViewerCard<'_>) ->
         "content": markdown.clean(&naming_block(&view)),
     }));
 
-    // An overflowed preview went out as its own message (#741): the card
-    // carries no preview and no truncation note — the tracking line below
-    // says where the content went.
+    // A LANDED overflow preview went out as its own message (#741): the card
+    // carries no preview, no truncation note and no rescue delivery — the
+    // tracking line below says where the content went. A preview the lane did
+    // NOT deliver keeps all three, so the content stays reachable on the card.
     if !view.overflowed {
         match view.kind {
             // An image the open lane embedded: the `img` element IS the preview.
@@ -859,15 +876,21 @@ fn lane_line(lane: &ViewerFileLane) -> String {
 }
 
 /// The viewer's button row (ADR-0083 §3, §5): 「📂 所在目录」 always, 「← 返回目录」
-/// when the viewer was opened from a browse listing, and 「发为文件」 always. The
-/// two directory buttons carry the browse handler's own payload shape
-/// ([`browse_view_value`]) so #742 only has to pass the listing in; the transfer
-/// button carries the RESOLVED path the click must upload, plus the browse
-/// listing's whole state so the card it PATCHes back to can still carry
-/// 「← 返回目录」.
+/// when the viewer was opened from a browse listing, and 「发为文件」 unless the
+/// preview already landed as its own message (`overflowed`): a landed preview
+/// needs no rescue delivery, while a preview the lane did NOT deliver keeps
+/// the button as its way out. The two directory buttons carry the browse
+/// handler's own payload shape ([`browse_view_value`]) so #742 only has to
+/// pass the listing in; the transfer button carries the RESOLVED path the
+/// click must upload, plus the browse listing's whole state so the card it
+/// PATCHes back to can still carry 「← 返回目录」.
 fn viewer_buttons(thread_key: &ThreadKey, view: &ViewerCard<'_>) -> serde_json::Value {
     let mut columns = directory_columns(thread_key, view.path, view.return_to);
-    columns.push(button_column("发为文件", transfer_value(thread_key, view)));
+    // A landed overflow preview is already delivered: offering 「发为文件」
+    // would deliver the same file a second time (#741, deliver-once).
+    if !view.overflowed {
+        columns.push(button_column("发为文件", transfer_value(thread_key, view)));
+    }
     button_row(columns)
 }
 
@@ -1801,12 +1824,12 @@ mod tests {
         assert!(card_text(&over).contains("未发送"), "{}", card_text(&over));
     }
 
-    /// Every viewer carries 「发为文件」 (ADR-0083 §5) — including a text preview,
-    /// whose full bytes are the reason the button exists. Its payload names the
-    /// RESOLVED path, routes to the Chat/Topic, and carries the browse listing's
-    /// whole state so the PATCHed card can still return.
+    /// A viewer whose preview fits carries 「发为文件」 (ADR-0083 §5) — including
+    /// a text preview, whose full bytes are the reason the button exists. Its
+    /// payload names the RESOLVED path, routes to the Chat/Topic, and carries
+    /// the browse listing's whole state so the PATCHed card can still return.
     #[test]
-    fn every_viewer_carries_the_send_as_file_button() {
+    fn fitting_viewers_carry_the_send_as_file_button() {
         let card = build_viewer_card(
             &key(),
             view("/tmp/proj/notes.md", ViewerKind::Text, Some("md"), "# hi\n"),
@@ -1842,6 +1865,69 @@ mod tests {
         assert_eq!(send["value"]["return_show_hidden"], true);
         assert_eq!(send["value"]["return_keyword"], "no");
         assert_eq!(send["value"]["return_page"], 2);
+    }
+
+    /// #741, deliver-once: a preview that LANDED as its own message carries no
+    /// 「发为文件」 — the content is already delivered, so the button would
+    /// deliver the same file a second time. A preview the lane did NOT deliver
+    /// keeps the button as its rescue way out.
+    #[test]
+    fn a_landed_overflow_card_offers_no_second_delivery() {
+        let mut landed = view(
+            "/tmp/proj/people.csv",
+            ViewerKind::Delimited,
+            Some("csv"),
+            "name,age\nann,3\n",
+        );
+        landed.overflowed = true;
+        landed.lane = Some(ViewerFileLane {
+            mime: "text/csv".to_string(),
+            name: "people.csv".to_string(),
+            size: 15,
+            delivery: FileDelivery::SentAsRichText,
+        });
+        let card = build_viewer_card(&key(), landed);
+        let text = card_text(&card);
+        assert!(
+            text.contains("已发送为富文本消息"),
+            "the tracking line says where the content went: {text}"
+        );
+        assert!(
+            !card_buttons(&card)
+                .iter()
+                .any(|b| b["text"]["content"] == "发为文件"),
+            "a landed preview offers no second delivery: {text}"
+        );
+
+        // The same lane, undelivered: the truncated preview, its cut note and
+        // the rescue button stay, with the tracking line stating the content
+        // did not land.
+        let mut failed = view(
+            "/tmp/proj/people.csv",
+            ViewerKind::Delimited,
+            Some("csv"),
+            "name,age\nann,3\n",
+        );
+        failed.lane = Some(ViewerFileLane {
+            mime: "text/csv".to_string(),
+            name: "people.csv".to_string(),
+            size: 15,
+            delivery: FileDelivery::Undelivered,
+        });
+        let card = build_viewer_card(&key(), failed);
+        let text = card_text(&card);
+        assert!(text.contains("| ann | 3 |"), "the preview stays: {text}");
+        assert!(text.contains("未发送"), "the miss is stated: {text}");
+        assert!(
+            !text.contains("富文本"),
+            "no claim to a lane that did not land: {text}"
+        );
+        assert!(
+            card_buttons(&card)
+                .iter()
+                .any(|b| b["text"]["content"] == "发为文件"),
+            "the rescue button stays when nothing landed: {text}"
+        );
     }
 
     /// A preview longer than the card can hold pages by lines through the
@@ -1935,21 +2021,27 @@ mod tests {
 
     /// #741: the structural-overflow lane is chosen from the RENDERED
     /// structure, never from byte size — past the element budget (a text
-    /// preview needing more fenced elements than the card holds), past the
-    /// five-table cap, or past the 49-row table cap.
+    /// preview needing more fenced elements than the card holds), or past the
+    /// 49-row table cap. (A single-file preview renders a single table, so the
+    /// card's five-table cap is unreachable here by construction.)
     #[test]
     fn structural_overflow_is_detected_from_the_rendered_structure() {
-        // A table past the row cap overflows, whatever its byte size.
+        // A table past the row cap overflows, whatever its byte size — by
+        // exactly one row past it.
         let long_csv = format!(
             "h1,h2\n{}",
-            (0..MAX_TABLE_ROWS + 11)
+            (0..MAX_TABLE_ROWS + 1)
                 .map(|i| format!("r{i},v{i}"))
                 .collect::<Vec<_>>()
                 .join("\n")
         );
-        assert!(
-            detect_structural_overflow(ViewerKind::Delimited, Some("csv"), &long_csv).is_some(),
-            "a table past the 49-row cap takes the lane"
+        assert_eq!(
+            detect_structural_overflow(ViewerKind::Delimited, Some("csv"), &long_csv),
+            Some(StructuralOverflow::TableOverBudget {
+                tables: 1,
+                rows: MAX_TABLE_ROWS + 1,
+            }),
+            "one row past the 49-row cap takes the lane"
         );
         // Exactly at the cap fits.
         let at_cap = format!(
@@ -1981,8 +2073,76 @@ mod tests {
         assert!(detect_structural_overflow(ViewerKind::TextTooLarge, Some("log"), "x").is_none());
     }
 
+    /// #741: the element boundary is exact — a text preview needing exactly
+    /// [`MAX_CARD_COMPONENTS`] fenced elements fits, one character more takes
+    /// the lane.
+    #[test]
+    fn structural_overflow_pins_the_exact_element_boundary() {
+        let at_budget = "x".repeat(PREVIEW_CHUNK_CHARS * MAX_CARD_COMPONENTS);
+        assert_eq!(
+            chunk_text(&at_budget, PREVIEW_CHUNK_CHARS).len(),
+            MAX_CARD_COMPONENTS,
+            "the fixture really is exactly the budget"
+        );
+        assert!(
+            detect_structural_overflow(ViewerKind::Text, Some("txt"), &at_budget).is_none(),
+            "exactly the element budget stays on the card"
+        );
+        let one_more = "x".repeat(PREVIEW_CHUNK_CHARS * MAX_CARD_COMPONENTS + 1);
+        assert_eq!(
+            detect_structural_overflow(ViewerKind::Text, Some("txt"), &one_more),
+            Some(StructuralOverflow::TooManyElements {
+                chunks: MAX_CARD_COMPONENTS + 1,
+            }),
+            "one character past the budget takes the lane"
+        );
+    }
+
+    /// #741: the Rich Text Message lane flips within one row of the documented
+    /// 30 KB body cap — a delimited preview just under it carries the content
+    /// intact, one row more takes no post body at all (the File lane owns it).
+    #[test]
+    fn the_rich_post_body_flips_within_one_row_of_the_cap() {
+        // One wide column per row, so a single row costs ~1.4 KB and the flip
+        // lands within one row of the cap rather than thousands of rows in.
+        fn csv_rows(n: usize) -> String {
+            let mut csv = String::from("h\n");
+            for _ in 0..n {
+                csv.push_str(&"x".repeat(1400));
+                csv.push('\n');
+            }
+            csv
+        }
+        // Grow to the flip: the first row count whose body does not fit.
+        let mut over = 0;
+        while rich_post_md(ViewerKind::Delimited, Some("csv"), &csv_rows(over)).is_some() {
+            over += 1;
+        }
+        assert!(over > 5, "the flip is a genuinely large table, got {over} rows");
+        let under = over - 1;
+        let md = rich_post_md(ViewerKind::Delimited, Some("csv"), &csv_rows(under))
+            .expect("one row under the flip still fits");
+        assert_eq!(
+            md.lines().count(),
+            under + 2,
+            "the fitting body carries every row, none cut"
+        );
+        // The fitting body is JUST under the cap: its slack is less than one
+        // row's own lane cost, so the flip is within one row of the budget.
+        let row_cost = serialized_len(&format!("| {} |", "x".repeat(1400))) + 8;
+        let slack = FEISHU_CARD_LIMIT_BYTES.saturating_sub(serialized_len(&md) + 128);
+        assert!(
+            slack < row_cost,
+            "the fitting body is just under the cap ({slack} bytes of slack, one row costs {row_cost})"
+        );
+        assert!(
+            rich_post_md(ViewerKind::Delimited, Some("csv"), &csv_rows(over)).is_none(),
+            "one row more takes no post body"
+        );
+    }
+
     /// #741: the Rich Text Message carries the content intact — the full
-    /// table, every row — while a body that would exceed the platform's
+    /// table, every row — while a body that would exceed the documented
     /// 30 KB cap takes no post body at all (it goes to the File lane).
     #[test]
     fn the_rich_post_body_carries_the_content_intact_within_the_cap() {
