@@ -3919,8 +3919,8 @@ impl App {
     /// surfaces as `未发送` on the card rather than a dropped result. A path
     /// that vanished or became unreadable between the viewer and the click has
     /// no lane to report: its own failure line IS the PATCHed card's body, so
-    /// the click's outcome is stated either way (finding #739 §4). Local work (a
-    /// read under the caps) is bounded by design and runs here.
+    /// the click's outcome is stated either way (finding #739 §4). All local
+    /// filesystem work is done in the bounded blocking-read pool below.
     async fn run_viewer_file_transfer(
         self: &Arc<Self>,
         thread_key: ThreadKey,
@@ -3950,49 +3950,54 @@ impl App {
             keyword: &return_keyword,
             page: return_page_num(&value),
         });
-        // Re-stat and re-classify: the path may have changed since the viewer
-        // was opened. A vanished or unreadable path (a denied `stat` included)
-        // states its own cause on the card; every other outcome renders the
-        // viewer with the lane that says where the bytes went.
-        let card = match std::fs::metadata(&resolved) {
-            Ok(meta) => match crate::bridge::viewer::classify(&resolved, meta.len()) {
-                Ok(mut classified) => {
-                    let name = crate::feishu::card::command::file_display_name(&resolved);
-                    let lane = crate::bridge::viewer::send_as_file(
-                        &self.feishu,
-                        &self.cards_handle(),
-                        &message_id,
-                        &resolved,
-                        &name,
-                        &mut classified,
-                        timeout_ms,
-                    )
-                    .await;
-                    crate::feishu::card::command::build_viewer_for_classified(
-                        &thread_key,
-                        &resolved,
-                        &classified,
-                        Some(lane),
-                        return_to,
-                        viewer_page(&value),
-                        false,
-                    )
+        // Stat, classification, and the transfer's fresh text snapshot may all
+        // block on a host/network filesystem. Keep the entire filesystem phase
+        // in the bounded blocking pool and time out its JoinHandle before doing
+        // any network delivery; a timed-out closure keeps its semaphore slot
+        // until the OS read actually returns, while this task can PATCH failure
+        // and drop its in-flight guard.
+        let read_path = resolved.clone();
+        let read_name = crate::feishu::card::command::file_display_name(&resolved);
+        let read = match spawn_bounded_viewer_fs_read(&VIEWER_FS_READ_SLOTS, move || {
+            let meta =
+                std::fs::metadata(&read_path).map_err(|error| crate::bridge::viewer::stat_failure(&error))?;
+            let mut classified = crate::bridge::viewer::classify(&read_path, meta.len())?;
+            let prepared =
+                crate::bridge::viewer::prepare_file_transfer(&read_path, &read_name, &mut classified);
+            Ok::<_, crate::bridge::viewer::CatFailure>((classified, prepared))
+        }) {
+            Ok(read) => {
+                match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), read).await {
+                    Ok(Ok(Ok(snapshot))) => Ok(snapshot),
+                    Ok(Ok(Err(failure))) => Err(failure.line(&resolved)),
+                    Ok(Err(error)) => Err(format!("⚠️ 无法读取 `{}`：{error}", resolved.display())),
+                    Err(_) => Err(format!("⚠️ 无法读取 `{}`：文件读取超时。", resolved.display())),
                 }
-                Err(failure) => crate::feishu::card::viewer::build_viewer_failure_card(
-                    &thread_key,
-                    &path,
-                    &failure.line(&resolved),
-                    return_to,
-                ),
-            },
-            Err(error) => {
-                let failure = crate::bridge::viewer::stat_failure(&error);
-                crate::feishu::card::viewer::build_viewer_failure_card(
-                    &thread_key,
-                    &path,
-                    &failure.line(&resolved),
-                    return_to,
+            }
+            Err(_) => Err("⚠️ 文件读取任务繁忙，请稍后再试。".to_string()),
+        };
+        let card = match read {
+            Ok((classified, prepared)) => {
+                let lane = crate::bridge::viewer::send_prepared_file_transfer(
+                    &self.feishu,
+                    &self.cards_handle(),
+                    &message_id,
+                    prepared,
+                    timeout_ms,
                 )
+                .await;
+                crate::feishu::card::command::build_viewer_for_classified(
+                    &thread_key,
+                    &resolved,
+                    &classified,
+                    Some(lane),
+                    return_to,
+                    viewer_page(&value),
+                    false,
+                )
+            }
+            Err(line) => {
+                crate::feishu::card::viewer::build_viewer_failure_card(&thread_key, &path, &line, return_to)
             }
         };
         if !matches!(
