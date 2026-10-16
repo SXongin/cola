@@ -417,6 +417,7 @@ pub(crate) fn build_viewer_for_classified(
     let kind = match classified.kind {
         ClassifiedKind::Image => ViewerKind::Image,
         ClassifiedKind::File => ViewerKind::Binary,
+        ClassifiedKind::TextTooLarge => ViewerKind::TextTooLarge,
         ClassifiedKind::Text => kind_for_extension(ext),
     };
     let shown = path.to_string_lossy().to_string();

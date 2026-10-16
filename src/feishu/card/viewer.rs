@@ -25,7 +25,7 @@ use serde_json::json;
 use crate::backend::file_content::human_size;
 use crate::config::ThreadKey;
 
-use super::sanitize::{CardMarkdown, MAX_TABLE_ROWS};
+use super::sanitize::{CardMarkdown, MAX_TABLE_ROWS, serialized_len};
 use super::session::{BrowseView, browse_view_value};
 use super::shell::card_shell;
 use super::tool_render::{FileDelivery, delivery_suffix, file_image_element};
@@ -37,13 +37,18 @@ use super::{MAX_CARD_JSON_CHARS, MAX_ELEMENT_TEXT_CHARS, chunk_text, fenced_code
 pub(crate) enum ViewerKind {
     /// UTF-8 text: a fenced code block with the extension's language token.
     Text,
+    /// UTF-8 text past the preview read cap: no preview (the bytes are too
+    /// large), but still named as TEXT — 「文本（过大，未预览）」 — and delivered
+    /// as a File Message. Content decides this, so a big UTF-8 text file is
+    /// never labelled 二进制 (finding #739 §5).
+    TextTooLarge,
     /// Delimited text (`.csv`/`.tsv`): a markdown table.
     Delimited,
     /// An image (by magic bytes): embedded in the card when Feishu accepts it,
     /// else delivered as a File Message.
     Image,
-    /// A non-text file (a known binary, or an unknown non-UTF-8 file), or a text
-    /// file past the preview read cap: no preview, delivered as a File Message.
+    /// A non-text file (a known binary, or an unknown non-UTF-8 file): no
+    /// preview, delivered as a File Message.
     Binary,
 }
 
@@ -51,7 +56,7 @@ impl ViewerKind {
     /// The type the card names, alongside the extension.
     pub(crate) fn label(self) -> &'static str {
         match self {
-            Self::Text => "文本",
+            Self::Text | Self::TextTooLarge => "文本",
             Self::Delimited => "表格",
             Self::Image => "图片",
             Self::Binary => "二进制",
@@ -260,6 +265,13 @@ pub(crate) fn language_token(ext: Option<&str>) -> &'static str {
 /// dropped with the truncation note (the structural-overflow lane is #741's).
 const MAX_PREVIEW_COLUMNS: usize = 20;
 
+/// The most characters one table CELL renders. A valid CSV with a single ~30 KB
+/// field would otherwise spend the whole card's JSON budget on one cell and get
+/// the card rejected; a longer cell is clipped (and the clip is reported). The
+/// budget covers the sanitizer's `<` expansion (five bytes per `<`), so
+/// `MAX_PREVIEW_COLUMNS` worst-case cells plus the rows still fit.
+const MAX_CELL_CHARS: usize = 120;
+
 /// The card-JSON share one preview may spend: the naming block, the trailing
 /// note and the button row need room, and the whole card must stay under
 /// [`MAX_CARD_JSON_CHARS`] or Feishu rejects it outright.
@@ -268,6 +280,18 @@ const PREVIEW_JSON_BUDGET: usize = MAX_CARD_JSON_CHARS - 4_000;
 /// Chars per fenced preview element: the per-element budget less the fence,
 /// its language token and the element's own JSON overhead.
 const PREVIEW_CHUNK_CHARS: usize = MAX_ELEMENT_TEXT_CHARS - 64;
+
+/// How a delimited preview was cut to fit the card: a dropped row/column is
+/// reported separately from a clipped long cell, so the card's note never
+/// claims a cut that did not happen (ADR-0083 §6).
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+struct TableCut {
+    /// Rows or columns were dropped (the platform's row cap / the column cap,
+    /// or the card's own JSON budget).
+    rows: bool,
+    /// Cells longer than [`MAX_CELL_CHARS`] were clipped.
+    cells: bool,
+}
 
 /// Everything the viewer card renders.
 pub(crate) struct ViewerCard<'a> {
@@ -302,6 +326,7 @@ pub(crate) fn build_viewer_card(thread_key: &ThreadKey, view: ViewerCard<'_>) ->
     let mut markdown = CardMarkdown::new();
     let mut elements: Vec<serde_json::Value> = Vec::new();
     let mut truncated = view.truncated;
+    let mut clipped_cells = false;
 
     elements.push(json!({
         "tag": "markdown",
@@ -324,7 +349,7 @@ pub(crate) fn build_viewer_card(thread_key: &ThreadKey, view: ViewerCard<'_>) ->
         }
         // No preview: the bytes went out (or could not) as a File Message, and
         // the tracking line below is the whole card body.
-        ViewerKind::Binary => {}
+        ViewerKind::Binary | ViewerKind::TextTooLarge => {}
         ViewerKind::Delimited => {
             let delim = if view.ext.map(str::to_ascii_lowercase).as_deref() == Some("tsv") {
                 '\t'
@@ -332,8 +357,9 @@ pub(crate) fn build_viewer_card(thread_key: &ThreadKey, view: ViewerCard<'_>) ->
                 ','
             };
             match delimited_table(view.text, delim) {
-                Some((table, rows_dropped)) => {
-                    truncated |= rows_dropped;
+                Some((table, cut)) => {
+                    truncated |= cut.rows;
+                    clipped_cells = cut.cells;
                     elements.push(json!({
                         "tag": "markdown",
                         "content": markdown.clean(&table),
@@ -378,6 +404,12 @@ pub(crate) fn build_viewer_card(thread_key: &ThreadKey, view: ViewerCard<'_>) ->
             },
         }));
     }
+    if clipped_cells {
+        elements.push(json!({
+            "tag": "markdown",
+            "content": format!("_（过长的单元格已截断，每格最多 {MAX_CELL_CHARS} 字）_"),
+        }));
+    }
 
     // The whole-bytes lane's tracking line: names the file and says where its
     // bytes went — 已内嵌 (an image in this card), 已发送为文件消息 (one File
@@ -403,10 +435,15 @@ fn file_name(path: &str) -> String {
 
 /// The viewer's naming block (ADR-0083 §3): which file this is — the RESOLVED
 /// path, its size and its type — so two similarly named files never look alike.
+/// A text file too large to preview names that in the type itself, so a big
+/// UTF-8 file is never read as 二进制.
 fn naming_block(view: &ViewerCard<'_>) -> String {
-    let type_label = match view.ext {
-        Some(ext) => format!("{}（.{ext}）", view.kind.label()),
-        None => format!("{}（无扩展名）", view.kind.label()),
+    let type_label = match view.kind {
+        ViewerKind::TextTooLarge => "文本（过大，未预览）".to_string(),
+        kind => match view.ext {
+            Some(ext) => format!("{}（.{ext}）", kind.label()),
+            None => format!("{}（无扩展名）", kind.label()),
+        },
     };
     format!(
         "**文件**：`{}`\n**大小**：{} · **类型**：{}",
@@ -435,55 +472,96 @@ fn lane_line(lane: &ViewerFileLane) -> String {
 /// listing's whole state so the card it PATCHes back to can still carry
 /// 「← 返回目录」.
 fn viewer_buttons(thread_key: &ThreadKey, view: &ViewerCard<'_>) -> serde_json::Value {
+    let mut columns = directory_columns(thread_key, view.path, view.return_to);
+    columns.push(button_column("发为文件", transfer_value(thread_key, view)));
+    button_row(columns)
+}
+
+/// The directory half of the viewer's button row (ADR-0083 §3): 「📂 所在目录」
+/// always, and 「← 返回目录」 — the browse handler's `restore` op, which rebuilds
+/// the listing's whole state where `go` would clear the filter and page — when
+/// the viewer was opened from a browse listing. Shared by the viewer card and
+/// the failed-transfer card, which keeps the way back but carries no
+/// 「发为文件」 (there is nothing left to send).
+fn directory_columns(
+    thread_key: &ThreadKey,
+    path: &str,
+    return_to: Option<BrowseView<'_>>,
+) -> Vec<serde_json::Value> {
     let mut columns: Vec<serde_json::Value> = Vec::new();
-    let mut push = |label: &str, op: &str, target: BrowseView<'_>| {
-        columns.push(json!({
-            "tag": "column",
-            "width": "auto",
-            "vertical_align": "center",
-            "elements": [{
-                "tag": "button",
-                "type": "default",
-                "text": { "tag": "plain_text", "content": label },
-                "value": browse_view_value(thread_key, op, target),
-            }],
-        }));
-    };
-    if let Some(parent) = std::path::Path::new(view.path).parent() {
+    if let Some(parent) = std::path::Path::new(path).parent() {
         let parent = parent.to_string_lossy().to_string();
-        push(
+        columns.push(button_column(
             "📂 所在目录",
-            "go",
-            BrowseView {
-                dir: &parent,
-                show_hidden: false,
-                keyword: "",
-                page: 1,
-            },
-        );
+            browse_view_value(
+                thread_key,
+                "go",
+                BrowseView {
+                    dir: &parent,
+                    show_hidden: false,
+                    keyword: "",
+                    page: 1,
+                },
+            ),
+        ));
     }
-    if let Some(return_to) = view.return_to {
-        // `restore` is the browse handler's pure rebuild: the listing's whole
-        // state comes back exactly, where `go` would clear the filter and page.
-        push("← 返回目录", "restore", return_to);
+    if let Some(return_to) = return_to {
+        columns.push(button_column(
+            "← 返回目录",
+            browse_view_value(thread_key, "restore", return_to),
+        ));
     }
-    columns.push(json!({
+    columns
+}
+
+/// One column holding one button with the given callback payload.
+fn button_column(label: &str, value: serde_json::Value) -> serde_json::Value {
+    json!({
         "tag": "column",
         "width": "auto",
         "vertical_align": "center",
         "elements": [{
             "tag": "button",
             "type": "default",
-            "text": { "tag": "plain_text", "content": "发为文件" },
-            "value": transfer_value(thread_key, view),
+            "text": { "tag": "plain_text", "content": label },
+            "value": value,
         }],
-    }));
+    })
+}
+
+/// The card's button row: a wrapping column set of `columns`.
+fn button_row(columns: Vec<serde_json::Value>) -> serde_json::Value {
     json!({
         "tag": "column_set",
         "flex_mode": "flow",
         "horizontal_spacing": "default",
         "columns": columns,
     })
+}
+
+/// The card a FAILED 「发为文件」 transfer PATCHes over the viewer (ADR-0083 §5):
+/// the path is named, the outcome is stated in the card's own copy, and the way
+/// back to the directory stays. It carries no preview and no 「发为文件」 — there
+/// is nothing left to send. Used when the path vanished or became unreadable
+/// between the viewer and the click, so the click's result lands on the card
+/// instead of being dropped (finding #739 §4).
+pub(crate) fn build_viewer_failure_card(
+    thread_key: &ThreadKey,
+    path: &str,
+    line: &str,
+    return_to: Option<BrowseView<'_>>,
+) -> serde_json::Value {
+    let mut markdown = CardMarkdown::new();
+    let elements = vec![json!({
+        "tag": "markdown",
+        "content": markdown.clean(line),
+    })];
+    let columns = directory_columns(thread_key, path, return_to);
+    let mut elements = elements;
+    if !columns.is_empty() {
+        elements.push(button_row(columns));
+    }
+    card_shell(&format!("📄 {}", file_name(path)), "blue", elements)
 }
 
 /// The 「发为文件」 button's payload (ADR-0083 §5): the **resolved** path the
@@ -510,79 +588,133 @@ fn transfer_value(thread_key: &ThreadKey, view: &ViewerCard<'_>) -> serde_json::
     value
 }
 
-/// A delimited-text preview as one markdown table: the first row is the header,
-/// the next the delimiter, the rest the body. `None` when the text has no rows
-/// at all; `Some((table, truncated))` with `truncated` true when rows or
-/// columns were dropped for the card's row cap / column cap.
-fn delimited_table(text: &str, delim: char) -> Option<(String, bool)> {
-    let mut rows = text
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| split_delimited(line, delim));
-    let header = rows.next()?;
+/// A delimited-text preview as one markdown table: the first record is the
+/// header, the next the delimiter, the rest the body. `None` when the text has
+/// no records at all; `Some((table, cut))` where `cut` says whether rows,
+/// columns or long cells were dropped/clipped to keep the card valid.
+fn delimited_table(text: &str, delim: char) -> Option<(String, TableCut)> {
+    let mut records = delimited_records(text, delim).into_iter();
+    let header = records.next()?;
+    let mut cut = TableCut {
+        rows: header.len() > MAX_PREVIEW_COLUMNS,
+        ..TableCut::default()
+    };
     let mut lines: Vec<String> = Vec::new();
-    let mut truncated = header.len() > MAX_PREVIEW_COLUMNS;
-    lines.push(table_row(&header));
-    lines.push(table_row(&vec![
-        "---".to_string();
-        header.len().min(MAX_PREVIEW_COLUMNS)
-    ]));
-    for (body, row) in rows.enumerate() {
+    let (header_line, header_clipped) = table_row(&header);
+    cut.cells |= header_clipped;
+    lines.push(header_line);
+    lines.push(table_row(&vec!["---".to_string(); header.len().min(MAX_PREVIEW_COLUMNS)]).0);
+    // The header and delimiter rows are the table's floor; the card budget is
+    // then spent row by row, so a CSV of very wide rows can never outgrow it.
+    let mut used = lines.iter().map(|line| serialized_len(line) + 8).sum::<usize>();
+    for (body, row) in records.enumerate() {
         if body == MAX_TABLE_ROWS {
-            truncated = true;
+            cut.rows = true;
             break;
         }
-        truncated |= row.len() > MAX_PREVIEW_COLUMNS;
-        lines.push(table_row(&row));
+        cut.rows |= row.len() > MAX_PREVIEW_COLUMNS;
+        let (line, clipped) = table_row(&row);
+        cut.cells |= clipped;
+        let cost = serialized_len(&line) + 8;
+        if used + cost > PREVIEW_JSON_BUDGET {
+            cut.rows = true;
+            break;
+        }
+        used += cost;
+        lines.push(line);
     }
-    Some((lines.join("\n"), truncated))
+    Some((lines.join("\n"), cut))
 }
 
-/// One markdown table row from its cells: extra columns past the cap drop, and
-/// a `|` inside a cell is escaped so it cannot split the row.
-fn table_row(cells: &[String]) -> String {
+/// One markdown table row from its cells: extra columns past the cap drop, a
+/// cell longer than [`MAX_CELL_CHARS`] is clipped (flagged in the second
+/// return), and a `|` inside a cell is escaped so it cannot split the row. A
+/// newline inside a cell (a quoted field may carry one) is flattened to a
+/// space, which keeps the row on ONE markdown line.
+fn table_row(cells: &[String]) -> (String, bool) {
+    let mut clipped = false;
     let shown: Vec<String> = cells
         .iter()
         .take(MAX_PREVIEW_COLUMNS)
-        .map(|cell| cell.replace('|', "\\|"))
+        .map(|cell| {
+            let flattened = cell.replace(['\n', '\r'], " ");
+            let (text, was_clipped) = clip_cell(&flattened);
+            clipped |= was_clipped;
+            text.replace('|', "\\|")
+        })
         .collect();
-    format!("| {} |", shown.join(" | "))
+    (format!("| {} |", shown.join(" | ")), clipped)
 }
 
-/// Split one delimited line into its cells, honoring RFC-4180-style quoting: a
-/// `"`-opened field may carry the delimiter and a doubled `""` for a literal
-/// quote. A `"` that does not open a field is an ordinary character, so a file
-/// that merely contains quotes still reads sensibly.
-fn split_delimited(line: &str, delim: char) -> Vec<String> {
-    let mut cells: Vec<String> = Vec::new();
-    let mut current = String::new();
+/// `cell` clipped to [`MAX_CELL_CHARS`] characters, with a trailing `…` when it
+/// was cut (counted inside the budget) — never silently. Returns the text and
+/// whether it was clipped.
+fn clip_cell(cell: &str) -> (String, bool) {
+    if cell.chars().count() <= MAX_CELL_CHARS {
+        return (cell.to_string(), false);
+    }
+    let mut text: String = cell.chars().take(MAX_CELL_CHARS.saturating_sub(1)).collect();
+    text.push('…');
+    (text, true)
+}
+
+/// Parse delimited text into records of cells, RFC 4180-style: a `"`-opened
+/// field may carry the delimiter, a doubled `""` for a literal quote, and
+/// embedded NEWLINES — so `1,"first\nsecond"` is ONE record of two cells, never
+/// two rows. A `"` that does not open a field is an ordinary character, so a
+/// file that merely contains quotes still reads sensibly. A blank line carries
+/// no record; a row of empty cells (a lone `,`) does.
+fn delimited_records(text: &str, delim: char) -> Vec<Vec<String>> {
+    let mut records: Vec<Vec<String>> = Vec::new();
+    let mut record: Vec<String> = Vec::new();
+    let mut cell = String::new();
     let mut quoted = false;
-    let mut chars = line.chars().peekable();
+    // Whether the current record has seen anything (a delimiter or a non-blank
+    // character): a blank line carries none and is dropped.
+    let mut touched = false;
+    let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
         if quoted {
-            if c == '"' {
-                if chars.peek() == Some(&'"') {
-                    current.push('"');
+            match c {
+                '"' if chars.peek() == Some(&'"') => {
+                    cell.push('"');
                     chars.next();
-                } else {
-                    quoted = false;
                 }
-            } else {
-                current.push(c);
+                '"' => quoted = false,
+                _ => cell.push(c),
             }
             continue;
         }
-        if c == '"' && current.trim().is_empty() {
+        if c == '"' && cell.trim().is_empty() {
             quoted = true;
+            touched = true;
         } else if c == delim {
-            cells.push(current.trim().to_string());
-            current = String::new();
+            record.push(std::mem::take(&mut cell).trim().to_string());
+            touched = true;
+        } else if c == '\n' || c == '\r' {
+            if c == '\r' && chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+            record.push(std::mem::take(&mut cell).trim().to_string());
+            if touched {
+                records.push(std::mem::take(&mut record));
+            } else {
+                record.clear();
+            }
+            touched = false;
         } else {
-            current.push(c);
+            if !c.is_whitespace() {
+                touched = true;
+            }
+            cell.push(c);
         }
     }
-    cells.push(current.trim().to_string());
-    cells
+    // The final record: a file may not end in a newline.
+    if touched {
+        record.push(cell.trim().to_string());
+        records.push(record);
+    }
+    records
 }
 
 #[cfg(test)]
@@ -717,12 +849,12 @@ mod tests {
     /// cap are dropped and reported.
     #[test]
     fn delimited_preview_is_a_markdown_table() {
-        let (table, truncated) = delimited_table("name,age\n\"Doe, Jane\",41\nbob\",42\n", ',').unwrap();
+        let (table, cut) = delimited_table("name,age\n\"Doe, Jane\",41\nbob\",42\n", ',').unwrap();
         assert_eq!(
             table,
             "| name | age |\n| --- | --- |\n| Doe, Jane | 41 |\n| bob\" | 42 |"
         );
-        assert!(!truncated);
+        assert_eq!(cut, TableCut::default(), "nothing was cut");
 
         let (piped, _) = delimited_table("a|b,c\nd,e", ',').unwrap();
         assert!(
@@ -735,25 +867,114 @@ mod tests {
             (1..=30).map(|i| i.to_string()).collect::<Vec<_>>().join(","),
             "x"
         );
-        let (table, _) = delimited_table(&wide, ',').unwrap();
+        let (table, cut) = delimited_table(&wide, ',').unwrap();
         assert_eq!(
             table.lines().next().unwrap().matches('|').count(),
             MAX_PREVIEW_COLUMNS + 1
         );
+        assert!(cut.rows, "columns past the cap are dropped and reported");
 
         let long = (0..MAX_TABLE_ROWS + 5)
             .map(|i| format!("r{i},1"))
             .collect::<Vec<_>>()
             .join("\n");
-        let (table, truncated) = delimited_table(&long, ',').unwrap();
+        let (table, cut) = delimited_table(&long, ',').unwrap();
         assert_eq!(
             table.lines().count(),
             MAX_TABLE_ROWS + 2,
             "header + delimiter + capped body"
         );
-        assert!(truncated, "a table past the row cap says so");
+        assert!(cut.rows, "a table past the row cap says so");
 
         assert!(delimited_table("   \n\n", ',').is_none(), "no rows, no table");
+    }
+
+    /// A quoted field may carry the delimiter, an escaped `""` for a literal
+    /// quote, and an EMBEDDED NEWLINE: such a field is ONE cell of ONE record,
+    /// never two rows (ADR-0083 §6, finding #739 §2). The newline is flattened
+    /// in the rendered row, so the markdown table stays structurally valid.
+    #[test]
+    fn delimited_preview_keeps_a_quoted_newline_in_one_cell() {
+        let text = "name,note\nann,\"first\nsecond\"\nbob,\"say \"\"hi\"\"\"\n";
+        let (table, cut) = delimited_table(text, ',').unwrap();
+        assert_eq!(
+            table,
+            "| name | note |\n| --- | --- |\n| ann | first second |\n| bob | say \"hi\" |"
+        );
+        assert_eq!(cut, TableCut::default());
+
+        // The parser is the pin: two records, the first body row carrying the
+        // newline inside its second cell until `table_row` flattens it.
+        assert_eq!(
+            delimited_records(text, ','),
+            vec![
+                vec!["name".to_string(), "note".to_string()],
+                vec!["ann".to_string(), "first\nsecond".to_string()],
+                vec!["bob".to_string(), "say \"hi\"".to_string()],
+            ]
+        );
+
+        // A CRLF inside quotes is data too, and a CRLF line ending still ends a
+        // record.
+        assert_eq!(
+            delimited_records("a,b\r\nc,\"d\r\ne\"\r\n", ','),
+            vec![
+                vec!["a".to_string(), "b".to_string()],
+                vec!["c".to_string(), "d\r\ne".to_string()],
+            ]
+        );
+    }
+
+    /// An oversized delimited file — one ~30 KB field, then a table of very wide
+    /// rows — is clipped and budgeted: the card stays under its own JSON limit
+    /// and the cut is reported, never an invalid card (finding #739 §1).
+    #[test]
+    fn an_oversized_delimited_preview_stays_within_the_card_budget() {
+        // One row with a single ~30 KB field: the cell is clipped, honestly.
+        let huge_cell = format!("name,notes\nrow,{}", "x".repeat(30_000));
+        let (table, cut) = delimited_table(&huge_cell, ',').unwrap();
+        assert!(cut.cells, "a long cell is clipped: {cut:?}");
+        assert!(
+            table.len() < 1_000,
+            "the ~30 KB field must not reach the table: {}",
+            table.len()
+        );
+        assert!(table.contains('…'), "the clip is visible: {table}");
+
+        let card = build_viewer_card(
+            &key(),
+            view("/tmp/huge.csv", ViewerKind::Delimited, Some("csv"), &huge_cell),
+        );
+        let json_len = serde_json::to_string(&card).unwrap().len();
+        assert!(
+            json_len < MAX_CARD_JSON_CHARS,
+            "the card must fit its own budget: {json_len}"
+        );
+        let text = card_text(&card);
+        assert!(text.contains("单元格已截断"), "the cut is stated: {text}");
+
+        // Many rows, every cell near the clip: the row budget stops the table
+        // before the card's JSON budget can be outgrown.
+        let wide = format!(
+            "{}\n{}",
+            "name,notes",
+            (0..MAX_TABLE_ROWS + 10)
+                .map(|i| format!("r{i},{}", "y".repeat(5_000)))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let card = build_viewer_card(
+            &key(),
+            view("/tmp/wide.csv", ViewerKind::Delimited, Some("csv"), &wide),
+        );
+        let json_len = serde_json::to_string(&card).unwrap().len();
+        assert!(
+            json_len < MAX_CARD_JSON_CHARS,
+            "a CSV of wide rows must stay within the card budget: {json_len}"
+        );
+        let text = card_text(&card);
+        assert!(text.contains("表格过长"), "the row cut is stated: {text}");
+        assert!(text.contains("单元格已截断"), "the cell clip is stated: {text}");
     }
 
     /// The card names the file it shows: the resolved path, its size and its
