@@ -64,6 +64,35 @@ fn pager_button<'a>(card: &'a serde_json::Value, label: &str) -> &'a serde_json:
         .unwrap_or_else(|| panic!("pager button `{label}` not found on {}", card_text(card)))
 }
 
+/// Drive a viewer pager callback through its asynchronous card PATCH. If the
+/// previous page task is still releasing its per-card claim, retry the same
+/// stateless payload until the next patch lands.
+async fn flip_viewer_page(
+    app: &std::sync::Arc<crate::bridge::App>,
+    platform: &RecordingPlatform,
+    mut payload: serde_json::Value,
+    message_id: &str,
+) -> serde_json::Value {
+    payload["open_message_id"] = serde_json::json!(message_id);
+    let previous_patches = patches_to(platform, message_id).await.len();
+    let result = app
+        .host_action(payload)
+        .await
+        .expect("the viewer page callback is acknowledged");
+    assert!(result.card.is_none(), "page rebuild stays off-callback");
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let patches = patches_to(platform, message_id).await;
+            if patches.len() > previous_patches {
+                return patches.last().unwrap().clone();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the viewer page PATCH lands")
+}
+
 /// `lines` numbered lines, each short enough that one card holds thousands —
 /// used to build a preview that genuinely outgrows one card.
 fn numbered_lines(lines: usize) -> String {
@@ -167,6 +196,181 @@ async fn cat_opens_a_text_file_with_the_language_hint_and_the_resolved_path() {
     assert!(text.contains("```rust"), "the extension's language hint: {text}");
     assert!(text.contains("println!"), "the file's own bytes: {text}");
     assert!(!text.contains("已截断"), "a small file is not truncated: {text}");
+}
+
+/// A `/cat` FIFO must fail promptly on the command path, without waiting for a
+/// writer or pinning the message handler's runtime worker.
+#[cfg(unix)]
+#[tokio::test]
+async fn cat_fifo_answers_without_waiting_for_a_writer() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let fifo = proj.path().join("waiting.pipe");
+    let status = std::process::Command::new("mkfifo").arg(&fifo).status().unwrap();
+    assert!(status.success(), "create test FIFO");
+
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        send_command_in(
+            &app,
+            "/cat waiting.pipe",
+            key,
+            "m_fifo",
+            crate::config::ConversationKind::P2p,
+        ),
+    )
+    .await
+    .expect("the FIFO command answers promptly");
+    let texts = platform.texts().await;
+    assert!(
+        texts.iter().any(|text| text.contains("not a regular file")),
+        "the special file gets an honest failure, not a hanging or empty viewer: {texts:?}"
+    );
+    assert!(platform.replied_cards().await.is_empty());
+}
+
+#[tokio::test]
+async fn reread_without_card_context_names_the_missing_viewer_card() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    std::fs::write(proj.path().join("notes.txt"), "hello\n").unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+    send_command_in(
+        &app,
+        "/cat notes.txt",
+        key,
+        "m_reread_missing_context",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let card = first_card(&platform).await;
+    let mut reread = card_buttons(&card)
+        .into_iter()
+        .find(|button| button["text"]["content"] == "🔄 重新读取")
+        .expect("re-read control")
+        .clone()["value"]
+        .clone();
+    reread.as_object_mut().unwrap().remove("open_message_id");
+
+    let result = app.host_action(reread).await.expect("the callback is answered");
+    assert!(result.card.is_none());
+    assert_eq!(result.toast.as_deref(), Some("无法重新读取：找不到文件查看卡。"));
+}
+
+/// Linux procfs files report a zero stat size while returning real bytes: the
+/// classifier's emptiness verdict and displayed size must use the bytes read.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_zero_stat_size_pseudo_file_is_classified_from_its_content() {
+    let path = std::path::Path::new("/proc/self/status");
+    assert_eq!(std::fs::metadata(path).unwrap().len(), 0);
+    let classified = crate::bridge::viewer::classify(path, 0).expect("proc status has content");
+    assert_eq!(classified.kind, crate::bridge::viewer::ClassifiedKind::Text);
+    assert!(classified.size > 0, "the bytes, not stat, determine size");
+    assert!(
+        classified
+            .text
+            .as_deref()
+            .is_some_and(|text| text.starts_with("Name:")),
+        "the pseudo-file contents are retained"
+    );
+}
+
+/// The shared bounded-reader failure path reports each caller's exact copy and
+/// keeps the slot occupied until a timed-out blocking closure really returns.
+#[tokio::test]
+async fn bounded_viewer_read_failure_copy_and_slot_lifetime_are_pinned() {
+    let test_slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+
+    let permit = std::sync::Arc::clone(&test_slots)
+        .try_acquire_owned()
+        .expect("test slot starts free");
+    let busy = crate::bridge::handler::bounded_viewer_fs_read(
+        std::sync::Arc::clone(&test_slots),
+        100,
+        "⚠️ 重新读取任务繁忙，请稍后再试。",
+        "⚠️ 打开超时，请稍后再试。",
+        || 1,
+    )
+    .await;
+    assert_eq!(
+        busy,
+        Err(crate::bridge::handler::ViewerFsReadError::Busy(
+            "⚠️ 重新读取任务繁忙，请稍后再试。".into()
+        ))
+    );
+    let transfer_busy = crate::bridge::handler::bounded_viewer_fs_read(
+        std::sync::Arc::clone(&test_slots),
+        100,
+        "⚠️ 文件读取繁忙，请稍后再试。",
+        "⚠️ 打开超时，请稍后再试。",
+        || 1,
+    )
+    .await;
+    assert_eq!(
+        transfer_busy,
+        Err(crate::bridge::handler::ViewerFsReadError::Busy(
+            "⚠️ 文件读取繁忙，请稍后再试。".into()
+        ))
+    );
+    drop(permit);
+
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let read = tokio::spawn(crate::bridge::handler::bounded_viewer_fs_read(
+        std::sync::Arc::clone(&test_slots),
+        20,
+        "⚠️ 文件读取繁忙，请稍后再试。",
+        "⚠️ 打开超时，请稍后再试。",
+        move || {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            2
+        },
+    ));
+    tokio::task::spawn_blocking(move || entered_rx.recv().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        read.await.unwrap(),
+        Err(crate::bridge::handler::ViewerFsReadError::Timeout(
+            "⚠️ 打开超时，请稍后再试。".into()
+        ))
+    );
+    assert_eq!(
+        test_slots.available_permits(),
+        0,
+        "timeout does not release a live worker's slot"
+    );
+    release_tx.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while test_slots.available_permits() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the completed blocking task releases its slot");
+
+    let busy = crate::bridge::handler::bounded_viewer_fs_read(
+        std::sync::Arc::clone(&test_slots),
+        100,
+        "⚠️ 文件读取繁忙，请稍后再试。",
+        "⚠️ 打开超时，请稍后再试。",
+        || 3,
+    )
+    .await
+    .expect("the slot is available again");
+    assert_eq!(busy, 3);
 }
 
 /// An extension the platform has no language token for renders as `plain_text`
@@ -1010,7 +1214,11 @@ async fn send_as_file_transfers_off_the_callback_path() {
         result.card.is_none(),
         "the click does not rebuild the card inline"
     );
-    assert!(result.toast.is_some(), "the click acknowledges with a toast");
+    assert_eq!(
+        result.toast.as_deref(),
+        Some("正在发送文件…"),
+        "the callback's duplicate-safe acknowledgement copy is stable"
+    );
     assert!(
         uploads(&platform).await.is_empty(),
         "the click returned before the upload ran"
@@ -1019,10 +1227,11 @@ async fn send_as_file_transfers_off_the_callback_path() {
         .await
         .expect("the first click reaches the parked upload");
     let repeated = app
-        .host_action(payload)
+        .host_action(payload.clone())
         .await
         .expect("a duplicate send click is acknowledged");
     assert!(repeated.card.is_none());
+    assert_eq!(repeated.toast.as_deref(), Some("正在发送文件…"));
 
     // Release the upload; the spawned transfer lands and PATCHes the card.
     release.notify_one();
@@ -1056,14 +1265,158 @@ async fn send_as_file_transfers_off_the_callback_path() {
         "the PATCH keeps the card's own naming: {}",
         card_text(updated)
     );
+    assert!(
+        !card_buttons(updated)
+            .iter()
+            .any(|button| button["text"]["content"] == "发为文件"),
+        "a successful transfer removes its button: {}",
+        card_text(updated)
+    );
+    let after_success = app
+        .host_action(payload)
+        .await
+        .expect("a stale successful-transfer callback is acknowledged");
+    assert_eq!(after_success.toast.as_deref(), Some("文件已发送"));
+    assert_eq!(
+        file_messages(&platform).await.len(),
+        1,
+        "a stale second click cannot post another File Message"
+    );
 }
 
-/// A FIFO can stall the transfer's classification/read without blocking a
-/// Tokio worker. Its timeout patches the card and releases the action guard, so
-/// a later click on the same card can still send a now-readable file.
+/// A transfer clicked from page 2 rebuilds that same page; a later pager flip
+/// preserves the successful tracking lane and never re-offers delivery.
+#[tokio::test]
+async fn transfer_from_a_later_page_survives_a_pager_flip() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let file = proj.path().join("long.txt");
+    std::fs::write(&file, numbered_lines(3000)).unwrap();
+    let proj_dir = proj.path().to_string_lossy().to_string();
+    let file_path = file.to_string_lossy().to_string();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj_dir)).await;
+    let mut open = crate::feishu::card::session::browse_file_value(
+        &key,
+        &file_path,
+        Some(crate::feishu::card::session::BrowseView {
+            dir: &proj_dir,
+            show_hidden: true,
+            keyword: "long",
+            page: 2,
+        }),
+    );
+    open["open_message_id"] = serde_json::json!("msg_page_transfer");
+    let result = app
+        .host_action(open)
+        .await
+        .expect("browse-row open is acknowledged before the filesystem read");
+    assert!(result.card.is_none());
+    wait_for_card_update(&platform, "viewer open", CardUpdates::Latest, |card| {
+        card_text(card).contains("line 0001")
+            && card_buttons(card)
+                .iter()
+                .any(|button| button["text"]["content"] == "← 返回目录")
+    })
+    .await;
+    let first = patches_to(&platform, "msg_page_transfer")
+        .await
+        .last()
+        .cloned()
+        .expect("browse-row viewer patch");
+    let next = pager_button(&first, "下一页")["value"].clone();
+    assert_eq!(next["return_dir"], proj_dir);
+    assert_eq!(next["return_show_hidden"], "true");
+    assert_eq!(next["return_keyword"], "long");
+    assert_eq!(next["return_page"], "2");
+    let page2 = flip_viewer_page(&app, &platform, next, "msg_page_transfer").await;
+    assert_eq!(pager_label(&page2).as_deref(), Some("第 2/2 页 · 共 3000 个"));
+
+    let mut transfer = send_as_file_payload(&page2);
+    assert_eq!(transfer["return_dir"], proj_dir);
+    assert_eq!(transfer["return_show_hidden"], true);
+    assert_eq!(transfer["return_keyword"], "long");
+    assert_eq!(transfer["return_page"], 2);
+    transfer["open_message_id"] = serde_json::json!("msg_page_transfer");
+    let transfer_result = app
+        .host_action(transfer.clone())
+        .await
+        .expect("transfer callback is acknowledged");
+    assert!(transfer_result.card.is_none());
+    wait_for_card_update(&platform, "page 2 transfer", CardUpdates::Latest, |card| {
+        card_text(card).contains("已发送为文件消息") && card_text(card).contains("line 3000")
+    })
+    .await;
+    assert_eq!(file_messages(&platform).await.len(), 1);
+    let sent = patches_to(&platform, "msg_page_transfer")
+        .await
+        .last()
+        .cloned()
+        .expect("transfer patch");
+    assert!(
+        card_text(&sent).contains("line 3000"),
+        "the clicked page stays: {}",
+        card_text(&sent)
+    );
+    assert!(
+        !card_buttons(&sent)
+            .iter()
+            .any(|button| button["text"]["content"] == "发为文件"),
+        "a landed file message is not offered again"
+    );
+
+    let duplicate = app
+        .host_action(transfer)
+        .await
+        .expect("stale transfer callbacks are acknowledged");
+    assert_eq!(duplicate.toast.as_deref(), Some("文件已发送"));
+    assert_eq!(file_messages(&platform).await.len(), 1, "no duplicate message");
+
+    let mut previous = pager_button(&sent, "上一页")["value"].clone();
+    previous["open_message_id"] = serde_json::json!("msg_page_transfer");
+    let result = app
+        .host_action(previous)
+        .await
+        .expect("the post-transfer flip is acknowledged");
+    assert!(result.card.is_none());
+    wait_for_card_update(&platform, "page 1 with sent lane", CardUpdates::Latest, |card| {
+        card_text(card).contains("line 0001")
+            && card_text(card).contains("已发送为文件消息")
+            && !card_buttons(card)
+                .iter()
+                .any(|button| button["text"]["content"] == "发为文件")
+    })
+    .await;
+    let back = patches_to(&platform, "msg_page_transfer")
+        .await
+        .last()
+        .cloned()
+        .expect("page 1 patch");
+    assert_eq!(pager_label(&back).as_deref(), Some("第 1/2 页 · 共 3000 个"));
+    assert!(card_text(&back).contains("已发送为文件消息"));
+    let back_button = card_buttons(&back)
+        .into_iter()
+        .find(|button| button["text"]["content"] == "← 返回目录")
+        .expect("the transferred page keeps the directory return button");
+    assert_eq!(back_button["value"]["dir"], proj_dir);
+    assert_eq!(back_button["value"]["show_hidden"], true);
+    assert_eq!(back_button["value"]["keyword"], "long");
+    assert_eq!(back_button["value"]["page"], 2);
+    assert!(
+        !card_buttons(&back)
+            .iter()
+            .any(|button| button["text"]["content"] == "发为文件")
+    );
+}
+
+/// A special file is rejected promptly during a transfer, and the failure
+/// releases the viewer action so a later regular-file transfer can proceed.
 #[cfg(unix)]
 #[tokio::test]
-async fn a_stalled_transfer_read_times_out_and_releases_the_card_guard() {
+async fn a_fifo_transfer_fails_fast_and_releases_the_card_guard() {
     let _wd = test_work_dir();
     let proj = tempfile::tempdir().unwrap();
     let file = proj.path().join("notes.txt");
@@ -1091,36 +1444,23 @@ async fn a_stalled_transfer_read_times_out_and_releases_the_card_guard() {
     std::fs::remove_file(&file).unwrap();
     let status = std::process::Command::new("mkfifo").arg(&file).status().unwrap();
     assert!(status.success(), "create a FIFO to park the transfer read");
-    let (writer_opened_tx, writer_opened_rx) = tokio::sync::oneshot::channel();
-    let (release_writer_tx, release_writer_rx) = std::sync::mpsc::channel();
-    let writer_path = file.clone();
-    let writer = std::thread::spawn(move || {
-        let mut fifo = std::fs::OpenOptions::new().write(true).open(writer_path).unwrap();
-        writer_opened_tx.send(()).unwrap();
-        release_writer_rx.recv().unwrap();
-        std::io::Write::write_all(&mut fifo, b"late FIFO bytes\n").unwrap();
-    });
-
-    let result = app
-        .host_action(payload.clone())
-        .await
-        .expect("the transfer click acks before filesystem work");
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        app.host_action(payload.clone()),
+    )
+    .await
+    .expect("the FIFO transfer callback returns promptly")
+    .expect("the transfer click acks before filesystem work");
     assert!(result.card.is_none());
-    tokio::time::timeout(std::time::Duration::from_secs(2), writer_opened_rx)
-        .await
-        .expect("the background reader opened the FIFO")
-        .unwrap();
     wait_for_card_update(
         &platform,
-        "bounded filesystem timeout",
+        "special-file transfer refusal",
         CardUpdates::Latest,
-        |card| card_text(card).contains("超时"),
+        |card| card_text(card).contains("not a regular file"),
     )
     .await;
 
-    // Replace the path while the timed-out spawn_blocking read still holds its
-    // FIFO descriptors. A later card action must get a new guard and read this
-    // regular file rather than being permanently suppressed.
+    // A later card action must get a new guard and read this regular file.
     std::fs::remove_file(&file).unwrap();
     std::fs::write(&file, "read after timeout\n").unwrap();
     let (second_upload_entered, release_second_upload) = platform.pause("upload_file", "");
@@ -1155,11 +1495,6 @@ async fn a_stalled_transfer_read_times_out_and_releases_the_card_guard() {
         1,
         "only the later action sends"
     );
-
-    release_writer_tx.send(()).unwrap();
-    tokio::task::spawn_blocking(move || writer.join().unwrap())
-        .await
-        .unwrap();
 }
 
 /// The 「发为文件」 transfer uploads ONE byte snapshot: a text file replaced by a
@@ -1605,13 +1940,13 @@ async fn a_long_text_file_pages_inside_the_viewer() {
 
     // Flipping renders the NEXT window: the last line arrives, the first is
     // gone, and the pager names the page it is on.
-    let next = pager_button(&card, "下一页")["value"].clone();
-    let page2 = app
-        .host_action(next)
-        .await
-        .expect("the flip rebuilds the card")
-        .card
-        .expect("a card");
+    let page2 = flip_viewer_page(
+        &app,
+        &platform,
+        pager_button(&card, "下一页")["value"].clone(),
+        "msg_long_viewer",
+    )
+    .await;
     let text = card_text(&page2);
     assert!(text.contains("line 3000"), "the last window: {text}");
     assert!(
@@ -1631,9 +1966,8 @@ async fn a_long_text_file_pages_inside_the_viewer() {
     );
 }
 
-/// Page state round-trips through the button payload (ADR-0052): replaying a
-/// flipped page's own pager value rebuilds the SAME window — the viewer keeps
-/// no per-card state, so the payload is the whole state.
+/// Page state round-trips through the button payload (ADR-0052): the viewer
+/// keeps no per-card state, so each payload rebuilds its target window.
 #[tokio::test]
 async fn viewer_pager_rebuilds_the_same_window_from_its_payload() {
     let _wd = test_work_dir();
@@ -1658,33 +1992,16 @@ async fn viewer_pager_rebuilds_the_same_window_from_its_payload() {
     let card = first_card(&platform).await;
     let first_text = card_text(&card);
 
-    // Replaying the SAME flip value renders the identical card.
+    // The target page renders its own window.
     let next = pager_button(&card, "下一页")["value"].clone();
-    let page2 = app
-        .host_action(next.clone())
-        .await
-        .expect("the flip rebuilds the card")
-        .card
-        .expect("a card");
-    let page2_again = app
-        .host_action(next)
-        .await
-        .expect("the replay rebuilds the card")
-        .card
-        .expect("a card");
-    assert_eq!(
-        page2_again, page2,
-        "a rebuild from the payload renders the same window"
-    );
+    let page2 = flip_viewer_page(&app, &platform, next, "msg_replay_viewer").await;
+    assert!(card_text(&page2).contains("line 3000"));
+    assert!(!card_text(&page2).contains("line 0001"));
 
     // And the way back lands exactly on the first window.
     let prev = pager_button(&page2, "上一页")["value"].clone();
-    let back = app
-        .host_action(prev)
-        .await
-        .expect("the flip back rebuilds the card")
-        .card
-        .expect("a card");
+    assert_eq!(prev["page"], 1, "previous-page payload: {prev}");
+    let back = flip_viewer_page(&app, &platform, prev, "msg_replay_viewer").await;
     assert_eq!(
         card_text(&back),
         first_text,
@@ -1754,7 +2071,7 @@ async fn flipping_a_viewer_page_keeps_the_way_back_to_the_listing() {
 
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
-    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
     let key = thread();
     seed_entry(&app, seeded_entry(&key, &proj_dir)).await;
 
@@ -1791,14 +2108,8 @@ async fn flipping_a_viewer_page_keeps_the_way_back_to_the_listing() {
     assert_eq!(next["return_show_hidden"], "true");
     assert_eq!(next["return_keyword"], "long");
     assert_eq!(next["return_page"], "1");
-
     // The flipped page still offers the same way back.
-    let page2 = app
-        .host_action(next)
-        .await
-        .expect("the flip rebuilds the card")
-        .card
-        .expect("a card");
+    let page2 = flip_viewer_page(&app, &platform, next, "msg_listing_viewer").await;
     let back2 = card_buttons(&page2)
         .into_iter()
         .find(|b| b["text"]["content"] == "← 返回目录")
@@ -2189,11 +2500,11 @@ async fn failed_reread_keeps_the_viewer_card_and_answers_with_the_failure() {
     assert!(platform.updated_cards().await.is_empty());
 }
 
-/// A FIFO stalls the read until a writer arrives. The click still returns its
-/// ack before the read finishes, proving filesystem I/O is off the callback.
+/// A FIFO is rejected by the bounded read without waiting for a writer; the
+/// click still returns its ack and the last-good viewer card stays in place.
 #[cfg(unix)]
 #[tokio::test]
-async fn reread_ack_is_not_blocked_by_a_stalled_filesystem_read() {
+async fn reread_fifo_fails_promptly_without_replacing_the_viewer_card() {
     let _wd = test_work_dir();
     let proj = tempfile::tempdir().unwrap();
     let file = proj.path().join("notes.txt");
@@ -2217,12 +2528,6 @@ async fn reread_ack_is_not_blocked_by_a_stalled_filesystem_read() {
     let status = std::process::Command::new("mkfifo").arg(&file).status().unwrap();
     assert!(status.success(), "create a FIFO to park the file read");
 
-    let writer_path = file.clone();
-    let writer = std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(1200));
-        let mut fifo = std::fs::OpenOptions::new().write(true).open(writer_path).unwrap();
-        std::io::Write::write_all(&mut fifo, b"read completed after the ack\n").unwrap();
-    });
     let started = std::time::Instant::now();
     let result = app
         .host_action_on_message(payload, "msg_reply")
@@ -2234,11 +2539,22 @@ async fn reread_ack_is_not_blocked_by_a_stalled_filesystem_read() {
         "callback ack waited for the FIFO read: {:?}",
         started.elapsed()
     );
-    wait_for_card_update(&platform, "FIFO read result", CardUpdates::Any, |card| {
-        card_text(card).contains("read completed after the ack")
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let answered = platform.calls.lock().await.iter().any(|call| {
+                matches!(call, PlatformCall::ReplyText { message_id, text }
+                    if message_id == "msg_reply" && text.contains("not a regular file"))
+            });
+            if answered {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
     })
-    .await;
-    writer.join().unwrap();
+    .await
+    .expect("the FIFO read failure is answered promptly");
+    assert_eq!(first_card(&platform).await, original);
+    assert!(platform.updated_cards().await.is_empty());
 }
 
 /// An overflow re-read edits the Rich Text Message at the id in the viewer
@@ -3047,10 +3363,10 @@ async fn a_fitting_row_open_patches_in_place_without_sending() {
 }
 
 /// Classification of a file-row open cannot hold the 3 s card callback open:
-/// a FIFO stalls the reader until after the immediate ack.
+/// a FIFO is rejected promptly after the immediate ack.
 #[cfg(unix)]
 #[tokio::test]
-async fn row_open_ack_is_not_blocked_by_a_stalled_filesystem_read() {
+async fn row_open_fifo_fails_promptly_after_the_callback_ack() {
     let _wd = test_work_dir();
     let proj = tempfile::tempdir().unwrap();
     let file = proj.path().join("stalled.txt");
@@ -3062,12 +3378,6 @@ async fn row_open_ack_is_not_blocked_by_a_stalled_filesystem_read() {
     let status = std::process::Command::new("mkfifo").arg(&file).status().unwrap();
     assert!(status.success(), "create a FIFO to park classification");
 
-    let writer_path = file.clone();
-    let writer = std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(1_200));
-        let mut fifo = std::fs::OpenOptions::new().write(true).open(writer_path).unwrap();
-        std::io::Write::write_all(&mut fifo, b"read completed after the ack\n").unwrap();
-    });
     let started = std::time::Instant::now();
     let result = app
         .host_action_on_message(
@@ -3088,11 +3398,10 @@ async fn row_open_ack_is_not_blocked_by_a_stalled_filesystem_read() {
         "callback ack waited for classification: {:?}",
         started.elapsed()
     );
-    wait_for_card_update(&platform, "FIFO row result", CardUpdates::Any, |card| {
-        card_text(card).contains("read completed after the ack")
+    wait_for_card_update(&platform, "special-file row refusal", CardUpdates::Any, |card| {
+        card_text(card).contains("not a regular file")
     })
     .await;
-    writer.join().unwrap();
 }
 
 /// #741: a structurally-overflowing file opened from a Tool Panel's
