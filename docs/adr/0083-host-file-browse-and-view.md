@@ -118,10 +118,15 @@ loop.
    **preview read cap** (8 MB) is not previewed at all — it goes straight to a File Message
    under its **text** label (`文本（过大，未预览）`), because the CONTENT decides the type and a
    big UTF-8 file is a text file, never 「二进制」 — and the 30 MB upload cap is unchanged. Both
-   are constants, not policy. Emptiness and the reported size come from the **bytes actually
-   read**, never from the `stat` size: a pseudo-file (`/proc`, `/sys`) reports size 0 while
-   having content, and a file that shrinks between the `stat` and the read is named by what was
-   read — the same bytes the upload carries.
+   are constants, not policy. **Classification reads at most the 30 MB upload cap**: a file
+   within that cap is read once and its bytes decide text vs binary, and a file past it is
+   named from a bounded header alone, because nothing more is read — so telling a large text
+   file from a binary is bounded by the constant, never by the file. Emptiness and the
+   reported size come from the **bytes actually read**, never from the `stat` size: a
+   pseudo-file (`/proc`, `/sys`) reports size 0 while having content, and a file that shrinks
+   between the `stat` and the read is named by what was read — the same bytes the upload
+   carries; a file that GROWS past the cap is read one byte over it and reported past-cap
+   (`未发送`), never delivered as a truncated prefix.
 7. **A locally-read file reaches the delivery path as bytes, not as a re-encoded URI.** The
    typed **File Content** gains a byte-backed construction beside its decode-from-URI one, so
    a viewer's bytes reach the Platform's upload paths with **no base64 round trip** — a 30 MB

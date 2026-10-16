@@ -592,8 +592,13 @@ fn transfer_value(thread_key: &ThreadKey, view: &ViewerCard<'_>) -> serde_json::
 /// header, the next the delimiter, the rest the body. `None` when the text has
 /// no records at all; `Some((table, cut))` where `cut` says whether rows,
 /// columns or long cells were dropped/clipped to keep the card valid.
+///
+/// Records are pulled LAZILY and the pull stops at the card's own caps (the row
+/// cap and the JSON budget), so a file of millions of tiny rows is parsed only
+/// as far as the card needs — never materialized whole (finding #739 §1,
+/// round 2).
 fn delimited_table(text: &str, delim: char) -> Option<(String, TableCut)> {
-    let mut records = delimited_records(text, delim).into_iter();
+    let mut records = delimited_records(text, delim);
     let header = records.next()?;
     let mut cut = TableCut {
         rows: header.len() > MAX_PREVIEW_COLUMNS,
@@ -664,57 +669,178 @@ fn clip_cell(cell: &str) -> (String, bool) {
 /// two rows. A `"` that does not open a field is an ordinary character, so a
 /// file that merely contains quotes still reads sensibly. A blank line carries
 /// no record; a row of empty cells (a lone `,`) does.
-fn delimited_records(text: &str, delim: char) -> Vec<Vec<String>> {
-    let mut records: Vec<Vec<String>> = Vec::new();
-    let mut record: Vec<String> = Vec::new();
-    let mut cell = String::new();
-    let mut quoted = false;
-    // Whether the current record has seen anything (a delimiter or a non-blank
-    // character): a blank line carries none and is dropped.
-    let mut touched = false;
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
-        if quoted {
-            match c {
-                '"' if chars.peek() == Some(&'"') => {
-                    cell.push('"');
-                    chars.next();
+///
+/// The parse is LAZY and every record is bounded: `next` reads only as far as
+/// the current record's end, and a record holds at most one cell past
+/// [`MAX_PREVIEW_COLUMNS`] and one character past [`MAX_CELL_CHARS`] in each —
+/// enough for the renderer to see the row was wide or the cell long. A caller
+/// that stops pulling at the card's caps therefore never lets a whole file (or
+/// one 30 KB field, or a million-column row) turn into allocations (finding
+/// #739 §1, round 2).
+fn delimited_records(text: &str, delim: char) -> DelimitedRecords<'_> {
+    DelimitedRecords {
+        chars: text.chars().peekable(),
+        delim,
+        done: false,
+        #[cfg(test)]
+        scanned: 0,
+    }
+}
+
+/// The lazy parser behind [`delimited_records`]: it pulls characters from the
+/// text on demand and yields one bounded record per `next`.
+struct DelimitedRecords<'a> {
+    chars: std::iter::Peekable<std::str::Chars<'a>>,
+    delim: char,
+    /// Set once the input is exhausted, so a later `next` never restarts.
+    done: bool,
+    /// Characters pulled so far — the bounded-work measure the test reads; it
+    /// does not exist in the production build.
+    #[cfg(test)]
+    scanned: usize,
+}
+
+impl DelimitedRecords<'_> {
+    /// How many characters the parse has pulled so far (tests only).
+    #[cfg(test)]
+    fn scanned(&self) -> usize {
+        self.scanned
+    }
+
+    /// Count one character pulled from the input (tests only).
+    #[inline]
+    fn count(&mut self) {
+        #[cfg(test)]
+        {
+            self.scanned += 1;
+        }
+    }
+}
+
+impl Iterator for DelimitedRecords<'_> {
+    type Item = Vec<String>;
+
+    fn next(&mut self) -> Option<Vec<String>> {
+        if self.done {
+            return None;
+        }
+        let mut record: Vec<String> = Vec::new();
+        let mut cell = BoundedCell::default();
+        let mut quoted = false;
+        // Whether the current record has seen anything (a delimiter or a
+        // non-blank character): a blank line carries none and is dropped.
+        let mut touched = false;
+        while let Some(c) = self.chars.next() {
+            self.count();
+            if quoted {
+                match c {
+                    '"' if self.chars.peek() == Some(&'"') => {
+                        cell.push('"');
+                        self.chars.next();
+                        self.count();
+                    }
+                    '"' => quoted = false,
+                    _ => cell.push(c),
                 }
-                '"' => quoted = false,
-                _ => cell.push(c),
+                continue;
             }
-            continue;
-        }
-        if c == '"' && cell.trim().is_empty() {
-            quoted = true;
-            touched = true;
-        } else if c == delim {
-            record.push(std::mem::take(&mut cell).trim().to_string());
-            touched = true;
-        } else if c == '\n' || c == '\r' {
-            if c == '\r' && chars.peek() == Some(&'\n') {
-                chars.next();
-            }
-            record.push(std::mem::take(&mut cell).trim().to_string());
-            if touched {
-                records.push(std::mem::take(&mut record));
-            } else {
-                record.clear();
-            }
-            touched = false;
-        } else {
-            if !c.is_whitespace() {
+            if c == '"' && cell.is_blank() {
+                quoted = true;
                 touched = true;
+            } else if c == self.delim {
+                push_record_cell(&mut record, &mut cell);
+                touched = true;
+            } else if c == '\n' || c == '\r' {
+                if c == '\r' && self.chars.peek() == Some(&'\n') {
+                    self.chars.next();
+                    self.count();
+                }
+                push_record_cell(&mut record, &mut cell);
+                if touched {
+                    return Some(std::mem::take(&mut record));
+                }
+                record.clear();
+                touched = false;
+            } else {
+                if !c.is_whitespace() {
+                    touched = true;
+                }
+                cell.push(c);
             }
-            cell.push(c);
+        }
+        // The final record: a file may not end in a newline.
+        self.done = true;
+        if touched {
+            push_record_cell(&mut record, &mut cell);
+            Some(record)
+        } else {
+            None
         }
     }
-    // The final record: a file may not end in a newline.
-    if touched {
-        record.push(cell.trim().to_string());
-        records.push(record);
+}
+
+/// One parsed cell, bounded: it stores at most [`MAX_CELL_CHARS`] + 1
+/// characters (the one extra lets [`clip_cell`] see the cell was cut), skips
+/// its leading whitespace (trimmed either way), and counts every character it
+/// consumes — so a pathological field can never grow without limit.
+#[derive(Default)]
+struct BoundedCell {
+    text: String,
+    /// Characters consumed since the first non-whitespace one; leading
+    /// whitespace is trimmed anyway and so is not counted.
+    counted: usize,
+    /// Whether a non-whitespace character has been consumed: a cell with none
+    /// is blank, which is what lets a `"` open a quoted field.
+    started: bool,
+}
+
+impl BoundedCell {
+    /// Append `c`, holding the stored text to [`MAX_CELL_CHARS`] + 1 characters.
+    fn push(&mut self, c: char) {
+        if !self.started {
+            if c.is_whitespace() {
+                return;
+            }
+            self.started = true;
+        }
+        if self.counted <= MAX_CELL_CHARS {
+            self.text.push(c);
+        }
+        self.counted += 1;
     }
-    records
+
+    /// Whether the cell has seen no non-whitespace character yet.
+    fn is_blank(&self) -> bool {
+        !self.started
+    }
+
+    /// The cell's text, trimmed like the whole-file parser did, and reset for
+    /// the next cell.
+    fn take(&mut self) -> String {
+        let text = std::mem::take(&mut self.text);
+        self.counted = 0;
+        self.started = false;
+        text.trim().to_string()
+    }
+
+    /// Discard the cell's text (a column past the cap) and reset.
+    fn reset(&mut self) {
+        self.text.clear();
+        self.counted = 0;
+        self.started = false;
+    }
+}
+
+/// Push one parsed cell onto a record, holding the record to
+/// [`MAX_PREVIEW_COLUMNS`] + 1 cells: one past the column cap, which is enough
+/// for the renderer's `cut` to see the row was wide. Any further cell is
+/// dropped with its text, so a million-column row cannot materialize.
+fn push_record_cell(record: &mut Vec<String>, cell: &mut BoundedCell) {
+    if record.len() <= MAX_PREVIEW_COLUMNS {
+        record.push(cell.take());
+    } else {
+        cell.reset();
+    }
 }
 
 #[cfg(test)]
@@ -906,7 +1032,7 @@ mod tests {
         // The parser is the pin: two records, the first body row carrying the
         // newline inside its second cell until `table_row` flattens it.
         assert_eq!(
-            delimited_records(text, ','),
+            delimited_records(text, ',').collect::<Vec<_>>(),
             vec![
                 vec!["name".to_string(), "note".to_string()],
                 vec!["ann".to_string(), "first\nsecond".to_string()],
@@ -917,7 +1043,7 @@ mod tests {
         // A CRLF inside quotes is data too, and a CRLF line ending still ends a
         // record.
         assert_eq!(
-            delimited_records("a,b\r\nc,\"d\r\ne\"\r\n", ','),
+            delimited_records("a,b\r\nc,\"d\r\ne\"\r\n", ',').collect::<Vec<_>>(),
             vec![
                 vec!["a".to_string(), "b".to_string()],
                 vec!["c".to_string(), "d\r\ne".to_string()],
@@ -975,6 +1101,62 @@ mod tests {
         let text = card_text(&card);
         assert!(text.contains("表格过长"), "the row cut is stated: {text}");
         assert!(text.contains("单元格已截断"), "the cell clip is stated: {text}");
+    }
+
+    /// A delimited file far larger than any card — hundreds of thousands of
+    /// tiny rows — is parsed only as far as the card's caps require: the parser
+    /// pulls a bounded prefix of the file (never the whole of it), the card
+    /// stays valid, and one pathological field is bounded too. This is the fix
+    /// for finding #739 §1 (round 2): an eager parse materializes the whole
+    /// file before the row cap can ever apply.
+    #[test]
+    fn a_huge_delimited_file_is_parsed_only_as_far_as_the_card_needs() {
+        // ~1.6 MB over 400k tiny rows: cheap to build, and far past what any
+        // card renders. The test itself must not expand into record form.
+        let rows = 400_000;
+        let mut csv = String::with_capacity(rows * 4 + 8);
+        csv.push_str("n,v\n");
+        for _ in 0..rows {
+            csv.push_str("a,1\n");
+        }
+
+        // Bounded WORK: pulling only the records the card needs must scan a
+        // small prefix of the file, not all of it.
+        let mut records = delimited_records(&csv, ',');
+        assert_eq!(records.next().unwrap(), vec!["n", "v"]);
+        let body = records.by_ref().take(MAX_TABLE_ROWS + 1).count();
+        assert_eq!(body, MAX_TABLE_ROWS + 1);
+        assert!(
+            records.scanned() < csv.len() / 4,
+            "the parse must not scan the whole file: {} of {} chars",
+            records.scanned(),
+            csv.len()
+        );
+
+        // Bounded OUTPUT: the card renders the capped table, stays valid, and
+        // says the table was cut.
+        let card = build_viewer_card(
+            &key(),
+            view("/tmp/many.csv", ViewerKind::Delimited, Some("csv"), &csv),
+        );
+        let json_len = serde_json::to_string(&card).unwrap().len();
+        assert!(
+            json_len < MAX_CARD_JSON_CHARS,
+            "the card must fit its own budget: {json_len}"
+        );
+        let text = card_text(&card);
+        assert!(text.contains("表格过长"), "the row cut is stated: {text}");
+
+        // One pathological field (a whole 8 MB cell) is bounded before it can
+        // materialize: the parser stores a clipped prefix, no more.
+        let mut giant = String::from("h\n");
+        giant.push_str(&"x".repeat(crate::bridge::viewer::PREVIEW_READ_CAP));
+        let cell = delimited_records(&giant, ',').nth(1).unwrap().pop().unwrap();
+        assert!(
+            cell.chars().count() <= MAX_CELL_CHARS + 1,
+            "a giant field is bounded to the cell cap: {}",
+            cell.chars().count()
+        );
     }
 
     /// The card names the file it shows: the resolved path, its size and its

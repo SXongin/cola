@@ -214,28 +214,32 @@ pub(crate) fn classify(path: &Path, size: u64) -> Result<Classified, CatFailure>
     // what this is. A text-shaped header is still TEXT — too large to preview —
     // never 「二进制」.
     if size > crate::feishu::file::MAX_FILE_BYTES {
-        let kind = if is_image {
-            ClassifiedKind::Image
-        } else if !is_known_binary && header_is_text {
-            ClassifiedKind::TextTooLarge
-        } else {
-            ClassifiedKind::File
-        };
-        return Ok(Classified {
+        return Ok(past_cap(
             size,
-            mime: octet_mime(),
-            kind,
-            text: None,
-            bytes: None,
-        });
+            octet_mime(),
+            is_image,
+            is_known_binary,
+            header_is_text,
+        ));
     }
 
     // Within Feishu's upload cap: read the file ONCE, bounded by that cap. The
     // bytes' own length is the truth the card reports (`size` below), so a file
     // that shrank — or a pseudo-file whose `stat` size is 0 — is named by what
     // was actually read, and `FileContent::from_bytes` receives those same
-    // bytes.
-    let bytes = read_bounded(path, crate::feishu::file::MAX_FILE_BYTES)?;
+    // bytes. A file that GREW past the cap after the caller's `stat` reads one
+    // byte past it and is reported past-cap — never as its truncated prefix —
+    // so the card says 未发送 instead of claiming a partial file was sent.
+    let Some(bytes) = read_bounded(path, crate::feishu::file::MAX_FILE_BYTES)? else {
+        let grown = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(size);
+        return Ok(past_cap(
+            grown,
+            octet_mime(),
+            is_image,
+            is_known_binary,
+            header_is_text,
+        ));
+    };
     let size = bytes.len() as u64;
     if size == 0 {
         return Err(CatFailure::Empty);
@@ -291,6 +295,35 @@ pub(crate) fn classify(path: &Path, size: u64) -> Result<Classified, CatFailure>
 /// is a control character the card must never hold — issue #519's family).
 fn is_text_bytes(bytes: &[u8]) -> bool {
     !bytes.contains(&0) && std::str::from_utf8(bytes).is_ok()
+}
+
+/// The classification for a file whose bytes are past Feishu's 30 MB upload
+/// cap, whether the caller's `stat` said so or the read discovered it (the file
+/// grew): nothing is read, so only the sniffed header can name it. A
+/// text-shaped header is still TEXT — too large to preview — never 「二进制」;
+/// `size` is the best figure available (the `stat`, or a fresh one for a file
+/// that grew) and carries no bytes, so every lane reports 未发送.
+fn past_cap(
+    size: u64,
+    mime: String,
+    is_image: bool,
+    is_known_binary: bool,
+    header_is_text: bool,
+) -> Classified {
+    let kind = if is_image {
+        ClassifiedKind::Image
+    } else if !is_known_binary && header_is_text {
+        ClassifiedKind::TextTooLarge
+    } else {
+        ClassifiedKind::File
+    };
+    Classified {
+        size,
+        mime,
+        kind,
+        text: None,
+        bytes: None,
+    }
 }
 
 /// The whole-bytes lane a viewer opens with (ADR-0083 §5): an image within
@@ -503,29 +536,39 @@ async fn send_file_message(
     }
 }
 
-/// The whole bytes for a delivery lane, or `None` when `stat_size` says the file
-/// is past Feishu's 30MB upload cap — never read, so a huge file cannot exhaust
-/// memory. The read itself is bounded by the cap (never by `stat_size`), so a
-/// size-0 pseudo-file still yields its content.
+/// The whole bytes for a delivery lane, or `None` when the file is past
+/// Feishu's 30MB upload cap — which `stat_size` may already say, or which the
+/// read itself discovers when the file grew after that `stat`. Either way a
+/// truncated prefix is never returned, so a partial file is never delivered as
+/// the whole. The read itself is bounded by the cap (never by `stat_size`), so
+/// a size-0 pseudo-file still yields its content.
 fn read_deliverable(path: &Path, stat_size: u64) -> Result<Option<Vec<u8>>, CatFailure> {
     if stat_size > crate::feishu::file::MAX_FILE_BYTES {
         return Ok(None);
     }
-    read_bounded(path, crate::feishu::file::MAX_FILE_BYTES).map(Some)
+    read_bounded(path, crate::feishu::file::MAX_FILE_BYTES)
 }
 
 /// Read `path`, at most `limit` bytes, reporting the OS's reason when it cannot
 /// be read. The bound is the CALLER's, never the `stat` size: a pseudo-file
 /// (procfs, sysfs) reports size 0 while having content, and a file that grows
-/// between the `stat` and this read is still bounded. The returned bytes' own
-/// length is what the caller reports.
-fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, CatFailure> {
+/// between the `stat` and this read is still bounded.
+///
+/// Reads ONE byte past `limit` to detect that more bytes remain, and `None`
+/// means exactly that: the file holds more than `limit` bytes. A file that
+/// outgrew the cap after the caller's `stat` is therefore reported past-cap
+/// rather than delivered as a truncated prefix (finding #739 §1, round 2).
+/// `Some(bytes)` is the whole file, at most `limit` bytes.
+fn read_bounded(path: &Path, limit: u64) -> Result<Option<Vec<u8>>, CatFailure> {
     let file = std::fs::File::open(path).map_err(|e| CatFailure::Unreadable(e.to_string()))?;
     let mut bytes = Vec::new();
-    file.take(limit)
+    file.take(limit + 1)
         .read_to_end(&mut bytes)
         .map_err(|e| CatFailure::Unreadable(e.to_string()))?;
-    Ok(bytes)
+    if bytes.len() as u64 > limit {
+        return Ok(None);
+    }
+    Ok(Some(bytes))
 }
 
 /// Read at most `n` bytes — the bounded header [`classify`] sniffs.
@@ -793,6 +836,60 @@ mod tests {
             "a text header past 30MB is still text, not 二进制"
         );
         assert!(classified.bytes.is_none(), "past 30MB, nothing is read");
+    }
+
+    /// A file that GREW past a read limit after the caller's `stat` is detected
+    /// by the one-byte-over read: it is never returned as a truncated prefix,
+    /// so a 「发为文件」 click can never report a partial file as sent
+    /// (finding #739 §1, round 2).
+    #[test]
+    fn read_bounded_detects_a_file_that_grew_past_its_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("grew.bin");
+        std::fs::write(&file, b"0123456789").unwrap();
+
+        // Exactly the limit, and under it, is the whole file.
+        assert_eq!(read_bounded(&file, 10).unwrap().unwrap(), b"0123456789".to_vec());
+        assert_eq!(read_bounded(&file, 11).unwrap().unwrap(), b"0123456789".to_vec());
+        // One byte past the limit means MORE bytes remain: reported as `None`,
+        // never as a 5-byte prefix of a 10-byte file.
+        assert_eq!(read_bounded(&file, 5).unwrap(), None);
+    }
+
+    /// The same growth at the two callers that guard the 30MB cap: `classify`
+    /// reads one byte past it and reports the file past-cap (no bytes to
+    /// deliver, the real grown size named), and `read_deliverable` returns no
+    /// bytes for it — so the lane can only be 未发送, never a truncated send.
+    #[test]
+    fn a_file_that_grew_past_the_cap_is_classified_and_delivered_as_past_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("grew.bin");
+        // A sparse file one byte past Feishu's cap, while the caller's `stat`
+        // (simulated by the small `size` argument) still says it fits.
+        let handle = std::fs::File::create(&file).unwrap();
+        handle.set_len(crate::feishu::file::MAX_FILE_BYTES + 1).unwrap();
+        drop(handle);
+
+        let classified = classify(&file, 10).unwrap();
+        assert!(
+            classified.bytes.is_none(),
+            "a file that grew past the cap holds no deliverable bytes"
+        );
+        assert_eq!(
+            classified.size,
+            crate::feishu::file::MAX_FILE_BYTES + 1,
+            "the grown size is the one named, not the stale stat"
+        );
+        assert_eq!(
+            classified.kind,
+            ClassifiedKind::File,
+            "a NUL header is a file, never text"
+        );
+        assert_eq!(
+            read_deliverable(&file, 10).unwrap(),
+            None,
+            "no truncated prefix is ever delivered"
+        );
     }
 
     /// A size-0 pseudo-file (procfs, sysfs) has real content: emptiness is
