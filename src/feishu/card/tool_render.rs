@@ -598,15 +598,26 @@ fn file_tracking_block(tool: &ToolPanel) -> Option<String> {
     Some(
         tool.files()
             .iter()
-            .map(|file| match &file.delivery {
-                FileDelivery::Embedded { .. } => format!("{} · 已内嵌", file.content.record_line()),
-                FileDelivery::SentAsFile => format!("{} · 已发送为文件消息", file.content.record_line()),
-                FileDelivery::Undelivered => format!("{} · 未发送", file.content.record_line()),
-                FileDelivery::Unresolved => file.content.record_line(),
+            .map(|file| match delivery_suffix(&file.delivery) {
+                Some(suffix) => format!("{} · {suffix}", file.content.record_line()),
+                None => file.content.record_line(),
             })
             .collect::<Vec<_>>()
             .join("\n"),
     )
+}
+
+/// The state suffix a File Content's tracking line carries (ADR-0076): the one
+/// copy `· 已内嵌` / `· 已发送为文件消息` / `· 未发送`, shared by the Tool Panel
+/// and the **File Viewer** card (ADR-0083 §5) so the two surfaces cannot drift.
+/// `None` for a content nothing has decided yet (no suffix while unresolved).
+pub(crate) fn delivery_suffix(delivery: &FileDelivery) -> Option<&'static str> {
+    match delivery {
+        FileDelivery::Embedded { .. } => Some("已内嵌"),
+        FileDelivery::SentAsFile => Some("已发送为文件消息"),
+        FileDelivery::Undelivered => Some("未发送"),
+        FileDelivery::Unresolved => None,
+    }
 }
 
 /// The character budget the folded panel HEADER spends on a single File
@@ -826,21 +837,29 @@ pub(super) fn file_image_elements(tool: &ToolPanel) -> Vec<serde_json::Value> {
     tool.files()
         .iter()
         .filter_map(|file| {
-            file.delivery.as_embedded_key().map(|image_key| {
-                // One short name for both fields: the `alt` (the image's
-                // accessible name, shown if the image fails to load) and the
-                // `title` (the visible caption).
-                let name = header_file_name(&file.content.name);
-                serde_json::json!({
-                    "tag": "img",
-                    "img_key": image_key,
-                    "alt": { "tag": "plain_text", "content": name.clone() },
-                    "title": { "tag": "plain_text", "content": format!("📎 {name}") },
-                    "preview": true,
-                })
-            })
+            file.delivery
+                .as_embedded_key()
+                .map(|image_key| file_image_element(image_key, &file.content.name))
         })
         .collect()
+}
+
+/// The `img` element one embedded File Content renders, from the reusable
+/// `image_key` and the content's name. `alt` is the image's accessible name (the
+/// text a client shows if the image fails to load) and `title` the visible
+/// caption, both the file's short BASENAME (`header_file_name`: folded and
+/// clipped to its tail when long). `preview` is on so a click enlarges it.
+/// Shared by the Tool Panel (ADR-0076) and the **File Viewer** card (ADR-0083
+/// §5), so the two embed surfaces cannot drift.
+pub(crate) fn file_image_element(image_key: &str, name: &str) -> serde_json::Value {
+    let name = header_file_name(name);
+    serde_json::json!({
+        "tag": "img",
+        "img_key": image_key,
+        "alt": { "tag": "plain_text", "content": name.clone() },
+        "title": { "tag": "plain_text", "content": format!("📎 {name}") },
+        "preview": true,
+    })
 }
 
 /// The serialized byte length the `img` elements [`file_image_elements`] emits

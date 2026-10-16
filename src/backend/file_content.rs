@@ -25,15 +25,25 @@ pub(crate) const DEFAULT_FILE_NAME: &str = "file";
 /// user-attachment sources.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileContent {
-    /// The inline `data:` URI the payload arrived in.
+    /// The inline `data:` URI the payload arrived in. Empty for a byte-backed
+    /// File Content (a locally-read file), whose payload lives in [`Self::data`]
+    /// instead.
     pub uri: String,
     /// The payload's media type — [`DEFAULT_FILE_MIME`] when none was reported.
     pub mime: String,
     /// The payload's display name — [`DEFAULT_FILE_NAME`] when none was
     /// reported.
     pub name: String,
-    /// The decoded byte length of the inline payload.
+    /// The byte length actually handed to the Platform: the decoded inline
+    /// payload's length for a [`Self::decode`]d File Content, the raw slice's
+    /// length for a [`Self::from_bytes`] one. The invariant is one number for
+    /// both sources, so they cannot drift.
     pub size: u64,
+    /// The raw payload of a **byte-backed** File Content (a locally-read file,
+    /// ADR-0083 §7), so a viewer's bytes reach the Platform's upload paths with
+    /// NO base64 round trip. `None` for a [`Self::decode`]d File Content, whose
+    /// payload lives in its `data:` URI.
+    pub data: Option<Vec<u8>>,
 }
 
 impl FileContent {
@@ -49,6 +59,7 @@ impl FileContent {
             mime: non_empty(mime).unwrap_or(DEFAULT_FILE_MIME).to_string(),
             name: non_empty(name).unwrap_or(DEFAULT_FILE_NAME).to_string(),
             size: 0,
+            data: None,
         };
         // `size` IS the decoded inline payload's length, read through the same
         // decoding `bytes` hands the Platform, so the two cannot drift.
@@ -56,10 +67,31 @@ impl FileContent {
         Some(content)
     }
 
-    /// The inline payload's bytes, base64-decoded from the `data:` URI. `None`
-    /// when the URI carries no decodable inline payload.
+    /// A byte-backed File Content from a locally-read file (ADR-0083 §7): the
+    /// bytes a viewer read from the **Host** filesystem, handed to the
+    /// Platform's upload paths directly — no `data:` URI, no base64 round trip,
+    /// so a 30MB file is not re-encoded into a ~40MB string only to be decoded
+    /// again. `size` is the slice's own length, the same number `bytes()` hands
+    /// the Platform, so the two constructions keep one invariant. An empty
+    /// `mime`/`name` reads its sane default, exactly like [`Self::decode`].
+    pub fn from_bytes(mime: &str, name: &str, bytes: Vec<u8>) -> Self {
+        Self {
+            uri: String::new(),
+            mime: non_empty(Some(mime)).unwrap_or(DEFAULT_FILE_MIME).to_string(),
+            name: non_empty(Some(name)).unwrap_or(DEFAULT_FILE_NAME).to_string(),
+            size: bytes.len() as u64,
+            data: Some(bytes),
+        }
+    }
+
+    /// The payload's bytes: the raw slice for a byte-backed File Content,
+    /// otherwise base64-decoded from the `data:` URI. `None` when the URI
+    /// carries no decodable inline payload.
     pub fn bytes(&self) -> Option<Vec<u8>> {
-        inline_payload(&self.uri)
+        match &self.data {
+            Some(bytes) => Some(bytes.clone()),
+            None => inline_payload(&self.uri),
+        }
     }
 
     /// The one line a File Content is recorded with where a message's body is
@@ -156,6 +188,36 @@ mod tests {
         assert_eq!(content.bytes().as_deref(), Some(b"ABC".as_slice()));
     }
 
+    /// A byte-backed File Content hands its raw bytes straight back — no
+    /// `data:` URI, no base64 round trip — and `size` is the byte count those
+    /// bytes ARE, the same number `bytes()` returns (ADR-0083 §7).
+    #[test]
+    fn from_bytes_keeps_size_equal_to_the_bytes_handed_to_the_platform() {
+        let bytes = vec![0x89, b'P', b'N', b'G', 0, 1, 2, 3];
+        let content = FileContent::from_bytes("image/png", "shot.png", bytes.clone());
+
+        assert!(content.uri.is_empty(), "a byte-backed content has no URI");
+        assert_eq!(content.data.as_deref(), Some(bytes.as_slice()));
+        assert_eq!(content.mime, "image/png");
+        assert_eq!(content.name, "shot.png");
+        assert_eq!(
+            content.size,
+            bytes.len() as u64,
+            "size IS the bytes the Platform receives"
+        );
+        assert_eq!(content.bytes().as_deref(), Some(bytes.as_slice()));
+    }
+
+    /// A byte-backed construction reads the same sane defaults for a missing
+    /// name/mime as `decode` — an empty field is "none reported", not a value.
+    #[test]
+    fn from_bytes_reads_the_sane_defaults() {
+        let content = FileContent::from_bytes("", "", vec![1, 2, 3]);
+        assert_eq!(content.mime, DEFAULT_FILE_MIME);
+        assert_eq!(content.name, DEFAULT_FILE_NAME);
+        assert_eq!(content.size, 3);
+    }
+
     /// A missing name or mime reads the sane default — an absent field and an
     /// empty one alike — and never panics.
     #[test]
@@ -197,6 +259,7 @@ mod tests {
             mime: "image/png".into(),
             name: "shot.png".into(),
             size: 512,
+            data: None,
         };
         assert_eq!(small.record_line(), "📎 shot.png · image/png · 512 B");
 
@@ -205,6 +268,7 @@ mod tests {
             mime: "application/pdf".into(),
             name: "report.pdf".into(),
             size: 1_258_291,
+            data: None,
         };
         assert_eq!(large.record_line(), "📎 report.pdf · application/pdf · 1.2 MB");
     }
@@ -219,6 +283,7 @@ mod tests {
                 mime: "image/png".into(),
                 name: "shot.png".into(),
                 size,
+                data: None,
             }
             .record_line()
         };

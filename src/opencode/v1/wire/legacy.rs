@@ -722,6 +722,7 @@ mod tests {
                     mime: "image/png".into(),
                     name: "shot.png".into(),
                     size: 3,
+                    data: None,
                 }),
             ]
         );
@@ -753,6 +754,7 @@ mod tests {
                 mime: "image/png".into(),
                 name: "shot.png".into(),
                 size: 3,
+                data: None,
             })
         );
         assert_eq!(
@@ -762,6 +764,7 @@ mod tests {
                 mime: "application/pdf".into(),
                 name: "file".into(),
                 size: 3,
+                data: None,
             }),
             "a part without a filename reads the sane default"
         );

@@ -28,16 +28,23 @@ use crate::config::ThreadKey;
 use super::sanitize::{CardMarkdown, MAX_TABLE_ROWS};
 use super::session::{BrowseView, browse_view_value};
 use super::shell::card_shell;
+use super::tool_render::{FileDelivery, delivery_suffix, file_image_element};
 use super::{MAX_CARD_JSON_CHARS, MAX_ELEMENT_TEXT_CHARS, chunk_text, fenced_code};
 
-/// What the viewer decided a file's bytes are (§6). #739 adds the image and
-/// binary kinds beside these; #738 answers for the two text shapes.
+/// What the viewer decided a file's bytes are (§6): decided by CONTENT — magic
+/// bytes first, then UTF-8 validity — never by the file's name.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum ViewerKind {
     /// UTF-8 text: a fenced code block with the extension's language token.
     Text,
     /// Delimited text (`.csv`/`.tsv`): a markdown table.
     Delimited,
+    /// An image (by magic bytes): embedded in the card when Feishu accepts it,
+    /// else delivered as a File Message.
+    Image,
+    /// A non-text file (a known binary, or an unknown non-UTF-8 file), or a text
+    /// file past the preview read cap: no preview, delivered as a File Message.
+    Binary,
 }
 
 impl ViewerKind {
@@ -46,8 +53,22 @@ impl ViewerKind {
         match self {
             Self::Text => "文本",
             Self::Delimited => "表格",
+            Self::Image => "图片",
+            Self::Binary => "二进制",
         }
     }
+}
+
+/// The whole-bytes lane a **File Viewer** card shows (ADR-0083 §5): what the
+/// file is and where its bytes went. Rendered as the card's tracking line
+/// (`📎 name · mime · size · 已内嵌` / `· 已发送为文件消息` / `· 未发送`) and, for
+/// an embedded image, the `img` element. Named so a file past Feishu's 30MB cap
+/// — which is never read — can still carry its real size and the 未发送 state.
+pub(crate) struct ViewerFileLane {
+    pub(crate) mime: String,
+    pub(crate) name: String,
+    pub(crate) size: u64,
+    pub(crate) delivery: FileDelivery,
 }
 
 /// What a file's extension declares: `.csv`/`.tsv` are delimited text,
@@ -260,12 +281,18 @@ pub(crate) struct ViewerCard<'a> {
     pub(crate) ext: Option<&'a str>,
     /// The preview's text: the bytes read, already bounded by the read cap.
     pub(crate) text: &'a str,
-    /// Whether the read already dropped content (the file is larger than the
-    /// preview read cap).
+    /// Whether the card layer already dropped preview content (the card budget
+    /// cut it). A file past the preview read cap is never previewed at all, so
+    /// it takes the File Message lane rather than being truncated here.
     pub(crate) truncated: bool,
     /// The browse listing this viewer was opened from, when it was (ADR-0083
     /// §3): renders 「← 返回目录」 carrying that state. `None` for `/cat`.
     pub(crate) return_to: Option<BrowseView<'a>>,
+    /// The whole-bytes lane this card shows (ADR-0083 §5), when it has one: the
+    /// tracking line and, for an embedded image, the `img` element. `None` for a
+    /// text preview that took no lane on open (its 「发为文件」 transfer still
+    /// works — the click carries the path).
+    pub(crate) lane: Option<ViewerFileLane>,
 }
 
 /// Build the File Viewer card (ADR-0083 §3).
@@ -282,6 +309,22 @@ pub(crate) fn build_viewer_card(thread_key: &ThreadKey, view: ViewerCard<'_>) ->
     }));
 
     match view.kind {
+        // An image the open lane embedded: the `img` element IS the preview.
+        // An image Feishu would not embed (past its caps) has no element — its
+        // tracking line below says it went out as a File Message instead.
+        ViewerKind::Image => {
+            if let Some(ViewerFileLane {
+                delivery: FileDelivery::Embedded { image_key },
+                name,
+                ..
+            }) = &view.lane
+            {
+                elements.push(file_image_element(image_key, name));
+            }
+        }
+        // No preview: the bytes went out (or could not) as a File Message, and
+        // the tracking line below is the whole card body.
+        ViewerKind::Binary => {}
         ViewerKind::Delimited => {
             let delim = if view.ext.map(str::to_ascii_lowercase).as_deref() == Some("tsv") {
                 '\t'
@@ -331,8 +374,18 @@ pub(crate) fn build_viewer_card(thread_key: &ThreadKey, view: ViewerCard<'_>) ->
             "tag": "markdown",
             "content": match view.kind {
                 ViewerKind::Delimited => format!("_（表格过长，仅显示前 {MAX_TABLE_ROWS} 行）_"),
-                ViewerKind::Text => "_（内容过长，预览已截断）_".to_string(),
+                _ => "_（内容过长，预览已截断）_".to_string(),
             },
+        }));
+    }
+
+    // The whole-bytes lane's tracking line: names the file and says where its
+    // bytes went — 已内嵌 (an image in this card), 已发送为文件消息 (one File
+    // Message), or 未发送 (past Feishu's 30MB cap, or a failed upload/send).
+    if let Some(lane) = &view.lane {
+        elements.push(json!({
+            "tag": "markdown",
+            "content": markdown.clean(&lane_line(lane)),
         }));
     }
 
@@ -363,10 +416,24 @@ fn naming_block(view: &ViewerCard<'_>) -> String {
     )
 }
 
-/// The viewer's button row (ADR-0083 §3): 「📂 所在目录」 always, 「← 返回目录」
-/// when the viewer was opened from a browse listing. Both carry the browse
-/// handler's own payload shape ([`browse_view_value`]) so #742 only has to pass
-/// the listing in.
+/// One tracking line for the card's whole-bytes lane (ADR-0083 §5): `📎 name ·
+/// mime · size` plus the shared delivery suffix, so the viewer spells a
+/// delivered file exactly as a Tool Panel does (ADR-0076).
+fn lane_line(lane: &ViewerFileLane) -> String {
+    let base = format!("📎 {} · {} · {}", lane.name, lane.mime, human_size(lane.size));
+    match delivery_suffix(&lane.delivery) {
+        Some(suffix) => format!("{base} · {suffix}"),
+        None => base,
+    }
+}
+
+/// The viewer's button row (ADR-0083 §3, §5): 「📂 所在目录」 always, 「← 返回目录」
+/// when the viewer was opened from a browse listing, and 「发为文件」 always. The
+/// two directory buttons carry the browse handler's own payload shape
+/// ([`browse_view_value`]) so #742 only has to pass the listing in; the transfer
+/// button carries the RESOLVED path the click must upload, plus the browse
+/// listing's whole state so the card it PATCHes back to can still carry
+/// 「← 返回目录」.
 fn viewer_buttons(thread_key: &ThreadKey, view: &ViewerCard<'_>) -> serde_json::Value {
     let mut columns: Vec<serde_json::Value> = Vec::new();
     let mut push = |label: &str, op: &str, target: BrowseView<'_>| {
@@ -400,12 +467,47 @@ fn viewer_buttons(thread_key: &ThreadKey, view: &ViewerCard<'_>) -> serde_json::
         // state comes back exactly, where `go` would clear the filter and page.
         push("← 返回目录", "restore", return_to);
     }
+    columns.push(json!({
+        "tag": "column",
+        "width": "auto",
+        "vertical_align": "center",
+        "elements": [{
+            "tag": "button",
+            "type": "default",
+            "text": { "tag": "plain_text", "content": "发为文件" },
+            "value": transfer_value(thread_key, view),
+        }],
+    }));
     json!({
         "tag": "column_set",
         "flex_mode": "flow",
         "horizontal_spacing": "default",
         "columns": columns,
     })
+}
+
+/// The 「发为文件」 button's payload (ADR-0083 §5): the **resolved** path the
+/// click uploads, its Chat/Topic routing, and — when the viewer was opened from
+/// a browse listing — that listing's whole state, so the transfer's card PATCH
+/// can rebuild a card that still carries 「← 返回目录」 (ADR-0052's statelessness).
+/// The click itself does NO transfer: it records the intent and acknowledges,
+/// and a bounded, timed-out step performs the upload and the send off the
+/// callback path (ADR-0078's 3 s budget).
+fn transfer_value(thread_key: &ThreadKey, view: &ViewerCard<'_>) -> serde_json::Value {
+    let mut value = json!({
+        "action": "file",
+        "op": "send",
+        "path": view.path,
+        "chat_id": thread_key.chat_id,
+        "thread_id": thread_key.thread_id,
+    });
+    if let Some(return_to) = view.return_to {
+        value["return_dir"] = json!(return_to.dir);
+        value["return_show_hidden"] = json!(return_to.show_hidden);
+        value["return_keyword"] = json!(return_to.keyword);
+        value["return_page"] = json!(return_to.page);
+    }
+    value
 }
 
 /// A delimited-text preview as one markdown table: the first row is the header,
@@ -542,7 +644,25 @@ mod tests {
             text,
             truncated: false,
             return_to: None,
+            lane: None,
         }
+    }
+
+    /// A whole-bytes lane on `view`, for the image/binary card shapes.
+    fn with_lane<'a>(
+        mut view: ViewerCard<'a>,
+        mime: &str,
+        name: &str,
+        size: u64,
+        delivery: FileDelivery,
+    ) -> ViewerCard<'a> {
+        view.lane = Some(ViewerFileLane {
+            mime: mime.to_string(),
+            name: name.to_string(),
+            size,
+            delivery,
+        });
+        view
     }
 
     /// Every token the map can produce is one Feishu documents, no extension is
@@ -741,6 +861,133 @@ mod tests {
                 .any(|b| b["text"]["content"] == "← 返回目录"),
             "no return button without a listing"
         );
+    }
+
+    /// An image the open lane embedded: the card names it 图片, renders the
+    /// `img` element carrying the reusable `image_key`, and its tracking line
+    /// says 已内嵌 (ADR-0083 §5).
+    #[test]
+    fn image_kind_embeds_the_image_and_shows_the_embedded_line() {
+        let card = build_viewer_card(
+            &key(),
+            with_lane(
+                view("/tmp/proj/shot.png", ViewerKind::Image, Some("png"), ""),
+                "image/png",
+                "shot.png",
+                2048,
+                FileDelivery::Embedded {
+                    image_key: "img_v2_shot".into(),
+                },
+            ),
+        );
+        let text = card_text(&card);
+        assert!(text.contains("图片（.png）"), "the type is named: {text}");
+        assert!(
+            text.contains("📎 shot.png · image/png · 2.0 KB · 已内嵌"),
+            "the tracking line: {text}"
+        );
+
+        fn find_img<'a>(value: &'a serde_json::Value, out: &mut Vec<&'a serde_json::Value>) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    if map.get("tag").and_then(|t| t.as_str()) == Some("img") {
+                        out.push(value);
+                    }
+                    map.values().for_each(|v| find_img(v, out));
+                }
+                serde_json::Value::Array(items) => items.iter().for_each(|v| find_img(v, out)),
+                _ => {}
+            }
+        }
+        let mut images = Vec::new();
+        find_img(&card, &mut images);
+        assert_eq!(images.len(), 1, "exactly one embedded image: {card}");
+        assert_eq!(images[0]["img_key"], "img_v2_shot");
+        assert_eq!(images[0]["preview"], true, "a click enlarges it");
+    }
+
+    /// A binary is delivered as a File Message: no preview element, a tracking
+    /// line that says where the bytes went — and NO copy promising a client-side
+    /// preview (the platform's 在线预览 list is unverified, ADR-0083 §10).
+    #[test]
+    fn binary_kind_shows_only_the_tracking_line() {
+        let card = build_viewer_card(
+            &key(),
+            with_lane(
+                view("/tmp/proj/archive.zip", ViewerKind::Binary, Some("zip"), ""),
+                "application/zip",
+                "archive.zip",
+                3_145_728,
+                FileDelivery::SentAsFile,
+            ),
+        );
+        let text = card_text(&card);
+        assert!(text.contains("二进制（.zip）"), "the type is named: {text}");
+        assert!(
+            text.contains("📎 archive.zip · application/zip · 3.0 MB · 已发送为文件消息"),
+            "the tracking line: {text}"
+        );
+        assert!(!text.contains("```"), "a binary is not previewed: {text}");
+        assert!(
+            !text.contains("内联预览") && !text.contains("在线预览"),
+            "no copy promises a client-side preview: {text}"
+        );
+
+        // A file past the 30MB cap (or a failed upload/send) says 未发送.
+        let over = build_viewer_card(
+            &key(),
+            with_lane(
+                view("/tmp/proj/huge.bin", ViewerKind::Binary, Some("bin"), ""),
+                "application/octet-stream",
+                "huge.bin",
+                crate::feishu::file::MAX_FILE_BYTES + 1,
+                FileDelivery::Undelivered,
+            ),
+        );
+        assert!(card_text(&over).contains("未发送"), "{}", card_text(&over));
+    }
+
+    /// Every viewer carries 「发为文件」 (ADR-0083 §5) — including a text preview,
+    /// whose full bytes are the reason the button exists. Its payload names the
+    /// RESOLVED path, routes to the Chat/Topic, and carries the browse listing's
+    /// whole state so the PATCHed card can still return.
+    #[test]
+    fn every_viewer_carries_the_send_as_file_button() {
+        let card = build_viewer_card(
+            &key(),
+            view("/tmp/proj/notes.md", ViewerKind::Text, Some("md"), "# hi\n"),
+        );
+        let buttons = card_buttons(&card);
+        let send = buttons
+            .iter()
+            .find(|b| b["text"]["content"] == "发为文件")
+            .unwrap_or_else(|| panic!("发为文件 button missing on {}", card_text(&card)));
+        assert_eq!(send["value"]["action"], "file");
+        assert_eq!(send["value"]["op"], "send");
+        assert_eq!(send["value"]["path"], "/tmp/proj/notes.md");
+        assert_eq!(send["value"]["chat_id"], "chat_1");
+        assert_eq!(send["value"]["thread_id"], "chat_1");
+        assert!(
+            send["value"].get("return_dir").is_none(),
+            "a /cat viewer has no listing to carry"
+        );
+
+        let mut from_browse = view("/tmp/proj/notes.md", ViewerKind::Text, Some("md"), "# hi\n");
+        from_browse.return_to = Some(BrowseView {
+            dir: "/tmp/proj",
+            show_hidden: true,
+            keyword: "no",
+            page: 2,
+        });
+        let card = build_viewer_card(&key(), from_browse);
+        let send = card_buttons(&card)
+            .into_iter()
+            .find(|b| b["text"]["content"] == "发为文件")
+            .expect("发为文件 button");
+        assert_eq!(send["value"]["return_dir"], "/tmp/proj");
+        assert_eq!(send["value"]["return_show_hidden"], true);
+        assert_eq!(send["value"]["return_keyword"], "no");
+        assert_eq!(send["value"]["return_page"], 2);
     }
 
     /// A preview longer than the card can hold is cut inside the budget and

@@ -893,6 +893,56 @@ pub(crate) type FileImageCache = ContentCellCache<Option<String>>;
 /// content uploads once, whichever Session renders it.
 pub(crate) type FileUploadCache = ContentCellCache<Option<String>>;
 
+/// The single-flight cell for `hash` in a per-content-key cache (ADR-0076): the
+/// lock, the `entry`, the `OnceCell` creation and the `Arc::clone` the image and
+/// file caches both need, in one place. Every concurrent resolver of one content
+/// key shares one cell, so the first's platform call is awaited by the rest
+/// instead of repeated. Bounded by [`CONTENT_CACHE_CAP`], evicting the oldest
+/// IDLE entry first (ADR-0076 review round 2): eviction never drops a cell a
+/// resolver is still holding — dropping an in-flight one would let a concurrent
+/// resolver of the same key create a new cell and re-run the platform call,
+/// which on the image path could re-open B1's embedded-and-sent split. Insertion
+/// trims idle entries until the map is back at/under the cap, so a batch of
+/// `join_all` insertions cannot leave it permanently oversized; a held entry may
+/// push it over temporarily, and the render path's `ContentCacheTrimGuard`
+/// (which drops once the batch's holds release) brings it back down even with no
+/// later insertion. A re-upload of a settled key after eviction is harmless, and
+/// the ADR accepts it.
+///
+/// Shared by the transcript render path (ADR-0076) and the File Viewer's
+/// whole-bytes lane (ADR-0083 §5), so one content identity's upload is
+/// single-flight across both surfaces: an image read by a tool and opened again
+/// in `/cat` uploads once.
+pub(crate) async fn content_cell<T>(cache: &ContentCellCache<T>, hash: u64) -> ContentCellHold<T> {
+    let mut cache = cache.lock().await;
+    if !cache.contains_key(&hash) {
+        // Evict idle entries until at/under the cap: evicting only one per
+        // later insertion would leave a large batch permanently oversized.
+        while cache.len() >= CONTENT_CACHE_CAP && evict_oldest_idle(&mut cache, |entry| entry.is_idle()) {}
+    }
+    let entry = Arc::clone(cache.entry(hash).or_insert_with(|| Arc::new(ContentCell::new())));
+    ContentCellHold::new(entry)
+}
+
+/// The identity of one File Content for the process-local caches (ADR-0076):
+/// stable within the process, never persisted. It covers the bytes AND the mime
+/// and name (ADR-0076 review, N1): image embeddability depends on the mime and
+/// the file upload carries the name, so identical bytes first seen as
+/// `application/octet-stream` must not cache a verdict that blocks a later
+/// `image/png` embed, and a reused file key must not carry the first upload's
+/// name. ONE function keys both surfaces (the transcript render path and the
+/// File Viewer's whole-bytes lane), so a content hash from one can never mean
+/// another's bytes; `bytes` is the already-read payload, so the identity never
+/// re-decodes a large file.
+pub(crate) fn content_identity_hash(mime: &str, name: &str, bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    mime.hash(&mut hasher);
+    name.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// The cap on the process-local File Message once-guard (ADR-0076, #649): the
 /// guard is in-memory only and a cola restart may resend, so an entry past this
 /// bound is evicted oldest-first — an evicted entry may resend, which the ADR
@@ -1021,6 +1071,10 @@ pub(crate) struct CardsHandle {
     /// so a later poll never sends a second one. Single-flight and bounded (see
     /// [`FileMessageSends`]).
     pub(crate) file_messages_sent: FileMessageSends,
+    /// The **File Viewer** whole-bytes lane's per-network-call bound (ms,
+    /// ADR-0083 §5), shared with the aggregate so a test can shrink it.
+    /// [`Self::viewer_transfer_timeout_ms`] is the accessor.
+    viewer_transfer_timeout_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl CardsHandle {
@@ -1037,6 +1091,7 @@ impl CardsHandle {
         file_images: FileImageCache,
         file_uploads: FileUploadCache,
         file_messages_sent: FileMessageSends,
+        viewer_transfer_timeout_ms: Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
         Self {
             cards,
@@ -1050,7 +1105,15 @@ impl CardsHandle {
             file_images,
             file_uploads,
             file_messages_sent,
+            viewer_transfer_timeout_ms,
         }
+    }
+
+    /// The File Viewer whole-bytes lane's per-network-call bound (ms, ADR-0083
+    /// §5).
+    pub(crate) fn viewer_transfer_timeout_ms(&self) -> u64 {
+        self.viewer_transfer_timeout_ms
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The preserved-ending card-view read's bound (ms, spec #571 review).
