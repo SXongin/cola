@@ -1715,10 +1715,15 @@ mod tests {
             .iter()
             .find(|b| b["text"]["content"] == "📂 所在目录")
             .unwrap_or_else(|| panic!("所在目录 button missing on {text}"));
+        let expected_parent = std::path::Path::new("/tmp/proj/src/main.rs")
+            .parent()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
         assert_eq!(out["value"]["action"], "dir");
         assert_eq!(out["value"]["view"], "browse");
         assert_eq!(out["value"]["op"], "go");
-        assert_eq!(out["value"]["dir"], "/tmp/proj/src");
+        assert_eq!(out["value"]["dir"], expected_parent);
         assert_eq!(out["value"]["chat_id"], "chat_1");
         assert_eq!(out["value"]["thread_id"], "chat_1");
     }
