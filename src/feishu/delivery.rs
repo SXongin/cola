@@ -1702,6 +1702,15 @@ impl Platform for CardDelivery {
         result
     }
 
+    async fn edit_message(
+        &self,
+        message_id: &str,
+        msg_type: &str,
+        content: &Value,
+    ) -> Result<crate::feishu::MessageEditOutcome> {
+        self.inner.edit_message(message_id, msg_type, content).await
+    }
+
     async fn submit_ordered(&self, submission: KeyedSubmission<'_>) -> CardWriteTicket {
         let (ticket, ticket_rx) = oneshot::channel();
         let message_id = submission.message_id.to_string();

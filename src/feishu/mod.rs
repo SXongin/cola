@@ -53,6 +53,22 @@ pub trait Platform: Send + Sync {
 
     async fn update_message(&self, message_id: &str, card: &Value) -> Result<()>;
 
+    /// Edit an existing non-card message (e.g. a Rich Text Message) with the
+    /// platform's message-edit API. `Refused` means the platform definitively
+    /// rejected the edit; transport/decoding failures remain `Err` because the
+    /// edit may have landed ambiguously.
+    async fn edit_message(
+        &self,
+        message_id: &str,
+        msg_type: &str,
+        content: &Value,
+    ) -> Result<MessageEditOutcome> {
+        let _ = (message_id, msg_type, content);
+        Err(crate::error::BridgeError::Feishu(
+            "message editing is unsupported by this Platform".into(),
+        ))
+    }
+
     /// Submit a **keyed submission** for ordered delivery (spec #571): an
     /// already-composed payload carrying the **chain generation** its writer
     /// decided under and the intent naming the logical write, with an optional
@@ -346,6 +362,13 @@ pub trait Platform: Send + Sync {
     }
 }
 
+/// Whether an in-place edit was accepted by the messaging platform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageEditOutcome {
+    Updated,
+    Refused,
+}
+
 #[async_trait]
 impl Platform for Client {
     async fn get_ws_endpoint(&self) -> Result<String> {
@@ -362,6 +385,15 @@ impl Platform for Client {
 
     async fn update_message(&self, message_id: &str, card: &Value) -> Result<()> {
         Client::update_message(self, message_id, card).await
+    }
+
+    async fn edit_message(
+        &self,
+        message_id: &str,
+        msg_type: &str,
+        content: &Value,
+    ) -> Result<MessageEditOutcome> {
+        Client::edit_message(self, message_id, msg_type, content).await
     }
 
     async fn reply_text(&self, message_id: &str, text: &str) -> Result<String> {

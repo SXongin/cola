@@ -413,6 +413,14 @@ pub(crate) struct OverflowPreview<'a> {
     pub(crate) text: &'a str,
 }
 
+/// Per-open lane options: a normal open has no carried Rich Text Message, while
+/// a re-read passes its stateless payload id here.
+#[derive(Clone, Copy)]
+pub(crate) struct ViewerLaneOptions<'a> {
+    pub(crate) timeout_ms: u64,
+    pub(crate) existing_rich_message_id: Option<&'a str>,
+}
+
 /// The structural-overflow lane a viewer opens with (ADR-0083 §5, #741): a
 /// preview the card structurally cannot hold — past the element budget, past
 /// the table row cap — goes out as exactly ONE Rich Text Message
@@ -441,31 +449,46 @@ pub(crate) async fn open_overflow_lane(
     reply_target: &str,
     preview: &OverflowPreview<'_>,
     timeout_ms: u64,
+    existing_rich_message_id: Option<&str>,
 ) -> Option<ViewerFileLane> {
-    detect_structural_overflow(preview.kind, preview.ext, preview.text)?;
+    let structural_overflow = detect_structural_overflow(preview.kind, preview.ext, preview.text).is_some();
+    if !structural_overflow && existing_rich_message_id.is_none() {
+        return None;
+    }
     if let Some(md) = rich_post_md(preview.kind, preview.ext, preview.text) {
         let content = rich_post_content(&md);
-        let delivery = match crate::bridge::bounded_call(
-            "viewer rich-text message",
+        let (delivery, rich_message_id) = refresh_rich_message(
+            platform,
+            reply_target,
+            &content,
+            existing_rich_message_id,
             timeout_ms,
-            platform.reply_message(reply_target, "post", &content),
         )
-        .await
-        {
-            Some(Ok(_)) => FileDelivery::SentAsRichText,
-            Some(Err(error)) => {
-                tracing::warn!("viewer Rich Text Message send failed: {error}");
-                FileDelivery::Undelivered
-            }
-            None => FileDelivery::Undelivered,
-        };
+        .await;
         return Some(ViewerFileLane {
             mime: preview.mime.to_string(),
             name: preview.name.to_string(),
             size: preview.size,
             delivery,
+            rich_message_id,
         });
     }
+    let rich_message_id = if existing_rich_message_id.is_some() {
+        // The updated body no longer fits Feishu's post budget. Retire the
+        // stale copy with a bounded notice before the File Message takes over.
+        let notice = rich_post_content("文件内容已更新；最新内容以文件消息为准。");
+        refresh_rich_message(
+            platform,
+            reply_target,
+            &notice,
+            existing_rich_message_id,
+            timeout_ms,
+        )
+        .await
+        .1
+    } else {
+        None
+    };
     // Past the post cap: the File Message lane owns the bytes. The preview
     // text IS the file's bytes (a text preview holds them decoded), so they
     // travel with no re-read, through the same cached upload + single send as
@@ -485,7 +508,57 @@ pub(crate) async fn open_overflow_lane(
         name: preview.name.to_string(),
         size: preview.size,
         delivery,
+        rich_message_id,
     })
+}
+
+/// Edit the carried message when possible. Only a definite platform refusal
+/// triggers a fresh send; a transport error is ambiguous and never duplicated.
+async fn refresh_rich_message(
+    platform: &Arc<dyn Platform>,
+    reply_target: &str,
+    content: &serde_json::Value,
+    existing_message_id: Option<&str>,
+    timeout_ms: u64,
+) -> (FileDelivery, Option<String>) {
+    if let Some(message_id) = existing_message_id {
+        match crate::bridge::bounded_call(
+            "viewer Rich Text Message edit",
+            timeout_ms,
+            platform.edit_message(message_id, "post", content),
+        )
+        .await
+        {
+            Some(Ok(crate::feishu::MessageEditOutcome::Updated)) => {
+                return (FileDelivery::SentAsRichText, Some(message_id.to_string()));
+            }
+            Some(Ok(crate::feishu::MessageEditOutcome::Refused)) => {
+                tracing::info!(
+                    "viewer Rich Text Message edit refused for {message_id}; sending a fresh copy"
+                );
+            }
+            Some(Err(error)) => {
+                tracing::warn!("viewer Rich Text Message edit failed: {error}");
+                return (FileDelivery::Undelivered, Some(message_id.to_string()));
+            }
+            None => return (FileDelivery::Undelivered, Some(message_id.to_string())),
+        }
+    }
+
+    match crate::bridge::bounded_call(
+        "viewer Rich Text Message send",
+        timeout_ms,
+        platform.reply_message(reply_target, "post", content),
+    )
+    .await
+    {
+        Some(Ok((message_id, _))) => (FileDelivery::SentAsRichText, Some(message_id)),
+        Some(Err(error)) => {
+            tracing::warn!("viewer Rich Text Message send failed: {error}");
+            (FileDelivery::Undelivered, existing_message_id.map(str::to_string))
+        }
+        None => (FileDelivery::Undelivered, existing_message_id.map(str::to_string)),
+    }
 }
 
 /// The lanes a viewer opens with (ADR-0083 §5): the whole-bytes lane first
@@ -510,16 +583,33 @@ pub(crate) async fn open_viewer_lanes(
     name: &str,
     ext: Option<&str>,
     classified: &mut Classified,
-    timeout_ms: u64,
+    options: ViewerLaneOptions<'_>,
 ) -> (Option<ViewerFileLane>, bool) {
+    let ViewerLaneOptions {
+        timeout_ms,
+        existing_rich_message_id,
+    } = options;
+    let (kind, preview_text) = match classified.kind {
+        ClassifiedKind::Text => (
+            crate::feishu::card::viewer::kind_for_extension(ext),
+            classified.text.as_deref().unwrap_or(""),
+        ),
+        _ => (crate::feishu::card::viewer::ViewerKind::Binary, ""),
+    };
+    let structural_overflow =
+        crate::feishu::card::viewer::detect_structural_overflow(kind, ext, preview_text).is_some();
     let lane = match open_lane(platform, cards, reply_target, name, classified, timeout_ms).await {
-        Some(lane) => Some(lane),
+        Some(mut lane) => {
+            if let Some(message_id) = existing_rich_message_id {
+                let notice = rich_post_content("文件内容已更新；最新内容以文件查看卡或文件消息为准。");
+                lane.rich_message_id =
+                    refresh_rich_message(platform, reply_target, &notice, Some(message_id), timeout_ms)
+                        .await
+                        .1;
+            }
+            Some(lane)
+        }
         None => {
-            let kind = match classified.kind {
-                ClassifiedKind::Text => crate::feishu::card::viewer::kind_for_extension(ext),
-                // A byte lane already decided these above.
-                _ => crate::feishu::card::viewer::ViewerKind::Binary,
-            };
             let preview = OverflowPreview {
                 name,
                 mime: &classified.mime,
@@ -528,7 +618,15 @@ pub(crate) async fn open_viewer_lanes(
                 ext,
                 text: classified.text.as_deref().unwrap_or(""),
             };
-            open_overflow_lane(platform, cards, reply_target, &preview, timeout_ms).await
+            open_overflow_lane(
+                platform,
+                cards,
+                reply_target,
+                &preview,
+                timeout_ms,
+                existing_rich_message_id,
+            )
+            .await
         }
     };
     // `overflowed` means LANDED — a delivered preview leaves the card — never
@@ -537,7 +635,7 @@ pub(crate) async fn open_viewer_lanes(
         matches!(
             lane.delivery,
             FileDelivery::SentAsRichText | FileDelivery::SentAsFile
-        )
+        ) && (classified.kind != ClassifiedKind::Text || structural_overflow)
     });
     (lane, overflowed)
 }
@@ -566,6 +664,7 @@ pub(crate) async fn open_lane(
             name: name.to_string(),
             size,
             delivery: FileDelivery::Undelivered,
+            rich_message_id: None,
         });
     };
     let content = FileContent::from_bytes(&mime, name, bytes);
@@ -583,6 +682,7 @@ pub(crate) async fn open_lane(
         name: name.to_string(),
         size,
         delivery,
+        rich_message_id: None,
     })
 }
 
@@ -637,6 +737,7 @@ pub(crate) async fn send_as_file(
         name: name.to_string(),
         size,
         delivery,
+        rich_message_id: None,
     }
 }
 
