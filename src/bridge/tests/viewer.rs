@@ -1701,3 +1701,103 @@ async fn flipping_a_viewer_page_keeps_the_way_back_to_the_listing() {
         card_text(&page2)
     );
 }
+
+/// A Tool Panel's 「📂 打开」 click (ADR-0083 §8, #743): the payload carries the
+/// Session, not the Chat — the click resolves the Session's Chat/Topic from
+/// the SessionStore and its (possibly relative) structured path against the
+/// Session's directory, then opens the File Viewer in place. No `op` rides
+/// along, so the click routes to the opener, never to #739's transfer.
+#[tokio::test]
+async fn tool_panel_open_button_opens_the_viewer_through_the_session() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let body = "# report\n\nwritten by the agent\n";
+    std::fs::write(proj.path().join("report.md"), body).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+
+    // The payload the button carries: the Session plus the call's structured
+    // path, spelled relative exactly as the tool recorded it.
+    let payload = crate::feishu::card::session::tool_file_value("ses_seed", "report.md");
+    assert!(
+        payload.get("op").is_none(),
+        "the button never transfers: {payload}"
+    );
+    let result = app.host_action(payload).await.expect("the click is handled");
+    let opened = result.card.expect("the viewer opens in place");
+    assert_eq!(card_header(&opened), "📄 report.md", "the viewer names the file");
+    let text = card_text(&opened);
+    assert!(
+        text.contains(&canonical(&proj.path().join("report.md"))),
+        "a relative tool path resolves against the Session's directory: {text}"
+    );
+    assert!(
+        text.contains("written by the agent"),
+        "the file's own bytes: {text}"
+    );
+    assert!(
+        !text.contains("返回目录"),
+        "no listing to return to, so no return control: {text}"
+    );
+    let buttons = card_buttons(&opened);
+    assert!(
+        buttons.iter().any(|b| b["text"]["content"] == "📂 所在目录"),
+        "the viewer opens with working controls: {opened}"
+    );
+    assert!(
+        platform.replied_cards().await.is_empty(),
+        "the ack patches in place"
+    );
+}
+
+/// A Tool Panel's 「📂 打开」 for an absolute path outside the Session's
+/// directory still opens (the Path Scope passes absolute paths through,
+/// ADR-0083 §4).
+#[tokio::test]
+async fn tool_panel_open_button_passes_absolute_paths_through() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    std::fs::write(elsewhere.path().join("notes.md"), "elsewhere\n").unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+
+    let absolute = elsewhere.path().join("notes.md").to_string_lossy().to_string();
+    let payload = crate::feishu::card::session::tool_file_value("ses_seed", &absolute);
+    let result = app.host_action(payload).await.expect("the click is handled");
+    let opened = result.card.expect("the viewer opens in place");
+    assert_eq!(card_header(&opened), "📄 notes.md");
+    assert!(
+        card_text(&opened).contains(&canonical(&elsewhere.path().join("notes.md"))),
+        "the absolute path opens as-is: {opened}"
+    );
+}
+
+/// A Tool Panel's 「📂 打开」 for a Session the store no longer knows answers
+/// honestly (a Toast, the card left standing) rather than a viewer whose
+/// controls route nowhere (#743: no broken buttons).
+#[tokio::test]
+async fn tool_panel_open_button_with_an_unknown_session_answers_honestly() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+
+    let payload = crate::feishu::card::session::tool_file_value("ses_gone", "report.md");
+    let result = app.host_action(payload).await.expect("the click is handled");
+    assert!(result.card.is_none(), "no viewer with dead controls");
+    let toast = result.toast.expect("an honest Toast");
+    assert!(toast.contains("report.md"), "the Toast names the path: {toast}");
+}
