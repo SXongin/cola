@@ -300,6 +300,7 @@ dependencies = [
  "futures-util",
  "indexmap",
  "infer",
+ "libc",
  "reqwest",
  "semver",
  "serde",

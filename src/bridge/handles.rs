@@ -1075,6 +1075,9 @@ pub(crate) struct CardsHandle {
     /// ADR-0083 §5), shared with the aggregate so a test can shrink it.
     /// [`Self::viewer_transfer_timeout_ms`] is the accessor.
     viewer_transfer_timeout_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Four bounded blocking slots shared by the File Viewer's command and
+    /// callback paths on this bridge instance.
+    pub(crate) viewer_fs_read_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl CardsHandle {
@@ -1092,6 +1095,7 @@ impl CardsHandle {
         file_uploads: FileUploadCache,
         file_messages_sent: FileMessageSends,
         viewer_transfer_timeout_ms: Arc<std::sync::atomic::AtomicU64>,
+        viewer_fs_read_slots: Arc<tokio::sync::Semaphore>,
     ) -> Self {
         Self {
             cards,
@@ -1106,6 +1110,7 @@ impl CardsHandle {
             file_uploads,
             file_messages_sent,
             viewer_transfer_timeout_ms,
+            viewer_fs_read_slots,
         }
     }
 

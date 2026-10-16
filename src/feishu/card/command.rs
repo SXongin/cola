@@ -400,11 +400,18 @@ pub(crate) async fn send_cat_card(
     // the default — so a conversation with no session yet still resolves
     // against its current project.
     let session_dir = handles.current_project_directory(thread_key).await;
-    let resolved = crate::bridge::viewer::resolve_cat_path(arg, &session_dir);
-    match crate::bridge::viewer::open_cat_path(&resolved) {
-        // `/cat <directory>` answers the Directory Browser there rather than
-        // erroring: `/cat` always means "show me this path" (ADR-0083 §2).
-        crate::bridge::viewer::CatOpen::Directory(dir) => {
+    let timeout = handles.flow.cards.viewer_transfer_timeout_ms();
+    let read = crate::bridge::handler::read_cat_path_bounded(
+        arg.to_string(),
+        session_dir,
+        timeout,
+        handles.flow.cards.viewer_fs_read_slots.clone(),
+    )
+    .await;
+    match read {
+        Ok(crate::bridge::handler::CatPathRead::Directory(dir)) => {
+            // `/cat <directory>` answers the Directory Browser there rather
+            // than erroring: `/cat` always means "show me this path".
             let dir = dir.to_string_lossy().to_string();
             let card = crate::bridge::handler::build_dir_browse_card_for(
                 &handles.flow.sessions,
@@ -419,25 +426,17 @@ pub(crate) async fn send_cat_card(
             .await;
             platform.reply_card(message_id, &card).await?;
         }
-        crate::bridge::viewer::CatOpen::File { path, size } => {
+        Ok(crate::bridge::handler::CatPathRead::File { path, mut classified }) => {
             // Classify by CONTENT (ADR-0083 §6) and deliver the whole-bytes lane
             // the file takes (ADR-0083 §5): an image embeds, a binary (or a text
             // past the preview cap) goes out as one File Message under this
-            // command's own message. `classify` reports an unreadable file's own
-            // cause instead.
-            let mut classified = match crate::bridge::viewer::classify(&path, size) {
-                Ok(classified) => classified,
-                Err(failure) => {
-                    platform.reply_text(message_id, &failure.line(&path)).await?;
-                    return Ok(());
-                }
-            };
+            // command's own message. The bounded read reports an unreadable
+            // file's own cause instead.
             let name = file_display_name(&path);
             // The byte lanes first (#739), then #741's structural-overflow
             // lane for a text preview the card cannot hold — one shared
             // helper, so `/cat` and a file-row/tool-open click cannot
             // disagree about where a preview went.
-            let timeout = handles.flow.cards.viewer_transfer_timeout_ms();
             let ext = path.extension().and_then(|e| e.to_str());
             let (lane, overflowed) = crate::bridge::viewer::open_viewer_lanes(
                 platform,
@@ -455,8 +454,19 @@ pub(crate) async fn send_cat_card(
             let card = build_viewer_for_classified(thread_key, &path, &classified, lane, None, 1, overflowed);
             platform.reply_card(message_id, &card).await?;
         }
-        crate::bridge::viewer::CatOpen::Failed(failure) => {
-            platform.reply_text(message_id, &failure.line(&resolved)).await?;
+        Ok(crate::bridge::handler::CatPathRead::Failure(line)) => {
+            platform.reply_text(message_id, &line).await?;
+        }
+        Err(
+            crate::bridge::handler::ViewerFsReadError::Busy(line)
+            | crate::bridge::handler::ViewerFsReadError::Timeout(line),
+        ) => {
+            platform.reply_text(message_id, &line).await?;
+        }
+        Err(crate::bridge::handler::ViewerFsReadError::Worker(error)) => {
+            platform
+                .reply_text(message_id, &format!("⚠️ 无法读取文件：{error}"))
+                .await?;
         }
     }
     Ok(())

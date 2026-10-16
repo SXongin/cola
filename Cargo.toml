@@ -65,6 +65,7 @@ tempfile = "3"
 # (ADR-0083 §6): image and known-binary types are decided by the bytes, never by
 # the file name.
 infer = "0.22"
+libc = "0.2"
 
 [dev-dependencies]
 # `start_paused` for timeout tests without wall-clock waits (`full` does not

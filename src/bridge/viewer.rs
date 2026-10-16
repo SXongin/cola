@@ -54,6 +54,8 @@ const SNIFF_BYTES: usize = 8192;
 /// [`crate::bridge::core::SharedCore`] so a test can shrink it and observe a
 /// timeout.
 pub(crate) const VIEWER_TRANSFER_TIMEOUT_MS: u64 = 60_000;
+/// Maximum simultaneous filesystem operations for one Bridge instance's viewer.
+pub(crate) const MAX_CONCURRENT_VIEWER_FS_READS: usize = 4;
 
 /// Resolve a user-supplied viewer path on the **Path Scope** (ADR-0083 §4):
 /// `~` expands against home, a relative path joins `session_dir`, an absolute
@@ -1066,7 +1068,7 @@ enum BoundedRead {
 /// reported past-cap rather than delivered as a truncated prefix (finding #739
 /// §1, round 2). `Whole(bytes)` is the whole file, at most `limit` bytes.
 fn read_bounded(path: &Path, limit: u64) -> Result<BoundedRead, CatFailure> {
-    let file = std::fs::File::open(path).map_err(|e| CatFailure::Unreadable(e.to_string()))?;
+    let file = open_viewer_file(path)?;
     let mut bytes = Vec::new();
     file.take(limit + 1)
         .read_to_end(&mut bytes)
@@ -1079,12 +1081,35 @@ fn read_bounded(path: &Path, limit: u64) -> Result<BoundedRead, CatFailure> {
 
 /// Read at most `n` bytes — the bounded header [`classify`] sniffs.
 fn read_prefix(path: &Path, n: usize) -> Result<Vec<u8>, CatFailure> {
-    let file = std::fs::File::open(path).map_err(|e| CatFailure::Unreadable(e.to_string()))?;
+    let file = open_viewer_file(path)?;
     let mut bytes = Vec::with_capacity(n);
     file.take(n as u64)
         .read_to_end(&mut bytes)
         .map_err(|e| CatFailure::Unreadable(e.to_string()))?;
     Ok(bytes)
+}
+
+/// Open only regular files. On Unix, `O_NONBLOCK` makes a path replaced with a
+/// FIFO/device after stat fail promptly instead of pinning a blocking worker;
+/// it has no effect on ordinary regular-file reads.
+fn open_viewer_file(path: &Path) -> Result<std::fs::File, CatFailure> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .map_err(|error| CatFailure::Unreadable(error.to_string()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| CatFailure::Unreadable(error.to_string()))?;
+    if !metadata.file_type().is_file() {
+        return Err(CatFailure::Unreadable("not a regular file".to_string()));
+    }
+    Ok(file)
 }
 
 #[cfg(test)]
