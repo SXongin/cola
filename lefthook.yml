@@ -3,7 +3,8 @@
 #
 # Pre-commit mirrors CI (fmt + clippy) but only fires when staged files touch
 # Rust, so docs/.scratch-only commits stay fast. commit-msg enforces
-# Conventional Commits. pre-push runs a dependency audit.
+# Conventional Commits. pre-push runs a dependency audit. post-checkout keeps a
+# linked worktree's CodeGraph index local (see AGENTS.md pitfall 15).
 # See AGENTS.md for details.
 
 pre-commit:
@@ -25,3 +26,24 @@ pre-push:
   commands:
     audit:
       run: cargo xtask audit
+
+# A linked worktree has no `.codegraph/` of its own (it is gitignored and
+# machine-local), so CodeGraph's up-walk either finds nothing or — for a
+# worktree nested inside the repo — reaches the main checkout's index and serves
+# main's source. Index each worktree on its first checkout, then just sync.
+# Scoped to linked worktrees via `.git` being a file: the main checkout's index
+# stays the user's own call. Every failure is reported, never propagated, so a
+# broken CodeGraph cannot fail a checkout. The job is configured by the checkout
+# it runs in, so a worktree created before it landed needs one manual
+# `codegraph init -y .` (AGENTS.md pitfall 15).
+post-checkout:
+  commands:
+    codegraph:
+      run: |
+        command -v codegraph >/dev/null 2>&1 || exit 0
+        [ -f .git ] || exit 0
+        if [ -f .codegraph/codegraph.db ]; then
+          codegraph sync -q . || echo "codegraph: sync failed; the worktree index may be stale" >&2
+        else
+          codegraph init -y . || echo "codegraph: init failed; CodeGraph stays off in this worktree" >&2
+        fi
