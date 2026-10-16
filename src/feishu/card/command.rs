@@ -433,52 +433,22 @@ pub(crate) async fn send_cat_card(
                 }
             };
             let name = file_display_name(&path);
-            // The byte lanes first (#739); a text preview that fits no
-            // structural limit takes none — and a preview the card
-            // structurally cannot hold takes the Rich Text Message lane (#741),
-            // or the File Message lane past the post cap.
+            // The byte lanes first (#739), then #741's structural-overflow
+            // lane for a text preview the card cannot hold — one shared
+            // helper, so `/cat` and a file-row/tool-open click cannot
+            // disagree about where a preview went.
             let timeout = handles.flow.cards.viewer_transfer_timeout_ms();
-            let mut overflowed = false;
-            let lane = match crate::bridge::viewer::open_lane(
+            let ext = path.extension().and_then(|e| e.to_str());
+            let (lane, overflowed) = crate::bridge::viewer::open_viewer_lanes(
                 platform,
                 &handles.flow.cards,
                 message_id,
                 &name,
+                ext,
                 &mut classified,
                 timeout,
             )
-            .await
-            {
-                Some(lane) => Some(lane),
-                None => {
-                    let ext = path.extension().and_then(|e| e.to_str());
-                    let kind = match classified.kind {
-                        crate::bridge::viewer::ClassifiedKind::Text => {
-                            crate::feishu::card::viewer::kind_for_extension(ext)
-                        }
-                        // A byte lane already decided these above.
-                        _ => crate::feishu::card::viewer::ViewerKind::Binary,
-                    };
-                    let preview = crate::bridge::viewer::OverflowPreview {
-                        name: &name,
-                        mime: &classified.mime,
-                        size: classified.size,
-                        kind,
-                        ext,
-                        text: classified.text.as_deref().unwrap_or(""),
-                    };
-                    let lane = crate::bridge::viewer::open_overflow_lane(
-                        platform,
-                        &handles.flow.cards,
-                        message_id,
-                        &preview,
-                        timeout,
-                    )
-                    .await;
-                    overflowed = lane.is_some();
-                    lane
-                }
-            };
+            .await;
             let card = build_viewer_for_classified(thread_key, &path, &classified, lane, None, 1, overflowed);
             platform.reply_card(message_id, &card).await?;
         }
@@ -501,10 +471,12 @@ pub(crate) fn file_display_name(path: &std::path::Path) -> String {
 /// (ADR-0083 §3, §5). Shared by `/cat` and the 「发为文件」 transfer — which
 /// PATCHes the card it was clicked on with the outcome — so both name the same
 /// file the same way and render the same lane. `page` is the 1-based page of
-/// the line-windowed text preview (#740). `overflowed` is #741's lane: the
-/// preview went out as its own Rich Text (or File) Message, so the card
-/// carries no preview and no truncation note — naming, the tracking line and
-/// the buttons.
+/// the line-windowed text preview (#740). `overflowed` is #741's LANDED lane:
+/// the preview went out as its own Rich Text (or File) Message and landed, so
+/// the card carries no preview, no truncation note and no 「发为文件」 —
+/// naming, the tracking line and the directory buttons. `false` whenever the
+/// lane did not land (a fitting preview, or a failed send that keeps its
+/// preview and its rescue button).
 pub(crate) fn build_viewer_for_classified(
     thread_key: &ThreadKey,
     path: &std::path::Path,

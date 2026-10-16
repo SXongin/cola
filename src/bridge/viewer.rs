@@ -415,21 +415,26 @@ pub(crate) struct OverflowPreview<'a> {
 
 /// The structural-overflow lane a viewer opens with (ADR-0083 §5, #741): a
 /// preview the card structurally cannot hold — past the element budget, past
-/// five tables, past the 49-row table cap — goes out as exactly ONE Rich Text
-/// Message (`msg_type: "post"` carrying the `md` tag) under `reply_target`,
-/// reusing the Platform's existing generic reply path (no new send method).
+/// the table row cap — goes out as exactly ONE Rich Text Message
+/// (`msg_type: "post"` carrying the `md` tag) under `reply_target`, reusing
+/// the Platform's existing generic reply path (no new send method).
 /// The lane is chosen from the RENDERED structure, never from byte size, and
-/// is itself bounded by the same 30 KB body cap as a card: content whose
-/// rich-text body would exceed that goes to the File Message lane instead
-/// (the case 「发为文件」 exists for), with the card saying where it went.
+/// is itself bounded by the documented 30 KB message-body cap (the card limit
+/// this lane sizes itself by — asserted from the documented limit, never
+/// measured against a live `post` send here): content whose rich-text body
+/// would exceed that goes to the File Message lane instead (the case
+/// 「发为文件」 exists for), with the card saying where it went.
 /// `None` when the preview fits the card's structural limits — the card (and
 /// #740's line paging) owns those.
 ///
 /// The returned lane is the card's tracking line: `SentAsRichText` for the
 /// message, `SentAsFile` past the post cap, `Undelivered` when the send (or
-/// the fallback upload/send) failed. The caller builds the viewer with
-/// `overflowed` set, so the card carries no preview and no truncation note —
-/// naming, this tracking line and the buttons.
+/// the fallback upload/send) failed or timed out. The caller builds the
+/// viewer `overflowed` ONLY when the content landed (`SentAsRichText` /
+/// `SentAsFile`): on `Undelivered` the card keeps its truncated preview, its
+/// honest cut note and the 「发为文件」 rescue button — with this tracking
+/// line stating the content did not land — so a failed send never silently
+/// drops the content.
 pub(crate) async fn open_overflow_lane(
     platform: &Arc<dyn Platform>,
     cards: &CardsHandle,
@@ -481,6 +486,60 @@ pub(crate) async fn open_overflow_lane(
         size: preview.size,
         delivery,
     })
+}
+
+/// The lanes a viewer opens with (ADR-0083 §5): the whole-bytes lane first
+/// (#739) — an image embeds, a binary (or a text past the preview cap) goes
+/// out as one File Message — then, for a text preview the card structurally
+/// cannot hold, #741's overflow lane (the Rich Text Message, or the File
+/// Message lane past the post cap). Decided from the RENDERED structure,
+/// never from byte size; a preview that fits takes no lane here.
+///
+/// Returns the lane for the card's tracking line and whether the preview
+/// LANDED as its own message. The card renders `overflowed` (no preview, no
+/// cut note, no rescue delivery) only then: on a failed/timed-out send the
+/// lane is `Undelivered` and the card keeps its truncated preview, its cut
+/// note and the 「发为文件」 rescue, so nothing is silently dropped.
+/// Shared by `/cat` (which sends the card anew) and a file-row/tool-open
+/// click (which PATCHes the clicked card once the send lands), so the two
+/// entry points cannot disagree about where a preview went.
+pub(crate) async fn open_viewer_lanes(
+    platform: &Arc<dyn Platform>,
+    cards: &CardsHandle,
+    reply_target: &str,
+    name: &str,
+    ext: Option<&str>,
+    classified: &mut Classified,
+    timeout_ms: u64,
+) -> (Option<ViewerFileLane>, bool) {
+    let lane = match open_lane(platform, cards, reply_target, name, classified, timeout_ms).await {
+        Some(lane) => Some(lane),
+        None => {
+            let kind = match classified.kind {
+                ClassifiedKind::Text => crate::feishu::card::viewer::kind_for_extension(ext),
+                // A byte lane already decided these above.
+                _ => crate::feishu::card::viewer::ViewerKind::Binary,
+            };
+            let preview = OverflowPreview {
+                name,
+                mime: &classified.mime,
+                size: classified.size,
+                kind,
+                ext,
+                text: classified.text.as_deref().unwrap_or(""),
+            };
+            open_overflow_lane(platform, cards, reply_target, &preview, timeout_ms).await
+        }
+    };
+    // `overflowed` means LANDED — a delivered preview leaves the card — never
+    // merely lane-taken: a failed send keeps its preview and its rescue.
+    let overflowed = lane.as_ref().is_some_and(|lane| {
+        matches!(
+            lane.delivery,
+            FileDelivery::SentAsRichText | FileDelivery::SentAsFile
+        )
+    });
+    (lane, overflowed)
 }
 
 /// The whole-bytes lane a viewer opens with (ADR-0083 §5): an image within

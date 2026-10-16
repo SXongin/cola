@@ -1894,10 +1894,248 @@ async fn structural_overflow_goes_out_as_one_rich_text_message() {
         "the preview lives in the message, not on the card: {text}"
     );
     assert!(
+        !card_buttons(&card)
+            .iter()
+            .any(|b| b["text"]["content"] == "发为文件"),
+        "a landed preview offers no second delivery: {text}"
+    );
+}
+
+/// #741: a Rich Text Message send that FAILS drops nothing — the card keeps
+/// its truncated preview with the honest cut note and the 「发为文件」 rescue
+/// button, and the tracking line states the content did not land (never a
+/// claim to a lane that missed).
+#[tokio::test]
+async fn a_failed_rich_text_send_keeps_the_preview_and_the_rescue() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let csv = format!(
+        "name,age\n{}",
+        (0..60)
+            .map(|i| format!("r{i},{i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    std::fs::write(proj.path().join("people.csv"), &csv).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+
+    // The Rich Text Message send fails; the card reply still lands.
+    platform
+        .fail_send_message_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    send_command_in(
+        &app,
+        "/cat people.csv",
+        key.clone(),
+        "m_csv",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+
+    assert!(
+        rich_text_messages(&platform).await.is_empty(),
+        "the failed send posts no Rich Text Message"
+    );
+    assert!(
+        file_messages(&platform).await.is_empty(),
+        "and no File Message either: the lane missed, nothing went out"
+    );
+    let card = first_card(&platform).await;
+    let text = card_text(&card);
+    assert!(
+        text.contains("| r0 | 0 |") && text.contains("表格过长"),
+        "the truncated preview and its honest cut note stay: {text}"
+    );
+    assert!(
+        text.contains("未发送"),
+        "the tracking line states the content did not land: {text}"
+    );
+    assert!(!text.contains("富文本"), "no claim to a lane that missed: {text}");
+    assert!(
         card_buttons(&card)
             .iter()
             .any(|b| b["text"]["content"] == "发为文件"),
-        "the whole bytes stay one click away: {text}"
+        "the rescue button stays when nothing landed: {text}"
+    );
+}
+
+/// #741: a structurally-overflowing file opened from a browse file row takes
+/// the same lane as `/cat` — the click acks at once (a toast, no card), the
+/// Rich Text Message goes out under the clicked card off the callback path,
+/// and the clicked card is PATCHed with the viewer that says so. Content that
+/// fits stays on the synchronous in-place path (pinned by #742's own test).
+#[tokio::test]
+async fn a_row_open_of_an_overflowing_preview_sends_then_patches() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let csv = format!(
+        "name,age\n{}",
+        (0..60)
+            .map(|i| format!("r{i},{i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    std::fs::write(proj.path().join("people.csv"), &csv).unwrap();
+    let proj_dir = proj.path().to_string_lossy().to_string();
+    let file = proj.path().join("people.csv").to_string_lossy().to_string();
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj_dir)).await;
+
+    // Park the row's send: the click must still ack immediately, and the ack
+    // must carry no send work. The payload is what a browse file row carries,
+    // plus the clicked card the platform threads in — the send's reply target
+    // and the PATCH target.
+    let (_entered, release) = platform.pause("send_message", "msg_browse_card");
+    let result = app
+        .host_action(serde_json::json!({
+            "action": "file",
+            "path": file,
+            "chat_id": "chat_1",
+            "thread_id": "chat_1",
+            "dir": proj_dir,
+            "show_hidden": false,
+            "keyword": "",
+            "page": 1,
+            "open_message_id": "msg_browse_card",
+        }))
+        .await
+        .expect("the click acks");
+    assert!(result.card.is_none(), "the click does not rebuild inline");
+    assert!(result.toast.is_some(), "the click acknowledges with a toast");
+    assert!(
+        rich_text_messages(&platform).await.is_empty(),
+        "the click returned before the send ran"
+    );
+
+    // Release the send; the spawned lane lands and PATCHes the clicked card.
+    release.notify_one();
+    wait_for_card_update(
+        &platform,
+        "已发送为富文本消息",
+        CardUpdates::Latest,
+        |card| card_text(card).contains("已发送为富文本消息"),
+    )
+    .await;
+    let posts = rich_text_messages(&platform).await;
+    assert_eq!(posts.len(), 1, "exactly one Rich Text Message: {posts:?}");
+    match &posts[0] {
+        PlatformCall::SendMessageReply {
+            message_id,
+            msg_type,
+            content,
+        } => {
+            assert_eq!(
+                message_id, "msg_browse_card",
+                "the reply targets the clicked card"
+            );
+            assert_eq!(msg_type, "post");
+            let md = content["zh_cn"]["content"][0][0]["text"]
+                .as_str()
+                .expect("the md text");
+            assert!(md.contains("| r59 | 59 |"), "every row, none cut: {md}");
+        }
+        other => panic!("expected a post reply, got {other:?}"),
+    }
+    assert!(
+        file_messages(&platform).await.is_empty(),
+        "no File Message: the post cap holds this table"
+    );
+    let patch = patches_to(&platform, "msg_browse_card").await;
+    let updated = patch.last().expect("the clicked card was PATCHed");
+    let text = card_text(updated);
+    assert_eq!(card_header(updated), "📄 people.csv");
+    assert!(
+        text.contains("已发送为富文本消息"),
+        "the PATCHed card says where the content went: {text}"
+    );
+    assert!(
+        !text.contains("| r0 |"),
+        "the preview lives in the message, not on the card: {text}"
+    );
+    assert!(
+        !card_buttons(updated)
+            .iter()
+            .any(|b| b["text"]["content"] == "发为文件"),
+        "a landed preview offers no second delivery: {text}"
+    );
+    assert!(
+        text.contains("← 返回目录"),
+        "the way back survives the PATCH: {text}"
+    );
+}
+
+/// #741: a structurally-overflowing file opened from a Tool Panel's
+/// 「📂 打开」 (#743) takes the same lane — the send goes out off the callback
+/// path and the clicked card is PATCHed with the landed viewer, which carries
+/// no listing to return to and no second delivery.
+#[tokio::test]
+async fn a_tool_open_of_an_overflowing_preview_sends_then_patches() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let csv = format!(
+        "name,age\n{}",
+        (0..60)
+            .map(|i| format!("r{i},{i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    std::fs::write(proj.path().join("people.csv"), &csv).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+
+    // The payload the button carries (the Session, never the Chat), plus the
+    // clicked card the platform threads in.
+    let mut payload = crate::feishu::card::session::tool_file_value("ses_seed", "people.csv");
+    payload["open_message_id"] = serde_json::json!("msg_turn_card");
+    let result = app.host_action(payload).await.expect("the click acks");
+    assert!(result.card.is_none(), "the click does not rebuild inline");
+    assert!(result.toast.is_some(), "the click acknowledges with a toast");
+
+    wait_for_card_update(
+        &platform,
+        "已发送为富文本消息",
+        CardUpdates::Latest,
+        |card| card_text(card).contains("已发送为富文本消息"),
+    )
+    .await;
+    let posts = rich_text_messages(&platform).await;
+    assert_eq!(posts.len(), 1, "exactly one Rich Text Message: {posts:?}");
+    match &posts[0] {
+        PlatformCall::SendMessageReply { message_id, .. } => {
+            assert_eq!(message_id, "msg_turn_card", "the reply targets the clicked card");
+        }
+        other => panic!("expected a post reply, got {other:?}"),
+    }
+    let patch = patches_to(&platform, "msg_turn_card").await;
+    let updated = patch.last().expect("the clicked card was PATCHed");
+    let text = card_text(updated);
+    assert_eq!(card_header(updated), "📄 people.csv");
+    assert!(
+        text.contains("已发送为富文本消息"),
+        "the PATCHed card says where the content went: {text}"
+    );
+    assert!(
+        !text.contains("返回目录"),
+        "no listing to return to, so no return control: {text}"
+    );
+    assert!(
+        !card_buttons(updated)
+            .iter()
+            .any(|b| b["text"]["content"] == "发为文件"),
+        "a landed preview offers no second delivery: {text}"
     );
 }
 
