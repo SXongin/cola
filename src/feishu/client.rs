@@ -546,6 +546,41 @@ impl Client {
         }
     }
 
+    /// Edit a non-card message in place (ADR-0083 §9). Feishu rejects an edit
+    /// after its per-message edit budget is exhausted; that business refusal is
+    /// distinct from an ambiguous transport error so callers can safely send a
+    /// fresh copy only for the former.
+    pub async fn edit_message(
+        &self,
+        message_id: &str,
+        msg_type: &str,
+        content: &serde_json::Value,
+    ) -> crate::error::Result<crate::feishu::MessageEditOutcome> {
+        let token = self.get_access_token().await?;
+        let body = serde_json::json!({
+            "msg_type": msg_type,
+            "content": content.to_string(),
+        });
+        let text = read_body_with_diag(
+            self.http
+                .put(self.endpoint(&format!("/open-apis/im/v1/messages/{message_id}")))
+                .bearer_auth(&token)
+                .json(&body)
+                .timeout(std::time::Duration::from_secs(10))
+                .send()
+                .await?,
+            "edit message",
+        )
+        .await?;
+        let resp: ApiResponse = parse_json(&text, "edit message response")?;
+        if resp.code != 0 {
+            tracing::warn!("Feishu refused message edit {}: {}", resp.code, resp.msg);
+            Ok(crate::feishu::MessageEditOutcome::Refused)
+        } else {
+            Ok(crate::feishu::MessageEditOutcome::Updated)
+        }
+    }
+
     /// Set or clear a Chat/Topic's **Instant Reminder** (`time_sensitive`,
     /// ADR-0043). A group targets its own chat (`feed_cards/{chat_id}`); a bot
     /// p2p chat targets the fixed `bot_time_sentive` feed card.
@@ -1491,6 +1526,50 @@ mod tests {
         assert_eq!(body["receive_id"], "oc_123");
         assert_eq!(body["msg_type"], "interactive");
         assert_eq!(body["content"], card.to_string());
+    }
+
+    #[tokio::test]
+    async fn edit_message_uses_put_and_reports_success() {
+        let (server, client) = wire_client().await;
+        server.route(
+            "PUT",
+            "/open-apis/im/v1/messages/om_rich",
+            200,
+            r#"{"code":0,"msg":"ok"}"#,
+        );
+        let content = serde_json::json!({"zh_cn":{"content":[[{"tag":"md","text":"updated"}]]}});
+
+        assert_eq!(
+            client.edit_message("om_rich", "post", &content).await.unwrap(),
+            crate::feishu::MessageEditOutcome::Updated
+        );
+        let request = last_request(&server);
+        assert_eq!(request.method, "PUT");
+        assert_eq!(request.path, "/open-apis/im/v1/messages/om_rich");
+        assert_eq!(request.header("authorization"), Some("Bearer t-abc"));
+        let body = body_json(&request);
+        assert_eq!(body["msg_type"], "post");
+        assert_eq!(body["content"], content.to_string());
+    }
+
+    #[tokio::test]
+    async fn edit_message_exposes_a_business_refusal_as_a_distinct_outcome() {
+        let (server, client) = wire_client().await;
+        server.route(
+            "PUT",
+            "/open-apis/im/v1/messages/om_rich",
+            200,
+            r#"{"code":230020,"msg":"message edit limit reached"}"#,
+        );
+        let content = serde_json::json!({"zh_cn":{"content":[[{"tag":"md","text":"updated"}]]}});
+
+        assert_eq!(
+            client.edit_message("om_rich", "post", &content).await.unwrap(),
+            crate::feishu::MessageEditOutcome::Refused
+        );
+        let request = last_request(&server);
+        assert_eq!(request.method, "PUT");
+        assert_eq!(request.path, "/open-apis/im/v1/messages/om_rich");
     }
 
     #[tokio::test]

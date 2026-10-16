@@ -446,7 +446,10 @@ pub(crate) async fn send_cat_card(
                 &name,
                 ext,
                 &mut classified,
-                timeout,
+                crate::bridge::viewer::ViewerLaneOptions {
+                    timeout_ms: timeout,
+                    existing_rich_message_id: None,
+                },
             )
             .await;
             let card = build_viewer_for_classified(thread_key, &path, &classified, lane, None, 1, overflowed);

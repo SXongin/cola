@@ -643,6 +643,17 @@ struct OwnedReturnTo {
     page: usize,
 }
 
+/// The stateless work captured by one File Viewer re-read click.
+struct ViewerReread {
+    thread_key: ThreadKey,
+    path: String,
+    card_message_id: String,
+    rich_message_id: Option<String>,
+    return_to: OwnedReturnTo,
+    page: usize,
+    classified: crate::bridge::viewer::Classified,
+}
+
 /// A viewer payload's viewer page (#740): the pager's TARGET page, or the page
 /// the 「发为文件」 transfer's card PATCH rebuilds — a missing page reads as
 /// the first window, and the builder clamps an out-of-range one.
@@ -2787,7 +2798,7 @@ impl App {
         // — strings only, because the shared pager holds string callback
         // fields — and the TARGET viewer page as `page` (a row's `page` is the
         // LISTING's, so the op is what tells the two shapes apart).
-        let (home_dir, home_keyword, home_hidden, home_page, page) = if op == "page" {
+        let (home_dir, home_keyword, home_hidden, home_page, page) = if matches!(op, "page" | "reread") {
             (
                 value
                     .get("return_dir")
@@ -2826,6 +2837,61 @@ impl App {
             keyword: &home_keyword,
             page: home_page,
         });
+        if op == "reread" {
+            let Some(open_message_id) = value
+                .get("open_message_id")
+                .and_then(|v| v.as_str())
+                .filter(|id| !id.is_empty())
+            else {
+                return Some(CardActionResult {
+                    card: None,
+                    toast: Some("无法重新读取：找不到文件查看卡。".to_string()),
+                });
+            };
+            let classified = match std::fs::metadata(&resolved) {
+                Ok(metadata) => crate::bridge::viewer::classify(&resolved, metadata.len()),
+                Err(error) => Err(crate::bridge::viewer::stat_failure(&error)),
+            };
+            let classified = match classified {
+                Ok(classified) => classified,
+                Err(failure) => {
+                    return Some(CardActionResult {
+                        card: None,
+                        toast: Some(failure.line(&resolved)),
+                    });
+                }
+            };
+            let app = Arc::clone(self);
+            let card_message_id = open_message_id.to_string();
+            let path = resolved.to_string_lossy().to_string();
+            let rich_message_id = value
+                .get("rich_message_id")
+                .and_then(|v| v.as_str())
+                .filter(|id| !id.is_empty())
+                .map(str::to_string);
+            let return_to = OwnedReturnTo {
+                dir: (!home_dir.is_empty()).then(|| home_dir.clone()),
+                keyword: home_keyword.clone(),
+                show_hidden: home_hidden,
+                page: home_page,
+            };
+            tokio::spawn(async move {
+                app.run_viewer_reread(ViewerReread {
+                    thread_key,
+                    path,
+                    card_message_id,
+                    rich_message_id,
+                    return_to,
+                    page,
+                    classified,
+                })
+                .await;
+            });
+            return Some(CardActionResult {
+                card: None,
+                toast: Some("正在重新读取…".to_string()),
+            });
+        }
         // #741: a click that OPENS a structurally-overflowing preview takes
         // the Rich Text Message lane — the send runs off the callback path
         // (spawned and bounded, the pattern #739's 「发为文件」 already uses)
@@ -2894,6 +2960,66 @@ impl App {
         }
     }
 
+    /// Finish a re-read after the callback has acknowledged. All platform I/O
+    /// is bounded and runs off the callback path; the local snapshot was read
+    /// under the viewer's cap before dispatch.
+    async fn run_viewer_reread(self: &Arc<Self>, reread: ViewerReread) {
+        let ViewerReread {
+            thread_key,
+            path,
+            card_message_id,
+            rich_message_id,
+            return_to,
+            page,
+            mut classified,
+        } = reread;
+        let timeout_ms = self
+            .viewer_transfer_timeout_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let browse_view = return_to.dir.as_deref().map(|dir| BrowseView {
+            dir,
+            show_hidden: return_to.show_hidden,
+            keyword: &return_to.keyword,
+            page: return_to.page,
+        });
+        let resolved = std::path::PathBuf::from(&path);
+        let name = crate::feishu::card::command::file_display_name(&resolved);
+        let ext = resolved.extension().and_then(|extension| extension.to_str());
+        let (lane, overflowed) = crate::bridge::viewer::open_viewer_lanes(
+            &self.feishu,
+            &self.cards_handle(),
+            &card_message_id,
+            &name,
+            ext,
+            &mut classified,
+            crate::bridge::viewer::ViewerLaneOptions {
+                timeout_ms,
+                existing_rich_message_id: rich_message_id.as_deref(),
+            },
+        )
+        .await;
+        let card = crate::feishu::card::command::build_viewer_for_classified(
+            &thread_key,
+            &resolved,
+            &classified,
+            lane,
+            browse_view,
+            page,
+            overflowed,
+        );
+        if !matches!(
+            crate::bridge::bounded_call(
+                "viewer re-read card update",
+                timeout_ms,
+                self.feishu.update_message(&card_message_id, &card),
+            )
+            .await,
+            Some(Ok(()))
+        ) {
+            tracing::warn!("viewer re-read card update for {card_message_id} did not land");
+        }
+    }
+
     /// Open a structurally-overflowing preview from a click, off the card
     /// callback (ADR-0083 §5, #741): the click already acked (a toast, no
     /// card), and this task sends the preview as its own message — the Rich
@@ -2942,7 +3068,10 @@ impl App {
                         &name,
                         ext,
                         &mut classified,
-                        timeout_ms,
+                        crate::bridge::viewer::ViewerLaneOptions {
+                            timeout_ms,
+                            existing_rich_message_id: None,
+                        },
                     )
                     .await;
                     crate::feishu::card::command::build_viewer_for_classified(

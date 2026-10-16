@@ -272,6 +272,12 @@ pub enum PlatformCall {
         message_id: String,
         card: serde_json::Value,
     },
+    EditMessage {
+        message_id: String,
+        msg_type: String,
+        content: serde_json::Value,
+        outcome: crate::feishu::MessageEditOutcome,
+    },
     ReplyText {
         message_id: String,
         text: String,
@@ -459,6 +465,10 @@ pub struct RecordingPlatform {
     /// The next N `reply_message` calls fail with a Feishu error (tests that a
     /// File Message failure degrades to `未发送` and never blocks the card).
     pub fail_send_message_count: std::sync::atomic::AtomicUsize,
+    /// The next N non-card message edits are definitively refused by Feishu.
+    pub refuse_edit_message_count: std::sync::atomic::AtomicUsize,
+    /// Scripted ids returned by `reply_message`; defaults to `msg_file`.
+    pub message_reply_ids: std::sync::Mutex<std::collections::VecDeque<String>>,
     /// file_key → the payload `download_file` serves. A present `Some` is
     /// served; a present `None` fails the download (the 下载失败 omission); an
     /// absent key serves a small PDF with the caller's name.
@@ -501,6 +511,8 @@ impl RecordingPlatform {
             file_key: std::sync::Mutex::new("file_test".into()),
             fail_upload_file_count: std::sync::atomic::AtomicUsize::new(0),
             fail_send_message_count: std::sync::atomic::AtomicUsize::new(0),
+            refuse_edit_message_count: std::sync::atomic::AtomicUsize::new(0),
+            message_reply_ids: std::sync::Mutex::new(std::collections::VecDeque::new()),
             downloaded_files: std::sync::Mutex::new(std::collections::HashMap::new()),
             download_file_calls: std::sync::Mutex::new(Vec::new()),
             download_file_delay: std::sync::Mutex::new(None),
@@ -518,6 +530,11 @@ impl RecordingPlatform {
     /// with none queued keeps the mock's default `msg_reply`.
     pub fn given_reply_id(&self, id: &str) {
         self.reply_ids.lock().unwrap().push_back(id.to_string());
+    }
+
+    /// Queue the id the next `reply_message` call returns.
+    pub fn given_message_reply_id(&self, id: &str) {
+        self.message_reply_ids.lock().unwrap().push_back(id.to_string());
     }
 
     /// Set the `image_key` every `upload_image` returns (ADR-0076).
@@ -909,6 +926,34 @@ impl feishu::Platform for RecordingPlatform {
         Ok(())
     }
 
+    async fn edit_message(
+        &self,
+        message_id: &str,
+        msg_type: &str,
+        content: &serde_json::Value,
+    ) -> crate::error::Result<crate::feishu::MessageEditOutcome> {
+        let refused = self
+            .refuse_edit_message_count
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0;
+        if refused {
+            self.refuse_edit_message_count
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        let outcome = if refused {
+            crate::feishu::MessageEditOutcome::Refused
+        } else {
+            crate::feishu::MessageEditOutcome::Updated
+        };
+        self.calls.lock().await.push(PlatformCall::EditMessage {
+            message_id: message_id.into(),
+            msg_type: msg_type.into(),
+            content: content.clone(),
+            outcome,
+        });
+        Ok(outcome)
+    }
+
     async fn reply_text(&self, message_id: &str, text: &str) -> crate::error::Result<String> {
         self.calls.lock().await.push(PlatformCall::ReplyText {
             message_id: message_id.into(),
@@ -1209,6 +1254,12 @@ impl feishu::Platform for RecordingPlatform {
                 "simulated send_message failure".into(),
             ));
         }
+        let reply_id = self
+            .message_reply_ids
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| "msg_file".into());
         // A test may park the send (the once-guard's single-flight tests):
         // signal entry, then hold until released, so a concurrent resolver is
         // forced to await it.
@@ -1220,7 +1271,7 @@ impl feishu::Platform for RecordingPlatform {
             msg_type: msg_type.into(),
             content: content.clone(),
         });
-        Ok(("msg_file".into(), Some("omt_file".into())))
+        Ok((reply_id, Some("omt_file".into())))
     }
 }
 

@@ -77,6 +77,9 @@ pub(crate) struct ViewerFileLane {
     pub(crate) name: String,
     pub(crate) size: u64,
     pub(crate) delivery: FileDelivery,
+    /// The Rich Text Message carrying a structural overflow, when one landed.
+    /// This id is carried by every viewer control instead of process-local state.
+    pub(crate) rich_message_id: Option<String>,
 }
 
 /// Why a preview cannot ride the card (ADR-0083 §5, #741): the RENDERED
@@ -885,13 +888,41 @@ fn lane_line(lane: &ViewerFileLane) -> String {
 /// click must upload, plus the browse listing's whole state so the card it
 /// PATCHes back to can still carry 「← 返回目录」.
 fn viewer_buttons(thread_key: &ThreadKey, view: &ViewerCard<'_>) -> serde_json::Value {
-    let mut columns = directory_columns(thread_key, view.path, view.return_to);
+    let mut columns = vec![button_column("🔄 重新读取", reread_value(thread_key, view))];
+    columns.extend(directory_columns(thread_key, view.path, view.return_to));
     // A landed overflow preview is already delivered: offering 「发为文件」
     // would deliver the same file a second time (#741, deliver-once).
     if !view.overflowed {
         columns.push(button_column("发为文件", transfer_value(thread_key, view)));
     }
     button_row(columns)
+}
+
+/// The stateless re-read action (ADR-0052, ADR-0083 §9): the resolved file,
+/// current viewer page, return-listing state and existing overflow message id.
+fn reread_value(thread_key: &ThreadKey, view: &ViewerCard<'_>) -> serde_json::Value {
+    let mut value = json!({
+        "action": "file",
+        "op": "reread",
+        "path": view.path,
+        "chat_id": thread_key.chat_id,
+        "thread_id": thread_key.thread_id,
+        "page": view.page,
+    });
+    if let Some(return_to) = view.return_to {
+        value["return_dir"] = json!(return_to.dir);
+        value["return_show_hidden"] = json!(return_to.show_hidden);
+        value["return_keyword"] = json!(return_to.keyword);
+        value["return_page"] = json!(return_to.page);
+    }
+    if let Some(message_id) = view
+        .lane
+        .as_ref()
+        .and_then(|lane| lane.rich_message_id.as_deref())
+    {
+        value["rich_message_id"] = json!(message_id);
+    }
+    value
 }
 
 /// The directory half of the viewer's button row (ADR-0083 §3): 「📂 所在目录」
@@ -1356,6 +1387,7 @@ mod tests {
             name: name.to_string(),
             size,
             delivery,
+            rich_message_id: None,
         });
         view
     }
@@ -1673,6 +1705,39 @@ mod tests {
         assert_eq!(out["value"]["thread_id"], "chat_1");
     }
 
+    /// ADR-0052/0083: re-read is stateless and carries the resolved path, the
+    /// current viewer page and the complete browse listing to return to.
+    #[test]
+    fn reread_payload_round_trips_viewer_and_return_listing_state() {
+        let mut view = view(
+            "/tmp/proj/src/main.rs",
+            ViewerKind::Text,
+            Some("rs"),
+            "fn main() {}\n",
+        );
+        view.page = 2;
+        view.return_to = Some(super::super::session::BrowseView {
+            dir: "/tmp/proj",
+            show_hidden: true,
+            keyword: "main",
+            page: 3,
+        });
+        let card = build_viewer_card(&key(), view);
+        let reread = card_buttons(&card)
+            .into_iter()
+            .find(|button| button["text"]["content"] == "🔄 重新读取")
+            .expect("every File Viewer offers a re-read")
+            .clone();
+        assert_eq!(reread["value"]["action"], "file");
+        assert_eq!(reread["value"]["op"], "reread");
+        assert_eq!(reread["value"]["path"], "/tmp/proj/src/main.rs");
+        assert_eq!(reread["value"]["page"], 2);
+        assert_eq!(reread["value"]["return_dir"], "/tmp/proj");
+        assert!(reread["value"]["return_show_hidden"].as_bool().unwrap());
+        assert_eq!(reread["value"]["return_keyword"], "main");
+        assert_eq!(reread["value"]["return_page"], 3);
+    }
+
     /// An extension the platform has no token for degrades honestly, and a
     /// `.csv` previews as a table rather than a code block.
     #[test]
@@ -1885,6 +1950,7 @@ mod tests {
             name: "people.csv".to_string(),
             size: 15,
             delivery: FileDelivery::SentAsRichText,
+            rich_message_id: Some("om_rich".into()),
         });
         let card = build_viewer_card(&key(), landed);
         let text = card_text(&card);
@@ -1913,6 +1979,7 @@ mod tests {
             name: "people.csv".to_string(),
             size: 15,
             delivery: FileDelivery::Undelivered,
+            rich_message_id: None,
         });
         let card = build_viewer_card(&key(), failed);
         let text = card_text(&card);
