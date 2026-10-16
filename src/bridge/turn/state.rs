@@ -529,10 +529,13 @@ pub(super) struct GapCoverage {
 /// [`StreamAccumulator::estimate_split_index`]'s accounting (element overhead
 /// plus the capped input and output the renderer keeps, plus the File Content
 /// tracking block the panel body appends, one `img` element per embedded image,
-/// and the compact file marker the folded header carries — ADR-0076). Shared by
-/// the timeline's tool items and the todo tail reserve, so every place a panel's
-/// bytes are summed charges its images and its header marker too.
-fn panel_estimate(p: &ToolPanel) -> usize {
+/// the compact file marker the folded header carries — ADR-0076 — and the
+/// 「📂 打开」 button a `write`/`edit` panel carries beside the fold, ADR-0083
+/// §8, #743). Shared by the timeline's tool items and the todo tail reserve,
+/// so every place a panel's bytes are summed charges its images, its header
+/// marker and its button too. `session_id` is the same routing the card build
+/// renders the button with — exactly what renders is charged, never more.
+fn panel_estimate(p: &ToolPanel, session_id: Option<&str>) -> usize {
     let input = p
         .input()
         .map(|x| x.to_string())
@@ -547,6 +550,7 @@ fn panel_estimate(p: &ToolPanel) -> usize {
         + crate::feishu::card::tool_render::file_tracking_estimate(p)
         + crate::feishu::card::tool_render::file_image_estimate(p)
         + crate::feishu::card::tool_render::file_header_marker_estimate(p)
+        + crate::feishu::card::tool_render::tool_open_button_estimate(p, session_id)
 }
 
 /// The content hash of one panel's File Content at `index` (ADR-0076), or
@@ -4213,8 +4217,9 @@ impl StreamAccumulator {
             // ([`Self::omitted_live_seeded`]): the reserve must not charge for
             // what the build will not render.
             if let Some(panel) = &self.todo_panel {
-                comps += 1 + panel.embedded_file_count();
-                size += panel_estimate(panel);
+                let session = self.session_id.as_deref();
+                comps += 1 + panel.embedded_file_count() + panel.open_button_count(session);
+                size += panel_estimate(panel, session);
             }
             if !self.ledger.is_empty() {
                 comps += 1;
@@ -4225,8 +4230,9 @@ impl StreamAccumulator {
                     continue;
                 }
                 if let Some(panel) = self.tools.get(call_id) {
-                    comps += 1 + panel.embedded_file_count();
-                    size += panel_estimate(panel);
+                    let session = self.session_id.as_deref();
+                    comps += 1 + panel.embedded_file_count() + panel.open_button_count(session);
+                    size += panel_estimate(panel, session);
                 }
             }
         }
@@ -4236,18 +4242,19 @@ impl StreamAccumulator {
                 TimelineKind::Tool(call_id) => {
                     // The panel's own elements plus one `img` per embedded File
                     // Content (`with_tool_at` pushes them after the panel,
-                    // ADR-0076); missing the images would let a near-budget
-                    // card be rejected by Feishu instead of splitting. The
-                    // size side comes from `panel_estimate`, which charges each
-                    // image's serialized bytes too.
-                    let images = self
-                        .tools
-                        .get(call_id)
-                        .map(ToolPanel::embedded_file_count)
-                        .unwrap_or(0);
+                    // ADR-0076) plus one 「📂 打开」 button after a `write`/`edit`
+                    // panel (ADR-0083 §8, #743) — missing any of them would let
+                    // a near-budget card be rejected by Feishu instead of
+                    // splitting. The size side comes from `panel_estimate`,
+                    // which charges each image's and the button's serialized
+                    // bytes too.
+                    let panel = self.tools.get(call_id);
+                    let session = self.session_id.as_deref();
+                    let images = panel.map(ToolPanel::embedded_file_count).unwrap_or(0);
+                    let open = panel.map(|p| p.open_button_count(session)).unwrap_or(0);
                     (
-                        4 + images,
-                        self.tools.get(call_id).map(panel_estimate).unwrap_or(400),
+                        4 + images + open,
+                        panel.map(|p| panel_estimate(p, session)).unwrap_or(400),
                         0,
                     )
                 }
@@ -4381,6 +4388,7 @@ impl StreamAccumulator {
                             panel.clone(),
                             item.shown_at,
                             Some(&format!("tool_{call_id}")),
+                            self.session_id.as_deref(),
                         );
                     }
                 }
@@ -4430,7 +4438,12 @@ impl StreamAccumulator {
             // on a finalized one). The block spans below are recorded from
             // `builder.body_len()`, so they stay correct with it in front.
             if let Some(todo) = &self.todo_panel {
-                builder = builder.with_tool_at(todo.clone(), self.todo_shown_at, Some("todo"));
+                builder = builder.with_tool_at(
+                    todo.clone(),
+                    self.todo_shown_at,
+                    Some("todo"),
+                    self.session_id.as_deref(),
+                );
             }
             // The Background Task Ledger follows the todo list (ADR-0060): the
             // Session's live tasks, kept on the newest card by the tail's own
@@ -4466,8 +4479,12 @@ impl StreamAccumulator {
                     continue;
                 }
                 if let Some(panel) = self.tools.get(call_id) {
-                    builder =
-                        builder.with_tool_at(panel.clone(), live.shown_at, Some(&format!("tool_{call_id}")));
+                    builder = builder.with_tool_at(
+                        panel.clone(),
+                        live.shown_at,
+                        Some(&format!("tool_{call_id}")),
+                        self.session_id.as_deref(),
+                    );
                 }
             }
             // The card's tail: the live interaction blocks, in accumulated
@@ -5514,13 +5531,115 @@ mod tests {
         assert!(marker > 0, "a file panel has a header marker");
 
         assert_eq!(
-            panel_estimate(&with_files),
-            panel_estimate(&without)
+            panel_estimate(&with_files, None),
+            panel_estimate(&without, None)
                 + crate::feishu::card::tool_render::file_tracking_estimate(&with_files)
                 + crate::feishu::card::tool_render::file_image_estimate(&with_files)
                 + marker,
             "panel_estimate must charge the header marker's bytes"
         );
+    }
+
+    /// A `write`/`edit` panel's 「📂 打开」 button (ADR-0083 §8, #743) is card
+    /// JSON too: `panel_estimate` charges its serialized bytes — exactly what
+    /// renders, so a turn heavy on written files cannot pass the size check
+    /// while the serialized card exceeds Feishu's cap. A panel with no usable
+    /// path, or one rendered with no Session to route by, carries no button
+    /// and charges nothing.
+    #[test]
+    fn panel_estimate_charges_the_open_button() {
+        let written = ToolPanel::for_test(
+            "write",
+            ToolStatus::Completed,
+            Some(serde_json::json!({"filePath": "report.md", "content": "hi"})),
+            Some("written"),
+        );
+        let button = crate::feishu::card::tool_render::tool_open_button_estimate(&written, Some("ses_1"));
+        assert!(button > 0, "a written file's button has a byte cost");
+        // The same panel with and without a Session differs by exactly the
+        // button: the estimate charges what renders, no more.
+        assert_eq!(
+            panel_estimate(&written, Some("ses_1")),
+            panel_estimate(&written, None) + button,
+            "panel_estimate must charge the button's bytes"
+        );
+        let pathless = ToolPanel::for_test("write", ToolStatus::Completed, None, Some("written"));
+        assert_eq!(
+            crate::feishu::card::tool_render::tool_open_button_estimate(&pathless, Some("ses_1")),
+            0,
+            "no usable path, no button, no charge"
+        );
+        assert_eq!(
+            panel_estimate(&pathless, Some("ses_1")),
+            panel_estimate(&pathless, None),
+            "without a button the Session changes nothing"
+        );
+        assert_eq!(
+            crate::feishu::card::tool_render::tool_open_button_estimate(&written, None),
+            0,
+            "no Session to route by, no button, no charge"
+        );
+    }
+
+    /// A turn with many `write` calls stays within the card's element budget
+    /// (#743): each button is one more component, so 35 tiny panels fit
+    /// without their buttons (35 × 4 = 140) but split with them (35 × 5 =
+    /// 175) — and every card the split produces fits both the element and
+    /// the size budget.
+    #[test]
+    fn card_splits_on_the_open_button_component_cost() {
+        fn written_turn(session: Option<&str>) -> StreamAccumulator {
+            let mut acc = StreamAccumulator::new("test");
+            acc.card_state = CardState::Done;
+            if let Some(session) = session {
+                acc.set_session(session);
+            }
+            for i in 0..35 {
+                acc.push_tool(
+                    &format!("call_{i}"),
+                    ToolPanel::for_test(
+                        "write",
+                        ToolStatus::Completed,
+                        Some(serde_json::json!({"filePath": format!("r{i}.md")})),
+                        Some("ok"),
+                    ),
+                );
+            }
+            acc
+        }
+        // Without a Session no button renders: 35 × 4 components fit one card.
+        let mut plain = written_turn(None);
+        let (card, full) = plain.build_card_with_split();
+        assert!(!full, "35 button-less panels fit one card");
+        assert_eq!(
+            card["body"]["elements"].as_array().unwrap().len(),
+            35,
+            "one element per panel and nothing else"
+        );
+
+        // With a Session each panel carries its button: the estimate must
+        // split, and every card stays within both budgets.
+        let mut acc = written_turn(Some("ses_1"));
+        let mut cards = Vec::new();
+        let mut full = true;
+        while full {
+            let (card, f) = acc.build_card_with_split();
+            full = f;
+            cards.push(card);
+        }
+        assert!(cards.len() >= 2, "35 buttoned panels must split: {}", cards.len());
+        for (i, card) in cards.iter().enumerate() {
+            let elements = card["body"]["elements"].as_array().unwrap().len();
+            assert!(
+                elements <= crate::feishu::card::MAX_CARD_COMPONENTS,
+                "card {i} exceeds the element budget: {elements}"
+            );
+            let bytes = serde_json::to_string(card).unwrap().len();
+            assert!(
+                bytes < crate::feishu::card::FEISHU_CARD_LIMIT_BYTES,
+                "card {i} exceeds Feishu's 30KB card limit: {bytes} bytes"
+            );
+        }
     }
 
     /// The tracking-line estimate must charge the JSON-ESCAPED bytes, not the
@@ -5578,7 +5697,7 @@ mod tests {
                 },
             );
         }
-        let with_images = panel_estimate(&panel);
+        let with_images = panel_estimate(&panel, None);
         let image_bytes = crate::feishu::card::tool_render::file_image_estimate(&panel);
         assert!(
             with_images - image_bytes < crate::feishu::card::MAX_CARD_JSON_CHARS,

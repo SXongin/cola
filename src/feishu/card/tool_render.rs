@@ -213,6 +213,33 @@ impl ToolPanel {
         self.call.input.as_ref()
     }
 
+    /// The structured path a 「📂 打开」 button would open for this panel
+    /// (ADR-0083 §8, #743): a `write`/`edit` call's own `filePath` (V1) —
+    /// `path` on V2 — read through the one [`input_path`] rule every file
+    /// formatter shares, so the button and the Input line can never disagree
+    /// about which file the call touched. `None` for any other tool — a `read`
+    /// above all, whose content is already on the card — and for a call whose
+    /// path is absent or unusable (no input, a non-object input, a missing or
+    /// non-string key, or an empty string): those panels carry no button
+    /// rather than a broken one. Natural-language paths in the agent's prose
+    /// never reach here — only the call's structured input is read.
+    pub(crate) fn file_open_path(&self) -> Option<&str> {
+        if !matches!(self.name(), "write" | "edit") {
+            return None;
+        }
+        let obj = self.input()?.as_object()?;
+        input_path(obj).filter(|path| !path.is_empty())
+    }
+
+    /// How many body elements the 「📂 打开」 button adds (ADR-0083 §8, #743):
+    /// one standalone button after a qualifying panel, none otherwise — so the
+    /// component estimate charges precisely what renders. Decided by the
+    /// button builder itself, never re-derived, so the count cannot drift from
+    /// the render.
+    pub(crate) fn open_button_count(&self, session_id: Option<&str>) -> usize {
+        usize::from(tool_open_button_element(self, session_id).is_some())
+    }
+
     /// The call's raw metadata (what OpenCode recorded beside the input): V2
     /// keeps a shell's exit code, a search's result count and a Code Mode
     /// program's nested call list here, so the panel reads run facts the text
@@ -880,6 +907,39 @@ pub(crate) fn file_image_estimate(tool: &ToolPanel) -> usize {
         .filter_map(|element| serde_json::to_string(element).ok())
         .map(|serialized| serialized.len())
         .sum()
+}
+
+/// The 「📂 打开」 button a `write`/`edit` panel carries (ADR-0083 §8, #743):
+/// a standalone `button` element, pushed immediately AFTER the panel — outside
+/// the fold, so it stays reachable while the panel is collapsed — whose value
+/// is the panel's [`super::session::tool_file_value`] payload: `action:
+/// "file"` with no `op`, opening the File Viewer rather than transferring it
+/// (#739's `op: "send"`). `None` when the panel names no open path
+/// ([`ToolPanel::file_open_path`]) or no Session is known to route the click
+/// by — no button rather than a broken one.
+pub(super) fn tool_open_button_element(
+    tool: &ToolPanel,
+    session_id: Option<&str>,
+) -> Option<serde_json::Value> {
+    let path = tool.file_open_path()?;
+    let session_id = session_id.filter(|id| !id.is_empty())?;
+    Some(serde_json::json!({
+        "tag": "button",
+        "text": { "tag": "plain_text", "content": "📂 打开" },
+        "type": "default",
+        "value": super::session::tool_file_value(session_id, path),
+    }))
+}
+
+/// The serialized byte length [`tool_open_button_element`] adds to a card body
+/// (ADR-0083 §8, #743), for a card-size estimate that must charge exactly what
+/// renders. `0` when the panel carries no button. Kept beside the render so
+/// the two cannot drift.
+pub(crate) fn tool_open_button_estimate(tool: &ToolPanel, session_id: Option<&str>) -> usize {
+    tool_open_button_element(tool, session_id)
+        .and_then(|element| serde_json::to_string(&element).ok())
+        .map(|serialized| serialized.len())
+        .unwrap_or(0)
 }
 
 /// One tool panel as a folded collapsible element. `at_ms` is the part's
@@ -2430,6 +2490,117 @@ mod tests {
         );
     }
 
+    /// A `write` or `edit` Tool Panel's 「📂 打开」 (ADR-0083 §8, #743) opens the
+    /// file the call itself produced: the button's path is the call's
+    /// STRUCTURED `filePath` (V1) — `path` on V2 — never the agent's prose, and
+    /// the payload routes by `action: "file"` with no `op`, so the click opens
+    /// the File Viewer rather than transferring it (#739's `op: "send"`).
+    #[test]
+    fn write_and_edit_panels_carry_an_open_button_from_the_structured_path() {
+        for (name, input) in [
+            ("write", json!({"filePath": "report.md", "content": "hi"})),
+            ("edit", json!({"filePath": "src/main.rs"})),
+            ("edit", json!({"path": "src/v2.rs"})),
+        ] {
+            let panel = ToolPanel::for_test(name, ToolStatus::Completed, Some(input), Some("ok"));
+            let path = panel.file_open_path().expect("a write/edit panel names its path");
+            let button = tool_open_button_element(&panel, Some("ses_1")).expect("the button");
+            assert_eq!(button["tag"], "button");
+            assert_eq!(button["text"]["content"], "📂 打开");
+            let value = &button["value"];
+            assert_eq!(value["action"], "file");
+            assert_eq!(value["path"], path);
+            assert_eq!(value["session_id"], "ses_1");
+            assert!(value.get("op").is_none(), "no op: the click opens, never sends");
+            assert!(value.get("dir").is_none(), "no listing rides along: {value}");
+        }
+    }
+
+    /// A `read` panel carries no 「📂 打开」 (ADR-0083 §8): its content is
+    /// already on the card — even when its structured input names the same
+    /// `filePath` a `write` panel would open.
+    #[test]
+    fn read_panels_carry_no_open_button() {
+        let panel = ToolPanel::for_test(
+            "read",
+            ToolStatus::Completed,
+            Some(json!({"filePath": "/x/y.rs"})),
+            Some("content"),
+        );
+        assert_eq!(panel.file_open_path(), None, "a read never names an open path");
+        assert!(
+            tool_open_button_element(&panel, Some("ses_1")).is_none(),
+            "a read panel carries no button"
+        );
+    }
+
+    /// A call whose path is absent or unusable carries no button rather than a
+    /// broken one (#743): no input at all, a non-object input, a missing key,
+    /// a non-string path, or an empty path — and prose in the OUTPUT naming a
+    /// path never becomes a control either.
+    #[test]
+    fn a_panel_without_a_usable_path_carries_no_open_button() {
+        let cases: Vec<(&str, Option<serde_json::Value>, Option<&str>)> = vec![
+            ("write", None, Some("the agent wrote /tmp/report.md, go look")),
+            ("write", Some(json!("report.md")), None),
+            ("write", Some(json!({"content": "hi"})), None),
+            ("write", Some(json!({"filePath": 7})), None),
+            ("write", Some(json!({"filePath": ""})), None),
+            ("edit", Some(json!({"filePath": ""})), None),
+            (
+                "bash",
+                Some(json!({"command": "cat report.md"})),
+                Some("report.md"),
+            ),
+        ];
+        for (name, input, output) in cases {
+            let panel = ToolPanel::for_test(name, ToolStatus::Completed, input, output);
+            assert_eq!(panel.file_open_path(), None, "no usable path for {name}");
+            assert!(
+                tool_open_button_element(&panel, Some("ses_1")).is_none(),
+                "no button for {name}"
+            );
+        }
+        // No Session to route by, no button either — the click could not know
+        // whose viewer to open.
+        let panel = ToolPanel::for_test(
+            "write",
+            ToolStatus::Completed,
+            Some(json!({"filePath": "report.md"})),
+            None,
+        );
+        assert!(tool_open_button_element(&panel, None).is_none());
+    }
+
+    /// The 「📂 打开」 rides BESIDE the folded panel, not inside it (ADR-0083
+    /// §8, #743): the panel's own fold state hides its body, so a button in
+    /// the body would need unfolding first. The button is the element right
+    /// after the still-folded panel.
+    #[test]
+    fn the_open_button_rides_beside_the_folded_panel() {
+        let panel = ToolPanel::for_test(
+            "write",
+            ToolStatus::Completed,
+            Some(json!({"filePath": "report.md", "content": "hi"})),
+            Some("written"),
+        );
+        let card = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_tool_at(panel, None, Some("tool_call_write"), Some("ses_1"))
+            .build();
+        let elements = card["body"]["elements"].as_array().expect("body elements");
+        assert_eq!(elements.len(), 2, "the panel and its button: {card}");
+        let folded = &elements[0];
+        assert_eq!(folded["tag"], "collapsible_panel");
+        assert_eq!(folded["expanded"], false, "the panel stays folded");
+        let button = &elements[1];
+        assert_eq!(button["tag"], "button");
+        assert_eq!(button["text"]["content"], "📂 打开");
+        assert_eq!(button["value"]["action"], "file");
+        assert_eq!(button["value"]["path"], "report.md");
+        assert_eq!(button["value"]["session_id"], "ses_1");
+    }
+
     /// A filename may carry a control character — a newline above all. The
     /// folded header is a one-line `plain_text` title, so the name is folded to
     /// spaces before it is clipped: no raw control character reaches the title,
@@ -2660,7 +2831,7 @@ mod tests {
         let panel = read_panel("doc.pdf", "application/pdf", b"%PDF", FileDelivery::Undelivered);
         let card = CardBuilder::new()
             .with_state(CardState::Done)
-            .with_tool_at(panel, None, Some("tool_call_read"))
+            .with_tool_at(panel, None, Some("tool_call_read"), None)
             .build();
         let element = &card["body"]["elements"][0];
         assert_eq!(element["element_id"], "tool_call_read", "{card}");
@@ -2941,6 +3112,7 @@ mod tests {
                     }),
                     Some(at),
                     None,
+                    None,
                 )
                 .build()
         };
@@ -3014,7 +3186,7 @@ mod tests {
         );
         let card = CardBuilder::new()
             .with_state(CardState::Done)
-            .with_tool_at(tool.clone(), Some(at), None)
+            .with_tool_at(tool.clone(), Some(at), None, None)
             .build();
         let elements = card["body"]["elements"].as_array().unwrap();
         assert_eq!(
@@ -3024,7 +3196,7 @@ mod tests {
 
         let untimed = CardBuilder::new()
             .with_state(CardState::Done)
-            .with_tool_at(tool, None, None)
+            .with_tool_at(tool, None, None, None)
             .build();
         let elements = untimed["body"]["elements"].as_array().unwrap();
         assert_eq!(
