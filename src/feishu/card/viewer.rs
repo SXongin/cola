@@ -26,7 +26,7 @@ use crate::backend::file_content::human_size;
 use crate::config::ThreadKey;
 
 use super::sanitize::{CardMarkdown, MAX_TABLE_ROWS, serialized_len};
-use super::session::{BrowseView, browse_view_value};
+use super::session::{BrowseView, browse_view_value, pager_element};
 use super::shell::card_shell;
 use super::tool_render::{FileDelivery, delivery_suffix, file_image_element};
 use super::{MAX_CARD_JSON_CHARS, MAX_ELEMENT_TEXT_CHARS, chunk_text, fenced_code};
@@ -309,6 +309,13 @@ pub(crate) struct ViewerCard<'a> {
     /// cut it). A file past the preview read cap is never previewed at all, so
     /// it takes the File Message lane rather than being truncated here.
     pub(crate) truncated: bool,
+    /// The 1-based page of the line-windowed text preview this card shows
+    /// (#740, ADR-0083 §6): a text preview longer than one card holds pages by
+    /// lines through the shared pager, and a flip rebuilds the card at the
+    /// payload's page — the viewer keeps no per-card state, so a rebuild from
+    /// a flipped page renders the same window (ADR-0052). `1` on open; the
+    /// builder clamps it into `[1, total_pages]`. Ignored by every other kind.
+    pub(crate) page: usize,
     /// The browse listing this viewer was opened from, when it was (ADR-0083
     /// §3): renders 「← 返回目录」 carrying that state. `None` for `/cat`.
     pub(crate) return_to: Option<BrowseView<'a>>,
@@ -379,18 +386,30 @@ pub(crate) fn build_viewer_card(thread_key: &ThreadKey, view: ViewerCard<'_>) ->
         ViewerKind::Text => {
             let lang = language_token(view.ext);
             let mut used = 0usize;
+            let mut blocks: Vec<String> = Vec::new();
+            let mut paged = false;
             for chunk in chunk_text(view.text, PREVIEW_CHUNK_CHARS) {
                 let block = fenced_code(&chunk, Some(lang));
                 let cost = super::sanitize::serialized_len(&block) + 128;
                 if used + cost > PREVIEW_JSON_BUDGET {
-                    truncated = true;
+                    paged = true;
                     break;
                 }
                 used += cost;
-                elements.push(json!({
-                    "tag": "markdown",
-                    "content": markdown.clean(&block),
-                }));
+                blocks.push(block);
+            }
+            if paged {
+                // A text preview longer than one card holds pages by LINES
+                // through the shared pager (#740): the budget cut above only
+                // decides THAT it pages, never what the reader sees.
+                push_text_page(&mut elements, &mut markdown, thread_key, &view, lang);
+            } else {
+                for block in blocks {
+                    elements.push(json!({
+                        "tag": "markdown",
+                        "content": markdown.clean(&block),
+                    }));
+                }
             }
         }
     }
@@ -423,6 +442,218 @@ pub(crate) fn build_viewer_card(thread_key: &ThreadKey, view: ViewerCard<'_>) ->
 
     elements.push(viewer_buttons(thread_key, &view));
     card_shell(&format!("📄 {}", file_name(view.path)), "blue", elements)
+}
+
+/// The paged text preview (#740, ADR-0083 §6): the requested 1-based page's
+/// window of whole lines as one fenced block, plus the shared pager — whose
+/// buttons carry the file's path, the TARGET page and (when opened from one)
+/// the browse listing's whole state, so a flip rebuilds the same window with
+/// the way back intact (ADR-0052's statelessness). The pager reports the
+/// preview's TRUE line total, so a reader knows what they are not seeing. A
+/// preview that fits one card never reaches here, so a single-page preview
+/// renders no pager.
+fn push_text_page(
+    elements: &mut Vec<serde_json::Value>,
+    markdown: &mut CardMarkdown,
+    thread_key: &ThreadKey,
+    view: &ViewerCard<'_>,
+    lang: &str,
+) {
+    let pages = paginate_text(view.text, lang);
+    let total_pages = pages.windows.len().max(1);
+    let page = view.page.clamp(1, total_pages);
+    let (start, end) = pages.windows.get(page - 1).copied().unwrap_or((0, 0));
+    let mut window_text = String::new();
+    for segment in pages.segments.get(start..end).unwrap_or(&[]) {
+        if !window_text.is_empty() {
+            window_text.push('\n');
+        }
+        match segment {
+            PageSegment::Line(index) => window_text.push_str(pages.lines[*index]),
+            PageSegment::Piece(piece) => window_text.push_str(piece),
+        }
+    }
+    let block = fenced_code(&window_text, Some(lang));
+    elements.push(json!({
+        "tag": "markdown",
+        "content": markdown.clean(&block),
+    }));
+    // The pager's extra fields are strings only: the path plus the browse
+    // listing to return to, mirroring the 「发为文件」 payload's `return_*`
+    // shape — never the row's `dir`/`page`, whose `page` is the LISTING's.
+    let return_page = view.return_to.map(|listing| listing.page.to_string());
+    let mut extra: Vec<(&str, &str)> = vec![("path", view.path)];
+    if let Some(listing) = view.return_to {
+        extra.push(("return_dir", listing.dir));
+        extra.push((
+            "return_show_hidden",
+            if listing.show_hidden { "true" } else { "false" },
+        ));
+        extra.push(("return_keyword", listing.keyword));
+        extra.push(("return_page", return_page.as_deref().unwrap_or("1")));
+    }
+    if let Some(pager) = pager_element(
+        "file",
+        thread_key,
+        "",
+        None,
+        page,
+        total_pages,
+        pages.lines.len(),
+        &extra,
+    ) {
+        elements.push(pager);
+    }
+}
+
+/// A line-windowed text preview: `lines` are the preview's TRUE lines (what
+/// the pager reports the total of), `segments` are what packs into windows —
+/// whole lines, except a line that alone outgrows a page contributes its
+/// char-split pieces — and `windows` are the `(start, end)` SEGMENT ranges the
+/// pager flips through, each rendering as one fenced block within
+/// [`PREVIEW_JSON_BUDGET`].
+struct TextPages<'a> {
+    lines: Vec<&'a str>,
+    segments: Vec<PageSegment>,
+    windows: Vec<(usize, usize)>,
+}
+
+/// One packable segment of a text preview: a whole line by index, or one
+/// char-split piece of an overlong line.
+enum PageSegment {
+    Line(usize),
+    Piece(String),
+}
+
+impl PageSegment {
+    /// The segment's serialized cost, longest backtick run and line count —
+    /// what the packer accumulates.
+    fn measure(&self, lines: &[&str]) -> (usize, usize, usize) {
+        let text = match self {
+            PageSegment::Line(index) => lines[*index],
+            PageSegment::Piece(piece) => piece,
+        };
+        (serialized_len(text), line_tick_run(text), 1)
+    }
+}
+
+/// Split a text preview into line windows for the pager (#740): whole lines
+/// packed greedily so each window's fenced block fits [`PREVIEW_JSON_BUDGET`] —
+/// a line that alone outgrows a page (a minified one-liner) is char-split
+/// first, so every window still fits and no card is ever rejected.
+fn paginate_text<'a>(text: &'a str, lang: &str) -> TextPages<'a> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut segments: Vec<PageSegment> = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        let (cost, run, _) = PageSegment::Line(index).measure(&lines);
+        if page_block_cost(cost, run, 1, lang) + 128 <= PREVIEW_JSON_BUDGET {
+            segments.push(PageSegment::Line(index));
+        } else {
+            segments.extend(
+                split_overlong_line(line, lang)
+                    .into_iter()
+                    .map(PageSegment::Piece),
+            );
+        }
+    }
+    // Greedily pack segments; each window's cost is exact (see
+    // `page_block_cost`), so a window never outgrows the page budget.
+    let mut windows: Vec<(usize, usize)> = Vec::new();
+    let mut start = 0usize;
+    let mut sum = 0usize;
+    let mut run = 0usize;
+    let mut count = 0usize;
+    for (index, segment) in segments.iter().enumerate() {
+        let (cost, segment_run, segment_count) = segment.measure(&lines);
+        if count > 0
+            && page_block_cost(sum + cost, run.max(segment_run), count + segment_count, lang) + 128
+                > PREVIEW_JSON_BUDGET
+        {
+            windows.push((start, index));
+            start = index;
+            sum = 0;
+            run = 0;
+            count = 0;
+        }
+        sum += cost;
+        run = run.max(segment_run);
+        count += segment_count;
+    }
+    if start < segments.len() {
+        windows.push((start, segments.len()));
+    }
+    TextPages {
+        lines,
+        segments,
+        windows,
+    }
+}
+
+/// The exact [`serialized_len`] of a fenced page block whose lines cost `sum`
+/// serialized chars, carry longest backtick run `run` and number `n` — JSON
+/// escaping is per-character, so joining lines is additive and a window is
+/// measured without ever rebuilding its block. `lang` is the fence's language
+/// token, whose bytes the head carries.
+fn page_block_cost(sum: usize, run: usize, n: usize, lang: &str) -> usize {
+    let fence_len = (run + 1).max(3);
+    let head_len = fence_len + lang.len();
+    head_len + fence_len + sum + 2 * (n + 1)
+}
+
+/// A line's longest backtick run — the page fence must outrun it, exactly as
+/// [`fenced_code`] outruns its whole block's.
+fn line_tick_run(line: &str) -> usize {
+    let mut best = 0usize;
+    let mut run = 0usize;
+    for c in line.chars() {
+        if c == '`' {
+            run += 1;
+            best = best.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    best
+}
+
+/// Split one overlong line — alone past a page's budget — into pieces that
+/// each fit a page, halving on char boundaries and measuring exactly, so a
+/// minified one-liner still pages instead of breaking the card.
+fn split_overlong_line(line: &str, lang: &str) -> Vec<String> {
+    let mut pieces = vec![line.to_string()];
+    let mut index = 0;
+    while index < pieces.len() {
+        let fits = {
+            let piece = &pieces[index];
+            page_block_cost(serialized_len(piece), line_tick_run(piece), 1, lang) + 128 <= PREVIEW_JSON_BUDGET
+        };
+        if fits {
+            index += 1;
+            continue;
+        }
+        let piece = std::mem::take(&mut pieces[index]);
+        let mid = char_mid(&piece);
+        if mid == 0 || mid >= piece.len() {
+            // A single character always fits a page — unreachable, but never
+            // loop forever on it.
+            pieces[index] = piece;
+            index += 1;
+            continue;
+        }
+        pieces[index] = piece[..mid].to_string();
+        pieces.insert(index + 1, piece[mid..].to_string());
+    }
+    pieces
+}
+
+/// A mid-string char boundary for halving: half the bytes, floored to a
+/// boundary so a char is never split.
+fn char_mid(text: &str) -> usize {
+    let mut mid = text.len() / 2;
+    while mid > 0 && !text.is_char_boundary(mid) {
+        mid -= 1;
+    }
+    mid
 }
 
 /// The file name the header shows: the path's last component.
@@ -578,6 +809,9 @@ fn transfer_value(thread_key: &ThreadKey, view: &ViewerCard<'_>) -> serde_json::
         "path": view.path,
         "chat_id": thread_key.chat_id,
         "thread_id": thread_key.thread_id,
+        // The viewer page the click came from, so the transfer's card PATCH
+        // rebuilds the page the reader was on (#740).
+        "page": view.page,
     });
     if let Some(return_to) = view.return_to {
         value["return_dir"] = json!(return_to.dir);
@@ -916,6 +1150,7 @@ mod tests {
             ext,
             text,
             truncated: false,
+            page: 1,
             return_to: None,
             lane: None,
         }
@@ -1445,11 +1680,12 @@ mod tests {
         assert_eq!(send["value"]["return_page"], 2);
     }
 
-    /// A preview longer than the card can hold is cut inside the budget and
-    /// says so — never a rejected card, never a silently empty one (#740 owns
-    /// the pager, #741 the rich-text lane).
+    /// A preview longer than the card can hold pages by lines through the
+    /// shared pager instead of being cut (#740) — still within the card
+    /// budget, still one closed fence per element, and the pager reports the
+    /// preview's true line total (#741 owns the structural-overflow lane).
     #[test]
-    fn a_long_preview_stays_within_the_card_budget() {
+    fn a_long_preview_pages_within_the_card_budget() {
         let body = "let x = 1;\n".repeat(40_000);
         let card = build_viewer_card(&key(), view("/tmp/huge.rs", ViewerKind::Text, Some("rs"), &body));
         let json_len = serde_json::to_string(&card).unwrap().len();
@@ -1458,8 +1694,18 @@ mod tests {
             "the card must fit its own budget: {json_len}"
         );
         let text = card_text(&card);
-        assert!(text.contains("```rust"), "the preview still renders a block");
-        assert!(text.contains("已截断"), "and admits the cut: {text}");
+        assert!(text.contains("```rust"), "the window still renders a block");
+        assert!(!text.contains("已截断"), "paging replaced the budget cut: {text}");
+        assert!(
+            text.contains("共 40000 个"),
+            "the pager reports the preview's true line total: {text}"
+        );
+        assert!(
+            card_buttons(&card)
+                .iter()
+                .any(|b| b["text"]["content"] == "下一页" && b["value"]["op"] == "page"),
+            "the pager flips: {text}"
+        );
 
         // Every fenced element is closed, so no element leaves a fence open.
         for element in card["body"]["elements"].as_array().unwrap() {
@@ -1469,9 +1715,57 @@ mod tests {
                 assert_eq!(
                     content.matches("```").count(),
                     2,
-                    "one chunk per element, each fence closed"
+                    "one window per element, each fence closed"
                 );
             }
         }
+
+        // An out-of-range page lands on the last page, never an empty card.
+        let mut last = view("/tmp/huge.rs", ViewerKind::Text, Some("rs"), &body);
+        last.page = usize::MAX;
+        let card = build_viewer_card(&key(), last);
+        let text = card_text(&card);
+        assert!(
+            text.contains("```rust") && text.contains("let x = 1;"),
+            "the clamped last page still shows lines: {text}"
+        );
+    }
+
+    /// A minified one-liner — a single line past a page's budget — is
+    /// char-split across pages, and every page still fits the card: no window
+    /// ever breaks the budget, however the bytes run together.
+    #[test]
+    fn an_overlong_line_pages_without_breaking_the_card_budget() {
+        let line = "x".repeat(30_000);
+        let mut first = view("/tmp/bundle.min.js", ViewerKind::Text, Some("js"), &line);
+        first.page = 1;
+        let card = build_viewer_card(&key(), first);
+        let json_len = serde_json::to_string(&card).unwrap().len();
+        assert!(
+            json_len < MAX_CARD_JSON_CHARS,
+            "the first window must fit its own budget: {json_len}"
+        );
+        let text = card_text(&card);
+        assert!(
+            !text.contains("已截断"),
+            "even one line pages instead of being cut: {text}"
+        );
+        assert!(
+            text.contains("共 1 个"),
+            "the pager still reports the true line total: {text}"
+        );
+
+        let mut second = view("/tmp/bundle.min.js", ViewerKind::Text, Some("js"), &line);
+        second.page = 2;
+        let card = build_viewer_card(&key(), second);
+        let json_len = serde_json::to_string(&card).unwrap().len();
+        assert!(
+            json_len < MAX_CARD_JSON_CHARS,
+            "the second window must fit too: {json_len}"
+        );
+        assert!(
+            card_text(&card).contains('x'),
+            "the split line continues on the next page"
+        );
     }
 }

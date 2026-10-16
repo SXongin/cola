@@ -337,11 +337,14 @@ pub(crate) enum PathAnswer {
 /// builder `/cat` answers through — so the two entry points cannot disagree
 /// about what a file is, nor about the copy a failure states. `return_to` is the
 /// browse listing the viewer returns to, when it was opened from one; a viewer
-/// with no listing passes `None` and carries no 「← 返回目录」.
+/// with no listing passes `None` and carries no 「← 返回目录」. `page` is the
+/// 1-based page of the line-windowed text preview (#740) — `1` on open, the
+/// payload's target page on a pager flip.
 pub(crate) fn path_answer(
     thread_key: &ThreadKey,
     resolved: &std::path::Path,
     return_to: Option<BrowseView<'_>>,
+    page: usize,
 ) -> PathAnswer {
     match crate::bridge::viewer::open_cat_path(resolved) {
         // `/cat <directory>` — and a browse row whose file became a directory —
@@ -366,6 +369,7 @@ pub(crate) fn path_answer(
                 &classified,
                 None,
                 return_to,
+                page,
             ))
         }
         crate::bridge::viewer::CatOpen::Failed(failure) => PathAnswer::Line(failure.line(resolved)),
@@ -437,7 +441,7 @@ pub(crate) async fn send_cat_card(
                 handles.flow.cards.viewer_transfer_timeout_ms(),
             )
             .await;
-            let card = build_viewer_for_classified(thread_key, &path, &classified, lane, None);
+            let card = build_viewer_for_classified(thread_key, &path, &classified, lane, None, 1);
             platform.reply_card(message_id, &card).await?;
         }
         crate::bridge::viewer::CatOpen::Failed(failure) => {
@@ -458,13 +462,15 @@ pub(crate) fn file_display_name(path: &std::path::Path) -> String {
 /// Build the **File Viewer** card for a file already classified by content
 /// (ADR-0083 §3, §5). Shared by `/cat` and the 「发为文件」 transfer — which
 /// PATCHes the card it was clicked on with the outcome — so both name the same
-/// file the same way and render the same lane.
+/// file the same way and render the same lane. `page` is the 1-based page of
+/// the line-windowed text preview (#740).
 pub(crate) fn build_viewer_for_classified(
     thread_key: &ThreadKey,
     path: &std::path::Path,
     classified: &crate::bridge::viewer::Classified,
     lane: Option<super::viewer::ViewerFileLane>,
     return_to: Option<BrowseView<'_>>,
+    page: usize,
 ) -> Value {
     use super::viewer::{ViewerCard, ViewerKind, build_viewer_card, kind_for_extension};
     use crate::bridge::viewer::ClassifiedKind;
@@ -486,6 +492,7 @@ pub(crate) fn build_viewer_for_classified(
             ext,
             text: classified.text.as_deref().unwrap_or(""),
             truncated: false,
+            page,
             return_to,
             lane,
         },

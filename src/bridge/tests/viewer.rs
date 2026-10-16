@@ -49,6 +49,27 @@ fn thread() -> crate::config::ThreadKey {
     crate::config::ThreadKey::new("chat_1".into(), "chat_1".into())
 }
 
+/// The pager's indicator text (`第 x/y 页 · 共 N 个`) on a card, when it has one.
+fn pager_label(card: &serde_json::Value) -> Option<String> {
+    card_texts(card)
+        .into_iter()
+        .find(|t| t.starts_with("第 ") && t.contains(" 页 · 共 "))
+}
+
+/// The pager button labelled `label` (上一页 / 下一页).
+fn pager_button<'a>(card: &'a serde_json::Value, label: &str) -> &'a serde_json::Value {
+    card_buttons(card)
+        .into_iter()
+        .find(|b| b["value"]["op"] == "page" && b["text"]["content"] == label)
+        .unwrap_or_else(|| panic!("pager button `{label}` not found on {}", card_text(card)))
+}
+
+/// `lines` numbered lines, each short enough that one card holds thousands —
+/// used to build a preview that genuinely outgrows one card.
+fn numbered_lines(lines: usize) -> String {
+    (1..=lines).map(|i| format!("line {i:04}\n")).collect()
+}
+
 /// `/cat` (no arg) answers usage and `/help cat` documents the command — and
 /// neither reaches the Backend, while an unknown `/...` still does (ADR-0083
 /// §2: `/cat` swallows nothing else).
@@ -1420,5 +1441,263 @@ async fn return_to_directory_restores_the_listing_state() {
     assert!(
         platform.replied_cards().await.is_empty(),
         "the ack patches in place"
+    );
+}
+
+/// A text preview longer than one card holds pages by **lines** inside the
+/// viewer (ADR-0083 §6): the first screen shows a window of lines plus the
+/// shared pager, the header still names the file, and the pager reports the
+/// preview's TRUE line total, so a reader knows what they are not seeing.
+#[tokio::test]
+async fn a_long_text_file_pages_inside_the_viewer() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    std::fs::write(proj.path().join("long.txt"), numbered_lines(3000)).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+
+    send_command_in(
+        &app,
+        "/cat long.txt",
+        key.clone(),
+        "m_long",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+
+    let card = first_card(&platform).await;
+    let text = card_text(&card);
+    assert_eq!(
+        card_header(&card),
+        "📄 long.txt",
+        "the header still names the file"
+    );
+    assert!(
+        text.contains("line 0001"),
+        "the first window opens the file: {text}"
+    );
+    assert!(
+        !text.contains("line 3000"),
+        "the last line belongs to a later page: {text}"
+    );
+    assert_eq!(
+        pager_label(&card).as_deref(),
+        Some("第 1/2 页 · 共 3000 个"),
+        "the pager reports the preview's true line total: {text}"
+    );
+
+    // Flipping renders the NEXT window: the last line arrives, the first is
+    // gone, and the pager names the page it is on.
+    let next = pager_button(&card, "下一页")["value"].clone();
+    let page2 = app
+        .host_action(next)
+        .await
+        .expect("the flip rebuilds the card")
+        .card
+        .expect("a card");
+    let text = card_text(&page2);
+    assert!(text.contains("line 3000"), "the last window: {text}");
+    assert!(
+        !text.contains("line 0001"),
+        "the first window's lines are behind us: {text}"
+    );
+    assert_eq!(
+        pager_label(&page2).as_deref(),
+        Some("第 2/2 页 · 共 3000 个"),
+        "{text}"
+    );
+    assert!(
+        pager_button(&page2, "下一页")["disabled"]
+            .as_bool()
+            .unwrap_or(false),
+        "the last page cannot flip forward: {text}"
+    );
+}
+
+/// Page state round-trips through the button payload (ADR-0052): replaying a
+/// flipped page's own pager value rebuilds the SAME window — the viewer keeps
+/// no per-card state, so the payload is the whole state.
+#[tokio::test]
+async fn viewer_pager_rebuilds_the_same_window_from_its_payload() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    std::fs::write(proj.path().join("long.txt"), numbered_lines(3000)).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+
+    send_command_in(
+        &app,
+        "/cat long.txt",
+        key.clone(),
+        "m_replay",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+
+    let card = first_card(&platform).await;
+    let first_text = card_text(&card);
+
+    // Replaying the SAME flip value renders the identical card.
+    let next = pager_button(&card, "下一页")["value"].clone();
+    let page2 = app
+        .host_action(next.clone())
+        .await
+        .expect("the flip rebuilds the card")
+        .card
+        .expect("a card");
+    let page2_again = app
+        .host_action(next)
+        .await
+        .expect("the replay rebuilds the card")
+        .card
+        .expect("a card");
+    assert_eq!(
+        page2_again, page2,
+        "a rebuild from the payload renders the same window"
+    );
+
+    // And the way back lands exactly on the first window.
+    let prev = pager_button(&page2, "上一页")["value"].clone();
+    let back = app
+        .host_action(prev)
+        .await
+        .expect("the flip back rebuilds the card")
+        .card
+        .expect("a card");
+    assert_eq!(
+        card_text(&back),
+        first_text,
+        "flipping back restores the first window"
+    );
+    assert_eq!(
+        pager_label(&back).as_deref(),
+        Some("第 1/2 页 · 共 3000 个"),
+        "{}",
+        card_text(&back)
+    );
+}
+
+/// A preview that fits one card renders NO pager — no 上一页/下一页 buttons,
+/// no page line (ADR-0083 §6).
+#[tokio::test]
+async fn a_short_text_file_renders_no_pager() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    std::fs::write(proj.path().join("short.txt"), "hello\nworld\n").unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+
+    send_command_in(
+        &app,
+        "/cat short.txt",
+        key.clone(),
+        "m_short",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+
+    let card = first_card(&platform).await;
+    let text = card_text(&card);
+    assert!(
+        text.contains("hello") && text.contains("world"),
+        "the whole preview is on the one card: {text}"
+    );
+    assert_eq!(
+        pager_label(&card),
+        None,
+        "a fitting preview has no page line: {text}"
+    );
+    assert!(
+        card_buttons(&card)
+            .into_iter()
+            .all(|b| b["value"]["op"] != "page"),
+        "a fitting preview has no pager buttons: {text}"
+    );
+}
+
+/// Flipping a viewer page keeps the way back: the pager carries the browse
+/// listing's whole state (`return_*`), so the rebuilt page still offers
+/// 「← 返回目录」 with that listing intact (ADR-0083 §3, ADR-0052).
+#[tokio::test]
+async fn flipping_a_viewer_page_keeps_the_way_back_to_the_listing() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let file = proj.path().join("long.txt");
+    std::fs::write(&file, numbered_lines(3000)).unwrap();
+    let proj_dir = proj.path().to_string_lossy().to_string();
+    let file_str = file.to_string_lossy().to_string();
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj_dir)).await;
+
+    // Open the viewer the way a browse file row does: no op, the listing's
+    // whole state in dir/show_hidden/keyword/page.
+    let card = app
+        .host_action(serde_json::json!({
+            "action": "file",
+            "path": file_str,
+            "chat_id": "chat_1",
+            "thread_id": "chat_1",
+            "dir": proj_dir,
+            "show_hidden": true,
+            "keyword": "long",
+            "page": 1,
+        }))
+        .await
+        .expect("the row opens the viewer")
+        .card
+        .expect("a card");
+    let back = card_buttons(&card)
+        .into_iter()
+        .find(|b| b["text"]["content"] == "← 返回目录")
+        .expect("the row-opened viewer offers the way back");
+    assert_eq!(back["value"]["op"], "restore");
+    assert_eq!(back["value"]["keyword"], "long");
+
+    // The pager carries the listing back as `return_*` — strings only, because
+    // the shared pager holds string callback fields.
+    let next = pager_button(&card, "下一页")["value"].clone();
+    assert_eq!(next["op"], "page");
+    assert_eq!(next["path"], file_str);
+    assert_eq!(next["return_dir"], proj_dir);
+    assert_eq!(next["return_show_hidden"], "true");
+    assert_eq!(next["return_keyword"], "long");
+    assert_eq!(next["return_page"], "1");
+
+    // The flipped page still offers the same way back.
+    let page2 = app
+        .host_action(next)
+        .await
+        .expect("the flip rebuilds the card")
+        .card
+        .expect("a card");
+    let back2 = card_buttons(&page2)
+        .into_iter()
+        .find(|b| b["text"]["content"] == "← 返回目录")
+        .expect("the flipped page keeps the way back");
+    assert_eq!(
+        back2["value"], back["value"],
+        "the listing state survives the flip"
+    );
+    assert_eq!(
+        pager_label(&page2).as_deref(),
+        Some("第 2/2 页 · 共 3000 个"),
+        "{}",
+        card_text(&page2)
     );
 }

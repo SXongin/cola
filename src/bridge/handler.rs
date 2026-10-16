@@ -573,6 +573,41 @@ fn parse_show_hidden(value: &serde_json::Value) -> bool {
     }
 }
 
+/// The viewer pager (`op: "page"`, #740) and the 「发为文件」 transfer carry the
+/// home listing as `return_*`: strings on the pager (the shared pager holds
+/// string callback fields only), JSON-typed on the transfer button — read
+/// both, defaulting like the row's own fields do.
+fn return_hidden(value: &serde_json::Value) -> bool {
+    match value.get("return_show_hidden") {
+        Some(serde_json::Value::Bool(hidden)) => *hidden,
+        Some(serde_json::Value::String(flag)) => flag == "true",
+        _ => false,
+    }
+}
+
+/// The home listing's page from `return_page`: a number on the transfer
+/// button, a decimal string on the pager — either way at least 1.
+fn return_page_num(value: &serde_json::Value) -> usize {
+    let page = match value.get("return_page") {
+        Some(serde_json::Value::Number(page)) => page.as_u64().unwrap_or(1),
+        Some(serde_json::Value::String(page)) => page.parse::<u64>().unwrap_or(1),
+        _ => 1,
+    };
+    page.max(1) as usize
+}
+
+/// A viewer payload's viewer page (#740): the pager's TARGET page, or the page
+/// the 「发为文件」 transfer's card PATCH rebuilds — a missing page reads as
+/// the first window, and the builder clamps an out-of-range one.
+fn viewer_page(value: &serde_json::Value) -> usize {
+    let page = match value.get("page") {
+        Some(serde_json::Value::Number(page)) => page.as_u64().unwrap_or(1),
+        Some(serde_json::Value::String(page)) => page.parse::<u64>().unwrap_or(1),
+        _ => 1,
+    };
+    page.max(1) as usize
+}
+
 /// Declare (or replace) the conversation's Pending Session at `directory` — the
 /// shared tail of the Recent Directories and browse cards' pick/选择 (Lazy
 /// Session Creation, ADR-0041). A persist failure is logged and the caller still
@@ -2638,6 +2673,7 @@ impl App {
         core: &Arc<SharedCore>,
         value: &serde_json::Value,
     ) -> Option<CardActionResult> {
+        let op = value.get("op").and_then(|v| v.as_str()).unwrap_or("");
         let thread_key = thread_key_from_value(value);
         // The row's `path` comes straight from the browse scan, so it names a
         // filesystem entry, not free text: it is read **verbatim**. Trimming it
@@ -2657,26 +2693,56 @@ impl App {
         }
         // The listing to return to, when the row came from one
         // (`browse_file_value`). Absent — a viewer opened from a tool panel
-        // (#743) — leaves the viewer without a 返回目录 control.
-        let home_dir = value
-            .get("dir")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let home_keyword = value
-            .get("keyword")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let home_page = value.get("page").and_then(|v| v.as_u64()).unwrap_or(1).max(1) as usize;
-        let home_hidden = parse_show_hidden(value);
+        // (#743) — leaves the viewer without a 返回目录 control. The viewer's
+        // own pager (`op: "page"`, #740) carries the same listing as `return_*`
+        // — strings only, because the shared pager holds string callback
+        // fields — and the TARGET viewer page as `page` (a row's `page` is the
+        // LISTING's, so the op is what tells the two shapes apart).
+        let (home_dir, home_keyword, home_hidden, home_page, page) = if op == "page" {
+            (
+                value
+                    .get("return_dir")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                value
+                    .get("return_keyword")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                return_hidden(value),
+                return_page_num(value),
+                viewer_page(value),
+            )
+        } else {
+            (
+                value
+                    .get("dir")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                value
+                    .get("keyword")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                parse_show_hidden(value),
+                value.get("page").and_then(|v| v.as_u64()).unwrap_or(1).max(1) as usize,
+                1,
+            )
+        };
         let return_to = (!home_dir.is_empty()).then(|| BrowseView {
             dir: &home_dir,
             show_hidden: home_hidden,
             keyword: &home_keyword,
             page: home_page,
         });
-        match crate::feishu::card::command::path_answer(&thread_key, std::path::Path::new(&path), return_to) {
+        match crate::feishu::card::command::path_answer(
+            &thread_key,
+            std::path::Path::new(&path),
+            return_to,
+            page,
+        ) {
             crate::feishu::card::command::PathAnswer::Viewer(card) => Some(CardActionResult {
                 card: Some(card),
                 toast: None,
@@ -3312,16 +3378,9 @@ impl App {
             .to_string();
         let return_to = return_dir.as_deref().map(|dir| BrowseView {
             dir,
-            show_hidden: value
-                .get("return_show_hidden")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
+            show_hidden: return_hidden(&value),
             keyword: &return_keyword,
-            page: value
-                .get("return_page")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(1)
-                .max(1) as usize,
+            page: return_page_num(&value),
         });
         // Re-stat and re-classify: the path may have changed since the viewer
         // was opened. A vanished or unreadable path (a denied `stat` included)
@@ -3347,6 +3406,7 @@ impl App {
                         &classified,
                         Some(lane),
                         return_to,
+                        viewer_page(&value),
                     )
                 }
                 Err(failure) => crate::feishu::card::viewer::build_viewer_failure_card(
