@@ -97,14 +97,19 @@ loop.
    **The whole-bytes lane is a user action, not a promise**: every viewer carries
    「发为文件」, which uploads the file and posts it as that File Message, and that is the only
    thing that gets a file whose preview fits nowhere (a 5000-line log, a 60-row table) out of
-   the chat. **That transfer never runs inside the card callback.** The click records the
+   the chat. **Deliver once:** when content has already landed as a Rich Text Message or File
+   Message, the viewer omits 「发为文件」 rather than offer a duplicate; its tracking line names
+   the message lane. An embedded image remains visible on the viewer
+   card and keeps the explicit File Message action. **That transfer never runs inside the card
+   callback.** The click records the
    intent and acknowledges; a bounded, timed-out step performs the upload and the send off
    the callback path, and the card reports the outcome — including a failure or a timeout —
    so a 30 MB upload can neither die with the callback's 3 s budget nor leave the clicker
-   with a dropped result (CODING_STANDARDS.md's callback-network rule). Local work a click
-   does stays inline, because that work is bounded by design: resolving a path, a `stat`, and
-   a read under the preview cap are the Directory Browser's own scan-cap discipline, and no
-   transfer shares it. A text file's card preview is a
+   with a dropped result (CODING_STANDARDS.md's callback-network rule). Viewer opens also
+   acknowledge first and run their `stat` plus classification in a bounded background task:
+   even a capped local read can stall on a slow or network-mounted filesystem, and the task
+   patches the clicked card after its lane settles. Directory navigation keeps its existing
+   bounded scan discipline. A text file's card preview is a
    fenced code block with a language hint, paged by **lines** with the shared pager control —
    **except a delimited-text file (`.csv`, `.tsv`), whose preview is a markdown table**, since
    a table is what those bytes *are* and the platform renders one natively; that lane is
