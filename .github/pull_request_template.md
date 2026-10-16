@@ -2,7 +2,7 @@
 <!-- One paragraph: what does this change do? -->
 
 ## Why
-<!-- The problem it solves. Reference the issue — ALWAYS (the Codex gate fails before the model runs when neither this body nor a `Refs: #N` commit trailer carries one, so a change with no issue yet creates one first — CONTRIBUTING.md "Pull request rules" 3): "Closes #123" completes an issue, "Refs #123" merely relates. A dependency batch references the standing deps spec #733 (`Refs`, never `Closes`). -->
+<!-- The problem it solves. Reference the issue — ALWAYS: the Codex gate collects references from this body and from `Refs: #N` commit trailers, and fails before the model runs when neither carries one, so a change with no issue yet creates one first (CONTRIBUTING.md "Pull request rules" 3) — `Closes #N` completes an issue, `Refs #N` merely relates to one; a dependency batch references the standing deps spec (#733) instead of a per-batch ticket. Leave the examples as `#N`: a literal number here is collected as this PR's own reference. -->
 
 ## How tested
 <!-- Commands run, e.g. the verification loop from CONTRIBUTING.md:
