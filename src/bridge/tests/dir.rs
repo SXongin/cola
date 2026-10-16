@@ -1786,6 +1786,74 @@ async fn dir_browse_file_rows_resolve_a_symlink_and_keep_a_plain_path() {
     assert!(text.contains("# real"), "and the target's bytes: {text}");
 }
 
+/// The per-row `canonicalize` is GATED, not unconditional (#742 review): only a
+/// symlink entry's path is resolved, a plain regular file's row path is the
+/// exact path the scan already holds — no syscall, no re-spelling. The
+/// black-box browse test above cannot pin this: the browsed directory is
+/// canonical, so canonicalizing a plain row would return a byte-identical path
+/// and stay invisible. Here the plain entry is paired with a deliberately
+/// NON-canonical spelling of its path, so the assertion fails the moment the
+/// gate is dropped.
+#[cfg(unix)]
+#[test]
+fn dir_browse_row_path_resolves_only_symlink_entries() {
+    let proj = tempfile::tempdir().unwrap();
+    let target = proj.path().join("real.md");
+    std::fs::write(&target, "# real\n").unwrap();
+    std::fs::write(proj.path().join("plain.md"), "# plain\n").unwrap();
+    let link = proj.path().join("link.md");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    // A real subdirectory, so `<proj>/sub/../` traverses and canonicalize can
+    // succeed — which is what makes it differ from the plain spelling.
+    let sub = proj.path().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+
+    let entry = |name: &str| {
+        std::fs::read_dir(proj.path())
+            .unwrap()
+            .map(|e| e.unwrap())
+            .find(|e| e.file_name() == std::ffi::OsStr::new(name))
+            .unwrap_or_else(|| panic!("a `{name}` entry"))
+    };
+    let plain = entry("plain.md");
+    let linked = entry("link.md");
+
+    // The gate itself: a plain regular file is not a symlink, a link is.
+    assert!(
+        !crate::bridge::handler::entry_is_symlink(&plain, &plain.path()),
+        "a plain file is no link"
+    );
+    assert!(
+        crate::bridge::handler::entry_is_symlink(&linked, &link),
+        "the link entry is one"
+    );
+
+    let non_canonical = sub.join("..").join("plain.md");
+    assert_ne!(
+        std::fs::canonicalize(&non_canonical).unwrap(),
+        non_canonical,
+        "the fixture path must be non-canonical or this pin is a tautology"
+    );
+    assert_eq!(
+        crate::bridge::handler::row_path_for(&plain, non_canonical.clone(), true),
+        non_canonical,
+        "a plain file's row path is the entry path verbatim — never canonicalized"
+    );
+    // A symlink entry IS resolved: its row names the target it followed.
+    assert_eq!(
+        crate::bridge::handler::row_path_for(&linked, link.clone(), true),
+        std::fs::canonicalize(&target).unwrap(),
+        "a symlink file row names the resolved target"
+    );
+    // A directory row is never resolved here — its click re-resolves through the
+    // browse handler anyway.
+    assert_eq!(
+        crate::bridge::handler::row_path_for(&plain, non_canonical.clone(), false),
+        non_canonical,
+        "a directory row keeps the entry path"
+    );
+}
+
 /// A non-regular, non-directory entry — a socket, a FIFO, a device node — is
 /// not a row at all (#742 review): only a directory and a **regular file** are
 /// listed, so a pseudo-file is never misrepresented as a `0 B` file the viewer

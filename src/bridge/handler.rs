@@ -410,26 +410,7 @@ fn browse_dir_state(view: BrowseView<'_>) -> BrowseState {
                 {
                     continue;
                 }
-                // A file row's path is the one the viewer will NAME (ADR-0083
-                // §3: "the path is the one that was resolved, not the one that
-                // was typed"). Its click bypasses `resolve_browse_path` — the
-                // row routes straight to `action: "file"` — so the link path
-                // `read_dir` handed us must not be stored: a symlinked file
-                // would otherwise open a viewer naming the link. The browsed
-                // directory is already canonical, so only a SYMLINK entry needs
-                // resolving — a plain entry's path is canonical as it stands,
-                // and canonicalizing every row would spend a syscall per file
-                // on a directory of up to `BROWSE_SCAN_CAP` entries, inside
-                // Feishu's 3 s callback budget. For a link, `metadata()` above
-                // followed it, so canonicalize here is exactly the
-                // `stat`-followed target the row's size came from. A directory
-                // row keeps the entry path: its click re-resolves through the
-                // browse handler anyway.
-                let row_path = if is_file && entry_is_symlink(&entry, &path) {
-                    std::fs::canonicalize(&path).unwrap_or(path)
-                } else {
-                    path
-                };
+                let row_path = row_path_for(&entry, path, is_file);
                 children.push(crate::feishu::card::session::BrowseChild {
                     name,
                     path: row_path.to_string_lossy().to_string(),
@@ -468,11 +449,44 @@ fn browse_dir_state(view: BrowseView<'_>) -> BrowseState {
     }
 }
 
+/// The path a browse row stores (ADR-0083 §3).
+///
+/// A **file** row stores the path the viewer will NAME: "the path is the one
+/// that was resolved, not the one that was typed". Its click bypasses
+/// `resolve_browse_path` — the row routes straight to `action: "file"` — so the
+/// link path `read_dir` handed us must not be stored: a symlinked file would
+/// otherwise open a viewer naming the link. The browsed directory is already
+/// canonical, so only a SYMLINK entry needs resolving — a plain entry's path is
+/// canonical as it stands, and canonicalizing every row would spend a syscall
+/// per file on a directory of up to `BROWSE_SCAN_CAP` entries, inside Feishu's
+/// 3 s callback budget. For a link, the scan's `metadata()` followed it, so
+/// canonicalize here is exactly the `stat`-followed target the row's size came
+/// from.
+///
+/// A **directory** row always keeps the entry path: its click re-resolves
+/// through the browse handler anyway.
+///
+/// `pub(crate)` so the gate itself is pinned by
+/// `tests::dir::dir_browse_row_path_resolves_only_symlink_entries` (#742
+/// review): a black-box browse of a canonical directory cannot tell a gated
+/// canonicalize from an unconditional one.
+pub(crate) fn row_path_for(
+    entry: &std::fs::DirEntry,
+    path: std::path::PathBuf,
+    is_file: bool,
+) -> std::path::PathBuf {
+    if is_file && entry_is_symlink(entry, &path) {
+        std::fs::canonicalize(&path).unwrap_or(path)
+    } else {
+        path
+    }
+}
+
 /// Whether the `read_dir` entry at `path` is a symlink, read from the entry's
 /// cached file type where the platform provides one — no extra syscall for the
 /// common case of a plain regular file — and from an `lstat` only when that type
 /// is unavailable (#742 review). Only such an entry's path needs canonicalizing.
-fn entry_is_symlink(entry: &std::fs::DirEntry, path: &std::path::Path) -> bool {
+pub(crate) fn entry_is_symlink(entry: &std::fs::DirEntry, path: &std::path::Path) -> bool {
     match entry.file_type() {
         Ok(file_type) => file_type.is_symlink(),
         Err(_) => std::fs::symlink_metadata(path)
