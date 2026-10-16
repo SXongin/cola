@@ -118,9 +118,11 @@ loop.
    **preview read cap** (8 MB) is not previewed at all — it goes straight to a File Message
    under its **text** label (`文本（过大，未预览）`), because the CONTENT decides the type and a
    big UTF-8 file is a text file, never 「二进制」 — and the 30 MB upload cap is unchanged. Both
-   are constants, not policy. **Classification reads at most the 30 MB upload cap**: a file
-   within that cap is read once and its bytes decide text vs binary, and a file past it is
-   named from a bounded header alone, because nothing more is read — so telling a large text
+   are constants, not policy. **Classification reads up to the 30 MB upload cap plus
+   one detection byte**: a file within that cap is read once — and those same bytes both
+   decide text vs binary and reach the delivery path, so the card can never describe
+   bytes the upload does not carry — and a file past it is named from a bounded header
+   alone, because nothing more is read — so telling a large text
    file from a binary is bounded by the constant, never by the file. Emptiness and the
    reported size come from the **bytes actually read**, never from the `stat` size: a
    pseudo-file (`/proc`, `/sys`) reports size 0 while having content, and a file that shrinks

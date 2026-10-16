@@ -687,6 +687,17 @@ fn delimited_records(text: &str, delim: char) -> DelimitedRecords<'_> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Characters the delimited parser has pulled on the calling thread (tests
+    /// only): [`delimited_table`] must stop pulling at the card's caps, and the
+    /// renderer's own test needs to observe that from the CARD build, not just
+    /// from the parser directly (finding #739 §1, round 2 — a regression that
+    /// collected every record before rendering would otherwise pass). A
+    /// thread-local keeps each test's build to itself.
+    static DELIMITED_SCANNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The lazy parser behind [`delimited_records`]: it pulls characters from the
 /// text on demand and yields one bounded record per `next`.
 struct DelimitedRecords<'a> {
@@ -707,12 +718,16 @@ impl DelimitedRecords<'_> {
         self.scanned
     }
 
-    /// Count one character pulled from the input (tests only).
+    /// Count one character pulled from the input (tests only). The per-instance
+    /// count is what a parser-level test reads; the thread-local total is what
+    /// the CARD build's test reads, so it can see that `delimited_table` stopped
+    /// pulling even though it holds no handle on the parser.
     #[inline]
     fn count(&mut self) {
         #[cfg(test)]
         {
             self.scanned += 1;
+            DELIMITED_SCANNED.with(|total| total.set(total.get() + 1));
         }
     }
 }
@@ -1157,6 +1172,43 @@ mod tests {
             "a giant field is bounded to the cell cap: {}",
             cell.chars().count()
         );
+    }
+
+    /// The parser-level test above proves the laziness of `delimited_records`;
+    /// this one proves the CARD BUILD actually relies on it. It asserts the
+    /// bounded scan from `build_viewer_card` (via the thread-local the parser
+    /// feeds), so a regression that collected every record before rendering —
+    /// `delimited_table` calling `records.collect()` — fails here, even though
+    /// the card's rendered output (a capped table) would look identical
+    /// (finding #739 §1, round 2).
+    #[test]
+    fn the_card_build_parses_a_delimited_preview_lazily() {
+        let rows = 400_000;
+        let mut csv = String::with_capacity(rows * 4 + 8);
+        csv.push_str("n,v\n");
+        for _ in 0..rows {
+            csv.push_str("a,1\n");
+        }
+
+        DELIMITED_SCANNED.with(|total| total.set(0));
+        let card = build_viewer_card(
+            &key(),
+            view("/tmp/many.csv", ViewerKind::Delimited, Some("csv"), &csv),
+        );
+        let scanned = DELIMITED_SCANNED.with(|total| total.get());
+        assert!(
+            scanned > 0,
+            "the card build did parse the preview (0 chars scanned)"
+        );
+        assert!(
+            scanned < csv.len() / 4,
+            "the card build must not scan the whole file: {scanned} of {} chars",
+            csv.len()
+        );
+        // The rendered table is unchanged by the laziness: it still says it was
+        // cut.
+        let text = card_text(&card);
+        assert!(text.contains("表格过长"), "the row cut is stated: {text}");
     }
 
     /// The card names the file it shows: the resolved path, its size and its
