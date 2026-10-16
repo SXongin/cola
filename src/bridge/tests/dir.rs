@@ -1697,16 +1697,20 @@ async fn dir_browse_pager_counts_files_toward_the_six_per_page() {
 /// The row dispatches straight to the viewer — it does not pass through the
 /// browse handler's `resolve_browse_path` — so the listing itself must store
 /// the resolved path, or the viewer would name the link that was typed into
-/// the directory.
+/// the directory. A **plain** (non-symlink) row keeps its entry path: the
+/// browsed directory is canonical, so only a link needs resolving and a
+/// directory of regular files pays no `canonicalize` syscall per row (#742
+/// review).
 #[cfg(unix)]
 #[tokio::test]
-async fn dir_browse_file_row_names_the_resolved_target_of_a_symlink() {
+async fn dir_browse_file_rows_resolve_a_symlink_and_keep_a_plain_path() {
     let _wd = test_work_dir();
     let proj = tempfile::tempdir().unwrap();
     let target = proj.path().join("real.md");
     std::fs::write(&target, "# real\n").unwrap();
     let link = proj.path().join("link.md");
     std::os::unix::fs::symlink(&target, &link).unwrap();
+    std::fs::write(proj.path().join("plain.md"), "# plain\n").unwrap();
     let proj_dir = canonical(proj.path());
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
@@ -1737,6 +1741,23 @@ async fn dir_browse_file_row_names_the_resolved_target_of_a_symlink() {
         payload["path"].as_str(),
         Some(link.to_string_lossy().as_ref()),
         "never the link spelling the scan read: {payload}"
+    );
+
+    // A plain file is no link, so its row keeps the entry path `read_dir`
+    // handed us verbatim — nothing is resolved on its behalf.
+    assert_eq!(
+        file_row(&card, "plain.md")["text"]["content"],
+        "📄 plain.md · 8 B",
+        "a plain file's row reports its own size"
+    );
+    let plain = file_row(&card, "plain.md")["value"].clone();
+    let plain_entry = std::path::Path::new(&proj_dir)
+        .join("plain.md")
+        .to_string_lossy()
+        .to_string();
+    assert_eq!(
+        plain["path"], plain_entry,
+        "a plain file's row keeps its entry path: {plain}"
     );
 
     // Clicking it opens the viewer at that same resolved path: the header and
