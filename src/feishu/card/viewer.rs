@@ -877,7 +877,7 @@ fn lane_line(lane: &ViewerFileLane) -> String {
     let base = format!("📎 {} · {} · {}", lane.name, lane.mime, human_size(lane.size));
     if lane.refresh_failed {
         return match lane.rich_message_id.as_deref() {
-            Some(message_id) => format!("{base} · 富文本刷新失败，当前仍是消息 `{message_id}`"),
+            Some(message_id) => format!("{base} · 富文本刷新失败；旧消息仍在 `{message_id}`"),
             None => format!("{base} · 刷新失败"),
         };
     }

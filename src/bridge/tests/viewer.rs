@@ -2270,6 +2270,47 @@ async fn reread_from_overflow_to_fitting_retires_rich_copy() {
     );
 }
 
+/// An exhausted edit budget cannot retire the old rich body. Keep its id and
+/// the current fitting preview on the card, but never send an untracked notice.
+#[tokio::test]
+async fn fitting_reread_edit_limit_does_not_send_an_untracked_notice() {
+    let (_work_dir, _project, _state, app, platform, file, original) = open_overflow_csv_viewer().await;
+    std::fs::write(&file, "name,age\nann,3\n").unwrap();
+    platform
+        .refuse_edit_message_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+
+    app.host_action_on_message(reread_payload(&original), "msg_reply")
+        .await
+        .expect("the fitting re-read acknowledges");
+    wait_for_card_update(&platform, "unretired rich copy", CardUpdates::Latest, |card| {
+        card_text(card).contains("| ann | 3 |") && card_text(card).contains("旧消息仍在 `msg_file`")
+    })
+    .await;
+
+    let card = platform.updated_cards().await.pop().expect("viewer card patch");
+    assert_eq!(reread_payload(&card)["rich_message_id"], "msg_file");
+    assert_eq!(
+        rich_text_messages(&platform).await.len(),
+        1,
+        "only the original overflow message exists; no fallback notice is sent"
+    );
+    let calls = platform.calls.lock().await.clone();
+    assert!(calls.iter().any(|call| matches!(call, PlatformCall::EditMessage {
+        message_id,
+        outcome: crate::feishu::MessageEditOutcome::EditLimitReached,
+        ..
+    } if message_id == "msg_file")));
+    assert!(
+        !calls
+            .iter()
+            .any(|call| matches!(call, PlatformCall::SendMessageReply {
+            msg_type, content, ..
+        } if msg_type == "post" && content.to_string().contains("最新内容以文件查看卡为准"))),
+        "an edit-limit refusal does not create an untracked retirement notice"
+    );
+}
+
 /// A fitting preview that grows past the structural limit moves to one rich
 /// message, and the card retains only its tracking line.
 #[tokio::test]
@@ -2461,7 +2502,7 @@ async fn frequency_limit_230020_does_not_resend_rich_message() {
         "no duplicate message is sent"
     );
     let card = platform.updated_cards().await.pop().unwrap();
-    assert!(card_text(&card).contains("当前仍是消息 `msg_file`"));
+    assert!(card_text(&card).contains("旧消息仍在 `msg_file`"));
     assert_eq!(reread_payload(&card)["rich_message_id"], "msg_file");
 }
 
@@ -2506,7 +2547,7 @@ async fn ambiguous_rich_message_edit_does_not_resend_and_preserves_id() {
         "ambiguous edits never duplicate content"
     );
     let card = platform.updated_cards().await.pop().unwrap();
-    assert!(card_text(&card).contains("当前仍是消息 `msg_file`"));
+    assert!(card_text(&card).contains("旧消息仍在 `msg_file`"));
     assert_eq!(reread_payload(&card)["rich_message_id"], "msg_file");
 }
 
@@ -2737,19 +2778,28 @@ async fn a_row_open_embeds_images_and_sends_binary_once() {
         "an embeddable image is not a file message"
     );
 
+    let binary_row = serde_json::json!({
+        "action": "file",
+        "path": binary.to_string_lossy(),
+        "chat_id": "chat_1",
+        "thread_id": "chat_1",
+    });
+    let (entered, release) = platform.pause("send_message", "msg_binary_row");
     let result = app
-        .host_action_on_message(
-            serde_json::json!({
-                "action": "file",
-                "path": binary.to_string_lossy(),
-                "chat_id": "chat_1",
-                "thread_id": "chat_1",
-            }),
-            "msg_binary_row",
-        )
+        .host_action_on_message(binary_row.clone(), "msg_binary_row")
         .await
         .expect("the binary row acknowledges");
     assert!(result.card.is_none());
+    tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+        .await
+        .expect("the first binary send reaches the paused send call");
+
+    let repeated = app
+        .host_action_on_message(binary_row, "msg_binary_row")
+        .await
+        .expect("a repeated binary row click is acknowledged");
+    assert!(repeated.card.is_none());
+    release.notify_one();
     wait_for_card_update(&platform, "binary viewer", CardUpdates::Latest, |card| {
         card_text(card).contains("已发送为文件消息")
     })
@@ -2757,7 +2807,7 @@ async fn a_row_open_embeds_images_and_sends_binary_once() {
     assert_eq!(
         file_messages(&platform).await.len(),
         1,
-        "exactly one File Message"
+        "the repeated click does not send a second File Message"
     );
     let binary_card = platform
         .updated_cards()

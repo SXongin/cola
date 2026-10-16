@@ -205,6 +205,9 @@ pub struct App {
     /// The Host gate (ADR-0035): every inbound message and card action is
     /// authorized against the Access List before cola acts.
     pub(crate) access: tokio::sync::Mutex<Access>,
+    /// File Viewer callbacks are acknowledged before work begins; hold one
+    /// process-local claim per Chat + clicked card until its task and PATCH end.
+    viewer_actions_in_flight: Arc<std::sync::Mutex<std::collections::HashSet<(String, String)>>>,
     /// Weak self-reference, set once inside `run` (which holds the Arc). Lets
     /// the `EventSink` trait impl (which only has `&self`) recover a
     /// `&Arc<App>` to hand to the inherent methods. `Weak` so it never keeps
@@ -623,6 +626,7 @@ struct ViewerOpen {
     return_to: OwnedReturnTo,
     page: usize,
     core: Arc<SharedCore>,
+    in_flight_guard: ViewerActionGuard,
 }
 
 /// The stateless work captured by one File Viewer re-read click.
@@ -633,6 +637,7 @@ struct ViewerReread {
     rich_message_id: Option<String>,
     return_to: OwnedReturnTo,
     page: usize,
+    in_flight_guard: ViewerActionGuard,
 }
 
 /// One stat/classification snapshot for a viewer open, completed off the card
@@ -653,6 +658,24 @@ struct ViewerOpenFailure<'a> {
     return_to: &'a OwnedReturnTo,
     line: &'a str,
     timeout_ms: u64,
+}
+
+/// RAII claim for one in-flight File Viewer action. A duplicate callback gets
+/// acknowledged without spawning another sender; Drop releases even if the
+/// spawned task is cancelled or unwinds.
+struct ViewerActionGuard {
+    in_flight: Arc<std::sync::Mutex<std::collections::HashSet<(String, String)>>>,
+    key: (String, String),
+}
+
+impl Drop for ViewerActionGuard {
+    fn drop(&mut self) {
+        let mut in_flight = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        in_flight.remove(&self.key);
+    }
 }
 
 /// Blocking filesystem reads cannot be cancelled by their async timeout. Keep
@@ -840,6 +863,25 @@ impl App {
             self_weak: std::sync::OnceLock::new(),
             core,
             access,
+            viewer_actions_in_flight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        })
+    }
+
+    /// Claim one clicked viewer card until its spawned operation and final card
+    /// update complete. The real card message id is supplied by Feishu callback
+    /// context; chat scopes it defensively across targets.
+    fn claim_viewer_action(&self, thread_key: &ThreadKey, message_id: &str) -> Option<ViewerActionGuard> {
+        let key = (thread_key.chat_id.clone(), message_id.to_string());
+        let mut in_flight = self
+            .viewer_actions_in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !in_flight.insert(key.clone()) {
+            return None;
+        }
+        Some(ViewerActionGuard {
+            in_flight: Arc::clone(&self.viewer_actions_in_flight),
+            key,
         })
     }
 
@@ -2876,6 +2918,12 @@ impl App {
                     toast: Some("无法重新读取：找不到文件查看卡。".to_string()),
                 });
             };
+            let Some(in_flight_guard) = self.claim_viewer_action(&thread_key, open_message_id) else {
+                return Some(CardActionResult {
+                    card: None,
+                    toast: Some("正在重新读取…".to_string()),
+                });
+            };
             let app = Arc::clone(self);
             let card_message_id = open_message_id.to_string();
             let path = resolved.to_string_lossy().to_string();
@@ -2898,6 +2946,7 @@ impl App {
                     rich_message_id,
                     return_to,
                     page,
+                    in_flight_guard,
                 })
                 .await;
             });
@@ -2918,6 +2967,12 @@ impl App {
                 .and_then(|v| v.as_str())
                 .filter(|id| !id.is_empty())
         {
+            let Some(in_flight_guard) = self.claim_viewer_action(&thread_key, open_message_id) else {
+                return Some(CardActionResult {
+                    card: None,
+                    toast: Some("正在打开文件…".to_string()),
+                });
+            };
             let app = Arc::clone(self);
             let core = Arc::clone(core);
             let message_id = open_message_id.to_string();
@@ -2936,6 +2991,7 @@ impl App {
                     return_to,
                     page,
                     core,
+                    in_flight_guard,
                 })
                 .await;
             });
@@ -2992,7 +3048,9 @@ impl App {
             rich_message_id,
             return_to,
             page,
+            in_flight_guard,
         } = reread;
+        let _in_flight_guard = in_flight_guard;
         let timeout_ms = self
             .viewer_transfer_timeout_ms
             .load(std::sync::atomic::Ordering::Relaxed);
@@ -3111,7 +3169,9 @@ impl App {
             return_to,
             page,
             core,
+            in_flight_guard,
         } = open;
+        let _in_flight_guard = in_flight_guard;
         let timeout_ms = self
             .viewer_transfer_timeout_ms
             .load(std::sync::atomic::Ordering::Relaxed);
@@ -3830,11 +3890,18 @@ impl App {
             });
         }
         let thread_key = thread_key_from_value(value);
+        let Some(in_flight_guard) = self.claim_viewer_action(&thread_key, message_id) else {
+            return Some(CardActionResult {
+                card: None,
+                toast: Some("正在发送文件…".to_string()),
+            });
+        };
         let path = path.to_string();
         let message_id = message_id.to_string();
         let value = value.clone();
         let app = Arc::clone(self);
         tokio::spawn(async move {
+            let _in_flight_guard = in_flight_guard;
             app.run_viewer_file_transfer(thread_key, path, message_id, value)
                 .await;
         });
