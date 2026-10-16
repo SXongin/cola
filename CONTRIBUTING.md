@@ -158,10 +158,13 @@ newly published RUSTSEC advisories surface even when nothing is pushed.
    **creates one first** (a ticket under its spec; `docs/agents/issue-tracker.md`).
    Reference the originating issue/spec (a GitHub issue number; archive specs
    live under `.scratch/<feature>/`). `Closes #N` is for an issue this PR
-   completes; `Refs: #N` links one it merely relates to. To auto-close on merge,
-   give **every** number its own keyword — `Closes #10, closes #11, closes #12`;
-   GitHub closes only the first issue of a bare comma list after a single
-   keyword (`Closes #10, #11`).
+   completes; `Refs: #N` links one it merely relates to. A dependency batch is
+   the one recurring case that skips the per-change ticket: it references the
+   standing deps spec (#733) with `Refs`, never `Closes` — which is what gives
+   the gate a spec for a change whose own body is a generated version table. To
+   auto-close on merge, give **every** number its own keyword — `Closes #10,
+   closes #11, closes #12`; GitHub closes only the first issue of a bare comma
+   list after a single keyword (`Closes #10, #11`).
 4. Record architectural decisions as ADRs in `docs/adr/` when the change is
    hard to reverse.
 5. Do not merge until CI (fmt, clippy, test, release build, dependency audit) is
