@@ -263,14 +263,40 @@ pub(crate) fn classify(path: &Path, size: u64) -> Result<Classified, CatFailure>
     // thing that can name a never-read file. A text-shaped header is still TEXT
     // — too large to preview — never 「二进制」.
     if size > crate::feishu::file::MAX_FILE_BYTES {
-        let header = read_prefix(path, SNIFF_BYTES)?;
-        count_read(header.len());
-        if header.is_empty() {
-            return Err(CatFailure::Empty);
-        }
-        return Ok(past_cap(&header, size));
+        return classify_after_over_cap_stat(path, size);
     }
 
+    classify_bounded(path, size)
+}
+
+/// A caller's over-cap stat may go stale during the header read. A short prefix
+/// is the complete file snapshot; otherwise re-stat after that read and take the
+/// bounded whole-file lane if the file has since shrunk under the upload cap.
+fn classify_after_over_cap_stat(path: &Path, size: u64) -> Result<Classified, CatFailure> {
+    let header = read_prefix(path, SNIFF_BYTES)?;
+    count_read(header.len());
+    if header.is_empty() {
+        return Err(CatFailure::Empty);
+    }
+    // `read_to_end` returned before the requested sniff window, so these are
+    // the bytes actually present at this read, not merely a prefix of a large
+    // file whose stale stat says it is over the upload cap.
+    if header.len() < SNIFF_BYTES {
+        return classify_read_bytes(header);
+    }
+
+    let observed_size = std::fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(size);
+    if observed_size <= crate::feishu::file::MAX_FILE_BYTES {
+        return classify_bounded(path, observed_size);
+    }
+    Ok(past_cap(&header, observed_size))
+}
+
+/// Read a file under the upload cap once, with one detection byte, so the
+/// content verdict and any later upload refer to that same snapshot.
+fn classify_bounded(path: &Path, size: u64) -> Result<Classified, CatFailure> {
     // Within Feishu's upload cap: read the file ONCE, bounded by that cap (plus
     // the one byte that detects growth), and let exactly those bytes decide
     // everything. The bytes' own length is the truth the card reports (`size`
@@ -466,14 +492,10 @@ pub(crate) async fn open_overflow_lane(
         // The refreshed preview now fits on the card. Never put that same body
         // into the old Rich Text Message as well: replace it with a retirement
         // notice, then let the viewer card carry the current content exactly
-        // once. A failed/limited edit leaves the old message tracked honestly.
+        // once. Do not fall back to a fresh notice on edit-limit refusal: it
+        // would be untracked and the old message cannot be retired anyway.
         let notice = rich_post_content("文件内容已更新；最新内容以文件查看卡为准。");
-        let (delivery, refreshed_id, refresh_failed) =
-            refresh_rich_message(platform, reply_target, &notice, Some(message_id), timeout_ms).await;
-        if matches!(delivery, FileDelivery::SentAsRichText)
-            && !refresh_failed
-            && refreshed_id.as_deref() == Some(message_id)
-        {
+        if retire_rich_message(platform, message_id, &notice, timeout_ms).await {
             return None;
         }
         return Some(ViewerFileLane {
@@ -542,6 +564,38 @@ pub(crate) async fn open_overflow_lane(
         rich_message_id,
         refresh_failed,
     })
+}
+
+/// Replace the old rich body with a notice without the normal edit-limit fresh
+/// send fallback. The old body is still present if refused, so the viewer card
+/// keeps its current preview and reports that the old message could not retire.
+async fn retire_rich_message(
+    platform: &Arc<dyn Platform>,
+    message_id: &str,
+    notice: &serde_json::Value,
+    timeout_ms: u64,
+) -> bool {
+    match crate::bridge::bounded_call(
+        "viewer Rich Text Message retirement",
+        timeout_ms,
+        platform.edit_message(message_id, "post", notice),
+    )
+    .await
+    {
+        Some(Ok(crate::feishu::MessageEditOutcome::Updated)) => true,
+        Some(Ok(outcome)) => {
+            tracing::info!("viewer Rich Text Message {message_id} was not retired: {outcome:?}");
+            false
+        }
+        Some(Err(error)) => {
+            tracing::warn!("viewer Rich Text Message {message_id} retirement failed: {error}");
+            false
+        }
+        None => {
+            tracing::warn!("viewer Rich Text Message {message_id} retirement timed out");
+            false
+        }
+    }
 }
 
 /// Edit the carried message when possible. Only a definite platform refusal
@@ -1466,6 +1520,23 @@ mod tests {
         assert_eq!(classified.text.as_deref(), Some("now small\n"));
         assert_eq!(classified.size, 10);
         assert!(classified.bytes.is_none());
+    }
+
+    /// If a file shrinks after `classify`'s first fresh stat but before its
+    /// header read, the post-header snapshot re-enters the full read lane.
+    #[test]
+    fn classify_rechecks_a_shrink_after_the_over_cap_header_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("shrank-during-classification.log");
+        let bytes = vec![b'x'; SNIFF_BYTES + 17];
+        write(&file, &bytes);
+
+        // Simulate the over-cap stat that became stale before the header read.
+        let classified =
+            classify_after_over_cap_stat(&file, crate::feishu::file::MAX_FILE_BYTES + 1).unwrap();
+        assert_eq!(classified.kind, ClassifiedKind::Text);
+        assert_eq!(classified.size, bytes.len() as u64);
+        assert_eq!(classified.text.as_deref(), std::str::from_utf8(&bytes).ok());
     }
 
     /// An empty file is its own answer, never a lane.

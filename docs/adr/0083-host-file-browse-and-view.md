@@ -94,12 +94,12 @@ loop.
    once, 30 MB cap, a `未发送` tracking line beyond it). **The middle lane is bounded**: a
    `post` body carries the same **30 KB** cap as a card, so content whose rich-text body would
    exceed that does not take it — it goes to the File Message lane, with the card saying so.
-   **The whole-bytes lane is a user action, not a promise**: every viewer carries
-   「发为文件」, which uploads the file and posts it as that File Message, and that is the only
-   thing that gets a file whose preview fits nowhere (a 5000-line log, a 60-row table) out of
-   the chat. **Deliver once:** when content has already landed as a Rich Text Message or File
-   Message, the viewer omits 「发为文件」 rather than offer a duplicate; its tracking line names
-   the message lane. An embedded image remains visible on the viewer
+   **The whole-bytes lane is a user action, not a promise**: a viewer carries 「发为文件」 when
+   its content has not already landed outside the card. The action uploads the file and posts it
+   as a File Message; it is the way to send a fitting preview's bytes and the rescue for an
+   overflow lane that did not land. **Deliver once:** when content has already landed as a Rich
+   Text Message or File Message, the viewer omits 「发为文件」 rather than offer a duplicate;
+   its tracking line names the message lane. An embedded image remains visible on the viewer
    card and keeps the explicit File Message action. **That transfer never runs inside the card
    callback.** The click records the
    intent and acknowledges; a bounded, timed-out step performs the upload and the send off
