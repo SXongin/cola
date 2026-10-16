@@ -567,17 +567,36 @@ impl Client {
             "msg_type": msg_type,
             "content": content.to_string(),
         });
-        let text = read_body_with_diag(
-            self.http
-                .put(self.endpoint(&format!("/open-apis/im/v1/messages/{message_id}")))
-                .bearer_auth(&token)
-                .json(&body)
-                .timeout(std::time::Duration::from_secs(10))
-                .send()
-                .await?,
-            "edit message",
-        )
-        .await?;
+        let response = self
+            .http
+            .put(self.endpoint(&format!("/open-apis/im/v1/messages/{message_id}")))
+            .bearer_auth(&token)
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await?;
+        // Feishu documents edit business failures (including the edit-count
+        // limit) as HTTP 400 JSON. The shared helper turns non-2xx responses
+        // into an error first, so inspect this endpoint's documented body before
+        // delegating ordinary success/HTTP failures to it.
+        if response.status() == reqwest::StatusCode::BAD_REQUEST {
+            let text = response.text().await.unwrap_or_default();
+            if let Ok(resp) = serde_json::from_str::<ApiResponse>(&text)
+                && resp.code != 0
+            {
+                tracing::warn!("Feishu refused message edit {}: {}", resp.code, resp.msg);
+                return Ok(if resp.code == MESSAGE_EDIT_LIMIT_REACHED_CODE {
+                    crate::feishu::MessageEditOutcome::EditLimitReached
+                } else {
+                    crate::feishu::MessageEditOutcome::Refused
+                });
+            }
+            return Err(crate::error::BridgeError::FeishuHttp {
+                status: reqwest::StatusCode::BAD_REQUEST.as_u16(),
+                detail: format!("edit message HTTP 400: {}", body_snippet(&text, 200)),
+            });
+        }
+        let text = read_body_with_diag(response, "edit message").await?;
         let resp: ApiResponse = parse_json(&text, "edit message response")?;
         if resp.code == MESSAGE_EDIT_LIMIT_REACHED_CODE {
             tracing::warn!("Feishu refused message edit {}: {}", resp.code, resp.msg);
@@ -1569,7 +1588,7 @@ mod tests {
         server.route(
             "PUT",
             "/open-apis/im/v1/messages/om_rich",
-            200,
+            400,
             r#"{"code":230072,"msg":"The message has reached the number of times it can be edited."}"#,
         );
         let content = serde_json::json!({"zh_cn":{"content":[[{"tag":"md","text":"updated"}]]}});
@@ -1589,7 +1608,7 @@ mod tests {
         server.route(
             "PUT",
             "/open-apis/im/v1/messages/om_rich",
-            200,
+            400,
             r#"{"code":230020,"msg":"This operation triggers the frequency limit."}"#,
         );
         let content = serde_json::json!({"zh_cn":{"content":[[{"tag":"md","text":"updated"}]]}});
