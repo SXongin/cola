@@ -263,12 +263,9 @@ silently overriding it.
 
 Every non-draft in-repo PR gets a Codex review, except the skips noted below
 (`.github/workflows/codex-review.yml`, ADR-0034). It runs on `opened`,
-`synchronize`, `reopened`, `ready_for_review` and `edited` against the OpenCode
-Go subscription's provider endpoint
-(`https://opencode.ai/zen/go/v1/responses`), reviews the diff
-read-only on
-the two axes above plus an adversarial correctness/test-adequacy pass
-(`.github/codex/prompts/review.md`, model `gpt-6-luna`), and — when it finds
+`synchronize`, `reopened`, `ready_for_review` and `edited`, reviews the diff
+read-only on the two axes above plus an adversarial correctness/test-adequacy pass
+(`.github/codex/prompts/review.md`), and — when it finds
 nothing blocking — `github-actions[bot]` approves. The prompt embeds every
 issue the PR references — body keywords and `Refs:` commit trailers,
 deduplicated and capped — fetched before the model runs; a PR with no
