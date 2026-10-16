@@ -1122,11 +1122,12 @@ mod tests {
         );
 
         let home = dirs::home_dir().unwrap();
+        let canonical_home = std::fs::canonicalize(&home).unwrap();
         assert_eq!(
             resolve_cat_path("~/notes.md", &session_dir),
             home.join("notes.md")
         );
-        assert_eq!(resolve_cat_path("~", &session_dir), home);
+        assert_eq!(resolve_cat_path("~", &session_dir), canonical_home);
     }
 
     /// An existing path resolves to its canonical spelling — symlinks and `..`
@@ -1152,16 +1153,14 @@ mod tests {
     /// them: it is a byte lane (#739), not a failure.
     #[test]
     fn cat_failures_answer_distinctly_and_name_the_path() {
-        let path = Path::new("/tmp/some/file.txt");
-        let missing = CatFailure::Missing.line(path);
-        let unreadable = CatFailure::Unreadable("Permission denied (os error 13)".into()).line(path);
-        let empty = CatFailure::Empty.line(path);
+        let path = Path::new("tmp").join("some").join("file.txt");
+        let displayed_path = path.display().to_string();
+        let missing = CatFailure::Missing.line(&path);
+        let unreadable = CatFailure::Unreadable("Permission denied (os error 13)".into()).line(&path);
+        let empty = CatFailure::Empty.line(&path);
 
         for line in [&missing, &unreadable, &empty] {
-            assert!(
-                line.contains("/tmp/some/file.txt"),
-                "the line names the path: {line}"
-            );
+            assert!(line.contains(&displayed_path), "the line names the path: {line}");
         }
         assert!(missing.contains("找不到"), "{missing}");
         assert!(

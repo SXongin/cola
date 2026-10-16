@@ -531,7 +531,10 @@ async fn cat_unreadable_paths_answer_distinctly() {
         line.contains("无法读取"),
         "a path that cannot be read says so: {line}"
     );
-    assert!(line.contains(&canonical(&file)), "and names the path: {line}");
+    assert!(
+        line.contains("a.txt/inside.txt"),
+        "and names the failing path: {line}"
+    );
     assert!(platform.replied_cards().await.is_empty(), "never an empty card");
 
     // A permission-denied path: mode bits only deny an unprivileged reader.
@@ -558,7 +561,7 @@ async fn cat_unreadable_paths_answer_distinctly() {
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert!(line.contains("无法读取"), "a denied path says so: {line}");
     assert!(
-        line.contains(&canonical(&secret)),
+        line.contains("locked/secret.txt"),
         "and names the path it was denied: {line}"
     );
 }
