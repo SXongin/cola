@@ -2542,6 +2542,199 @@ async fn a_row_open_of_an_overflowing_preview_sends_then_patches() {
     );
 }
 
+/// A browse-row open uses the same byte lanes as `/cat`: images are embedded
+/// into the patched card, while non-text files get exactly one File Message.
+#[tokio::test]
+async fn a_row_open_embeds_images_and_sends_binary_once() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let image = proj.path().join("picture.png");
+    let binary = proj.path().join("archive.bin");
+    std::fs::write(&image, png()).unwrap();
+    std::fs::write(&binary, [0xff, 0xfe, 0x00, 0x01]).unwrap();
+
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+
+    let result = app
+        .host_action_on_message(
+            serde_json::json!({
+                "action": "file",
+                "path": image.to_string_lossy(),
+                "chat_id": "chat_1",
+                "thread_id": "chat_1",
+            }),
+            "msg_image_row",
+        )
+        .await
+        .expect("the image row acknowledges");
+    assert!(result.card.is_none(), "row opens are acknowledged before I/O");
+    wait_for_card_update(&platform, "embedded image viewer", CardUpdates::Latest, |card| {
+        card_text(card).contains("已内嵌")
+    })
+    .await;
+    let image_card = platform
+        .updated_cards()
+        .await
+        .pop()
+        .expect("patched image viewer");
+    assert!(
+        image_card.to_string().contains("\"tag\":\"img\""),
+        "the image is embedded: {image_card}"
+    );
+    assert!(
+        card_buttons(&image_card)
+            .iter()
+            .any(|button| button["text"]["content"] == "发为文件"),
+        "the embedded image remains visible and keeps the explicit File Message action"
+    );
+    assert_eq!(uploads(&platform).await.len(), 1, "one image upload");
+    assert!(
+        file_messages(&platform).await.is_empty(),
+        "an embeddable image is not a file message"
+    );
+
+    let result = app
+        .host_action_on_message(
+            serde_json::json!({
+                "action": "file",
+                "path": binary.to_string_lossy(),
+                "chat_id": "chat_1",
+                "thread_id": "chat_1",
+            }),
+            "msg_binary_row",
+        )
+        .await
+        .expect("the binary row acknowledges");
+    assert!(result.card.is_none());
+    wait_for_card_update(&platform, "binary viewer", CardUpdates::Latest, |card| {
+        card_text(card).contains("已发送为文件消息")
+    })
+    .await;
+    assert_eq!(
+        file_messages(&platform).await.len(),
+        1,
+        "exactly one File Message"
+    );
+    let binary_card = platform
+        .updated_cards()
+        .await
+        .pop()
+        .expect("patched binary viewer");
+    let text = card_text(&binary_card);
+    assert!(text.contains("已发送为文件消息"), "the outcome is stated: {text}");
+    assert!(
+        !card_buttons(&binary_card)
+            .iter()
+            .any(|button| button["text"]["content"] == "发为文件"),
+        "the delivered bytes cannot be sent a second time"
+    );
+}
+
+/// Fitting text takes no delivery lane: the row's own card is replaced in
+/// place, with no reply, Rich Text Message, or File Message.
+#[tokio::test]
+async fn a_fitting_row_open_patches_in_place_without_sending() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let file = proj.path().join("notes.txt");
+    std::fs::write(&file, "only on the viewer card\n").unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+
+    let result = app
+        .host_action_on_message(
+            serde_json::json!({
+                "action": "file",
+                "path": file.to_string_lossy(),
+                "chat_id": "chat_1",
+                "thread_id": "chat_1",
+                "dir": proj.path().to_string_lossy(),
+                "show_hidden": false,
+                "keyword": "",
+                "page": 1,
+            }),
+            "msg_fitting_row",
+        )
+        .await
+        .expect("the fitting row acknowledges");
+    assert!(result.card.is_none());
+    wait_for_card_update(&platform, "fitting row viewer", CardUpdates::Latest, |card| {
+        card_text(card).contains("only on the viewer card")
+    })
+    .await;
+    assert_eq!(
+        patches_to(&platform, "msg_fitting_row").await.len(),
+        1,
+        "the viewer replaces the clicked card in place"
+    );
+    assert!(
+        platform.replied_cards().await.is_empty(),
+        "no replacement message is sent"
+    );
+    assert!(
+        rich_text_messages(&platform).await.is_empty(),
+        "no Rich Text Message"
+    );
+    assert!(file_messages(&platform).await.is_empty(), "no File Message");
+    assert!(uploads(&platform).await.is_empty(), "no upload");
+}
+
+/// Classification of a file-row open cannot hold the 3 s card callback open:
+/// a FIFO stalls the reader until after the immediate ack.
+#[cfg(unix)]
+#[tokio::test]
+async fn row_open_ack_is_not_blocked_by_a_stalled_filesystem_read() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let file = proj.path().join("stalled.txt");
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+    let status = std::process::Command::new("mkfifo").arg(&file).status().unwrap();
+    assert!(status.success(), "create a FIFO to park classification");
+
+    let writer_path = file.clone();
+    let writer = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(1_200));
+        let mut fifo = std::fs::OpenOptions::new().write(true).open(writer_path).unwrap();
+        std::io::Write::write_all(&mut fifo, b"read completed after the ack\n").unwrap();
+    });
+    let started = std::time::Instant::now();
+    let result = app
+        .host_action_on_message(
+            serde_json::json!({
+                "action": "file",
+                "path": file.to_string_lossy(),
+                "chat_id": "chat_1",
+                "thread_id": "chat_1",
+            }),
+            "msg_stalled_row",
+        )
+        .await
+        .expect("the row callback acknowledges");
+    assert!(result.card.is_none());
+    assert!(result.toast.is_some());
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(700),
+        "callback ack waited for classification: {:?}",
+        started.elapsed()
+    );
+    wait_for_card_update(&platform, "FIFO row result", CardUpdates::Any, |card| {
+        card_text(card).contains("read completed after the ack")
+    })
+    .await;
+    writer.join().unwrap();
+}
+
 /// #741: a structurally-overflowing file opened from a Tool Panel's
 /// 「📂 打开」 (#743) takes the same lane — the send goes out off the callback
 /// path and the clicked card is PATCHed with the landed viewer, which carries
