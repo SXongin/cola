@@ -313,10 +313,12 @@ pub enum PlatformCall {
         mime: String,
         size: u64,
     },
-    /// A file upload (ADR-0076, #649): the File Content's name and decoded
-    /// length, recorded so a test can assert how many file uploads a turn made.
+    /// A file upload (ADR-0076, #649): the File Content's name, mime and decoded
+    /// length, recorded so a test can assert how many file uploads a turn made —
+    /// and that the bytes a lane uploaded are the ones its label names.
     UploadFile {
         name: String,
+        mime: String,
         size: u64,
     },
     /// A generic reply message send (ADR-0076, #649): the live card it replied
@@ -1184,6 +1186,7 @@ impl feishu::Platform for RecordingPlatform {
         }
         self.calls.lock().await.push(PlatformCall::UploadFile {
             name: content.name.clone(),
+            mime: content.mime.clone(),
             size: content.size,
         });
         Ok(Some(self.file_key.lock().unwrap().clone()))

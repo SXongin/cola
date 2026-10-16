@@ -21,6 +21,11 @@
 //! rejected card. Emptiness and the read bound are decided by the **bytes
 //! actually read**, never by the `stat` size: a pseudo-file (procfs, sysfs)
 //! reports size 0 while having content.
+//!
+//! A lane only ever hands the Platform bytes its own label was decided from: a
+//! 「发为文件」 transfer re-reads a file the viewer kept no bytes for (a text
+//! preview) and re-classifies exactly what it read, so a file replaced between
+//! the two can never go out under the earlier verdict's mime and kind.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -137,7 +142,10 @@ pub(crate) enum ClassifiedKind {
     /// UTF-8 text PAST the preview read cap: still text, just too large to
     /// preview — the File Message lane under a 「文本（过大，未预览）」 label,
     /// never 「二进制」. Whether it is text is decided by the content: the whole
-    /// file when it is within Feishu's upload cap, else its bounded header.
+    /// file when it is within Feishu's upload cap, else its bounded header. A
+    /// header-only verdict is ADR-0083 §6's documented approximation for a file
+    /// cola never reads in full — and such a file is neither previewed nor
+    /// delivered (未发送), so the label is the only thing it decides.
     TextTooLarge,
     /// A non-text file (a known binary, or an unknown non-UTF-8 file): no
     /// preview, delivered as a File Message.
@@ -163,8 +171,9 @@ pub(crate) struct Classified {
     pub(crate) text: Option<String>,
     /// The whole bytes for a delivery lane that hands them to the Platform (an
     /// image or a file), when the file is within Feishu's 30MB upload cap. `None`
-    /// for a text preview (which holds only its decoded text) and for a file past
-    /// the cap (never read — the card says 未发送).
+    /// for a text preview (which holds only its decoded text), for a file past
+    /// the cap (never read — the card says 未发送), and for a classification
+    /// whose bytes a lane has already taken.
     pub(crate) bytes: Option<Vec<u8>>,
 }
 
@@ -227,8 +236,9 @@ fn sniff(header: &[u8]) -> Sniff {
 /// exactly those bytes, which are then handed to the delivery lane — so a file
 /// that changed between two reads can never be described by one read's bytes
 /// and delivered from another's, and no byte within the cap is read twice. A
-/// file **past** the cap is never delivered, so a single bounded header is all
-/// that is read to name it.
+/// file **past** the cap is never delivered, so one bounded read is all that
+/// names it: a single header when the caller's `stat` already says so, and the
+/// header of the very bytes that discovered the growth when it does not.
 ///
 /// Emptiness is decided by the **bytes actually read**, never by the `stat`
 /// size: a pseudo-file (procfs, sysfs) reports size 0 in its metadata while
@@ -247,14 +257,7 @@ pub(crate) fn classify(path: &Path, size: u64) -> Result<Classified, CatFailure>
         if header.is_empty() {
             return Err(CatFailure::Empty);
         }
-        let sniffed = sniff(&header);
-        return Ok(past_cap(
-            size,
-            sniffed.octet_mime(),
-            sniffed.is_image,
-            sniffed.is_known_binary,
-            sniffed.is_text,
-        ));
+        return Ok(past_cap(&header, size));
     }
 
     // Within Feishu's upload cap: read the file ONCE, bounded by that cap (plus
@@ -263,31 +266,37 @@ pub(crate) fn classify(path: &Path, size: u64) -> Result<Classified, CatFailure>
     // below), so a file that shrank — or a pseudo-file whose `stat` size is 0 —
     // is named by what was actually read, and `FileContent::from_bytes`
     // receives those same bytes.
-    let Some(bytes) = read_bounded(path, crate::feishu::file::MAX_FILE_BYTES)? else {
-        // A file that GREW past the cap after the caller's `stat` reads one
-        // byte over it and is reported past-cap — never as its truncated
-        // prefix — so the card says 未发送 instead of claiming a partial file
-        // was sent. Nothing is deliverable, so only a bounded header names it.
-        let grown = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(size);
-        let header = read_prefix(path, SNIFF_BYTES)?;
-        count_read(header.len());
-        let sniffed = sniff(&header);
-        return Ok(past_cap(
-            grown,
-            sniffed.octet_mime(),
-            sniffed.is_image,
-            sniffed.is_known_binary,
-            sniffed.is_text,
-        ));
-    };
-    count_read(bytes.len());
+    match read_bounded(path, crate::feishu::file::MAX_FILE_BYTES)? {
+        BoundedRead::Whole(bytes) => {
+            count_read(bytes.len());
+            classify_read_bytes(bytes)
+        }
+        // A file that GREW past the cap after the caller's `stat`: the bounded
+        // read that discovered the growth is capped one byte over it, and the
+        // header of those very bytes names the file — never a second open, and
+        // never its truncated prefix — so the card says 未发送 instead of
+        // claiming a partial file was sent.
+        BoundedRead::Over(read) => {
+            count_read(read.len());
+            let grown = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(size);
+            Ok(past_cap(&read, grown))
+        }
+    }
+}
+
+/// Decide what a snapshot of `bytes` IS, for a file within Feishu's upload cap
+/// (ADR-0083 §6): magic bytes decide an image or a known binary first, then
+/// UTF-8 validity decides text. These are exactly the bytes a delivery lane
+/// hands the Platform, so the verdict and the upload can never describe two
+/// different reads.
+fn classify_read_bytes(bytes: Vec<u8>) -> Result<Classified, CatFailure> {
     if bytes.is_empty() {
         return Err(CatFailure::Empty);
     }
-    // The sniff sees only a header-BOUNDED prefix of the read bytes (the depth
+    let size = bytes.len() as u64;
+    // The sniff sees only a header-BOUNDED prefix of the snapshot (the depth
     // `infer` reads), while the text decision below sees the whole file.
     let sniffed = sniff(&bytes[..bytes.len().min(SNIFF_BYTES)]);
-    let size = bytes.len() as u64;
     if sniffed.is_image {
         return Ok(Classified {
             size,
@@ -362,27 +371,23 @@ fn is_text_bytes(bytes: &[u8]) -> bool {
 
 /// The classification for a file whose bytes are past Feishu's 30 MB upload
 /// cap, whether the caller's `stat` said so or the read discovered it (the file
-/// grew): nothing is read, so only the sniffed header can name it. A
-/// text-shaped header is still TEXT — too large to preview — never 「二进制」;
+/// grew): nothing is deliverable, so every lane reports 未发送 and only a bounded
+/// `header` — at most [`SNIFF_BYTES`] of whatever the caller read — can name it.
+/// A text-shaped header is still TEXT — too large to preview — never 「二进制」;
 /// `size` is the best figure available (the `stat`, or a fresh one for a file
-/// that grew) and carries no bytes, so every lane reports 未发送.
-fn past_cap(
-    size: u64,
-    mime: String,
-    is_image: bool,
-    is_known_binary: bool,
-    header_is_text: bool,
-) -> Classified {
-    let kind = if is_image {
+/// that grew) and no bytes travel.
+fn past_cap(header: &[u8], size: u64) -> Classified {
+    let sniffed = sniff(&header[..header.len().min(SNIFF_BYTES)]);
+    let kind = if sniffed.is_image {
         ClassifiedKind::Image
-    } else if !is_known_binary && header_is_text {
+    } else if !sniffed.is_known_binary && sniffed.is_text {
         ClassifiedKind::TextTooLarge
     } else {
         ClassifiedKind::File
     };
     Classified {
         size,
-        mime,
+        mime: sniffed.octet_mime(),
         kind,
         text: None,
         bytes: None,
@@ -449,17 +454,21 @@ pub(crate) async fn send_as_file(
     classified: &mut Classified,
     timeout_ms: u64,
 ) -> ViewerFileLane {
-    let (mime, stat_size) = (classified.mime.clone(), classified.size);
-    // Reuse the bytes the open already read (an image/binary lane), and read
-    // them for a text preview, whose open held only the decoded text.
+    // ONE byte snapshot decides and travels (finding #739, round 3). The bytes
+    // the open already read (an image/binary lane) go out as they are; for a
+    // text preview, which kept only its decoded text, the transfer reads the
+    // file afresh and RE-CLASSIFIES exactly the bytes it will hand the Platform
+    // — so a file replaced between the viewer build and the click can never be
+    // uploaded under the earlier verdict's mime and kind.
     let bytes = match classified.bytes.take() {
         Some(bytes) => Some(bytes),
-        None => read_deliverable(path, stat_size).ok().flatten(),
+        None => reread_for_transfer(path, classified),
     };
     // The lane names the bytes that actually go out, never the earlier `stat`
     // size: a file that shrank between the two is described by what was handed
     // to the Platform (the same number `FileContent::from_bytes` carries).
-    let size = bytes.as_ref().map_or(stat_size, |bytes| bytes.len() as u64);
+    let size = bytes.as_ref().map_or(classified.size, |bytes| bytes.len() as u64);
+    let mime = classified.mime.clone();
     let delivery = match bytes {
         Some(bytes) => {
             let content = FileContent::from_bytes(&mime, name, bytes);
@@ -481,6 +490,63 @@ pub(crate) async fn send_as_file(
         size,
         delivery,
     }
+}
+
+/// The bytes a 「发为文件」 transfer sends for a file whose classification kept
+/// none (a text preview), RE-CLASSIFIED from exactly the bytes it will hand the
+/// Platform: the fresh verdict replaces `classified`, so the mime, kind and size
+/// the card names and the bytes the upload carries describe one snapshot,
+/// whatever changed on disk between the viewer and the click (finding #739,
+/// round 3).
+///
+/// `None` when nothing is deliverable — past Feishu's 30MB upload cap (by the
+/// viewer's `stat`, or because the file grew since), empty, or unreadable — with
+/// `classified` naming the outcome it can: the fresh past-cap verdict for a file
+/// that grew, and the viewer's own verdict for a file that became empty or
+/// unreadable (nothing is left to name).
+fn reread_for_transfer(path: &Path, classified: &mut Classified) -> Option<Vec<u8>> {
+    // Past the cap by the viewer's `stat`: nothing is ever read, nothing can be
+    // sent, and the classification already says 未发送.
+    if classified.size > crate::feishu::file::MAX_FILE_BYTES {
+        return None;
+    }
+    let read = match read_bounded(path, crate::feishu::file::MAX_FILE_BYTES) {
+        Ok(read) => read,
+        // Unreadable: nothing to deliver, and the click's own outcome line is
+        // the caller's.
+        Err(_) => return None,
+    };
+    let bytes = match read {
+        BoundedRead::Whole(bytes) => {
+            count_read(bytes.len());
+            bytes
+        }
+        // Grew past the cap since the viewer's `stat`: the header of the very
+        // bytes that discovered it names the file — no second open — and
+        // nothing is delivered, never a truncated prefix.
+        BoundedRead::Over(read) => {
+            count_read(read.len());
+            let grown = std::fs::metadata(path)
+                .map(|meta| meta.len())
+                .unwrap_or(classified.size);
+            *classified = past_cap(&read, grown);
+            return None;
+        }
+    };
+    // Became empty between the viewer and the click: `Empty` is not a
+    // classification, so there is no lane — and no zero-byte upload either.
+    let mut fresh = classify_read_bytes(bytes).ok()?;
+    let bytes = match fresh.kind {
+        // A fresh text verdict keeps its decoded text (the card that PATCHes
+        // over the viewer still previews it) AND sends the same snapshot's
+        // bytes: one bounded copy, at most the preview cap, on an explicit
+        // user action.
+        ClassifiedKind::Text => fresh.text.as_ref().map(|text| text.clone().into_bytes()),
+        // Every other kind carries the very bytes its lane uploads.
+        _ => fresh.bytes.take(),
+    };
+    *classified = fresh;
+    bytes
 }
 
 /// Upload `bytes` once (content-hash cached, single-flight across the process)
@@ -599,17 +665,13 @@ async fn send_file_message(
     }
 }
 
-/// The whole bytes for a delivery lane, or `None` when the file is past
-/// Feishu's 30MB upload cap — which `stat_size` may already say, or which the
-/// read itself discovers when the file grew after that `stat`. Either way a
-/// truncated prefix is never returned, so a partial file is never delivered as
-/// the whole. The read itself is bounded by the cap (never by `stat_size`), so
-/// a size-0 pseudo-file still yields its content.
-fn read_deliverable(path: &Path, stat_size: u64) -> Result<Option<Vec<u8>>, CatFailure> {
-    if stat_size > crate::feishu::file::MAX_FILE_BYTES {
-        return Ok(None);
-    }
-    read_bounded(path, crate::feishu::file::MAX_FILE_BYTES)
+/// What a bounded read saw: `Whole` when the file holds at most the limit,
+/// `Over` when it holds more — carrying the bytes read so far (a bounded
+/// prefix), never dropping them, so a file that outgrew its cap is named from
+/// the very bytes that discovered it instead of being opened a second time.
+enum BoundedRead {
+    Whole(Vec<u8>),
+    Over(Vec<u8>),
 }
 
 /// Read `path`, at most `limit` bytes, reporting the OS's reason when it cannot
@@ -617,21 +679,21 @@ fn read_deliverable(path: &Path, stat_size: u64) -> Result<Option<Vec<u8>>, CatF
 /// (procfs, sysfs) reports size 0 while having content, and a file that grows
 /// between the `stat` and this read is still bounded.
 ///
-/// Reads ONE byte past `limit` to detect that more bytes remain, and `None`
-/// means exactly that: the file holds more than `limit` bytes. A file that
-/// outgrew the cap after the caller's `stat` is therefore reported past-cap
-/// rather than delivered as a truncated prefix (finding #739 §1, round 2).
-/// `Some(bytes)` is the whole file, at most `limit` bytes.
-fn read_bounded(path: &Path, limit: u64) -> Result<Option<Vec<u8>>, CatFailure> {
+/// Reads ONE byte past `limit` to detect that more bytes remain, and
+/// [`BoundedRead::Over`] means exactly that: the file holds more than `limit`
+/// bytes. A file that outgrew the cap after the caller's `stat` is therefore
+/// reported past-cap rather than delivered as a truncated prefix (finding #739
+/// §1, round 2). `Whole(bytes)` is the whole file, at most `limit` bytes.
+fn read_bounded(path: &Path, limit: u64) -> Result<BoundedRead, CatFailure> {
     let file = std::fs::File::open(path).map_err(|e| CatFailure::Unreadable(e.to_string()))?;
     let mut bytes = Vec::new();
     file.take(limit + 1)
         .read_to_end(&mut bytes)
         .map_err(|e| CatFailure::Unreadable(e.to_string()))?;
     if bytes.len() as u64 > limit {
-        return Ok(None);
+        return Ok(BoundedRead::Over(bytes));
     }
-    Ok(Some(bytes))
+    Ok(BoundedRead::Whole(bytes))
 }
 
 /// Read at most `n` bytes — the bounded header [`classify`] sniffs.
@@ -903,8 +965,9 @@ mod tests {
 
     /// A file that GREW past a read limit after the caller's `stat` is detected
     /// by the one-byte-over read: it is never returned as a truncated prefix,
-    /// so a 「发为文件」 click can never report a partial file as sent
-    /// (finding #739 §1, round 2).
+    /// so a 「发为文件」 click can never report a partial file as sent — and the
+    /// bytes that discovered the growth come back with it, so naming a file
+    /// past its cap costs no second open (finding #739 §1 round 2, §2 round 3).
     #[test]
     fn read_bounded_detects_a_file_that_grew_past_its_limit() {
         let dir = tempfile::tempdir().unwrap();
@@ -912,11 +975,20 @@ mod tests {
         std::fs::write(&file, b"0123456789").unwrap();
 
         // Exactly the limit, and under it, is the whole file.
-        assert_eq!(read_bounded(&file, 10).unwrap().unwrap(), b"0123456789".to_vec());
-        assert_eq!(read_bounded(&file, 11).unwrap().unwrap(), b"0123456789".to_vec());
-        // One byte past the limit means MORE bytes remain: reported as `None`,
-        // never as a 5-byte prefix of a 10-byte file.
-        assert_eq!(read_bounded(&file, 5).unwrap(), None);
+        assert!(matches!(
+            read_bounded(&file, 10).unwrap(),
+            BoundedRead::Whole(bytes) if bytes == b"0123456789"
+        ));
+        assert!(matches!(
+            read_bounded(&file, 11).unwrap(),
+            BoundedRead::Whole(bytes) if bytes == b"0123456789"
+        ));
+        // One byte past the limit means MORE bytes remain: reported as `Over`
+        // with what was read, never as a 10-byte file's 5-byte prefix.
+        match read_bounded(&file, 5).unwrap() {
+            BoundedRead::Over(read) => assert_eq!(read, b"012345"),
+            BoundedRead::Whole(bytes) => panic!("expected Over, got {bytes:?}"),
+        }
     }
 
     /// ADR-0083 §6: a file WITHIN the 30MB upload cap is read **once**, and
@@ -979,16 +1051,20 @@ mod tests {
 
     /// The same growth at the two callers that guard the 30MB cap: `classify`
     /// reads one byte past it and reports the file past-cap (no bytes to
-    /// deliver, the real grown size named), and `read_deliverable` returns no
-    /// bytes for it — so the lane can only be 未发送, never a truncated send.
+    /// deliver, the real grown size named), and the 「发为文件」 transfer's own
+    /// re-read returns no bytes for it — so the lane can only be 未发送, never a
+    /// truncated send. The read that discovers the growth is the ONLY read: its
+    /// header names the file.
     #[test]
     fn a_file_that_grew_past_the_cap_is_classified_and_delivered_as_past_cap() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("grew.bin");
+        let cap = crate::feishu::file::MAX_FILE_BYTES;
+
         // A sparse file one byte past Feishu's cap, while the caller's `stat`
         // (simulated by the small `size` argument) still says it fits.
         let handle = std::fs::File::create(&file).unwrap();
-        handle.set_len(crate::feishu::file::MAX_FILE_BYTES + 1).unwrap();
+        handle.set_len(cap + 1).unwrap();
         drop(handle);
 
         let classified = classify(&file, 10).unwrap();
@@ -998,7 +1074,7 @@ mod tests {
         );
         assert_eq!(
             classified.size,
-            crate::feishu::file::MAX_FILE_BYTES + 1,
+            cap + 1,
             "the grown size is the one named, not the stale stat"
         );
         assert_eq!(
@@ -1006,10 +1082,36 @@ mod tests {
             ClassifiedKind::File,
             "a NUL header is a file, never text"
         );
+
+        // The transfer's path: a small text file classified as such, which grew
+        // past the cap before the click. Its re-read discovers the growth with
+        // ONE bounded read — the header that names it comes from those bytes,
+        // never from a second open — and delivers nothing.
+        let small = dir.path().join("small.log");
+        let size = write(&small, b"a small text file");
+        let mut classified = classify(&small, size).unwrap();
+        assert_eq!(classified.kind, ClassifiedKind::Text);
+        let handle = std::fs::File::create(&small).unwrap();
+        handle.set_len(cap + 1).unwrap();
+        drop(handle);
+
+        CLASSIFY_BYTES_READ.with(|count| count.set(0));
         assert_eq!(
-            read_deliverable(&file, 10).unwrap(),
+            reread_for_transfer(&small, &mut classified),
             None,
             "no truncated prefix is ever delivered"
+        );
+        assert_eq!(
+            CLASSIFY_BYTES_READ.with(|count| count.get()),
+            cap + 1,
+            "the growth is discovered by one bounded read, not a read plus a header"
+        );
+        assert!(classified.bytes.is_none(), "nothing is deliverable");
+        assert_eq!(classified.size, cap + 1, "the grown size is the one named");
+        assert_eq!(
+            classified.kind,
+            ClassifiedKind::File,
+            "the grown file's own header decides: sparse zeros are not text"
         );
     }
 
@@ -1060,5 +1162,59 @@ mod tests {
         let empty = dir.path().join("empty.txt");
         std::fs::write(&empty, "").unwrap();
         assert!(matches!(classify(&empty, 0), Err(CatFailure::Empty)));
+    }
+
+    /// The 「发为文件」 transfer sends ONE byte snapshot: a file whose viewer-time
+    /// classification kept no bytes (a text preview) is re-read AND
+    /// re-classified, so the mime/kind/size the lane reports describe the very
+    /// bytes the upload carries — a text file replaced by a PDF between the two
+    /// goes out as `application/pdf`, never under the stale `text/plain`
+    /// (finding #739, round 3).
+    #[test]
+    fn the_transfer_reclassifies_the_bytes_it_sends() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Unchanged: a text preview's bytes still travel, under text/plain —
+        // and the preview the card shows survives the transfer.
+        let file = dir.path().join("report.txt");
+        let size = write(&file, b"# plain text\n");
+        let mut classified = classify(&file, size).unwrap();
+        assert_eq!(classified.kind, ClassifiedKind::Text);
+        assert!(classified.bytes.is_none(), "a text preview holds no bytes");
+        assert_eq!(
+            reread_for_transfer(&file, &mut classified).as_deref(),
+            Some(b"# plain text\n".as_slice())
+        );
+        assert_eq!(classified.mime, "text/plain");
+        assert_eq!(classified.kind, ClassifiedKind::Text);
+        assert_eq!(
+            classified.text.as_deref(),
+            Some("# plain text\n"),
+            "the card that PATCHes over the viewer keeps its preview"
+        );
+
+        // Replaced by a PDF of a different length: the verdict the viewer built
+        // is stale, and the transfer must not upload the new bytes under it. Its
+        // label follows the bytes actually sent — and so do kind, size and the
+        // (now absent) preview text.
+        let pdf = b"%PDF-1.7\nbinary-ish bytes\n";
+        std::fs::write(&file, pdf).unwrap();
+        let bytes = reread_for_transfer(&file, &mut classified).expect("the bytes are delivered");
+        assert_eq!(bytes, pdf.to_vec(), "the bytes sent are the file's current ones");
+        assert_eq!(
+            classified.mime, "application/pdf",
+            "the label is the delivered bytes' own, never the earlier verdict's"
+        );
+        assert_eq!(classified.kind, ClassifiedKind::File);
+        assert_eq!(classified.size, pdf.len() as u64, "the size is the bytes' own");
+        assert!(classified.text.is_none(), "a PDF is never previewed as text");
+
+        // A text file that shrank to nothing sends nothing: no zero-byte
+        // upload, and no file message.
+        std::fs::write(&file, b"# plain text\n").unwrap();
+        let mut classified = classify(&file, size).unwrap();
+        assert_eq!(classified.kind, ClassifiedKind::Text);
+        std::fs::write(&file, b"").unwrap();
+        assert_eq!(reread_for_transfer(&file, &mut classified), None);
     }
 }
