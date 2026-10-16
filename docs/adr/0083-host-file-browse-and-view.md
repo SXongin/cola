@@ -60,8 +60,11 @@ loop.
    — the form that gets its value from the agent, from a log, or from the user's memory —
    and a path inside `/cat` resolves relative to the Session's directory with `~` expanded.
    `/cat <directory>` opens the browse card at that directory instead of erroring, and a bare
-   `/cat` answers usage. `/ls` is deliberately **not** added: the browse card already owns
-   listing, and a second path language would cost more than it saves.
+   `/cat` answers usage. A path that does not exist, a path cola cannot read, and an empty
+   file each answer **distinctly**, naming the path that was resolved — an unopenable file is
+   a stated reason, never an empty card, and `/help cat` documents the command. `/ls` is
+   deliberately **not** added: the browse card already owns listing, and a second path
+   language would cost more than it saves.
 3. **The viewer is a command card.** The **File Viewer** replies to the command (or replaces
    the browse card in place, exactly as the browse card replaces the Recent Directories card)
    and is a member of the *command card* family — `/dir`, `/switch`, `/help` — a standalone
@@ -86,7 +89,13 @@ loop.
    budget, past five tables, past the 49-row table cap — goes out as one **Rich Text
    Message** rather than a half-rendered or paginated-around card; and the file's whole bytes
    are always available as a **File Message** through ADR-0076's existing ladder (uploaded
-   once, 30 MB cap, a `未发送` tracking line beyond it). A text file's card preview is a
+   once, 30 MB cap, a `未发送` tracking line beyond it). **The middle lane is bounded**: a
+   `post` body carries the same **30 KB** cap as a card, so content whose rich-text body would
+   exceed that does not take it — it goes to the File Message lane, with the card saying so.
+   **The whole-bytes lane is a user action, not a promise**: every viewer carries
+   「发为文件」, which uploads the file and posts it as that File Message, and that is the only
+   thing that gets a file whose preview fits nowhere (a 5000-line log, a 60-row table) out of
+   the chat. A text file's card preview is a
    fenced code block with a language hint, paged by **lines** with the shared pager control —
    **except a delimited-text file (`.csv`, `.tsv`), whose preview is a markdown table**, since
    a table is what those bytes *are* and the platform renders one natively; that lane is
@@ -188,5 +197,7 @@ loop.
 
 `GLOSSARY.md` gains **File Viewer**（文件查看）, **Path Scope**（路径作用域） and **Rich
 Text Message**（富文本消息）; **Directory Browser** loses "directories only" and gains the file
-rows and the way into the File Viewer; **Command** gains `/cat`. "Viewer" alone is not a
-domain term — the platform has viewers (在线预览) that cola does not control.
+rows and the way into the File Viewer; **Command** gains `/cat`. **ADR-0078 is marked
+amended**: its browser listed directories only, and ADR-0083 extends that same card — the
+later record governs, and the earlier one says so where it states the old scope. "Viewer"
+alone is not a domain term — the platform has viewers (在线预览) that cola does not control.
