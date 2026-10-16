@@ -1620,6 +1620,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn edit_message_maps_a_nonzero_business_code_on_http_200_to_refused() {
+        let (server, client) = wire_client().await;
+        server.route(
+            "PUT",
+            "/open-apis/im/v1/messages/om_rich",
+            200,
+            r#"{"code":230099,"msg":"business refusal"}"#,
+        );
+
+        assert_eq!(
+            client
+                .edit_message("om_rich", "post", &serde_json::json!({"text":"updated"}))
+                .await
+                .unwrap(),
+            crate::feishu::MessageEditOutcome::Refused
+        );
+        assert_eq!(last_request(&server).method, "PUT");
+    }
+
+    #[tokio::test]
+    async fn edit_message_returns_http_400_for_an_unparseable_refusal_body() {
+        let (server, client) = wire_client().await;
+        server.route("PUT", "/open-apis/im/v1/messages/om_rich", 400, "not json");
+
+        let error = client
+            .edit_message("om_rich", "post", &serde_json::json!({"text":"updated"}))
+            .await
+            .expect_err("an unparseable 400 is not a business refusal");
+        assert!(
+            matches!(&error, crate::error::BridgeError::FeishuHttp { status: 400, .. }),
+            "the HTTP status stays typed: {error}"
+        );
+        assert!(
+            error.to_string().contains("edit message HTTP 400"),
+            "the error keeps the edit endpoint context: {error}"
+        );
+    }
+
+    #[tokio::test]
     async fn send_card_maps_business_error_code() {
         let (server, client) = wire_client().await;
         // Feishu error envelopes still carry a `data` object; the client maps
