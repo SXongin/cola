@@ -25,8 +25,10 @@ fn seeded_entry(key: &crate::config::ThreadKey, directory: &str) -> crate::confi
 }
 
 /// The canonical spelling of `path` — what the viewer must name, since it
-/// resolves the path instead of echoing what was typed.
-fn canonical(path: &std::path::Path) -> String {
+/// resolves the path instead of echoing what was typed. Shared with the
+/// browse-card tests (they assert the same resolved spelling on a file row and
+/// on the viewer it opens): one helper, so the two suites cannot drift.
+pub(super) fn canonical(path: &std::path::Path) -> String {
     std::fs::canonicalize(path)
         .unwrap_or_else(|_| path.to_path_buf())
         .to_string_lossy()

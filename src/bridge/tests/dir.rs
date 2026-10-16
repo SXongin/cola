@@ -1,3 +1,4 @@
+use super::viewer::canonical;
 use crate::bridge::test_support::*;
 
 #[tokio::test]
@@ -1366,7 +1367,7 @@ async fn dir_browse_pick_on_a_file_refuses() {
 async fn dir_browse_file_row_on_a_vanished_path_toasts_and_a_directory_opens_the_browser() {
     let _wd = test_work_dir();
     let proj = browse_project();
-    let proj_dir = canonical_of(proj.path());
+    let proj_dir = canonical(proj.path());
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
@@ -1386,10 +1387,7 @@ async fn dir_browse_file_row_on_a_vanished_path_toasts_and_a_directory_opens_the
     assert!(result.card.is_none(), "a vanished file patches no card");
     let toast = result.toast.unwrap_or_default();
     assert!(toast.contains("找不到路径"), "the reason is stated: {toast}");
-    assert!(
-        toast.contains(&canonical_of(&ghost)),
-        "and names the path: {toast}"
-    );
+    assert!(toast.contains(&canonical(&ghost)), "and names the path: {toast}");
     assert!(platform.replied_cards().await.is_empty(), "never an empty viewer");
 
     let result = app
@@ -1411,15 +1409,6 @@ async fn dir_browse_file_row_on_a_vanished_path_toasts_and_a_directory_opens_the
 }
 
 // ---- ADR-0083 §3: files in the browse card ----
-
-/// The canonical spelling of `path` — what the viewer names, since it resolves
-/// the file it opened rather than echoing the typed spelling.
-fn canonical_of(path: &std::path::Path) -> String {
-    std::fs::canonicalize(path)
-        .unwrap_or_else(|_| path.to_path_buf())
-        .to_string_lossy()
-        .to_string()
-}
 
 /// The card's file row button for `name` (its label is `📄 <name> · <size>`).
 fn file_row<'a>(card: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
@@ -1534,7 +1523,7 @@ async fn dir_browse_file_row_opens_the_viewer_in_place_and_declares_nothing() {
         payload.get("op").is_none(),
         "no pick/topic op on a file row: {payload}"
     );
-    assert_eq!(payload["path"], canonical_of(&file), "the row names the file");
+    assert_eq!(payload["path"], canonical(&file), "the row names the file");
 
     let sent_before = platform.calls.lock().await.len();
     let result = app.host_action(payload).await.expect("the click answers");
@@ -1542,7 +1531,7 @@ async fn dir_browse_file_row_opens_the_viewer_in_place_and_declares_nothing() {
     assert!(result.toast.is_none(), "opening a file is not a toast");
     assert_eq!(card_header(&viewer), "📄 notes.md", "the viewer names the file");
     let text = card_text(&viewer);
-    assert!(text.contains(&canonical_of(&file)), "the resolved path: {text}");
+    assert!(text.contains(&canonical(&file)), "the resolved path: {text}");
     assert!(text.contains("13 B"), "the size: {text}");
     assert!(
         text.contains("```markdown") && text.contains("# notes"),
@@ -1579,7 +1568,7 @@ async fn dir_browse_file_row_returns_to_the_same_listing_state() {
         std::fs::write(proj.path().join(format!("a{i:02}.txt")), "x").unwrap();
     }
     std::fs::write(proj.path().join(".a00.txt"), "x").unwrap();
-    let proj_dir = canonical_of(proj.path());
+    let proj_dir = canonical(proj.path());
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
@@ -1663,7 +1652,7 @@ async fn dir_browse_pager_counts_files_toward_the_six_per_page() {
         std::fs::create_dir(proj.path().join(format!("d{i:02}"))).unwrap();
         std::fs::write(proj.path().join(format!("f{i:02}.txt")), "x").unwrap();
     }
-    let proj_dir = canonical_of(proj.path());
+    let proj_dir = canonical(proj.path());
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
@@ -1718,7 +1707,7 @@ async fn dir_browse_file_row_names_the_resolved_target_of_a_symlink() {
     std::fs::write(&target, "# real\n").unwrap();
     let link = proj.path().join("link.md");
     std::os::unix::fs::symlink(&target, &link).unwrap();
-    let proj_dir = canonical_of(proj.path());
+    let proj_dir = canonical(proj.path());
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
@@ -1741,7 +1730,7 @@ async fn dir_browse_file_row_names_the_resolved_target_of_a_symlink() {
     let payload = file_row(&card, "link.md")["value"].clone();
     assert_eq!(
         payload["path"],
-        canonical_of(&target),
+        canonical(&target),
         "the row names the resolved target, not the link: {payload}"
     );
     assert_ne!(
@@ -1766,7 +1755,7 @@ async fn dir_browse_file_row_names_the_resolved_target_of_a_symlink() {
     );
     let text = card_text(&viewer);
     assert!(
-        text.contains(&canonical_of(&target)),
+        text.contains(&canonical(&target)),
         "the resolved path is shown: {text}"
     );
     assert!(
@@ -1794,7 +1783,7 @@ async fn dir_browse_lists_only_regular_files_and_directories() {
     // reports neither a file nor a directory. Exists as long as this tempdir.
     let socket = proj.path().join("agent.sock");
     let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-    let proj_dir = canonical_of(proj.path());
+    let proj_dir = canonical(proj.path());
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
