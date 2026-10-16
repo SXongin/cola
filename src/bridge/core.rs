@@ -244,6 +244,9 @@ pub struct SharedCore {
     /// the handler through the aggregate; a test shrinks it to observe a
     /// timeout.
     pub viewer_transfer_timeout_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// The File Viewer's bounded blocking-read budget, shared by `/cat` and
+    /// every card action on this bridge instance.
+    pub viewer_fs_read_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl SharedCore {
@@ -367,6 +370,9 @@ impl SharedCore {
             viewer_transfer_timeout_ms: Arc::new(std::sync::atomic::AtomicU64::new(
                 crate::bridge::viewer::VIEWER_TRANSFER_TIMEOUT_MS,
             )),
+            viewer_fs_read_slots: Arc::new(tokio::sync::Semaphore::new(
+                crate::bridge::viewer::MAX_CONCURRENT_VIEWER_FS_READS,
+            )),
         })
     }
 
@@ -462,6 +468,7 @@ impl SharedCore {
             Arc::clone(&self.file_uploads),
             Arc::clone(&self.file_messages_sent),
             Arc::clone(&self.viewer_transfer_timeout_ms),
+            Arc::clone(&self.viewer_fs_read_slots),
         )
     }
 

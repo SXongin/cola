@@ -208,6 +208,8 @@ pub struct App {
     /// File Viewer callbacks are acknowledged before work begins; hold one
     /// process-local claim per Chat + clicked card until its task and PATCH end.
     viewer_actions_in_flight: Arc<std::sync::Mutex<std::collections::HashSet<(String, String)>>>,
+    /// Viewers whose File Message landed, so stale callbacks cannot redeliver.
+    viewer_file_transfers_sent: Arc<std::sync::Mutex<std::collections::HashSet<(String, String)>>>,
     /// Weak self-reference, set once inside `run` (which holds the Arc). Lets
     /// the `EventSink` trait impl (which only has `&self`) recover a
     /// `&Arc<App>` to hand to the inherent methods. `Weak` so it never keeps
@@ -640,6 +642,17 @@ struct ViewerReread {
     in_flight_guard: ViewerActionGuard,
 }
 
+/// The bounded filesystem rebuild captured by one viewer pager callback.
+struct ViewerPage {
+    thread_key: ThreadKey,
+    path: String,
+    card_message_id: String,
+    return_to: OwnedReturnTo,
+    page: usize,
+    lane: Option<crate::feishu::card::viewer::ViewerFileLane>,
+    in_flight_guard: ViewerActionGuard,
+}
+
 /// One stat/classification snapshot for a viewer open, completed off the card
 /// callback path before any content lane or card replacement is decided.
 enum ViewerOpenRead {
@@ -681,25 +694,90 @@ impl Drop for ViewerActionGuard {
 /// Blocking filesystem reads cannot be cancelled by their async timeout. Keep
 /// only this many outstanding viewer reads; a timed-out closure holds its slot
 /// until the OS call returns, and later taps fail fast instead of queueing more.
-const MAX_CONCURRENT_VIEWER_FS_READS: usize = 4;
-static VIEWER_FS_READ_SLOTS: tokio::sync::Semaphore =
-    tokio::sync::Semaphore::const_new(MAX_CONCURRENT_VIEWER_FS_READS);
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ViewerFsReadError {
+    Busy(String),
+    Timeout(String),
+    Worker(String),
+}
 
 /// Acquire a bounded slot before submitting work, and hold it inside the
 /// blocking closure so timing out its JoinHandle cannot free capacity early.
 fn spawn_bounded_viewer_fs_read<T, F>(
-    slots: &'static tokio::sync::Semaphore,
+    slots: &Arc<tokio::sync::Semaphore>,
     work: F,
 ) -> Result<tokio::task::JoinHandle<T>, tokio::sync::TryAcquireError>
 where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
-    let permit = slots.try_acquire()?;
+    let permit = Arc::clone(slots).try_acquire_owned()?;
     Ok(tokio::task::spawn_blocking(move || {
         let _permit = permit;
         work()
     }))
+}
+
+/// Run a viewer filesystem operation in the shared bounded blocking pool. A
+/// timed-out closure keeps its permit until the OS call actually returns.
+pub(crate) async fn bounded_viewer_fs_read<T, F>(
+    slots: Arc<tokio::sync::Semaphore>,
+    timeout_ms: u64,
+    busy_line: &str,
+    timeout_line: &str,
+    work: F,
+) -> Result<T, ViewerFsReadError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let read = spawn_bounded_viewer_fs_read(&slots, work)
+        .map_err(|_| ViewerFsReadError::Busy(busy_line.to_string()))?;
+    match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), read).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(ViewerFsReadError::Worker(error.to_string())),
+        Err(_) => Err(ViewerFsReadError::Timeout(timeout_line.to_string())),
+    }
+}
+
+/// The result of the `/cat` path's bounded resolution, stat and classification.
+pub(crate) enum CatPathRead {
+    Directory(std::path::PathBuf),
+    File {
+        path: std::path::PathBuf,
+        classified: crate::bridge::viewer::Classified,
+    },
+    Failure(String),
+}
+
+pub(crate) async fn read_cat_path_bounded(
+    input: String,
+    session_dir: String,
+    timeout_ms: u64,
+    slots: Arc<tokio::sync::Semaphore>,
+) -> Result<CatPathRead, ViewerFsReadError> {
+    bounded_viewer_fs_read(
+        slots,
+        timeout_ms,
+        "⚠️ 文件读取繁忙，请稍后再试。",
+        "⚠️ 打开超时，请稍后再试。",
+        move || {
+            let resolved = crate::bridge::viewer::resolve_cat_path(&input, &session_dir);
+            match crate::bridge::viewer::open_cat_path(&resolved) {
+                crate::bridge::viewer::CatOpen::Directory(dir) => CatPathRead::Directory(dir),
+                crate::bridge::viewer::CatOpen::File { path, size } => {
+                    match crate::bridge::viewer::classify(&path, size) {
+                        Ok(classified) => CatPathRead::File { path, classified },
+                        Err(failure) => CatPathRead::Failure(failure.line(&path)),
+                    }
+                }
+                crate::bridge::viewer::CatOpen::Failed(failure) => {
+                    CatPathRead::Failure(failure.line(&resolved))
+                }
+            }
+        },
+    )
+    .await
 }
 
 /// A viewer payload's viewer page (#740): the pager's TARGET page, or the page
@@ -864,6 +942,7 @@ impl App {
             core,
             access,
             viewer_actions_in_flight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            viewer_file_transfers_sent: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         })
     }
 
@@ -2904,6 +2983,44 @@ impl App {
             keyword: &home_keyword,
             page: home_page,
         });
+        if op == "page" {
+            let Some(open_message_id) = value
+                .get("open_message_id")
+                .and_then(|v| v.as_str())
+                .filter(|id| !id.is_empty())
+            else {
+                return Some(CardActionResult {
+                    card: None,
+                    toast: Some("无法翻页：找不到文件查看卡。".to_string()),
+                });
+            };
+            let Some(in_flight_guard) = self.claim_viewer_action(&thread_key, open_message_id) else {
+                return Some(CardActionResult {
+                    card: None,
+                    toast: Some("正在翻页…".to_string()),
+                });
+            };
+            let app = Arc::clone(self);
+            let page = ViewerPage {
+                thread_key,
+                path: resolved.to_string_lossy().to_string(),
+                card_message_id: open_message_id.to_string(),
+                return_to: OwnedReturnTo {
+                    dir: (!home_dir.is_empty()).then(|| home_dir.clone()),
+                    keyword: home_keyword.clone(),
+                    show_hidden: home_hidden,
+                    page: home_page,
+                },
+                page,
+                lane: crate::feishu::card::viewer::lane_from_page_payload(value),
+                in_flight_guard,
+            };
+            tokio::spawn(async move { app.run_viewer_page(page).await });
+            return Some(CardActionResult {
+                card: None,
+                toast: Some("正在翻页…".to_string()),
+            });
+        }
         if op == "reread" {
             // The viewer's own Feishu message id cannot be serialized when its
             // card is built (the send returns that id afterward). ws injects
@@ -2960,7 +3077,7 @@ impl App {
         // the byte lane and structural-overflow lane, then the clicked card is
         // patched after delivery. Even a fitting text file must classify off
         // this callback path because a host read can block (e.g. a network mount).
-        // Pager flips are not opens and continue to rebuild the existing card.
+        // Pager flips are handled above with their own bounded background path.
         if op.is_empty()
             && let Some(open_message_id) = value
                 .get("open_message_id")
@@ -3037,6 +3154,82 @@ impl App {
         }
     }
 
+    /// Finish a pager flip after the callback has acknowledged. The carried
+    /// lane is retained while the bounded read rebuilds the requested window.
+    async fn run_viewer_page(self: &Arc<Self>, page: ViewerPage) {
+        let ViewerPage {
+            thread_key,
+            path,
+            card_message_id,
+            return_to,
+            page,
+            lane,
+            in_flight_guard,
+        } = page;
+        let _in_flight_guard = in_flight_guard;
+        let timeout_ms = self
+            .viewer_transfer_timeout_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let resolved = std::path::PathBuf::from(&path);
+        let read_path = resolved.clone();
+        let read = bounded_viewer_fs_read(
+            self.cards_handle().viewer_fs_read_slots.clone(),
+            timeout_ms,
+            "⚠️ 文件读取繁忙，请稍后再试。",
+            "⚠️ 打开超时，请稍后再试。",
+            move || match std::fs::metadata(&read_path) {
+                Ok(metadata) => crate::bridge::viewer::classify(&read_path, metadata.len()),
+                Err(error) => Err(crate::bridge::viewer::stat_failure(&error)),
+            },
+        )
+        .await;
+        let classified = match read {
+            Ok(Ok(classified)) => classified,
+            Ok(Err(failure)) => {
+                self.answer_viewer_reread_failure(&card_message_id, &failure.line(&resolved), timeout_ms)
+                    .await;
+                return;
+            }
+            Err(ViewerFsReadError::Busy(line) | ViewerFsReadError::Timeout(line)) => {
+                self.answer_viewer_reread_failure(&card_message_id, &line, timeout_ms)
+                    .await;
+                return;
+            }
+            Err(ViewerFsReadError::Worker(error)) => {
+                let line = format!("⚠️ 无法读取 `{}`：{error}", resolved.display());
+                self.answer_viewer_reread_failure(&card_message_id, &line, timeout_ms)
+                    .await;
+                return;
+            }
+        };
+        let browse_view = return_to.dir.as_deref().map(|dir| BrowseView {
+            dir,
+            show_hidden: return_to.show_hidden,
+            keyword: &return_to.keyword,
+            page: return_to.page,
+        });
+        let card = crate::feishu::card::command::build_viewer_for_classified(
+            &thread_key,
+            &resolved,
+            &classified,
+            lane,
+            browse_view,
+            page,
+            false,
+        );
+        if !matches!(
+            crate::bridge::bounded_call(
+                "viewer page card update",
+                timeout_ms,
+                self.feishu.update_message(&card_message_id, &card),
+            )
+            .await,
+            Some(Ok(()))
+        ) {
+            tracing::warn!("viewer page card update for {card_message_id} did not land");
+        }
+    }
+
     /// Finish a re-read after the callback has acknowledged. All platform I/O
     /// is bounded and runs off the callback path; the local snapshot was read
     /// under the viewer's cap before dispatch.
@@ -3065,45 +3258,36 @@ impl App {
         // network mount). Run that bounded read off the callback/runtime worker:
         // the card click has already been acknowledged before this task starts.
         let read_path = resolved.clone();
-        let read =
-            match spawn_bounded_viewer_fs_read(&VIEWER_FS_READ_SLOTS, move || {
-                match std::fs::metadata(&read_path) {
-                    Ok(metadata) => crate::bridge::viewer::classify(&read_path, metadata.len()),
-                    Err(error) => Err(crate::bridge::viewer::stat_failure(&error)),
-                }
-            }) {
-                Ok(read) => read,
-                Err(_) => {
-                    self.answer_viewer_reread_failure(
-                        &card_message_id,
-                        "⚠️ 重新读取任务繁忙，请稍后再试。",
-                        timeout_ms,
-                    )
+        let read = bounded_viewer_fs_read(
+            self.cards_handle().viewer_fs_read_slots.clone(),
+            timeout_ms,
+            "⚠️ 重新读取任务繁忙，请稍后再试。",
+            &format!("⚠️ 无法读取 `{}`：重新读取超时。", resolved.display()),
+            move || match std::fs::metadata(&read_path) {
+                Ok(metadata) => crate::bridge::viewer::classify(&read_path, metadata.len()),
+                Err(error) => Err(crate::bridge::viewer::stat_failure(&error)),
+            },
+        )
+        .await;
+        let mut classified = match read {
+            Ok(Ok(classified)) => classified,
+            Ok(Err(failure)) => {
+                self.answer_viewer_reread_failure(&card_message_id, &failure.line(&resolved), timeout_ms)
                     .await;
-                    return;
-                }
-            };
-        let mut classified =
-            match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), read).await {
-                Ok(Ok(Ok(classified))) => classified,
-                Ok(Ok(Err(failure))) => {
-                    self.answer_viewer_reread_failure(&card_message_id, &failure.line(&resolved), timeout_ms)
-                        .await;
-                    return;
-                }
-                Ok(Err(error)) => {
-                    let line = format!("⚠️ 无法读取 `{}`：{error}", resolved.display());
-                    self.answer_viewer_reread_failure(&card_message_id, &line, timeout_ms)
-                        .await;
-                    return;
-                }
-                Err(_) => {
-                    let line = format!("⚠️ 无法读取 `{}`：重新读取超时。", resolved.display());
-                    self.answer_viewer_reread_failure(&card_message_id, &line, timeout_ms)
-                        .await;
-                    return;
-                }
-            };
+                return;
+            }
+            Err(ViewerFsReadError::Busy(line) | ViewerFsReadError::Timeout(line)) => {
+                self.answer_viewer_reread_failure(&card_message_id, &line, timeout_ms)
+                    .await;
+                return;
+            }
+            Err(ViewerFsReadError::Worker(error)) => {
+                let line = format!("⚠️ 无法读取 `{}`：{error}", resolved.display());
+                self.answer_viewer_reread_failure(&card_message_id, &line, timeout_ms)
+                    .await;
+                return;
+            }
+        };
         let name = crate::feishu::card::command::file_display_name(&resolved);
         let ext = resolved.extension().and_then(|extension| extension.to_str());
         let (lane, overflowed) = crate::bridge::viewer::open_viewer_lanes(
@@ -3177,34 +3361,24 @@ impl App {
             .load(std::sync::atomic::Ordering::Relaxed);
         let resolved = std::path::PathBuf::from(&path);
         let read_path = resolved.clone();
-        let read = match spawn_bounded_viewer_fs_read(&VIEWER_FS_READ_SLOTS, move || {
-            match crate::bridge::viewer::open_cat_path(&read_path) {
+        let read = bounded_viewer_fs_read(
+            self.cards_handle().viewer_fs_read_slots.clone(),
+            timeout_ms,
+            "⚠️ 打开任务繁忙，请稍后再试。",
+            &format!("⚠️ 无法读取 `{}`：打开超时。", resolved.display()),
+            move || match crate::bridge::viewer::open_cat_path(&read_path) {
                 crate::bridge::viewer::CatOpen::Directory(dir) => Ok(ViewerOpenRead::Directory(dir)),
                 crate::bridge::viewer::CatOpen::File { path, size } => {
                     crate::bridge::viewer::classify(&path, size)
                         .map(|classified| ViewerOpenRead::File { path, classified })
                 }
                 crate::bridge::viewer::CatOpen::Failed(failure) => Err(failure),
-            }
-        }) {
-            Ok(read) => read,
-            Err(_) => {
-                self.patch_viewer_open_failure(ViewerOpenFailure {
-                    thread_key: &thread_key,
-                    resolved: &resolved,
-                    path: &path,
-                    card_message_id: &card_message_id,
-                    return_to: &return_to,
-                    line: "⚠️ 打开任务繁忙，请稍后再试。",
-                    timeout_ms,
-                })
-                .await;
-                return;
-            }
-        };
-        let read = match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), read).await {
-            Ok(Ok(Ok(read))) => read,
-            Ok(Ok(Err(failure))) => {
+            },
+        )
+        .await;
+        let read = match read {
+            Ok(Ok(read)) => read,
+            Ok(Err(failure)) => {
                 self.patch_viewer_open_failure(ViewerOpenFailure {
                     thread_key: &thread_key,
                     resolved: &resolved,
@@ -3217,7 +3391,7 @@ impl App {
                 .await;
                 return;
             }
-            Ok(Err(error)) => {
+            Err(ViewerFsReadError::Worker(error)) => {
                 let line = format!("⚠️ 无法读取 `{}`：{error}", resolved.display());
                 self.patch_viewer_open_failure(ViewerOpenFailure {
                     thread_key: &thread_key,
@@ -3231,8 +3405,7 @@ impl App {
                 .await;
                 return;
             }
-            Err(_) => {
-                let line = format!("⚠️ 无法读取 `{}`：打开超时。", resolved.display());
+            Err(ViewerFsReadError::Busy(line) | ViewerFsReadError::Timeout(line)) => {
                 self.patch_viewer_open_failure(ViewerOpenFailure {
                     thread_key: &thread_key,
                     resolved: &resolved,
@@ -3890,6 +4063,18 @@ impl App {
             });
         }
         let thread_key = thread_key_from_value(value);
+        let transfer_key = (thread_key.chat_id.clone(), message_id.to_string());
+        if self
+            .viewer_file_transfers_sent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&transfer_key)
+        {
+            return Some(CardActionResult {
+                card: None,
+                toast: Some("文件已发送".to_string()),
+            });
+        }
         let Some(in_flight_guard) = self.claim_viewer_action(&thread_key, message_id) else {
             return Some(CardActionResult {
                 card: None,
@@ -3958,23 +4143,28 @@ impl App {
         // and drop its in-flight guard.
         let read_path = resolved.clone();
         let read_name = crate::feishu::card::command::file_display_name(&resolved);
-        let read = match spawn_bounded_viewer_fs_read(&VIEWER_FS_READ_SLOTS, move || {
-            let meta =
-                std::fs::metadata(&read_path).map_err(|error| crate::bridge::viewer::stat_failure(&error))?;
-            let mut classified = crate::bridge::viewer::classify(&read_path, meta.len())?;
-            let prepared =
-                crate::bridge::viewer::prepare_file_transfer(&read_path, &read_name, &mut classified);
-            Ok::<_, crate::bridge::viewer::CatFailure>((classified, prepared))
-        }) {
-            Ok(read) => {
-                match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), read).await {
-                    Ok(Ok(Ok(snapshot))) => Ok(snapshot),
-                    Ok(Ok(Err(failure))) => Err(failure.line(&resolved)),
-                    Ok(Err(error)) => Err(format!("⚠️ 无法读取 `{}`：{error}", resolved.display())),
-                    Err(_) => Err(format!("⚠️ 无法读取 `{}`：文件读取超时。", resolved.display())),
-                }
+        let read = bounded_viewer_fs_read(
+            self.cards_handle().viewer_fs_read_slots.clone(),
+            timeout_ms,
+            "⚠️ 文件读取繁忙，请稍后再试。",
+            &format!("⚠️ 无法读取 `{}`：文件读取超时。", resolved.display()),
+            move || {
+                let meta = std::fs::metadata(&read_path)
+                    .map_err(|error| crate::bridge::viewer::stat_failure(&error))?;
+                let mut classified = crate::bridge::viewer::classify(&read_path, meta.len())?;
+                let prepared =
+                    crate::bridge::viewer::prepare_file_transfer(&read_path, &read_name, &mut classified);
+                Ok::<_, crate::bridge::viewer::CatFailure>((classified, prepared))
+            },
+        )
+        .await;
+        let read = match read {
+            Ok(Ok(snapshot)) => Ok(snapshot),
+            Ok(Err(failure)) => Err(failure.line(&resolved)),
+            Err(ViewerFsReadError::Busy(line) | ViewerFsReadError::Timeout(line)) => Err(line),
+            Err(ViewerFsReadError::Worker(error)) => {
+                Err(format!("⚠️ 无法读取 `{}`：{error}", resolved.display()))
             }
-            Err(_) => Err("⚠️ 文件读取任务繁忙，请稍后再试。".to_string()),
         };
         let card = match read {
             Ok((classified, prepared)) => {
@@ -3986,6 +4176,15 @@ impl App {
                     timeout_ms,
                 )
                 .await;
+                if matches!(
+                    &lane.delivery,
+                    crate::feishu::card::tool_render::FileDelivery::SentAsFile
+                ) {
+                    self.viewer_file_transfers_sent
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert((thread_key.chat_id.clone(), message_id.clone()));
+                }
                 crate::feishu::card::command::build_viewer_for_classified(
                     &thread_key,
                     &resolved,
@@ -4476,10 +4675,10 @@ mod viewer_reread_slot_tests {
     /// returns; subsequent work is refused rather than accumulated in the pool.
     #[tokio::test]
     async fn a_timed_out_reader_keeps_its_slot_until_the_os_work_returns() {
-        static SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let mut first = spawn_bounded_viewer_fs_read(&SLOTS, move || {
+        let mut first = spawn_bounded_viewer_fs_read(&slots, move || {
             started_tx.send(()).unwrap();
             release_rx.recv().unwrap();
         })
@@ -4494,13 +4693,13 @@ mod viewer_reread_slot_tests {
                 .is_err()
         );
         assert!(
-            spawn_bounded_viewer_fs_read(&SLOTS, || ()).is_err(),
+            spawn_bounded_viewer_fs_read(&slots, || ()).is_err(),
             "the timed-out worker still holds the only slot"
         );
 
         release_tx.send(()).unwrap();
         first.await.unwrap();
-        spawn_bounded_viewer_fs_read(&SLOTS, || ())
+        spawn_bounded_viewer_fs_read(&slots, || ())
             .unwrap()
             .await
             .unwrap();

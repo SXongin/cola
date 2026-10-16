@@ -678,6 +678,46 @@ fn push_text_page(
         extra.push(("return_keyword", listing.keyword));
         extra.push(("return_page", return_page.as_deref().unwrap_or("1")));
     }
+    let lane_size = view.lane.as_ref().map(|lane| lane.size.to_string());
+    let lane_delivery = view.lane.as_ref().map(|lane| match &lane.delivery {
+        super::tool_render::FileDelivery::Unresolved => "unresolved",
+        super::tool_render::FileDelivery::Embedded { .. } => "embedded",
+        super::tool_render::FileDelivery::SentAsFile => "sent_as_file",
+        super::tool_render::FileDelivery::SentAsRichText => "sent_as_rich_text",
+        super::tool_render::FileDelivery::Undelivered => "undelivered",
+    });
+    let lane_image_key = view.lane.as_ref().and_then(|lane| match &lane.delivery {
+        super::tool_render::FileDelivery::Embedded { image_key } => Some(image_key.as_str()),
+        _ => None,
+    });
+    let lane_rich_message_id = view
+        .lane
+        .as_ref()
+        .and_then(|lane| lane.rich_message_id.as_deref());
+    let lane_refresh_failed = view
+        .lane
+        .as_ref()
+        .map(|lane| if lane.refresh_failed { "true" } else { "false" });
+    if let (Some(lane), Some(size), Some(delivery), Some(refresh_failed)) = (
+        view.lane.as_ref(),
+        lane_size.as_deref(),
+        lane_delivery,
+        lane_refresh_failed,
+    ) {
+        extra.extend([
+            ("viewer_lane_mime", lane.mime.as_str()),
+            ("viewer_lane_name", lane.name.as_str()),
+            ("viewer_lane_size", size),
+            ("viewer_lane_delivery", delivery),
+            ("viewer_lane_refresh_failed", refresh_failed),
+        ]);
+        if let Some(image_key) = lane_image_key {
+            extra.push(("viewer_lane_image_key", image_key));
+        }
+        if let Some(message_id) = lane_rich_message_id {
+            extra.push(("viewer_lane_rich_message_id", message_id));
+        }
+    }
     if let Some(pager) = pager_element(
         "file",
         thread_key,
@@ -907,7 +947,11 @@ fn viewer_buttons(thread_key: &ThreadKey, view: &ViewerCard<'_>) -> serde_json::
     // A preview landed in its own Rich Text/File Message already: offering
     // 「发为文件」 would deliver the same file a second time (#741, deliver-once).
     // Embedded images remain visible on this card and keep the explicit action.
-    if !view.overflowed {
+    let already_sent = view
+        .lane
+        .as_ref()
+        .is_some_and(|lane| matches!(&lane.delivery, super::tool_render::FileDelivery::SentAsFile));
+    if !view.overflowed && !already_sent {
         columns.push(button_column("发为文件", transfer_value(thread_key, view)));
     }
     button_row(columns)
@@ -942,10 +986,8 @@ fn reread_value(thread_key: &ThreadKey, view: &ViewerCard<'_>) -> serde_json::Va
     value
 }
 
-/// The directory half of the viewer's button row (ADR-0083 §3): 「📂 所在目录」
-/// always, and 「← 返回目录」 — the browse handler's `restore` op, which rebuilds
-/// the listing's whole state where `go` would clear the filter and page — when
-/// the viewer was opened from a browse listing. Shared by the viewer card and
+/// The directory half of the viewer's button row (ADR-0083 §3): 「← 返回目录」
+/// when the viewer replaced a browse listing, otherwise 「📂 所在目录」. Shared by the viewer card and
 /// the failed-transfer card, which keeps the way back but carries no
 /// 「发为文件」 (there is nothing left to send).
 fn directory_columns(
@@ -954,7 +996,12 @@ fn directory_columns(
     return_to: Option<BrowseView<'_>>,
 ) -> Vec<serde_json::Value> {
     let mut columns: Vec<serde_json::Value> = Vec::new();
-    if let Some(parent) = std::path::Path::new(path).parent() {
+    if let Some(return_to) = return_to {
+        columns.push(button_column(
+            "← 返回目录",
+            browse_view_value(thread_key, "restore", return_to),
+        ));
+    } else if let Some(parent) = std::path::Path::new(path).parent() {
         let parent = parent.to_string_lossy().to_string();
         columns.push(button_column(
             "📂 所在目录",
@@ -970,13 +1017,39 @@ fn directory_columns(
             ),
         ));
     }
-    if let Some(return_to) = return_to {
-        columns.push(button_column(
-            "← 返回目录",
-            browse_view_value(thread_key, "restore", return_to),
-        ));
-    }
     columns
+}
+
+/// Recover the whole-bytes lane carried by a pager callback, so a stateless
+/// page flip cannot erase the tracking line or re-enable a completed transfer.
+pub(crate) fn lane_from_page_payload(value: &serde_json::Value) -> Option<ViewerFileLane> {
+    let mime = value.get("viewer_lane_mime")?.as_str()?.to_string();
+    let name = value.get("viewer_lane_name")?.as_str()?.to_string();
+    let size = value.get("viewer_lane_size")?.as_str()?.parse().ok()?;
+    let delivery = match value.get("viewer_lane_delivery")?.as_str()? {
+        "unresolved" => super::tool_render::FileDelivery::Unresolved,
+        "embedded" => super::tool_render::FileDelivery::Embedded {
+            image_key: value.get("viewer_lane_image_key")?.as_str()?.to_string(),
+        },
+        "sent_as_file" => super::tool_render::FileDelivery::SentAsFile,
+        "sent_as_rich_text" => super::tool_render::FileDelivery::SentAsRichText,
+        "undelivered" => super::tool_render::FileDelivery::Undelivered,
+        _ => return None,
+    };
+    Some(ViewerFileLane {
+        mime,
+        name,
+        size,
+        delivery,
+        rich_message_id: value
+            .get("viewer_lane_rich_message_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        refresh_failed: value
+            .get("viewer_lane_refresh_failed")
+            .and_then(serde_json::Value::as_str)
+            == Some("true"),
+    })
 }
 
 /// One column holding one button with the given callback payload.
@@ -1814,6 +1887,10 @@ mod tests {
         assert_eq!(back["value"]["show_hidden"], true);
         assert_eq!(back["value"]["keyword"], "a");
         assert_eq!(back["value"]["page"], 3);
+        assert!(
+            !buttons.iter().any(|b| b["text"]["content"] == "📂 所在目录"),
+            "a browse-opened viewer offers the return target instead of its parent"
+        );
 
         // A `/cat` viewer has no listing to return to.
         let card = build_viewer_card(
@@ -1825,6 +1902,12 @@ mod tests {
                 .iter()
                 .any(|b| b["text"]["content"] == "← 返回目录"),
             "no return button without a listing"
+        );
+        assert!(
+            card_buttons(&card)
+                .iter()
+                .any(|b| b["text"]["content"] == "📂 所在目录"),
+            "a /cat viewer offers its parent directory"
         );
     }
 
