@@ -12,10 +12,11 @@ pub(crate) const INSTANT_REMINDER_SCOPE: &str = "im:datasync.feed_card.time_sens
 /// for the same reason.
 pub(crate) const MESSAGE_PIN_SCOPE: &str = "im:message.pins:write_only";
 
-// Assumption pending a published Feishu error-code reference: 230020 denotes
-// the per-message edit-count ceiling. Only this code permits a fresh-copy
-// fallback; all other business failures remain refusals and must not duplicate.
-const MESSAGE_EDIT_LIMIT_REACHED_CODE: i32 = 230020;
+// Verified in Feishu's Edit message error table:
+// https://open.feishu.cn/document/server-docs/im-v1/message/update
+// 230072 is the per-message edit-count ceiling (20 edits). 230020 is a
+// frequency limit and must not trigger a fresh-copy fallback.
+const MESSAGE_EDIT_LIMIT_REACHED_CODE: i32 = 230072;
 
 /// A minimal Feishu REST client.
 pub struct Client {
@@ -1560,14 +1561,16 @@ mod tests {
         assert_eq!(body["content"], content.to_string());
     }
 
+    /// Feishu's official Edit message error table documents 230072 as the
+    /// exhausted 20-edit budget: https://open.feishu.cn/document/server-docs/im-v1/message/update
     #[tokio::test]
-    async fn edit_message_identifies_the_edit_budget_refusal() {
+    async fn edit_message_identifies_the_documented_edit_budget_refusal() {
         let (server, client) = wire_client().await;
         server.route(
             "PUT",
             "/open-apis/im/v1/messages/om_rich",
             200,
-            r#"{"code":230020,"msg":"message edit limit reached"}"#,
+            r#"{"code":230072,"msg":"The message has reached the number of times it can be edited."}"#,
         );
         let content = serde_json::json!({"zh_cn":{"content":[[{"tag":"md","text":"updated"}]]}});
 
@@ -1581,13 +1584,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn edit_message_keeps_other_business_refusals_distinct_from_the_edit_limit() {
+    async fn edit_message_treats_frequency_limit_230020_as_a_non_budget_refusal() {
         let (server, client) = wire_client().await;
         server.route(
             "PUT",
             "/open-apis/im/v1/messages/om_rich",
             200,
-            r#"{"code":230099,"msg":"invalid message content"}"#,
+            r#"{"code":230020,"msg":"This operation triggers the frequency limit."}"#,
         );
         let content = serde_json::json!({"zh_cn":{"content":[[{"tag":"md","text":"updated"}]]}});
 

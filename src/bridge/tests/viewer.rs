@@ -2178,6 +2178,7 @@ async fn reread_edits_the_same_overflow_message_and_updates_the_card() {
     assert!(
         calls.iter().any(|call| matches!(call, PlatformCall::EditMessage {
             message_id, msg_type, content, outcome: crate::feishu::MessageEditOutcome::Updated,
+            ..
         } if message_id == "msg_file" && msg_type == "post" && content.to_string().contains("r60"))),
         "the original Rich Text Message is edited with the new row: {calls:?}"
     );
@@ -2248,7 +2249,10 @@ async fn refused_rich_message_edit_resends_and_tracks_the_fresh_message() {
     let calls = platform.calls.lock().await.clone();
     assert!(
         calls.iter().any(|call| matches!(call, PlatformCall::EditMessage {
-            message_id, outcome: crate::feishu::MessageEditOutcome::EditLimitReached, ..
+            message_id,
+            outcome: crate::feishu::MessageEditOutcome::EditLimitReached,
+            business_code: Some(230072),
+            ..
         } if message_id == "msg_file")),
         "the original edit is explicitly refused: {calls:?}"
     );
@@ -2278,7 +2282,7 @@ async fn refused_rich_message_edit_resends_and_tracks_the_fresh_message() {
 /// A business refusal other than the edit-budget ceiling is not a license to
 /// duplicate the overflow. The card keeps the old id and names it as current.
 #[tokio::test]
-async fn unrelated_rich_message_edit_refusal_does_not_resend() {
+async fn frequency_limit_230020_does_not_resend_rich_message() {
     let (_work_dir, _project, _state, app, platform, file, original) = open_overflow_csv_viewer().await;
     std::fs::write(
         &file,
@@ -2308,6 +2312,7 @@ async fn unrelated_rich_message_edit_refusal_does_not_resend() {
     assert!(calls.iter().any(|call| matches!(call, PlatformCall::EditMessage {
         message_id,
         outcome: crate::feishu::MessageEditOutcome::Refused,
+        business_code: Some(230020),
         ..
     } if message_id == "msg_file")));
     assert_eq!(

@@ -277,6 +277,7 @@ pub enum PlatformCall {
         msg_type: String,
         content: serde_json::Value,
         outcome: crate::feishu::MessageEditOutcome,
+        business_code: Option<i32>,
     },
     EditMessageFailed {
         message_id: String,
@@ -471,7 +472,7 @@ pub struct RecordingPlatform {
     pub fail_send_message_count: std::sync::atomic::AtomicUsize,
     /// The next N non-card message edits are definitively refused by Feishu.
     pub refuse_edit_message_count: std::sync::atomic::AtomicUsize,
-    /// The next N non-card edits are refused for a reason other than the edit budget.
+    /// The next N non-card edits simulate Feishu's 230020 frequency-limit refusal.
     pub reject_edit_message_count: std::sync::atomic::AtomicUsize,
     /// The next N non-card message edits fail ambiguously at transport.
     pub fail_edit_message_count: std::sync::atomic::AtomicUsize,
@@ -974,18 +975,19 @@ impl feishu::Platform for RecordingPlatform {
             self.reject_edit_message_count
                 .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         }
-        let outcome = if limit_reached {
-            crate::feishu::MessageEditOutcome::EditLimitReached
+        let (outcome, business_code) = if limit_reached {
+            (crate::feishu::MessageEditOutcome::EditLimitReached, Some(230072))
         } else if rejected {
-            crate::feishu::MessageEditOutcome::Refused
+            (crate::feishu::MessageEditOutcome::Refused, Some(230020))
         } else {
-            crate::feishu::MessageEditOutcome::Updated
+            (crate::feishu::MessageEditOutcome::Updated, None)
         };
         self.calls.lock().await.push(PlatformCall::EditMessage {
             message_id: message_id.into(),
             msg_type: msg_type.into(),
             content: content.clone(),
             outcome,
+            business_code,
         });
         Ok(outcome)
     }
