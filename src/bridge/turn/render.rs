@@ -18,7 +18,7 @@ use crate::bridge::chain::{EndingFacts, EndingKey, TaskEndingClass, TaskEndingSt
 use crate::bridge::core::SESSION_INFO_TIMEOUT;
 use crate::bridge::handles::{
     CONTENT_CACHE_CAP, CardsHandle, ContentCell, ContentCellCache, ContentCellHold, FILE_MESSAGE_SENDS_CAP,
-    FileMessageSends, RequestsHandle, SessionsHandle, TurnHandles, evict_oldest_idle,
+    FileMessageSends, RequestsHandle, SessionsHandle, TurnHandles, content_cell, evict_oldest_idle,
 };
 use crate::bridge::span;
 use crate::bridge::tasks::TaskRunId;
@@ -1098,32 +1098,6 @@ async fn resolve_file_deliveries(cards: &CardsHandle, session_id: &str) -> bool 
     // every cell this pass inserted is idle again when the guard trims both
     // caches back to the cap (ADR-0076 review round 4).
     changed
-}
-
-/// The single-flight cell for `hash` in a per-content-key cache (ADR-0076): the
-/// lock, the `entry`, the `OnceCell` creation and the `Arc::clone` the image and
-/// file caches both need, in one place. Every concurrent resolver of one content
-/// key shares one cell, so the first's platform call is awaited by the rest
-/// instead of repeated. Bounded by [`CONTENT_CACHE_CAP`], evicting the oldest
-/// IDLE entry first (ADR-0076 review round 2): eviction never drops a cell a
-/// resolver is still holding — dropping an in-flight one would let a concurrent
-/// resolver of the same key create a new cell and re-run the platform call,
-/// which on the image path could re-open B1's embedded-and-sent split. Insertion
-/// trims idle entries until the map is back at/under the cap, so a batch of
-/// `join_all` insertions cannot leave it permanently oversized; a held entry may
-/// push it over temporarily, and [`ContentCacheTrimGuard`] (which drops once the
-/// batch's holds release) brings it back down even with no later insertion. A
-/// re-upload of a settled key after eviction is harmless, and the ADR accepts
-/// it.
-async fn content_cell<T>(cache: &ContentCellCache<T>, hash: u64) -> ContentCellHold<T> {
-    let mut cache = cache.lock().await;
-    if !cache.contains_key(&hash) {
-        // Evict idle entries until at/under the cap: evicting only one per
-        // later insertion would leave a large batch permanently oversized.
-        while cache.len() >= CONTENT_CACHE_CAP && evict_oldest_idle(&mut cache, |entry| entry.is_idle()) {}
-    }
-    let entry = Arc::clone(cache.entry(hash).or_insert_with(|| Arc::new(ContentCell::new())));
-    ContentCellHold::new(entry)
 }
 
 /// Trim `cache` back to [`CONTENT_CACHE_CAP`] without awaiting, evicting idle

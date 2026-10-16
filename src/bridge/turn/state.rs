@@ -1591,12 +1591,10 @@ pub(super) struct PendingFileDelivery {
 /// marked with another file's key. `bytes` is the already-decoded payload (the
 /// callers hold it), so the identity never re-decodes a large file.
 pub(super) fn file_content_hash(content: &FileContent, bytes: &[u8]) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    content.mime.hash(&mut hasher);
-    content.name.hash(&mut hasher);
-    hasher.finish()
+    // The identity lives beside the caches it keys ([`crate::bridge::handles`]),
+    // so the File Viewer's whole-bytes lane (ADR-0083 §5) hashes a content the
+    // same way and cannot collide with the transcript path's key space.
+    crate::bridge::handles::content_identity_hash(&content.mime, &content.name, bytes)
 }
 
 impl StreamAccumulator {

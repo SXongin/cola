@@ -12,18 +12,38 @@
 //! passed through — `~`/relative/absolute only, with the scope a *privacy hint,
 //! not a boundary* (#673 owns the real one; this module adds none).
 //!
-//! Everything here is bounded: a preview reads at most [`PREVIEW_READ_CAP`]
-//! bytes and the card layer holds the preview to its own card budget, so a huge
-//! file can neither exhaust memory nor produce a rejected card.
+//! Everything here is bounded. Magic bytes decide what a file *is* (§6): a text
+//! file past [`PREVIEW_READ_CAP`] is not previewed at all — it takes the **File
+//! Message** lane — and a file past Feishu's 30 MB upload cap is classified from
+//! its header alone and never read. A text preview reads at most the cap and the
+//! card layer holds it to its own budget, so a huge file can neither exhaust
+//! memory nor produce a rejected card.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use crate::backend::FileContent;
+use crate::bridge::handles::{CardsHandle, content_cell, content_identity_hash};
+use crate::feishu::Platform;
+use crate::feishu::card::tool_render::FileDelivery;
+use crate::feishu::card::viewer::ViewerFileLane;
 
 /// The most bytes a preview reads (ADR-0083 §6): 8 MB. A text file past it is
-/// not previewed in full — #739 routes such a file to the File Message lane;
-/// until that lane exists a preview renders the bounded prefix and the card
-/// says it is truncated rather than reading the whole file into memory.
+/// not previewed at all — it takes the File Message lane (ADR-0083 §5).
 pub(crate) const PREVIEW_READ_CAP: usize = 8 * 1024 * 1024;
+
+/// How many bytes [`classify`] sniffs for magic bytes (ADR-0083 §6): well past
+/// the longest signature `infer` carries, and a bounded, cheap read.
+const SNIFF_BYTES: usize = 8192;
+
+/// The bound on ONE network call of the whole-bytes lane (ADR-0083 §5): the
+/// upload and the File Message send each get this, so the 「发为文件」 transfer
+/// the click spawns off the card callback can neither run forever nor leave the
+/// clicker with a dropped result. The default lives on
+/// [`crate::bridge::core::SharedCore`] so a test can shrink it and observe a
+/// timeout.
+pub(crate) const VIEWER_TRANSFER_TIMEOUT_MS: u64 = 60_000;
 
 /// Resolve a user-supplied viewer path on the **Path Scope** (ADR-0083 §4):
 /// `~` expands against home, a relative path joins `session_dir`, an absolute
@@ -70,8 +90,9 @@ pub(crate) fn open_cat_path(path: &Path) -> CatOpen {
 
 /// Why a path could not be shown (ADR-0083 §2). Every cause answers its own
 /// line and every line names the path — an unopenable file is a stated reason,
-/// never an empty card. `#739` replaces the [`CatFailure::NotText`] answer with
-/// the byte lanes; the honesty requirement is this ticket's.
+/// never an empty card. A non-UTF-8 file is no longer a failure: it is a byte
+/// lane (#739), so it answers with a viewer card whose tracking line says where
+/// its bytes went.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum CatFailure {
     /// The resolved path does not exist.
@@ -81,9 +102,6 @@ pub(crate) enum CatFailure {
     Unreadable(String),
     /// The file is zero bytes.
     Empty,
-    /// The bytes are not valid UTF-8 (or carry a NUL), so this is not the text
-    /// preview the viewer renders.
-    NotText,
 }
 
 impl CatFailure {
@@ -94,46 +112,348 @@ impl CatFailure {
             Self::Missing => format!("⚠️ 找不到路径 `{shown}`。"),
             Self::Unreadable(reason) => format!("⚠️ 无法读取 `{shown}`：{reason}"),
             Self::Empty => format!("📄 `{shown}` 是空文件（0 字节）。"),
-            Self::NotText => format!("⚠️ `{shown}` 不是 UTF-8 文本，无法预览。"),
         }
     }
 }
 
-/// Read a file's preview bytes and decode them as text: the file's content, or
-/// the honest reason there is none. Bounded by [`PREVIEW_READ_CAP`] — a longer
-/// file yields its prefix, which the caller reports as truncated.
-pub(crate) fn read_preview(path: &Path, size: u64) -> Result<String, CatFailure> {
-    read_preview_capped(path, size, PREVIEW_READ_CAP)
+/// What a file's bytes *are* (ADR-0083 §6): magic bytes decide an image or a
+/// known binary first, then UTF-8 validity decides text.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ClassifiedKind {
+    /// An image, by magic bytes: the embed lane when Feishu accepts it, else
+    /// the File Message lane.
+    Image,
+    /// UTF-8 text within the preview read cap: the card's preview.
+    Text,
+    /// A non-text file — or a text file past the preview read cap, which is not
+    /// previewed at all: the File Message lane.
+    File,
 }
 
-/// [`read_preview`] with an explicit cap, so its truncation rules are testable
-/// without writing an 8 MB fixture.
-fn read_preview_capped(path: &Path, size: u64, cap: usize) -> Result<String, CatFailure> {
+/// A Host file read locally and classified by **content**, never by name
+/// (ADR-0083 §1, §6).
+pub(crate) struct Classified {
+    /// The file's byte size (from `stat`): the number the card names, and the
+    /// cap check is made against it so a past-cap file is never read.
+    pub(crate) size: u64,
+    /// The content's mime — `infer`'s answer when magic bytes named it, else
+    /// derived from the header's own shape.
+    pub(crate) mime: String,
+    /// What the bytes are.
+    pub(crate) kind: ClassifiedKind,
+    /// The preview text, for a UTF-8 text file within the preview read cap.
+    pub(crate) text: Option<String>,
+    /// The whole bytes for a delivery lane that hands them to the Platform (an
+    /// image or a file), when the file is within Feishu's 30MB upload cap. `None`
+    /// for a text preview (which holds only its decoded text) and for a file past
+    /// the cap (never read — the card says 未发送).
+    pub(crate) bytes: Option<Vec<u8>>,
+}
+
+/// Read `path` and decide what its bytes are (ADR-0083 §6): a bounded header is
+/// sniffed for magic bytes (image / known binary), then — for anything the
+/// sniff does not decide — the whole file is read under [`PREVIEW_READ_CAP`] and
+/// UTF-8 validity decides text. A text file past the cap takes the File Message
+/// lane without being previewed. Reads at most Feishu's 30MB upload cap for a
+/// byte lane; a larger file is classified from its header alone and carries no
+/// bytes.
+pub(crate) fn classify(path: &Path, size: u64) -> Result<Classified, CatFailure> {
     if size == 0 {
         return Err(CatFailure::Empty);
     }
+    let header = read_prefix(path, SNIFF_BYTES.min(size as usize))?;
+    let inferred = infer::get(&header);
+    let mime_from_infer = inferred.map(|kind| kind.mime_type().to_string());
+    let is_image = inferred.is_some_and(|kind| kind.matcher_type() == infer::MatcherType::Image);
+    // `infer`'s Text matchers (html, xml, a shell script) are still TEXT: they
+    // must fall through to the UTF-8 decision rather than being called binary.
+    let is_known_binary = inferred.is_some_and(|kind| {
+        !matches!(
+            kind.matcher_type(),
+            infer::MatcherType::Image | infer::MatcherType::Text
+        )
+    });
+    let header_is_text = !header.contains(&0) && std::str::from_utf8(&header).is_ok();
+    let octet_mime = || {
+        mime_from_infer.clone().unwrap_or_else(|| {
+            if header_is_text {
+                "text/plain".to_string()
+            } else {
+                crate::backend::file_content::DEFAULT_FILE_MIME.to_string()
+            }
+        })
+    };
+
+    if is_image {
+        return Ok(Classified {
+            size,
+            mime: octet_mime(),
+            kind: ClassifiedKind::Image,
+            text: None,
+            bytes: read_deliverable(path, size)?,
+        });
+    }
+    if is_known_binary || size > PREVIEW_READ_CAP as u64 {
+        return Ok(Classified {
+            size,
+            mime: octet_mime(),
+            kind: ClassifiedKind::File,
+            text: None,
+            bytes: read_deliverable(path, size)?,
+        });
+    }
+    // Under the preview cap and undecided by magic bytes: UTF-8 validity
+    // decides. A NUL byte means this is not text whatever its encoding —
+    // rendering it would put a control character into the card (issue #519's
+    // family), and the byte lane is where it belongs.
+    let bytes = read_full(path, size)?;
+    if let Ok(text) = std::str::from_utf8(&bytes)
+        && !bytes.contains(&0)
+    {
+        return Ok(Classified {
+            size,
+            mime: "text/plain".to_string(),
+            kind: ClassifiedKind::Text,
+            text: Some(text.to_string()),
+            bytes: None,
+        });
+    }
+    // The whole file failed the UTF-8 test, so its header's shape must not label
+    // it `text/plain`: only `infer` may name it, else it is a generic binary.
+    let mime = mime_from_infer.unwrap_or_else(|| crate::backend::file_content::DEFAULT_FILE_MIME.to_string());
+    Ok(Classified {
+        size,
+        mime,
+        kind: ClassifiedKind::File,
+        text: None,
+        bytes: Some(bytes),
+    })
+}
+
+/// The whole-bytes lane a viewer opens with (ADR-0083 §5): an image within
+/// Feishu's caps uploads once and is embedded, anything else uploads once and is
+/// posted as exactly ONE File Message, and a file past the 30MB cap — or a
+/// failed upload/send — is 未发送. `None` for a text preview, which takes no
+/// lane on open.
+pub(crate) async fn open_lane(
+    platform: &Arc<dyn Platform>,
+    cards: &CardsHandle,
+    reply_target: &str,
+    name: &str,
+    classified: &mut Classified,
+    timeout_ms: u64,
+) -> Option<ViewerFileLane> {
+    if classified.kind == ClassifiedKind::Text {
+        return None;
+    }
+    let (mime, size) = (classified.mime.clone(), classified.size);
+    let Some(bytes) = classified.bytes.take() else {
+        // Past Feishu's 30MB cap: nothing was read, nothing can be uploaded.
+        return Some(ViewerFileLane {
+            mime,
+            name: name.to_string(),
+            size,
+            delivery: FileDelivery::Undelivered,
+        });
+    };
+    let content = FileContent::from_bytes(&mime, name, bytes);
+    let delivery = deliver(
+        platform,
+        cards,
+        reply_target,
+        classified.kind,
+        content,
+        timeout_ms,
+    )
+    .await;
+    Some(ViewerFileLane {
+        mime,
+        name: name.to_string(),
+        size,
+        delivery,
+    })
+}
+
+/// The 「发为文件」 transfer (ADR-0083 §5): read the file's whole bytes and post
+/// them as exactly ONE File Message, whatever the file is — this is the action
+/// that gets a file whose preview fits nowhere out of the chat, and the one that
+/// reaches a text preview's or an embedded image's **full** bytes. Reads at most
+/// Feishu's 30MB cap; past it (or on a failed upload/send) the lane is 未发送 and
+/// no message is posted. Off the card callback, bounded by `timeout_ms` per
+/// network call.
+pub(crate) async fn send_as_file(
+    platform: &Arc<dyn Platform>,
+    cards: &CardsHandle,
+    reply_target: &str,
+    path: &Path,
+    name: &str,
+    classified: &mut Classified,
+    timeout_ms: u64,
+) -> ViewerFileLane {
+    let (mime, size) = (classified.mime.clone(), classified.size);
+    // Reuse the bytes the open already read (an image/binary lane), and read
+    // them for a text preview, whose open held only the decoded text.
+    let bytes = match classified.bytes.take() {
+        Some(bytes) => Some(bytes),
+        None => read_deliverable(path, size).ok().flatten(),
+    };
+    let delivery = match bytes {
+        Some(bytes) => {
+            let content = FileContent::from_bytes(&mime, name, bytes);
+            deliver(
+                platform,
+                cards,
+                reply_target,
+                ClassifiedKind::File,
+                content,
+                timeout_ms,
+            )
+            .await
+        }
+        None => FileDelivery::Undelivered,
+    };
+    ViewerFileLane {
+        mime,
+        name: name.to_string(),
+        size,
+        delivery,
+    }
+}
+
+/// Upload `bytes` once (content-hash cached, single-flight across the process)
+/// and deliver them: an image the Platform accepts is embedded, anything else is
+/// posted as exactly ONE File Message under `reply_target`. Every failure
+/// degrades to [`FileDelivery::Undelivered`] — never an error, never a duplicate
+/// message.
+async fn deliver(
+    platform: &Arc<dyn Platform>,
+    cards: &CardsHandle,
+    reply_target: &str,
+    kind: ClassifiedKind,
+    content: FileContent,
+    timeout_ms: u64,
+) -> FileDelivery {
+    let hash = content_identity_hash(
+        &content.mime,
+        &content.name,
+        content.data.as_deref().unwrap_or_default(),
+    );
+    if kind == ClassifiedKind::Image {
+        let cell = content_cell(&cards.file_images, hash).await;
+        let key = cell
+            .cell()
+            .get_or_init(|| async {
+                // Infallible on purpose (ADR-0076 review, B1): a failed or
+                // timed-out embed settles the cell as `None`, the same verdict a
+                // decided non-image gets, so a concurrent resolver cannot embed
+                // while this one sends a File Message.
+                match crate::bridge::bounded_call(
+                    "viewer image upload",
+                    timeout_ms,
+                    platform.upload_image(&content),
+                )
+                .await
+                {
+                    Some(Ok(key)) => key,
+                    Some(Err(error)) => {
+                        tracing::warn!("viewer image upload failed: {error}");
+                        None
+                    }
+                    None => None,
+                }
+            })
+            .await
+            .clone();
+        if let Some(image_key) = key {
+            return FileDelivery::Embedded { image_key };
+        }
+        // A non-embeddable image (past the 10MB / dimension caps) falls through
+        // to the File Message lane.
+    }
+    send_file_message(platform, cards, reply_target, &content, hash, timeout_ms).await
+}
+
+/// Upload `content` once (content-hash cached) and post exactly ONE File Message
+/// carrying its key under `reply_target`. `Undelivered` past Feishu's 30MB cap,
+/// on a failed upload, or on a failed/timed-out send.
+async fn send_file_message(
+    platform: &Arc<dyn Platform>,
+    cards: &CardsHandle,
+    reply_target: &str,
+    content: &FileContent,
+    hash: u64,
+    timeout_ms: u64,
+) -> FileDelivery {
+    if !crate::feishu::file::deliverable_file(content) {
+        return FileDelivery::Undelivered;
+    }
+    let cell = content_cell(&cards.file_uploads, hash).await;
+    let file_key = match cell
+        .cell()
+        .get_or_try_init(|| async {
+            match crate::bridge::bounded_call("viewer file upload", timeout_ms, platform.upload_file(content))
+                .await
+            {
+                Some(Ok(Some(file_key))) => Ok(Some(file_key)),
+                Some(Ok(None)) => Ok(None),
+                Some(Err(error)) => {
+                    tracing::warn!("viewer file upload failed: {error}");
+                    Err(())
+                }
+                None => Err(()),
+            }
+        })
+        .await
+    {
+        Ok(Some(file_key)) => file_key.clone(),
+        // Past Feishu's cap, a failed upload, or a timeout.
+        Ok(None) | Err(()) => return FileDelivery::Undelivered,
+    };
+    let payload = serde_json::json!({ "file_key": file_key });
+    match crate::bridge::bounded_call(
+        "viewer file message",
+        timeout_ms,
+        platform.reply_message(reply_target, "file", &payload),
+    )
+    .await
+    {
+        Some(Ok(_)) => FileDelivery::SentAsFile,
+        Some(Err(error)) => {
+            tracing::warn!("viewer File Message send failed: {error}");
+            FileDelivery::Undelivered
+        }
+        None => FileDelivery::Undelivered,
+    }
+}
+
+/// The whole bytes for a delivery lane, or `None` when the file is past
+/// Feishu's 30MB upload cap — never read, so a huge file cannot exhaust memory.
+fn read_deliverable(path: &Path, size: u64) -> Result<Option<Vec<u8>>, CatFailure> {
+    if size > crate::feishu::file::MAX_FILE_BYTES {
+        return Ok(None);
+    }
+    read_full(path, size).map(Some)
+}
+
+/// Read at most `size` bytes (the `stat`-reported length), reporting the OS's
+/// reason when the file cannot be read.
+fn read_full(path: &Path, size: u64) -> Result<Vec<u8>, CatFailure> {
     let file = std::fs::File::open(path).map_err(|e| CatFailure::Unreadable(e.to_string()))?;
-    let mut bytes = Vec::new();
-    file.take(cap as u64)
+    let mut bytes = Vec::with_capacity(size.min(crate::feishu::file::MAX_FILE_BYTES) as usize);
+    file.take(size)
         .read_to_end(&mut bytes)
         .map_err(|e| CatFailure::Unreadable(e.to_string()))?;
-    // A NUL byte means this is not text whatever its encoding: rendering it
-    // would put a control character into the card (issue #519's family), and
-    // the byte lanes (#739) are where a binary belongs anyway.
-    if bytes.contains(&0) {
-        return Err(CatFailure::NotText);
-    }
-    let truncated = size.saturating_sub(cap as u64) > 0;
-    match std::str::from_utf8(&bytes) {
-        Ok(text) => Ok(text.to_string()),
-        // The cap can land mid-character: keep the valid prefix (the caller
-        // already reports the truncation) instead of calling real text binary.
-        Err(e) if truncated => {
-            let valid = e.valid_up_to();
-            Ok(String::from_utf8(bytes[..valid].to_vec()).expect("a valid prefix"))
-        }
-        Err(_) => Err(CatFailure::NotText),
-    }
+    Ok(bytes)
+}
+
+/// Read at most `n` bytes — the bounded header [`classify`] sniffs.
+fn read_prefix(path: &Path, n: usize) -> Result<Vec<u8>, CatFailure> {
+    let file = std::fs::File::open(path).map_err(|e| CatFailure::Unreadable(e.to_string()))?;
+    let mut bytes = Vec::with_capacity(n);
+    file.take(n as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|e| CatFailure::Unreadable(e.to_string()))?;
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -197,16 +517,16 @@ mod tests {
     }
 
     /// The three distinct failures (ADR-0083 §2) each answer their own line and
-    /// every line names the resolved path.
+    /// every line names the resolved path. A non-UTF-8 file is no longer among
+    /// them: it is a byte lane (#739), not a failure.
     #[test]
     fn cat_failures_answer_distinctly_and_name_the_path() {
         let path = Path::new("/tmp/some/file.txt");
         let missing = CatFailure::Missing.line(path);
         let unreadable = CatFailure::Unreadable("Permission denied (os error 13)".into()).line(path);
         let empty = CatFailure::Empty.line(path);
-        let not_text = CatFailure::NotText.line(path);
 
-        for line in [&missing, &unreadable, &empty, &not_text] {
+        for line in [&missing, &unreadable, &empty] {
             assert!(
                 line.contains("/tmp/some/file.txt"),
                 "the line names the path: {line}"
@@ -218,9 +538,8 @@ mod tests {
             "{unreadable}"
         );
         assert!(empty.contains("空文件") && empty.contains("0 字节"), "{empty}");
-        assert!(not_text.contains("UTF-8"), "{not_text}");
         // Distinct: no two causes share their copy.
-        let mut lines: Vec<String> = vec![missing, unreadable, empty, not_text];
+        let mut lines: Vec<String> = vec![missing, unreadable, empty];
         lines.sort();
         let before = lines.len();
         lines.dedup();
@@ -250,29 +569,118 @@ mod tests {
         ));
     }
 
-    /// The preview read is honest about empty, non-UTF-8 and truncated files.
+    /// A tiny, structurally real PNG header (the 8-byte signature plus an IHDR
+    /// declaring `width`×`height`) — the magic bytes `infer` reads.
+    fn png(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        bytes.extend_from_slice(&13u32.to_be_bytes());
+        bytes.extend_from_slice(b"IHDR");
+        bytes.extend_from_slice(&width.to_be_bytes());
+        bytes.extend_from_slice(&height.to_be_bytes());
+        bytes.extend_from_slice(&[8, 6, 0, 0, 0]);
+        bytes
+    }
+
+    fn write(path: &Path, bytes: &[u8]) -> u64 {
+        std::fs::write(path, bytes).unwrap();
+        std::fs::metadata(path).unwrap().len()
+    }
+
+    /// Classification is by CONTENT, never by name (ADR-0083 §6): a PNG named
+    /// `.txt` is an image, a text file named `.png` is text, a non-UTF-8 file
+    /// named `.txt` is a binary, and a known binary (a PDF header) is a file
+    /// whatever its name says. A non-UTF-8 file is NEVER rendered as text.
     #[test]
-    fn read_preview_reports_empty_binary_and_cap() {
+    fn classify_decides_by_magic_bytes_and_utf8_validity_not_by_name() {
         let dir = tempfile::tempdir().unwrap();
 
+        let image = dir.path().join("actually-an-image.txt");
+        let size = write(&image, &png(4, 4));
+        let classified = classify(&image, size).unwrap();
+        assert_eq!(classified.kind, ClassifiedKind::Image, "magic bytes win");
+        assert_eq!(classified.mime, "image/png");
+        assert!(classified.text.is_none());
+        assert_eq!(classified.bytes.as_deref(), Some(png(4, 4).as_slice()));
+
+        // A text file with an image's name is TEXT: UTF-8 validity decides.
+        let text = dir.path().join("actually-text.png");
+        let size = write(&text, b"# just text\n");
+        let classified = classify(&text, size).unwrap();
+        assert_eq!(classified.kind, ClassifiedKind::Text);
+        assert_eq!(classified.text.as_deref(), Some("# just text\n"));
+        assert!(classified.bytes.is_none(), "a text preview holds no bytes");
+
+        // A non-UTF-8 file is a binary, never text.
+        let binary = dir.path().join("looks-like-a-text-file.txt");
+        let size = write(&binary, &[0xff, 0xfe, 0x00, 0x01]);
+        let classified = classify(&binary, size).unwrap();
+        assert_eq!(classified.kind, ClassifiedKind::File);
+        assert!(classified.text.is_none(), "a non-UTF-8 file is never text");
+        assert_eq!(
+            classified.bytes.as_deref(),
+            Some([0xff, 0xfe, 0x00, 0x01].as_slice())
+        );
+
+        // A known binary (a PDF magic) is a file even though it is UTF-8-ish.
+        let pdf = dir.path().join("report.txt");
+        let size = write(&pdf, b"%PDF-1.7\nplain-ish");
+        let classified = classify(&pdf, size).unwrap();
+        assert_eq!(classified.kind, ClassifiedKind::File);
+        assert_eq!(classified.mime, "application/pdf");
+
+        // A NUL byte means not text, whatever the rest decodes to.
+        let nul = dir.path().join("nul.txt");
+        let size = write(&nul, b"hello\0world");
+        assert_eq!(classify(&nul, size).unwrap().kind, ClassifiedKind::File);
+    }
+
+    /// A text file past the preview read cap is NOT previewed — it takes the
+    /// File lane — and a file past Feishu's 30MB upload cap is classified from
+    /// its header alone, carrying no bytes at all (ADR-0083 §5, §6).
+    #[test]
+    fn classify_routes_a_past_cap_file_to_the_file_lane_without_reading_it() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // A real sparse file, one byte past the preview cap: cheap to create,
+        // and the file lane takes it without a preview.
+        let big = dir.path().join("big.log");
+        let file = std::fs::File::create(&big).unwrap();
+        file.set_len(PREVIEW_READ_CAP as u64 + 1).unwrap();
+        drop(file);
+        let classified = classify(&big, std::fs::metadata(&big).unwrap().len()).unwrap();
+        assert_eq!(classified.kind, ClassifiedKind::File, "past the cap, no preview");
+        assert!(classified.text.is_none());
+
+        // Exactly at the preview cap stays text (the other side of the same
+        // boundary): real text bytes, not a sparse hole.
+        let at_cap = dir.path().join("at_cap.log");
+        let size = write(&at_cap, &vec![b'a'; PREVIEW_READ_CAP]);
+        let classified = classify(&at_cap, size).unwrap();
+        assert_eq!(
+            classified.kind,
+            ClassifiedKind::Text,
+            "exactly at the cap previews"
+        );
+        assert_eq!(classified.text.as_deref().map(str::len), Some(PREVIEW_READ_CAP));
+
+        // A file past the 30MB upload cap: no bytes are ever read.
+        let huge = dir.path().join("huge.bin");
+        let file = std::fs::File::create(&huge).unwrap();
+        file.set_len(crate::feishu::file::MAX_FILE_BYTES + 1).unwrap();
+        drop(file);
+        let size = std::fs::metadata(&huge).unwrap().len();
+        let classified = classify(&huge, size).unwrap();
+        assert_eq!(classified.kind, ClassifiedKind::File);
+        assert!(classified.bytes.is_none(), "past 30MB, nothing is read");
+        assert_eq!(classified.size, size, "the card still names the real size");
+    }
+
+    /// An empty file is its own answer, never a lane.
+    #[test]
+    fn classify_reports_an_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
         let empty = dir.path().join("empty.txt");
         std::fs::write(&empty, "").unwrap();
-        assert_eq!(read_preview(&empty, 0), Err(CatFailure::Empty));
-
-        let binary = dir.path().join("bin");
-        std::fs::write(&binary, [0xff, 0xfe, 0x00, 0x01]).unwrap();
-        assert_eq!(read_preview(&binary, 4), Err(CatFailure::NotText));
-
-        // A cap landing mid-character keeps the valid prefix instead of
-        // calling real text binary.
-        let text = dir.path().join("long.txt");
-        std::fs::write(&text, "日本語のテキスト").unwrap();
-        let bytes = std::fs::metadata(&text).unwrap().len();
-        let short = read_preview_capped(&text, bytes, 4).unwrap();
-        assert_eq!(short, "日", "the cap keeps the valid prefix");
-        assert_eq!(
-            read_preview_capped(&text, bytes, 1024).unwrap(),
-            "日本語のテキスト"
-        );
+        assert!(matches!(classify(&empty, 0), Err(CatFailure::Empty)));
     }
 }

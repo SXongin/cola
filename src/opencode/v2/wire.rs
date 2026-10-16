@@ -1755,6 +1755,7 @@ mod tests {
                     mime: "image/png".into(),
                     name: "shot.png".into(),
                     size: 3,
+                    data: None,
                 }),
             ]
         );
@@ -1789,6 +1790,7 @@ mod tests {
                 mime: DEFAULT_FILE_MIME.into(),
                 name: "file".into(),
                 size: 3,
+                data: None,
             })]
         );
     }
@@ -1819,6 +1821,7 @@ mod tests {
                 mime: "image/png".into(),
                 name: "shot.png".into(),
                 size: 3,
+                data: None,
             })
         );
         assert_eq!(
@@ -1828,6 +1831,7 @@ mod tests {
                 mime: "image/png".into(),
                 name: "file".into(),
                 size: 3,
+                data: None,
             })
         );
     }
@@ -1865,6 +1869,7 @@ mod tests {
                 mime: DEFAULT_FILE_MIME.into(),
                 name: "shot.png".into(),
                 size: 3,
+                data: None,
             })]
         );
     }

@@ -359,37 +359,80 @@ pub(crate) async fn send_cat_card(
             platform.reply_card(message_id, &card).await?;
         }
         crate::bridge::viewer::CatOpen::File { path, size } => {
-            // A file past the preview read cap yields its bounded prefix; the
-            // card says so (#739 routes such a file to the File Message lane).
-            let truncated = size > crate::bridge::viewer::PREVIEW_READ_CAP as u64;
-            match crate::bridge::viewer::read_preview(&path, size) {
-                Ok(text) => {
-                    let ext = path.extension().and_then(|e| e.to_str());
-                    let shown = path.to_string_lossy().to_string();
-                    let card = super::viewer::build_viewer_card(
-                        thread_key,
-                        super::viewer::ViewerCard {
-                            path: &shown,
-                            size,
-                            kind: super::viewer::kind_for_extension(ext),
-                            ext,
-                            text: &text,
-                            truncated,
-                            return_to: None,
-                        },
-                    );
-                    platform.reply_card(message_id, &card).await?;
-                }
+            // Classify by CONTENT (ADR-0083 §6) and deliver the whole-bytes lane
+            // the file takes (ADR-0083 §5): an image embeds, a binary (or a text
+            // past the preview cap) goes out as one File Message under this
+            // command's own message. `classify` reports an unreadable file's own
+            // cause instead.
+            let mut classified = match crate::bridge::viewer::classify(&path, size) {
+                Ok(classified) => classified,
                 Err(failure) => {
                     platform.reply_text(message_id, &failure.line(&path)).await?;
+                    return Ok(());
                 }
-            }
+            };
+            let name = file_display_name(&path);
+            let lane = crate::bridge::viewer::open_lane(
+                platform,
+                &handles.flow.cards,
+                message_id,
+                &name,
+                &mut classified,
+                handles.flow.cards.viewer_transfer_timeout_ms(),
+            )
+            .await;
+            let card = build_viewer_for_classified(thread_key, &path, &classified, lane, None);
+            platform.reply_card(message_id, &card).await?;
         }
         crate::bridge::viewer::CatOpen::Failed(failure) => {
             platform.reply_text(message_id, &failure.line(&resolved)).await?;
         }
     }
     Ok(())
+}
+
+/// The file name a viewer names and a File Message uploads under: the path's
+/// last component, or `file` when the path has none.
+pub(crate) fn file_display_name(path: &std::path::Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".to_string())
+}
+
+/// Build the **File Viewer** card for a file already classified by content
+/// (ADR-0083 §3, §5). Shared by `/cat` and the 「发为文件」 transfer — which
+/// PATCHes the card it was clicked on with the outcome — so both name the same
+/// file the same way and render the same lane.
+pub(crate) fn build_viewer_for_classified(
+    thread_key: &ThreadKey,
+    path: &std::path::Path,
+    classified: &crate::bridge::viewer::Classified,
+    lane: Option<super::viewer::ViewerFileLane>,
+    return_to: Option<BrowseView<'_>>,
+) -> Value {
+    use super::viewer::{ViewerCard, ViewerKind, build_viewer_card, kind_for_extension};
+    use crate::bridge::viewer::ClassifiedKind;
+
+    let ext = path.extension().and_then(|e| e.to_str());
+    let kind = match classified.kind {
+        ClassifiedKind::Image => ViewerKind::Image,
+        ClassifiedKind::File => ViewerKind::Binary,
+        ClassifiedKind::Text => kind_for_extension(ext),
+    };
+    let shown = path.to_string_lossy().to_string();
+    build_viewer_card(
+        thread_key,
+        ViewerCard {
+            path: &shown,
+            size: classified.size,
+            kind,
+            ext,
+            text: classified.text.as_deref().unwrap_or(""),
+            truncated: false,
+            return_to,
+            lane,
+        },
+    )
 }
 
 /// The first agent in `GET /agent` order that the server would actually run as

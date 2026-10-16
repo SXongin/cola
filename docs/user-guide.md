@@ -417,7 +417,7 @@ detailed help for any of these.
 | --- | --- |
 | `/dir <path> [name]` | Declare a new session rooted at `<path>` — created by the next message |
 | `/claim <code>` | Claim this cola as Host (private chat only; code from the startup log) |
-| `/cat <path>` | View one file on cola's host as a File Viewer card: a text file as a fenced code block with its extension's language hint (an extension the platform has no token for renders as plain text), a `.csv`/`.tsv` file as a markdown table; the card names the file's resolved path, size and type, and its 📂 所在目录 button opens the Directory Browser at the file's parent. `/cat <directory>` opens the browser there instead, and a bare `/cat` shows usage. The path resolves on the Path Scope: `~` expands, a relative path resolves against the session's directory (the conversation's current project while the session is still pending), an absolute path is used as-is — including one outside that directory |
+| `/cat <path>` | View one file on cola's host as a File Viewer card, classified by content: a text file as a fenced code block with its extension's language hint (an extension the platform has no token for renders as plain text), a `.csv`/`.tsv` file as a markdown table, an image embedded in the card, and any other binary — or a file past the 8 MB preview cap — sent as a File Message (past Feishu's 30 MB upload cap the card says 未发送 and sends nothing). Every viewer's 发为文件 button uploads the file's full bytes as one File Message. The card names the file's resolved path, size and type, and its 📂 所在目录 button opens the Directory Browser at the file's parent. `/cat <directory>` opens the browser there instead, and a bare `/cat` shows usage. The path resolves on the Path Scope: `~` expands, a relative path resolves against the session's directory (the conversation's current project while the session is still pending), an absolute path is used as-is — including one outside that directory |
 | `/dir` | Recent Directories card: pick a folder and declare a session there, or open it as a fresh topic (每行「建话题」= `/topic <dir>` 的免打字版); its 📁 浏览目录 button opens a filesystem browser — drill into subdirectories, type a path (前往 browses it, 选择 declares it), toggle dot-directories, filter child names |
 | `/switch` | Session card: browse / search / adopt / new |
 | `/switch <kw>` | Switch to a session by name/dir/id (adopts foreign ones; no match opens the card pre-filtered) |
@@ -448,6 +448,8 @@ Notes:
 
 - `/cat` reads the file's bytes on the machine cola itself runs on — no model
   in the loop, and the same behaviour whatever Generation the server speaks.
+  A File Message is just a file the reader downloads or hands to the client:
+  cola does **not** promise it will be previewed inline.
   Its **Path Scope** (relative to the session's directory, `~` expanded,
   absolute paths passed through) is a **privacy hint, not a sandbox**: any path
   cola's user can read is reachable, and every card cola sends is readable by

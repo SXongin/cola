@@ -1683,6 +1683,7 @@ impl App {
                 "think_clear" => self.handle_think_card_action(&self.core, &value, true).await,
                 "autoaccept" => self.handle_autoaccept_card_action(&self.core, &value).await,
                 "skill" => self.handle_skill_card_action(&value).await,
+                "file" => self.handle_viewer_file_action(&value).await,
                 _ => None,
             }
         };
@@ -3060,6 +3061,127 @@ impl App {
             directory,
             handles,
         })
+    }
+
+    /// Handle the **File Viewer** card's 「发为文件」 click (ADR-0083 §5). The
+    /// card callback must ack within Feishu's 3 s, no-retry budget (ADR-0078),
+    /// and a 30 MB upload cannot fit it, so the click records the intent, spawns
+    /// the transfer and returns a toast immediately; the transfer then re-reads
+    /// the file locally, posts exactly ONE File Message under the clicked card,
+    /// and PATCHes that card with the outcome — `已发送为文件消息`, or `未发送`
+    /// for a file past the 30 MB cap, a failed upload/send, or a timeout. No
+    /// network work rides the callback path.
+    async fn handle_viewer_file_action(
+        self: &Arc<Self>,
+        value: &serde_json::Value,
+    ) -> Option<CardActionResult> {
+        let path = value.get("path").and_then(|v| v.as_str()).unwrap_or("");
+        let message_id = value
+            .get("open_message_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if path.is_empty() || message_id.is_empty() {
+            return Some(CardActionResult {
+                card: None,
+                toast: Some("无效操作".to_string()),
+            });
+        }
+        let thread_key = thread_key_from_value(value);
+        let path = path.to_string();
+        let message_id = message_id.to_string();
+        let value = value.clone();
+        let app = Arc::clone(self);
+        tokio::spawn(async move {
+            app.run_viewer_file_transfer(thread_key, path, message_id, value)
+                .await;
+        });
+        Some(CardActionResult {
+            card: None,
+            toast: Some("正在发送文件…".to_string()),
+        })
+    }
+
+    /// The 「发为文件」 transfer, off the card callback (ADR-0083 §5): re-read the
+    /// file locally, upload its bytes once and post exactly ONE File Message
+    /// under the clicked card, then PATCH the card with the outcome. Every
+    /// network call is bounded by [`SharedCore::viewer_transfer_timeout_ms`], so
+    /// a failure or a timeout surfaces as `未发送` on the card rather than a
+    /// dropped result. Local work (a `stat`, a read under the caps) is bounded by
+    /// design and runs here.
+    async fn run_viewer_file_transfer(
+        self: &Arc<Self>,
+        thread_key: ThreadKey,
+        path: String,
+        message_id: String,
+        value: serde_json::Value,
+    ) {
+        let resolved = std::path::PathBuf::from(&path);
+        let timeout_ms = self
+            .viewer_transfer_timeout_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        // The browse listing the viewer was opened from, when it was — carried
+        // on the transfer button's payload so the PATCHed card keeps
+        // 「← 返回目录」 (ADR-0083 §3, ADR-0052).
+        let return_dir = value
+            .get("return_dir")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let return_keyword = value
+            .get("return_keyword")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let return_to = return_dir.as_deref().map(|dir| BrowseView {
+            dir,
+            show_hidden: value
+                .get("return_show_hidden")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            keyword: &return_keyword,
+            page: value
+                .get("return_page")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1)
+                .max(1) as usize,
+        });
+        // A vanished path has no card to rebuild honestly: nothing was sent, and
+        // the viewer it came from is already showing the file that is now gone.
+        let Ok(meta) = std::fs::metadata(&resolved) else {
+            tracing::warn!("viewer transfer: {path} vanished before the read");
+            return;
+        };
+        let mut classified = match crate::bridge::viewer::classify(&resolved, meta.len()) {
+            Ok(classified) => classified,
+            Err(failure) => {
+                // An unreadable path: state it; no File Message goes out.
+                let _ = self
+                    .feishu
+                    .reply_text(&message_id, &failure.line(&resolved))
+                    .await;
+                return;
+            }
+        };
+        let name = crate::feishu::card::command::file_display_name(&resolved);
+        let lane = crate::bridge::viewer::send_as_file(
+            &self.feishu,
+            &self.cards_handle(),
+            &message_id,
+            &resolved,
+            &name,
+            &mut classified,
+            timeout_ms,
+        )
+        .await;
+        let card = crate::feishu::card::command::build_viewer_for_classified(
+            &thread_key,
+            &resolved,
+            &classified,
+            Some(lane),
+            return_to,
+        );
+        if let Err(error) = self.feishu.update_message(&message_id, &card).await {
+            tracing::warn!("viewer transfer: card update failed for {message_id}: {error}");
+        }
     }
 
     /// Re-submit a failed prompt from the error-card "retry" button (spec

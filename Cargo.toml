@@ -61,6 +61,10 @@ sysinfo = "0.39"
 semver = "1"
 sha2 = "0.11"
 tempfile = "3"
+# Magic-byte file-type sniffing for the File Viewer's content classification
+# (ADR-0083 §6): image and known-binary types are decided by the bytes, never by
+# the file name.
+infer = "0.22"
 
 [dev-dependencies]
 # `start_paused` for timeout tests without wall-clock waits (`full` does not

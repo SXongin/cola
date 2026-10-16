@@ -236,6 +236,14 @@ pub struct SharedCore {
     /// `(session_id, content hash)` entries whose File Message already went out,
     /// so a later poll never sends a second one. Single-flight and bounded.
     pub file_messages_sent: crate::bridge::handles::FileMessageSends,
+    /// How long ONE network call of the **File Viewer**'s whole-bytes lane is
+    /// awaited before it gives up (ms, ADR-0083 §5): the upload and the File
+    /// Message send each get this bound, so the 「发为文件」 transfer that the
+    /// click spawns off the card callback (ADR-0078's 3 s budget) can neither
+    /// run forever nor leave the clicker without a stated outcome. Shared with
+    /// the handler through the aggregate; a test shrinks it to observe a
+    /// timeout.
+    pub viewer_transfer_timeout_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl SharedCore {
@@ -355,6 +363,10 @@ impl SharedCore {
             file_images: Arc::new(Mutex::new(indexmap::IndexMap::new())),
             file_uploads: Arc::new(Mutex::new(indexmap::IndexMap::new())),
             file_messages_sent: Arc::new(Mutex::new(indexmap::IndexMap::new())),
+            // The File Viewer transfer's per-network-call bound (ADR-0083 §5).
+            viewer_transfer_timeout_ms: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::bridge::viewer::VIEWER_TRANSFER_TIMEOUT_MS,
+            )),
         })
     }
 
@@ -449,6 +461,7 @@ impl SharedCore {
             Arc::clone(&self.file_images),
             Arc::clone(&self.file_uploads),
             Arc::clone(&self.file_messages_sent),
+            Arc::clone(&self.viewer_transfer_timeout_ms),
         )
     }
 

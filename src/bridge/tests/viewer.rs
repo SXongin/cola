@@ -641,6 +641,478 @@ async fn parent_directory_button_opens_the_browser_at_the_files_parent() {
     );
 }
 
+/// A structurally real PNG (signature + IHDR declaring 4×4) — the magic bytes
+/// `infer` reads, and dimensions Feishu's embed cap accepts.
+fn png() -> Vec<u8> {
+    let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    bytes.extend_from_slice(&13u32.to_be_bytes());
+    bytes.extend_from_slice(b"IHDR");
+    bytes.extend_from_slice(&4u32.to_be_bytes());
+    bytes.extend_from_slice(&4u32.to_be_bytes());
+    bytes.extend_from_slice(&[8, 6, 0, 0, 0]);
+    bytes
+}
+
+/// Every recorded upload of `platform`, in call order.
+async fn uploads(platform: &RecordingPlatform) -> Vec<PlatformCall> {
+    platform
+        .calls
+        .lock()
+        .await
+        .iter()
+        .filter(|call| {
+            matches!(
+                call,
+                PlatformCall::UploadImage { .. } | PlatformCall::UploadFile { .. }
+            )
+        })
+        .cloned()
+        .collect()
+}
+
+/// Every File Message `platform` posted (`msg_type:"file"`).
+async fn file_messages(platform: &RecordingPlatform) -> Vec<PlatformCall> {
+    platform
+        .calls
+        .lock()
+        .await
+        .iter()
+        .filter(|call| matches!(call, PlatformCall::SendMessageReply { msg_type, .. } if msg_type == "file"))
+        .cloned()
+        .collect()
+}
+
+/// Find the 「发为文件」 button's payload on a card.
+fn send_as_file_payload(card: &serde_json::Value) -> serde_json::Value {
+    card_buttons(card)
+        .into_iter()
+        .find(|b| b["text"]["content"] == "发为文件")
+        .unwrap_or_else(|| panic!("发为文件 missing on {}", card_text(card)))["value"]
+        .clone()
+}
+
+/// The three-way routing is by CONTENT, not by name (ADR-0083 §5, §6): a PNG
+/// embeds, text previews, and a non-UTF-8 file goes out as exactly one File
+/// Message — with each name deliberately lying about its bytes.
+#[tokio::test]
+async fn cat_routes_image_text_and_binary_by_content() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    std::fs::write(proj.path().join("picture.txt"), png()).unwrap();
+    std::fs::write(proj.path().join("notes.bin"), "just text\n").unwrap();
+    std::fs::write(proj.path().join("blob.txt"), [0xff, 0xfe, 0x00, 0x01]).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+
+    // An image named `.txt` is recognised by magic bytes and embedded.
+    send_command_in(
+        &app,
+        "/cat picture.txt",
+        key.clone(),
+        "m_img",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let card = first_card(&platform).await;
+    let text = card_text(&card);
+    assert_eq!(card_header(&card), "📄 picture.txt", "the header names the file");
+    assert!(text.contains("图片（.txt）"), "the type is by content: {text}");
+    assert!(text.contains("已内嵌"), "the image is embedded: {text}");
+    let recorded = uploads(&platform).await;
+    assert_eq!(recorded.len(), 1, "one image upload: {recorded:?}");
+    assert!(
+        matches!(recorded[0], PlatformCall::UploadImage { .. }),
+        "{recorded:?}"
+    );
+
+    // A text file named `.bin` previews as text.
+    send_command_in(
+        &app,
+        "/cat notes.bin",
+        key.clone(),
+        "m_txt",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let card = platform.replied_cards().await.last().cloned().expect("a card");
+    let text = card_text(&card);
+    assert!(text.contains("文本（.bin）"), "the type is by content: {text}");
+    assert!(
+        text.contains("```plain_text") && text.contains("just text"),
+        "{text}"
+    );
+    assert_eq!(
+        uploads(&platform).await.len(),
+        1,
+        "a text preview uploads nothing"
+    );
+
+    // A non-UTF-8 file named `.txt` is a binary: one File Message, never text.
+    send_command_in(
+        &app,
+        "/cat blob.txt",
+        key.clone(),
+        "m_bin",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let card = platform.replied_cards().await.last().cloned().expect("a card");
+    let text = card_text(&card);
+    assert!(text.contains("二进制（.txt）"), "the type is by content: {text}");
+    assert!(
+        !text.contains("```"),
+        "a non-UTF-8 file is never rendered as text: {text}"
+    );
+    assert!(
+        text.contains("已发送为文件消息"),
+        "the card shows the tracking line: {text}"
+    );
+    let sends = file_messages(&platform).await;
+    assert_eq!(sends.len(), 1, "exactly one File Message: {sends:?}");
+    let recorded = uploads(&platform).await;
+    assert_eq!(recorded.len(), 2, "the binary was uploaded: {recorded:?}");
+    assert!(
+        matches!(recorded[1], PlatformCall::UploadFile { .. }),
+        "{recorded:?}"
+    );
+}
+
+/// Re-opening the same image uploads it once: the process-local content-hash
+/// cache reuses the `image_key` (ADR-0083 §5, ADR-0076).
+#[tokio::test]
+async fn an_image_opened_twice_uploads_once() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    std::fs::write(proj.path().join("shot.png"), png()).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+
+    for message in ["m_one", "m_two"] {
+        send_command_in(
+            &app,
+            "/cat shot.png",
+            key.clone(),
+            message,
+            crate::config::ConversationKind::P2p,
+        )
+        .await;
+    }
+
+    assert_eq!(
+        platform
+            .upload_image_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the same bytes upload once"
+    );
+    for card in platform.replied_cards().await {
+        assert!(card_text(&card).contains("已内嵌"), "{}", card_text(&card));
+    }
+}
+
+/// A text file past the preview read cap is NOT previewed: it takes the File
+/// Message lane, and its bytes are never rendered in the card (ADR-0083 §5,
+/// §6).
+#[tokio::test]
+async fn a_text_file_past_the_preview_cap_takes_the_file_lane() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let big = vec![b'a'; crate::bridge::viewer::PREVIEW_READ_CAP + 1];
+    std::fs::write(proj.path().join("huge.log"), &big).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+
+    send_command_in(
+        &app,
+        "/cat huge.log",
+        key.clone(),
+        "m_huge",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let card = first_card(&platform).await;
+    let text = card_text(&card);
+    assert!(
+        text.contains("二进制"),
+        "past the cap there is no preview: {text}"
+    );
+    assert!(text.contains("已发送为文件消息"), "{text}");
+    assert!(!text.contains("```"), "the bytes are not previewed: {text}");
+    assert_eq!(file_messages(&platform).await.len(), 1, "one File Message");
+}
+
+/// A file past Feishu's 30MB cap leaves only the 未发送 line — no upload, no
+/// message (ADR-0083 §5); exactly at the cap stays deliverable.
+#[tokio::test]
+async fn a_file_past_the_upload_cap_leaves_unsent() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let over = proj.path().join("over.bin");
+    std::fs::File::create(&over)
+        .unwrap()
+        .set_len(crate::feishu::file::MAX_FILE_BYTES + 1)
+        .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+
+    send_command_in(
+        &app,
+        "/cat over.bin",
+        key.clone(),
+        "m_over",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let card = first_card(&platform).await;
+    let text = card_text(&card);
+    assert!(text.contains("未发送"), "past the cap: {text}");
+    assert!(
+        uploads(&platform).await.is_empty(),
+        "nothing is uploaded past the cap"
+    );
+    assert!(
+        file_messages(&platform).await.is_empty(),
+        "no File Message past the cap"
+    );
+
+    // Exactly at the cap: deliverable (the other side of the same boundary).
+    let at = proj.path().join("at_cap.bin");
+    std::fs::File::create(&at)
+        .unwrap()
+        .set_len(crate::feishu::file::MAX_FILE_BYTES)
+        .unwrap();
+    send_command_in(
+        &app,
+        "/cat at_cap.bin",
+        key.clone(),
+        "m_at",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let card = platform.replied_cards().await.last().cloned().expect("a card");
+    assert!(
+        card_text(&card).contains("已发送为文件消息"),
+        "the boundary stays deliverable: {}",
+        card_text(&card)
+    );
+    assert_eq!(file_messages(&platform).await.len(), 1, "one File Message");
+}
+
+/// 「发为文件」 posts exactly one File Message carrying the file's bytes, and the
+/// click itself does not carry the upload: the ack returns while the upload is
+/// still parked (ADR-0083 §5 — the transfer is off the card callback's 3 s
+/// budget).
+#[tokio::test]
+async fn send_as_file_transfers_off_the_callback_path() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    std::fs::write(proj.path().join("notes.txt"), "# notes\n").unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+
+    send_command_in(
+        &app,
+        "/cat notes.txt",
+        key.clone(),
+        "m_view",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let card = first_card(&platform).await;
+    let mut payload = send_as_file_payload(&card);
+    payload["open_message_id"] = serde_json::json!("msg_view_card");
+
+    // Park the transfer's upload: the click must still ack immediately, and the
+    // ack must carry no upload work.
+    let (_entered, release) = platform.pause("upload_file", "");
+    let result = app.host_action(payload).await.expect("the click acks");
+    assert!(
+        result.card.is_none(),
+        "the click does not rebuild the card inline"
+    );
+    assert!(result.toast.is_some(), "the click acknowledges with a toast");
+    assert!(
+        uploads(&platform).await.is_empty(),
+        "the click returned before the upload ran"
+    );
+
+    // Release the upload; the spawned transfer lands and PATCHes the card.
+    release.notify_one();
+    wait_for_card_update(
+        &platform,
+        "已发送为文件消息",
+        CardUpdates::Latest,
+        |card| card_text(card).contains("已发送为文件消息"),
+    )
+    .await;
+    assert_eq!(
+        file_messages(&platform).await.len(),
+        1,
+        "exactly one File Message"
+    );
+    assert_eq!(
+        platform
+            .calls
+            .lock()
+            .await
+            .iter()
+            .filter(|c| matches!(c, PlatformCall::UploadFile { .. }))
+            .count(),
+        1,
+        "uploaded once"
+    );
+    let patch = patches_to(&platform, "msg_view_card").await;
+    let updated = patch.last().expect("the card was PATCHed");
+    assert!(
+        card_text(updated).contains(&canonical(&proj.path().join("notes.txt"))),
+        "the PATCH keeps the card's own naming: {}",
+        card_text(updated)
+    );
+}
+
+/// A failed upload surfaces as 未发送 on the card — a stated outcome, never a
+/// dropped result — and posts no File Message (ADR-0083 §5).
+#[tokio::test]
+async fn a_failed_transfer_upload_surfaces_as_unsent() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    std::fs::write(proj.path().join("notes.txt"), "# notes\n").unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+
+    send_command_in(
+        &app,
+        "/cat notes.txt",
+        key.clone(),
+        "m_view",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let card = first_card(&platform).await;
+    let mut payload = send_as_file_payload(&card);
+    payload["open_message_id"] = serde_json::json!("msg_view_card");
+
+    platform
+        .fail_upload_file_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    app.host_action(payload).await.expect("the click acks");
+
+    wait_for_card_update(&platform, "未发送", CardUpdates::Latest, |card| {
+        card_text(card).contains("未发送")
+    })
+    .await;
+    assert!(
+        file_messages(&platform).await.is_empty(),
+        "a failed upload posts no File Message"
+    );
+}
+
+/// A transfer whose upload never answers is timed out off the callback path and
+/// surfaces as 未发送 (ADR-0083 §5) — the click itself still returns at once.
+#[tokio::test]
+async fn a_timed_out_transfer_surfaces_as_unsent() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    std::fs::write(proj.path().join("notes.txt"), "# notes\n").unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+
+    send_command_in(
+        &app,
+        "/cat notes.txt",
+        key.clone(),
+        "m_view",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let card = first_card(&platform).await;
+    let mut payload = send_as_file_payload(&card);
+    payload["open_message_id"] = serde_json::json!("msg_view_card");
+
+    // A transfer bound so short the parked upload cannot answer in time.
+    app.viewer_transfer_timeout_ms
+        .store(1, std::sync::atomic::Ordering::Relaxed);
+    let (_entered, _release) = platform.pause("upload_file", "");
+    app.host_action(payload).await.expect("the click acks");
+
+    wait_for_card_update(&platform, "未发送 (timeout)", CardUpdates::Latest, |card| {
+        card_text(card).contains("未发送")
+    })
+    .await;
+    assert!(
+        file_messages(&platform).await.is_empty(),
+        "a timed-out upload posts no File Message"
+    );
+}
+
+/// 「发为文件」 on a viewer past the 30MB cap leaves the 未发送 line and posts
+/// nothing — the same cap the open lane applies (ADR-0083 §5).
+#[tokio::test]
+async fn send_as_file_past_the_cap_leaves_unsent() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let over = proj.path().join("over.bin");
+    std::fs::File::create(&over)
+        .unwrap()
+        .set_len(crate::feishu::file::MAX_FILE_BYTES + 1)
+        .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+
+    send_command_in(
+        &app,
+        "/cat over.bin",
+        key.clone(),
+        "m_view",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let card = first_card(&platform).await;
+    assert!(card_text(&card).contains("未发送"), "the open lane says so");
+    let mut payload = send_as_file_payload(&card);
+    payload["open_message_id"] = serde_json::json!("msg_view_card");
+
+    app.host_action(payload).await.expect("the click acks");
+    wait_for_card_update(&platform, "未发送", CardUpdates::Latest, |card| {
+        card_text(card).contains("未发送")
+    })
+    .await;
+    assert!(uploads(&platform).await.is_empty(), "nothing is read or uploaded");
+    assert!(file_messages(&platform).await.is_empty(), "no File Message");
+}
+
 /// A viewer's 「← 返回目录」 payload re-renders the browse listing it was opened
 /// from, filter/page/hidden intact — the round trip #742's file rows will wire
 /// through `ViewerCard::return_to` (ADR-0083 §3).
