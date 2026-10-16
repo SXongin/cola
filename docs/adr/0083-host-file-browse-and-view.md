@@ -51,7 +51,8 @@ loop.
 ## Decision
 
 1. **A cola-local read, not a server route.** The bytes come from the local filesystem
-   (`tokio::fs`), not from V2's `GET /api/fs/read` nor V1's `/file/content`. Two
+   (`std::fs`, in a bounded blocking task), not from V2's `GET /api/fs/read` nor V1's
+   `/file/content`. Two
    consequences are accepted outright: the read is **generation-neutral** (no V1/V2 branch,
    and V1's richer `text|binary` answer costs us nothing because V1 is not consulted), and it
    is **backend-neutral** — it depends on no OpenCode concept, which is what keeps the door
