@@ -1557,6 +1557,64 @@ async fn dir_browse_file_row_opens_the_viewer_in_place_and_declares_nothing() {
     );
 }
 
+/// A file row's `path` is read **verbatim**, never trimmed (#742 review): it
+/// names a filesystem entry the scan just saw, not free text, and Unix allows a
+/// name that ends in whitespace. Trimming would open a *different* file (if that
+/// spelling happens to exist) or none at all, so the row must open the exact
+/// file it listed.
+#[cfg(unix)]
+#[tokio::test]
+async fn dir_browse_file_row_opens_a_name_with_trailing_whitespace() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let file = proj.path().join("notes.txt ");
+    std::fs::write(&file, "trailing\n").unwrap();
+    assert!(
+        !proj.path().join("notes.txt").exists(),
+        "the trimmed spelling must not exist, or this test could pass by accident"
+    );
+    let proj_dir = canonical(proj.path());
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    seed_entry(&app, seeded_entry(&key, &proj_dir)).await;
+
+    let card = app
+        .host_action(browse_action("go", &proj_dir))
+        .await
+        .unwrap()
+        .card
+        .expect("card");
+    let payload = file_row(&card, "notes.txt ")["value"].clone();
+    assert_eq!(
+        payload["path"],
+        canonical(&file),
+        "the row carries the filesystem name verbatim, trailing space and all"
+    );
+
+    let viewer = app
+        .host_action(payload)
+        .await
+        .expect("the click answers")
+        .card
+        .expect("the row opens the exact file it listed");
+    assert_eq!(
+        card_header(&viewer),
+        "📄 notes.txt ",
+        "the viewer names the same file, untrimmed"
+    );
+    assert!(
+        card_text(&viewer).contains("trailing"),
+        "and shows the file's own bytes: {}",
+        card_text(&viewer)
+    );
+    assert!(
+        platform.replied_cards().await.is_empty(),
+        "and nothing is replied"
+    );
+}
+
 /// 「← 返回目录」 restores the browse card at the same directory, page, filter
 /// and hidden-toggle (ADR-0083 §3): the file row round-trips the listing's whole
 /// state through its payload, so opening a file never loses your place.

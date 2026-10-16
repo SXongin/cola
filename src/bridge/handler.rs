@@ -2639,11 +2639,15 @@ impl App {
         value: &serde_json::Value,
     ) -> Option<CardActionResult> {
         let thread_key = thread_key_from_value(value);
+        // The row's `path` comes straight from the browse scan, so it names a
+        // filesystem entry, not free text: it is read **verbatim**. Trimming it
+        // would open a different file (or none) for a name that ends in — or is
+        // surrounded by — whitespace, which Unix allows (the `/cat <path>` lane
+        // may still trim, because there the path IS typed by hand).
         let path = value
             .get("path")
             .and_then(|v| v.as_str())
             .unwrap_or("")
-            .trim()
             .to_string();
         if path.is_empty() {
             return Some(CardActionResult {
