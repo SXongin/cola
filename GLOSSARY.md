@@ -499,7 +499,7 @@ The OS facility that honours cola's **Autostart** registration and can also stop
 _Avoid_: launcher, systemd/launchd (platform names for one platform's Supervisor)
 
 **Command**:
-A slash-prefixed instruction (e.g. `/new`, `/dir`, `/switch`, `/compact`, `/cat`). Every command supports two forms: a text-direct form (an argument that completes the action in one step) and a card form (no argument pops a card — an **Interactive Card** for strong-interaction commands like `/switch`, `/dir`, `/model`, `/agent`, `/autoaccept`, or a **Reference Card** for `/help`). cola parses its own commands locally and forwards unrecognized ones to the Backend as prompt text.
+A slash-prefixed instruction (e.g. `/new`, `/dir`, `/switch`, `/compact`, `/cat`). Every command supports a text-direct form (an argument that completes the action in one step) and a no-argument form: an **Interactive Card** for strong-interaction commands like `/switch`, `/dir`, `/model`, `/agent`, `/autoaccept`, a **Reference Card** for `/help`, or — for a command whose bare form is usage rather than a card, such as `/cat` — that usage. cola parses its own commands locally and forwards unrecognized ones to the Backend as prompt text.
 _Avoid_: Slash command, action, operation
 
 **Reference Card**:
