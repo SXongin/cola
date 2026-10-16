@@ -6,6 +6,12 @@ chat. Primary sources are `open.feishu.cn` official docs; claims are tagged
 **[doc]** (documented upstream), **[ours]** (measured by cola — ADR / date), or
 **[unverified]** (not covered by the docs, or not measured).
 
+> **Naming note (2026-10-16)**: this note was written while the card this feature wanted was
+> called `/ls`. [#669](https://github.com/SXongin/cola/issues/669) and
+> [ADR-0083](../../adr/0083-host-file-browse-and-view.md) settled on **extending the
+> Directory Browser** (it lists files now) with a `/cat` viewer instead — **there is no `/ls`
+> command**. Read every `/ls` below as that card.
+
 ---
 
 ## Verdict
@@ -16,7 +22,7 @@ message body, 200 elements/components, 5 tables per card, 5 data rows per markdo
 [doc]. Nothing richer exists *inside* the card: the Card JSON 2.0 catalog is exhaustive —
 containers, display, interactive — and contains **no file/document component, no tree, no
 iframe/web-view element, and no server-loaded (dynamic or cascading) select options** [doc]. So
-the proposed `/ls` card + `/cat` fenced-code-block viewer is the correct ceiling, not a
+the proposed browse card (listing files) + `/cat` fenced-code-block viewer is the correct ceiling, not a
 shortcoming of the design.
 
 Two surfaces meaningfully beat the card for *large text*, and both are real:
@@ -65,7 +71,7 @@ configuration [doc].
 | **H5 mini-app `open_url`** | Same, richer container (window/sidebar/tab modes) | — | **YES** | A separate 小程序 app, built in Feishu's mini-program toolchain and published [doc] | Yes | **Out.** A whole second app identity. |
 | **链接预览 (link preview)** | Bare URLs in messages/chat are parsed into an icon+title ("inline") and optionally a **card** | The preview body is itself a card → 30 KB / 200 elements again [doc] | **YES** — URL rules need a **TLD + second-level domain** (IP addresses explicitly rejected) [doc], *and* an HTTP callback answered within 3 s [doc] | App **Link preview** capability, ≤10 URL rules, a **published (not test) version**, `url.preview.get` event subscription [doc] | Yes | **Out**, doubly: needs a domain *and* an HTTP callback URL, and it doesn't raise the ceiling even if it worked. |
 | **`docx` `iframe` block** | A web page embedded **inside a docx** — the only documented "embed a web page" primitive in the whole platform | — | **YES** for the framed page | `docx:document` | Yes (client behaviour unverified) | Curiosity, not a viewer. Also the closest thing to a card-embedded web view — and it is not in a card. |
-| **多维表格 (Base)** | Structured rows/fields: text, attachment, URL, select, date, user | 500 records per `batch_create`; 20 000 records per table; 300 tables per Base [doc] | No | `bitable:app` or `base:record:create` | Yes | **Reject for a viewer.** It's a spreadsheet, not a document; text files don't map onto it. Fine for a structured `/ls` listing if ever needed. |
+| **多维表格 (Base)** | Structured rows/fields: text, attachment, URL, select, date, user | 500 records per `batch_create`; 20 000 records per table; 300 tables per Base [doc] | No | `bitable:app` or `base:record:create` | Yes | **Reject for a viewer.** It's a spreadsheet, not a document; text files don't map onto it. Fine for a structured listing if ever needed. |
 
 ---
 

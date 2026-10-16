@@ -25,7 +25,9 @@ loop.
 - **Two surfaces beat the card for *why* content overflows, and neither needs public
   ingress** (research note, §Verdict): a **`post`** message's `md` tag renders CommonMark
   0.31 + GFM, and is **reported** to do so without the card's 200-element cap, 5-table cap and
-  per-element clipping — a claim inferred from cc-connect's use, never measured here (§11) —
+  per-element clipping — a claim inferred from cc-connect's use, never measured here, which
+  is why the spec (#669's decision 11) keeps it unverified and decision 5 below bounds the
+  lane —
   while a `text` message body allows 150 KB. `post` and `text` are also editable in place
   (`PUT /im/v1/messages/:id`, at most 20 edits). Everything genuinely richer is closed to a
   bot with no public address: 网页应用 (H5) documents that its production homepage "needs to
@@ -115,14 +117,20 @@ loop.
    embed path, any other binary takes the File Message path. A text file larger than the
    **preview read cap** (8 MB) is not previewed at all — it goes straight to a File Message —
    and the 30 MB upload cap is unchanged. Both are constants, not policy.
-7. **The tool panel gains the way in, and only where it pays.** A `write` or `edit` **Tool
+7. **A locally-read file reaches the delivery path as bytes, not as a re-encoded URI.** The
+   typed **File Content** gains a byte-backed construction beside its decode-from-URI one, so
+   a viewer's bytes reach the Platform's upload paths with **no base64 round trip** — a 30 MB
+   file would otherwise be re-encoded into a ~40 MB string and decoded again. `size` keeps its
+   meaning on both constructions: the byte count actually handed to the Platform, so the two
+   sources cannot drift, and the transcript path's decode-from-URI is unchanged.
+8. **The tool panel gains the way in, and only where it pays.** A `write` or `edit` **Tool
    Panel** carries a 「📂 打开」 button built from that call's **structured** `filePath` — the
    files the agent *produced*, which are the ones a reader wants in full. A `read` panel gets
    none: its content is already on the card. Natural-language paths in the agent's reply are
    **not** parsed into controls — a card's `<link>`/`<a>` can only open a URL and cannot
    invoke a callback, so a tappable path would have to be a button (a false-positive
    minefield, and an element-budget cost per mention), and structure beats prose.
-8. **Re-reading is a button.** 「🔄 重新读取」 re-reads the file and updates the viewer in
+9. **Re-reading is a button.** 「🔄 重新读取」 re-reads the file and updates the viewer in
    place — the card, and the Rich Text Message that carries its overflow, together. The
    message half is **best-effort against the platform's edit budget** (20 edits per message):
    while an edit is still available the message is edited in place, and once the budget is
@@ -130,7 +138,7 @@ loop.
    which — so a long-lived viewer never quietly stops refreshing half of itself. No watcher
    and no auto-refresh: a build artifact that changes should not rewrite a card the reader is
    looking at, and a filesystem watcher would contend with the card machinery.
-9. **What this is not.** No HTML or rich-text rendering (the platform has no such component);
+10. **What this is not.** No HTML or rich-text rendering (the platform has no such component);
    no 云文档 import (it is the one surface with a bigger byte budget, but it is a new
    subsystem — 2–3 scopes, async import tickets, copies accumulating in the user's My Space —
    and only `.md`/`.txt`/`.html` are importable, never source code; deferred to its own
@@ -173,7 +181,7 @@ divergence between the two is a defect in this record rather than a design chang
   It is bigger but formatting-blind: no code block, no tables, no headings.
 - **Paginating the card around a structural limit**: rejected. Five tables and 200 elements
   are not size problems — a 60-row table cannot be fixed by showing it a page at a time.
-- **Parsing the agent's reply prose for paths and rendering buttons**: rejected (§7).
+- **Parsing the agent's reply prose for paths and rendering buttons**: rejected (§8).
 - **A `/ls` command alongside the browse card**: rejected (§2).
 - **Asking the model to read the file**: rejected — that is the token-and-latency cost this
   feature exists to remove.
