@@ -1021,18 +1021,41 @@ pub(crate) fn browse_file_value(
     path: &str,
     view: Option<BrowseView<'_>>,
 ) -> serde_json::Value {
-    let mut value = json!({
-        "action": "file",
-        "path": path,
-        "chat_id": thread_key.chat_id,
-        "thread_id": thread_key.thread_id,
-    });
+    let mut value = file_open_value(path);
+    value["chat_id"] = json!(thread_key.chat_id);
+    value["thread_id"] = json!(thread_key.thread_id);
     if let Some(view) = view {
         value["dir"] = json!(view.dir);
         value["show_hidden"] = json!(view.show_hidden);
         value["keyword"] = json!(view.keyword);
         value["page"] = json!(view.page);
     }
+    value
+}
+
+/// The routing payload alone, the half every `action: "file"` click shares
+/// (ADR-0083 §3, §8): the action tag and the **verbatim** `path`. The browse
+/// card's file row adds its listing and the Chat/Topic
+/// ([`browse_file_value`]); a Tool Panel's 「📂 打开」 adds the Session instead
+/// ([`tool_file_value`], #743). ONE constructor, so the action a click routes
+/// by and the key the path travels in can never drift between the two entry
+/// points.
+fn file_open_value(path: &str) -> serde_json::Value {
+    json!({ "action": "file", "path": path })
+}
+
+/// The routing payload a **Tool Panel**'s 「📂 打开」 button carries (ADR-0083
+/// §8, #743): the file to open, and the **Session** the panel was rendered for
+/// — never the Chat/Topic, which a live Turn card does not know. The click's
+/// card-action span context resolves that Session's Chat/Topic from the
+/// SessionStore (the same read the span itself makes, and the rule a live
+/// card's own section-level buttons follow — see `ledger::cleanup_button`), so
+/// the viewer opens with working controls. No listing rides along
+/// (`dir`/`keyword`/`page` absent), which is exactly what makes the viewer
+/// carry no 「← 返回目录」: a tool panel has no listing to return to.
+pub(crate) fn tool_file_value(session_id: &str, path: &str) -> serde_json::Value {
+    let mut value = file_open_value(path);
+    value["session_id"] = json!(session_id);
     value
 }
 
@@ -2620,6 +2643,32 @@ mod tests {
         let bare = browse_file_value(&key, "/work/notes.md", None);
         assert_eq!(bare["path"], "/work/notes.md");
         assert!(bare.get("dir").is_none(), "no listing, no return target: {bare}");
+    }
+
+    /// A Tool Panel's 「📂 打开」 payload (ADR-0083 §8, #743): the same
+    /// `action: "file"` + verbatim `path` routing a browse file row travels
+    /// by — one shared constructor, so the two entry points cannot drift —
+    /// with the ROW's Chat/Topic swapped for the panel's Session, which the
+    /// click resolves back to a Chat/Topic from the SessionStore. No `op`
+    /// (that would route to #739's transfer) and no listing state (a tool
+    /// panel has none to return to).
+    #[test]
+    fn tool_panel_open_payload_shares_the_file_open_routing() {
+        let tool = tool_file_value("ses_1", "/work/report.md");
+        let row = browse_file_value(
+            &crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            "/work/report.md",
+            None,
+        );
+        assert_eq!(tool["action"], row["action"], "one action tag: {tool} vs {row}");
+        assert_eq!(tool["path"], row["path"], "one path key: {tool} vs {row}");
+        assert_eq!(tool["session_id"], "ses_1");
+        assert!(tool.get("op").is_none(), "no op: the click opens, never sends");
+        assert!(tool.get("dir").is_none(), "no listing, no return target: {tool}");
+        assert!(
+            tool.get("chat_id").is_none(),
+            "a live Turn card knows no Chat: {tool}"
+        );
     }
 
     #[test]

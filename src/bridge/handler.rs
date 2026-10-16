@@ -2657,24 +2657,50 @@ impl App {
         }
     }
 
-    /// Handle a browse card's **file row** (ADR-0083 §3): read the file and
-    /// answer its **File Viewer** card, which replaces the browse card *in
-    /// place* — the ack patches the clicked message, the same move as the browse
-    /// card replacing the Recent Directories card, so the listing is never left
-    /// as a second message.
+    /// Handle a browse card's **file row** — and a Tool Panel's **「📂 打开」**
+    /// (ADR-0083 §3, §8): read the file and answer its **File Viewer** card,
+    /// which replaces the clicked card *in place* — the ack patches the
+    /// clicked message, the same move as the browse card replacing the Recent
+    /// Directories card, so the listing is never left as a second message.
     ///
     /// The row's payload carries the listing's own state (`dir`/`keyword`/
     /// `page`/`show_hidden`), so the viewer's 「← 返回目录」 restores it exactly.
     /// The action tag is `file`, never the browse card's `dir`: a file row
     /// offers no 选择/建话题, because declaring a Session requires a directory
     /// (the pick op refuses a file path on its own too).
+    ///
+    /// A tool panel's 打开 carries the Session instead of the Chat/Topic (a
+    /// live Turn card knows no Chat — see
+    /// [`crate::feishu::card::session::tool_file_value`]): the click resolves
+    /// the Session's Chat/Topic from the SessionStore — the same read the
+    /// card-action span context makes, and the rule a live card's own
+    /// section-level buttons follow (`ledger::cleanup_button`) — so the viewer
+    /// opens with working controls. Its structured path resolves on the Path
+    /// Scope (ADR-0083 §4): `~` expands, a relative path joins the Session's
+    /// directory, an absolute path passes through. A Session the store no
+    /// longer knows answers an honest Toast, never a viewer whose controls
+    /// route nowhere.
     async fn handle_file_card_action(
         self: &Arc<Self>,
         core: &Arc<SharedCore>,
         value: &serde_json::Value,
     ) -> Option<CardActionResult> {
+        let session_id = value
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .filter(|id| !id.is_empty());
         let op = value.get("op").and_then(|v| v.as_str()).unwrap_or("");
-        let thread_key = thread_key_from_value(value);
+        let mut thread_key = thread_key_from_value(value);
+        let mut session_dir: Option<String> = None;
+        if let Some(sid) = session_id {
+            let sessions = self.sessions.lock().await;
+            if thread_key.chat_id.is_empty()
+                && let Some(resolved) = sessions.thread_for_session(sid)
+            {
+                thread_key = resolved;
+            }
+            session_dir = sessions.directory_for_session(sid);
+        }
         // The row's `path` comes straight from the browse scan, so it names a
         // filesystem entry, not free text: it is read **verbatim**. Trimming it
         // would open a different file (or none) for a name that ends in — or is
@@ -2691,6 +2717,22 @@ impl App {
                 toast: Some("无效操作".to_string()),
             });
         }
+        // A tool panel's 打开 without a Session behind it — and no Chat routing
+        // on the payload to fall back to — cannot route the viewer's own
+        // controls: say so, and leave the card standing.
+        if session_id.is_some() && thread_key.chat_id.is_empty() {
+            return Some(CardActionResult {
+                card: None,
+                toast: Some(format!("⚠️ 打不开 `{path}`：会话已不在。")),
+            });
+        }
+        // A tool panel's structured path resolves on the Path Scope (an
+        // absolute scan path resolves to itself, so browse rows never take
+        // this lane — only a payload carrying a Session does).
+        let resolved = match session_dir {
+            Some(dir) if session_id.is_some() => crate::bridge::viewer::resolve_cat_path(&path, &dir),
+            _ => std::path::PathBuf::from(&path),
+        };
         // The listing to return to, when the row came from one
         // (`browse_file_value`). Absent — a viewer opened from a tool panel
         // (#743) — leaves the viewer without a 返回目录 control. The viewer's
@@ -2737,12 +2779,7 @@ impl App {
             keyword: &home_keyword,
             page: home_page,
         });
-        match crate::feishu::card::command::path_answer(
-            &thread_key,
-            std::path::Path::new(&path),
-            return_to,
-            page,
-        ) {
+        match crate::feishu::card::command::path_answer(&thread_key, &resolved, return_to, page) {
             crate::feishu::card::command::PathAnswer::Viewer(card) => Some(CardActionResult {
                 card: Some(card),
                 toast: None,
@@ -2769,8 +2806,8 @@ impl App {
                     toast: None,
                 })
             }
-            // The file vanished or cannot be read between the scan and the
-            // click: the reason as a Toast, the browse card still standing —
+            // The file vanished or cannot be read between the render and the
+            // click: the reason as a Toast, the clicked card still standing —
             // never an empty viewer (ADR-0083 §2).
             crate::feishu::card::command::PathAnswer::Line(line) => Some(CardActionResult {
                 card: None,

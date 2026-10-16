@@ -7,7 +7,7 @@ use super::ledger::{
     task_ledger_text, task_ledger_title,
 };
 use super::sanitize::CardMarkdown;
-use super::tool_render::{ToolPanel, file_image_elements, tool_panel_element};
+use super::tool_render::{ToolPanel, file_image_elements, tool_open_button_element, tool_panel_element};
 use super::{
     CardActionButton, CardState, HeaderProgress, chunk_text, fenced_code, fmt_local_time, truncate_md,
 };
@@ -229,13 +229,30 @@ impl CardBuilder {
     /// running → completed update keeps the start time (the item is keyed once,
     /// on first appearance); `None` renders no clock. `element_id` is the
     /// panel's stable identity on the card (see [`collapsible_panel_chunks`]).
-    pub fn with_tool_at(mut self, tool: ToolPanel, at_ms: Option<i64>, element_id: Option<&str>) -> Self {
+    /// `session_id` is the Turn's Session when known: a `write`/`edit` panel
+    /// then carries its 「📂 打开」 button right after the panel — outside the
+    /// fold, so reachable while collapsed (ADR-0083 §8, #743).
+    pub fn with_tool_at(
+        mut self,
+        tool: ToolPanel,
+        at_ms: Option<i64>,
+        element_id: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Self {
         let panel = tool.clone();
         self.tools.push(tool);
         // All tools are shown; the streaming card splits into continuation
         // cards when the component estimate exceeds the Feishu limit.
         self.body
             .push(tool_panel_element(&panel, at_ms, element_id, &mut self.markdown));
+        // A written file's way in (ADR-0083 §8, #743): the standalone button
+        // beside its panel — never folded into it, whose body starts
+        // collapsed — so the file opens without unfolding. `None` for every
+        // other tool and when no Session routes the click: no button rather
+        // than a broken one.
+        if let Some(button) = tool_open_button_element(&panel, session_id) {
+            self.body.push(button);
+        }
         // An embedded File Content shows immediately AFTER its panel (ADR-0076):
         // a standalone `img` element, never folded into the panel (which starts
         // collapsed), so the image is visible and its adjacency gives the
@@ -248,7 +265,7 @@ impl CardBuilder {
     /// [`Self::with_tool_at`] for panels with no part time — tests only.
     #[cfg(test)]
     pub fn with_tool(self, tool: ToolPanel) -> Self {
-        self.with_tool_at(tool, None, None)
+        self.with_tool_at(tool, None, None, None)
     }
 
     /// The Background Task Ledger section (ADR-0060): a Session's live
