@@ -3444,6 +3444,7 @@ impl App {
                         Some(lane),
                         return_to,
                         viewer_page(&value),
+                        false,
                     )
                 }
                 Err(failure) => crate::feishu::card::viewer::build_viewer_failure_card(

@@ -35,7 +35,9 @@ use crate::backend::FileContent;
 use crate::bridge::handles::{CardsHandle, content_cell, content_identity_hash};
 use crate::feishu::Platform;
 use crate::feishu::card::tool_render::FileDelivery;
-use crate::feishu::card::viewer::ViewerFileLane;
+use crate::feishu::card::viewer::{
+    ViewerFileLane, ViewerKind, detect_structural_overflow, rich_post_content, rich_post_md,
+};
 
 /// The most bytes a preview reads (ADR-0083 §6): 8 MB. A text file past it is
 /// not previewed at all — it takes the File Message lane (ADR-0083 §5).
@@ -392,6 +394,93 @@ fn past_cap(header: &[u8], size: u64) -> Classified {
         text: None,
         bytes: None,
     }
+}
+
+/// What the structural-overflow lane sends: the preview's identity (what the
+/// card names) plus its rendered shape (what the lane decision reads).
+pub(crate) struct OverflowPreview<'a> {
+    /// The file name the card names and a File Message uploads under.
+    pub(crate) name: &'a str,
+    /// The content's mime (`text/plain` for a text preview).
+    pub(crate) mime: &'a str,
+    /// The file's byte size, as the card names it.
+    pub(crate) size: u64,
+    /// What the viewer decided the bytes render as.
+    pub(crate) kind: ViewerKind,
+    /// The file's extension (without the dot), as the path spells it.
+    pub(crate) ext: Option<&'a str>,
+    /// The preview's text: the bytes read, already bounded by the read cap.
+    pub(crate) text: &'a str,
+}
+
+/// The structural-overflow lane a viewer opens with (ADR-0083 §5, #741): a
+/// preview the card structurally cannot hold — past the element budget, past
+/// five tables, past the 49-row table cap — goes out as exactly ONE Rich Text
+/// Message (`msg_type: "post"` carrying the `md` tag) under `reply_target`,
+/// reusing the Platform's existing generic reply path (no new send method).
+/// The lane is chosen from the RENDERED structure, never from byte size, and
+/// is itself bounded by the same 30 KB body cap as a card: content whose
+/// rich-text body would exceed that goes to the File Message lane instead
+/// (the case 「发为文件」 exists for), with the card saying where it went.
+/// `None` when the preview fits the card's structural limits — the card (and
+/// #740's line paging) owns those.
+///
+/// The returned lane is the card's tracking line: `SentAsRichText` for the
+/// message, `SentAsFile` past the post cap, `Undelivered` when the send (or
+/// the fallback upload/send) failed. The caller builds the viewer with
+/// `overflowed` set, so the card carries no preview and no truncation note —
+/// naming, this tracking line and the buttons.
+pub(crate) async fn open_overflow_lane(
+    platform: &Arc<dyn Platform>,
+    cards: &CardsHandle,
+    reply_target: &str,
+    preview: &OverflowPreview<'_>,
+    timeout_ms: u64,
+) -> Option<ViewerFileLane> {
+    detect_structural_overflow(preview.kind, preview.ext, preview.text)?;
+    if let Some(md) = rich_post_md(preview.kind, preview.ext, preview.text) {
+        let content = rich_post_content(&md);
+        let delivery = match crate::bridge::bounded_call(
+            "viewer rich-text message",
+            timeout_ms,
+            platform.reply_message(reply_target, "post", &content),
+        )
+        .await
+        {
+            Some(Ok(_)) => FileDelivery::SentAsRichText,
+            Some(Err(error)) => {
+                tracing::warn!("viewer Rich Text Message send failed: {error}");
+                FileDelivery::Undelivered
+            }
+            None => FileDelivery::Undelivered,
+        };
+        return Some(ViewerFileLane {
+            mime: preview.mime.to_string(),
+            name: preview.name.to_string(),
+            size: preview.size,
+            delivery,
+        });
+    }
+    // Past the post cap: the File Message lane owns the bytes. The preview
+    // text IS the file's bytes (a text preview holds them decoded), so they
+    // travel with no re-read, through the same cached upload + single send as
+    // every other whole-bytes lane.
+    let content = FileContent::from_bytes(preview.mime, preview.name, preview.text.as_bytes().to_vec());
+    let delivery = deliver(
+        platform,
+        cards,
+        reply_target,
+        ClassifiedKind::File,
+        content,
+        timeout_ms,
+    )
+    .await;
+    Some(ViewerFileLane {
+        mime: preview.mime.to_string(),
+        name: preview.name.to_string(),
+        size: preview.size,
+        delivery,
+    })
 }
 
 /// The whole-bytes lane a viewer opens with (ADR-0083 §5): an image within

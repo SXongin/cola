@@ -65,6 +65,12 @@ pub enum FileDelivery {
     /// is already threaded, a plain reply that creates no topic otherwise
     /// (ADR-0076's amendment). The panel line reads `· 已发送为文件消息`.
     SentAsFile,
+    /// A preview the card structurally cannot hold, posted as exactly one
+    /// Rich Text Message (`msg_type: "post"` carrying the `md` tag) under the
+    /// viewer (ADR-0083 §5, #741). The reply rides the same generic reply path
+    /// as [`Self::SentAsFile`], so it lands in the card's own container the
+    /// same way. The tracking line reads `· 已发送为富文本消息`.
+    SentAsRichText,
     /// A File Content that could not be delivered: over Feishu's 30MB message
     /// cap, or a failed upload/send. The panel line reads `· 未发送`.
     Undelivered,
@@ -75,7 +81,10 @@ impl FileDelivery {
     fn as_embedded_key(&self) -> Option<&str> {
         match self {
             FileDelivery::Embedded { image_key } => Some(image_key),
-            FileDelivery::Unresolved | FileDelivery::SentAsFile | FileDelivery::Undelivered => None,
+            FileDelivery::Unresolved
+            | FileDelivery::SentAsFile
+            | FileDelivery::SentAsRichText
+            | FileDelivery::Undelivered => None,
         }
     }
 }
@@ -645,6 +654,7 @@ pub(crate) fn delivery_suffix(delivery: &FileDelivery) -> Option<&'static str> {
     match delivery {
         FileDelivery::Embedded { .. } => Some("已内嵌"),
         FileDelivery::SentAsFile => Some("已发送为文件消息"),
+        FileDelivery::SentAsRichText => Some("已发送为富文本消息"),
         FileDelivery::Undelivered => Some("未发送"),
         FileDelivery::Unresolved => None,
     }

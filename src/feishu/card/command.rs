@@ -370,6 +370,7 @@ pub(crate) fn path_answer(
                 None,
                 return_to,
                 page,
+                false,
             ))
         }
         crate::bridge::viewer::CatOpen::Failed(failure) => PathAnswer::Line(failure.line(resolved)),
@@ -432,16 +433,53 @@ pub(crate) async fn send_cat_card(
                 }
             };
             let name = file_display_name(&path);
-            let lane = crate::bridge::viewer::open_lane(
+            // The byte lanes first (#739); a text preview that fits no
+            // structural limit takes none — and a preview the card
+            // structurally cannot hold takes the Rich Text Message lane (#741),
+            // or the File Message lane past the post cap.
+            let timeout = handles.flow.cards.viewer_transfer_timeout_ms();
+            let mut overflowed = false;
+            let lane = match crate::bridge::viewer::open_lane(
                 platform,
                 &handles.flow.cards,
                 message_id,
                 &name,
                 &mut classified,
-                handles.flow.cards.viewer_transfer_timeout_ms(),
+                timeout,
             )
-            .await;
-            let card = build_viewer_for_classified(thread_key, &path, &classified, lane, None, 1);
+            .await
+            {
+                Some(lane) => Some(lane),
+                None => {
+                    let ext = path.extension().and_then(|e| e.to_str());
+                    let kind = match classified.kind {
+                        crate::bridge::viewer::ClassifiedKind::Text => {
+                            crate::feishu::card::viewer::kind_for_extension(ext)
+                        }
+                        // A byte lane already decided these above.
+                        _ => crate::feishu::card::viewer::ViewerKind::Binary,
+                    };
+                    let preview = crate::bridge::viewer::OverflowPreview {
+                        name: &name,
+                        mime: &classified.mime,
+                        size: classified.size,
+                        kind,
+                        ext,
+                        text: classified.text.as_deref().unwrap_or(""),
+                    };
+                    let lane = crate::bridge::viewer::open_overflow_lane(
+                        platform,
+                        &handles.flow.cards,
+                        message_id,
+                        &preview,
+                        timeout,
+                    )
+                    .await;
+                    overflowed = lane.is_some();
+                    lane
+                }
+            };
+            let card = build_viewer_for_classified(thread_key, &path, &classified, lane, None, 1, overflowed);
             platform.reply_card(message_id, &card).await?;
         }
         crate::bridge::viewer::CatOpen::Failed(failure) => {
@@ -463,7 +501,10 @@ pub(crate) fn file_display_name(path: &std::path::Path) -> String {
 /// (ADR-0083 §3, §5). Shared by `/cat` and the 「发为文件」 transfer — which
 /// PATCHes the card it was clicked on with the outcome — so both name the same
 /// file the same way and render the same lane. `page` is the 1-based page of
-/// the line-windowed text preview (#740).
+/// the line-windowed text preview (#740). `overflowed` is #741's lane: the
+/// preview went out as its own Rich Text (or File) Message, so the card
+/// carries no preview and no truncation note — naming, the tracking line and
+/// the buttons.
 pub(crate) fn build_viewer_for_classified(
     thread_key: &ThreadKey,
     path: &std::path::Path,
@@ -471,6 +512,7 @@ pub(crate) fn build_viewer_for_classified(
     lane: Option<super::viewer::ViewerFileLane>,
     return_to: Option<BrowseView<'_>>,
     page: usize,
+    overflowed: bool,
 ) -> Value {
     use super::viewer::{ViewerCard, ViewerKind, build_viewer_card, kind_for_extension};
     use crate::bridge::viewer::ClassifiedKind;
@@ -495,6 +537,7 @@ pub(crate) fn build_viewer_for_classified(
             page,
             return_to,
             lane,
+            overflowed,
         },
     )
 }
