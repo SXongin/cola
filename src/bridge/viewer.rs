@@ -457,7 +457,7 @@ pub(crate) async fn open_overflow_lane(
     }
     if let Some(md) = rich_post_md(preview.kind, preview.ext, preview.text) {
         let content = rich_post_content(&md);
-        let (delivery, rich_message_id) = refresh_rich_message(
+        let (delivery, rich_message_id, refresh_failed) = refresh_rich_message(
             platform,
             reply_target,
             &content,
@@ -471,23 +471,24 @@ pub(crate) async fn open_overflow_lane(
             size: preview.size,
             delivery,
             rich_message_id,
+            refresh_failed,
         });
     }
-    let rich_message_id = if existing_rich_message_id.is_some() {
+    let (rich_message_id, refresh_failed) = if existing_rich_message_id.is_some() {
         // The updated body no longer fits Feishu's post budget. Retire the
         // stale copy with a bounded notice before the File Message takes over.
         let notice = rich_post_content("文件内容已更新；最新内容以文件消息为准。");
-        refresh_rich_message(
+        let (_, rich_message_id, refresh_failed) = refresh_rich_message(
             platform,
             reply_target,
             &notice,
             existing_rich_message_id,
             timeout_ms,
         )
-        .await
-        .1
+        .await;
+        (rich_message_id, refresh_failed)
     } else {
-        None
+        (None, false)
     };
     // Past the post cap: the File Message lane owns the bytes. The preview
     // text IS the file's bytes (a text preview holds them decoded), so they
@@ -509,6 +510,7 @@ pub(crate) async fn open_overflow_lane(
         size: preview.size,
         delivery,
         rich_message_id,
+        refresh_failed,
     })
 }
 
@@ -520,7 +522,7 @@ async fn refresh_rich_message(
     content: &serde_json::Value,
     existing_message_id: Option<&str>,
     timeout_ms: u64,
-) -> (FileDelivery, Option<String>) {
+) -> (FileDelivery, Option<String>, bool) {
     if let Some(message_id) = existing_message_id {
         match crate::bridge::bounded_call(
             "viewer Rich Text Message edit",
@@ -530,18 +532,24 @@ async fn refresh_rich_message(
         .await
         {
             Some(Ok(crate::feishu::MessageEditOutcome::Updated)) => {
-                return (FileDelivery::SentAsRichText, Some(message_id.to_string()));
+                return (FileDelivery::SentAsRichText, Some(message_id.to_string()), false);
+            }
+            Some(Ok(crate::feishu::MessageEditOutcome::EditLimitReached)) => {
+                tracing::info!(
+                    "viewer Rich Text Message edit budget exhausted for {message_id}; sending a fresh copy"
+                );
             }
             Some(Ok(crate::feishu::MessageEditOutcome::Refused)) => {
-                tracing::info!(
-                    "viewer Rich Text Message edit refused for {message_id}; sending a fresh copy"
+                tracing::warn!(
+                    "viewer Rich Text Message edit refused for {message_id}; keeping the existing copy"
                 );
+                return (FileDelivery::Undelivered, Some(message_id.to_string()), true);
             }
             Some(Err(error)) => {
                 tracing::warn!("viewer Rich Text Message edit failed: {error}");
-                return (FileDelivery::Undelivered, Some(message_id.to_string()));
+                return (FileDelivery::Undelivered, Some(message_id.to_string()), true);
             }
-            None => return (FileDelivery::Undelivered, Some(message_id.to_string())),
+            None => return (FileDelivery::Undelivered, Some(message_id.to_string()), true),
         }
     }
 
@@ -552,12 +560,20 @@ async fn refresh_rich_message(
     )
     .await
     {
-        Some(Ok((message_id, _))) => (FileDelivery::SentAsRichText, Some(message_id)),
+        Some(Ok((message_id, _))) => (FileDelivery::SentAsRichText, Some(message_id), false),
         Some(Err(error)) => {
             tracing::warn!("viewer Rich Text Message send failed: {error}");
-            (FileDelivery::Undelivered, existing_message_id.map(str::to_string))
+            (
+                FileDelivery::Undelivered,
+                existing_message_id.map(str::to_string),
+                existing_message_id.is_some(),
+            )
         }
-        None => (FileDelivery::Undelivered, existing_message_id.map(str::to_string)),
+        None => (
+            FileDelivery::Undelivered,
+            existing_message_id.map(str::to_string),
+            existing_message_id.is_some(),
+        ),
     }
 }
 
@@ -602,10 +618,10 @@ pub(crate) async fn open_viewer_lanes(
         Some(mut lane) => {
             if let Some(message_id) = existing_rich_message_id {
                 let notice = rich_post_content("文件内容已更新；最新内容以文件查看卡或文件消息为准。");
-                lane.rich_message_id =
-                    refresh_rich_message(platform, reply_target, &notice, Some(message_id), timeout_ms)
-                        .await
-                        .1;
+                let (_, rich_message_id, refresh_failed) =
+                    refresh_rich_message(platform, reply_target, &notice, Some(message_id), timeout_ms).await;
+                lane.rich_message_id = rich_message_id;
+                lane.refresh_failed = refresh_failed;
             }
             Some(lane)
         }
@@ -665,6 +681,7 @@ pub(crate) async fn open_lane(
             size,
             delivery: FileDelivery::Undelivered,
             rich_message_id: None,
+            refresh_failed: false,
         });
     };
     let content = FileContent::from_bytes(&mime, name, bytes);
@@ -683,6 +700,7 @@ pub(crate) async fn open_lane(
         size,
         delivery,
         rich_message_id: None,
+        refresh_failed: false,
     })
 }
 
@@ -738,6 +756,7 @@ pub(crate) async fn send_as_file(
         size,
         delivery,
         rich_message_id: None,
+        refresh_failed: false,
     }
 }
 

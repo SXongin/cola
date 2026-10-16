@@ -12,6 +12,11 @@ pub(crate) const INSTANT_REMINDER_SCOPE: &str = "im:datasync.feed_card.time_sens
 /// for the same reason.
 pub(crate) const MESSAGE_PIN_SCOPE: &str = "im:message.pins:write_only";
 
+// Assumption pending a published Feishu error-code reference: 230020 denotes
+// the per-message edit-count ceiling. Only this code permits a fresh-copy
+// fallback; all other business failures remain refusals and must not duplicate.
+const MESSAGE_EDIT_LIMIT_REACHED_CODE: i32 = 230020;
+
 /// A minimal Feishu REST client.
 pub struct Client {
     http: reqwest::Client,
@@ -573,7 +578,10 @@ impl Client {
         )
         .await?;
         let resp: ApiResponse = parse_json(&text, "edit message response")?;
-        if resp.code != 0 {
+        if resp.code == MESSAGE_EDIT_LIMIT_REACHED_CODE {
+            tracing::warn!("Feishu refused message edit {}: {}", resp.code, resp.msg);
+            Ok(crate::feishu::MessageEditOutcome::EditLimitReached)
+        } else if resp.code != 0 {
             tracing::warn!("Feishu refused message edit {}: {}", resp.code, resp.msg);
             Ok(crate::feishu::MessageEditOutcome::Refused)
         } else {
@@ -1553,7 +1561,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn edit_message_exposes_a_business_refusal_as_a_distinct_outcome() {
+    async fn edit_message_identifies_the_edit_budget_refusal() {
         let (server, client) = wire_client().await;
         server.route(
             "PUT",
@@ -1565,11 +1573,28 @@ mod tests {
 
         assert_eq!(
             client.edit_message("om_rich", "post", &content).await.unwrap(),
-            crate::feishu::MessageEditOutcome::Refused
+            crate::feishu::MessageEditOutcome::EditLimitReached
         );
         let request = last_request(&server);
         assert_eq!(request.method, "PUT");
         assert_eq!(request.path, "/open-apis/im/v1/messages/om_rich");
+    }
+
+    #[tokio::test]
+    async fn edit_message_keeps_other_business_refusals_distinct_from_the_edit_limit() {
+        let (server, client) = wire_client().await;
+        server.route(
+            "PUT",
+            "/open-apis/im/v1/messages/om_rich",
+            200,
+            r#"{"code":230099,"msg":"invalid message content"}"#,
+        );
+        let content = serde_json::json!({"zh_cn":{"content":[[{"tag":"md","text":"updated"}]]}});
+
+        assert_eq!(
+            client.edit_message("om_rich", "post", &content).await.unwrap(),
+            crate::feishu::MessageEditOutcome::Refused
+        );
     }
 
     #[tokio::test]

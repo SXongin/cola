@@ -278,6 +278,10 @@ pub enum PlatformCall {
         content: serde_json::Value,
         outcome: crate::feishu::MessageEditOutcome,
     },
+    EditMessageFailed {
+        message_id: String,
+        content: serde_json::Value,
+    },
     ReplyText {
         message_id: String,
         text: String,
@@ -467,6 +471,10 @@ pub struct RecordingPlatform {
     pub fail_send_message_count: std::sync::atomic::AtomicUsize,
     /// The next N non-card message edits are definitively refused by Feishu.
     pub refuse_edit_message_count: std::sync::atomic::AtomicUsize,
+    /// The next N non-card edits are refused for a reason other than the edit budget.
+    pub reject_edit_message_count: std::sync::atomic::AtomicUsize,
+    /// The next N non-card message edits fail ambiguously at transport.
+    pub fail_edit_message_count: std::sync::atomic::AtomicUsize,
     /// Scripted ids returned by `reply_message`; defaults to `msg_file`.
     pub message_reply_ids: std::sync::Mutex<std::collections::VecDeque<String>>,
     /// file_key → the payload `download_file` serves. A present `Some` is
@@ -512,6 +520,8 @@ impl RecordingPlatform {
             fail_upload_file_count: std::sync::atomic::AtomicUsize::new(0),
             fail_send_message_count: std::sync::atomic::AtomicUsize::new(0),
             refuse_edit_message_count: std::sync::atomic::AtomicUsize::new(0),
+            reject_edit_message_count: std::sync::atomic::AtomicUsize::new(0),
+            fail_edit_message_count: std::sync::atomic::AtomicUsize::new(0),
             message_reply_ids: std::sync::Mutex::new(std::collections::VecDeque::new()),
             downloaded_files: std::sync::Mutex::new(std::collections::HashMap::new()),
             download_file_calls: std::sync::Mutex::new(Vec::new()),
@@ -932,15 +942,41 @@ impl feishu::Platform for RecordingPlatform {
         msg_type: &str,
         content: &serde_json::Value,
     ) -> crate::error::Result<crate::feishu::MessageEditOutcome> {
-        let refused = self
+        let failed = self
+            .fail_edit_message_count
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0;
+        if failed {
+            self.fail_edit_message_count
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            self.calls.lock().await.push(PlatformCall::EditMessageFailed {
+                message_id: message_id.into(),
+                content: content.clone(),
+            });
+            return Err(crate::error::BridgeError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "simulated ambiguous message edit failure",
+            )));
+        }
+        let limit_reached = self
             .refuse_edit_message_count
             .load(std::sync::atomic::Ordering::SeqCst)
             > 0;
-        if refused {
+        if limit_reached {
             self.refuse_edit_message_count
                 .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         }
-        let outcome = if refused {
+        let rejected = self
+            .reject_edit_message_count
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0;
+        if rejected {
+            self.reject_edit_message_count
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        let outcome = if limit_reached {
+            crate::feishu::MessageEditOutcome::EditLimitReached
+        } else if rejected {
             crate::feishu::MessageEditOutcome::Refused
         } else {
             crate::feishu::MessageEditOutcome::Updated
@@ -3415,6 +3451,13 @@ pub(crate) async fn send_command_in(
 pub(crate) trait HostCardAction {
     async fn host_action(&self, value: serde_json::Value)
     -> Option<crate::bridge::handler::CardActionResult>;
+    /// Dispatch a rendered button value as if Feishu supplied the containing
+    /// card's message id in callback context (it is not part of the card JSON).
+    async fn host_action_on_message(
+        &self,
+        value: serde_json::Value,
+        message_id: &str,
+    ) -> Option<crate::bridge::handler::CardActionResult>;
 }
 
 #[async_trait::async_trait]
@@ -3425,6 +3468,16 @@ impl HostCardAction for Arc<App> {
     ) -> Option<crate::bridge::handler::CardActionResult> {
         let mut value = value;
         value["operator_open_id"] = serde_json::Value::String(TEST_HOST.to_string());
+        self.handle_card_action(value).await
+    }
+
+    async fn host_action_on_message(
+        &self,
+        mut value: serde_json::Value,
+        message_id: &str,
+    ) -> Option<crate::bridge::handler::CardActionResult> {
+        value["operator_open_id"] = serde_json::Value::String(TEST_HOST.to_string());
+        value["open_message_id"] = serde_json::Value::String(message_id.to_string());
         self.handle_card_action(value).await
     }
 }

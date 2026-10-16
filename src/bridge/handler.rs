@@ -651,7 +651,6 @@ struct ViewerReread {
     rich_message_id: Option<String>,
     return_to: OwnedReturnTo,
     page: usize,
-    classified: crate::bridge::viewer::Classified,
 }
 
 /// A viewer payload's viewer page (#740): the pager's TARGET page, or the page
@@ -2838,6 +2837,9 @@ impl App {
             page: home_page,
         });
         if op == "reread" {
+            // The viewer's own Feishu message id cannot be serialized when its
+            // card is built (the send returns that id afterward). ws injects
+            // it from callback context; it is the target for the in-place PATCH.
             let Some(open_message_id) = value
                 .get("open_message_id")
                 .and_then(|v| v.as_str())
@@ -2847,19 +2849,6 @@ impl App {
                     card: None,
                     toast: Some("无法重新读取：找不到文件查看卡。".to_string()),
                 });
-            };
-            let classified = match std::fs::metadata(&resolved) {
-                Ok(metadata) => crate::bridge::viewer::classify(&resolved, metadata.len()),
-                Err(error) => Err(crate::bridge::viewer::stat_failure(&error)),
-            };
-            let classified = match classified {
-                Ok(classified) => classified,
-                Err(failure) => {
-                    return Some(CardActionResult {
-                        card: None,
-                        toast: Some(failure.line(&resolved)),
-                    });
-                }
             };
             let app = Arc::clone(self);
             let card_message_id = open_message_id.to_string();
@@ -2883,7 +2872,6 @@ impl App {
                     rich_message_id,
                     return_to,
                     page,
-                    classified,
                 })
                 .await;
             });
@@ -2971,7 +2959,6 @@ impl App {
             rich_message_id,
             return_to,
             page,
-            mut classified,
         } = reread;
         let timeout_ms = self
             .viewer_transfer_timeout_ms
@@ -2983,6 +2970,35 @@ impl App {
             page: return_to.page,
         });
         let resolved = std::path::PathBuf::from(&path);
+        // `metadata` and classify may block on the host filesystem (e.g. a
+        // network mount). Run that bounded read off the callback/runtime worker:
+        // the card click has already been acknowledged before this task starts.
+        let read_path = resolved.clone();
+        let read = tokio::task::spawn_blocking(move || match std::fs::metadata(&read_path) {
+            Ok(metadata) => crate::bridge::viewer::classify(&read_path, metadata.len()),
+            Err(error) => Err(crate::bridge::viewer::stat_failure(&error)),
+        });
+        let mut classified =
+            match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), read).await {
+                Ok(Ok(Ok(classified))) => classified,
+                Ok(Ok(Err(failure))) => {
+                    self.answer_viewer_reread_failure(&card_message_id, &failure.line(&resolved), timeout_ms)
+                        .await;
+                    return;
+                }
+                Ok(Err(error)) => {
+                    let line = format!("⚠️ 无法读取 `{}`：{error}", resolved.display());
+                    self.answer_viewer_reread_failure(&card_message_id, &line, timeout_ms)
+                        .await;
+                    return;
+                }
+                Err(_) => {
+                    let line = format!("⚠️ 无法读取 `{}`：重新读取超时。", resolved.display());
+                    self.answer_viewer_reread_failure(&card_message_id, &line, timeout_ms)
+                        .await;
+                    return;
+                }
+            };
         let name = crate::feishu::card::command::file_display_name(&resolved);
         let ext = resolved.extension().and_then(|extension| extension.to_str());
         let (lane, overflowed) = crate::bridge::viewer::open_viewer_lanes(
@@ -3017,6 +3033,22 @@ impl App {
             Some(Ok(()))
         ) {
             tracing::warn!("viewer re-read card update for {card_message_id} did not land");
+        }
+    }
+
+    /// Report an off-thread file read failure under the viewer card without
+    /// replacing its last good contents.
+    async fn answer_viewer_reread_failure(&self, card_message_id: &str, line: &str, timeout_ms: u64) {
+        if !matches!(
+            crate::bridge::bounded_call(
+                "viewer re-read failure reply",
+                timeout_ms,
+                self.feishu.reply_text(card_message_id, line),
+            )
+            .await,
+            Some(Ok(_))
+        ) {
+            tracing::warn!("viewer re-read failure reply for {card_message_id} did not land");
         }
     }
 

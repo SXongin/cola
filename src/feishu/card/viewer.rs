@@ -80,6 +80,8 @@ pub(crate) struct ViewerFileLane {
     /// The Rich Text Message carrying a structural overflow, when one landed.
     /// This id is carried by every viewer control instead of process-local state.
     pub(crate) rich_message_id: Option<String>,
+    /// A refresh of the carried Rich Text Message failed without replacing it.
+    pub(crate) refresh_failed: bool,
 }
 
 /// Why a preview cannot ride the card (ADR-0083 §5, #741): the RENDERED
@@ -872,6 +874,17 @@ fn naming_block(view: &ViewerCard<'_>) -> String {
 /// delivered file exactly as a Tool Panel does (ADR-0076).
 fn lane_line(lane: &ViewerFileLane) -> String {
     let base = format!("📎 {} · {} · {}", lane.name, lane.mime, human_size(lane.size));
+    if lane.refresh_failed {
+        return match lane.rich_message_id.as_deref() {
+            Some(message_id) => format!("{base} · 富文本刷新失败，当前仍是消息 `{message_id}`"),
+            None => format!("{base} · 刷新失败"),
+        };
+    }
+    if matches!(lane.delivery, FileDelivery::SentAsRichText)
+        && let Some(message_id) = lane.rich_message_id.as_deref()
+    {
+        return format!("{base} · 已发送为富文本消息（当前消息 `{message_id}`）");
+    }
     match delivery_suffix(&lane.delivery) {
         Some(suffix) => format!("{base} · {suffix}"),
         None => base,
@@ -900,6 +913,8 @@ fn viewer_buttons(thread_key: &ThreadKey, view: &ViewerCard<'_>) -> serde_json::
 
 /// The stateless re-read action (ADR-0052, ADR-0083 §9): the resolved file,
 /// current viewer page, return-listing state and existing overflow message id.
+/// The viewer's own Feishu message id is intentionally absent: the card is
+/// built before Feishu returns that id, and `ws` supplies it as callback context.
 fn reread_value(thread_key: &ThreadKey, view: &ViewerCard<'_>) -> serde_json::Value {
     let mut value = json!({
         "action": "file",
@@ -1388,6 +1403,7 @@ mod tests {
             size,
             delivery,
             rich_message_id: None,
+            refresh_failed: false,
         });
         view
     }
@@ -1951,6 +1967,7 @@ mod tests {
             size: 15,
             delivery: FileDelivery::SentAsRichText,
             rich_message_id: Some("om_rich".into()),
+            refresh_failed: false,
         });
         let card = build_viewer_card(&key(), landed);
         let text = card_text(&card);
@@ -1980,6 +1997,7 @@ mod tests {
             size: 15,
             delivery: FileDelivery::Undelivered,
             rich_message_id: None,
+            refresh_failed: false,
         });
         let card = build_viewer_card(&key(), failed);
         let text = card_text(&card);
