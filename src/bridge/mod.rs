@@ -26,6 +26,7 @@ pub mod surfaces;
 pub(crate) mod tasks;
 pub mod topic;
 pub mod turn;
+pub(crate) mod viewer;
 
 #[cfg(test)]
 mod attach_live;

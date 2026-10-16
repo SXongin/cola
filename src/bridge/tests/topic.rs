@@ -879,6 +879,13 @@ async fn topic_command_gate_rejects_banned_commands_and_lets_others_through() {
             has_session: true,
             rejection: None,
         },
+        // `/cat` is a read surface, never gated: a viewer card lands inside the
+        // topic the command was sent in (spec #669 story 41).
+        Case {
+            text: format!("/cat {dir}/ghost"),
+            has_session: true,
+            rejection: None,
+        },
     ];
 
     let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_gate".into());

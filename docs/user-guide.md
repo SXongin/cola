@@ -417,6 +417,7 @@ detailed help for any of these.
 | --- | --- |
 | `/dir <path> [name]` | Declare a new session rooted at `<path>` — created by the next message |
 | `/claim <code>` | Claim this cola as Host (private chat only; code from the startup log) |
+| `/cat <path>` | View one file on cola's host as a File Viewer card: a text file as a fenced code block with its extension's language hint (an extension the platform has no token for renders as plain text), a `.csv`/`.tsv` file as a markdown table; the card names the file's resolved path, size and type, and its 📂 所在目录 button opens the Directory Browser at the file's parent. `/cat <directory>` opens the browser there instead, and a bare `/cat` shows usage. The path resolves on the Path Scope: `~` expands, a relative path resolves against the session's directory (the conversation's current project while the session is still pending), an absolute path is used as-is — including one outside that directory |
 | `/dir` | Recent Directories card: pick a folder and declare a session there, or open it as a fresh topic (每行「建话题」= `/topic <dir>` 的免打字版); its 📁 浏览目录 button opens a filesystem browser — drill into subdirectories, type a path (前往 browses it, 选择 declares it), toggle dot-directories, filter child names |
 | `/switch` | Session card: browse / search / adopt / new |
 | `/switch <kw>` | Switch to a session by name/dir/id (adopts foreign ones; no match opens the card pre-filtered) |
@@ -445,6 +446,12 @@ detailed help for any of these.
 
 Notes:
 
+- `/cat` reads the file's bytes on the machine cola itself runs on — no model
+  in the loop, and the same behaviour whatever Generation the server speaks.
+  Its **Path Scope** (relative to the session's directory, `~` expanded,
+  absolute paths passed through) is a **privacy hint, not a sandbox**: any path
+  cola's user can read is reachable, and every card cola sends is readable by
+  everyone in that chat. Who may *act* is still the Access List (`/claim`).
 - `/new`, `/dir` and `/topic` only **declare** the session — the conversation's
   next non-command message creates it in the chosen directory and maps it here,
   so a mistaken `/new`, `/dir` or `/topic` can be corrected with another `/new`,
