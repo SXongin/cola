@@ -24,8 +24,9 @@ loop.
   and an unknown token degrades to `plain_text` rather than failing.
 - **Two surfaces beat the card for *why* content overflows, and neither needs public
   ingress** (research note, §Verdict): a **`post`** message's `md` tag renders CommonMark
-  0.31 + GFM with **no 200-element cap, no 5-table cap and no per-element clipping**, and a
-  `text` message body allows 150 KB. `post` and `text` are also editable in place
+  0.31 + GFM, and is **reported** to do so without the card's 200-element cap, 5-table cap and
+  per-element clipping — a claim inferred from cc-connect's use, never measured here (§11) —
+  while a `text` message body allows 150 KB. `post` and `text` are also editable in place
   (`PUT /im/v1/messages/:id`, at most 20 edits). Everything genuinely richer is closed to a
   bot with no public address: 网页应用 (H5) documents that its production homepage "needs to
   be a public network address" (`127.0.0.1` appears only as a local-debugging stopgap),
@@ -68,9 +69,11 @@ loop.
    never reaped. Opened from the browse card it carries 「← 返回目录」 and round-trips that
    card's state (browsed directory, page, filter, hidden toggle) through its own button
    payloads, so returning restores the listing exactly (ADR-0052's statelessness). A `/cat`
-   card, which has no listing to return to, carries 「📂 所在目录」 instead. The consequence is
-   accepted: the viewer is not collected when the conversation moves on, so a chat can
-   accumulate them.
+   card, which has no listing to return to, carries 「📂 所在目录」 instead. Every viewer
+   **names the file it shows** — path, size and type — so two similarly named files are never
+   ambiguous, and the path is the one that was resolved, not the one that was typed. The
+   consequence is accepted: the viewer is not collected when the conversation moves on, so a
+   chat can accumulate them.
 4. **The path scope is advisory, and says so.** Every path resolves relative to the Session's
    directory (the conversation's current **Project** when the Session is still **Pending**),
    with `~` expanded and absolute paths passed through. This is a **privacy hint, not a
@@ -84,9 +87,13 @@ loop.
    Message** rather than a half-rendered or paginated-around card; and the file's whole bytes
    are always available as a **File Message** through ADR-0076's existing ladder (uploaded
    once, 30 MB cap, a `未发送` tracking line beyond it). A text file's card preview is a
-   fenced code block with a language hint, paged by **lines** with the shared pager control;
-   an image within Feishu's caps is embedded by ADR-0076's image path and reuses its
-   content-hash upload cache, so opening the same image twice uploads once.
+   fenced code block with a language hint, paged by **lines** with the shared pager control —
+   **except a delimited-text file (`.csv`, `.tsv`), whose preview is a markdown table**, since
+   a table is what those bytes *are* and the platform renders one natively; that lane is
+   where the card's table caps bite, so a table too big for the card takes the Rich Text
+   Message lane above rather than being silently cut to five rows. An image within Feishu's
+   caps is embedded by ADR-0076's image path and reuses its content-hash upload cache, so
+   opening the same image twice uploads once.
 6. **Type detection is local, explicit, and bounded.** Magic bytes (`infer`) decide image and
    known-binary types first, then UTF-8 validity decides text; an image takes ADR-0076's
    embed path, any other binary takes the File Message path. A text file larger than the
@@ -99,10 +106,14 @@ loop.
    **not** parsed into controls — a card's `<link>`/`<a>` can only open a URL and cannot
    invoke a callback, so a tappable path would have to be a button (a false-positive
    minefield, and an element-budget cost per mention), and structure beats prose.
-8. **Re-reading is a button.** 「🔄 重新读取」 re-reads the file and PATCHes the viewer in
-   place — the card, and the Rich Text Message that carries its overflow, together. No
-   watcher and no auto-refresh: a build artifact that changes should not rewrite a card the
-   reader is looking at, and a filesystem watcher would contend with the card machinery.
+8. **Re-reading is a button.** 「🔄 重新读取」 re-reads the file and updates the viewer in
+   place — the card, and the Rich Text Message that carries its overflow, together. The
+   message half is **best-effort against the platform's edit budget** (20 edits per message):
+   while an edit is still available the message is edited in place, and once the budget is
+   spent the refreshed copy is **re-sent as a fresh message** — the card's tracking line says
+   which — so a long-lived viewer never quietly stops refreshing half of itself. No watcher
+   and no auto-refresh: a build artifact that changes should not rewrite a card the reader is
+   looking at, and a filesystem watcher would contend with the card machinery.
 9. **What this is not.** No HTML or rich-text rendering (the platform has no such component);
    no 云文档 import (it is the one surface with a bigger byte budget, but it is a new
    subsystem — 2–3 scopes, async import tickets, copies accumulating in the user's My Space —
