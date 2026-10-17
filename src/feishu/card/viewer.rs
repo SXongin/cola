@@ -66,7 +66,8 @@ impl ViewerKind {
 
 /// The whole-bytes lane a **File Viewer** card shows (ADR-0083 §5): what the
 /// file is and where its bytes went. Rendered as the card's tracking line
-/// (`📎 name · mime · size · 已内嵌` / `· 已发送为文件消息` / `· 未发送`) and, for
+/// (`📎 name · mime · size · 已内嵌` / `· 已发送为文件消息` / `· 未发送` or an
+/// ambiguous-send status) and, for
 /// an embedded image, the `img` element. Named so a file past Feishu's 30MB cap
 /// — which is never read — can still carry its real size and the 未发送 state.
 pub(crate) struct ViewerFileLane {
@@ -504,11 +505,11 @@ pub(crate) struct ViewerCard<'a> {
     /// The preview went out as its own message and LANDED (#741): a
     /// structurally overflowing preview rides the Rich Text Message lane (or
     /// the File Message lane past the post cap), so the card carries NO
-    /// preview elements, NO truncation note and NO 「发为文件」 — the content
-    /// is already delivered, so a rescue button would deliver the same file a
-    /// second time. A whole-bytes lane for an image or binary likewise records
-    /// where its content went; an embedded image is itself visible on this card
-    /// and keeps the explicit File Message action. `false` whenever a required
+    /// preview elements or truncation note. Only a File Message carries the
+    /// original bytes; Rich Text is a rendered preview and keeps 「发为文件」.
+    /// A whole-bytes lane for an image or binary likewise records where its
+    /// content went; an embedded image remains visible and keeps the explicit
+    /// File Message action. `false` whenever a required
     /// lane did not land: a structural overflow then keeps its truncated
     /// preview, honest cut note and rescue button, with the tracking line
     /// stating the content was not delivered.
@@ -707,6 +708,7 @@ fn push_text_page(
         super::tool_render::FileDelivery::Unresolved => "unresolved",
         super::tool_render::FileDelivery::Embedded { .. } => "embedded",
         super::tool_render::FileDelivery::SentAsFile => "sent_as_file",
+        super::tool_render::FileDelivery::FileSendOutcomeUnknown => "file_send_outcome_unknown",
         super::tool_render::FileDelivery::SentAsRichText => "sent_as_rich_text",
         super::tool_render::FileDelivery::Undelivered => "undelivered",
     });
@@ -1015,14 +1017,18 @@ fn lane_line(lane: &ViewerFileLane) -> String {
 fn viewer_buttons(thread_key: &ThreadKey, view: &ViewerCard<'_>) -> serde_json::Value {
     let mut columns = vec![button_column("🔄 重新读取", reread_value(thread_key, view))];
     columns.extend(directory_columns(thread_key, view.path, view.return_to));
-    // A preview landed in its own Rich Text/File Message already: offering
-    // 「发为文件」 would deliver the same file a second time (#741, deliver-once).
-    // Embedded images remain visible on this card and keep the explicit action.
-    let already_sent = view
-        .lane
-        .as_ref()
-        .is_some_and(|lane| matches!(&lane.delivery, super::tool_render::FileDelivery::SentAsFile));
-    if !view.overflowed && !already_sent {
+    // A File Message already carries the original bytes; Rich Text carries only
+    // a rendered preview, so the transfer action remains essential there.
+    // An ambiguous timed-out File Message is also not retried: it may have
+    // landed and Feishu cannot edit or retract it.
+    let file_message_may_already_be_delivered = view.lane.as_ref().is_some_and(|lane| {
+        matches!(
+            &lane.delivery,
+            super::tool_render::FileDelivery::SentAsFile
+                | super::tool_render::FileDelivery::FileSendOutcomeUnknown
+        )
+    });
+    if !file_message_may_already_be_delivered {
         columns.push(button_column("发为文件", transfer_value(thread_key, view)));
     }
     button_row(columns)
@@ -1058,7 +1064,21 @@ fn reread_value(thread_key: &ThreadKey, view: &ViewerCard<'_>) -> serde_json::Va
             .is_some_and(|lane| matches!(lane.delivery, FileDelivery::SentAsFile))
         {
             value["viewer_sent_file_identity"] = json!(identity.to_string());
+        } else if view
+            .lane
+            .as_ref()
+            .is_some_and(|lane| matches!(lane.delivery, FileDelivery::FileSendOutcomeUnknown))
+        {
+            value["viewer_ambiguous_file_identity"] = json!(identity.to_string());
         }
+    }
+    if let Some(image_key) = view.lane.as_ref().and_then(|lane| {
+        lane.embedded_image_key.as_deref().or(match &lane.delivery {
+            FileDelivery::Embedded { image_key } => Some(image_key.as_str()),
+            _ => None,
+        })
+    }) {
+        value["viewer_embedded_image_key"] = json!(image_key);
     }
     if let Some(message_id) = view
         .lane
@@ -1116,6 +1136,7 @@ pub(crate) fn lane_from_page_payload(value: &serde_json::Value) -> Option<Viewer
             image_key: value.get("viewer_lane_image_key")?.as_str()?.to_string(),
         },
         "sent_as_file" => super::tool_render::FileDelivery::SentAsFile,
+        "file_send_outcome_unknown" => super::tool_render::FileDelivery::FileSendOutcomeUnknown,
         "sent_as_rich_text" => super::tool_render::FileDelivery::SentAsRichText,
         "undelivered" => super::tool_render::FileDelivery::Undelivered,
         _ => return None,
@@ -2330,10 +2351,10 @@ mod tests {
 
     /// #741, deliver-once: a preview that LANDED as its own message carries no
     /// 「发为文件」 — the content is already delivered, so the button would
-    /// deliver the same file a second time. A preview the lane did NOT deliver
-    /// keeps the button as its rescue way out.
+    /// deliver the same file a second time. Rich Text carries only the rendered
+    /// preview, so the original-byte transfer remains available.
     #[test]
-    fn a_landed_overflow_card_offers_no_second_delivery() {
+    fn a_landed_rich_text_overflow_keeps_the_original_file_transfer() {
         let mut landed = view(
             "/tmp/proj/people.csv",
             ViewerKind::Delimited,
@@ -2358,10 +2379,10 @@ mod tests {
             "the tracking line says where the content went: {text}"
         );
         assert!(
-            !card_buttons(&card)
+            card_buttons(&card)
                 .iter()
                 .any(|b| b["text"]["content"] == "发为文件"),
-            "a landed preview offers no second delivery: {text}"
+            "Rich Text carries a preview, not the original bytes: {text}"
         );
 
         // The same lane, undelivered: the truncated preview, its cut note and
@@ -2396,6 +2417,60 @@ mod tests {
                 .iter()
                 .any(|b| b["text"]["content"] == "发为文件"),
             "the rescue button stays when nothing landed: {text}"
+        );
+    }
+
+    #[test]
+    fn every_viewer_lane_keeps_file_transfer_except_an_already_sent_file_message() {
+        let carries_transfer = |view| {
+            card_buttons(&build_viewer_card(&key(), view))
+                .iter()
+                .any(|button| button["text"]["content"] == "发为文件")
+        };
+
+        let text = view("/tmp/notes.txt", ViewerKind::Text, Some("txt"), "notes");
+        assert!(carries_transfer(text), "text previews need original bytes");
+
+        let mut csv = view(
+            "/tmp/people.csv",
+            ViewerKind::Delimited,
+            Some("csv"),
+            "name,age\nann,3\n",
+        );
+        csv.overflowed = true;
+        csv.lane = Some(ViewerFileLane {
+            mime: "text/csv".into(),
+            name: "people.csv".into(),
+            size: 15,
+            delivery: FileDelivery::SentAsRichText,
+            content_identity: None,
+            embedded_image_key: None,
+            rich_message_id: Some("om_rich".into()),
+            refresh_failed: false,
+        });
+        assert!(carries_transfer(csv), "Rich Text is not the original file");
+
+        let image = with_lane(
+            view("/tmp/shot.png", ViewerKind::Image, Some("png"), ""),
+            "image/png",
+            "shot.png",
+            8,
+            FileDelivery::Embedded {
+                image_key: "img_shot".into(),
+            },
+        );
+        assert!(carries_transfer(image), "the embedded image is still a preview");
+
+        let binary = with_lane(
+            view("/tmp/archive.bin", ViewerKind::Binary, Some("bin"), ""),
+            "application/octet-stream",
+            "archive.bin",
+            8,
+            FileDelivery::SentAsFile,
+        );
+        assert!(
+            !carries_transfer(binary),
+            "the File Message already carries the original bytes"
         );
     }
 

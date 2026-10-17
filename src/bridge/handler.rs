@@ -202,6 +202,12 @@ enum PromptRoute {
 /// the Turn's bundle, spec #298).
 type ViewerFileTransferKey = (String, String, u64);
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ViewerFileTransferStatus {
+    Sent,
+    OutcomeUnknown,
+}
+
 pub struct App {
     pub(crate) core: Arc<SharedCore>,
     /// The Host gate (ADR-0035): every inbound message and card action is
@@ -210,8 +216,10 @@ pub struct App {
     /// File Viewer callbacks are acknowledged before work begins; hold one
     /// process-local claim per Chat + clicked card until its task and PATCH end.
     viewer_actions_in_flight: Arc<std::sync::Mutex<std::collections::HashSet<(String, String)>>>,
-    /// Viewers whose File Message landed, so stale callbacks cannot redeliver.
-    viewer_file_transfers_sent: Arc<std::sync::Mutex<indexmap::IndexMap<ViewerFileTransferKey, ()>>>,
+    /// Viewer File Message outcomes, so stale callbacks cannot redeliver after
+    /// either a confirmed send or an ambiguous timeout.
+    viewer_file_transfers_sent:
+        Arc<std::sync::Mutex<indexmap::IndexMap<ViewerFileTransferKey, ViewerFileTransferStatus>>>,
     /// Weak self-reference, set once inside `run` (which holds the Arc). Lets
     /// the `EventSink` trait impl (which only has `&self`) recover a
     /// `&Arc<App>` to hand to the inherent methods. `Weak` so it never keeps
@@ -639,6 +647,8 @@ struct ViewerReread {
     card_message_id: String,
     rich_message_id: Option<String>,
     sent_file_identity: Option<u64>,
+    ambiguous_file_identity: Option<u64>,
+    embedded_image_key: Option<String>,
     return_to: OwnedReturnTo,
     page: usize,
     in_flight_guard: ViewerActionGuard,
@@ -715,18 +725,19 @@ struct ViewerOpenFailure<'a> {
     timeout_ms: u64,
 }
 
-/// Remember a completed viewer File Message within the same bounded,
-/// oldest-first window as the bridge's other process-local once-guards.
+/// Remember a completed or ambiguous viewer File Message attempt within the
+/// same bounded, oldest-first window as the bridge's other process-local guards.
 fn remember_viewer_file_transfer(
-    sent: &mut indexmap::IndexMap<ViewerFileTransferKey, ()>,
+    sent: &mut indexmap::IndexMap<ViewerFileTransferKey, ViewerFileTransferStatus>,
     key: ViewerFileTransferKey,
+    status: ViewerFileTransferStatus,
     cap: usize,
 ) {
     if sent.contains_key(&key) {
         return;
     }
     while sent.len() >= cap && crate::bridge::handles::evict_oldest_idle(sent, |_| true) {}
-    sent.insert(key, ());
+    sent.insert(key, status);
 }
 
 /// RAII claim for one in-flight File Viewer action. A duplicate callback gets
@@ -3154,6 +3165,14 @@ impl App {
                 .get("viewer_sent_file_identity")
                 .and_then(serde_json::Value::as_str)
                 .and_then(|identity| identity.parse().ok());
+            let ambiguous_file_identity = value
+                .get("viewer_ambiguous_file_identity")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|identity| identity.parse().ok());
+            let embedded_image_key = value
+                .get("viewer_embedded_image_key")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
             let return_to = OwnedReturnTo {
                 dir: (!home_dir.is_empty()).then(|| home_dir.clone()),
                 keyword: home_keyword.clone(),
@@ -3168,6 +3187,8 @@ impl App {
                     card_message_id,
                     rich_message_id,
                     sent_file_identity,
+                    ambiguous_file_identity,
+                    embedded_image_key,
                     return_to,
                     page,
                     in_flight_guard,
@@ -3332,6 +3353,8 @@ impl App {
             card_message_id,
             rich_message_id,
             sent_file_identity,
+            ambiguous_file_identity,
+            embedded_image_key,
             return_to,
             page,
             in_flight_guard,
@@ -3394,6 +3417,8 @@ impl App {
                 timeout_ms,
                 existing_rich_message_id: rich_message_id.as_deref(),
                 existing_sent_file_identity: sent_file_identity,
+                existing_ambiguous_file_identity: ambiguous_file_identity,
+                existing_embedded_image_key: embedded_image_key.as_deref(),
             },
         )
         .await;
@@ -3566,6 +3591,8 @@ impl App {
                         timeout_ms,
                         existing_rich_message_id: None,
                         existing_sent_file_identity: None,
+                        existing_ambiguous_file_identity: None,
+                        existing_embedded_image_key: None,
                     },
                 )
                 .await;
@@ -4188,9 +4215,9 @@ impl App {
     /// and a 30 MB upload cannot fit it, so the click records the intent, spawns
     /// the transfer and returns a toast immediately; the transfer then re-reads
     /// the file locally, posts exactly ONE File Message under the clicked card,
-    /// and PATCHes that card with the outcome — `已发送为文件消息`, or `未发送`
-    /// for a file past the 30 MB cap, a failed upload/send, or a timeout. No
-    /// network work rides the callback path.
+    /// and PATCHes that card with the outcome — `已发送为文件消息`, `未发送`
+    /// for a file past the 30 MB cap or definite failure, or an honest unknown
+    /// result after an ambiguous timeout. No network work rides the callback path.
     async fn handle_viewer_file_action(
         self: &Arc<Self>,
         value: &serde_json::Value,
@@ -4217,15 +4244,19 @@ impl App {
             message_id.to_string(),
             content_identity,
         );
-        if self
+        let prior_transfer = self
             .viewer_file_transfers_sent
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains_key(&transfer_key)
-        {
+            .get(&transfer_key)
+            .copied();
+        if let Some(status) = prior_transfer {
             return Some(CardActionResult {
                 card: None,
-                toast: Some("文件已发送".to_string()),
+                toast: Some(match status {
+                    ViewerFileTransferStatus::Sent => "文件已发送".to_string(),
+                    ViewerFileTransferStatus::OutcomeUnknown => "发送结果未知，为避免重复未重试".to_string(),
+                }),
             });
         }
         let Some(in_flight_guard) = self.claim_viewer_action(&thread_key, message_id) else {
@@ -4334,10 +4365,16 @@ impl App {
                     .get("viewer_embedded_image_key")
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_string);
-                if matches!(
-                    &lane.delivery,
-                    crate::feishu::card::tool_render::FileDelivery::SentAsFile
-                ) {
+                let transfer_status = match &lane.delivery {
+                    crate::feishu::card::tool_render::FileDelivery::SentAsFile => {
+                        Some(ViewerFileTransferStatus::Sent)
+                    }
+                    crate::feishu::card::tool_render::FileDelivery::FileSendOutcomeUnknown => {
+                        Some(ViewerFileTransferStatus::OutcomeUnknown)
+                    }
+                    _ => None,
+                };
+                if let Some(status) = transfer_status {
                     let mut sent = self
                         .viewer_file_transfers_sent
                         .lock()
@@ -4346,12 +4383,14 @@ impl App {
                     remember_viewer_file_transfer(
                         &mut sent,
                         (key.0.clone(), key.1.clone(), content_identity),
+                        status,
                         crate::bridge::handles::FILE_MESSAGE_SENDS_CAP,
                     );
                     if let Some(delivered_identity) = lane.content_identity {
                         remember_viewer_file_transfer(
                             &mut sent,
                             (key.0, key.1, delivered_identity),
+                            status,
                             crate::bridge::handles::FILE_MESSAGE_SENDS_CAP,
                         );
                     }
@@ -4852,14 +4891,29 @@ impl App {
 
 #[cfg(test)]
 mod viewer_reread_slot_tests {
-    use super::{remember_viewer_file_transfer, spawn_bounded_viewer_fs_read};
+    use super::{ViewerFileTransferStatus, remember_viewer_file_transfer, spawn_bounded_viewer_fs_read};
 
     #[test]
     fn viewer_transfer_once_guard_evicts_the_oldest_entry_at_its_cap() {
         let mut sent = indexmap::IndexMap::new();
-        remember_viewer_file_transfer(&mut sent, ("chat".into(), "card".into(), 1), 2);
-        remember_viewer_file_transfer(&mut sent, ("chat".into(), "card".into(), 2), 2);
-        remember_viewer_file_transfer(&mut sent, ("chat".into(), "other".into(), 3), 2);
+        remember_viewer_file_transfer(
+            &mut sent,
+            ("chat".into(), "card".into(), 1),
+            ViewerFileTransferStatus::Sent,
+            2,
+        );
+        remember_viewer_file_transfer(
+            &mut sent,
+            ("chat".into(), "card".into(), 2),
+            ViewerFileTransferStatus::Sent,
+            2,
+        );
+        remember_viewer_file_transfer(
+            &mut sent,
+            ("chat".into(), "other".into(), 3),
+            ViewerFileTransferStatus::Sent,
+            2,
+        );
 
         assert_eq!(sent.len(), 2);
         assert!(!sent.contains_key(&("chat".into(), "card".into(), 1)));
@@ -4872,14 +4926,14 @@ mod viewer_reread_slot_tests {
         let mut sent = indexmap::IndexMap::new();
         let old = ("chat".into(), "card".into(), 11);
         let refreshed = ("chat".into(), "card".into(), 22);
-        remember_viewer_file_transfer(&mut sent, old.clone(), 10);
+        remember_viewer_file_transfer(&mut sent, old.clone(), ViewerFileTransferStatus::Sent, 10);
 
         assert!(sent.contains_key(&old), "same snapshot remains deliver-once");
         assert!(
             !sent.contains_key(&refreshed),
             "a refreshed content identity can be delivered"
         );
-        remember_viewer_file_transfer(&mut sent, refreshed.clone(), 10);
+        remember_viewer_file_transfer(&mut sent, refreshed.clone(), ViewerFileTransferStatus::Sent, 10);
         assert!(sent.contains_key(&refreshed));
     }
 

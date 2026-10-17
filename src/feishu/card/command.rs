@@ -388,6 +388,8 @@ pub(crate) async fn send_cat_card(
                     timeout_ms: timeout,
                     existing_rich_message_id: None,
                     existing_sent_file_identity: None,
+                    existing_ambiguous_file_identity: None,
+                    existing_embedded_image_key: None,
                 },
             )
             .await;

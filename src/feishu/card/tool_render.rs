@@ -48,8 +48,9 @@ pub struct ToolFile {
 /// A File Content's card delivery (ADR-0076). Exactly one per File Content; the
 /// card build renders the line and image from it instead of re-deriving
 /// anything. A content that cannot be embedded is delivered as a File Message
-/// (#649): `SentAsFile` when the message went out, `Undelivered` when it could
-/// not be — over Feishu's 30MB cap, or a failed upload/send.
+/// (#649): `SentAsFile` when the message went out, `FileSendOutcomeUnknown` when
+/// a timed-out request may have landed, or `Undelivered` when it could not be —
+/// over Feishu's 30MB cap, or a failed upload/send.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileDelivery {
     /// The render path has not resolved this content yet. A card built before
@@ -65,6 +66,10 @@ pub enum FileDelivery {
     /// is already threaded, a plain reply that creates no topic otherwise
     /// (ADR-0076's amendment). The panel line reads `· 已发送为文件消息`.
     SentAsFile,
+    /// A File Message send timed out after the request may have reached Feishu.
+    /// Do not retry this identity: the card says the result is unknown because
+    /// the message cannot be edited or retracted.
+    FileSendOutcomeUnknown,
     /// A preview the card structurally cannot hold, posted as exactly one
     /// Rich Text Message (`msg_type: "post"` carrying the `md` tag) under the
     /// viewer (ADR-0083 §5, #741). The reply rides the same generic reply path
@@ -83,6 +88,7 @@ impl FileDelivery {
             FileDelivery::Embedded { image_key } => Some(image_key),
             FileDelivery::Unresolved
             | FileDelivery::SentAsFile
+            | FileDelivery::FileSendOutcomeUnknown
             | FileDelivery::SentAsRichText
             | FileDelivery::Undelivered => None,
         }
@@ -654,6 +660,7 @@ pub(crate) fn delivery_suffix(delivery: &FileDelivery) -> Option<&'static str> {
     match delivery {
         FileDelivery::Embedded { .. } => Some("已内嵌"),
         FileDelivery::SentAsFile => Some("已发送为文件消息"),
+        FileDelivery::FileSendOutcomeUnknown => Some("发送结果未知，可能已发送；为避免重复未重试"),
         FileDelivery::SentAsRichText => Some("已发送为富文本消息"),
         FileDelivery::Undelivered => Some("未发送"),
         FileDelivery::Unresolved => None,

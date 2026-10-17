@@ -357,6 +357,9 @@ pub struct CallGate {
     pub entered: Arc<tokio::sync::Notify>,
     /// The parked call proceeds once this is signalled.
     pub release: Arc<tokio::sync::Notify>,
+    /// Whether the test models Feishu accepting a message before the response
+    /// is held, making a timeout explicitly ambiguous.
+    pub accepted_before_reply: bool,
 }
 
 /// A scripted `reply_card` outcome (spec #561, review #569).
@@ -579,6 +582,26 @@ impl RecordingPlatform {
             target: target.to_string(),
             entered: entered.clone(),
             release: release.clone(),
+            accepted_before_reply: false,
+        });
+        (entered, release)
+    }
+
+    /// Park the first matching reply after recording it as accepted, so a
+    /// caller timing out observes an accepted-but-unacknowledged send.
+    pub fn pause_after_accept(
+        &self,
+        method: &'static str,
+        target: &str,
+    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.pause_call.lock().unwrap() = Some(CallGate {
+            method,
+            target: target.to_string(),
+            entered: entered.clone(),
+            release: release.clone(),
+            accepted_before_reply: true,
         });
         (entered, release)
     }
@@ -1298,17 +1321,25 @@ impl feishu::Platform for RecordingPlatform {
             .unwrap()
             .pop_front()
             .unwrap_or_else(|| "msg_file".into());
-        // A test may park the send (the once-guard's single-flight tests):
-        // signal entry, then hold until released, so a concurrent resolver is
-        // forced to await it.
-        if let Some(gate) = self.take_gate("send_message", message_id) {
+        let gate = self.take_gate("send_message", message_id);
+        let accepted_before_reply = gate.as_ref().is_some_and(|gate| gate.accepted_before_reply);
+        if accepted_before_reply {
+            self.calls.lock().await.push(PlatformCall::SendMessageReply {
+                message_id: message_id.into(),
+                msg_type: msg_type.into(),
+                content: content.clone(),
+            });
+        }
+        if let Some(gate) = gate {
             wait_gate(gate).await;
         }
-        self.calls.lock().await.push(PlatformCall::SendMessageReply {
-            message_id: message_id.into(),
-            msg_type: msg_type.into(),
-            content: content.clone(),
-        });
+        if !accepted_before_reply {
+            self.calls.lock().await.push(PlatformCall::SendMessageReply {
+                message_id: message_id.into(),
+                msg_type: msg_type.into(),
+                content: content.clone(),
+            });
+        }
         Ok((reply_id, Some("omt_file".into())))
     }
 }
