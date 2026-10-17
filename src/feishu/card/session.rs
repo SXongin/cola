@@ -1059,6 +1059,19 @@ pub(crate) fn tool_file_value(session_id: &str, path: &str) -> serde_json::Value
     value
 }
 
+/// The routing payload a Tool Panel's 「🌐 预览网页」 button carries (#778): the
+/// same Session-routed [`tool_file_value`], plus `op: "preview"`. The op is the
+/// whole difference: it tells the `action: "file"` dispatch that the click
+/// **sends** the file as one File Message and must **not** PATCH the clicked
+/// message — the panel rides the agent's Turn card, which a transfer's card
+/// PATCH would overwrite (#739's `op: "send"` rewrites the viewer card it was
+/// clicked on, and that is exactly what must not happen here).
+pub(crate) fn tool_page_value(session_id: &str, path: &str) -> serde_json::Value {
+    let mut value = tool_file_value(session_id, path);
+    value["op"] = json!("preview");
+    value
+}
+
 /// The browse card's clickable breadcrumb (ADR-0078): 🏠 home, ⬆ 上一级, then
 /// the path's tail segments (at most four, with a leading `…` jumping to the
 /// segment just before them) as `column_set`/`flex_mode: "flow"` buttons.
@@ -2668,6 +2681,29 @@ mod tests {
         assert!(
             tool.get("chat_id").is_none(),
             "a live Turn card knows no Chat: {tool}"
+        );
+    }
+
+    /// A Tool Panel's 「🌐 预览网页」 payload (#778) is the open payload plus
+    /// `op: "preview"` — the same `action: "file"`, path and Session, so the
+    /// transfer routes identically, with the op marking the one difference: the
+    /// click sends, and no card is rewritten.
+    #[test]
+    fn tool_panel_page_payload_marks_the_preview_op() {
+        let preview = tool_page_value("ses_1", "/work/index.html");
+        let open = tool_file_value("ses_1", "/work/index.html");
+        assert_eq!(preview["action"], open["action"], "one action tag: {preview}");
+        assert_eq!(preview["path"], open["path"], "one path key: {preview}");
+        assert_eq!(preview["session_id"], "ses_1");
+        assert_eq!(
+            preview["op"], "preview",
+            "the op the dispatch routes by: {preview}"
+        );
+        assert!(open.get("op").is_none(), "the open payload stays op-less: {open}");
+        assert!(preview.get("chat_id").is_none(), "no Chat rides along: {preview}");
+        assert!(
+            preview.get("dir").is_none(),
+            "no listing, no return target: {preview}"
         );
     }
 

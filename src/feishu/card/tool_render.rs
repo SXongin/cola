@@ -21,7 +21,8 @@ const V2_DIRECTORY_HEADER_PREFIX: &str = "Read directory ";
 /// The line a `read` panel appends under a body its budget CLIPPED
 /// (ADR-0083 §8 amendment, #770): the panel is a
 /// [`TOOL_OUTPUT_MAX_CHARS`]-character preview, so a clipped one says so where
-/// the reader can act on it — the 「📂 打开」 button inside the fold.
+/// the reader can act on it — the way-in button inside the fold (「📂 打开」, or
+/// 「🌐 预览网页」 for an HTML page, #778).
 const READ_TRUNCATION_NOTE: &str = "_（预览已截断，打开查看完整文件）_";
 
 /// A Tool Panel: the typed tool call as the card renders it (ADR-0053).
@@ -1025,27 +1026,41 @@ pub(crate) fn file_image_estimate(tool: &ToolPanel) -> usize {
         .sum()
 }
 
-/// The 「📂 打开」 button a panel naming an open path carries (ADR-0083 §8, #743):
-/// a `button` element placed INSIDE the panel's body, first, so the folded card
-/// shows no button row (ADR-0083 §8 amendment, #766) and a long diff — or a
-/// clipped `read` body (ADR-0083 §8 amendment, #770) — cannot push the way in
-/// out of view. Its value is the panel's [`super::session::tool_file_value`]
-/// payload: `action: "file"` with no `op`, opening the File Viewer rather than
-/// transferring it (#739's `op: "send"`). Feishu's JSON 2.0 button supports
-/// nesting in a collapsible panel. `None` when the panel names no open path
-/// ([`ToolPanel::file_open_path`]: a `write`/`edit`, or a FILE `read`) or no
-/// Session is known to route the click by — no button rather than a broken one.
+/// The way-in button a panel naming an open path carries (ADR-0083 §8, #743,
+/// #778): a `button` element placed INSIDE the panel's body, first, so the
+/// folded card shows no button row (ADR-0083 §8 amendment, #766) and a long
+/// diff — or a clipped `read` body (ADR-0083 §8 amendment, #770) — cannot push
+/// the way in out of view. Feishu's JSON 2.0 button supports nesting in a
+/// collapsible panel.
+///
+/// An HTML page (`.html`/`.htm`, [`super::viewer::is_html_page_path`]) reads
+/// 「🌐 预览网页」 and carries the [`super::session::tool_page_value`] payload
+/// (`op: "preview"`): the panel's body already showed the markup, so the middle
+/// hop through the viewer buys nothing, and the click sends the File Message the
+/// client renders — WITHOUT rewriting the clicked Turn card (#778). Every other
+/// file keeps 「📂 打开」 and the [`super::session::tool_file_value`] payload
+/// (`action: "file"` with no `op`), opening the File Viewer rather than
+/// transferring it (#739's `op: "send"`).
+///
+/// `None` when the panel names no open path ([`ToolPanel::file_open_path`]: a
+/// `write`/`edit`, or a FILE `read`) or no Session is known to route the click
+/// by — no button rather than a broken one.
 pub(super) fn tool_open_button_element(
     tool: &ToolPanel,
     session_id: Option<&str>,
 ) -> Option<serde_json::Value> {
     let path = tool.file_open_path()?;
     let session_id = session_id.filter(|id| !id.is_empty())?;
+    let (label, value) = if super::viewer::is_html_page_path(path) {
+        ("🌐 预览网页", super::session::tool_page_value(session_id, path))
+    } else {
+        ("📂 打开", super::session::tool_file_value(session_id, path))
+    };
     Some(serde_json::json!({
         "tag": "button",
-        "text": { "tag": "plain_text", "content": "📂 打开" },
+        "text": { "tag": "plain_text", "content": label },
         "type": "default",
-        "value": super::session::tool_file_value(session_id, path),
+        "value": value,
     }))
 }
 
@@ -1063,7 +1078,7 @@ pub(crate) fn tool_open_button_estimate(tool: &ToolPanel, session_id: Option<&st
 /// The note a `read` panel appends under a body its budget CLIPPED (ADR-0083 §8
 /// amendment, #770): the body is a [`TOOL_OUTPUT_MAX_CHARS`]-character preview,
 /// so a clipped one says what it is and names the way to the rest. It renders
-/// IFF that way renders — the panel carries the 「📂 打开」 button
+/// IFF that way renders — the panel carries a way-in button
 /// ([`tool_open_button_element`]: a file read, and a Session to route the click
 /// by) — so the note never promises a control a directory read, an image read
 /// or a routeless panel does not have, and the size estimate can charge exactly
@@ -2784,6 +2799,55 @@ mod tests {
             assert_eq!(body[0]["tag"], "button", "the button leads the body: {card}");
             assert_eq!(body[0]["value"]["path"], "/x/y.rs");
             assert_eq!(body[1]["tag"], "markdown", "the content follows: {card}");
+        }
+    }
+
+    /// An HTML page's Tool Panel (#778) leads with 「🌐 预览网页」 and carries the
+    /// `op: "preview"` payload: `write`, `edit` and a FILE `read` of an
+    /// `.html`/`.htm` path (case-insensitively) all take it, on the SAME
+    /// structured path the open payload used, so the click sends the File
+    /// Message the client renders instead of detouring through the viewer whose
+    /// source the panel already showed. A non-page path is untouched (its own
+    /// tests above).
+    #[test]
+    fn an_html_panel_leads_with_a_page_preview_button() {
+        // `write`/`edit` and a file `read`, across V1/V2 input keys and both
+        // HTML extensions — the extension decides, never the tool.
+        let cases: Vec<(&str, serde_json::Value, String)> = vec![
+            (
+                "write",
+                json!({"filePath": "/site/index.html", "content": "<p>hi</p>"}),
+                "ok".to_string(),
+            ),
+            ("edit", json!({"path": "/site/INDEX.HTM"}), "ok".to_string()),
+            (
+                "read",
+                json!({"filePath": "/site/page.html"}),
+                "Read file /site/page.html, lines 1-1\n1: <p>hi</p>".to_string(),
+            ),
+        ];
+        for (name, input, output) in cases {
+            let panel = ToolPanel::for_test(name, ToolStatus::Completed, Some(input), Some(&output));
+            let path = panel.file_open_path().expect("the panel names its path");
+            let button = tool_open_button_element(&panel, Some("ses_1")).expect("the button");
+            assert_eq!(button["tag"], "button");
+            assert_eq!(button["text"]["content"], "🌐 预览网页", "{name} {path}");
+            let value = &button["value"];
+            assert_eq!(value["action"], "file", "one action tag: {value}");
+            assert_eq!(value["path"], path);
+            assert_eq!(value["session_id"], "ses_1");
+            assert_eq!(
+                value["op"], "preview",
+                "the op that sends without rewriting the clicked card: {value}"
+            );
+            assert!(value.get("dir").is_none(), "no listing rides along: {value}");
+            // The estimate charges the very element that renders, whatever its
+            // label and payload — one constructor, no re-derivation.
+            assert_eq!(panel.open_button_count(Some("ses_1")), 1, "one component");
+            assert!(
+                tool_open_button_estimate(&panel, Some("ses_1")) > 0,
+                "and its bytes are charged"
+            );
         }
     }
 

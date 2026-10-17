@@ -941,17 +941,29 @@ fn naming_block(view: &ViewerCard<'_>) -> String {
     )
 }
 
+/// Whether a path spells an HTML page extension (#774, #778): `html`/`htm`,
+/// case-insensitively. The extension never decides the KIND — CONTENT does
+/// (§6) — and this is the one rule the viewer's page lane and a Tool Panel's
+/// 「🌐 预览网页」 button share, so the two can never disagree about which
+/// files are pages.
+pub(crate) fn is_html_page_path(path: &str) -> bool {
+    matches!(
+        std::path::Path::new(path)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("html" | "htm")
+    )
+}
+
 /// Whether this viewer is an HTML page's lane (#774): its bytes are text — the
 /// CONTENT decides that, as §6 requires — and the path spells an HTML
-/// extension. The extension never decides the KIND; it decides only which
-/// transfer the card leads with, because the page's rendered preview exists
-/// solely in the client's File Message preview.
+/// extension ([`is_html_page_path`]). The extension never decides the KIND; it
+/// decides only which transfer the card leads with, because the page's rendered
+/// preview exists solely in the client's File Message preview.
 fn needs_html_page_lane(view: &ViewerCard<'_>) -> bool {
-    matches!(view.kind, ViewerKind::Text | ViewerKind::TextTooLarge)
-        && matches!(
-            view.ext.map(str::to_ascii_lowercase).as_deref(),
-            Some("html" | "htm")
-        )
+    matches!(view.kind, ViewerKind::Text | ViewerKind::TextTooLarge) && is_html_page_path(view.path)
 }
 
 /// Whether the file's own bytes already went out (or may have) as a File
