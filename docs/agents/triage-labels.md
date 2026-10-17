@@ -1,19 +1,21 @@
 # Triage Labels
 
-The skills speak in terms of five canonical triage roles. This file maps those roles to the actual label strings used in this repo's issue tracker.
+The skills speak in terms of five canonical triage roles, and in this tracker each
+role's label is the role name, unchanged:
 
-| Role in skills    | Label in our tracker | Meaning                                  |
-| ----------------- | -------------------- | ---------------------------------------- |
-| `needs-triage`    | `needs-triage`       | Maintainer needs to evaluate this issue  |
-| `needs-info`      | `needs-info`         | Waiting on reporter for more information |
-| `ready-for-agent` | `ready-for-agent`    | Fully specified, ready for an AFK agent  |
-| `ready-for-human` | `ready-for-human`    | Requires human implementation            |
-| `wontfix`         | `wontfix`            | Will not be actioned                     |
+`needs-triage` · `needs-info` · `ready-for-agent` · `ready-for-human` · `wontfix`
+
+- `needs-triage` — the maintainer evaluates it.
+- `needs-info` — waiting on the reporter.
+- `ready-for-agent` — fully specified, ready for an AFK agent.
+- `ready-for-human` — requires human implementation.
+- `wontfix` — will not be actioned.
 
 Repo-local, not a skill role — skills neither apply nor consume it:
 
-| Label      | Meaning                                                                                       |
-| ---------- | --------------------------------------------------------------------------------------------- |
-| `deferred` | Evaluated; intentionally postponed and may be revisited. Stays open, unlike `wontfix`.        |
+- `deferred` — evaluated, intentionally postponed, and may be revisited. Stays
+  open, unlike `wontfix`.
 
-When a skill mentions a role (e.g. "apply the AFK-ready triage label"), use the corresponding GitHub label. Archive files under `.scratch/` still carry the equivalent `Status:` string, but those are inert.
+When a skill mentions a role (e.g. "apply the AFK-ready triage label"), use the
+label of that name. Archive files under `.scratch/` still carry the equivalent
+`Status:` string, but those are inert.
