@@ -11,7 +11,7 @@ CI deliberately kept this pass out of `/code-review` (`ADR-0034`, 2026-10-04 ame
 
 ## The rubric is not written here
 
-Do not invent the checks. Read `.github/codex/prompts/review.md` and lift its `## The adversarial pass (the part an author-side review tends to miss)` and `## Rules` sections **verbatim** into the sub-agent prompt, so the local pass and the gate stay one rubric. One clause does not carry to this host: the reference trees named in `docs/agents/references.md` exist here, so the host-tree exemption is dropped — say so in the prompt. Everything else stands, the final `CODEX_REVIEW_VERDICT` line included.
+Do not invent the checks. The sub-agent lifts its `## The adversarial pass (the part an author-side review tends to miss)` and `## Rules` sections **verbatim** from `.github/codex/prompts/review.md`, so the local pass and the gate stay one rubric. The rubric is a file in this repo, so hand over its path rather than a copy — no network is involved. One clause does not carry to this host: the reference trees named in `docs/agents/references.md` exist here, so the host-tree exemption is dropped — say so in the prompt. Everything else stands, the final `CODEX_REVIEW_VERDICT` line included.
 
 ## Process
 
@@ -19,17 +19,17 @@ Do not invent the checks. Read `.github/codex/prompts/review.md` and lift its `#
 
 Whatever the caller names for the **base**: a branch, a SHA, or a **ticket window** — the run of commits carrying one ticket's `Refs: #<n>` trailer, with the base at the commit before the run (the `foreman` window definition). Default the base to `main` when none is given. A caller may also scope the review to a **pathspec** (a subset of the touched files) — carry it through to both commands.
 
-Confirm the base resolves (`git rev-parse <base>`). Review with the gate's merge-base semantics: `BASE=$(git merge-base <base> HEAD)`, then `git diff "$BASE"` (add `-- <paths>` when scoped) — the scope of CI's `git diff <base>...HEAD`, extended to the working tree so committed, staged, and unstaged work are all in scope. That diff still omits **untracked** files, so list them with `git ls-files --others --exclude-standard` (add `-- <paths>` when scoped) and hand them to the reviewer as content. The commit list is `git log <base>..HEAD --oneline` (add `-- <paths>` when scoped). Fail here when the diff and the untracked list are both empty, never inside the sub-agent.
+Confirm the base resolves (`git rev-parse <base>`). Review with the gate's merge-base semantics: `BASE=$(git merge-base <base> HEAD)`, then `git diff "$BASE"` (add `-- <paths>` when scoped) — the scope of CI's `git diff <base>...HEAD`, extended to the working tree so committed, staged, and unstaged work are all in scope. That diff still omits **untracked** files, so list them with `git ls-files --others --exclude-standard` (add `-- <paths>` when scoped) and hand the reviewer the **paths** — it reads each one itself and reports any it could not. The commit list is `git log <base>..HEAD --oneline` (add `-- <paths>` when scoped). Fail here when the diff and the untracked list are both empty, never inside the sub-agent.
 
 ### 2. Spawn one reviewer sub-agent
 
 Dispatch a single `code-reviewer` sub-agent **from the orchestrating session** — a sub-agent cannot spawn it. The prompt carries:
 
 - the merge-base SHA `BASE` and the pathspec, so the reviewer runs `git diff "$BASE"` itself (plus `-- <paths>`) — hand over the **ref, never pasted diff text**; it holds `git diff`, `git log` and `git show`. Give the commit list as the command too (`git log <base>..HEAD --oneline`, plus `-- <paths>` when scoped);
-- the untracked files' **content** from `git ls-files --others --exclude-standard` (they are not in the diff);
-- the `## The adversarial pass` and `## Rules` sections pasted in full (the sub-agent has no network; paste the rubric rather than pointing at it), minus the host-tree clause, with that omission stated in the prompt;
+- the untracked **paths** from `git ls-files --others --exclude-standard` (they are in no diff), with the brief requiring every one to be read;
+- the path `.github/codex/prompts/review.md` and the two sections to lift from it (`## The adversarial pass`, `## Rules`) — the rubric is a local file, so a pointer replaces a copy;
 - this brief:
-  > You are reproducing the CI Codex gate's adversarial pass on this diff. The reference trees named in `docs/agents/references.md` exist on this host, so the host-tree exemption in the Rules does not apply. Report findings first and finish with the `CODEX_REVIEW_VERDICT` line the Rules prescribe.
+  > You are reproducing the CI Codex gate's adversarial pass on this diff. Take `## The adversarial pass` and `## Rules` verbatim from `.github/codex/prompts/review.md`. The reference trees named in `docs/agents/references.md` exist on this host, so the host-tree exemption in the Rules does not apply. Read every untracked path this prompt lists, and report any you could not read. Report findings first and finish with the `CODEX_REVIEW_VERDICT` line the Rules prescribe.
 
 ### 3. Re-review round (same scope)
 
@@ -37,8 +37,8 @@ Dispatch a single `code-reviewer` sub-agent **from the orchestrating session** �
 
 - the findings **verbatim**;
 - the ref pair `<round-head>..HEAD` for the fix's delta, plus the unchanged full-diff command;
-- the **refreshed** untracked files' content (`git ls-files --others --exclude-standard` run again — a fix that adds a file is in neither diff, so the first round's list is stale);
-- the brief: for every finding, resolved / not resolved / partially, with the reason; what the delta could break; and re-derive `CODEX_REVIEW_VERDICT` from the **whole** `git diff "$BASE"`, not the delta alone.
+- the **refreshed** untracked **paths** (`git ls-files --others --exclude-standard` run again — a fix that adds a file is in neither diff, so the first round's list is stale), read in full by the reviewer; a path it silently skips is a coverage hole;
+- the brief: for every finding, resolved / not resolved / partially, with the reason; what the delta could break; read every refreshed untracked path; and re-derive `CODEX_REVIEW_VERDICT` from the **whole** `git diff "$BASE"`, not the delta alone.
 
 Start a fresh reviewer at a new scope, on a design-changing fix, and for a cross-ticket finding — a resumed reviewer has already accepted the rest of the diff.
 
