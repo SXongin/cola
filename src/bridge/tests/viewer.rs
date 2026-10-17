@@ -4434,7 +4434,8 @@ async fn fitting_content_stays_on_the_card() {
     let _wd = test_work_dir();
     let proj = tempfile::tempdir().unwrap();
     std::fs::write(proj.path().join("small.csv"), "name,age\nann,3\nbob,7\n").unwrap();
-    // ~15 KB: several fenced elements, within one card's budget.
+    // ~17 KB of lines: one whole fenced block now that the preview is no
+    // longer cut per raw chunk (#769), still within one card's budget.
     std::fs::write(proj.path().join("big.rs"), "let x = 1;\n".repeat(1_400)).unwrap();
 
     let dir = tempfile::tempdir().unwrap();
@@ -4475,6 +4476,20 @@ async fn fitting_content_stays_on_the_card() {
     assert!(
         text.contains("```rust") && text.contains("let x = 1;"),
         "a large fitting block stays on the card: {text}"
+    );
+    let blocks = card["body"]["elements"]
+        .as_array()
+        .expect("the card body carries elements")
+        .iter()
+        .filter(|element| {
+            element["content"]
+                .as_str()
+                .is_some_and(|content| content.starts_with("```"))
+        })
+        .count();
+    assert_eq!(
+        blocks, 1,
+        "the whole preview is ONE element, never one per raw chunk (#769): {text}"
     );
 
     assert!(
@@ -4539,15 +4554,15 @@ async fn a_post_body_past_the_cap_goes_to_the_file_lane() {
     );
 }
 
-/// #740: even a text file that would need hundreds of raw chunks remains in the
-/// card lane; the renderer windows it and supplies a pager rather than treating
-/// chunk count as structural overflow.
+/// #740/#769: even a text file far past one card's preview budget remains in
+/// the card lane; the renderer windows it by LINES and supplies a pager rather
+/// than treating its length as structural overflow.
 #[tokio::test]
 async fn element_overflow_text_stays_on_the_card_pager() {
     let _wd = test_work_dir();
     let proj = tempfile::tempdir().unwrap();
-    // ~1 MB of short lines: far more raw elements than one card can hold, but
-    // still within the 8 MB preview cap.
+    // ~1 MB of short lines: far more lines than one card can hold, but still
+    // within the 8 MB preview cap.
     std::fs::write(proj.path().join("long.log"), "x\n".repeat(500_000)).unwrap();
 
     let dir = tempfile::tempdir().unwrap();
