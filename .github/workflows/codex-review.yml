@@ -338,20 +338,26 @@ jobs:
             exit 1
           fi
           body=$(jq -nc --arg model "$GATE_MODEL" '{model: $model, input: "ping", max_output_tokens: 16}')
+          curl_status=0
           code=$(curl -sS -o "$RUNNER_TEMP/gate-preflight.json" -w '%{http_code}' \
             --max-time 30 \
             -X POST "$GATE_ENDPOINT" \
             -H "Authorization: Bearer $GATE_KEY" \
             -H 'Content-Type: application/json' \
             -H 'x-opencode-session: cola-codex-gate-preflight' \
-            -d "$body") || {
-              echo "::error title=Review gate unreachable::curl could not reach $GATE_ENDPOINT."
-              exit 1
-            }
-          if [ "$code" != "200" ]; then
-            echo "::error title=Review gate credential::HTTP $code from $GATE_ENDPOINT: $(head -c 400 "$RUNNER_TEMP/gate-preflight.json" | tr '\n' ' ')"
+            -d "$body") || curl_status=$?
+          # `--write-out` prints the status even when the body transfer then
+          # breaks, so a response cut after its headers keeps its status; `000`
+          # means no status was ever received.
+          if [ "$code" = "200" ]; then
+            exit 0
+          fi
+          if [ "$code" = "000" ] || [ -z "$code" ]; then
+            echo "::error title=Review gate unreachable::curl could not reach $GATE_ENDPOINT (exit $curl_status)."
             exit 1
           fi
+          echo "::error title=Review gate credential::HTTP $code from $GATE_ENDPOINT: $( (head -c 400 "$RUNNER_TEMP/gate-preflight.json" || true) | tr '\n' ' ')"
+          exit 1
 
       # Bounded, and salvageable when it does not return (#530): a completed
       # review is still published if the step is cancelled at its bound; a cut

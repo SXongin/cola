@@ -196,6 +196,29 @@ mod tests {
         })
     }
 
+    /// A one-shot HTTP stub whose response promises more body than it sends
+    /// and closes, so curl fails the transfer after the headers were read.
+    fn respond_cut(listener: TcpListener, status: u16) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("curl connects");
+            let mut head = String::new();
+            let mut buf = [0u8; 1024];
+            while !head.contains("\r\n\r\n") {
+                let read = stream.read(&mut buf).expect("the request reads");
+                if read == 0 {
+                    break;
+                }
+                head.push_str(&String::from_utf8_lossy(&buf[..read]));
+            }
+            write!(
+                stream,
+                "HTTP/1.1 {status} Service Unavailable\r\nContent-Type: application/json\r\n\
+                 Content-Length: 400\r\nConnection: close\r\n\r\n{{\"error\":{{\"mess"
+            )
+            .expect("the partial response writes");
+        })
+    }
+
     /// Run the workflow's credential check against `endpoint`.
     fn run_credential_check(endpoint: &str) -> std::process::Output {
         let workflow = workflow();
@@ -413,6 +436,25 @@ mod tests {
             String::from_utf8_lossy(&out.stdout)
         );
         assert!(request.join().unwrap().starts_with("POST /v1/responses"));
+    }
+
+    #[test]
+    fn the_credential_check_keeps_the_status_when_the_body_is_cut() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stub = respond_cut(listener, 503);
+        let out = run_credential_check(&format!("http://{addr}/v1/responses"));
+        let log = String::from_utf8_lossy(&out.stdout);
+        stub.join().unwrap();
+        assert!(!out.status.success(), "a 503 must fail the step");
+        assert!(
+            log.contains("HTTP 503"),
+            "a cut body must not hide the status the endpoint sent: {log}"
+        );
+        assert!(
+            !log.contains("could not reach"),
+            "the endpoint was reached, so the failure is not a transport one: {log}"
+        );
     }
 
     #[test]
