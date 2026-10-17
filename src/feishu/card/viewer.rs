@@ -77,6 +77,9 @@ pub(crate) struct ViewerFileLane {
     pub(crate) name: String,
     pub(crate) size: u64,
     pub(crate) delivery: FileDelivery,
+    /// An image already embedded before a later file transfer. It remains on
+    /// the viewer while `delivery` records the additional File Message.
+    pub(crate) embedded_image_key: Option<String>,
     /// The Rich Text Message carrying a structural overflow, when one landed.
     /// This id is carried by every viewer control instead of process-local state.
     pub(crate) rich_message_id: Option<String>,
@@ -535,13 +538,14 @@ pub(crate) fn build_viewer_card(thread_key: &ThreadKey, view: ViewerCard<'_>) ->
             // An image Feishu would not embed (past its caps) has no element — its
             // tracking line below says it went out as a File Message instead.
             ViewerKind::Image => {
-                if let Some(ViewerFileLane {
-                    delivery: FileDelivery::Embedded { image_key },
-                    name,
-                    ..
-                }) = &view.lane
-                {
-                    elements.push(file_image_element(image_key, name));
+                if let Some(lane) = &view.lane {
+                    let image_key = lane.embedded_image_key.as_deref().or(match &lane.delivery {
+                        FileDelivery::Embedded { image_key } => Some(image_key.as_str()),
+                        _ => None,
+                    });
+                    if let Some(image_key) = image_key {
+                        elements.push(file_image_element(image_key, &lane.name));
+                    }
                 }
             }
             // No preview: the bytes went out (or could not) as a File Message, and
@@ -700,9 +704,11 @@ fn push_text_page(
         super::tool_render::FileDelivery::SentAsRichText => "sent_as_rich_text",
         super::tool_render::FileDelivery::Undelivered => "undelivered",
     });
-    let lane_image_key = view.lane.as_ref().and_then(|lane| match &lane.delivery {
-        super::tool_render::FileDelivery::Embedded { image_key } => Some(image_key.as_str()),
-        _ => None,
+    let lane_image_key = view.lane.as_ref().and_then(|lane| {
+        lane.embedded_image_key.as_deref().or(match &lane.delivery {
+            super::tool_render::FileDelivery::Embedded { image_key } => Some(image_key.as_str()),
+            _ => None,
+        })
     });
     let lane_rich_message_id = view
         .lane
@@ -983,11 +989,11 @@ fn lane_line(lane: &ViewerFileLane) -> String {
     }
 }
 
-/// The viewer's button row (ADR-0083 §3, §5): 「📂 所在目录」 always, 「← 返回目录」
-/// when the viewer was opened from a browse listing, and 「发为文件」 unless the
+/// The viewer's button row (ADR-0083 §3, §5): 「← 返回目录」 when opened from a
+/// browse listing, otherwise 「📂 所在目录」, and 「发为文件」 unless the
 /// preview already landed as its own message (`overflowed`): a landed preview
 /// needs no rescue delivery, while a preview the lane did NOT deliver keeps
-/// the button as its way out. The two directory buttons carry the browse
+/// the button as its way out. The directory control carries the browse
 /// handler's own payload shape ([`browse_view_value`]) so #742 only has to
 /// pass the listing in; the transfer button carries the RESOLVED path the
 /// click must upload, plus the browse listing's whole state so the card it
@@ -1095,6 +1101,10 @@ pub(crate) fn lane_from_page_payload(value: &serde_json::Value) -> Option<Viewer
         name,
         size,
         delivery,
+        embedded_image_key: value
+            .get("viewer_lane_image_key")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
         rich_message_id: value
             .get("viewer_lane_rich_message_id")
             .and_then(serde_json::Value::as_str)
@@ -1182,6 +1192,14 @@ fn transfer_value(thread_key: &ThreadKey, view: &ViewerCard<'_>) -> serde_json::
     }
     if let Some(session_dir) = view.session_dir {
         value["session_dir"] = json!(session_dir);
+    }
+    if let Some(image_key) = view.lane.as_ref().and_then(|lane| {
+        lane.embedded_image_key.as_deref().or(match &lane.delivery {
+            super::tool_render::FileDelivery::Embedded { image_key } => Some(image_key.as_str()),
+            _ => None,
+        })
+    }) {
+        value["viewer_embedded_image_key"] = json!(image_key);
     }
     value
 }
@@ -1555,6 +1573,7 @@ mod tests {
             name: name.to_string(),
             size,
             delivery,
+            embedded_image_key: None,
             rich_message_id: None,
             refresh_failed: false,
         });
@@ -2148,6 +2167,24 @@ mod tests {
         assert_eq!(images[0]["preview"], true, "a click enlarges it");
     }
 
+    #[test]
+    fn page_payload_recovers_a_completed_non_undelivered_lane() {
+        let lane = lane_from_page_payload(&json!({
+            "viewer_lane_mime": "image/png",
+            "viewer_lane_name": "shot.png",
+            "viewer_lane_size": "2048",
+            "viewer_lane_delivery": "sent_as_file",
+            "viewer_lane_image_key": "img_v2_shot",
+            "viewer_lane_refresh_failed": "false",
+        }))
+        .expect("a completed whole-bytes lane survives a page flip");
+
+        assert_eq!(lane.mime, "image/png");
+        assert_eq!(lane.size, 2048);
+        assert_eq!(lane.delivery, FileDelivery::SentAsFile);
+        assert_eq!(lane.embedded_image_key.as_deref(), Some("img_v2_shot"));
+    }
+
     /// A binary is delivered as a File Message: no preview element, a tracking
     /// line that says where the bytes went — and NO copy promising a client-side
     /// preview (the platform's 在线预览 list is unverified, ADR-0083 §10).
@@ -2250,6 +2287,7 @@ mod tests {
             name: "people.csv".to_string(),
             size: 15,
             delivery: FileDelivery::SentAsRichText,
+            embedded_image_key: None,
             rich_message_id: Some("om_rich".into()),
             refresh_failed: false,
         });
@@ -2280,6 +2318,7 @@ mod tests {
             name: "people.csv".to_string(),
             size: 15,
             delivery: FileDelivery::Undelivered,
+            embedded_image_key: None,
             rich_message_id: None,
             refresh_failed: false,
         });

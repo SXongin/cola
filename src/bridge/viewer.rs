@@ -505,6 +505,7 @@ pub(crate) async fn open_overflow_lane(
             name: preview.name.to_string(),
             size: preview.size,
             delivery: FileDelivery::Undelivered,
+            embedded_image_key: None,
             rich_message_id: Some(message_id.to_string()),
             refresh_failed: true,
         });
@@ -524,6 +525,7 @@ pub(crate) async fn open_overflow_lane(
             name: preview.name.to_string(),
             size: preview.size,
             delivery,
+            embedded_image_key: None,
             rich_message_id,
             refresh_failed,
         });
@@ -563,6 +565,7 @@ pub(crate) async fn open_overflow_lane(
         name: preview.name.to_string(),
         size: preview.size,
         delivery,
+        embedded_image_key: None,
         rich_message_id,
         refresh_failed,
     })
@@ -767,6 +770,7 @@ pub(crate) async fn open_lane(
             name: name.to_string(),
             size,
             delivery: FileDelivery::Undelivered,
+            embedded_image_key: None,
             rich_message_id: None,
             refresh_failed: false,
         });
@@ -786,6 +790,7 @@ pub(crate) async fn open_lane(
         name: name.to_string(),
         size,
         delivery,
+        embedded_image_key: None,
         rich_message_id: None,
         refresh_failed: false,
     })
@@ -871,6 +876,7 @@ pub(crate) async fn send_prepared_file_transfer(
         name,
         size,
         delivery,
+        embedded_image_key: None,
         rich_message_id: None,
         refresh_failed: false,
     }
