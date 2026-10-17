@@ -308,6 +308,7 @@ carries the same control, in the same place:
 
 Everything else in §8 stands: prose paths are still never parsed into controls, and a `read` stays a
 cola-local, generation-neutral read.
+
 ## Amendment (2026-10-17, #771): the viewer card stops repeating the path-scope statement
 
 §4 remains the home of the privacy statement — the scope is advisory, a hint rather than a
