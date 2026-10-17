@@ -4427,6 +4427,235 @@ async fn a_tool_open_of_an_overflowing_preview_sends_then_replies() {
     );
 }
 
+/// #778: a Tool Panel of an HTML page leads with 「🌐 预览网页」, and its click
+/// sends the page as exactly ONE File Message WITHOUT PATCHing the clicked
+/// message — that message is the agent's **Turn card**, and the transfer's own
+/// card PATCH would overwrite the panel and the reply. The panel's structured
+/// path is relative, so this also pins the Path Scope resolution the open lane
+/// applies. The button stays on the card, so a duplicate click is refused by the
+/// send memory instead of a PATCH.
+#[tokio::test]
+async fn a_tool_panel_html_preview_sends_a_file_message_and_leaves_the_turn_card_alone() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    std::fs::write(proj.path().join("index.html"), "<!doctype html><p>hi</p>\n").unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+
+    // The payload the panel's 「🌐 预览网页」 button carries (the Session, never
+    // the Chat), plus the clicked Turn card the platform threads in.
+    let mut payload = crate::feishu::card::session::tool_page_value("ses_seed", "index.html");
+    payload["open_message_id"] = serde_json::json!("msg_turn_card");
+    let result = app.host_action(payload.clone()).await.expect("the click acks");
+    assert!(result.card.is_none(), "the click does not rebuild inline");
+    assert_eq!(
+        result.toast.as_deref(),
+        Some("正在发送文件…"),
+        "the callback acknowledges immediately"
+    );
+
+    let posts = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let posts = file_messages(&platform).await;
+            if !posts.is_empty() {
+                break posts;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the preview's File Message lands");
+    assert_eq!(posts.len(), 1, "exactly one File Message: {posts:?}");
+    match &posts[0] {
+        PlatformCall::SendMessageReply {
+            message_id, msg_type, ..
+        } => {
+            assert_eq!(message_id, "msg_turn_card", "the reply targets the clicked card");
+            assert_eq!(msg_type, "file", "the page rides a File Message");
+        }
+        other => panic!("expected a file reply, got {other:?}"),
+    }
+    assert!(
+        rich_text_messages(&platform).await.is_empty(),
+        "an HTML page goes out as the file itself, not a Rich Text preview"
+    );
+    assert!(
+        patches_to(&platform, "msg_turn_card").await.is_empty(),
+        "the Tool Panel's Turn card is never PATCHed"
+    );
+
+    // A duplicate click is refused once the transfer lands — the spawned task
+    // drops its in-flight claim and remembers the send, so the refusal is the
+    // observable completion. Either way no second File Message is posted.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let toast = app
+                .host_action(payload.clone())
+                .await
+                .expect("a duplicate click is acknowledged")
+                .toast;
+            if toast.as_deref() == Some("文件已发送") {
+                break;
+            }
+            assert_eq!(
+                toast.as_deref(),
+                Some("正在发送文件…"),
+                "only a held claim or a remembered send answers here"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the send is remembered, so a stale click is refused");
+    assert_eq!(
+        file_messages(&platform).await.len(),
+        1,
+        "a duplicate click cannot post a second File Message"
+    );
+    assert!(
+        patches_to(&platform, "msg_turn_card").await.is_empty(),
+        "a duplicate click still never PATCHes the Turn card"
+    );
+}
+
+/// #778: a preview with no file to send replies the failure under the clicked
+/// Turn card — there is no card of cola's own to write `未发送` on, and no card
+/// is PATCHed; nothing is sent.
+#[tokio::test]
+async fn a_tool_panel_preview_failure_speaks_a_reply() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+
+    let mut payload = crate::feishu::card::session::tool_page_value("ses_seed", "gone.html");
+    payload["open_message_id"] = serde_json::json!("msg_turn_card");
+    let result = app.host_action(payload).await.expect("the click acks");
+    assert_eq!(result.toast.as_deref(), Some("正在发送文件…"));
+
+    let (message_id, text) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let replies: Vec<(String, String)> = platform
+                .calls
+                .lock()
+                .await
+                .iter()
+                .filter_map(|call| match call {
+                    PlatformCall::ReplyText { message_id, text } => Some((message_id.clone(), text.clone())),
+                    _ => None,
+                })
+                .collect();
+            if let Some(reply) = replies.into_iter().next() {
+                break reply;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the failure reply lands");
+    assert_eq!(message_id, "msg_turn_card", "the reply targets the clicked card");
+    assert!(
+        text.contains("找不到路径") && text.contains("gone.html"),
+        "the reply names the cause and the file: {text}"
+    );
+    assert!(
+        file_messages(&platform).await.is_empty(),
+        "a failed read sends nothing"
+    );
+    assert!(
+        patches_to(&platform, "msg_turn_card").await.is_empty(),
+        "a failed preview never PATCHes the Turn card"
+    );
+}
+
+/// #778: a preview whose bytes cannot be delivered (past Feishu's 30 MB cap)
+/// names that cause in its reply — the panel decides the button by EXTENSION, so
+/// a `.html`-named file past the cap still tries to send and reports why it did
+/// not.
+#[tokio::test]
+async fn a_tool_panel_preview_past_the_upload_cap_names_the_cap() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    std::fs::File::create(proj.path().join("huge.html"))
+        .unwrap()
+        .set_len(crate::feishu::file::MAX_FILE_BYTES + 1)
+        .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+
+    let mut payload = crate::feishu::card::session::tool_page_value("ses_seed", "huge.html");
+    payload["open_message_id"] = serde_json::json!("msg_turn_card");
+    app.host_action(payload).await.expect("the click acks");
+
+    let text = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let replies: Vec<String> = platform
+                .calls
+                .lock()
+                .await
+                .iter()
+                .filter_map(|call| match call {
+                    PlatformCall::ReplyText { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect();
+            if let Some(text) = replies.into_iter().next() {
+                break text;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the failure reply lands");
+    assert!(
+        text.contains("超过 30 MB") && text.contains("huge.html"),
+        "the reply names the cap and the file: {text}"
+    );
+    assert!(uploads(&platform).await.is_empty(), "nothing is uploaded");
+    assert!(file_messages(&platform).await.is_empty(), "nothing is sent");
+    assert!(
+        patches_to(&platform, "msg_turn_card").await.is_empty(),
+        "the Turn card is never PATCHed"
+    );
+}
+
+/// #778: a preview whose Session the store no longer knows cannot route a reply
+/// and answers an honest Toast — the same rule the open lane already follows —
+/// rather than sending into the void.
+#[tokio::test]
+async fn a_tool_panel_preview_with_an_unknown_session_answers_honestly() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    std::fs::write(proj.path().join("index.html"), "<p>hi</p>\n").unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+
+    let mut payload = crate::feishu::card::session::tool_page_value("ses_gone", "index.html");
+    payload["open_message_id"] = serde_json::json!("msg_turn_card");
+    let result = app.host_action(payload).await.expect("the click is acknowledged");
+    assert!(result.card.is_none(), "no transfer without a route");
+    let toast = result.toast.expect("an honest Toast");
+    assert!(
+        toast.contains("会话已不在") && toast.contains("index.html"),
+        "the Toast names the cause and the path: {toast}"
+    );
+    assert!(file_messages(&platform).await.is_empty(), "nothing is sent");
+}
+
 /// #741: content that fits the card's structural limits stays on the card —
 /// this lane is not taken for size alone. A large single code block that fits
 /// the budget previews in place with no message of any kind.

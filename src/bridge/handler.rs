@@ -195,12 +195,25 @@ enum PromptRoute {
     },
 }
 
-/// The bridge coordinator. Owns the state shared by every flow ([`SharedCore`])
-/// plus the per-flow modules that hold their own private state. `Deref`s to the
-/// shared core so the coordinator's own code can reach the aggregate; flows
-/// receive narrow per-concern handles instead (`SharedCore::turn_handles` is
-/// the Turn's bundle, spec #298).
-type ViewerFileTransferKey = (String, String, u64);
+/// Which `action: "file"` transfer a card click asked for (#739, #778). Both
+/// send the file's whole bytes as one File Message; they differ in the card the
+/// click landed on. [`ViewerFileOp::Send`] is the viewer's own button, so its
+/// outcome is PATCHed back onto that viewer card (in place). [`ViewerFileOp::Preview`]
+/// is a Tool Panel's button, and the clicked message is the agent's **Turn
+/// card**: a PATCH would overwrite the panel and the reply, so a preview sends
+/// and reports nothing on the card (the File Message is the evidence, and a
+/// failure is spoken as a reply instead).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ViewerFileOp {
+    Send,
+    Preview,
+}
+
+/// The transfer key of one viewer File Message attempt: the Chat, the clicked
+/// message, the **path** (a Tool Panel's Turn card can carry several file
+/// panels, so the clicked message alone does not name one file), and the content
+/// identity (a re-read rotates it, so changed bytes may be sent again).
+type ViewerFileTransferKey = (String, String, String, u64);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ViewerFileTransferStatus {
@@ -208,6 +221,11 @@ enum ViewerFileTransferStatus {
     OutcomeUnknown,
 }
 
+/// The bridge coordinator. Owns the state shared by every flow ([`SharedCore`])
+/// plus the per-flow modules that hold their own private state. `Deref`s to the
+/// shared core so the coordinator's own code can reach the aggregate; flows
+/// receive narrow per-concern handles instead (`SharedCore::turn_handles` is
+/// the Turn's bundle, spec #298).
 pub struct App {
     pub(crate) core: Arc<SharedCore>,
     /// The Host gate (ADR-0035): every inbound message and card action is
@@ -738,6 +756,18 @@ fn remember_viewer_file_transfer(
     }
     while sent.len() >= cap && crate::bridge::handles::evict_oldest_idle(sent, |_| true) {}
     sent.insert(key, status);
+}
+
+/// Why a Tool Panel's 「🌐 预览网页」 File Message did not land (#778): the
+/// prepared snapshot carried no deliverable bytes, and the re-classified size
+/// names the one cause the reader can act on — a file past Feishu's upload cap,
+/// or one that became empty/unreadable between the panel and the click.
+fn viewer_preview_failure_reason(size: u64) -> &'static str {
+    if size > crate::feishu::file::MAX_FILE_BYTES {
+        "文件超过 30 MB 上限"
+    } else {
+        "文件为空或不可读"
+    }
 }
 
 /// RAII claim for one in-flight File Viewer action. A duplicate callback gets
@@ -2095,18 +2125,22 @@ impl App {
                 "switch" => self.handle_switch_card_action(&self.core, &value).await,
                 "sub" => self.handle_sub_card_action(&self.core, &value).await,
                 "dir" => self.handle_dir_card_action(&self.core, &value).await,
-                // Two different cards carry `action: "file"` (#739, #742): the
-                // viewer's own 「发为文件」 button, whose payload carries
-                // `op: "send"` and transfers the file's whole bytes, and a browse
-                // card's file row, which carries no op and opens the file in
-                // place. The op is what tells the two clicks apart.
-                "file" => {
-                    if value.get("op").and_then(|v| v.as_str()) == Some("send") {
-                        self.handle_viewer_file_action(&value).await
-                    } else {
-                        self.handle_file_card_action(&self.core, &value).await
+                // Different cards carry `action: "file"` (#739, #742, #778): the
+                // viewer's own 「发为文件」/「🌐 预览网页」 button, whose payload
+                // carries `op: "send"` and transfers the file's whole bytes
+                // (PATCHing the clicked viewer card), a Tool Panel's 「🌐 预览
+                // 网页」 button, whose `op: "preview"` sends the same File Message
+                // but must NOT PATCH — the clicked message is the agent's Turn
+                // card (#778) — and a browse card's file row, which carries no op
+                // and opens the file in place. The op tells the three apart.
+                "file" => match value.get("op").and_then(|v| v.as_str()) {
+                    Some("send") => self.handle_viewer_file_action(&value, ViewerFileOp::Send).await,
+                    Some("preview") => {
+                        self.handle_viewer_file_action(&value, ViewerFileOp::Preview)
+                            .await
                     }
-                }
+                    _ => self.handle_file_card_action(&self.core, &value).await,
+                },
                 "agent" => self.handle_agent_card_action(&self.core, &value, false).await,
                 "agent_clear" => self.handle_agent_card_action(&self.core, &value, true).await,
                 "model" => self.handle_model_card_action(&self.core, &value).await,
@@ -4225,30 +4259,82 @@ impl App {
         })
     }
 
-    /// Handle the **File Viewer** card's 「发为文件」 click (ADR-0083 §5). The
-    /// card callback must ack within Feishu's 3 s, no-retry budget (ADR-0078),
-    /// and a 30 MB upload cannot fit it, so the click records the intent, spawns
-    /// the transfer and returns a toast immediately; the transfer then re-reads
-    /// the file locally, posts exactly ONE File Message under the clicked card,
-    /// and PATCHes that card with the outcome — `已发送为文件消息`, `未发送`
-    /// for a file past the 30 MB cap or definite failure, or an honest unknown
-    /// result after an ambiguous timeout. No network work rides the callback path.
+    /// Handle the **File Viewer** card's 「发为文件」 click (ADR-0083 §5) — and,
+    /// since #778, a Tool Panel's 「🌐 预览网页」 click (`.html`/`.htm`, `op:
+    /// "preview"`). The card callback must ack within Feishu's 3 s, no-retry
+    /// budget (ADR-0078), and a 30 MB upload cannot fit it, so the click records
+    /// the intent, spawns the transfer and returns a toast immediately; the
+    /// transfer then re-reads the file locally and posts exactly ONE File Message
+    /// under the clicked card.
+    ///
+    /// The two ops differ in what happens to that clicked card. `Send` PATCHes it
+    /// with the outcome — `已发送为文件消息`, `未发送` for a file past the 30 MB cap
+    /// or definite failure, or an honest unknown result after an ambiguous
+    /// timeout — because the clicked card IS the viewer. `Preview` **never**
+    /// PATCHes: the clicked message is a Tool Panel on the agent's Turn card, and
+    /// a transfer card built for the file would overwrite the panel and the
+    /// reply. So a preview reports nothing on the card when the File Message
+    /// lands (it is its own evidence) and speaks a failure as a reply instead.
+    ///
+    /// A viewer payload carries its Chat/Topic; a Tool Panel payload carries only
+    /// the Session (`tool_file_value`), so this resolves the Chat/Topic and the
+    /// path scope from the SessionStore the way the open lane does
+    /// (`handle_file_card_action`) — the panel's structured path may be relative
+    /// to the Session's directory. A Session the store no longer knows cannot
+    /// route the reply and answers an honest Toast.
     async fn handle_viewer_file_action(
         self: &Arc<Self>,
         value: &serde_json::Value,
+        op: ViewerFileOp,
     ) -> Option<CardActionResult> {
         let path = value.get("path").and_then(|v| v.as_str()).unwrap_or("");
         let message_id = value
             .get("open_message_id")
             .and_then(|v| v.as_str())
             .unwrap_or("");
+        let session_id = value
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .filter(|id| !id.is_empty());
         if path.is_empty() || message_id.is_empty() {
             return Some(CardActionResult {
                 card: None,
                 toast: Some("无效操作".to_string()),
             });
         }
-        let thread_key = thread_key_from_value(value);
+        // Route from the payload's Chat/Topic, or — a Tool Panel — from the
+        // Session, exactly as the open lane does; a panel whose Session is gone
+        // has nothing to reply under and nothing to resolve its path against.
+        let (thread_key, session_dir) = {
+            let sessions = self.sessions.lock().await;
+            let mut thread_key = thread_key_from_value(value);
+            let mut session_dir = None;
+            if let Some(sid) = session_id {
+                if thread_key.chat_id.is_empty()
+                    && let Some(resolved) = sessions.thread_for_session(sid)
+                {
+                    thread_key = resolved;
+                }
+                session_dir = sessions.directory_for_session(sid);
+            }
+            (thread_key, session_dir)
+        };
+        if thread_key.chat_id.is_empty() {
+            return Some(CardActionResult {
+                card: None,
+                toast: Some(format!("⚠️ 无法发送 `{path}`：会话已不在。")),
+            });
+        }
+        // The structured path resolves on the Path Scope (ADR-0083 §4), the same
+        // rule the open lane applies; a viewer's already-resolved absolute path
+        // passes through unchanged.
+        let resolved = match (session_id, session_dir.as_deref()) {
+            (Some(_), Some(dir)) => crate::bridge::command::lexical_normalize(
+                &crate::bridge::command::expand_against(path, std::path::Path::new(dir)),
+            ),
+            _ => std::path::PathBuf::from(path),
+        };
+        let resolved = resolved.to_string_lossy().to_string();
         let content_identity = value
             .get("viewer_file_identity")
             .and_then(serde_json::Value::as_str)
@@ -4257,6 +4343,7 @@ impl App {
         let transfer_key = (
             thread_key.chat_id.clone(),
             message_id.to_string(),
+            resolved.clone(),
             content_identity,
         );
         let prior_transfer = self
@@ -4280,13 +4367,12 @@ impl App {
                 toast: Some("正在发送文件…".to_string()),
             });
         };
-        let path = path.to_string();
         let message_id = message_id.to_string();
         let value = value.clone();
         let app = Arc::clone(self);
         tokio::spawn(async move {
             let _in_flight_guard = in_flight_guard;
-            app.run_viewer_file_transfer(thread_key, path, message_id, content_identity, value)
+            app.run_viewer_file_transfer(thread_key, resolved, message_id, content_identity, value, op)
                 .await;
         });
         Some(CardActionResult {
@@ -4295,16 +4381,22 @@ impl App {
         })
     }
 
-    /// The 「发为文件」 transfer, off the card callback (ADR-0083 §5): re-read the
-    /// file locally, upload its bytes once and post exactly ONE File Message
-    /// under the clicked card, then PATCH the card with the outcome. Every
-    /// network call — the outcome PATCH included — is bounded by
-    /// [`SharedCore::viewer_transfer_timeout_ms`], so a failure or a timeout
-    /// surfaces as `未发送` on the card rather than a dropped result. A path
-    /// that vanished or became unreadable between the viewer and the click has
-    /// no lane to report: its own failure line IS the PATCHed card's body, so
-    /// the click's outcome is stated either way (finding #739 §4). All local
-    /// filesystem work is done in the bounded blocking-read pool below.
+    /// The 「发为文件」/「🌐 预览网页」 transfer, off the card callback (ADR-0083
+    /// §5, #778): re-read the file locally, upload its bytes once and post
+    /// exactly ONE File Message under the clicked card. Every network call is
+    /// bounded by [`SharedCore::viewer_transfer_timeout_ms`], so a failure or a
+    /// timeout is stated rather than dropped.
+    ///
+    /// What the outcome does depends on `op`. `Send` — the viewer's own button —
+    /// PATCHes the clicked viewer card with the outcome: `未发送` for a file past
+    /// the 30 MB cap or definite failure, or an honest unknown after an ambiguous
+    /// timeout; a path that vanished between the viewer and the click has no lane
+    /// to report, and its own failure line IS the PATCHed card's body, so the
+    /// click's outcome is stated either way (finding #739 §4). `Preview` — a Tool
+    /// Panel's button — PATCHes nothing (the clicked message is the agent's Turn
+    /// card): a landed File Message is its own evidence, and a failure is spoken
+    /// as a reply (see [`Self::finish_viewer_preview`]). All local filesystem work
+    /// is done in the bounded blocking-read pool below.
     async fn run_viewer_file_transfer(
         self: &Arc<Self>,
         thread_key: ThreadKey,
@@ -4312,6 +4404,7 @@ impl App {
         message_id: String,
         content_identity: u64,
         value: serde_json::Value,
+        op: ViewerFileOp,
     ) {
         let resolved = std::path::PathBuf::from(&path);
         let timeout_ms = self
@@ -4366,6 +4459,18 @@ impl App {
                 Err(format!("⚠️ 无法读取 `{}`：{error}", resolved.display()))
             }
         };
+        if op == ViewerFileOp::Preview {
+            self.finish_viewer_preview(
+                &thread_key,
+                &resolved,
+                &message_id,
+                content_identity,
+                read,
+                timeout_ms,
+            )
+            .await;
+            return;
+        }
         let card = match read {
             Ok((classified, prepared)) => {
                 let mut lane = crate::bridge::viewer::send_prepared_file_transfer(
@@ -4408,17 +4513,18 @@ impl App {
                         .viewer_file_transfers_sent
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let key = (thread_key.chat_id.clone(), message_id.clone());
+                    let key_path = resolved.to_string_lossy().to_string();
+                    let key = (thread_key.chat_id.clone(), message_id.clone(), key_path);
                     remember_viewer_file_transfer(
                         &mut sent,
-                        (key.0.clone(), key.1.clone(), content_identity),
+                        (key.0.clone(), key.1.clone(), key.2.clone(), content_identity),
                         status,
                         crate::bridge::handles::FILE_MESSAGE_SENDS_CAP,
                     );
                     if let Some(delivered_identity) = lane.content_identity {
                         remember_viewer_file_transfer(
                             &mut sent,
-                            (key.0, key.1, delivered_identity),
+                            (key.0, key.1, key.2, delivered_identity),
                             status,
                             crate::bridge::handles::FILE_MESSAGE_SENDS_CAP,
                         );
@@ -4460,6 +4566,115 @@ impl App {
             Some(Ok(()))
         ) {
             tracing::warn!("viewer transfer: card update for {message_id} did not land");
+        }
+    }
+
+    /// The tail of a Tool Panel's 「🌐 预览网页」 transfer (#778): post the file as
+    /// one File Message and report ONLY off the card — the clicked message is the
+    /// agent's Turn card, so no PATCH may touch it.
+    ///
+    /// A landed send is remembered on the same bounded window as every other
+    /// viewer File Message ([`ViewerFileTransferKey`], keyed by the path too
+    /// because one Turn card can carry several file panels), so a second click on
+    /// the same panel does not post a duplicate — the button stays on the card,
+    /// which no PATCH rewrites. A definite failure (an unreadable file, or bytes
+    /// past the 30 MB cap) is deduped on nothing and spoken as a reply, so the
+    /// button stays live for a retry.
+    async fn finish_viewer_preview(
+        self: &Arc<Self>,
+        thread_key: &ThreadKey,
+        resolved: &std::path::Path,
+        message_id: &str,
+        content_identity: u64,
+        read: Result<
+            (
+                crate::bridge::viewer::Classified,
+                crate::bridge::viewer::PreparedFileTransfer,
+            ),
+            String,
+        >,
+        timeout_ms: u64,
+    ) {
+        let (classified, prepared) = match read {
+            Ok(snapshot) => snapshot,
+            Err(line) => {
+                self.reply_viewer_preview_failure(message_id, &line, timeout_ms)
+                    .await;
+                return;
+            }
+        };
+        // A snapshot with no bytes can only be a definite non-send (past the cap,
+        // empty, unreadable); every other `Undelivered` after this is a failed
+        // upload or File Message send, which the reason must not misname.
+        let snapshot_undeliverable = !prepared.carries_bytes();
+        let lane = crate::bridge::viewer::send_prepared_file_transfer(
+            &self.feishu,
+            &self.cards_handle(),
+            message_id,
+            prepared,
+            timeout_ms,
+        )
+        .await;
+        let status = match &lane.delivery {
+            crate::feishu::card::tool_render::FileDelivery::SentAsFile => {
+                Some(ViewerFileTransferStatus::Sent)
+            }
+            crate::feishu::card::tool_render::FileDelivery::FileSendOutcomeUnknown => {
+                Some(ViewerFileTransferStatus::OutcomeUnknown)
+            }
+            _ => None,
+        };
+        if let Some(status) = status {
+            let mut sent = self
+                .viewer_file_transfers_sent
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let key_path = resolved.to_string_lossy().to_string();
+            let key = (thread_key.chat_id.clone(), message_id.to_string(), key_path);
+            remember_viewer_file_transfer(
+                &mut sent,
+                (key.0.clone(), key.1.clone(), key.2.clone(), content_identity),
+                status,
+                crate::bridge::handles::FILE_MESSAGE_SENDS_CAP,
+            );
+            if let Some(delivered_identity) = lane.content_identity {
+                remember_viewer_file_transfer(
+                    &mut sent,
+                    (key.0, key.1, key.2, delivered_identity),
+                    status,
+                    crate::bridge::handles::FILE_MESSAGE_SENDS_CAP,
+                );
+            }
+            return;
+        }
+        let line = format!(
+            "⚠️ 无法发送 `{}`：{}。",
+            resolved.display(),
+            if snapshot_undeliverable {
+                viewer_preview_failure_reason(classified.size)
+            } else {
+                "发送失败"
+            }
+        );
+        self.reply_viewer_preview_failure(message_id, &line, timeout_ms)
+            .await;
+    }
+
+    /// Speak a Tool Panel preview's failure under the clicked card (#778). With
+    /// no card of cola's own to write `未发送` on, the reply IS the outcome —
+    /// bounded like every other transfer network step, so a wedged call cannot
+    /// outlive its timeout.
+    async fn reply_viewer_preview_failure(self: &Arc<Self>, message_id: &str, line: &str, timeout_ms: u64) {
+        if !matches!(
+            crate::bridge::bounded_call(
+                "viewer preview failure reply",
+                timeout_ms,
+                self.feishu.reply_text(message_id, line),
+            )
+            .await,
+            Some(Ok(_))
+        ) {
+            tracing::warn!("viewer preview: failure reply for {message_id} did not land");
         }
     }
 
@@ -4927,34 +5142,34 @@ mod viewer_reread_slot_tests {
         let mut sent = indexmap::IndexMap::new();
         remember_viewer_file_transfer(
             &mut sent,
-            ("chat".into(), "card".into(), 1),
+            ("chat".into(), "card".into(), "/a.rs".into(), 1),
             ViewerFileTransferStatus::Sent,
             2,
         );
         remember_viewer_file_transfer(
             &mut sent,
-            ("chat".into(), "card".into(), 2),
+            ("chat".into(), "card".into(), "/a.rs".into(), 2),
             ViewerFileTransferStatus::Sent,
             2,
         );
         remember_viewer_file_transfer(
             &mut sent,
-            ("chat".into(), "other".into(), 3),
+            ("chat".into(), "other".into(), "/b.rs".into(), 3),
             ViewerFileTransferStatus::Sent,
             2,
         );
 
         assert_eq!(sent.len(), 2);
-        assert!(!sent.contains_key(&("chat".into(), "card".into(), 1)));
-        assert!(sent.contains_key(&("chat".into(), "card".into(), 2)));
-        assert!(sent.contains_key(&("chat".into(), "other".into(), 3)));
+        assert!(!sent.contains_key(&("chat".into(), "card".into(), "/a.rs".into(), 1)));
+        assert!(sent.contains_key(&("chat".into(), "card".into(), "/a.rs".into(), 2)));
+        assert!(sent.contains_key(&("chat".into(), "other".into(), "/b.rs".into(), 3)));
     }
 
     #[test]
     fn viewer_transfer_once_guard_rotates_with_content_identity() {
         let mut sent = indexmap::IndexMap::new();
-        let old = ("chat".into(), "card".into(), 11);
-        let refreshed = ("chat".into(), "card".into(), 22);
+        let old = ("chat".into(), "card".into(), "/a.rs".into(), 11);
+        let refreshed = ("chat".into(), "card".into(), "/a.rs".into(), 22);
         remember_viewer_file_transfer(&mut sent, old.clone(), ViewerFileTransferStatus::Sent, 10);
 
         assert!(sent.contains_key(&old), "same snapshot remains deliver-once");
@@ -4964,6 +5179,22 @@ mod viewer_reread_slot_tests {
         );
         remember_viewer_file_transfer(&mut sent, refreshed.clone(), ViewerFileTransferStatus::Sent, 10);
         assert!(sent.contains_key(&refreshed));
+    }
+
+    /// #778: two Tool Panels on one Turn card share the clicked message, so the
+    /// PATH is part of the key — a second file's preview is not mistaken for a
+    /// duplicate of the first's.
+    #[test]
+    fn viewer_transfer_once_guard_separates_two_files_on_one_card() {
+        let mut sent = indexmap::IndexMap::new();
+        let first = ("chat".into(), "card".into(), "/a.html".into(), 0);
+        let second = ("chat".into(), "card".into(), "/b.html".into(), 0);
+        remember_viewer_file_transfer(&mut sent, first.clone(), ViewerFileTransferStatus::Sent, 10);
+        assert!(sent.contains_key(&first));
+        assert!(
+            !sent.contains_key(&second),
+            "a different path on the same card is a different file"
+        );
     }
 
     /// A timed-out wait leaves the blocking job's slot held until its closure
