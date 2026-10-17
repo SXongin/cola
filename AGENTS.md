@@ -8,7 +8,11 @@ A bridge bot that brings the OpenCode AI coding experience into Feishu.
 
 Which skill runs when: the main flow (idea → ship), the bug/issue on-ramps, and the local bindings. See `docs/agents/flow.md`.
 
-**Review is always the pair** — `/code-review` plus `/adversarial-review` — even where an installed skill names only `/code-review`. `docs/agents/flow.md` is the binding.
+**Review is always the pair** — `/code-review` carries both the two-axis review and the adversarial pass. `docs/agents/flow.md` is the binding.
+
+### Local skills
+
+Where a workflow *mechanism* differs from an upstream skill, the mechanism lives in a repo-local skill under `.opencode/skill/` — which shadows the global skill of the same id — not restated in `AGENTS.md` prose; the *policy* stays in `docs/agents/flow.md`. The convention (shadowing, where a skill lives, compose-vs-fork, the upgrade discipline) is `docs/agents/skills.md`.
 
 ### Feishu skill invocation
 
