@@ -96,8 +96,8 @@ filter bot reviewers — see the 2026-09-15 amendment.
   the release workflow renames them per artifact.
 - CodeRabbit was removed on 2026-09-15 (see the amendments). Its repository
   read access and approval voice are replaced by the review gate — OpenCode
-  until 2026-10-04, Codex Action since — which holds the workflow permissions
-  needed to publish the review and its approval.
+  until 2026-10-04, Codex Action since — which holds `pull-requests: write` and
+  an API key shared with local development.
 - The Scorecard number will be lower than its theoretical maximum by design.
   Do not "fix" the remaining zeros without revisiting this ADR.
 
@@ -107,7 +107,7 @@ The gate in item 6 is now `.github/workflows/opencode-review.yml` (PR #164,
 issue #163):
 
 - It reviews every non-draft in-repo PR on `opened`, `synchronize`, `reopened`
-  and `ready_for_review` through the OpenCode review workflow and, on a clean
+  and `ready_for_review` with the OpenCode Go subscription and, on a clean
   review, approves through `github-actions[bot]` — same approval, no manual
   trigger.
 - The approval is deterministic: the model ends its PR comment with a
@@ -214,15 +214,16 @@ replaces the OpenCode gate remains an open decision (issue #516).
 
 The gate in item 6 is now `.github/workflows/codex-review.yml` (PR #518),
 replacing `.github/workflows/opencode-review.yml`: `openai/codex-action`
-(v1.12) runs Codex read-only through the workflow's configured
-Responses-compatible endpoint, with the two axes plus an adversarial pass
-rubric at `.github/codex/prompts/review.md`. The approval contract is carried
-over: a line-final `CODEX_REVIEW_VERDICT: PASS|FAIL` in the review comment,
-approval only on `PASS`, pinned to the reviewed commit. This supersedes the
-2026-09-15 amendment's OpenCode implementation details; the skips (fork,
-Dependabot, `release/*`) carry over. The local `/code-review` skill stays the
-author-side OpenCode two-axis pass — the CI gate is deliberately independent,
-so the two are separate review signals.
+(v1.12) runs Codex read-only on `gpt-6-luna` through the OpenCode Go
+subscription's Responses-compatible inference endpoint, with the two axes plus
+an adversarial pass rubric at `.github/codex/prompts/review.md`. The approval contract is
+carried over: a line-final `CODEX_REVIEW_VERDICT: PASS|FAIL` in the review
+comment, approval only on `PASS`, pinned to the reviewed commit. This
+supersedes the 2026-09-15 amendment's OpenCode specifics (model, prompt
+injection, permission allowlist); the skips (fork, Dependabot, `release/*`)
+carry over. The local `/code-review` skill stays the author-side OpenCode
+two-axis pass — the CI gate is deliberately a different agent and model
+family, so the two are independent review signals.
 
 The advisory trial (issue #516, PR #517) is the evidence: nine review rounds
 at ~1.5 minutes per run, including a FAIL that caught a real defect in the
@@ -239,10 +240,11 @@ marker rule dies with the trial workflow.
 
 The trial header recorded `pull_request_target` as the hardening to evaluate
 if Codex became the gate; this replacement keeps the `pull_request` + fork-skip
-trust model instead. Codex runs read-only through the workflow's configured
-Responses-compatible endpoint. The endpoint and its credentials are workflow
-configuration, not part of the approval contract. As before, a FAIL is a
-comment without an approval, never a `request-changes`.
+trust model instead. Endpoint, key and read-only posture are unchanged from the
+trial: the Console inference API round-trips `gpt-6-luna` with the
+`OPENCODE_API_KEY` Go key, which stays inside the action's Responses proxy and
+never reaches the Codex step's environment. As before, a FAIL is a comment
+without an approval, never a `request-changes`.
 
 ## Amendment (2026-10-05): the gate is pinned to codex-action v1.11 and salvages a completed review
 
@@ -326,8 +328,8 @@ never the adversarial pass alone. The upstream `/implement` and
 authors no rubric of its own: it lifts the pass and its rules verbatim from
 `.github/codex/prompts/review.md`, so the local pass and the gate cannot drift.
 This deliberately spends the independence the 2026-10-04 amendment bought —
-the author-side review now shares the gate's lens — in exchange for far fewer
-review round-trips.
+the author-side review now shares the gate's lens (and, with `code-reviewer` on
+`gpt-6-luna`, its model family) — in exchange for far fewer review round-trips.
 The gate stays the independent final run (a fresh sandbox, its own execution),
 and the two axes stay a separate report from the adversarial pass, exactly as CI
 keeps them.
@@ -339,12 +341,24 @@ an implementer (`docs/agents/flow.md`): the originating session for a
 ticket-local finding, a fresh one for a cross-ticket finding, with the merger
 landing the result and the pass re-run at that same scope.
 
-## Amendment (2026-10-14): the gate uses its configured Responses-compatible endpoint
+## Amendment (2026-10-14): the gate reaches Go through the Go provider endpoint
 
-The Codex Action runs read-only through the workflow's configured
-Responses-compatible endpoint. The endpoint, model and credentials are
-workflow configuration and are intentionally not pinned by this ADR; the
-review rubric, trust model and approval contract above are unchanged.
+The 2026-10-04 amendment pointed the Codex action's Responses proxy at Console's
+inference endpoint (`https://opencode.ai/inference/openai/v1/responses`). That
+surface is served under the `opencode` provider slug, so the gate's own usage
+was reported as `opencode/gpt-6-luna` in the OpenCode Go usage report — beside
+the author-side `/code-review` pair's `opencode-go/gpt-6-luna` — even though the
+same Go key paid for both. The endpoint moves to the Go provider's own
+Responses-compatible path, `https://opencode.ai/zen/go/v1/responses`, so the
+gate's usage is attributed to `opencode-go`.
+
+Nothing else about the model changes: `gpt-6-luna` is the same model on both
+paths, and the action's Responses proxy (`codex-responses-api-proxy`) forwards
+every request header except `Authorization` and `Host`, so Codex's native
+session header — which Go recognizes — reaches the endpoint. Verified locally
+end-to-end: Codex 0.160.0 through the action's proxy against
+`/zen/go/v1/responses` completes a review request. `CONTRIBUTING.md`'s
+"Reviewing" section and the workflow header name the new endpoint.
 
 ## Amendment (2026-10-16): the gate moves to codex-action v1.13
 
