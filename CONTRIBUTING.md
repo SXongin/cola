@@ -146,6 +146,44 @@ Note: CI's Format job is `cargo fmt --all -- --check` — clippy and rustc do
 `Advisory audit` workflow re-runs `cargo deny check advisories` weekly, so
 newly published RUSTSEC advisories surface even when nothing is pushed.
 
+## Local development
+
+**Worktrees live in `.worktrees/<task-name>`** — `git worktree add
+.worktrees/<task-name> origin/<branch>`, and a committed `opencode.json` points
+OpenCode's own worktree tool at the same place, so an agent-made worktree and a
+hand-made one land together. The directory is gitignored.
+
+The `post-checkout` hook keeps a **worktree-local** CodeGraph index
+(`codegraph init -y .` on a linked worktree's first checkout, `codegraph sync -q
+.` after) — but only when lefthook is installed, so a worktree older than the
+hook, or one without CodeGraph, still has none: CodeGraph's up-walk then reaches
+the main checkout's index and serves *its* source, so read the file in your own
+worktree or run `codegraph init -y .` there.
+
+## Live contract suite
+
+The live suite (ADR-0057) is opt-in: every test is `#[ignore]`-gated and runs one
+generation per test, always in a fresh isolated XDG tree (never the default
+store). The V1 chains need the pinned OpenCode **1.18.31** binary (the one
+`.github/actions/install-opencode-v1` installs — never V2); CI installs it on
+`PATH` and runs `cargo test --locked -- --ignored live_v1`. The V2 chains need a
+2.x binary, spawned directly with relocated XDG trees; point
+`COLA_LIVE_OPENCODE_V2_BIN` at one (`opencode2` on `PATH` is the fallback), and
+the `Live V2` job installs the exact-version + sha256 pin via
+`.github/actions/install-opencode-v2` (npm-based, version-keyed cache) and runs
+`cargo test --locked -- --ignored live_v2`; `Live V1` deliberately does not run
+it. `--list` names the chains:
+
+```bash
+COLA_LIVE_OPENCODE_BIN=/path/to/opencode cargo test --locked -- --ignored live_v1
+COLA_LIVE_OPENCODE_V2_BIN=/path/to/opencode2 cargo test --locked -- --ignored live_v2
+cargo test --locked -- --ignored --list
+```
+
+Set `COLA_LIVE_CAPTURE_DIR=<dir>` on either run to re-record the raw transcript
+responses into the fixture format; sanitize them by hand before committing under
+`src/opencode/wire/fixtures/`.
+
 ## Pull request rules
 
 1. **Title** is a Conventional Commits subject (kept verbatim by the rebase
@@ -238,18 +276,9 @@ filler" test. `#[coverage(off)]` is still nightly-only (verified on stable
 or region goes on the `ignore` list with its reason, or into the boundary list
 above.
 
-Description template:
-
-```markdown
-## What
-<what changed, one paragraph>
-
-## Why
-<the problem this solves / the issue it closes>
-
-## How tested
-<commands run; e.g. the verification loop above, specific cargo test filters>
-```
+The description template is `.github/pull_request_template.md` — keep its
+`## What` / `## Why` / `## How tested` sections and take the rendering from the
+`/pr` skill (`docs/agents/flow.md`, "PR body").
 
 ## Reviewing
 

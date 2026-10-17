@@ -11,7 +11,7 @@ CI deliberately kept this pass out of `/code-review` (`ADR-0034`, 2026-10-04 ame
 
 ## The rubric is not written here
 
-Do not invent the checks. Read `.github/codex/prompts/review.md` and lift its `## The adversarial pass (the part an author-side review tends to miss)` and `## Rules` sections **verbatim** into the sub-agent prompt, so the local pass and the gate stay one rubric. One clause does not carry to this host: the reference trees named in `AGENTS.md` exist here, so the host-tree exemption is dropped — say so in the prompt. Everything else stands, the final `CODEX_REVIEW_VERDICT` line included.
+Do not invent the checks. Read `.github/codex/prompts/review.md` and lift its `## The adversarial pass (the part an author-side review tends to miss)` and `## Rules` sections **verbatim** into the sub-agent prompt, so the local pass and the gate stay one rubric. One clause does not carry to this host: the reference trees named in `docs/agents/references.md` exist here, so the host-tree exemption is dropped — say so in the prompt. Everything else stands, the final `CODEX_REVIEW_VERDICT` line included.
 
 ## Process
 
@@ -28,7 +28,7 @@ Dispatch a single `code-reviewer` sub-agent **from the orchestrating session** �
 - the diff `git diff "$BASE"` (with `BASE` the merge-base, plus `-- <paths>` when scoped), the untracked files from `git ls-files --others --exclude-standard` (not in the diff), and the commit list (`git log <base>..HEAD --oneline`, plus `-- <paths>` when scoped);
 - the `## The adversarial pass` and `## Rules` sections pasted in full (the sub-agent has no network; paste the rubric rather than pointing at it), minus the host-tree clause, with that omission stated in the prompt;
 - this brief:
-  > You are reproducing the CI Codex gate's adversarial pass on this diff. The reference trees named in `AGENTS.md` exist on this host, so the host-tree exemption in the Rules does not apply. Report findings first and finish with the `CODEX_REVIEW_VERDICT` line the Rules prescribe.
+  > You are reproducing the CI Codex gate's adversarial pass on this diff. The reference trees named in `docs/agents/references.md` exist on this host, so the host-tree exemption in the Rules does not apply. Report findings first and finish with the `CODEX_REVIEW_VERDICT` line the Rules prescribe.
 
 ### 3. Aggregate
 
