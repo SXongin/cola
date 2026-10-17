@@ -412,6 +412,9 @@ mod tests {
             "$GATE_ENDPOINT",
             "$GATE_MODEL",
             "%{http_code}",
+            // The bound: without it a stalled endpoint holds the run until the
+            // job's own timeout.
+            "--max-time 30",
             "exit 1",
         ] {
             assert!(check.contains(needle), "the credential check must use {needle}");
