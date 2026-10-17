@@ -243,15 +243,29 @@ mod tests {
     /// on loopback, so the harness bypasses any proxy the host sets — the
     /// workflow itself must keep curl's normal proxy handling.
     fn run_credential_check(endpoint: &str) -> std::process::Output {
+        run_credential_check_with(endpoint, "test-key")
+    }
+
+    /// Run the workflow's credential check against `endpoint` with `key`.
+    fn run_credential_check_with(endpoint: &str, key: &str) -> std::process::Output {
         let workflow = workflow();
         let script = run_block(step(&workflow, "Check the gate credential"));
+        // A directory per call: the tests run in parallel, and each run writes
+        // `gate-preflight.json` into it.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "cola-codex-gate-credential-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
         Command::new("bash")
             .arg("-c")
             .arg(script)
-            .env("RUNNER_TEMP", temp_dir("credential"))
+            .env("RUNNER_TEMP", dir)
             .env("GATE_ENDPOINT", endpoint)
             .env("GATE_MODEL", "test-model")
-            .env("GATE_KEY", "test-key")
+            .env("GATE_KEY", key)
             .env("no_proxy", "*")
             .env("NO_PROXY", "*")
             .output()
@@ -438,6 +452,10 @@ mod tests {
         assert!(!out.status.success(), "a 401 must fail the step");
         assert!(log.contains("HTTP 401"), "the step must name the status: {log}");
         assert!(
+            log.contains(&addr.to_string()),
+            "the step must name the endpoint: {log}"
+        );
+        assert!(
             log.contains("This API key has expired."),
             "the step must carry the body, so the reason is the upstream's: {log}"
         );
@@ -458,6 +476,17 @@ mod tests {
         ] {
             assert!(seen.contains(field), "the probe must send {field}: {seen}");
         }
+    }
+
+    #[test]
+    fn the_credential_check_refuses_an_empty_key() {
+        let out = run_credential_check_with("http://127.0.0.1:1/v1/responses", "");
+        let log = String::from_utf8_lossy(&out.stdout);
+        assert!(!out.status.success(), "an empty key must fail the step");
+        assert!(
+            log.contains("OPENCODE_API_KEY is empty"),
+            "the step must name the missing secret: {log}"
+        );
     }
 
     #[test]
