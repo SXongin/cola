@@ -88,7 +88,7 @@ the handoff skill when it is missing or stale.
    cola attaches to whatever `opencode serve` runs on the default store
    (`~/.local/share/opencode`; `XDG_DATA_HOME` unset), whoever started it,
    reading port + password live from `/proc`. With none running it self-starts
-   one there (`bridge/discovery.rs`). A private data dir silently breaks sharing;
+   one there (`src/bridge/discovery.rs`). A private data dir silently breaks sharing;
    a mapped session that 404s is a leftover from another store and is recreated
    automatically. (On OpenChamber's server the global SSE connection is ended
    every few seconds — cosmetic; cola renders by polling.)
