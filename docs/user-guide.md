@@ -457,6 +457,10 @@ Notes:
   cannot fit in the card may use the Rich Text Message lane, subject to Feishu's
   rendering; content beyond that lane's 30 KB budget uses the File Message lane
   (subject to the same upload cap). The card reports the delivery outcome.
+  「发为文件」 sends the original bytes as one File Message. It remains available
+  for text, embedded-image and Rich Text previews; it is suppressed after a File
+  Message has already carried the bytes. If a File Message send times out, the
+  card says the result is unknown and does not retry to avoid a duplicate.
   「🔄 重新读取」 re-reads and updates the viewer in
   place. 「📂 所在目录」 opens the file's parent in the Directory Browser;
   「← 返回目录」 returns from a browse-row viewer to its listing. A write/edit

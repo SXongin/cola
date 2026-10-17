@@ -1108,6 +1108,31 @@ async fn transferring_an_embedded_image_keeps_its_image_element() {
     assert_eq!(recorded.len(), 2, "one image and one file upload: {recorded:?}");
     assert!(matches!(recorded[0], PlatformCall::UploadImage { .. }));
     assert!(matches!(recorded[1], PlatformCall::UploadFile { .. }));
+
+    let reread = card_buttons(&updated)
+        .into_iter()
+        .find(|button| button["text"]["content"] == "🔄 重新读取")
+        .expect("the transferred viewer still offers re-read")["value"]
+        .clone();
+    assert_eq!(reread["viewer_embedded_image_key"], original_key);
+    app.host_action_on_message(reread, "msg_image_viewer")
+        .await
+        .expect("the image re-read acknowledges");
+    wait_for_card_update(&platform, "image re-read", CardUpdates::Latest, |card| {
+        image_key(card).as_deref() == Some(original_key.as_str())
+            && card_text(card).contains("已发送为文件消息")
+    })
+    .await;
+    let reread_card = platform.updated_cards().await.pop().expect("re-read patch");
+    assert_eq!(image_key(&reread_card).as_deref(), Some(original_key.as_str()));
+    assert_eq!(file_messages(&platform).await.len(), 1, "re-read does not resend");
+    assert_eq!(
+        platform
+            .upload_image_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "re-read keeps the existing image upload"
+    );
 }
 
 /// Re-opening the same image uploads it once: the process-local content-hash
@@ -1380,6 +1405,83 @@ async fn send_as_file_transfers_off_the_callback_path() {
         file_messages(&platform).await.len(),
         1,
         "a stale second click cannot post another File Message"
+    );
+}
+
+/// A timed-out reply may already have landed: keep the identity, say the
+/// outcome is unknown, and refuse both a stale click and re-read retry.
+#[tokio::test]
+async fn accepted_then_timed_out_file_message_is_never_retried() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let file = proj.path().join("notes.txt");
+    std::fs::write(&file, "original text snapshot\n").unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    app.viewer_transfer_timeout_ms
+        .store(25, std::sync::atomic::Ordering::Relaxed);
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+    send_command_in(
+        &app,
+        "/cat notes.txt",
+        key,
+        "m_ambiguous_transfer",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let original = first_card(&platform).await;
+    let mut transfer = send_as_file_payload(&original);
+    transfer["open_message_id"] = serde_json::json!("msg_reply");
+    let (entered, _release) = platform.pause_after_accept("send_message", "msg_reply");
+
+    app.host_action(transfer.clone())
+        .await
+        .expect("the transfer click acknowledges before the send");
+    tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+        .await
+        .expect("the send reached Feishu before the response timed out");
+    wait_for_card_update(&platform, "发送结果未知", CardUpdates::Latest, |card| {
+        card_text(card).contains("发送结果未知")
+    })
+    .await;
+    assert_eq!(file_messages(&platform).await.len(), 1, "Feishu accepted once");
+    let uncertain = patches_to(&platform, "msg_reply")
+        .await
+        .last()
+        .cloned()
+        .expect("the uncertain result patches the viewer");
+    assert!(
+        !card_buttons(&uncertain)
+            .iter()
+            .any(|button| button["text"]["content"] == "发为文件"),
+        "an ambiguous attempt must not offer a duplicate: {}",
+        card_text(&uncertain)
+    );
+
+    let duplicate = app
+        .host_action(transfer)
+        .await
+        .expect("a stale ambiguous-transfer click is acknowledged");
+    assert_eq!(duplicate.toast.as_deref(), Some("发送结果未知，为避免重复未重试"));
+
+    let reread = card_buttons(&uncertain)
+        .into_iter()
+        .find(|button| button["text"]["content"] == "🔄 重新读取")
+        .expect("the viewer still offers re-read")["value"]
+        .clone();
+    app.host_action_on_message(reread, "msg_reply")
+        .await
+        .expect("re-read acknowledges");
+    wait_for_card_update(&platform, "uncertain re-read", CardUpdates::Latest, |card| {
+        card_text(card).contains("发送结果未知")
+    })
+    .await;
+    assert_eq!(
+        file_messages(&platform).await.len(),
+        1,
+        "the same identity is not posted again after re-read"
     );
 }
 
@@ -2797,10 +2899,10 @@ async fn structural_overflow_goes_out_as_one_rich_text_message() {
         "the preview lives in the message, not on the card: {text}"
     );
     assert!(
-        !card_buttons(&card)
+        card_buttons(&card)
             .iter()
             .any(|b| b["text"]["content"] == "发为文件"),
-        "a landed preview offers no second delivery: {text}"
+        "Rich Text carries a preview, not the original bytes: {text}"
     );
 }
 
@@ -3896,10 +3998,10 @@ async fn a_row_open_of_an_overflowing_preview_sends_then_patches() {
         "the preview lives in the message, not on the card: {text}"
     );
     assert!(
-        !card_buttons(updated)
+        card_buttons(updated)
             .iter()
             .any(|b| b["text"]["content"] == "发为文件"),
-        "a landed preview offers no second delivery: {text}"
+        "the Rich Text preview keeps a transfer to the original bytes: {text}"
     );
     assert!(
         text.contains("← 返回目录"),
@@ -4164,10 +4266,10 @@ async fn a_tool_open_of_an_overflowing_preview_sends_then_replies() {
         "no listing to return to, so no return control: {text}"
     );
     assert!(
-        !card_buttons(&updated)
+        card_buttons(&updated)
             .iter()
             .any(|b| b["text"]["content"] == "发为文件"),
-        "a landed preview offers no second delivery: {text}"
+        "Rich Text carries a preview, not the original bytes: {text}"
     );
     assert!(
         patches_to(&platform, "msg_turn_card").await.is_empty(),

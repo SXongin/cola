@@ -462,6 +462,19 @@ pub(crate) struct ViewerLaneOptions<'a> {
     /// Identity of the File Message already delivered by this viewer snapshot.
     /// A re-read with the same bytes updates the card without posting again.
     pub(crate) existing_sent_file_identity: Option<u64>,
+    /// Identity whose File Message request timed out after it may have landed.
+    /// A re-read keeps that honest outcome without risking a duplicate.
+    pub(crate) existing_ambiguous_file_identity: Option<u64>,
+    /// Image preview already embedded for this file, preserved across re-reads
+    /// even when the File Message lane has also delivered the original bytes.
+    pub(crate) existing_embedded_image_key: Option<&'a str>,
+}
+
+#[derive(Clone, Copy)]
+struct ExistingViewerLane<'a> {
+    sent_file_identity: Option<u64>,
+    ambiguous_file_identity: Option<u64>,
+    embedded_image_key: Option<&'a str>,
 }
 
 /// The structural-overflow lane a viewer opens with (ADR-0083 §5, #741): a
@@ -714,6 +727,8 @@ pub(crate) async fn open_viewer_lanes(
         timeout_ms,
         existing_rich_message_id,
         existing_sent_file_identity,
+        existing_ambiguous_file_identity,
+        existing_embedded_image_key,
     } = options;
     let (kind, preview_text) = match classified.kind {
         ClassifiedKind::Text => (
@@ -730,7 +745,11 @@ pub(crate) async fn open_viewer_lanes(
         reply_target,
         name,
         classified,
-        existing_sent_file_identity,
+        ExistingViewerLane {
+            sent_file_identity: existing_sent_file_identity,
+            ambiguous_file_identity: existing_ambiguous_file_identity,
+            embedded_image_key: existing_embedded_image_key,
+        },
         timeout_ms,
     )
     .await
@@ -780,21 +799,41 @@ pub(crate) async fn open_viewer_lanes(
 /// The whole-bytes lane a viewer opens with (ADR-0083 §5): an image within
 /// Feishu's caps uploads once and is embedded, anything else uploads once and is
 /// posted as exactly ONE File Message, and a file past the 30MB cap — or a
-/// failed upload/send — is 未发送. `None` for a text preview, which takes no
-/// lane on open.
-pub(crate) async fn open_lane(
+/// definite send failure — is 未发送. A fresh text preview takes no lane on
+/// open; a text re-read can carry a prior File Message outcome.
+async fn open_lane(
     platform: &Arc<dyn Platform>,
     cards: &CardsHandle,
     reply_target: &str,
     name: &str,
     classified: &mut Classified,
-    existing_sent_file_identity: Option<u64>,
+    existing: ExistingViewerLane<'_>,
     timeout_ms: u64,
 ) -> Option<ViewerFileLane> {
-    if classified.kind == ClassifiedKind::Text {
-        return None;
-    }
     let (mime, size) = (classified.mime.clone(), classified.size);
+    if classified.kind == ClassifiedKind::Text {
+        let identity = classified
+            .text
+            .as_deref()
+            .map(|text| content_identity_hash(&mime, name, text.as_bytes()))?;
+        let delivery = if existing.sent_file_identity == Some(identity) {
+            FileDelivery::SentAsFile
+        } else if existing.ambiguous_file_identity == Some(identity) {
+            FileDelivery::FileSendOutcomeUnknown
+        } else {
+            return None;
+        };
+        return Some(ViewerFileLane {
+            mime,
+            name: name.to_string(),
+            size,
+            delivery,
+            content_identity: Some(identity),
+            embedded_image_key: existing.embedded_image_key.map(str::to_string),
+            rich_message_id: None,
+            refresh_failed: false,
+        });
+    }
     let Some(bytes) = classified.bytes.take() else {
         // Past Feishu's 30MB cap: nothing was read, nothing can be uploaded.
         return Some(ViewerFileLane {
@@ -809,14 +848,26 @@ pub(crate) async fn open_lane(
         });
     };
     let identity = content_identity_hash(&mime, name, &bytes);
-    if existing_sent_file_identity == Some(identity) {
+    if existing.sent_file_identity == Some(identity) {
         return Some(ViewerFileLane {
             mime,
             name: name.to_string(),
             size,
             delivery: FileDelivery::SentAsFile,
             content_identity: Some(identity),
-            embedded_image_key: None,
+            embedded_image_key: existing.embedded_image_key.map(str::to_string),
+            rich_message_id: None,
+            refresh_failed: false,
+        });
+    }
+    if existing.ambiguous_file_identity == Some(identity) {
+        return Some(ViewerFileLane {
+            mime,
+            name: name.to_string(),
+            size,
+            delivery: FileDelivery::FileSendOutcomeUnknown,
+            content_identity: Some(identity),
+            embedded_image_key: existing.embedded_image_key.map(str::to_string),
             rich_message_id: None,
             refresh_failed: false,
         });
@@ -831,13 +882,17 @@ pub(crate) async fn open_lane(
         timeout_ms,
     )
     .await;
+    let embedded_image_key = match &delivery {
+        FileDelivery::Embedded { image_key } => Some(image_key.clone()),
+        _ => None,
+    };
     Some(ViewerFileLane {
         mime,
         name: name.to_string(),
         size,
         delivery,
         content_identity: Some(identity),
-        embedded_image_key: None,
+        embedded_image_key,
         rich_message_id: None,
         refresh_failed: false,
     })
@@ -1058,7 +1113,8 @@ async fn deliver(
 
 /// Upload `content` once (content-hash cached) and post exactly ONE File Message
 /// carrying its key under `reply_target`. `Undelivered` past Feishu's 30MB cap,
-/// on a failed upload, or on a failed/timed-out send.
+/// on a failed upload or definite send refusal. A timed-out send is ambiguous:
+/// it may have landed, so its identity must not be retried.
 async fn send_file_message(
     platform: &Arc<dyn Platform>,
     cards: &CardsHandle,
@@ -1105,7 +1161,7 @@ async fn send_file_message(
             tracing::warn!("viewer File Message send failed: {error}");
             FileDelivery::Undelivered
         }
-        None => FileDelivery::Undelivered,
+        None => FileDelivery::FileSendOutcomeUnknown,
     }
 }
 
