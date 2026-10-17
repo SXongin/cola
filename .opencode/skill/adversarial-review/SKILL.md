@@ -37,6 +37,7 @@ Dispatch a single `code-reviewer` sub-agent **from the orchestrating session** �
 
 - the findings **verbatim**;
 - the ref pair `<round-head>..HEAD` for the fix's delta, plus the unchanged full-diff command;
+- the **refreshed** untracked files' content (`git ls-files --others --exclude-standard` run again — a fix that adds a file is in neither diff, so the first round's list is stale);
 - the brief: for every finding, resolved / not resolved / partially, with the reason; what the delta could break; and re-derive `CODEX_REVIEW_VERDICT` from the **whole** `git diff "$BASE"`, not the delta alone.
 
 Start a fresh reviewer at a new scope, on a design-changing fix, and for a cross-ticket finding — a resumed reviewer has already accepted the rest of the diff.
