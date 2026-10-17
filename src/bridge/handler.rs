@@ -601,12 +601,6 @@ fn return_page_num(value: &serde_json::Value) -> usize {
     page.max(1) as usize
 }
 
-/// Whether opening `resolved` shows a preview the card structurally cannot
-/// hold (#741): the path is classified by CONTENT exactly as the viewer
-/// opener classifies it, and the verdict is read from the RENDERED shape —
-/// never from byte size. `false` for a directory, for a path that cannot be
-/// read, and for anything the whole-bytes lanes own (an image, a binary, a
-/// text past the preview cap): none of those take the Rich Text Message
 /// The browse listing a clicked viewer returns to, owned for a spawned task
 /// (ADR-0052's statelessness rides the button; the task carries the same
 /// state owned): `dir: None` when the viewer was opened with no listing (a
@@ -811,6 +805,30 @@ fn viewer_page(value: &serde_json::Value) -> usize {
         _ => 1,
     };
     page.max(1) as usize
+}
+
+/// A pager payload can outlive the file snapshot it described. Keep its lane
+/// only while the fresh read still matches its MIME and size; otherwise show the
+/// newly classified file as undelivered rather than carrying stale status or
+/// an image key across a kind change.
+fn reconcile_viewer_page_lane(
+    lane: Option<crate::feishu::card::viewer::ViewerFileLane>,
+    classified: &crate::bridge::viewer::Classified,
+    path: &std::path::Path,
+) -> Option<crate::feishu::card::viewer::ViewerFileLane> {
+    let lane = lane?;
+    if lane.mime == classified.mime && lane.size == classified.size {
+        return Some(lane);
+    }
+    Some(crate::feishu::card::viewer::ViewerFileLane {
+        mime: classified.mime.clone(),
+        name: crate::feishu::card::command::file_display_name(path),
+        size: classified.size,
+        delivery: crate::feishu::card::tool_render::FileDelivery::Undelivered,
+        embedded_image_key: None,
+        rich_message_id: None,
+        refresh_failed: false,
+    })
 }
 
 /// Declare (or replace) the conversation's Pending Session at `directory` — the
@@ -3214,6 +3232,7 @@ impl App {
             keyword: &return_to.keyword,
             page: return_to.page,
         });
+        let lane = reconcile_viewer_page_lane(lane, &classified, &resolved);
         let card = crate::feishu::card::command::build_viewer_for_classified(
             &thread_key,
             &resolved,
@@ -4217,7 +4236,7 @@ impl App {
         };
         let card = match read {
             Ok((classified, prepared)) => {
-                let lane = crate::bridge::viewer::send_prepared_file_transfer(
+                let mut lane = crate::bridge::viewer::send_prepared_file_transfer(
                     &self.feishu,
                     &self.cards_handle(),
                     &message_id,
@@ -4225,6 +4244,10 @@ impl App {
                     timeout_ms,
                 )
                 .await;
+                lane.embedded_image_key = value
+                    .get("viewer_embedded_image_key")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
                 if matches!(
                     &lane.delivery,
                     crate::feishu::card::tool_render::FileDelivery::SentAsFile
