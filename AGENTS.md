@@ -90,8 +90,9 @@ and the map from the old numbers.
   `sysinfo`: a classic `serve --port P` keeps its port in argv and its credentials
   in the environment (`OPENCODE_SERVER_PASSWORD`, and `OPENCODE_SERVER_USERNAME`
   on V1 only), while a V2 `serve --service` has no `--port` and is reached through
-  its registration file (`$XDG_STATE_HOME/opencode/service.json`), always with the
-  username `opencode`. Either way Basic auth needs **both** halves — the server
+  its registration file (`$XDG_STATE_HOME/opencode/service.json` — the server's
+  own state home, not cola's), always with the username `opencode`. Either way
+  Basic auth needs **both** halves — the server
   compares the username, so a missing or wrong one 401s even with a correct
   password. (On OpenChamber's server the global SSE connection is ended every few
   seconds — cosmetic; cola renders by polling.)
@@ -103,7 +104,8 @@ and the map from the old numbers.
   until the client is treated as dead and stops receiving events at all (symptom:
   the bot goes silent while its TCP connection still reads ESTAB). Message
   delivery is at-least-once, so `im.message.receive_v1` is deduped on
-  `header.event_id` and anything older than 5 minutes is dropped.
+  `header.event_id` and dropped when its `create_time` is older than 5 minutes —
+  both optional fields, so a payload carrying neither passes through.
 - **`mentions`** — Feishu @mentions arrive as opaque `@_user_N` tokens, so a
   prompt leaks `@_user_1` and the AI cannot see who was referenced unless they are
   resolved: strip the bot's own mention (it needs `bot_open_id` from

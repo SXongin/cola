@@ -18,8 +18,7 @@ decision is resolved. If they don't exist yet, proceed silently.
 
 ## Use its vocabulary, and flag conflicts
 
-`CODING_STANDARDS.md` "Code conventions" owns both rules — a concept named with
-the term `GLOSSARY.md` defines, and a contradiction with an existing ADR surfaced
-rather than silently overridden. One signal it does not carry: a concept with no
-entry yet means either you are inventing language the project does not use, or
-there is a real gap to note for `/domain-modeling`.
+Both rules are `CODING_STANDARDS.md` "Code conventions" — this file adds only the
+signal it does not carry: a concept with no glossary entry yet means either you
+are inventing language the project does not use, or there is a real gap to note
+for `/domain-modeling`.
