@@ -346,18 +346,22 @@ jobs:
             -H 'Content-Type: application/json' \
             -H 'x-opencode-session: cola-codex-gate-preflight' \
             -d "$body") || curl_status=$?
-          # `--write-out` prints the status even when the body transfer then
-          # breaks, so a response cut after its headers keeps its status; `000`
-          # means no status was ever received.
-          if [ "$code" = "200" ]; then
-            exit 0
-          fi
-          if [ "$code" = "000" ] || [ -z "$code" ]; then
-            echo "::error title=Review gate unreachable::curl could not reach $GATE_ENDPOINT (exit $curl_status)."
+          # `--write-out` prints the status even when the transfer then breaks,
+          # so a cut response keeps the status it sent; `000` means none
+          # arrived. A broken transfer fails whatever its status: a `200` whose
+          # body never completed is not a healthy credential.
+          if [ "$curl_status" -ne 0 ]; then
+            if [ "$code" = "000" ] || [ -z "$code" ]; then
+              echo "::error title=Review gate unreachable::curl could not reach $GATE_ENDPOINT (exit $curl_status)."
+            else
+              echo "::error title=Review gate credential::HTTP $code from $GATE_ENDPOINT, response cut (curl exit $curl_status): $( (head -c 400 "$RUNNER_TEMP/gate-preflight.json" || true) | tr '\n' ' ')"
+            fi
             exit 1
           fi
-          echo "::error title=Review gate credential::HTTP $code from $GATE_ENDPOINT: $( (head -c 400 "$RUNNER_TEMP/gate-preflight.json" || true) | tr '\n' ' ')"
-          exit 1
+          if [ "$code" != "200" ]; then
+            echo "::error title=Review gate credential::HTTP $code from $GATE_ENDPOINT: $( (head -c 400 "$RUNNER_TEMP/gate-preflight.json" || true) | tr '\n' ' ')"
+            exit 1
+          fi
 
       # Bounded, and salvageable when it does not return (#530): a completed
       # review is still published if the step is cancelled at its bound; a cut

@@ -167,7 +167,8 @@ mod tests {
     }
 
     /// A one-shot HTTP stub: answers the first request on `listener` with
-    /// `status` and `body`, and hands back the request head it read.
+    /// `status` and `body`, and hands back the whole request it read (head and
+    /// body), so the caller can assert on what the check actually sent.
     fn respond_once(
         listener: TcpListener,
         status: u16,
@@ -175,14 +176,28 @@ mod tests {
     ) -> std::thread::JoinHandle<String> {
         std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("curl connects");
-            let mut head = String::new();
+            let mut request = Vec::new();
             let mut buf = [0u8; 1024];
-            while !head.contains("\r\n\r\n") {
+            loop {
                 let read = stream.read(&mut buf).expect("the request reads");
                 if read == 0 {
                     break;
                 }
-                head.push_str(&String::from_utf8_lossy(&buf[..read]));
+                request.extend_from_slice(&buf[..read]);
+                let text = String::from_utf8_lossy(&request);
+                if let Some(head_end) = text.find("\r\n\r\n") {
+                    let declared: usize = text[..head_end]
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|value| value.trim().parse().expect("a numeric length"))
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= head_end + 4 + declared {
+                        break;
+                    }
+                }
             }
             let reason = if status == 200 { "OK" } else { "Unauthorized" };
             write!(
@@ -192,7 +207,7 @@ mod tests {
                 body.len()
             )
             .expect("the response writes");
-            head
+            String::from_utf8_lossy(&request).into_owned()
         })
     }
 
@@ -210,9 +225,14 @@ mod tests {
                 }
                 head.push_str(&String::from_utf8_lossy(&buf[..read]));
             }
+            let reason = if status == 200 {
+                "OK"
+            } else {
+                "Service Unavailable"
+            };
             write!(
                 stream,
-                "HTTP/1.1 {status} Service Unavailable\r\nContent-Type: application/json\r\n\
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n\
                  Content-Length: 400\r\nConnection: close\r\n\r\n{{\"error\":{{\"mess"
             )
             .expect("the partial response writes");
@@ -384,7 +404,12 @@ mod tests {
             check_at < codex_at,
             "the credential check must precede the Codex run"
         );
-        // One definition of the provider, shared by the check and the action.
+        // One definition of the provider, shared by the check and the action:
+        // the job env declares both (six-space indentation — a step env would
+        // be deeper), and the action steps read the declarations.
+        for declared in ["\n      GATE_ENDPOINT: ", "\n      GATE_MODEL: "] {
+            assert!(workflow.contains(declared), "the job env must declare {declared}");
+        }
         assert!(
             workflow.contains("responses-api-endpoint: ${{ env.GATE_ENDPOINT }}"),
             "the Codex step must read the shared endpoint"
@@ -422,6 +447,13 @@ mod tests {
                 .contains("x-opencode-session: cola-codex-gate-preflight"),
             "the Go lane rejects a request without a session header: {seen}"
         );
+        for field in [
+            r#""model":"test-model""#,
+            r#""input":"ping""#,
+            r#""max_output_tokens":16"#,
+        ] {
+            assert!(seen.contains(field), "the probe must send {field}: {seen}");
+        }
     }
 
     #[test]
@@ -436,6 +468,24 @@ mod tests {
             String::from_utf8_lossy(&out.stdout)
         );
         assert!(request.join().unwrap().starts_with("POST /v1/responses"));
+    }
+
+    #[test]
+    fn the_credential_check_fails_when_a_200_body_is_cut() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stub = respond_cut(listener, 200);
+        let out = run_credential_check(&format!("http://{addr}/v1/responses"));
+        let log = String::from_utf8_lossy(&out.stdout);
+        stub.join().unwrap();
+        assert!(
+            !out.status.success(),
+            "a 200 whose body never completed is not a healthy credential: {log}"
+        );
+        assert!(
+            log.contains("HTTP 200"),
+            "the cut response still names the status it sent: {log}"
+        );
     }
 
     #[test]
