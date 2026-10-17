@@ -39,9 +39,11 @@ loop.
   `read_dir` (capped at `BROWSE_SCAN_CAP`), `is_dir()`-probes symlinks and `stat`s each child
   for a `.git` entry. Reading a file's **bytes** locally is the same act on the same machine —
   not a new capability class, and not a new trust boundary.
-- **cola is on the server's host.** Discovery reads the server's port and password from
-  environment (AGENTS.md pitfall `attach`), so the attached server is always a local process; a
-  Session's directory is a local path. There is no remote-server deployment to design for.
+- **cola is on the server's host.** Discovery resolves the server from local processes — a
+  classic `serve --port P` through its argv and environment, a V2 `serve --service` through its
+  registration file (`AGENTS.md` pitfall `attach`) — so the attached server is always a local
+  process; a Session's directory is a local path. There is no remote-server deployment to design
+  for.
 - **Every Feishu card is readable by the whole chat.** The **Access List** (ADR-0035) gates
   who may *click*, not who may *read* a card — so a viewer card publishes a file's content to
   every member of a group chat. The same exposure already applies to directory names, and
