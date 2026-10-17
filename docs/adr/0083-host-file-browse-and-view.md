@@ -98,9 +98,12 @@ loop.
    **The whole-bytes lane is a user action, not a promise**: a viewer carries 「发为文件」 when
    its content has not already landed outside the card. The action uploads the file and posts it
    as a File Message; it is the way to send a fitting preview's bytes and the rescue for an
-   overflow lane that did not land. **Deliver once:** when content has already landed as a Rich
-   Text Message or File Message, the viewer omits 「发为文件」 rather than offer a duplicate;
-   its tracking line names the message lane. An embedded image remains visible on the viewer
+   overflow lane that did not land. **Deliver once, by bytes:** when the bytes have already
+   landed as a **File Message**, the viewer omits 「发为文件」 rather than offer a duplicate (as
+   does an ambiguous send whose retry might duplicate); its tracking line names the message
+   lane. A **Rich Text Message** is a rendered preview, not the bytes, so that viewer still
+   carries the action — the original file still needs a way out. An embedded image remains
+   visible on the viewer
    card and keeps the explicit File Message action. **That transfer never runs inside the card
    callback.** The click records the
    intent and acknowledges; a bounded, timed-out step performs the upload and the send off
