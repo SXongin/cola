@@ -2778,6 +2778,32 @@ async fn rich_text_messages(platform: &RecordingPlatform) -> Vec<PlatformCall> {
         .collect()
 }
 
+/// The first `reply_text` the platform recorded, once one lands — the reply a
+/// card-less Tool Panel preview speaks its outcome with (#778): the target message
+/// and the text.
+async fn first_reply_text(platform: &RecordingPlatform) -> (String, String) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let replies: Vec<(String, String)> = platform
+                .calls
+                .lock()
+                .await
+                .iter()
+                .filter_map(|call| match call {
+                    PlatformCall::ReplyText { message_id, text } => Some((message_id.clone(), text.clone())),
+                    _ => None,
+                })
+                .collect();
+            if let Some(reply) = replies.into_iter().next() {
+                break reply;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the reply lands")
+}
+
 fn reread_payload(card: &serde_json::Value) -> serde_json::Value {
     card_buttons(card)
         .into_iter()
@@ -4541,26 +4567,7 @@ async fn a_tool_panel_preview_failure_speaks_a_reply() {
     let result = app.host_action(payload).await.expect("the click acks");
     assert_eq!(result.toast.as_deref(), Some("正在发送文件…"));
 
-    let (message_id, text) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            let replies: Vec<(String, String)> = platform
-                .calls
-                .lock()
-                .await
-                .iter()
-                .filter_map(|call| match call {
-                    PlatformCall::ReplyText { message_id, text } => Some((message_id.clone(), text.clone())),
-                    _ => None,
-                })
-                .collect();
-            if let Some(reply) = replies.into_iter().next() {
-                break reply;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("the failure reply lands");
+    let (message_id, text) = first_reply_text(&platform).await;
     assert_eq!(message_id, "msg_turn_card", "the reply targets the clicked card");
     assert!(
         text.contains("找不到路径") && text.contains("gone.html"),
@@ -4599,26 +4606,7 @@ async fn a_tool_panel_preview_past_the_upload_cap_names_the_cap() {
     payload["open_message_id"] = serde_json::json!("msg_turn_card");
     app.host_action(payload).await.expect("the click acks");
 
-    let text = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            let replies: Vec<String> = platform
-                .calls
-                .lock()
-                .await
-                .iter()
-                .filter_map(|call| match call {
-                    PlatformCall::ReplyText { text, .. } => Some(text.clone()),
-                    _ => None,
-                })
-                .collect();
-            if let Some(text) = replies.into_iter().next() {
-                break text;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("the failure reply lands");
+    let (_, text) = first_reply_text(&platform).await;
     assert!(
         text.contains("超过 30 MB") && text.contains("huge.html"),
         "the reply names the cap and the file: {text}"
@@ -4628,6 +4616,53 @@ async fn a_tool_panel_preview_past_the_upload_cap_names_the_cap() {
     assert!(
         patches_to(&platform, "msg_turn_card").await.is_empty(),
         "the Turn card is never PATCHed"
+    );
+}
+
+/// #778: a preview whose File Message timed out after Feishu may have accepted it
+/// replies the honest unknown — there is no card of cola's own to state
+/// `发送结果未知` on — and a stale click is refused rather than posting a duplicate.
+#[tokio::test]
+async fn a_tool_panel_preview_with_an_ambiguous_send_replies_the_unknown() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    std::fs::write(proj.path().join("index.html"), "<p>hi</p>\n").unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    // A transfer bound so short the parked send cannot answer in time, after the
+    // mock has already ACCEPTED it (the ambiguous case).
+    app.viewer_transfer_timeout_ms
+        .store(25, std::sync::atomic::Ordering::Relaxed);
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+
+    let mut payload = crate::feishu::card::session::tool_page_value("ses_seed", "index.html");
+    payload["open_message_id"] = serde_json::json!("msg_turn_card");
+    let (entered, _release) = platform.pause_after_accept("send_message", "msg_turn_card");
+    app.host_action(payload.clone()).await.expect("the click acks");
+    tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+        .await
+        .expect("the send reached Feishu before the response timed out");
+
+    let (message_id, text) = first_reply_text(&platform).await;
+    assert_eq!(message_id, "msg_turn_card", "the reply targets the clicked card");
+    assert!(
+        text.contains("发送结果未知"),
+        "the reply is the honest unknown, not a silent success: {text}"
+    );
+    assert_eq!(file_messages(&platform).await.len(), 1, "Feishu accepted once");
+    assert!(
+        patches_to(&platform, "msg_turn_card").await.is_empty(),
+        "the Turn card is never PATCHed"
+    );
+    let duplicate = app.host_action(payload).await.expect("a stale click acks");
+    assert_eq!(duplicate.toast.as_deref(), Some("发送结果未知，为避免重复未重试"));
+    assert_eq!(
+        file_messages(&platform).await.len(),
+        1,
+        "an ambiguous send is never retried"
     );
 }
 

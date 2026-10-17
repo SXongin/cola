@@ -416,10 +416,11 @@ else:
   `handle_file_card_action` does; the structured path resolves on the Path Scope (§4), so a panel
   whose `filePath` is relative to the session directory sends the right file. A Session the store
   no longer knows answers an honest Toast, no transfer.
-- **There is no card of cola's own to write `未发送` on.** A landed send is its own evidence (the
-  File Message) and adds no card copy; a definite failure is spoken as a reply under the clicked
-  card — `⚠️ 无法发送 …：原因` — because a silent failure would leave the button looking live with
-  nothing sent.
+- **There is no card of cola's own to write `未发送` on.** A landed send is its own evidence
+  (the File Message) and adds no card copy; a definite failure is spoken as a reply under the
+  clicked card — `⚠️ 无法发送 …：原因` — and so is an ambiguous timeout
+  (`⚠️ 发送结果未知，为避免重复未重试。`), because a silent outcome would read as a silent failure.
+  A definite failure is remembered on nothing, so the button stays live for a retry.
 - **Deliver-once still holds, keyed by the path.** The same bounded window remembers a landed or
   ambiguous send so a stale second click cannot post a duplicate; the key gains the path, because
   one Turn card can carry several file panels and the clicked message alone does not name one file.
