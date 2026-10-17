@@ -96,8 +96,8 @@ filter bot reviewers — see the 2026-09-15 amendment.
   the release workflow renames them per artifact.
 - CodeRabbit was removed on 2026-09-15 (see the amendments). Its repository
   read access and approval voice are replaced by the review gate — OpenCode
-  until 2026-10-04, Codex Action since — which holds `pull-requests: write` and
-  an API key shared with local development.
+  until 2026-10-04, Codex Action since — which holds the workflow permissions
+  needed to publish the review and its approval.
 - The Scorecard number will be lower than its theoretical maximum by design.
   Do not "fix" the remaining zeros without revisiting this ADR.
 
@@ -390,3 +390,23 @@ the pinned SHA's bump and failed `cargo test -p xtask` until the guard's
 expected SHA moved with it (PR #713, the bump to v1.13 this amendment lands).
 The guard's job is to make that move deliberate — this is that deliberation —
 not to freeze the pin against every future release.
+
+## Amendment (2026-10-17): the gate's provider is workflow configuration, not an ADR pin
+
+The 2026-10-04 and 2026-10-14 amendments named the gate's provider, endpoint and
+model, and that specificity aged badly: the metered allowance behind it ran out,
+so a gate whose provider was an ADR decision produced no review at all until the
+record itself was rewritten.
+
+The gate's **provider, endpoint, model and secret** are therefore workflow
+configuration, recorded in `.github/workflows/codex-review.yml` (the step's own
+comment carries the current choice) and deliberately not pinned here or in
+`CONTRIBUTING.md`; both describe the gate generically. This supersedes the
+provider specifics of the 2026-10-04 and 2026-10-14 amendments, which stay in
+place as the historical record of what the gate ran on.
+
+What this ADR pins is unchanged: the Codex Action, the two axes plus adversarial
+rubric, the read-only posture, the line-final `CODEX_REVIEW_VERDICT: PASS|FAIL`
+contract, approval only on `PASS` and pinned to the reviewed commit, and the
+skips (fork, Dependabot, `release/*`). Swapping the provider is a workflow change
+that CI has to prove, not a decision-record change.
