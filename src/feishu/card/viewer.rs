@@ -1589,6 +1589,29 @@ mod tests {
         ThreadKey::new("chat_1".into(), "chat_1".into())
     }
 
+    /// Every `markdown` element's content on the card, in body order — so a
+    /// test can say how many prose blocks a card carries, not just whether one
+    /// specific sentence is absent.
+    fn markdown_contents(card: &serde_json::Value) -> Vec<String> {
+        fn walk(value: &serde_json::Value, out: &mut Vec<String>) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    if map.get("tag").and_then(|t| t.as_str()) == Some("markdown")
+                        && let Some(content) = map.get("content").and_then(|c| c.as_str())
+                    {
+                        out.push(content.to_string());
+                    }
+                    map.values().for_each(|v| walk(v, out));
+                }
+                serde_json::Value::Array(items) => items.iter().for_each(|v| walk(v, out)),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        walk(card, &mut out);
+        out
+    }
+
     /// The card's visible text (every `content`/`text` field, walked) —
     /// `card_text`'s rule, local so the card layer's own tests need no bridge
     /// harness.
@@ -2423,11 +2446,20 @@ mod tests {
             ),
         );
         let text = card_text(&card);
-        assert!(
-            !text.contains("点此把文件发到会话"),
-            "the card carries no explanatory note: {text}"
-        );
         assert!(text.contains("```html"), "the source preview stays: {text}");
+        // Structurally, not by wording: a fresh page card is the naming block
+        // and the source block, nothing else. Any reintroduced explanatory line
+        // — whatever it says — adds a third markdown element.
+        let markdown = markdown_contents(&card);
+        assert_eq!(
+            markdown.len(),
+            2,
+            "naming + source, no explanatory note: {markdown:?}"
+        );
+        assert!(
+            markdown[0].contains("/tmp/proj/index.html") && markdown[1].starts_with("```html"),
+            "and in that order: {markdown:?}"
+        );
 
         let buttons = card_buttons(&card);
         assert_eq!(buttons[0]["text"]["content"], "🌐 预览网页");

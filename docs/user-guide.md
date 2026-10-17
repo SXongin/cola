@@ -461,7 +461,7 @@ Notes:
   for text, embedded-image and Rich Text previews; it is suppressed after a File
   Message has already carried the bytes. If a File Message send times out, the
   card says the result is unknown and does not retry to avoid a duplicate.
-  For an `.html`/`.htm` file the transfer **leads** the row as
+  For a **text** `.html`/`.htm` file the transfer **leads** the row as
   「🌐 预览网页」: Feishu renders an uploaded `.html` as a page when the file
   message is opened (inline scripts included), so the File Message is that
   file's real viewer — no card component renders HTML.
