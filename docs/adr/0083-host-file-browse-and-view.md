@@ -369,18 +369,17 @@ changes is only the **card's action priority and copy** — no new lane, no new 
   (`file`/`send`, the resolved path, the browse listing's whole state); 「🔄 重新读取」 and the
   directory control follow. Every other file keeps 「发为文件」 exactly as it was, so one action
   keeps one name per intent and the callback grammar is unchanged.
-- **The card says where the preview is.** One line above the source block states that the button
-  sends the file and that opening it in Feishu shows the rendered page; past
-  `HTML_PREVIEW_MAX_BYTES` (12 MB, `src/feishu/file.rs`) it adds that the client may not render it
-  at all. The line reads the lane's own delivery state rather than a boolean, so it never outruns
-  what happened: bytes still to send, sent, **possibly** sent (an ambiguous timeout keeps its
-  uncertainty, as the tracking line does), or impossible to send — a file past Feishu's 30 MB
-  upload cap says so instead of promising a page, and a `TextTooLarge` page delivered on open
-  reads the delivered form. The transfer button keeps the delivered-bytes predicate it had — a
-  card that already sent the file offers no second send, and an ambiguous send is not retried —
-  and a file past the upload cap keeps its button too, exactly as every other kind does: the
-  click re-reads the file and reports 未发送 on the card. What must not happen is the note
-  promising a page the cap forbids, so the note alone changes there.
+- **The card does not explain itself; the label does.** The transfer button is named for the
+  page it produces — 「🌐 预览网页」 — and that is the whole story: an owner who presses it once
+  sees the File Message and the page its client renders. A standing line of prose above every
+  HTML viewer's source block would occupy the card's most valuable row to teach a one-time fact,
+  so the note this amendment first carried was **dropped during the owner's manual verification**
+  (#774). What remains is the button, obeying the predicate it always had: a card that already
+  sent the file offers no second send, an ambiguous send is not retried, and a file past the
+  upload cap keeps its button — the click re-reads the file and reports 未发送 on the card,
+  exactly as every other kind does. The client's 12 MB preview limit stays documented evidence
+  (`docs/research/feishu-rich-surfaces/r1-display-surface-inventory.md`), not card copy.
+
 - **The source preview stays.** A page's markup is still worth reading, and the card is the only
   place cola shows it; the amendment demotes the action, it does not delete the preview.
 
