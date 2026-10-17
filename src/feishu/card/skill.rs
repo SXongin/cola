@@ -18,7 +18,7 @@ use super::truncate_md;
 /// The bytes one loaded-skill card's folds may spend in total — every fold's
 /// JSON structure, its title AND its **sanitized** body (spec #652, ticket
 /// #655). Feishu rejects a card whose serialized JSON exceeds 30 KB (AGENTS.md
-/// pitfall #13), and the dedicated card carries ONE message's skills (usually
+/// pitfall `card-budgets`), and the dedicated card carries ONE message's skills (usually
 /// 1–3), so the budget is sized to the card limit rather than the removed
 /// many-message tail's tight one: 24 KB leaves ~6 KB for the card shell,
 /// comfortably under 30 KB. It bounds the WORST CASE (a pathological dispatch
@@ -82,7 +82,7 @@ const SUMMARY_BODY: &str = "（技能过多，其余已省略）";
 /// title and body bytes its folds may spend AND the individual folds it may
 /// render. Every fold on the card draws from that one budget, so a dispatch
 /// loading several large skills cannot push the one-shot loaded-skill card past
-/// Feishu's total limit (AGENTS.md #13), and a pathological skill count cannot
+/// Feishu's total limit (AGENTS.md pitfall `card-budgets`), and a pathological skill count cannot
 /// push it past the component ceiling ([`SKILL_FOLD_MAX`]). `prefix` names each
 /// panel for the reader's fold state (`{prefix}{index}`), like every other
 /// panel's `element_id`; `md` is the CARD's markdown state, so the folds share
@@ -168,7 +168,7 @@ pub(crate) fn build_loaded_skill_card(skills: &[SkillInfo], error: Option<&str>)
 /// One fold's title: `🧩 已加载技能：<name>`. The name is clipped to the same
 /// budget the picker's row label uses ([`SKILL_ROW_LABEL_CHARS`]) — the fold's
 /// body budget never bounds its title, so an unbounded name could alone push the
-/// card past Feishu's 30 KB limit (AGENTS.md #13).
+/// card past Feishu's 30 KB limit (AGENTS.md pitfall `card-budgets`).
 fn fold_title(name: &str) -> String {
     format!("🧩 已加载技能：{}", truncate_md(name, SKILL_ROW_LABEL_CHARS))
 }
@@ -325,7 +325,7 @@ mod tests {
 
     /// The card's shared budget bounds the folds even when a dispatch loads
     /// several large CJK skills whose per-fold caps would sum far past Feishu's
-    /// total card limit (AGENTS.md #13). Every skill still gets its OWN titled
+    /// total card limit (AGENTS.md pitfall `card-budgets`). Every skill still gets its OWN titled
     /// fold below the component cap — the budget is the size guard — and a fold
     /// past the budget renders its title with the omission body rather than an
     /// oversized body. The whole card stays under Feishu's limit.

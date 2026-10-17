@@ -2024,7 +2024,7 @@ where
 }
 
 /// Poll `GET /session` until the freshly started child answers — the server
-/// can accept TCP before its dispatch is wired (AGENTS.md pitfall #12).
+/// can accept TCP before its dispatch is wired (AGENTS.md pitfall `attach`).
 async fn wait_for_ready(backend: &OpenCodeBackend, server: &LiveServer) {
     poll_until(
         "the child V1 server to answer",

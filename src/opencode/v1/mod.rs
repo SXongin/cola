@@ -208,7 +208,7 @@ impl GenerationStrategy for V1Strategy {
         // created before a server restart/replacement, or another client removed
         // it). Report SessionNotFound so the bridge recreates the session and
         // retries once; any other failure stays a plain OpenCode error, which
-        // the error card offers to re-submit (see AGENTS.md pitfall #1).
+        // the error card offers to re-submit (see AGENTS.md pitfall `generations`).
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Err(crate::error::BridgeError::SessionNotFound(session_id.to_string()));
         }
@@ -629,7 +629,7 @@ impl GenerationStrategy for V1Strategy {
 
     /// Interrupt an active session.
     async fn interrupt(&self, http: &Transport, session_id: &str) -> Result<()> {
-        // Canonical path has NO `/api` prefix (see AGENTS.md pitfall #1); the
+        // Canonical path has NO `/api` prefix (see AGENTS.md pitfall `generations`); the
         // old `/api/session/{id}/interrupt` 404'd so `/stop` silently failed.
         http.client()
             .post(http.url(&format!("{SESSION}/{session_id}/abort")))

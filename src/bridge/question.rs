@@ -12,7 +12,7 @@ pub struct QuestionState {
     /// Owning directory, recorded where the poll loop knows it. The question
     /// card's `name` no longer carries the directory (Feishu caps `name` at
     /// 100 chars), so a value-less form-submit callback re-resolves it here
-    /// (sub-task child sessions aren't in the Session Mapping — pitfall 11).
+    /// (sub-task child sessions aren't in the Session Mapping — pitfall `child-session-permissions`).
     dir: String,
     /// FINAL answers: `answers[i]` is `None` until question `i` is finalized.
     /// A request is only submitted once every slot is filled (or the user

@@ -1,7 +1,7 @@
 //! Wire types for the OpenCode Server REST API.
 //!
 //! Every type mirrors the server's JSON contract; camelCase fields carry
-//! `#[serde(rename)]` (AGENTS.md pitfall #2). Request-body builders and
+//! `#[serde(rename)]` (AGENTS.md pitfall `wire-shapes`). Request-body builders and
 //! payload parsing live with the generation strategy (`v1`), never here.
 //!
 //! These DTOs are the [`crate::backend`] contract's shapes and the documented
@@ -27,7 +27,7 @@ pub struct CreateSessionResponse {
 
 /// One entry from the canonical `GET /session` list — `Session.Info` with the
 /// fields the discovery commands need. Server JSON uses camelCase; serde
-/// renames are required (AGENTS.md pitfall #2).
+/// renames are required (AGENTS.md pitfall `wire-shapes`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct SessionListInfo {
     pub id: String,
@@ -505,7 +505,7 @@ mod tests {
     #[test]
     fn parses_session_list_info_camelcase_fixture() {
         // A real `GET /session` entry (Session.Info, camelCase). ParentID/time
-        // must map onto the serde-renamed fields (AGENTS.md pitfall #2).
+        // must map onto the serde-renamed fields (AGENTS.md pitfall `wire-shapes`).
         let json = r#"{
             "id": "ses_alpha01",
             "slug": "alpha",

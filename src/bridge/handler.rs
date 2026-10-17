@@ -965,7 +965,7 @@ async fn open_topic_from_card(
 /// The whole `⚠️ 未找到技能：…` line's clip. The line is passed into the picker
 /// card and the dedicated loaded-skill card OUTSIDE the fold budget, so a
 /// dispatch naming many or very long unknown ids must still be bounded well
-/// under Feishu's 30 KB card limit (AGENTS.md #13).
+/// under Feishu's 30 KB card limit (AGENTS.md pitfall `card-budgets`).
 const UNKNOWN_IDS_LINE_CHARS: usize = 500;
 
 /// Resolve one Skill Token id against the read skill list (spec #662). The

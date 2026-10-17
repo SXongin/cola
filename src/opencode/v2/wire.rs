@@ -1170,7 +1170,7 @@ fn decode_content(content: Option<&Value>) -> Vec<Part> {
 /// is not a string is malformed and stays raw (V1's arm, so a valid+malformed
 /// pair never joins an extra line); reasoning has no id anywhere, so the
 /// decoded order is the whole identity, and dedup stays content-based in the
-/// renderer (AGENTS.md #9).
+/// renderer (AGENTS.md pitfall `wire-shapes`).
 fn decode_content_item(item: &Value) -> Part {
     match item.get("type").and_then(Value::as_str) {
         Some("text") => match item.get("text").and_then(Value::as_str) {
