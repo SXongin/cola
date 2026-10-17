@@ -461,13 +461,20 @@ Notes:
   for text, embedded-image and Rich Text previews; it is suppressed after a File
   Message has already carried the bytes. If a File Message send times out, the
   card says the result is unknown and does not retry to avoid a duplicate.
+  For an `.html`/`.htm` file the transfer **leads** the row as
+  「🌐 预览网页」: Feishu renders an uploaded `.html` as a page when the file
+  message is opened (inline scripts included), so the File Message is that
+  file's real viewer — no card component renders HTML. Past the client's 12 MB
+  preview limit the card warns that the page may not render and only download.
   「🔄 重新读取」 re-reads and updates the viewer in
   place. 「📂 所在目录」 opens the file's parent in the Directory Browser;
   「← 返回目录」 returns from a browse-row viewer to its listing. A write/edit
   Tool Panel's folded header names the file it touched, and its 「📂 打开」 button
   rides inside the fold — expand the panel, then open the file in the viewer. A File Message
   is a file for the reader to download or hand to the client; cola does **not**
-  promise inline preview.
+  promise the client will inline-preview it. Feishu's own preview renders
+  `.md` and `.html` (measured), but that is the client's behaviour, not
+  something cola controls.
 - The **Path Scope** (`~` expanded, relative paths resolved from the session
   directory, absolute paths resolved as absolute paths) is a **privacy hint, not a security
   control or boundary**: any path the Host can read is reachable. Missing,
