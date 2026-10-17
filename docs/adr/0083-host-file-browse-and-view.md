@@ -372,9 +372,13 @@ changes is only the **card's action priority and copy** — no new lane, no new 
 - **The card says where the preview is.** One line above the source block states that the button
   sends the file and that opening it in Feishu shows the rendered page; past
   `HTML_PREVIEW_MAX_BYTES` (12 MB, `src/feishu/file.rs`) it adds that the client may not render it
-  at all. The line obeys the same delivered-bytes predicate as the button, so the card can neither
-  offer a send it has performed nor claim one it has not — a `TextTooLarge` page, delivered on
-  open by the File Message lane, reads the delivered form.
+  at all. The line reads the lane's own delivery state rather than a boolean, so it never outruns
+  what happened: bytes still to send, sent, **possibly** sent (an ambiguous timeout keeps its
+  uncertainty, as the tracking line does), or impossible to send — a file past Feishu's 30 MB
+  upload cap says so instead of promising a page, and a `TextTooLarge` page delivered on open
+  reads the delivered form. The transfer button keeps the delivered-bytes predicate it had — a
+  card that already sent the file offers no second send, and an ambiguous send is not retried —
+  so the note and the control can never tell two different stories.
 - **The source preview stays.** A page's markup is still worth reading, and the card is the only
   place cola shows it; the amendment demotes the action, it does not delete the preview.
 
