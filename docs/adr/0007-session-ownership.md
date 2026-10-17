@@ -94,7 +94,7 @@ How cola decides what identity a session has, and which session a thread may use
   transient, cosmetic.
 - Legacy entries keep their `name` field harmlessly; nothing reads it after
   migration. Old entries whose server session 404s are already recreated
-  (pitfall #7); unchanged.
+  (pitfall `attach`); unchanged.
 - `CONTEXT.md` glossary needs a correction: the lobby may hold several sessions,
   and "A Thread contains exactly one Session" applies to topics only. Update it
   as part of the implementation.

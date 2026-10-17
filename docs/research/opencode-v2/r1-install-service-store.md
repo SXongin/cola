@@ -655,7 +655,7 @@ Confirm V1 is untouched: `ls -l ~/.local/share/opencode/opencode.db` (mtime unch
    executed is the third-party `opencode2-linux-x64@2.0.16` binary (`--version` → `opencode v2.0.16`).
 8. **V2's HTTP API surface was not audited** beyond `/api/info` and the auth/discovery handshake.
    Whether V2's `/api/*` routes are wire-compatible with what cola currently calls on a V1 server
-   is a separate question (this repo's `AGENTS.md` pitfall #1 already flags that the prefix
+   is a separate question (this repo's `AGENTS.md` pitfall `generations` already flags that the prefix
    generation was redefined mid-project).
 9. **Whether the update service will ever move V2 onto the `opencode-ai` package name** (which
    would remove the bin conflict) or the reverse — no signal either way in the tree. Today they are

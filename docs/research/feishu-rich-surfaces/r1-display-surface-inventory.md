@@ -162,7 +162,7 @@ Notes for #669:
 | Markdown tables per **card** | 5 | [ours] measured 2026-09-22 (`src/feishu/card/sanitize.rs:45`) — the doc only states "four per rich text component" |
 | Markdown table **body rows** | 49 | [ours] measured 2026-09-22 (`sanitize.rs:50`): 50 fails, 49 renders. **Not documented at all.** |
 | `table` component: per card / columns / page size | ≤5 components, ≤50 columns, `page_size` 1–10 | [doc] [Table component](https://open.feishu.cn/document/feishu-cards/card-json-v2-components/content-components/table) |
-| Per-element text | **No platform cap is documented.** A single 8000-char ASCII / 3060-char CJK element renders fully via create and PATCH; limits are 30 KB total + 200 elements | [ours] measured 2026-09-18 — AGENTS.md pitfall 13, and the comment on `src/feishu/card/mod.rs:249` explicitly warns not to "fix" the 3000-char `MAX_ELEMENT_TEXT_CHARS` as a platform cap |
+| Per-element text | **No platform cap is documented.** A single 8000-char ASCII / 3060-char CJK element renders fully via create and PATCH; limits are 30 KB total + 200 elements | [ours] measured 2026-09-18 — AGENTS.md pitfall `card-budgets`, and the comment on `src/feishu/card/mod.rs:249` explicitly warns not to "fix" the 3000-char `MAX_ELEMENT_TEXT_CHARS` as a platform cap |
 | Card nesting depth | **Not documented** | [unverified] — issue #279 lists it as a known gap |
 | `loop` container | Builder-tool only, **not constructible in card JSON** | [doc] catalog + ADR-0078 |
 | Image upload | ≤10 MB; jpg/jpeg/png/webp/gif/bmp/ico/tiff/heic (tiff/heic → jpg); GIF ≤2000×2000, others ≤12000×12000 | [ours] ADR-0076, 2026-10-10 |
@@ -500,7 +500,7 @@ not have.
 |---|---|
 | Card JSON 2.0 has no file component; `img` fits inside `collapsible_panel` | `docs/adr/0076-file-content-delivery.md` (2026-10-10), "Feishu's surfaces (confirmed 2026-10-10)" |
 | Image ≤10 MB / dimension caps; file ≤30 MB; uploaded key stable across PATCHs | same ADR, Context |
-| 30 KB card, 200 elements, `11310`; an 8000-char ASCII / 3060-char CJK element renders fully; 3000 chars is **cola's** budget, not a platform cap | `AGENTS.md` pitfall 13 (measured 2026-09-18) + the comment on `src/feishu/card/mod.rs:249` |
+| 30 KB card, 200 elements, `11310`; an 8000-char ASCII / 3060-char CJK element renders fully; 3000 chars is **cola's** budget, not a platform cap | `AGENTS.md` pitfall `card-budgets` (measured 2026-09-18) + the comment on `src/feishu/card/mod.rs:249` |
 | Card callback 3 s, no retry; no file-picker/tree/dynamic options; `form` cannot nest in `collapsible_panel`; `loop` is builder-tool only; table cells are not buttons | `docs/adr/0078-directory-browser-card.md` (2026-10-11), Context |
 | `MAX_CARD_TABLES = 5` (whole card), `MAX_TABLE_ROWS = 49` | `src/feishu/card/sanitize.rs:41-50`, both "measured 2026-09-22" |
 | `FEISHU_CARD_LIMIT_BYTES = 30_000`, `MAX_CARD_JSON_CHARS = 30_000 − 5_000`, `MAX_CARD_COMPONENTS = 150` | `src/feishu/card/mod.rs:229-246` |

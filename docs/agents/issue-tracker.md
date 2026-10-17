@@ -58,3 +58,4 @@ Used by `/wayfinder`. The **map** is a single issue with **child** issues as tic
 - The 26 resolved tickets and all specs stay in `.scratch/` as history.
 - Four in-flight specs remain there as design docs: `.scratch/architecture-deepening/spec.md`, `command-redesign/spec.md`, `supplement-message/spec.md`, `test-surface/spec.md`. Read them when working the related issues; new specs publish to GitHub.
 - The old `Status:` lines are inert — the issue labels are authoritative.
+- The archive cites `AGENTS.md` pitfalls by their **pre-slug numbers**; `docs/adr/0084-pitfall-slugs.md` maps them.

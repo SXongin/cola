@@ -27,7 +27,7 @@ Primary sources used, all read on 2026-09-26:
 |---|---|
 | `/root/workspace/dev/opencode` @ `16c56fe5ec` | route tables, auth, CLI, data dir, schemas |
 | `cola` `src/`, `.github/workflows/`, `docs/adr/`, `CONTEXT.md` | cola's side |
-| `AGENTS.md` "Known pitfalls" #1–#13 | cola's own record of protocol couplings |
+| `AGENTS.md` "Known pitfalls" (eight slugs, ADR-0084) | cola's own record of protocol couplings |
 
 **Classification**
 
@@ -48,7 +48,7 @@ Counts: **~86 recorded dependencies — 12 (a), 55 (b), 19 (c).**
 | 1 | `src/bridge/discovery.rs:115-116` | A running server is a process whose `argv[0]` **contains** `"opencode"` and whose args include the exact subcommand `"serve"` | **c** | Matches `cli/cmd/serve.ts:7` `command: "serve"`. A renamed binary breaks discovery silently. |
 | 2 | `src/bridge/discovery.rs:120-124` | The port is passed as `--port <n>` on the **command line** (parsed positionally) | **c** | `cli/network.ts` owns the flags; a flag rename or `--port=4096` (equals form) yields **no candidate at all** (the `?` on `parse()` drops it). |
 | 3 | `src/bridge/discovery.rs:130-134` | The password arrives as `OPENCODE_SERVER_PASSWORD=` in the process env | **c** | `server/auth.ts` `EffectConfig.string("OPENCODE_SERVER_PASSWORD")`. Empty → `password: ""` → **no Authorization header** → 401 (verified: `authorized()` returns false when `password` is `None`/empty). |
-| 4 | `src/bridge/discovery.rs:69-75`, `:32` | The effective basic-auth **username** is `OPENCODE_SERVER_USERNAME` else the literal `"opencode"` | **c** | Verified primary source: `server/auth.ts` `username: EffectConfig.string("OPENCODE_SERVER_USERNAME").pipe(EffectConfig.withDefault("opencode"))`. Pitfall #12. |
+| 4 | `src/bridge/discovery.rs:69-75`, `:32` | The effective basic-auth **username** is `OPENCODE_SERVER_USERNAME` else the literal `"opencode"` | **c** | Verified primary source: `server/auth.ts` `username: EffectConfig.string("OPENCODE_SERVER_USERNAME").pipe(EffectConfig.withDefault("opencode"))`. Pitfall `attach`. |
 | 5 | `src/bridge/discovery.rs:136-148`, `:55-64` | The "Shared Store" is `$XDG_DATA_HOME` else `~/.local/share`, **on every platform** (macOS/Windows included) | **c** | Mirrors `packages/core/src/global.ts` `import { xdgData … } from "xdg-basedir"` and `packages/desktop/src/main/logging.ts` `process.env.XDG_DATA_HOME \|\| join(homedir(), ".local", "share")`. ADR-0005 + opencode #8235. A store-path change silently makes every server ineligible → cola spawns a duplicate server on the same store. |
 | 6 | `src/bridge/discovery.rs:87-92` | `sysinfo` must scan with `without_tasks()`, or each thread of a server looks like a separate server | **c** | Platform-general, but exists only because the server is a multi-threaded Bun process. |
 | 7 | `src/bridge/discovery.rs:170-189` | "Owned vs Coexistent" is decided by **pid identity** recorded in `~/.cola/self-opencode.pid` | **c** | ADR-0013. Depends on cola having spawned the process itself. |
@@ -100,7 +100,7 @@ Every path cola calls, with its V1/V2 status. V2 column verified from
 | `GET /agent` | `client.rs:694` | **V1** | `GET /api/agent` |
 | `GET /provider` | `client.rs:638`, `:714` | **V1** | `GET /api/provider` |
 | `?directory=` on every instance-routed call | `client.rs:479`, `:497`, `:520`, `:575`, `:612`, `:677`, `:734` | **a** (routing) | `?location` + `GET /api/location` (V2 has a `location` group) |
-| **no** model-switch endpoint (model sent per prompt) | `client.rs:335`, `parsing.rs:142-157` | **b** | V2 *has* `POST /api/session/{id}/model` (`protocol/src/groups/session.ts:189`) — see pitfall #4 |
+| **no** model-switch endpoint (model sent per prompt) | `client.rs:335`, `parsing.rs:142-157` | **b** | V2 *has* `POST /api/session/{id}/model` (`protocol/src/groups/session.ts:189`) — see pitfall `generations` |
 
 So of **19 route families cola touches, 15 are V1, 2 are V2, 2 are
 generation-neutral routing.**
@@ -110,7 +110,7 @@ generation-neutral routing.**
 | # | file:line | What cola assumes | Class | Notes |
 |---|---|---|---|---|
 | 24 | `src/opencode/wire/legacy.rs:29-34` | A V1 message is an envelope **`{info, parts}`** | **b** | `WireSessionMessage`. V2 `GET /api/session/{id}/message` returns a different envelope. |
-| 25 | `src/opencode/wire/legacy.rs:36-50` | `info` carries `id`, `role`, `time`, **`modelID`**, **`providerID`**, `tokens` (all camelCase) | **b** | Pitfall #2. `#[serde(rename)]` omissions silently null fields. |
+| 25 | `src/opencode/wire/legacy.rs:36-50` | `info` carries `id`, `role`, `time`, **`modelID`**, **`providerID`**, `tokens` (all camelCase) | **b** | Pitfall `wire-shapes`. `#[serde(rename)]` omissions silently null fields. |
 | 26 | `src/opencode/wire/legacy.rs:52-71` | Usage lives at `info.tokens.{input,output,total,cache.{read,write}}` | **b** | Powers the card footer's 📊. |
 | 27 | `src/opencode/wire/legacy.rs:73-80` | `time.{created, completed}` in **epoch millis**; `completed` absent while in flight | **b** | The absence is load-bearing for turn membership (below). |
 | 28 | `src/opencode/wire/legacy.rs:144-177` | Part `type` vocabulary is exactly `text, reasoning, tool, step-start, step-finish, patch` (+ anything else → `Other`) | **b** | Verified upstream `packages/schema/src/v1/session.ts:360-366` `Part = Union([TextPart, SubtaskPart, ReasoningPart, FilePart, ToolPart, StepStartPart, StepFinishPart, SnapshotPart, PatchPart, AgentPart, RetryPart, CompactionPart])` — 12 kinds, of which cola models 6. The 6 unmodelled kinds include **`SubtaskPart`**, which V2 has a first-class session type for. |
@@ -118,7 +118,7 @@ generation-neutral routing.**
 | 30 | `src/opencode/wire/legacy.rs:184` | Tool lifecycle is `state.status ∈ {pending, running, completed, error}` | **b** | Verified: `schema/src/v1/session.ts:305-313` `ToolState = Union([ToolStatePending, ToolStateRunning, ToolStateCompleted, ToolStateError], { discriminator: "status" })`. Drives `⏳/✅/❌` (`feishu/card/tool_render.rs:55-69`). |
 | 31 | `src/opencode/wire/legacy.rs:206-244` | Tool output precedence: `state.output` (string) → `state.content[].text` + `state.result` → `state.metadata.output` | **b** | Four V1 field names in one precedence ladder; `error_suppresses_fallback` (`wire/mod.rs:167-169`) suppresses the last rung for `status:error`. |
 | 32 | `src/opencode/wire/legacy.rs:162-163` | `step-finish.reason ∈ {tool-calls, stop, length, content-filter, error}`; terminal-ness drives turn completion | **b** | `wire/mod.rs:82-92`; `backend/transcript.rs:51-68` `turn_for_user` sets `complete` only on a terminal reason. |
-| 33 | `src/opencode/wire/legacy.rs:85-86`, `wire/mod.rs:46-48` | **Part payloads carry NO `id`** — dedup must key on content | **b** | Pitfall #9. Verified upstream: `core/src/session/sql.ts:20` `type V1PartData = Omit<SessionV1.Part, "id" \| "sessionID" \| "messageID">` and `projector.ts:85` `const { id: _, messageID: __, sessionID: ___, ...rest } = part` — `id` is a DB column, not part data. |
+| 33 | `src/opencode/wire/legacy.rs:85-86`, `wire/mod.rs:46-48` | **Part payloads carry NO `id`** — dedup must key on content | **b** | Pitfall `wire-shapes`. Verified upstream: `core/src/session/sql.ts:20` `type V1PartData = Omit<SessionV1.Part, "id" \| "sessionID" \| "messageID">` and `projector.ts:85` `const { id: _, messageID: __, sessionID: ___, ...rest } = part` — `id` is a DB column, not part data. |
 | 34 | `src/bridge/turn/render.rs:126-202` | Text/reasoning dedup by **exact content**; a tool re-renders when its typed panel revision changes; `todowrite` is special-cased by name and clock | **b** | The direct consequence of #33. `:135`, `:145-149`, `:165-172`. |
 | 35 | `src/backend/transcript.rs:51-68`, `:105-110` | Turn membership: an **in-flight** message (no `completed`) always belongs; a completed one belongs iff `created >= anchor` or `completed >= anchor` | **b** | #190/#310 semantics. Depends on the `completed` field existing at all. |
 | 36 | `src/backend/transcript.rs:129-137` + `turn/render.rs:218-243` | A turn's **anchor** is the cola-chosen `msg_cola_…` message id **plus its server `time.created`** | **b** | Two V1 facts at once: server-controlled identity + server time. |
@@ -137,7 +137,7 @@ generation-neutral routing.**
 | 49 | `src/opencode/parsing.rs:97-107` | Prompt parts are `[{type:"text",text}, {type:"file",mime,url:"data:…"}]` | **b** | `FilePartInput` with a data URL. |
 | 50 | `src/opencode/parsing.rs:142-157`, `:162-166` | Prompt body carries `model{providerID,modelID}`, `variant`, `agent` as **top-level** keys | **b** | Verified: `groups/session.ts:70` `PromptPayload = Schema.Struct(Struct.omit(SessionPrompt.PromptInput.fields, ["sessionID"]))` — flat. |
 | 51 | `src/opencode/client.rs:354-379` | Prompt response is `{info:{id,parentID,error}, parts}`; the error message is at `info.error.data.message` **or** `info.error.message` | **b** | V2's error union is a *discriminated* `name` union (`schema/src/v1/session.ts:381-391` `AssistantErrorSchema = Union([AuthError, UnknownError, OutputLengthError, AbortedError, StructuredOutputError, ContextOverflowError, ContentFilterError, APIError], {discriminator:"name"})`). |
-| 52 | `src/opencode/client.rs:401-403`, `:454-456` | **404** on prompt/prompt_async ⇒ the session is gone ⇒ `SessionNotFound` ⇒ recreate | **b** | Pitfall #7. A 404 with a different meaning would trigger spurious session recreation. |
+| 52 | `src/opencode/client.rs:401-403`, `:454-456` | **404** on prompt/prompt_async ⇒ the session is gone ⇒ `SessionNotFound` ⇒ recreate | **b** | Pitfall `attach`. A 404 with a different meaning would trigger spurious session recreation. |
 | 53 | `src/feishu/card/tool_render.rs:123-132` | A `task` tool's child session id is `state.metadata.**sessionId**` | **b** | camelCase inside a V1 tool `metadata` record; the exact field that drives the whole sub-task liveness feature (ADR-0054). |
 | 54 | `src/feishu/card/tool_render.rs:101`, `:649-651`, `:675-708` | Tool names `edit`, `apply_patch`, `task`, `skill`, `todowrite`, `websearch`, `read` and their **output text grammars** (`<task …>`, `<skill_content …>`, `<path>`, `JSON.stringify(todos)`, websearch result envelope) | **b** | Presentation-only, but every one is a V1 built-in tool contract. |
 | 55 | `src/feishu/card/tool_render.rs:544-590` | `todowrite` payload is `{todos:[{content, status}]}` with status ∈ `in_progress/pending/completed/cancelled` | **b** | `TODO_STATUSES`. |
@@ -161,13 +161,13 @@ generation-neutral routing.**
 | 63 | `docs/adr/0011-…md:1-23` | The global SSE is **heartbeat-only** on this store; the server ends it every few seconds. `OpenCodeEvent` + the parallel event→card fold were deleted | **b** | The consequence, not the cause: **cola has no event subscription at all**. There is nothing to migrate; the cost is that every live fact is a poll. |
 | 64 | `docs/adr/0001-…md` (SSE bullet) | V1 `session.next.*` streaming events are dropped by the server's `event.location?.directory === instance.directory` filter, and `permission.*` is PubSub-only | **b** | The stated reason cola polls permissions instead of streaming them. |
 | 65 | `src/bridge/pollers.rs:313-339` | A `task` child session can be resolved by walking `parentID` up to **8 hops**, with a stop-on-self-parent rule, and **the walk is impossible without a directory** (`None` ⇒ start session only) | **b** | `walk_parent_chain`; ADR-0010 makes the directory mandatory for the hop. |
-| 66 | `src/bridge/pollers.rs:390-428`, `:436-453` | A permission/question card for a child session is delivered to the chat mapped to the nearest **mapped ancestor**, carrying `directory` so the reply routes correctly | **b** | Pitfall #11. |
+| 66 | `src/bridge/pollers.rs:390-428`, `:436-453` | A permission/question card for a child session is delivered to the chat mapped to the nearest **mapped ancestor**, carrying `directory` so the reply routes correctly | **b** | Pitfall `child-session-permissions`. |
 
 ### 1.7 Permissions & questions
 
 | # | file:line | What cola assumes | Class | Notes |
 |---|---|---|---|---|
-| 67 | `src/opencode/client.rs:510-537` | Permissions are listed **globally** (`GET /permission`) and must be scoped with `?directory=` or the server checks only its cwd instance | **b** | Pitfall #3. V2 makes them **session-scoped** (`/api/session/{id}/permission`) — a structural change: cola's poller is instance-driven, V2's is session-driven. |
+| 67 | `src/opencode/client.rs:510-537` | Permissions are listed **globally** (`GET /permission`) and must be scoped with `?directory=` or the server checks only its cwd instance | **b** | Pitfall `generations`. V2 makes them **session-scoped** (`/api/session/{id}/permission`) — a structural change: cola's poller is instance-driven, V2's is session-driven. |
 | 68 | `src/opencode/client.rs:485-508` | The reply is `POST /permission/{id}/reply?directory=` with body `{"reply": …}` | **b** | Verified `schema/src/v1/permission.ts:41-44` `ReplyBody = Struct({ reply: Reply, message: optional(String) })`. |
 | 69 | `src/opencode/client.rs:605-629`, `:667-688`, `:726-739` | Questions mirror permissions: global `GET /question`, `POST /question/{id}/reply` `{answers}`, `POST /question/{id}/reject` | **b** | Same structural change under V2. |
 | 70 | `src/bridge/discovery.rs:390-392` | cola's self-started server must keep the **question tool enabled** (it does not pass any flag to disable it) | **c** | Explicitly reasoned in the source: disabling it would make the question cards unreachable. |
@@ -193,7 +193,7 @@ Ranked by (blast radius when the assumption breaks) × (likelihood the assumptio
 `src/opencode/wire/legacy.rs:29-244` feeds *everything user-visible*: the streaming card, the final render, the external-message sync, the session snapshot, sub-task liveness, token usage, the context footer. ADR-0053 confines the field names to this one module — but the **semantics** leak upward: `turn_for_user` (which messages belong to a turn), the in-flight/completed distinction, and the content-based dedup that exists *only* because parts have no `id`. A generation switch here is not an adapter edit; it is a re-derivation of turn membership and dedup. This is the single highest-risk coupling, and ADR-0053's 2026-09-26 amendment is explicit that the message stores do not project into each other, so it cannot be switched alone.
 
 **R2 — Permissions and questions are global-and-instance-scoped, not session-scoped.**
-`client.rs:518`, `:610` vs `request/kind.rs:267-275` and the whole poller architecture. V2 nests both under a session (`/api/session/{id}/permission`, `/api/session/{id}/question/…`). That inverts the poller's driver from "per known directory" to "per known session" — a different iteration domain, a different 404 semantics, and it invalidates the `?directory=` instance-routing story that ADR-0010 is built on. Pitfall #3 records that the *old* per-session endpoint returned empty, so this has already burned once.
+`client.rs:518`, `:610` vs `request/kind.rs:267-275` and the whole poller architecture. V2 nests both under a session (`/api/session/{id}/permission`, `/api/session/{id}/question/…`). That inverts the poller's driver from "per known directory" to "per known session" — a different iteration domain, a different 404 semantics, and it invalidates the `?directory=` instance-routing story that ADR-0010 is built on. Pitfall `generations` records that the *old* per-session endpoint returned empty, so this has already burned once.
 
 **R3 — Permissions are polled, never streamed, because `permission.*` never reaches an SSE and the global SSE is heartbeat-only.**
 `docs/adr/0001` SSE/permission bullets, `docs/adr/0011`. If a generation delivers permissions as events, the poller becomes redundant — but until then cola cannot tell a *live* permission from a 3 s-stale one, and the card latency is bounded by the poll.
@@ -208,7 +208,7 @@ Ranked by (blast radius when the assumption breaks) × (likelihood the assumptio
 `discovery.rs:115-148`, `:207-228`. A cmdline-flag change, an equals-form `--port=`, a password delivered by config file instead of env, or a store-path change each fail **silently** — the scan returns nothing, so cola concludes "no shared server" and **spawns a second server against the same store**, which is precisely the two-servers-one-store condition ADR-0013 was written to prevent. There is no positive assertion that anything was found.
 
 **R7 — Basic auth needs the username as well as the password, and the username default is `"opencode"`.**
-`client.rs:66-73`, `discovery.rs:32`, `:69-75`. Pitfall #12, verified against `server/auth.ts`. Classified (a) because it is generation-agnostic, but it is the difference between a working bridge and a silent 401 on every call, and the failure mode (no header at all when either half is missing) is a *silent* degradation.
+`client.rs:66-73`, `discovery.rs:32`, `:69-75`. Pitfall `attach`, verified against `server/auth.ts`. Classified (a) because it is generation-agnostic, but it is the difference between a working bridge and a silent 401 on every call, and the failure mode (no header at all when either half is missing) is a *silent* degradation.
 
 **R8 — `GET /experimental/session` + `x-next-cursor` pagination, with a 404-triggered fallback to project-scoped `GET /session`.**
 `client.rs:229-263`. The `x-next-cursor` header exists only on the V1 experimental handler; V2 paginates in the body. And the fallback (`/session`) is itself V1 and project-scoped — so on a V2 server the 404 probe would return empty rather than 404, and cola would silently show a stale, wrong-project list (the exact bug the primary route was added for, issue #325).
@@ -230,7 +230,7 @@ Ranked by (blast radius when the assumption breaks) × (likelihood the assumptio
 | `.github/workflows/release.yml:214-224` | Downloads `opencode-linux-x64-baseline.tar.gz` from `v1.18.31` + hardcoded `SHA256: b283e8db…` | **c** | Deliberate: the comment says `anomalyco/opencode/github` installs from `releases/latest` at run time, so pinning the action would not pin the code. Version, URL and digest must move together. |
 | `.github/workflows/release.yml:226-247` | `OPENCODE_PERMISSION` is a JSON object of tool→`"deny"`/`"allow"` | **b** | A **CLI env-var contract**, not the HTTP API. A rename of any of `edit, bash, read, grep, glob, list, webfetch, task, todowrite` silently stops denying. |
 | `.github/workflows/release.yml:290-297` | `opencode run --model opencode-go/deepseek-v4.1-flash --format json "$PROMPT" --file=…` | **c** | Subcommand + flag grammar. |
-| `.github/workflows/release.yml:302-345` | The embedded Python parses stdout as **JSONL events** and keys on `event.type == "text"`, `part.time.end`, and dedupes by `part.text` **content** | **b** | The workflow's own comment restates pitfall #9 — "the API's part payloads carry no serialized id". Two independent implementations of the same V1 assumption (Rust + Python). |
+| `.github/workflows/release.yml:302-345` | The embedded Python parses stdout as **JSONL events** and keys on `event.type == "text"`, `part.time.end`, and dedupes by `part.text` **content** | **b** | The workflow's own comment restates pitfall `wire-shapes` — "the API's part payloads carry no serialized id". Two independent implementations of the same V1 assumption (Rust + Python). |
 | `.github/workflows/opencode-review.yml:54-66` | Same 1.18.31 pin + digest | **c** | |
 | `.github/workflows/opencode-review.yml:82-109` | `OPENCODE_PERMISSION` with a **nested** `bash: {"*":"deny", "git diff*":"allow", …}` allowlist, plus `external_directory` and `read` entries | **b** | The nested-glob shape is a V1 CLI permission-schema contract. A schema change here fails **open** (asks hang to the 20-min timeout) or fails closed (review never runs) — both visible in CI. |
 | `.github/workflows/opencode-review.yml:136` | `opencode github run` (subcommand) with `USE_GITHUB_TOKEN`, `MODEL`, `PROMPT` env | **c** | The subcommand asserts the triggering actor is a collaborator — the workflow skips Dependabot because of it (`opencode-review.yml:27-29`). |
@@ -362,7 +362,7 @@ documented exception (ADR-0042/0053).
    (`types.rs:28-29`), `metadata.sessionId` on the `task` tool
    (`tool_render.rs:123-132`), the parent-chain walk needing `directory`
    (`pollers.rs:328`), and `task` creating a session absent from cola's store
-   (pitfall #11). V2 has a first-class `SubtaskPart` and a `parent_id` column
+   (pitfall `child-session-permissions`). V2 has a first-class `SubtaskPart` and a `parent_id` column
    (`sql.ts:36`). If V2 models children explicitly, the whole workaround chain
    (`walk_parent_chain` → `resolve_card_target` → `inline_host_session`) could
    collapse — but that is a *feature* migration, not a compat fix, and belongs on

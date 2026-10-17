@@ -40,7 +40,7 @@ loop.
   for a `.git` entry. Reading a file's **bytes** locally is the same act on the same machine —
   not a new capability class, and not a new trust boundary.
 - **cola is on the server's host.** Discovery reads the server's port and password from
-  `/proc` (AGENTS.md pitfall 7), so the attached server is always a local process; a
+  environment (AGENTS.md pitfall `attach`), so the attached server is always a local process; a
   Session's directory is a local path. There is no remote-server deployment to design for.
 - **Every Feishu card is readable by the whole chat.** The **Access List** (ADR-0035) gates
   who may *click*, not who may *read* a card — so a viewer card publishes a file's content to

@@ -442,7 +442,7 @@ it is the shape OpenChamber v2 keeps.
    `/api/info`.
 4. **Don't.** Do not route through the OpenChamber proxy (§4.3), and do not give cola its own
    long-lived data directory — that is precisely the mistake that broke session sharing before
-   (`discovery.rs:1-7`, pitfall 7 in cola's `AGENTS.md`), and it would additionally split the
+   (`discovery.rs:1-7`, pitfall `attach` in cola's `AGENTS.md`), and it would additionally split the
    V1→V2 migration, which only ever runs for the store OpenCode actually opens.
 
 ---
