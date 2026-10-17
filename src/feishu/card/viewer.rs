@@ -926,49 +926,12 @@ fn naming_block(view: &ViewerCard<'_>) -> String {
             None => format!("{}（无扩展名）", kind.label()),
         },
     };
-    let mut block = format!(
+    format!(
         "**文件**：`{}`\n**大小**：{} · **类型**：{}",
         view.path,
         human_size(view.size),
         type_label,
-    );
-    if view
-        .session_dir
-        .is_some_and(|dir| is_outside_session_dir(view.path, dir))
-    {
-        block.push_str("\n⚠️ 此路径位于会话目录之外；仍可打开。此提示不是访问边界。");
-    }
-    block
-}
-
-/// Compare absolute paths lexically, normalizing `.` and `..` without another
-/// filesystem access. The hint is informational; symlinks remain within the
-/// caller's filesystem permissions and are not a sandbox boundary.
-fn is_outside_session_dir(path: &str, session_dir: &str) -> bool {
-    fn normalize(path: &str) -> Option<std::path::PathBuf> {
-        use std::path::Component;
-
-        let path = std::path::Path::new(path);
-        if !path.is_absolute() {
-            return None;
-        }
-        let mut normalized = std::path::PathBuf::new();
-        for component in path.components() {
-            match component {
-                Component::CurDir => {}
-                Component::ParentDir => {
-                    normalized.pop();
-                }
-                other => normalized.push(other.as_os_str()),
-            }
-        }
-        Some(normalized)
-    }
-
-    match (normalize(path), normalize(session_dir)) {
-        (Some(path), Some(session_dir)) => !path.starts_with(session_dir),
-        _ => false,
-    }
+    )
 }
 
 /// One tracking line for the card's whole-bytes lane (ADR-0083 §5): `📎 name ·
@@ -2115,42 +2078,40 @@ mod tests {
         assert_eq!(out["value"]["thread_id"], "chat_1");
     }
 
+    /// ADR-0083 §4 (amended #771): the scope is a privacy hint carried by the
+    /// ADR and the user guide, not a line repeated on every viewer card. An
+    /// outside-session path renders its resolved path like any other — the
+    /// naming block is 文件 / 大小 / 类型 and nothing more.
     #[test]
-    fn viewer_names_when_the_resolved_path_is_outside_the_session_directory() {
-        let root = tempfile::tempdir().unwrap();
-        let session_dir = root.path().join("session");
-        let outside_dir = root.path().join("outside");
-        std::fs::create_dir_all(&session_dir).unwrap();
-        std::fs::create_dir_all(&outside_dir).unwrap();
-        let notes = outside_dir.join("notes.md");
-        std::fs::write(&notes, "private notes").unwrap();
-        let resolved_path = std::fs::canonicalize(notes).unwrap();
-        let resolved_path = resolved_path.to_string_lossy().to_string();
-        let session_dir = std::fs::canonicalize(session_dir)
-            .unwrap()
-            .to_string_lossy()
-            .to_string();
-        let mut viewer = view(&resolved_path, ViewerKind::Text, Some("md"), "private notes");
-        viewer.session_dir = Some(&session_dir);
+    fn viewer_names_an_outside_session_path_without_a_scope_notice() {
+        let mut viewer = view(
+            "/tmp/outside/notes.md",
+            ViewerKind::Text,
+            Some("md"),
+            "private notes",
+        );
+        viewer.session_dir = Some("/tmp/session");
         let card = build_viewer_card(&key(), viewer);
 
         let text = card_text(&card);
         assert!(
-            text.contains("会话目录之外"),
-            "the privacy hint is present: {text}"
+            text.contains("/tmp/outside/notes.md"),
+            "the resolved path is still named: {text}"
+        );
+        assert!(text.contains("**大小**"), "the size is named: {text}");
+        assert!(text.contains("文本（.md）"), "the type is named: {text}");
+        assert!(
+            !text.contains("⚠️"),
+            "no warning row on an outside-session path: {text}"
         );
         assert!(
-            text.contains("不是访问边界"),
-            "the hint is not a boundary: {text}"
+            !text.contains("会话目录之外"),
+            "the card no longer repeats the scope: {text}"
         );
         assert!(
-            text.contains("notes.md"),
-            "the resolved file remains named on every platform: {text}"
+            !text.contains("不是访问边界"),
+            "the card no longer implies a boundary: {text}"
         );
-        assert!(is_outside_session_dir(
-            &format!("{session_dir}/../outside/notes.md"),
-            &session_dir
-        ));
     }
 
     /// ADR-0052/0083: re-read is stateless and carries the resolved path, the
