@@ -14,7 +14,8 @@
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::io::Write;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
     use std::path::PathBuf;
     use std::process::{Command, Stdio};
 
@@ -140,6 +141,74 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("cola-codex-gate-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// The `run:` block of the step text `step`, de-indented the way YAML's
+    /// block scalar indents it (bash ignores that indentation, so the body runs
+    /// as-is).
+    fn run_block(step: &str) -> String {
+        let after = step
+            .split_once("run: |\n")
+            .unwrap_or_else(|| panic!("the step runs an inline script"))
+            .1;
+        let mut script = String::new();
+        for line in after.lines() {
+            if let Some(rest) = line.strip_prefix("          ") {
+                script.push_str(rest);
+                script.push('\n');
+            } else if line.trim().is_empty() {
+                script.push('\n');
+            } else {
+                break;
+            }
+        }
+        assert!(!script.is_empty(), "the step's run block has a body");
+        script
+    }
+
+    /// A one-shot HTTP stub: answers the first request on `listener` with
+    /// `status` and `body`, and hands back the request head it read.
+    fn respond_once(
+        listener: TcpListener,
+        status: u16,
+        body: &'static str,
+    ) -> std::thread::JoinHandle<String> {
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("curl connects");
+            let mut head = String::new();
+            let mut buf = [0u8; 1024];
+            while !head.contains("\r\n\r\n") {
+                let read = stream.read(&mut buf).expect("the request reads");
+                if read == 0 {
+                    break;
+                }
+                head.push_str(&String::from_utf8_lossy(&buf[..read]));
+            }
+            let reason = if status == 200 { "OK" } else { "Unauthorized" };
+            write!(
+                stream,
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .expect("the response writes");
+            head
+        })
+    }
+
+    /// Run the workflow's credential check against `endpoint`.
+    fn run_credential_check(endpoint: &str) -> std::process::Output {
+        let workflow = workflow();
+        let script = run_block(step(&workflow, "Check the gate credential"));
+        Command::new("bash")
+            .arg("-c")
+            .arg(script)
+            .env("RUNNER_TEMP", temp_dir("credential"))
+            .env("GATE_ENDPOINT", endpoint)
+            .env("GATE_MODEL", "test-model")
+            .env("GATE_KEY", "test-key")
+            .output()
+            .expect("bash runs")
     }
 
     fn verdict_of(content: &str) -> String {
@@ -301,6 +370,49 @@ mod tests {
             workflow.contains("model: ${{ env.GATE_MODEL }}"),
             "the Codex step must read the shared model"
         );
+    }
+
+    #[test]
+    fn the_credential_check_fails_on_a_dead_key_and_names_it() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let request = respond_once(
+            listener,
+            401,
+            r#"{"error":{"message":"This API key has expired."}}"#,
+        );
+        let out = run_credential_check(&format!("http://{addr}/v1/responses"));
+        let log = String::from_utf8_lossy(&out.stdout);
+        assert!(!out.status.success(), "a 401 must fail the step");
+        assert!(log.contains("HTTP 401"), "the step must name the status: {log}");
+        assert!(
+            log.contains("This API key has expired."),
+            "the step must carry the body, so the reason is the upstream's: {log}"
+        );
+        let seen = request.join().unwrap();
+        assert!(
+            seen.contains("Authorization: Bearer test-key"),
+            "the step must send the workflow's key"
+        );
+        assert!(
+            seen.to_lowercase()
+                .contains("x-opencode-session: cola-codex-gate-preflight"),
+            "the Go lane rejects a request without a session header: {seen}"
+        );
+    }
+
+    #[test]
+    fn the_credential_check_passes_on_a_200() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let request = respond_once(listener, 200, r#"{"id":"resp_test","status":"incomplete"}"#);
+        let out = run_credential_check(&format!("http://{addr}/v1/responses"));
+        assert!(
+            out.status.success(),
+            "a 200 must pass, whatever the answer's status: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert!(request.join().unwrap().starts_with("POST /v1/responses"));
     }
 
     #[test]
