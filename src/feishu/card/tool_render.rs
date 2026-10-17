@@ -2,12 +2,27 @@ use crate::backend::{ContentBlock, FileContent, ToolCall, ToolStatus};
 
 use super::sanitize::CardMarkdown;
 use super::shell::{collapsible_panel, fmt_elapsed, panel_time_suffix};
-use super::{AwaitingAction, fenced_code, truncate_md};
+use super::{AwaitingAction, exceeds_md_budget, fenced_code, truncate_md};
 
 /// Cap for a tool's OUTPUT shown inside its collapsible panel. Higher than the
 /// old 800: code-wrapped output renders without line wrapping, so a file or
 /// command output can be meaningfully long.
 pub const TOOL_OUTPUT_MAX_CHARS: usize = 3000;
+
+/// V1's `read` output marks a DIRECTORY listing with this tag line in its XML
+/// envelope, where a file's carries `<type>file</type>` — the shape that says
+/// "this read has no file to open" (ADR-0083 §8 amendment, #770).
+const V1_DIRECTORY_TYPE_TAG: &str = "<type>directory</type>";
+
+/// V2's `read` output opens a DIRECTORY listing's header line with this prefix,
+/// where a file's opens `Read file `; the same verdict in V2's wire shape.
+const V2_DIRECTORY_HEADER_PREFIX: &str = "Read directory ";
+
+/// The line a `read` panel appends under a body its budget CLIPPED
+/// (ADR-0083 §8 amendment, #770): the panel is a
+/// [`TOOL_OUTPUT_MAX_CHARS`]-character preview, so a clipped one says so where
+/// the reader can act on it — the 「📂 打开」 button inside the fold.
+const READ_TRUNCATION_NOTE: &str = "_（预览已截断，打开查看完整文件）_";
 
 /// A Tool Panel: the typed tool call as the card renders it (ADR-0053).
 ///
@@ -232,21 +247,41 @@ impl ToolPanel {
     /// (ADR-0083 §8, #743): a `write`/`edit` call's own `filePath` (V1) —
     /// `path` on V2 — read through the one [`input_path`] rule every file
     /// formatter shares, so the button and the Input line can never disagree
-    /// about which file the call touched. `None` for any other tool — a `read`
-    /// above all, whose content is already on the card — and for a call whose
-    /// path is absent or unusable (no input, a non-object input, a missing or
-    /// non-string key, or a blank string): those panels carry no button
+    /// about which file the call touched. A FILE `read` names one too
+    /// (ADR-0083 §8 amendment, #770): its panel is a preview of the file
+    /// clipped to [`TOOL_OUTPUT_MAX_CHARS`], so the whole file is a tap away
+    /// rather than on the card. Two read shapes are excluded, both of which
+    /// already reach the reader whole: a read carrying a File Content (an
+    /// image or a PDF has its own delivery, ADR-0076) and a DIRECTORY read
+    /// ([`read_output_is_directory`]), which names no file at all. `None` for
+    /// every other tool, and for a call whose path is absent or unusable (no
+    /// input, a non-object input, a missing or non-string key, or a blank
+    /// string) — or whose output has not arrived yet, a still-running `read`
+    /// having no directory verdict to decide on. Those panels carry no button
     /// rather than a broken one. A path that merely carries surrounding
     /// whitespace is still a name Unix allows, so it stays verbatim — only a
     /// path with nothing printable is unusable. Natural-language paths in the
     /// agent's prose never reach here — only the call's structured input is
     /// read.
     pub(crate) fn file_open_path(&self) -> Option<&str> {
-        if !matches!(self.name(), "write" | "edit") {
-            return None;
-        }
         let obj = self.input()?.as_object()?;
-        input_path(obj).filter(|path| !path.trim().is_empty())
+        let path = input_path(obj).filter(|path| !path.trim().is_empty());
+        match self.name() {
+            "write" | "edit" => path,
+            "read" => {
+                // A panel of a file the viewer can show WHOLE: the body is a
+                // preview, so the way in is what the panel lacks. The two
+                // exclusions already reach the reader whole (a File Content's
+                // own delivery; a directory, which is no file at all), and a
+                // call with no output yet has no verdict — `?` leaves a
+                // still-running read buttonless until it renders one.
+                if !self.files.is_empty() || read_output_is_directory(&self.output()?) {
+                    return None;
+                }
+                path
+            }
+            _ => None,
+        }
     }
 
     /// How many card elements the 「📂 打开」 button adds (ADR-0083 §8, #743):
@@ -990,14 +1025,15 @@ pub(crate) fn file_image_estimate(tool: &ToolPanel) -> usize {
         .sum()
 }
 
-/// The 「📂 打开」 button a `write`/`edit` panel carries (ADR-0083 §8, #743):
-/// a `button` element placed INSIDE the panel's body, first, so the folded
-/// card shows no button row (ADR-0083 §8 amendment, #766) and a long diff
-/// cannot push the way in out of view. Its value is the panel's
-/// [`super::session::tool_file_value`] payload: `action: "file"` with no `op`,
-/// opening the File Viewer rather than transferring it (#739's `op: "send"`).
-/// Feishu's JSON 2.0 button supports nesting in a collapsible panel. `None`
-/// when the panel names no open path ([`ToolPanel::file_open_path`]) or no
+/// The 「📂 打开」 button a panel naming an open path carries (ADR-0083 §8, #743):
+/// a `button` element placed INSIDE the panel's body, first, so the folded card
+/// shows no button row (ADR-0083 §8 amendment, #766) and a long diff — or a
+/// clipped `read` body (ADR-0083 §8 amendment, #770) — cannot push the way in
+/// out of view. Its value is the panel's [`super::session::tool_file_value`]
+/// payload: `action: "file"` with no `op`, opening the File Viewer rather than
+/// transferring it (#739's `op: "send"`). Feishu's JSON 2.0 button supports
+/// nesting in a collapsible panel. `None` when the panel names no open path
+/// ([`ToolPanel::file_open_path`]: a `write`/`edit`, or a FILE `read`) or no
 /// Session is known to route the click by — no button rather than a broken one.
 pub(super) fn tool_open_button_element(
     tool: &ToolPanel,
@@ -1024,6 +1060,47 @@ pub(crate) fn tool_open_button_estimate(tool: &ToolPanel, session_id: Option<&st
         .unwrap_or(0)
 }
 
+/// The note a `read` panel appends under a body its budget CLIPPED (ADR-0083 §8
+/// amendment, #770): the body is a [`TOOL_OUTPUT_MAX_CHARS`]-character preview,
+/// so a clipped one says what it is and names the way to the rest. It renders
+/// IFF that way renders — the panel carries the 「📂 打开」 button
+/// ([`tool_open_button_element`]: a file read, and a Session to route the click
+/// by) — so the note never promises a control a directory read, an image read
+/// or a routeless panel does not have, and the size estimate can charge exactly
+/// the bytes it adds. `None` for every other panel and for a body that fits.
+fn read_truncation_note(tool: &ToolPanel, session_id: Option<&str>) -> Option<&'static str> {
+    // The button first: a panel without one (a directory read, an image read, a
+    // routeless panel) leaves without assembling the body at all.
+    tool_open_button_element(tool, session_id)?;
+    read_body_clipped(tool).then_some(READ_TRUNCATION_NOTE)
+}
+
+/// Whether a `read` panel's rendered body is clipped by its own budget — the
+/// clamp [`tool_panel_element`] applies ([`truncate_md`] at
+/// [`TOOL_OUTPUT_MAX_CHARS`]) — re-derived through the same formatter, the way
+/// every size estimate here re-derives its render, so the note
+/// [`read_truncation_note`] renders is the one charged. `false` for every other
+/// tool and for a call with no output.
+fn read_body_clipped(tool: &ToolPanel) -> bool {
+    tool.name() == "read"
+        && tool
+            .output()
+            .map(|raw| format_tool_output("read", &raw).2)
+            .is_some_and(|body| exceeds_md_budget(&body, TOOL_OUTPUT_MAX_CHARS))
+}
+
+/// The serialized byte length the truncation note [`read_truncation_note`]
+/// appends to a `read` panel's body (ADR-0083 §8 amendment, #770), for a
+/// card-size estimate that must charge exactly what the panel writes — a note
+/// the estimate missed would let a clipped read pass the split check while the
+/// serialized card still carries bytes nothing counted. `0` when the note does
+/// not render. Kept beside the render so the two cannot drift.
+pub(crate) fn read_truncation_note_estimate(tool: &ToolPanel, session_id: Option<&str>) -> usize {
+    read_truncation_note(tool, session_id)
+        .map(|note| json_escaped_len(&CardMarkdown::new().element(note)))
+        .unwrap_or(0)
+}
+
 /// One tool panel as a folded collapsible element. `at_ms` is the part's
 /// server `state.time.start`; when present, the panel header carries it as
 /// `· HH:MM` so the start time is visible while collapsed (#183), and when
@@ -1036,7 +1113,9 @@ pub(crate) fn tool_open_button_estimate(tool: &ToolPanel, session_id: Option<&st
 /// amendment, #766). `element_id` is the panel's stable identity on the card
 /// (see [`super::shell::collapsible_panel_chunks`]). `session_id` routes the
 /// panel's 「📂 打开」 button, which renders inside the fold — a `write`/`edit`
-/// panel's way into the file it produced (ADR-0083 §8 amendment, #766).
+/// panel's way into the file it produced (ADR-0083 §8 amendment, #766), and a
+/// file `read`'s way into the file it only previewed, whose clipped body says
+/// so beside it (ADR-0083 §8 amendment, #770).
 pub(super) fn tool_panel_element(
     tool: &ToolPanel,
     at_ms: Option<i64>,
@@ -1125,6 +1204,13 @@ pub(super) fn tool_panel_element(
                 }
                 BodyStyle::Auto => content.push_str(&body),
             }
+            // A clipped `read` body says so, naming the button above it
+            // (ADR-0083 §8 amendment, #770). Only a `read` gets it: it is the
+            // panel whose clip hides a file the viewer can show whole, and the
+            // note appears exactly when that button does.
+            if let Some(note) = read_truncation_note(tool, session_id) {
+                content.push_str(&format!("\n\n{note}"));
+            }
         }
     }
     // The File Contents' tracking lines (ADR-0076) close the panel body: the
@@ -1170,12 +1256,12 @@ pub(super) fn tool_panel_element(
         title.push_str(&marker);
     }
     let mut panel = collapsible_panel(&title, &content, element_id);
-    // The way into the produced file lives INSIDE the fold (ADR-0083 §8
-    // amendment, #766): a full-width button after every `write`/`edit` panel
-    // crowded the chat, above all on a phone. Opening the file now takes
-    // expanding the panel first, accepted because the folded header already
-    // names it. It is the body's FIRST element so a long diff cannot push it
-    // out of view.
+    // The way into the file lives INSIDE the fold (ADR-0083 §8 amendment,
+    // #766): a full-width button after every `write`/`edit` panel crowded the
+    // chat, above all on a phone. Opening the file now takes expanding the
+    // panel first, accepted because the folded header already names it. It is
+    // the body's FIRST element so a long diff — or a clipped `read` body
+    // (ADR-0083 §8 amendment, #770) — cannot push it out of view.
     if let Some(button) = tool_open_button_element(tool, session_id)
         && let Some(elements) = panel
             .get_mut("elements")
@@ -1406,6 +1492,29 @@ fn format_todo_list(todos: &[TodoItem]) -> String {
         .join("\n")
 }
 
+/// Whether a `read` call's raw output is a DIRECTORY listing, by output shape
+/// (ADR-0083 §8 amendment, #770): V1's XML envelope marks it
+/// `<type>directory</type>` where a file's marks `<type>file</type>`, and V2's
+/// header line opens `Read directory ` where a file's opens `Read file `. The
+/// one place the two shapes are spelled — [`format_tool_output`] skips the V1
+/// tag from here, [`parse_v2_read_output`] reads V2's prefix from here — so the
+/// verdict a `read` panel's open path hangs on cannot drift from the parsers it
+/// comes from. Each generation is read in its own envelope: the V1 tag only
+/// counts ABOVE `<content>`, so a file whose own text spells the tag is still a
+/// file, and the V2 prefix only on the first line, where its header lives.
+fn read_output_is_directory(output: &str) -> bool {
+    if output.contains("<path>") {
+        return output
+            .lines()
+            .take_while(|line| line.trim() != "<content>")
+            .any(|line| line.trim() == V1_DIRECTORY_TYPE_TAG);
+    }
+    output
+        .lines()
+        .next()
+        .is_some_and(|first| first.starts_with(V2_DIRECTORY_HEADER_PREFIX))
+}
+
 /// Render a tool's raw output string human-friendly. OpenCode's `read` tool
 /// wraps its output in XML tags (`<path>…</path>`, `<type>…</type>`,
 /// `<content>…</content>`) — strip them so the card shows just the file path
@@ -1516,7 +1625,7 @@ fn format_tool_output(name: &str, output: &str) -> (Option<String>, BodyStyle, S
         } else if l.trim() == "<content>"
             || l.trim() == "</content>"
             || l.trim() == "<type>file</type>"
-            || l.trim() == "<type>directory</type>"
+            || l.trim() == V1_DIRECTORY_TYPE_TAG
         {
             // Skip the wrapper tags.
         } else if !body.is_empty() || !line.is_empty() {
@@ -1734,7 +1843,7 @@ fn parse_v2_read_output(output: &str) -> Option<(Option<String>, BodyStyle, Stri
     let (icon, path) = if let Some(path) = head.strip_prefix("Read file ") {
         ("📄", path)
     } else {
-        let path = head.strip_prefix("Read directory ")?;
+        let path = head.strip_prefix(V2_DIRECTORY_HEADER_PREFIX)?;
         ("📁", path)
     };
     let style = if icon == "📄" {
@@ -2624,22 +2733,228 @@ mod tests {
         }
     }
 
-    /// A `read` panel carries no 「📂 打开」 (ADR-0083 §8): its content is
-    /// already on the card — even when its structured input names the same
-    /// `filePath` a `write` panel would open.
+    /// A FILE `read` panel carries 「📂 打开」 (ADR-0083 §8 amendment, #770) from
+    /// its STRUCTURED `filePath` (V1) — `path` on V2 — through the same payload
+    /// #743/#766 gave `write`/`edit` (`action: "file"`, no `op`, the Session to
+    /// route by), in the same in-fold position (#767): the body's FIRST
+    /// element, so the panel stays folded and a long body cannot push it out of
+    /// view. The body is a `TOOL_OUTPUT_MAX_CHARS`-character preview, which is
+    /// exactly why a read needs the way in, and the folded header keeps naming
+    /// the file while it is collapsed.
     #[test]
-    fn read_panels_carry_no_open_button() {
-        let panel = ToolPanel::for_test(
+    fn a_file_read_panel_carries_an_open_button_from_the_structured_path() {
+        for (input, output) in [
+            (
+                json!({"filePath": "/x/y.rs"}),
+                "<path>/x/y.rs</path>\n<type>file</type>\n<content>\n1: fn main() {}\n</content>",
+            ),
+            (
+                json!({"path": "/x/y.rs"}),
+                "Read file /x/y.rs, lines 1-1\n1: fn main() {}",
+            ),
+        ] {
+            let panel = ToolPanel::for_test("read", ToolStatus::Completed, Some(input), Some(output));
+            let path = panel.file_open_path().expect("a file read names its open path");
+            assert_eq!(path, "/x/y.rs");
+            let button = tool_open_button_element(&panel, Some("ses_1")).expect("the button");
+            assert_eq!(button["tag"], "button");
+            assert_eq!(button["text"]["content"], "📂 打开");
+            let value = &button["value"];
+            assert_eq!(value["action"], "file");
+            assert_eq!(value["path"], path);
+            assert_eq!(value["session_id"], "ses_1");
+            assert!(value.get("op").is_none(), "no op: the click opens, never sends");
+            assert!(value.get("dir").is_none(), "no listing rides along: {value}");
+            assert_eq!(panel.open_button_count(Some("ses_1")), 1, "one component");
+            assert!(
+                tool_open_button_estimate(&panel, Some("ses_1")) > 0,
+                "and its bytes are charged"
+            );
+            assert!(
+                panel_title(panel.clone()).ends_with(" · 📖 y.rs"),
+                "the folded header still names the file"
+            );
+            let card = CardBuilder::new()
+                .with_state(CardState::Done)
+                .with_tool_at(panel, None, Some("tool_call_read"), Some("ses_1"))
+                .build();
+            let body = card["body"]["elements"][0]["elements"]
+                .as_array()
+                .expect("panel body");
+            assert_eq!(body[0]["tag"], "button", "the button leads the body: {card}");
+            assert_eq!(body[0]["value"]["path"], "/x/y.rs");
+            assert_eq!(body[1]["tag"], "markdown", "the content follows: {card}");
+        }
+    }
+
+    /// A DIRECTORY `read` carries no 「📂 打开」 (ADR-0083 §8 amendment, #770):
+    /// there is no file to open — the viewer shows files, and a listing's
+    /// overflow is what the folded panel's own body already is. The verdict is
+    /// the OUTPUT's shape in both generations (V1's `<type>directory</type>`,
+    /// V2's `Read directory …` header), and the folded header keeps its 📖 name
+    /// either way (#766).
+    #[test]
+    fn a_directory_read_panel_carries_no_open_button() {
+        for (input, output) in [
+            (
+                json!({"filePath": "/tmp/notes"}),
+                "<path>/tmp/notes</path>\n<type>directory</type>\n<content>\n/tmp/notes/a.rs\n</content>",
+            ),
+            (
+                json!({"path": "/tmp/notes"}),
+                "Read directory /tmp/notes, entries 1-2\n/tmp/notes/a.rs\n/tmp/notes/b.rs",
+            ),
+            (
+                json!({"path": "/tmp/notes"}),
+                "Read directory /tmp/notes, 0 entries",
+            ),
+        ] {
+            let panel = ToolPanel::for_test("read", ToolStatus::Completed, Some(input), Some(output));
+            assert_eq!(
+                panel.file_open_path(),
+                None,
+                "a directory is not an open path: {output}"
+            );
+            assert!(
+                tool_open_button_element(&panel, Some("ses_1")).is_none(),
+                "no button: {output}"
+            );
+            assert_eq!(tool_open_button_estimate(&panel, Some("ses_1")), 0);
+            assert_eq!(panel.open_button_count(Some("ses_1")), 0);
+            assert!(
+                panel_title(panel).ends_with(" · 📖 notes"),
+                "the folded header still names the directory: {output}"
+            );
+        }
+    }
+
+    /// A `read` that carries a File Content — an image or a PDF (ADR-0076) —
+    /// gets no 「📂 打开」 (ADR-0083 §8 amendment, #770): that file has its own
+    /// delivery channel (the embedded image, or the `📎` marker and its File
+    /// Message), so a second way in would only duplicate it.
+    #[test]
+    fn a_read_with_a_file_content_carries_no_open_button() {
+        let mut panel = ToolPanel::for_test_with_files("read", &[("shot.png", b"ABC")]);
+        panel.call.input = Some(json!({"filePath": "/x/shot.png"}));
+        assert_eq!(
+            panel.file_open_path(),
+            None,
+            "the file content is already named and delivered"
+        );
+        assert!(tool_open_button_element(&panel, Some("ses_1")).is_none());
+        assert_eq!(panel.open_button_count(Some("ses_1")), 0);
+    }
+
+    /// A still-running `read` has no output yet, so the directory verdict is
+    /// unknown: no button (ADR-0083 §8 amendment, #770) — nothing renders,
+    /// nothing is charged. The button appears once the call settles with a
+    /// file's output.
+    #[test]
+    fn a_running_read_carries_no_open_button_until_it_renders_a_file() {
+        let running = ToolPanel::for_test(
+            "read",
+            ToolStatus::Running,
+            Some(json!({"filePath": "/x/y.rs"})),
+            None,
+        );
+        assert_eq!(running.file_open_path(), None, "no output, no verdict");
+        assert!(tool_open_button_element(&running, Some("ses_1")).is_none());
+
+        let settled = ToolPanel::for_test(
             "read",
             ToolStatus::Completed,
             Some(json!({"filePath": "/x/y.rs"})),
-            Some("content"),
+            Some("Read file /x/y.rs, lines 1-1\n1: fn main() {}"),
         );
-        assert_eq!(panel.file_open_path(), None, "a read never names an open path");
+        assert_eq!(settled.file_open_path(), Some("/x/y.rs"));
+        assert!(tool_open_button_element(&settled, Some("ses_1")).is_some());
+    }
+
+    /// The `read` body is a `TOOL_OUTPUT_MAX_CHARS`-character preview, so a
+    /// body the clamp cut says so and points at the way to the rest — the
+    /// 「📂 打开」 button inside the fold (ADR-0083 §8 amendment, #770). A body
+    /// that fits carries no note; a clipped DIRECTORY listing carries none
+    /// either (it has no button to name); and a panel with no Session to route
+    /// the click by renders neither, so the note never promises a control the
+    /// card does not carry — nor bytes the estimate does not charge.
+    #[test]
+    fn a_clipped_read_body_says_the_preview_was_clipped() {
+        let clipped = ToolPanel::for_test(
+            "read",
+            ToolStatus::Completed,
+            Some(json!({"path": "/x/big.rs"})),
+            Some(&format!(
+                "Read file /x/big.rs, lines 1-300\n{}",
+                long_read_lines()
+            )),
+        );
+        assert!(clipped.file_open_path().is_some());
+        assert!(read_truncation_note(&clipped, Some("ses_1")).is_some());
+        // The note is plain text — nothing in it is sanitizer-expanded or
+        // JSON-escaped — so its charge is its own byte length.
+        assert_eq!(
+            read_truncation_note_estimate(&clipped, Some("ses_1")),
+            READ_TRUNCATION_NOTE.len(),
+            "the note's bytes are charged"
+        );
+        let md = panel_md_with_session(clipped.clone(), "ses_1");
         assert!(
-            tool_open_button_element(&panel, Some("ses_1")).is_none(),
-            "a read panel carries no button"
+            md.ends_with(&format!("\n\n{READ_TRUNCATION_NOTE}")),
+            "the note closes a clipped body: {md}"
         );
+        assert!(md.contains('…'), "the clipped body is marked: {md}");
+
+        // V1's envelope clips the same way: the note is the body's, not the
+        // generation's.
+        let v1 = format!(
+            "<path>/x/big.rs</path>\n<type>file</type>\n<content>\n{}</content>",
+            long_read_lines()
+        );
+        let panel = ToolPanel::for_test(
+            "read",
+            ToolStatus::Completed,
+            Some(json!({"filePath": "/x/big.rs"})),
+            Some(&v1),
+        );
+        let md = panel_md_with_session(panel, "ses_1");
+        assert!(
+            md.ends_with(&format!("\n\n{READ_TRUNCATION_NOTE}")),
+            "V1 clips too: {md}"
+        );
+
+        let small = ToolPanel::for_test(
+            "read",
+            ToolStatus::Completed,
+            Some(json!({"path": "/x/small.rs"})),
+            Some("Read file /x/small.rs, lines 1-1\n1: fn main() {}"),
+        );
+        assert_eq!(read_truncation_note_estimate(&small, Some("ses_1")), 0);
+        let md = panel_md_with_session(small, "ses_1");
+        assert!(!md.contains(READ_TRUNCATION_NOTE), "nothing was cut: {md}");
+
+        let directory = ToolPanel::for_test(
+            "read",
+            ToolStatus::Completed,
+            Some(json!({"path": "/x/huge"})),
+            Some(&format!(
+                "Read directory /x/huge, entries 1-300\n{}",
+                long_read_lines()
+            )),
+        );
+        assert_eq!(read_truncation_note_estimate(&directory, Some("ses_1")), 0);
+        let md = panel_md_with_session(directory, "ses_1");
+        assert!(!md.contains(READ_TRUNCATION_NOTE), "no button, no promise: {md}");
+
+        assert_eq!(read_truncation_note_estimate(&clipped, None), 0);
+        let md = panel_md(clipped);
+        assert!(!md.contains(READ_TRUNCATION_NOTE), "no button, no note: {md}");
+    }
+
+    /// 300 numbered lines of well over [`TOOL_OUTPUT_MAX_CHARS`] characters — a
+    /// `read` body the panel clips, the shape the truncation note exists for
+    /// (ADR-0083 §8 amendment, #770).
+    fn long_read_lines() -> String {
+        (1..=300).map(|n| format!("{n}: {}\n", "x".repeat(40))).collect()
     }
 
     /// A call whose path is absent or unusable carries no button rather than a
@@ -4864,6 +5179,26 @@ LSP errors detected in a.rs, please fix:
             .with_tool(tool)
             .build();
         card["body"]["elements"][0]["elements"][0]["content"]
+            .as_str()
+            .expect("panel markdown content")
+            .to_string()
+    }
+
+    /// [`panel_md`] with the Session a live Turn card renders with, so the
+    /// fold's controls — the 「📂 打开」 button and the truncation note beside it
+    /// (ADR-0083 §8 amendment, #770) — can exist. The body is found by tag: a
+    /// panel with a button does not lead with its markdown.
+    fn panel_md_with_session(tool: ToolPanel, session: &str) -> String {
+        let card = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_tool_at(tool, None, Some("tool_call"), Some(session))
+            .build();
+        card["body"]["elements"][0]["elements"]
+            .as_array()
+            .expect("panel body")
+            .iter()
+            .find(|element| element["tag"] == "markdown")
+            .expect("the panel's markdown body")["content"]
             .as_str()
             .expect("panel markdown content")
             .to_string()

@@ -488,14 +488,23 @@ pub(crate) fn test_local_ms(y: i32, m: u32, d: u32, h: u32, min: u32) -> i64 {
 /// the card never showed, or a restart would skip them.
 pub(crate) const REASONING_TEXT_CAP: usize = 800;
 
+/// Whether [`truncate_md`] would cut `text` at `max_len`: the character
+/// comparison the clip itself makes, so a caller that must know whether a
+/// rendered body was ACTUALLY clipped — a `read` panel's truncation note
+/// (ADR-0083 §8 amendment, #770) — decides on exactly the case the `…` marks
+/// rather than on a second, drifting rule.
+pub(crate) fn exceeds_md_budget(text: &str, max_len: usize) -> bool {
+    text.chars().count() > max_len
+}
+
 /// Clip `text` to at most `max_len` characters, appending a "…" marker when it
 /// was cut. Character-counted so CJK content (3 bytes/char) is truncated at the
 /// same visual length as ASCII instead of at a byte budget.
 pub(crate) fn truncate_md(text: &str, max_len: usize) -> String {
-    if text.chars().count() <= max_len {
-        text.to_string()
-    } else {
+    if exceeds_md_budget(text, max_len) {
         format!("{}…", text.chars().take(max_len).collect::<String>())
+    } else {
+        text.to_string()
     }
 }
 
