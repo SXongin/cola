@@ -14,15 +14,6 @@ use crate::backend::FileContent;
 /// delivered through this path.
 pub(crate) const MAX_FILE_BYTES: u64 = 30 * 1024 * 1024;
 
-/// Feishu's **client-side HTML preview** cap: a `.html` file up to 12MB renders
-/// as a page in the file message's preview (the help centre's "在飞书中查看
-/// HTML 文件"); past it the file still uploads and arrives, it just is not
-/// rendered. A *display* limit, not an upload one — unlike [`MAX_FILE_BYTES`],
-/// nothing is refused here, so the viewer only warns. Measured 2026-10-18
-/// (#774): the chat preview renders the page and executes its inline
-/// `<script>`, on desktop and mobile.
-pub(crate) const HTML_PREVIEW_MAX_BYTES: u64 = 12 * 1024 * 1024;
-
 /// Whether `content` is within Feishu's File Message upload cap. `false` means
 /// the caller marks it `未发送` and uploads nothing.
 pub(crate) fn deliverable_file(content: &FileContent) -> bool {

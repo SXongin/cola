@@ -464,8 +464,7 @@ Notes:
   For an `.html`/`.htm` file the transfer **leads** the row as
   「🌐 预览网页」: Feishu renders an uploaded `.html` as a page when the file
   message is opened (inline scripts included), so the File Message is that
-  file's real viewer — no card component renders HTML. Past the client's 12 MB
-  preview limit the card warns that the page may not render and only download.
+  file's real viewer — no card component renders HTML.
   「🔄 重新读取」 re-reads and updates the viewer in
   place. 「📂 所在目录」 opens the file's parent in the Directory Browser;
   「← 返回目录」 returns from a browse-row viewer to its listing. A write/edit
