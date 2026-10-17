@@ -64,7 +64,7 @@ configuration [doc].
 | **Card `img`** | Images (≤10 MB upload; GIF ≤2000×2000, others ≤12000×12000) [doc/ours] | 10 MB, dimension-capped [ours, ADR-0076] | No | `im:resource` (already held) | Yes | Already used by ADR-0076. Keeps "thumbnail in the card". |
 | **Card `table`** | Plain text / `lark_md` / `markdown` / options / number / persons / date cells. Cells **clip at the end**; the user sees the rest by hover/click [doc]. **Cells are not buttons** | 5 table components per card, ≤50 columns, `page_size` 1–10 rows per page, row height ≤999px [doc] | No | none | Yes | Good for *file listings* (name/size/mtime columns), bad for long text. ADR-0078 already established cells can't be clickable. |
 | **Card `chart`** | VChart spec (`line/area/bar/pie/funnel/scatter/radar/wordCloud/linearProgress/circularProgress/common`), interactive on click, enlargeable on PC / full-screen on mobile | ≤5 charts per card (recommended), `height` ≤999px [doc]; `chart_spec` is validated server-side (error `200550`) and **no JavaScript syntax** is allowed [doc] | No | none | Yes (with documented mobile gaps: conical gradient, grid word-cloud, texture, SVG bar background [doc]) | **Not a file viewer.** Could be a bonus for "plot this CSV" later. Not a display escape hatch. |
-| **`file` message** | The bytes. Client-side preview depends on type (see §2) — **format list unverified** | 30 MB upload hard cap; no 0-byte files [doc] | No | `im:resource` (already held) | Yes | **The binary/PDF download path** (ADR-0076). Not an inline content surface. |
+| **`file` message** | The bytes. Client-side preview depends on type (see §2) — `.html` renders as a page (inline `<script>` runs) and `.md` renders as rich text, both **measured 2026-10-18**; the full format list is still unverified | 30 MB upload hard cap; no 0-byte files [doc]. Client preview: **12 MB** for `.html` [doc, measured] | No | `im:resource` (already held) | Yes | **The binary/PDF download path** (ADR-0076) — and the only surface that renders an HTML page (#774). |
 | **`audio` / `media`** | Audio player / mp4 video with cover [doc] | file upload ≤30 MB; audio must be `opus`, video `mp4` (or `stream`) [doc] | No | `im:resource` | Yes | Only useful for a future "read this aloud". Also `<audio file_key=…>` inline in a card's markdown [doc] — a card *can* embed an audio player, which is the precedent that a card can reference an uploaded `file_key`, but only for audio. |
 | **云文档 import** | A real online doc: rich text, headings, tables, images, `code` blocks with `CodeLanguage`, `file`/`iframe` blocks. Link renders natively in the client | Import source ≤20 MB for txt/md/html (600 MB docx, 800 MB xlsx) [doc]; `file_token` expires after **5 minutes** [doc]; folder tree ≤15 levels / 1500 nodes per level [doc] | **No** — everything is outbound REST to `open.feishu.cn` | `docs:document:import` **or** `drive:drive`; plus `docs:document.media:upload` for the upload step; a `folder_token` (empty = My Space root) | Yes | **Viable but heavy.** The one surface that genuinely beats the card for a 5000-line log. Only `.md/.mark/.markdown/.txt/.html` — **no arbitrary source code**. |
 | **H5 via `open_url`** | Whatever you serve — full text viewer, syntax highlighting, search, a real file tree | Unlimited (it's your server) | **YES** — and the app's homepage URL must be a public network address in production [doc] | App needs the **Web application** capability + a published version; `applink.feishu.cn/client/web_app/open?appId=…` [doc] | Yes | **Out.** Requires exactly what cola does not have. |
@@ -230,10 +230,27 @@ Per type, and what it can show that a card cannot:
   the upload's `file_type` must match the message type or the send fails with `230055` [doc].
   The **client-side** 在线预览 behaviour is governed by
   [文件上传、在线预览的大小及格式要求](https://www.feishu.cn/hc/zh-CN/articles/360049067549)
-  — **that help-centre page is client-side rendered and could not be extracted; the exact
-  supported preview-format list is [unverified] here.** A search-result snippet from that same
+  — **that help-centre page is client-side rendered and the full preview-format list still
+  has not been extracted here.** A search-result snippet from that same
   article states "支持预览压缩包内文件列表和目录结构,不支持预览压缩包内文件" (archives: directory
   listing is previewable, contents are not) — treat as weak evidence, not a citation.
+  **Measured 2026-10-18 (#774)** — in a real chat, desktop *and* mobile, sent through cola's own
+  upload path (`file_type=stream`, the real file name) — for the two formats cola cares about:
+  - a **`.html`** file renders as a page in the file message's preview; its inline `<script>`
+    **executes**; the client's own "code view" toggles back to the source. The help centre's
+    [在飞书中查看 HTML 文件](https://www.feishu.cn/hc/zh-CN/articles/052565607602) caps that
+    preview at **12 MB** (a display cap — a larger file still uploads and downloads). Desktop
+    and mobile both render; on mobile the reference-quote bar was flattened to an indent.
+    Feishu's own guidance is that a page with heavy front-end logic or many external assets
+    belongs on 妙搭 instead, which matches the 12 MB single-page framing.
+  - a **`.md`** file renders as rich text, and **without opening it** the message already shows
+    a rendered preview excerpt.
+  - the same markdown through a card `markdown` element and through a `post` `md` tag renders
+    **equivalent** to that `.md` file preview — the file preview is not a better renderer, only
+    a surface that needs no card.
+
+  These are `[ours]` measurements from one client version (the V7.71 era), not a documented
+  format list; they are evidence for `.html` and `.md` only.
 - **`image`** — `{"image_key": …}`, same 10 MB upload. Nothing a card can't already do.
 - **`audio` / `media`** — `{"file_key": …}` (+ optional `image_key` cover for `media`). Audio
   must be uploaded as `opus`, video as `mp4` [doc]. A card can *also* embed an audio player via
