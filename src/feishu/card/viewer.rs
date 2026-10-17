@@ -1005,7 +1005,10 @@ fn html_page_note(view: &ViewerCard<'_>) -> String {
             human_size(crate::feishu::file::HTML_PREVIEW_MAX_BYTES),
         )
     } else {
-        "在飞书中点开即为渲染后的页面。".to_string()
+        // Stated as the client's behaviour — never as "点开即为渲染后的页面".
+        // That phrasing presupposes a delivered file, and this half is appended
+        // in every delivery state, including "尚未发送成功".
+        "飞书会在打开该文件消息时渲染页面。".to_string()
     };
     note.push_str(&how_to_view);
     note
@@ -2545,7 +2548,7 @@ mod tests {
         assert!(text.contains("超过 12.0 MB"), "{text}");
         assert!(text.contains("可能不渲染"), "{text}");
         assert!(
-            !text.contains("点开即为渲染后的页面"),
+            !text.contains("飞书会在打开该文件消息时渲染页面"),
             "no promise the cap contradicts: {text}"
         );
     }
@@ -2660,7 +2663,7 @@ mod tests {
         assert!(text.contains("尚未发送成功"), "{text}");
         assert!(text.contains("超过 12.0 MB"), "{text}");
         assert!(
-            !text.contains("点开即为渲染后的页面"),
+            !text.contains("飞书会在打开该文件消息时渲染页面"),
             "the cap outranks the retry wording: {text}"
         );
 
