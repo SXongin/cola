@@ -199,7 +199,7 @@ async fn cat_opens_a_text_file_with_the_language_hint_and_the_resolved_path() {
 }
 
 #[tokio::test]
-async fn absolute_file_outside_session_directory_opens_with_privacy_hint() {
+async fn absolute_file_outside_session_directory_opens_without_a_scope_notice() {
     let _wd = test_work_dir();
     let session_dir = tempfile::tempdir().unwrap();
     let outside_dir = tempfile::tempdir().unwrap();
@@ -227,11 +227,12 @@ async fn absolute_file_outside_session_directory_opens_with_privacy_hint() {
         text.contains("private notes"),
         "the file content is shown: {text}"
     );
+    // ADR-0083 §4 (amended #771): the privacy statement belongs to the ADR and
+    // the user guide, not to a line repeated on every viewer card.
     assert!(
-        text.contains("会话目录之外"),
-        "the privacy hint names the scope: {text}"
+        !text.contains("⚠️"),
+        "an outside-session path carries no warning row: {text}"
     );
-    assert!(text.contains("不是访问边界"), "the hint is not a sandbox: {text}");
 }
 
 /// A `/cat` FIFO must fail promptly on the command path, without waiting for a
@@ -2739,8 +2740,8 @@ async fn tool_panel_open_button_passes_absolute_paths_through() {
         "the absolute path opens as-is: {opened}"
     );
     assert!(
-        card_text(&opened).contains("会话目录之外"),
-        "the outside-session path carries a privacy hint: {opened}"
+        !card_text(&opened).contains("⚠️"),
+        "an outside-session path carries no warning row: {opened}"
     );
 }
 

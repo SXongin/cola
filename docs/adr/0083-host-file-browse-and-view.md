@@ -308,3 +308,37 @@ carries the same control, in the same place:
 
 Everything else in §8 stands: prose paths are still never parsed into controls, and a `read` stays a
 cola-local, generation-neutral read.
+## Amendment (2026-10-17, #771): the viewer card stops repeating the path-scope statement
+
+§4 remains the home of the privacy statement — the scope is advisory, a hint rather than a
+control, and the **Access List** is the only gate on who may act. What changes is where that
+statement is *told*: the viewer card had been repeating it as a `⚠️` row appended to the
+naming block of every path outside the Session's directory:
+
+> ⚠️ 此路径位于会话目录之外；仍可打开。此提示不是访问边界。
+
+The row is removed, together with `is_outside_session_dir` — the lexical `.`/`..`-normalizing
+comparison whose only caller built it.
+
+- **The naming block is 文件 / 大小 / 类型, and nothing more.** The viewer still names the
+  **resolved** path, so an outside-session file is as unambiguous as any other; the card simply
+  no longer editorialises about where the file lives. A statement read once belongs to the ADR
+  and the user guide's **Path Scope** entry, not to a line repeated on every card — repeated
+  copy is read as boilerplate and stops being read at all.
+- **「此提示不是访问边界」 was the worst part of it.** On a card that is showing file content,
+  that sentence reads as "a boundary exists here, and this loading is a bypass of it" — a claim
+  §4 and the rejected browse-root allow-list took pains never to make (#673 holds the real
+  work; #670's six escapes are why the ADR words §4 as a hint).
+- **No behaviour changes.** A path outside the Session's directory still opens, `/cat` still
+  resolves and displays the **resolved** path, and the scope is still advisory. The guide's
+  Path Scope entry already carries the plain statement the card was trying to make — a group
+  chat can read whatever a Host opens.
+- **`ViewerCard.session_dir` stays.** Only the naming block stopped reading it; the pager
+  payload still carries `session_dir` (`extra.push(("session_dir", …))`) and a viewer action
+  still consumes it as the directory a relative path resolves against. No payload, handler or
+  pager change rides along.
+
+The unit test that asserted the row is replaced by its inverse: an outside-session path renders
+its resolved path with no `⚠️` row, and the two bridge tests that asserted the row now assert
+its absence.
+
