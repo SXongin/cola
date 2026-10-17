@@ -446,14 +446,19 @@ const PREVIEW_JSON_BUDGET: usize = MAX_CARD_JSON_CHARS - 4_000;
 /// its language token and the element's own JSON overhead.
 const PREVIEW_CHUNK_CHARS: usize = MAX_ELEMENT_TEXT_CHARS - 64;
 
-/// How a delimited preview was cut to fit the card: a dropped row/column is
-/// reported separately from a clipped long cell, so the card's note never
-/// claims a cut that did not happen (ADR-0083 §6).
+/// How a delimited preview was cut to fit the card, so its note names the rows,
+/// columns and budget limits that actually affected the rendered table
+/// (ADR-0083 §6).
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 struct TableCut {
-    /// Rows or columns were dropped (the platform's row cap / the column cap,
-    /// or the card's own JSON budget).
-    rows: bool,
+    /// Body rows present in the rendered table (not including its header).
+    rows_shown: usize,
+    /// At least one body row was omitted.
+    rows_dropped: bool,
+    /// At least one rendered row/header had columns beyond the preview cap.
+    columns_dropped: bool,
+    /// A row did not fit the remaining card JSON budget.
+    budget_limited: bool,
     /// Cells longer than [`MAX_CELL_CHARS`] were clipped.
     cells: bool,
 }
@@ -462,6 +467,8 @@ struct TableCut {
 pub(crate) struct ViewerCard<'a> {
     /// The **resolved** absolute path (never the typed spelling).
     pub(crate) path: &'a str,
+    /// The directory the current Session uses as its path scope, when known.
+    pub(crate) session_dir: Option<&'a str>,
     /// The file's byte size.
     pub(crate) size: u64,
     /// What the viewer decided the bytes are.
@@ -509,8 +516,9 @@ pub(crate) fn build_viewer_card(thread_key: &ThreadKey, view: ViewerCard<'_>) ->
     // preview's own table spends is counted exactly once.
     let mut markdown = CardMarkdown::new();
     let mut elements: Vec<serde_json::Value> = Vec::new();
-    let mut truncated = view.truncated;
+    let truncated = view.truncated;
     let mut clipped_cells = false;
+    let mut table_cut = None;
 
     elements.push(json!({
         "tag": "markdown",
@@ -547,8 +555,8 @@ pub(crate) fn build_viewer_card(thread_key: &ThreadKey, view: ViewerCard<'_>) ->
                 };
                 match delimited_table(view.text, delim) {
                     Some((table, cut)) => {
-                        truncated |= cut.rows;
                         clipped_cells = cut.cells;
+                        table_cut = Some(cut);
                         elements.push(json!({
                             "tag": "markdown",
                             "content": markdown.clean(&table),
@@ -601,10 +609,13 @@ pub(crate) fn build_viewer_card(thread_key: &ThreadKey, view: ViewerCard<'_>) ->
         if truncated {
             elements.push(json!({
                 "tag": "markdown",
-                "content": match view.kind {
-                    ViewerKind::Delimited => format!("_（表格过长，仅显示前 {MAX_TABLE_ROWS} 行）_"),
-                    _ => "_（内容过长，预览已截断）_".to_string(),
-                },
+                "content": "_（内容过长，预览已截断）_",
+            }));
+        }
+        if let Some(cut) = table_cut.filter(|cut| cut.rows_dropped || cut.columns_dropped) {
+            elements.push(json!({
+                "tag": "markdown",
+                "content": markdown.clean(&table_cut_note(cut)),
             }));
         }
         if clipped_cells {
@@ -669,6 +680,9 @@ fn push_text_page(
     // shape — never the row's `dir`/`page`, whose `page` is the LISTING's.
     let return_page = view.return_to.map(|listing| listing.page.to_string());
     let mut extra: Vec<(&str, &str)> = vec![("path", view.path)];
+    if let Some(session_dir) = view.session_dir {
+        extra.push(("session_dir", session_dir));
+    }
     if let Some(listing) = view.return_to {
         extra.push(("return_dir", listing.dir));
         extra.push((
@@ -902,12 +916,49 @@ fn naming_block(view: &ViewerCard<'_>) -> String {
             None => format!("{}（无扩展名）", kind.label()),
         },
     };
-    format!(
+    let mut block = format!(
         "**文件**：`{}`\n**大小**：{} · **类型**：{}",
         view.path,
         human_size(view.size),
         type_label,
-    )
+    );
+    if view
+        .session_dir
+        .is_some_and(|dir| is_outside_session_dir(view.path, dir))
+    {
+        block.push_str("\n⚠️ 此路径位于会话目录之外；仍可打开。此提示不是访问边界。");
+    }
+    block
+}
+
+/// Compare absolute paths lexically, normalizing `.` and `..` without another
+/// filesystem access. The hint is informational; symlinks remain within the
+/// caller's filesystem permissions and are not a sandbox boundary.
+fn is_outside_session_dir(path: &str, session_dir: &str) -> bool {
+    fn normalize(path: &str) -> Option<std::path::PathBuf> {
+        use std::path::Component;
+
+        let path = std::path::Path::new(path);
+        if !path.is_absolute() {
+            return None;
+        }
+        let mut normalized = std::path::PathBuf::new();
+        for component in path.components() {
+            match component {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    normalized.pop();
+                }
+                other => normalized.push(other.as_os_str()),
+            }
+        }
+        Some(normalized)
+    }
+
+    match (normalize(path), normalize(session_dir)) {
+        (Some(path), Some(session_dir)) => !path.starts_with(session_dir),
+        _ => false,
+    }
 }
 
 /// One tracking line for the card's whole-bytes lane (ADR-0083 §5): `📎 name ·
@@ -975,6 +1026,9 @@ fn reread_value(thread_key: &ThreadKey, view: &ViewerCard<'_>) -> serde_json::Va
         value["return_show_hidden"] = json!(return_to.show_hidden);
         value["return_keyword"] = json!(return_to.keyword);
         value["return_page"] = json!(return_to.page);
+    }
+    if let Some(session_dir) = view.session_dir {
+        value["session_dir"] = json!(session_dir);
     }
     if let Some(message_id) = view
         .lane
@@ -1126,6 +1180,9 @@ fn transfer_value(thread_key: &ThreadKey, view: &ViewerCard<'_>) -> serde_json::
         value["return_keyword"] = json!(return_to.keyword);
         value["return_page"] = json!(return_to.page);
     }
+    if let Some(session_dir) = view.session_dir {
+        value["session_dir"] = json!(session_dir);
+    }
     value
 }
 
@@ -1142,7 +1199,7 @@ fn delimited_table(text: &str, delim: char) -> Option<(String, TableCut)> {
     let mut records = delimited_records(text, delim);
     let header = records.next()?;
     let mut cut = TableCut {
-        rows: header.len() > MAX_PREVIEW_COLUMNS,
+        columns_dropped: header.len() > MAX_PREVIEW_COLUMNS,
         ..TableCut::default()
     };
     let mut lines: Vec<String> = Vec::new();
@@ -1155,21 +1212,41 @@ fn delimited_table(text: &str, delim: char) -> Option<(String, TableCut)> {
     let mut used = lines.iter().map(|line| serialized_len(line) + 8).sum::<usize>();
     for (body, row) in records.enumerate() {
         if body == MAX_TABLE_ROWS {
-            cut.rows = true;
+            cut.rows_dropped = true;
             break;
         }
-        cut.rows |= row.len() > MAX_PREVIEW_COLUMNS;
         let (line, clipped) = table_row(&row);
-        cut.cells |= clipped;
         let cost = serialized_len(&line) + 8;
         if used + cost > PREVIEW_JSON_BUDGET {
-            cut.rows = true;
+            cut.rows_dropped = true;
+            cut.budget_limited = true;
             break;
         }
         used += cost;
         lines.push(line);
+        cut.rows_shown += 1;
+        cut.columns_dropped |= row.len() > MAX_PREVIEW_COLUMNS;
+        cut.cells |= clipped;
     }
     Some((lines.join("\n"), cut))
+}
+
+/// A truthful note for the delimited preview's actual cuts. The parser stops
+/// as soon as the row cap or JSON budget is reached, so it never invents a
+/// total for rows it deliberately did not scan.
+fn table_cut_note(cut: TableCut) -> String {
+    let mut details = vec![format!("显示 {} 行", cut.rows_shown)];
+    if cut.rows_dropped {
+        details.push(if cut.budget_limited {
+            "预览预算不足，后续行未显示".to_string()
+        } else {
+            "达到行数上限，后续行未显示".to_string()
+        });
+    }
+    if cut.columns_dropped {
+        details.push(format!("超出前 {MAX_PREVIEW_COLUMNS} 列的列已省略"));
+    }
+    format!("_（{}）_", details.join("；"))
 }
 
 /// One markdown table row from its cells: extra columns past the cap drop, a
@@ -1452,6 +1529,7 @@ mod tests {
     fn view<'a>(path: &'a str, kind: ViewerKind, ext: Option<&'a str>, text: &'a str) -> ViewerCard<'a> {
         ViewerCard {
             path,
+            session_dir: None,
             size: text.len() as u64,
             kind,
             ext,
@@ -1540,7 +1618,14 @@ mod tests {
             table,
             "| name | age |\n| --- | --- |\n| Doe, Jane | 41 |\n| bob\" | 42 |"
         );
-        assert_eq!(cut, TableCut::default(), "nothing was cut");
+        assert_eq!(
+            cut,
+            TableCut {
+                rows_shown: 2,
+                ..TableCut::default()
+            },
+            "nothing was cut"
+        );
 
         let (piped, _) = delimited_table("a|b,c\nd,e", ',').unwrap();
         assert!(
@@ -1558,7 +1643,10 @@ mod tests {
             table.lines().next().unwrap().matches('|').count(),
             MAX_PREVIEW_COLUMNS + 1
         );
-        assert!(cut.rows, "columns past the cap are dropped and reported");
+        assert!(
+            cut.columns_dropped,
+            "columns past the cap are dropped and reported"
+        );
 
         let long = (0..MAX_TABLE_ROWS + 5)
             .map(|i| format!("r{i},1"))
@@ -1570,7 +1658,7 @@ mod tests {
             MAX_TABLE_ROWS + 2,
             "header + delimiter + capped body"
         );
-        assert!(cut.rows, "a table past the row cap says so");
+        assert!(cut.rows_dropped, "a table past the row cap says so");
 
         assert!(delimited_table("   \n\n", ',').is_none(), "no rows, no table");
     }
@@ -1587,7 +1675,13 @@ mod tests {
             table,
             "| name | note |\n| --- | --- |\n| ann | first second |\n| bob | say \"hi\" |"
         );
-        assert_eq!(cut, TableCut::default());
+        assert_eq!(
+            cut,
+            TableCut {
+                rows_shown: 2,
+                ..TableCut::default()
+            }
+        );
 
         // The parser is the pin: two records, the first body row carrying the
         // newline inside its second cell until `table_row` flattens it.
@@ -1659,8 +1753,70 @@ mod tests {
             "a CSV of wide rows must stay within the card budget: {json_len}"
         );
         let text = card_text(&card);
-        assert!(text.contains("表格过长"), "the row cut is stated: {text}");
+        assert!(text.contains("后续行未显示"), "the row cut is stated: {text}");
         assert!(text.contains("单元格已截断"), "the cell clip is stated: {text}");
+    }
+
+    #[test]
+    fn delimited_budget_note_reports_the_rows_shown_and_budget_cut() {
+        let header = (0..MAX_PREVIEW_COLUMNS)
+            .map(|i| format!("column{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let row = (0..MAX_PREVIEW_COLUMNS)
+            .map(|_| "x".repeat(MAX_CELL_CHARS - 10))
+            .collect::<Vec<_>>()
+            .join(",");
+        let csv = format!(
+            "{header}\n{}",
+            std::iter::repeat_n(row, 100).collect::<Vec<_>>().join("\n")
+        );
+        let card = build_viewer_card(
+            &key(),
+            view("/work/large.csv", ViewerKind::Delimited, Some("csv"), &csv),
+        );
+        let text = card_text(&card);
+        let note = text
+            .lines()
+            .find(|line| line.contains("预算不足"))
+            .unwrap_or_else(|| panic!("the budget cut is stated: {text}"));
+
+        assert!(note.contains("显示 "), "the note gives rows shown: {note}");
+        assert!(
+            note.contains("后续行未显示"),
+            "the note names omitted rows: {note}"
+        );
+        assert!(!note.contains("仅显示前 49 行"), "no false fixed count: {note}");
+    }
+
+    #[test]
+    fn delimited_columns_only_note_does_not_claim_rows_were_cut() {
+        let header = (0..=MAX_PREVIEW_COLUMNS)
+            .map(|i| format!("column{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let row = (0..=MAX_PREVIEW_COLUMNS)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let csv = format!("{header}\n{row}");
+        let card = build_viewer_card(
+            &key(),
+            view("/work/wide.csv", ViewerKind::Delimited, Some("csv"), &csv),
+        );
+        let text = card_text(&card);
+        let note = text
+            .lines()
+            .find(|line| line.contains("列已省略"))
+            .unwrap_or_else(|| panic!("the dropped column is stated: {text}"));
+
+        assert!(note.contains("显示 1 行"), "the row count is honest: {note}");
+        assert!(
+            note.contains(&format!("超出前 {MAX_PREVIEW_COLUMNS} 列")),
+            "the column cap is stated: {note}"
+        );
+        assert!(!note.contains("后续行未显示"), "rows were not dropped: {note}");
+        assert!(!note.contains("预算不足"), "the budget was not exhausted: {note}");
     }
 
     /// A delimited file far larger than any card — hundreds of thousands of
@@ -1705,7 +1861,7 @@ mod tests {
             "the card must fit its own budget: {json_len}"
         );
         let text = card_text(&card);
-        assert!(text.contains("表格过长"), "the row cut is stated: {text}");
+        assert!(text.contains("后续行未显示"), "the row cut is stated: {text}");
 
         // One pathological field (a whole 8 MB cell) is bounded before it can
         // materialize: the parser stores a clipped prefix, no more.
@@ -1753,7 +1909,7 @@ mod tests {
         // The rendered table is unchanged by the laziness: it still says it was
         // cut.
         let text = card_text(&card);
-        assert!(text.contains("表格过长"), "the row cut is stated: {text}");
+        assert!(text.contains("后续行未显示"), "the row cut is stated: {text}");
     }
 
     /// The card names the file it shows: the resolved path, its size and its
@@ -1799,6 +1955,36 @@ mod tests {
         assert_eq!(out["value"]["dir"], expected_parent);
         assert_eq!(out["value"]["chat_id"], "chat_1");
         assert_eq!(out["value"]["thread_id"], "chat_1");
+    }
+
+    #[test]
+    fn viewer_names_when_the_resolved_path_is_outside_the_session_directory() {
+        let mut viewer = view(
+            "/work/outside/notes.md",
+            ViewerKind::Text,
+            Some("md"),
+            "private notes",
+        );
+        viewer.session_dir = Some("/work/session");
+        let card = build_viewer_card(&key(), viewer);
+
+        let text = card_text(&card);
+        assert!(
+            text.contains("会话目录之外"),
+            "the privacy hint is present: {text}"
+        );
+        assert!(
+            text.contains("不是访问边界"),
+            "the hint is not a boundary: {text}"
+        );
+        assert!(
+            text.contains("/work/outside/notes.md"),
+            "the resolved path remains named: {text}"
+        );
+        assert!(is_outside_session_dir(
+            "/work/session/../outside/notes.md",
+            "/work/session"
+        ));
     }
 
     /// ADR-0052/0083: re-read is stateless and carries the resolved path, the

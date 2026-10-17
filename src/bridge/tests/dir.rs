@@ -1381,11 +1381,16 @@ async fn dir_browse_file_row_on_a_vanished_path_toasts_and_a_directory_opens_the
             "path": ghost.to_string_lossy(),
             "chat_id": "chat_1",
             "thread_id": "chat_1",
+            "open_message_id": "msg_ghost",
         }))
         .await
-        .expect("the click answers");
-    assert!(result.card.is_none(), "a vanished file patches no card");
-    let toast = result.toast.unwrap_or_default();
+        .expect("the callback is acknowledged");
+    assert!(result.card.is_none(), "the open runs after acknowledgement");
+    wait_for_card_update(&platform, "vanished file", CardUpdates::Latest, |card| {
+        card_text(card).contains("找不到路径")
+    })
+    .await;
+    let toast = card_text(patches_to(&platform, "msg_ghost").await.last().unwrap());
     assert!(toast.contains("找不到路径"), "the reason is stated: {toast}");
     assert!(toast.contains(&canonical(&ghost)), "and names the path: {toast}");
     assert!(platform.replied_cards().await.is_empty(), "never an empty viewer");
@@ -1396,10 +1401,20 @@ async fn dir_browse_file_row_on_a_vanished_path_toasts_and_a_directory_opens_the
             "path": proj_dir,
             "chat_id": "chat_1",
             "thread_id": "chat_1",
+            "open_message_id": "msg_directory",
         }))
         .await
-        .expect("the click answers");
-    let card = result.card.expect("a directory answers the browser");
+        .expect("the callback is acknowledged");
+    assert!(result.card.is_none());
+    wait_for_card_update(&platform, "directory browser", CardUpdates::Latest, |card| {
+        card_text(card).contains("📁 alpha")
+    })
+    .await;
+    let card = patches_to(&platform, "msg_directory")
+        .await
+        .last()
+        .cloned()
+        .expect("a directory answers the browser");
     assert_eq!(card_header(&card), "📁 浏览目录");
     assert!(
         card_text(&card).contains("📁 alpha"),
@@ -1514,7 +1529,7 @@ async fn dir_browse_file_row_opens_the_viewer_in_place_and_declares_nothing() {
         .unwrap()
         .card
         .expect("card");
-    let payload = file_row(&card, "notes.md")["value"].clone();
+    let mut payload = file_row(&card, "notes.md")["value"].clone();
     assert_eq!(
         payload["action"], "file",
         "the row routes to the viewer, not the browse handler: {payload}"
@@ -1524,11 +1539,23 @@ async fn dir_browse_file_row_opens_the_viewer_in_place_and_declares_nothing() {
         "no pick/topic op on a file row: {payload}"
     );
     assert_eq!(payload["path"], canonical(&file), "the row names the file");
+    payload["open_message_id"] = serde_json::json!("msg_file_row");
 
     let sent_before = platform.calls.lock().await.len();
-    let result = app.host_action(payload).await.expect("the click answers");
-    let viewer = result.card.expect("the viewer patches the browse card in place");
-    assert!(result.toast.is_none(), "opening a file is not a toast");
+    let result = app
+        .host_action(payload)
+        .await
+        .expect("the callback is acknowledged");
+    assert!(result.card.is_none(), "the bounded read follows acknowledgement");
+    wait_for_card_update(&platform, "file row viewer", CardUpdates::Latest, |card| {
+        card_text(card).contains("# notes")
+    })
+    .await;
+    let viewer = patches_to(&platform, "msg_file_row")
+        .await
+        .last()
+        .cloned()
+        .expect("the viewer patches the browse card in place");
     assert_eq!(card_header(&viewer), "📄 notes.md", "the viewer names the file");
     let text = card_text(&viewer);
     assert!(text.contains(&canonical(&file)), "the resolved path: {text}");
@@ -1544,8 +1571,8 @@ async fn dir_browse_file_row_opens_the_viewer_in_place_and_declares_nothing() {
     // In place: the ack patches the clicked message, so nothing is sent anew.
     assert_eq!(
         platform.calls.lock().await.len(),
-        sent_before,
-        "no new message — the ack patches the browse card"
+        sent_before + 1,
+        "one in-place PATCH, no new message"
     );
     assert!(
         platform.replied_cards().await.is_empty(),
@@ -1586,18 +1613,27 @@ async fn dir_browse_file_row_opens_a_name_with_trailing_whitespace() {
         .unwrap()
         .card
         .expect("card");
-    let payload = file_row(&card, "notes.txt ")["value"].clone();
+    let mut payload = file_row(&card, "notes.txt ")["value"].clone();
     assert_eq!(
         payload["path"],
         canonical(&file),
         "the row carries the filesystem name verbatim, trailing space and all"
     );
+    payload["open_message_id"] = serde_json::json!("msg_trailing_space");
 
-    let viewer = app
+    let result = app
         .host_action(payload)
         .await
-        .expect("the click answers")
-        .card
+        .expect("the callback is acknowledged");
+    assert!(result.card.is_none());
+    wait_for_card_update(&platform, "trailing-space file", CardUpdates::Latest, |card| {
+        card_text(card).contains("trailing")
+    })
+    .await;
+    let viewer = patches_to(&platform, "msg_trailing_space")
+        .await
+        .last()
+        .cloned()
         .expect("the row opens the exact file it listed");
     assert_eq!(
         card_header(&viewer),
@@ -1629,7 +1665,7 @@ async fn dir_browse_file_row_returns_to_the_same_listing_state() {
     let proj_dir = canonical(proj.path());
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
-    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
     seed_entry(&app, seeded_entry(&key, &proj_dir)).await;
 
@@ -1654,11 +1690,18 @@ async fn dir_browse_file_row_returns_to_the_same_listing_state() {
         card_text(&page2)
     );
 
-    let viewer = app
-        .host_action(file_row(&page2, "a06.txt")["value"].clone())
+    let mut open = file_row(&page2, "a06.txt")["value"].clone();
+    open["open_message_id"] = serde_json::json!("msg_return_listing");
+    let result = app.host_action(open).await.unwrap();
+    assert!(result.card.is_none());
+    wait_for_card_update(&platform, "return-listing viewer", CardUpdates::Latest, |card| {
+        card_text(card).contains("a06.txt")
+    })
+    .await;
+    let viewer = patches_to(&platform, "msg_return_listing")
         .await
-        .unwrap()
-        .card
+        .last()
+        .cloned()
         .expect("viewer");
     let back = card_buttons(&viewer)
         .into_iter()
@@ -1772,7 +1815,7 @@ async fn dir_browse_file_rows_resolve_a_symlink_and_keep_a_plain_path() {
     let proj_dir = canonical(proj.path());
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
-    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
     seed_entry(&app, seeded_entry(&key, &proj_dir)).await;
 
@@ -1789,7 +1832,7 @@ async fn dir_browse_file_rows_resolve_a_symlink_and_keep_a_plain_path() {
         "📄 link.md · 7 B",
         "the link's row reports its target's size"
     );
-    let payload = file_row(&card, "link.md")["value"].clone();
+    let mut payload = file_row(&card, "link.md")["value"].clone();
     assert_eq!(
         payload["path"],
         canonical(&target),
@@ -1800,6 +1843,7 @@ async fn dir_browse_file_rows_resolve_a_symlink_and_keep_a_plain_path() {
         Some(link.to_string_lossy().as_ref()),
         "never the link spelling the scan read: {payload}"
     );
+    payload["open_message_id"] = serde_json::json!("msg_symlink_viewer");
 
     // A plain file is no link, so its row keeps the entry path `read_dir`
     // handed us verbatim — nothing is resolved on its behalf.
@@ -1821,11 +1865,19 @@ async fn dir_browse_file_rows_resolve_a_symlink_and_keep_a_plain_path() {
     // Clicking it opens the viewer at that same resolved path: the header and
     // the naming block name the TARGET, and — the point of the fix — the link
     // spelling never reaches the card at all.
-    let viewer = app
+    let result = app
         .host_action(payload)
         .await
-        .expect("the click answers")
-        .card
+        .expect("the callback is acknowledged");
+    assert!(result.card.is_none());
+    wait_for_card_update(&platform, "symlink viewer", CardUpdates::Latest, |card| {
+        card_text(card).contains("# real")
+    })
+    .await;
+    let viewer = patches_to(&platform, "msg_symlink_viewer")
+        .await
+        .last()
+        .cloned()
         .expect("the viewer patches the browse card");
     assert_eq!(
         card_header(&viewer),
