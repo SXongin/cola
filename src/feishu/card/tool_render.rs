@@ -348,7 +348,7 @@ impl ToolPanel {
 
     /// The child Session a `task`/`subagent` call runs — V1 records
     /// `state.metadata.sessionId`, V2 `state.metadata.sessionID` (the camelCase
-    /// field each generation's contract carries; AGENTS.md #2). `None` for any
+    /// field each generation's contract carries; AGENTS.md pitfall `wire-shapes`). `None` for any
     /// other tool, or when the payload recorded no session id.
     pub(crate) fn child_session_id(&self) -> Option<&str> {
         if !is_task_tool(&self.call.identity.name) {

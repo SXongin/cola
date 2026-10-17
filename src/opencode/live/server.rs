@@ -26,7 +26,7 @@ use crate::opencode::strategy::Generation;
 use super::provider;
 
 /// The Basic-auth password the child server requires; the test's client sends
-/// it with the default `opencode` username (AGENTS.md pitfall #12).
+/// it with the default `opencode` username (AGENTS.md pitfall `attach`).
 pub const PASSWORD: &str = "live-harness-secret";
 
 /// Which permission rules the isolated V2 config declares. Each live chain

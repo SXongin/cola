@@ -775,7 +775,7 @@ async fn handle_binary_frame(
         }
         FrameAction::CardAction(value) => {
             // Ack ALWAYS — even an unparseable card action must be acked,
-            // otherwise Feishu re-delivers it forever (pitfall 8) — and always
+            // otherwise Feishu re-delivers it forever (pitfall `ws-lifecycle`) — and always
             // within CARD_ACK_BUDGET: Feishu fails a callback it does not hear
             // back from within 3 s. The handler runs detached so a slow backend
             // cannot hold the ack hostage; only a result that beats the budget

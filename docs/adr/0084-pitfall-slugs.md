@@ -2,10 +2,11 @@
 
 ## Context
 
-`AGENTS.md` "Known pitfalls" was a numbered list, and 29 references across
-fifteen files cite those numbers: four ADRs, six `docs/research/` notes, and five
-files inside the frozen `.scratch/` archive — which the tracker policy forbids
-editing, so those references can never be repaired in place.
+`AGENTS.md` "Known pitfalls" was a numbered list, and 49 references across
+twenty-five files cite those numbers: four ADRs, six `docs/research/` notes, ten
+`src/` files whose comments point at a pitfall by number, and five files inside
+the frozen `.scratch/` archive — which the tracker policy forbids editing, so
+those references can never be repaired in place.
 
 A number is a position, not an identity. Consolidating two pitfalls, deleting
 one, or reordering the list silently repoints every citation at a different

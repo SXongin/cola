@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// One part already rendered into this card, addressed by content: a part
-/// payload carries no stable id (AGENTS.md #9), so text and reasoning dedupe
+/// payload carries no stable id (AGENTS.md pitfall `wire-shapes`), so text and reasoning dedupe
 /// on the content itself — equal content never renders twice, whatever message
 /// carried it.
 ///
@@ -71,7 +71,7 @@ pub(super) struct TimelineItem {
 
 /// Where a timeline text/reasoning entry came from: the typed transcript
 /// part's own position (spec #561's cursor frontier). The payload carries no
-/// stable part id (AGENTS.md #9), so identity is the message plus the part's
+/// stable part id (AGENTS.md pitfall `wire-shapes`), so identity is the message plus the part's
 /// ordinal in it. Test and synthetic pushes carry none.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct PartSource {
@@ -1740,7 +1740,7 @@ impl StreamAccumulator {
 
     /// Whether this part's content was already rendered into the card — the
     /// content-keyed dedup read (`renders_part` in the renderer), so equal
-    /// content never renders twice (parts carry no id, AGENTS.md #9).
+    /// content never renders twice (parts carry no id, AGENTS.md pitfall `wire-shapes`).
     pub(super) fn has_rendered_part(&self, part: &RenderedPart) -> bool {
         self.rendered_parts.contains(part)
     }

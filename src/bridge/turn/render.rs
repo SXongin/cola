@@ -187,7 +187,7 @@ fn renders_part(acc: &StreamAccumulator, part: &Part) -> bool {
 
 /// Render one typed part into the accumulator, applying the dedup rules
 /// ([`renders_part`]): text and reasoning are tracked by their content
-/// (OpenCode part payloads carry NO `id`, AGENTS.md #9), and a tool call
+/// (OpenCode part payloads carry NO `id`, AGENTS.md pitfall `wire-shapes`), and a tool call
 /// re-renders exactly when its typed panel revision changed. A part the SEED
 /// already delivered in this very message is skipped whatever the read's
 /// positions say (spec #561, review #569): the resolved positions can shift
