@@ -24,8 +24,8 @@
 //! so CONTENT keeps deciding the kind) leads with 「🌐 预览网页」 instead
 //! (#774): the platform renders an uploaded `.html` in the *client's* file
 //! preview — measured 2026-10-18, inline `<script>` included — and no card
-//! component can. The card keeps its source preview and says where the rendered
-//! page is.
+//! component can. The card keeps its source preview and says nothing else: the
+//! label is the whole explanation.
 
 use serde_json::json;
 
@@ -2452,6 +2452,28 @@ mod tests {
                 "{name} leads with the page preview"
             );
         }
+        // A page too large to preview (>8 MB) opens straight into the File
+        // Message lane; when that send has not landed, the page's transfer
+        // still leads — the lane spans both text kinds, not just `Text`, and
+        // this is the `TextTooLarge` arm `needs_html_page_lane` matches.
+        let mut big = view("/tmp/p/huge.html", ViewerKind::TextTooLarge, Some("html"), "");
+        big.size = 9 * 1024 * 1024;
+        big.lane = Some(ViewerFileLane {
+            mime: "text/plain".into(),
+            name: "huge.html".into(),
+            size: big.size,
+            delivery: FileDelivery::Undelivered,
+            content_identity: None,
+            embedded_image_key: None,
+            rich_message_id: None,
+            refresh_failed: false,
+        });
+        let too_large = build_viewer_card(&key(), big);
+        let text = card_text(&too_large);
+        assert!(text.contains("文本（过大，未预览）"), "{text}");
+        assert_eq!(card_buttons(&too_large)[0]["text"]["content"], "🌐 预览网页");
+        assert_eq!(card_buttons(&too_large)[0]["value"]["op"], "send");
+
         let md = build_viewer_card(
             &key(),
             view("/tmp/p/notes.md", ViewerKind::Text, Some("md"), "# hi\n"),
@@ -2468,8 +2490,9 @@ mod tests {
     }
 
     /// #774, deliver-once: once the page's bytes went out as a File Message the
-    /// card offers no second send — and, since the note was dropped, the button
-    /// is the whole page story (nothing claims a delivery the lane did not make).
+    /// card offers no second send. The PAGE label's own guard is the leads test
+    /// above — this one pins the delivered half of it, which the shared
+    /// delivered-bytes predicate would satisfy for any kind.
     #[test]
     fn a_delivered_html_page_drops_the_page_send() {
         let card = build_viewer_card(
