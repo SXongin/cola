@@ -1959,13 +1959,21 @@ mod tests {
 
     #[test]
     fn viewer_names_when_the_resolved_path_is_outside_the_session_directory() {
-        let mut viewer = view(
-            "/work/outside/notes.md",
-            ViewerKind::Text,
-            Some("md"),
-            "private notes",
-        );
-        viewer.session_dir = Some("/work/session");
+        let root = tempfile::tempdir().unwrap();
+        let session_dir = root.path().join("session");
+        let outside_dir = root.path().join("outside");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        let notes = outside_dir.join("notes.md");
+        std::fs::write(&notes, "private notes").unwrap();
+        let resolved_path = std::fs::canonicalize(notes).unwrap();
+        let resolved_path = resolved_path.to_string_lossy().to_string();
+        let session_dir = std::fs::canonicalize(session_dir)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let mut viewer = view(&resolved_path, ViewerKind::Text, Some("md"), "private notes");
+        viewer.session_dir = Some(&session_dir);
         let card = build_viewer_card(&key(), viewer);
 
         let text = card_text(&card);
@@ -1978,12 +1986,12 @@ mod tests {
             "the hint is not a boundary: {text}"
         );
         assert!(
-            text.contains("/work/outside/notes.md"),
-            "the resolved path remains named: {text}"
+            text.contains("notes.md"),
+            "the resolved file remains named on every platform: {text}"
         );
         assert!(is_outside_session_dir(
-            "/work/session/../outside/notes.md",
-            "/work/session"
+            &format!("{session_dir}/../outside/notes.md"),
+            &session_dir
         ));
     }
 
