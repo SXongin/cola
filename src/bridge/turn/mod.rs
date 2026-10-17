@@ -4144,6 +4144,14 @@ impl Turn {
         }
     }
 
+    /// Set the owning Session on a seeded test card, so its Tool Panel controls
+    /// render the same `session_id` routing as a production Turn card.
+    pub(crate) async fn set_session(cards: &CardsHandle, session_id: &str) {
+        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
+            card.acc.set_session(session_id);
+        }
+    }
+
     /// The identity of the NEWEST staged cursor (spec #561, review #569): the
     /// exact stage a confirmation must name, for the tests that drive the
     /// confirmation seams directly.
