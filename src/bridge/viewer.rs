@@ -930,6 +930,16 @@ pub(crate) struct PreparedFileTransfer {
     content: Option<FileContent>,
 }
 
+impl PreparedFileTransfer {
+    /// Whether this snapshot carries bytes at all (#778): `false` when the file
+    /// was past the upload cap, became empty, or could not be read, so the
+    /// transfer can only report a definite non-send — never an upload failure,
+    /// which the delivery distinguishes on its own.
+    pub(crate) fn carries_bytes(&self) -> bool {
+        self.content.is_some()
+    }
+}
+
 pub(crate) fn prepare_file_transfer(
     path: &Path,
     name: &str,
