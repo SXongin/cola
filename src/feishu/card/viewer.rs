@@ -965,9 +965,13 @@ fn needs_html_page_lane(view: &ViewerCard<'_>) -> bool {
         )
 }
 
-/// Whether the file's own bytes already went out (or may have) as a File
-/// Message — the predicate the transfer button obeys, so the card never offers
-/// a send it has performed.
+/// Whether the transfer control has nothing left to do: the bytes already went
+/// out, or may have — a timed-out send is not retried, because it may have
+/// landed and Feishu cannot edit or retract it. A file past the upload cap
+/// deliberately KEEPS its button (see the bridge test on the click path): the
+/// click reports 未发送 on the card, and the viewer's size is a snapshot the
+/// click re-reads — the page note is what stops promising a preview there,
+/// never a hidden control.
 fn file_message_delivered(view: &ViewerCard<'_>) -> bool {
     matches!(
         file_delivery(view),
@@ -982,27 +986,34 @@ fn file_delivery<'a>(view: &'a ViewerCard<'_>) -> Option<&'a FileDelivery> {
 
 /// The HTML page's lead line (#774): where the rendered preview is — the File
 /// Message, opened in Feishu's client — in the state the card is actually in,
-/// plus the client's 12MB preview cap when it applies. Never promises a preview
-/// the lane has not delivered: an ambiguous timeout and an undeliverable file
-/// each keep their own wording, the same uncertainty the tracking line states.
+/// plus what the client's 12MB preview cap means for a file past it. The two
+/// halves are deliberately independent: a file past the cap gets the cap
+/// sentence in every delivery state, so the note never promises the page and
+/// warns it may not render in the same breath.
 fn html_page_note(view: &ViewerCard<'_>) -> String {
-    let mut note = format!("{SEND_AS_PAGE}：{}", html_page_state(view));
-    // Past the client's preview cap the page may not render at all. A file past
-    // the *upload* cap never arrives in the first place, and its state line
-    // already says so, so the cap note is skipped there.
-    let undeliverable = matches!(file_delivery(view), Some(FileDelivery::Undelivered));
-    if view.size > crate::feishu::file::HTML_PREVIEW_MAX_BYTES && !undeliverable {
-        note.push_str(&format!(
+    let mut note = format!("{SEND_AS_PAGE}：{}", html_delivery_state(view));
+    // A file past the *upload* cap never arrives, so there is no preview to
+    // describe — the state sentence already said exactly that.
+    if view.size > crate::feishu::file::MAX_FILE_BYTES
+        && matches!(file_delivery(view), Some(FileDelivery::Undelivered))
+    {
+        return note;
+    }
+    let how_to_view = if view.size > crate::feishu::file::HTML_PREVIEW_MAX_BYTES {
+        format!(
             "超过 {} 的文件，飞书客户端可能不渲染，只能下载。",
             human_size(crate::feishu::file::HTML_PREVIEW_MAX_BYTES),
-        ));
-    }
+        )
+    } else {
+        "在飞书中点开即为渲染后的页面。".to_string()
+    };
+    note.push_str(&how_to_view);
     note
 }
 
-/// Where an HTML page's rendered preview is, for the state this card is in: the
-/// bytes still to send, already sent, possibly sent, or impossible to send.
-fn html_page_state(view: &ViewerCard<'_>) -> String {
+/// The delivery half of the HTML page note: what became of the bytes, in the
+/// lane's own terms — still to send, sent, possibly sent, or impossible to send.
+fn html_delivery_state(view: &ViewerCard<'_>) -> String {
     match file_delivery(view) {
         // Past Feishu's 30MB upload cap nothing can arrive, and the lane line
         // already reads 未发送 — the note says why rather than promising a page.
@@ -1012,14 +1023,10 @@ fn html_page_state(view: &ViewerCard<'_>) -> String {
                 human_size(crate::feishu::file::MAX_FILE_BYTES),
             )
         }
-        Some(FileDelivery::Undelivered) => {
-            "文件尚未发送成功（见上方状态）；发送成功后在飞书中点开即为渲染后的页面。".to_string()
-        }
-        Some(FileDelivery::FileSendOutcomeUnknown) => {
-            "文件可能已发到会话（发送结果未知）；若已在会话中，点开即可看到渲染后的页面。".to_string()
-        }
-        Some(FileDelivery::SentAsFile) => "文件已发到会话，在飞书中点开即为渲染后的页面。".to_string(),
-        _ => "点此把文件发到会话，在飞书中点开即为渲染后的页面。".to_string(),
+        Some(FileDelivery::Undelivered) => "文件尚未发送成功（见上方状态）。".to_string(),
+        Some(FileDelivery::FileSendOutcomeUnknown) => "文件可能已发到会话（发送结果未知）。".to_string(),
+        Some(FileDelivery::SentAsFile) => "文件已发到会话。".to_string(),
+        _ => "点此把文件发到会话。".to_string(),
     }
 }
 
@@ -1061,10 +1068,6 @@ fn lane_line(lane: &ViewerFileLane) -> String {
 /// Same action, same payload — only the label and the order differ.
 fn viewer_buttons(thread_key: &ThreadKey, view: &ViewerCard<'_>) -> serde_json::Value {
     let page = needs_html_page_lane(view);
-    // A File Message already carries the original bytes; Rich Text carries only
-    // a rendered preview, so the transfer action remains essential there.
-    // An ambiguous timed-out File Message is also not retried: it may have
-    // landed and Feishu cannot edit or retract it.
     let delivered = file_message_delivered(view);
     let mut columns = Vec::new();
     if page && !delivered {
@@ -2527,8 +2530,8 @@ mod tests {
     }
 
     /// Past Feishu's 12MB client preview cap the page still sends — the card
-    /// says the client may not render it, rather than promising a preview it
-    /// cannot deliver.
+    /// says the client may not render it, and never also promises a rendered
+    /// page in the same line.
     #[test]
     fn an_over_cap_html_page_warns_the_client_may_not_render_it() {
         let mut over = view(
@@ -2541,6 +2544,10 @@ mod tests {
         let text = card_text(&build_viewer_card(&key(), over));
         assert!(text.contains("超过 12.0 MB"), "{text}");
         assert!(text.contains("可能不渲染"), "{text}");
+        assert!(
+            !text.contains("点开即为渲染后的页面"),
+            "no promise the cap contradicts: {text}"
+        );
     }
 
     /// #774, deliver-once: once the page's bytes went out as a File Message the
@@ -2630,6 +2637,33 @@ mod tests {
             "the retry stays: {text}"
         );
 
+        // A failed send of a file past the preview cap gets the cap sentence,
+        // not a promise of a rendered page.
+        let mut failed_big = view(
+            "/tmp/p/big.html",
+            ViewerKind::Text,
+            Some("html"),
+            "<html></html>\n",
+        );
+        failed_big.size = crate::feishu::file::HTML_PREVIEW_MAX_BYTES + 1;
+        failed_big.lane = Some(ViewerFileLane {
+            mime: "text/plain".into(),
+            name: "big.html".into(),
+            size: failed_big.size,
+            delivery: FileDelivery::Undelivered,
+            content_identity: None,
+            embedded_image_key: None,
+            rich_message_id: None,
+            refresh_failed: false,
+        });
+        let text = card_text(&build_viewer_card(&key(), failed_big));
+        assert!(text.contains("尚未发送成功"), "{text}");
+        assert!(text.contains("超过 12.0 MB"), "{text}");
+        assert!(
+            !text.contains("点开即为渲染后的页面"),
+            "the cap outranks the retry wording: {text}"
+        );
+
         let mut over_upload_cap = view("/tmp/p/huge.html", ViewerKind::TextTooLarge, Some("html"), "");
         over_upload_cap.size = crate::feishu::file::MAX_FILE_BYTES + 1;
         over_upload_cap.lane = Some(ViewerFileLane {
@@ -2642,7 +2676,8 @@ mod tests {
             rich_message_id: None,
             refresh_failed: false,
         });
-        let text = card_text(&build_viewer_card(&key(), over_upload_cap));
+        let huge = build_viewer_card(&key(), over_upload_cap);
+        let text = card_text(&huge);
         assert!(text.contains("无法发送，也就无法在飞书中查看页面"), "{text}");
         assert!(!text.contains("点此把文件发到会话"), "no send promised: {text}");
         assert!(

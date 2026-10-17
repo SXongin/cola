@@ -378,7 +378,9 @@ changes is only the **card's action priority and copy** — no new lane, no new 
   upload cap says so instead of promising a page, and a `TextTooLarge` page delivered on open
   reads the delivered form. The transfer button keeps the delivered-bytes predicate it had — a
   card that already sent the file offers no second send, and an ambiguous send is not retried —
-  so the note and the control can never tell two different stories.
+  and a file past the upload cap keeps its button too, exactly as every other kind does: the
+  click re-reads the file and reports 未发送 on the card. What must not happen is the note
+  promising a page the cap forbids, so the note alone changes there.
 - **The source preview stays.** A page's markup is still worth reading, and the card is the only
   place cola shows it; the amendment demotes the action, it does not delete the preview.
 
