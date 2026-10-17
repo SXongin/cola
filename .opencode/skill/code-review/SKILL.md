@@ -32,6 +32,7 @@ The resumed prompt carries:
 
 - the findings **verbatim**, never a summary;
 - the fix's delta as a **ref pair**, not pasted text: the HEAD the first round reviewed and the current HEAD, so the reviewer runs `git diff <from>..<to>` itself — plus the original full-diff command for the whole picture;
+- the **refreshed** untracked-file list and content (`git ls-files --others --exclude-standard` run again): a fix that adds a file leaves no hunk in either diff, so the first round's list is stale by definition;
 - the brief: for every finding, resolved / not resolved / partially, with the reason; and what the delta could break that the first round did not see.
 
 The adversarial half follows its own skill's re-review step, which re-derives its verdict from the whole diff rather than the delta alone. Resuming keeps the reviewer independent of the author and leaves the bound and the reported verdict untouched.
